@@ -53,6 +53,14 @@ name = "aris-reader-core"
 version = "0.0.0"
 
 [[package]]
+name = "aris-reader-desktop-ffi"
+version = "0.0.0"
+dependencies = [
+ "aris-reader-runtime",
+ "serde_json",
+]
+
+[[package]]
 name = "aris-reader-edit"
 version = "0.0.0"
 dependencies = [
@@ -93,6 +101,15 @@ name = "aris-reader-render"
 version = "0.0.0"
 dependencies = [
  "aris-reader-core",
+]
+
+[[package]]
+name = "aris-reader-runtime"
+version = "0.0.0"
+dependencies = [
+ "aris-reader-core",
+ "aris-reader-pdfium",
+ "aris-reader-session",
 ]
 
 [[package]]

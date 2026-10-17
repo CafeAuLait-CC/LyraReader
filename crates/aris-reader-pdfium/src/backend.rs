@@ -36,9 +36,28 @@ fn library_candidates_with(env_override: Option<&str>) -> Vec<PathBuf> {
         candidates.push(PathBuf::from(explicit));
     }
 
+    // A directory-style desktop bundle puts PDFium beside its executable in lib/.
+    // Prefer the bundled engine over a development checkout that may hold another version.
+    // This also works for a Windows build without a global DLL search-path change.
+    #[cfg(not(target_vendor = "apple"))]
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(directory) = executable.parent()
+    {
+        candidates.push(Pdfium::pdfium_platform_library_name_at_path(
+            &directory.join("lib"),
+        ));
+    }
+
     // Development layout: <repo>/vendor/pdfium/lib (see scripts/fetch-pdfium.sh).
     let dev_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/pdfium/lib");
     candidates.push(Pdfium::pdfium_platform_library_name_at_path(&dev_dir));
+
+    // Keep platform downloads separate so a Linux checkout never replaces a macOS dylib.
+    #[cfg(target_os = "linux")]
+    {
+        let linux_dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/pdfium-linux/lib");
+        candidates.push(Pdfium::pdfium_platform_library_name_at_path(&linux_dev));
+    }
 
     // Bundled layout: resolved by the OS loader through the executable's rpath.
     candidates.push(PathBuf::from(Pdfium::pdfium_platform_library_name()));
@@ -1232,6 +1251,22 @@ mod tests {
             library_candidates_with(Some("")).len(),
             library_candidates_with(None).len(),
             "an empty override must not add a candidate"
+        );
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    #[test]
+    fn executable_bundle_precedes_the_development_engine() {
+        let executable = std::env::current_exe().unwrap();
+        let bundled =
+            Pdfium::pdfium_platform_library_name_at_path(&executable.parent().unwrap().join("lib"));
+        let development = Pdfium::pdfium_platform_library_name_at_path(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/pdfium/lib"),
+        );
+        let candidates = library_candidates_with(None);
+        assert!(
+            candidates.iter().position(|p| p == &bundled).unwrap()
+                < candidates.iter().position(|p| p == &development).unwrap()
         );
     }
 

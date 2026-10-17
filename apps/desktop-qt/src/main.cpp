@@ -1,0 +1,93 @@
+#include "PageItem.h"
+#include "ReaderController.h"
+#include <QCommandLineParser>
+#include <QFileInfo>
+#include <QGuiApplication>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+#include <QQuickStyle>
+#include <QQuickWindow>
+#include <QSGRendererInterface>
+#include <QStandardPaths>
+#include <QTimer>
+
+static const char *graphicsName(QSGRendererInterface::GraphicsApi api) {
+    switch (api) {
+    case QSGRendererInterface::OpenGL: return "OpenGL";
+    case QSGRendererInterface::Vulkan: return "Vulkan";
+    case QSGRendererInterface::Direct3D11: return "Direct3D11";
+    case QSGRendererInterface::Direct3D12: return "Direct3D12";
+    case QSGRendererInterface::Metal: return "Metal";
+    case QSGRendererInterface::Software: return "Software";
+    default: return "Other";
+    }
+}
+
+int main(int argc, char **argv) {
+    QGuiApplication application(argc, argv);
+    QCoreApplication::setApplicationName(QStringLiteral("Lyra"));
+    QCoreApplication::setOrganizationName(QStringLiteral("Aris"));
+    // Installed builds have a desktop entry the portal can resolve. An uninstalled
+    // development binary should not register a nonexistent desktop identity.
+    if (!QStandardPaths::locate(QStandardPaths::GenericDataLocation,
+            QStringLiteral("applications/io.github.CafeAuLaitCC.Lyra.desktop")).isEmpty())
+        QGuiApplication::setDesktopFileName(QStringLiteral("io.github.CafeAuLaitCC.Lyra"));
+    QCommandLineParser parser;
+    parser.setApplicationDescription(QStringLiteral("Lyra native Qt PDF reader"));
+    parser.addHelpOption();
+    parser.addPositionalArgument(QStringLiteral("file"), QStringLiteral("Local PDF to open"));
+    parser.addOption({QStringLiteral("quit-after"), QStringLiteral("Exit after N milliseconds (development check)"), QStringLiteral("ms")});
+    parser.addOption({QStringLiteral("snapshot"), QStringLiteral("Save a window snapshot before quitting (development check)"), QStringLiteral("path")});
+    parser.addOption({QStringLiteral("graphics"), QStringLiteral("Graphics backend: auto, vulkan, opengl, software"), QStringLiteral("backend"), QStringLiteral("auto")});
+    parser.process(application);
+    const auto graphics = parser.value(QStringLiteral("graphics"));
+    if (graphics == QStringLiteral("vulkan")) QQuickWindow::setGraphicsApi(QSGRendererInterface::Vulkan);
+    else if (graphics == QStringLiteral("opengl")) QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
+    else if (graphics == QStringLiteral("software")) QQuickWindow::setSceneGraphBackend(QStringLiteral("software"));
+    else if (graphics != QStringLiteral("auto")) { qCritical() << "Unknown graphics backend:" << graphics; return 2; }
+    if (qEnvironmentVariableIsEmpty("QT_QUICK_CONTROLS_STYLE")) {
+#ifdef Q_OS_WIN
+        QQuickStyle::setStyle(QStringLiteral("FluentWinUI3"));
+#else
+        QQuickStyle::setStyle(QStringLiteral("Fusion"));
+#endif
+    }
+    qmlRegisterUncreatableType<ReaderController>("Lyra", 1, 0, "ReaderController", QStringLiteral("Created by the application"));
+    qmlRegisterType<PageItem>("Lyra", 1, 0, "PdfPage");
+    ReaderController reader;
+    QQmlApplicationEngine engine;
+    engine.rootContext()->setContextProperty(QStringLiteral("reader"), &reader);
+    engine.load(QUrl(QStringLiteral("qrc:/qml/Main.qml")));
+    if (engine.rootObjects().isEmpty()) return 1;
+    auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().first());
+    if (!window) return 1;
+    QObject::connect(window, &QQuickWindow::sceneGraphInitialized, window, [window] {
+        qInfo() << "aris-qt-backend:" << QGuiApplication::platformName()
+                << "graphicsApi=" << graphicsName(window->rendererInterface()->graphicsApi());
+    }, Qt::DirectConnection);
+    const auto files = parser.positionalArguments();
+    if (!files.isEmpty()) reader.openFile(QUrl::fromLocalFile(QFileInfo(files.first()).absoluteFilePath()));
+    if (parser.isSet(QStringLiteral("quit-after"))) {
+        bool ok = false;
+        const int duration = parser.value(QStringLiteral("quit-after")).toInt(&ok);
+        if (!ok || duration < 1) return 2;
+        const auto snapshot = parser.value(QStringLiteral("snapshot"));
+        QTimer::singleShot(duration, &application, [&application, window, snapshot] {
+            if (!snapshot.isEmpty()) {
+                if (auto *sidebar = window->findChild<QObject *>(QStringLiteral("pagesSidebar")))
+                    qInfo() << "aris-qt-sidebar:" << "height=" << sidebar->property("height")
+                        << "contentHeight=" << sidebar->property("contentHeight")
+                        << "contentY=" << sidebar->property("contentY")
+                        << "originY=" << sidebar->property("originY")
+                        << "current=" << sidebar->property("currentIndex");
+            }
+            if (!snapshot.isEmpty() && !window->grabWindow().save(snapshot)) {
+                qCritical() << "Could not save window snapshot" << snapshot;
+                application.exit(3);
+                return;
+            }
+            application.quit();
+        });
+    }
+    return application.exec();
+}

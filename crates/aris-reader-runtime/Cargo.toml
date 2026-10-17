@@ -1,0 +1,15 @@
+[package]
+name = "aris-reader-runtime"
+description = "Toolkit-independent document services for native desktop shells"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aris-reader-core = { workspace = true }
+aris-reader-pdfium = { workspace = true }
+aris-reader-session = { workspace = true }

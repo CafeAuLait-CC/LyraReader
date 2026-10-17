@@ -1,0 +1,78 @@
+cmake_minimum_required(VERSION 3.22)
+project(LyraDesktop VERSION 0.0.0 LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_AUTOMOC ON)
+find_package(Qt6 6.7 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Concurrent)
+find_package(Threads REQUIRED)
+get_filename_component(ARIS_READER_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+set(ARIS_READER_RUST_PROFILE "debug" CACHE STRING "Rust build profile (debug or release)")
+if(WIN32)
+    set(RUST_LIBRARY_NAME aris_reader_desktop_ffi.lib)
+else()
+    set(RUST_LIBRARY_NAME libaris_reader_desktop_ffi.a)
+endif()
+set(ARIS_READER_RUST_LIBRARY "${ARIS_READER_ROOT}/target/${ARIS_READER_RUST_PROFILE}/${RUST_LIBRARY_NAME}" CACHE FILEPATH "Built Rust desktop static library")
+add_library(aris_reader_rust STATIC IMPORTED GLOBAL)
+set_target_properties(aris_reader_rust PROPERTIES IMPORTED_LOCATION "${ARIS_READER_RUST_LIBRARY}")
+find_program(ARIS_CARGO_EXECUTABLE cargo REQUIRED)
+set(ARIS_CARGO_PROFILE_ARGS)
+if(ARIS_READER_RUST_PROFILE STREQUAL "release")
+    list(APPEND ARIS_CARGO_PROFILE_ARGS --release)
+elseif(NOT ARIS_READER_RUST_PROFILE STREQUAL "debug")
+    message(FATAL_ERROR "ARIS_READER_RUST_PROFILE must be debug or release")
+endif()
+add_custom_target(aris_reader_build
+    COMMAND ${CMAKE_COMMAND} -E env "CARGO_TARGET_DIR=${ARIS_READER_ROOT}/target"
+        ${ARIS_CARGO_EXECUTABLE} build -p aris-reader-desktop-ffi ${ARIS_CARGO_PROFILE_ARGS}
+    WORKING_DIRECTORY "${ARIS_READER_ROOT}"
+    BYPRODUCTS "${ARIS_READER_RUST_LIBRARY}"
+    COMMENT "Checking/building the Rust document service"
+    VERBATIM)
+add_dependencies(aris_reader_rust aris_reader_build)
+add_library(lyra_shell STATIC src/ReaderController.cpp src/ReaderController.h src/PageItem.cpp src/PageItem.h)
+target_include_directories(lyra_shell PUBLIC src)
+target_link_libraries(lyra_shell PUBLIC Qt6::Quick Qt6::QuickControls2 Qt6::Concurrent aris_reader_rust Threads::Threads ${CMAKE_DL_LIBS})
+if(WIN32)
+    target_link_libraries(lyra_shell PUBLIC userenv ws2_32 bcrypt ntdll)
+elseif(UNIX AND NOT APPLE)
+    target_link_libraries(lyra_shell PUBLIC m rt util)
+endif()
+qt_add_executable(lyra src/main.cpp)
+target_link_libraries(lyra PRIVATE lyra_shell)
+qt_add_resources(lyra qml_resources PREFIX "/" FILES qml/Main.qml)
+get_target_property(QT_CORE_LIBRARY_TYPE Qt6::Core TYPE)
+if(QT_CORE_LIBRARY_TYPE STREQUAL "SHARED_LIBRARY")
+    # System/shared Qt loads QML plugins dynamically; importing nonexistent static
+    # plugin targets produces misleading warnings on Debian's split Qt packages.
+    set_target_properties(lyra PROPERTIES QT_QML_MODULE_NO_IMPORT_SCAN TRUE)
+endif()
+install(TARGETS lyra RUNTIME DESTINATION bin)
+if(UNIX AND NOT APPLE)
+    install(FILES platform/linux/io.github.CafeAuLaitCC.Lyra.desktop DESTINATION share/applications)
+    install(FILES platform/linux/io.github.CafeAuLaitCC.Lyra.svg DESTINATION share/icons/hicolor/scalable/apps)
+    install(FILES "${ARIS_READER_ROOT}/vendor/pdfium-linux/lib/libpdfium.so" DESTINATION bin/lib)
+    install(FILES "${ARIS_READER_ROOT}/vendor/pdfium-linux/LICENSE" DESTINATION share/licenses/Lyra/pdfium)
+    install(DIRECTORY "${ARIS_READER_ROOT}/vendor/pdfium-linux/licenses/" DESTINATION share/licenses/Lyra/pdfium/dependencies)
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    find_package(Qt6 REQUIRED COMPONENTS Test)
+    find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+    add_custom_target(lyra_check_fixtures
+        COMMAND ${Python3_EXECUTABLE} "${ARIS_READER_ROOT}/scripts/make-fixtures.py"
+            "${CMAKE_CURRENT_BINARY_DIR}/fixtures" --long-pages 9 --long-name qt-nine-pages.pdf
+        BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/fixtures/qt-nine-pages.pdf"
+        COMMENT "Generating synthetic Qt reading fixtures"
+        VERBATIM)
+    qt_add_executable(lyra_checks tests/ReaderChecks.cpp)
+    add_dependencies(lyra_checks lyra_check_fixtures)
+    target_link_libraries(lyra_checks PRIVATE lyra_shell Qt6::Test)
+    qt_add_resources(lyra_checks check_qml_resources PREFIX "/" FILES qml/Main.qml)
+    if(QT_CORE_LIBRARY_TYPE STREQUAL "SHARED_LIBRARY")
+        set_target_properties(lyra_checks PROPERTIES QT_QML_MODULE_NO_IMPORT_SCAN TRUE)
+    endif()
+    add_test(NAME lyra_checks COMMAND lyra_checks "${ARIS_READER_ROOT}")
+    set_tests_properties(lyra_checks PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QUICK_BACKEND=software")
+endif()

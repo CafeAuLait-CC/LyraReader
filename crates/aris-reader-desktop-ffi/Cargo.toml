@@ -1,0 +1,17 @@
+[package]
+name = "aris-reader-desktop-ffi"
+description = "Small C ABI between the shared Rust runtime and the Qt desktop shell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+aris-reader-runtime = { path = "../aris-reader-runtime" }
+serde_json = "1"
