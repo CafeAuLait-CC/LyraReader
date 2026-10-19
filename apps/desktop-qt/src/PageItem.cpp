@@ -1,4 +1,5 @@
 #include "PageItem.h"
+#include "PaperAppearance.h"
 #include <QQuickWindow>
 #include <QSGImageNode>
 #include <cmath>
@@ -56,7 +57,7 @@ void PageItem::setRasterScale(double scale) {
 
 void PageItem::refresh() {
     if (!m_controller) return;
-    auto image = m_controller->cachedPage(m_page, effectiveScale());
+    auto image = m_controller->cachedPage(m_page, effectiveScale(),m_embedded);
     if (image.isNull()) return; // Keep the previous resolution sharp while refinement is pending.
     if (m_image.cacheKey() == image.cacheKey()) return;
     m_image = std::move(image);
@@ -66,9 +67,13 @@ void PageItem::refresh() {
 }
 
 void PageItem::request() {
-    if (!m_controller || m_page < 0) return;
+    if (!m_controller || m_page < 0 || !isVisible()) return;
     refresh();
-    m_controller->requestPage(m_page, effectiveScale());
+    if (!m_controller->cachedPage(m_page, effectiveScale(),m_embedded).isNull()) return;
+    m_controller->requestPage(m_page, effectiveScale(),m_embedded);
+    // A bounded scheduler can discard obsolete work during fast jumps/zooms.
+    // An item still alive at this density must eventually retry rather than stay blank.
+    m_requestTimer.start(200);
 }
 
 double PageItem::effectiveScale() const {
@@ -80,6 +85,7 @@ double PageItem::effectiveScale() const {
 
 void PageItem::itemChange(ItemChange change, const ItemChangeData &data) {
     QQuickItem::itemChange(change, data);
+    if(change==ItemVisibleHasChanged && isVisible())m_requestTimer.start();
     if (change == ItemDevicePixelRatioHasChanged || change == ItemSceneChange) {
         const double deviceScale = window() ? window()->effectiveDevicePixelRatio() : 1.0;
         if (!qFuzzyCompare(deviceScale, m_lastDeviceScale)) {
@@ -89,24 +95,30 @@ void PageItem::itemChange(ItemChange change, const ItemChangeData &data) {
     }
 }
 
-QSGNode *PageItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *) {
-    auto *node = static_cast<QSGImageNode *>(oldNode);
+QSGNode *PageItem::updatePaintNode(QSGNode *node, UpdatePaintNodeData *) {
     if (m_image.isNull()) { delete node; return nullptr; }
-    if (!node || m_dirty) {
-        // Let Qt create the node appropriate to its graphics backend. Replacing
-        // the owned node also disposes of its texture exactly once.
+    const int appearance=PaperAppearance::mode(m_paperAppearance);
+    const bool software=window()->rendererInterface()->graphicsApi()==QSGRendererInterface::Software;
+    if (!node || m_dirty || (software && m_uploadedAppearance!=appearance)) {
         delete node;
-        node = window()->createImageNode();
-        if (!node) return nullptr;
-        auto *texture = window()->createTextureFromImage(m_image);
-        if (!texture) { delete node; return nullptr; }
-        node->setTexture(texture);
-        node->setOwnsTexture(true);
-        node->setFiltering(QSGTexture::Linear);
-        node->setSourceRect(QRectF(QPointF(0, 0), m_image.size()));
-        m_dirty = false;
-        qInfo().nospace() << "lyra-reader-qt-upload: page=" << m_page << " size=" << m_image.width() << 'x' << m_image.height();
+        if(software) {
+            auto *imageNode=window()->createImageNode();
+            if(!imageNode)return nullptr;
+            const auto display=PaperAppearance::displayImage(m_image,appearance);
+            auto *texture=window()->createTextureFromImage(display);
+            if(!texture){delete imageNode;return nullptr;}
+            imageNode->setTexture(texture);
+            imageNode->setOwnsTexture(true);
+            imageNode->setFiltering(QSGTexture::Linear);
+            imageNode->setSourceRect(QRectF(QPointF(0,0),display.size()));
+            node=imageNode;
+        } else node=PaperAppearance::createNode(window(),m_image,appearance);
+        if(!node)return nullptr;
+        m_dirty=false;
+        m_uploadedAppearance=appearance;
+        qInfo().nospace()<<"lyra-reader-qt-upload: page="<<m_page<<" size="<<m_image.width()<<'x'<<m_image.height();
     }
-    node->setRect(boundingRect());
+    if(software)static_cast<QSGImageNode *>(node)->setRect(boundingRect());
+    else PaperAppearance::updateNode(node,boundingRect(),appearance);
     return node;
 }

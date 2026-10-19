@@ -99,6 +99,7 @@ impl From<lyra_reader_core::LyraReaderError> for LyraReaderFfiError {
 
 /// Value-typed document summary, safe to copy across the boundary.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct DocumentSummary {
     /// Absolute or user-supplied path the document was opened from.
     pub path: String,
@@ -115,6 +116,7 @@ pub struct DocumentSummary {
 
 /// One widget of an AcroForm field, in view space (points, top-left origin).
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct FormWidgetRecord {
     /// 0-based page the widget annotation is on.
     pub page: u32,
@@ -128,6 +130,7 @@ pub struct FormWidgetRecord {
 
 /// One option of a choice or radio field.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct FormOptionRecord {
     /// The value written to `/V`.
     pub value: String,
@@ -141,6 +144,7 @@ pub struct FormOptionRecord {
 /// rectangle is in view space — the same convention as [`AnnotationRecord`] — and comes from the
 /// widget's `/Rect` through the page's `/CropBox`, `/Rotate` and `/UserUnit`.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct FormFieldRecord {
     /// Stable identity for a save: `f<object number>` of the field dictionary.
     pub id: String,
@@ -172,6 +176,7 @@ pub struct FormFieldRecord {
 
 /// The form facts and fields of a document.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct FormInfoRecord {
     pub fields: Vec<FormFieldRecord>,
     /// Encrypted files are read (when the caller has the password) but refused for filling.
@@ -185,6 +190,7 @@ pub struct FormInfoRecord {
 
 /// One field value the shell asks the writer to put into the document.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct FormFieldValueRecord {
     pub field_id: String,
     /// A text field's new value, or a choice's chosen value.
@@ -197,6 +203,7 @@ pub struct FormFieldValueRecord {
 
 /// What a successful form save did.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct FormSaveReport {
     pub destination_path: String,
     pub written_field_ids: Vec<String>,
@@ -208,6 +215,7 @@ pub struct FormSaveReport {
 
 /// The facts and editable `/Info` entries of a document.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct DocumentInfoRecord {
     pub title: String,
     pub author: String,
@@ -221,6 +229,7 @@ pub struct DocumentInfoRecord {
 
 /// What a successful properties save did.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct PropertiesSaveReport {
     pub destination_path: String,
     pub written_keys: Vec<String>,
@@ -236,6 +245,7 @@ pub struct PropertiesSaveReport {
 /// modes the shell can actually draw cross the FFI boundary today. `Facing` means the book
 /// convention: page 1 alone, then 2–3, 4–5, … with odd pages on the right.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub enum ReaderLayout {
     Continuous,
     Facing,
@@ -318,6 +328,7 @@ impl LyraReaderEngine {
 
 /// Size of a page in points, already accounting for `/Rotate`.
 #[derive(Debug, Clone, Copy, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct PageSize {
     pub width_pt: f64,
     pub height_pt: f64,
@@ -330,6 +341,7 @@ pub struct PageSize {
 /// `docs/03-rendering.md` §5. The shell uploads it and draws a quad; until the tile
 /// pipeline lands (T1.5–T1.7) a whole page is one texture.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct PageBitmap {
     pub width_px: u32,
     pub height_px: u32,
@@ -391,6 +403,7 @@ pub struct DocumentMetadataRecord {
 ///
 /// Provenance is not part of the request: an edited value is the reader's, not the file's.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct MetadataDraftRecord {
     pub title: String,
     pub authors: Vec<String>,
@@ -459,6 +472,7 @@ pub fn generate_bibtex_entry(draft: MetadataDraftRecord) -> String {
 /// become `?`: the writer encodes it through `.notdef` with its exact Unicode in `/ToUnicode`, so
 /// `/Contents` and text extraction stay exact while the page shows a missing-glyph box.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AppearanceCoverageRecord {
     /// Family name of the bundled font (currently `LyraReader Sans SC`).
     pub family: String,
@@ -591,6 +605,7 @@ pub struct ResolvedReference {
 /// Reported for checks and measurements (and visible in the app's stderr log), not shown in the
 /// UI. `Hit` means no index component was derived from the PDF for this document instance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub enum IndexCacheOutcome {
     /// No index access has happened yet, so nothing was looked up.
     NotAttempted,
@@ -619,6 +634,7 @@ pub enum IndexCacheOutcome {
 /// metadata, outline); a cache hit leaves it at zero, which is the check that a second open did
 /// not reparse anything.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct IndexCacheReport {
     pub outcome: IndexCacheOutcome,
     pub cache_path: String,
@@ -666,6 +682,88 @@ impl Default for IndexRuntime {
             write_disabled: false,
             write_error: None,
         }
+    }
+}
+
+impl LyraReaderDocument {
+    fn rasterize_region_bitmap(
+        &self,
+        page: u32,
+        scale: f64,
+        region: (f64, f64, f64, f64),
+        transparent_background: bool,
+        annotations: bool,
+    ) -> Result<PageBitmap, LyraReaderFfiError> {
+        let (x_pt, y_pt, width_pt, height_pt) = region;
+        if !(scale.is_finite() && scale > 0.0) {
+            return Err(LyraReaderFfiError::InvalidArgument {
+                message: format!("scale must be positive and finite, got {scale}"),
+            });
+        }
+        if page >= self.backend.page_count() {
+            return Err(LyraReaderFfiError::InvalidArgument {
+                message: format!("page {page} is out of range"),
+            });
+        }
+        if !(x_pt.is_finite()
+            && y_pt.is_finite()
+            && width_pt.is_finite()
+            && height_pt.is_finite()
+            && width_pt > 0.0
+            && height_pt > 0.0
+            && (x_pt + width_pt).is_finite()
+            && (y_pt + height_pt).is_finite())
+        {
+            return Err(LyraReaderFfiError::InvalidArgument {
+                message: format!(
+                    "region ({x_pt}, {y_pt}, {width_pt}×{height_pt}) must be finite with positive dimensions"
+                ),
+            });
+        }
+        let geometry = self.backend.page_info(PageIndex(page))?.geometry;
+        let page_size = geometry.view_size(1.0);
+        let tolerance = 1e-6;
+        if x_pt < -tolerance
+            || y_pt < -tolerance
+            || x_pt + width_pt > page_size.width + tolerance
+            || y_pt + height_pt > page_size.height + tolerance
+        {
+            return Err(LyraReaderFfiError::InvalidArgument {
+                message: format!(
+                    "region ({x_pt}, {y_pt}, {width_pt}×{height_pt}) is outside the page bounds ({}, {})",
+                    page_size.width, page_size.height
+                ),
+            });
+        }
+
+        // A caller can request an arbitrary region, so apply the same pixel and edge limits as a
+        // whole-page bitmap before asking PDFium to allocate it.
+        let scale = clamp_scale((width_pt, height_pt), scale);
+        if !(scale.is_finite() && scale > 0.0 && (scale as f32) > 0.0) {
+            return Err(LyraReaderFfiError::InvalidArgument {
+                message: "region dimensions exceed the renderer's supported range".to_string(),
+            });
+        }
+        let mut request =
+            RasterRequest::tile(PageIndex(page), scale, (x_pt, y_pt), (width_pt, height_pt));
+        request.flags.annotations = annotations;
+        if transparent_background {
+            // A zero-alpha clear: the page background stays clear, the content PDFium draws
+            // supplies the coverage alpha. The RGB of a fully clear pixel is irrelevant to
+            // alpha-over, which weights it by zero.
+            request.background = [0, 0, 0, 0];
+        }
+        let tile = self.backend.rasterize(&request)?;
+
+        Ok(PageBitmap {
+            width_px: tile.size.width.round() as u32,
+            height_px: tile.size.height.round() as u32,
+            stride: tile.stride as u32,
+            width_pt,
+            height_pt,
+            scale_used: scale,
+            pixels: tile.pixels,
+        })
     }
 }
 
@@ -866,74 +964,27 @@ impl LyraReaderDocument {
         height_pt: f64,
         transparent_background: bool,
     ) -> Result<PageBitmap, LyraReaderFfiError> {
-        if !(scale.is_finite() && scale > 0.0) {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                message: format!("scale must be positive and finite, got {scale}"),
-            });
-        }
-        if page >= self.backend.page_count() {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                message: format!("page {page} is out of range"),
-            });
-        }
-        if !(x_pt.is_finite()
-            && y_pt.is_finite()
-            && width_pt.is_finite()
-            && height_pt.is_finite()
-            && width_pt > 0.0
-            && height_pt > 0.0
-            && (x_pt + width_pt).is_finite()
-            && (y_pt + height_pt).is_finite())
-        {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                message: format!(
-                    "region ({x_pt}, {y_pt}, {width_pt}×{height_pt}) must be finite with positive dimensions"
-                ),
-            });
-        }
-        let geometry = self.backend.page_info(PageIndex(page))?.geometry;
-        let page_size = geometry.view_size(1.0);
-        let tolerance = 1e-6;
-        if x_pt < -tolerance
-            || y_pt < -tolerance
-            || x_pt + width_pt > page_size.width + tolerance
-            || y_pt + height_pt > page_size.height + tolerance
-        {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                message: format!(
-                    "region ({x_pt}, {y_pt}, {width_pt}×{height_pt}) is outside the page bounds ({}, {})",
-                    page_size.width, page_size.height
-                ),
-            });
-        }
+        self.rasterize_region_bitmap(
+            page,
+            scale,
+            (x_pt, y_pt, width_pt, height_pt),
+            transparent_background,
+            false,
+        )
+    }
 
-        // A caller can request an arbitrary region, so apply the same pixel and edge limits as a
-        // whole-page bitmap before asking PDFium to allocate it.
-        let scale = clamp_scale((width_pt, height_pt), scale);
-        if !(scale.is_finite() && scale > 0.0 && (scale as f32) > 0.0) {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                message: "region dimensions exceed the renderer's supported range".to_string(),
-            });
-        }
-        let mut request =
-            RasterRequest::tile(PageIndex(page), scale, (x_pt, y_pt), (width_pt, height_pt));
-        if transparent_background {
-            // A zero-alpha clear: the page background stays clear, the content PDFium draws
-            // supplies the coverage alpha. The RGB of a fully clear pixel is irrelevant to
-            // alpha-over, which weights it by zero.
-            request.background = [0, 0, 0, 0];
-        }
-        let tile = self.backend.rasterize(&request)?;
-
-        Ok(PageBitmap {
-            width_px: tile.size.width.round() as u32,
-            height_px: tile.size.height.round() as u32,
-            stride: tile.stride as u32,
-            width_pt,
-            height_pt,
-            scale_used: scale,
-            pixels: tile.pixels,
-        })
+    /// An opaque crop with the PDF's annotation appearances burned in, for printing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rasterize_region_with_annotations(
+        &self,
+        page: u32,
+        scale: f64,
+        x_pt: f64,
+        y_pt: f64,
+        width_pt: f64,
+        height_pt: f64,
+    ) -> Result<PageBitmap, LyraReaderFfiError> {
+        self.rasterize_region_bitmap(page, scale, (x_pt, y_pt, width_pt, height_pt), false, true)
     }
 
     /// Extracts the text layer of `page`.
@@ -3431,6 +3482,7 @@ fn clamp_scale(page_size_pt: (f64, f64), requested: f64) -> f64 {
 
 /// One link: a clickable box plus where it leads.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct LinkRecord {
     pub x_pt: f64,
     pub y_pt: f64,
@@ -3446,6 +3498,7 @@ pub struct LinkRecord {
 
 /// A rectangle on a page, in view space (points, top-left origin).
 #[derive(Debug, Clone, Copy, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct LinkRegion {
     pub x_pt: f64,
     pub y_pt: f64,
@@ -3464,6 +3517,7 @@ pub struct LinkRegion {
 /// really drawn from, so prefer `quads` and fall back to `x_pt`/`y_pt`/`width_pt`/`height_pt`
 /// when it is empty.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AnnotationRecord {
     /// Page the annotation is on (0-based).
     pub page: u32,
@@ -3546,6 +3600,7 @@ pub struct AnnotationRecord {
 
 /// One point of an ink stroke or a line, in view space (points, top-left origin).
 #[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AnnotationPoint {
     pub x_pt: f64,
     pub y_pt: f64,
@@ -3553,6 +3608,7 @@ pub struct AnnotationPoint {
 
 /// One quadrilateral of an annotation's `/QuadPoints`, in view space.
 #[derive(Debug, Clone, Copy, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AnnotationQuad {
     pub x_pt: f64,
     pub y_pt: f64,
@@ -3562,6 +3618,7 @@ pub struct AnnotationQuad {
 
 /// An annotation colour, 8-bit sRGB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AnnotationColorRecord {
     pub red: u8,
     pub green: u8,
@@ -3575,6 +3632,7 @@ pub struct AnnotationColorRecord {
 /// are the text boxes and `contents` is the comment attached to the mark (what the shell's
 /// `note` field is).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub enum AnnotationWriteKind {
     Highlight,
     Underline,
@@ -3599,6 +3657,7 @@ pub enum AnnotationWriteKind {
 /// `y_pt` is page-local view space (0 at the page top), the same value the sidecar stores, so a
 /// bookmark survives a zoom change, a resize and a layout switch.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct WriteBookmarkRecord {
     /// The sidecar bookmark's UUID string, written as the private `/LyraReaderID` key so a
     /// reopened document can adopt the file's bookmarks with their identities intact.
@@ -3614,6 +3673,7 @@ pub struct WriteBookmarkRecord {
 /// draws in. The Rust side owns the single conversion into page space, so a highlight saved at
 /// 100% and the same highlight saved at 300% produce identical PDF coordinates.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct WriteAnnotationRecord {
     /// Stable identity written as `/NM`; the shell uses the sidecar's UUID string so a saved
     /// annotation can be recognised after reopening.
@@ -3658,6 +3718,7 @@ pub struct WriteAnnotationRecord {
 /// the file's `/NM` (unless `assign_name` fills in a missing one), author, flags, popup, parent,
 /// reply links and every key this reader does not model.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AnnotationUpdateRecord {
     pub target: String,
     pub annotation: WriteAnnotationRecord,
@@ -3668,6 +3729,7 @@ pub struct AnnotationUpdateRecord {
 
 /// One annotation the shell asks the writer to remove, with its reply thread and popup.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AnnotationDeleteRecord {
     pub target: String,
     /// Page the annotation is on, for a clearer refusal when it has moved. The writer resolves
@@ -3678,6 +3740,7 @@ pub struct AnnotationDeleteRecord {
 /// What a successful write did. Every value is about the *file that was written*, not about the
 /// request: `written_ids` comes back so the shell removes exactly those sidecar entries.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AnnotationSaveReport {
     pub destination_path: String,
     pub written_ids: Vec<String>,
@@ -3715,6 +3778,7 @@ pub struct AnnotationSaveReport {
 /// top-left origin). The engine converts it to PDF user space with the page's own crop box and
 /// rotation, so the same mark saved at any zoom lands on the same content.
 #[derive(Debug, Clone, Copy, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct RedactionAreaRecord {
     pub page: u32,
     pub x_pt: f64,
@@ -3725,6 +3789,7 @@ pub struct RedactionAreaRecord {
 
 /// What one page would lose if the marks were applied.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct RedactionPagePreviewRecord {
     pub page: u32,
     pub characters: u32,
@@ -3736,6 +3801,7 @@ pub struct RedactionPagePreviewRecord {
 
 /// What applying the marks would lose, for the confirmation dialog.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct RedactionPreviewRecord {
     pub pages: Vec<RedactionPagePreviewRecord>,
     pub removed_characters: u32,
@@ -3743,6 +3809,7 @@ pub struct RedactionPreviewRecord {
 
 /// What one page lost when the redaction was applied.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct RedactionPageReportRecord {
     pub page: u32,
     pub removed_characters: u32,
@@ -3754,6 +3821,7 @@ pub struct RedactionPageReportRecord {
 
 /// What a successful redaction write did.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct RedactionReportRecord {
     pub destination_path: String,
     /// Present only when the original was replaced; the file is verified byte-identical.
@@ -3777,6 +3845,7 @@ pub struct RedactionReportRecord {
 /// `destination = page - 1` and moving it down is `destination = page` on a document with at
 /// least one page after it.
 #[derive(Debug, Clone, uniffi::Enum)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub enum PageOperationRecord {
     Rotate {
         pages: Vec<u32>,
@@ -3800,6 +3869,7 @@ pub enum PageOperationRecord {
 
 /// The result of a page operation or of publishing a page-edit revision.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct PageEditReport {
     /// The file that was written.
     pub destination_path: String,
@@ -3979,6 +4049,7 @@ pub struct FigureRecord {
 /// `kind` + `label` resolve against [`FigureRecord`]s; `start`/`end` address the page's text
 /// layer, the same range [`CitationRecord`] uses for a citation.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct CaptionMentionRecord {
     pub page: u32,
     pub kind: String,
@@ -3995,6 +4066,7 @@ pub struct CaptionMentionRecord {
 
 /// One search hit: a character range in a page's text layer.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct SearchHit {
     pub page: u32,
     /// First matching character index.
@@ -4308,6 +4380,7 @@ fn text_of(raw: &lyra_reader_core::RawTextPage) -> String {
 
 /// One character of a page's text layer, boxed in **view space** (points, top-left origin).
 #[derive(Debug, Clone, Copy, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct TextChar {
     pub unicode: u32,
     pub x_pt: f64,
@@ -4318,6 +4391,7 @@ pub struct TextChar {
 
 /// A page's text layer plus the whole-page string.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct TextPage {
     pub page: u32,
     pub chars: Vec<TextChar>,
@@ -4329,6 +4403,7 @@ pub struct TextPage {
 
 /// One rasterized tile of a page.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct TileBitmap {
     pub page: u32,
     /// Pyramid level; the raster scale is `2^lod`.
@@ -4342,6 +4417,7 @@ pub struct TileBitmap {
 
 /// Where one page sits in the scrolling content (mirrors `PagePlacement`).
 #[derive(Debug, Clone, Copy, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct PagePlacementRecord {
     pub index: u32,
     pub top_pt: f64,
@@ -4383,6 +4459,7 @@ impl LyraReaderEngine {
 
 /// What the reader asked the assistant to do, as the Swift panel names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub enum AiActionRecord {
     SummarizePage,
     SummarizeDocument,
@@ -4392,6 +4469,7 @@ pub enum AiActionRecord {
 
 /// A selected character range on one page (0-based, inclusive).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AiSelectionRecord {
     pub page: u32,
     pub start: u32,
@@ -4400,6 +4478,7 @@ pub struct AiSelectionRecord {
 
 /// Everything needed to build a preview. The API key is deliberately absent.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AiPlanRequestRecord {
     pub action: AiActionRecord,
     pub current_page: u32,
@@ -4418,6 +4497,7 @@ pub struct AiPlanRequestRecord {
 
 /// One part summary used by the consolidation request.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AiMergePartRecord {
     pub index: u32,
     pub total: u32,
@@ -4427,6 +4507,7 @@ pub struct AiMergePartRecord {
 
 /// The local input to the consolidation request. It carries part summaries, not page text.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AiMergePlanRequestRecord {
     pub document_title: String,
     pub parts: Vec<AiMergePartRecord>,
@@ -4439,6 +4520,7 @@ pub struct AiMergePlanRequestRecord {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AiHeaderRecord {
     pub name: String,
     pub value: String,
@@ -4447,6 +4529,7 @@ pub struct AiHeaderRecord {
 /// One request in the preview. `wire_body` is the exact JSON body; the key is added only when
 /// the reader presses Send, so it can never appear here.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AiPlanPartRecord {
     pub index: u32,
     pub total: u32,
@@ -4463,6 +4546,7 @@ pub struct AiPlanPartRecord {
 
 /// The complete, previewable plan for one action.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AiPlanRecord {
     pub action: AiActionRecord,
     pub action_label: String,
@@ -4484,6 +4568,7 @@ pub struct AiPlanRecord {
 
 /// A validated base URL: the settings panel and the preview show the same normalised values.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AiEndpointRecord {
     pub base_url: String,
     pub endpoint: String,
@@ -4511,6 +4596,7 @@ pub fn validate_ai_model(model: String) -> Result<String, LyraReaderFfiError> {
 
 /// Per-request instrumentation. Counts and byte totals only; no content.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AiStreamDiagnostics {
     pub http_status: u16,
     pub bytes: u64,
@@ -4531,6 +4617,7 @@ pub struct AiStreamDiagnostics {
 
 /// One event from a running request. The shell polls a handle and renders these in order.
 #[derive(Debug, Clone, uniffi::Enum)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub enum AiEventRecord {
     PartStarted {
         index: u32,

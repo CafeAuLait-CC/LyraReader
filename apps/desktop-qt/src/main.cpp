@@ -1,8 +1,11 @@
 #include "PageItem.h"
 #include "ReaderController.h"
+#include "WorkspaceController.h"
+#include "AnnotationOverlay.h"
 #include <QCommandLineParser>
 #include <QFileInfo>
-#include <QGuiApplication>
+#include <QApplication>
+#include <QFontDatabase>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickStyle>
@@ -10,6 +13,7 @@
 #include <QSGRendererInterface>
 #include <QStandardPaths>
 #include <QTimer>
+#include <functional>
 
 static const char *graphicsName(QSGRendererInterface::GraphicsApi api) {
     switch (api) {
@@ -24,7 +28,8 @@ static const char *graphicsName(QSGRendererInterface::GraphicsApi api) {
 }
 
 int main(int argc, char **argv) {
-    QGuiApplication application(argc, argv);
+    QApplication application(argc, argv);
+    QFontDatabase::addApplicationFont(QStringLiteral(":/fonts/LyraReaderSansSC-Regular.ttf"));
     QCoreApplication::setApplicationName(QStringLiteral("LyraReader"));
     QCoreApplication::setOrganizationName(QStringLiteral("Alex"));
     QCoreApplication::setOrganizationDomain(QStringLiteral("alex.com"));
@@ -55,25 +60,43 @@ int main(int argc, char **argv) {
     }
     qmlRegisterUncreatableType<ReaderController>("LyraReader", 1, 0, "ReaderController", QStringLiteral("Created by the application"));
     qmlRegisterType<PageItem>("LyraReader", 1, 0, "PdfPage");
-    ReaderController reader;
-    QQmlApplicationEngine engine;
-    engine.rootContext()->setContextProperty(QStringLiteral("reader"), &reader);
-    engine.load(QUrl(QStringLiteral("qrc:/qml/Main.qml")));
-    if (engine.rootObjects().isEmpty()) return 1;
-    auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().first());
+    qmlRegisterType<AnnotationOverlay>("LyraReader",1,0,"PdfAnnotations");
+    std::function<QQuickWindow *(const QUrl &,int)> createWindow;
+    createWindow = [&](const QUrl &url,int page) -> QQuickWindow * {
+        auto *engine = new QQmlApplicationEngine(&application);
+        auto *workspace = new WorkspaceController(engine);
+        engine->rootContext()->setContextProperty(QStringLiteral("workspace"),workspace);
+        engine->rootContext()->setContextProperty(QStringLiteral("reader"),workspace->activeReader());
+        engine->load(QUrl(QStringLiteral("qrc:/qml/Main.qml")));
+        if (engine->rootObjects().isEmpty()) { delete engine; return nullptr; }
+        auto *created = qobject_cast<QQuickWindow *>(engine->rootObjects().first());
+        if (!created) { delete engine; return nullptr; }
+        created->setProperty("requestedPage",page);
+        QObject::connect(workspace,&WorkspaceController::newWindowRequested,&application,[&](const QUrl &file,int targetPage) {createWindow(file,targetPage);});
+        QObject::connect(created,&QQuickWindow::closing,engine,[engine,created] {
+            QTimer::singleShot(0,engine,[engine,created] { if(!created->isVisible())engine->deleteLater(); });
+        });
+        QObject::connect(created,&QQuickWindow::sceneGraphInitialized,created,[created] {
+            qInfo()<<"lyra-reader-qt-backend:"<<QGuiApplication::platformName()
+                   <<"graphicsApi="<<graphicsName(created->rendererInterface()->graphicsApi());
+        },Qt::DirectConnection);
+        if (!url.isEmpty()) workspace->openFile(url);
+        return created;
+    };
+    auto *window=createWindow({},0);
     if (!window) return 1;
-    QObject::connect(window, &QQuickWindow::sceneGraphInitialized, window, [window] {
-        qInfo() << "lyra-reader-qt-backend:" << QGuiApplication::platformName()
-                << "graphicsApi=" << graphicsName(window->rendererInterface()->graphicsApi());
-    }, Qt::DirectConnection);
     const auto files = parser.positionalArguments();
-    if (!files.isEmpty()) reader.openFile(QUrl::fromLocalFile(QFileInfo(files.first()).absoluteFilePath()));
+    if (!files.isEmpty()) {
+        auto *workspace=window->property("session").value<WorkspaceController *>();
+        if (workspace) for (const auto &file:files) workspace->openFile(QUrl::fromLocalFile(QFileInfo(file).absoluteFilePath()));
+    }
     if (parser.isSet(QStringLiteral("quit-after"))) {
         bool ok = false;
         const int duration = parser.value(QStringLiteral("quit-after")).toInt(&ok);
         if (!ok || duration < 1) return 2;
         const auto snapshot = parser.value(QStringLiteral("snapshot"));
-        QTimer::singleShot(duration, &application, [&application, window, snapshot] {
+        QTimer::singleShot(duration, &application, [&application, window=QPointer<QQuickWindow>(window), snapshot] {
+            if(!window){application.quit();return;}
             if (!snapshot.isEmpty()) {
                 if (auto *sidebar = window->findChild<QObject *>(QStringLiteral("pagesSidebar")))
                     qInfo() << "lyra-reader-qt-sidebar:" << "height=" << sidebar->property("height")

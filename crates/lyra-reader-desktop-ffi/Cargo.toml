@@ -14,4 +14,11 @@ workspace = true
 
 [dependencies]
 lyra-reader-runtime = { path = "../lyra-reader-runtime" }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
+
+lyra-reader-ffi = { workspace = true, features = ["desktop-json"] }
+lyra-reader-session = { workspace = true }
+lyra-reader-core = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+getrandom = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

@@ -926,7 +926,13 @@ version = "0.0.0"
 name = "lyra-reader-desktop-ffi"
 version = "0.0.0"
 dependencies = [
+ "chrono",
+ "getrandom 0.4.3",
+ "lyra-reader-core",
+ "lyra-reader-ffi",
  "lyra-reader-runtime",
+ "lyra-reader-session",
+ "serde",
  "serde_json",
 ]
 

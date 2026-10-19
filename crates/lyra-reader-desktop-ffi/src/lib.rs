@@ -2,7 +2,11 @@
 //! passes QObject pointers into Rust. Header: apps/desktop-qt/src/lyra_reader_desktop.h.
 #![allow(unsafe_code)]
 
-use lyra_reader_runtime::Document;
+mod document;
+mod marks;
+mod pages;
+mod render_source;
+use document::DesktopDocument as Document;
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
@@ -83,7 +87,7 @@ pub unsafe extern "C" fn lyra_reader_desktop_open(
                         .map_err(|e| e.to_string())?,
                 )
             };
-            let document = Document::open(Path::new(path), password).map_err(|e| e.to_string())?;
+            let document = Document::open(Path::new(path), password)?;
             Ok(Box::into_raw(Box::new(document)))
         })
     }
@@ -115,15 +119,7 @@ pub unsafe extern "C" fn lyra_reader_desktop_info(
             if output.is_null() {
                 return Err("output buffer is null".into());
             }
-            let pages: Vec<_> = doc.layout().placements().iter().map(|p| serde_json::json!({
-            "index": p.index, "width": p.width_pt, "height": p.height_pt, "top": p.top_pt,
-        })).collect();
-            let info = serde_json::json!({
-                "pages": pages,
-                "width": doc.layout().content_width_pt(),
-                "height": doc.layout().content_height_pt(),
-                "gap": doc.layout().gap_pt(),
-            });
+            let info = doc.info()?;
             output.write(Buffer::owned(
                 serde_json::to_vec(&info).map_err(|e| e.to_string())?,
             ));
@@ -149,15 +145,74 @@ pub unsafe extern "C" fn lyra_reader_desktop_render(
             if output.is_null() {
                 return Err("output bitmap is null".into());
             }
-            let raster = doc.render_page(page, scale).map_err(|e| e.to_string())?;
-            let stride = u32::try_from(raster.tile.stride).map_err(|_| "bitmap stride overflow")?;
+            let raster = doc.render(page, scale, false)?;
             output.write(Bitmap {
-                width: raster.tile.size.width as u32,
-                height: raster.tile.size.height as u32,
-                stride,
-                scale: raster.scale,
-                pixels: Buffer::owned(raster.tile.pixels),
+                width: raster.width_px,
+                height: raster.height_px,
+                stride: raster.stride,
+                scale: raster.scale_used,
+                pixels: Buffer::owned(raster.pixels),
             });
+            Ok(())
+        })
+    }
+    .is_some()
+}
+
+/// # Safety
+/// Same handle and empty output/error contract as render. This path burns the PDF's
+/// existing appearances into thumbnails; editable canvas annotations are separate GPU nodes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_render_annotated(
+    document: *const Document,
+    page: u32,
+    scale: f64,
+    output: *mut Bitmap,
+    error: *mut Buffer,
+) -> bool {
+    unsafe {
+        run(error, || {
+            let doc = document.as_ref().ok_or("document handle is null")?;
+            if output.is_null() {
+                return Err("output bitmap is null".into());
+            }
+            let image = doc.render(page, scale, true)?;
+            output.write(Bitmap {
+                width: image.width_px,
+                height: image.height_px,
+                stride: image.stride,
+                scale: image.scale_used,
+                pixels: Buffer::owned(image.pixels),
+            });
+            Ok(())
+        })
+    }
+    .is_some()
+}
+
+/// # Safety
+/// Document stays alive during the call; request addresses request_len readable bytes.
+/// Output and error are writable, empty buffers and must be freed by buffer_free.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_command(
+    document: *const Document,
+    request: *const u8,
+    request_len: usize,
+    output: *mut Buffer,
+    error: *mut Buffer,
+) -> bool {
+    unsafe {
+        run(error, || {
+            let doc = document.as_ref().ok_or("document handle is null")?;
+            if output.is_null() {
+                return Err("output buffer is null".into());
+            }
+            let request =
+                serde_json::from_slice(bytes(request, request_len)?).map_err(|e| e.to_string())?;
+            let result = doc.command(request)?;
+            let response = serde_json::to_vec(&serde_json::json!({"result":result}))
+                .map_err(|e| e.to_string())?;
+            output.write(Buffer::owned(response));
             Ok(())
         })
     }
@@ -197,6 +252,81 @@ pub extern "C" fn lyra_reader_desktop_zoom_offset(
         return 0.0;
     }
     lyra_reader_runtime::zoomed_offset(offset, anchor, old_zoom, new_zoom)
+}
+
+/// # Safety
+/// The document remains alive during preparation. The returned snapshot is independent;
+/// free it once with render_source_free, after all crop requests finish.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_render_source(
+    document: *const Document,
+    include_edits: bool,
+    error: *mut Buffer,
+) -> *mut render_source::RenderSource {
+    unsafe {
+        run(error, || {
+            let document = document.as_ref().ok_or("document handle is null")?;
+            Ok(Box::into_raw(Box::new(render_source::RenderSource::new(
+                document,
+                include_edits,
+            )?)))
+        })
+    }
+    .unwrap_or(ptr::null_mut())
+}
+/// # Safety
+/// Source is null or uniquely owned, with no crop calls in progress.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_render_source_free(
+    source: *mut render_source::RenderSource,
+) {
+    if !source.is_null() {
+        unsafe {
+            drop(Box::from_raw(source));
+        }
+    }
+}
+/// # Safety
+/// Source remains alive during the call. Output/error are writable empty structures.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn lyra_reader_desktop_render_region(
+    source: *const render_source::RenderSource,
+    page: u32,
+    scale: f64,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    annotated: bool,
+    transparent: bool,
+    output: *mut Bitmap,
+    error: *mut Buffer,
+) -> bool {
+    unsafe {
+        run(error, || {
+            let source = source.as_ref().ok_or("render source is null")?;
+            if output.is_null() {
+                return Err("output bitmap is null".into());
+            }
+            let image = source.render(
+                page,
+                scale,
+                lyra_reader_core::Rect::new(x, y, width, height),
+                annotated,
+                transparent,
+            )?;
+            output.write(Bitmap {
+                width: image.width_px,
+                height: image.height_px,
+                stride: image.stride,
+                scale: image.scale_used,
+                pixels: Buffer::owned(image.pixels),
+            });
+            Ok(())
+        })
+    }
+    .is_some()
 }
 
 #[cfg(test)]

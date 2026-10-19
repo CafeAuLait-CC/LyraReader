@@ -4,6 +4,7 @@ import QtQuick.Layouts
 import QtQuick.Dialogs
 import QtQuick.Window
 import LyraReader 1.0
+import "ReaderLogic.js" as Logic
 
 ApplicationWindow {
     id: root
@@ -13,11 +14,175 @@ ApplicationWindow {
     height: 820
     minimumWidth: 640
     minimumHeight: 440
-    title: reader.title === "LyraReader" ? "LyraReader" : reader.title + " — LyraReader"
+    title: currentReader.title === "LyraReader" ? "LyraReader" : currentReader.title + " — LyraReader"
     color: theme.windowBg
     // Palette specification defaults to light; the user can opt into dark or system.
-    property string appearance: "light"
-    SystemPalette { id: systemPalette }
+    readonly property var session: typeof workspace !== "undefined" ? workspace : null
+    readonly property var currentReader: session ? session.activeReader : reader
+    readonly property var colors: theme
+    readonly property var pageList: canvas.view
+    property string appearance: session ? session.preference("appearance", "light") : "light"
+    property string sidebarTab: "thumbnails"
+    property bool annotationToolsVisible: false
+    property bool overviewVisible: false
+    property bool formToolActive: false
+    property string annotationTool: "select"
+    property string layoutMode: "Continuous"
+    property real pageGap: 12
+    property var selection: null
+    property string searchQuery: ""
+    property var searchResults: []
+    property int searchIndex: -1
+    property bool searchVisible: false
+    readonly property var activeSearchHit: searchIndex >= 0 && searchIndex < searchResults.length ? searchResults[searchIndex] : null
+    readonly property var markState: currentReader.data.marks || {
+        annotations: [],
+        file_annotations: currentReader.data.annotations || [],
+        bookmarks: []
+    }
+    readonly property var bookmarks: markState.bookmarks || []
+    readonly property var annotations: (markState.annotations || []).map(function (a) {
+        return Logic.normalized(a, false);
+    }).concat((markState.file_annotations || []).map(function (a) {
+        return Logic.normalized(a, true);
+    }))
+    property var annotationDraft: null
+    property var eraseDraft: []
+    property double pendingDraftRequestId: -1
+    property double searchRequestId: -1
+    property string brushColor: "#E8BC55"
+    property real brushOpacity: 0.32
+    property real brushWidth: 2
+    property string annotationFont: "LyraReader Sans SC"
+    property var aiSettings: session ? session.preference("ai", {}) : ({})
+    property var previousReader: null
+    property var pendingPosition: null
+    property alias searchDebounce: searchTimer
+    property var selectedAnnotation: null
+    property var infoData: ({})
+    property var formValues: ({})
+    property string exportKind: ""
+    readonly property bool pageEditsPending: !!markState.page_pending
+    property bool pageEditBusy: false
+    property var selectedPages: [0]
+    property int pendingPage: 0
+    property var pendingPageSelection: []
+    property string paperAppearance: session ? session.preference("paper", "original") : "original"
+    readonly property string bibtex: currentReader.data.bibtex || (currentReader.data.metadata ? currentReader.data.metadata.bibtex : "")
+    property var metadataDraft: null
+    property string operationStatus: ""
+    onAppearanceChanged: if (session)
+        session.setPreference("appearance", appearance)
+    onCurrentReaderChanged: {
+        printRequested = false;
+        previousReader = currentReader;
+        selection = null;
+        searchResults = [];
+        searchIndex = -1;
+        if (currentReader && currentReader.pageCount > 0)
+            Qt.callLater(restorePosition);
+    }
+    property bool closeApproved: false
+    property int closingTab: -2
+    function saveReadingPosition() {
+        positionTimer.stop();
+        if (session && currentReader.pageCount > 0)
+            session.saveViewState(currentReader, {
+                page: currentPage,
+                zoom: zoom,
+                fitting: fitting,
+                offset: pageList.contentY,
+                layout: layoutMode,
+                gap: pageGap
+            });
+    }
+    function hasPendingCloseWork(index) {
+        const tabs = session ? session.tabs : [
+            {
+                reader: currentReader
+            }
+        ];
+        return tabs.some(function (tab, i) {
+            return (index < 0 || i === index) && tab.reader.pendingCommands > 0;
+        });
+    }
+    function hasUnsavedChanges(index) {
+        const tabs = session ? session.tabs : [
+            {
+                reader: currentReader
+            }
+        ];
+        return tabs.some(function (tab, i) {
+            const marks = tab.reader.data.marks || {};
+            return (index < 0 || i === index) && (marks.page_pending || marks.pending_deletions > 0 || Object.keys(tab.reader.noteDrafts).length > 0);
+        });
+    }
+    function requestCloseTab(index) {
+        if (!session)
+            return;
+        dialogs.flushAnnotation();
+        closingTab = index;
+        if (hasPendingCloseWork(index)) {
+            closeRetry.start();
+            return;
+        }
+        closingTab = -2;
+        if (hasUnsavedChanges(index))
+            dialogs.confirmClose(index);
+        else
+            session.closeTab(index);
+    }
+    function discardAndClose(index) {
+        dialogs.cancelAnnotationDraft();
+        saveReadingPosition();
+        if (index < 0) {
+            closeApproved = true;
+            root.close();
+        } else if (session)
+            session.closeTab(index, true);
+    }
+    onClosing: function (event) {
+        if (closeApproved)
+            return;
+        dialogs.flushAnnotation();
+        saveReadingPosition();
+        if (hasPendingCloseWork(-1)) {
+            event.accepted = false;
+            closingTab = -1;
+            closeRetry.start();
+            return;
+        }
+        if (hasUnsavedChanges(-1)) {
+            event.accepted = false;
+            dialogs.confirmClose(-1);
+        }
+    }
+    Timer {
+        id: closeRetry
+        interval: 80
+        onTriggered: {
+            if (root.closingTab === -2)
+                return;
+            if (root.hasPendingCloseWork(root.closingTab)) {
+                restart();
+                return;
+            }
+            if (dialogs.annotationWriteError.length) {
+                root.operationStatus = dialogs.annotationWriteError;
+                root.closingTab = -2;
+                return;
+            }
+            const index = root.closingTab;
+            root.closingTab = -2;
+            if (index < 0)
+                root.close();
+            else
+                root.requestCloseTab(index);
+        }
+    }
+    SystemPalette {
+        id: systemPalette
+    }
     LyraReaderTheme {
         id: theme
         objectName: "lyraReaderTheme"
@@ -50,270 +215,774 @@ ApplicationWindow {
     property bool sidebarVisible: true
     property int currentPage: 0
 
-    function navigate(page) {
-        if (reader.pageCount === 0) return
-        page = Math.max(0, Math.min(reader.pageCount - 1, page))
-        pageList.positionViewAtIndex(page, ListView.Beginning)
-        root.currentPage = page
+    function navigate(page, y) {
+        if (currentReader.pageCount === 0)
+            return;
+        page = Math.max(0, Math.min(currentReader.pageCount - 1, page));
+        canvas.navigate(page, y || 0);
+        root.currentPage = page;
     }
     function changeZoom(value, anchorX, anchorY) {
-        const old = root.zoom
-        const next = Math.max(0.1, Math.min(4, value))
-        const oldLeft = (pageList.contentWidth - reader.documentWidth * old) / 2
-        const x = reader.zoomOffset(pageList.contentX, anchorX - oldLeft, old, next)
-        const y = reader.zoomOffset(pageList.contentY, anchorY, old, next)
-        root.zoom = next
-        Qt.callLater(function() {
-            const newLeft = (pageList.contentWidth - reader.documentWidth * next) / 2
-            pageList.contentX = Math.max(0, Math.min(pageList.contentWidth - pageList.width, x + newLeft))
-            pageList.contentY = Math.max(-pageList.topMargin,
-                Math.min(Math.max(-pageList.topMargin, pageList.contentHeight - pageList.height + pageList.bottomMargin), y))
-        })
+        const old = root.zoom;
+        const next = Math.max(0.1, Math.min(4, value));
+        const oldLeft = (pageList.contentWidth - currentReader.documentWidth * old) / 2;
+        const x = currentReader.zoomOffset(pageList.contentX, anchorX - oldLeft, old, next);
+        const y = currentReader.zoomOffset(pageList.contentY, anchorY, old, next);
+        root.zoom = next;
+        Qt.callLater(function () {
+            const newLeft = (pageList.contentWidth - currentReader.documentWidth * next) / 2;
+            pageList.contentX = Math.max(0, Math.min(pageList.contentWidth - pageList.width, x + newLeft));
+            pageList.contentY = Math.max(-pageList.topMargin, Math.min(Math.max(-pageList.topMargin, pageList.contentHeight - pageList.height + pageList.bottomMargin), y));
+        });
     }
     function zoomBy(factor) {
-        root.fitting = false
-        changeZoom(zoom * factor, pageList.width / 2, pageList.height / 2)
+        root.fitting = false;
+        changeZoom(zoom * factor, pageList.width / 2, pageList.height / 2);
     }
     function fitWidth() {
-        if (reader.pageCount > 0) changeZoom(reader.fitWidth(pageList.width), pageList.width / 2, 0)
-        root.fitting = true
+        if (currentReader.pageCount > 0)
+            changeZoom(currentReader.fitWidth(pageList.width), pageList.width / 2, 0);
+        root.fitting = true;
     }
     function updateCurrentPage() {
-        const page = pageList.indexAt(pageList.contentX + pageList.width / 2,
-            pageList.contentY + Math.min(pageList.height / 3, 180))
-        if (page >= 0) root.currentPage = page
+        if (currentReader.pageCount > 0)
+            root.currentPage = canvas.pageAtOffset();
     }
 
-    Action { id: openAction; text: qsTr("Open PDF…"); shortcut: StandardKey.Open; onTriggered: fileDialog.open() }
-    Action { id: quitAction; text: qsTr("Quit"); shortcut: StandardKey.Quit; onTriggered: Qt.quit() }
-    Action { id: zoomIn; text: qsTr("Zoom In"); shortcut: StandardKey.ZoomIn; enabled: reader.pageCount > 0; onTriggered: root.zoomBy(1.2) }
-    Action { id: zoomOut; text: qsTr("Zoom Out"); shortcut: StandardKey.ZoomOut; enabled: reader.pageCount > 0; onTriggered: root.zoomBy(1 / 1.2) }
-    Action { id: fitAction; text: qsTr("Fit Width"); shortcut: "Ctrl+1"; enabled: reader.pageCount > 0; onTriggered: root.fitWidth() }
-    Action { id: actualAction; text: qsTr("Actual Size"); shortcut: "Ctrl+0"; enabled: reader.pageCount > 0; onTriggered: { root.fitting = false; root.changeZoom(1, pageList.width/2, pageList.height/2) } }
-    Shortcut { sequence: "PageDown"; onActivated: root.navigate(root.currentPage + 1) }
-    Shortcut { sequence: "PageUp"; onActivated: root.navigate(root.currentPage - 1) }
-    Shortcut { sequence: "Ctrl+Home"; onActivated: root.navigate(0) }
-    Shortcut { sequence: "Ctrl+End"; onActivated: root.navigate(reader.pageCount - 1) }
-    Shortcut { sequence: "Ctrl+L"; onActivated: { pageNumber.forceActiveFocus(); pageNumber.selectAll() } }
-    Shortcut { sequence: "Ctrl+B"; onActivated: root.sidebarVisible = !root.sidebarVisible }
-    Shortcut { sequence: "F11"; onActivated: root.visibility = root.visibility === Window.FullScreen ? Window.Windowed : Window.FullScreen }
+    function openDialog() {
+        fileDialog.open();
+    }
+    function showSidebar(tab) {
+        sidebarTab = tab;
+        sidebarVisible = true;
+        overviewVisible = false;
+    }
+    function setPageLayout(mode) {
+        layoutMode = mode;
+        currentReader.setLayout(mode, pageGap);
+    }
+    function fitResize() {
+        resizeTimer.restart();
+    }
+    function schedulePositionSave() {
+        positionTimer.restart();
+    }
+    function restorePosition() {
+        const state = session ? session.viewState(currentReader) : ({});
+        pendingPosition = Object.assign({}, state);
+        if (requestedPage) {
+            pendingPosition.page = requestedPage;
+            delete pendingPosition.offset;
+            requestedPage = 0;
+        }
+        layoutMode = state.layout || "Continuous";
+        pageGap = state.gap === undefined ? 12 : state.gap;
+        currentReader.setLayout(layoutMode, pageGap);
+    }
+    function runSearch() {
+        if (currentReader.pageCount > 0)
+            searchRequestId = currentReader.submit("search", {
+                pattern: searchQuery
+            });
+    }
+    function stepSearch(delta) {
+        if (!searchResults.length)
+            return;
+        searchIndex = (searchIndex + delta + searchResults.length) % searchResults.length;
+        navigate(activeSearchHit.page);
+    }
+    function selectedText() {
+        if (!selection)
+            return "";
+        const text = currentReader.textPages[selection.page.toString()];
+        return text ? Logic.selectedText(text.chars, selection.start, selection.end) : "";
+    }
+    function copySelection() {
+        if (session && selection)
+            session.copyText(selectedText());
+    }
+    function selectionFinished() {
+        if (["highlight", "underline", "strikeout"].indexOf(annotationTool) >= 0)
+            markSelection(annotationTool);
+    }
+    function pageClicked(page, x, y) {
+        currentPage = page;
+        if (annotationTool === "stickyNote" || annotationTool === "textBox") {
+            const size = currentReader.pages[page];
+            const width = annotationTool === "stickyNote" ? 22 : Math.min(180, size.width);
+            const height = annotationTool === "stickyNote" ? 22 : Math.min(60, size.height);
+            currentReader.submit("mark_create", {
+                entry: {
+                    kind: annotationTool,
+                    page: page,
+                    version: 1,
+                    rect: {
+                        x: Math.max(0, Math.min(size.width - width, x)),
+                        y: Math.max(0, Math.min(size.height - height, y)),
+                        width: width,
+                        height: height
+                    },
+                    fontSize: 14,
+                    color: brushColor + "ff",
+                    note: ""
+                }
+            });
+        } else if (annotationTool === "select") {
+            const hit = annotationAt(page, x, y, false);
+            if (hit)
+                selectAnnotation(hit);
+        }
+    }
+    function showSelectionMenu(item, page, x, y) {
+        const point = item.mapToItem(Overlay.overlay, x, y);
+        dialogs.selectionMenu.x = point.x;
+        dialogs.selectionMenu.y = point.y;
+        dialogs.selectionMenu.open();
+    }
+    function showExportMenu(item) {
+        const point = item.mapToItem(Overlay.overlay, 0, item.height);
+        dialogs.exportMenu.x = point.x;
+        dialogs.exportMenu.y = point.y;
+        dialogs.exportMenu.open();
+    }
+    function showSettings() {
+        dialogs.settingsDialog.open();
+    }
+    function showDocumentInformation() {
+        currentReader.submit("document_info");
+        currentReader.submit("metadata");
+        dialogs.informationDialog.open();
+    }
+    function toggleForms() {
+        formToolActive = !formToolActive;
+        if (formToolActive) {
+            currentReader.submit("forms");
+            dialogs.formsDialog.open();
+        }
+    }
+    function selectAnnotation(annotation) {
+        if (annotation.foreign) {
+            currentReader.submit("file_adopt", {
+                id: annotation.id
+            });
+            selectedAnnotation = annotation;
+        } else {
+            selectedAnnotation = annotation;
+            dialogs.annotationDialog.open();
+        }
+        navigate(annotation.page);
+    }
+    function addBookmark() {
+        if (currentReader.pageCount > 0) {
+            showSidebar("bookmarks");
+            currentReader.submit("bookmark_create", {
+                page: currentPage,
+                title: qsTr("Page %1").arg(currentPage + 1),
+                yPt: Math.max(0, pageList.contentY / zoom - currentReader.pages[currentPage].top)
+            });
+        }
+    }
+    function editBookmark(bookmark, index) {
+        dialogs.openBookmark(bookmark, index);
+    }
+    function annotationAt(page, x, y, inkOnly) {
+        const values = annotations.filter(function (a) {
+            return a.page === page && (!inkOnly || a.kind === "ink");
+        });
+        for (let i = values.length - 1; i >= 0; --i)
+            if (Logic.hit(values[i], x, y, inkOnly ? 10 : 4))
+                return values[i];
+        return null;
+    }
+    function setAnnotationTool(tool) {
+        annotationTool = annotationTool === tool ? "select" : tool;
+        if (["highlight", "underline", "strikeout"].indexOf(annotationTool) >= 0 && selection)
+            markSelection(annotationTool);
+    }
+    function markSelection(kind) {
+        if (!selection)
+            return;
+        currentReader.submit("mark_create", {
+            entry: {
+                kind: kind,
+                page: selection.page,
+                start: Math.min(selection.start, selection.end),
+                end: Math.max(selection.start, selection.end),
+                color: brushColor + Logic.hex(brushOpacity * 255),
+                note: ""
+            }
+        });
+        selection = null;
+    }
+    function updateAnnotationNote(note) {
+        if (selectedAnnotation)
+            currentReader.submit("mark_update", {
+                id: selectedAnnotation.id,
+                patch: {
+                    note: note
+                }
+            });
+    }
+    function deleteSelectedAnnotation() {
+        dialogs.cancelAnnotationDraft();
+        if (selectedAnnotation)
+            currentReader.clearNoteDraft(selectedAnnotation.id);
+        if (!selectedAnnotation)
+            return;
+        currentReader.submit(selectedAnnotation.foreign ? "file_delete" : "mark_delete", {
+            id: selectedAnnotation.id
+        });
+        selectedAnnotation = null;
+    }
+    function eraseAlong(page, start, end) {
+        const ids = eraseDraft.slice();
+        for (const a of annotations) {
+            if (a.page !== page || a.kind !== "ink" || ids.indexOf(a.id) >= 0)
+                continue;
+            let hit = false;
+            for (const path of a.paths || [])
+                for (let i = 1; i < path.length; ++i)
+                    if (Logic.segmentsNear(start, end, path[i - 1], path[i], 10 + (a.strokeWidth || 2) / 2)) {
+                        hit = true;
+                        break;
+                    }
+            if (hit)
+                ids.push(a.id);
+        }
+        eraseDraft = ids;
+    }
+    function commitErase() {
+        if (eraseDraft.length)
+            currentReader.submit("marks_erase", {
+                ids: eraseDraft.slice()
+            });
+    }
+    function selectPage(index, modifiers) {
+        if (modifiers & Qt.ShiftModifier) {
+            const first = Math.min(currentPage, index), last = Math.max(currentPage, index);
+            const pages = [];
+            for (let p = first; p <= last; ++p)
+                pages.push(p);
+            selectedPages = pages;
+        } else if (modifiers & Qt.ControlModifier) {
+            const pages = selectedPages.slice();
+            const at = pages.indexOf(index);
+            if (at >= 0)
+                pages.splice(at, 1);
+            else
+                pages.push(index);
+            selectedPages = pages.sort(function (a, b) {
+                return a - b;
+            });
+        } else
+            selectedPages = [index];
+        currentPage = index;
+    }
+    function pageOperation(operation) {
+        if (pageEditBusy)
+            return;
+        pageEditBusy = true;
+        pendingPage = currentPage;
+        pendingPageSelection = selectedPages.slice();
+        currentReader.submit("page_stage", {
+            operation: operation
+        });
+    }
+    function movePages(destination) {
+        if (selectedPages.length)
+            pageOperation({
+                Move: {
+                    pages: selectedPages,
+                    destination: destination
+                }
+            });
+    }
+    function confirmPageDeletion() {
+        dialogs.confirmPageDeletion();
+    }
+    function confirmDiscardPages() {
+        dialogs.confirmDiscardPages();
+    }
+    function undo() {
+        if (markState.can_undo)
+            currentReader.submit("marks_undo");
+        else if (markState.can_page_undo) {
+            pendingPage = currentPage;
+            currentReader.submit("page_undo");
+        }
+    }
+    function redo() {
+        if (markState.can_redo)
+            currentReader.submit("marks_redo");
+        else if (markState.can_page_redo) {
+            pendingPage = currentPage;
+            currentReader.submit("page_redo");
+        }
+    }
+    property bool printRequested: false
+    function printDocument() {
+        if (dialogs.annotationWriteError.length) {
+            operationStatus = dialogs.annotationWriteError;
+            printRequested = false;
+            return;
+        }
+        dialogs.flushAnnotation();
+        if (currentReader.pendingCommands > 0) {
+            printRequested = true;
+            printRetry.restart();
+            return;
+        }
+        printRequested = false;
+        if (session)
+            session.printDocument(currentReader, currentPage);
+    }
+    Timer {
+        id: printRetry
+        interval: 80
+        onTriggered: if (root.printRequested)
+            root.printDocument()
+    }
+    function chooseExport(kind) {
+        exportKind = kind;
+        dialogs.saveDialog.open();
+    }
+    function updateFormValue(id, value) {
+        const next = Object.assign({}, formValues);
+        next[id] = Object.assign({
+            field_id: id
+        }, value);
+        formValues = next;
+    }
+    function formPayload() {
+        return Object.keys(formValues).map(function (key) {
+            return formValues[key];
+        });
+    }
+    function editMetadata(key, text) {
+        if (!metadataDraft) {
+            const m = currentReader.data.metadata || ({});
+            const values = function (k) {
+                return m[k] ? m[k].values.join(" ") : "";
+            };
+            metadataDraft = {
+                title: values("title"),
+                authors: m.authors ? m.authors.values : [],
+                venue: values("venue"),
+                year: values("year"),
+                doi: values("doi"),
+                arxiv_id: values("arxiv_id")
+            };
+        }
+        const draft = Object.assign({}, metadataDraft);
+        draft[key] = key === "authors" ? text.split(";").map(function (s) {
+            return s.trim();
+        }).filter(function (s) {
+            return s.length;
+        }) : text;
+        metadataDraft = draft;
+        currentReader.submit("bibtex", {
+            draft: draft
+        });
+    }
+    function exportTo(url) {
+        if (!session)
+            return;
+        const destination = session.localPath(url);
+        if (exportKind === "properties")
+            currentReader.submit("save_properties", Object.assign({
+                destination: destination
+            }, dialogs.informationDialog.draft()));
+        else if (exportKind === "forms")
+            currentReader.submit("save_forms", {
+                destination: destination,
+                values: formPayload()
+            });
+        else if (exportKind === "extract")
+            currentReader.submit("extract_pages", {
+                destination: destination,
+                pages: selectedPages
+            });
+        else if (exportKind === "pages")
+            currentReader.submit("save_current_edited_copy", {
+                destination: destination
+            });
+        else if (exportKind === "bibtex")
+            operationStatus = session.writeTextFile(url, bibtex) || qsTr("BibTeX saved.");
+        else if (exportKind === "markdown" || exportKind === "csv")
+            operationStatus = session.writeTextFile(url, annotationExport(exportKind)) || qsTr("Annotations exported.");
+        else
+            currentReader.submit("save_current_annotations", {
+                destination: destination
+            });
+    }
+    function annotationPayload() {
+        return {
+            annotations: [],
+            bookmarks: [],
+            updates: [],
+            deletions: []
+        };
+    }
+    function annotationExport(format) {
+        const quote = function (s) {
+            return '"' + String(s || "").replace(/"/g, '""') + '"';
+        };
+        if (format === "csv")
+            return "page,kind,text\r\n" + annotations.map(function (a) {
+                return (a.page + 1) + "," + quote(a.kind) + "," + quote(a.note || a.contents);
+            }).join("\r\n") + "\r\n";
+        return "# " + currentReader.title + "\n\n" + annotations.map(function (a) {
+            return "## Page " + (a.page + 1) + " · " + a.kind + "\n\n" + (a.note || a.contents || "") + "\n";
+        }).join("\n");
+    }
+    function confirmReplace(kind) {
+        dialogs.confirmReplacement(kind);
+    }
+    function performReplace(kind) {
+        dialogs.flushAnnotation();
+        dialogs.annotationDialog.close();
+        if (kind === "pages")
+            currentReader.submit("page_apply");
+        else if (kind === "properties")
+            currentReader.submit("replace_properties", dialogs.informationDialog.draft());
+        else if (kind === "forms")
+            currentReader.submit("replace_forms", {
+                values: formPayload()
+            });
+        else
+            currentReader.submit("replace_current_annotations");
+    }
+    function saveAiCredential(account, key) {
+        if (session)
+            session.credentials.write(account, key);
+    }
+    function removeAiCredential(account) {
+        if (session)
+            session.credentials.remove(account);
+    }
+    function sendAi(panel, plan) {
+        if (plan.is_local)
+            panel.send("local");
+        else {
+            pendingAiPanel = panel;
+            credentialReadId = session ? session.credentials.read(plan.base_url) : -1;
+            if (!session)
+                dialogs.credentialDialog.open();
+        }
+    }
+    property int requestedPage: 0
+    property double credentialReadId: -1
+    property var pendingAiPanel: null
 
+    Action {
+        id: openAction
+        text: qsTr("Open PDF…")
+        shortcut: StandardKey.Open
+        onTriggered: fileDialog.open()
+    }
+    Action {
+        id: quitAction
+        text: qsTr("Quit")
+        shortcut: StandardKey.Quit
+        onTriggered: Qt.quit()
+    }
+    Action {
+        id: zoomIn
+        text: qsTr("Zoom In")
+        shortcut: StandardKey.ZoomIn
+        enabled: currentReader.pageCount > 0
+        onTriggered: root.zoomBy(1.2)
+    }
+    Action {
+        id: zoomOut
+        text: qsTr("Zoom Out")
+        shortcut: StandardKey.ZoomOut
+        enabled: currentReader.pageCount > 0
+        onTriggered: root.zoomBy(1 / 1.2)
+    }
+    Action {
+        id: fitAction
+        text: qsTr("Fit Width")
+        shortcut: "Ctrl+1"
+        enabled: currentReader.pageCount > 0
+        onTriggered: root.fitWidth()
+    }
+    Action {
+        id: actualAction
+        text: qsTr("Actual Size")
+        shortcut: "Ctrl+0"
+        enabled: currentReader.pageCount > 0
+        onTriggered: {
+            root.fitting = false;
+            root.changeZoom(1, pageList.width / 2, pageList.height / 2);
+        }
+    }
+    Shortcut {
+        sequence: "PageDown"
+        onActivated: root.navigate(root.currentPage + 1)
+    }
+    Shortcut {
+        sequence: "PageUp"
+        onActivated: root.navigate(root.currentPage - 1)
+    }
+    Shortcut {
+        sequence: "Ctrl+Home"
+        onActivated: root.navigate(0)
+    }
+    Shortcut {
+        sequence: "Ctrl+End"
+        onActivated: root.navigate(currentReader.pageCount - 1)
+    }
+    Shortcut {
+        sequence: "Ctrl+L"
+        onActivated: {
+            pageNumber.forceActiveFocus();
+            pageNumber.selectAll();
+        }
+    }
+    Shortcut {
+        sequence: "Ctrl+B"
+        onActivated: root.sidebarVisible = !root.sidebarVisible
+    }
+    Shortcut {
+        sequence: "F11"
+        onActivated: root.visibility = root.visibility === Window.FullScreen ? Window.Windowed : Window.FullScreen
+    }
+    Shortcut {
+        sequences: [StandardKey.Copy]
+        enabled: !!root.selection && root.activeFocusItem && root.activeFocusItem.objectName === "pdfPointer"
+        onActivated: root.copySelection()
+    }
+    Shortcut {
+        sequences: [StandardKey.Find]
+        onActivated: {
+            root.searchVisible = true;
+            const field = root.findSearchField();
+            if (field)
+                field.forceActiveFocus();
+        }
+    }
+    Shortcut {
+        sequence: "Ctrl+D"
+        onActivated: root.addBookmark()
+    }
+    Shortcut {
+        sequence: "Ctrl+W"
+        onActivated: if (root.session)
+            root.requestCloseTab(root.session.activeIndex)
+    }
+    Shortcut {
+        sequence: "Ctrl+Tab"
+        onActivated: if (root.session)
+            root.session.selectTab((root.session.activeIndex + 1) % root.session.tabs.length)
+    }
+    function findSearchField() {
+        return chromeSearchField;
+    }
+    property var chromeSearchField: null
+
+    Shortcut {
+        sequences: [StandardKey.Undo]
+        enabled: !(root.activeFocusItem && typeof root.activeFocusItem.selectedText !== "undefined")
+        onActivated: root.undo()
+    }
+    Shortcut {
+        sequences: [StandardKey.Redo]
+        enabled: !(root.activeFocusItem && typeof root.activeFocusItem.selectedText !== "undefined")
+        onActivated: root.redo()
+    }
+    Shortcut {
+        sequence: "Escape"
+        onActivated: {
+            root.annotationTool = "select";
+            root.annotationDraft = null;
+            root.selection = null;
+            root.overviewVisible = false;
+        }
+    }
     menuBar: MenuBar {
-        background: Rectangle { color: theme.titlebarBg }
+        background: Rectangle {
+            color: theme.titlebarBg
+        }
         Menu {
             title: qsTr("&File")
-            MenuItem { action: openAction }
+            MenuItem {
+                action: openAction
+            }
             MenuSeparator {}
-            MenuItem { action: quitAction }
+            MenuItem {
+                action: quitAction
+            }
         }
         Menu {
             title: qsTr("&View")
-            MenuItem { action: zoomIn }
-            MenuItem { action: zoomOut }
-            MenuItem { action: fitAction }
-            MenuItem { action: actualAction }
+            MenuItem {
+                action: zoomIn
+            }
+            MenuItem {
+                action: zoomOut
+            }
+            MenuItem {
+                action: fitAction
+            }
+            MenuItem {
+                action: actualAction
+            }
             MenuSeparator {}
-            MenuItem { text: qsTr("Pages Sidebar"); checkable: true; checked: root.sidebarVisible; onTriggered: root.sidebarVisible = checked }
+            MenuItem {
+                text: qsTr("Pages Sidebar")
+                checkable: true
+                checked: root.sidebarVisible
+                onTriggered: root.sidebarVisible = checked
+            }
             MenuSeparator {}
             Menu {
                 title: qsTr("Appearance")
-                ActionGroup { id: appearanceGroup }
-                MenuItem { action: Action { text: qsTr("Light"); checkable: true; checked: root.appearance === "light"; ActionGroup.group: appearanceGroup; onTriggered: root.appearance = "light" } }
-                MenuItem { action: Action { text: qsTr("Dark"); checkable: true; checked: root.appearance === "dark"; ActionGroup.group: appearanceGroup; onTriggered: root.appearance = "dark" } }
-                MenuItem { action: Action { text: qsTr("Follow System"); checkable: true; checked: root.appearance === "system"; ActionGroup.group: appearanceGroup; onTriggered: root.appearance = "system" } }
+                ActionGroup {
+                    id: appearanceGroup
+                }
+                MenuItem {
+                    action: Action {
+                        text: qsTr("Light")
+                        checkable: true
+                        checked: root.appearance === "light"
+                        ActionGroup.group: appearanceGroup
+                        onTriggered: root.appearance = "light"
+                    }
+                }
+                MenuItem {
+                    action: Action {
+                        text: qsTr("Dark")
+                        checkable: true
+                        checked: root.appearance === "dark"
+                        ActionGroup.group: appearanceGroup
+                        onTriggered: root.appearance = "dark"
+                    }
+                }
+                MenuItem {
+                    action: Action {
+                        text: qsTr("Follow System")
+                        checkable: true
+                        checked: root.appearance === "system"
+                        ActionGroup.group: appearanceGroup
+                        onTriggered: root.appearance = "system"
+                    }
+                }
             }
         }
     }
-    header: ToolBar {
-        padding: 10
-        background: Rectangle { color: theme.toolbarBg }
-        RowLayout {
-            anchors.fill: parent
-            spacing: 8
-            ToolButton {
-                text: "☰"
-                Accessible.name: qsTr("Toggle pages sidebar")
-                ToolTip.visible: hovered
-                ToolTip.text: qsTr("Pages sidebar (Ctrl+B)")
-                checkable: true
-                checked: root.sidebarVisible
-                onClicked: root.sidebarVisible = !root.sidebarVisible
-            }
-            Rectangle {
-                implicitWidth: 30; implicitHeight: 30; radius: 9; color: theme.selectedBg
-                Label { anchors.centerIn: parent; text: "L"; color: theme.selectedFg; font.pixelSize: 19; font.weight: Font.DemiBold }
-            }
-            ColumnLayout {
-                spacing: 1
-                Layout.fillWidth: true
-                Label { text: reader.pageCount > 0 ? reader.title : "LyraReader"; elide: Text.ElideMiddle; Layout.fillWidth: true; font.weight: Font.DemiBold }
-                Label { text: reader.loading ? qsTr("Opening document…") : reader.pageCount > 0 ? qsTr("%1 pages").arg(reader.pageCount) : qsTr("A little space to read"); font.pixelSize: 11; color: theme.textSecondary }
-            }
-            ToolButton { action: openAction; display: AbstractButton.TextOnly }
-            ToolSeparator { visible: reader.pageCount > 0 }
-            ToolButton { visible: reader.pageCount > 0; text: "−"; Accessible.name: zoomOut.text; onClicked: zoomOut.trigger(); font.pixelSize: 20 }
-            ToolButton {
-                visible: reader.pageCount > 0
-                text: Math.round(root.zoom * 100) + "%"
-                Accessible.name: qsTr("Zoom. Click to fit width")
-                onClicked: root.fitWidth()
-            }
-            ToolButton { visible: reader.pageCount > 0; text: "+"; Accessible.name: zoomIn.text; onClicked: zoomIn.trigger(); font.pixelSize: 20 }
-        }
+    header: ReaderChrome {
+        app: root
     }
 
     ColumnLayout {
         anchors.fill: parent
         spacing: 0
         Frame {
-            visible: reader.error.length > 0 && !reader.passwordRequired
+            visible: (currentReader.error.length > 0 || !!root.markState.error) && !currentReader.passwordRequired
             Layout.fillWidth: true
-            background: Rectangle { color: theme.errorBg }
+            background: Rectangle {
+                color: theme.errorBg
+            }
             RowLayout {
                 anchors.fill: parent
-                Label { text: qsTr("Error: %1").arg(reader.error); color: theme.errorFg; wrapMode: Text.Wrap; Layout.fillWidth: true; Accessible.role: Accessible.AlertMessage }
-                ToolButton { text: qsTr("Dismiss"); onClicked: reader.dismissError() }
+                Label {
+                    text: qsTr("Error: %1").arg(root.markState.error || currentReader.error)
+                    color: theme.errorFg
+                    wrapMode: Text.Wrap
+                    Layout.fillWidth: true
+                    Accessible.role: Accessible.AlertMessage
+                }
+                ToolButton {
+                    text: qsTr("Back Up & Start Fresh…")
+                    visible: !!root.markState.error
+                    onClicked: dialogs.recoverSidecar()
+                }
+                ToolButton {
+                    text: qsTr("Dismiss")
+                    onClicked: currentReader.dismissError()
+                }
             }
         }
         RowLayout {
             Layout.fillWidth: true
             Layout.fillHeight: true
             spacing: 0
-            Pane {
-                visible: root.sidebarVisible && reader.pageCount > 0
-                Layout.preferredWidth: root.width < 850 ? 150 : 214
+            ReaderSidebar {
+                app: root
+                visible: root.sidebarVisible && currentReader.pageCount > 0
+                Layout.preferredWidth: root.width < 850 ? 210 : 246
                 Layout.fillHeight: true
-                padding: 0
-                background: Rectangle { color: theme.sidebarBg }
-                ColumnLayout {
-                    anchors.fill: parent
-                    spacing: 0
-                    Label { text: qsTr("PAGES"); font.pixelSize: 11; font.letterSpacing: 1.5; color: theme.textTertiary; Layout.margins: 18 }
-                    ListView {
-                        id: sidebar
-                        objectName: "pagesSidebar"
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        clip: true
-                        model: reader.pageCount
-                        currentIndex: root.currentPage
-                        boundsBehavior: Flickable.StopAtBounds
-                        onHeightChanged: if (contentHeight <= height) positionViewAtBeginning()
-                        onCurrentIndexChanged: if (currentIndex >= 0) positionViewAtIndex(currentIndex, ListView.Contain)
-                        ScrollBar.vertical: ScrollBar {}
-                        delegate: ItemDelegate {
-                            id: pageEntry
-                            required property int index
-                            width: ListView.view.width
-                            height: 54
-                            highlighted: root.currentPage === index
-                            background: Rectangle {
-                                color: pageEntry.highlighted
-                                    ? (root.active ? theme.selectedBg : theme.inactiveSelectionBg)
-                                    : pageEntry.down ? theme.pressedBg : pageEntry.hovered ? theme.hoverBg : theme.sidebarBg
-                                border.width: pageEntry.visualFocus ? 2 : 0
-                                border.color: theme.focusRing
-                            }
-                            contentItem: RowLayout {
-                                spacing: 12
-                                Rectangle {
-                                    implicitWidth: 25; implicitHeight: 33; radius: 2
-                                    color: theme.raisedBg; border.color: theme.pageEdge
-                                    Label { anchors.centerIn: parent; text: index + 1; font.pixelSize: 9; color: theme.textTertiary }
-                                }
-                                Label { text: qsTr("Page %1").arg(index + 1); Layout.fillWidth: true; color: root.currentPage === index ? (root.active ? theme.selectedFg : theme.inactiveSelectionFg) : theme.textPrimary }
-                            }
-                            onClicked: root.navigate(index)
-                        }
-                    }
-                }
             }
-            Rectangle { visible: root.sidebarVisible && reader.pageCount > 0; Layout.preferredWidth: 1; Layout.fillHeight: true; color: theme.separator }
+
+            Rectangle {
+                visible: root.sidebarVisible && currentReader.pageCount > 0
+                Layout.preferredWidth: 1
+                Layout.fillHeight: true
+                color: theme.separator
+            }
             Item {
                 id: readingArea
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                Rectangle { anchors.fill: parent; color: reader.pageCount > 0 ? theme.canvasBg : theme.emptyBg }
-                ListView {
-                    id: pageList
-                    objectName: "pageList"
+                Rectangle {
                     anchors.fill: parent
-                    visible: reader.pageCount > 0
-                    clip: true
-                    model: reader.pages
-                    contentWidth: Math.max(width, reader.documentWidth * root.zoom + 64)
-                    topMargin: 24
-                    bottomMargin: 24
-                    cacheBuffer: height / 2
-                    reuseItems: false
-                    boundsBehavior: Flickable.StopAtBounds
-                    flickableDirection: Flickable.AutoFlickIfNeeded
-                    ScrollBar.vertical: ScrollBar { minimumSize: 0.04 }
-                    ScrollBar.horizontal: ScrollBar {}
-                    onContentYChanged: root.updateCurrentPage()
-                    onWidthChanged: if (root.fitting) resizeTimer.restart()
-                    delegate: Item {
-                        required property var modelData
-                        width: pageList.contentWidth
-                        height: (modelData.height + 12) * root.zoom
-                        Rectangle {
-                            id: sheet
-                            width: modelData.width * root.zoom
-                            height: modelData.height * root.zoom
-                            x: (parent.width - width) / 2
-                            color: "white"
-                            PdfPage {
-                                id: pdfPage
-                                objectName: "pdfPage" + modelData.index
-                                anchors.fill: parent
-                                controller: reader
-                                pageIndex: modelData.index
-                                rasterScale: root.zoom
-                                Accessible.role: Accessible.Graphic
-                                Accessible.name: qsTr("PDF page %1").arg(modelData.index + 1)
-                            }
-                            BusyIndicator { anchors.centerIn: parent; running: !pdfPage.loaded; visible: running; width: 34; height: 34 }
-                        }
-                    }
-                    WheelHandler {
-                        acceptedModifiers: Qt.ControlModifier
-                        onWheel: function(event) {
-                            root.fitting = false
-                            const delta = event.pixelDelta.y !== 0 ? event.pixelDelta.y : event.angleDelta.y
-                            root.changeZoom(root.zoom * Math.pow(1.0015, delta), event.x, event.y)
-                            event.accepted = true
-                        }
-                    }
-                    PinchHandler {
-                        target: null
-                        property real previousScale: 1
-                        onActiveChanged: previousScale = 1
-                        onActiveScaleChanged: {
-                            if (active) {
-                                root.fitting = false
-                                root.changeZoom(root.zoom * activeScale / previousScale, centroid.position.x, centroid.position.y)
-                                previousScale = activeScale
-                            }
-                        }
-                    }
+                    color: currentReader.pageCount > 0 ? theme.canvasBg : theme.emptyBg
+                }
+                DocumentCanvas {
+                    id: canvas
+                    anchors.fill: parent
+                    app: root
+                    visible: !root.overviewVisible
+                }
+                PageOverview {
+                    anchors.fill: parent
+                    app: root
+                    visible: root.overviewVisible && currentReader.pageCount > 0
+                }
+                AnnotationTools {
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    app: root
+                    visible: root.annotationToolsVisible && currentReader.pageCount > 0 && !root.overviewVisible
+                    z: 5
                 }
                 ColumnLayout {
                     anchors.centerIn: parent
-                    visible: reader.pageCount === 0
+                    visible: currentReader.pageCount === 0
                     spacing: 16
                     Rectangle {
                         Layout.alignment: Qt.AlignHCenter
-                        implicitWidth: 62; implicitHeight: 74; radius: 6
-                        color: theme.raisedBg; border.color: theme.pageEdge
-                        Label { anchors.centerIn: parent; text: "L"; color: theme.accent; font.pixelSize: 32; font.weight: Font.Light }
+                        implicitWidth: 62
+                        implicitHeight: 74
+                        radius: 6
+                        color: theme.raisedBg
+                        border.color: theme.pageEdge
+                        Label {
+                            anchors.centerIn: parent
+                            text: "L"
+                            color: theme.accent
+                            font.pixelSize: 32
+                            font.weight: Font.Light
+                        }
                     }
-                    Label { Layout.alignment: Qt.AlignHCenter; text: reader.loading ? qsTr("Opening your document") : qsTr("Make room for a good paper."); font.pixelSize: 23; font.weight: Font.Light }
-                    Label { Layout.alignment: Qt.AlignHCenter; text: qsTr("Drop a PDF here, or open one to begin."); color: theme.textSecondary }
+                    Label {
+                        Layout.alignment: Qt.AlignHCenter
+                        text: currentReader.loading ? qsTr("Opening your document") : qsTr("Make room for a good paper.")
+                        font.pixelSize: 23
+                        font.weight: Font.Light
+                    }
+                    Label {
+                        Layout.alignment: Qt.AlignHCenter
+                        text: qsTr("Drop a PDF here, or open one to begin.")
+                        color: theme.textSecondary
+                    }
                     Button {
                         id: primaryOpen
                         Layout.alignment: Qt.AlignHCenter
                         action: openAction
-                        visible: !reader.loading
+                        visible: !currentReader.loading
                         palette.buttonText: theme.onAccent
                         contentItem: Text {
                             text: primaryOpen.text
@@ -323,55 +992,117 @@ ApplicationWindow {
                             verticalAlignment: Text.AlignVCenter
                         }
                         background: Rectangle {
-                            implicitWidth: 130; implicitHeight: 36; radius: 4
+                            implicitWidth: 130
+                            implicitHeight: 36
+                            radius: 4
                             color: primaryOpen.down ? theme.accentPressed : primaryOpen.hovered ? theme.accentHover : theme.accent
                             border.width: primaryOpen.visualFocus ? 2 : 0
                             border.color: theme.focusRing
                         }
                     }
-                    BusyIndicator { Layout.alignment: Qt.AlignHCenter; running: reader.loading; visible: running }
+                    BusyIndicator {
+                        Layout.alignment: Qt.AlignHCenter
+                        running: currentReader.loading
+                        visible: running
+                    }
                 }
                 DropArea {
                     anchors.fill: parent
-                    onDropped: function(drop) {
+                    onDropped: function (drop) {
                         if (drop.hasUrls && drop.urls.length > 0) {
-                            reader.openFile(drop.urls[0])
-                            drop.accepted = true
+                            if (root.session)
+                                root.session.openFiles(drop.urls);
+                            else
+                                currentReader.openFile(drop.urls[0]);
+                            drop.accepted = true;
                         }
                     }
                 }
             }
+            SearchPanel {
+                app: root
+                visible: root.searchVisible && currentReader.pageCount > 0
+                Layout.preferredWidth: Math.min(280, root.width / 3)
+                Layout.fillHeight: true
+            }
         }
     }
     footer: ToolBar {
-        visible: reader.pageCount > 0
+        visible: currentReader.pageCount > 0
         padding: 5
-        background: Rectangle { color: theme.statusbarBg }
+        background: Rectangle {
+            color: theme.statusbarBg
+        }
         RowLayout {
             anchors.fill: parent
-            ToolButton { text: "‹"; font.pixelSize: 22; enabled: root.currentPage > 0; Accessible.name: qsTr("Previous page"); onClicked: root.navigate(root.currentPage - 1) }
+            ToolButton {
+                text: "‹"
+                font.pixelSize: 22
+                enabled: root.currentPage > 0
+                Accessible.name: qsTr("Previous page")
+                onClicked: root.navigate(root.currentPage - 1)
+            }
             TextField {
                 id: pageNumber
                 objectName: "pageNumber"
                 text: (root.currentPage + 1).toString()
                 Layout.preferredWidth: 52
                 horizontalAlignment: Text.AlignHCenter
-                validator: IntValidator { bottom: 1; top: Math.max(1, reader.pageCount) }
+                validator: IntValidator {
+                    bottom: 1
+                    top: Math.max(1, currentReader.pageCount)
+                }
                 Accessible.name: qsTr("Go to page")
-                onAccepted: { root.navigate(Number(text) - 1); pageList.forceActiveFocus() }
+                onAccepted: {
+                    root.navigate(Number(text) - 1);
+                    pageList.forceActiveFocus();
+                }
             }
-            Label { text: "/ " + reader.pageCount; color: theme.textTertiary }
-            ToolButton { text: "›"; font.pixelSize: 22; enabled: root.currentPage < reader.pageCount - 1; Accessible.name: qsTr("Next page"); onClicked: root.navigate(root.currentPage + 1) }
-            Item { Layout.fillWidth: true }
-            ToolButton { action: fitAction }
-            Label { text: qsTr("Ctrl + scroll to zoom"); color: theme.textTertiary; font.pixelSize: 11; visible: root.width > 850; Layout.rightMargin: 12 }
+            Label {
+                text: "/ " + currentReader.pageCount
+                color: theme.textTertiary
+            }
+            ToolButton {
+                text: "›"
+                font.pixelSize: 22
+                enabled: root.currentPage < currentReader.pageCount - 1
+                Accessible.name: qsTr("Next page")
+                onClicked: root.navigate(root.currentPage + 1)
+            }
+            Item {
+                Layout.fillWidth: true
+            }
+            Label {
+                text: root.operationStatus
+                elide: Text.ElideMiddle
+                Layout.maximumWidth: Math.max(100, root.width / 3)
+                color: root.colors.textSecondary
+                font.pixelSize: 11
+                visible: text.length > 0
+            }
+            ToolButton {
+                action: fitAction
+            }
+            Label {
+                text: qsTr("Ctrl + scroll to zoom")
+                color: theme.textTertiary
+                font.pixelSize: 11
+                visible: root.width > 850
+                Layout.rightMargin: 12
+            }
         }
     }
     FileDialog {
         id: fileDialog
         title: qsTr("Open a PDF")
         nameFilters: [qsTr("PDF documents (*.pdf)"), qsTr("All files (*)")]
-        onAccepted: reader.openFile(selectedFile)
+        fileMode: FileDialog.OpenFiles
+        onAccepted: {
+            if (root.session)
+                root.session.openFiles(selectedFiles);
+            else if (selectedFiles.length)
+                currentReader.openFile(selectedFiles[0]);
+        }
     }
     Dialog {
         id: passwordDialog
@@ -380,23 +1111,159 @@ ApplicationWindow {
         modal: true
         standardButtons: Dialog.Ok | Dialog.Cancel
         ColumnLayout {
-            Label { text: qsTr("Enter the password for this PDF.") }
-            TextField { id: passwordField; echoMode: TextInput.Password; Accessible.name: qsTr("PDF password"); onAccepted: passwordDialog.accept() }
+            Label {
+                text: qsTr("Enter the password for this PDF.")
+            }
+            TextField {
+                id: passwordField
+                echoMode: TextInput.Password
+                Accessible.name: qsTr("PDF password")
+                onAccepted: passwordDialog.accept()
+            }
         }
         onOpened: passwordField.forceActiveFocus()
-        onAccepted: { reader.retryPassword(passwordField.text); passwordField.clear() }
+        onAccepted: {
+            currentReader.retryPassword(passwordField.text);
+            passwordField.clear();
+        }
         onRejected: passwordField.clear()
     }
-    Timer { id: resizeTimer; interval: 0; onTriggered: if (root.fitting) root.fitWidth() }
+    ReaderDialogs {
+        id: dialogs
+        app: root
+    }
+    Timer {
+        id: searchTimer
+        interval: 250
+        onTriggered: root.runSearch()
+    }
+    Timer {
+        id: positionTimer
+        interval: 500
+        onTriggered: root.saveReadingPosition()
+    }
+    Timer {
+        id: resizeTimer
+        interval: 0
+        onTriggered: if (root.fitting)
+            root.fitWidth()
+    }
     Connections {
-        target: reader
-        function onDocumentChanged() {
-            if (reader.pageCount > 0) Qt.callLater(function() {
-                root.fitWidth()
-                root.navigate(0)
-                sidebar.positionViewAtBeginning()
-            })
+        target: root.session ? root.session.credentials : null
+        function onFinished(id, operation, secret, error) {
+            if (operation === "read" && id === root.credentialReadId && root.pendingAiPanel) {
+                if (secret.length) {
+                    root.pendingAiPanel.send(secret);
+                    root.pendingAiPanel = null;
+                } else {
+                    root.operationStatus = error;
+                    dialogs.credentialDialog.open();
+                }
+            } else if (operation === "write" || operation === "remove")
+                root.operationStatus = error || qsTr("System keychain updated.");
         }
-        function onPasswordRequiredChanged() { if (reader.passwordRequired) passwordDialog.open() }
+    }
+    Connections {
+        target: root.session
+        function onPrintFinished(error) {
+            root.operationStatus = error || qsTr("Print job completed.");
+        }
+        function onCloseTabRequested(index) {
+            root.requestCloseTab(index);
+        }
+        function onActiveReaderAboutToChange() {
+            dialogs.flushAnnotation();
+            dialogs.annotationDialog.close();
+            root.saveReadingPosition();
+        }
+    }
+    Connections {
+        target: root.currentReader
+        function onOpenFinished(success) {
+            if (success)
+                Qt.callLater(root.restorePosition);
+        }
+        function onCommandFinished(id, op, result, error) {
+            if (op.indexOf("page_") === 0 && op !== "page_operation") {
+                root.pageEditBusy = false;
+                if (!error.length) {
+                    const map = result.report ? result.report.page_map : null;
+                    const page = map && map[root.pendingPage] !== null && map[root.pendingPage] !== undefined ? map[root.pendingPage] : Math.min(root.pendingPage, currentReader.pageCount - 1);
+                    root.selection = null;
+                    root.selectedAnnotation = null;
+                    root.searchResults = [];
+                    root.selectedPages = map ? root.pendingPageSelection.map(function (p) {
+                        return map[p];
+                    }).filter(function (p) {
+                        return p !== null && p !== undefined;
+                    }) : [page];
+                    root.pendingPosition = {
+                        page: result.report && result.report.inserted_page !== null && result.report.inserted_page !== undefined ? result.report.inserted_page : page,
+                        zoom: root.zoom,
+                        fitting: root.fitting
+                    };
+                    currentReader.setLayout(root.layoutMode, root.pageGap);
+                    root.operationStatus = op === "page_apply" ? qsTr("Page changes applied. Backup: %1").arg(result.report.backup_path || "") : qsTr("Page session updated; original unchanged.");
+                }
+            }
+            if (id === root.pendingDraftRequestId)
+                root.annotationDraft = null;
+            if (op === "marks_erase")
+                root.eraseDraft = [];
+            if (error.length) {
+                if (op === "file_adopt")
+                    dialogs.annotationDialog.open();
+                return;
+            }
+            if (op === "mark_create" || op === "file_adopt") {
+                if (result.selected_id) {
+                    root.selectedAnnotation = root.annotations.find(function (a) {
+                        return a.id === result.selected_id;
+                    }) || null;
+                    if (root.selectedAnnotation && (root.selectedAnnotation.kind === "stickyNote" || root.selectedAnnotation.kind === "textBox"))
+                        dialogs.annotationDialog.open();
+                }
+            } else if (op.indexOf("mark_") === 0 || op.indexOf("marks_") === 0) {
+                if (root.selectedAnnotation)
+                    root.selectedAnnotation = root.annotations.find(function (a) {
+                        return a.id === root.selectedAnnotation.id;
+                    }) || null;
+            }
+
+            if (op === "layout") {
+                if (root.pendingPosition) {
+                    const state = root.pendingPosition;
+                    root.pendingPosition = null;
+                    if (state.zoom && !state.fitting) {
+                        root.fitting = false;
+                        root.zoom = state.zoom;
+                    } else
+                        root.fitWidth();
+                    Qt.callLater(function () {
+                        root.navigate(state.page || 0);
+                        if (state.offset !== undefined)
+                            pageList.contentY = state.offset;
+                    });
+                } else if (root.fitting)
+                    root.fitWidth();
+            } else if (op === "search" && id === root.searchRequestId) {
+                root.searchResults = result;
+                root.searchIndex = result.length ? 0 : -1;
+                root.searchVisible = true;
+                if (root.activeSearchHit)
+                    root.navigate(root.activeSearchHit.page);
+            } else if (op === "document_info")
+                root.infoData = result;
+            else if (op.indexOf("save_") === 0)
+                root.operationStatus = qsTr("Saved to %1").arg(result.destination_path || "");
+            else if (op.indexOf("replace_") === 0) {
+                root.operationStatus = qsTr("Saved. Verified backup: %1").arg(result.backup_path || "");
+                currentReader.openFile(currentReader.fileUrl);
+            }
+        }
+        function onPasswordRequiredChanged() {
+            if (currentReader.passwordRequired)
+                passwordDialog.open();
+        }
     }
 }

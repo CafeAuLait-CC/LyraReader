@@ -7,6 +7,7 @@
 // All document operations may block and must run on a worker, not the UI thread.
 extern "C" {
 struct LyraReaderDesktopDocument;
+struct LyraReaderRenderSource;
 struct LyraReaderBuffer { std::uint8_t *data; std::size_t len; };
 struct LyraReaderBitmap {
     std::uint32_t width, height, stride;
@@ -19,7 +20,18 @@ void lyra_reader_desktop_close(LyraReaderDesktopDocument *document);
 bool lyra_reader_desktop_info(const LyraReaderDesktopDocument *document, LyraReaderBuffer *output, LyraReaderBuffer *error);
 bool lyra_reader_desktop_render(const LyraReaderDesktopDocument *document, std::uint32_t page, double scale,
     LyraReaderBitmap *output, LyraReaderBuffer *error);
+bool lyra_reader_desktop_render_annotated(const LyraReaderDesktopDocument *document, std::uint32_t page, double scale,
+    LyraReaderBitmap *output, LyraReaderBuffer *error);
+// Immutable revision. include_edits prepares a verified temporary PDF for printing;
+// it never modifies the source PDF or sidecar. Preparation is a worker operation.
+LyraReaderRenderSource *lyra_reader_desktop_render_source(const LyraReaderDesktopDocument *, bool include_edits, LyraReaderBuffer *error);
+void lyra_reader_desktop_render_source_free(LyraReaderRenderSource *);
+bool lyra_reader_desktop_render_region(const LyraReaderRenderSource *, std::uint32_t page, double scale,
+    double x, double y, double width, double height, bool annotated, bool transparent,
+    LyraReaderBitmap *output, LyraReaderBuffer *error);
 void lyra_reader_desktop_buffer_free(LyraReaderBuffer buffer);
+bool lyra_reader_desktop_command(const LyraReaderDesktopDocument *document,
+    const std::uint8_t *request, std::size_t request_len, LyraReaderBuffer *output, LyraReaderBuffer *error);
 double lyra_reader_desktop_fit_width(double page_width, double viewport_width);
 double lyra_reader_desktop_zoom_offset(double offset, double anchor, double old_zoom, double new_zoom);
 }

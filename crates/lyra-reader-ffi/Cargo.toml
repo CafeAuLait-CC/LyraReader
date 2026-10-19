@@ -21,6 +21,9 @@ path = "src/bin/uniffi-bindgen.rs"
 [lints]
 workspace = true
 
+[features]
+desktop-json = []
+
 [dependencies]
 lyra-reader-text = { path = "../lyra-reader-text" }
 lyra-reader-ai = { workspace = true }

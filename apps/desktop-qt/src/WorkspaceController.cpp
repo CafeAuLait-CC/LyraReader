@@ -1,0 +1,166 @@
+#include "WorkspaceController.h"
+#include "PdfPrintJob.h"
+#include <QPrinter>
+#include <QPrintDialog>
+#include <QPointer>
+#include <filesystem>
+#include <QFileInfo>
+#include <QSettings>
+#include <QClipboard>
+#include <QGuiApplication>
+#include <QDesktopServices>
+#include <QCryptographicHash>
+#include <QSaveFile>
+
+namespace {
+QString positionKey(const ReaderController *reader) {
+    return QStringLiteral("reader/positions/") + QString::fromLatin1(QCryptographicHash::hash(
+        reader->fileUrl().toEncoded(), QCryptographicHash::Sha256).toHex());
+}
+}
+
+WorkspaceController::WorkspaceController(QObject *parent) : QObject(parent) {
+    QSettings settings;
+    m_recent = settings.value(QStringLiteral("reader/recentDocuments")).toList();
+    appendTab();
+}
+ReaderController *WorkspaceController::appendTab() {
+    auto *reader = new ReaderController(this);
+    m_tabs.append(reader);
+    connect(reader, &ReaderController::documentChanged, this, &WorkspaceController::tabsChanged);
+    connect(reader, &ReaderController::loadingChanged, this, &WorkspaceController::tabsChanged);
+    connect(reader, &ReaderController::openFinished, this, [this,reader](bool success) { if (success) remember(reader); });
+    emit tabsChanged();
+    return reader;
+}
+QVariantList WorkspaceController::tabs() const {
+    QVariantList result;
+    for (auto *reader : m_tabs) result.append(QVariantMap{
+        {QStringLiteral("title"),reader->title()}, {QStringLiteral("loading"),reader->loading()},
+        {QStringLiteral("reader"),QVariant::fromValue(reader)}, {QStringLiteral("url"),reader->fileUrl()}
+    });
+    return result;
+}
+ReaderController *WorkspaceController::activeReader() const { return m_tabs.value(m_activeIndex); }
+void WorkspaceController::selectTab(int index) {
+    if (index < 0 || index >= m_tabs.size() || index == m_activeIndex) return;
+    emit activeReaderAboutToChange();
+    m_activeIndex = index;
+    emit activeReaderChanged();
+}
+void WorkspaceController::openFiles(const QList<QUrl> &urls) { for (const auto &url : urls) openFile(url); }
+void WorkspaceController::openFile(const QUrl &url) {
+    if (!url.isLocalFile()) return;
+    const auto path = QFileInfo(url.toLocalFile()).absoluteFilePath();
+    for (int i = 0; i < m_tabs.size(); ++i) {
+        if (m_tabs.at(i)->fileUrl().toLocalFile() == path) { selectTab(i); return; }
+    }
+    auto *reader = activeReader();
+    if (!reader || reader->loading() || reader->pageCount() || !reader->fileUrl().isEmpty()) {
+        reader = appendTab();
+        selectTab(int(m_tabs.size()) - 1);
+    }
+    reader->openFile(QUrl::fromLocalFile(path));
+}
+void WorkspaceController::newTab() {
+    appendTab();
+    selectTab(int(m_tabs.size()) - 1);
+}
+void WorkspaceController::closeTab(int index, bool discardPending) {
+    if (index < 0 || index >= m_tabs.size()) return;
+    auto *candidate=m_tabs.at(index);
+    const auto marks=candidate->data().value(QStringLiteral("marks")).toMap();
+    if(candidate->pendingCommands()>0 || (!discardPending &&
+        (marks.value(QStringLiteral("page_pending")).toBool() || marks.value(QStringLiteral("pending_deletions")).toInt()>0 || !candidate->noteDrafts().isEmpty()))) {
+        emit closeTabRequested(index);
+        return;
+    }
+    emit activeReaderAboutToChange();
+    auto *reader = m_tabs.takeAt(index);
+    m_views.remove(reader);
+    reader->deleteLater(); // Outstanding workers own their Rust handles independently.
+    if (m_tabs.isEmpty()) appendTab();
+    if (index < m_activeIndex) --m_activeIndex;
+    m_activeIndex = qBound(0, m_activeIndex, int(m_tabs.size()) - 1);
+    emit tabsChanged();
+    emit activeReaderChanged();
+}
+void WorkspaceController::openInNewWindow(const QUrl &url, int page) { emit newWindowRequested(url,page); }
+QVariantMap WorkspaceController::viewState(ReaderController *reader) const {
+    if (m_views.contains(reader)) return m_views.value(reader);
+    QSettings settings;
+    return settings.value(positionKey(reader)).toMap();
+}
+void WorkspaceController::saveViewState(ReaderController *reader, const QVariantMap &state) {
+    if (!reader) return;
+    m_views.insert(reader,state);
+    if (!reader->fileUrl().isEmpty()) {
+        QSettings settings;
+        settings.setValue(positionKey(reader),state);
+    }
+}
+void WorkspaceController::remember(ReaderController *reader) {
+    const auto url = reader->fileUrl().toString();
+    for (auto it=m_recent.begin();it!=m_recent.end();) {
+        if (it->toMap().value(QStringLiteral("url")).toString()==url) it=m_recent.erase(it);
+        else ++it;
+    }
+    m_recent.prepend(QVariantMap{{QStringLiteral("url"),url},{QStringLiteral("title"),reader->title()}});
+    while (m_recent.size()>20) m_recent.removeLast();
+    QSettings settings;
+    settings.setValue(QStringLiteral("reader/recentDocuments"),m_recent);
+    emit recentDocumentsChanged();
+}
+void WorkspaceController::clearRecentDocuments() {
+    m_recent.clear();
+    QSettings settings;
+    settings.remove(QStringLiteral("reader/recentDocuments"));
+    emit recentDocumentsChanged();
+}
+void WorkspaceController::copyText(const QString &text) { QGuiApplication::clipboard()->setText(text); }
+void WorkspaceController::openExternal(const QUrl &url) {
+    if (url.scheme()==QStringLiteral("https") || url.scheme()==QStringLiteral("http") || url.scheme()==QStringLiteral("mailto"))
+        QDesktopServices::openUrl(url);
+}
+QVariant WorkspaceController::preference(const QString &key,const QVariant &fallback) const {
+    QSettings settings;
+    return settings.value(QStringLiteral("reader/preferences/")+key,fallback);
+}
+void WorkspaceController::setPreference(const QString &key,const QVariant &value) {
+    QSettings settings;
+    settings.setValue(QStringLiteral("reader/preferences/")+key,value);
+}
+QString WorkspaceController::writeTextFile(const QUrl &url,const QString &text) {
+    if (!url.isLocalFile()) return tr("Choose a local destination.");
+    QSaveFile file(url.toLocalFile());
+    if (!file.open(QIODevice::WriteOnly)) return file.errorString();
+    const auto bytes=text.toUtf8();
+    if (file.write(bytes)!=bytes.size() || !file.commit()) return file.errorString();
+    return {};
+}
+
+void WorkspaceController::printDocument(ReaderController *reader,int currentPage) {
+    if(!reader || !reader->pageCount())return;
+    if(reader->pendingCommands()>0){emit printFinished(tr("Wait for the document operation to finish before printing."));return;}
+    const auto document=reader->documentHandle();
+    const auto pages=reader->pages();
+    const auto original=reader->fileUrl().toLocalFile();
+    auto printer=std::make_shared<QPrinter>(QPrinter::HighResolution);
+    printer->setDocName(reader->title());
+    QPrintDialog dialog(printer.get());
+    dialog.setMinMax(1,int(pages.size()));
+    dialog.setOption(QAbstractPrintDialog::PrintPageRange,true);
+    dialog.setOption(QAbstractPrintDialog::PrintCurrentPage,true);
+    if(dialog.exec()!=QDialog::Accepted)return;
+    if(!printer->outputFileName().isEmpty()) {
+        const auto destination=QFileInfo(printer->outputFileName());
+        std::error_code error;
+        if(destination.absoluteFilePath()==QFileInfo(original).absoluteFilePath() ||
+            std::filesystem::equivalent(std::filesystem::u8path(original.toUtf8().constData()),
+                std::filesystem::u8path(destination.absoluteFilePath().toUtf8().constData()),error)) {
+            emit printFinished(tr("Printing cannot overwrite the original PDF. Choose another destination."));return;
+        }
+    }
+    const auto owner=QPointer<WorkspaceController>(this);
+    PdfPrintJob::start(document,pages,printer,currentPage,[owner](const QString &error){if(owner)emit owner->printFinished(error);});
+}
