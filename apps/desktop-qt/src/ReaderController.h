@@ -1,5 +1,5 @@
 #pragma once
-#include "aris_desktop.h"
+#include "lyra_reader_desktop.h"
 #include <QCache>
 #include <QImage>
 #include <QObject>
@@ -52,11 +52,11 @@ private:
     struct Request { int page; double scale; QString key; };
     void startNextRaster();
     void setError(const QString &error);
-    std::shared_ptr<ArisDesktopDocument> m_document;
+    std::shared_ptr<LyraReaderDesktopDocument> m_document;
     QUrl m_lastUrl;
     QVariantList m_pages;
     double m_documentWidth = 0;
-    QString m_title = QStringLiteral("Lyra");
+    QString m_title = QStringLiteral("LyraReader");
     QString m_error;
     bool m_loading = false;
     bool m_passwordRequired = false;

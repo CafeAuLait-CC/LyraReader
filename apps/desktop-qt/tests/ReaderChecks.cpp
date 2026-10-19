@@ -17,11 +17,11 @@ public:
 private slots:
     void initTestCase() {
         qInfo() << "Qt test platform:" << QGuiApplication::platformName();
-        if (qEnvironmentVariableIsSet("ARIS_READER_REQUIRE_NATIVE_QT")) {
+        if (qEnvironmentVariableIsSet("LYRA_READER_REQUIRE_NATIVE_QT")) {
             QVERIFY(QGuiApplication::platformName() == "wayland" || QGuiApplication::platformName() == "xcb");
         }
-        qmlRegisterUncreatableType<ReaderController>("Lyra", 1, 0, "ReaderController", "Created by host");
-        qmlRegisterType<PageItem>("Lyra", 1, 0, "PdfPage");
+        qmlRegisterUncreatableType<ReaderController>("LyraReader", 1, 0, "ReaderController", "Created by host");
+        qmlRegisterType<PageItem>("LyraReader", 1, 0, "PdfPage");
     }
     void wholeWindowSurvivesTextureReplacementAndPageJump() {
         ReaderController reader;
@@ -53,6 +53,25 @@ private slots:
         const auto selected = frame.pixelColor(qRound(point.x() * sx), qRound(point.y() * sy));
         const auto following = frame.pixelColor(qRound(point.x() * sx), qRound((point.y() + current->height()) * sy));
         QVERIFY2(selected != following, "The selected first page row must be visible in the captured frame");
+        // Changing application appearance must repaint the chrome without
+        // recoloring or rerasterizing the source PDF.
+        auto *theme = window->findChild<QObject *>("lyraReaderTheme");
+        QVERIFY(theme);
+        QVERIFY(!theme->property("dark").toBool());
+        const auto rastersBeforeAppearance = reader.completedRasters();
+        QVERIFY(window->setProperty("appearance", "dark"));
+        QTRY_VERIFY(theme->property("dark").toBool());
+        QTest::qWait(150);
+        const auto darkFrame = window->grabWindow();
+        QVERIFY(!darkFrame.isNull());
+        QVERIFY(frame.pixelColor(2, frame.height() / 2) != darkFrame.pixelColor(2, darkFrame.height() / 2));
+        QCOMPARE(reader.completedRasters(), rastersBeforeAppearance);
+        const auto snapshots = qEnvironmentVariable("LYRA_READER_CHECK_SNAPSHOTS");
+        if (!snapshots.isEmpty()) {
+            QVERIFY(frame.save(snapshots + "/lyrareader-light.png"));
+            QVERIFY(darkFrame.save(snapshots + "/lyrareader-dark.png"));
+        }
+        window->setProperty("appearance", "light");
         QVERIFY(QMetaObject::invokeMethod(window, "navigate", Q_ARG(QVariant, reader.pageCount() - 1)));
         QTRY_COMPARE(window->property("currentPage").toInt(), reader.pageCount() - 1);
         QTest::qWait(200);

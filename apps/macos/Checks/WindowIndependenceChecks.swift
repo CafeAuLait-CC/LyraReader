@@ -1,5 +1,5 @@
 import AppKit
-import ArisReaderKit
+import LyraReaderKit
 import Foundation
 
 extension ReaderChecks {
@@ -89,18 +89,17 @@ extension ReaderChecks {
                 && right.state.zoomPercent == rightZoom,
                 "zooming one window leaves the other window's zoom alone")
 
-        // 5. The wheel glide is per window as well. `AppState` owns a `ScrollGlide` and its driver
-        //    (not a global), so a window's session isolates it the same way it isolates the offset
-        //    — but that is exactly the class of accident this change exists to prevent (one shared
-        //    object animating two windows), so it is asserted rather than assumed: a notch in one
-        //    window must aim a glide there, leave the other window with no glide at all, and the
-        //    ticks of that glide must move only the window that owns it.
-        require(right.state.scrollDestinationYPt == nil, "the second window starts with no glide")
+        // 5. Immediate wheel input and keyboard animation both belong to one window.
+        let beforeWheel = left.state.scrollYPt
+        let otherBeforeWheel = right.state.scrollYPt
         left.state.scrollByWheelStep(96)
+        require(left.state.scrollYPt > beforeWheel && left.state.scrollDestinationYPt == nil,
+                "wheel input moves only its window immediately without a glide")
+        require(right.state.scrollYPt == otherBeforeWheel && right.state.scrollDestinationYPt == nil,
+                "wheel input leaves the other window stationary")
+        left.state.scrollByKeyboardStep(96)
         require(left.state.scrollDestinationYPt != nil,
-                "a wheel notch aims a glide in the window it happened in")
-        require(right.state.scrollDestinationYPt == nil,
-                "…and the other window has no glide of its own (the glide is not shared)")
+                "keyboard input starts an animation in its own window")
         let leftBeforeGlide = left.state.scrollYPt
         let rightBeforeGlide = right.state.scrollYPt
         var glideFinished = false
@@ -139,7 +138,7 @@ extension ReaderChecks {
         //
         //    7a. macOS made a window for this request: its session registers before (or while)
         //        AppKit delivers the URLs, and that window may not be key yet — measured:
-        //        `aris-window: 1 url(s) → session 2 of 3` with the key window still the second one.
+        //        `lyra-reader-window: 1 url(s) → session 2 of 3` with the key window still the second one.
         //        The document must go to the new window, not to the one the reader was using.
         let beforeRequest = (left: left.state.tabs.count, right: right.state.tabs.count)
         let requestWindow = window("request window")
@@ -206,7 +205,7 @@ extension ReaderChecks {
         // 10. A launch that arrives with documents, before any window exists: the URLs wait in the
         //    registry (never dropped) and the first window that appears opens them.
         let launchRegistry = ReaderWindowRegistry()
-        let launchDelegate = ArisReaderAppDelegate(registry: launchRegistry)
+        let launchDelegate = LyraReaderAppDelegate(registry: launchRegistry)
         launchDelegate.application(NSApplication.shared, open: [a, b])
         require(launchRegistry.pendingCount == 2 && launchRegistry.sessions.isEmpty,
                 "documents delivered before any window exists wait instead of being lost")
@@ -311,7 +310,7 @@ extension ReaderChecks {
 /// A pasteboard holding file URLs for a check drag.
 enum CheckPasteboard {
     @MainActor static func files(_ urls: [URL]) -> NSPasteboard {
-        let pasteboard = NSPasteboard(name: NSPasteboard.Name("aris-checks-drop-\(UUID().uuidString)"))
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("lyra-reader-checks-drop-\(UUID().uuidString)"))
         pasteboard.clearContents()
         pasteboard.writeObjects(urls.map { $0 as NSURL })
         return pasteboard

@@ -1,0 +1,15 @@
+[package]
+name = "lyra-reader-runtime"
+description = "Toolkit-independent document services for native desktop shells"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+lyra-reader-core = { workspace = true }
+lyra-reader-pdfium = { workspace = true }
+lyra-reader-session = { workspace = true }

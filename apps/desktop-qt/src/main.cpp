@@ -25,15 +25,16 @@ static const char *graphicsName(QSGRendererInterface::GraphicsApi api) {
 
 int main(int argc, char **argv) {
     QGuiApplication application(argc, argv);
-    QCoreApplication::setApplicationName(QStringLiteral("Lyra"));
-    QCoreApplication::setOrganizationName(QStringLiteral("Aris"));
+    QCoreApplication::setApplicationName(QStringLiteral("LyraReader"));
+    QCoreApplication::setOrganizationName(QStringLiteral("Alex"));
+    QCoreApplication::setOrganizationDomain(QStringLiteral("alex.com"));
     // Installed builds have a desktop entry the portal can resolve. An uninstalled
     // development binary should not register a nonexistent desktop identity.
     if (!QStandardPaths::locate(QStandardPaths::GenericDataLocation,
-            QStringLiteral("applications/io.github.CafeAuLaitCC.Lyra.desktop")).isEmpty())
-        QGuiApplication::setDesktopFileName(QStringLiteral("io.github.CafeAuLaitCC.Lyra"));
+            QStringLiteral("applications/com.alex.lyrareader.desktop")).isEmpty())
+        QGuiApplication::setDesktopFileName(QStringLiteral("com.alex.lyrareader"));
     QCommandLineParser parser;
-    parser.setApplicationDescription(QStringLiteral("Lyra native Qt PDF reader"));
+    parser.setApplicationDescription(QStringLiteral("LyraReader native Qt PDF reader"));
     parser.addHelpOption();
     parser.addPositionalArgument(QStringLiteral("file"), QStringLiteral("Local PDF to open"));
     parser.addOption({QStringLiteral("quit-after"), QStringLiteral("Exit after N milliseconds (development check)"), QStringLiteral("ms")});
@@ -52,8 +53,8 @@ int main(int argc, char **argv) {
         QQuickStyle::setStyle(QStringLiteral("Fusion"));
 #endif
     }
-    qmlRegisterUncreatableType<ReaderController>("Lyra", 1, 0, "ReaderController", QStringLiteral("Created by the application"));
-    qmlRegisterType<PageItem>("Lyra", 1, 0, "PdfPage");
+    qmlRegisterUncreatableType<ReaderController>("LyraReader", 1, 0, "ReaderController", QStringLiteral("Created by the application"));
+    qmlRegisterType<PageItem>("LyraReader", 1, 0, "PdfPage");
     ReaderController reader;
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("reader"), &reader);
@@ -62,7 +63,7 @@ int main(int argc, char **argv) {
     auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().first());
     if (!window) return 1;
     QObject::connect(window, &QQuickWindow::sceneGraphInitialized, window, [window] {
-        qInfo() << "aris-qt-backend:" << QGuiApplication::platformName()
+        qInfo() << "lyra-reader-qt-backend:" << QGuiApplication::platformName()
                 << "graphicsApi=" << graphicsName(window->rendererInterface()->graphicsApi());
     }, Qt::DirectConnection);
     const auto files = parser.positionalArguments();
@@ -75,7 +76,7 @@ int main(int argc, char **argv) {
         QTimer::singleShot(duration, &application, [&application, window, snapshot] {
             if (!snapshot.isEmpty()) {
                 if (auto *sidebar = window->findChild<QObject *>(QStringLiteral("pagesSidebar")))
-                    qInfo() << "aris-qt-sidebar:" << "height=" << sidebar->property("height")
+                    qInfo() << "lyra-reader-qt-sidebar:" << "height=" << sidebar->property("height")
                         << "contentHeight=" << sidebar->property("contentHeight")
                         << "contentY=" << sidebar->property("contentY")
                         << "originY=" << sidebar->property("originY")

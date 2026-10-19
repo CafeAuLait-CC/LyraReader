@@ -16,10 +16,10 @@ done
 if [ -n "$BACKEND" ] && [ "$NATIVE" -ne 1 ]; then echo "A GPU backend check requires --native" >&2; exit 2; fi
 cd "$ROOT"
 bash scripts/build-qt.sh
-cargo test -p aris-reader-runtime -p aris-reader-desktop-ffi
+cargo test --locked -p lyra-reader-runtime -p lyra-reader-desktop-ffi
 if [ "$NATIVE" = 1 ]; then
   if [ -n "$BACKEND" ]; then export QSG_RHI_BACKEND="$BACKEND"; fi
-  ARIS_READER_REQUIRE_NATIVE_QT=1 "$ROOT/build/desktop-qt-debug/lyra_checks" "$ROOT"
+  LYRA_READER_REQUIRE_NATIVE_QT=1 "$ROOT/build/desktop-qt-debug/LyraReaderChecks" "$ROOT"
 else
   ctest --test-dir "$ROOT/build/desktop-qt-debug" --output-on-failure
 fi

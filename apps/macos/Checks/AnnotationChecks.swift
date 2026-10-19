@@ -1,4 +1,4 @@
-import ArisReaderKit
+import LyraReaderKit
 import CoreGraphics
 import Foundation
 import ImageIO
@@ -6,7 +6,7 @@ import UniformTypeIdentifiers
 
 extension ReaderChecks {
     @MainActor static func annotationChecks(a: URL, b: URL) async throws {
-        let sidecar = a.appendingPathExtension("aris-annotations.json")
+        let sidecar = a.appendingPathExtension("lyra-reader-annotations.json")
         let annotation = AppState.Annotation(id: UUID(), page: 0, start: 0, end: 3,
             color: AppState.highlightPalette[0].color, note: "old", createdAt: Date())
         let encoder = JSONEncoder()
@@ -77,7 +77,7 @@ extension ReaderChecks {
             return document
         }
         func sidecar(of document: URL) -> URL {
-            document.appendingPathExtension("aris-annotations.json")
+            document.appendingPathExtension("lyra-reader-annotations.json")
         }
         func readSidecar(_ document: URL) throws -> String {
             try String(decoding: Data(contentsOf: sidecar(of: document)), as: UTF8.self)
@@ -201,9 +201,8 @@ extension ReaderChecks {
         let placement = futureEngine.visiblePages(scrollYPt: futureState.scrollYPt,
             viewportHeightPt: 500, gapPt: futureState.pageGapPt, marginPt: 0)
             .first { $0.index == known.page }!
-        // The tint texture holds the stored colour straight (this annotation is drawn
-        // alpha-over), so the bytes to look for are the annotation's own colour.
-        let expectedColor = Data(known.color.bgra)
+        // Multiply folds opacity into the tint rather than replacing the source glyphs.
+        let expectedColor = Data(known.color.baked(opacity: 1).bgra)
         require(!expectedRects.isEmpty, "known annotation has nonempty text geometry")
         // Texture-cache IDs are private allocation details. Assert that the actual
         // annotation-colored quads cover the expected text, not a numeric ID range
@@ -212,7 +211,7 @@ extension ReaderChecks {
             expectedRects.allSatisfy { rect in
                 futureState.canvasPages.contains { canvas in
                     canvas.image.pixelWidth == 1 && canvas.image.pixelHeight == 1
-                        && canvas.image.bgra == expectedColor
+                        && canvas.image.bgra == expectedColor && canvas.blend == .multiply
                         && canvas.placement.leftPt == placement.leftPt + rect.minX
                         && canvas.placement.topPt == placement.topPt + rect.minY
                         && canvas.placement.widthPt == rect.width
@@ -369,7 +368,7 @@ extension ReaderChecks {
         let lockedOnDisk = try JSONDecoder().decode([AppState.Annotation].self, from: lockedBytes)
         require(lockedOnDisk.first?.note == "first", "the sidecar bytes survive a refused write")
         let leftovers = try FileManager.default.contentsOfDirectory(atPath: lockedDirectory.path)
-            .filter { $0 != "locked.pdf" && $0 != "locked.pdf.aris-annotations.json" }
+            .filter { $0 != "locked.pdf" && $0 != "locked.pdf.lyra-reader-annotations.json" }
         require(leftovers.isEmpty, "a failed write leaves no temporary files behind")
     }
 
@@ -668,6 +667,9 @@ extension ReaderChecks {
         for index in 0..<4_096 {
             claim(PlacementIndex.documentNote(index), "note glyph \(index)")
         }
+        for index in 0..<4_096 {
+            claim(PlacementIndex.ownNote(index), "sidecar placed-text glyph \(index)")
+        }
 
         // …and the ends of every block, which is where two blocks would meet if a capacity grew
         // past what the layout allows: the last page raster, the last selection box, the last
@@ -680,10 +682,11 @@ extension ReaderChecks {
         claim(PlacementIndex.documentAnnotation(262_143, box: 1_023),
               "the last loaded annotation's last box")
         claim(PlacementIndex.documentNote(PlacementIndex.block - 1), "the last note glyph")
+        claim(PlacementIndex.ownNote(PlacementIndex.block - 1), "the last sidecar placed-text glyph")
 
-        require(owner.count == 4_096 * 4 + 4_096 * 64 + 5,
-                "page rasters, the selection, this reader's annotations, loaded annotations and "
-                    + "note glyphs never share a placement index (\(owner.count) distinct indices, "
+        require(owner.count == 4_096 * 5 + 4_096 * 64 + 6,
+                "page rasters, the selection, this reader's annotations, loaded annotations, "
+                    + "sidecar placed-text glyphs and note glyphs never share a placement index (\(owner.count) distinct indices, "
                     + "including the ends of each block)")
     }
 
@@ -698,14 +701,14 @@ extension ReaderChecks {
 
         func fixture(_ name: String) throws -> URL {
             let document = directory.appendingPathComponent(name)
-            let sidecar = document.appendingPathExtension("aris-annotations.json")
+            let sidecar = document.appendingPathExtension("lyra-reader-annotations.json")
             try? FileManager.default.removeItem(at: document)
             try? FileManager.default.removeItem(at: sidecar)
             try FileManager.default.copyItem(at: a, to: document)
             return document
         }
         func sidecar(of document: URL) -> URL {
-            document.appendingPathExtension("aris-annotations.json")
+            document.appendingPathExtension("lyra-reader-annotations.json")
         }
         func text(of document: URL) throws -> String {
             try String(decoding: Data(contentsOf: sidecar(of: document)), as: UTF8.self)
@@ -834,11 +837,11 @@ extension ReaderChecks {
         require(customState.annotations.count == 2, "both annotations reload")
         let reloaded = customState.annotations.first { $0.note.isEmpty }
         require(reloaded?.color == chosen, "the exact colour survives a save and a reopen")
-        // …and the canvas quad carries those bytes: the colour is not just stored, it is drawn.
-        let expected = Data(chosen.bgra)
+        // The stored hue/opacity is folded into the Multiply tint used on the canvas.
+        let expected = Data(chosen.baked(opacity: 1).bgra)
         try await eventually("the custom colour is the one drawn on the canvas", {
             customState.canvasPages.contains { page in
-                page.image.pixelWidth == 1 && page.image.bgra == expected
+                page.image.pixelWidth == 1 && page.image.bgra == expected && page.blend == .multiply
             }
         })
     }
@@ -859,11 +862,11 @@ extension ReaderChecks {
     ///   alpha-over, carrying a bitmap that is not a 1×1 tint (i.e. a real icon);
     /// * a free-text annotation's quad does too, laid out at the size `/DA` states;
     /// * the hidden marker and the `/Ink` annotation get no quad at all;
-    /// * clicking a drawn note shows its text (the sidebar follows, and the status line repeats it);
+    /// * clicking a drawn note expands its text on the canvas;
     /// * and the composite of those quads — the same quads, the same blend modes, composited by
     ///   CoreGraphics instead of by Metal — has the note's colour where the note is and page white
     ///   where it is not. That is the pixel evidence a headless run can produce; it is written to
-    ///   `ARIS_READER_CHECK_SNAPSHOT_DIR` when that variable names a directory.
+    ///   `LYRA_READER_CHECK_SNAPSHOT_DIR` when that variable names a directory.
     @MainActor static func annotationNoteChecks(url: URL) async throws {
         guard FileManager.default.fileExists(atPath: url.path) else {
             print("INFO: skipping note annotation checks (no notes fixture at \(url.path))")
@@ -883,6 +886,7 @@ extension ReaderChecks {
         var drawnNotes = 0
         var drawnText = 0
         var drawnMarkup = 0
+        var drawnGeometry = 0
         var skipReasons: [String] = []
         for annotation in state.documentAnnotations {
             switch annotation.drawing {
@@ -892,19 +896,23 @@ extension ReaderChecks {
                 drawnNotes += 1
             case .freeText:
                 drawnText += 1
+            case .geometry:
+                drawnGeometry += 1
             case .skipped:
                 require(annotation.skipReason != nil,
                         "a skipped annotation says why (\(annotation.kind))")
                 skipReasons.append(annotation.skipReason?.rawValue ?? "?")
             }
         }
-        require(drawnMarkup + drawnNotes + drawnText + skipReasons.count
+        require(drawnMarkup + drawnNotes + drawnText + drawnGeometry + skipReasons.count
                     == state.documentAnnotations.count,
                 "every content annotation is accounted for exactly once")
         require(drawnMarkup == 0, "this fixture carries no text markup at all")
         require(drawnNotes == 2, "both sticky notes are classified as drawn")
         require(drawnText == 2, "both readable free texts are classified as drawn")
-        require(skipReasons == ["no-text", "hidden", "unmodelled"],
+        require(drawnGeometry == 0,
+                "the fixture's /InkList is the malformed flat form, so no stroke is drawn")
+        require(skipReasons == ["no-text", "hidden", "empty-geometry"],
                 "the three undrawn annotations say why, got \(skipReasons)")
 
         // A note that is classified as drawn has to *reach the canvas*, in the note index block.
@@ -949,7 +957,10 @@ extension ReaderChecks {
         require(!state.canvasPages.contains { $0.placement.index == PlacementIndex.documentNote(5) },
                 "a hidden note gets no quad, so the page cannot contradict the file")
         require(!state.canvasPages.contains { $0.placement.index == PlacementIndex.documentNote(6) },
-                "an /Ink annotation gets no quad — it is reported, not invented")
+                "a malformed /Ink annotation gets no quad — it is reported, not invented")
+        require(ink.kind == "ink" && ink.drawing == .skipped
+                    && ink.skipReason == .emptyGeometry,
+                "the /Ink is still named, with the reason it has no path to draw")
         // Five, not four: the sidebar lists what a note *is*, so the empty free-text annotation
         // (undrawn, `no-text`) is in the list even though it puts nothing on the page.
         require(state.documentNotes.count == 5,
@@ -967,8 +978,11 @@ extension ReaderChecks {
         require(state.openDocumentNote(at: iconCentre), "a click on the note icon finds the note")
         require(state.selectedDocumentAnnotationID == colouredNote.id,
                 "the clicked note is the one the sidebar highlights")
-        require(state.sidebarTab == .annotations && state.sidebarVisible,
-                "the note list is brought up, which is where a note's text can be read")
+        require(state.openDocumentNote?.contents == colouredNote.contents,
+                "the clicked note expands its complete text on the canvas")
+        state.closeDocumentNote()
+        require(state.openDocumentNote == nil, "the note paper can be closed")
+        require(state.openDocumentNote(at: iconCentre), "the note can be reopened")
         require(state.statusMessage.contains("sticky note with a colour"),
                 "the note's own text is shown, got \"\(state.statusMessage)\"")
         require(!state.openDocumentNote(at: CGPoint(x: iconCentre.x - 200, y: iconCentre.y)),
@@ -1046,7 +1060,7 @@ extension ReaderChecks {
         } else {
             fatalError("FAIL: the colourless note reached no quad")
         }
-        if let directory = ProcessInfo.processInfo.environment["ARIS_READER_CHECK_SNAPSHOT_DIR"] {
+        if let directory = ProcessInfo.processInfo.environment["LYRA_READER_CHECK_SNAPSHOT_DIR"] {
             snapshot.write(to: URL(fileURLWithPath: directory)
                 .appendingPathComponent("annotated-notes.png"))
         }
@@ -1061,7 +1075,7 @@ extension ReaderChecks {
     /// glyph is a real bitmap, in the right place, in the right colour — which is where both of
     /// this area's defects have actually lived.
     ///
-    /// Blend modes mirror `aris-reader-gpu`'s shaders: alpha-over for `normal`, and CoreGraphics'
+    /// Blend modes mirror `lyra-reader-gpu`'s shaders: alpha-over for `normal`, and CoreGraphics'
     /// `multiply` for a tint whose `/CA` is already baked into its colour, which reproduces the
     /// GPU's `dst × (a·c + 1 − a)` exactly at alpha 255.
     struct CanvasSnapshot {

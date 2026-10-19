@@ -1,0 +1,17 @@
+[package]
+name = "lyra-reader-desktop-ffi"
+description = "Small C ABI between the shared Rust runtime and the Qt desktop shell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+lyra-reader-runtime = { path = "../lyra-reader-runtime" }
+serde_json = "1"

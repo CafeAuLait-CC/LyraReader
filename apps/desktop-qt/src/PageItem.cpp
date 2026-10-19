@@ -105,7 +105,7 @@ QSGNode *PageItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *) {
         node->setFiltering(QSGTexture::Linear);
         node->setSourceRect(QRectF(QPointF(0, 0), m_image.size()));
         m_dirty = false;
-        qInfo().nospace() << "aris-qt-upload: page=" << m_page << " size=" << m_image.width() << 'x' << m_image.height();
+        qInfo().nospace() << "lyra-reader-qt-upload: page=" << m_page << " size=" << m_image.width() << 'x' << m_image.height();
     }
     node->setRect(boundingRect());
     return node;

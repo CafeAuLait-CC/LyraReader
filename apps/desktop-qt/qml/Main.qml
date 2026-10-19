@@ -3,7 +3,7 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Dialogs
 import QtQuick.Window
-import Lyra 1.0
+import LyraReader 1.0
 
 ApplicationWindow {
     id: root
@@ -13,13 +13,42 @@ ApplicationWindow {
     height: 820
     minimumWidth: 640
     minimumHeight: 440
-    title: reader.title === "Lyra" ? "Lyra" : reader.title + " — Lyra"
-    color: palette.window
+    title: reader.title === "LyraReader" ? "LyraReader" : reader.title + " — LyraReader"
+    color: theme.windowBg
+    // Palette specification defaults to light; the user can opt into dark or system.
+    property string appearance: "light"
+    SystemPalette { id: systemPalette }
+    LyraReaderTheme {
+        id: theme
+        objectName: "lyraReaderTheme"
+        dark: root.appearance === "dark" || (root.appearance === "system" && systemPalette.window.hslLightness < 0.5)
+    }
+    palette.window: theme.windowBg
+    palette.windowText: theme.textPrimary
+    palette.base: theme.fieldBg
+    palette.alternateBase: theme.panelBg
+    palette.text: theme.textPrimary
+    palette.button: theme.toolbarBg
+    palette.buttonText: theme.textPrimary
+    palette.highlight: theme.selectedBg
+    palette.highlightedText: theme.selectedFg
+    palette.accent: theme.accent
+    palette.link: theme.accent
+    palette.placeholderText: theme.textPlaceholder
+    palette.mid: theme.controlBorder
+    palette.dark: theme.border
+    palette.light: theme.raisedBg
+    palette.toolTipBase: theme.raisedBg
+    palette.toolTipText: theme.textPrimary
+    palette.disabled.text: theme.textDisabled
+    palette.disabled.buttonText: theme.textDisabled
+    palette.disabled.windowText: theme.textDisabled
+    palette.inactive.highlight: theme.inactiveSelectionBg
+    palette.inactive.highlightedText: theme.inactiveSelectionFg
     property real zoom: 1
     property bool fitting: true
     property bool sidebarVisible: true
     property int currentPage: 0
-    readonly property color accent: "#d16a3a"
 
     function navigate(page) {
         if (reader.pageCount === 0) return
@@ -70,6 +99,7 @@ ApplicationWindow {
     Shortcut { sequence: "F11"; onActivated: root.visibility = root.visibility === Window.FullScreen ? Window.Windowed : Window.FullScreen }
 
     menuBar: MenuBar {
+        background: Rectangle { color: theme.titlebarBg }
         Menu {
             title: qsTr("&File")
             MenuItem { action: openAction }
@@ -84,10 +114,19 @@ ApplicationWindow {
             MenuItem { action: actualAction }
             MenuSeparator {}
             MenuItem { text: qsTr("Pages Sidebar"); checkable: true; checked: root.sidebarVisible; onTriggered: root.sidebarVisible = checked }
+            MenuSeparator {}
+            Menu {
+                title: qsTr("Appearance")
+                ActionGroup { id: appearanceGroup }
+                MenuItem { action: Action { text: qsTr("Light"); checkable: true; checked: root.appearance === "light"; ActionGroup.group: appearanceGroup; onTriggered: root.appearance = "light" } }
+                MenuItem { action: Action { text: qsTr("Dark"); checkable: true; checked: root.appearance === "dark"; ActionGroup.group: appearanceGroup; onTriggered: root.appearance = "dark" } }
+                MenuItem { action: Action { text: qsTr("Follow System"); checkable: true; checked: root.appearance === "system"; ActionGroup.group: appearanceGroup; onTriggered: root.appearance = "system" } }
+            }
         }
     }
     header: ToolBar {
         padding: 10
+        background: Rectangle { color: theme.toolbarBg }
         RowLayout {
             anchors.fill: parent
             spacing: 8
@@ -101,14 +140,14 @@ ApplicationWindow {
                 onClicked: root.sidebarVisible = !root.sidebarVisible
             }
             Rectangle {
-                implicitWidth: 30; implicitHeight: 30; radius: 9; color: root.accent
-                Label { anchors.centerIn: parent; text: "L"; color: "white"; font.pixelSize: 19; font.weight: Font.DemiBold }
+                implicitWidth: 30; implicitHeight: 30; radius: 9; color: theme.selectedBg
+                Label { anchors.centerIn: parent; text: "L"; color: theme.selectedFg; font.pixelSize: 19; font.weight: Font.DemiBold }
             }
             ColumnLayout {
                 spacing: 1
                 Layout.fillWidth: true
-                Label { text: reader.pageCount > 0 ? reader.title : "Lyra"; elide: Text.ElideMiddle; Layout.fillWidth: true; font.weight: Font.DemiBold }
-                Label { text: reader.loading ? qsTr("Opening document…") : reader.pageCount > 0 ? qsTr("%1 pages").arg(reader.pageCount) : qsTr("A little space to read"); font.pixelSize: 11; opacity: 0.6 }
+                Label { text: reader.pageCount > 0 ? reader.title : "LyraReader"; elide: Text.ElideMiddle; Layout.fillWidth: true; font.weight: Font.DemiBold }
+                Label { text: reader.loading ? qsTr("Opening document…") : reader.pageCount > 0 ? qsTr("%1 pages").arg(reader.pageCount) : qsTr("A little space to read"); font.pixelSize: 11; color: theme.textSecondary }
             }
             ToolButton { action: openAction; display: AbstractButton.TextOnly }
             ToolSeparator { visible: reader.pageCount > 0 }
@@ -129,9 +168,10 @@ ApplicationWindow {
         Frame {
             visible: reader.error.length > 0 && !reader.passwordRequired
             Layout.fillWidth: true
+            background: Rectangle { color: theme.errorBg }
             RowLayout {
                 anchors.fill: parent
-                Label { text: reader.error; wrapMode: Text.Wrap; Layout.fillWidth: true; Accessible.role: Accessible.AlertMessage }
+                Label { text: qsTr("Error: %1").arg(reader.error); color: theme.errorFg; wrapMode: Text.Wrap; Layout.fillWidth: true; Accessible.role: Accessible.AlertMessage }
                 ToolButton { text: qsTr("Dismiss"); onClicked: reader.dismissError() }
             }
         }
@@ -144,10 +184,11 @@ ApplicationWindow {
                 Layout.preferredWidth: root.width < 850 ? 150 : 214
                 Layout.fillHeight: true
                 padding: 0
+                background: Rectangle { color: theme.sidebarBg }
                 ColumnLayout {
                     anchors.fill: parent
                     spacing: 0
-                    Label { text: qsTr("PAGES"); font.pixelSize: 11; font.letterSpacing: 1.5; opacity: 0.6; Layout.margins: 18 }
+                    Label { text: qsTr("PAGES"); font.pixelSize: 11; font.letterSpacing: 1.5; color: theme.textTertiary; Layout.margins: 18 }
                     ListView {
                         id: sidebar
                         objectName: "pagesSidebar"
@@ -161,30 +202,38 @@ ApplicationWindow {
                         onCurrentIndexChanged: if (currentIndex >= 0) positionViewAtIndex(currentIndex, ListView.Contain)
                         ScrollBar.vertical: ScrollBar {}
                         delegate: ItemDelegate {
+                            id: pageEntry
                             required property int index
                             width: ListView.view.width
                             height: 54
                             highlighted: root.currentPage === index
+                            background: Rectangle {
+                                color: pageEntry.highlighted
+                                    ? (root.active ? theme.selectedBg : theme.inactiveSelectionBg)
+                                    : pageEntry.down ? theme.pressedBg : pageEntry.hovered ? theme.hoverBg : theme.sidebarBg
+                                border.width: pageEntry.visualFocus ? 2 : 0
+                                border.color: theme.focusRing
+                            }
                             contentItem: RowLayout {
                                 spacing: 12
                                 Rectangle {
                                     implicitWidth: 25; implicitHeight: 33; radius: 2
-                                    color: palette.base; border.color: palette.mid
-                                    Label { anchors.centerIn: parent; text: index + 1; font.pixelSize: 9; opacity: 0.65 }
+                                    color: theme.raisedBg; border.color: theme.pageEdge
+                                    Label { anchors.centerIn: parent; text: index + 1; font.pixelSize: 9; color: theme.textTertiary }
                                 }
-                                Label { text: qsTr("Page %1").arg(index + 1); Layout.fillWidth: true }
+                                Label { text: qsTr("Page %1").arg(index + 1); Layout.fillWidth: true; color: root.currentPage === index ? (root.active ? theme.selectedFg : theme.inactiveSelectionFg) : theme.textPrimary }
                             }
                             onClicked: root.navigate(index)
                         }
                     }
                 }
             }
-            Rectangle { visible: root.sidebarVisible && reader.pageCount > 0; Layout.preferredWidth: 1; Layout.fillHeight: true; color: palette.mid; opacity: 0.3 }
+            Rectangle { visible: root.sidebarVisible && reader.pageCount > 0; Layout.preferredWidth: 1; Layout.fillHeight: true; color: theme.separator }
             Item {
                 id: readingArea
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                Rectangle { anchors.fill: parent; color: palette.dark; opacity: 0.09 }
+                Rectangle { anchors.fill: parent; color: reader.pageCount > 0 ? theme.canvasBg : theme.emptyBg }
                 ListView {
                     id: pageList
                     objectName: "pageList"
@@ -255,12 +304,31 @@ ApplicationWindow {
                     Rectangle {
                         Layout.alignment: Qt.AlignHCenter
                         implicitWidth: 62; implicitHeight: 74; radius: 6
-                        color: palette.base; border.color: palette.mid
-                        Label { anchors.centerIn: parent; text: "L"; color: root.accent; font.pixelSize: 32; font.weight: Font.Light }
+                        color: theme.raisedBg; border.color: theme.pageEdge
+                        Label { anchors.centerIn: parent; text: "L"; color: theme.accent; font.pixelSize: 32; font.weight: Font.Light }
                     }
                     Label { Layout.alignment: Qt.AlignHCenter; text: reader.loading ? qsTr("Opening your document") : qsTr("Make room for a good paper."); font.pixelSize: 23; font.weight: Font.Light }
-                    Label { Layout.alignment: Qt.AlignHCenter; text: qsTr("Drop a PDF here, or open one to begin."); opacity: 0.6 }
-                    Button { Layout.alignment: Qt.AlignHCenter; action: openAction; highlighted: true; visible: !reader.loading }
+                    Label { Layout.alignment: Qt.AlignHCenter; text: qsTr("Drop a PDF here, or open one to begin."); color: theme.textSecondary }
+                    Button {
+                        id: primaryOpen
+                        Layout.alignment: Qt.AlignHCenter
+                        action: openAction
+                        visible: !reader.loading
+                        palette.buttonText: theme.onAccent
+                        contentItem: Text {
+                            text: primaryOpen.text
+                            font: primaryOpen.font
+                            color: theme.onAccent
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        background: Rectangle {
+                            implicitWidth: 130; implicitHeight: 36; radius: 4
+                            color: primaryOpen.down ? theme.accentPressed : primaryOpen.hovered ? theme.accentHover : theme.accent
+                            border.width: primaryOpen.visualFocus ? 2 : 0
+                            border.color: theme.focusRing
+                        }
+                    }
                     BusyIndicator { Layout.alignment: Qt.AlignHCenter; running: reader.loading; visible: running }
                 }
                 DropArea {
@@ -278,6 +346,7 @@ ApplicationWindow {
     footer: ToolBar {
         visible: reader.pageCount > 0
         padding: 5
+        background: Rectangle { color: theme.statusbarBg }
         RowLayout {
             anchors.fill: parent
             ToolButton { text: "‹"; font.pixelSize: 22; enabled: root.currentPage > 0; Accessible.name: qsTr("Previous page"); onClicked: root.navigate(root.currentPage - 1) }
@@ -291,11 +360,11 @@ ApplicationWindow {
                 Accessible.name: qsTr("Go to page")
                 onAccepted: { root.navigate(Number(text) - 1); pageList.forceActiveFocus() }
             }
-            Label { text: "/ " + reader.pageCount; opacity: 0.6 }
+            Label { text: "/ " + reader.pageCount; color: theme.textTertiary }
             ToolButton { text: "›"; font.pixelSize: 22; enabled: root.currentPage < reader.pageCount - 1; Accessible.name: qsTr("Next page"); onClicked: root.navigate(root.currentPage + 1) }
             Item { Layout.fillWidth: true }
             ToolButton { action: fitAction }
-            Label { text: qsTr("Ctrl + scroll to zoom"); opacity: 0.5; font.pixelSize: 11; visible: root.width > 850; Layout.rightMargin: 12 }
+            Label { text: qsTr("Ctrl + scroll to zoom"); color: theme.textTertiary; font.pixelSize: 11; visible: root.width > 850; Layout.rightMargin: 12 }
         }
     }
     FileDialog {

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=LyraReader
+GenericName=PDF Reader
+Comment=Read papers in a native desktop window
+Exec=LyraReader %f
+Icon=com.alex.lyrareader
+Terminal=false
+Categories=Office;Viewer;
+MimeType=application/pdf;
+StartupNotify=true

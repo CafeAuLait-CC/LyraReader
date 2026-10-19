@@ -10,22 +10,22 @@
 #include <cmath>
 
 namespace {
-QString takeError(ArisBuffer &buffer) {
+QString takeError(LyraReaderBuffer &buffer) {
     const auto message = QString::fromUtf8(reinterpret_cast<const char *>(buffer.data), qsizetype(buffer.len));
-    aris_reader_desktop_buffer_free(buffer);
+    lyra_reader_desktop_buffer_free(buffer);
     buffer = {};
     return message;
 }
 struct OpenResult {
-    std::shared_ptr<ArisDesktopDocument> document;
+    std::shared_ptr<LyraReaderDesktopDocument> document;
     QVariantList pages;
     double width = 0;
     QString error;
 };
 struct RasterResult { QImage image; QString error; double actualScale = 0; qint64 elapsedMs = 0; };
 void releasePixels(void *info) {
-    auto *buffer = static_cast<ArisBuffer *>(info);
-    aris_reader_desktop_buffer_free(*buffer);
+    auto *buffer = static_cast<LyraReaderBuffer *>(info);
+    lyra_reader_desktop_buffer_free(*buffer);
     delete buffer;
 }
 }
@@ -86,16 +86,16 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
     const auto secret = password.toUtf8();
     watcher->setFuture(QtConcurrent::run([path, secret] {
         OpenResult result;
-        ArisBuffer error{}, info{};
-        auto *raw = aris_reader_desktop_open(reinterpret_cast<const std::uint8_t *>(path.constData()), path.size(),
+        LyraReaderBuffer error{}, info{};
+        auto *raw = lyra_reader_desktop_open(reinterpret_cast<const std::uint8_t *>(path.constData()), path.size(),
             secret.isEmpty() ? nullptr : reinterpret_cast<const std::uint8_t *>(secret.constData()), secret.size(), &error);
         if (!raw) { result.error = takeError(error); return result; }
-        result.document = std::shared_ptr<ArisDesktopDocument>(raw, aris_reader_desktop_close);
-        if (!aris_reader_desktop_info(raw, &info, &error)) { result.error = takeError(error); return result; }
+        result.document = std::shared_ptr<LyraReaderDesktopDocument>(raw, lyra_reader_desktop_close);
+        if (!lyra_reader_desktop_info(raw, &info, &error)) { result.error = takeError(error); return result; }
         QJsonParseError parseError{};
         const auto json = QJsonDocument::fromJson(QByteArray::fromRawData(
             reinterpret_cast<const char *>(info.data), qsizetype(info.len)), &parseError);
-        aris_reader_desktop_buffer_free(info);
+        lyra_reader_desktop_buffer_free(info);
         if (parseError.error != QJsonParseError::NoError || !json.isObject()) {
             result.error = QStringLiteral("The document service returned invalid page information.");
             return result;
@@ -110,11 +110,11 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
 void ReaderController::retryPassword(const QString &password) { openFile(m_lastUrl, password); }
 
 double ReaderController::fitWidth(double viewportWidth) const {
-    return aris_reader_desktop_fit_width(m_documentWidth, viewportWidth);
+    return lyra_reader_desktop_fit_width(m_documentWidth, viewportWidth);
 }
 
 double ReaderController::zoomOffset(double offset, double anchor, double oldZoom, double newZoom) const {
-    return aris_reader_desktop_zoom_offset(offset, anchor, oldZoom, newZoom);
+    return lyra_reader_desktop_zoom_offset(offset, anchor, oldZoom, newZoom);
 }
 
 QString ReaderController::rasterKey(int page, double scale) {
@@ -165,7 +165,7 @@ void ReaderController::startNextRaster() {
                 const int cost = int((result.image.sizeInBytes() + 1023) / 1024);
                 m_cache.insert(request.key, new QImage(result.image), cost);
                 ++m_completed;
-                qInfo().nospace() << "aris-qt-raster: page=" << request.page << " requested=" << request.scale
+                qInfo().nospace() << "lyra-reader-qt-raster: page=" << request.page << " requested=" << request.scale
                     << " actual=" << result.actualScale << " bytes=" << result.image.sizeInBytes()
                     << " ms=" << result.elapsedMs << " cpu-cache-kib=" << m_cache.totalCost();
                 emit pageReady(request.page, request.scale);
@@ -178,9 +178,9 @@ void ReaderController::startNextRaster() {
         RasterResult result;
         QElapsedTimer timer;
         timer.start();
-        ArisBitmap bitmap{};
-        ArisBuffer error{};
-        if (!aris_reader_desktop_render(document.get(), std::uint32_t(request.page), request.scale, &bitmap, &error)) {
+        LyraReaderBitmap bitmap{};
+        LyraReaderBuffer error{};
+        if (!lyra_reader_desktop_render(document.get(), std::uint32_t(request.page), request.scale, &bitmap, &error)) {
             result.error = takeError(error);
             return result;
         }
@@ -188,7 +188,7 @@ void ReaderController::startNextRaster() {
         // QImage shares the Rust allocation and releases it using the same allocator.
         // No BGRA->RGBA conversion or extra full-page CPU copy on this boundary.
         result.image = QImage(bitmap.pixels.data, int(bitmap.width), int(bitmap.height), bitmap.stride,
-            QImage::Format_ARGB32_Premultiplied, releasePixels, new ArisBuffer(bitmap.pixels));
+            QImage::Format_ARGB32_Premultiplied, releasePixels, new LyraReaderBuffer(bitmap.pixels));
         result.elapsedMs = timer.elapsed();
         return result;
     }));

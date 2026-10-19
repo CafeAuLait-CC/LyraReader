@@ -10,7 +10,7 @@ esac
 [ "$(uname -s)" = Linux ] || { echo "This script is for Linux" >&2; exit 1; }
 DEST="$ROOT/vendor/pdfium-linux"
 if [ -e "$DEST" ]; then
-  echo "$DEST already exists; set ARIS_READER_PDFIUM_PATH for another engine, or move it aside before fetching." >&2
+  echo "$DEST already exists; set LYRA_READER_PDFIUM_PATH for another engine, or move it aside before fetching." >&2
   exit 1
 fi
 mkdir -p "$ROOT/vendor"
