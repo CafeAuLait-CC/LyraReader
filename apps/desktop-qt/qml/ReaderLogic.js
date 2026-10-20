@@ -58,7 +58,7 @@ function normalized(a, foreign) {
     const b=Object.assign({},a)
     b.foreign=foreign
     if (foreign) {
-        b.kind=a.kind==="text" ? "stickyNote" : a.kind==="freeText" ? "textBox" : a.kind
+        b.kind=a.kind==="text" ? "stickyNote" : a.kind==="freeText" ? "textBox" : a.kind==="line" && a.line_arrow ? "arrow" : a.kind
         b.rect={x:a.x_pt,y:a.y_pt,width:a.width_pt,height:a.height_pt}
         b.paths=(a.ink_paths || []).map(function(path){return path.map(function(p){return {x:p.x_pt,y:p.y_pt}})})
         b.lineStart=a.line_start ? {x:a.line_start.x_pt,y:a.line_start.y_pt} : null
@@ -68,7 +68,7 @@ function normalized(a, foreign) {
         b.note=a.contents || ""
         const c=a.color || {red:232,green:188,blue:85}
         b.color="#"+hex(c.red)+hex(c.green)+hex(c.blue)+hex((a.opacity===null || a.opacity===undefined ? 1 : a.opacity)*255)
-        b.visible=a.visible && a.drawing==="drawn"
+        b.visible=a.visible && a.drawing!=="skipped"
     } else b.visible=true
     b.quads=(a.quads || []).map(function(q){return {x:q.x_pt===undefined ? q.x : q.x_pt,y:q.y_pt===undefined ? q.y : q.y_pt,width:q.width_pt===undefined ? q.width : q.width_pt,height:q.height_pt===undefined ? q.height : q.height_pt}})
     if (!b.rect || !(b.rect.width>0 && b.rect.height>0)) {
@@ -128,4 +128,86 @@ function displayColor(color, mode) {
     const lightness=channels[0]*.2126+channels[1]*.7152+channels[2]*.0722;
     const output=channels.map(function(c,i){return srgb(ink[i]+(paper[i]-ink[i])*(mode==="night" ? lightness : c));});
     return Qt.rgba(output[0],output[1],output[2],color.a);
+}
+
+function editableGeometry(annotation) {
+    return annotation && !annotation.foreign && ["ink","square","circle","line","arrow","stickyNote","textBox"].indexOf(annotation.kind)>=0
+}
+function geometryPatch(annotation, target) {
+    const from=annotation.rect
+    const point=function(p){return {x:target.x+(p.x-from.x)*target.width/from.width,y:target.y+(p.y-from.y)*target.height/from.height}}
+    if(annotation.kind==="ink") return {paths:annotation.paths.map(function(path){return path.map(point)})}
+    if(annotation.kind==="line" || annotation.kind==="arrow") return {lineStart:point(annotation.lineStart),lineEnd:point(annotation.lineEnd)}
+    return {rect:target}
+}
+function translatedRect(rect, dx, dy, size) {
+    return {x:Math.max(0,Math.min(size.width-rect.width,rect.x+dx)),y:Math.max(0,Math.min(size.height-rect.height,rect.y+dy)),width:rect.width,height:rect.height}
+}
+
+// Match the macOS sidebar: hidden replies stay readable, cross-page replies stay
+// with their root, and malformed parent chains become explicit orphan rows.
+function annotationThreads(annotations) {
+    const byID=new Map(), order=[], aliases=new Map()
+    for(const a of annotations) if(!byID.has(a.id)) {
+        byID.set(a.id,a);order.push(a.id);aliases.set(a.id,a.id)
+        if(a.fileIdentity)aliases.set(a.fileIdentity,a.id)
+        if(!a.foreign)aliases.set("nm:"+a.id,a.id)
+    }
+    const included=new Set(order.filter(function(id){const a=byID.get(id);return a.visible || a.is_reply})), parents=new Map(), orphans=new Map()
+    for(const id of order) {
+        const a=byID.get(id)
+        if(!included.has(id) || !a.is_reply)continue
+        let current=a, first=null, reason=""
+        const seen=new Set([id])
+        for(;;) {
+            if(!current.parent_id){reason="The reply link could not be read.";break}
+            const parentID=aliases.get(current.parent_id) || current.parent_id
+            if(seen.has(parentID)){reason="The reply chain contains a cycle.";break}
+            const parent=byID.get(parentID)
+            if(!parent){reason="The parent annotation is missing.";break}
+            if(first===null)first=parentID
+            if(!included.has(parentID)){reason="The parent annotation is hidden on page "+(parent.page+1)+".";break}
+            if(!parent.is_reply)break
+            seen.add(parentID);current=parent
+        }
+        if(reason)orphans.set(id,reason)
+        else parents.set(id,first)
+    }
+    const children=new Map(), groups=new Map(), rendered=new Set()
+    for(const id of order)if(parents.has(id)) {
+        const parent=parents.get(id)
+        if(!children.has(parent))children.set(parent,[])
+        children.get(parent).push(id)
+    }
+    for(const id of order)if(included.has(id) && (!byID.get(id).is_reply || orphans.has(id))) {
+        const sectionPage=byID.get(id).page
+        if(!groups.has(sectionPage))groups.set(sectionPage,[])
+        // Iterative traversal also handles long valid threads without overflowing JS's stack.
+        const pending=[{id:id,depth:0}]
+        while(pending.length) {
+            const next=pending.pop()
+            if(rendered.has(next.id))continue
+            rendered.add(next.id)
+            groups.get(sectionPage).push({annotation:byID.get(next.id),depth:next.depth,sectionPage:sectionPage,sectionKey:String(sectionPage+1),orphanReason:next.depth===0 ? orphans.get(next.id) || "" : ""})
+            const descendants=children.get(next.id) || []
+            for(let i=descendants.length-1;i>=0;--i)pending.push({id:descendants[i],depth:next.depth+1})
+        }
+    }
+    let rows=[]
+    for(const page of Array.from(groups.keys()).sort(function(a,b){return a-b}))rows=rows.concat(groups.get(page))
+    return {rows:rows,replyCount:order.filter(function(id){return byID.get(id).is_reply}).length,nestedReplyCount:parents.size,orphanedReplyCount:orphans.size}
+}
+function annotationDate(modified) {
+    if(!modified)return ""
+    const match=/^(?:D:)?(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/.exec(modified)
+    return match ? match[1]+"-"+match[2]+"-"+match[3]+" "+match[4]+":"+match[5] : modified
+}
+function annotationUnsupportedReason(a) {
+    if(!a || !a.foreign)return ""
+    if(a.is_reply)return "This is a reply. Edit or delete the annotation at the top of its thread; the replies stay attached."
+    if(!a.visible)return "This annotation is hidden or is not drawn by the reader."
+    if(["highlight","underline","strikeout","stickyNote","textBox","ink","square","circle","line","arrow"].indexOf(a.kind)<0)return "This annotation kind has no editable model yet."
+    if(a.kind==="ink" && (!a.paths || !a.paths.length))return "This ink annotation has no editable paths."
+    if((a.kind==="line" || a.kind==="arrow") && (!a.lineStart || !a.lineEnd))return "This line annotation has no editable endpoints."
+    return ""
 }

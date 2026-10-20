@@ -1,6 +1,7 @@
 #include "AnnotationOverlay.h"
 #include "PaperAppearance.h"
 #include <QSGGeometryNode>
+#include <QSGTransformNode>
 #include <QSGFlatColorMaterial>
 #include <QSGMaterialShader>
 #include <QVector4D>
@@ -19,7 +20,10 @@ public:
     QVector<QPointF> vertices;
     QColor color;
     bool multiply=false;
-    RenderingFlags flags()const override{return BoundedRectRendering;}
+    // Multiply reads the backdrop. Qt's partial software updates can otherwise
+    // composite it onto an already tinted backing store on successive frames.
+    // Full redraw is confined to the software fallback; RHI uses its native blend.
+    RenderingFlags flags()const override{return {};}
     QRectF rect()const override{return bounds;}
     void render(const RenderState *)override {
         auto *painter=static_cast<QPainter *>(window->rendererInterface()->getResource(window,QSGRendererInterface::PainterResource));
@@ -101,7 +105,7 @@ void append(QSGNode *root,const QVector<QPointF>&vertices,const QColor &color,bo
 }
 QSGNode *AnnotationOverlay::updatePaintNode(QSGNode *old,UpdatePaintNodeData *){
     delete old;
-    auto *root=new QSGNode;
+    auto *root=new QSGTransformNode;
     for(const auto &entry:m_annotations){
         const auto a=entry.toMap();if(a.value(QStringLiteral("visible"),true).toBool()==false)continue;
         const auto kind=a.value(QStringLiteral("kind")).toString();

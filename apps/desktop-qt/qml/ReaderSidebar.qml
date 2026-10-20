@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import LyraReader 1.0
+import "ReaderLogic.js" as Logic
 
 Pane {
     id: sidebarPanel
@@ -230,38 +231,67 @@ Pane {
             ListView {
                 id: annotationList
                 clip: true
-                model: app.annotations
+                objectName: "annotationThreadList"
+                model: app.annotationThreads.rows
+                section.property: "sectionKey"
+                section.delegate: Label {
+                    required property string section
+                    text: qsTr("Page %1").arg(section)
+                    width: annotationList.width
+                    padding: 10
+                    color: app.colors.textSecondary
+                    font.bold: true
+                    font.pixelSize: 11
+                }
                 ScrollBar.vertical: ScrollBar {}
                 delegate: ItemDelegate {
                     required property var modelData
+                    readonly property var annotation: modelData.annotation
+                    objectName: "annotationThreadRow_" + annotation.id
                     width: annotationList.width
-                    height: Math.max(68, annotationText.implicitHeight + 44)
+                    leftPadding: 10 + Math.min(modelData.depth, 6) * 14
+                    height: Math.max(68, annotationContent.implicitHeight + 20)
                     contentItem: ColumnLayout {
+                        id: annotationContent
                         spacing: 4
                         RowLayout {
                             Label {
-                                text: modelData.kind
+                                text: annotation.is_reply ? "↳ " + (annotation.author || qsTr("Reply")) : annotation.kind
                                 color: app.colors.accent
                                 font.pixelSize: 11
                                 Layout.fillWidth: true
                             }
                             Label {
-                                text: qsTr("p.%1").arg(modelData.page + 1)
+                                text: qsTr("p.%1").arg(annotation.page + 1)
                                 color: app.colors.textTertiary
                                 font.pixelSize: 11
                             }
                         }
                         Label {
                             id: annotationText
-                            text: modelData.note || modelData.contents || qsTr("No text")
+                            text: annotation.note || annotation.contents || qsTr("No text")
                             wrapMode: Text.Wrap
                             maximumLineCount: 4
                             elide: Text.ElideRight
                             Layout.fillWidth: true
                             font.pixelSize: 12
                         }
+                        Label {
+                            visible: !!annotation.modified
+                            text: Logic.annotationDate(annotation.modified)
+                            font.pixelSize: 10
+                            color: app.colors.textTertiary
+                        }
+                        Label {
+                            visible: modelData.orphanReason.length > 0
+                            text: modelData.orphanReason
+                            Layout.fillWidth: true
+                            wrapMode: Text.Wrap
+                            font.pixelSize: 10
+                            color: app.colors.warningFg
+                        }
                     }
-                    onClicked: app.selectAnnotation(modelData)
+                    onClicked: app.selectAnnotation(annotation)
                 }
                 Label {
                     anchors.centerIn: parent

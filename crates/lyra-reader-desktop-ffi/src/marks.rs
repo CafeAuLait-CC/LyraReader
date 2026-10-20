@@ -837,14 +837,31 @@ impl Marks {
                 adopted.insert(format!("nm:{id}"));
             }
         }
-        let deleted: HashSet<&str> = self.deletions.iter().map(|d| d.target.as_str()).collect();
+        // The writer removes a deleted parent's entire /IRT descendant chain.
+        // Mirror that closure in the staged UI, including replies to replies.
+        let mut children = std::collections::HashMap::<&str, Vec<&str>>::new();
+        for a in &file {
+            if a.is_reply
+                && let Some(parent) = a.parent_id.as_deref()
+            {
+                children.entry(parent).or_default().push(a.id.as_str());
+            }
+        }
+        let mut deleted: HashSet<&str> = self.deletions.iter().map(|d| d.target.as_str()).collect();
+        let mut pending: Vec<&str> = deleted.iter().copied().collect();
+        while let Some(parent) = pending.pop() {
+            if let Some(replies) = children.get(parent) {
+                for &reply in replies {
+                    if deleted.insert(reply) {
+                        pending.push(reply);
+                    }
+                }
+            }
+        }
+        let removed: HashSet<String> = deleted.into_iter().map(str::to_owned).collect();
         let file: Vec<_> = file
             .into_iter()
-            .filter(|a| {
-                !adopted.contains(&a.id)
-                    && !deleted.contains(a.id.as_str())
-                    && a.parent_id.as_deref().is_none_or(|p| !deleted.contains(p))
-            })
+            .filter(|a| !adopted.contains(&a.id) && !removed.contains(&a.id))
             .collect();
         Ok(
             json!({"annotations":own,"file_annotations":file,"bookmarks":bookmarks,"can_undo":!self.undo.is_empty(),"can_redo":!self.redo.is_empty(),"preserved":self.entries.iter().filter(|e|matches!(e,Entry::Opaque(_))).count(),"error":self.error,"path":self.path,"pdf_dirty":!own.is_empty()||!self.deletions.is_empty(),"pending_deletions":self.deletions.len()}),
@@ -1043,6 +1060,11 @@ impl Marks {
                     .iter()
                     .find(|a| a.id == id)
                     .ok_or("File annotation not found")?;
+                if record.is_reply {
+                    return Err(
+                        "Edit or delete the annotation at the top of this reply thread".into(),
+                    );
+                }
                 let deletion = AnnotationDeleteRecord {
                     target: id,
                     page: record.page,
@@ -1073,7 +1095,9 @@ impl Marks {
                                 });
                             }
                             s.entries.remove(index);
-                        } else if let Some(a) = file.iter().find(|a| a.id == id && a.kind == "ink")
+                        } else if let Some(a) = file
+                            .iter()
+                            .find(|a| a.id == id && a.kind == "ink" && !a.is_reply && a.visible)
                         {
                             if !s.deletions.iter().any(|d| d.target == id) {
                                 s.deletions.push(AnnotationDeleteRecord {
@@ -1095,7 +1119,17 @@ impl Marks {
                     .iter()
                     .find(|a| a.id == id)
                     .ok_or("File annotation not found")?;
+                if a.is_reply {
+                    return Err(
+                        "Replies stay attached to their thread and cannot be adopted separately"
+                            .into(),
+                    );
+                }
+                if !a.visible || a.drawing == "skipped" {
+                    return Err("This file annotation is hidden or not drawn".into());
+                }
                 let k = match a.kind.as_str() {
+                    "line" if a.line_arrow => "arrow",
                     "text" => "stickyNote",
                     "freeText" => "textBox",
                     kind if KINDS.contains(&kind) => kind,

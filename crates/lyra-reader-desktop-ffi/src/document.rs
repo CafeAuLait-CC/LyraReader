@@ -652,6 +652,60 @@ mod tests {
         assert!(!directory.exists());
     }
     #[test]
+    fn reply_threads_keep_identity_and_staged_deletion_cascades_to_every_depth() {
+        let fixture = Fixture::new("annotated-replies.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        for op in ["file_adopt", "file_delete"] {
+            assert!(doc.command(json!({"op":op,"id":"nm:reply-two"})).is_err());
+        }
+        let adopted = doc
+            .command(json!({"op":"file_adopt","id":"nm:parent-highlight"}))
+            .unwrap();
+        let id = adopted["selected_id"].as_str().unwrap();
+        assert!(
+            adopted["annotations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["fileIdentity"] == "nm:parent-highlight")
+        );
+        assert!(
+            adopted["file_annotations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["id"] == "nm:reply-two")
+        );
+        let deleted = doc.command(json!({"op":"mark_delete","id":id})).unwrap();
+        for removed in [
+            "nm:parent-highlight",
+            "nm:reply-one",
+            "nm:reply-two",
+            "nm:reply-empty",
+            "nm:reply-cross-page",
+        ] {
+            assert!(
+                !deleted["file_annotations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|a| a["id"] == removed),
+                "{removed}"
+            );
+        }
+        let restored = doc.command(json!({"op":"marks_undo"})).unwrap();
+        assert!(
+            restored["file_annotations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["id"] == "nm:reply-two")
+        );
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+    }
+
+    #[test]
     fn signed_original_status_survives_derived_page_revisions() {
         let fixture = Fixture::new("signed-signature.pdf");
         let doc = fixture.open();

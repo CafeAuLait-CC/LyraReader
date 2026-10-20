@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Dialogs
+import "ReaderLogic.js" as Logic
 
 Item {
     id: dialogs
@@ -41,6 +42,19 @@ Item {
     property bool noteReady: false
     property double noteRequestId: -1
     property string annotationWriteError: ""
+    property double coverageRequestId: -1
+    property string coverageText: ""
+    property var missingGlyphs: []
+    Timer {
+        id: coverageTimer
+        interval: 350
+        onTriggered: if (annotation.visible && dialogs.noteReader && app.selectedAnnotation && app.selectedAnnotation.kind === "textBox") {
+            dialogs.coverageText = noteText.text;
+            dialogs.coverageRequestId = dialogs.noteReader.submit("font_coverage", {
+                text: dialogs.coverageText
+            });
+        }
+    }
     function cancelAnnotationDraft() {
         noteSave.stop();
         noteDirty = false;
@@ -67,6 +81,8 @@ Item {
     Connections {
         target: dialogs.noteReader
         function onCommandFinished(id, op, result, error) {
+            if (id === dialogs.coverageRequestId && !error.length && dialogs.coverageText === noteText.text)
+                dialogs.missingGlyphs = result.missing || [];
             if (id === dialogs.noteRequestId && error.length) {
                 dialogs.annotationWriteError = error;
                 dialogs.noteDirty = true;
@@ -618,22 +634,30 @@ Item {
             }
         }
     }
+    function showAnnotation() {
+        flushAnnotation();
+        annotation.open();
+        loadAnnotation();
+    }
+    function loadAnnotation() {
+        dialogs.noteReady = false;
+        dialogs.noteReader = app.currentReader;
+        dialogs.noteId = app.selectedAnnotation ? app.selectedAnnotation.id : "";
+        noteText.text = app.selectedAnnotation ? app.selectedAnnotation.note || app.selectedAnnotation.contents || "" : "";
+        dialogs.savedNote = noteText.text;
+        if (dialogs.noteId.length && dialogs.noteReader.noteDrafts[dialogs.noteId] !== undefined)
+            noteText.text = dialogs.noteReader.noteDrafts[dialogs.noteId];
+        dialogs.noteDirty = noteText.text !== dialogs.savedNote;
+        dialogs.annotationWriteError = "";
+        dialogs.noteReady = true;
+        dialogs.missingGlyphs = [];
+        coverageTimer.restart();
+        noteText.forceActiveFocus();
+    }
     Dialog {
         id: annotation
         objectName: "annotationEditor"
-        onOpened: {
-            dialogs.noteReady = false;
-            dialogs.noteReader = app.currentReader;
-            dialogs.noteId = app.selectedAnnotation ? app.selectedAnnotation.id : "";
-            noteText.text = app.selectedAnnotation ? app.selectedAnnotation.note || app.selectedAnnotation.contents || "" : "";
-            dialogs.savedNote = noteText.text;
-            if (dialogs.noteId.length && dialogs.noteReader.noteDrafts[dialogs.noteId] !== undefined)
-                noteText.text = dialogs.noteReader.noteDrafts[dialogs.noteId];
-            dialogs.noteDirty = noteText.text !== dialogs.savedNote;
-            dialogs.annotationWriteError = "";
-            dialogs.noteReady = true;
-            noteText.forceActiveFocus();
-        }
+        onOpened: dialogs.loadAnnotation()
         onClosed: dialogs.flushAnnotation()
         title: qsTr("Annotation")
         parent: Overlay.overlay
@@ -647,6 +671,108 @@ Item {
                 text: app.selectedAnnotation ? app.selectedAnnotation.kind + qsTr(" · page %1").arg(app.selectedAnnotation.page + 1) : ""
                 color: app.colors.textTertiary
             }
+            RowLayout {
+                enabled: !!app.selectedAnnotation && !app.selectedAnnotation.foreign
+                Label {
+                    text: qsTr("Colour")
+                }
+                Repeater {
+                    model: ["#E8BC55", "#EFA77D", "#90B79A", "#7DADD6", "#AB9ACB", "#D99A9B"]
+                    ToolButton {
+                        required property string modelData
+                        implicitWidth: 26
+                        implicitHeight: 28
+                        Accessible.name: qsTr("Set annotation colour %1").arg(modelData)
+                        background: Rectangle {
+                            anchors.centerIn: parent
+                            width: 18
+                            height: 18
+                            radius: 9
+                            color: modelData
+                            border.width: app.selectedAnnotation && app.selectedAnnotation.color.slice(0, 7).toLowerCase() === modelData.toLowerCase() ? 2 : 1
+                            border.color: app.colors.focusRing
+                        }
+                        onClicked: if (app.selectedAnnotation)
+                            app.updateSelectedAnnotation({
+                                color: modelData + app.selectedAnnotation.color.slice(7, 9)
+                            })
+                    }
+                }
+                ToolButton {
+                    text: "…"
+                    Accessible.name: qsTr("Custom annotation colour")
+                    onClicked: {
+                        annotationColor.selectedColor = Logic.color(app.selectedAnnotation);
+                        annotationColor.open();
+                    }
+                }
+            }
+            RowLayout {
+                enabled: !!app.selectedAnnotation && !app.selectedAnnotation.foreign
+                Label {
+                    text: qsTr("Opacity")
+                }
+                Slider {
+                    objectName: "annotationOpacity"
+                    Layout.fillWidth: true
+                    from: 0
+                    to: 1
+                    stepSize: .01
+                    live: false
+                    value: app.selectedAnnotation ? Logic.color(app.selectedAnnotation).a : 1
+                    Accessible.name: qsTr("Annotation opacity")
+                    onMoved: if (app.selectedAnnotation)
+                        app.updateSelectedAnnotation({
+                            color: app.selectedAnnotation.color.slice(0, 7) + Logic.hex(value * 255)
+                        })
+                }
+                SpinBox {
+                    objectName: "annotationStrokeWidth"
+                    visible: app.selectedAnnotation && ["ink", "square", "circle", "line", "arrow"].indexOf(app.selectedAnnotation.kind) >= 0
+                    from: 1
+                    to: 32
+                    value: app.selectedAnnotation ? app.selectedAnnotation.strokeWidth || 2 : 2
+                    editable: true
+                    Accessible.name: qsTr("Annotation stroke width")
+                    onValueModified: app.updateSelectedAnnotation({
+                        strokeWidth: value
+                    })
+                }
+            }
+            RowLayout {
+                visible: !!app.selectedAnnotation && app.selectedAnnotation.kind === "textBox"
+                enabled: !!app.selectedAnnotation && !app.selectedAnnotation.foreign
+                Label {
+                    text: qsTr("Text size")
+                }
+                SpinBox {
+                    objectName: "annotationFontSize"
+                    from: 4
+                    to: 144
+                    value: app.selectedAnnotation ? app.selectedAnnotation.fontSize || 14 : 14
+                    editable: true
+                    Accessible.name: qsTr("Text box font size")
+                    onValueModified: app.updateSelectedAnnotation({
+                        fontSize: value
+                    })
+                }
+                ComboBox {
+                    objectName: "annotationAlignment"
+                    model: [qsTr("Left"), qsTr("Centre"), qsTr("Right")]
+                    currentIndex: app.selectedAnnotation ? Math.max(0, ["left", "center", "right"].indexOf(app.selectedAnnotation.textAlignment || "left")) : 0
+                    Accessible.name: qsTr("Text alignment")
+                    onActivated: app.updateSelectedAnnotation({
+                        textAlignment: ["left", "center", "right"][currentIndex]
+                    })
+                }
+            }
+            Label {
+                visible: !!app.selectedAnnotation && Logic.annotationUnsupportedReason(app.selectedAnnotation).length > 0
+                text: Logic.annotationUnsupportedReason(app.selectedAnnotation)
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                color: app.colors.warningFg
+            }
             TextArea {
                 id: noteText
                 objectName: "annotationNoteText"
@@ -656,6 +782,7 @@ Item {
                 wrapMode: Text.Wrap
                 placeholderText: qsTr("Note")
                 onTextChanged: if (dialogs.noteReady && annotation.visible && !readOnly) {
+                    coverageTimer.restart();
                     dialogs.noteDirty = text !== dialogs.savedNote;
                     if (dialogs.noteDirty)
                         dialogs.noteReader.setNoteDraft(dialogs.noteId, text);
@@ -665,6 +792,21 @@ Item {
                         noteSave.restart();
                 }
             }
+            Label {
+                objectName: "annotationGlyphWarning"
+                visible: !!app.selectedAnnotation && app.selectedAnnotation.kind === "textBox" && dialogs.missingGlyphs.length > 0
+                text: qsTr("The PDF font cannot draw: %1. The saved text stays intact; these characters appear as missing-glyph boxes.").arg(dialogs.missingGlyphs.join(" "))
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                color: app.colors.warningFg
+            }
+            Label {
+                visible: dialogs.annotationWriteError.length > 0
+                text: dialogs.annotationWriteError
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                color: app.colors.errorFg
+            }
             RowLayout {
                 Button {
                     text: qsTr("Save Note")
@@ -673,6 +815,7 @@ Item {
                 }
                 Button {
                     text: qsTr("Delete Annotation")
+                    enabled: !!app.selectedAnnotation && !Logic.annotationUnsupportedReason(app.selectedAnnotation).length
                     onClicked: {
                         app.deleteSelectedAnnotation();
                         annotation.close();
@@ -680,6 +823,14 @@ Item {
                 }
             }
         }
+    }
+    ColorDialog {
+        id: annotationColor
+        title: qsTr("Annotation colour")
+        options: ColorDialog.ShowAlphaChannel
+        onAccepted: app.updateSelectedAnnotation({
+            color: "#" + Logic.hex(selectedColor.r * 255) + Logic.hex(selectedColor.g * 255) + Logic.hex(selectedColor.b * 255) + Logic.hex(selectedColor.a * 255)
+        })
     }
     Dialog {
         id: credential

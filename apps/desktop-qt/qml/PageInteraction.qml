@@ -3,7 +3,7 @@ import QtQuick.Controls
 import "ReaderLogic.js" as Logic
 
 Item {
-    id: layer
+    id: annotationLayer
     required property var app
     required property int page
     readonly property var textPage: app.currentReader.textPages[page.toString()] || {
@@ -14,7 +14,7 @@ Item {
     readonly property var searchRects: app.activeSearchHit && app.activeSearchHit.page === page ? Logic.quads(textPage.chars, app.activeSearchHit.start, app.activeSearchHit.end - 1) : []
     Component.onCompleted: app.currentReader.requestText(page)
     Repeater {
-        model: layer.searchRects
+        model: annotationLayer.searchRects
         Rectangle {
             required property var modelData
             x: modelData.x * app.zoom
@@ -28,7 +28,7 @@ Item {
         }
     }
     Repeater {
-        model: layer.selectedRects
+        model: annotationLayer.selectedRects
         Rectangle {
             required property var modelData
             x: modelData.x * app.zoom
@@ -53,6 +53,7 @@ Item {
         property string gestureTool: "select"
         property var points: []
         property var previousPoint: null
+        property var editBase: null
         preventStealing: pressed
         function position(mouse) {
             const size = app.currentReader.pages[page];
@@ -109,6 +110,17 @@ Item {
             app.pendingDraftRequestId = -1;
             const p = position(mouse);
             previousPoint = p;
+            editBase = null;
+            if (gestureTool === "select") {
+                const hit = app.annotationAt(page, p.x, p.y, false);
+                if (Logic.editableGeometry(hit)) {
+                    editBase = hit;
+                    app.selectAnnotation(hit, false);
+                    app.selection = null;
+                    gestureTool = "move";
+                    return;
+                }
+            }
             if (["ink", "square", "circle", "line", "arrow"].indexOf(gestureTool) >= 0) {
                 app.selection = null;
                 points = [p];
@@ -121,7 +133,7 @@ Item {
                 app.eraseAlong(page, p, p);
                 return;
             }
-            start = Logic.nearestCharacter(layer.textPage.chars, p.x, p.y);
+            start = Logic.nearestCharacter(annotationLayer.textPage.chars, p.x, p.y);
             if (start >= 0)
                 app.selection = {
                     page: page,
@@ -129,12 +141,30 @@ Item {
                     end: start
                 };
         }
+        Keys.onEscapePressed: {
+            gestureTool = "canceled";
+            editBase = null;
+            app.annotationDraft = null;
+            app.selectedAnnotation = null;
+            app.selection = null;
+        }
         onPositionChanged: function (mouse) {
+            if (gestureTool === "canceled")
+                return;
             const p = position(mouse);
             if (!(pressedButtons & Qt.LeftButton))
                 return;
             if (Math.abs(mouse.x - pressX) + Math.abs(mouse.y - pressY) > 3)
                 dragged = true;
+            if (gestureTool === "move") {
+                if (!app.selectedAnnotation || app.selectedAnnotation.id !== editBase.id)
+                    return;
+                const target = Logic.translatedRect(editBase.rect, p.x - pressX / app.zoom, p.y - pressY / app.zoom, app.currentReader.pages[page]);
+                app.annotationDraft = Object.assign({}, editBase, Logic.geometryPatch(editBase, target), {
+                    rect: target
+                });
+                return;
+            }
             if (["ink", "square", "circle", "line", "arrow"].indexOf(gestureTool) >= 0) {
                 draw(p);
                 return;
@@ -144,7 +174,7 @@ Item {
                 previousPoint = p;
                 return;
             }
-            const end = Logic.nearestCharacter(layer.textPage.chars, p.x, p.y);
+            const end = Logic.nearestCharacter(annotationLayer.textPage.chars, p.x, p.y);
             if (start >= 0 && end >= 0)
                 app.selection = {
                     page: page,
@@ -153,8 +183,15 @@ Item {
                 };
         }
         onReleased: function (mouse) {
-            if (mouse.button !== Qt.LeftButton)
+            if (mouse.button !== Qt.LeftButton || gestureTool === "canceled")
                 return;
+            if (gestureTool === "move") {
+                if (dragged && app.annotationDraft)
+                    app.commitAnnotationGeometry(editBase.id, Logic.geometryPatch(editBase, app.annotationDraft.rect));
+                else
+                    app.annotationDraft = null;
+                return;
+            }
             if (["ink", "square", "circle", "line", "arrow"].indexOf(gestureTool) >= 0) {
                 if (!dragged) {
                     app.annotationDraft = null;
@@ -172,7 +209,7 @@ Item {
                 return;
             }
             if (!dragged) {
-                const scene = layer.mapToItem(null, mouse.x, mouse.y);
+                const scene = annotationLayer.mapToItem(null, mouse.x, mouse.y);
                 app.pageClicked(page, mouse.x / app.zoom, mouse.y / app.zoom, scene.x, scene.y);
             } else
                 app.selectionFinished();
@@ -187,7 +224,7 @@ Item {
                 app.selectAnnotation(hit);
                 return;
             }
-            const chars = layer.textPage.chars;
+            const chars = annotationLayer.textPage.chars;
             const at = Logic.nearestCharacter(chars, mouse.x / app.zoom, mouse.y / app.zoom);
             if (at < 0)
                 return;
@@ -206,5 +243,10 @@ Item {
             };
             app.selectionFinished();
         }
+    }
+    AnnotationHandles {
+        anchors.fill: parent
+        app: annotationLayer.app
+        page: annotationLayer.page
     }
 }

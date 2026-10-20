@@ -13,6 +13,7 @@
 #include <QSignalSpy>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
+#include <QJSValue>
 #include <QQuickStyle>
 #include <QQuickWindow>
 #include <QSGRendererInterface>
@@ -236,6 +237,155 @@ private slots:
         for(int y=0;y<raster.height();++y)for(int x=0;x<raster.width();++x){const auto c=raster.pixelColor(x,y);if(c.red()<80&&c.green()<80&&c.blue()<80)ink=true;if(c.red()>180&&c.green()>180&&c.blue()<180)yellow=true;}
         QVERIFY(ink);QVERIFY(yellow);
     }
+    void annotationGeometryUsesRealGesturesAndOneUndoPerGesture() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto path=scratch.path()+"/geometry.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        ReaderController reader;QQmlApplicationEngine engine;
+        engine.addImageProvider("lyrapreview",new NativeImageProvider);
+        engine.rootContext()->setContextProperty("reader",&reader);engine.load(QUrl("qrc:/qml/Main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        reader.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),1,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QTest::qWait(150);
+        window->setProperty("fitting",false);
+        QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,1.0),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QTest::qWait(100);
+        auto *page=visualItem(window->contentItem(),"pdfPage0");QVERIFY(page);
+        QTRY_VERIFY(reader.textPages().contains("0"));
+        const auto chars=reader.textPages().value("0").toMap().value("chars").toList();QVERIFY(chars.size()>6);
+        const auto character=[&](int i){const auto c=chars[i].toMap();return page->mapToScene(QPointF(c.value("x_pt").toDouble()+c.value("width_pt").toDouble()/2,c.value("y_pt").toDouble()+c.value("height_pt").toDouble()/2)).toPoint();};
+        QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,character(0));
+        QTest::mouseMove(window,character(5),30);QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,character(5));
+        const auto selection=window->property("selection").value<QJSValue>().toVariant().toMap();
+        QVERIFY(selection.value("end").toInt()-selection.value("start").toInt()>=4);
+        QTest::keyClick(window,Qt::Key_Escape);
+        reader.submit("mark_create",{{"entry",QVariantMap{{"kind","square"},{"page",0},{"version",1},{"rect",QVariantMap{{"x",100},{"y",100},{"width",100},{"height",70}}},{"color","#E8BC55FF"},{"note",""},{"strokeWidth",2}}}});
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        const auto entry=[&]{return reader.data().value("marks").toMap().value("annotations").toList().first().toMap();};
+        const auto rect=[&]{return entry().value("rect").toMap();};
+        const auto point=[&](double x,double y){return page->mapToScene(QPointF(x,y)).toPoint();};
+        // Drag the top stroke: a single press/move/release writes exactly one undo step.
+        QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,point(150,100));
+        QTest::mouseMove(window,point(180,120),30);QTest::mouseMove(window,point(190,130),30);
+        QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,point(190,130));
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QTRY_VERIFY(qAbs(rect().value("x").toDouble()-140)<1);
+        QVERIFY(qAbs(rect().value("y").toDouble()-130)<1);
+        auto *editor=window->findChild<QObject *>("annotationEditor");QVERIFY(editor);QVERIFY(!editor->property("visible").toBool());
+        reader.submit("marks_undo");QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QCOMPARE(rect().value("x").toDouble(),100.0);QCOMPARE(rect().value("y").toDouble(),100.0);
+        reader.submit("marks_redo");QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QTRY_VERIFY(visualItem(window->contentItem(),"annotationHandle3"));
+        auto *grip=visualItem(window->contentItem(),"annotationHandle3");
+        const auto start=grip->mapToScene(QPointF(5,5)).toPoint();
+        QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,start);
+        QTest::mouseMove(window,start+QPoint(35,20),30);
+        QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,start+QPoint(35,20));
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QTRY_VERIFY(qAbs(rect().value("width").toDouble()-135)<1);
+        QVERIFY(qAbs(rect().value("height").toDouble()-90)<1);
+        reader.submit("marks_undo");QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QCOMPARE(rect().value("width").toDouble(),100.0);QCOMPARE(rect().value("x").toDouble(),140.0);
+        // Escape cancels an in-progress move without adding another history step.
+        QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,point(180,130));
+        QTest::mouseMove(window,point(210,150),30);QTest::keyClick(window,Qt::Key_Escape);
+        QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,point(210,150));
+        QTest::qWait(100);QVERIFY(window->property("annotationDraft").isNull());
+        QCOMPARE(rect().value("x").toDouble(),140.0);
+        reader.submit("marks_undo");QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QCOMPARE(rect().value("x").toDouble(),100.0);
+        // Properties and geometry share the sidecar, and a fresh reader sees both.
+        // Escape cleared selection; select the annotation through the page before editing.
+        QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,point(150,100));
+        QVERIFY(QMetaObject::invokeMethod(window,"updateSelectedAnnotation",Q_ARG(QVariant,(QVariantMap{{"color","#7DADD680"},{"strokeWidth",5}}))));
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        ReaderController reopened;reopened.openFile(QUrl::fromLocalFile(path));
+        QTRY_COMPARE_WITH_TIMEOUT(reopened.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reopened.pendingCommands(),0,10000);
+        const auto persisted=reopened.data().value("marks").toMap().value("annotations").toList().first().toMap();
+        QCOMPARE(persisted.value("color").toString(),QString("#7DADD680"));QCOMPARE(persisted.value("strokeWidth").toInt(),5);
+        QCOMPARE(persisted.value("rect").toMap().value("x").toDouble(),100.0);
+        reader.submit("mark_create",{{"entry",QVariantMap{{"kind","arrow"},{"page",0},{"version",1},{"lineStart",QVariantMap{{"x",80},{"y",220}}},{"lineEnd",QVariantMap{{"x",200},{"y",280}}},{"color","#E8BC55FF"},{"note",""},{"strokeWidth",2}}}});
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QTest::qWait(50);
+        grip=visualItem(window->contentItem(),"annotationHandle1");QVERIFY(grip);
+        const auto arrowEnd=grip->mapToScene(QPointF(5,5)).toPoint();
+        QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,arrowEnd);
+        QTest::mouseMove(window,arrowEnd+QPoint(-25,30),30);
+        QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,arrowEnd+QPoint(-25,30));
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        const auto arrow=reader.data().value("marks").toMap().value("annotations").toList().last().toMap();
+        QVERIFY(qAbs(arrow.value("lineEnd").toMap().value("x").toDouble()-175)<1);
+        QVERIFY(qAbs(arrow.value("lineEnd").toMap().value("y").toDouble()-310)<1);
+        QCOMPARE(arrow.value("lineStart").toMap().value("x").toDouble(),80.0);
+        reader.submit("mark_create",{{"entry",QVariantMap{{"kind","textBox"},{"page",0},{"version",1},{"rect",QVariantMap{{"x",100},{"y",350},{"width",180},{"height",60}}},{"color","#7DADD6FF"},{"note",""},{"fontSize",14}}}});
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QTRY_VERIFY(editor->property("visible").toBool());
+        auto *note=window->findChild<QObject *>("annotationNoteText");QVERIFY(note);note->setProperty("text",QString::fromUtf8("English 中文 🙂"));
+        auto *warning=window->findChild<QQuickItem *>("annotationGlyphWarning");QVERIFY(warning);
+        QTRY_VERIFY_WITH_TIMEOUT(warning->isVisible(),10000);
+        QVERIFY(warning->property("text").toString().contains(QString::fromUtf8("🙂")));
+        auto *font=window->findChild<QQuickItem *>("annotationFontSize");QVERIFY(font);font->forceActiveFocus();
+        QTest::keyClick(window,Qt::Key_Up);
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QTRY_COMPARE(reader.data().value("marks").toMap().value("annotations").toList().last().toMap().value("fontSize").toInt(),15);
+        QMetaObject::invokeMethod(editor,"close");
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QCOMPARE(reader.data().value("marks").toMap().value("annotations").toList().last().toMap().value("note").toString(),QString::fromUtf8("English 中文 🙂"));
+    }
+    void fileReplyThreadsShowHiddenCrossPageAndMalformedChains() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto path=scratch.path()+"/replies.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/annotated-replies.pdf",path));
+        ReaderController reader;QQmlApplicationEngine engine;
+        engine.addImageProvider("lyrapreview",new NativeImageProvider);
+        engine.rootContext()->setContextProperty("reader",&reader);engine.load(QUrl("qrc:/qml/Main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        reader.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),2,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QTest::qWait(100);
+        const auto model=[&]{return window->property("annotationThreads").value<QJSValue>().toVariant().toMap();};
+        QTRY_COMPARE(model().value("replyCount").toInt(),8);
+        QCOMPARE(model().value("nestedReplyCount").toInt(),4);QCOMPARE(model().value("orphanedReplyCount").toInt(),4);
+        const auto row=[&](const QString &id) {for(const auto &value:model().value("rows").toList())if(value.toMap().value("annotation").toMap().value("id").toString()==id)return value.toMap();return QVariantMap{};};
+        QCOMPARE(model().value("rows").toList().size(),10);
+        QCOMPARE(row("nm:reply-two").value("depth").toInt(),2);
+        QCOMPARE(row("nm:reply-cross-page").value("sectionPage").toInt(),0);
+        QCOMPARE(row("nm:reply-cross-page").value("annotation").toMap().value("page").toInt(),1);
+        QVERIFY(row("nm:parent-highlight").value("annotation").toMap().value("visible").toBool());
+        QVERIFY(!row("nm:reply-empty").isEmpty());
+        auto *page=visualItem(window->contentItem(),"pdfPage0");QVERIFY(page);
+        const auto highlight=row("nm:parent-highlight").value("annotation").toMap();
+        const auto quad=highlight.value("quads").toList().first().toMap();
+        QTRY_VERIFY_WITH_TIMEOUT(page->property("refined").toBool(),10000);
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingRasters(),0,10000);
+        QTest::qWait(100);const auto frame=window->grabWindow();const double zoom=window->property("zoom").toDouble();
+        bool painted=false;
+        for(double x=quad.value("x").toDouble()+2;x<quad.value("x").toDouble()+quad.value("width").toDouble()-2;x+=4) {
+            const auto at=page->mapToScene(QPointF(x*zoom,(quad.value("y").toDouble()+2)*zoom));
+            const int px=qRound(at.x()*frame.width()/window->width()),py=qRound(at.y()*frame.height()/window->height());
+            if(!frame.rect().contains(px,py))continue;
+            const auto c=frame.pixelColor(px,py);if(c.blue()>240 && c.red()<230 && c.green()>150)painted=true;
+        }
+        if(!painted){frame.save(root+"/build/foreign-markup-failure.png");qInfo()<<"Markup sample"<<quad<<highlight.value("color")<<highlight.value("blend")<<zoom<<page->mapToScene(QPointF(quad.value("x").toDouble()*zoom,quad.value("y").toDouble()*zoom));}
+        QVERIFY2(painted,"File markup must be drawn on the page, including drawing=markup records");
+        QVERIFY(row("nm:cycle-a").value("orphanReason").toString().contains("cycle"));
+        QVERIFY(row("nm:reply-to-hidden").value("orphanReason").toString().contains("hidden"));
+        QVERIFY(row("nm:reply-to-link").value("orphanReason").toString().contains("missing"));
+        QVERIFY(QMetaObject::invokeMethod(window,"showSidebar",Q_ARG(QVariant,"annotations")));
+        QTest::qWait(100);
+        auto *list=window->findChild<QObject *>("annotationThreadList");QVERIFY(list);QCOMPARE(list->property("count").toInt(),10);
+        const auto reply=row("nm:reply-two").value("annotation");
+        QVERIFY(QMetaObject::invokeMethod(window,"selectAnnotation",Q_ARG(QVariant,reply),Q_ARG(QVariant,true)));
+        auto *note=window->findChild<QObject *>("annotationNoteText");QVERIFY(note);QVERIFY(note->property("readOnly").toBool());
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QVERIFY(reader.data().value("marks").toMap().value("annotations").toList().isEmpty());
+        auto *editor=window->findChild<QObject *>("annotationEditor");QVERIFY(editor);QMetaObject::invokeMethod(editor,"close");
+        reader.submit("file_adopt",{{"id","nm:parent-highlight"}});
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QCOMPARE(model().value("nestedReplyCount").toInt(),4);QCOMPARE(model().value("rows").toList().size(),10);
+        const auto adopted=reader.data().value("marks").toMap().value("annotations").toList().first().toMap();
+        reader.submit("mark_delete",{{"id",adopted.value("id")}});
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QCOMPARE(model().value("replyCount").toInt(),4);QVERIFY(row("nm:reply-two").isEmpty());
+        reader.submit("marks_undo");QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QCOMPARE(model().value("nestedReplyCount").toInt(),4);
+        const auto snapshots=qEnvironmentVariable("LYRA_READER_CHECK_SNAPSHOTS");if(!snapshots.isEmpty())QVERIFY(window->grabWindow().save(snapshots+"/lyrareader-reply-threads.png"));
+    }
     void deepZoomRefinesVisibleTilesWithoutSeamsAndSharesTheCacheBudget() {
         ReaderController reader;QQmlApplicationEngine engine;
         engine.addImageProvider("lyrapreview",new NativeImageProvider);
@@ -389,7 +539,7 @@ private slots:
         first->submit("marks_redo");
         QTRY_COMPARE_WITH_TIMEOUT(first->data().value("marks").toMap().value("annotations").toList().size(),1,10000);
         const auto note=first->data().value("marks").toMap().value("annotations").toList().first();
-        QVERIFY(QMetaObject::invokeMethod(window,"selectAnnotation",Q_ARG(QVariant,note)));
+        QVERIFY(QMetaObject::invokeMethod(window,"selectAnnotation",Q_ARG(QVariant,note),Q_ARG(QVariant,true)));
         auto *editor=window->findChild<QObject *>("annotationEditor");
         auto *noteField=window->findChild<QObject *>("annotationNoteText");
         QVERIFY(editor);QVERIFY(noteField);
@@ -443,8 +593,9 @@ int main(int argc, char **argv) {
     if (argc < 2) return 2;
     ReaderChecks checks;
     checks.root = QDir(QString::fromLocal8Bit(argv[1])).absolutePath();
-    // The root argument belongs to this harness, not QTest's test-function selection.
-    int testArgc = 1;
-    return QTest::qExec(&checks, testArgc, argv);
+    // Remove the fixture root; preserve QTest's optional function/filter arguments.
+    QList<char *> testArguments{argv[0]};
+    for(int i=2;i<argc;++i)testArguments.append(argv[i]);
+    return QTest::qExec(&checks,int(testArguments.size()),testArguments.data());
 }
 #include "ReaderChecks.moc"

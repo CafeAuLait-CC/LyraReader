@@ -52,6 +52,7 @@ ApplicationWindow {
     }).concat((markState.file_annotations || []).map(function (a) {
         return Logic.normalized(a, true);
     }))
+    readonly property var annotationThreads: Logic.annotationThreads(annotations)
     property var annotationDraft: null
     property var eraseDraft: []
     property double pendingDraftRequestId: -1
@@ -83,6 +84,9 @@ ApplicationWindow {
         printRequested = false;
         navigationHistory = [];
         previousReader = currentReader;
+        selectedAnnotation = null;
+        annotationDraft = null;
+        pendingDraftRequestId = -1;
         selection = null;
         searchResults = [];
         searchIndex = -1;
@@ -337,10 +341,13 @@ ApplicationWindow {
         } else if (annotationTool === "select") {
             const hit = annotationAt(page, x, y, false);
             if (hit)
-                selectAnnotation(hit);
-            else if (previewController) {
-                selection = null;
-                previewController.openAt(currentReader, page, x, y, sceneX === undefined ? width / 2 : sceneX, sceneY === undefined ? height / 2 : sceneY, zoom);
+                selectAnnotation(hit, false);
+            else {
+                selectedAnnotation = null;
+                if (previewController) {
+                    selection = null;
+                    previewController.openAt(currentReader, page, x, y, sceneX === undefined ? width / 2 : sceneX, sceneY === undefined ? height / 2 : sceneY, zoom);
+                }
             }
         }
     }
@@ -417,17 +424,27 @@ ApplicationWindow {
             dialogs.formsDialog.open();
         }
     }
-    function selectAnnotation(annotation) {
-        if (annotation.foreign) {
+    function selectAnnotation(annotation, edit) {
+        dialogs.flushAnnotation();
+        if (edit === false)
+            dialogs.annotationDialog.close();
+        const reason = Logic.annotationUnsupportedReason(annotation);
+        if (reason.length) {
+            selectedAnnotation = annotation;
+            operationStatus = reason;
+            dialogs.showAnnotation();
+        } else if (annotation.foreign) {
             currentReader.submit("file_adopt", {
                 id: annotation.id
             });
             selectedAnnotation = annotation;
         } else {
             selectedAnnotation = annotation;
-            dialogs.annotationDialog.open();
+            if (edit !== false)
+                dialogs.showAnnotation();
         }
-        navigate(annotation.page);
+        if (edit !== false)
+            navigate(annotation.page);
     }
     function addBookmark() {
         if (currentReader.pageCount > 0) {
@@ -470,6 +487,22 @@ ApplicationWindow {
             }
         });
         selection = null;
+    }
+    function updateSelectedAnnotation(patch) {
+        if (selectedAnnotation && !selectedAnnotation.foreign)
+            return currentReader.submit("mark_update", {
+                id: selectedAnnotation.id,
+                patch: patch
+            });
+        return -1;
+    }
+    function commitAnnotationGeometry(id, patch) {
+        if (!annotationDraft || annotationDraft.id !== id)
+            return;
+        pendingDraftRequestId = currentReader.submit("mark_update", {
+            id: id,
+            patch: patch
+        });
     }
     function updateAnnotationNote(note) {
         if (selectedAnnotation)
@@ -863,6 +896,7 @@ ApplicationWindow {
                 root.previewController.close();
             root.annotationTool = "select";
             root.annotationDraft = null;
+            root.selectedAnnotation = null;
             root.selection = null;
             root.overviewVisible = false;
         }
@@ -1279,7 +1313,7 @@ ApplicationWindow {
                 root.eraseDraft = [];
             if (error.length) {
                 if (op === "file_adopt")
-                    dialogs.annotationDialog.open();
+                    dialogs.showAnnotation();
                 return;
             }
             if (op === "mark_create" || op === "file_adopt") {
@@ -1288,7 +1322,7 @@ ApplicationWindow {
                         return a.id === result.selected_id;
                     }) || null;
                     if (root.selectedAnnotation && (root.selectedAnnotation.kind === "stickyNote" || root.selectedAnnotation.kind === "textBox"))
-                        dialogs.annotationDialog.open();
+                        dialogs.showAnnotation();
                 }
             } else if (op.indexOf("mark_") === 0 || op.indexOf("marks_") === 0) {
                 if (root.selectedAnnotation)
