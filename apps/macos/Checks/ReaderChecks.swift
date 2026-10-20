@@ -228,6 +228,13 @@ struct ReaderChecks {
             print("Annotation write-back checks passed")
             return
         }
+        // Stamps and image signatures on their own (`LyraReaderChecks --check-stamps .`).
+        if CommandLine.arguments.contains("--check-stamps") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await stampSignatureChecks(root: root)
+            return
+        }
         // Bookmark outline write-back on its own (`LyraReaderChecks --check-bookmark-writeback .`).
         if CommandLine.arguments.contains("--check-bookmark-writeback") {
             let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
@@ -243,6 +250,23 @@ struct ReaderChecks {
             try await eraserChecks(
                 drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
                 strokes: root.appendingPathComponent("tests/fixtures/annotated-strokes.pdf"))
+            try await partialEraseChecks(
+                drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
+                signed: root.appendingPathComponent("tests/fixtures/signed-signature.pdf"),
+                inkReview: root.appendingPathComponent(
+                    "tests/fixtures/annotated-ink-review.pdf"))
+            return
+        }
+        // Partial stroke erase on its own (`LyraReaderChecks --check-partial-erase .`).
+        if CommandLine.arguments.contains("--check-partial-erase") {
+            let root = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first
+                ?? FileManager.default.currentDirectoryPath)
+            try await partialEraseChecks(
+                drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
+                signed: root.appendingPathComponent("tests/fixtures/signed-signature.pdf"),
+                inkReview: root.appendingPathComponent(
+                    "tests/fixtures/annotated-ink-review.pdf"))
+            print("Partial erase checks passed")
             return
         }
         // Ink and shapes on their own (`LyraReaderChecks --check-ink-annotations .`).
@@ -556,6 +580,7 @@ struct ReaderChecks {
             url: root.appendingPathComponent("tests/fixtures/annotated.pdf"))
         try await annotationWritebackChecks(
             fixture: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
+        try await stampSignatureChecks(root: root)
         try await bookmarkWritebackChecks(root: root)
         try await crossReaderAnnotationChecks(
             replies: root.appendingPathComponent("tests/fixtures/annotated-replies.pdf"),
@@ -567,6 +592,11 @@ struct ReaderChecks {
         try await eraserChecks(
             drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
             strokes: root.appendingPathComponent("tests/fixtures/annotated-strokes.pdf"))
+        try await partialEraseChecks(
+            drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
+            signed: root.appendingPathComponent("tests/fixtures/signed-signature.pdf"),
+            inkReview: root.appendingPathComponent(
+                "tests/fixtures/annotated-ink-review.pdf"))
         try await placedTextChecks(
             drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
             annotated: root.appendingPathComponent("tests/fixtures/annotated.pdf"),

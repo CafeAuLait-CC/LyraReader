@@ -625,6 +625,8 @@ public enum AnnotationDrawing: String, Sendable {
     /// An ink stroke or a stroked shape: drawn from `DocumentAnnotation.inkPaths`,
     /// `lineStart`/`lineEnd` or `boxes` in the annotation's colour and border width.
     case geometry
+    /// A `/Stamp`: its badge text or its image signature, filling `/Rect`.
+    case stamp
     /// Nothing, for the reason in `DocumentAnnotation.skipReason`.
     case skipped
 }
@@ -642,6 +644,9 @@ public enum AnnotationSkipReason: String, Sendable {
     /// A stroked annotation with no path to draw (`/Ink` without an `/InkList`, `/Line` without
     /// an `/L`).
     case emptyGeometry = "empty-geometry"
+    /// A `/Stamp` whose only picture is an image encoding this build cannot decode, with no text
+    /// to draw in its place.
+    case stampImageUnreadable = "stamp-image-unreadable"
 }
 
 /// An annotation that was **already inside the PDF**, in view space (points, top-left origin).
@@ -660,6 +665,11 @@ public struct DocumentAnnotation: Sendable, Identifiable, Equatable {
     /// Whether the file carries an `/IRT` entry. True even when `parentID` is nil because the
     /// parent could not be read; that is the orphan case, not "not a reply".
     public let isReply: Bool
+    /// Whether the file links a `/Popup` window to this annotation.
+    ///
+    /// The window is structural and is not listed as an editable mark, but its text belongs to
+    /// this annotation's review thread: deleting the annotation deletes it too.
+    public let hasPopup: Bool
     /// `highlight`, `underline`, `strikeout`, `squiggly`, `text`, `freeText`, or the PDF subtype
     /// name for anything this build does not model (`Ink`, `Stamp`, …).
     public let kind: String
@@ -693,6 +703,17 @@ public struct DocumentAnnotation: Sendable, Identifiable, Equatable {
     /// `/Q`: `left`, `center` or `right`. Never anything else — the reader substitutes the PDF's
     /// own default (left) for an absent or unreadable value.
     public let alignment: String
+    /// The words on a `/Stamp`, when the file states them or the appearance paints them.
+    public let stampText: String?
+    /// `approved`, `reviewed`, `draft`, `confidential`, `date`, `signature` or `custom`.
+    public let stampStyle: String
+    /// A `/Stamp`'s image, encoded as `stampImageEncoding` says (`png` or `jpeg`).
+    public let stampImageData: Data?
+    public let stampImageEncoding: String
+    public let stampImageWidth: Int
+    public let stampImageHeight: Int
+    /// Why a stamp image the file carries could not be decoded, when it could not.
+    public let stampImageError: String?
     /// What to put on the page, as the **reader** classified it: `markup`, `noteIcon`, `freeText`
     /// or `skipped`. Read from the engine rather than re-derived here, so the sidebar, the canvas
     /// and the CLI dump cannot disagree about which annotations are supposed to appear.
@@ -783,6 +804,11 @@ public struct AnnotationWriteRequest: Sendable, Equatable {
         case circle
         /// `/Subtype /Line`, with `/LE` when `lineArrow` is true.
         case line
+        /// `/Subtype /Stamp`: a text stamp in `rect`, with `stampStyle` and `contents` as the
+        /// words and an appearance stream that draws the border and text.
+        case stamp
+        /// `/Subtype /Stamp`: an image signature. The pixels are `signatureRGBA`.
+        case signature
     }
 
     /// Written as `/NM`; the sidecar's UUID string, so a saved annotation can be recognised.
@@ -813,6 +839,12 @@ public struct AnnotationWriteRequest: Sendable, Equatable {
     public let fontSizePt: CGFloat
     /// `/Q` for `.freeText`: `left`, `center` or `right`.
     public let textAlignment: String
+    /// `.stamp`: `approved`, `reviewed`, `draft`, `confidential`, `date` or `custom`.
+    public let stampStyle: String
+    /// `.signature`: the decoded picture, straight RGBA, `width × height × 4` bytes.
+    public let signatureWidth: Int
+    public let signatureHeight: Int
+    public let signatureRGBA: [UInt8]
 
     public init(
         id: String,
@@ -831,7 +863,11 @@ public struct AnnotationWriteRequest: Sendable, Equatable {
         author: String,
         modified: String,
         fontSizePt: CGFloat = 0,
-        textAlignment: String = "left"
+        textAlignment: String = "left",
+        stampStyle: String = "",
+        signatureWidth: Int = 0,
+        signatureHeight: Int = 0,
+        signatureRGBA: [UInt8] = []
     ) {
         self.id = id
         self.page = page
@@ -850,6 +886,10 @@ public struct AnnotationWriteRequest: Sendable, Equatable {
         self.modified = modified
         self.fontSizePt = fontSizePt
         self.textAlignment = textAlignment
+        self.stampStyle = stampStyle
+        self.signatureWidth = signatureWidth
+        self.signatureHeight = signatureHeight
+        self.signatureRGBA = signatureRGBA
     }
 }
 
@@ -3218,6 +3258,8 @@ public final class RustEngine: PDFEngine {
             case .square: .square
             case .circle: .circle
             case .line: .line
+            case .stamp: .stamp
+            case .signature: .signature
             }
             let point = { (point: CGPoint) in
                 AnnotationPoint(xPt: Double(point.x), yPt: Double(point.y))
@@ -3243,7 +3285,11 @@ public final class RustEngine: PDFEngine {
                 author: request.author,
                 modified: request.modified,
                 fontSizePt: Double(request.fontSizePt),
-                textAlignment: request.textAlignment
+                textAlignment: request.textAlignment,
+                stampStyle: request.stampStyle,
+                signatureWidth: UInt32(clamping: request.signatureWidth),
+                signatureHeight: UInt32(clamping: request.signatureHeight),
+                signatureRgba: Data(request.signatureRGBA)
             )
         }
     }
@@ -3319,6 +3365,7 @@ public final class RustEngine: PDFEngine {
             id: record.id,
             parentID: record.parentId,
             isReply: record.isReply,
+            hasPopup: record.hasPopup,
             kind: record.kind,
             page: Int(record.page),
             xPt: CGFloat(record.xPt),
@@ -3339,6 +3386,13 @@ public final class RustEngine: PDFEngine {
             modified: record.modified,
             fontSizePt: record.fontSizePt.map { CGFloat($0) },
             alignment: record.alignment,
+            stampText: record.stamp?.text,
+            stampStyle: record.stamp?.style ?? "",
+            stampImageData: record.stamp.flatMap { $0.image.isEmpty ? nil : $0.image },
+            stampImageEncoding: record.stamp?.imageEncoding ?? "",
+            stampImageWidth: Int(record.stamp?.imageWidth ?? 0),
+            stampImageHeight: Int(record.stamp?.imageHeight ?? 0),
+            stampImageError: record.stamp?.imageError,
             // An unknown classification from a newer engine reads as "not drawn" rather than as
             // a guess: drawing the wrong thing over a page is worse than drawing nothing, and the
             // sidebar still lists it.
