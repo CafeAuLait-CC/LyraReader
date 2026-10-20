@@ -130,6 +130,8 @@ Pane {
                 }
                 Accessible.name: qsTr("Page %1 text").arg(view.page + 1)
                 Accessible.description: qsTr("Read-only page text. Select with the keyboard and copy with Control+C. Page view preserves the original layout.")
+                Accessible.editable: false
+                Accessible.readOnly: true
                 Keys.onPressed: function (event) {
                     if (!(event.modifiers & Qt.AltModifier))
                         return;

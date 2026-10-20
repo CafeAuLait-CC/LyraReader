@@ -74,6 +74,32 @@ private slots:
         second.activeReader()->openFile(QUrl::fromLocalFile(secondPath));QTRY_COMPARE_WITH_TIMEOUT(second.activeReader()->pendingCommands(),0,10000);QTRY_COMPARE(first.recentDocuments().size(),1);
         WorkspaceController third;QCOMPARE(third.recentDocuments(),first.recentDocuments());third.clearRecentDocuments();QVERIFY(first.recentDocuments().isEmpty());QVERIFY(second.recentDocuments().isEmpty());
     }
+    void accessibleTabsExposeSelectionAndActivationAfterAsyncLoads() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto firstPath=scratch.path()+"/first.pdf",secondPath=scratch.path()+"/second.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",firstPath));QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",secondPath));
+        WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);
+        engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
+        auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        workspace.openFile(QUrl::fromLocalFile(firstPath));auto *first=workspace.activeReader();
+        workspace.openFile(QUrl::fromLocalFile(secondPath));auto *second=workspace.activeReader();QVERIFY(first!=second);
+        QTRY_COMPARE_WITH_TIMEOUT(first->pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(second->pageCount(),1,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(first->pendingCommands(),0,10000);QTRY_COMPARE_WITH_TIMEOUT(second->pendingCommands(),0,10000);
+        const auto tab=[&](const QString &name) {
+            std::function<QAccessibleInterface *(QQuickItem *)> find=[&](QQuickItem *item)->QAccessibleInterface * {
+                auto *interface=QAccessible::queryAccessibleInterface(item);
+                if(interface && interface->role()==QAccessible::PageTab && interface->text(QAccessible::Name)==name)return interface;
+                for(auto *child:item->childItems())if(auto *found=find(child))return found;
+                return nullptr;
+            };
+            return find(window->contentItem());
+        };
+        QTRY_VERIFY(tab("first.pdf") && tab("second.pdf"));
+        QTRY_VERIFY(tab("second.pdf")->state().selected);QVERIFY(!tab("first.pdf")->state().selected);
+        auto *action=tab("first.pdf")->actionInterface();QVERIFY(action);QVERIFY(action->actionNames().contains(QAccessibleActionInterface::pressAction()));
+        action->doAction(QAccessibleActionInterface::pressAction());QTRY_COMPARE(workspace.activeReader(),first);
+        QTRY_VERIFY(tab("first.pdf")->state().selected);QVERIFY(!tab("second.pdf")->state().selected);
+    }
     void requestedWindowRegionOverridesSavedFirstPagePosition() {
         WorkspaceController saved;const auto url=QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf");
         saved.openFile(url);QTRY_COMPARE_WITH_TIMEOUT(saved.activeReader()->pageCount(),3,10000);
@@ -691,7 +717,7 @@ private slots:
         const auto snapshots=qEnvironmentVariable("LYRA_READER_CHECK_SNAPSHOTS");if(!snapshots.isEmpty())QVERIFY(window->grabWindow().save(snapshots+"/lyrareader-page-text.png"));
         text->forceActiveFocus();QTest::keyClick(window,Qt::Key_A,Qt::ControlModifier);QCOMPARE(text->property("selectedText").toString(),text->property("text").toString());
         auto *interface=QAccessible::queryAccessibleInterface(text);QVERIFY(interface);QCOMPARE(interface->role(),QAccessible::EditableText);
-        auto *accessible=interface->textInterface();QVERIFY(accessible);QCOMPARE(accessible->characterCount(),text->property("text").toString().size());QVERIFY(interface->state().readOnly);QVERIFY(interface->text(QAccessible::Name).contains("Page 1"));
+        auto *accessible=interface->textInterface();QVERIFY(accessible);QCOMPARE(accessible->characterCount(),text->property("text").toString().size());QVERIFY(interface->state().readOnly);QVERIFY(!interface->state().editable);QVERIFY(interface->text(QAccessible::Name).contains("Page 1"));
         QTest::keyClick(window,Qt::Key_Home,Qt::ControlModifier);QCOMPARE(text->property("cursorPosition").toInt(),0);QCOMPARE(window->property("currentPage").toInt(),0);
         QTest::keyClick(window,Qt::Key_PageDown,Qt::AltModifier);QTRY_COMPARE(window->property("currentPage").toInt(),1);QTRY_VERIFY(text->property("text").toString().contains("Page 2"));
         QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));QCOMPARE(workspace.viewState(&reader).value("page").toInt(),1);QVERIFY(!workspace.viewState(&reader).contains("offset"));

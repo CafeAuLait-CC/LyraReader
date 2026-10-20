@@ -995,7 +995,7 @@ ApplicationWindow {
         enabled: currentReader.pageCount > 0
         checkable: true
         checked: root.textViewVisible
-        onTriggered: root.setTextViewEnabled(checked)
+        onTriggered: root.setTextViewEnabled(!root.textViewVisible)
     }
     Shortcut {
         sequence: "PageDown"
@@ -1124,7 +1124,7 @@ ApplicationWindow {
                 text: qsTr("Pages Sidebar")
                 checkable: true
                 checked: root.sidebarVisible
-                onTriggered: root.sidebarVisible = checked
+                onTriggered: root.sidebarVisible = !root.sidebarVisible
             }
             MenuSeparator {}
             Menu {

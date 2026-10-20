@@ -34,7 +34,10 @@ ColumnLayout {
                     id: tab
                     required property var modelData
                     required property int index
-                    readonly property bool selected: index === tabStrip.currentIndex
+                    // A QVariantList reset may temporarily reset ListView's
+                    // currentIndex while documents finish loading. The workspace
+                    // remains the source of truth for the actual active reader.
+                    readonly property bool selected: index === (app.session ? app.session.activeIndex : 0)
                     width: Math.max(120, Math.min(230, (tabStrip.width - 30) / Math.max(1, tabStrip.count) - 4))
                     height: 40
                     y: 4
@@ -87,7 +90,10 @@ ColumnLayout {
                             app.session.selectTab(tab.index)
                         Accessible.role: Accessible.PageTab
                         Accessible.name: modelData.title
+                        Accessible.selectable: true
                         Accessible.selected: tab.selected
+                        Accessible.onPressAction: if (app.session)
+                            app.session.selectTab(tab.index)
                     }
                     Rectangle {
                         anchors.bottom: parent.bottom
@@ -156,7 +162,7 @@ ColumnLayout {
                     checkable: true
                     checked: app.textViewVisible
                     enabled: app.currentReader.pageCount > 0
-                    onTriggered: app.setTextViewEnabled(checked)
+                    onTriggered: app.setTextViewEnabled(!app.textViewVisible)
                 }
                 MenuSeparator {}
                 MenuItem {
