@@ -50,6 +50,8 @@ def build_pdf(
     info: dict[str, str] | None = None,
     xmp: bytes | None = None,
     catalog_extra: bytes = b"",
+    font_object: bytes | None = None,
+    page_resources_extra: bytes = b"",
 ) -> bytes:
     """Assemble a PDF from (content_stream, rotation_degrees) pairs.
 
@@ -74,6 +76,10 @@ def build_pdf(
     object the caller numbers through `first_extra_object_id` (a `/Names /EmbeddedFiles`
     tree, a `/Perms /DocMDP` dictionary). It is empty by default, so the existing fixtures
     stay byte-identical.
+
+    `font_object` replaces the default Helvetica dictionary (object 3), and
+    `page_resources_extra` is appended verbatim to every page's `/Resources` dictionary.
+    Both default to the old output, so only the text-edit fixture uses them.
     """
     annotations = annotations or {}
     extra_objects = extra_objects or []
@@ -104,8 +110,11 @@ def build_pdf(
         f"<< /Type /Pages /Kids [{kids}] /Count {len(pages)} >>".encode("ascii")
     )
     objects.append(
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
-        b"/Encoding /WinAnsiEncoding >>"
+        font_object
+        or (
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+            b"/Encoding /WinAnsiEncoding >>"
+        )
     )
 
     for index, (content, rotation) in enumerate(pages):
@@ -119,7 +128,7 @@ def build_pdf(
             (
                 f"<< /Type /Page /Parent 2 0 R "
                 f"/MediaBox [0 0 {A4_WIDTH} {A4_HEIGHT}] "
-                f"/Resources << /Font << /F1 3 0 R >> >> "
+                f"/Resources << /Font << /F1 3 0 R >>{page_resources_extra.decode('latin-1')} >> "
                 f"/Contents {content_id} 0 R{rotate}{annots} >>"
             ).encode("ascii")
         )
@@ -1936,6 +1945,124 @@ def long_document(page_count: int) -> list[tuple[str, int]]:
     ]
 
 
+def text_edit_pdf() -> bytes:
+    """The text-edit analysis fixture: editable `Tj`/plain-`TJ` runs and every refusal shape.
+
+    Widths are a flat 500/1000 em for the ASCII range. That is not Helvetica's metric, but the
+    page's own content stream and the fixture's `/Widths` say the same thing, so the analyzer's
+    computed origins agree with PDFium's layout: the test is about the analysis rules, not about
+    the shape of a particular typeface. A `/ToUnicode` CMap maps the same range, so the text layer
+    is exact and a refusal cannot come from a missing mapping.
+    """
+    page_count = 1
+    form_id = first_extra_object_id(page_count, 0)
+    tounicode_id = form_id + 1
+    widths = " ".join("500" for _ in range(32, 127))
+    font = (
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+        b"/FirstChar 32 /LastChar 126 /Widths [" + widths.encode("ascii") + b"] "
+        b"/Encoding /WinAnsiEncoding /ToUnicode "
+        + str(tounicode_id).encode("ascii") + b" 0 R >>"
+    )
+    form_content = b"BT /F1 12 Tf 0 0 Td (In form) Tj ET"
+    form = (
+        b"<< /Type /XObject /Subtype /Form /BBox [0 0 240 40] "
+        b"/Resources << /Font << /F1 3 0 R >> >> /Length "
+        + str(len(form_content)).encode("ascii")
+        + b" >>\nstream\n" + form_content + b"\nendstream"
+    )
+    cmap = (
+        b"/CIDInit /ProcSet findresource begin\n"
+        b"12 dict begin\nbegincmap\n"
+        b"/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n"
+        b"/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n"
+        b"1 begincodespacerange\n<00> <FF>\nendcodespacerange\n"
+        b"1 beginbfrange\n<20> <7E> <0020>\nendbfrange\n"
+        b"endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n"
+    )
+    tounicode = (
+        b"<< /Length " + str(len(cmap)).encode("ascii") + b" >>\nstream\n"
+        + cmap + b"\nendstream"
+    )
+    content = "\n".join(
+        [
+            "BT /F1 12 Tf 72 700 Td (Hello world) Tj ET",
+            "BT /F1 12 Tf 72 660 Td [(Ke) 20 (rned)] TJ ET",
+            "BT /F1 12 Tf 72 620 Td [(Plain) ( array)] TJ ET",
+            "q 60 560 250 24 re W n BT /F1 12 Tf 72 565 Td (Clipped) Tj ET Q",
+            "BT /F1 12 Tf 0 1 -1 0 400 500 Tm (Rotated) Tj ET",
+            "q 1 0 0 1 72 520 cm /Fm1 Do Q",
+        ]
+    )
+    return build_pdf(
+        [(content, 0)],
+        extra_objects=[form, tounicode],
+        font_object=font,
+        page_resources_extra=f" /XObject << /Fm1 {form_id} 0 R >>".encode("ascii"),
+    )
+
+
+def narrative_citation_pdf() -> bytes:
+    """A year-only internal link must open the complete author-year entry as text."""
+    body = text_page("Narrative citations", "author names outside the year parentheses", [
+        "Guo et al. (2022) describe a synthetic motion baseline.",
+        "See the overview page for more context.",
+    ])
+    references = text_page("REFERENCES", "Synthetic bibliography", [
+        "Yun Bai. 2020. An example baseline.",
+        "Yiyi Cai. 2021. A second example.",
+        "Yuming Du. 2023. A third example.",
+        "Chuan Guo, Shihao Zou, and Li Cheng. Synthetic motion baseline. 2022.",
+        "Haonan Han. 2025. Another example.",
+        "Heng Li. 2024. An example model.",
+        "Guy Tevet. 2023. A synthetic comparison.",
+        "Tao Wang. 2025. The final example.",
+    ])
+    return build_pdf([(body, 0), (references, 0)], annotations={0: [
+        annotation("Link", (130, 687, 158, 701), extra="/Border [0 0 0] /Dest [6 0 R /Fit]"),
+        annotation("Link", body_line_box(1, 260), extra="/Border [0 0 0] /Dest [6 0 R /Fit]"),
+    ]})
+
+
+def booktabs_bounds_pdf() -> bytes:
+    """Top captions, three-rule tables, and a fraction bar after the first table."""
+    body = text_page("Table previews", "bounds come from rules and text rows", [
+        "See Table 1 for synthetic results.",
+        "See Table 6 for synthetic settings.",
+        "See the overview for more context.",
+    ])
+
+    def table_page(label: int, left: float, right: float) -> str:
+        commands = ["0 G 0 g 0.7 w"]
+
+        def text(x: float, y: float, value: str) -> None:
+            commands.append(f"BT /F1 11 Tf {x} {y} Td ({escape_pdf_string(value)}) Tj ET")
+
+        caption = ("Table 1: Quantitative comparison of synthetic baseline methods and results."
+                   if label == 1 else "Table 6: Main optimization settings for all baselines.")
+        text(left, 710, caption)
+        # Only two spaces between rules, but four distinct rows of cells.
+        for y in [690, 670, 610]:
+            commands.append(f"{left} {y} m {right} {y} l S")
+        for y, name in [(677, "Method"), (653, "Alpha"), (635, "Beta"), (617, "Gamma")]:
+            text(left + 5, y, name)
+            text(right - 50, y, "1.0")
+        text(left, 575, "This paragraph belongs below the table.")
+        text(left, 559, "The preview must stop before these lines.")
+        if label == 1:
+            text(left + 85, 540, "numerator")
+            commands.append(f"{left + 75} 530 m {left + 165} 530 l S")
+            text(left + 85, 515, "denominator")
+        return "\n".join(commands) + "\n"
+
+    return build_pdf([(body, 0), (table_page(1, 72, 523), 0),
+                      (table_page(6, 160, 440), 0)], annotations={0: [
+        annotation("Link", body_line_box(0, 200), extra="/Border [0 0 0] /Dest [6 0 R /Fit]"),
+        annotation("Link", body_line_box(1, 200), extra="/Border [0 0 0] /Dest [8 0 R /Fit]"),
+        annotation("Link", body_line_box(2, 200), extra="/Border [0 0 0] /Dest [6 0 R /Fit]"),
+    ]})
+
+
 def main() -> int:
     args = sys.argv[1:]
     out_dir = Path("tests/fixtures")
@@ -2096,6 +2223,15 @@ def main() -> int:
         path = out_dir / name
         path.write_bytes(build_pdf(pages))
         print(f"  {path}  ({path.stat().st_size} bytes, {len(pages)} page(s))")
+
+    path = out_dir / "text-edit.pdf"
+    path.write_bytes(text_edit_pdf())
+    print(f"  {path}  ({path.stat().st_size} bytes, text-edit analysis shapes)")
+
+    path = out_dir / "narrative-citation.pdf"
+    path.write_bytes(narrative_citation_pdf())
+    (out_dir / "booktabs-bounds.pdf").write_bytes(booktabs_bounds_pdf())
+    print(f"  {path}  ({path.stat().st_size} bytes, narrative author-year link)")
 
     # 12) T4.52: section references in running text. Page 1 points at "Section 2" and page 2 at
     #     "Appendix A"; the destination of the first is in the outline (so the preview title comes
