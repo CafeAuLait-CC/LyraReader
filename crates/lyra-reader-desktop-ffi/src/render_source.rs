@@ -2,12 +2,14 @@ use crate::document::DesktopDocument;
 use lyra_reader_core::{Rect, Size};
 use lyra_reader_ffi::api::*;
 use lyra_reader_runtime::{MAX_PAGE_BYTES, bounded_raster_scale};
+use serde_json::{Value, json};
 use std::{fs, path::PathBuf, sync::Arc};
 
 /// An immutable revision, independent of the active tab and its later page edits.
 pub struct RenderSource {
     engine: Arc<LyraReaderDocument>,
     _temporary: Option<OwnedDirectory>,
+    _session_directory: Option<Arc<crate::pages::SessionDirectory>>,
 }
 struct OwnedDirectory(PathBuf);
 impl Drop for OwnedDirectory {
@@ -17,15 +19,17 @@ impl Drop for OwnedDirectory {
 }
 impl RenderSource {
     pub fn new(document: &DesktopDocument, include_edits: bool) -> Result<Self, String> {
-        let _edits = document
+        let edits = document
             .edits
             .lock()
             .map_err(|_| "Page-edit state is unavailable")?;
         let engine = document.active()?;
+        let session_directory = edits.directory.clone();
         if !include_edits {
             return Ok(Self {
                 engine,
                 _temporary: None,
+                _session_directory: session_directory,
             });
         }
         let marks = document
@@ -40,6 +44,7 @@ impl RenderSource {
             return Ok(Self {
                 engine,
                 _temporary: None,
+                _session_directory: session_directory,
             });
         }
         let directory =
@@ -74,11 +79,44 @@ impl RenderSource {
             Ok(engine) => Ok(Self {
                 engine,
                 _temporary: Some(OwnedDirectory(directory)),
+                _session_directory: session_directory,
             }),
             Err(error) => {
                 let _ = fs::remove_dir_all(directory);
                 Err(error)
             }
+        }
+    }
+    pub fn query(&self, request: Value) -> Result<Value, String> {
+        let page = || {
+            request["page"]
+                .as_u64()
+                .and_then(|p| u32::try_from(p).ok())
+                .ok_or("Missing page".to_string())
+        };
+        fn value<T: serde::Serialize>(
+            result: Result<T, LyraReaderFfiError>,
+        ) -> Result<Value, String> {
+            serde_json::to_value(result.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+        }
+        match request["op"].as_str().unwrap_or("") {
+            "info" => value(
+                (0..self.engine.page_count())
+                    .map(|p| self.engine.page_size_pt(p))
+                    .collect::<Result<Vec<_>, _>>(),
+            ),
+            "outline" => value(self.engine.outline()),
+            "text" => value(self.engine.text_page(page()?)),
+            "page_targets" => Ok(
+                json!({"links":self.engine.links(page()?).map_err(|e|e.to_string())?,"citations":self.engine.citations(page()?).map_err(|e|e.to_string())?,"mentions":self.engine.caption_mentions(page()?).map_err(|e|e.to_string())?}),
+            ),
+            "resolve_citations" => value(self.engine.resolve_citations_on(
+                page()?,
+                serde_json::from_value(request["labels"].clone()).map_err(|e| e.to_string())?,
+            )),
+            "references" => value(self.engine.references()),
+            "figures" => value(self.engine.figures()),
+            _ => Err("Unknown render snapshot query".into()),
         }
     }
     pub fn render(

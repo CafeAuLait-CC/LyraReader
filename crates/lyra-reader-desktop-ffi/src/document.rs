@@ -14,6 +14,7 @@ use std::{
 pub struct DesktopDocument {
     pub(super) engine: RwLock<Arc<LyraReaderDocument>>,
     pub(super) layout: RwLock<DocumentLayout>,
+    original_signature: SignatureStatusRecord,
     ai: Mutex<Option<Arc<LyraReaderAiRequest>>>,
     pub(super) marks: Mutex<crate::marks::Marks>,
     pub(super) edits: Mutex<crate::pages::PageEdits>,
@@ -62,6 +63,7 @@ impl DesktopDocument {
         }
         let marks = Mutex::new(mark_state);
         Ok(Self {
+            original_signature: engine.signature_status(),
             engine: RwLock::new(engine),
             layout: RwLock::new(DocumentLayout::new(sizes, PAGE_GAP_PT)),
             edits: Mutex::new(crate::pages::PageEdits::default()),
@@ -85,7 +87,7 @@ impl DesktopDocument {
             .map_err(|_| "Layout state is unavailable")?;
         Ok(json!({
             "pages":layout.placements().iter().map(|p|json!({"index":p.index,"width":p.width_pt,"height":p.height_pt,"top":p.top_pt,"left":p.left_pt})).collect::<Vec<_>>(),
-            "width":layout.content_width_pt(),"height":layout.content_height_pt(),"gap":layout.gap_pt(),"path":self.original_path,
+            "width":layout.content_width_pt(),"height":layout.content_height_pt(),"gap":layout.gap_pt(),"path":self.original_path,"signature_status":self.original_signature,
         }))
     }
 
@@ -149,6 +151,18 @@ impl DesktopDocument {
         ) {
             return self.page_command(op, &r);
         }
+        let _write_guard = if op.starts_with("save_")
+            || op.starts_with("replace_")
+            || matches!(op, "extract_pages" | "page_operation" | "layout")
+        {
+            Some(
+                self.edits
+                    .lock()
+                    .map_err(|_| "Page-edit state is unavailable")?,
+            )
+        } else {
+            None
+        };
         let d = self.active()?;
         if op.starts_with("replace_") && d.path() != self.original_path.to_string_lossy() {
             return Err(
@@ -184,6 +198,7 @@ impl DesktopDocument {
             let state = marks.command(op, &r, &active)?;
             if !matches!(op, "marks" | "marks_undo" | "marks_redo") {
                 edits.clear_redo();
+                edits.collect_garbage(Path::new(&active.path()));
             }
             return Ok(edits.annotate_state(state, &active, &self.original_path));
         }
@@ -241,6 +256,9 @@ impl DesktopDocument {
             "info" => self.info(),
             "outline" => value(d.outline()),
             "metadata" => value(d.metadata()),
+            "signature_status" => {
+                serde_json::to_value(&self.original_signature).map_err(|e| e.to_string())
+            }
             "document_info" => value(d.document_info()),
             "forms" => value(d.form_info()),
             "annotations" => value(d.annotations()),
@@ -590,6 +608,61 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+    #[test]
+    fn page_history_reclaims_old_files_and_live_render_snapshots_keep_their_session() {
+        let fixture = Fixture::new("multipage.pdf");
+        let doc = fixture.open();
+        doc.command(json!({"op":"page_stage","operation":{"InsertBlank":{"index":0}}}))
+            .unwrap();
+        let source = crate::render_source::RenderSource::new(&doc, false).unwrap();
+        let directory = doc
+            .edits
+            .lock()
+            .unwrap()
+            .directory
+            .as_ref()
+            .unwrap()
+            .0
+            .clone();
+        for _ in 0..36 {
+            doc.command(json!({"op":"page_stage","operation":{"InsertBlank":{"index":0}}}))
+                .unwrap();
+        }
+        let pdfs = fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "pdf"))
+            .count();
+        assert!(pdfs <= 33, "{pdfs} revisions retained");
+        doc.command(json!({"op":"page_discard"})).unwrap();
+        drop(doc);
+        assert!(directory.exists());
+        let image = source
+            .render(
+                0,
+                1.0,
+                lyra_reader_core::Rect::new(0., 0., 100., 100.),
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(image.width_px, 100);
+        drop(source);
+        assert!(!directory.exists());
+    }
+    #[test]
+    fn signed_original_status_survives_derived_page_revisions() {
+        let fixture = Fixture::new("signed-signature.pdf");
+        let doc = fixture.open();
+        assert_eq!(doc.info().unwrap()["signature_status"]["signed"], true);
+        let original = fs::read(&fixture.path).unwrap();
+        let staged = doc
+            .command(json!({"op":"page_stage","operation":{"InsertBlank":{"index":0}}}))
+            .unwrap();
+        assert_eq!(staged["info"]["signature_status"]["signed"], true);
+        assert!(doc.command(json!({"op":"page_apply"})).is_err());
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
     }
     #[test]
     fn page_sessions_remap_marks_undo_without_touching_original_and_apply_with_backups() {

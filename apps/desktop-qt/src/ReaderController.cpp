@@ -43,6 +43,7 @@ struct OpenResult {
     QVariantList pages;
     double width = 0;
     double height = 0;
+    QVariantMap signature;
     QString error;
 };
 struct RasterResult { QImage image; QString error; double actualScale = 0; qint64 elapsedMs = 0; };
@@ -105,6 +106,7 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
         }
         m_document = std::move(result.document);
         m_pages = std::move(result.pages);
+        m_data.insert(QStringLiteral("signature_status"),result.signature);emit dataChanged();
         m_documentWidth = result.width;
         m_documentHeight = result.height;
         emit documentChanged();
@@ -136,6 +138,7 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
         result.pages = object.value(QStringLiteral("pages")).toArray().toVariantList();
         result.width = object.value(QStringLiteral("width")).toDouble();
         result.height = object.value(QStringLiteral("height")).toDouble();
+        result.signature = object.value(QStringLiteral("signature_status")).toObject().toVariantMap();
         return result;
     }));
 }
@@ -179,7 +182,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
             const auto info=revision.value(QStringLiteral("info")).toMap();
             ++m_generation;m_cache.clear();m_pending.clear();m_failed.clear();m_requests.clear();m_textPages.clear();m_textPending.clear();
             m_pages=info.value(QStringLiteral("pages")).toList();m_documentWidth=info.value(QStringLiteral("width")).toDouble();m_documentHeight=info.value(QStringLiteral("height")).toDouble();
-            m_data.clear();m_data.insert(QStringLiteral("marks"),revision.value(QStringLiteral("marks")));
+            m_data.clear();m_data.insert(QStringLiteral("marks"),revision.value(QStringLiteral("marks")));m_data.insert(QStringLiteral("signature_status"),info.value(QStringLiteral("signature_status")));
             emit documentReset();emit documentChanged();emit dataChanged();emit textPagesChanged();
             submit(QStringLiteral("outline"));submit(QStringLiteral("metadata"));
         } else if (operation == QStringLiteral("text")) {

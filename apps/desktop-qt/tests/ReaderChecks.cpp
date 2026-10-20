@@ -2,6 +2,8 @@
 #include "PageItem.h"
 #include "PaperAppearance.h"
 #include "PdfPrintJob.h"
+#include "NativeRaster.h"
+#include "PreviewController.h"
 #include <QPrinter>
 #include "AnnotationOverlay.h"
 #include "WorkspaceController.h"
@@ -18,6 +20,12 @@
 #include <QTemporaryDir>
 #include <QtTest>
 #include <functional>
+
+static QQuickItem *visualItem(QQuickItem *root,const QString &name) {
+    if(root->objectName()==name)return root;
+    for(auto *child:root->childItems())if(auto *found=visualItem(child,name))return found;
+    return nullptr;
+}
 
 class ReaderChecks : public QObject {
     Q_OBJECT
@@ -36,6 +44,7 @@ private slots:
     void wholeWindowSurvivesTextureReplacementAndPageJump() {
         ReaderController reader;
         QQmlApplicationEngine engine;
+        engine.addImageProvider(QStringLiteral("lyrapreview"),new NativeImageProvider);
         engine.rootContext()->setContextProperty("reader", &reader);
         engine.load(QUrl("qrc:/qml/Main.qml"));
         QVERIFY(!engine.rootObjects().isEmpty());
@@ -179,6 +188,7 @@ private slots:
     }
     void multiplyHighlightPreservesBlackTextOnEveryBackend(){
         QQmlApplicationEngine engine;
+        engine.addImageProvider(QStringLiteral("lyrapreview"),new NativeImageProvider);
         engine.load(QUrl("qrc:/tests/MultiplyCheck.qml"));
         QVERIFY(!engine.rootObjects().isEmpty());
         auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());
@@ -226,6 +236,70 @@ private slots:
         for(int y=0;y<raster.height();++y)for(int x=0;x<raster.width();++x){const auto c=raster.pixelColor(x,y);if(c.red()<80&&c.green()<80&&c.blue()<80)ink=true;if(c.red()>180&&c.green()>180&&c.blue()<180)yellow=true;}
         QVERIFY(ink);QVERIFY(yellow);
     }
+    void referencesFiguresAndSectionsUseRealAsynchronousPreviews() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        for(const auto &name:{"numeric-citations.pdf","cross-references.pdf","section-references.pdf"})
+            QVERIFY(QFile::copy(root+"/tests/fixtures/"+name,scratch.path()+"/"+name));
+        WorkspaceController workspace;QQmlApplicationEngine engine;
+        engine.addImageProvider("lyrapreview",new NativeImageProvider);
+        engine.rootContext()->setContextProperty("workspace",&workspace);
+        engine.rootContext()->setContextProperty("reader",workspace.activeReader());
+        engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
+        auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        auto *preview=workspace.preview();
+        workspace.openFile(QUrl::fromLocalFile(scratch.path()+"/numeric-citations.pdf"));
+        auto *reader=workspace.activeReader();QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()>1,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        reader->submit("citations",{{"page",0}});
+        QTRY_VERIFY_WITH_TIMEOUT(reader->data().contains("citations"),10000);
+        QVariantMap group;
+        for(const auto &value:reader->data().value("citations").toList())if(value.toMap().value("labels").toList().size()>1){group=value.toMap();break;}
+        QVERIFY(!group.isEmpty());
+        auto click=[&](const QVariantMap &hit) {
+            const double x=hit.value("x_pt").toDouble()+hit.value("width_pt").toDouble()/2;
+            const double y=hit.value("y_pt").toDouble()+hit.value("height_pt").toDouble()/2;
+            return QMetaObject::invokeMethod(window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,x),Q_ARG(QVariant,y),Q_ARG(QVariant,320),Q_ARG(QVariant,200));
+        };
+        const auto offset=window->property("pageList").value<QObject *>()->property("contentY").toDouble();
+        QVERIFY(click(group));QTRY_VERIFY_WITH_TIMEOUT(preview->visible(),10000);
+        QCOMPARE(preview->model().value("kind").toString(),QString("reference"));
+        QCOMPARE(preview->model().value("entries").toList().size(),group.value("labels").toList().size());
+        QCOMPARE(preview->model().value("page").toInt(),1); // The bibliography, not the source citation page.
+        for(const auto &entry:preview->model().value("entries").toList())QVERIFY(!entry.toMap().value("text").toString().isEmpty());
+        QCOMPARE(window->property("pageList").value<QObject *>()->property("contentY").toDouble(),offset);
+        preview->togglePin();const auto pinned=preview->model();preview->openAt(reader,0,10,10,100,100,1);QCOMPARE(preview->model(),pinned);
+        preview->togglePin();preview->showEntry(0);
+        const auto ready=[&] {const auto *image=visualItem(window->contentItem(),"referencePreviewImage");return image && image->property("status").toInt()==1;};
+        QTRY_VERIFY_WITH_TIMEOUT(ready(),10000);
+        QVERIFY(!preview->imageUrl(450,1.5,"original").isEmpty());
+        const auto snapshotDirectory=qEnvironmentVariable("LYRA_READER_CHECK_SNAPSHOTS");
+        if(!snapshotDirectory.isEmpty())QVERIFY(window->grabWindow().save(snapshotDirectory+"/lyrareader-preview.png"));
+        preview->jump();QTRY_VERIFY(window->property("canGoBack").toBool());
+        QVERIFY(QMetaObject::invokeMethod(window,"goBack"));
+        QTRY_VERIFY(qAbs(window->property("pageList").value<QObject *>()->property("contentY").toDouble()-offset)<.1);
+        QSignalSpy newWindow(&workspace,&WorkspaceController::newWindowRequested);preview->openWindow();QCOMPARE(newWindow.size(),1);
+        workspace.openFile(QUrl::fromLocalFile(scratch.path()+"/cross-references.pdf"));
+        QVERIFY(!preview->visible());reader=workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),3,10000);
+        reader->submit("caption_mentions",{{"page",0}});QTRY_VERIFY_WITH_TIMEOUT(reader->data().contains("caption_mentions"),10000);
+        const auto mentions=reader->data().value("caption_mentions").toList();QVERIFY(!mentions.isEmpty());
+        for(const auto &mention:mentions) {
+            QVERIFY(click(mention.toMap()));QTRY_VERIFY_WITH_TIMEOUT(preview->visible(),10000);
+            QCOMPARE(preview->model().value("kind").toString(),QString("figure"));
+            QTRY_VERIFY_WITH_TIMEOUT(ready(),10000);
+            QVERIFY(!preview->model().value("caption").toString().isEmpty());preview->close();
+        }
+        workspace.openFile(QUrl::fromLocalFile(scratch.path()+"/section-references.pdf"));reader=workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),3,10000);reader->submit("links",{{"page",0}});
+        QTRY_VERIFY_WITH_TIMEOUT(reader->data().contains("links"),10000);
+        const auto links=reader->data().value("links").toList();QCOMPARE(links.size(),2);
+        for(int i=0;i<links.size();++i) {
+            QVERIFY(click(links.at(i).toMap()));QTRY_VERIFY_WITH_TIMEOUT(preview->visible(),10000);
+            QCOMPARE(preview->model().value("kind").toString(),QString("section"));
+            if(i==0)QCOMPARE(preview->model().value("section_title").toString(),QString("2 Method"));
+            else QVERIFY(preview->model().value("section_title").toString().isEmpty());
+            preview->close();
+        }
+    }
     void tabsRetainDocumentsAndSharedSearchAndMarksWork(){
         QTemporaryDir scratch;
         QVERIFY(scratch.isValid());
@@ -234,6 +308,7 @@ private slots:
         QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",secondPath));
         WorkspaceController workspace;
         QQmlApplicationEngine engine;
+        engine.addImageProvider(QStringLiteral("lyrapreview"),new NativeImageProvider);
         engine.rootContext()->setContextProperty("workspace",&workspace);
         engine.rootContext()->setContextProperty("reader",workspace.activeReader());
         engine.load(QUrl("qrc:/qml/Main.qml"));

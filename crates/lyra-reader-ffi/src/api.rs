@@ -121,6 +121,7 @@ pub struct DocumentSummary {
 
 /// One kind of evidence that a document carries a digital signature.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct SignatureEvidenceRecord {
     /// Stable machine name: `sigFlags`, `docMdp`, `signatureField`, `dss` or `pdfium`.
     pub kind: String,
@@ -136,6 +137,7 @@ pub struct SignatureEvidenceRecord {
 /// save edited/filled/properties/redacted copy, annotation copy export) remain available; a
 /// modified copy has its signature material stripped so it cannot look signed but be invalid.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct SignatureStatusRecord {
     pub signed: bool,
     pub evidence: Vec<SignatureEvidenceRecord>,

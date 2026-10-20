@@ -25,6 +25,8 @@ bool lyra_reader_desktop_render_annotated(const LyraReaderDesktopDocument *docum
 // Immutable revision. include_edits prepares a verified temporary PDF for printing;
 // it never modifies the source PDF or sidecar. Preparation is a worker operation.
 LyraReaderRenderSource *lyra_reader_desktop_render_source(const LyraReaderDesktopDocument *, bool include_edits, LyraReaderBuffer *error);
+bool lyra_reader_desktop_source_command(const LyraReaderRenderSource *, const std::uint8_t *request,
+    std::size_t request_len, LyraReaderBuffer *output, LyraReaderBuffer *error);
 void lyra_reader_desktop_render_source_free(LyraReaderRenderSource *);
 bool lyra_reader_desktop_render_region(const LyraReaderRenderSource *, std::uint32_t page, double scale,
     double x, double y, double width, double height, bool annotated, bool transparent,

@@ -1,6 +1,7 @@
 #pragma once
 #include "ReaderController.h"
 #include "CredentialStore.h"
+#include "PreviewController.h"
 #include <QVariantList>
 
 // Native window session. Tabs retain their own document, raster cache and view state.
@@ -10,6 +11,7 @@ class WorkspaceController : public QObject {
     Q_PROPERTY(ReaderController *activeReader READ activeReader NOTIFY activeReaderChanged)
     Q_PROPERTY(int activeIndex READ activeIndex NOTIFY activeReaderChanged)
     Q_PROPERTY(QVariantList recentDocuments READ recentDocuments NOTIFY recentDocumentsChanged)
+    Q_PROPERTY(PreviewController *preview READ preview CONSTANT)
     Q_PROPERTY(CredentialStore *credentials READ credentials CONSTANT)
 public:
     explicit WorkspaceController(QObject *parent = nullptr);
@@ -17,6 +19,7 @@ public:
     ReaderController *activeReader() const;
     int activeIndex() const { return m_activeIndex; }
     QVariantList recentDocuments() const { return m_recent; }
+    PreviewController *preview()const{return m_preview;}
     CredentialStore *credentials() const { return m_credentials; }
     Q_INVOKABLE void printDocument(ReaderController *reader, int currentPage = 0);
     Q_INVOKABLE void openFiles(const QList<QUrl> &urls);
@@ -49,5 +52,6 @@ private:
     QHash<ReaderController *, QVariantMap> m_views;
     QVariantList m_recent;
     int m_activeIndex = 0;
+    PreviewController *m_preview = new PreviewController(this);
     CredentialStore *m_credentials = new CredentialStore(this);
 };

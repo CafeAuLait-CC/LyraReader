@@ -329,6 +329,35 @@ pub unsafe extern "C" fn lyra_reader_desktop_render_region(
     .is_some()
 }
 
+/// # Safety
+/// Source remains alive throughout the query. Request/output follow the desktop command contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_source_command(
+    source: *const render_source::RenderSource,
+    request: *const u8,
+    len: usize,
+    output: *mut Buffer,
+    error: *mut Buffer,
+) -> bool {
+    unsafe {
+        run(error, || {
+            let source = source.as_ref().ok_or("render source is null")?;
+            if output.is_null() {
+                return Err("output buffer is null".into());
+            }
+            let request =
+                serde_json::from_slice(bytes(request, len)?).map_err(|e| e.to_string())?;
+            let result = source.query(request)?;
+            output.write(Buffer::owned(
+                serde_json::to_vec(&serde_json::json!({"result":result}))
+                    .map_err(|e| e.to_string())?,
+            ));
+            Ok(())
+        })
+    }
+    .is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

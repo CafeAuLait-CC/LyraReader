@@ -31,7 +31,7 @@ add_custom_target(lyra_reader_build
     COMMENT "Checking/building the Rust document service"
     VERBATIM)
 add_dependencies(lyra_reader_rust lyra_reader_build)
-add_library(lyrareader_shell STATIC src/ReaderController.cpp src/ReaderController.h src/PageItem.cpp src/PageItem.h src/WorkspaceController.cpp src/WorkspaceController.h src/CredentialStore.cpp src/CredentialStore.h src/AnnotationOverlay.cpp src/AnnotationOverlay.h src/PaperAppearance.cpp src/PaperAppearance.h src/PdfPrintJob.cpp src/PdfPrintJob.h)
+add_library(lyrareader_shell STATIC src/ReaderController.cpp src/ReaderController.h src/PageItem.cpp src/PageItem.h src/WorkspaceController.cpp src/WorkspaceController.h src/CredentialStore.cpp src/CredentialStore.h src/AnnotationOverlay.cpp src/AnnotationOverlay.h src/PaperAppearance.cpp src/PaperAppearance.h src/PdfPrintJob.cpp src/PdfPrintJob.h src/NativeRaster.cpp src/NativeRaster.h src/PreviewController.cpp src/PreviewController.h)
 target_include_directories(lyrareader_shell PUBLIC src)
 target_link_libraries(lyrareader_shell PUBLIC Qt6::Quick Qt6::QuickControls2 Qt6::Concurrent Qt6::Widgets Qt6::PrintSupport Qt6Keychain::Qt6Keychain lyra_reader_rust Threads::Threads ${CMAKE_DL_LIBS})
 if(WIN32)
@@ -43,7 +43,7 @@ qt_add_executable(LyraReader src/main.cpp)
 target_link_libraries(LyraReader PRIVATE lyrareader_shell)
 set(LYRA_READER_QML_FILES qml/Main.qml qml/LyraReaderTheme.qml qml/LyraToolButton.qml
     qml/ReaderChrome.qml qml/ReaderSidebar.qml qml/DocumentCanvas.qml qml/PageInteraction.qml
-    qml/PageOverview.qml qml/AnnotationsLayer.qml qml/AnnotationTools.qml qml/SearchPanel.qml qml/AiPanel.qml qml/ReaderDialogs.qml qml/ReaderLogic.js)
+    qml/PageOverview.qml qml/PreviewPanel.qml qml/AnnotationsLayer.qml qml/AnnotationTools.qml qml/SearchPanel.qml qml/AiPanel.qml qml/ReaderDialogs.qml qml/ReaderLogic.js)
 file(GLOB LYRA_READER_ICONS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/icons/*.svg")
 foreach(ICON_PATH IN LISTS LYRA_READER_ICONS)
     file(RELATIVE_PATH ICON_RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" "${ICON_PATH}")

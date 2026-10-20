@@ -171,9 +171,10 @@ Item {
                 app.commitErase();
                 return;
             }
-            if (!dragged)
-                app.pageClicked(page, mouse.x / app.zoom, mouse.y / app.zoom);
-            else
+            if (!dragged) {
+                const scene = layer.mapToItem(null, mouse.x, mouse.y);
+                app.pageClicked(page, mouse.x / app.zoom, mouse.y / app.zoom, scene.x, scene.y);
+            } else
                 app.selectionFinished();
         }
         onCanceled: {

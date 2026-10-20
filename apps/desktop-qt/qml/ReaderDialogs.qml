@@ -249,6 +249,7 @@ Item {
         }
         MenuItem {
             text: qsTr("Save and Replace Original…")
+            enabled: !app.originalReadOnly
             onTriggered: app.confirmReplace("annotations")
         }
         MenuSeparator {}
@@ -447,12 +448,12 @@ Item {
                 RowLayout {
                     Button {
                         text: qsTr("Save Properties Copy…")
-                        enabled: !app.infoData.is_encrypted
+                        enabled: !app.infoData.is_encrypted && !app.originalReadOnly
                         onClicked: app.chooseExport("properties")
                     }
                     Button {
                         text: qsTr("Write to Original…")
-                        enabled: !app.infoData.is_encrypted
+                        enabled: !app.infoData.is_encrypted && !app.originalReadOnly
                         onClicked: app.confirmReplace("properties")
                     }
                 }
@@ -610,6 +611,7 @@ Item {
                     }
                     Button {
                         text: qsTr("Write to Original…")
+                        enabled: !app.originalReadOnly
                         onClicked: app.confirmReplace("forms")
                     }
                 }

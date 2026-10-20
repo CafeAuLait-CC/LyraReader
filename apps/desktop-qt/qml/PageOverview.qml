@@ -75,6 +75,7 @@ Item {
                 }
                 Button {
                     text: qsTr("Apply to Original…")
+                    enabled: !app.originalReadOnly
                     visible: app.pageEditsPending
                     onClicked: app.confirmReplace("pages")
                 }
@@ -94,7 +95,7 @@ Item {
             Layout.fillWidth: true
             Layout.margins: 10
             wrapMode: Text.Wrap
-            text: app.pageEditsPending ? qsTr("Page changes are staged. The original PDF stays unchanged until Apply. Undo restores pages and their marks.") : qsTr("Shift-click or Ctrl-click to select pages. Drag a page to reorder.")
+            text: app.originalReadOnly ? qsTr("Signed PDF: export changes to a new copy. The signed original cannot be replaced.") : app.pageEditsPending ? qsTr("Page changes are staged. The original PDF stays unchanged until Apply. Undo restores pages and their marks.") : qsTr("Shift-click or Ctrl-click to select pages. Drag a page to reorder.")
             color: app.colors.textSecondary
             font.pixelSize: 11
         }

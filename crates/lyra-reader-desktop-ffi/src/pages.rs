@@ -2,7 +2,19 @@ use crate::{document::DesktopDocument, marks::Marks};
 use lyra_reader_ffi::api::*;
 use lyra_reader_session::DocumentLayout;
 use serde_json::{Value, json};
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+pub(super) struct SessionDirectory(pub PathBuf);
+impl Drop for SessionDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
 
 #[derive(Clone)]
 struct Revision {
@@ -11,21 +23,11 @@ struct Revision {
 }
 #[derive(Default)]
 pub struct PageEdits {
-    directory: Option<PathBuf>,
+    pub(super) directory: Option<Arc<SessionDirectory>>,
     base: Option<Revision>,
     undo: Vec<Revision>,
     redo: Vec<Revision>,
     sequence: u64,
-}
-impl Drop for PageEdits {
-    fn drop(&mut self) {
-        self.base = None;
-        self.undo.clear();
-        self.redo.clear();
-        if let Some(path) = &self.directory {
-            let _ = fs::remove_dir_all(path);
-        }
-    }
 }
 impl PageEdits {
     fn trim_history(history: &mut Vec<Revision>) {
@@ -35,6 +37,40 @@ impl PageEdits {
             .sum::<usize>();
         while history.len() > 1 && (history.len() > 32 || bytes > 64 * 1024 * 1024) {
             bytes = bytes.saturating_sub(history.remove(0).marks.storage_bytes());
+        }
+    }
+    pub(super) fn collect_garbage(&self, current: &Path) {
+        let Some(directory) = &self.directory else {
+            return;
+        };
+        let retained: HashSet<_> = self
+            .undo
+            .iter()
+            .chain(&self.redo)
+            .chain(self.base.iter())
+            .map(|r| r.path.clone())
+            .chain(std::iter::once(current.to_path_buf()))
+            .collect();
+        let Ok(files) = fs::read_dir(&directory.0) else {
+            return;
+        };
+        for file in files.flatten() {
+            let name = file.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some((stem, _)) = name.split_once(".pdf") else {
+                continue;
+            };
+            let Some(sequence) = stem.strip_prefix("revision-") else {
+                continue;
+            };
+            if sequence.is_empty() || !sequence.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            if !retained.contains(&directory.0.join(format!("{stem}.pdf"))) {
+                // This private directory contains only this session's revisions and caches.
+                // On Windows an open render snapshot may retain a file; retry next time.
+                let _ = fs::remove_file(file.path());
+            }
         }
     }
     pub fn clear_redo(&mut self) {
@@ -103,13 +139,20 @@ impl DesktopDocument {
                     let path = std::env::temp_dir()
                         .join(format!("LyraReaderPageEdits-{}", crate::marks::uuid()?));
                     fs::create_dir(&path).map_err(|e| e.to_string())?;
-                    edits.directory = Some(path);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                            .map_err(|e| e.to_string())?;
+                    }
+                    edits.directory = Some(Arc::new(SessionDirectory(path)));
                 }
                 edits.sequence += 1;
                 let destination = edits
                     .directory
                     .as_ref()
                     .unwrap()
+                    .0
                     .join(format!("revision-{}.pdf", edits.sequence));
                 let outcome = current
                     .apply_page_operation(destination.to_string_lossy().into_owned(), operation)
@@ -204,6 +247,7 @@ impl DesktopDocument {
         PageEdits::trim_history(&mut edits.redo);
         drop(marks);
         self.activate(Arc::clone(&document), next_marks)?;
+        edits.collect_garbage(Path::new(&document.path()));
         let state = self
             .marks
             .lock()

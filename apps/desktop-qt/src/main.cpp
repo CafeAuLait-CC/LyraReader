@@ -2,6 +2,7 @@
 #include "ReaderController.h"
 #include "WorkspaceController.h"
 #include "AnnotationOverlay.h"
+#include "NativeRaster.h"
 #include <QCommandLineParser>
 #include <QFileInfo>
 #include <QApplication>
@@ -64,6 +65,7 @@ int main(int argc, char **argv) {
     std::function<QQuickWindow *(const QUrl &,int)> createWindow;
     createWindow = [&](const QUrl &url,int page) -> QQuickWindow * {
         auto *engine = new QQmlApplicationEngine(&application);
+        engine->addImageProvider(QStringLiteral("lyrapreview"),new NativeImageProvider);
         auto *workspace = new WorkspaceController(engine);
         engine->rootContext()->setContextProperty(QStringLiteral("workspace"),workspace);
         engine->rootContext()->setContextProperty(QStringLiteral("reader"),workspace->activeReader());

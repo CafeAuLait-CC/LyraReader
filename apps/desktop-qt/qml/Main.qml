@@ -18,7 +18,13 @@ ApplicationWindow {
     color: theme.windowBg
     // Palette specification defaults to light; the user can opt into dark or system.
     readonly property var session: typeof workspace !== "undefined" ? workspace : null
+    readonly property var previewController: session ? session.preview : null
+    property var navigationHistory: []
+    readonly property bool canGoBack: navigationHistory.length > 0
     readonly property var currentReader: session ? session.activeReader : reader
+    readonly property var signatureStatus: currentReader.data.signature_status || {}
+    readonly property bool originalReadOnly: !!signatureStatus.signed
+    readonly property string readOnlyReason: signatureStatus.read_only_reason || ""
     readonly property var colors: theme
     readonly property var pageList: canvas.view
     property string appearance: session ? session.preference("appearance", "light") : "light"
@@ -75,6 +81,7 @@ ApplicationWindow {
         session.setPreference("appearance", appearance)
     onCurrentReaderChanged: {
         printRequested = false;
+        navigationHistory = [];
         previousReader = currentReader;
         selection = null;
         searchResults = [];
@@ -305,7 +312,7 @@ ApplicationWindow {
         if (["highlight", "underline", "strikeout"].indexOf(annotationTool) >= 0)
             markSelection(annotationTool);
     }
-    function pageClicked(page, x, y) {
+    function pageClicked(page, x, y, sceneX, sceneY) {
         currentPage = page;
         if (annotationTool === "stickyNote" || annotationTool === "textBox") {
             const size = currentReader.pages[page];
@@ -331,7 +338,57 @@ ApplicationWindow {
             const hit = annotationAt(page, x, y, false);
             if (hit)
                 selectAnnotation(hit);
+            else if (previewController) {
+                selection = null;
+                previewController.openAt(currentReader, page, x, y, sceneX === undefined ? width / 2 : sceneX, sceneY === undefined ? height / 2 : sceneY, zoom);
+            }
         }
+    }
+    function jumpFromPreview(page, y) {
+        const history = navigationHistory.slice();
+        history.push({
+            page: currentPage,
+            offset: pageList.contentY,
+            x: pageList.contentX,
+            zoom: zoom,
+            fitting: fitting,
+            selection: selection
+        });
+        navigationHistory = history.slice(-64);
+        selection = null;
+        navigate(page, y);
+    }
+    function goBack() {
+        if (!navigationHistory.length)
+            return;
+        const history = navigationHistory.slice(), location = history.pop();
+        navigationHistory = history;
+        fitting = false;
+        zoom = location.zoom;
+        selection = location.selection;
+        Qt.callLater(function () {
+            pageList.contentY = location.offset;
+            pageList.contentX = location.x;
+            fitting = location.fitting;
+        });
+    }
+    Connections {
+        target: root.previewController
+        function onStatusMessage(message) {
+            root.operationStatus = message;
+        }
+        function onNavigateRequested(page, y) {
+            root.jumpFromPreview(page, y);
+        }
+    }
+    PreviewPanel {
+        app: root
+        controller: root.previewController
+    }
+    Shortcut {
+        sequence: "Alt+Left"
+        enabled: root.canGoBack
+        onActivated: root.goBack()
     }
     function showSelectionMenu(item, page, x, y) {
         const point = item.mapToItem(Overlay.overlay, x, y);
@@ -636,9 +693,17 @@ ApplicationWindow {
         }).join("\n");
     }
     function confirmReplace(kind) {
+        if (originalReadOnly) {
+            operationStatus = readOnlyReason;
+            return;
+        }
         dialogs.confirmReplacement(kind);
     }
     function performReplace(kind) {
+        if (originalReadOnly) {
+            operationStatus = readOnlyReason;
+            return;
+        }
         dialogs.flushAnnotation();
         dialogs.annotationDialog.close();
         if (kind === "pages")
@@ -794,6 +859,8 @@ ApplicationWindow {
     Shortcut {
         sequence: "Escape"
         onActivated: {
+            if (root.previewController && root.previewController.visible)
+                root.previewController.close();
             root.annotationTool = "select";
             root.annotationDraft = null;
             root.selection = null;

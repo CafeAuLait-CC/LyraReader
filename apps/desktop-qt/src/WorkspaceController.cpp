@@ -20,6 +20,8 @@ QString positionKey(const ReaderController *reader) {
 }
 
 WorkspaceController::WorkspaceController(QObject *parent) : QObject(parent) {
+    connect(m_preview,&PreviewController::newWindowRequested,this,&WorkspaceController::openInNewWindow);
+    connect(m_preview,&PreviewController::externalRequested,this,&WorkspaceController::openExternal);
     QSettings settings;
     m_recent = settings.value(QStringLiteral("reader/recentDocuments")).toList();
     appendTab();
@@ -44,6 +46,7 @@ QVariantList WorkspaceController::tabs() const {
 ReaderController *WorkspaceController::activeReader() const { return m_tabs.value(m_activeIndex); }
 void WorkspaceController::selectTab(int index) {
     if (index < 0 || index >= m_tabs.size() || index == m_activeIndex) return;
+    m_preview->close();
     emit activeReaderAboutToChange();
     m_activeIndex = index;
     emit activeReaderChanged();
@@ -75,6 +78,7 @@ void WorkspaceController::closeTab(int index, bool discardPending) {
         emit closeTabRequested(index);
         return;
     }
+    if(candidate==activeReader())m_preview->close();
     emit activeReaderAboutToChange();
     auto *reader = m_tabs.takeAt(index);
     m_views.remove(reader);

@@ -123,6 +123,12 @@ ColumnLayout {
                 }
             }
             LyraToolButton {
+                symbol: "back"
+                text: qsTr("Back to reading position (Alt+Left)")
+                visible: app.canGoBack
+                onClicked: app.goBack()
+            }
+            LyraToolButton {
                 symbol: "overview"
                 text: qsTr("Page overview")
                 selected: app.overviewVisible
@@ -265,6 +271,17 @@ ColumnLayout {
                 MenuItem {
                     text: qsTr("Settings…")
                     onTriggered: app.showSettings()
+                }
+            }
+            Label {
+                visible: app.originalReadOnly
+                text: qsTr("Signed · edits to copy")
+                color: app.colors.textSecondary
+                font.pixelSize: 11
+                ToolTip.visible: signedHover.hovered
+                ToolTip.text: app.readOnlyReason
+                HoverHandler {
+                    id: signedHover
                 }
             }
             Item {
