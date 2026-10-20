@@ -11,7 +11,7 @@
 // Real loopback HTTP/SSE, used only by the GUI checks. No external service or key.
 class MockChatServer {
 public:
-    struct Response {QList<QByteArray> chunks;int delay=50;int status=200;};
+    struct Response {QList<QByteArray> chunks;int delay=50;int status=200;bool holdLast=false;};
     QList<Response> responses;
     QList<QByteArray> requests;
     bool listen() {
@@ -32,7 +32,11 @@ public:
                     qsizetype size=0;for(const auto &chunk:response.chunks)size+=chunk.size();
                     socket->write(QByteArray("HTTP/1.1 ")+QByteArray::number(response.status)+(response.status==200 ? " OK\r\n" : " Error\r\n")+
                         "Content-Type: "+(response.status==200 ? "text/event-stream" : "application/json")+"\r\nContent-Length: "+QByteArray::number(size)+"\r\nConnection: close\r\n\r\n");
-                    for(qsizetype i=0;i<response.chunks.size();++i)QTimer::singleShot(int(i)*response.delay,socket,[socket,chunk=response.chunks[i],last=i==response.chunks.size()-1]{if(socket->state()!=QAbstractSocket::ConnectedState || !socket->isOpen())return;socket->write(chunk);socket->flush();if(last)socket->disconnectFromHost();});
+                    for(qsizetype i=0;i<response.chunks.size();++i){
+                        // An unfinished response lets cancellation be tested without racing the compositor.
+                        if(response.holdLast && i==response.chunks.size()-1)continue;
+                        QTimer::singleShot(int(i)*response.delay,socket,[socket,chunk=response.chunks[i],last=i==response.chunks.size()-1]{if(socket->state()!=QAbstractSocket::ConnectedState || !socket->isOpen())return;socket->write(chunk);socket->flush();if(last)socket->disconnectFromHost();});
+                    }
                 });
             }
         });
