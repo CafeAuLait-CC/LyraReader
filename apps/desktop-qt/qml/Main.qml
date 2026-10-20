@@ -134,8 +134,11 @@ ApplicationWindow {
                 layout: layoutMode,
                 gap: pageGap
             };
-            if (!textViewVisible)
-                state.offset = pageList.contentY;
+            if (!textViewVisible) {
+                state.viewportAnchor = canvas.viewportAnchor(0);
+                state.offset = canvas.documentOffset(state.viewportAnchor);
+                state.documentX = canvas.documentX();
+            }
             session.saveViewState(currentReader, state);
         }
     }
@@ -284,25 +287,18 @@ ApplicationWindow {
         if (currentReader.pageCount === 0)
             return;
         page = Math.max(0, Math.min(currentReader.pageCount - 1, page));
-        if (!textViewVisible)
+        if (!textViewVisible) {
             canvas.navigate(page, y || 0);
+            canvas.revealPage(page);
+        }
         root.currentPage = page;
         if (textViewVisible)
             schedulePositionSave();
     }
     function changeZoom(value, anchorX, anchorY) {
-        const old = root.zoom;
-        const next = Math.max(0.1, Math.min(4, value));
-        const oldLeft = (pageList.contentWidth - currentReader.documentWidth * old) / 2;
-        const x = currentReader.zoomOffset(pageList.contentX, anchorX - oldLeft, old, next);
-        const y = currentReader.zoomOffset(pageList.contentY, anchorY, old, next);
-        root.zoom = next;
-        Qt.callLater(function () {
-            const newLeft = (pageList.contentWidth - currentReader.documentWidth * next) / 2;
-            pageList.contentX = Math.max(0, Math.min(pageList.contentWidth - pageList.width, x + newLeft));
-            pageList.contentY = Math.max(-pageList.topMargin, Math.min(Math.max(-pageList.topMargin, pageList.contentHeight - pageList.height + pageList.bottomMargin), y));
-        });
+        canvas.changeZoom(value, anchorX, anchorY);
     }
+
     function zoomBy(factor) {
         if (textViewVisible) {
             accessibleTextView.zoomBy(factor);
@@ -317,7 +313,7 @@ ApplicationWindow {
         root.fitting = true;
     }
     function updateCurrentPage() {
-        if (currentReader.pageCount > 0 && !textViewVisible && !overviewVisible)
+        if (currentReader.pageCount > 0 && !textViewVisible && !overviewVisible && !canvas.positioning)
             root.currentPage = canvas.pageAtOffset();
     }
 
@@ -346,6 +342,8 @@ ApplicationWindow {
             pendingPosition.page = requestedPage;
             pendingPosition.y = requestedY;
             delete pendingPosition.offset;
+            delete pendingPosition.viewportAnchor;
+            delete pendingPosition.documentX;
             requestedPage = -1;
         }
         layoutMode = state.layout || "Continuous";
@@ -417,7 +415,8 @@ ApplicationWindow {
         const history = navigationHistory.slice();
         history.push({
             page: currentPage,
-            offset: pageList.contentY,
+            viewportAnchor: canvas.viewportAnchor(0),
+            offset: canvas.documentOffset(canvas.viewportAnchor(0)),
             x: pageList.contentX,
             zoom: zoom,
             fitting: fitting,
@@ -436,7 +435,11 @@ ApplicationWindow {
         zoom = location.zoom;
         selection = location.selection;
         Qt.callLater(function () {
-            pageList.contentY = location.offset;
+            if (location.viewportAnchor)
+                canvas.navigate(location.viewportAnchor.page, location.viewportAnchor.y);
+            else
+                canvas.restoreDocumentOffset(location.offset);
+            root.currentPage = location.page;
             pageList.contentX = location.x;
             fitting = location.fitting;
         });
@@ -534,7 +537,7 @@ ApplicationWindow {
             currentReader.submit("bookmark_create", {
                 page: currentPage,
                 title: qsTr("Page %1").arg(currentPage + 1),
-                yPt: Math.max(0, pageList.contentY / zoom - currentReader.pages[currentPage].top)
+                yPt: canvas.pageOffset(currentPage)
             });
         }
     }
@@ -1517,8 +1520,15 @@ ApplicationWindow {
                         root.fitWidth();
                     Qt.callLater(function () {
                         root.navigate(state.page || 0, state.y || 0);
-                        if (state.offset !== undefined)
-                            pageList.contentY = state.offset;
+                        if (state.viewportAnchor)
+                            canvas.navigate(state.viewportAnchor.page, state.viewportAnchor.y);
+                        else if (state.offset !== undefined)
+                            canvas.restoreDocumentOffset(state.offset);
+                        if (state.documentX !== undefined)
+                            canvas.restoreDocumentX(state.documentX);
+                        else
+                            canvas.revealPage(state.page || 0);
+                        root.currentPage = state.page || 0;
                     });
                 } else if (root.fitting)
                     root.fitWidth();

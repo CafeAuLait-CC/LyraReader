@@ -103,7 +103,7 @@ private slots:
     void requestedWindowRegionOverridesSavedFirstPagePosition() {
         WorkspaceController saved;const auto url=QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf");
         saved.openFile(url);QTRY_COMPARE_WITH_TIMEOUT(saved.activeReader()->pageCount(),3,10000);
-        saved.saveViewState(saved.activeReader(),{{"page",2},{"offset",1800},{"zoom",1},{"fitting",false}});
+        saved.saveViewState(saved.activeReader(),{{"page",2},{"offset",1800},{"viewportAnchor",QVariantMap{{"page",2},{"y",99}}},{"zoom",1},{"fitting",false}});
         WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);
         engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
         auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
@@ -111,13 +111,84 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pendingCommands(),0,10000);
         QTRY_COMPARE(window->property("requestedPage").toInt(),-1);
         auto *view=window->findChild<QQuickItem *>("pageList");QVERIFY(view);
-        QTRY_VERIFY(qAbs(view->property("contentY").toDouble()-150.0*window->property("zoom").toDouble())<1);
+        QTRY_VERIFY(visualItem(window->contentItem(),"pdfPage0"));
+        QTRY_VERIFY(qAbs(visualItem(window->contentItem(),"pdfPage0")->mapToItem(view,QPointF(0,0)).y()+150.0*window->property("zoom").toDouble())<1);
         QSignalSpy requested(&workspace,&WorkspaceController::newWindowRequested);workspace.openInNewWindow(url,1,200);
         QCOMPARE(requested.size(),1);QCOMPARE(requested.first().at(1).toInt(),1);QCOMPARE(requested.first().at(2).toDouble(),200.0);
         window->setProperty("requestedPage",1);window->setProperty("requestedY",200.0);QVERIFY(QMetaObject::invokeMethod(window,"restorePosition"));
         QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pendingCommands(),0,10000);
-        const auto placement=workspace.activeReader()->pages().at(1).toMap();
-        QTRY_VERIFY(qAbs(view->property("contentY").toDouble()-(placement.value("top").toDouble()+200)*window->property("zoom").toDouble())<1);
+        QTRY_VERIFY(visualItem(window->contentItem(),"pdfPage1"));
+        QTRY_VERIFY(qAbs(visualItem(window->contentItem(),"pdfPage1")->mapToItem(view,QPointF(0,0)).y()+200.0*window->property("zoom").toDouble())<1);
+    }
+    void latePageZoomPreservesTheVisiblePointAndReadingPosition_data() {
+        QTest::addColumn<bool>("facing");QTest::addColumn<bool>("legacy");
+        QTest::newRow("continuous")<<false<<false;
+        QTest::newRow("facing-right-page")<<true<<false;
+        QTest::newRow("legacy-continuous-offset")<<false<<true;
+        QTest::newRow("legacy-facing-offset")<<true<<true;
+    }
+    void latePageZoomPreservesTheVisiblePointAndReadingPosition() {
+        QFETCH(bool,facing);QFETCH(bool,legacy);
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto file=scratch.path()+"/late-page.pdf";
+        QVERIFY(QFile::copy(QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf",file));
+        const auto url=QUrl::fromLocalFile(file);QVariantMap saved;QPointF savedPoint;
+        {
+            WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);
+            engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
+            auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);workspace.openFile(url);
+            QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pageCount(),9,10000);QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pendingCommands(),0,10000);
+            auto *view=window->findChild<QQuickItem *>("pageList");QVERIFY(view);
+            // Opening schedules a saved-position/layout restore; begin interaction
+            // only after its first textured page has actually reached the scene.
+            QTRY_VERIFY_WITH_TIMEOUT(visualItem(window->contentItem(),"pdfPage0") && visualItem(window->contentItem(),"pdfPage0")->property("texturesReady").toBool(),10000);
+            if(facing) {
+                QVERIFY(QMetaObject::invokeMethod(window,"setPageLayout",Q_ARG(QVariant,"Facing")));
+                QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pendingCommands(),0,10000);
+            }
+            window->setProperty("fitting",false);
+            QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,6),Q_ARG(QVariant,150.0)));
+            const auto page=[&]{return visualItem(window->contentItem(),"pdfPage6");};
+            QTRY_VERIFY_WITH_TIMEOUT(page() && page()->property("texturesReady").toBool(),10000);
+            const QPointF anchor(view->width()/2,180);
+            const auto point=page()->mapFromItem(view,anchor)/window->property("zoom").toDouble();
+            for(int step=0;step<12;++step) {
+                const double scale=step%3==0?2.7:step%3==1?4.0:3.6;
+                QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,scale),Q_ARG(QVariant,anchor.x()),Q_ARG(QVariant,anchor.y())));
+                QTest::qWait(16);QVERIFY(page());
+                const auto actual=page()->mapFromItem(view,anchor)/scale;
+                QVERIFY2(QLineF(point,actual).length()<0.5,qPrintable(QString("Zoom anchor drift: %1 pt").arg(QLineF(point,actual).length())));
+            }
+            QTRY_VERIFY_WITH_TIMEOUT(page() && page()->property("texturesReady").toBool(),10000);QCOMPARE(window->property("currentPage").toInt(),facing?5:6);
+            // Retain a specifically selected right-hand page as well as the row anchor.
+            QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,6),Q_ARG(QVariant,-page()->mapToItem(view,QPointF(0,0)).y()/window->property("zoom").toDouble())));
+            const double bookmarkY=qMax(0.0,-page()->mapToItem(view,QPointF(0,0)).y()/window->property("zoom").toDouble());
+            QVERIFY(QMetaObject::invokeMethod(window,"addBookmark"));
+            const auto bookmarks=[&]{return workspace.activeReader()->data().value("marks").toMap().value("bookmarks").toList();};
+            QTRY_COMPARE_WITH_TIMEOUT(bookmarks().size(),1,10000);QCOMPARE(bookmarks().first().toMap().value("page").toInt(),6);
+            QVERIFY(qAbs(bookmarks().first().toMap().value("yPt").toDouble()-bookmarkY)<0.5);
+            const auto before=page()->mapToItem(view,QPointF(0,0));
+            QVERIFY(QMetaObject::invokeMethod(window,"jumpFromPreview",Q_ARG(QVariant,2),Q_ARG(QVariant,80.0)));
+            QTest::qWait(20);QVERIFY(QMetaObject::invokeMethod(window,"goBack"));
+            QTRY_VERIFY(page() && qAbs(page()->mapToItem(view,QPointF(0,0)).y()-before.y())<1);
+            QCOMPARE(window->property("currentPage").toInt(),6);
+            QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));saved=workspace.viewState(workspace.activeReader());
+            savedPoint=page()->mapFromItem(view,QPointF(view->width()/2,180))/window->property("zoom").toDouble();
+            QCOMPARE(saved.value("page").toInt(),6);QCOMPARE(saved.value("viewportAnchor").toMap().value("page").toInt(),facing?5:6);
+            if(legacy){auto previous=saved;previous.remove("viewportAnchor");previous.remove("documentX");workspace.saveViewState(workspace.activeReader(),previous);}
+        }
+        {
+            WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);
+            engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
+            auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);workspace.openFile(url);
+            QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pageCount(),9,10000);QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pendingCommands(),0,10000);
+            auto *view=window->findChild<QQuickItem *>("pageList");QVERIFY(view);
+            const auto page=[&]{return visualItem(window->contentItem(),"pdfPage6");};
+            QTRY_VERIFY_WITH_TIMEOUT(page() && page()->property("texturesReady").toBool(),10000);
+            QTRY_COMPARE(window->property("currentPage").toInt(),6);QCOMPARE(window->property("zoom").toDouble(),saved.value("zoom").toDouble());
+            const double expected=-saved.value("viewportAnchor").toMap().value("y").toDouble()*window->property("zoom").toDouble();
+            QTRY_VERIFY(qAbs(page()->mapToItem(view,QPointF(0,0)).y()-expected)<1);
+            if(!legacy)QVERIFY(QLineF(savedPoint,page()->mapFromItem(view,QPointF(view->width()/2,180))/window->property("zoom").toDouble()).length()<0.5);
+        }
     }
     void pageOverviewSupportsAccessibleSelectionAndKeyboardReading() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto file=scratch.path()+"/overview.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",file));
@@ -802,7 +873,8 @@ private slots:
                 const auto inputTime=Performance::now();if(step)inputPacing.append((inputTime-lastInput)/1000.0);lastInput=inputTime;
                 const auto scale=step%3==0?2.7:step%3==1?4.0:3.6;
                 QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,scale),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
-                view->setProperty("contentX",double((step+trial)%8*70));view->setProperty("contentY",reader.pages().at(pageIndex).toMap().value("top").toDouble()*scale+double(200+(step+trial)%8*70));
+                view->setProperty("contentX",double((step+trial)%8*70));
+                QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,pageIndex),Q_ARG(QVariant,double(200+(step+trial)%8*70)/scale)));
                 if(step<11)QTest::qWait(16);
             }
             const auto endInput=Performance::now();burstDurations.append((endInput-begin)/1000.0);bool armed=false;QTimer ready;ready.setInterval(5);
