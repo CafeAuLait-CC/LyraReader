@@ -15,6 +15,7 @@ Pane {
         width: parent.width
         spacing: 6
         Label {
+            textFormat: Text.PlainText
             height: 30
             verticalAlignment: Text.AlignVCenter
             text: app.pendingRedactions.length ? qsTr("%1 pending redactions").arg(app.pendingRedactions.length) : (app.currentReader.data.forms && app.currentReader.data.forms.refusal ? app.currentReader.data.forms.refusal : qsTr("Fill form fields on the page"))

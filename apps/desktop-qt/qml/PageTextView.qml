@@ -56,6 +56,7 @@ Pane {
                 onClicked: app.navigate(view.page - 1)
             }
             Label {
+                textFormat: Text.PlainText
                 Layout.fillWidth: true
                 text: qsTr("Page %1 of %2 · Text").arg(view.page + 1).arg(view.owner.pageCount)
                 elide: Text.ElideRight
@@ -86,6 +87,7 @@ Pane {
             }
         }
         Label {
+            textFormat: Text.PlainText
             Layout.fillWidth: true
             text: qsTr("Extracted text. Use page view for the original layout, figures and annotations. Alt+PageUp / Alt+PageDown changes pages.")
             wrapMode: Text.Wrap
@@ -98,6 +100,7 @@ Pane {
             running: visible
         }
         Label {
+            textFormat: Text.PlainText
             visible: !!view.extracted && !view.extracted.text.length
             text: qsTr("No text was found on this page.")
             color: app.colors.textSecondary

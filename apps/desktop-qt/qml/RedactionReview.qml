@@ -69,11 +69,13 @@ Dialog {
     ColumnLayout {
         anchors.fill: parent
         Label {
+            textFormat: Text.PlainText
             text: qsTr("Covered text is deleted from page content. Intersecting vectors and images are removed whole. A page whose content cannot be attributed is rasterised and loses its entire text layer. Marks are painted black.")
             Layout.fillWidth: true
             wrapMode: Text.Wrap
         }
         Label {
+            textFormat: Text.PlainText
             text: reviewDialog.replacing ? qsTr("This changes the original file. A byte-identical backup is verified before the replacement is written.") : qsTr("The source PDF stays unchanged. The copy is reopened and verified before it is saved. Session form edits and sidecar annotations are not included.")
             Layout.fillWidth: true
             wrapMode: Text.Wrap
@@ -85,6 +87,7 @@ Dialog {
             Layout.alignment: Qt.AlignHCenter
         }
         Label {
+            textFormat: Text.PlainText
             visible: reviewDialog.error.length > 0
             text: reviewDialog.error
             color: app.colors.errorFg
@@ -92,6 +95,7 @@ Dialog {
             wrapMode: Text.Wrap
         }
         Label {
+            textFormat: Text.PlainText
             visible: !!reviewDialog.preview
             text: qsTr("%1 areas · %2 characters under the marks").arg(reviewDialog.areas.length).arg(reviewDialog.preview ? reviewDialog.preview.removed_characters : 0)
             color: app.colors.textSecondary
@@ -108,6 +112,7 @@ Dialog {
                         required property var modelData
                         Layout.fillWidth: true
                         Label {
+                            textFormat: Text.PlainText
                             text: qsTr("Page %1 · %2 characters · %3 graphic objects").arg(modelData.page + 1).arg(modelData.characters).arg(modelData.graphics)
                             Layout.fillWidth: true
                             wrapMode: Text.Wrap

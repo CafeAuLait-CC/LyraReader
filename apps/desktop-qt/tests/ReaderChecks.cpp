@@ -7,6 +7,7 @@
 #include "PreviewController.h"
 #include "MockChatServer.h"
 #include "PerformanceRecorder.h"
+#include "NativeCorpusChecks.h"
 #include <QJsonDocument>
 #include <QSaveFile>
 #include <QSysInfo>
@@ -661,10 +662,22 @@ private slots:
         if(removed){const auto event=completion(store.read(account));absent=!event.isEmpty() && event[2].toString().isEmpty() && event[3].toString().isEmpty();}
         QVERIFY2(wrote && writeOk && readOk && removed && absent,qPrintable(failure.isEmpty()?QString("System vault did not complete the isolated round trip"):failure));
     }
+    void coldNarrativeCitationsAndBooktabsPreviewTheIndexedRegion() { NativeCorpus::coldNarrativeAndTablePreviews(root); }
+    void realLockedPapersUseNativeReferenceCrops() { NativeCorpus::realPapers(root); }
+    void documentCommentsStayLiteralAndDoNotLoadRemoteImages() {
+        MockChatServer server;QVERIFY(server.listen());QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/literal.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
+        auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto note="<b>Literal annotation</b><img src='"+server.baseUrl()+"/unwanted-image'>";
+        reader->submit("mark_create",{{"entry",QVariantMap{{"kind","square"},{"page",0},{"version",1},{"rect",QVariantMap{{"x",100},{"y",100},{"width",100},{"height",70}}},{"color","#E8BC55FF"},{"note",note},{"strokeWidth",2}}}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(window,"showSidebar",Q_ARG(QVariant,"annotations")));QTest::qWait(300);QCOMPARE(server.requests.size(),0);
+    }
     void pageTextViewExposesReadOnlyAccessibleTextAndKeyboardSelection() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto firstPath=scratch.path()+"/reading.pdf",secondPath=scratch.path()+"/other.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",firstPath));QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",secondPath));
         WorkspaceController workspace;auto &reader=*workspace.activeReader();QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("reader",&reader);engine.rootContext()->setContextProperty("workspace",&workspace);engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
         auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
-        reader.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        reader.openFile(QUrl::fromLocalFile(firstPath));QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
         const bool shortcutFocus=QGuiApplication::platformName()=="offscreen" || QGuiApplication::focusWindow()==window;
         auto *readAction=window->findChild<QObject *>("readPageTextAction");QVERIFY(readAction);
         if(shortcutFocus)QTest::keyClick(window,Qt::Key_R,Qt::ControlModifier|Qt::ShiftModifier);
@@ -678,7 +691,7 @@ private slots:
         QTest::keyClick(window,Qt::Key_Home,Qt::ControlModifier);QCOMPARE(text->property("cursorPosition").toInt(),0);QCOMPARE(window->property("currentPage").toInt(),0);
         QTest::keyClick(window,Qt::Key_PageDown,Qt::AltModifier);QTRY_COMPARE(window->property("currentPage").toInt(),1);QTRY_VERIFY(text->property("text").toString().contains("Page 2"));
         QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));QCOMPARE(workspace.viewState(&reader).value("page").toInt(),1);QVERIFY(!workspace.viewState(&reader).contains("offset"));
-        workspace.newTab();workspace.activeReader()->openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pendingCommands(),0,10000);
+        workspace.newTab();workspace.activeReader()->openFile(QUrl::fromLocalFile(secondPath));QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pendingCommands(),0,10000);
         workspace.selectTab(0);QTRY_COMPARE(window->property("currentPage").toInt(),1);QTRY_VERIFY(text->property("text").toString().contains("Page 2"));text->forceActiveFocus();
         QTest::keyClick(window,Qt::Key_PageUp,Qt::AltModifier);QTRY_COMPARE(window->property("currentPage").toInt(),0);
         if(shortcutFocus)QTest::keyClick(window,Qt::Key_R,Qt::ControlModifier|Qt::ShiftModifier);

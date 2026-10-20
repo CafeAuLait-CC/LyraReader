@@ -48,6 +48,7 @@ Item {
                 color: app.colors.noteBg
                 border.color: app.colors.noteFg
                 Label {
+                    textFormat: Text.PlainText
                     anchors.centerIn: parent
                     text: "✎"
                     font.pixelSize: Math.max(6, Math.min(18, parent.height * .7))

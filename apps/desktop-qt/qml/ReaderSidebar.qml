@@ -62,6 +62,7 @@ Pane {
             Layout.rightMargin: 8
             Layout.bottomMargin: 8
             Label {
+                textFormat: Text.PlainText
                 text: ({
                         bookmarks: qsTr("Bookmarks"),
                         outline: qsTr("Outline"),
@@ -145,6 +146,7 @@ Pane {
                             }
                         }
                         Label {
+                            textFormat: Text.PlainText
                             width: 102
                             horizontalAlignment: Text.AlignHCenter
                             text: qsTr("Page %1").arg(thumbnail.index + 1)
@@ -168,6 +170,7 @@ Pane {
                     highlighted: modelData.page === app.currentPage
                     contentItem: Label {
                         id: outlineText
+                        textFormat: Text.PlainText
                         text: modelData.title
                         wrapMode: Text.Wrap
                         font.pixelSize: 12
@@ -177,6 +180,7 @@ Pane {
                         app.navigate(modelData.page, modelData.y_pt || 0)
                 }
                 Label {
+                    textFormat: Text.PlainText
                     anchors.centerIn: parent
                     visible: outline.count === 0
                     width: parent.width - 30
@@ -201,11 +205,13 @@ Pane {
                             Layout.fillWidth: true
                             spacing: 3
                             Label {
+                                textFormat: Text.PlainText
                                 text: modelData.title
                                 Layout.fillWidth: true
                                 elide: Text.ElideRight
                             }
                             Label {
+                                textFormat: Text.PlainText
                                 text: qsTr("Page %1").arg(modelData.page + 1)
                                 color: app.colors.textTertiary
                                 font.pixelSize: 11
@@ -220,6 +226,7 @@ Pane {
                     onClicked: app.navigate(modelData.page, modelData.yPt || 0)
                 }
                 Label {
+                    textFormat: Text.PlainText
                     anchors.centerIn: parent
                     width: parent.width - 32
                     visible: bookmarkList.count === 0
@@ -257,12 +264,14 @@ Pane {
                         spacing: 4
                         RowLayout {
                             Label {
+                                textFormat: Text.PlainText
                                 text: annotation.is_reply ? "↳ " + (annotation.author || qsTr("Reply")) : annotation.kind
                                 color: app.colors.accent
                                 font.pixelSize: 11
                                 Layout.fillWidth: true
                             }
                             Label {
+                                textFormat: Text.PlainText
                                 text: qsTr("p.%1").arg(annotation.page + 1)
                                 color: app.colors.textTertiary
                                 font.pixelSize: 11
@@ -270,6 +279,7 @@ Pane {
                         }
                         Label {
                             id: annotationText
+                            textFormat: Text.PlainText
                             text: annotation.note || annotation.contents || qsTr("No text")
                             wrapMode: Text.Wrap
                             maximumLineCount: 4
@@ -278,12 +288,14 @@ Pane {
                             font.pixelSize: 12
                         }
                         Label {
+                            textFormat: Text.PlainText
                             visible: !!annotation.modified
                             text: Logic.annotationDate(annotation.modified)
                             font.pixelSize: 10
                             color: app.colors.textTertiary
                         }
                         Label {
+                            textFormat: Text.PlainText
                             visible: modelData.orphanReason.length > 0
                             text: modelData.orphanReason
                             Layout.fillWidth: true
@@ -295,6 +307,7 @@ Pane {
                     onClicked: app.selectAnnotation(annotation)
                 }
                 Label {
+                    textFormat: Text.PlainText
                     anchors.centerIn: parent
                     visible: annotationList.count === 0
                     width: parent.width - 30

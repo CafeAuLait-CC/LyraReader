@@ -85,6 +85,7 @@ Popup {
                     Layout.fillWidth: true
                     spacing: 1
                     Label {
+                        textFormat: Text.PlainText
                         text: panel.preview.title || ""
                         Layout.fillWidth: true
                         elide: Text.ElideRight
@@ -92,6 +93,7 @@ Popup {
                         font.weight: Font.DemiBold
                     }
                     Label {
+                        textFormat: Text.PlainText
                         text: qsTr("From page %1 · %2").arg((panel.preview.from_page || 0) + 1).arg(panel.preview.kind || "")
                         font.pixelSize: 10
                         color: app.colors.textTertiary
@@ -130,6 +132,7 @@ Popup {
                     height: 2
                 }
                 Label {
+                    textFormat: Text.PlainText
                     visible: panel.preview.kind === "section"
                     Layout.fillWidth: true
                     Layout.leftMargin: 16
@@ -141,6 +144,7 @@ Popup {
                     wrapMode: Text.Wrap
                 }
                 Label {
+                    textFormat: Text.PlainText
                     visible: panel.preview.kind === "section"
                     Layout.fillWidth: true
                     Layout.leftMargin: 16
@@ -150,6 +154,7 @@ Popup {
                     wrapMode: Text.Wrap
                 }
                 Label {
+                    textFormat: Text.PlainText
                     visible: panel.preview.kind === "reference" && !!panel.preview.ambiguous
                     text: panel.preview.resolution_reason || ""
                     Layout.fillWidth: true
@@ -175,6 +180,7 @@ Popup {
                             onClicked: controller.showEntry(referenceEntry.index)
                         }
                         TextArea {
+                            textFormat: TextEdit.PlainText
                             text: referenceEntry.modelData.text || ""
                             Layout.fillWidth: true
                             readOnly: true
@@ -218,6 +224,7 @@ Popup {
                             }
                         }
                         Label {
+                            textFormat: Text.PlainText
                             visible: crop.status === Image.Error
                             text: qsTr("This preview could not be rendered.")
                             color: app.colors.errorFg
@@ -226,6 +233,7 @@ Popup {
                     }
                 }
                 Label {
+                    textFormat: Text.PlainText
                     visible: !!panel.preview.caption
                     text: panel.preview.caption || ""
                     Layout.fillWidth: true

@@ -49,6 +49,7 @@ Pane {
         anchors.fill: parent
         spacing: 8
         Label {
+            textFormat: Text.PlainText
             text: aiPanel.running ? (aiPanel.viewState.activeModel || "") + " · " + (aiPanel.viewState.activeHost || "") : (app.aiSettings.model || qsTr("Choose an AI model in Settings"))
             wrapMode: Text.Wrap
             Layout.fillWidth: true
@@ -67,6 +68,7 @@ Pane {
         }
         TextArea {
             id: question
+            textFormat: TextEdit.PlainText
             objectName: "aiQuestion"
             text: aiPanel.input.question || ""
             Layout.fillWidth: true
@@ -97,6 +99,7 @@ Pane {
             onClicked: aiPanel.prepare()
         }
         Label {
+            textFormat: Text.PlainText
             text: aiPanel.viewState.status || ""
             visible: text.length > 0
             wrapMode: Text.Wrap
@@ -106,6 +109,7 @@ Pane {
             Accessible.role: Accessible.StaticText
         }
         Label {
+            textFormat: Text.PlainText
             visible: !!aiPanel.plan
             Layout.fillWidth: true
             wrapMode: Text.Wrap
@@ -178,6 +182,7 @@ Pane {
             }
         }
         Label {
+            textFormat: Text.PlainText
             visible: !!aiPanel.viewState.usage && !!aiPanel.viewState.usage.total_tokens
             text: qsTr("Tokens: %1").arg(aiPanel.viewState.usage ? aiPanel.viewState.usage.total_tokens || 0 : 0)
             color: app.colors.textTertiary

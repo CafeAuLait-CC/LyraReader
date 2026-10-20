@@ -13,6 +13,7 @@ Pane {
         anchors.fill: parent
         RowLayout {
             Label {
+                textFormat: Text.PlainText
                 text: qsTr("Search")
                 font.weight: Font.DemiBold
                 Layout.fillWidth: true
@@ -36,6 +37,7 @@ Pane {
         }
         RowLayout {
             Label {
+                textFormat: Text.PlainText
                 text: qsTr("%1 results").arg(app.searchResults.length)
                 color: app.colors.textSecondary
                 Layout.fillWidth: true
@@ -69,12 +71,14 @@ Pane {
                 highlighted: index === app.searchIndex
                 contentItem: ColumnLayout {
                     Label {
+                        textFormat: Text.PlainText
                         text: qsTr("Page %1").arg(modelData.page + 1)
                         color: app.colors.accent
                         font.pixelSize: 11
                     }
                     Label {
                         id: snippet
+                        textFormat: Text.PlainText
                         text: modelData.snippet
                         wrapMode: Text.Wrap
                         maximumLineCount: 4

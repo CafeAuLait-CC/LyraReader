@@ -1155,6 +1155,7 @@ ApplicationWindow {
             RowLayout {
                 anchors.fill: parent
                 Label {
+                    textFormat: Text.PlainText
                     text: qsTr("Error: %1").arg(root.markState.error || currentReader.error)
                     color: theme.errorFg
                     wrapMode: Text.Wrap
@@ -1288,6 +1289,7 @@ ApplicationWindow {
                 }
             }
             Label {
+                textFormat: Text.PlainText
                 text: "/ " + currentReader.pageCount
                 color: theme.textTertiary
             }
@@ -1302,6 +1304,7 @@ ApplicationWindow {
                 Layout.fillWidth: true
             }
             Label {
+                textFormat: Text.PlainText
                 text: root.operationStatus
                 elide: Text.ElideMiddle
                 Layout.maximumWidth: Math.max(100, root.width / 3)
@@ -1313,6 +1316,7 @@ ApplicationWindow {
                 action: fitAction
             }
             Label {
+                textFormat: Text.PlainText
                 text: qsTr("Ctrl + scroll to zoom")
                 color: theme.textTertiary
                 font.pixelSize: 11
@@ -1341,6 +1345,7 @@ ApplicationWindow {
         standardButtons: Dialog.Ok | Dialog.Cancel
         ColumnLayout {
             Label {
+                textFormat: Text.PlainText
                 text: qsTr("Enter the password for this PDF.")
             }
             TextField {

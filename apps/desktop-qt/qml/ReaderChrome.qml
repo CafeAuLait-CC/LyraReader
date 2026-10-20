@@ -47,6 +47,7 @@ ColumnLayout {
                         anchors.rightMargin: 4
                         spacing: 8
                         Label {
+                            textFormat: Text.PlainText
                             text: modelData.title
                             elide: Text.ElideRight
                             Layout.fillWidth: true
@@ -325,6 +326,7 @@ ColumnLayout {
                 }
             }
             Label {
+                textFormat: Text.PlainText
                 visible: app.originalReadOnly && app.width >= 1000
                 text: qsTr("Signed · edits to copy")
                 color: app.colors.textSecondary

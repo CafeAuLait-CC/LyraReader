@@ -15,6 +15,7 @@ ScrollView {
         y: Math.max(20, (welcome.availableHeight - implicitHeight) / 2)
         spacing: 12
         Label {
+            textFormat: Text.PlainText
             Layout.alignment: Qt.AlignHCenter
             text: "L"
             visible: welcome.height > 440
@@ -23,6 +24,7 @@ ScrollView {
             Accessible.ignored: true
         }
         Label {
+            textFormat: Text.PlainText
             Layout.fillWidth: true
             horizontalAlignment: Text.AlignHCenter
             wrapMode: Text.Wrap
@@ -31,6 +33,7 @@ ScrollView {
             font.weight: Font.Light
         }
         Label {
+            textFormat: Text.PlainText
             Layout.fillWidth: true
             horizontalAlignment: Text.AlignHCenter
             text: qsTr("Drop a PDF here, or open one to begin.")
@@ -44,6 +47,7 @@ ScrollView {
             visible: !app.currentReader.loading
             onClicked: app.openDialog()
             contentItem: Text {
+                textFormat: Text.PlainText
                 text: primaryOpen.text
                 font: primaryOpen.font
                 color: app.colors.onAccent
@@ -69,6 +73,7 @@ ScrollView {
             Layout.topMargin: 12
             visible: welcome.recents.length > 0 && !app.currentReader.loading
             Label {
+                textFormat: Text.PlainText
                 text: qsTr("Recent documents")
                 font.weight: Font.DemiBold
                 Layout.fillWidth: true

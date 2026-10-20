@@ -66,6 +66,7 @@ Item {
                     onClicked: app.movePages(Math.min(app.currentReader.pageCount, Math.max.apply(null, app.selectedPages) + 2))
                 }
                 Label {
+                    textFormat: Text.PlainText
                     text: qsTr("%1 selected").arg(app.selectedPages.length)
                     color: app.colors.textSecondary
                     font.pixelSize: 11
@@ -92,6 +93,7 @@ Item {
             }
         }
         Label {
+            textFormat: Text.PlainText
             Layout.fillWidth: true
             Layout.margins: 10
             wrapMode: Text.Wrap
@@ -151,6 +153,7 @@ Item {
                             }
                         }
                         Label {
+                            textFormat: Text.PlainText
                             width: 145
                             horizontalAlignment: Text.AlignHCenter
                             text: qsTr("Page %1").arg(cell.index + 1)

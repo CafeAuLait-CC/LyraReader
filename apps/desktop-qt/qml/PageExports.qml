@@ -141,17 +141,20 @@ Dialog {
     ColumnLayout {
         anchors.fill: parent
         Label {
+            textFormat: Text.PlainText
             text: exportsDialog.merging ? qsTr("The open document comes first. PDFs below are appended in order. The first outline is kept; appended outlines are not imported. Embedded annotations travel with their pages.") : qsTr("Type disjoint page ranges using the page numbers shown by the reader, or split every N pages. Existing PDFs or annotation sidecars stop the split before writing.")
             wrapMode: Text.Wrap
             Layout.fillWidth: true
         }
         Label {
+            textFormat: Text.PlainText
             text: qsTr("LyraReader annotations are carried in adjacent sidecars. Other documents' sidecars are not imported. The open document is unchanged.")
             wrapMode: Text.Wrap
             Layout.fillWidth: true
             color: app.colors.textSecondary
         }
         Label {
+            textFormat: Text.PlainText
             visible: exportsDialog.blockedReason.length > 0
             text: exportsDialog.blockedReason
             wrapMode: Text.Wrap
@@ -162,6 +165,7 @@ Dialog {
             visible: exportsDialog.merging
             Layout.fillWidth: true
             Label {
+                textFormat: Text.PlainText
                 text: qsTr("First: %1").arg(exportsDialog.owner ? exportsDialog.owner.title : "")
                 Layout.fillWidth: true
                 elide: Text.ElideMiddle
@@ -183,6 +187,7 @@ Dialog {
                 required property int index
                 width: ListView.view.width
                 Label {
+                    textFormat: Text.PlainText
                     text: (index + 2) + ". " + decodeURIComponent(modelData.toString().split('/').pop())
                     Layout.fillWidth: true
                     elide: Text.ElideMiddle
@@ -242,6 +247,7 @@ Dialog {
             visible: !exportsDialog.merging
             Layout.fillWidth: true
             Label {
+                textFormat: Text.PlainText
                 text: exportsDialog.outputDirectory.toString() || qsTr("Output beside the source PDF")
                 Layout.fillWidth: true
                 elide: Text.ElideMiddle
@@ -257,6 +263,7 @@ Dialog {
             Layout.alignment: Qt.AlignHCenter
         }
         Label {
+            textFormat: Text.PlainText
             visible: exportsDialog.error.length > 0
             text: exportsDialog.error
             color: app.colors.errorFg
@@ -264,6 +271,7 @@ Dialog {
             wrapMode: Text.Wrap
         }
         Label {
+            textFormat: Text.PlainText
             visible: !!exportsDialog.plan && exportsDialog.plan.conflicts.length > 0
             text: qsTr("One or more output files or sidecars already exist. Choose another folder.")
             color: app.colors.errorFg
@@ -288,6 +296,7 @@ Dialog {
             }
         }
         Label {
+            textFormat: Text.PlainText
             visible: !exportsDialog.merging
             text: qsTr("Each output is verified independently. If a later write fails, earlier completed files remain and the error reports them.")
             wrapMode: Text.Wrap

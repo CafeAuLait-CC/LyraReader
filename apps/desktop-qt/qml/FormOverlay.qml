@@ -91,6 +91,7 @@ Item {
                     color: app.colors.fieldBg
                     border.color: app.colors.accentBorder
                     Label {
+                        textFormat: Text.PlainText
                         anchors.centerIn: parent
                         text: "✓"
                         visible: parent.parent.checked
@@ -150,6 +151,7 @@ Item {
                 })
             }
             Label {
+                textFormat: Text.PlainText
                 anchors.fill: parent
                 visible: widget.field.kind === "signature"
                 text: qsTr("Signature field · read only")

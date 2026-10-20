@@ -29,6 +29,7 @@ Item {
         modal: true
         standardButtons: Dialog.Discard | Dialog.Cancel
         Label {
+            textFormat: Text.PlainText
             width: Math.min(400, app.width - 80)
             wrapMode: Text.Wrap
             text: qsTr("Page edits, form edits, redaction marks, pending deletions, or unsaved annotation notes have not been written to the PDF. Discard them and close? Choose Cancel to apply or export your changes first. Saved annotations remain in their sidecar.")
@@ -102,6 +103,7 @@ Item {
         modal: true
         standardButtons: Dialog.Yes | Dialog.Cancel
         Label {
+            textFormat: Text.PlainText
             text: qsTr("A byte-identical backup will be verified before the original is replaced. Pending changes are written only after this confirmation.")
             width: Math.min(400, app.width - 80)
             wrapMode: Text.Wrap
@@ -125,6 +127,7 @@ Item {
         modal: true
         standardButtons: Dialog.Ok | Dialog.Cancel
         Label {
+            textFormat: Text.PlainText
             width: Math.min(400, app.width - 80)
             text: qsTr("The unreadable sidecar will be copied and verified as a backup before a fresh annotation file is created. The PDF is unchanged.")
             wrapMode: Text.Wrap
@@ -195,6 +198,7 @@ Item {
         modal: true
         standardButtons: Dialog.Yes | Dialog.Cancel
         Label {
+            textFormat: Text.PlainText
             text: qsTr("Pages and their marks are removed from the working copy. Undo restores them. The original stays unchanged until Apply.")
             width: Math.min(400, app.width - 80)
             wrapMode: Text.Wrap
@@ -213,6 +217,7 @@ Item {
         modal: true
         standardButtons: Dialog.Yes | Dialog.Cancel
         Label {
+            textFormat: Text.PlainText
             text: qsTr("Discard staged page changes and marks made in the working copy, then reopen the original PDF.")
             width: Math.min(400, app.width - 80)
             wrapMode: Text.Wrap
@@ -312,6 +317,7 @@ Item {
                 width: parent.width
                 spacing: 12
                 Label {
+                    textFormat: Text.PlainText
                     text: qsTr("Reading")
                     font.weight: Font.DemiBold
                 }
@@ -329,6 +335,7 @@ Item {
                 }
                 RowLayout {
                     Label {
+                        textFormat: Text.PlainText
                         text: qsTr("Page gap (pt)")
                         Layout.fillWidth: true
                     }
@@ -340,6 +347,7 @@ Item {
                     }
                 }
                 Label {
+                    textFormat: Text.PlainText
                     text: qsTr("AI Assistant")
                     font.weight: Font.DemiBold
                     Layout.topMargin: 12
@@ -378,6 +386,7 @@ Item {
                     Accessible.name: qsTr("AI API key")
                 }
                 Label {
+                    textFormat: Text.PlainText
                     text: qsTr("Remote requests send the previewed document text only after Send. Keys use the system keychain; no plaintext fallback.")
                     wrapMode: Text.Wrap
                     Layout.fillWidth: true
@@ -435,6 +444,7 @@ Item {
                 width: parent.width
                 spacing: 9
                 Label {
+                    textFormat: Text.PlainText
                     text: qsTr("PDF properties")
                     font.weight: Font.DemiBold
                 }
@@ -463,6 +473,7 @@ Item {
                     placeholderText: qsTr("Keywords")
                 }
                 Label {
+                    textFormat: Text.PlainText
                     text: qsTr("%1 pages · PDF %2%3").arg(app.currentReader.pageCount).arg(app.infoData.pdf_version || "").arg(app.infoData.is_encrypted ? qsTr(" · encrypted") : "")
                     color: app.colors.textTertiary
                 }
@@ -479,6 +490,7 @@ Item {
                     }
                 }
                 Label {
+                    textFormat: Text.PlainText
                     text: qsTr("Recognised paper metadata")
                     font.weight: Font.DemiBold
                     Layout.topMargin: 12
@@ -516,6 +528,7 @@ Item {
                         Layout.fillWidth: true
                         spacing: 2
                         Label {
+                            textFormat: Text.PlainText
                             text: modelData.label + " · " + (field ? field.source_label : "")
                             font.pixelSize: 11
                             color: app.colors.textTertiary
@@ -528,6 +541,7 @@ Item {
                     }
                 }
                 TextArea {
+                    textFormat: TextEdit.PlainText
                     text: app.bibtex
                     readOnly: true
                     selectByMouse: true
@@ -566,6 +580,7 @@ Item {
                 width: parent.width
                 spacing: 10
                 Label {
+                    textFormat: Text.PlainText
                     text: app.currentReader.data.forms ? (app.currentReader.data.forms.refusal || qsTr("Changes stay in this session until saved.")) : qsTr("Reading form fields…")
                     Layout.fillWidth: true
                     wrapMode: Text.Wrap
@@ -578,6 +593,7 @@ Item {
                         readonly property var draft: app.formValues[modelData.id] || null
                         Layout.fillWidth: true
                         Label {
+                            textFormat: Text.PlainText
                             text: modelData.name + qsTr(" · p.%1").arg(modelData.page + 1)
                             font.pixelSize: 11
                             color: app.colors.textSecondary
@@ -619,6 +635,7 @@ Item {
                             })
                         }
                         Label {
+                            textFormat: Text.PlainText
                             visible: !modelData.editable
                             text: qsTr("This field cannot be edited.")
                             font.pixelSize: 10
@@ -674,12 +691,14 @@ Item {
         ColumnLayout {
             anchors.fill: parent
             Label {
+                textFormat: Text.PlainText
                 text: app.selectedAnnotation ? app.selectedAnnotation.kind + qsTr(" · page %1").arg(app.selectedAnnotation.page + 1) : ""
                 color: app.colors.textTertiary
             }
             RowLayout {
                 enabled: !!app.selectedAnnotation && !app.selectedAnnotation.foreign
                 Label {
+                    textFormat: Text.PlainText
                     text: qsTr("Colour")
                 }
                 Repeater {
@@ -716,6 +735,7 @@ Item {
             RowLayout {
                 enabled: !!app.selectedAnnotation && !app.selectedAnnotation.foreign
                 Label {
+                    textFormat: Text.PlainText
                     text: qsTr("Opacity")
                 }
                 Slider {
@@ -749,6 +769,7 @@ Item {
                 visible: !!app.selectedAnnotation && app.selectedAnnotation.kind === "textBox"
                 enabled: !!app.selectedAnnotation && !app.selectedAnnotation.foreign
                 Label {
+                    textFormat: Text.PlainText
                     text: qsTr("Text size")
                 }
                 SpinBox {
@@ -773,6 +794,7 @@ Item {
                 }
             }
             Label {
+                textFormat: Text.PlainText
                 visible: !!app.selectedAnnotation && Logic.annotationUnsupportedReason(app.selectedAnnotation).length > 0
                 text: Logic.annotationUnsupportedReason(app.selectedAnnotation)
                 Layout.fillWidth: true
@@ -781,6 +803,7 @@ Item {
             }
             TextArea {
                 id: noteText
+                textFormat: TextEdit.PlainText
                 objectName: "annotationNoteText"
                 Layout.fillWidth: true
                 implicitHeight: 150
@@ -799,6 +822,7 @@ Item {
                 }
             }
             Label {
+                textFormat: Text.PlainText
                 objectName: "annotationGlyphWarning"
                 visible: !!app.selectedAnnotation && app.selectedAnnotation.kind === "textBox" && dialogs.missingGlyphs.length > 0
                 text: qsTr("The PDF font cannot draw: %1. The saved text stays intact; these characters appear as missing-glyph boxes.").arg(dialogs.missingGlyphs.join(" "))
@@ -807,6 +831,7 @@ Item {
                 color: app.colors.warningFg
             }
             Label {
+                textFormat: Text.PlainText
                 visible: dialogs.annotationWriteError.length > 0
                 text: dialogs.annotationWriteError
                 Layout.fillWidth: true
@@ -847,6 +872,7 @@ Item {
         standardButtons: Dialog.Ok | Dialog.Cancel
         ColumnLayout {
             Label {
+                textFormat: Text.PlainText
                 text: qsTr("Use a key for this request, or save one in Settings.")
                 wrapMode: Text.Wrap
                 Layout.maximumWidth: 350
