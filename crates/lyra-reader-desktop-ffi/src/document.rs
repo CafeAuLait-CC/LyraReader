@@ -118,6 +118,9 @@ impl DesktopDocument {
             .get("op")
             .and_then(Value::as_str)
             .ok_or("Missing operation")?;
+        if matches!(op, "save_merge" | "save_split" | "split_plan") {
+            return self.export_command(op, &r);
+        }
         if let Some(destination) = r.get("destination").and_then(Value::as_str) {
             if op.starts_with("save_")
                 && [
@@ -706,10 +709,129 @@ mod tests {
     }
 
     #[test]
+    fn merge_and_split_preserve_marks_and_refuse_conflicting_outputs() {
+        let fixture = Fixture::new("multipage.pdf");
+        let other = Fixture::new("annotated.pdf");
+        let source_bytes = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        for page in [0, 2] {
+            doc.command(json!({"op":"mark_create","entry":{"kind":"highlight","page":page,"start":0,"end":3,"color":"#E8BC5580","note":format!("mark-{page}")}})).unwrap();
+        }
+        let merged = fixture.directory.join("merged.pdf");
+        let report = doc
+            .command(json!({"op":"save_merge","others":[other.path],"destination":merged}))
+            .unwrap();
+        assert!(report["page_count"].as_u64().unwrap() > 3);
+        assert!(
+            report["appended_annotation_counts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n.as_u64().unwrap() > 0)
+        );
+        let merged_doc = DesktopDocument::open(&merged, None).unwrap();
+        let marks = merged_doc.command(json!({"op":"marks"})).unwrap();
+        assert_eq!(marks["annotations"].as_array().unwrap().len(), 2);
+        assert!(
+            doc.command(json!({"op":"save_merge","others":[other.path],"destination":merged}))
+                .is_err()
+        );
+        let split_dir = fixture.directory.join("split");
+        fs::create_dir(&split_dir).unwrap();
+        let plan = doc
+            .command(json!({"op":"split_plan","ranges":"3, 1-2","directory":split_dir}))
+            .unwrap();
+        assert_eq!(plan["parts"][0]["pages"], json!([0, 1]));
+        let report = doc
+            .command(json!({"op":"save_split","parts":plan["parts"]}))
+            .unwrap();
+        assert_eq!(report["parts"].as_array().unwrap().len(), 2);
+        let last = PathBuf::from(report["parts"][1]["destination_path"].as_str().unwrap());
+        let part = DesktopDocument::open(&last, None).unwrap();
+        let marks = part.command(json!({"op":"marks"})).unwrap();
+        assert_eq!(marks["annotations"][0]["page"], 0);
+        assert_eq!(marks["annotations"][0]["note"], "mark-2");
+        assert!(
+            doc.command(json!({"op":"save_split","parts":plan["parts"]}))
+                .is_err()
+        );
+        let blocked = fixture.directory.join("blocked.pdf");
+        fs::write(
+            format!("{}.aris-annotations.json", blocked.display()),
+            b"[]",
+        )
+        .unwrap();
+        assert!(
+            doc.command(
+                json!({"op":"save_split","parts":[{"destination_path":blocked,"pages":[0]}]})
+            )
+            .is_err()
+        );
+        assert!(!blocked.exists());
+        assert_eq!(fs::read(&fixture.path).unwrap(), source_bytes);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_later_split_failure_keeps_earlier_outputs_with_their_marks() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new("multipage.pdf");
+        let doc = fixture.open();
+        doc.command(json!({"op":"mark_create","entry":{"kind":"highlight","page":0,"start":0,"end":3,"color":"#E8BC5580","note":"carried"}})).unwrap();
+        let blocked = fixture.directory.join("readonly");
+        fs::create_dir(&blocked).unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o500)).unwrap();
+        let first = fixture.directory.join("first.pdf");
+        let outcome=doc.command(json!({"op":"save_split","parts":[{"destination_path":first,"pages":[0]},{"destination_path":blocked.join("second.pdf"),"pages":[2]}]}));
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(outcome.unwrap_err().contains("1 completed outputs"));
+        let first = DesktopDocument::open(&first, None).unwrap();
+        let marks = first.command(json!({"op":"marks"})).unwrap();
+        assert_eq!(marks["annotations"][0]["note"], "carried");
+    }
+
+    #[test]
+    fn unknown_marks_survive_append_but_stop_unsafe_split_remapping() {
+        let fixture = Fixture::new("multipage.pdf");
+        let other = Fixture::new("text-page.pdf");
+        let raw = r#"{"kind" : "future-entry", "page": 2, "unknown" : [1, 2]}"#;
+        fs::write(
+            format!("{}.lyra-reader-annotations.json", fixture.path.display()),
+            format!("[{raw}]"),
+        )
+        .unwrap();
+        let doc = fixture.open();
+        let merged = fixture.directory.join("future-merged.pdf");
+        doc.command(json!({"op":"save_merge","others":[other.path],"destination":merged}))
+            .unwrap();
+        assert!(
+            fs::read_to_string(format!("{}.lyra-reader-annotations.json", merged.display()))
+                .unwrap()
+                .contains(raw)
+        );
+        let split = fixture.directory.join("unsafe.pdf");
+        assert!(
+            doc.command(
+                json!({"op":"save_split","parts":[{"destination_path":split,"pages":[2]}]})
+            )
+            .is_err()
+        );
+        assert!(!split.exists());
+    }
+
+    #[test]
     fn signed_original_status_survives_derived_page_revisions() {
         let fixture = Fixture::new("signed-signature.pdf");
         let doc = fixture.open();
         assert_eq!(doc.info().unwrap()["signature_status"]["signed"], true);
+        let copy = fixture.directory.join("signed-split.pdf");
+        doc.command(json!({"op":"save_split","parts":[{"destination_path":copy,"pages":[0]}]}))
+            .unwrap();
+        assert_eq!(
+            DesktopDocument::open(&copy, None).unwrap().info().unwrap()["signature_status"]["signed"],
+            false
+        );
+
         let original = fs::read(&fixture.path).unwrap();
         let staged = doc
             .command(json!({"op":"page_stage","operation":{"InsertBlank":{"index":0}}}))

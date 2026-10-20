@@ -258,6 +258,16 @@ ColumnLayout {
                     onTriggered: app.addBookmark()
                 }
                 MenuItem {
+                    text: qsTr("Merge PDFs…")
+                    enabled: app.currentReader.pageCount > 0 && !app.currentReader.hasEditDrafts
+                    onTriggered: app.showMergeDialog()
+                }
+                MenuItem {
+                    text: qsTr("Split PDF…")
+                    enabled: app.currentReader.pageCount > 0 && !app.currentReader.hasEditDrafts
+                    onTriggered: app.showSplitDialog()
+                }
+                MenuItem {
                     text: qsTr("Document Information…")
                     enabled: app.currentReader.pageCount > 0
                     onTriggered: app.showDocumentInformation()

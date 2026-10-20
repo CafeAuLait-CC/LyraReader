@@ -169,7 +169,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         }, Qt::QueuedConnection);
         return id;
     }
-    if((operation==QStringLiteral("page_stage") || operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo")) && hasEditDrafts()) {
+    if((operation==QStringLiteral("page_stage") || operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo") || operation==QStringLiteral("save_merge") || operation==QStringLiteral("save_split")) && hasEditDrafts()) {
         const auto error=tr("Save or clear pending form edits and redaction marks before changing pages.");
         QMetaObject::invokeMethod(this,[this,id,operation,error]{setError(error);emit commandFinished(id,operation,{},error);},Qt::QueuedConnection);
         return id;
@@ -188,7 +188,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
     if(mutation)++m_mutationSequence;
     const auto mutationSequence=m_mutationSequence;
     const auto generation = m_generation;
-    const bool latestOnly=operation==QStringLiteral("search") || operation==QStringLiteral("bibtex") || operation==QStringLiteral("layout") || operation==QStringLiteral("ai_preview");
+    const bool latestOnly=operation==QStringLiteral("search") || operation==QStringLiteral("bibtex") || operation==QStringLiteral("layout") || operation==QStringLiteral("ai_preview") || operation==QStringLiteral("split_plan");
     if(latestOnly)m_latestRead.insert(operation,id);
     ++m_pendingCommands;
     emit commandsChanged();
@@ -203,7 +203,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         if(document!=m_document || (!mutation && generation!=m_generation))return;
         if(operation==QStringLiteral("marks") && mutationSequence!=m_mutationSequence)return;
         if(latestOnly && m_latestRead.value(operation)!=id)return;
-        if (!outcome.error.isEmpty()) setError(outcome.error);
+        if (!outcome.error.isEmpty() && operation!=QStringLiteral("split_plan")) setError(outcome.error);
         else if (operation==QStringLiteral("page_stage") || operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo") || operation==QStringLiteral("page_discard") || operation==QStringLiteral("page_apply")) {
             m_source=outcome.source;
             const auto revision=outcome.result.toMap();

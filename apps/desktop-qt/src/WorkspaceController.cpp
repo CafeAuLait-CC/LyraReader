@@ -8,6 +8,7 @@
 #include <QSettings>
 #include <QClipboard>
 #include <QGuiApplication>
+#include <QWindow>
 #include <QDesktopServices>
 #include <QCryptographicHash>
 #include <QSaveFile>
@@ -65,6 +66,13 @@ void WorkspaceController::openFile(const QUrl &url) {
     }
     reader->openFile(QUrl::fromLocalFile(path));
 }
+void WorkspaceController::requestQuit() {
+    // Each reader window flushes notes, waits for writes and confirms its own drafts.
+    // A cancelled close keeps the application alive; do not bypass that with quit().
+    const auto windows=QGuiApplication::topLevelWindows();
+    for(auto *window:windows)if(window->isVisible() && window->objectName()==QStringLiteral("readerWindow"))window->close();
+}
+
 void WorkspaceController::newTab() {
     appendTab();
     selectTab(int(m_tabs.size()) - 1);

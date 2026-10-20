@@ -294,12 +294,48 @@ impl Marks {
         }
         Ok(())
     }
+    pub fn validate_export(&self, remapping: bool) -> Result<(), String> {
+        if let Some(error) = &self.error {
+            return Err(format!("The annotation sidecar cannot be read: {error}"));
+        }
+        if remapping && self.entries.iter().any(|e| matches!(e, Entry::Opaque(_))) {
+            return Err(
+                "The sidecar contains unknown entries whose pages cannot be remapped safely".into(),
+            );
+        }
+        if !self.deletions.is_empty() {
+            return Err(
+                "Write pending file annotation deletions to a PDF before merging or splitting"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+    pub fn appended_copy(
+        &self,
+        path: &Path,
+        old: &LyraReaderDocument,
+        new: &LyraReaderDocument,
+    ) -> Result<Self, String> {
+        let map: Vec<_> = (0..old.page_count()).map(Some).collect();
+        self.copy_with_map(path, &map, old, new, true)
+    }
     pub fn staging_copy(
         &self,
         path: &Path,
         map: &[Option<u32>],
         old: &LyraReaderDocument,
         new: &LyraReaderDocument,
+    ) -> Result<Self, String> {
+        self.copy_with_map(path, map, old, new, false)
+    }
+    fn copy_with_map(
+        &self,
+        path: &Path,
+        map: &[Option<u32>],
+        old: &LyraReaderDocument,
+        new: &LyraReaderDocument,
+        allow_opaque: bool,
     ) -> Result<Self, String> {
         let old_file = old.annotations().map_err(|e| e.to_string())?;
         let new_file = new.annotations().map_err(|e| e.to_string())?;
@@ -333,6 +369,10 @@ impl Marks {
         let mut entries = vec![];
         for entry in &self.entries {
             let Entry::Known(v) = entry else {
+                if allow_opaque {
+                    entries.push(entry.clone());
+                    continue;
+                }
                 return Err("Unsupported sidecar entry".into());
             };
             if v["id"]

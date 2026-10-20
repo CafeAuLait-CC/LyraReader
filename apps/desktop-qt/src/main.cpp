@@ -115,5 +115,9 @@ int main(int argc, char **argv) {
             application.quit();
         });
     }
-    return application.exec();
+    const int result=application.exec();
+    // Destroy QML windows and their platform/theme connections while QApplication
+    // services are still alive, rather than in QObject's later child cleanup.
+    qDeleteAll(application.findChildren<QQmlApplicationEngine *>(QString{},Qt::FindDirectChildrenOnly));
+    return result;
 }

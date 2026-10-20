@@ -395,6 +395,16 @@ ApplicationWindow {
             root.jumpFromPreview(page, y);
         }
     }
+    function showMergeDialog() {
+        pageExports.show(true);
+    }
+    function showSplitDialog() {
+        pageExports.show(false);
+    }
+    PageExports {
+        id: pageExports
+        app: root
+    }
     RedactionReview {
         id: redactionReview
         app: root
@@ -874,7 +884,10 @@ ApplicationWindow {
         id: quitAction
         text: qsTr("Quit")
         shortcut: StandardKey.Quit
-        onTriggered: Qt.quit()
+        onTriggered: if (root.session)
+            root.session.requestQuit()
+        else
+            root.close()
     }
     Action {
         id: zoomIn
@@ -1463,6 +1476,10 @@ ApplicationWindow {
                     root.navigate(root.activeSearchHit.page);
             } else if (op === "document_info")
                 root.infoData = result;
+            else if (op === "save_merge")
+                root.operationStatus = qsTr("Merged %1 pages into %2. Appended outline entries not imported: %3.").arg(result.page_count).arg(result.destination_path).arg(result.dropped_outline_entries);
+            else if (op === "save_split")
+                root.operationStatus = qsTr("Wrote %1 verified split PDFs with their annotation sidecars.").arg(result.parts.length);
             else if (op === "save_redactions") {
                 root.annotationTool = "select";
                 root.operationStatus = qsTr("Verified redacted copy saved: %1 · %2 characters removed.").arg(result.destination_path).arg(result.removed_characters);

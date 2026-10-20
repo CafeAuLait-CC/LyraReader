@@ -439,6 +439,7 @@ private slots:
         workspace.selectTab(0);QCOMPARE(reader->editDrafts().value("redactions").toList(),newer);
         reader->submit("page_stage",{{"operation",QVariantMap{{"Rotate",QVariantMap{{"pages",QVariantList{0}},{"quarter_turns",1}}}}}});QTest::qWait(50);QVERIFY(reader->error().contains("pending form"));reader->dismissError();
         workspace.closeTab(0);QCOMPARE(workspace.tabs().size(),2);auto *close=window->findChild<QObject *>("closeChangesConfirmation");QVERIFY(close);QTRY_VERIFY(close->property("visible").toBool());QMetaObject::invokeMethod(close,"close");
+        workspace.requestQuit();QTRY_VERIFY(close->property("visible").toBool());QVERIFY(window->isVisible());QMetaObject::invokeMethod(close,"close");
         // Matching successful snapshots clear their marks, while the source remains unchanged.
         const QVariant currentContext=QVariantMap{{"reader",QVariant::fromValue(reader)},{"kind","redactions"},{"redactions",newer}};window->setProperty("exportContext",currentContext);
         QVERIFY(QMetaObject::invokeMethod(window,"exportTo",Q_ARG(QVariant,QUrl::fromLocalFile(scratch.path()+"/second.pdf"))));
@@ -485,6 +486,34 @@ private slots:
         for(const auto &value:saved){const auto f=value.toMap();if(f.value("name")==textField.value("name")){QCOMPARE(f.value("value").toString(),QString::fromUtf8("Linux 中文"));found.insert("text");}if(f.value("name")==checkField.value("name")){QCOMPARE(f.value("checked").toBool(),!checkField.value("checked").toBool());found.insert("check");}if(f.value("name")==radioField.value("name")){QCOMPARE(f.value("selected").toList().first().toInt(),radioTarget);found.insert("radio");}if(f.value("name")==choiceField.value("name")){QCOMPARE(f.value("selected").toList().first().toInt(),choiceTarget);found.insert("choice");}}
         QCOMPARE(found.size(),4);
         QVERIFY(original.open(QIODevice::ReadOnly));QCOMPARE(original.readAll(),bytes);
+    }
+    void mergeAndSplitDialogsUseVerifiedWritersAndCarryRemappedMarks() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/source.pdf",mergedPath=scratch.path()+"/merged.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",path));QFile original(path);QVERIFY(original.open(QIODevice::ReadOnly));const auto bytes=original.readAll();original.close();
+        const auto folder=scratch.path()+"/split";QVERIFY(QDir().mkpath(folder));
+        WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);
+        engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
+        auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTest::qWait(150);
+        reader->submit("mark_create",{{"entry",QVariantMap{{"kind","highlight"},{"page",2},{"start",0},{"end",3},{"color","#E8BC5580"},{"note","split identity"}}}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(window,"showMergeDialog"));auto *dialog=window->findChild<QObject *>("pageExports");QVERIFY(dialog);QTRY_VERIFY(dialog->property("visible").toBool());
+        dialog->setProperty("additions",QVariantList{QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"),QUrl::fromLocalFile(root+"/tests/fixtures/annotated.pdf")});
+        QVERIFY(QMetaObject::invokeMethod(dialog,"move",Q_ARG(QVariant,0),Q_ARG(QVariant,1)));
+        QVERIFY(QMetaObject::invokeMethod(dialog,"saveMergeTo",Q_ARG(QVariant,QUrl::fromLocalFile(mergedPath))));
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
+        const auto merged=reader->data().value("save_merge").toMap();QCOMPARE(merged.value("first_page_count").toInt(),3);QVERIFY(merged.value("page_count").toInt()>4);QCOMPARE(merged.value("appended_page_counts").toList().last().toInt(),1);
+        ReaderController reopened;reopened.openFile(QUrl::fromLocalFile(mergedPath));QTRY_COMPARE_WITH_TIMEOUT(reopened.pageCount(),merged.value("page_count").toInt(),10000);QTRY_COMPARE_WITH_TIMEOUT(reopened.pendingCommands(),0,10000);QCOMPARE(reopened.data().value("marks").toMap().value("annotations").toList().first().toMap().value("page").toInt(),2);
+        QVERIFY(QMetaObject::invokeMethod(window,"showSplitDialog"));
+        dialog->setProperty("outputDirectory",QUrl::fromLocalFile(folder));auto *ranges=window->findChild<QObject *>("splitRanges");QVERIFY(ranges);ranges->setProperty("text","1-2, 2-3");QVERIFY(QMetaObject::invokeMethod(dialog,"requestPlan"));
+        QTRY_VERIFY(!dialog->property("planning").toBool());QVERIFY(dialog->property("error").toString().contains("more than one"));QVERIFY(reader->error().isEmpty());
+        ranges->setProperty("text",QString::fromUtf8("3, 1–2"));QVERIFY(QMetaObject::invokeMethod(dialog,"requestPlan"));QTRY_VERIFY(!dialog->property("planning").toBool());QVERIFY2(dialog->property("error").toString().isEmpty(),qPrintable(dialog->property("error").toString()));
+        const auto plan=dialog->property("plan").toMap();QCOMPARE(plan.value("parts").toList().size(),2);QCOMPARE(plan.value("parts").toList().first().toMap().value("pages").toList(),QVariantList({0,1}));
+        QTRY_VERIFY(dialog->property("canWrite").toBool());auto *apply=window->findChild<QQuickItem *>("applyPageExport");QVERIFY(apply);QTest::qWait(100);QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,apply->mapToScene(QPointF(apply->width()/2,apply->height()/2)).toPoint());
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QTRY_VERIFY(reader->data().contains("save_split"));QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
+        const auto report=reader->data().value("save_split").toMap();QCOMPARE(report.value("parts").toList().size(),2);
+        ReaderController last;last.openFile(QUrl::fromLocalFile(report.value("parts").toList().last().toMap().value("destination_path").toString()));QTRY_COMPARE_WITH_TIMEOUT(last.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(last.pendingCommands(),0,10000);
+        const auto mark=last.data().value("marks").toMap().value("annotations").toList().first().toMap();QCOMPARE(mark.value("page").toInt(),0);QCOMPARE(mark.value("note").toString(),QString("split identity"));
+        QVERIFY(original.open(QIODevice::ReadOnly));QCOMPARE(original.readAll(),bytes);
+        QVERIFY(QMetaObject::invokeMethod(window,"showSplitDialog"));dialog->setProperty("outputDirectory",QUrl::fromLocalFile(folder));QVERIFY(QMetaObject::invokeMethod(dialog,"requestPlan"));QTRY_VERIFY(!dialog->property("planning").toBool());QVERIFY(!dialog->property("canWrite").toBool());QCOMPARE(dialog->property("plan").toMap().value("conflicts").toList().size(),2);
     }
     void deepZoomRefinesVisibleTilesWithoutSeamsAndSharesTheCacheBudget() {
         ReaderController reader;QQmlApplicationEngine engine;

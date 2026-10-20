@@ -3,6 +3,7 @@
 #![allow(unsafe_code)]
 
 mod document;
+mod exports;
 mod marks;
 mod pages;
 mod render_source;

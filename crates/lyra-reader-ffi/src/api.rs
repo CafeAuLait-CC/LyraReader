@@ -4152,6 +4152,7 @@ pub struct PageEditReport {
 
 /// One output of a split, as the shell requested it.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct SplitPartRecord {
     /// Where this part should be written.
     pub destination_path: String,
@@ -4161,6 +4162,7 @@ pub struct SplitPartRecord {
 
 /// What a split wrote for one part.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct SplitOutputRecord {
     pub destination_path: String,
     pub page_count: u32,
@@ -4172,6 +4174,7 @@ pub struct SplitOutputRecord {
 
 /// What a split wrote.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct SplitReportRecord {
     pub parts: Vec<SplitOutputRecord>,
     pub source_page_count: u32,
@@ -4180,6 +4183,7 @@ pub struct SplitReportRecord {
 
 /// What a merge wrote.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct MergeReportRecord {
     pub destination_path: String,
     /// Sum of every input's page count.

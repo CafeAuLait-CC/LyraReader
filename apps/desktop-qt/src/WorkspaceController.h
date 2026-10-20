@@ -27,6 +27,7 @@ public:
     Q_INVOKABLE void selectTab(int index);
     Q_INVOKABLE void closeTab(int index, bool discardPending = false);
     Q_INVOKABLE void newTab();
+    Q_INVOKABLE void requestQuit();
     Q_INVOKABLE void openInNewWindow(const QUrl &url, int page = 0);
     Q_INVOKABLE QVariantMap viewState(ReaderController *reader) const;
     Q_INVOKABLE void saveViewState(ReaderController *reader, const QVariantMap &state);
