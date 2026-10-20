@@ -85,6 +85,8 @@ ApplicationWindow {
     property var aiSettings: session ? session.preference("ai", {}) : ({})
     property var previousReader: null
     property var pendingPosition: null
+    property bool positionRestoring: true
+    property int positionRestoreEpoch: 0
     property alias searchDebounce: searchTimer
     property var selectedAnnotation: null
     property var infoData: ({})
@@ -106,6 +108,8 @@ ApplicationWindow {
     onAppearanceChanged: if (session)
         session.setPreference("appearance", appearance)
     onCurrentReaderChanged: {
+        ++positionRestoreEpoch;
+        positionRestoring = true;
         printRequested = false;
         navigationHistory = [];
         previousReader = currentReader;
@@ -117,7 +121,11 @@ ApplicationWindow {
         searchResults = [];
         searchIndex = -1;
         if (currentReader && currentReader.pageCount > 0) {
-            Qt.callLater(restorePosition);
+            const epoch = positionRestoreEpoch;
+            Qt.callLater(function () {
+                if (epoch === root.positionRestoreEpoch)
+                    root.restorePosition();
+            });
             if (formToolActive)
                 currentReader.submit("forms");
         }
@@ -126,7 +134,7 @@ ApplicationWindow {
     property int closingTab: -2
     function saveReadingPosition() {
         positionTimer.stop();
-        if (session && currentReader.pageCount > 0) {
+        if (session && currentReader.pageCount > 0 && !positionRestoring) {
             const state = {
                 page: currentPage,
                 zoom: zoom,
@@ -336,6 +344,9 @@ ApplicationWindow {
         positionTimer.restart();
     }
     function restorePosition() {
+        positionTimer.stop();
+        positionRestoring = true;
+        ++positionRestoreEpoch;
         const state = session ? session.viewState(currentReader) : ({});
         pendingPosition = Object.assign({}, state);
         if (requestedPage >= 0) {
@@ -1448,6 +1459,8 @@ ApplicationWindow {
     Connections {
         target: root.currentReader
         function onDocumentReset() {
+            ++root.positionRestoreEpoch;
+            root.positionRestoring = true;
             root.selection = null;
             root.selectedAnnotation = null;
             root.annotationDraft = null;
@@ -1457,7 +1470,7 @@ ApplicationWindow {
         }
         function onOpenFinished(success) {
             if (success) {
-                Qt.callLater(root.restorePosition);
+                root.restorePosition();
                 if (root.formToolActive)
                     currentReader.submit("forms");
             }
@@ -1511,7 +1524,10 @@ ApplicationWindow {
 
             if (op === "layout") {
                 if (root.pendingPosition) {
+                    root.positionRestoring = true;
+                    positionTimer.stop();
                     const state = root.pendingPosition;
+                    const epoch = root.positionRestoreEpoch;
                     root.pendingPosition = null;
                     if (state.zoom && !state.fitting) {
                         root.fitting = false;
@@ -1519,6 +1535,8 @@ ApplicationWindow {
                     } else
                         root.fitWidth();
                     Qt.callLater(function () {
+                        if (epoch !== root.positionRestoreEpoch)
+                            return;
                         root.navigate(state.page || 0, state.y || 0);
                         if (state.viewportAnchor)
                             canvas.navigate(state.viewportAnchor.page, state.viewportAnchor.y);
@@ -1529,6 +1547,8 @@ ApplicationWindow {
                         else
                             canvas.revealPage(state.page || 0);
                         root.currentPage = state.page || 0;
+                        root.positionRestoring = false;
+                        root.schedulePositionSave();
                     });
                 } else if (root.fitting)
                     root.fitWidth();

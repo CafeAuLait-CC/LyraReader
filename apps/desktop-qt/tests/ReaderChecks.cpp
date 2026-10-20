@@ -135,12 +135,13 @@ private slots:
         {
             WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);
             engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
-            auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);workspace.openFile(url);
+            auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+            window->setProperty("requestedPage",6);window->setProperty("requestedY",150.0);workspace.openFile(url);
             QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pageCount(),9,10000);QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pendingCommands(),0,10000);
             auto *view=window->findChild<QQuickItem *>("pageList");QVERIFY(view);
-            // Opening schedules a saved-position/layout restore; begin interaction
-            // only after its first textured page has actually reached the scene.
-            QTRY_VERIFY_WITH_TIMEOUT(visualItem(window->contentItem(),"pdfPage0") && visualItem(window->contentItem(),"pdfPage0")->property("texturesReady").toBool(),10000);
+            // Wait for the requested opening region, so an initial deferred
+            // saved-position restore cannot race the first simulated interaction.
+            QTRY_VERIFY_WITH_TIMEOUT(visualItem(window->contentItem(),"pdfPage6") && visualItem(window->contentItem(),"pdfPage6")->property("texturesReady").toBool(),10000);
             if(facing) {
                 QVERIFY(QMetaObject::invokeMethod(window,"setPageLayout",Q_ARG(QVariant,"Facing")));
                 QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pendingCommands(),0,10000);
@@ -179,10 +180,20 @@ private slots:
         {
             WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);
             engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
-            auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);workspace.openFile(url);
+            auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+            // Force the startup autosave ordering seen on XWayland before the
+            // asynchronous layout/position restore has completed.
+            connect(workspace.activeReader(),&ReaderController::openFinished,window,[window](bool success){if(success)QMetaObject::invokeMethod(window,"saveReadingPosition");});
+            workspace.openFile(url);
             QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pageCount(),9,10000);QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pendingCommands(),0,10000);
             auto *view=window->findChild<QQuickItem *>("pageList");QVERIFY(view);
             const auto page=[&]{return visualItem(window->contentItem(),"pdfPage6");};
+            QTimer::singleShot(2000,window,[window,view,&workspace,saved] {
+                auto *target=visualItem(window->contentItem(),"pdfPage6");
+                QVariantMap state{{"expected",saved},{"stored",workspace.viewState(workspace.activeReader())},{"page",window->property("currentPage")},{"zoom",window->property("zoom")},{"pendingPosition",window->property("pendingPosition")},{"contentY",view->property("contentY")},{"originY",view->property("originY")},{"pageExists",bool(target)}};
+                if(target){state.insert("sceneY",target->mapToItem(view,QPointF(0,0)).y());state.insert("texturesReady",target->property("texturesReady"));}
+                qInfo().noquote()<<"lyra-reader-restore-pending:"<<QJsonDocument::fromVariant(state).toJson(QJsonDocument::Compact);
+            });
             QTRY_VERIFY_WITH_TIMEOUT(page() && page()->property("texturesReady").toBool(),10000);
             QTRY_COMPARE(window->property("currentPage").toInt(),6);QCOMPARE(window->property("zoom").toDouble(),saved.value("zoom").toDouble());
             const double expected=-saved.value("viewportAnchor").toMap().value("y").toDouble()*window->property("zoom").toDouble();
