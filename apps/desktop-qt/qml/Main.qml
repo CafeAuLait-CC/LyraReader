@@ -3,6 +3,7 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Dialogs
 import QtQuick.Window
+import QtQml.Models
 import LyraReader 1.0
 import "ReaderLogic.js" as Logic
 
@@ -197,6 +198,38 @@ ApplicationWindow {
             dialogs.confirmClose(-1);
         }
     }
+    function retryPendingClose() {
+        if (closingTab === -2 || hasPendingCloseWork(closingTab))
+            return;
+        if (dialogs.annotationWriteError.length) {
+            operationStatus = dialogs.annotationWriteError;
+            closingTab = -2;
+            return;
+        }
+        const index = closingTab;
+        closingTab = -2;
+        if (index < 0)
+            root.close();
+        else
+            requestCloseTab(index);
+    }
+    Instantiator {
+        model: root.session ? root.session.tabs : [
+            {
+                reader: root.currentReader
+            }
+        ]
+        delegate: Connections {
+            required property var modelData
+            target: modelData.reader
+            function onCommandsChanged() {
+                // Defer until the command's data/error notifications finish.
+                // Unlike animation timers this also runs without frame callbacks.
+                if (root.closingTab !== -2)
+                    Qt.callLater(root.retryPendingClose);
+            }
+        }
+    }
     Timer {
         id: closeRetry
         interval: 80
@@ -207,17 +240,7 @@ ApplicationWindow {
                 restart();
                 return;
             }
-            if (dialogs.annotationWriteError.length) {
-                root.operationStatus = dialogs.annotationWriteError;
-                root.closingTab = -2;
-                return;
-            }
-            const index = root.closingTab;
-            root.closingTab = -2;
-            if (index < 0)
-                root.close();
-            else
-                root.requestCloseTab(index);
+            root.retryPendingClose();
         }
     }
     SystemPalette {

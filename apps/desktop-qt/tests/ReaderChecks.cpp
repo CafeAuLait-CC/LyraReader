@@ -640,7 +640,10 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(reader->startAi("local",plan));QTRY_COMPARE(server.requests.size(),4);QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QVERIFY(reader->aiState().value("status").toString().contains("fixture rejection"));QVERIFY(reader->error().isEmpty());
         reader->invalidateAiPlan();QVERIFY(!reader->startAi("local",plan));QCOMPARE(server.requests.size(),4);
         QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(!reader->aiState().value("plan").toMap().isEmpty());QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(reader->startAi("local",reader->aiState().value("plan").toMap()));QTRY_COMPARE(server.requests.size(),5);
-        QPointer<ReaderController> closing=reader;workspace.closeTab(0);QTRY_VERIFY_WITH_TIMEOUT(closing.isNull(),10000);QTRY_COMPARE_WITH_TIMEOUT(server.activeConnections(),0,10000);
+        // Closing must drain in-flight commands even for a hidden/background tab,
+        // where the compositor need not drive QML animation timers.
+        workspace.selectTab(1);window->hide();QVERIFY(reader->submit("ai_poll")>0);QVERIFY(reader->pendingCommands()>0);
+        QPointer<ReaderController> closing=reader;workspace.closeTab(0);QTRY_VERIFY_WITH_TIMEOUT(closing.isNull(),10000);QTRY_COMPARE_WITH_TIMEOUT(server.activeConnections(),0,10000);QCOMPARE(workspace.activeReader(),other);
     }
     void secureCredentialRoundTripUsesAnIsolatedEphemeralAccount() {
         if(!qEnvironmentVariableIsSet("LYRA_READER_CHECK_VAULT"))QSKIP("Opt-in real vault check; use LYRA_READER_CHECK_VAULT=1 with an unlocked system vault");
