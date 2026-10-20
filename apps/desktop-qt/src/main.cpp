@@ -1,4 +1,5 @@
 #include "PageItem.h"
+#include "CropItem.h"
 #include "ReaderController.h"
 #include "WorkspaceController.h"
 #include "AnnotationOverlay.h"
@@ -61,6 +62,7 @@ int main(int argc, char **argv) {
     }
     qmlRegisterUncreatableType<ReaderController>("LyraReader", 1, 0, "ReaderController", QStringLiteral("Created by the application"));
     qmlRegisterType<PageItem>("LyraReader", 1, 0, "PdfPage");
+        qmlRegisterType<CropItem>("LyraReader",1,0,"PdfCrop");
     qmlRegisterType<AnnotationOverlay>("LyraReader",1,0,"PdfAnnotations");
     std::function<QQuickWindow *(const QUrl &,int,double)> createWindow;
     createWindow = [&](const QUrl &url,int page,double y) -> QQuickWindow * {
@@ -73,6 +75,7 @@ int main(int argc, char **argv) {
         if (engine->rootObjects().isEmpty()) { delete engine; return nullptr; }
         auto *created = qobject_cast<QQuickWindow *>(engine->rootObjects().first());
         if (!created) { delete engine; return nullptr; }
+        created->setPersistentSceneGraph(false);
         created->setProperty("requestedPage",page);
         created->setProperty("requestedY",y);
         QObject::connect(workspace,&WorkspaceController::newWindowRequested,&application,[&](const QUrl &file,int targetPage,double targetY) {createWindow(file,targetPage,targetY);});

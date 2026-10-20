@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Window
+import LyraReader 1.0
 
 Popup {
     id: panel
@@ -196,21 +197,20 @@ Popup {
                 Repeater {
                     model: !panel.textPreview && controller ? controller.imageSegments(Math.max(40, scroll.availableWidth - 24), Screen.devicePixelRatio, app.paperAppearance) : []
                     ColumnLayout {
+                        id: regionEntry
                         required property var modelData
                         required property int index
                         Layout.fillWidth: true
                         Layout.leftMargin: 12
                         Layout.rightMargin: 12
-                        Image {
+                        PdfCrop {
                             id: crop
                             objectName: index === 0 ? "referencePreviewImage" : "referencePreviewImage" + index
                             Layout.fillWidth: true
                             Layout.preferredHeight: width * modelData.aspect
                             source: modelData.url
-                            asynchronous: true
-                            cache: false
-                            fillMode: Image.PreserveAspectFit
-                            smooth: true
+                            resourceActive: panel.visible && regionEntry.y + crop.y + crop.height > scroll.contentItem.contentY && regionEntry.y + crop.y < scroll.contentItem.contentY + scroll.availableHeight
+                            paperAppearance: app.paperAppearance
                             BusyIndicator {
                                 anchors.centerIn: parent
                                 running: crop.status === Image.Loading

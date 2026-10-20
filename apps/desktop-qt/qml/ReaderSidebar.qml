@@ -127,6 +127,7 @@ Pane {
                             border.width: thumbnail.highlighted ? 2 : 1
                             border.color: thumbnail.highlighted ? app.colors.accentBorder : app.colors.pageEdge
                             PdfPage {
+                                resourceActive: thumbnail.y + thumbnail.height > thumbnails.contentY && thumbnail.y < thumbnails.contentY + thumbnails.height
                                 anchors.fill: parent
                                 anchors.margins: parent.border.width
                                 embeddedAnnotations: true

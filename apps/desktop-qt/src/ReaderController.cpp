@@ -53,13 +53,16 @@ struct OpenResult {
     QVariantMap signature;
     QString error;
 };
-struct RasterResult { QImage image; QString error; double actualScale = 0; qint64 elapsedMs = 0; };
+struct RasterResult { QImage image; QString error; double actualScale = 0; qint64 elapsedMs = 0;bool cancelled=false; };
 struct CommandResult { QVariant result; QString error; std::shared_ptr<NativeRasterSource> source; };
+double quantizedRasterScale(double scale) {
+    return scale>=.125 ? std::ceil(scale*8)/8.0 : std::exp2(std::ceil(std::log2(scale)*4)/4);
+}
 }
 
 ReaderController::ReaderController(QObject *parent) : QObject(parent),m_cachePrefix(QUuid::createUuid().toString()+QLatin1Char('/')),m_mutations(std::make_shared<CommandQueue>()) {initAi();}
 ReaderController::~ReaderController(){clearRasterCache();}
-void ReaderController::clearRasterCache(){RasterCache::clearPrefix(m_cachePrefix);m_tileDemand.clear();}
+void ReaderController::clearRasterCache(){RasterJobs::cancel(m_activeRaster);RasterCache::clearPrefix(m_cachePrefix);m_tileDemand.clear();m_pageDemand.clear();m_manualDemand.clear();}
 int ReaderController::cpuCacheKiB(){return RasterCache::costKiB();}
 
 void ReaderController::setEditDraft(const QString &key,const QVariant &value) {
@@ -287,7 +290,7 @@ double ReaderController::zoomOffset(double offset, double anchor, double oldZoom
 }
 
 QString ReaderController::rasterKey(int page, double scale,bool embedded) {
-    return QString::number(page) + QLatin1Char(':') + QString::number(int(std::ceil(scale * 8)))+(embedded?QStringLiteral(":annotations"):QString{});
+    return QString::number(page) + QLatin1Char(':') + QString::number(quantizedRasterScale(scale),'g',14)+(embedded?QStringLiteral(":annotations"):QString{});
 }
 
 QImage ReaderController::cachedPage(int page,double scale,bool embedded) const {
@@ -297,24 +300,36 @@ QImage ReaderController::cachedTile(const QString &key)const{return RasterCache:
 double ReaderController::tileScale(int level){return std::exp2(double(level)/4.0);}
 void ReaderController::enqueue(const Request &request) {
     if(RasterCache::contains(m_cachePrefix+request.key) || m_pending.contains(request.key) || m_failed.contains(request.key))return;
-    while(m_requests.size()>=128){m_pending.remove(m_requests.last().key);m_requests.removeLast();}
+    while(m_requests.size()>=128){m_pending.remove(m_requests.last().key);m_manualDemand.remove(m_requests.last().key);m_requests.removeLast();}
     m_pending.insert(request.key);
     auto position=m_requests.begin();while(position!=m_requests.end() && position->priority>=request.priority)++position;
     m_requests.insert(position,request);
 }
 void ReaderController::requestPage(int page,double scale,bool embedded) {
+    requestPageInternal(page,scale,embedded,true);
+}
+void ReaderController::requestPageForConsumer(quintptr consumer,int page,double scale,bool embedded) {
+    if(!m_source || page<0 || page>=pageCount() || !std::isfinite(scale) || scale<=0 || scale>128){clearRasterDemand(consumer);return;}
+    m_pageDemand.insert(consumer,rasterKey(page,scale,embedded));pruneTileRequests();
+    requestPageInternal(page,scale,embedded,false);
+}
+void ReaderController::requestPageInternal(int page,double scale,bool embedded,bool manual) {
     if(!m_source || page<0 || page>=pageCount() || !std::isfinite(scale) || scale<=0 || scale>128)return;
-    scale=std::ceil(scale*8)/8.0;const auto dimensions=m_pages.at(page).toMap();
+    scale=quantizedRasterScale(scale);const auto dimensions=m_pages.at(page).toMap();
     const QRectF region(0,0,dimensions.value(QStringLiteral("width")).toDouble(),dimensions.value(QStringLiteral("height")).toDouble());
+    if(manual && !RasterCache::contains(m_cachePrefix+rasterKey(page,scale,embedded)))m_manualDemand.insert(rasterKey(page,scale,embedded));
     enqueue({page,scale,rasterKey(page,scale,embedded),embedded,false,region,embedded?0:2});startNextRaster();
 }
 void ReaderController::pruneTileRequests() {
     QSet<QString> wanted;for(const auto &keys:m_tileDemand)wanted.unite(keys);
+    QSet<QString> pages=m_manualDemand;for(const auto &key:m_pageDemand)pages.insert(key);
     for(auto it=m_requests.begin();it!=m_requests.end();) {
-        if(it->tile && !wanted.contains(it->key)){m_pending.remove(it->key);it=m_requests.erase(it);}else ++it;
+        if(!(it->tile?wanted:pages).contains(it->key)){m_pending.remove(it->key);it=m_requests.erase(it);}else ++it;
     }
+    if(m_activeRaster && !(m_activeRasterIsTile?wanted:pages).contains(m_activeRasterKey))RasterJobs::cancel(m_activeRaster);
 }
 void ReaderController::clearTileDemand(quintptr consumer){m_tileDemand.remove(consumer);pruneTileRequests();}
+void ReaderController::clearRasterDemand(quintptr consumer){m_pageDemand.remove(consumer);clearTileDemand(consumer);}
 QList<TileSpec> ReaderController::requestTiles(quintptr consumer,int page,int level,const QRectF &visible,const QSet<QString> &retained) {
     if(!m_source || page<0 || page>=pageCount() || visible.isEmpty() || !std::isfinite(visible.x()) || !std::isfinite(visible.y()) || !std::isfinite(visible.width()) || !std::isfinite(visible.height())){clearTileDemand(consumer);return {};}
     const auto dimensions=m_pages.at(page).toMap();
@@ -344,14 +359,19 @@ QList<TileSpec> ReaderController::requestTiles(quintptr consumer,int page,int le
 }
 void ReaderController::startNextRaster() {
     if(m_rendering || m_requests.isEmpty() || !m_source)return;
+    auto ticket=RasterJobs::enqueue();if(!ticket){
+        if(!m_rasterRetryQueued){m_rasterRetryQueued=true;QTimer::singleShot(100,this,[this]{m_rasterRetryQueued=false;startNextRaster();});}
+        return;
+    }
     const auto request=m_requests.takeFirst();const auto generation=m_generation;const auto source=m_source;
-    m_rendering=true;
+    m_rendering=true;m_activeRaster=ticket;m_activeRasterKey=request.key;m_activeRasterIsTile=request.tile;
     auto *watcher=new QFutureWatcher<RasterResult>(this);
     connect(watcher,&QFutureWatcher<RasterResult>::finished,this,[this,watcher,request,generation]{
-        auto result=watcher->result();watcher->deleteLater();m_rendering=false;
-        if(generation!=m_generation){++m_discarded;}
+        auto result=watcher->result();watcher->deleteLater();m_rendering=false;m_activeRaster.reset();
+        if(generation!=m_generation || result.cancelled){++m_discarded;if(generation==m_generation)m_pending.remove(request.key);}
         else {
             m_pending.remove(request.key);
+            m_manualDemand.remove(request.key);
             if(result.image.isNull()){m_failed.insert(request.key);setError(result.error);}
             else {
                 RasterCache::put(m_cachePrefix+request.key,result.image);++m_completed;
@@ -361,9 +381,11 @@ void ReaderController::startNextRaster() {
         }
         emit statisticsChanged();startNextRaster();
     });
-    watcher->setFuture(QtConcurrent::run([source,request]{
-        RasterResult result;QElapsedTimer timer;timer.start();
+    watcher->setFuture(QtConcurrent::run(RasterJobs::pool(),[source,request,ticket]{
+        RasterJobs::Run run(ticket);RasterResult result;QElapsedTimer timer;timer.start();
+        if(ticket->cancelled.load()){result.cancelled=true;return result;}
         result.image=source->crop(request.page,request.region,request.scale,request.embedded,false,&result.error,&result.actualScale);
+        if(ticket->cancelled.load()){result.image={};result.cancelled=true;}
         result.elapsedMs=timer.elapsed();return result;
     }));
 }

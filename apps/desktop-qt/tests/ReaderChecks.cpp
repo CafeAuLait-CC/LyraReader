@@ -1,10 +1,15 @@
 #include "ReaderController.h"
 #include "PageItem.h"
+#include "CropItem.h"
 #include "PaperAppearance.h"
 #include "PdfPrintJob.h"
 #include "NativeRaster.h"
 #include "PreviewController.h"
 #include "MockChatServer.h"
+#include "PerformanceRecorder.h"
+#include <QJsonDocument>
+#include <QSaveFile>
+#include <QSysInfo>
 #include <QUuid>
 #include <QPrinter>
 #include "AnnotationOverlay.h"
@@ -24,6 +29,9 @@
 #include <QTemporaryDir>
 #include <QtTest>
 #include <functional>
+#include <thread>
+#include <vector>
+#include <atomic>
 
 static QQuickItem *visualItem(QQuickItem *root,const QString &name) {
     if(root->objectName()==name)return root;
@@ -43,6 +51,7 @@ private slots:
         }
         qmlRegisterUncreatableType<ReaderController>("LyraReader", 1, 0, "ReaderController", "Created by host");
         qmlRegisterType<PageItem>("LyraReader", 1, 0, "PdfPage");
+        qmlRegisterType<CropItem>("LyraReader",1,0,"PdfCrop");
         qmlRegisterType<AnnotationOverlay>("LyraReader",1,0,"PdfAnnotations");
     }
     void recentHistoryIsSharedByAllReaderWindows() {
@@ -91,7 +100,7 @@ private slots:
         QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);
         engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());
         engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
-        auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);window->setMaximumSize(QSize(640,440));window->resize(640,440);
+        auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);if(QGuiApplication::platformName()!="offscreen")window->setMaximumSize(QSize(640,440));window->resize(640,440);
         QTRY_VERIFY_WITH_TIMEOUT(window->width()<=640 && window->height()<=440,5000);
         auto *recent=window->findChild<QQuickItem *>("recentDocuments");QVERIFY(recent);
         QTRY_COMPARE(recent->property("count").toInt(),1);
@@ -651,6 +660,94 @@ private slots:
         if(removed){const auto event=completion(store.read(account));absent=!event.isEmpty() && event[2].toString().isEmpty() && event[3].toString().isEmpty();}
         QVERIFY2(wrote && writeOk && readOk && removed && absent,qPrintable(failure.isEmpty()?QString("System vault did not complete the isolated round trip"):failure));
     }
+    void renderingPerformanceRecordsRealQueueLatencyFramesAndRss() {
+        if(!qEnvironmentVariableIsSet("LYRA_READER_CHECK_PERFORMANCE"))QSKIP("Opt-in native performance run; use LYRA_READER_CHECK_PERFORMANCE=1");
+        const auto input=qEnvironmentVariable("LYRA_READER_PERF_PDF",QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf");
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto fixture=scratch.path()+"/performance.pdf";QVERIFY(QFile::copy(input,fixture));
+        ReaderController reader;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("reader",&reader);engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
+        auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);window->setPersistentSceneGraph(false);
+        if(QGuiApplication::platformName()!="offscreen")window->setMaximumSize(QSize(1200,820));window->resize(1200,820);
+        Performance::Frames frames(window);QList<double> inputIntervals,refinement,guiIntervals;
+        qint64 peakRss=Performance::memory("VmRSS"),lastTick=Performance::now();
+        QTimer sampler;sampler.setInterval(10);connect(&sampler,&QTimer::timeout,window,[&] {
+            const auto time=Performance::now();guiIntervals.append((time-lastTick)/1000.0);lastTick=time;peakRss=qMax(peakRss,Performance::memory("VmRSS"));
+        });sampler.start();
+        const auto openStart=Performance::now();reader.openFile(QUrl::fromLocalFile(fixture));
+        QTRY_VERIFY_WITH_TIMEOUT(reader.pageCount()>0,60000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,60000);
+        const auto textured=[&]{auto *page=visualItem(window->contentItem(),"pdfPage0");return page && page->property("texturesReady").toBool();};
+        QTRY_VERIFY_WITH_TIMEOUT(textured(),30000);frames.arm();window->update();QTRY_VERIFY_WITH_TIMEOUT(frames.queued()>0,10000);
+        const auto openMs=(frames.queued()-openStart)/1000.0;
+        auto *view=window->findChild<QQuickItem *>("pageList");QVERIFY(view);window->setProperty("fitting",false);
+        for(int trial=0;trial<6;++trial) {
+            frames.clear();const auto begin=Performance::now();
+            for(int step=0;step<12;++step) {
+                const auto scale=step%3==0?2.7:step%3==1?4.0:3.6;
+                QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,scale),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+                view->setProperty("contentX",double((step+trial)%8*70));view->setProperty("contentY",double(200+(step+trial)%8*70));
+                if(step<11)QTest::qWait(16);
+            }
+            const auto lastInput=Performance::now();bool armed=false;QTimer ready;ready.setInterval(5);
+            connect(&ready,&QTimer::timeout,window,[&]{if(!armed && textured() && reader.pendingRasters()==0){armed=true;frames.arm();window->update();}});ready.start();
+            QTRY_VERIFY_WITH_TIMEOUT(frames.queued()>0,30000);ready.stop();
+            refinement.append((frames.queued()-lastInput)/1000.0);inputIntervals.append(frames.intervals(begin,lastInput));
+        }
+        sampler.stop();
+        QVariantMap report{{"schema",1},{"qt",qVersion()},{"platform",QGuiApplication::platformName()},{"graphicsApi",int(window->rendererInterface()->graphicsApi())},{"requestedBackend",qEnvironmentVariable("QSG_RHI_BACKEND")},
+            {"architecture",QSysInfo::currentCpuArchitecture()},{"fixture",QFileInfo(input).fileName()},{"pages",reader.pageCount()},{"windowWidth",window->width()},{"windowHeight",window->height()},{"devicePixelRatio",window->effectiveDevicePixelRatio()},
+            {"pdfOpenToTexturedFrameQueueMs",openMs},{"lastInputToTexturedFrameQueueMs",Performance::distribution(refinement)},{"duringInputFrameQueueIntervalsMs",Performance::distribution(inputIntervals)},
+            {"guiTenMsTimerIntervalsMs",Performance::distribution(guiIntervals)},{"rssPeakSampledBytes",peakRss},{"rssFinalBytes",Performance::memory("VmRSS")},{"processLifetimeRssHighWaterBytes",Performance::memory("VmHWM")},
+            {"renderResources",RenderBudget::statistics()},{"rasterJobs",RasterJobs::statistics()},{"cpuLruKiB",ReaderController::cpuCacheKiB()},
+            {"interactivePresentationMeasured",inputIntervals.size()>=6},{"windowExposed",window->isExposed()},{"windowActive",window->isActive()},
+            {"measurementNotes","Six 12-input zoom/pan bursts at nominal 16 ms. Last input to fully textured scene queued for presentation includes 5 ms readiness polling. frameSwapped measures queued presentation, not physical display FPS. If interactivePresentationMeasured is false, the compositor withheld input-period callbacks and those latency/frame figures are not an interactive performance result. RSS includes Qt, PDFium, fonts and index memory; unsupported OS values are -1. Driver allocations and Qt chrome are outside the pixel payload ledger."}};
+        const auto output=qEnvironmentVariable("LYRA_READER_PERF_OUTPUT");
+        if(!output.isEmpty()){QSaveFile file(output);QVERIFY(file.open(QIODevice::WriteOnly));QVERIFY(file.write(QJsonDocument::fromVariant(report).toJson())>0);QVERIFY(file.commit());}
+        qInfo().noquote()<<"lyra-reader-performance:"<<QJsonDocument::fromVariant(report).toJson(QJsonDocument::Compact);
+        QVERIFY(RenderBudget::statistics().value("residentPeakBytes").toLongLong()<=RenderBudget::residentLimit);
+        QVERIFY(RenderBudget::statistics().value("texturePeakBytes").toLongLong()<=RenderBudget::textureLimit);
+        QVERIFY(RasterJobs::statistics().value("peakRunning").toInt()<=RasterJobs::maximumRunning);
+        if(inputIntervals.size()<6)QSKIP("Compositor did not deliver input-period frame callbacks; interactive native performance remains unmeasured. Diagnostic JSON was saved.");
+    }
+    void liveRenderBudgetsResistContentionAndReleaseHiddenWindows() {
+        QTRY_COMPARE_WITH_TIMEOUT(RenderBudget::statistics().value("residentBytes").toLongLong(),0,10000);
+        for(const auto kind:{RenderBudget::Kind::Resident,RenderBudget::Kind::Texture}) {
+            std::atomic_int ready{0},admitted{0};std::atomic_bool release{false};std::vector<std::thread> workers;
+            for(int i=0;i<16;++i)workers.emplace_back([&]{auto lease=RenderBudget::reserve(kind,32LL*1024*1024);if(lease)++admitted;++ready;while(!release.load())std::this_thread::yield();});
+            while(ready.load()!=16)QTest::qWait(1);
+            const auto snapshot=RenderBudget::statistics();release=true;for(auto &worker:workers)worker.join();
+            QCOMPARE(admitted.load(),6);
+            const auto key=kind==RenderBudget::Kind::Resident ? "residentBytes" : "textureBytes";
+            QCOMPARE(snapshot.value(key).toLongLong(),192LL*1024*1024);QCOMPARE(RenderBudget::statistics().value(key).toLongLong(),0);
+        }
+        WorkspaceController first,second;QQmlApplicationEngine a,b;
+        const auto load=[&](QQmlApplicationEngine &engine,WorkspaceController &workspace) {
+            engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));
+            auto *window=engine.rootObjects().isEmpty()?nullptr:qobject_cast<QQuickWindow *>(engine.rootObjects().first());
+            if(window){window->setPersistentSceneGraph(false);if(QGuiApplication::platformName()!="offscreen")window->setMaximumSize(QSize(960,640));window->resize(960,640);}
+            workspace.openFile(QUrl::fromLocalFile(QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf"));return window;
+        };
+        auto *one=load(a,first);auto *two=load(b,second);QVERIFY(one && two);
+        QTRY_COMPARE_WITH_TIMEOUT(first.activeReader()->pageCount(),9,10000);QTRY_COMPARE_WITH_TIMEOUT(second.activeReader()->pageCount(),9,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(first.activeReader()->pendingCommands(),0,10000);QTRY_COMPARE_WITH_TIMEOUT(second.activeReader()->pendingCommands(),0,10000);QTest::qWait(150);
+        one->setProperty("fitting",false);two->setProperty("fitting",false);
+        QVERIFY(QMetaObject::invokeMethod(one,"changeZoom",Q_ARG(QVariant,4.0),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+        QVERIFY(QMetaObject::invokeMethod(two,"changeZoom",Q_ARG(QVariant,3.8),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+        const auto ready=[&](QQuickWindow *window){auto *page=visualItem(window->contentItem(),"pdfPage0");return page && page->property("refined").toBool();};
+        QTRY_VERIFY_WITH_TIMEOUT(ready(one) && ready(two),15000);
+        auto *view=one->findChild<QQuickItem *>("pageList");QVERIFY(view);
+        for(int i=0;i<12;++i){view->setProperty("contentX",i*45.0);view->setProperty("contentY",300+i*45.0);QTest::qWait(8);}
+        QTRY_VERIFY_WITH_TIMEOUT(ready(one),15000);QTRY_COMPARE_WITH_TIMEOUT(first.activeReader()->pendingRasters(),0,15000);
+        QVERIFY(!one->grabWindow().isNull());QVERIFY(!two->grabWindow().isNull());
+        const auto stats=RenderBudget::statistics();QVERIFY(stats.value("residentBytes").toLongLong()>0);QVERIFY(stats.value("textureBytes").toLongLong()>0);
+        QVERIFY(stats.value("residentPeakBytes").toLongLong()<=RenderBudget::residentLimit);QVERIFY(stats.value("texturePeakBytes").toLongLong()<=RenderBudget::textureLimit);
+        QVERIFY(RasterJobs::statistics().value("peakRunning").toInt()<=RasterJobs::maximumRunning);
+        QVERIFY(RasterJobs::statistics().value("peakQueued").toInt()<=RasterJobs::maximumQueued);
+        one->hide();one->releaseResources();
+        auto *page=visualItem(one->contentItem(),"pdfPage0");QVERIFY(page);QTRY_VERIFY(!page->property("loaded").toBool());
+        two->hide();two->releaseResources();
+        QTRY_COMPARE_WITH_TIMEOUT(RenderBudget::statistics().value("residentBytes").toLongLong(),0,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(RenderBudget::statistics().value("textureBytes").toLongLong(),0,10000);
+        one->show();QTRY_VERIFY_WITH_TIMEOUT(ready(one),15000);QVERIFY(!one->grabWindow().isNull());
+    }
     void deepZoomRefinesVisibleTilesWithoutSeamsAndSharesTheCacheBudget() {
         ReaderController reader;QQmlApplicationEngine engine;
         engine.addImageProvider("lyrapreview",new NativeImageProvider);
@@ -730,6 +827,12 @@ private slots:
         preview->togglePin();preview->showEntry(0);
         const auto ready=[&] {const auto *image=visualItem(window->contentItem(),"referencePreviewImage");return image && image->property("status").toInt()==1;};
         QTRY_VERIFY_WITH_TIMEOUT(ready(),10000);
+        const auto cropFrame=window->grabWindow();auto *crop=visualItem(window->contentItem(),"referencePreviewImage");QVERIFY(crop);
+        const auto bounds=crop->mapRectToScene(QRectF(0,0,crop->width(),crop->height()));
+        const double cropDprX=double(cropFrame.width())/window->width(),cropDprY=double(cropFrame.height())/window->height();
+        const auto area=QRectF(bounds.x()*cropDprX,bounds.y()*cropDprY,bounds.width()*cropDprX,bounds.height()*cropDprY).toAlignedRect().intersected(cropFrame.rect());
+        int black=0,white=0;for(int y=area.top();y<area.bottom();++y)for(int x=area.left();x<area.right();++x){const auto c=cropFrame.pixelColor(x,y);if(c.red()<80 && c.green()<80 && c.blue()<80)++black;if(c.red()>245 && c.green()>245 && c.blue()>245)++white;}
+        QVERIFY2(black>20 && white>100,"The budgeted region must render real bibliography ink and paper");
         QVERIFY(!preview->imageUrl(450,1.5,"original").isEmpty());
         const auto snapshotDirectory=qEnvironmentVariable("LYRA_READER_CHECK_SNAPSHOTS");
         if(!snapshotDirectory.isEmpty())QVERIFY(window->grabWindow().save(snapshotDirectory+"/lyrareader-preview.png"));

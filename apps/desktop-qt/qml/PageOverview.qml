@@ -133,6 +133,7 @@ Item {
                             color: "white"
                             border.color: app.colors.pageEdge
                             PdfPage {
+                                resourceActive: cell.y + cell.height > grid.contentY && cell.y < grid.contentY + grid.height
                                 anchors.fill: parent
                                 anchors.margins: 1
                                 paperAppearance: app.paperAppearance

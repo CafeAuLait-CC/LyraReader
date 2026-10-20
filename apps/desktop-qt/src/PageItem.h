@@ -1,5 +1,6 @@
 #pragma once
 #include "ReaderController.h"
+#include "RenderBudget.h"
 #include <QQuickItem>
 #include <QPointer>
 #include <QTimer>
@@ -16,6 +17,8 @@ class PageItem : public QQuickItem {
     Q_PROPERTY(QRectF visibleRegion READ visibleRegion WRITE setVisibleRegion NOTIFY visibleRegionChanged)
     Q_PROPERTY(bool refined READ refined NOTIFY refinementChanged)
     Q_PROPERTY(int loadedTileCount READ loadedTileCount NOTIFY refinementChanged)
+    Q_PROPERTY(bool resourceActive READ resourceActive WRITE setResourceActive NOTIFY resourceActiveChanged)
+    Q_PROPERTY(bool texturesReady READ texturesReady NOTIFY texturesReadyChanged)
 public:
     explicit PageItem(QQuickItem *parent=nullptr);
     ~PageItem() override;
@@ -27,6 +30,9 @@ public:
     bool refined() const {return m_refined;}
     int loadedTileCount() const {return int(m_tileImages.size());}
     bool embeddedAnnotations() const {return m_embedded;}
+    bool resourceActive()const{return m_resourceActive;}
+    bool texturesReady()const{return m_texturesReady;}
+    void setResourceActive(bool active);
     bool tilesEnabled() const {return m_tilesEnabled;}
     QRectF visibleRegion() const {return m_visibleRegion;}
     void setController(ReaderController *controller);
@@ -40,6 +46,8 @@ signals:
     void controllerChanged();void pageIndexChanged();void rasterScaleChanged();void loadedChanged();
     void paperAppearanceChanged();void embeddedAnnotationsChanged();void tilesEnabledChanged();
     void visibleRegionChanged();void refinementChanged();
+    void resourceActiveChanged();
+    void texturesReadyChanged();
 protected:
     QSGNode *updatePaintNode(QSGNode *node,UpdatePaintNodeData *) override;
     void itemChange(ItemChange change,const ItemChangeData &data) override;
@@ -51,15 +59,23 @@ private:
     void request();
     void refresh();
     void setRefined(bool value);
+    bool demandVisible()const;
+    void syncBudget();
+    void budgetChanged();
     QPointer<ReaderController> m_controller;
     QVector<QMetaObject::Connection> m_connections;
+    QVector<QMetaObject::Connection> m_windowConnections;
     int m_page=-1,m_level=-1000;
     double m_scale=1,m_lastDeviceScale=0;
-    QImage m_image;
+    ResidentImage m_image;
     QList<TileSpec> m_tiles,m_previousTiles;
-    QHash<QString,QImage> m_tileImages,m_previousImages;
+    QHash<QString,ResidentImage> m_tileImages,m_previousImages;
     QRectF m_visibleRegion;
     QString m_paperAppearance=QStringLiteral("original");
     bool m_embedded=false,m_tilesEnabled=false,m_refined=false,m_demandCurrent=false;
+    bool m_resourceActive=true;
+    qint64 m_targetBytes=0;
+    bool m_texturesReady=false;
+    quint64 m_textureEpoch=0;
     QTimer m_requestTimer;
 };

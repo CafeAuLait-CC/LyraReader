@@ -61,8 +61,8 @@ QString NativeImageProvider::registerSource(const std::shared_ptr<NativeRasterSo
 void NativeImageProvider::unregisterSource(const QString &key) {
     QMutexLocker lock(&sourcesMutex);sources.remove(key);
 }
-QImage NativeImageProvider::requestImage(const QString &id,QSize *size,const QSize &) {
-    const QUrl url(QStringLiteral("image://lyrapreview/")+id);
+QImage NativeImageProvider::rawImage(const QUrl &url,qint64 maximumBytes) {
+    if(url.scheme()!=QStringLiteral("image") || url.host()!=QStringLiteral("lyrapreview"))return {};
     const auto path=url.path().split('/',Qt::SkipEmptyParts);
     if(path.size()!=2)return {};
     std::shared_ptr<NativeRasterSource> source;
@@ -74,7 +74,15 @@ QImage NativeImageProvider::requestImage(const QString &id,QSize *size,const QSi
     const auto number=[&](const QString &key){bool valid=false;const double value=query.queryItemValue(key).toDouble(&valid);return valid ? value : std::nan("");};
     const QRectF region(number(QStringLiteral("x")),number(QStringLiteral("y")),number(QStringLiteral("w")),number(QStringLiteral("h")));
     QString error;
-    auto image=source->crop(page,region,number(QStringLiteral("scale")),true,false,&error);
+    double scale=number(QStringLiteral("scale"));
+    if(region.isEmpty() || !std::isfinite(scale) || scale<=0 || maximumBytes<4)return {};
+    scale=qMin(scale,std::sqrt(double(maximumBytes)/(4*region.width()*region.height())));
+    while(std::ceil(region.width()*scale)*std::ceil(region.height()*scale)*4>maximumBytes)scale*=.99;
+    return source->crop(page,region,scale,true,false,&error);
+}
+QImage NativeImageProvider::requestImage(const QString &id,QSize *size,const QSize &) {
+    const QUrl url(QStringLiteral("image://lyrapreview/")+id);const QUrlQuery query(url);
+    auto image=rawImage(url);
     if(!image.isNull())image=PaperAppearance::displayImage(image,PaperAppearance::mode(query.queryItemValue(QStringLiteral("paper"))));
     if(size)*size=image.size();
     return image;

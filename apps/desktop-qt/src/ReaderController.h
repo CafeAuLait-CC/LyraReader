@@ -1,5 +1,6 @@
 #pragma once
 #include "lyra_reader_desktop.h"
+#include "RasterJobs.h"
 #include <QRectF>
 #include <QImage>
 #include <QObject>
@@ -79,6 +80,8 @@ public:
     Q_INVOKABLE double zoomOffset(double offset, double anchor, double oldZoom, double newZoom) const;
     std::shared_ptr<LyraReaderDesktopDocument> documentHandle()const{return m_document;}
     void requestPage(int page, double scale,bool embedded=false);
+    void requestPageForConsumer(quintptr consumer,int page,double scale,bool embedded=false);
+    void clearRasterDemand(quintptr consumer);
     QImage cachedPage(int page, double scale,bool embedded=false) const;
     QList<TileSpec> requestTiles(quintptr consumer,int page,int level,const QRectF &visible,const QSet<QString> &retained);
     void clearTileDemand(quintptr consumer);
@@ -112,6 +115,7 @@ private:
     QVariantMap m_aiState;
     quint64 m_aiPreviewId=0,m_aiStartId=0,m_aiPollId=0,m_aiPlanGeneration=0;
     void enqueue(const Request &request);
+    void requestPageInternal(int page,double scale,bool embedded,bool manual);
     void pruneTileRequests();
     void clearRasterCache();
     void startNextRaster();
@@ -120,6 +124,11 @@ private:
     std::shared_ptr<NativeRasterSource> m_source;
     QString m_cachePrefix;
     QHash<quintptr,QSet<QString>> m_tileDemand;
+    QHash<quintptr,QString> m_pageDemand;
+    QSet<QString> m_manualDemand;
+    RasterJobs::Handle m_activeRaster;
+    QString m_activeRasterKey;
+    bool m_activeRasterIsTile=false;
     QUrl m_lastUrl;
     QVariantList m_pages;
     double m_documentWidth = 0;
@@ -136,6 +145,7 @@ private:
     bool m_loading = false;
     bool m_passwordRequired = false;
     bool m_rendering = false;
+    bool m_rasterRetryQueued=false;
     quint64 m_generation = 0;
     qulonglong m_completed = 0, m_discarded = 0;
     // Whole pages and bounded tiles share the process-wide 96 MiB CPU LRU.

@@ -7,6 +7,7 @@
 #include <QProgressDialog>
 #include <QTimer>
 #include <QtConcurrentRun>
+#include "RasterJobs.h"
 #include <algorithm>
 
 namespace {
@@ -48,6 +49,8 @@ public:
         const double height=size.value(QStringLiteral("height")).toDouble();
         const double y=top,bandHeight=qMin(128.0,height-y);
         const int page=pages.at(index);
+        auto ticket=RasterJobs::enqueue();
+        if(!ticket){QTimer::singleShot(100,this,[this]{nextBand();});return;}
         auto *watcher=new QFutureWatcher<Band>(this);
         connect(watcher,&QFutureWatcher<Band>::finished,this,[this,watcher,width,height,y,bandHeight] {
             const auto band=watcher->result();watcher->deleteLater();
@@ -67,7 +70,8 @@ public:
             QTimer::singleShot(0,this,[this]{nextBand();});
         });
         const auto snapshot=source;
-        watcher->setFuture(QtConcurrent::run([snapshot,page,width,y,bandHeight] {
+        watcher->setFuture(QtConcurrent::run(RasterJobs::pool(),[snapshot,page,width,y,bandHeight,ticket] {
+            RasterJobs::Run run(ticket);
             Band result;LyraReaderBitmap bitmap{};LyraReaderBuffer error{};
             if(!lyra_reader_desktop_render_region(snapshot.get(),page,300.0/72.0,0,y,width,bandHeight,true,false,&bitmap,&error)) {
                 result.error=takeError(error);return result;
