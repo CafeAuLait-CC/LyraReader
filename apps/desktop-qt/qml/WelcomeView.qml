@@ -96,6 +96,9 @@ ScrollView {
             boundsBehavior: Flickable.StopAtBounds
             ScrollBar.vertical: ScrollBar {}
             delegate: ItemDelegate {
+                activeFocusOnTab: true
+                Accessible.onPressAction: if (enabled && visible)
+                    clicked()
                 required property var modelData
                 required property int index
                 objectName: "recentDocument" + index

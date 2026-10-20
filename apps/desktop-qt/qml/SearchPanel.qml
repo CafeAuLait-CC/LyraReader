@@ -64,11 +64,17 @@ Pane {
             currentIndex: app.searchIndex
             ScrollBar.vertical: ScrollBar {}
             delegate: ItemDelegate {
+                activeFocusOnTab: true
                 required property var modelData
                 required property int index
                 width: results.width
                 height: Math.max(75, snippet.implicitHeight + 35)
                 highlighted: index === app.searchIndex
+                Accessible.name: qsTr("Page %1: %2").arg(modelData.page + 1).arg(modelData.snippet)
+                Accessible.selectable: true
+                Accessible.selected: highlighted
+                Accessible.onPressAction: if (enabled && visible)
+                    clicked()
                 contentItem: ColumnLayout {
                     Label {
                         textFormat: Text.PlainText

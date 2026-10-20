@@ -102,6 +102,7 @@ ApplicationWindow {
     property var metadataDraft: null
     property string operationStatus: ""
     property string previewStatus: ""
+    onOperationStatusChanged: previewStatus = ""
     onAppearanceChanged: if (session)
         session.setPreference("appearance", appearance)
     onCurrentReaderChanged: {
@@ -316,7 +317,7 @@ ApplicationWindow {
         root.fitting = true;
     }
     function updateCurrentPage() {
-        if (currentReader.pageCount > 0 && !textViewVisible)
+        if (currentReader.pageCount > 0 && !textViewVisible && !overviewVisible)
             root.currentPage = canvas.pageAtOffset();
     }
 

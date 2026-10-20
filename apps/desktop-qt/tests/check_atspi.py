@@ -23,6 +23,7 @@ def main():
     parser.add_argument('--graphics', choices=['vulkan', 'opengl', 'software'], default='vulkan')
     parser.add_argument('--output', type=Path)
     parser.add_argument('--forms', action='store_true', help='Also exercise draft-only form actions')
+    parser.add_argument('--overview', action='store_true', help='Also exercise thumbnail and overview actions')
     args = parser.parse_args()
     try:
         import gi
@@ -166,6 +167,17 @@ def main():
                 report.update(passed=True, assertions=['tab activation', 'menu action', 'read-only text',
                               'character count', 'selection round trip', 'page action', 'hidden state'],
                               firstPageCharacters=len(contents), secondPageCharacters=len(contents2))
+                if args.overview:
+                    thumbnail = wait('named thumbnail', lambda: find('Page 1 thumbnail', Atspi.Role.LIST_ITEM))
+                    press(thumbnail)
+                    wait('thumbnail selection', lambda: state(thumbnail, Atspi.StateType.SELECTED))
+                    press(wait('overview action', lambda: find('Page overview')))
+                    page = wait('overview page', lambda: find('Overview page 3', Atspi.Role.LIST_ITEM))
+                    press(page)
+                    wait('overview selection', lambda: state(page, Atspi.StateType.SELECTED))
+                    press(wait('leave overview', lambda: find('Close Page Overview')))
+                    wait('overview no longer showing', lambda: not showing(page))
+                    report['assertions'].append('thumbnail and overview actions/states')
                 if args.forms:
                     press(wait('form tab', lambda: find('forms.pdf', Atspi.Role.PAGE_TAB)))
                     press(wait('inline form mode', lambda: find('Fill & Sign')))
@@ -204,6 +216,15 @@ def main():
                     wait('dialog checkbox draft reset', lambda: not state(dialog_check, Atspi.StateType.CHECKED))
                     report['assertions'].append('form dialog draft/reset')
                     assert form.read_bytes() == form_bytes, 'Draft actions must leave the source unchanged'
+                    press(wait('close fields dialog', lambda: find('Close', Atspi.Role.PUSH_BUTTON, dialog)))
+                    press(wait('leave form mode', lambda: find('Fill & Sign')))
+                if args.overview:
+                    for filename in reversed(inputs):
+                        press(wait('close copied document', lambda f=filename: find('Close ' + Path(f).name)))
+                    recent = wait('recent document', lambda: find('Open recent document first.pdf', Atspi.Role.LIST_ITEM))
+                    press(recent)
+                    wait('reopened document', lambda: find('Page 1 thumbnail', Atspi.Role.LIST_ITEM))
+                    report['assertions'].append('recent document activation')
             except Exception:
                 try:
                     print('Own page-related accessibility states:', [

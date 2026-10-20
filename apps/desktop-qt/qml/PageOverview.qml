@@ -97,7 +97,7 @@ Item {
             Layout.fillWidth: true
             Layout.margins: 10
             wrapMode: Text.Wrap
-            text: app.originalReadOnly ? qsTr("Signed PDF: export changes to a new copy. The signed original cannot be replaced.") : app.pageEditsPending ? qsTr("Page changes are staged. The original PDF stays unchanged until Apply. Undo restores pages and their marks.") : qsTr("Shift-click or Ctrl-click to select pages. Drag a page to reorder.")
+            text: app.originalReadOnly ? qsTr("Signed PDF: export changes to a new copy. The signed original cannot be replaced.") : app.pageEditsPending ? qsTr("Page changes are staged. The original PDF stays unchanged until Apply. Undo restores pages and their marks.") : qsTr("Space selects; Ctrl+Space toggles; Shift+Space selects a range. Enter opens a page. Drag to reorder.")
             color: app.colors.textSecondary
             font.pixelSize: 11
         }
@@ -111,20 +111,55 @@ Item {
             cellHeight: 245
             leftMargin: Math.max(8, (width - Math.floor(width / cellWidth) * cellWidth) / 2)
             model: app.currentReader.pages
+            keyNavigationEnabled: true
+            function syncPage() {
+                if (visible && count > 0) {
+                    currentIndex = Math.max(0, Math.min(app.currentPage, count - 1));
+                    positionViewAtIndex(currentIndex, GridView.Contain);
+                }
+            }
+            onVisibleChanged: syncPage()
+            onCountChanged: Qt.callLater(syncPage)
+            Connections {
+                target: app
+                function onCurrentPageChanged() {
+                    grid.syncPage();
+                }
+            }
             ScrollBar.vertical: ScrollBar {}
             delegate: Item {
                 id: cell
                 required property var modelData
                 required property int index
+                objectName: "overviewPage" + index
                 width: grid.cellWidth
                 height: grid.cellHeight
+                focus: GridView.isCurrentItem
+                activeFocusOnTab: GridView.isCurrentItem
+                function choosePage(modifiers) {
+                    grid.currentIndex = index;
+                    app.selectPage(index, modifiers);
+                }
+                Accessible.role: Accessible.ListItem
+                Accessible.name: qsTr("Overview page %1").arg(index + 1)
+                Accessible.description: qsTr("Space selects this page; Enter opens it. Control or Shift extends the selection.")
+                Accessible.selectable: true
+                Accessible.selected: app.selectedPages.indexOf(index) >= 0
+                Accessible.onPressAction: choosePage(Qt.NoModifier)
+                Keys.onSpacePressed: function (event) {
+                    choosePage(event.modifiers);
+                }
+                Keys.onReturnPressed: {
+                    app.navigate(index);
+                    app.overviewVisible = false;
+                }
                 Rectangle {
                     anchors.fill: parent
                     anchors.margins: 8
                     radius: 5
                     color: app.selectedPages.indexOf(cell.index) >= 0 ? app.colors.selectedBg : hover.hovered ? app.colors.hoverBg : "transparent"
-                    border.width: overview.dropIndex === cell.index ? 2 : 0
-                    border.color: app.colors.accentBorder
+                    border.width: overview.dropIndex === cell.index || cell.activeFocus ? 2 : 0
+                    border.color: cell.activeFocus ? app.colors.focusRing : app.colors.accentBorder
                     Column {
                         anchors.centerIn: parent
                         spacing: 8
@@ -167,7 +202,8 @@ Item {
                     MouseArea {
                         anchors.fill: parent
                         onClicked: function (mouse) {
-                            app.selectPage(cell.index, mouse.modifiers);
+                            cell.forceActiveFocus();
+                            cell.choosePage(mouse.modifiers);
                         }
                         onDoubleClicked: {
                             app.navigate(cell.index);

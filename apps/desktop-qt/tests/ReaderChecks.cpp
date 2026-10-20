@@ -119,6 +119,27 @@ private slots:
         const auto placement=workspace.activeReader()->pages().at(1).toMap();
         QTRY_VERIFY(qAbs(view->property("contentY").toDouble()-(placement.value("top").toDouble()+200)*window->property("zoom").toDouble())<1);
     }
+    void pageOverviewSupportsAccessibleSelectionAndKeyboardReading() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto file=scratch.path()+"/overview.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",file));
+        WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);
+        engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
+        auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);workspace.openFile(QUrl::fromLocalFile(file));
+        QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pendingCommands(),0,10000);
+        QTRY_VERIFY_WITH_TIMEOUT(visualItem(window->contentItem(),"pdfPage0") && visualItem(window->contentItem(),"pdfPage0")->property("texturesReady").toBool(),10000);
+        window->setProperty("overviewVisible",true);QTRY_VERIFY(visualItem(window->contentItem(),"overviewPage2"));
+        auto *third=visualItem(window->contentItem(),"overviewPage2");auto *first=visualItem(window->contentItem(),"overviewPage0");QVERIFY(third && first);
+        auto *interface=QAccessible::queryAccessibleInterface(third);QVERIFY(interface);QCOMPARE(interface->role(),QAccessible::ListItem);QCOMPARE(interface->text(QAccessible::Name),QString("Overview page 3"));QVERIFY(interface->state().selectable);
+        auto *action=interface->actionInterface();QVERIFY(action);QVERIFY(action->actionNames().contains(QAccessibleActionInterface::pressAction()));action->doAction(QAccessibleActionInterface::pressAction());
+        QTRY_COMPARE(window->property("selectedPages").toList(),QVariantList({2}));QVERIFY(interface->state().selected);
+        auto *canvas=window->findChild<QQuickItem *>("pageList");QVERIFY(canvas);
+        canvas->setProperty("contentY",workspace.activeReader()->pages().at(1).toMap().value("top").toDouble()*window->property("zoom").toDouble());QTest::qWait(50);
+        QCOMPARE(window->property("currentPage").toInt(),2); // Hidden canvas reflow must not change the overview's keyboard target.
+        third->forceActiveFocus();QTest::keyClick(window,Qt::Key_Space,Qt::ControlModifier);QCOMPARE(window->property("selectedPages").toList(),QVariantList{});
+        first->forceActiveFocus();QTest::keyClick(window,Qt::Key_Space,Qt::ShiftModifier);QCOMPARE(window->property("selectedPages").toList(),QVariantList({0,1,2}));
+        QTest::keyClick(window,Qt::Key_Space);QCOMPARE(window->property("selectedPages").toList(),QVariantList({0}));
+        QTest::keyClick(window,Qt::Key_Right);QTRY_VERIFY(visualItem(window->contentItem(),"overviewPage1")->hasActiveFocus());
+        QTest::keyClick(window,Qt::Key_Return);QTRY_VERIFY(!window->property("overviewVisible").toBool());QTRY_COMPARE(window->property("currentPage").toInt(),1);
+    }
     void recentDocumentsAndNarrowWindowRemainKeyboardReachable() {
         WorkspaceController workspace;workspace.clearRecentDocuments();
         workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));
@@ -135,6 +156,7 @@ private slots:
         QTRY_VERIFY(visualItem(window->contentItem(),"recentDocument0"));
         auto *row=visualItem(window->contentItem(),"recentDocument0");QVERIFY(row);QTest::qWait(150);
         QVERIFY(row->isVisible());
+        auto *recentInterface=QAccessible::queryAccessibleInterface(row);QVERIFY(recentInterface);QVERIFY(recentInterface->actionInterface());QVERIFY(recentInterface->actionInterface()->actionNames().contains(QAccessibleActionInterface::pressAction()));
         QTRY_VERIFY(row->mapToScene(QPointF(0,row->height())).y()<=window->height());
         row->forceActiveFocus();QTest::keyClick(window,Qt::Key_Space);
         QTRY_COMPARE(workspace.activeReader(),original);QCOMPARE(workspace.tabs().size(),2);
@@ -736,50 +758,79 @@ private slots:
     }
     void renderingPerformanceRecordsRealQueueLatencyFramesAndRss() {
         if(!qEnvironmentVariableIsSet("LYRA_READER_CHECK_PERFORMANCE"))QSKIP("Opt-in native performance run; use LYRA_READER_CHECK_PERFORMANCE=1");
+        const auto publish=[](const QVariantMap &report) {
+            const auto output=qEnvironmentVariable("LYRA_READER_PERF_OUTPUT");
+            if(!output.isEmpty()){QSaveFile file(output);const auto bytes=QJsonDocument::fromVariant(report).toJson();if(!file.open(QIODevice::WriteOnly) || file.write(bytes)!=bytes.size() || !file.commit())return false;}
+            qInfo().noquote()<<"lyra-reader-performance:"<<QJsonDocument::fromVariant(report).toJson(QJsonDocument::Compact);return true;
+        };
         const auto input=qEnvironmentVariable("LYRA_READER_PERF_PDF",QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf");
+        bool validPage=false;const int pageIndex=qEnvironmentVariable("LYRA_READER_PERF_PAGE","0").toInt(&validPage);QVERIFY(validPage && pageIndex>=0);
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto fixture=scratch.path()+"/performance.pdf";QVERIFY(QFile::copy(input,fixture));
         ReaderController reader;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("reader",&reader);engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
         auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);window->setPersistentSceneGraph(false);
-        if(QGuiApplication::platformName()!="offscreen")window->setMaximumSize(QSize(1200,820));window->resize(1200,820);
-        Performance::Frames frames(window);QList<double> inputIntervals,refinement,guiIntervals;
+        window->setProperty("requestedPage",pageIndex);
+        const bool native=QGuiApplication::platformName()!="offscreen";
+        if(native)window->setMaximumSize(QSize(1200,820));window->resize(1200,820);
+        if(native) {
+            const bool exposed=QTest::qWaitForWindowExposed(window,5000);
+            if(exposed)window->requestActivate();
+            if(!exposed || !QTest::qWaitForWindowActive(window,2500)) {
+                QVERIFY(publish({{"schema",2},{"phase","preflight"},{"qt",qVersion()},{"platform",QGuiApplication::platformName()},
+                    {"requestedBackend",qEnvironmentVariable("QSG_RHI_BACKEND")},{"windowActive",window->isActive()},{"windowExposed",window->isExposed()},
+                    {"interactivePresentationMeasured",false},{"inputBurstsAttempted",false},{"reason",exposed ? "Native window could not obtain keyboard focus; no interactive timing was attempted." : "Native window was not exposed within the preflight timeout; no interactive timing was attempted."}}));
+                QSKIP("Native window was not exposed or active; input bursts were not attempted. Diagnostic JSON was saved.");
+            }
+        }
+        Performance::Frames frames(window);QList<double> inputIntervals,refinement,guiIntervals,inputPacing,burstDurations;
         qint64 peakRss=Performance::memory("VmRSS"),lastTick=Performance::now();
-        QTimer sampler;sampler.setInterval(10);connect(&sampler,&QTimer::timeout,window,[&] {
+        bool focusMaintained=true;
+        QTimer sampler;connect(window,&QWindow::activeChanged,&sampler,[&]{if(native && !window->isActive())focusMaintained=false;});
+        sampler.setInterval(10);connect(&sampler,&QTimer::timeout,window,[&] {
             const auto time=Performance::now();guiIntervals.append((time-lastTick)/1000.0);lastTick=time;peakRss=qMax(peakRss,Performance::memory("VmRSS"));
         });sampler.start();
         const auto openStart=Performance::now();reader.openFile(QUrl::fromLocalFile(fixture));
         QTRY_VERIFY_WITH_TIMEOUT(reader.pageCount()>0,60000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,60000);
-        const auto textured=[&]{auto *page=visualItem(window->contentItem(),"pdfPage0");return page && page->property("texturesReady").toBool();};
+        QVERIFY(pageIndex<reader.pageCount());
+        const auto textured=[&]{auto *page=visualItem(window->contentItem(),QString("pdfPage%1").arg(pageIndex));return page && page->property("texturesReady").toBool();};
         QTRY_VERIFY_WITH_TIMEOUT(textured(),30000);frames.arm();window->update();QTRY_VERIFY_WITH_TIMEOUT(frames.queued()>0,10000);
         const auto openMs=(frames.queued()-openStart)/1000.0;
         auto *view=window->findChild<QQuickItem *>("pageList");QVERIFY(view);window->setProperty("fitting",false);
-        for(int trial=0;trial<6;++trial) {
-            frames.clear();const auto begin=Performance::now();
+        constexpr int trials=30;
+        for(int trial=0;trial<trials;++trial) {
+            frames.clear();const auto begin=Performance::now();qint64 lastInput=begin;
             for(int step=0;step<12;++step) {
+                const auto inputTime=Performance::now();if(step)inputPacing.append((inputTime-lastInput)/1000.0);lastInput=inputTime;
                 const auto scale=step%3==0?2.7:step%3==1?4.0:3.6;
                 QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,scale),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
-                view->setProperty("contentX",double((step+trial)%8*70));view->setProperty("contentY",double(200+(step+trial)%8*70));
+                view->setProperty("contentX",double((step+trial)%8*70));view->setProperty("contentY",reader.pages().at(pageIndex).toMap().value("top").toDouble()*scale+double(200+(step+trial)%8*70));
                 if(step<11)QTest::qWait(16);
             }
-            const auto lastInput=Performance::now();bool armed=false;QTimer ready;ready.setInterval(5);
+            const auto endInput=Performance::now();burstDurations.append((endInput-begin)/1000.0);bool armed=false;QTimer ready;ready.setInterval(5);
             connect(&ready,&QTimer::timeout,window,[&]{if(!armed && textured() && reader.pendingRasters()==0){armed=true;frames.arm();window->update();}});ready.start();
+            QTimer::singleShot(2000,&ready,[&,trial] {
+                auto *page=visualItem(window->contentItem(),QString("pdfPage%1").arg(pageIndex));
+                QVariantMap state{{"trial",trial},{"currentPage",window->property("currentPage")},{"zoom",window->property("zoom")},{"contentY",view->property("contentY")},{"originY",view->property("originY")},{"pendingRasters",reader.pendingRasters()},{"error",reader.error()},{"jobs",RasterJobs::statistics()},{"budget",RenderBudget::statistics()}};
+                if(page){state.insert("visibleRegion",page->property("visibleRegion"));state.insert("refined",page->property("refined"));state.insert("texturesReady",page->property("texturesReady"));state.insert("sceneY",page->mapToScene(QPointF(0,0)).y());}else state.insert("pageMissing",true);
+                qInfo().noquote()<<"lyra-reader-performance-pending:"<<QJsonDocument::fromVariant(state).toJson(QJsonDocument::Compact);
+            });
             QTRY_VERIFY_WITH_TIMEOUT(frames.queued()>0,30000);ready.stop();
-            refinement.append((frames.queued()-lastInput)/1000.0);inputIntervals.append(frames.intervals(begin,lastInput));
+            refinement.append((frames.queued()-lastInput)/1000.0);inputIntervals.append(frames.intervals(begin,endInput));
+            if(!focusMaintained || (native && trial>=2 && inputIntervals.isEmpty()))break;
         }
         sampler.stop();
-        QVariantMap report{{"schema",1},{"qt",qVersion()},{"platform",QGuiApplication::platformName()},{"graphicsApi",int(window->rendererInterface()->graphicsApi())},{"requestedBackend",qEnvironmentVariable("QSG_RHI_BACKEND")},
-            {"architecture",QSysInfo::currentCpuArchitecture()},{"fixture",QFileInfo(input).fileName()},{"pages",reader.pageCount()},{"windowWidth",window->width()},{"windowHeight",window->height()},{"devicePixelRatio",window->effectiveDevicePixelRatio()},
+        QVariantMap report{{"schema",2},{"phase","bursts"},{"qt",qVersion()},{"platform",QGuiApplication::platformName()},{"graphicsApi",int(window->rendererInterface()->graphicsApi())},{"requestedBackend",qEnvironmentVariable("QSG_RHI_BACKEND")},
+            {"architecture",QSysInfo::currentCpuArchitecture()},{"fixture",QFileInfo(input).fileName()},{"pages",reader.pageCount()},{"pageIndex",pageIndex},{"windowWidth",window->width()},{"windowHeight",window->height()},{"devicePixelRatio",window->effectiveDevicePixelRatio()},
             {"pdfOpenToTexturedFrameQueueMs",openMs},{"lastInputToTexturedFrameQueueMs",Performance::distribution(refinement)},{"duringInputFrameQueueIntervalsMs",Performance::distribution(inputIntervals)},
+            {"trialsRequested",trials},{"trialsCompleted",refinement.size()},{"inputsPerBurst",12},{"targetInputIntervalMs",16},{"actualInputIntervalsMs",Performance::distribution(inputPacing)},{"inputBurstDurationMs",Performance::distribution(burstDurations)},{"percentileMethod","lower order statistic"},
             {"guiTenMsTimerIntervalsMs",Performance::distribution(guiIntervals)},{"rssPeakSampledBytes",peakRss},{"rssFinalBytes",Performance::memory("VmRSS")},{"processLifetimeRssHighWaterBytes",Performance::memory("VmHWM")},
             {"renderResources",RenderBudget::statistics()},{"rasterJobs",RasterJobs::statistics()},{"cpuLruKiB",ReaderController::cpuCacheKiB()},
-            {"interactivePresentationMeasured",inputIntervals.size()>=6},{"windowExposed",window->isExposed()},{"windowActive",window->isActive()},
-            {"measurementNotes","Six 12-input zoom/pan bursts at nominal 16 ms. Last input to fully textured scene queued for presentation includes 5 ms readiness polling. frameSwapped measures queued presentation, not physical display FPS. If interactivePresentationMeasured is false, the compositor withheld input-period callbacks and those latency/frame figures are not an interactive performance result. RSS includes Qt, PDFium, fonts and index memory; unsupported OS values are -1. The source ledger includes pre-raster capacity reservations. Driver allocations and Qt chrome are outside the pixel payload ledger."}};
-        const auto output=qEnvironmentVariable("LYRA_READER_PERF_OUTPUT");
-        if(!output.isEmpty()){QSaveFile file(output);QVERIFY(file.open(QIODevice::WriteOnly));QVERIFY(file.write(QJsonDocument::fromVariant(report).toJson())>0);QVERIFY(file.commit());}
-        qInfo().noquote()<<"lyra-reader-performance:"<<QJsonDocument::fromVariant(report).toJson(QJsonDocument::Compact);
+            {"interactivePresentationMeasured",inputIntervals.size()>=6 && focusMaintained},{"inputBurstsAttempted",true},{"nativeFocusRequired",native},{"focusMaintained",focusMaintained},{"windowExposed",window->isExposed()},{"windowActive",window->isActive()},
+            {"measurementNotes","Up to thirty 12-input zoom/pan bursts targeting 16 ms; actual delivery intervals are recorded. Last input starts before applying its zoom/pan change and includes GUI handling and 5 ms readiness polling. frameSwapped measures queued presentation, not physical display FPS. Insufficient input-period frame callbacks or lost native focus invalidate the sample and stop further bursts; no cause for missing callbacks is inferred. RSS includes Qt, PDFium, fonts and index memory; unsupported OS values are -1. The source ledger includes pre-raster capacity reservations. Driver allocations and Qt chrome are outside the pixel payload ledger."}};
+        QVERIFY(publish(report));
         QVERIFY(RenderBudget::statistics().value("residentPeakBytes").toLongLong()<=RenderBudget::residentLimit);
         QVERIFY(RenderBudget::statistics().value("texturePeakBytes").toLongLong()<=RenderBudget::textureLimit);
         QVERIFY(RasterJobs::statistics().value("peakRunning").toInt()<=RasterJobs::maximumRunning);
-        if(inputIntervals.size()<6)QSKIP("Compositor did not deliver input-period frame callbacks; interactive native performance remains unmeasured. Diagnostic JSON was saved.");
+        if(inputIntervals.size()<6 || !focusMaintained)QSKIP("Insufficient input-period frames or lost native focus; interactive performance remains unmeasured. Diagnostic JSON was saved.");
     }
     void completedBackgroundPixelsStayChargedWhileTheGuiIsBusy() {
         QTRY_COMPARE_WITH_TIMEOUT(RenderBudget::statistics().value("residentBytes").toLongLong(),0,10000);
@@ -914,7 +965,8 @@ private slots:
         auto *status=window->findChild<QObject *>("operationStatusLabel");QVERIFY(status);window->setProperty("operationStatus","Earlier export completed");
         preview->togglePin();const auto pinned=preview->model();preview->openAt(reader,0,10,10,100,100,1);QCOMPARE(preview->model(),pinned);
         QVERIFY(status->property("text").toString().contains("pinned"));QCOMPARE(window->property("operationStatus").toString(),QString("Earlier export completed"));
-        preview->togglePin();QCOMPARE(status->property("text").toString(),QString("Earlier export completed"));preview->showEntry(0);
+        window->setProperty("operationStatus","A newer export completed");QCOMPARE(status->property("text").toString(),QString("A newer export completed"));
+        preview->togglePin();QCOMPARE(status->property("text").toString(),QString("A newer export completed"));preview->showEntry(0);
         const auto ready=[&] {const auto *image=visualItem(window->contentItem(),"referencePreviewImage");return image && image->property("status").toInt()==1;};
         QTRY_VERIFY_WITH_TIMEOUT(ready(),10000);
         const auto cropFrame=window->grabWindow();auto *crop=visualItem(window->contentItem(),"referencePreviewImage");QVERIFY(crop);

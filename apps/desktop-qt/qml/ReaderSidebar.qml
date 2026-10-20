@@ -107,11 +107,17 @@ Pane {
                 ScrollBar.vertical: ScrollBar {}
                 delegate: ItemDelegate {
                     id: thumbnail
+                    activeFocusOnTab: true
+                    Accessible.onPressAction: if (enabled && visible)
+                        clicked()
                     required property var modelData
                     required property int index
                     width: thumbnails.width
                     height: 178
                     highlighted: app.currentPage === index
+                    Accessible.name: qsTr("Page %1 thumbnail").arg(index + 1)
+                    Accessible.selectable: true
+                    Accessible.selected: highlighted
                     background: Rectangle {
                         color: thumbnail.highlighted ? (app.active ? app.colors.selectedBg : app.colors.inactiveSelectionBg) : thumbnail.hovered ? app.colors.hoverBg : app.colors.sidebarBg
                         border.width: thumbnail.visualFocus ? 2 : 0
@@ -164,10 +170,14 @@ Pane {
                 ScrollBar.vertical: ScrollBar {}
                 delegate: ItemDelegate {
                     required property var modelData
+                    activeFocusOnTab: true
+                    Accessible.onPressAction: if (enabled && visible)
+                        clicked()
                     width: outline.width
                     height: Math.max(42, outlineText.implicitHeight + 18)
                     leftPadding: 12 + modelData.depth * 13
                     highlighted: modelData.page === app.currentPage
+                    Accessible.name: modelData.title
                     contentItem: Label {
                         id: outlineText
                         textFormat: Text.PlainText
@@ -198,6 +208,10 @@ Pane {
                 delegate: ItemDelegate {
                     required property var modelData
                     required property int index
+                    activeFocusOnTab: true
+                    Accessible.name: qsTr("%1 · page %2").arg(modelData.title || qsTr("Bookmark")).arg(modelData.page + 1)
+                    Accessible.onPressAction: if (enabled && visible)
+                        clicked()
                     width: bookmarkList.width
                     height: 62
                     contentItem: RowLayout {
@@ -255,6 +269,11 @@ Pane {
                 delegate: ItemDelegate {
                     required property var modelData
                     readonly property var annotation: modelData.annotation
+                    activeFocusOnTab: true
+                    Accessible.name: qsTr("%1 · page %2").arg(annotation.is_reply ? annotation.author || qsTr("Reply") : annotation.kind).arg(annotation.page + 1)
+                    Accessible.description: (annotation.note || annotation.contents || "") + (modelData.orphanReason ? " · " + modelData.orphanReason : "")
+                    Accessible.onPressAction: if (enabled && visible)
+                        clicked()
                     objectName: "annotationThreadRow_" + annotation.id
                     width: annotationList.width
                     leftPadding: 10 + Math.min(modelData.depth, 6) * 14
