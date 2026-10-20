@@ -887,6 +887,13 @@ private slots:
         const auto area=QRectF(bounds.x()*cropDprX,bounds.y()*cropDprY,bounds.width()*cropDprX,bounds.height()*cropDprY).toAlignedRect().intersected(cropFrame.rect());
         int black=0,white=0;for(int y=area.top();y<area.bottom();++y)for(int x=area.left();x<area.right();++x){const auto c=cropFrame.pixelColor(x,y);if(c.red()<80 && c.green()<80 && c.blue()<80)++black;if(c.red()>245 && c.green()>245 && c.blue()>245)++white;}
         QVERIFY2(black>20 && white>100,"The budgeted region must render real bibliography ink and paper");
+        const auto firstSource=crop->property("source").toUrl();preview->showEntry(1);
+        QTRY_VERIFY_WITH_TIMEOUT(visualItem(window->contentItem(),"referencePreviewImage") && visualItem(window->contentItem(),"referencePreviewImage")->property("source").toUrl()!=firstSource,10000);
+        QTRY_VERIFY_WITH_TIMEOUT(ready(),10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingRasters(),0,10000);QTest::qWait(100);
+        const auto beforePaperJobs=RasterJobs::statistics().value("completed").toLongLong();
+        window->setProperty("paperAppearance","warm");QTest::qWait(200);
+        QCOMPARE(RasterJobs::statistics().value("completed").toLongLong(),beforePaperJobs);
+        window->setProperty("paperAppearance","original");QTest::qWait(50);
         QVERIFY(!preview->imageUrl(450,1.5,"original").isEmpty());
         const auto snapshotDirectory=qEnvironmentVariable("LYRA_READER_CHECK_SNAPSHOTS");
         if(!snapshotDirectory.isEmpty())QVERIFY(window->grabWindow().save(snapshotDirectory+"/lyrareader-preview.png"));

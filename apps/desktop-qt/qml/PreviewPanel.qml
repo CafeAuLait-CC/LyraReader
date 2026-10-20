@@ -201,7 +201,9 @@ Popup {
                     }
                 }
                 Repeater {
-                    model: !panel.textPreview && controller ? controller.imageSegments(Math.max(40, scroll.availableWidth - 24), Screen.devicePixelRatio, app.paperAppearance) : []
+                    // Read the model explicitly: an invokable cannot expose its
+                    // private C++ model reads to the QML dependency tracker.
+                    model: !panel.textPreview && controller && panel.preview.page !== undefined ? controller.imageSegments(Math.max(40, scroll.availableWidth - 24), Screen.devicePixelRatio, "original") : []
                     ColumnLayout {
                         id: regionEntry
                         required property var modelData
@@ -215,6 +217,9 @@ Popup {
                             Layout.fillWidth: true
                             Layout.preferredHeight: width * modelData.aspect
                             source: modelData.url
+                            Accessible.role: Accessible.Graphic
+                            Accessible.name: qsTr("Preview of page %1").arg(modelData.page + 1)
+                            Accessible.description: panel.preview.caption || qsTr("Use Text to read reference information.")
                             resourceActive: panel.visible && regionEntry.y + crop.y + crop.height > scroll.contentItem.contentY && regionEntry.y + crop.y < scroll.contentItem.contentY + scroll.availableHeight
                             paperAppearance: app.paperAppearance
                             BusyIndicator {
