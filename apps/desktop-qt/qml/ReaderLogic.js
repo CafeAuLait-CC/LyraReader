@@ -211,3 +211,10 @@ function annotationUnsupportedReason(a) {
     if((a.kind==="line" || a.kind==="arrow") && (!a.lineStart || !a.lineEnd))return "This line annotation has no editable endpoints."
     return ""
 }
+
+// Provider text is escaped before adding our formatting and local page links.
+// Image syntax and external URLs remain text; they cannot load resources.
+function answerMarkup(text) {
+    const escaped=String(text || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+    return "<p>"+escaped.replace(/^### (.+)$/gm,"<b>$1</b>").replace(/\*\*([^*]+)\*\*/g,"<b>$1</b>").replace(/\[p\.(\d+)\]/g,'<a href="p.$1">[p.$1]</a>').replace(/\n/g,"<br/>")+"</p>"
+}

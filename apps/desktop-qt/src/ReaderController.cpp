@@ -57,7 +57,7 @@ struct RasterResult { QImage image; QString error; double actualScale = 0; qint6
 struct CommandResult { QVariant result; QString error; std::shared_ptr<NativeRasterSource> source; };
 }
 
-ReaderController::ReaderController(QObject *parent) : QObject(parent),m_cachePrefix(QUuid::createUuid().toString()+QLatin1Char('/')),m_mutations(std::make_shared<CommandQueue>()) {}
+ReaderController::ReaderController(QObject *parent) : QObject(parent),m_cachePrefix(QUuid::createUuid().toString()+QLatin1Char('/')),m_mutations(std::make_shared<CommandQueue>()) {initAi();}
 ReaderController::~ReaderController(){clearRasterCache();}
 void ReaderController::clearRasterCache(){RasterCache::clearPrefix(m_cachePrefix);m_tileDemand.clear();}
 int ReaderController::cpuCacheKiB(){return RasterCache::costKiB();}
@@ -86,7 +86,7 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
     }
     m_lastUrl = url;
     const auto generation = ++m_generation;
-    m_document.reset();m_source.reset();
+    resetAi();m_document.reset();m_source.reset();
     m_pages.clear();
     clearRasterCache();
     m_pending.clear();
@@ -169,7 +169,11 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         }, Qt::QueuedConnection);
         return id;
     }
-    if((operation==QStringLiteral("page_stage") || operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo") || operation==QStringLiteral("save_merge") || operation==QStringLiteral("save_split")) && hasEditDrafts()) {
+    if((operation.startsWith(QStringLiteral("page_")) || operation.startsWith(QStringLiteral("replace_"))) && m_aiState.value(QStringLiteral("running")).toBool()) {
+        const auto error=tr("Cancel the active AI request before changing the open document.");
+        QMetaObject::invokeMethod(this,[this,id,operation,error]{setError(error);emit commandFinished(id,operation,{},error);},Qt::QueuedConnection);return id;
+    }
+    if((operation==QStringLiteral("page_stage") || operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo") || operation==QStringLiteral("page_apply") || operation==QStringLiteral("page_discard") || operation==QStringLiteral("save_merge") || operation==QStringLiteral("save_split")) && hasEditDrafts()) {
         const auto error=tr("Save or clear pending form edits and redaction marks before changing pages.");
         QMetaObject::invokeMethod(this,[this,id,operation,error]{setError(error);emit commandFinished(id,operation,{},error);},Qt::QueuedConnection);
         return id;
@@ -203,12 +207,12 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         if(document!=m_document || (!mutation && generation!=m_generation))return;
         if(operation==QStringLiteral("marks") && mutationSequence!=m_mutationSequence)return;
         if(latestOnly && m_latestRead.value(operation)!=id)return;
-        if (!outcome.error.isEmpty() && operation!=QStringLiteral("split_plan")) setError(outcome.error);
+        if (!outcome.error.isEmpty() && operation!=QStringLiteral("split_plan") && !operation.startsWith(QStringLiteral("ai_"))) setError(outcome.error);
         else if (operation==QStringLiteral("page_stage") || operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo") || operation==QStringLiteral("page_discard") || operation==QStringLiteral("page_apply")) {
             m_source=outcome.source;
             const auto revision=outcome.result.toMap();
             const auto info=revision.value(QStringLiteral("info")).toMap();
-            ++m_generation;clearRasterCache();m_pending.clear();m_failed.clear();m_requests.clear();m_textPages.clear();m_textPending.clear();
+            ++m_generation;resetAi();clearRasterCache();m_pending.clear();m_failed.clear();m_requests.clear();m_textPages.clear();m_textPending.clear();
             m_pages=info.value(QStringLiteral("pages")).toList();m_documentWidth=info.value(QStringLiteral("width")).toDouble();m_documentHeight=info.value(QStringLiteral("height")).toDouble();
             m_data.clear();m_data.insert(QStringLiteral("marks"),revision.value(QStringLiteral("marks")));m_data.insert(QStringLiteral("signature_status"),info.value(QStringLiteral("signature_status")));
             emit documentReset();emit documentChanged();emit dataChanged();emit textPagesChanged();
@@ -257,7 +261,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
             result.source=NativeRasterSource::prepare(document,false,&result.error);
         return result;
     };
-    if(mutation){
+    if(mutation || operation==QStringLiteral("ai_start") || operation==QStringLiteral("ai_cancel")){
         auto promise=std::make_shared<QPromise<CommandResult>>();promise->start();watcher->setFuture(promise->future());
         m_mutations->append([task,promise]{try{promise->addResult(task());}catch(...){promise->addResult(CommandResult{{},QStringLiteral("The command worker stopped unexpectedly.")});}promise->finish();});
     }else watcher->setFuture(QtConcurrent::run(std::move(task)));

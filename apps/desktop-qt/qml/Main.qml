@@ -860,19 +860,31 @@ ApplicationWindow {
         if (session)
             session.credentials.remove(account);
     }
-    function sendAi(panel, plan) {
-        if (plan.is_local)
-            panel.send("local");
-        else {
-            pendingAiPanel = panel;
+    function sendAi(owner, plan) {
+        if (!owner || !plan)
+            return;
+        if (plan.is_local) {
+            if (!owner.startAi("local", plan))
+                operationStatus = qsTr("The request changed or the document is busy. Preview and Send again.");
+        } else {
+            pendingAiReader = owner;
+            pendingAiPlan = plan;
             credentialReadId = session ? session.credentials.read(plan.base_url) : -1;
             if (!session)
                 dialogs.credentialDialog.open();
         }
     }
+    onAiSettingsChanged: {
+        if (session)
+            for (const tab of session.tabs)
+                tab.reader.invalidateAiPlan();
+        else if (currentReader)
+            currentReader.invalidateAiPlan();
+    }
     property int requestedPage: 0
     property double credentialReadId: -1
-    property var pendingAiPanel: null
+    property var pendingAiReader: null
+    property var pendingAiPlan: null
 
     Action {
         id: openAction
@@ -1362,10 +1374,12 @@ ApplicationWindow {
     Connections {
         target: root.session ? root.session.credentials : null
         function onFinished(id, operation, secret, error) {
-            if (operation === "read" && id === root.credentialReadId && root.pendingAiPanel) {
+            if (operation === "read" && id === root.credentialReadId && root.pendingAiReader) {
                 if (secret.length) {
-                    root.pendingAiPanel.send(secret);
-                    root.pendingAiPanel = null;
+                    if (!root.pendingAiReader.startAi(secret, root.pendingAiPlan))
+                        root.operationStatus = qsTr("The request changed or the document is busy. Preview and Send again.");
+                    root.pendingAiPlan = null;
+                    root.pendingAiReader = null;
                 } else {
                     root.operationStatus = error;
                     dialogs.credentialDialog.open();

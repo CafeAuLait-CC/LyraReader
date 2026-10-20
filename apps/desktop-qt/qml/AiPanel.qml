@@ -1,65 +1,55 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import "ReaderLogic.js" as Logic
 
 Pane {
-    id: ai
+    id: aiPanel
+    objectName: "aiPanel"
     required property var app
-    property var plan: null
-    property var planReader: null
-    property string output: ""
-    property string reasoning: ""
-    property string status: ""
-    property bool running: false
-    property var usage: ({})
+    readonly property var owner: app.currentReader
+    readonly property var viewState: owner.aiState
+    readonly property var plan: viewState.plan || null
+    readonly property bool running: !!viewState.running
+    readonly property var input: viewState.input || ({})
     padding: 10
     background: Rectangle {
         color: app.colors.sidebarBg
     }
     function prepare() {
-        planReader = app.currentReader;
-        ai.plan = null;
-        ai.status = qsTr("Preparing request locally…");
         const settings = app.aiSettings;
         const modes = ["SummarizePage", "SummarizeDocument", "AskSelection", "TranslateSelection"];
-        planReader.submit("ai_preview", {
-            request: {
-                action: modes[actionBox.currentIndex],
-                current_page: app.currentPage,
-                selection: app.selection ? {
-                    page: app.selection.page,
-                    start: Math.min(app.selection.start, app.selection.end),
-                    end: Math.max(app.selection.start, app.selection.end)
-                } : null,
-                question: question.text.length ? question.text : null,
-                language: language.text.length ? language.text : null,
-                base_url: settings.baseUrl || "http://localhost:11434/v1",
-                model: settings.model || "",
-                temperature: null,
-                max_tokens: null,
-                reasoning_mode: settings.reasoningMode || "default",
-                reasoning_encoding: settings.reasoningEncoding || "none"
-            }
+        owner.prepareAi({
+            action: modes[actionBox.currentIndex],
+            current_page: app.currentPage,
+            selection: app.selection ? {
+                page: app.selection.page,
+                start: Math.min(app.selection.start, app.selection.end),
+                end: Math.max(app.selection.start, app.selection.end)
+            } : null,
+            question: question.text.length ? question.text : null,
+            language: language.text.length ? language.text : null,
+            base_url: settings.baseUrl || "http://localhost:11434/v1",
+            model: settings.model || "",
+            temperature: null,
+            max_tokens: null,
+            reasoning_mode: settings.reasoningMode || "default",
+            reasoning_encoding: settings.reasoningEncoding || "none"
         });
     }
-    function send(key) {
-        if (!ai.plan || !ai.planReader)
+    function followLink(link) {
+        const match = /^p\.(\d+)$/.exec(link);
+        if (!match)
             return;
-        ai.output = "";
-        ai.reasoning = "";
-        ai.usage = ({});
-        ai.running = true;
-        planReader.submit("ai_start", {
-            plan: ai.plan,
-            api_key: key
-        });
-        poll.start();
+        const page = Number(match[1]) - 1;
+        if (page >= 0 && page < owner.pageCount)
+            app.navigate(page);
     }
     ColumnLayout {
         anchors.fill: parent
-        spacing: 9
+        spacing: 8
         Label {
-            text: app.aiSettings.model || qsTr("Choose an AI model in Settings")
+            text: aiPanel.running ? (aiPanel.viewState.activeModel || "") + " · " + (aiPanel.viewState.activeHost || "") : (app.aiSettings.model || qsTr("Choose an AI model in Settings"))
             wrapMode: Text.Wrap
             Layout.fillWidth: true
             color: app.colors.textSecondary
@@ -67,100 +57,144 @@ Pane {
         }
         ComboBox {
             id: actionBox
+            objectName: "aiAction"
             Layout.fillWidth: true
             model: [qsTr("Summarize this page"), qsTr("Summarize document"), qsTr("Ask about selection"), qsTr("Translate selection")]
+            currentIndex: aiPanel.input.action || 0
+            enabled: !aiPanel.running
+            Accessible.name: qsTr("AI action")
+            onActivated: aiPanel.owner.setAiInput("action", currentIndex)
         }
         TextArea {
             id: question
+            objectName: "aiQuestion"
+            text: aiPanel.input.question || ""
             Layout.fillWidth: true
             Layout.preferredHeight: 70
             visible: actionBox.currentIndex === 2
+            enabled: !aiPanel.running
             placeholderText: qsTr("Question about selected text")
-            wrapMode: Text.Wrap
+            wrapMode: TextEdit.Wrap
+            Accessible.name: qsTr("Question about selection")
+            onTextChanged: if (activeFocus)
+                aiPanel.owner.setAiInput("question", text)
         }
         TextField {
             id: language
             visible: actionBox.currentIndex === 3
+            enabled: !aiPanel.running
             Layout.fillWidth: true
             placeholderText: qsTr("Target language")
-            text: "中文"
+            text: aiPanel.input.language || "中文"
+            Accessible.name: qsTr("Translation language")
+            onTextEdited: aiPanel.owner.setAiInput("language", text)
         }
         Button {
+            objectName: "prepareAiRequest"
             text: qsTr("Preview Request")
             Layout.fillWidth: true
-            enabled: !ai.running && app.currentReader.pageCount > 0
-            onClicked: ai.prepare()
+            enabled: !aiPanel.running && aiPanel.owner.pageCount > 0 && aiPanel.owner.pendingCommands === 0
+            onClicked: aiPanel.prepare()
         }
         Label {
-            text: ai.status
+            text: aiPanel.viewState.status || ""
             visible: text.length > 0
             wrapMode: Text.Wrap
             Layout.fillWidth: true
             color: app.colors.textSecondary
             font.pixelSize: 11
+            Accessible.role: Accessible.StaticText
         }
         Label {
-            visible: !!ai.plan
+            visible: !!aiPanel.plan
             Layout.fillWidth: true
             wrapMode: Text.Wrap
-            text: ai.plan ? (ai.plan.is_local ? qsTr("Local endpoint: %1").arg(ai.plan.host) : qsTr("Remote endpoint: %1").arg(ai.plan.host)) + "\n" + qsTr("%1 request(s), about %2 tokens").arg(ai.plan.parts.length).arg(ai.plan.estimated_tokens) : ""
+            text: aiPanel.plan ? (aiPanel.plan.is_local ? qsTr("Local endpoint: %1").arg(aiPanel.plan.host) : qsTr("Remote endpoint: %1").arg(aiPanel.plan.host)) + "\n" + qsTr("%1 request(s), about %2 tokens").arg(aiPanel.plan.parts.length).arg(aiPanel.plan.estimated_tokens) : ""
             color: app.colors.infoFg
             font.pixelSize: 11
         }
         RowLayout {
-            visible: !!ai.plan && !ai.running
+            visible: !!aiPanel.plan && !aiPanel.running
             Button {
                 text: qsTr("Inspect Payload")
                 Layout.fillWidth: true
                 onClicked: payload.open()
             }
             Button {
+                objectName: "sendAiRequest"
                 text: qsTr("Send")
                 Layout.fillWidth: true
-                onClicked: app.sendAi(ai, ai.plan)
+                enabled: aiPanel.owner.pendingCommands === 0
+                onClicked: app.sendAi(aiPanel.owner, aiPanel.plan)
             }
         }
         Button {
+            objectName: "cancelAiRequest"
             text: qsTr("Cancel")
-            visible: ai.running
+            visible: aiPanel.running
             Layout.fillWidth: true
-            onClicked: if (ai.planReader)
-                ai.planReader.submit("ai_cancel")
+            onClicked: aiPanel.owner.cancelAi()
+        }
+        ToolButton {
+            id: reasoningToggle
+            objectName: "aiReasoningToggle"
+            visible: !!aiPanel.viewState.reasoning
+            text: qsTr("Provider reasoning") + (checked ? " ▴" : " ▾")
+            checkable: true
+            Accessible.name: qsTr("Show provider reasoning separately")
+        }
+        ScrollView {
+            visible: reasoningToggle.visible && reasoningToggle.checked
+            Layout.fillWidth: true
+            Layout.preferredHeight: 110
+            contentWidth: availableWidth
+            TextArea {
+                objectName: "aiReasoningText"
+                text: aiPanel.viewState.reasoning || ""
+                readOnly: true
+                selectByMouse: true
+                textFormat: TextEdit.PlainText
+                wrapMode: TextEdit.Wrap
+                background: null
+                font.pixelSize: 11
+            }
         }
         ScrollView {
             Layout.fillWidth: true
             Layout.fillHeight: true
+            contentWidth: availableWidth
             TextArea {
-                text: ai.output.replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/\[p\.(\d+)\]/g, "[p.$1](p.$1)")
+                objectName: "aiAnswerText"
+                text: Logic.answerMarkup(aiPanel.viewState.output || "")
                 readOnly: true
                 selectByMouse: true
-                wrapMode: Text.Wrap
+                wrapMode: TextEdit.Wrap
                 background: null
-                textFormat: TextEdit.MarkdownText
+                textFormat: TextEdit.RichText
+                Accessible.name: qsTr("AI response")
                 onLinkActivated: function (link) {
-                    const match = /^p\.(\d+)$/.exec(link);
-                    if (match)
-                        app.navigate(Number(match[1]) - 1);
+                    aiPanel.followLink(link);
                 }
             }
         }
         Label {
-            visible: !!ai.usage.total_tokens
-            text: qsTr("Tokens: %1").arg(ai.usage.total_tokens || 0)
+            visible: !!aiPanel.viewState.usage && !!aiPanel.viewState.usage.total_tokens
+            text: qsTr("Tokens: %1").arg(aiPanel.viewState.usage ? aiPanel.viewState.usage.total_tokens || 0 : 0)
             color: app.colors.textTertiary
             font.pixelSize: 10
         }
         RowLayout {
             Button {
                 text: qsTr("Copy")
-                enabled: ai.output.length > 0
+                enabled: !!aiPanel.viewState.output
                 onClicked: if (app.session)
-                    app.session.copyText(ai.output)
+                    app.session.copyText(aiPanel.viewState.output)
             }
             Button {
+                objectName: "retryAiRequest"
                 text: qsTr("Retry")
-                enabled: !!ai.plan && !ai.running
-                onClicked: app.sendAi(ai, ai.plan)
+                enabled: !!aiPanel.plan && !aiPanel.running && aiPanel.owner.pendingCommands === 0
+                onClicked: app.sendAi(aiPanel.owner, aiPanel.plan)
             }
             LyraToolButton {
                 symbol: "settings"
@@ -180,50 +214,14 @@ Pane {
         standardButtons: Dialog.Close
         ScrollView {
             anchors.fill: parent
+            contentWidth: availableWidth
             TextArea {
-                text: ai.plan ? JSON.stringify(ai.plan, null, 2) : ""
+                text: aiPanel.plan ? JSON.stringify(aiPanel.plan, null, 2) : ""
                 readOnly: true
                 selectByMouse: true
-                wrapMode: Text.WrapAnywhere
+                wrapMode: TextEdit.WrapAnywhere
+                textFormat: TextEdit.PlainText
                 font.family: "monospace"
-            }
-        }
-    }
-    Timer {
-        id: poll
-        interval: 60
-        repeat: true
-        onTriggered: if (ai.running && ai.planReader)
-            ai.planReader.submit("ai_poll")
-        else
-            stop()
-    }
-    Connections {
-        target: ai.planReader
-        function onCommandFinished(id, op, result, error) {
-            if (op === "ai_preview") {
-                ai.plan = error.length ? null : result;
-                ai.status = error;
-            } else if (op === "ai_start" && error.length) {
-                ai.running = false;
-                ai.status = error;
-            } else if (op === "ai_poll" && !error.length) {
-                for (const event of result.events) {
-                    if (event.Delta)
-                        ai.output += event.Delta.text;
-                    if (event.ReasoningDelta)
-                        ai.reasoning += event.ReasoningDelta.text;
-                    if (event.Usage)
-                        ai.usage = event.Usage;
-                    if (event.Error) {
-                        ai.status = event.Error.message;
-                        ai.running = false;
-                    }
-                    if (event.PartStarted)
-                        ai.output += (ai.output.length ? "\n\n" : "") + "### " + event.PartStarted.label + "\n\n";
-                }
-                if (result.finished)
-                    ai.running = false;
             }
         }
     }

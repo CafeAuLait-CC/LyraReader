@@ -31,7 +31,7 @@ add_custom_target(lyra_reader_build
     COMMENT "Checking/building the Rust document service"
     VERBATIM)
 add_dependencies(lyra_reader_rust lyra_reader_build)
-add_library(lyrareader_shell STATIC src/ReaderController.cpp src/ReaderController.h src/PageItem.cpp src/PageItem.h src/WorkspaceController.cpp src/WorkspaceController.h src/CredentialStore.cpp src/CredentialStore.h src/AnnotationOverlay.cpp src/AnnotationOverlay.h src/PaperAppearance.cpp src/PaperAppearance.h src/PdfPrintJob.cpp src/PdfPrintJob.h src/RasterCache.cpp src/RasterCache.h src/NativeRaster.cpp src/NativeRaster.h src/PreviewController.cpp src/PreviewController.h)
+add_library(lyrareader_shell STATIC src/ReaderController.cpp src/ReaderController.h src/ReaderAi.cpp src/PageItem.cpp src/PageItem.h src/WorkspaceController.cpp src/WorkspaceController.h src/CredentialStore.cpp src/CredentialStore.h src/AnnotationOverlay.cpp src/AnnotationOverlay.h src/PaperAppearance.cpp src/PaperAppearance.h src/PdfPrintJob.cpp src/PdfPrintJob.h src/RasterCache.cpp src/RasterCache.h src/NativeRaster.cpp src/NativeRaster.h src/PreviewController.cpp src/PreviewController.h)
 target_include_directories(lyrareader_shell PUBLIC src)
 target_link_libraries(lyrareader_shell PUBLIC Qt6::Quick Qt6::QuickControls2 Qt6::Concurrent Qt6::Widgets Qt6::PrintSupport Qt6Keychain::Qt6Keychain lyra_reader_rust Threads::Threads ${CMAKE_DL_LIBS})
 if(WIN32)
@@ -73,7 +73,7 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
-    find_package(Qt6 REQUIRED COMPONENTS Test)
+    find_package(Qt6 REQUIRED COMPONENTS Test Network)
     find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
     add_custom_target(LyraReaderCheckFixtures
         COMMAND ${Python3_EXECUTABLE} "${LYRA_READER_ROOT}/scripts/make-fixtures.py"
@@ -83,7 +83,7 @@ if(BUILD_TESTING)
         VERBATIM)
     qt_add_executable(LyraReaderChecks tests/ReaderChecks.cpp)
     add_dependencies(LyraReaderChecks LyraReaderCheckFixtures)
-    target_link_libraries(LyraReaderChecks PRIVATE lyrareader_shell Qt6::Test)
+    target_link_libraries(LyraReaderChecks PRIVATE lyrareader_shell Qt6::Test Qt6::Network)
     qt_add_resources(LyraReaderChecks check_qml_resources PREFIX "/" FILES ${LYRA_READER_QML_FILES} tests/MultiplyCheck.qml)
     qt_add_shaders(LyraReaderChecks check_annotation_shaders BATCHABLE PREFIX "/shaders" BASE "shaders" FILES shaders/annotation.vert shaders/annotation.frag shaders/paper.vert shaders/paper.frag)
     if(QT_CORE_LIBRARY_TYPE STREQUAL "SHARED_LIBRARY")

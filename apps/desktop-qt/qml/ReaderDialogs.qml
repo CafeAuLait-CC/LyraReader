@@ -859,14 +859,16 @@ Item {
             }
         }
         onAccepted: {
-            if (app.pendingAiPanel)
-                app.pendingAiPanel.send(requestKey.text);
+            if (app.pendingAiReader && !app.pendingAiReader.startAi(requestKey.text, app.pendingAiPlan))
+                app.operationStatus = qsTr("The request changed or the document is busy. Preview and Send again.");
             requestKey.clear();
-            app.pendingAiPanel = null;
+            app.pendingAiReader = null;
+            app.pendingAiPlan = null;
         }
         onRejected: {
             requestKey.clear();
-            app.pendingAiPanel = null;
+            app.pendingAiReader = null;
+            app.pendingAiPlan = null;
         }
     }
 }

@@ -4,6 +4,7 @@
 #include <QImage>
 #include <QObject>
 #include <QSet>
+#include <QTimer>
 #include <QUrl>
 #include <QVariantList>
 #include <memory>
@@ -24,6 +25,7 @@ class ReaderController : public QObject {
     Q_PROPERTY(double documentWidth READ documentWidth NOTIFY documentChanged)
     Q_PROPERTY(double documentHeight READ documentHeight NOTIFY documentChanged)
     Q_PROPERTY(QUrl fileUrl READ fileUrl NOTIFY documentChanged)
+    Q_PROPERTY(QVariantMap aiState READ aiState NOTIFY aiStateChanged)
     Q_PROPERTY(QVariantMap editDrafts READ editDrafts NOTIFY editDraftsChanged)
     Q_PROPERTY(bool hasEditDrafts READ hasEditDrafts NOTIFY editDraftsChanged)
     Q_PROPERTY(QVariantMap noteDrafts READ noteDrafts NOTIFY noteDraftsChanged)
@@ -45,6 +47,12 @@ public:
     double documentWidth() const { return m_documentWidth; }
     double documentHeight() const { return m_documentHeight; }
     QUrl fileUrl() const { return m_lastUrl; }
+    QVariantMap aiState()const{return m_aiState;}
+    Q_INVOKABLE void prepareAi(const QVariantMap &request);
+    Q_INVOKABLE bool startAi(const QString &key,const QVariantMap &expectedPlan);
+    Q_INVOKABLE void cancelAi();
+    Q_INVOKABLE void setAiInput(const QString &key,const QVariant &value);
+    Q_INVOKABLE void invalidateAiPlan();
     QVariantMap editDrafts()const{return m_editDrafts;}
     bool hasEditDrafts()const{return !m_editDrafts.isEmpty();}
     Q_INVOKABLE void setEditDraft(const QString &key,const QVariant &value);
@@ -92,10 +100,17 @@ signals:
     void dataChanged();
     void noteDraftsChanged();
     void editDraftsChanged();
+    void aiStateChanged();
     void textPagesChanged();
     void commandsChanged();
 private:
     struct Request { int page; double scale; QString key; bool embedded=false; bool tile=false; QRectF region; int priority=0; };
+    void initAi();
+    void resetAi();
+    void handleAiCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error);
+    QTimer m_aiTimer;
+    QVariantMap m_aiState;
+    quint64 m_aiPreviewId=0,m_aiStartId=0,m_aiPollId=0,m_aiPlanGeneration=0;
     void enqueue(const Request &request);
     void pruneTileRequests();
     void clearRasterCache();

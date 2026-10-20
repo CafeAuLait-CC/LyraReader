@@ -4,6 +4,8 @@
 #include "PdfPrintJob.h"
 #include "NativeRaster.h"
 #include "PreviewController.h"
+#include "MockChatServer.h"
+#include <QUuid>
 #include <QPrinter>
 #include "AnnotationOverlay.h"
 #include "WorkspaceController.h"
@@ -514,6 +516,53 @@ private slots:
         const auto mark=last.data().value("marks").toMap().value("annotations").toList().first().toMap();QCOMPARE(mark.value("page").toInt(),0);QCOMPARE(mark.value("note").toString(),QString("split identity"));
         QVERIFY(original.open(QIODevice::ReadOnly));QCOMPARE(original.readAll(),bytes);
         QVERIFY(QMetaObject::invokeMethod(window,"showSplitDialog"));dialog->setProperty("outputDirectory",QUrl::fromLocalFile(folder));QVERIFY(QMetaObject::invokeMethod(dialog,"requestPlan"));QTRY_VERIFY(!dialog->property("planning").toBool());QVERIFY(!dialog->property("canWrite").toBool());QCOMPARE(dialog->property("plan").toMap().value("conflicts").toList().size(),2);
+    }
+    void aiPreviewStreamingCancellationAndTabsUseTheRealLocalTransport() {
+        MockChatServer server;QVERIFY2(server.listen(),"Loopback HTTP is required for this GUI check; no external service is contacted");
+        const auto imageUrl=server.baseUrl()+"/unwanted-image";
+        server.responses.append({{MockChatServer::delta({{"reasoning_content","provider rationale"}}),MockChatServer::delta({{"content","Answer [p.2] **ready**.\n![remote][image]\n[image]: "+imageUrl}}),MockChatServer::usage(),QByteArray("data: [DONE]\n\n")},70,200});
+        MockChatServer::Response slow;slow.delay=100;for(int i=0;i<20;++i)slow.chunks.append(MockChatServer::delta({{"content",i==19 ? QString("END") : QString("chunk%1 ").arg(i)}}));slow.chunks.append("data: [DONE]\n\n");server.responses.append(slow);
+        server.responses.append({{MockChatServer::delta({{"content","retry succeeded"}}),MockChatServer::usage(),QByteArray("data: [DONE]\n\n")},30,200});
+        server.responses.append({{QByteArray("{\"error\":{\"message\":\"fixture rejection\"}}")},0,400});server.responses.append(slow);
+        WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);
+        engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));auto *reader=workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTest::qWait(150);
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","fixture"}});QVERIFY(QMetaObject::invokeMethod(window,"showSidebar",Q_ARG(QVariant,"ai")));
+        auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("plan").toMap().isEmpty(),10000);QCOMPARE(server.requests.size(),0);
+        const auto plan=reader->aiState().value("plan").toMap();QVERIFY(plan.value("is_local").toBool());
+        auto *send=window->findChild<QQuickItem *>("sendAiRequest");QVERIFY(send);QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,send->mapToScene(QPointF(send->width()/2,send->height()/2)).toPoint());
+        QTRY_COMPARE(server.requests.size(),1);QVERIFY(reader->aiState().value("running").toBool());
+        workspace.newTab();auto *other=workspace.activeReader();other->openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));QTRY_COMPARE_WITH_TIMEOUT(other->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(other->pendingCommands(),0,10000);
+        QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QVERIFY(other->aiState().value("output").toString().isEmpty());QVERIFY(reader->aiState().value("output").toString().contains("Answer"));QVERIFY(!reader->aiState().value("output").toString().contains("provider rationale"));QCOMPARE(reader->aiState().value("reasoning").toString(),QString("provider rationale"));QCOMPARE(reader->aiState().value("usage").toMap().value("total_tokens").toInt(),10);
+        workspace.selectTab(0);QTest::qWait(200);QCOMPARE(server.requests.size(),1); // Reference images must remain text.
+        auto *answer=window->findChild<QObject *>("aiAnswerText");QVERIFY(answer);QVERIFY(!answer->property("text").toString().contains("<img"));
+        QVERIFY(QMetaObject::invokeMethod(panel,"followLink",Q_ARG(QVariant,"p.2")));QTRY_COMPARE(window->property("currentPage").toInt(),1);
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(reader->startAi("local",plan));QTRY_COMPARE(server.requests.size(),2);QTRY_VERIFY(reader->aiState().value("output").toString().contains("chunk0"));reader->cancelAi();QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QVERIFY(reader->aiState().value("status").toString().contains("Cancel",Qt::CaseInsensitive));QVERIFY(!reader->aiState().value("output").toString().contains("END"));
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);auto *retry=window->findChild<QQuickItem *>("retryAiRequest");QVERIFY(retry);QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,retry->mapToScene(QPointF(retry->width()/2,retry->height()/2)).toPoint());QTRY_COMPARE(server.requests.size(),3);QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QVERIFY(reader->aiState().value("output").toString().contains("retry succeeded"));
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(reader->startAi("local",plan));QTRY_COMPARE(server.requests.size(),4);QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QVERIFY(reader->aiState().value("status").toString().contains("fixture rejection"));QVERIFY(reader->error().isEmpty());
+        reader->invalidateAiPlan();QVERIFY(!reader->startAi("local",plan));QCOMPARE(server.requests.size(),4);
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(!reader->aiState().value("plan").toMap().isEmpty());QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(reader->startAi("local",reader->aiState().value("plan").toMap()));QTRY_COMPARE(server.requests.size(),5);
+        QPointer<ReaderController> closing=reader;workspace.closeTab(0);QTRY_VERIFY_WITH_TIMEOUT(closing.isNull(),10000);QTRY_COMPARE_WITH_TIMEOUT(server.activeConnections(),0,10000);
+    }
+    void secureCredentialRoundTripUsesAnIsolatedEphemeralAccount() {
+        if(!qEnvironmentVariableIsSet("LYRA_READER_CHECK_VAULT"))QSKIP("Opt-in real vault check; use LYRA_READER_CHECK_VAULT=1 with an unlocked system vault");
+        CredentialStore store;QSignalSpy events(&store,&CredentialStore::finished);
+        const auto token=QUuid::createUuid().toString(QUuid::WithoutBraces),account="https://lyra-vault-check-"+token+".invalid/v1",secret="ephemeral-test-"+token;
+        const auto completion=[&](quint64 id) {
+            QElapsedTimer timer;timer.start();
+            while(timer.elapsed()<15000) {
+                while(!events.isEmpty()){const auto event=events.takeFirst();if(event[0].toULongLong()==id)return event;}
+                events.wait(int(qMin<qint64>(1000,15000-timer.elapsed())));
+            }
+            return QVariantList{};
+        };
+        const auto written=completion(store.write(account,secret));
+        const bool wrote=!written.isEmpty(),writeOk=wrote && written[3].toString().isEmpty();
+        QString failure=wrote ? written[3].toString() : QString{};bool readOk=false,removed=false,absent=false;
+        if(writeOk){const auto event=completion(store.read(account));readOk=!event.isEmpty() && event[2].toString()==secret && event[3].toString().isEmpty();if(!event.isEmpty() && !readOk)failure=event[3].toString();}
+        const auto deleted=completion(store.remove(account));removed=!deleted.isEmpty() && deleted[3].toString().isEmpty();if(!deleted.isEmpty() && !removed)failure=deleted[3].toString();
+        if(removed){const auto event=completion(store.read(account));absent=!event.isEmpty() && event[2].toString().isEmpty() && event[3].toString().isEmpty();}
+        QVERIFY2(wrote && writeOk && readOk && removed && absent,qPrintable(failure.isEmpty()?QString("System vault did not complete the isolated round trip"):failure));
     }
     void deepZoomRefinesVisibleTilesWithoutSeamsAndSharesTheCacheBudget() {
         ReaderController reader;QQmlApplicationEngine engine;
