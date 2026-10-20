@@ -1,6 +1,7 @@
 #include "ReaderController.h"
 #include "NativeRaster.h"
 #include "RasterCache.h"
+#include "RenderBudget.h"
 #include <QUuid>
 #include <QLineF>
 #include <algorithm>
@@ -53,7 +54,7 @@ struct OpenResult {
     QVariantMap signature;
     QString error;
 };
-struct RasterResult { QImage image; QString error; double actualScale = 0; qint64 elapsedMs = 0;bool cancelled=false; };
+struct RasterResult { ResidentImage image; QString error; double actualScale = 0; qint64 elapsedMs = 0;bool cancelled=false,pressure=false; };
 struct CommandResult { QVariant result; QString error; std::shared_ptr<NativeRasterSource> source; };
 double quantizedRasterScale(double scale) {
     return scale>=.125 ? std::ceil(scale*8)/8.0 : std::exp2(std::ceil(std::log2(scale)*4)/4);
@@ -369,14 +370,22 @@ void ReaderController::startNextRaster() {
     connect(watcher,&QFutureWatcher<RasterResult>::finished,this,[this,watcher,request,generation]{
         auto result=watcher->result();watcher->deleteLater();m_rendering=false;m_activeRaster.reset();
         if(generation!=m_generation || result.cancelled){++m_discarded;if(generation==m_generation)m_pending.remove(request.key);}
-        else {
+        else if(result.pressure) {
+            m_pending.remove(request.key);
+            QTimer::singleShot(100,this,[this,request,generation] {
+                if(generation!=m_generation)return;
+                bool wanted=!request.tile && (m_manualDemand.contains(request.key) || m_pageDemand.values().contains(request.key));
+                if(request.tile)for(const auto &keys:m_tileDemand)wanted=wanted || keys.contains(request.key);
+                if(wanted){enqueue(request);startNextRaster();}
+            });
+        }else {
             m_pending.remove(request.key);
             m_manualDemand.remove(request.key);
             if(result.image.isNull()){m_failed.insert(request.key);setError(result.error);}
             else {
-                RasterCache::put(m_cachePrefix+request.key,result.image);++m_completed;
+                RasterCache::put(m_cachePrefix+request.key,result.image.pixels);++m_completed;
                 if(request.tile)emit tileReady(request.page);
-                else {qInfo().nospace()<<"lyra-reader-qt-raster: page="<<request.page<<" requested="<<request.scale<<" actual="<<result.actualScale<<" bytes="<<result.image.sizeInBytes()<<" ms="<<result.elapsedMs<<" global-cache-kib="<<RasterCache::costKiB();emit pageReady(request.page,request.scale);}
+                else {qInfo().nospace()<<"lyra-reader-qt-raster: page="<<request.page<<" requested="<<request.scale<<" actual="<<result.actualScale<<" bytes="<<result.image.pixels.sizeInBytes()<<" ms="<<result.elapsedMs<<" global-cache-kib="<<RasterCache::costKiB();emit pageReady(request.page,request.scale);}
             }
         }
         emit statisticsChanged();startNextRaster();
@@ -384,7 +393,10 @@ void ReaderController::startNextRaster() {
     watcher->setFuture(QtConcurrent::run(RasterJobs::pool(),[source,request,ticket]{
         RasterJobs::Run run(ticket);RasterResult result;QElapsedTimer timer;timer.start();
         if(ticket->cancelled.load()){result.cancelled=true;return result;}
-        result.image=source->crop(request.page,request.region,request.scale,request.embedded,false,&result.error,&result.actualScale);
+        auto reservation=RenderBudget::reserve(RenderBudget::Kind::Resident,RenderBudget::maximumJobBytes);
+        if(!reservation){result.pressure=true;return result;}
+        auto image=source->crop(request.page,request.region,request.scale,request.embedded,false,&result.error,&result.actualScale);
+        if(!image.isNull())result.image=ResidentImage::publish(std::move(reservation),std::move(image));
         if(ticket->cancelled.load()){result.image={};result.cancelled=true;}
         result.elapsedMs=timer.elapsed();return result;
     }));

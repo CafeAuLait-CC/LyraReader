@@ -8,6 +8,7 @@
 #include <QTimer>
 #include <QtConcurrentRun>
 #include "RasterJobs.h"
+#include "RenderBudget.h"
 #include <algorithm>
 
 namespace {
@@ -17,7 +18,7 @@ QString takeError(LyraReaderBuffer &buffer) {
     lyra_reader_desktop_buffer_free(buffer);buffer={};return error;
 }
 struct Prepared { Source source;QString error; };
-struct Band { QImage image;QString error; };
+struct Band {ResidentImage image;QString error;bool pressure=false;};
 void releasePixels(void *data) {
     auto *pixels=static_cast<LyraReaderBuffer *>(data);
     lyra_reader_desktop_buffer_free(*pixels);delete pixels;
@@ -55,6 +56,7 @@ public:
         connect(watcher,&QFutureWatcher<Band>::finished,this,[this,watcher,width,height,y,bandHeight] {
             const auto band=watcher->result();watcher->deleteLater();
             if(cancelled){finish();return;}
+            if(band.pressure){QTimer::singleShot(100,this,[this]{nextBand();});return;}
             if(!band.error.isEmpty()){finish(band.error);return;}
             if(!painter) {
                 painter=std::make_unique<QPainter>();
@@ -63,7 +65,7 @@ public:
             const QRectF available(QPointF(0,0),printer->pageRect(QPrinter::DevicePixel).size());
             const double fit=qMin(available.width()/width,available.height()/height);
             const QPointF origin(available.x()+(available.width()-width*fit)/2,available.y()+(available.height()-height*fit)/2);
-            painter->drawImage(QRectF(origin.x(),origin.y()+y*fit,width*fit,bandHeight*fit),band.image);
+            painter->drawImage(QRectF(origin.x(),origin.y()+y*fit,width*fit,bandHeight*fit),band.image.pixels);
             top=y+bandHeight;
             if(top>=height-0.00001){++index;top=0;if(progress)progress->setValue(index);}
             // Yield between bounded strips so cancellation and native window events remain responsive.
@@ -73,6 +75,8 @@ public:
         watcher->setFuture(QtConcurrent::run(RasterJobs::pool(),[snapshot,page,width,y,bandHeight,ticket] {
             RasterJobs::Run run(ticket);
             Band result;LyraReaderBitmap bitmap{};LyraReaderBuffer error{};
+            auto reservation=RenderBudget::reserve(RenderBudget::Kind::Resident,RenderBudget::maximumJobBytes);
+            if(!reservation){result.pressure=true;return result;}
             if(!lyra_reader_desktop_render_region(snapshot.get(),page,300.0/72.0,0,y,width,bandHeight,true,false,&bitmap,&error)) {
                 result.error=takeError(error);return result;
             }
@@ -80,7 +84,9 @@ public:
                 lyra_reader_desktop_buffer_free(bitmap.pixels);result.error=QStringLiteral("Invalid print raster.");return result;
             }
             auto *pixels=new LyraReaderBuffer(bitmap.pixels);
-            result.image=QImage(pixels->data,int(bitmap.width),int(bitmap.height),int(bitmap.stride),QImage::Format_ARGB32,releasePixels,pixels);
+            QImage image(pixels->data,int(bitmap.width),int(bitmap.height),int(bitmap.stride),QImage::Format_ARGB32,releasePixels,pixels);
+            result.image=ResidentImage::publish(std::move(reservation),std::move(image));
+            if(result.image.isNull())result.error=QStringLiteral("The print raster exceeded its admission reservation.");
             return result;
         }));
     }

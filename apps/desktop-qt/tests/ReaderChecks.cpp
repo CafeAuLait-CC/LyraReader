@@ -670,7 +670,8 @@ private slots:
         auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
         const auto note="<b>Literal annotation</b><img src='"+server.baseUrl()+"/unwanted-image'>";
         reader->submit("mark_create",{{"entry",QVariantMap{{"kind","square"},{"page",0},{"version",1},{"rect",QVariantMap{{"x",100},{"y",100},{"width",100},{"height",70}}},{"color","#E8BC55FF"},{"note",note},{"strokeWidth",2}}}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
-        QVERIFY(QMetaObject::invokeMethod(window,"showSidebar",Q_ARG(QVariant,"annotations")));QTest::qWait(300);QCOMPARE(server.requests.size(),0);
+        QVERIFY(QMetaObject::invokeMethod(window,"showSidebar",Q_ARG(QVariant,"annotations")));QTest::qWait(700);QCOMPARE(server.requests.size(),0);
+        QCOMPARE(reader->data().value("marks").toMap().value("annotations").toList().first().toMap().value("note").toString(),note);
     }
     void pageTextViewExposesReadOnlyAccessibleTextAndKeyboardSelection() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto firstPath=scratch.path()+"/reading.pdf",secondPath=scratch.path()+"/other.pdf";
@@ -737,7 +738,7 @@ private slots:
             {"guiTenMsTimerIntervalsMs",Performance::distribution(guiIntervals)},{"rssPeakSampledBytes",peakRss},{"rssFinalBytes",Performance::memory("VmRSS")},{"processLifetimeRssHighWaterBytes",Performance::memory("VmHWM")},
             {"renderResources",RenderBudget::statistics()},{"rasterJobs",RasterJobs::statistics()},{"cpuLruKiB",ReaderController::cpuCacheKiB()},
             {"interactivePresentationMeasured",inputIntervals.size()>=6},{"windowExposed",window->isExposed()},{"windowActive",window->isActive()},
-            {"measurementNotes","Six 12-input zoom/pan bursts at nominal 16 ms. Last input to fully textured scene queued for presentation includes 5 ms readiness polling. frameSwapped measures queued presentation, not physical display FPS. If interactivePresentationMeasured is false, the compositor withheld input-period callbacks and those latency/frame figures are not an interactive performance result. RSS includes Qt, PDFium, fonts and index memory; unsupported OS values are -1. Driver allocations and Qt chrome are outside the pixel payload ledger."}};
+            {"measurementNotes","Six 12-input zoom/pan bursts at nominal 16 ms. Last input to fully textured scene queued for presentation includes 5 ms readiness polling. frameSwapped measures queued presentation, not physical display FPS. If interactivePresentationMeasured is false, the compositor withheld input-period callbacks and those latency/frame figures are not an interactive performance result. RSS includes Qt, PDFium, fonts and index memory; unsupported OS values are -1. The source ledger includes pre-raster capacity reservations. Driver allocations and Qt chrome are outside the pixel payload ledger."}};
         const auto output=qEnvironmentVariable("LYRA_READER_PERF_OUTPUT");
         if(!output.isEmpty()){QSaveFile file(output);QVERIFY(file.open(QIODevice::WriteOnly));QVERIFY(file.write(QJsonDocument::fromVariant(report).toJson())>0);QVERIFY(file.commit());}
         qInfo().noquote()<<"lyra-reader-performance:"<<QJsonDocument::fromVariant(report).toJson(QJsonDocument::Compact);
@@ -745,6 +746,20 @@ private slots:
         QVERIFY(RenderBudget::statistics().value("texturePeakBytes").toLongLong()<=RenderBudget::textureLimit);
         QVERIFY(RasterJobs::statistics().value("peakRunning").toInt()<=RasterJobs::maximumRunning);
         if(inputIntervals.size()<6)QSKIP("Compositor did not deliver input-period frame callbacks; interactive native performance remains unmeasured. Diagnostic JSON was saved.");
+    }
+    void completedBackgroundPixelsStayChargedWhileTheGuiIsBusy() {
+        QTRY_COMPARE_WITH_TIMEOUT(RenderBudget::statistics().value("residentBytes").toLongLong(),0,10000);
+        const auto denied=RenderBudget::statistics().value("residentDenied").toLongLong();
+        std::vector<std::unique_ptr<ReaderController>> readers;
+        for(int i=0;i<16;++i){readers.push_back(std::make_unique<ReaderController>());readers.back()->openFile(QUrl::fromLocalFile(QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf"));}
+        for(const auto &reader:readers){QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),9,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);}
+        for(const auto &reader:readers)reader->requestPage(0,4);
+        // Finished futures must retain their lease before the GUI caches/paints them.
+        QThread::msleep(900);
+        const auto queued=RenderBudget::statistics();QVERIFY(queued.value("residentBytes").toLongLong()>0);QVERIFY(queued.value("residentBytes").toLongLong()<=RenderBudget::residentLimit);
+        QVERIFY(queued.value("residentDenied").toLongLong()>denied);
+        for(const auto &reader:readers){QTRY_VERIFY_WITH_TIMEOUT(reader->completedRasters()>0,15000);QVERIFY(reader->error().isEmpty());}
+        readers.clear();QTRY_COMPARE_WITH_TIMEOUT(RenderBudget::statistics().value("residentBytes").toLongLong(),0,10000);
     }
     void liveRenderBudgetsResistContentionAndReleaseHiddenWindows() {
         QTRY_COMPARE_WITH_TIMEOUT(RenderBudget::statistics().value("residentBytes").toLongLong(),0,10000);

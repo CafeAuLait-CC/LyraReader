@@ -6,12 +6,12 @@
 #include <mutex>
 
 namespace {
-struct Ledger {std::mutex mutex;std::array<qint64,2> used{},peak{},denied{};};
+struct Ledger {std::mutex mutex;std::array<qint64,2> used{},peak{},denied{};QHash<qint64,std::weak_ptr<RenderBudget::Allocation>> images;};
 // Scene nodes can outlive the GUI singleton during application shutdown.
 Ledger &ledger(){static auto *value=new Ledger;return *value;}
 size_t index(RenderBudget::Kind kind){return kind==RenderBudget::Kind::Resident ? 0 : 1;}
 }
-RenderBudget::Allocation::~Allocation(){auto &state=ledger();std::lock_guard lock(state.mutex);state.used[index(kind)]-=bytes;}
+RenderBudget::Allocation::~Allocation(){auto &state=ledger();std::lock_guard lock(state.mutex);state.used[index(kind)]-=bytes;if(imageKey && state.images.value(imageKey).expired())state.images.remove(imageKey);}
 RenderBudget::Lease RenderBudget::reserve(Kind kind,qint64 bytes) {
     if(bytes<=0)return {};
     auto &state=ledger();std::lock_guard lock(state.mutex);const auto i=index(kind);
@@ -20,6 +20,23 @@ RenderBudget::Lease RenderBudget::reserve(Kind kind,qint64 bytes) {
     state.used[i]+=bytes;state.peak[i]=qMax(state.peak[i],state.used[i]);
     // Construct directly: a temporary Allocation would release the charge twice.
     return Lease(new Allocation{kind,bytes});
+}
+RenderBudget::Lease RenderBudget::retainImage(const QImage &image) {
+    if(image.isNull())return {};
+    auto &s=ledger();std::lock_guard lock(s.mutex);const auto key=image.cacheKey();
+    if(auto existing=s.images.value(key).lock())return existing;
+    const auto bytes=image.sizeInBytes();
+    if(bytes>residentLimit-s.used[0]){++s.denied[0];return {};}
+    s.used[0]+=bytes;s.peak[0]=qMax(s.peak[0],s.used[0]);
+    Lease result(new Allocation{Kind::Resident,bytes,key});s.images.insert(key,result);return result;
+}
+RenderBudget::Lease RenderBudget::publishImage(Lease reservation,const QImage &image) {
+    if(!reservation || image.isNull() || reservation->kind!=Kind::Resident || image.sizeInBytes()>reservation->bytes)return {};
+    auto &s=ledger();std::lock_guard lock(s.mutex);const auto key=image.cacheKey();
+    if(auto existing=s.images.value(key).lock())return existing;
+    // Only the worker owns this reservation until its future publishes the result.
+    s.used[0]-=reservation->bytes-image.sizeInBytes();reservation->bytes=image.sizeInBytes();reservation->imageKey=key;
+    s.images.insert(key,reservation);return reservation;
 }
 QVariantMap RenderBudget::statistics() {
     auto &state=ledger();std::lock_guard lock(state.mutex);

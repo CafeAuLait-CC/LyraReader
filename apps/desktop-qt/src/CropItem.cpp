@@ -6,6 +6,7 @@
 #include <QtConcurrentRun>
 #include <QUrlQuery>
 #include <QQuickWindow>
+namespace {struct CropResult {ResidentImage image;bool pressure=false;};}
 
 CropItem::CropItem(QQuickItem *parent):QQuickItem(parent) {
     setFlag(ItemHasContents,true);m_timer.setSingleShot(true);m_timer.setInterval(70);
@@ -38,18 +39,21 @@ void CropItem::request() {
     syncBudget();if(!active() || m_job)return;
     auto ticket=RasterJobs::enqueue();if(!ticket){m_timer.start(200);return;}m_job=ticket;
     const auto epoch=m_epoch;const auto url=m_source;const auto bytes=qMax<qint64>(4096,m_target/2);setStatus(2);
-    auto *watcher=new QFutureWatcher<QImage>(this);
-    connect(watcher,&QFutureWatcher<QImage>::finished,this,[this,watcher,epoch,ticket] {
-        auto image=watcher->result();watcher->deleteLater();if(epoch!=m_epoch)return;m_job.reset();
+    auto *watcher=new QFutureWatcher<CropResult>(this);
+    connect(watcher,&QFutureWatcher<CropResult>::finished,this,[this,watcher,epoch,ticket] {
+        auto result=watcher->result();watcher->deleteLater();if(epoch!=m_epoch)return;m_job.reset();
         if(ticket->cancelled.load())return;
-        if(image.isNull()){setStatus(3);return;}
-        auto retained=ResidentImage::retain(image);
-        if(retained.isNull()){m_timer.start(200);return;}
-        m_image=std::move(retained);setStatus(1);update();
+        if(result.pressure){m_timer.start(200);return;}
+        if(result.image.isNull()){setStatus(3);return;}
+        m_image=std::move(result.image);setStatus(1);update();
     });
     watcher->setFuture(QtConcurrent::run(RasterJobs::pool(),[url,bytes,ticket] {
-        RasterJobs::Run run(ticket);if(ticket->cancelled.load())return QImage{};
-        return NativeImageProvider::rawImage(url,bytes);
+        RasterJobs::Run run(ticket);CropResult result;if(ticket->cancelled.load())return result;
+        auto reservation=RenderBudget::reserve(RenderBudget::Kind::Resident,RenderBudget::maximumJobBytes);
+        if(!reservation){result.pressure=true;return result;}
+        auto image=NativeImageProvider::rawImage(url,bytes);
+        if(!image.isNull() && !ticket->cancelled.load())result.image=ResidentImage::publish(std::move(reservation),std::move(image));
+        return result;
     }));
 }
 QSGNode *CropItem::updatePaintNode(QSGNode *old,UpdatePaintNodeData *) {
