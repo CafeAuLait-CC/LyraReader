@@ -94,7 +94,13 @@ Item {
                     width: Math.abs(first.x - p.x),
                     height: Math.abs(first.y - p.y)
                 };
-            app.annotationDraft = entry;
+            if (gestureTool === "redact")
+                app.redactionDraft = {
+                    page: page,
+                    rect: entry.rect
+                };
+            else
+                app.annotationDraft = entry;
         }
         onPressed: function (mouse) {
             if (mouse.button === Qt.RightButton) {
@@ -110,6 +116,10 @@ Item {
             app.pendingDraftRequestId = -1;
             const p = position(mouse);
             previousPoint = p;
+            if (gestureTool === "redact" && !app.canRedact) {
+                gestureTool = "canceled";
+                return;
+            }
             editBase = null;
             if (gestureTool === "select") {
                 const hit = app.annotationAt(page, p.x, p.y, false);
@@ -121,7 +131,7 @@ Item {
                     return;
                 }
             }
-            if (["ink", "square", "circle", "line", "arrow"].indexOf(gestureTool) >= 0) {
+            if (["ink", "square", "circle", "line", "arrow", "redact"].indexOf(gestureTool) >= 0) {
                 app.selection = null;
                 points = [p];
                 draw(p);
@@ -145,6 +155,7 @@ Item {
             gestureTool = "canceled";
             editBase = null;
             app.annotationDraft = null;
+            app.redactionDraft = null;
             app.selectedAnnotation = null;
             app.selection = null;
         }
@@ -165,7 +176,7 @@ Item {
                 });
                 return;
             }
-            if (["ink", "square", "circle", "line", "arrow"].indexOf(gestureTool) >= 0) {
+            if (["ink", "square", "circle", "line", "arrow", "redact"].indexOf(gestureTool) >= 0) {
                 draw(p);
                 return;
             }
@@ -192,9 +203,16 @@ Item {
                     app.annotationDraft = null;
                 return;
             }
-            if (["ink", "square", "circle", "line", "arrow"].indexOf(gestureTool) >= 0) {
+            if (["ink", "square", "circle", "line", "arrow", "redact"].indexOf(gestureTool) >= 0) {
                 if (!dragged) {
                     app.annotationDraft = null;
+                    app.redactionDraft = null;
+                    return;
+                }
+                if (gestureTool === "redact") {
+                    if (app.redactionDraft)
+                        app.addRedaction(page, app.redactionDraft.rect);
+                    app.redactionDraft = null;
                     return;
                 }
                 const entry = app.annotationDraft;
@@ -216,6 +234,7 @@ Item {
         }
         onCanceled: {
             app.annotationDraft = null;
+            app.redactionDraft = null;
             app.eraseDraft = [];
         }
         onDoubleClicked: function (mouse) {

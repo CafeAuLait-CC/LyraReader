@@ -14,6 +14,7 @@
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QJSValue>
+#include <QInputMethodEvent>
 #include <QQuickStyle>
 #include <QQuickWindow>
 #include <QSGRendererInterface>
@@ -202,6 +203,9 @@ private slots:
         const auto ink=image.pixelColor(qRound(90*sx),qRound(40*sy));
         QVERIFY2(paper.red()>245 && paper.green()>245 && paper.blue()>115 && paper.blue()<140,qPrintable(paper.name()));
         QVERIFY2(ink.red()<3 && ink.green()<3 && ink.blue()<3,qPrintable(ink.name()));
+        // Updating an unrelated item must not multiply the unchanged highlight
+        // onto an already tinted backing store outside the software dirty clip.
+        for(int i=0;i<12;++i){window->setProperty("pulse",double(i%2));QTest::qWait(16);const auto frame=window->grabWindow();QCOMPARE(frame.pixelColor(qRound(30*sx),qRound(40*sy)),paper);QCOMPARE(frame.pixelColor(qRound(90*sx),qRound(40*sy)),ink);}
     }
     void printingUsesImmutableEditedPagesAndKeepsTheSourceUntouched() {
         QTemporaryDir scratch;
@@ -385,6 +389,102 @@ private slots:
         reader.submit("marks_undo");QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
         QCOMPARE(model().value("nestedReplyCount").toInt(),4);
         const auto snapshots=qEnvironmentVariable("LYRA_READER_CHECK_SNAPSHOTS");if(!snapshots.isEmpty())QVERIFY(window->grabWindow().save(snapshots+"/lyrareader-reply-threads.png"));
+    }
+    void redactionReviewDeletesRealContentAndKeepsNewerDrafts() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto path=scratch.path()+"/source.pdf", output=scratch.path()+"/redacted.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        QFile original(path);QVERIFY(original.open(QIODevice::ReadOnly));const auto bytes=original.readAll();original.close();
+        WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);
+        engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());
+        engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTest::qWait(150);
+        window->setProperty("fitting",false);QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,1.0),Q_ARG(QVariant,0),Q_ARG(QVariant,0));QTest::qWait(100);
+        QTRY_VERIFY(reader->textPages().contains("0"));const auto before=reader->textPages().value("0").toMap();const auto chars=before.value("chars").toList();QVERIFY(chars.size()>8);
+        QRectF area;
+        for(int i=0;i<6;++i){const auto c=chars[i].toMap();const QRectF box(c.value("x_pt").toDouble(),c.value("y_pt").toDouble(),c.value("width_pt").toDouble(),c.value("height_pt").toDouble());if(!box.isEmpty())area=area.isEmpty()?box:area.united(box);}
+        area=area.adjusted(-2,-2,2,2);
+        auto *page=visualItem(window->contentItem(),"pdfPage0");QVERIFY(page);
+        window->setProperty("annotationTool","redact");
+        QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,page->mapToScene(area.topLeft()).toPoint());
+        QTest::mouseMove(window,page->mapToScene(area.bottomRight()).toPoint(),30);
+        QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,page->mapToScene(area.bottomRight()).toPoint());
+        QTRY_COMPARE(reader->editDrafts().value("redactions").toList().size(),1);
+        const auto areas=reader->editDrafts().value("redactions").toList();
+        QVERIFY(QMetaObject::invokeMethod(window,"reviewRedactions",Q_ARG(QVariant,false)));
+        auto *review=window->findChild<QObject *>("redactionReview");QVERIFY(review);
+        QTRY_VERIFY(!review->property("loading").toBool());QVERIFY(review->property("error").toString().isEmpty());
+        const auto preview=review->property("preview").toMap();QVERIFY(preview.value("removed_characters").toInt()>0);
+        QMetaObject::invokeMethod(review,"close");
+        // A failed save retains all marks. A save dialog's old snapshot must not clear newer marks.
+        const QVariant context=QVariantMap{{"reader",QVariant::fromValue(reader)},{"kind","redactions"},{"redactions",areas}};
+        window->setProperty("exportContext",context);
+        QVERIFY(QMetaObject::invokeMethod(window,"exportTo",Q_ARG(QVariant,QUrl::fromLocalFile(scratch.path()+"/missing/out.pdf"))));
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(!reader->error().isEmpty());QCOMPARE(reader->editDrafts().value("redactions").toList(),areas);reader->dismissError();
+        auto newer=areas;newer.append(QVariantMap{{"page",0},{"x_pt",10},{"y_pt",10},{"width_pt",5},{"height_pt",5}});reader->setEditDraft("redactions",newer);
+        QVERIFY(QMetaObject::invokeMethod(window,"exportTo",Q_ARG(QVariant,QUrl::fromLocalFile(output))));
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
+        QCOMPARE(reader->editDrafts().value("redactions").toList(),newer);QVERIFY(reader->data().value("save_redactions").toMap().value("verified").toBool());
+        QVERIFY(original.open(QIODevice::ReadOnly));QCOMPARE(original.readAll(),bytes);original.close();
+        ReaderController redacted;redacted.openFile(QUrl::fromLocalFile(output));QTRY_COMPARE_WITH_TIMEOUT(redacted.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(redacted.pendingCommands(),0,10000);
+        redacted.requestText(0);QTRY_VERIFY(redacted.textPages().contains("0"));
+        QVERIFY(redacted.textPages().value("0").toMap().value("text").toString().size()<before.value("text").toString().size());
+        redacted.requestPage(0,1);QTRY_VERIFY_WITH_TIMEOUT(!redacted.cachedPage(0,1).isNull(),10000);const auto image=redacted.cachedPage(0,1);
+        const auto saved=areas.first().toMap();const QRect sample=QRectF(saved.value("x_pt").toDouble()+1,saved.value("y_pt").toDouble()+1,saved.value("width_pt").toDouble()-2,saved.value("height_pt").toDouble()-2).toAlignedRect();
+        for(int y=sample.top();y<sample.bottom();y+=3)for(int x=sample.left();x<sample.right();x+=3){const auto c=image.pixelColor(x,y);QVERIFY(c.red()<4 && c.green()<4 && c.blue()<4);}
+        // Every removed character is absent from the saved page's text geometry.
+        for(const auto &value:redacted.textPages().value("0").toMap().value("chars").toList()) {const auto c=value.toMap();if(c.value("unicode").toUInt()<=32)continue;const QRectF box(c.value("x_pt").toDouble(),c.value("y_pt").toDouble(),c.value("width_pt").toDouble(),c.value("height_pt").toDouble());QVERIFY(!box.intersects(area.adjusted(1,1,-1,-1)));}
+        workspace.newTab();auto *other=workspace.activeReader();other->openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));QTRY_VERIFY(other->pageCount()>0);QTRY_COMPARE_WITH_TIMEOUT(other->pendingCommands(),0,10000);QVERIFY(other->editDrafts().isEmpty());
+        workspace.selectTab(0);QCOMPARE(reader->editDrafts().value("redactions").toList(),newer);
+        reader->submit("page_stage",{{"operation",QVariantMap{{"Rotate",QVariantMap{{"pages",QVariantList{0}},{"quarter_turns",1}}}}}});QTest::qWait(50);QVERIFY(reader->error().contains("pending form"));reader->dismissError();
+        workspace.closeTab(0);QCOMPARE(workspace.tabs().size(),2);auto *close=window->findChild<QObject *>("closeChangesConfirmation");QVERIFY(close);QTRY_VERIFY(close->property("visible").toBool());QMetaObject::invokeMethod(close,"close");
+        // Matching successful snapshots clear their marks, while the source remains unchanged.
+        const QVariant currentContext=QVariantMap{{"reader",QVariant::fromValue(reader)},{"kind","redactions"},{"redactions",newer}};window->setProperty("exportContext",currentContext);
+        QVERIFY(QMetaObject::invokeMethod(window,"exportTo",Q_ARG(QVariant,QUrl::fromLocalFile(scratch.path()+"/second.pdf"))));
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QVERIFY(!reader->hasEditDrafts());
+    }
+    void formWidgetsEditOnThePageAndSaveAnIsolatedSnapshot() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/forms.pdf",output=scratch.path()+"/filled.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/form-fields.pdf",path));QFile original(path);QVERIFY(original.open(QIODevice::ReadOnly));const auto bytes=original.readAll();original.close();
+        WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);
+        engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
+        auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),2,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTest::qWait(150);
+        window->setProperty("fitting",false);QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,1.0),Q_ARG(QVariant,0),Q_ARG(QVariant,0));QTest::qWait(100);
+        QVERIFY(QMetaObject::invokeMethod(window,"toggleForms"));QTRY_VERIFY(reader->data().contains("forms"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto fields=reader->data().value("forms").toMap().value("fields").toList();QCOMPARE(fields.size(),8);QVERIFY(reader->editDrafts().isEmpty());
+        auto *view=window->findChild<QQuickItem *>("pageList");QVERIFY(view);
+        const auto reveal=[&](QQuickItem *item){const auto center=item->mapToItem(view,QPointF(item->width()/2,item->height()/2));const double target=view->property("contentY").toDouble()+center.y()-view->height()/2;view->setProperty("contentY",qBound(-24.0,target,qMax(-24.0,view->property("contentHeight").toDouble()-view->height()+24)));QTest::qWait(50);};
+        QVariantMap textField,checkField,radioField,choiceField;
+        for(const auto &value:fields){const auto f=value.toMap();if(f.value("kind")=="text" && f.value("editable").toBool() && !f.value("multiline").toBool())textField=f;else if(f.value("kind")=="checkBox")checkField=f;else if(f.value("kind")=="radio")radioField=f;else if(f.value("kind")=="comboBox")choiceField=f;}
+        QVERIFY(!textField.isEmpty());auto *text=visualItem(window->contentItem(),"formText_"+textField.value("id").toString()+"_0");QVERIFY(text);QVERIFY(text->isVisible());
+        QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,text->mapToScene(QPointF(text->width()/2,text->height()/2)).toPoint());QTest::keyClick(window,Qt::Key_A,Qt::ControlModifier);
+        QInputMethodEvent input;input.setCommitString(QString::fromUtf8("Linux 中文"));QCoreApplication::sendEvent(text,&input);
+        QTRY_COMPARE(reader->editDrafts().value("forms").toMap().value(textField.value("id").toString()).toMap().value("text").toString(),QString::fromUtf8("Linux 中文"));
+        auto *check=visualItem(window->contentItem(),"formCheck_"+checkField.value("id").toString()+"_0");QVERIFY(check);reveal(check);QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,check->mapToScene(QPointF(check->width()/2,check->height()/2)).toPoint());
+        QTRY_COMPARE(reader->editDrafts().value("forms").toMap().value(checkField.value("id").toString()).toMap().value("checked").toBool(),!checkField.value("checked").toBool());
+        const int radioTarget=radioField.value("selected").toList().isEmpty() || radioField.value("selected").toList().first().toInt()!=1 ? 1 : 0;
+        auto *radio=visualItem(window->contentItem(),"formRadio_"+radioField.value("id").toString()+"_"+QString::number(radioTarget));QVERIFY(radio);reveal(radio);QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,radio->mapToScene(QPointF(radio->width()/2,radio->height()/2)).toPoint());
+        QTRY_VERIFY(reader->editDrafts().value("forms").toMap().contains(radioField.value("id").toString()));
+        QCOMPARE(reader->editDrafts().value("forms").toMap().value(radioField.value("id").toString()).toMap().value("selected").toInt(),radioTarget);
+        QVERIFY(radio->property("checked").toBool());auto *firstRadio=visualItem(window->contentItem(),"formRadio_"+radioField.value("id").toString()+"_"+QString::number(1-radioTarget));QVERIFY(firstRadio);QVERIFY(!firstRadio->property("checked").toBool());
+        auto *choice=visualItem(window->contentItem(),"formChoice_"+choiceField.value("id").toString()+"_0");QVERIFY(choice);reveal(choice);choice->forceActiveFocus();
+        const int choiceInitial=choice->property("currentIndex").toInt(),choiceTarget=choiceInitial>0 ? choiceInitial-1 : choiceInitial+1;
+        QTest::keyClick(window,choiceInitial>0 ? Qt::Key_Up : Qt::Key_Down);QTest::keyClick(window,Qt::Key_Return);
+        QTRY_VERIFY(reader->editDrafts().value("forms").toMap().contains(choiceField.value("id").toString()));
+        QCOMPARE(reader->editDrafts().value("forms").toMap().value(choiceField.value("id").toString()).toMap().value("selected").toInt(),choiceTarget);
+        QTest::keyClick(window,Qt::Key_Escape);
+        const auto values=reader->editDrafts().value("forms").toMap();QVariantList payload;for(const auto &value:values)payload.append(value);
+        const QVariant context=QVariantMap{{"reader",QVariant::fromValue(reader)},{"kind","forms"},{"forms",payload}};window->setProperty("exportContext",context);
+        workspace.newTab();auto *other=workspace.activeReader();other->openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));QTRY_COMPARE_WITH_TIMEOUT(other->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(other->pendingCommands(),0,10000);QVERIFY(other->editDrafts().isEmpty());
+        // The save operation still belongs to the tab that opened it.
+        QVERIFY(QMetaObject::invokeMethod(window,"exportTo",Q_ARG(QVariant,QUrl::fromLocalFile(output))));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QVERIFY(reader->editDrafts().isEmpty());QVERIFY(other->data().value("save_forms").isNull());
+        ReaderController filled;filled.openFile(QUrl::fromLocalFile(output));QTRY_COMPARE_WITH_TIMEOUT(filled.pageCount(),2,10000);filled.submit("forms");QTRY_COMPARE_WITH_TIMEOUT(filled.pendingCommands(),0,10000);
+        const auto saved=filled.data().value("forms").toMap().value("fields").toList();
+        QSet<QString> found;
+        for(const auto &value:saved){const auto f=value.toMap();if(f.value("name")==textField.value("name")){QCOMPARE(f.value("value").toString(),QString::fromUtf8("Linux 中文"));found.insert("text");}if(f.value("name")==checkField.value("name")){QCOMPARE(f.value("checked").toBool(),!checkField.value("checked").toBool());found.insert("check");}if(f.value("name")==radioField.value("name")){QCOMPARE(f.value("selected").toList().first().toInt(),radioTarget);found.insert("radio");}if(f.value("name")==choiceField.value("name")){QCOMPARE(f.value("selected").toList().first().toInt(),choiceTarget);found.insert("choice");}}
+        QCOMPARE(found.size(),4);
+        QVERIFY(original.open(QIODevice::ReadOnly));QCOMPARE(original.readAll(),bytes);
     }
     void deepZoomRefinesVisibleTilesWithoutSeamsAndSharesTheCacheBudget() {
         ReaderController reader;QQmlApplicationEngine engine;

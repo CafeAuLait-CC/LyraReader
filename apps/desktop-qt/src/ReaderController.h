@@ -24,6 +24,8 @@ class ReaderController : public QObject {
     Q_PROPERTY(double documentWidth READ documentWidth NOTIFY documentChanged)
     Q_PROPERTY(double documentHeight READ documentHeight NOTIFY documentChanged)
     Q_PROPERTY(QUrl fileUrl READ fileUrl NOTIFY documentChanged)
+    Q_PROPERTY(QVariantMap editDrafts READ editDrafts NOTIFY editDraftsChanged)
+    Q_PROPERTY(bool hasEditDrafts READ hasEditDrafts NOTIFY editDraftsChanged)
     Q_PROPERTY(QVariantMap noteDrafts READ noteDrafts NOTIFY noteDraftsChanged)
     Q_PROPERTY(QVariantMap data READ data NOTIFY dataChanged)
     Q_PROPERTY(QVariantMap textPages READ textPages NOTIFY textPagesChanged)
@@ -43,6 +45,9 @@ public:
     double documentWidth() const { return m_documentWidth; }
     double documentHeight() const { return m_documentHeight; }
     QUrl fileUrl() const { return m_lastUrl; }
+    QVariantMap editDrafts()const{return m_editDrafts;}
+    bool hasEditDrafts()const{return !m_editDrafts.isEmpty();}
+    Q_INVOKABLE void setEditDraft(const QString &key,const QVariant &value);
     QVariantMap noteDrafts()const{return m_noteDrafts;}
     Q_INVOKABLE void setNoteDraft(const QString &id,const QString &text){m_noteDrafts.insert(id,text);emit noteDraftsChanged();}
     Q_INVOKABLE void clearNoteDraft(const QString &id){if(m_noteDrafts.remove(id))emit noteDraftsChanged();}
@@ -86,6 +91,7 @@ signals:
     void commandFinished(quint64 id, const QString &operation, const QVariant &result, const QString &error);
     void dataChanged();
     void noteDraftsChanged();
+    void editDraftsChanged();
     void textPagesChanged();
     void commandsChanged();
 private:
@@ -103,7 +109,7 @@ private:
     QVariantList m_pages;
     double m_documentWidth = 0;
     double m_documentHeight = 0;
-    QVariantMap m_data, m_textPages, m_noteDrafts;
+    QVariantMap m_data, m_textPages, m_noteDrafts, m_editDrafts;
     QSet<int> m_textPending;
     int m_pendingCommands = 0;
     quint64 m_commandSequence = 0;

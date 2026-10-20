@@ -54,6 +54,7 @@ ApplicationWindow {
     }))
     readonly property var annotationThreads: Logic.annotationThreads(annotations)
     property var annotationDraft: null
+    property var redactionDraft: null
     property var eraseDraft: []
     property double pendingDraftRequestId: -1
     property double searchRequestId: -1
@@ -67,7 +68,9 @@ ApplicationWindow {
     property alias searchDebounce: searchTimer
     property var selectedAnnotation: null
     property var infoData: ({})
-    property var formValues: ({})
+    readonly property var formValues: currentReader.editDrafts.forms || ({})
+    readonly property var pendingRedactions: currentReader.editDrafts.redactions || []
+    readonly property bool canRedact: currentReader.pageCount > 0 && !pageEditsPending && currentReader.pendingCommands === 0
     property string exportKind: ""
     readonly property bool pageEditsPending: !!markState.page_pending
     property bool pageEditBusy: false
@@ -86,12 +89,16 @@ ApplicationWindow {
         previousReader = currentReader;
         selectedAnnotation = null;
         annotationDraft = null;
+        redactionDraft = null;
         pendingDraftRequestId = -1;
         selection = null;
         searchResults = [];
         searchIndex = -1;
-        if (currentReader && currentReader.pageCount > 0)
+        if (currentReader && currentReader.pageCount > 0) {
             Qt.callLater(restorePosition);
+            if (formToolActive)
+                currentReader.submit("forms");
+        }
     }
     property bool closeApproved: false
     property int closingTab: -2
@@ -125,7 +132,7 @@ ApplicationWindow {
         ];
         return tabs.some(function (tab, i) {
             const marks = tab.reader.data.marks || {};
-            return (index < 0 || i === index) && (marks.page_pending || marks.pending_deletions > 0 || Object.keys(tab.reader.noteDrafts).length > 0);
+            return (index < 0 || i === index) && (marks.page_pending || marks.pending_deletions > 0 || Object.keys(tab.reader.noteDrafts).length > 0 || tab.reader.hasEditDrafts);
         });
     }
     function requestCloseTab(index) {
@@ -388,6 +395,10 @@ ApplicationWindow {
             root.jumpFromPreview(page, y);
         }
     }
+    RedactionReview {
+        id: redactionReview
+        app: root
+    }
     PreviewPanel {
         app: root
         controller: root.previewController
@@ -417,12 +428,14 @@ ApplicationWindow {
         currentReader.submit("metadata");
         dialogs.informationDialog.open();
     }
+    function showFormsDialog() {
+        currentReader.submit("forms");
+        dialogs.formsDialog.open();
+    }
     function toggleForms() {
         formToolActive = !formToolActive;
-        if (formToolActive) {
+        if (formToolActive)
             currentReader.submit("forms");
-            dialogs.formsDialog.open();
-        }
     }
     function selectAnnotation(annotation, edit) {
         dialogs.flushAnnotation();
@@ -472,6 +485,43 @@ ApplicationWindow {
         annotationTool = annotationTool === tool ? "select" : tool;
         if (["highlight", "underline", "strikeout"].indexOf(annotationTool) >= 0 && selection)
             markSelection(annotationTool);
+    }
+    function addRedaction(page, rect) {
+        if (!canRedact)
+            return;
+        const size = currentReader.pages[page];
+        if (!size)
+            return;
+        const left = Math.max(0, rect.x), top = Math.max(0, rect.y);
+        const right = Math.min(size.width, rect.x + rect.width), bottom = Math.min(size.height, rect.y + rect.height);
+        if (right - left < 1 || bottom - top < 1)
+            return;
+        const area = {
+            page: page,
+            x_pt: left,
+            y_pt: top,
+            width_pt: right - left,
+            height_pt: bottom - top
+        };
+        if (pendingRedactions.some(function (a) {
+            return JSON.stringify(a) === JSON.stringify(area);
+        }))
+            return;
+        currentReader.setEditDraft("redactions", pendingRedactions.concat([area]));
+        operationStatus = qsTr("%1 pending redaction areas; the file is unchanged.").arg(pendingRedactions.length);
+    }
+    function markSelectionForRedaction() {
+        if (!selection || !canRedact)
+            return;
+        const text = currentReader.textPages[selection.page.toString()];
+        if (!text)
+            return;
+        for (const rect of Logic.quads(text.chars, selection.start, selection.end))
+            addRedaction(selection.page, rect);
+        selection = null;
+    }
+    function reviewRedactions(replacing) {
+        redactionReview.review(replacing);
     }
     function markSelection(kind) {
         if (!selection)
@@ -632,16 +682,44 @@ ApplicationWindow {
         onTriggered: if (root.printRequested)
             root.printDocument()
     }
+    property var exportContext: null
     function chooseExport(kind) {
         exportKind = kind;
+        exportContext = {
+            reader: currentReader,
+            kind: kind,
+            forms: formPayload(),
+            redactions: pendingRedactions.slice(),
+            pages: selectedPages.slice(),
+            properties: kind === "properties" ? dialogs.informationDialog.draft() : null,
+            text: kind === "bibtex" ? bibtex : (kind === "markdown" || kind === "csv" ? annotationExport(kind) : "")
+        };
+        dialogs.saveDialog.open();
+    }
+    function chooseRedactionExport(owner, areas) {
+        exportKind = "redactions";
+        exportContext = {
+            reader: owner,
+            kind: "redactions",
+            redactions: areas
+        };
         dialogs.saveDialog.open();
     }
     function updateFormValue(id, value) {
         const next = Object.assign({}, formValues);
-        next[id] = Object.assign({
-            field_id: id
-        }, value);
-        formValues = next;
+        const field = currentReader.data.forms ? currentReader.data.forms.fields.find(function (f) {
+            return f.id === id;
+        }) : null;
+        if (!field || !field.editable)
+            return;
+        const same = field.kind === "text" ? value.text === (field.value || "") : field.kind === "checkBox" ? value.checked === field.checked : value.selected === (field.selected.length ? field.selected[0] : -1);
+        if (same)
+            delete next[id];
+        else
+            next[id] = Object.assign({
+                field_id: id
+            }, value);
+        currentReader.setEditDraft("forms", next);
     }
     function formPayload() {
         return Object.keys(formValues).map(function (key) {
@@ -677,31 +755,45 @@ ApplicationWindow {
     function exportTo(url) {
         if (!session)
             return;
+        const context = exportContext || {
+            reader: currentReader,
+            kind: exportKind,
+            forms: formPayload(),
+            redactions: pendingRedactions.slice()
+        };
+        const owner = context.reader;
+        if (!owner)
+            return;
         const destination = session.localPath(url);
-        if (exportKind === "properties")
-            currentReader.submit("save_properties", Object.assign({
-                destination: destination
-            }, dialogs.informationDialog.draft()));
-        else if (exportKind === "forms")
-            currentReader.submit("save_forms", {
+        if (context.kind === "redactions")
+            owner.submit("save_redactions", {
                 destination: destination,
-                values: formPayload()
+                areas: context.redactions
             });
-        else if (exportKind === "extract")
-            currentReader.submit("extract_pages", {
+        else if (context.kind === "properties")
+            owner.submit("save_properties", Object.assign({
+                destination: destination
+            }, context.properties));
+        else if (context.kind === "forms")
+            owner.submit("save_forms", {
                 destination: destination,
-                pages: selectedPages
+                values: context.forms
             });
-        else if (exportKind === "pages")
-            currentReader.submit("save_current_edited_copy", {
+        else if (context.kind === "extract")
+            owner.submit("extract_pages", {
+                destination: destination,
+                pages: context.pages
+            });
+        else if (context.kind === "pages")
+            owner.submit("save_current_edited_copy", {
                 destination: destination
             });
-        else if (exportKind === "bibtex")
-            operationStatus = session.writeTextFile(url, bibtex) || qsTr("BibTeX saved.");
-        else if (exportKind === "markdown" || exportKind === "csv")
-            operationStatus = session.writeTextFile(url, annotationExport(exportKind)) || qsTr("Annotations exported.");
+        else if (context.kind === "bibtex")
+            operationStatus = session.writeTextFile(url, context.text) || qsTr("BibTeX saved.");
+        else if (context.kind === "markdown" || context.kind === "csv")
+            operationStatus = session.writeTextFile(url, context.text) || qsTr("Annotations exported.");
         else
-            currentReader.submit("save_current_annotations", {
+            owner.submit("save_current_annotations", {
                 destination: destination
             });
     }
@@ -896,6 +988,7 @@ ApplicationWindow {
                 root.previewController.close();
             root.annotationTool = "select";
             root.annotationDraft = null;
+            root.redactionDraft = null;
             root.selectedAnnotation = null;
             root.selection = null;
             root.overviewVisible = false;
@@ -1004,6 +1097,10 @@ ApplicationWindow {
                     onClicked: currentReader.dismissError()
                 }
             }
+        }
+        DocumentDraftBar {
+            app: root
+            Layout.fillWidth: true
         }
         RowLayout {
             Layout.fillWidth: true
@@ -1280,9 +1377,20 @@ ApplicationWindow {
     }
     Connections {
         target: root.currentReader
+        function onDocumentReset() {
+            root.selection = null;
+            root.selectedAnnotation = null;
+            root.annotationDraft = null;
+            root.redactionDraft = null;
+            root.metadataDraft = null;
+            root.infoData = {};
+        }
         function onOpenFinished(success) {
-            if (success)
+            if (success) {
                 Qt.callLater(root.restorePosition);
+                if (root.formToolActive)
+                    currentReader.submit("forms");
+            }
         }
         function onCommandFinished(id, op, result, error) {
             if (op.indexOf("page_") === 0 && op !== "page_operation") {
@@ -1355,7 +1463,10 @@ ApplicationWindow {
                     root.navigate(root.activeSearchHit.page);
             } else if (op === "document_info")
                 root.infoData = result;
-            else if (op.indexOf("save_") === 0)
+            else if (op === "save_redactions") {
+                root.annotationTool = "select";
+                root.operationStatus = qsTr("Verified redacted copy saved: %1 · %2 characters removed.").arg(result.destination_path).arg(result.removed_characters);
+            } else if (op.indexOf("save_") === 0)
                 root.operationStatus = qsTr("Saved to %1").arg(result.destination_path || "");
             else if (op.indexOf("replace_") === 0) {
                 root.operationStatus = qsTr("Saved. Verified backup: %1").arg(result.backup_path || "");

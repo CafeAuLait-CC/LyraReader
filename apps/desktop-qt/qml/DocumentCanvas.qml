@@ -82,7 +82,17 @@ Item {
                         app: canvas.app
                         page: sheet.modelData.index
                     }
+                    RedactionLayer {
+                        anchors.fill: parent
+                        app: canvas.app
+                        page: sheet.modelData.index
+                    }
                     PageInteraction {
+                        anchors.fill: parent
+                        app: canvas.app
+                        page: sheet.modelData.index
+                    }
+                    FormOverlay {
                         anchors.fill: parent
                         app: canvas.app
                         page: sheet.modelData.index

@@ -31,7 +31,7 @@ Item {
         Label {
             width: Math.min(400, app.width - 80)
             wrapMode: Text.Wrap
-            text: qsTr("Page edits, pending deletions, or unsaved annotation notes have not been written to the PDF. Discard them and close? Choose Cancel to apply or export your changes first. Saved annotations remain in their sidecar.")
+            text: qsTr("Page edits, form edits, redaction marks, pending deletions, or unsaved annotation notes have not been written to the PDF. Discard them and close? Choose Cancel to apply or export your changes first. Saved annotations remain in their sidecar.")
         }
         onDiscarded: app.discardAndClose(dialogs.closeIndex)
     }
@@ -228,6 +228,11 @@ Item {
     }
     Menu {
         id: selection
+        MenuItem {
+            text: qsTr("Mark Selection for Redaction")
+            enabled: !!app.selection && app.canRedact
+            onTriggered: app.markSelectionForRedaction()
+        }
         parent: Overlay.overlay
         MenuItem {
             text: qsTr("Copy Text")
@@ -570,6 +575,7 @@ Item {
                     model: app.currentReader.data.forms ? app.currentReader.data.forms.fields : []
                     ColumnLayout {
                         required property var modelData
+                        readonly property var draft: app.formValues[modelData.id] || null
                         Layout.fillWidth: true
                         Label {
                             text: modelData.name + qsTr(" · p.%1").arg(modelData.page + 1)
@@ -579,7 +585,7 @@ Item {
                         TextField {
                             visible: modelData.kind === "text"
                             Layout.fillWidth: true
-                            text: modelData.value || ""
+                            text: parent.draft && parent.draft.text !== null ? parent.draft.text : modelData.value || ""
                             enabled: modelData.editable
                             maximumLength: modelData.max_length || 32767
                             onTextEdited: app.updateFormValue(modelData.id, {
@@ -591,7 +597,7 @@ Item {
                         CheckBox {
                             visible: modelData.kind === "checkBox"
                             text: modelData.name
-                            checked: modelData.checked
+                            checked: parent.draft && parent.draft.checked !== null ? parent.draft.checked : modelData.checked
                             enabled: modelData.editable
                             onToggled: app.updateFormValue(modelData.id, {
                                 text: null,
@@ -604,7 +610,7 @@ Item {
                             Layout.fillWidth: true
                             model: modelData.options
                             textRole: "label"
-                            currentIndex: modelData.selected.length ? modelData.selected[0] : -1
+                            currentIndex: parent.draft && parent.draft.selected !== null ? parent.draft.selected : modelData.selected.length ? modelData.selected[0] : -1
                             enabled: modelData.editable
                             onActivated: app.updateFormValue(modelData.id, {
                                 text: null,

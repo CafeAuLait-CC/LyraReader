@@ -13,6 +13,7 @@
 #include <QLoggingCategory>
 #include <QtConcurrentRun>
 #include <QPromise>
+#include <QJSValue>
 #include <cmath>
 #include <deque>
 #include <functional>
@@ -61,6 +62,15 @@ ReaderController::~ReaderController(){clearRasterCache();}
 void ReaderController::clearRasterCache(){RasterCache::clearPrefix(m_cachePrefix);m_tileDemand.clear();}
 int ReaderController::cpuCacheKiB(){return RasterCache::costKiB();}
 
+void ReaderController::setEditDraft(const QString &key,const QVariant &value) {
+    if(key!=QStringLiteral("forms") && key!=QStringLiteral("redactions"))return;
+    const auto next=value.metaType()==QMetaType::fromType<QJSValue>() ? value.value<QJSValue>().toVariant() : value;
+    const bool empty=next.isNull() || (key==QStringLiteral("forms") ? next.toMap().isEmpty() : next.toList().isEmpty());
+    if(empty){if(m_editDrafts.remove(key))emit editDraftsChanged();return;}
+    if(m_editDrafts.value(key)==next)return;
+    m_editDrafts.insert(key,next);emit editDraftsChanged();
+}
+
 void ReaderController::setError(const QString &error) {
     if (m_error == error) return;
     m_error = error;
@@ -84,7 +94,7 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
     m_requests.clear();
     m_documentWidth = 0;
     m_documentHeight = 0;
-    m_data.clear(); m_textPages.clear(); m_textPending.clear();m_noteDrafts.clear();emit noteDraftsChanged();
+    m_data.clear(); m_textPages.clear(); m_textPending.clear();m_noteDrafts.clear();emit noteDraftsChanged();m_editDrafts.clear();emit editDraftsChanged();
     emit dataChanged(); emit textPagesChanged();
     m_title = QFileInfo(url.toLocalFile()).fileName();
     m_loading = true;
@@ -159,6 +169,18 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         }, Qt::QueuedConnection);
         return id;
     }
+    if((operation==QStringLiteral("page_stage") || operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo")) && hasEditDrafts()) {
+        const auto error=tr("Save or clear pending form edits and redaction marks before changing pages.");
+        QMetaObject::invokeMethod(this,[this,id,operation,error]{setError(error);emit commandFinished(id,operation,{},error);},Qt::QueuedConnection);
+        return id;
+    }
+    const QString draftKey=(operation==QStringLiteral("save_forms") || operation==QStringLiteral("replace_forms")) ? QStringLiteral("forms") :
+        ((operation==QStringLiteral("save_redactions") || operation==QStringLiteral("replace_redactions")) ? QStringLiteral("redactions") : QString{});
+    const auto savedDraft=m_editDrafts.value(draftKey);
+    QVariantList draftValues;
+    if(draftKey==QStringLiteral("forms")) {const auto fields=savedDraft.toMap();for(const auto &field:fields)draftValues.append(field);}
+    const bool draftMatchesRequest=!draftKey.isEmpty() && !savedDraft.isNull() &&
+        (draftKey==QStringLiteral("forms") ? draftValues==arguments.value(QStringLiteral("values")).toList() : savedDraft.toList()==arguments.value(QStringLiteral("areas")).toList());
     auto request = QJsonObject::fromVariantMap(arguments);
     request.insert(QStringLiteral("op"), operation);
     const auto bytes = QJsonDocument(request).toJson(QJsonDocument::Compact);
@@ -171,7 +193,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
     ++m_pendingCommands;
     emit commandsChanged();
     auto *watcher = new QFutureWatcher<CommandResult>(this);
-    connect(watcher, &QFutureWatcher<CommandResult>::finished, this, [this,watcher,id,operation,arguments,generation,latestOnly,document,mutation,mutationSequence] {
+    connect(watcher, &QFutureWatcher<CommandResult>::finished, this, [this,watcher,id,operation,arguments,generation,latestOnly,document,mutation,mutationSequence,draftKey,savedDraft,draftMatchesRequest] {
         const auto outcome = watcher->result();
         watcher->deleteLater();
         --m_pendingCommands;
@@ -209,6 +231,8 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         }
         if (!outcome.error.isEmpty() && operation == QStringLiteral("text"))
             m_textPending.remove(arguments.value(QStringLiteral("page")).toInt());
+        if(outcome.error.isEmpty() && draftMatchesRequest && m_editDrafts.value(draftKey)==savedDraft)
+            setEditDraft(draftKey,{});
         if(outcome.error.isEmpty() && operation==QStringLiteral("mark_update")) {
             const auto annotationId=arguments.value(QStringLiteral("id")).toString();
             const auto patch=arguments.value(QStringLiteral("patch")).toMap();

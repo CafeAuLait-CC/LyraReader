@@ -20,15 +20,18 @@ public:
     QVector<QPointF> vertices;
     QColor color;
     bool multiply=false;
-    // Multiply reads the backdrop. Qt's partial software updates can otherwise
-    // composite it onto an already tinted backing store on successive frames.
-    // Full redraw is confined to the software fallback; RHI uses its native blend.
-    RenderingFlags flags()const override{return {};}
+    RenderingFlags flags()const override{return BoundedRectRendering;}
     QRectF rect()const override{return bounds;}
-    void render(const RenderState *)override {
+    void render(const RenderState *state)override {
         auto *painter=static_cast<QPainter *>(window->rendererInterface()->getResource(window,QSGRendererInterface::PainterResource));
         if(!painter)return;
-        painter->save();painter->setWorldTransform(matrix()->toTransform());painter->setClipRect(bounds,Qt::IntersectClip);
+        painter->save();
+        // Qt supplies dirty + ancestor clips in window coordinates. Apply them
+        // before the item transform; otherwise a partial update multiplies old
+        // backing-store pixels again, including when this node's dirty region is empty.
+        painter->resetTransform();
+        if(const auto *clip=state->clipRegion())painter->setClipRegion(*clip,Qt::ReplaceClip);
+        painter->setWorldTransform(matrix()->toTransform());painter->setClipRect(bounds,Qt::IntersectClip);
         painter->setRenderHint(QPainter::Antialiasing,true);painter->setOpacity(inheritedOpacity());
         painter->setCompositionMode(multiply?QPainter::CompositionMode_Multiply:QPainter::CompositionMode_SourceOver);
         QPainterPath path;path.setFillRule(Qt::WindingFill);
