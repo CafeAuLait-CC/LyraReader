@@ -590,11 +590,16 @@ private slots:
         QTRY_COMPARE(reader->editDrafts().value("forms").toMap().value(textField.value("id").toString()).toMap().value("text").toString(),QString::fromUtf8("Linux 中文"));
         auto *check=visualItem(window->contentItem(),"formCheck_"+checkField.value("id").toString()+"_0");QVERIFY(check);reveal(check);QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,check->mapToScene(QPointF(check->width()/2,check->height()/2)).toPoint());
         QTRY_COMPARE(reader->editDrafts().value("forms").toMap().value(checkField.value("id").toString()).toMap().value("checked").toBool(),!checkField.value("checked").toBool());
+        auto *checkAction=QAccessible::queryAccessibleInterface(check)->actionInterface();QVERIFY(checkAction);
+        checkAction->doAction(QAccessibleActionInterface::toggleAction());QTRY_VERIFY(!reader->editDrafts().value("forms").toMap().contains(checkField.value("id").toString()));
+        checkAction->doAction(QAccessibleActionInterface::pressAction());QTRY_VERIFY(reader->editDrafts().value("forms").toMap().contains(checkField.value("id").toString()));QVERIFY(check->property("checked").toBool()==!checkField.value("checked").toBool());
         const int radioTarget=radioField.value("selected").toList().isEmpty() || radioField.value("selected").toList().first().toInt()!=1 ? 1 : 0;
         auto *radio=visualItem(window->contentItem(),"formRadio_"+radioField.value("id").toString()+"_"+QString::number(radioTarget));QVERIFY(radio);reveal(radio);QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,radio->mapToScene(QPointF(radio->width()/2,radio->height()/2)).toPoint());
         QTRY_VERIFY(reader->editDrafts().value("forms").toMap().contains(radioField.value("id").toString()));
         QCOMPARE(reader->editDrafts().value("forms").toMap().value(radioField.value("id").toString()).toMap().value("selected").toInt(),radioTarget);
         QVERIFY(radio->property("checked").toBool());auto *firstRadio=visualItem(window->contentItem(),"formRadio_"+radioField.value("id").toString()+"_"+QString::number(1-radioTarget));QVERIFY(firstRadio);QVERIFY(!firstRadio->property("checked").toBool());
+        auto *radioAction=QAccessible::queryAccessibleInterface(radio)->actionInterface();QVERIFY(radioAction);
+        radioAction->doAction(QAccessibleActionInterface::toggleAction());QVERIFY(radio->property("checked").toBool());QCOMPARE(reader->editDrafts().value("forms").toMap().value(radioField.value("id").toString()).toMap().value("selected").toInt(),radioTarget);
         auto *choice=visualItem(window->contentItem(),"formChoice_"+choiceField.value("id").toString()+"_0");QVERIFY(choice);reveal(choice);choice->forceActiveFocus();
         const int choiceInitial=choice->property("currentIndex").toInt(),choiceTarget=choiceInitial>0 ? choiceInitial-1 : choiceInitial+1;
         QTest::keyClick(window,choiceInitial>0 ? Qt::Key_Up : Qt::Key_Down);QTest::keyClick(window,Qt::Key_Return);

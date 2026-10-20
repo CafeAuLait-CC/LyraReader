@@ -600,6 +600,7 @@ Item {
                         }
                         TextField {
                             visible: modelData.kind === "text"
+                            Accessible.name: modelData.name
                             Layout.fillWidth: true
                             text: parent.draft && parent.draft.text !== null ? parent.draft.text : modelData.value || ""
                             enabled: modelData.editable
@@ -615,6 +616,16 @@ Item {
                             text: modelData.name
                             checked: parent.draft && parent.draft.checked !== null ? parent.draft.checked : modelData.checked
                             enabled: modelData.editable
+                            function toggleField() {
+                                if (enabled)
+                                    app.updateFormValue(modelData.id, {
+                                        text: null,
+                                        checked: !checked,
+                                        selected: null
+                                    });
+                            }
+                            Accessible.onPressAction: toggleField()
+                            Accessible.onToggleAction: toggleField()
                             onToggled: app.updateFormValue(modelData.id, {
                                 text: null,
                                 checked: checked,
@@ -623,6 +634,7 @@ Item {
                         }
                         ComboBox {
                             visible: modelData.options.length > 0
+                            Accessible.name: modelData.name
                             Layout.fillWidth: true
                             model: modelData.options
                             textRole: "label"

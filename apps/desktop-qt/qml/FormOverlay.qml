@@ -83,6 +83,16 @@ Item {
                 padding: 0
                 checked: widget.checkedValue
                 Accessible.name: widget.field.name
+                function toggleField() {
+                    if (enabled)
+                        app.updateFormValue(widget.field.id, {
+                            text: null,
+                            checked: !widget.checkedValue,
+                            selected: null
+                        });
+                }
+                Accessible.onPressAction: toggleField()
+                Accessible.onToggleAction: toggleField()
                 indicator: Rectangle {
                     anchors.centerIn: parent
                     width: Math.max(1, Math.min(widget.width, widget.height) - 4)
@@ -113,6 +123,16 @@ Item {
                 autoExclusive: false
                 checked: widget.selectedIndex === widget.modelData.index
                 Accessible.name: widget.field.name + ": " + (widget.field.options[widget.modelData.index] ? widget.field.options[widget.modelData.index].label : widget.modelData.index + 1)
+                function selectField() {
+                    if (enabled)
+                        app.updateFormValue(widget.field.id, {
+                            text: null,
+                            checked: null,
+                            selected: widget.modelData.index
+                        });
+                }
+                Accessible.onPressAction: selectField()
+                Accessible.onToggleAction: selectField()
                 indicator: Rectangle {
                     anchors.centerIn: parent
                     width: Math.max(1, Math.min(widget.width, widget.height) - 4)
@@ -129,11 +149,7 @@ Item {
                         visible: parent.parent.checked
                     }
                 }
-                onClicked: app.updateFormValue(widget.field.id, {
-                    text: null,
-                    checked: null,
-                    selected: widget.modelData.index
-                })
+                onClicked: selectField()
             }
             ComboBox {
                 objectName: "formChoice_" + widget.field.id + "_" + widget.modelData.index

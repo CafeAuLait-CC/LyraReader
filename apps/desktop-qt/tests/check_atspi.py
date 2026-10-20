@@ -22,6 +22,7 @@ def main():
     parser.add_argument('--platform', choices=['wayland', 'xcb', 'offscreen'], default='wayland')
     parser.add_argument('--graphics', choices=['vulkan', 'opengl', 'software'], default='vulkan')
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--forms', action='store_true', help='Also exercise draft-only form actions')
     args = parser.parse_args()
     try:
         import gi
@@ -65,8 +66,8 @@ def main():
     def showing(obj):
         return state(obj, Atspi.StateType.VISIBLE) and state(obj, Atspi.StateType.SHOWING)
 
-    def tree():
-        pending, seen, nodes = [app_root], set(), []
+    def tree(start=None):
+        pending, seen, nodes = [start or app_root], set(), []
         while pending:
             obj = pending.pop()
             if obj in seen:
@@ -94,16 +95,16 @@ def main():
             time.sleep(.1)
         raise AssertionError(f'Timed out: {description}; last D-Bus error: {last_error}')
 
-    def find(label, role=None):
-        for obj, text in tree():
-            if text == label and showing(obj) and (role is None or
+    def find(label, role=None, within=None):
+        for obj, text in tree(within):
+            if (label is None or text == label) and showing(obj) and (role is None or
                     call(name, obj, accessible, 'GetRole')[0] == int(role)):
                 return obj
         return None
 
-    def press(obj):
+    def press(obj, preferred='press'):
         actions = call(name, obj, 'org.a11y.atspi.Action', 'GetActions')[0]
-        index = next((i for i, action in enumerate(actions) if action[0].lower() == 'press'), None)
+        index = next((i for i, action in enumerate(actions) if action[0].lower() == preferred), None)
         if index is None:
             index = next((i for i, action in enumerate(actions) if action[0].lower() == 'toggle'), None)
         assert index is not None, f'No press action for {get(obj, accessible, "Name")}: {actions}'
@@ -117,10 +118,16 @@ def main():
         first, second = folder / 'first.pdf', folder / 'second.pdf'
         shutil.copyfile(root / 'tests/fixtures/multipage.pdf', first)
         shutil.copyfile(root / 'tests/fixtures/text-page.pdf', second)
+        inputs = [str(first), str(second)]
+        if args.forms:
+            form = folder / 'forms.pdf'
+            shutil.copyfile(root / 'tests/fixtures/form-fields.pdf', form)
+            form_bytes = form.read_bytes()
+            inputs.append(str(form))
         env = dict(os.environ, QT_QPA_PLATFORM=args.platform,
                    QT_LINUX_ACCESSIBILITY_ALWAYS_ON='1', XDG_CONFIG_HOME=str(folder / 'config'))
         with (folder / 'reader.log').open('w+') as log:
-            process = subprocess.Popen([str(args.binary.resolve()), str(first), str(second),
+            process = subprocess.Popen([str(args.binary.resolve()), *inputs,
                                         '--graphics', args.graphics, '--quit-after', '180000'],
                                        env=env, stdout=log, stderr=subprocess.STDOUT)
             try:
@@ -159,11 +166,49 @@ def main():
                 report.update(passed=True, assertions=['tab activation', 'menu action', 'read-only text',
                               'character count', 'selection round trip', 'page action', 'hidden state'],
                               firstPageCharacters=len(contents), secondPageCharacters=len(contents2))
+                if args.forms:
+                    press(wait('form tab', lambda: find('forms.pdf', Atspi.Role.PAGE_TAB)))
+                    press(wait('inline form mode', lambda: find('Fill & Sign')))
+                    check = wait('editable checkbox', lambda: find('agree', Atspi.Role.CHECK_BOX))
+                    reset = wait('form draft reset', lambda: find('Reset Form Edits'))
+                    assert not state(reset, Atspi.StateType.ENABLED)
+                    press(check, 'toggle')
+                    wait('checkbox action recorded as a draft', lambda: state(reset, Atspi.StateType.ENABLED))
+                    press(reset)
+                    wait('checkbox draft reset', lambda: not state(check, Atspi.StateType.CHECKED))
+                    wait('no draft after reset', lambda: not state(reset, Atspi.StateType.ENABLED))
+                    report['assertions'].append('form checkbox draft/reset')
+                    radio = wait('radio option', lambda: find('color: Red', Atspi.Role.RADIO_BUTTON))
+                    press(radio, 'toggle')
+                    wait('radio action recorded as a draft', lambda: state(reset, Atspi.StateType.ENABLED))
+                    assert state(radio, Atspi.StateType.CHECKED)
+                    press(reset)
+                    wait('radio draft reset', lambda: not state(radio, Atspi.StateType.CHECKED))
+                    report['assertions'].append('form radio draft/reset')
+                    entry = wait('form text field', lambda: find('fullName', Atspi.Role.TEXT))
+                    interfaces = call(name, entry, accessible, 'GetInterfaces')[0]
+                    report['formEditableTextInterface'] = 'org.a11y.atspi.EditableText' in interfaces
+                    print('Form text interfaces:', interfaces, flush=True)
+                    if report['formEditableTextInterface']:
+                        assert call(name, entry, 'org.a11y.atspi.EditableText', 'SetTextContents', '(s)', ('Assistive form text',))[0]
+                        wait('text action recorded as a draft', lambda: state(reset, Atspi.StateType.ENABLED))
+                        press(reset)
+                        wait('text draft reset', lambda: not call(name, entry, 'org.a11y.atspi.Text', 'GetText', '(ii)', (0, -1))[0])
+                        report['assertions'].append('form text draft/reset')
+                    press(wait('all fields', lambda: find('All Fields…')))
+                    dialog = wait('fields dialog', lambda: find(None, Atspi.Role.DIALOG))
+                    dialog_check = wait('dialog checkbox', lambda: find('agree', Atspi.Role.CHECK_BOX, dialog))
+                    press(dialog_check, 'toggle')
+                    wait('dialog action recorded as a draft', lambda: state(reset, Atspi.StateType.ENABLED))
+                    press(reset)
+                    wait('dialog checkbox draft reset', lambda: not state(dialog_check, Atspi.StateType.CHECKED))
+                    report['assertions'].append('form dialog draft/reset')
+                    assert form.read_bytes() == form_bytes, 'Draft actions must leave the source unchanged'
             except Exception:
                 try:
                     print('Own page-related accessibility states:', [
                         (label, call(name, obj, accessible, 'GetState')[0])
-                        for obj, label in tree() if 'page' in label.lower() or 'text' in label.lower()
+                        for obj, label in tree() if 'page' in label.lower() or 'text' in label.lower() or label in ('agree', 'Reset Form Edits')
                     ], file=sys.stderr)
                 except GLib.Error:
                     pass
