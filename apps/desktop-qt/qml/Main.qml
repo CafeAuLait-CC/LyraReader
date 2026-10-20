@@ -53,6 +53,14 @@ ApplicationWindow {
     }
     property bool formToolActive: false
     property string annotationTool: "select"
+    property string pendingStampStyle: ""
+    property var pendingSignatureImage: null
+    onAnnotationToolChanged: {
+        if (annotationTool !== "stamp")
+            pendingStampStyle = "";
+        if (annotationTool !== "signature")
+            pendingSignatureImage = null;
+    }
     property string layoutMode: "Continuous"
     property real pageGap: 12
     property var selection: null
@@ -108,6 +116,11 @@ ApplicationWindow {
     onAppearanceChanged: if (session)
         session.setPreference("appearance", appearance)
     onCurrentReaderChanged: {
+        pendingArtworkRequest = -1;
+        pendingStampStyle = "";
+        pendingSignatureImage = null;
+        if (annotationTool === "stamp" || annotationTool === "signature")
+            annotationTool = "select";
         ++positionRestoreEpoch;
         positionRestoring = true;
         printRequested = false;
@@ -389,7 +402,51 @@ ApplicationWindow {
     }
     function pageClicked(page, x, y, sceneX, sceneY) {
         currentPage = page;
-        if (annotationTool === "stickyNote" || annotationTool === "textBox") {
+        if (annotationTool === "stamp" || annotationTool === "signature") {
+            if (pendingArtworkRequest >= 0)
+                return;
+            const size = currentReader.pages[page];
+            const style = pendingStampStyle;
+            const image = pendingSignatureImage;
+            if (!size || (annotationTool === "stamp" && !style.length) || (annotationTool === "signature" && !image))
+                return;
+            const signature = annotationTool === "signature";
+            const height = Math.min(size.height, signature ? 64 : 50);
+            const width = Math.min(size.width, signature ? height * Math.max(.2, Math.min(8, image.width / image.height)) : 150);
+            const words = {
+                approved: "APPROVED",
+                reviewed: "REVIEWED",
+                draft: "DRAFT",
+                confidential: "CONFIDENTIAL",
+                date: Qt.formatDate(new Date(), "yyyy-MM-dd")
+            };
+            const colors = {
+                approved: "#1B7F3BFF",
+                reviewed: "#1F5FA8FF",
+                draft: "#6B7280FF",
+                confidential: "#B3261EFF",
+                date: "#334155FF"
+            };
+            const entry = {
+                kind: annotationTool,
+                page: page,
+                version: 1,
+                rect: {
+                    x: Math.max(0, Math.min(size.width - width, x - width / 2)),
+                    y: Math.max(0, Math.min(size.height - height, y - height / 2)),
+                    width: width,
+                    height: height
+                },
+                color: signature ? "#000000FF" : colors[style],
+                note: signature ? "" : words[style],
+                stampStyle: signature ? "signature" : style
+            };
+            if (signature)
+                entry.image = image.image;
+            pendingArtworkRequest = currentReader.submit("mark_create", {
+                entry: entry
+            });
+        } else if (annotationTool === "stickyNote" || annotationTool === "textBox") {
             const size = currentReader.pages[page];
             const width = annotationTool === "stickyNote" ? 22 : Math.min(180, size.width);
             const height = annotationTool === "stickyNote" ? 22 : Math.min(60, size.height);
@@ -568,6 +625,39 @@ ApplicationWindow {
         annotationTool = annotationTool === tool ? "select" : tool;
         if (["highlight", "underline", "strikeout"].indexOf(annotationTool) >= 0 && selection)
             markSelection(annotationTool);
+    }
+    property double pendingArtworkRequest: -1
+    function armStamp(style) {
+        if (currentReader.pageCount === 0 || ["approved", "reviewed", "draft", "confidential", "date"].indexOf(style) < 0)
+            return;
+        setTextViewEnabled(false);
+        overviewVisible = false;
+        formToolActive = false;
+        annotationToolsVisible = true;
+        annotationTool = "stamp";
+        pendingStampStyle = style;
+        selectedAnnotation = null;
+        selection = null;
+        operationStatus = qsTr("Click on the page to place the stamp. Escape cancels.");
+    }
+    function armSignature(url) {
+        if (currentReader.pageCount === 0)
+            return false;
+        const image = currentReader.signatureImage(url);
+        if (image.error) {
+            operationStatus = image.error;
+            return false;
+        }
+        setTextViewEnabled(false);
+        overviewVisible = false;
+        formToolActive = false;
+        annotationToolsVisible = true;
+        annotationTool = "signature";
+        pendingSignatureImage = image;
+        selectedAnnotation = null;
+        selection = null;
+        operationStatus = qsTr("Click on the page to place the signature image. Escape cancels.");
+        return true;
     }
     function addRedaction(page, rect) {
         if (!canRedact)
@@ -1476,6 +1566,13 @@ ApplicationWindow {
             }
         }
         function onCommandFinished(id, op, result, error) {
+            if (id === root.pendingArtworkRequest) {
+                root.pendingArtworkRequest = -1;
+                if (!error.length) {
+                    root.annotationTool = "select";
+                    root.operationStatus = qsTr("Artwork placed. Saved in the annotation sidecar.");
+                }
+            }
             if (op.indexOf("page_") === 0 && op !== "page_operation") {
                 root.pageEditBusy = false;
                 if (!error.length) {

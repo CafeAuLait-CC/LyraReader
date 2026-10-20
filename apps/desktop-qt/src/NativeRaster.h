@@ -25,5 +25,6 @@ public:
     static QString registerSource(const std::shared_ptr<NativeRasterSource> &source);
     static void unregisterSource(const QString &key);
     static QImage rawImage(const QUrl &url,qint64 maximumBytes=16*1024*1024);
+    static QSize artworkSize(const QByteArray &encoded);
     QImage requestImage(const QString &id, QSize *size, const QSize &requestedSize) override;
 };

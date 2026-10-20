@@ -459,6 +459,81 @@ private slots:
         for(int y=0;y<raster.height();++y)for(int x=0;x<raster.width();++x){const auto c=raster.pixelColor(x,y);if(c.red()<80&&c.green()<80&&c.blue()<80)ink=true;if(c.red()>180&&c.green()>180&&c.blue()<180)yellow=true;}
         QVERIFY(ink);QVERIFY(yellow);
     }
+    void stampsAndSignaturesUseNativeGesturesAndPreserveTransparentPixels() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto path=scratch.path()+"/artwork.pdf",imagePath=scratch.path()+"/signature.png",output=scratch.path()+"/saved.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        QFile source(path);QVERIFY(source.open(QIODevice::ReadOnly));const auto original=source.readAll();source.close();
+        QImage signature(64,32,QImage::Format_RGBA8888);signature.fill(Qt::transparent);
+        for(int y=0;y<32;++y)for(int x=0;x<32;++x)signature.setPixelColor(x,y,QColor(240,20,40,128));
+        QVERIFY(signature.save(imagePath));
+        ReaderController reader;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);
+        engine.rootContext()->setContextProperty("reader",&reader);engine.load(QUrl("qrc:/qml/Main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        reader.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),1,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QTRY_VERIFY_WITH_TIMEOUT(visualItem(window->contentItem(),"pdfPage0") && visualItem(window->contentItem(),"pdfPage0")->property("texturesReady").toBool(),10000);
+        window->setProperty("fitting",false);window->setProperty("paperAppearance","original");
+        QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,1.0),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+        QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QTest::qWait(150);
+        const auto point=[&](double x,double y){return visualItem(window->contentItem(),"pdfPage0")->mapToScene(QPointF(x,y)).toPoint();};
+        const auto entries=[&]{return reader.data().value("marks").toMap().value("annotations").toList();};
+        QVERIFY(QMetaObject::invokeMethod(window,"armStamp",Q_ARG(QVariant,"approved")));QTest::qWait(50);
+        QVERIFY(visualItem(window->contentItem(),"stampToolButton"));QVERIFY(visualItem(window->contentItem(),"signatureToolButton"));
+        auto *accessible=QAccessible::queryAccessibleInterface(visualItem(window->contentItem(),"signatureToolButton"));QVERIFY(accessible);QVERIFY(!accessible->text(QAccessible::Name).isEmpty());
+        QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,point(180,200));QTRY_COMPARE_WITH_TIMEOUT(entries().size(),1,10000);
+        QTRY_COMPARE(window->property("annotationTool").toString(),QString("select"));
+        QCOMPARE(entries().first().toMap().value("kind").toString(),QString("stamp"));QCOMPARE(entries().first().toMap().value("note").toString(),QString("APPROVED"));
+        QVERIFY(window->property("selection").isNull());
+        QVERIFY(QMetaObject::invokeMethod(window,"armSignature",Q_ARG(QVariant,QUrl::fromLocalFile(imagePath))));QTest::qWait(100);
+        const auto before=window->grabWindow();QVERIFY(!before.isNull());
+        const auto sample=[&](const QImage &frame,double x,double y){const auto p=point(x,y);return frame.pixelColor(qRound(p.x()*frame.width()/double(window->width())),qRound(p.y()*frame.height()/double(window->height())));};
+        const auto background=sample(before,318,350),transparent=sample(before,382,350);
+        QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,point(350,350));QTRY_COMPARE_WITH_TIMEOUT(entries().size(),2,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QTRY_COMPARE(window->property("annotationTool").toString(),QString("select"));
+        const auto entry=entries().last().toMap();QCOMPARE(entry.value("kind").toString(),QString("signature"));QVERIFY(!entry.value("image").toString().isEmpty());
+        const auto cropName="signatureArt"+entry.value("id").toString();
+        const auto artworkItem=[&]{return visualItem(visualItem(window->contentItem(),"pdfPage0")->parentItem(),cropName);};
+        QTRY_VERIFY_WITH_TIMEOUT(artworkItem() && artworkItem()->property("status").toInt()==1,10000);
+        QTest::qWait(100);const auto frame=window->grabWindow();const auto actual=sample(frame,318,350);
+        const auto blend=[](int foreground,int background){return qRound((foreground*128+background*127)/255.0);};
+        QVERIFY2(qAbs(actual.red()-blend(240,background.red()))<=2,qPrintable(actual.name()));
+        QVERIFY2(qAbs(actual.green()-blend(20,background.green()))<=2,qPrintable(actual.name()));
+        QVERIFY2(qAbs(actual.blue()-blend(40,background.blue()))<=2,qPrintable(actual.name()));
+        QCOMPARE(sample(frame,382,350),transparent);
+        QTRY_COMPARE_WITH_TIMEOUT(RasterJobs::statistics().value("running").toInt(),0,10000);QTRY_COMPARE_WITH_TIMEOUT(RasterJobs::statistics().value("queued").toInt(),0,10000);
+        const auto jobs=RasterJobs::statistics().value("completed");auto *crop=artworkItem();
+        auto draft=entry;auto rect=draft.value("rect").toMap();rect["x"]=rect.value("x").toDouble()+10;draft["rect"]=rect;
+        window->setProperty("annotationDraft",draft);QTest::qWait(100);
+        QCOMPARE(artworkItem(),crop);QCOMPARE(crop->parentItem()->x(),rect.value("x").toDouble());
+        QCOMPARE(RasterJobs::statistics().value("completed"),jobs);window->setProperty("annotationDraft",QVariant::fromValue(nullptr));
+        window->setProperty("paperAppearance","night");QTest::qWait(100);QVERIFY(!window->grabWindow().isNull());QCOMPARE(RasterJobs::statistics().value("completed"),jobs);
+        window->setProperty("paperAppearance","original");
+        const auto snapshots=qEnvironmentVariable("LYRA_READER_CHECK_SNAPSHOTS");if(!snapshots.isEmpty())QVERIFY(window->grabWindow().save(snapshots+"/lyrareader-stamp-signature.png"));
+        QVERIFY(reader.signatureImage(QUrl("https://example.invalid/signature.png")).contains("error"));QVERIFY(reader.signatureImage(QUrl::fromLocalFile(path)).contains("error"));
+        QVERIFY(QMetaObject::invokeMethod(window,"armStamp",Q_ARG(QVariant,"draft")));QTest::keyClick(window,Qt::Key_Escape);QCOMPARE(window->property("annotationTool").toString(),QString("select"));QCOMPARE(entries().size(),2);
+        reader.submit("save_current_annotations",{{"destination",output}});QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QVERIFY2(reader.error().isEmpty(),qPrintable(reader.error()));
+        QVERIFY(source.open(QIODevice::ReadOnly));QCOMPARE(source.readAll(),original);
+        ReaderController saved;saved.openFile(QUrl::fromLocalFile(output));QTRY_COMPARE_WITH_TIMEOUT(saved.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(saved.pendingCommands(),0,10000);
+        const auto file=saved.data().value("annotations").toList();QCOMPARE(file.size(),2);
+        int text=0,images=0;for(const auto &value:file){const auto a=value.toMap();QCOMPARE(a.value("kind").toString(),QString("stamp"));const auto stamp=a.value("stamp").toMap();if(!stamp.value("text").toString().isEmpty())++text;if(!stamp.value("image").toString().isEmpty())++images;}
+        QCOMPARE(text,1);QCOMPARE(images,1);
+        // Reopen into the actual canvas and adopt the PDF-owned image through a click.
+        reader.openFile(QUrl::fromLocalFile(output));QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QTRY_VERIFY_WITH_TIMEOUT(visualItem(window->contentItem(),"pdfPage0") && visualItem(window->contentItem(),"pdfPage0")->property("texturesReady").toBool(),10000);
+        window->setProperty("fitting",false);QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,1.0),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+        QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QTest::qWait(100);
+        QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,point(318,350));QTRY_COMPARE_WITH_TIMEOUT(entries().size(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        const auto adopted=entries().first().toMap();QCOMPARE(adopted.value("kind").toString(),QString("signature"));QVERIFY(!adopted.value("fileIdentity").toString().isEmpty());
+        const auto oldX=adopted.value("rect").toMap().value("x").toDouble();
+        QTest::keyClick(window,Qt::Key_Right);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QCOMPARE(entries().first().toMap().value("rect").toMap().value("x").toDouble(),oldX+1);
+        reader.submit("marks_undo");QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QCOMPARE(entries().first().toMap().value("rect").toMap().value("x").toDouble(),oldX);
+        reader.submit("marks_redo");QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(window,"selectAnnotation",Q_ARG(QVariant,entries().first()),Q_ARG(QVariant,true)));
+        QTRY_VERIFY(window->findChild<QObject *>("annotationNoteText")->property("readOnly").toBool());
+        const auto edited=scratch.path()+"/edited.pdf";reader.submit("save_current_annotations",{{"destination",edited}});QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QVERIFY2(reader.error().isEmpty(),qPrintable(reader.error()));
+        saved.openFile(QUrl::fromLocalFile(edited));QTRY_COMPARE_WITH_TIMEOUT(saved.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(saved.pendingCommands(),0,10000);QCOMPARE(saved.data().value("annotations").toList().size(),2);
+    }
     void annotationGeometryUsesRealGesturesAndOneUndoPerGesture() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());
         const auto path=scratch.path()+"/geometry.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));

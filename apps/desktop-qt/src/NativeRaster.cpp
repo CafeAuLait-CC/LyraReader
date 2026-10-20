@@ -1,6 +1,8 @@
 #include "NativeRaster.h"
 #include "PaperAppearance.h"
 #include <QHash>
+#include <QBuffer>
+#include <QImageReader>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMutex>
@@ -61,7 +63,34 @@ QString NativeImageProvider::registerSource(const std::shared_ptr<NativeRasterSo
 void NativeImageProvider::unregisterSource(const QString &key) {
     QMutexLocker lock(&sourcesMutex);sources.remove(key);
 }
+QSize NativeImageProvider::artworkSize(const QByteArray &encoded) {
+    if(encoded.isEmpty() || encoded.size()>8*1024*1024)return {};
+    QBuffer buffer;buffer.setData(encoded);buffer.open(QIODevice::ReadOnly);
+    QImageReader reader(&buffer);reader.setDecideFormatFromContent(true);
+    const auto format=reader.format();
+    if(format!="png" && format!="jpeg" && format!="jpg")return {};
+    const auto size=reader.size();
+    if(size.isEmpty() || size.width()>8192 || size.height()>8192 || qint64(size.width())*size.height()>16LL*1024*1024)return {};
+    return size;
+}
 QImage NativeImageProvider::rawImage(const QUrl &url,qint64 maximumBytes) {
+    if(url.scheme()==QStringLiteral("data")) {
+        const auto path=url.path();const auto comma=path.indexOf(',');
+        if(comma<0 || (path.left(comma)!=QStringLiteral("image/png;base64") && path.left(comma)!=QStringLiteral("image/jpeg;base64")) || path.size()>12*1024*1024 || maximumBytes<4)return {};
+        const auto bytes=QByteArray::fromBase64Encoding(path.mid(comma+1).toLatin1(),QByteArray::AbortOnBase64DecodingErrors);
+        if(!bytes)return {};
+        const auto size=artworkSize(bytes.decoded);if(size.isEmpty())return {};
+        const double scale=qMin(1.0,qMin(2048.0/qMax(size.width(),size.height()),std::sqrt(double(maximumBytes)/(4.0*size.width()*size.height()))));
+        const QSize target(qMax(1,int(std::floor(size.width()*scale))),qMax(1,int(std::floor(size.height()*scale))));
+        QBuffer buffer;buffer.setData(bytes.decoded);buffer.open(QIODevice::ReadOnly);
+        QImageReader reader(&buffer);reader.setDecideFormatFromContent(true);reader.setScaledSize(target);
+        auto image=reader.read();
+        if(image.isNull())return {};
+        if(image.size()!=target)image=image.scaled(target,Qt::IgnoreAspectRatio,Qt::SmoothTransformation);
+        image=image.convertToFormat(QImage::Format_RGBA8888_Premultiplied);
+        if(image.sizeInBytes()>maximumBytes)return {};
+        return image;
+    }
     if(url.scheme()!=QStringLiteral("image") || url.host()!=QStringLiteral("lyrapreview"))return {};
     const auto path=url.path().split('/',Qt::SkipEmptyParts);
     if(path.size()!=2)return {};

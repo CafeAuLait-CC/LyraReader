@@ -78,6 +78,7 @@ public:
     Q_INVOKABLE void setLayout(const QString &mode, double gap);
     Q_INVOKABLE double fitWidth(double viewportWidth) const;
     Q_INVOKABLE double zoomOffset(double offset, double anchor, double oldZoom, double newZoom) const;
+    Q_INVOKABLE QVariantMap signatureImage(const QUrl &url) const;
     std::shared_ptr<LyraReaderDesktopDocument> documentHandle()const{return m_document;}
     void requestPage(int page, double scale,bool embedded=false);
     void requestPageForConsumer(quintptr consumer,int page,double scale,bool embedded=false);

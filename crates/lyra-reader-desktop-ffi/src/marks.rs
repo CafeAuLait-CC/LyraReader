@@ -32,6 +32,8 @@ const ANNOTATION_KEYS: &[&str] = &[
     "fileIdentity",
     "quads",
     "textAlignment",
+    "stampStyle",
+    "image",
 ];
 const BOOKMARK_KEYS: &[&str] = &["id", "kind", "page", "title", "yPt", "createdAt"];
 const LEGACY_COLORS: [&str; 8] = [
@@ -55,6 +57,8 @@ const KINDS: &[&str] = &[
     "arrow",
     "stickyNote",
     "textBox",
+    "stamp",
+    "signature",
 ];
 
 #[derive(Clone)]
@@ -191,6 +195,8 @@ fn validate(v: &Value, pages: u32) -> Result<bool, String> {
             "arrow",
             "stickyNote",
             "textBox",
+            "stamp",
+            "signature",
         ]
         .contains(&k);
         if geometry && v["version"].as_u64() != Some(1) || !geometry && v.get("version").is_some() {
@@ -259,6 +265,25 @@ fn validate(v: &Value, pages: u32) -> Result<bool, String> {
         "stickyNote" | "textBox" => {
             rect(&v["rect"])?;
             number(v, "fontSize")?;
+        }
+        "stamp" => {
+            rect(&v["rect"])?;
+            if string(v, "note")?.trim().is_empty() {
+                return Err("A stamp needs text".into());
+            }
+            if !matches!(
+                v["stampStyle"].as_str().unwrap_or("custom"),
+                "approved" | "reviewed" | "draft" | "confidential" | "date" | "custom"
+            ) {
+                return Ok(false);
+            }
+        }
+        "signature" => {
+            rect(&v["rect"])?;
+            if !string(v, "note")?.is_empty() {
+                return Err("A signature image cannot carry stamp text".into());
+            }
+            crate::artwork::dimensions(&string(v, "image")?)?;
         }
         _ => {}
     }
@@ -589,7 +614,14 @@ impl Marks {
                 "ink" => AnnotationWriteKind::Ink,
                 "square" => AnnotationWriteKind::Square,
                 "circle" => AnnotationWriteKind::Circle,
+                "stamp" => AnnotationWriteKind::Stamp,
+                "signature" => AnnotationWriteKind::Signature,
                 _ => AnnotationWriteKind::Line,
+            };
+            let (signature_width, signature_height, signature_rgba) = if kind(v) == "signature" {
+                crate::artwork::pixels(&string(v, "image")?)?
+            } else {
+                (0, 0, Vec::new())
             };
             let annotation = WriteAnnotationRecord {
                 id: id.clone(),
@@ -613,10 +645,10 @@ impl Marks {
                 modified: chrono::Utc::now().format("D:%Y%m%d%H%M%SZ").to_string(),
                 font_size_pt: v["fontSize"].as_f64().unwrap_or(14.0),
                 text_alignment: v["textAlignment"].as_str().unwrap_or("left").to_string(),
-                stamp_style: String::new(),
-                signature_width: 0,
-                signature_height: 0,
-                signature_rgba: Vec::new(),
+                stamp_style: v["stampStyle"].as_str().unwrap_or("custom").into(),
+                signature_width,
+                signature_height,
+                signature_rgba,
             };
             let target = v["fileIdentity"].as_str().map(str::to_string).or_else(|| {
                 file.iter()
@@ -907,6 +939,7 @@ impl Marks {
             .into_iter()
             .filter(|a| !adopted.contains(&a.id) && !removed.contains(&a.id))
             .collect();
+        let file = crate::artwork::annotations(file)?;
         Ok(
             json!({"annotations":own,"file_annotations":file,"bookmarks":bookmarks,"can_undo":!self.undo.is_empty(),"can_redo":!self.redo.is_empty(),"preserved":self.entries.iter().filter(|e|matches!(e,Entry::Opaque(_))).count(),"error":self.error,"path":self.path,"pdf_dirty":!own.is_empty()||!self.deletions.is_empty(),"pending_deletions":self.deletions.len()}),
         )
@@ -1173,6 +1206,14 @@ impl Marks {
                     return Err("This file annotation is hidden or not drawn".into());
                 }
                 let k = match a.kind.as_str() {
+                    "stamp"
+                        if a.stamp.as_ref().is_some_and(|s| {
+                            s.text.as_deref().is_some_and(|t| !t.trim().is_empty())
+                        }) =>
+                    {
+                        "stamp"
+                    }
+                    "stamp" if a.stamp.as_ref().is_some_and(|s| !s.image.is_empty()) => "signature",
                     "line" if a.line_arrow => "arrow",
                     "text" => "stickyNote",
                     "freeText" => "textBox",
@@ -1240,6 +1281,19 @@ impl Marks {
                             if k == "stickyNote" || k == "textBox" {
                                 entry["fontSize"] = json!(a.font_size_pt.unwrap_or(14.0));
                                 entry["textAlignment"] = json!(a.alignment);
+                            } else if k == "stamp" {
+                                let stamp = a.stamp.as_ref().ok_or("Missing stamp artwork")?;
+                                entry["note"] = json!(stamp.text.clone().unwrap_or_default());
+                                entry["stampStyle"] = json!(match stamp.style.as_str() {
+                                    "approved" | "reviewed" | "draft" | "confidential" | "date" =>
+                                        stamp.style.as_str(),
+                                    _ => "custom",
+                                });
+                            } else if k == "signature" {
+                                let stamp = a.stamp.as_ref().ok_or("Missing signature artwork")?;
+                                entry["note"] = json!("");
+                                entry["stampStyle"] = json!("signature");
+                                entry["image"] = json!(crate::artwork::encode(&stamp.image));
                             } else {
                                 entry["strokeWidth"] =
                                     json!(a.border_width_pt.unwrap_or(2.0).max(0.1));

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <QElapsedTimer>
 #include <QFileInfo>
+#include <QFile>
 #include <QFutureWatcher>
 #include <QJsonDocument>
 #include <QJsonArray>
@@ -272,6 +273,14 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
     return id;
 }
 
+QVariantMap ReaderController::signatureImage(const QUrl &url) const {
+    if(!url.isLocalFile())return {{"error",tr("Choose a local PNG or JPEG signature image.")}};
+    QFile file(url.toLocalFile());
+    if(!file.open(QIODevice::ReadOnly) || file.size()>8*1024*1024)return {{"error",tr("The signature image could not be read or exceeds 8 MiB.")}};
+    const auto bytes=file.read(8*1024*1024+1);const auto size=NativeImageProvider::artworkSize(bytes);
+    if(size.isEmpty())return {{"error",tr("Choose a PNG or JPEG up to 8192 pixels per side and 16 megapixels.")}};
+    return {{"image",QString::fromLatin1(bytes.toBase64())},{"width",size.width()},{"height",size.height()}};
+}
 void ReaderController::requestText(int page) {
     if (page < 0 || page >= pageCount() || m_textPages.contains(QString::number(page)) || m_textPending.contains(page)) return;
     m_textPending.insert(page);

@@ -49,7 +49,7 @@ Item {
     Timer {
         id: coverageTimer
         interval: 350
-        onTriggered: if (annotation.visible && dialogs.noteReader && app.selectedAnnotation && app.selectedAnnotation.kind === "textBox") {
+        onTriggered: if (annotation.visible && dialogs.noteReader && app.selectedAnnotation && ["textBox", "stamp"].indexOf(app.selectedAnnotation.kind) >= 0) {
             dialogs.coverageText = noteText.text;
             dialogs.coverageRequestId = dialogs.noteReader.submit("font_coverage", {
                 text: dialogs.coverageText
@@ -709,6 +709,7 @@ Item {
             }
             RowLayout {
                 enabled: !!app.selectedAnnotation && !app.selectedAnnotation.foreign
+                visible: !app.selectedAnnotation || app.selectedAnnotation.kind !== "signature"
                 Label {
                     textFormat: Text.PlainText
                     text: qsTr("Colour")
@@ -819,7 +820,7 @@ Item {
                 objectName: "annotationNoteText"
                 Layout.fillWidth: true
                 implicitHeight: 150
-                readOnly: !!(app.selectedAnnotation && app.selectedAnnotation.foreign)
+                readOnly: !!(app.selectedAnnotation && (app.selectedAnnotation.foreign || app.selectedAnnotation.kind === "signature"))
                 wrapMode: Text.Wrap
                 placeholderText: qsTr("Note")
                 onTextChanged: if (dialogs.noteReady && annotation.visible && !readOnly) {
@@ -836,7 +837,7 @@ Item {
             Label {
                 textFormat: Text.PlainText
                 objectName: "annotationGlyphWarning"
-                visible: !!app.selectedAnnotation && app.selectedAnnotation.kind === "textBox" && dialogs.missingGlyphs.length > 0
+                visible: !!app.selectedAnnotation && ["textBox", "stamp"].indexOf(app.selectedAnnotation.kind) >= 0 && dialogs.missingGlyphs.length > 0
                 text: qsTr("The PDF font cannot draw: %1. The saved text stays intact; these characters appear as missing-glyph boxes.").arg(dialogs.missingGlyphs.join(" "))
                 Layout.fillWidth: true
                 wrapMode: Text.Wrap

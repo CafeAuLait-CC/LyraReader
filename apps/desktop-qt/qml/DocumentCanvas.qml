@@ -175,6 +175,7 @@ Item {
                         anchors.fill: parent
                         app: canvas.app
                         page: sheet.modelData.index
+                        visibleRegion: pdfPage.visibleRegion
                     }
                     RedactionLayer {
                         anchors.fill: parent

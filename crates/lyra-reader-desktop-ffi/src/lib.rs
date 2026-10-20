@@ -2,6 +2,7 @@
 //! passes QObject pointers into Rust. Header: apps/desktop-qt/src/lyra_reader_desktop.h.
 #![allow(unsafe_code)]
 
+mod artwork;
 mod document;
 mod exports;
 mod marks;

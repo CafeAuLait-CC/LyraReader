@@ -264,7 +264,9 @@ impl DesktopDocument {
             }
             "document_info" => value(d.document_info()),
             "forms" => value(d.form_info()),
-            "annotations" => value(d.annotations()),
+            "annotations" => {
+                crate::artwork::annotations(d.annotations().map_err(|e| e.to_string())?)
+            }
             "links" => value(d.links(arg(&r, "page")?)),
             "text" => value(d.text_page(arg(&r, "page")?)),
             "search" => value(
@@ -434,6 +436,90 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.directory);
         }
+    }
+
+    #[test]
+    fn artwork_round_trips_through_sidecar_pdf_and_identity_preserving_adoption() {
+        use image::{ExtendedColorType, ImageEncoder};
+        let fixture = Fixture::new("text-page.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        let rgba = [220, 40, 10, 128, 20, 80, 200, 255];
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&rgba, 2, 1, ExtendedColorType::Rgba8)
+            .unwrap();
+        let encoded = crate::artwork::encode(&png);
+        for entry in [
+            json!({"kind":"stamp","page":0,"version":1,"color":"#90B79AFF","note":"APPROVED","rect":{"x":60,"y":120,"width":150,"height":50},"stampStyle":"approved"}),
+            json!({"kind":"signature","page":0,"version":1,"color":"#000000FF","note":"","rect":{"x":250,"y":120,"width":128,"height":64},"stampStyle":"signature","image":encoded}),
+        ] {
+            doc.command(json!({"op":"mark_create","entry":entry}))
+                .unwrap();
+        }
+        assert_eq!(
+            doc.command(json!({"op":"marks"})).unwrap()["annotations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let copy = fixture.directory.join("artwork.pdf");
+        doc.command(json!({"op":"save_current_annotations","destination":copy}))
+            .unwrap();
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        let copy_doc = DesktopDocument::open(&copy, None).unwrap();
+        let file = copy_doc.command(json!({"op":"annotations"})).unwrap();
+        assert_eq!(file.as_array().unwrap().len(), 2);
+        assert!(
+            file.as_array()
+                .unwrap()
+                .iter()
+                .all(|a| a["kind"] == "stamp" && a["drawing"] == "stamp")
+        );
+        assert!(
+            file.as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["stamp"]["text"] == "APPROVED")
+        );
+        let image = file
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["stamp"]["image"].as_str().is_some_and(|s| !s.is_empty()))
+            .unwrap();
+        let decoded = crate::artwork::pixels(image["stamp"]["image"].as_str().unwrap()).unwrap();
+        assert_eq!(decoded, (2, 1, rgba.to_vec()));
+        let identity = image["id"].as_str().unwrap();
+        let adopted = copy_doc
+            .command(json!({"op":"file_adopt","id":identity}))
+            .unwrap();
+        let id = adopted["selected_id"].as_str().unwrap();
+        let edited=copy_doc.command(json!({"op":"mark_update","id":id,"patch":{"rect":{"x":260,"y":130,"width":128,"height":64}}})).unwrap();
+        assert_eq!(edited["annotations"][0]["kind"], "signature");
+        assert_eq!(edited["annotations"][0]["image"], image["stamp"]["image"]);
+        let second = fixture.directory.join("edited-artwork.pdf");
+        copy_doc
+            .command(json!({"op":"save_current_annotations","destination":second}))
+            .unwrap();
+        let reopened = DesktopDocument::open(&second, None)
+            .unwrap()
+            .command(json!({"op":"annotations"}))
+            .unwrap();
+        assert_eq!(reopened.as_array().unwrap().len(), 2);
+        let moved = reopened
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == identity)
+            .unwrap();
+        assert!((moved["x_pt"].as_f64().unwrap() - 260.0).abs() < 0.01);
+        assert!((moved["y_pt"].as_f64().unwrap() - 130.0).abs() < 0.01);
+        let sidecar = format!("{}.lyra-reader-annotations.json", fixture.path.display());
+        let before = fs::read(&sidecar).unwrap();
+        assert!(doc.command(json!({"op":"mark_create","entry":{"kind":"signature","page":0,"version":1,"color":"#000000FF","note":"","image":"invalid","rect":{"x":10,"y":10,"width":10,"height":10}}})).is_err());
+        assert_eq!(before, fs::read(&sidecar).unwrap());
     }
 
     #[test]

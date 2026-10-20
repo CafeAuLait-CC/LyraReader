@@ -200,6 +200,11 @@ Item {
                 return;
             }
             start = Logic.nearestCharacter(annotationLayer.textPage.chars, p.x, p.y);
+            if (gestureTool === "stamp" || gestureTool === "signature") {
+                app.selection = null;
+                start = -1;
+                return;
+            }
             if (start >= 0)
                 app.selection = {
                     page: page,
@@ -208,6 +213,8 @@ Item {
                 };
         }
         Keys.onEscapePressed: {
+            if (app.annotationTool === "stamp" || app.annotationTool === "signature")
+                app.annotationTool = "select";
             gestureTool = "canceled";
             editBase = null;
             keyBase = null;
@@ -244,6 +251,8 @@ Item {
                 return;
             }
             const end = Logic.nearestCharacter(annotationLayer.textPage.chars, p.x, p.y);
+            if (gestureTool === "stamp" || gestureTool === "signature")
+                return;
             if (start >= 0 && end >= 0)
                 app.selection = {
                     page: page,

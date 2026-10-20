@@ -66,6 +66,13 @@ function normalized(a, foreign) {
         b.strokeWidth=a.border_width_pt || 2
         b.fontSize=a.font_size_pt || 14
         b.note=a.contents || ""
+        if(a.kind==="stamp" && a.stamp) {
+            b.kind=a.stamp.text && a.stamp.text.trim().length ? "stamp" : "signature"
+            b.note=b.kind==="stamp" ? a.stamp.text : ""
+            b.stampStyle=a.stamp.style || "custom"
+            b.image=a.stamp.image || ""
+            b.imageError=a.stamp.image_error || ""
+        }
         const c=a.color || {red:232,green:188,blue:85}
         b.color="#"+hex(c.red)+hex(c.green)+hex(c.blue)+hex((a.opacity===null || a.opacity===undefined ? 1 : a.opacity)*255)
         b.visible=a.visible && a.drawing!=="skipped"
@@ -131,7 +138,7 @@ function displayColor(color, mode) {
 }
 
 function editableGeometry(annotation) {
-    return annotation && !annotation.foreign && ["ink","square","circle","line","arrow","stickyNote","textBox"].indexOf(annotation.kind)>=0
+    return annotation && !annotation.foreign && ["ink","square","circle","line","arrow","stickyNote","textBox","stamp","signature"].indexOf(annotation.kind)>=0
 }
 function geometryPatch(annotation, target) {
     const from=annotation.rect
@@ -205,8 +212,8 @@ function annotationDate(modified) {
 function annotationUnsupportedReason(a) {
     if(!a || !a.foreign)return ""
     if(a.is_reply)return "This is a reply. Edit or delete the annotation at the top of its thread; the replies stay attached."
-    if(!a.visible)return "This annotation is hidden or is not drawn by the reader."
-    if(["highlight","underline","strikeout","stickyNote","textBox","ink","square","circle","line","arrow"].indexOf(a.kind)<0)return "This annotation kind has no editable model yet."
+    if(!a.visible)return a.imageError || "This annotation is hidden or is not drawn by the reader."
+    if(["highlight","underline","strikeout","stickyNote","textBox","ink","square","circle","line","arrow","stamp","signature"].indexOf(a.kind)<0)return "This annotation kind has no editable model yet."
     if(a.kind==="ink" && (!a.paths || !a.paths.length))return "This ink annotation has no editable paths."
     if((a.kind==="line" || a.kind==="arrow") && (!a.lineStart || !a.lineEnd))return "This line annotation has no editable endpoints."
     return ""
