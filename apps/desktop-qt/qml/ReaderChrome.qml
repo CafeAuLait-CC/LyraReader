@@ -151,6 +151,14 @@ ColumnLayout {
             Menu {
                 id: viewMenu
                 MenuItem {
+                    text: qsTr("Read Page Text (Ctrl+Shift+R)")
+                    checkable: true
+                    checked: app.textViewVisible
+                    enabled: app.currentReader.pageCount > 0
+                    onTriggered: app.setTextViewEnabled(checked)
+                }
+                MenuSeparator {}
+                MenuItem {
                     text: qsTr("Continuous Pages")
                     checkable: true
                     checked: app.layoutMode === "Continuous"
@@ -165,10 +173,12 @@ ColumnLayout {
                 MenuSeparator {}
                 MenuItem {
                     text: qsTr("Fit Width")
+                    enabled: !app.textViewVisible
                     onTriggered: app.fitWidth()
                 }
                 MenuItem {
                     text: qsTr("Actual Size")
+                    enabled: !app.textViewVisible
                     onTriggered: {
                         app.fitting = false;
                         app.changeZoom(1, 0, 0);
@@ -187,11 +197,11 @@ ColumnLayout {
                 onClicked: app.zoomBy(1 / 1.2)
             }
             ToolButton {
-                text: Math.round(app.zoom * 100) + "% ▾"
+                text: Math.round((app.textViewVisible ? app.textViewZoom : app.zoom) * 100) + (app.textViewVisible ? "%" : "% ▾")
                 Layout.preferredWidth: 72
                 Layout.minimumWidth: 72
                 onClicked: zoomMenu.popup(0, height)
-                enabled: app.currentReader.pageCount > 0
+                enabled: app.currentReader.pageCount > 0 && !app.textViewVisible
             }
             Menu {
                 id: zoomMenu
@@ -222,6 +232,7 @@ ColumnLayout {
                 enabled: app.currentReader.pageCount > 0
                 onClicked: {
                     app.overviewVisible = false;
+                    app.setTextViewEnabled(false);
                     app.annotationToolsVisible = !app.annotationToolsVisible;
                 }
             }

@@ -31,6 +31,25 @@ ApplicationWindow {
     property string sidebarTab: "thumbnails"
     property bool annotationToolsVisible: false
     property bool overviewVisible: false
+    property bool textViewVisible: false
+    readonly property real textViewZoom: accessibleTextView.textSize / 16
+    onOverviewVisibleChanged: if (overviewVisible)
+        textViewVisible = false
+    function setTextViewEnabled(show) {
+        const returningToPage = textViewVisible && !show;
+        const page = currentPage;
+        textViewVisible = show;
+        if (show) {
+            overviewVisible = false;
+            annotationToolsVisible = false;
+            formToolActive = false;
+            selection = null;
+        }
+        if (returningToPage)
+            Qt.callLater(function () {
+                root.navigate(page);
+            });
+    }
     property bool formToolActive: false
     property string annotationTool: "select"
     property string layoutMode: "Continuous"
@@ -104,15 +123,18 @@ ApplicationWindow {
     property int closingTab: -2
     function saveReadingPosition() {
         positionTimer.stop();
-        if (session && currentReader.pageCount > 0)
-            session.saveViewState(currentReader, {
+        if (session && currentReader.pageCount > 0) {
+            const state = {
                 page: currentPage,
                 zoom: zoom,
                 fitting: fitting,
-                offset: pageList.contentY,
                 layout: layoutMode,
                 gap: pageGap
-            });
+            };
+            if (!textViewVisible)
+                state.offset = pageList.contentY;
+            session.saveViewState(currentReader, state);
+        }
     }
     function hasPendingCloseWork(index) {
         const tabs = session ? session.tabs : [
@@ -237,8 +259,11 @@ ApplicationWindow {
         if (currentReader.pageCount === 0)
             return;
         page = Math.max(0, Math.min(currentReader.pageCount - 1, page));
-        canvas.navigate(page, y || 0);
+        if (!textViewVisible)
+            canvas.navigate(page, y || 0);
         root.currentPage = page;
+        if (textViewVisible)
+            schedulePositionSave();
     }
     function changeZoom(value, anchorX, anchorY) {
         const old = root.zoom;
@@ -254,6 +279,10 @@ ApplicationWindow {
         });
     }
     function zoomBy(factor) {
+        if (textViewVisible) {
+            accessibleTextView.zoomBy(factor);
+            return;
+        }
         root.fitting = false;
         changeZoom(zoom * factor, pageList.width / 2, pageList.height / 2);
     }
@@ -263,7 +292,7 @@ ApplicationWindow {
         root.fitting = true;
     }
     function updateCurrentPage() {
-        if (currentReader.pageCount > 0)
+        if (currentReader.pageCount > 0 && !textViewVisible)
             root.currentPage = canvas.pageAtOffset();
     }
 
@@ -444,6 +473,7 @@ ApplicationWindow {
         dialogs.formsDialog.open();
     }
     function toggleForms() {
+        setTextViewEnabled(false);
         formToolActive = !formToolActive;
         if (formToolActive)
             currentReader.submit("forms");
@@ -921,33 +951,47 @@ ApplicationWindow {
         id: fitAction
         text: qsTr("Fit Width")
         shortcut: "Ctrl+1"
-        enabled: currentReader.pageCount > 0
+        enabled: currentReader.pageCount > 0 && !root.textViewVisible
         onTriggered: root.fitWidth()
     }
     Action {
         id: actualAction
         text: qsTr("Actual Size")
         shortcut: "Ctrl+0"
-        enabled: currentReader.pageCount > 0
+        enabled: currentReader.pageCount > 0 && !root.textViewVisible
         onTriggered: {
             root.fitting = false;
             root.changeZoom(1, pageList.width / 2, pageList.height / 2);
         }
     }
+    Action {
+        id: readPageTextAction
+        objectName: "readPageTextAction"
+        text: qsTr("Read Page Text")
+        shortcut: "Ctrl+Shift+R"
+        enabled: currentReader.pageCount > 0
+        checkable: true
+        checked: root.textViewVisible
+        onTriggered: root.setTextViewEnabled(checked)
+    }
     Shortcut {
         sequence: "PageDown"
+        enabled: !root.textViewVisible
         onActivated: root.navigate(root.currentPage + 1)
     }
     Shortcut {
         sequence: "PageUp"
+        enabled: !root.textViewVisible
         onActivated: root.navigate(root.currentPage - 1)
     }
     Shortcut {
         sequence: "Ctrl+Home"
+        enabled: !root.textViewVisible
         onActivated: root.navigate(0)
     }
     Shortcut {
         sequence: "Ctrl+End"
+        enabled: !root.textViewVisible
         onActivated: root.navigate(currentReader.pageCount - 1)
     }
     Shortcut {
@@ -1037,6 +1081,9 @@ ApplicationWindow {
         }
         Menu {
             title: qsTr("&View")
+            MenuItem {
+                action: readPageTextAction
+            }
             MenuItem {
                 action: zoomIn
             }
@@ -1160,7 +1207,14 @@ ApplicationWindow {
                     id: canvas
                     anchors.fill: parent
                     app: root
-                    visible: !root.overviewVisible
+                    visible: !root.overviewVisible && !root.textViewVisible
+                }
+                PageTextView {
+                    id: accessibleTextView
+                    objectName: "pageTextView"
+                    anchors.fill: parent
+                    app: root
+                    visible: root.textViewVisible && currentReader.pageCount > 0
                 }
                 PageOverview {
                     anchors.fill: parent

@@ -15,6 +15,7 @@
 #include "AnnotationOverlay.h"
 #include "WorkspaceController.h"
 #include <QApplication>
+#include <QAccessible>
 #include <QFontDatabase>
 #include <QDir>
 #include <QSignalSpy>
@@ -659,6 +660,31 @@ private slots:
         const auto deleted=completion(store.remove(account));removed=!deleted.isEmpty() && deleted[3].toString().isEmpty();if(!deleted.isEmpty() && !removed)failure=deleted[3].toString();
         if(removed){const auto event=completion(store.read(account));absent=!event.isEmpty() && event[2].toString().isEmpty() && event[3].toString().isEmpty();}
         QVERIFY2(wrote && writeOk && readOk && removed && absent,qPrintable(failure.isEmpty()?QString("System vault did not complete the isolated round trip"):failure));
+    }
+    void pageTextViewExposesReadOnlyAccessibleTextAndKeyboardSelection() {
+        WorkspaceController workspace;auto &reader=*workspace.activeReader();QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("reader",&reader);engine.rootContext()->setContextProperty("workspace",&workspace);engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
+        auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        reader.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        const bool shortcutFocus=QGuiApplication::platformName()=="offscreen" || QGuiApplication::focusWindow()==window;
+        auto *readAction=window->findChild<QObject *>("readPageTextAction");QVERIFY(readAction);
+        if(shortcutFocus)QTest::keyClick(window,Qt::Key_R,Qt::ControlModifier|Qt::ShiftModifier);
+        else {qInfo()<<"Window lacks native shortcut focus; exercise its real Action. Global native shortcut coverage remains pending.";QVERIFY(QMetaObject::invokeMethod(readAction,"trigger",Q_ARG(QObject *,nullptr)));}
+        auto *view=window->findChild<QQuickItem *>("pageTextView");auto *text=window->findChild<QQuickItem *>("accessiblePageText");QVERIFY(view && text);QTRY_VERIFY(view->isVisible());
+        QTRY_VERIFY(!text->property("text").toString().isEmpty());QVERIFY(text->property("readOnly").toBool());QCOMPARE(text->property("textFormat").toInt(),int(Qt::PlainText));
+        const auto snapshots=qEnvironmentVariable("LYRA_READER_CHECK_SNAPSHOTS");if(!snapshots.isEmpty())QVERIFY(window->grabWindow().save(snapshots+"/lyrareader-page-text.png"));
+        text->forceActiveFocus();QTest::keyClick(window,Qt::Key_A,Qt::ControlModifier);QCOMPARE(text->property("selectedText").toString(),text->property("text").toString());
+        auto *interface=QAccessible::queryAccessibleInterface(text);QVERIFY(interface);QCOMPARE(interface->role(),QAccessible::EditableText);
+        auto *accessible=interface->textInterface();QVERIFY(accessible);QCOMPARE(accessible->characterCount(),text->property("text").toString().size());QVERIFY(interface->state().readOnly);QVERIFY(interface->text(QAccessible::Name).contains("Page 1"));
+        QTest::keyClick(window,Qt::Key_Home,Qt::ControlModifier);QCOMPARE(text->property("cursorPosition").toInt(),0);QCOMPARE(window->property("currentPage").toInt(),0);
+        QTest::keyClick(window,Qt::Key_PageDown,Qt::AltModifier);QTRY_COMPARE(window->property("currentPage").toInt(),1);QTRY_VERIFY(text->property("text").toString().contains("Page 2"));
+        QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));QCOMPARE(workspace.viewState(&reader).value("page").toInt(),1);QVERIFY(!workspace.viewState(&reader).contains("offset"));
+        workspace.newTab();workspace.activeReader()->openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pendingCommands(),0,10000);
+        workspace.selectTab(0);QTRY_COMPARE(window->property("currentPage").toInt(),1);QTRY_VERIFY(text->property("text").toString().contains("Page 2"));text->forceActiveFocus();
+        QTest::keyClick(window,Qt::Key_PageUp,Qt::AltModifier);QTRY_COMPARE(window->property("currentPage").toInt(),0);
+        if(shortcutFocus)QTest::keyClick(window,Qt::Key_R,Qt::ControlModifier|Qt::ShiftModifier);
+        else QVERIFY(QMetaObject::invokeMethod(readAction,"trigger",Q_ARG(QObject *,nullptr)));
+        QTRY_VERIFY(!view->isVisible());
+        QTRY_VERIFY_WITH_TIMEOUT(visualItem(window->contentItem(),"pdfPage0") && visualItem(window->contentItem(),"pdfPage0")->property("texturesReady").toBool(),10000);
     }
     void renderingPerformanceRecordsRealQueueLatencyFramesAndRss() {
         if(!qEnvironmentVariableIsSet("LYRA_READER_CHECK_PERFORMANCE"))QSKIP("Opt-in native performance run; use LYRA_READER_CHECK_PERFORMANCE=1");
