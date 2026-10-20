@@ -45,6 +45,44 @@ private slots:
         qmlRegisterType<PageItem>("LyraReader", 1, 0, "PdfPage");
         qmlRegisterType<AnnotationOverlay>("LyraReader",1,0,"PdfAnnotations");
     }
+    void recentDocumentsAndNarrowWindowRemainKeyboardReachable() {
+        WorkspaceController workspace;workspace.clearRecentDocuments();
+        workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));
+        QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pageCount(),3,10000);
+        QTRY_COMPARE(workspace.recentDocuments().size(),1);
+        auto *original=workspace.activeReader();workspace.newTab();
+        QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);
+        engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());
+        engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
+        auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);window->setMaximumSize(QSize(640,440));window->resize(640,440);
+        QTRY_VERIFY_WITH_TIMEOUT(window->width()<=640 && window->height()<=440,5000);
+        auto *recent=window->findChild<QQuickItem *>("recentDocuments");QVERIFY(recent);
+        QTRY_COMPARE(recent->property("count").toInt(),1);
+        QTRY_VERIFY(visualItem(window->contentItem(),"recentDocument0"));
+        auto *row=visualItem(window->contentItem(),"recentDocument0");QVERIFY(row);QTest::qWait(150);
+        QVERIFY(row->isVisible());
+        QTRY_VERIFY(row->mapToScene(QPointF(0,row->height())).y()<=window->height());
+        row->forceActiveFocus();QTest::keyClick(window,Qt::Key_Space);
+        QTRY_COMPARE(workspace.activeReader(),original);QCOMPARE(workspace.tabs().size(),2);
+        QTRY_COMPARE_WITH_TIMEOUT(original->pendingCommands(),0,10000);
+        auto *more=window->findChild<QQuickItem *>("moreCommands");auto *search=window->findChild<QQuickItem *>("searchField");
+        auto *sidebar=window->findChild<QQuickItem *>("readerSidebar");auto *area=window->findChild<QQuickItem *>("readingArea");
+        QVERIFY(more && search && sidebar && area);QTest::qWait(150);
+        const auto moreBounds=more->mapRectToScene(QRectF(0,0,more->width(),more->height()));
+        const auto searchBounds=search->mapRectToScene(QRectF(0,0,search->width(),search->height()));
+        QVERIFY(moreBounds.right()<=searchBounds.left());QVERIFY(searchBounds.right()<=window->width());
+        QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,moreBounds.center().toPoint());
+        auto *menu=window->findChild<QObject *>("moreCommandsMenu");QVERIFY(menu);QTRY_VERIFY(menu->property("visible").toBool());
+        QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!menu->property("visible").toBool());
+        window->setProperty("sidebarVisible",true);window->setProperty("searchVisible",true);
+        QTRY_VERIFY(!sidebar->isVisible());QTRY_VERIFY(area->width()>350);
+        window->setProperty("searchVisible",false);QTRY_VERIFY(sidebar->isVisible());
+        workspace.selectTab(1);QTRY_VERIFY(recent->isVisible());
+        auto *clear=window->findChild<QQuickItem *>("clearRecentDocuments");QVERIFY(clear);clear->forceActiveFocus();QTest::keyClick(window,Qt::Key_Space);
+        QTRY_VERIFY(workspace.recentDocuments().isEmpty());QTRY_COMPARE(recent->property("count").toInt(),0);
+        const auto snapshots=qEnvironmentVariable("LYRA_READER_CHECK_SNAPSHOTS");
+        if(!snapshots.isEmpty())QVERIFY(window->grabWindow().save(snapshots+"/lyrareader-welcome-narrow.png"));
+    }
     void wholeWindowSurvivesTextureReplacementAndPageJump() {
         ReaderController reader;
         QQmlApplicationEngine engine;
@@ -298,6 +336,18 @@ private slots:
         QCOMPARE(rect().value("x").toDouble(),140.0);
         reader.submit("marks_undo");QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
         QCOMPARE(rect().value("x").toDouble(),100.0);
+        // Keyboard repeats stay in a draft until release, with one history step.
+        QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,point(150,100));
+        QTest::keyPress(window,Qt::Key_Right);QTest::keyPress(window,Qt::Key_Right);QTest::keyPress(window,Qt::Key_Right);
+        QCOMPARE(rect().value("x").toDouble(),100.0);
+        QTest::keyRelease(window,Qt::Key_Right);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QTRY_COMPARE(rect().value("x").toDouble(),103.0);
+        reader.submit("marks_undo");QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QCOMPARE(rect().value("x").toDouble(),100.0);
+        QTest::keyClick(window,Qt::Key_Right,Qt::ControlModifier|Qt::ShiftModifier);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QTRY_COMPARE(rect().value("width").toDouble(),110.0);
+        reader.submit("marks_undo");QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QCOMPARE(rect().value("width").toDouble(),100.0);
+        QTest::keyPress(window,Qt::Key_Down);QTest::keyClick(window,Qt::Key_Escape);QTest::keyRelease(window,Qt::Key_Down);
+        QTest::qWait(50);QCOMPARE(rect().value("y").toDouble(),100.0);QVERIFY(window->property("annotationDraft").isNull());
         // Properties and geometry share the sidecar, and a fresh reader sees both.
         // Escape cleared selection; select the annotation through the page before editing.
         QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,point(150,100));

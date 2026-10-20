@@ -25,6 +25,7 @@ Pane {
         }
         TextField {
             Layout.fillWidth: true
+            Accessible.name: qsTr("Search document")
             placeholderText: qsTr("Search document")
             text: app.searchQuery
             onTextEdited: {

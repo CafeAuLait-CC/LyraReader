@@ -54,6 +54,62 @@ Item {
         property var points: []
         property var previousPoint: null
         property var editBase: null
+        property var keyBase: null
+        property var keyOwner: null
+        activeFocusOnTab: true
+        Accessible.role: Accessible.Canvas
+        Accessible.name: qsTr("Page %1").arg(page + 1)
+        Accessible.description: qsTr("Select an annotation, then use arrow keys to move it, Control and arrow keys to resize, or Shift for ten-point steps. Escape cancels.")
+        function finishKeyboardEdit() {
+            if (!keyBase)
+                return;
+            const base = keyBase;
+            keyBase = null;
+            if (keyOwner === app.currentReader && app.selectedAnnotation && app.selectedAnnotation.id === base.id && app.annotationDraft && app.annotationDraft.id === base.id)
+                app.commitAnnotationGeometry(base.id, Logic.geometryPatch(base, app.annotationDraft.rect));
+            keyOwner = null;
+        }
+        onActiveFocusChanged: if (!activeFocus)
+            finishKeyboardEdit()
+        Keys.onPressed: function (event) {
+            const arrows = [Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down];
+            if (arrows.indexOf(event.key) < 0 || event.modifiers & (Qt.AltModifier | Qt.MetaModifier) || app.annotationTool !== "select")
+                return;
+            const selected = app.selectedAnnotation;
+            if (!selected || selected.page !== page || !Logic.editableGeometry(selected))
+                return;
+            event.accepted = true;
+            if (!keyBase) {
+                if (app.currentReader.pendingCommands > 0)
+                    return;
+                keyBase = selected;
+                keyOwner = app.currentReader;
+                app.pendingDraftRequestId = -1;
+            }
+            if (keyOwner !== app.currentReader || selected.id !== keyBase.id)
+                return;
+            const previous = app.annotationDraft && app.annotationDraft.id === keyBase.id ? app.annotationDraft.rect : keyBase.rect;
+            const step = event.modifiers & Qt.ShiftModifier ? 10 : 1;
+            const dx = event.key === Qt.Key_Left ? -step : event.key === Qt.Key_Right ? step : 0;
+            const dy = event.key === Qt.Key_Up ? -step : event.key === Qt.Key_Down ? step : 0;
+            const size = app.currentReader.pages[page];
+            const target = event.modifiers & Qt.ControlModifier ? {
+                x: previous.x,
+                y: previous.y,
+                width: Math.min(size.width - previous.x, Math.max(2, previous.width + dx)),
+                height: Math.min(size.height - previous.y, Math.max(2, previous.height + dy))
+            } : Logic.translatedRect(previous, dx, dy, size);
+            app.annotationDraft = Object.assign({}, keyBase, Logic.geometryPatch(keyBase, target), {
+                rect: target
+            });
+        }
+        Keys.onReleased: function (event) {
+            if (keyBase && [Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down].indexOf(event.key) >= 0) {
+                event.accepted = true;
+                if (!event.isAutoRepeat)
+                    finishKeyboardEdit();
+            }
+        }
         preventStealing: pressed
         function position(mouse) {
             const size = app.currentReader.pages[page];
@@ -104,7 +160,7 @@ Item {
         }
         onPressed: function (mouse) {
             if (mouse.button === Qt.RightButton) {
-                app.showSelectionMenu(layer, page, mouse.x, mouse.y);
+                app.showSelectionMenu(annotationLayer, page, mouse.x, mouse.y);
                 return;
             }
             forceActiveFocus();
@@ -154,6 +210,8 @@ Item {
         Keys.onEscapePressed: {
             gestureTool = "canceled";
             editBase = null;
+            keyBase = null;
+            keyOwner = null;
             app.annotationDraft = null;
             app.redactionDraft = null;
             app.selectedAnnotation = null;
@@ -264,6 +322,7 @@ Item {
         }
     }
     AnnotationHandles {
+        focusTarget: pointer
         anchors.fill: parent
         app: annotationLayer.app
         page: annotationLayer.page

@@ -6,6 +6,7 @@ Item {
     id: handles
     required property var app
     required property int page
+    property var focusTarget: null
     readonly property var selected: app.selectedAnnotation
     readonly property var shown: app.annotationDraft && selected && app.annotationDraft.id === selected.id ? app.annotationDraft : selected
     readonly property bool line: shown && (shown.kind === "line" || shown.kind === "arrow")
@@ -67,11 +68,15 @@ Item {
             app.commitAnnotationGeometry(base.id, patch);
         base = null;
         patch = null;
+        if (focusTarget)
+            focusTarget.forceActiveFocus();
     }
     function cancel() {
         app.annotationDraft = null;
         base = null;
         patch = null;
+        if (focusTarget)
+            focusTarget.forceActiveFocus();
     }
     Repeater {
         model: handles.visible ? (handles.line ? 2 : 4) : 0

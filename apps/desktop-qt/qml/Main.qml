@@ -1132,20 +1132,22 @@ ApplicationWindow {
             Layout.fillHeight: true
             spacing: 0
             ReaderSidebar {
+                objectName: "readerSidebar"
                 app: root
-                visible: root.sidebarVisible && currentReader.pageCount > 0
+                visible: root.sidebarVisible && currentReader.pageCount > 0 && !(root.searchVisible && root.width < 950)
                 Layout.preferredWidth: root.width < 850 ? 210 : 246
                 Layout.fillHeight: true
             }
 
             Rectangle {
-                visible: root.sidebarVisible && currentReader.pageCount > 0
+                visible: root.sidebarVisible && currentReader.pageCount > 0 && !(root.searchVisible && root.width < 950)
                 Layout.preferredWidth: 1
                 Layout.fillHeight: true
                 color: theme.separator
             }
             Item {
                 id: readingArea
+                objectName: "readingArea"
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 Rectangle {
@@ -1171,63 +1173,10 @@ ApplicationWindow {
                     visible: root.annotationToolsVisible && currentReader.pageCount > 0 && !root.overviewVisible
                     z: 5
                 }
-                ColumnLayout {
-                    anchors.centerIn: parent
+                WelcomeView {
+                    anchors.fill: parent
                     visible: currentReader.pageCount === 0
-                    spacing: 16
-                    Rectangle {
-                        Layout.alignment: Qt.AlignHCenter
-                        implicitWidth: 62
-                        implicitHeight: 74
-                        radius: 6
-                        color: theme.raisedBg
-                        border.color: theme.pageEdge
-                        Label {
-                            anchors.centerIn: parent
-                            text: "L"
-                            color: theme.accent
-                            font.pixelSize: 32
-                            font.weight: Font.Light
-                        }
-                    }
-                    Label {
-                        Layout.alignment: Qt.AlignHCenter
-                        text: currentReader.loading ? qsTr("Opening your document") : qsTr("Make room for a good paper.")
-                        font.pixelSize: 23
-                        font.weight: Font.Light
-                    }
-                    Label {
-                        Layout.alignment: Qt.AlignHCenter
-                        text: qsTr("Drop a PDF here, or open one to begin.")
-                        color: theme.textSecondary
-                    }
-                    Button {
-                        id: primaryOpen
-                        Layout.alignment: Qt.AlignHCenter
-                        action: openAction
-                        visible: !currentReader.loading
-                        palette.buttonText: theme.onAccent
-                        contentItem: Text {
-                            text: primaryOpen.text
-                            font: primaryOpen.font
-                            color: theme.onAccent
-                            horizontalAlignment: Text.AlignHCenter
-                            verticalAlignment: Text.AlignVCenter
-                        }
-                        background: Rectangle {
-                            implicitWidth: 130
-                            implicitHeight: 36
-                            radius: 4
-                            color: primaryOpen.down ? theme.accentPressed : primaryOpen.hovered ? theme.accentHover : theme.accent
-                            border.width: primaryOpen.visualFocus ? 2 : 0
-                            border.color: theme.focusRing
-                        }
-                    }
-                    BusyIndicator {
-                        Layout.alignment: Qt.AlignHCenter
-                        running: currentReader.loading
-                        visible: running
-                    }
+                    app: root
                 }
                 DropArea {
                     anchors.fill: parent
@@ -1243,6 +1192,7 @@ ApplicationWindow {
                 }
             }
             SearchPanel {
+                objectName: "searchPanel"
                 app: root
                 visible: root.searchVisible && currentReader.pageCount > 0
                 Layout.preferredWidth: Math.min(280, root.width / 3)

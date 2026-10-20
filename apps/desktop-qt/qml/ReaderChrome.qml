@@ -74,7 +74,15 @@ ColumnLayout {
                         anchors.fill: parent
                         anchors.rightMargin: app.session ? 30 : 0
                         hoverEnabled: true
-                        onClicked: if (app.session)
+                        activeFocusOnTab: true
+                        onClicked: {
+                            forceActiveFocus();
+                            if (app.session)
+                                app.session.selectTab(tab.index);
+                        }
+                        Keys.onReturnPressed: if (app.session)
+                            app.session.selectTab(tab.index)
+                        Keys.onSpacePressed: if (app.session)
                             app.session.selectTab(tab.index)
                         Accessible.role: Accessible.PageTab
                         Accessible.name: modelData.title
@@ -84,8 +92,8 @@ ColumnLayout {
                         anchors.bottom: parent.bottom
                         width: parent.width
                         height: 2
-                        visible: tab.selected
-                        color: app.colors.accent
+                        visible: tab.selected || tabMouse.activeFocus
+                        color: tabMouse.activeFocus ? app.colors.focusRing : app.colors.accent
                     }
                 }
             }
@@ -180,7 +188,8 @@ ColumnLayout {
             }
             ToolButton {
                 text: Math.round(app.zoom * 100) + "% ▾"
-                implicitWidth: 72
+                Layout.preferredWidth: 72
+                Layout.minimumWidth: 72
                 onClicked: zoomMenu.popup(0, height)
                 enabled: app.currentReader.pageCount > 0
             }
@@ -217,6 +226,7 @@ ColumnLayout {
                 }
             }
             LyraToolButton {
+                visible: app.width >= 1100
                 symbol: "pages"
                 text: qsTr("Page operations")
                 enabled: app.currentReader.pageCount > 0
@@ -229,6 +239,7 @@ ColumnLayout {
                 onClicked: app.showExportMenu(this)
             }
             LyraToolButton {
+                visible: app.width >= 850
                 symbol: "form"
                 text: qsTr("Fill & Sign")
                 selected: app.formToolActive
@@ -236,18 +247,37 @@ ColumnLayout {
                 onClicked: app.toggleForms()
             }
             LyraToolButton {
+                visible: app.width >= 850
                 symbol: "ai"
                 text: qsTr("AI Assistant")
                 selected: app.sidebarVisible && app.sidebarTab === "ai"
                 onClicked: app.showSidebar("ai")
             }
             LyraToolButton {
+                objectName: "moreCommands"
                 symbol: "more"
                 text: qsTr("More commands")
                 onClicked: moreMenu.popup(0, height)
             }
             Menu {
                 id: moreMenu
+                objectName: "moreCommandsMenu"
+                MenuItem {
+                    text: qsTr("Fill & Sign")
+                    enabled: app.currentReader.pageCount > 0
+                    onTriggered: app.toggleForms()
+                }
+                MenuItem {
+                    text: qsTr("AI Assistant")
+                    enabled: app.currentReader.pageCount > 0
+                    onTriggered: app.showSidebar("ai")
+                }
+                MenuItem {
+                    text: qsTr("Page operations")
+                    enabled: app.currentReader.pageCount > 0
+                    onTriggered: app.overviewVisible = !app.overviewVisible
+                }
+                MenuSeparator {}
                 MenuItem {
                     text: qsTr("Open PDF…")
                     onTriggered: app.openDialog()
@@ -284,7 +314,7 @@ ColumnLayout {
                 }
             }
             Label {
-                visible: app.originalReadOnly
+                visible: app.originalReadOnly && app.width >= 1000
                 text: qsTr("Signed · edits to copy")
                 color: app.colors.textSecondary
                 font.pixelSize: 11
@@ -300,7 +330,8 @@ ColumnLayout {
             TextField {
                 id: searchField
                 objectName: "searchField"
-                Layout.preferredWidth: app.width < 1000 ? 135 : 220
+                Layout.preferredWidth: app.width < 850 ? 120 : app.width < 1000 ? 135 : 220
+                Layout.minimumWidth: 100
                 implicitHeight: 30
                 placeholderText: qsTr("Search document")
                 text: app.searchQuery
