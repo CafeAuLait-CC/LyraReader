@@ -613,6 +613,10 @@ impl Marks {
                 modified: chrono::Utc::now().format("D:%Y%m%d%H%M%SZ").to_string(),
                 font_size_pt: v["fontSize"].as_f64().unwrap_or(14.0),
                 text_alignment: v["textAlignment"].as_str().unwrap_or("left").to_string(),
+                stamp_style: String::new(),
+                signature_width: 0,
+                signature_height: 0,
+                signature_rgba: Vec::new(),
             };
             let target = v["fileIdentity"].as_str().map(str::to_string).or_else(|| {
                 file.iter()

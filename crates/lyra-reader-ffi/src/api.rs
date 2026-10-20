@@ -3837,6 +3837,7 @@ pub struct LinkRegion {
 /// the file carries an image this reader cannot decode; the stamp is then listed with the reason
 /// instead of drawn as an empty box.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct StampRecord {
     pub text: Option<String>,
     /// `approved`, `reviewed`, `draft`, `confidential`, `date`, `signature` or `custom`.
