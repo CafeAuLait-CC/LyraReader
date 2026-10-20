@@ -34,7 +34,7 @@ signals:
     void changed();
     void statusMessage(const QString &message);
     void navigateRequested(int page,double y);
-    void newWindowRequested(const QUrl &url,int page);
+    void newWindowRequested(const QUrl &url,int page,double y);
     void externalRequested(const QUrl &url);
 private:
     void imageRegion(int page,const QVariantMap &region,const QVariantList &fragments = {});

@@ -288,10 +288,11 @@ ApplicationWindow {
     function restorePosition() {
         const state = session ? session.viewState(currentReader) : ({});
         pendingPosition = Object.assign({}, state);
-        if (requestedPage) {
+        if (requestedPage >= 0) {
             pendingPosition.page = requestedPage;
+            pendingPosition.y = requestedY;
             delete pendingPosition.offset;
-            requestedPage = 0;
+            requestedPage = -1;
         }
         layoutMode = state.layout || "Continuous";
         pageGap = state.gap === undefined ? 12 : state.gap;
@@ -881,7 +882,8 @@ ApplicationWindow {
         else if (currentReader)
             currentReader.invalidateAiPlan();
     }
-    property int requestedPage: 0
+    property int requestedPage: -1
+    property real requestedY: 0
     property double credentialReadId: -1
     property var pendingAiReader: null
     property var pendingAiPlan: null
@@ -1426,7 +1428,7 @@ ApplicationWindow {
                     } else
                         root.fitWidth();
                     Qt.callLater(function () {
-                        root.navigate(state.page || 0);
+                        root.navigate(state.page || 0, state.y || 0);
                         if (state.offset !== undefined)
                             pageList.contentY = state.offset;
                     });

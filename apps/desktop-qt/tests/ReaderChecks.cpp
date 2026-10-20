@@ -45,6 +45,43 @@ private slots:
         qmlRegisterType<PageItem>("LyraReader", 1, 0, "PdfPage");
         qmlRegisterType<AnnotationOverlay>("LyraReader",1,0,"PdfAnnotations");
     }
+    void recentHistoryIsSharedByAllReaderWindows() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto firstPath=scratch.path()+"/first.pdf",secondPath=scratch.path()+"/second.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",firstPath));QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",secondPath));
+        QSettings settings;settings.setValue("reader/recentDocuments",QVariantList{QVariantMap{{"url","https://example.invalid/document.pdf"}},QVariantMap{{"url",QUrl::fromLocalFile(firstPath).toString()},{"title",""}},QVariantMap{{"url",QUrl::fromLocalFile(firstPath).toString()},{"title","duplicate"}}});
+        WorkspaceController first,second;
+        QCOMPARE(first.recentDocuments().size(),1);QCOMPARE(first.recentDocuments(),second.recentDocuments());
+        QCOMPARE(first.recentDocuments().first().toMap().value("title").toString(),QString("first.pdf"));
+        first.clearRecentDocuments();QVERIFY(second.recentDocuments().isEmpty());
+        first.openFile(QUrl::fromLocalFile(firstPath));QTRY_COMPARE_WITH_TIMEOUT(first.activeReader()->pageCount(),1,10000);
+        QTRY_COMPARE(second.recentDocuments().size(),1);QCOMPARE(first.recentDocuments(),second.recentDocuments());
+        second.openFile(QUrl::fromLocalFile(secondPath));QTRY_COMPARE_WITH_TIMEOUT(second.activeReader()->pageCount(),3,10000);
+        QTRY_COMPARE(first.recentDocuments().size(),2);QCOMPARE(first.recentDocuments(),second.recentDocuments());
+        QCOMPARE(first.recentDocuments().first().toMap().value("title").toString(),QString("second.pdf"));
+        first.clearRecentDocuments();QVERIFY(second.recentDocuments().isEmpty());
+        second.activeReader()->openFile(QUrl::fromLocalFile(secondPath));QTRY_COMPARE_WITH_TIMEOUT(second.activeReader()->pendingCommands(),0,10000);QTRY_COMPARE(first.recentDocuments().size(),1);
+        WorkspaceController third;QCOMPARE(third.recentDocuments(),first.recentDocuments());third.clearRecentDocuments();QVERIFY(first.recentDocuments().isEmpty());QVERIFY(second.recentDocuments().isEmpty());
+    }
+    void requestedWindowRegionOverridesSavedFirstPagePosition() {
+        WorkspaceController saved;const auto url=QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf");
+        saved.openFile(url);QTRY_COMPARE_WITH_TIMEOUT(saved.activeReader()->pageCount(),3,10000);
+        saved.saveViewState(saved.activeReader(),{{"page",2},{"offset",1800},{"zoom",1},{"fitting",false}});
+        WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);
+        engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
+        auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        window->setProperty("requestedPage",0);window->setProperty("requestedY",150.0);workspace.openFile(url);
+        QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pendingCommands(),0,10000);
+        QTRY_COMPARE(window->property("requestedPage").toInt(),-1);
+        auto *view=window->findChild<QQuickItem *>("pageList");QVERIFY(view);
+        QTRY_VERIFY(qAbs(view->property("contentY").toDouble()-150.0*window->property("zoom").toDouble())<1);
+        QSignalSpy requested(&workspace,&WorkspaceController::newWindowRequested);workspace.openInNewWindow(url,1,200);
+        QCOMPARE(requested.size(),1);QCOMPARE(requested.first().at(1).toInt(),1);QCOMPARE(requested.first().at(2).toDouble(),200.0);
+        window->setProperty("requestedPage",1);window->setProperty("requestedY",200.0);QVERIFY(QMetaObject::invokeMethod(window,"restorePosition"));
+        QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pendingCommands(),0,10000);
+        const auto placement=workspace.activeReader()->pages().at(1).toMap();
+        QTRY_VERIFY(qAbs(view->property("contentY").toDouble()-(placement.value("top").toDouble()+200)*window->property("zoom").toDouble())<1);
+    }
     void recentDocumentsAndNarrowWindowRemainKeyboardReachable() {
         WorkspaceController workspace;workspace.clearRecentDocuments();
         workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));
@@ -700,6 +737,7 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(window,"goBack"));
         QTRY_VERIFY(qAbs(window->property("pageList").value<QObject *>()->property("contentY").toDouble()-offset)<.1);
         QSignalSpy newWindow(&workspace,&WorkspaceController::newWindowRequested);preview->openWindow();QCOMPARE(newWindow.size(),1);
+        QCOMPARE(newWindow.first().at(2).toDouble(),preview->model().value("region").toMap().value("y_pt").toDouble());
         workspace.openFile(QUrl::fromLocalFile(scratch.path()+"/cross-references.pdf"));
         QVERIFY(!preview->visible());reader=workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),3,10000);
         reader->submit("caption_mentions",{{"page",0}});QTRY_VERIFY_WITH_TIMEOUT(reader->data().contains("caption_mentions"),10000);

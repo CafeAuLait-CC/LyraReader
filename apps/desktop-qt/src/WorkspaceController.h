@@ -15,6 +15,7 @@ class WorkspaceController : public QObject {
     Q_PROPERTY(CredentialStore *credentials READ credentials CONSTANT)
 public:
     explicit WorkspaceController(QObject *parent = nullptr);
+    ~WorkspaceController() override;
     QVariantList tabs() const;
     ReaderController *activeReader() const;
     int activeIndex() const { return m_activeIndex; }
@@ -28,7 +29,7 @@ public:
     Q_INVOKABLE void closeTab(int index, bool discardPending = false);
     Q_INVOKABLE void newTab();
     Q_INVOKABLE void requestQuit();
-    Q_INVOKABLE void openInNewWindow(const QUrl &url, int page = 0);
+    Q_INVOKABLE void openInNewWindow(const QUrl &url, int page = 0, double y = 0);
     Q_INVOKABLE QVariantMap viewState(ReaderController *reader) const;
     Q_INVOKABLE void saveViewState(ReaderController *reader, const QVariantMap &state);
     Q_INVOKABLE void clearRecentDocuments();
@@ -45,10 +46,11 @@ signals:
     void activeReaderChanged();
     void activeReaderAboutToChange();
     void recentDocumentsChanged();
-    void newWindowRequested(const QUrl &url, int page);
+    void newWindowRequested(const QUrl &url, int page, double y);
 private:
     ReaderController *appendTab();
     void remember(ReaderController *reader);
+    static void publishRecents(const QVariantList &entries);
     QList<ReaderController *> m_tabs;
     QHash<ReaderController *, QVariantMap> m_views;
     QVariantList m_recent;

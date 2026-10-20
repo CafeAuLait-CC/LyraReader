@@ -62,8 +62,8 @@ int main(int argc, char **argv) {
     qmlRegisterUncreatableType<ReaderController>("LyraReader", 1, 0, "ReaderController", QStringLiteral("Created by the application"));
     qmlRegisterType<PageItem>("LyraReader", 1, 0, "PdfPage");
     qmlRegisterType<AnnotationOverlay>("LyraReader",1,0,"PdfAnnotations");
-    std::function<QQuickWindow *(const QUrl &,int)> createWindow;
-    createWindow = [&](const QUrl &url,int page) -> QQuickWindow * {
+    std::function<QQuickWindow *(const QUrl &,int,double)> createWindow;
+    createWindow = [&](const QUrl &url,int page,double y) -> QQuickWindow * {
         auto *engine = new QQmlApplicationEngine(&application);
         engine->addImageProvider(QStringLiteral("lyrapreview"),new NativeImageProvider);
         auto *workspace = new WorkspaceController(engine);
@@ -74,7 +74,8 @@ int main(int argc, char **argv) {
         auto *created = qobject_cast<QQuickWindow *>(engine->rootObjects().first());
         if (!created) { delete engine; return nullptr; }
         created->setProperty("requestedPage",page);
-        QObject::connect(workspace,&WorkspaceController::newWindowRequested,&application,[&](const QUrl &file,int targetPage) {createWindow(file,targetPage);});
+        created->setProperty("requestedY",y);
+        QObject::connect(workspace,&WorkspaceController::newWindowRequested,&application,[&](const QUrl &file,int targetPage,double targetY) {createWindow(file,targetPage,targetY);});
         QObject::connect(created,&QQuickWindow::closing,engine,[engine,created] {
             QTimer::singleShot(0,engine,[engine,created] { if(!created->isVisible())engine->deleteLater(); });
         });
@@ -85,7 +86,7 @@ int main(int argc, char **argv) {
         if (!url.isEmpty()) workspace->openFile(url);
         return created;
     };
-    auto *window=createWindow({},0);
+    auto *window=createWindow({},-1,0);
     if (!window) return 1;
     const auto files = parser.positionalArguments();
     if (!files.isEmpty()) {

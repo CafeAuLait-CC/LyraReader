@@ -12,8 +12,24 @@
 #include <QDesktopServices>
 #include <QCryptographicHash>
 #include <QSaveFile>
+#include <cmath>
 
 namespace {
+QSet<WorkspaceController *> &workspaces() {static QSet<WorkspaceController *> all;return all;}
+QVariantList normalizedRecents(const QVariantList &entries) {
+    QVariantList result;QSet<QString> seen;
+    for(const auto &value:entries) {
+        const auto entry=value.toMap();const QUrl url(entry.value(QStringLiteral("url")).toString());
+        if(!url.isLocalFile())continue;
+        const QFileInfo file(url.toLocalFile());const auto normalized=QUrl::fromLocalFile(file.absoluteFilePath()).toString();
+        if(seen.contains(normalized))continue;
+        seen.insert(normalized);
+        const auto title=entry.value(QStringLiteral("title")).toString();
+        result.append(QVariantMap{{QStringLiteral("url"),normalized},{QStringLiteral("title"),title.isEmpty()?file.fileName():title}});
+        if(result.size()==20)break;
+    }
+    return result;
+}
 QString positionKey(const ReaderController *reader) {
     return QStringLiteral("reader/positions/") + QString::fromLatin1(QCryptographicHash::hash(
         reader->fileUrl().toEncoded(), QCryptographicHash::Sha256).toHex());
@@ -24,8 +40,18 @@ WorkspaceController::WorkspaceController(QObject *parent) : QObject(parent) {
     connect(m_preview,&PreviewController::newWindowRequested,this,&WorkspaceController::openInNewWindow);
     connect(m_preview,&PreviewController::externalRequested,this,&WorkspaceController::openExternal);
     QSettings settings;
-    m_recent = settings.value(QStringLiteral("reader/recentDocuments")).toList();
+    m_recent = normalizedRecents(settings.value(QStringLiteral("reader/recentDocuments")).toList());
+    workspaces().insert(this);
     appendTab();
+}
+WorkspaceController::~WorkspaceController() {workspaces().remove(this);}
+void WorkspaceController::publishRecents(const QVariantList &entries) {
+    // Signals can close another window; never keep an unguarded raw pointer across one.
+    QList<QPointer<WorkspaceController>> recipients;
+    for(auto *workspace:workspaces())recipients.append(workspace);
+    for(const auto &workspace:recipients)if(workspace && workspace->m_recent!=entries) {
+        workspace->m_recent=entries;emit workspace->recentDocumentsChanged();
+    }
 }
 ReaderController *WorkspaceController::appendTab() {
     auto *reader = new ReaderController(this);
@@ -97,7 +123,7 @@ void WorkspaceController::closeTab(int index, bool discardPending) {
     emit tabsChanged();
     emit activeReaderChanged();
 }
-void WorkspaceController::openInNewWindow(const QUrl &url, int page) { emit newWindowRequested(url,page); }
+void WorkspaceController::openInNewWindow(const QUrl &url,int page,double y) {emit newWindowRequested(url,page,std::isfinite(y)?qMax(0.0,y):0.0);}
 QVariantMap WorkspaceController::viewState(ReaderController *reader) const {
     if (m_views.contains(reader)) return m_views.value(reader);
     QSettings settings;
@@ -112,22 +138,22 @@ void WorkspaceController::saveViewState(ReaderController *reader, const QVariant
     }
 }
 void WorkspaceController::remember(ReaderController *reader) {
+    QSettings settings;
+    auto entries=normalizedRecents(settings.value(QStringLiteral("reader/recentDocuments")).toList());
     const auto url = reader->fileUrl().toString();
-    for (auto it=m_recent.begin();it!=m_recent.end();) {
-        if (it->toMap().value(QStringLiteral("url")).toString()==url) it=m_recent.erase(it);
+    for (auto it=entries.begin();it!=entries.end();) {
+        if (it->toMap().value(QStringLiteral("url")).toString()==url) it=entries.erase(it);
         else ++it;
     }
-    m_recent.prepend(QVariantMap{{QStringLiteral("url"),url},{QStringLiteral("title"),reader->title()}});
-    while (m_recent.size()>20) m_recent.removeLast();
-    QSettings settings;
-    settings.setValue(QStringLiteral("reader/recentDocuments"),m_recent);
-    emit recentDocumentsChanged();
+    entries.prepend(QVariantMap{{QStringLiteral("url"),url},{QStringLiteral("title"),reader->title()}});
+    while (entries.size()>20) entries.removeLast();
+    settings.setValue(QStringLiteral("reader/recentDocuments"),entries);
+    publishRecents(entries);
 }
 void WorkspaceController::clearRecentDocuments() {
-    m_recent.clear();
     QSettings settings;
     settings.remove(QStringLiteral("reader/recentDocuments"));
-    emit recentDocumentsChanged();
+    publishRecents({});
 }
 void WorkspaceController::copyText(const QString &text) { QGuiApplication::clipboard()->setText(text); }
 void WorkspaceController::openExternal(const QUrl &url) {
