@@ -906,8 +906,10 @@ private slots:
         QCOMPARE(preview->model().value("page").toInt(),1); // The bibliography, not the source citation page.
         for(const auto &entry:preview->model().value("entries").toList())QVERIFY(!entry.toMap().value("text").toString().isEmpty());
         QCOMPARE(window->property("pageList").value<QObject *>()->property("contentY").toDouble(),offset);
+        auto *status=window->findChild<QObject *>("operationStatusLabel");QVERIFY(status);window->setProperty("operationStatus","Earlier export completed");
         preview->togglePin();const auto pinned=preview->model();preview->openAt(reader,0,10,10,100,100,1);QCOMPARE(preview->model(),pinned);
-        preview->togglePin();preview->showEntry(0);
+        QVERIFY(status->property("text").toString().contains("pinned"));QCOMPARE(window->property("operationStatus").toString(),QString("Earlier export completed"));
+        preview->togglePin();QCOMPARE(status->property("text").toString(),QString("Earlier export completed"));preview->showEntry(0);
         const auto ready=[&] {const auto *image=visualItem(window->contentItem(),"referencePreviewImage");return image && image->property("status").toInt()==1;};
         QTRY_VERIFY_WITH_TIMEOUT(ready(),10000);
         const auto cropFrame=window->grabWindow();auto *crop=visualItem(window->contentItem(),"referencePreviewImage");QVERIFY(crop);

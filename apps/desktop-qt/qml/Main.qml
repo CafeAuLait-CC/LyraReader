@@ -101,6 +101,7 @@ ApplicationWindow {
     readonly property string bibtex: currentReader.data.bibtex || (currentReader.data.metadata ? currentReader.data.metadata.bibtex : "")
     property var metadataDraft: null
     property string operationStatus: ""
+    property string previewStatus: ""
     onAppearanceChanged: if (session)
         session.setPreference("appearance", appearance)
     onCurrentReaderChanged: {
@@ -441,8 +442,11 @@ ApplicationWindow {
     }
     Connections {
         target: root.previewController
+        function onChanged() {
+            root.previewStatus = "";
+        }
         function onStatusMessage(message) {
-            root.operationStatus = message;
+            root.previewStatus = message;
         }
         function onNavigateRequested(page, y) {
             root.jumpFromPreview(page, y);
@@ -1328,7 +1332,8 @@ ApplicationWindow {
             }
             Label {
                 textFormat: Text.PlainText
-                text: root.operationStatus
+                objectName: "operationStatusLabel"
+                text: root.previewStatus || root.operationStatus
                 elide: Text.ElideMiddle
                 Layout.maximumWidth: Math.max(100, root.width / 3)
                 color: root.colors.textSecondary
