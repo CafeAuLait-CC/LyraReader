@@ -1,4 +1,9 @@
 #include "ReaderController.h"
+#include "NativeRaster.h"
+#include "RasterCache.h"
+#include <QUuid>
+#include <QLineF>
+#include <algorithm>
 #include <QElapsedTimer>
 #include <QFileInfo>
 #include <QFutureWatcher>
@@ -40,6 +45,7 @@ QString takeError(LyraReaderBuffer &buffer) {
 }
 struct OpenResult {
     std::shared_ptr<LyraReaderDesktopDocument> document;
+    std::shared_ptr<NativeRasterSource> source;
     QVariantList pages;
     double width = 0;
     double height = 0;
@@ -47,15 +53,13 @@ struct OpenResult {
     QString error;
 };
 struct RasterResult { QImage image; QString error; double actualScale = 0; qint64 elapsedMs = 0; };
-struct CommandResult { QVariant result; QString error; };
-void releasePixels(void *info) {
-    auto *buffer = static_cast<LyraReaderBuffer *>(info);
-    lyra_reader_desktop_buffer_free(*buffer);
-    delete buffer;
-}
+struct CommandResult { QVariant result; QString error; std::shared_ptr<NativeRasterSource> source; };
 }
 
-ReaderController::ReaderController(QObject *parent) : QObject(parent),m_mutations(std::make_shared<CommandQueue>()) {}
+ReaderController::ReaderController(QObject *parent) : QObject(parent),m_cachePrefix(QUuid::createUuid().toString()+QLatin1Char('/')),m_mutations(std::make_shared<CommandQueue>()) {}
+ReaderController::~ReaderController(){clearRasterCache();}
+void ReaderController::clearRasterCache(){RasterCache::clearPrefix(m_cachePrefix);m_tileDemand.clear();}
+int ReaderController::cpuCacheKiB(){return RasterCache::costKiB();}
 
 void ReaderController::setError(const QString &error) {
     if (m_error == error) return;
@@ -72,9 +76,9 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
     }
     m_lastUrl = url;
     const auto generation = ++m_generation;
-    m_document.reset();
+    m_document.reset();m_source.reset();
     m_pages.clear();
-    m_cache.clear();
+    clearRasterCache();
     m_pending.clear();
     m_failed.clear();
     m_requests.clear();
@@ -104,7 +108,7 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
             emit openFinished(false);
             return;
         }
-        m_document = std::move(result.document);
+        m_document = std::move(result.document);m_source=std::move(result.source);
         m_pages = std::move(result.pages);
         m_data.insert(QStringLiteral("signature_status"),result.signature);emit dataChanged();
         m_documentWidth = result.width;
@@ -139,6 +143,7 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
         result.width = object.value(QStringLiteral("width")).toDouble();
         result.height = object.value(QStringLiteral("height")).toDouble();
         result.signature = object.value(QStringLiteral("signature_status")).toObject().toVariantMap();
+        result.source=NativeRasterSource::prepare(result.document,false,&result.error);
         return result;
     }));
 }
@@ -178,9 +183,10 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         if(latestOnly && m_latestRead.value(operation)!=id)return;
         if (!outcome.error.isEmpty()) setError(outcome.error);
         else if (operation==QStringLiteral("page_stage") || operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo") || operation==QStringLiteral("page_discard") || operation==QStringLiteral("page_apply")) {
+            m_source=outcome.source;
             const auto revision=outcome.result.toMap();
             const auto info=revision.value(QStringLiteral("info")).toMap();
-            ++m_generation;m_cache.clear();m_pending.clear();m_failed.clear();m_requests.clear();m_textPages.clear();m_textPending.clear();
+            ++m_generation;clearRasterCache();m_pending.clear();m_failed.clear();m_requests.clear();m_textPages.clear();m_textPending.clear();
             m_pages=info.value(QStringLiteral("pages")).toList();m_documentWidth=info.value(QStringLiteral("width")).toDouble();m_documentHeight=info.value(QStringLiteral("height")).toDouble();
             m_data.clear();m_data.insert(QStringLiteral("marks"),revision.value(QStringLiteral("marks")));m_data.insert(QStringLiteral("signature_status"),info.value(QStringLiteral("signature_status")));
             emit documentReset();emit documentChanged();emit dataChanged();emit textPagesChanged();
@@ -210,7 +216,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         }
         emit commandFinished(id, operation, outcome.result, outcome.error);
     });
-    auto task=[document,bytes] {
+    auto task=[document,bytes,operation] {
         CommandResult result;
         LyraReaderBuffer output{}, error{};
         if (!lyra_reader_desktop_command(document.get(), reinterpret_cast<const std::uint8_t *>(bytes.constData()), bytes.size(), &output, &error)) {
@@ -223,6 +229,8 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         if (parseError.error != QJsonParseError::NoError || !json.isObject())
             result.error = QStringLiteral("The document service returned an invalid response.");
         else result.result = json.object().value(QStringLiteral("result")).toVariant();
+        if(result.error.isEmpty() && (operation==QStringLiteral("page_stage") || operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo") || operation==QStringLiteral("page_discard") || operation==QStringLiteral("page_apply")))
+            result.source=NativeRasterSource::prepare(document,false,&result.error);
         return result;
     };
     if(mutation){
@@ -254,74 +262,80 @@ QString ReaderController::rasterKey(int page, double scale,bool embedded) {
     return QString::number(page) + QLatin1Char(':') + QString::number(int(std::ceil(scale * 8)))+(embedded?QStringLiteral(":annotations"):QString{});
 }
 
-QImage ReaderController::cachedPage(int page, double scale,bool embedded) const {
-    if (auto *image = m_cache.object(rasterKey(page, scale,embedded))) return *image;
-    return {};
+QImage ReaderController::cachedPage(int page,double scale,bool embedded) const {
+    return RasterCache::get(m_cachePrefix+rasterKey(page,scale,embedded));
 }
-
-void ReaderController::requestPage(int page, double scale,bool embedded) {
-    if (!m_document || page < 0 || page >= pageCount() || !std::isfinite(scale) || scale <= 0) return;
-    scale = std::ceil(scale * 8) / 8.0;
-    const auto key = rasterKey(page, scale,embedded);
-    if (m_cache.contains(key) || m_pending.contains(key) || m_failed.contains(key)) return;
-    // The canvas and thumbnails can need different densities of the same page.
-    // Keep both requests; visible items retry if a very fast jump displaces their work.
-    while (m_requests.size() >= 32) { m_pending.remove(m_requests.last().key); m_requests.removeLast(); }
-    m_pending.insert(key);
-    auto position = m_requests.begin();
-    while (position != m_requests.end() && position->scale >= scale) ++position;
-    m_requests.insert(position, {page, scale, key,embedded});
-    startNextRaster();
+QImage ReaderController::cachedTile(const QString &key)const{return RasterCache::get(m_cachePrefix+key);}
+double ReaderController::tileScale(int level){return std::exp2(double(level)/4.0);}
+void ReaderController::enqueue(const Request &request) {
+    if(RasterCache::contains(m_cachePrefix+request.key) || m_pending.contains(request.key) || m_failed.contains(request.key))return;
+    while(m_requests.size()>=128){m_pending.remove(m_requests.last().key);m_requests.removeLast();}
+    m_pending.insert(request.key);
+    auto position=m_requests.begin();while(position!=m_requests.end() && position->priority>=request.priority)++position;
+    m_requests.insert(position,request);
 }
-
+void ReaderController::requestPage(int page,double scale,bool embedded) {
+    if(!m_source || page<0 || page>=pageCount() || !std::isfinite(scale) || scale<=0 || scale>128)return;
+    scale=std::ceil(scale*8)/8.0;const auto dimensions=m_pages.at(page).toMap();
+    const QRectF region(0,0,dimensions.value(QStringLiteral("width")).toDouble(),dimensions.value(QStringLiteral("height")).toDouble());
+    enqueue({page,scale,rasterKey(page,scale,embedded),embedded,false,region,embedded?0:2});startNextRaster();
+}
+void ReaderController::pruneTileRequests() {
+    QSet<QString> wanted;for(const auto &keys:m_tileDemand)wanted.unite(keys);
+    for(auto it=m_requests.begin();it!=m_requests.end();) {
+        if(it->tile && !wanted.contains(it->key)){m_pending.remove(it->key);it=m_requests.erase(it);}else ++it;
+    }
+}
+void ReaderController::clearTileDemand(quintptr consumer){m_tileDemand.remove(consumer);pruneTileRequests();}
+QList<TileSpec> ReaderController::requestTiles(quintptr consumer,int page,int level,const QRectF &visible,const QSet<QString> &retained) {
+    if(!m_source || page<0 || page>=pageCount() || visible.isEmpty() || !std::isfinite(visible.x()) || !std::isfinite(visible.y()) || !std::isfinite(visible.width()) || !std::isfinite(visible.height())){clearTileDemand(consumer);return {};}
+    const auto dimensions=m_pages.at(page).toMap();
+    const QRectF full(0,0,dimensions.value(QStringLiteral("width")).toDouble(),dimensions.value(QStringLiteral("height")).toDouble());
+    const auto view=visible.intersected(full);if(view.isEmpty()){clearTileDemand(consumer);return {};}
+    level=qBound(-24,level,28);
+    // Quarter-octave density tiers limit oversampling to 1.42x the visible pixel area.
+    // Very large displays lower one tier if needed to keep this page's demand bounded.
+    while(level>-24){const double edge=512/tileScale(level);const auto count=(std::ceil(view.right()/edge)-std::floor(view.left()/edge))*(std::ceil(view.bottom()/edge)-std::floor(view.top()/edge));if(count<=96)break;--level;}
+    const double scale=tileScale(level),edge=512/scale;
+    if(!std::isfinite(full.width()) || !std::isfinite(full.height()) || full.width()/edge>2147483645.0 || full.height()/edge>2147483645.0){clearTileDemand(consumer);return {};}
+    const int left=qMax(0,int(std::floor(view.left()/edge))),top=qMax(0,int(std::floor(view.top()/edge)));
+    const int right=qMin(int(std::ceil(full.width()/edge)),int(std::ceil(view.right()/edge)));
+    const int bottom=qMin(int(std::ceil(full.height()/edge)),int(std::ceil(view.bottom()/edge)));
+    QList<TileSpec> result;
+    for(int row=top;row<bottom;++row)for(int column=left;column<right;++column){
+        const auto target=QRectF(column*edge,row*edge,edge,edge).intersected(full);
+        const auto render=target.adjusted(-1/scale,-1/scale,1/scale,1/scale).intersected(full);
+        const auto key=QStringLiteral("tile:%1:%2:%3:%4").arg(page).arg(level).arg(column).arg(row);
+        result.append({key,page,level,column,row,scale,target,render});
+    }
+    std::sort(result.begin(),result.end(),[&](const auto &a,const auto &b){return QLineF(a.target.center(),view.center()).length()<QLineF(b.target.center(),view.center()).length();});
+    QSet<QString> wanted;for(const auto &tile:result)wanted.insert(tile.key);
+    m_tileDemand.insert(consumer,wanted);pruneTileRequests();
+    for(const auto &tile:result)if(!retained.contains(tile.key))enqueue({page,scale,tile.key,false,true,tile.render,1});
+    startNextRaster();return result;
+}
 void ReaderController::startNextRaster() {
-    if (m_rendering || m_requests.isEmpty() || !m_document) return;
-    const auto request = m_requests.takeFirst();
-    const auto generation = m_generation;
-    const auto document = m_document;
-    m_rendering = true;
-    auto *watcher = new QFutureWatcher<RasterResult>(this);
-    connect(watcher, &QFutureWatcher<RasterResult>::finished, this, [this, watcher, request, generation] {
-        auto result = watcher->result();
-        watcher->deleteLater();
-        m_rendering = false;
-        if (generation != m_generation) {
-            ++m_discarded;
-        } else {
+    if(m_rendering || m_requests.isEmpty() || !m_source)return;
+    const auto request=m_requests.takeFirst();const auto generation=m_generation;const auto source=m_source;
+    m_rendering=true;
+    auto *watcher=new QFutureWatcher<RasterResult>(this);
+    connect(watcher,&QFutureWatcher<RasterResult>::finished,this,[this,watcher,request,generation]{
+        auto result=watcher->result();watcher->deleteLater();m_rendering=false;
+        if(generation!=m_generation){++m_discarded;}
+        else {
             m_pending.remove(request.key);
-            if (result.image.isNull()) {
-                m_failed.insert(request.key);
-                setError(result.error);
-            } else {
-                const int cost = int((result.image.sizeInBytes() + 1023) / 1024);
-                m_cache.insert(request.key, new QImage(result.image), cost);
-                ++m_completed;
-                qInfo().nospace() << "lyra-reader-qt-raster: page=" << request.page << " requested=" << request.scale
-                    << " actual=" << result.actualScale << " bytes=" << result.image.sizeInBytes()
-                    << " ms=" << result.elapsedMs << " cpu-cache-kib=" << m_cache.totalCost();
-                emit pageReady(request.page, request.scale);
+            if(result.image.isNull()){m_failed.insert(request.key);setError(result.error);}
+            else {
+                RasterCache::put(m_cachePrefix+request.key,result.image);++m_completed;
+                if(request.tile)emit tileReady(request.page);
+                else {qInfo().nospace()<<"lyra-reader-qt-raster: page="<<request.page<<" requested="<<request.scale<<" actual="<<result.actualScale<<" bytes="<<result.image.sizeInBytes()<<" ms="<<result.elapsedMs<<" global-cache-kib="<<RasterCache::costKiB();emit pageReady(request.page,request.scale);}
             }
         }
-        emit statisticsChanged();
-        startNextRaster();
+        emit statisticsChanged();startNextRaster();
     });
-    watcher->setFuture(QtConcurrent::run([document, request] {
-        RasterResult result;
-        QElapsedTimer timer;
-        timer.start();
-        LyraReaderBitmap bitmap{};
-        LyraReaderBuffer error{};
-        const auto render=request.embedded ? lyra_reader_desktop_render_annotated : lyra_reader_desktop_render;
-        if (!render(document.get(), std::uint32_t(request.page), request.scale, &bitmap, &error)) {
-            result.error = takeError(error);
-            return result;
-        }
-        result.actualScale = bitmap.scale;
-        // QImage shares the Rust allocation and releases it using the same allocator.
-        // No BGRA->RGBA conversion or extra full-page CPU copy on this boundary.
-        result.image = QImage(bitmap.pixels.data, int(bitmap.width), int(bitmap.height), bitmap.stride,
-            QImage::Format_ARGB32_Premultiplied, releasePixels, new LyraReaderBuffer(bitmap.pixels));
-        result.elapsedMs = timer.elapsed();
-        return result;
+    watcher->setFuture(QtConcurrent::run([source,request]{
+        RasterResult result;QElapsedTimer timer;timer.start();
+        result.image=source->crop(request.page,request.region,request.scale,request.embedded,false,&result.error,&result.actualScale);
+        result.elapsedMs=timer.elapsed();return result;
     }));
 }

@@ -72,6 +72,8 @@ Item {
                         controller: app.currentReader
                         pageIndex: sheet.modelData.index
                         rasterScale: app.zoom
+                        tilesEnabled: true
+                        visibleRegion: Qt.rect((pageList.contentX - sheet.x) / app.zoom, (pageList.contentY - sheet.modelData.top * app.zoom) / app.zoom, pageList.width / app.zoom, pageList.height / app.zoom)
                         Accessible.role: Accessible.Graphic
                         Accessible.name: qsTr("PDF page %1").arg(sheet.modelData.index + 1)
                     }

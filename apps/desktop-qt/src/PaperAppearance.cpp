@@ -113,9 +113,9 @@ QSGNode *PaperAppearance::createNode(QQuickWindow *window,const QImage &source,i
     node->paint.setFiltering(QSGTexture::Linear);
     return node;
 }
-void PaperAppearance::updateNode(QSGNode *base,const QRectF &bounds,int mode) {
+void PaperAppearance::updateNode(QSGNode *base,const QRectF &bounds,int mode,const QRectF &sourceRect) {
     auto *node=static_cast<PaperNode *>(base);
-    QSGGeometry::updateTexturedRectGeometry(&node->vertices,bounds,QRectF(0,0,1,1));
+    QSGGeometry::updateTexturedRectGeometry(&node->vertices,bounds,sourceRect);
     node->markDirty(QSGNode::DirtyGeometry);
     if(node->paint.appearance!=mode) {
         node->paint.appearance=mode;

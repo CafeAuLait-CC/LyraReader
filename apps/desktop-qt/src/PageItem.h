@@ -12,41 +12,54 @@ class PageItem : public QQuickItem {
     Q_PROPERTY(QString paperAppearance READ paperAppearance WRITE setPaperAppearance NOTIFY paperAppearanceChanged)
     Q_PROPERTY(bool loaded READ loaded NOTIFY loadedChanged)
     Q_PROPERTY(bool embeddedAnnotations READ embeddedAnnotations WRITE setEmbeddedAnnotations NOTIFY embeddedAnnotationsChanged)
+    Q_PROPERTY(bool tilesEnabled READ tilesEnabled WRITE setTilesEnabled NOTIFY tilesEnabledChanged)
+    Q_PROPERTY(QRectF visibleRegion READ visibleRegion WRITE setVisibleRegion NOTIFY visibleRegionChanged)
+    Q_PROPERTY(bool refined READ refined NOTIFY refinementChanged)
+    Q_PROPERTY(int loadedTileCount READ loadedTileCount NOTIFY refinementChanged)
 public:
-    explicit PageItem(QQuickItem *parent = nullptr);
-    ReaderController *controller() const { return m_controller; }
-    int pageIndex() const { return m_page; }
-    double rasterScale() const { return m_scale; }
-    QString paperAppearance() const { return m_paperAppearance; }
-    void setPaperAppearance(const QString &appearance) { if(m_paperAppearance==appearance)return; m_paperAppearance=appearance; update(); emit paperAppearanceChanged(); }
-    bool loaded() const { return !m_image.isNull(); }
-    bool embeddedAnnotations()const{return m_embedded;}
+    explicit PageItem(QQuickItem *parent=nullptr);
+    ~PageItem() override;
+    ReaderController *controller() const {return m_controller;}
+    int pageIndex() const {return m_page;}
+    double rasterScale() const {return m_scale;}
+    QString paperAppearance() const {return m_paperAppearance;}
+    bool loaded() const {return !m_image.isNull() || !m_tileImages.isEmpty();}
+    bool refined() const {return m_refined;}
+    int loadedTileCount() const {return int(m_tileImages.size());}
+    bool embeddedAnnotations() const {return m_embedded;}
+    bool tilesEnabled() const {return m_tilesEnabled;}
+    QRectF visibleRegion() const {return m_visibleRegion;}
     void setController(ReaderController *controller);
     void setPageIndex(int page);
     void setRasterScale(double scale);
-    void setEmbeddedAnnotations(bool enabled){if(m_embedded==enabled)return;m_embedded=enabled;m_image={};m_dirty=true;m_requestTimer.start();update();emit embeddedAnnotationsChanged();}
+    void setPaperAppearance(const QString &appearance);
+    void setEmbeddedAnnotations(bool enabled);
+    void setTilesEnabled(bool enabled);
+    void setVisibleRegion(const QRectF &region);
 signals:
-    void controllerChanged();
-    void pageIndexChanged();
-    void rasterScaleChanged();
-    void loadedChanged();
-    void paperAppearanceChanged();
-    void embeddedAnnotationsChanged();
+    void controllerChanged();void pageIndexChanged();void rasterScaleChanged();void loadedChanged();
+    void paperAppearanceChanged();void embeddedAnnotationsChanged();void tilesEnabledChanged();
+    void visibleRegionChanged();void refinementChanged();
 protected:
-    QSGNode *updatePaintNode(QSGNode *node, UpdatePaintNodeData *) override;
-    void itemChange(ItemChange change, const ItemChangeData &data) override;
+    QSGNode *updatePaintNode(QSGNode *node,UpdatePaintNodeData *) override;
+    void itemChange(ItemChange change,const ItemChangeData &data) override;
 private:
     double effectiveScale() const;
+    double fallbackScale() const;
+    bool needsTiles() const;
+    void resetImages();
     void request();
     void refresh();
+    void setRefined(bool value);
     QPointer<ReaderController> m_controller;
-    int m_page = -1;
-    double m_scale = 1;
-    double m_lastDeviceScale = 0;
+    QVector<QMetaObject::Connection> m_connections;
+    int m_page=-1,m_level=-1000;
+    double m_scale=1,m_lastDeviceScale=0;
     QImage m_image;
+    QList<TileSpec> m_tiles,m_previousTiles;
+    QHash<QString,QImage> m_tileImages,m_previousImages;
+    QRectF m_visibleRegion;
     QString m_paperAppearance=QStringLiteral("original");
-    int m_uploadedAppearance=-1;
-    bool m_dirty = true;
-    bool m_embedded = false;
+    bool m_embedded=false,m_tilesEnabled=false,m_refined=false,m_demandCurrent=false;
     QTimer m_requestTimer;
 };

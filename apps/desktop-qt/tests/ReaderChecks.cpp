@@ -59,7 +59,7 @@ private slots:
         const auto before = reader.completedRasters();
         QVERIFY(QMetaObject::invokeMethod(window, "zoomBy", Q_ARG(QVariant, 1.2)));
         QTRY_VERIFY_WITH_TIMEOUT(reader.completedRasters() > before, 10000);
-        QTRY_VERIFY_WITH_TIMEOUT(!reader.cachedPage(0,window->property("zoom").toDouble()*window->effectiveDevicePixelRatio()).isNull(),10000);
+        QTRY_VERIFY_WITH_TIMEOUT(visualItem(window->contentItem(),"pdfPage0") && visualItem(window->contentItem(),"pdfPage0")->property("refined").toBool(),10000);
         QTRY_COMPARE_WITH_TIMEOUT(reader.pendingRasters(),0,10000);
         QTest::qWait(150); // Give the scene graph time to replace its first texture.
         const auto frame = window->grabWindow();
@@ -235,6 +235,50 @@ private slots:
         bool ink=false,yellow=false;
         for(int y=0;y<raster.height();++y)for(int x=0;x<raster.width();++x){const auto c=raster.pixelColor(x,y);if(c.red()<80&&c.green()<80&&c.blue()<80)ink=true;if(c.red()>180&&c.green()>180&&c.blue()<180)yellow=true;}
         QVERIFY(ink);QVERIFY(yellow);
+    }
+    void deepZoomRefinesVisibleTilesWithoutSeamsAndSharesTheCacheBudget() {
+        ReaderController reader;QQmlApplicationEngine engine;
+        engine.addImageProvider("lyrapreview",new NativeImageProvider);
+        engine.rootContext()->setContextProperty("reader",&reader);engine.load(QUrl("qrc:/qml/Main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        reader.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/alpha-crop.pdf"));
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QTest::qWait(150); // Let the initial layout and saved-position restore finish.
+        auto *view=window->findChild<QObject *>("pageList");QVERIFY(view);
+        window->setProperty("fitting",false);
+        QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,3.7),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+        QTest::qWait(100);
+        view->setProperty("contentX",1200.0);view->setProperty("contentY",640.0);
+        QTRY_COMPARE(view->property("contentX").toDouble(),1200.0);
+        const auto refined=[&] {const auto *page=visualItem(window->contentItem(),"pdfPage0");return page && page->property("refined").toBool() && page->property("loadedTileCount").toInt()>0;};
+        QTRY_VERIFY_WITH_TIMEOUT(refined(),10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingRasters(),0,10000);QTest::qWait(100);
+        auto *page=visualItem(window->contentItem(),"pdfPage0");QVERIFY(page);
+        const double zoom=window->property("zoom").toDouble();
+        const double native=zoom*window->effectiveDevicePixelRatio();const int level=int(std::ceil(std::log2(native)*4));
+        const auto tiles=reader.requestTiles(1,0,level,QRectF(400,180,130,70),{});QVERIFY(!tiles.isEmpty());
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingRasters(),0,10000);
+        // One sample border per edge; irrational density tiers may ceil one extra pixel.
+        for(const auto &tile:tiles){const auto image=reader.cachedTile(tile.key);QVERIFY(!image.isNull());QVERIFY(image.width()<=515 && image.height()<=515);QVERIFY(image.sizeInBytes()<=515*515*4);QVERIFY(tile.scale>=native);}
+        reader.clearTileDemand(1);
+        const auto checkBlack=[&](const QImage &frame,const QColor &expected) {
+            const double sx=double(frame.width())/window->width(),sy=double(frame.height())/window->height();
+            int count=0;
+            for(int x=416;x<=520;x+=2){const auto p=page->mapToScene(QPointF(x*zoom,200*zoom));const int px=qRound(p.x()*sx),py=qRound(p.y()*sy);if(px<0 || py<0 || px>=frame.width() || py>=frame.height())continue;const auto color=frame.pixelColor(px,py);if(qAbs(color.red()-expected.red())>3 || qAbs(color.green()-expected.green())>3 || qAbs(color.blue()-expected.blue())>3)return false;++count;}
+            return count>=10;
+        };
+        const auto original=window->grabWindow();QVERIFY2(checkBlack(original,QColor(0,0,0)),"The black patch must stay solid across tile boundaries");
+        const auto completed=reader.completedRasters();window->setProperty("paperAppearance","night");QTest::qWait(150);
+        QVERIFY(checkBlack(window->grabWindow(),QColor(201,197,189)));QCOMPARE(reader.completedRasters(),completed);
+        for(int i=0;i<8;++i){view->setProperty("contentX",double(i*80));view->setProperty("contentY",double(500+i*100));}
+        QTRY_VERIFY_WITH_TIMEOUT(refined(),10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingRasters(),0,10000);
+        QVERIFY(ReaderController::cpuCacheKiB()<=96*1024);
+        ReaderController another,third;
+        const auto longPdf=QUrl::fromLocalFile(QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf");
+        another.openFile(longPdf);third.openFile(longPdf);QTRY_COMPARE_WITH_TIMEOUT(another.pageCount(),9,10000);QTRY_COMPARE_WITH_TIMEOUT(third.pageCount(),9,10000);
+        for(int i=0;i<9;++i){another.requestPage(i,4);third.requestPage(i,4);}
+        QTRY_COMPARE_WITH_TIMEOUT(another.pendingRasters(),0,15000);QTRY_COMPARE_WITH_TIMEOUT(third.pendingRasters(),0,15000);
+        QVERIFY(ReaderController::cpuCacheKiB()<=96*1024);QVERIFY(refined());
+        const auto snapshots=qEnvironmentVariable("LYRA_READER_CHECK_SNAPSHOTS");if(!snapshots.isEmpty())QVERIFY(window->grabWindow().save(snapshots+"/lyrareader-deep-zoom.png"));
     }
     void referencesFiguresAndSectionsUseRealAsynchronousPreviews() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());

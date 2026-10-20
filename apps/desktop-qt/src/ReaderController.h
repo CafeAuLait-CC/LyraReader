@@ -1,6 +1,6 @@
 #pragma once
 #include "lyra_reader_desktop.h"
-#include <QCache>
+#include <QRectF>
 #include <QImage>
 #include <QObject>
 #include <QSet>
@@ -8,6 +8,13 @@
 #include <QVariantList>
 #include <memory>
 class CommandQueue;
+class NativeRasterSource;
+struct TileSpec {
+    QString key;
+    int page=0,level=0,column=0,row=0;
+    double scale=1;
+    QRectF target,render;
+};
 
 // One controller per tab; windows own independent sets of tabs.
 class ReaderController : public QObject {
@@ -30,6 +37,7 @@ class ReaderController : public QObject {
     Q_PROPERTY(int pendingRasters READ pendingRasters NOTIFY statisticsChanged)
 public:
     explicit ReaderController(QObject *parent = nullptr);
+    ~ReaderController() override;
     QVariantList pages() const { return m_pages; }
     int pageCount() const { return int(m_pages.size()); }
     double documentWidth() const { return m_documentWidth; }
@@ -59,6 +67,11 @@ public:
     std::shared_ptr<LyraReaderDesktopDocument> documentHandle()const{return m_document;}
     void requestPage(int page, double scale,bool embedded=false);
     QImage cachedPage(int page, double scale,bool embedded=false) const;
+    QList<TileSpec> requestTiles(quintptr consumer,int page,int level,const QRectF &visible,const QSet<QString> &retained);
+    void clearTileDemand(quintptr consumer);
+    QImage cachedTile(const QString &key)const;
+    static double tileScale(int level);
+    static int cpuCacheKiB();
     static QString rasterKey(int page, double scale,bool embedded=false);
 signals:
     void documentChanged();
@@ -68,6 +81,7 @@ signals:
     void passwordRequiredChanged();
     void statisticsChanged();
     void pageReady(int page, double scale);
+    void tileReady(int page);
     void openFinished(bool success);
     void commandFinished(quint64 id, const QString &operation, const QVariant &result, const QString &error);
     void dataChanged();
@@ -75,10 +89,16 @@ signals:
     void textPagesChanged();
     void commandsChanged();
 private:
-    struct Request { int page; double scale; QString key; bool embedded; };
+    struct Request { int page; double scale; QString key; bool embedded=false; bool tile=false; QRectF region; int priority=0; };
+    void enqueue(const Request &request);
+    void pruneTileRequests();
+    void clearRasterCache();
     void startNextRaster();
     void setError(const QString &error);
     std::shared_ptr<LyraReaderDesktopDocument> m_document;
+    std::shared_ptr<NativeRasterSource> m_source;
+    QString m_cachePrefix;
+    QHash<quintptr,QSet<QString>> m_tileDemand;
     QUrl m_lastUrl;
     QVariantList m_pages;
     double m_documentWidth = 0;
@@ -97,8 +117,7 @@ private:
     bool m_rendering = false;
     quint64 m_generation = 0;
     qulonglong m_completed = 0, m_discarded = 0;
-    // KiB, CPU raster cache only. Visible items can retain a shared image after LRU eviction.
-    QCache<QString, QImage> m_cache{48 * 1024};
+    // Whole pages and bounded tiles share the process-wide 96 MiB CPU LRU.
     QSet<QString> m_pending, m_failed;
     QList<Request> m_requests;
 };
