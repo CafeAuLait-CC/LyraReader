@@ -835,6 +835,10 @@ ApplicationWindow {
     function eraseAlong(page, start, end) {
         if (!eraserToken.length || eraserFinishing)
             return;
+        // Release at the last sampled point adds no swept area. Avoid a redundant circle
+        // changing a fractional cut boundary through a second numerical intersection.
+        if (Math.abs(start.x - end.x) < 1e-9 && Math.abs(start.y - end.y) < 1e-9)
+            return;
         if (eraserQueue.length >= 4096) {
             cancelErase();
             operationStatus = qsTr("The eraser is busy. Try a shorter stroke; no cut was saved.");
