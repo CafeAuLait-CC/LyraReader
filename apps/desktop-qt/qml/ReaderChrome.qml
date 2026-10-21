@@ -187,8 +187,7 @@ ColumnLayout {
                     text: qsTr("Actual Size")
                     enabled: !app.textViewVisible
                     onTriggered: {
-                        app.fitting = false;
-                        app.changeZoom(1, 0, 0);
+                        app.actualSize();
                     }
                 }
                 MenuItem {
@@ -204,7 +203,7 @@ ColumnLayout {
                 onClicked: app.zoomBy(1 / 1.2)
             }
             ToolButton {
-                text: Math.round((app.textViewVisible ? app.textViewZoom : app.zoom) * 100) + (app.textViewVisible ? "%" : "% ▾")
+                text: Math.round((app.textViewVisible ? app.textViewZoom * 100 : app.zoomPercent)) + (app.textViewVisible ? "%" : "% ▾")
                 Layout.preferredWidth: 72
                 Layout.minimumWidth: 72
                 onClicked: zoomMenu.popup(0, height)
@@ -215,13 +214,16 @@ ColumnLayout {
                 MenuItem {
                     text: qsTr("Actual Size (100%)")
                     onTriggered: {
-                        app.fitting = false;
-                        app.changeZoom(1, 0, 0);
+                        app.actualSize();
                     }
                 }
                 MenuItem {
                     text: qsTr("Fit Width")
                     onTriggered: app.fitWidth()
+                }
+                MenuItem {
+                    text: qsTr("Fit Page")
+                    onTriggered: app.fitPage()
                 }
             }
             LyraToolButton {

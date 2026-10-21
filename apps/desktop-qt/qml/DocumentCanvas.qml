@@ -120,7 +120,7 @@ Item {
         const oldLeft = (pageList.contentWidth - app.currentReader.documentWidth * old) / 2;
         const pointX = (pageList.contentX + anchorX - oldLeft) / old;
         positioning = true;
-        app.zoom = Math.max(0.1, Math.min(4, value));
+        app.zoom = Math.max(0.25 * app.calibrationFactor, Math.min(4 * app.calibrationFactor, value));
         pageList.forceLayout();
         if (anchor)
             positionAnchor(anchor, anchorY);
@@ -165,6 +165,8 @@ Item {
             app.schedulePositionSave();
         }
         onWidthChanged: if (app.fitting)
+            app.fitResize()
+        onHeightChanged: if (app.fitting && app.fitPreset === "page")
             app.fitResize()
         delegate: Item {
             id: rowItem

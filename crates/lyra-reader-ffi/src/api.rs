@@ -5022,6 +5022,7 @@ pub struct AiSelectionRecord {
 /// One previous document-chat exchange. `answer` is what the reader saw; the shell trims the
 /// list to the bound before asking for a plan.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AiConversationTurnRecord {
     pub question: String,
     pub answer: String,
@@ -5037,6 +5038,7 @@ pub struct AiPlanRequestRecord {
     pub question: Option<String>,
     pub language: Option<String>,
     /// Oldest first. Only used by document chat.
+    #[cfg_attr(feature = "desktop-json", serde(default))]
     pub history: Vec<AiConversationTurnRecord>,
     pub base_url: String,
     pub model: String,
@@ -5100,6 +5102,7 @@ pub struct AiPlanPartRecord {
 /// A page-local rectangle of a retrieved passage, in 100% view space. The shell highlights these
 /// briefly when a citation chip is clicked; they are never written to the PDF or the sidecar.
 #[derive(Debug, Clone, Copy, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AiSourceRectRecord {
     pub x_pt: f64,
     pub y_pt: f64,
@@ -5109,6 +5112,7 @@ pub struct AiSourceRectRecord {
 
 /// One retrieved passage attached to a plan. `page` is 1-based and matches `[p.N]`.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AiSourceRecord {
     pub page: u32,
     pub snippet: String,

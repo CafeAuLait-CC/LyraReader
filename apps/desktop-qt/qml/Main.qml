@@ -154,6 +154,8 @@ ApplicationWindow {
             const state = {
                 page: currentPage,
                 zoom: zoom,
+                zoomPercent: zoomPercent,
+                fitPreset: fitPreset,
                 fitting: fitting,
                 layout: layoutMode,
                 gap: pageGap
@@ -306,6 +308,28 @@ ApplicationWindow {
     onZoomChanged: if (eraserToken.length && !eraserCommitting) cancelErase()
     property real zoom: 1
     property bool fitting: true
+    property string fitPreset: "width"
+    readonly property real calibrationFactor: displayCalibration.factor
+    readonly property real zoomPercent: zoom / calibrationFactor * 100
+    property real previousCalibrationFactor: 1
+    property bool calibrationReady: false
+    DisplayCalibration {
+        id: displayCalibration
+        objectName: "displayCalibration"
+        window: root
+        onCalibrationChanged: {
+            if (root.calibrationReady && root.currentReader.pageCount > 0) {
+                if (root.fitting) root.refit();
+                else root.changeZoom(root.zoom / root.previousCalibrationFactor * factor,
+                                     pageList.width / 2, pageList.height / 2);
+            }
+            root.previousCalibrationFactor = factor;
+        }
+        Component.onCompleted: {
+            root.previousCalibrationFactor = factor;
+            root.calibrationReady = true;
+        }
+    }
     property bool sidebarVisible: true
     property int currentPage: 0
 
@@ -331,13 +355,37 @@ ApplicationWindow {
             return;
         }
         root.fitting = false;
-        changeZoom(zoom * factor, pageList.width / 2, pageList.height / 2);
+        changeZoom(Math.max(25, Math.min(400, Math.round(zoomPercent) + (factor > 1 ? 10 : -10))) / 100 * calibrationFactor, pageList.width / 2, pageList.height / 2);
     }
-    function fitWidth() {
-        if (currentReader.pageCount > 0)
-            changeZoom(currentReader.fitWidth(pageList.width), pageList.width / 2, 0);
-        root.fitting = true;
+    function actualSize() {
+        fitting = false;
+        changeZoom(calibrationFactor, pageList.width / 2, pageList.height / 2);
+        operationStatus = displayCalibration.fallbackReason.length
+            ? qsTr("100% · Uncalibrated display: ") + displayCalibration.fallbackReason
+            : qsTr("Actual Size · 100%");
     }
+    function applyFit(preset) {
+        if (currentReader.pageCount === 0) return;
+        const page = currentPage;
+        const row = canvas.rows[canvas.pageRows[page]];
+        if (!row || !row.pages.length) return;
+        const left = Math.min.apply(null, row.pages.map(p => p.left));
+        const right = Math.max.apply(null, row.pages.map(p => p.left + p.width));
+        const extent = preset === "page" ? row.bottom - row.top : right - left;
+        // Keep the native canvas' 32 point side margins; percentages round down.
+        const available = preset === "page" ? pageList.height - 16 : pageList.width - 64;
+        if (!(extent > 0 && available > 0)) return;
+        const percent = Math.max(25, Math.min(400, Math.floor(available / extent / calibrationFactor * 100)));
+        fitPreset = preset;
+        changeZoom(percent / 100 * calibrationFactor, pageList.width / 2, 0);
+        const rowCenter = (pageList.contentWidth - currentReader.documentWidth * zoom) / 2 + (left + right) / 2 * zoom;
+        pageList.contentX = Math.max(0, Math.min(pageList.contentWidth - pageList.width, rowCenter - pageList.width / 2));
+        if (preset === "page") navigate(page, 0);
+        fitting = true;
+    }
+    function fitWidth() { applyFit("width"); }
+    function fitPage() { applyFit("page"); }
+    function refit() { applyFit(fitPreset); }
     function updateCurrentPage() {
         if (currentReader.pageCount > 0 && !textViewVisible && !overviewVisible && !canvas.positioning)
             root.currentPage = canvas.pageAtOffset();
@@ -1135,8 +1183,7 @@ ApplicationWindow {
         shortcut: "Ctrl+0"
         enabled: currentReader.pageCount > 0 && !root.textViewVisible
         onTriggered: {
-            root.fitting = false;
-            root.changeZoom(1, pageList.width / 2, pageList.height / 2);
+            root.actualSize();
         }
     }
     Action {
@@ -1557,7 +1604,7 @@ ApplicationWindow {
         id: resizeTimer
         interval: 0
         onTriggered: if (root.fitting)
-            root.fitWidth()
+            root.refit()
     }
     Connections {
         target: root.session ? root.session.credentials : null
@@ -1698,9 +1745,12 @@ ApplicationWindow {
                     root.pendingPosition = null;
                     if (state.zoom && !state.fitting) {
                         root.fitting = false;
-                        root.zoom = state.zoom;
-                    } else
-                        root.fitWidth();
+                        root.zoom = state.zoomPercent ? state.zoomPercent / 100 * root.calibrationFactor : state.zoom;
+                    } else {
+                        root.currentPage = Math.max(0, Math.min(currentReader.pageCount - 1, state.page || 0));
+                        root.fitPreset = state.fitPreset === "page" ? "page" : "width";
+                        root.refit();
+                    }
                     Qt.callLater(function () {
                         if (epoch !== root.positionRestoreEpoch)
                             return;
@@ -1718,7 +1768,7 @@ ApplicationWindow {
                         root.schedulePositionSave();
                     });
                 } else if (root.fitting)
-                    root.fitWidth();
+                    root.refit();
             } else if (op === "search" && id === root.searchRequestId) {
                 root.searchResults = result;
                 root.searchIndex = result.length ? 0 : -1;

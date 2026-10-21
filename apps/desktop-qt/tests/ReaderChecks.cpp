@@ -1,3 +1,4 @@
+#include "DisplayCalibration.h"
 #include "ReaderController.h"
 #include "PageItem.h"
 #include "CropItem.h"
@@ -52,9 +53,53 @@ private slots:
             QVERIFY(QGuiApplication::platformName() == "wayland" || QGuiApplication::platformName() == "xcb");
         }
         qmlRegisterUncreatableType<ReaderController>("LyraReader", 1, 0, "ReaderController", "Created by host");
+        qmlRegisterType<DisplayCalibration>("LyraReader",1,0,"DisplayCalibration");
         qmlRegisterType<PageItem>("LyraReader", 1, 0, "PdfPage");
         qmlRegisterType<CropItem>("LyraReader",1,0,"PdfCrop");
         qmlRegisterType<AnnotationOverlay>("LyraReader",1,0,"PdfAnnotations");
+    }
+    void displayCalibrationValidatesPhysicalMetrics() {
+        const auto normal=DisplayCalibration::resolve(1920,508);
+        QVERIFY(normal.fallbackReason.isEmpty());QVERIFY(std::abs(normal.factor-4.0/3)<1e-9);
+        const auto retina=DisplayCalibration::resolve(960,508);
+        QVERIFY(retina.fallbackReason.isEmpty());QVERIFY(std::abs(retina.factor-2.0/3)<1e-9);
+        for (const auto &metrics : std::vector<std::pair<double,double>>{{0,508},{1920,0},{1920,24},{1920,3001},{100000,508},{1,508},{qQNaN(),508},{1920,qInf()}}) {
+            const auto bad=DisplayCalibration::resolve(metrics.first,metrics.second);
+            QCOMPARE(bad.factor,1.0);QVERIFY(!bad.fallbackReason.isEmpty());
+        }
+        DisplayCalibration calibration;QQuickWindow window;
+        calibration.setWindow(&window);QVERIFY(window.screen());
+        const auto expected=DisplayCalibration::resolve(window.screen()->geometry().width(),window.screen()->physicalSize().width());
+        QCOMPARE(calibration.factor(),expected.factor);
+        calibration.setWindow(nullptr);QCOMPARE(calibration.factor(),1.0);QVERIFY(!calibration.fallbackReason().isEmpty());
+        auto *closing=new QQuickWindow;calibration.setWindow(closing);QSignalSpy changes(&calibration,&DisplayCalibration::calibrationChanged);
+        delete closing;QCOMPARE(changes.size(),0);QVERIFY(!calibration.window());QCOMPARE(calibration.factor(),1.0);
+    }
+    void calibratedActualSizeAndFitPresetsPreservePageAndState() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/zoom.pdf";
+        QVERIFY(QFile::copy(QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf",path));
+        WorkspaceController workspace;auto *reader=workspace.activeReader();QQmlApplicationEngine engine;
+        engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("reader",reader);engine.rootContext()->setContextProperty("workspace",&workspace);
+        engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        reader->openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),9,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,6),Q_ARG(QVariant,0)));QTRY_COMPARE(window->property("currentPage").toInt(),6);
+        QVERIFY(QMetaObject::invokeMethod(window,"actualSize"));const auto factor=window->property("calibrationFactor").toDouble();
+        QVERIFY(std::abs(window->property("zoom").toDouble()-factor)<1e-9);QVERIFY(std::abs(window->property("zoomPercent").toDouble()-100)<1e-9);
+        QVERIFY(QMetaObject::invokeMethod(window,"zoomBy",Q_ARG(QVariant,1.2)));QVERIFY(std::abs(window->property("zoomPercent").toDouble()-110)<1e-9);
+        QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));QVERIFY(std::abs(workspace.viewState(reader).value("zoomPercent").toDouble()-110)<1e-9);
+        QVERIFY(QMetaObject::invokeMethod(window,"fitPage"));QTRY_COMPARE(window->property("currentPage").toInt(),6);QCOMPARE(window->property("fitPreset").toString(),QStringLiteral("page"));
+        const double fit=window->property("zoom").toDouble();auto *view=visualItem(window->contentItem(),"pageList");QVERIFY(view);
+        const auto page=reader->pages().at(6).toMap();QVERIFY(page.value("height").toDouble()*fit<=view->height()-16+.01);
+        QVERIFY(QMetaObject::invokeMethod(window,"fitPage"));QCOMPARE(window->property("zoom").toDouble(),fit);QCOMPARE(window->property("currentPage").toInt(),6);
+        QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));const auto saved=workspace.viewState(reader);QCOMPARE(saved.value("fitPreset").toString(),QStringLiteral("page"));
+        workspace.newTab();workspace.selectTab(0);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTRY_VERIFY(!window->property("positionRestoring").toBool());
+        QCOMPARE(window->property("fitPreset").toString(),QStringLiteral("page"));QCOMPARE(window->property("currentPage").toInt(),6);
+        QVERIFY(QMetaObject::invokeMethod(window,"fitWidth"));QCOMPARE(window->property("fitPreset").toString(),QStringLiteral("width"));
+        QVERIFY(QMetaObject::invokeMethod(window,"setPageLayout",Q_ARG(QVariant,QStringLiteral("Facing"))));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,6),Q_ARG(QVariant,0)));QVERIFY(QMetaObject::invokeMethod(window,"fitWidth"));
+        const auto placements=reader->pages();const double top=placements.at(6).toMap().value("top").toDouble();double left=1e9,right=-1e9;
+        for(const auto &entry:placements){const auto p=entry.toMap();if(std::abs(p.value("top").toDouble()-top)<.01){left=std::min(left,p.value("left").toDouble());right=std::max(right,p.value("left").toDouble()+p.value("width").toDouble());}}
+        QVERIFY((right-left)*window->property("zoom").toDouble()<=view->width()-64+.01);
     }
     void recentHistoryIsSharedByAllReaderWindows() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());

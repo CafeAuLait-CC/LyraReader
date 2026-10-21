@@ -1,3 +1,4 @@
+#include "DisplayCalibration.h"
 #include "PageItem.h"
 #include "CropItem.h"
 #include "ReaderController.h"
@@ -61,8 +62,9 @@ int main(int argc, char **argv) {
 #endif
     }
     qmlRegisterUncreatableType<ReaderController>("LyraReader", 1, 0, "ReaderController", QStringLiteral("Created by the application"));
+    qmlRegisterType<DisplayCalibration>("LyraReader",1,0,"DisplayCalibration");
     qmlRegisterType<PageItem>("LyraReader", 1, 0, "PdfPage");
-        qmlRegisterType<CropItem>("LyraReader",1,0,"PdfCrop");
+    qmlRegisterType<CropItem>("LyraReader",1,0,"PdfCrop");
     qmlRegisterType<AnnotationOverlay>("LyraReader",1,0,"PdfAnnotations");
     std::function<QQuickWindow *(const QUrl &,int,double)> createWindow;
     createWindow = [&](const QUrl &url,int page,double y) -> QQuickWindow * {
