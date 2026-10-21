@@ -950,11 +950,29 @@ private slots:
         auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);auto *close=window->findChild<QObject *>("closeAiPanel");QVERIFY(close);QVERIFY(QMetaObject::invokeMethod(close,"clicked"));QTRY_VERIFY(!dock->isVisible());
         QCOMPARE(reader->aiState().value("input").toMap().value("question").toString(),QStringLiteral("Draft kept while reading"));
         QVERIFY(QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,true)));QTRY_VERIFY(dock->isVisible());QCOMPARE(window->findChild<QObject *>("aiPanel"),panel);
-        QVERIFY(QMetaObject::invokeMethod(window,"resizeAiPanel",Q_ARG(QVariant,360),Q_ARG(QVariant,true)));auto *handle=visualItem(window->contentItem(),"aiPanelResizeHandle");QVERIFY(handle);handle->forceActiveFocus();QTest::keyClick(window,Qt::Key_Right);QTRY_COMPARE(window->property("aiPanelWidth").toInt(),340);QCOMPARE(workspace.preference("aiPanelWidth").toInt(),340);
+        QVERIFY(QMetaObject::invokeMethod(window,"resizeAiPanel",Q_ARG(QVariant,360),Q_ARG(QVariant,true)));auto *handle=visualItem(window->contentItem(),"aiPanelResizeHandle");QVERIFY(handle);
+        const auto grip=handle->mapToScene(QPointF(3,40)).toPoint();
+        QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,grip);QTest::mouseMove(window,grip-QPoint(40,0),30);QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,grip-QPoint(40,0));
+        QTRY_COMPARE(window->property("aiPanelWidth").toInt(),400);QCOMPARE(workspace.preference("aiPanelWidth").toInt(),400);
+        QVERIFY(QMetaObject::invokeMethod(window,"resizeAiPanel",Q_ARG(QVariant,360),Q_ARG(QVariant,true)));
+        handle->forceActiveFocus();QTest::keyClick(window,Qt::Key_Right);QTRY_COMPARE(window->property("aiPanelWidth").toInt(),340);QCOMPARE(workspace.preference("aiPanelWidth").toInt(),340);
         window->resize(700,820);QTest::qWait(50);if(window->width()<1100){QVERIFY(!left->isVisible());QTRY_VERIFY_WITH_TIMEOUT(view->width()>=350,5000);}
         if(!evidence.isEmpty()){QTest::qWait(100);QVERIFY(window->grabWindow().save(evidence+"/ai-dock-narrow.png"));}
         window->setProperty("searchVisible",true);if(window->width()<1200)QTRY_VERIFY(!dock->isVisible());
         QVERIFY(QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,true)));if(window->width()<1200)QVERIFY(!window->property("searchVisible").toBool());
+    }
+    void documentQuestionUsesRetrievedSourcesAndRejectsUnsentCitations() {
+        MockChatServer server;QVERIFY(server.listen());server.responses.append({{MockChatServer::delta({{"content","Document answer [p.1], invented [p.99], invalid [p.0]."}}),MockChatServer::usage(),QByteArray("data: [DONE]\n\n")},20,200});
+        QTemporaryDir scratch;const auto path=scratch.path()+"/question.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",path));
+        WorkspaceController workspace;auto *reader=workspace.activeReader();QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",reader);engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        reader->openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","fixture"}});reader->setAiInput("action",4);reader->setAiInput("question",QStringLiteral("Which page contains body text and caching?"));
+        auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("plan").toMap().isEmpty(),10000);const auto plan=reader->aiState().value("plan").toMap();QCOMPARE(plan.value("action").toString(),QStringLiteral("DocumentChat"));const auto sources=plan.value("sources").toList();QVERIFY(!sources.isEmpty());QCOMPARE(server.requests.size(),0);
+        QVERIFY(reader->startAi("local",plan));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QVERIFY(reader->aiState().value("output").toString().contains("Document answer"));
+        reader->setAiInput("question",QStringLiteral("A changed question"));QVERIFY(!reader->aiState().contains("plan"));
+        const int page=sources.first().toMap().value("page").toInt();QVERIFY(QMetaObject::invokeMethod(panel,"followLink",Q_ARG(QVariant,QString("p.%1").arg(page))));QTRY_COMPARE(window->property("currentPage").toInt(),page-1);
+        QVERIFY(QMetaObject::invokeMethod(panel,"followLink",Q_ARG(QVariant,QStringLiteral("p.99"))));QVERIFY(window->property("operationStatus").toString().contains("cannot be verified"));QCOMPARE(window->property("currentPage").toInt(),page-1);
+        QVERIFY(QMetaObject::invokeMethod(panel,"followLink",Q_ARG(QVariant,QStringLiteral("p.0"))));QCOMPARE(window->property("currentPage").toInt(),page-1);
     }
     void aiPreviewStreamingCancellationAndTabsUseTheRealLocalTransport() {
         MockChatServer server;QVERIFY2(server.listen(),"Loopback HTTP is required for this GUI check; no external service is contacted");

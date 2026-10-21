@@ -18,7 +18,7 @@ Pane {
     }
     function prepare() {
         const settings = app.aiSettings;
-        const modes = ["SummarizePage", "SummarizeDocument", "AskSelection", "TranslateSelection"];
+        const modes = ["SummarizePage", "SummarizeDocument", "AskSelection", "TranslateSelection", "DocumentChat"];
         owner.prepareAi({
             action: modes[actionBox.currentIndex],
             current_page: app.currentPage,
@@ -42,6 +42,17 @@ Pane {
         if (!match)
             return;
         const page = Number(match[1]) - 1;
+        const responsePlan = aiPanel.viewState.responsePlan || {};
+        if (responsePlan.action === "DocumentChat") {
+            const source = (responsePlan.sources || []).find(s => s.page === page + 1);
+            if (!source || page < 0 || page >= owner.pageCount) {
+                app.operationStatus = qsTr("This citation cannot be verified from the document passages sent.");
+                return;
+            }
+            const region = (source.rects || [])[0];
+            app.navigate(page, region ? region.y_pt : 0);
+            return;
+        }
         if (page >= 0 && page < owner.pageCount)
             app.navigate(page);
     }
@@ -60,7 +71,7 @@ Pane {
             id: actionBox
             objectName: "aiAction"
             Layout.fillWidth: true
-            model: [qsTr("Summarize this page"), qsTr("Summarize document"), qsTr("Ask about selection"), qsTr("Translate selection")]
+            model: [qsTr("Summarize this page"), qsTr("Summarize document"), qsTr("Ask about selection"), qsTr("Translate selection"), qsTr("Ask document")]
             currentIndex: aiPanel.input.action || 0
             enabled: !aiPanel.running
             Accessible.name: qsTr("AI action")
@@ -73,11 +84,11 @@ Pane {
             text: aiPanel.input.question || ""
             Layout.fillWidth: true
             Layout.preferredHeight: 70
-            visible: actionBox.currentIndex === 2
+            visible: actionBox.currentIndex === 2 || actionBox.currentIndex === 4
             enabled: !aiPanel.running
-            placeholderText: qsTr("Question about selected text")
+            placeholderText: actionBox.currentIndex === 4 ? qsTr("Question about this document") : qsTr("Question about selected text")
             wrapMode: TextEdit.Wrap
-            Accessible.name: qsTr("Question about selection")
+            Accessible.name: actionBox.currentIndex === 4 ? qsTr("Question about document") : qsTr("Question about selection")
             onTextChanged: if (activeFocus)
                 aiPanel.owner.setAiInput("question", text)
         }

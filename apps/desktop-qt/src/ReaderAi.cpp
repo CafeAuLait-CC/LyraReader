@@ -37,6 +37,7 @@ void ReaderController::prepareAi(const QVariantMap &request) {
 bool ReaderController::startAi(const QString &key,const QVariantMap &expectedPlan) {
     const auto plan=m_aiState.value(QStringLiteral("plan")).toMap();
     if(!m_document || m_pendingCommands>0 || m_loading || plan.isEmpty() || plan!=expectedPlan || m_aiPlanGeneration!=m_generation || m_aiState.value(QStringLiteral("running")).toBool())return false;
+    m_aiState.insert(QStringLiteral("responsePlan"),plan);
     m_aiState.insert(QStringLiteral("output"),QString{});m_aiState.insert(QStringLiteral("reasoning"),QString{});
     m_aiState.insert(QStringLiteral("usage"),QVariantMap{});m_aiState.insert(QStringLiteral("diagnostics"),QVariantMap{});
     m_aiState.insert(QStringLiteral("limited"),false);m_aiState.insert(QStringLiteral("running"),true);
