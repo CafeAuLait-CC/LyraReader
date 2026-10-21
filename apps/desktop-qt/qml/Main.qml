@@ -1508,7 +1508,9 @@ ApplicationWindow {
                 objectName: "aiDock"
                 visible: root.aiPanelVisible && currentReader.pageCount > 0
                 padding: 0
-                Layout.preferredWidth: Math.min(root.aiPanelWidth, Math.max(280, root.width - 360))
+                Layout.minimumWidth: 280
+                Layout.maximumWidth: Math.min(520, Math.max(280, root.width - 360))
+                Layout.preferredWidth: Math.min(root.aiPanelWidth, Layout.maximumWidth)
                 Layout.fillHeight: true
                 background: Rectangle { color: theme.sidebarBg }
                 ColumnLayout {

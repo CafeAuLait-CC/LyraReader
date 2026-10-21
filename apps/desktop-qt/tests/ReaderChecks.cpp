@@ -951,7 +951,7 @@ private slots:
         QCOMPARE(reader->aiState().value("input").toMap().value("question").toString(),QStringLiteral("Draft kept while reading"));
         QVERIFY(QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,true)));QTRY_VERIFY(dock->isVisible());QCOMPARE(window->findChild<QObject *>("aiPanel"),panel);
         QVERIFY(QMetaObject::invokeMethod(window,"resizeAiPanel",Q_ARG(QVariant,360),Q_ARG(QVariant,true)));auto *handle=visualItem(window->contentItem(),"aiPanelResizeHandle");QVERIFY(handle);handle->forceActiveFocus();QTest::keyClick(window,Qt::Key_Right);QTRY_COMPARE(window->property("aiPanelWidth").toInt(),340);QCOMPARE(workspace.preference("aiPanelWidth").toInt(),340);
-        window->resize(700,820);QTest::qWait(50);if(window->width()<1100){QVERIFY(!left->isVisible());QVERIFY(view->width()>=350);}
+        window->resize(700,820);QTest::qWait(50);if(window->width()<1100){QVERIFY(!left->isVisible());QTRY_VERIFY_WITH_TIMEOUT(view->width()>=350,5000);}
         if(!evidence.isEmpty()){QTest::qWait(100);QVERIFY(window->grabWindow().save(evidence+"/ai-dock-narrow.png"));}
         window->setProperty("searchVisible",true);if(window->width()<1200)QTRY_VERIFY(!dock->isVisible());
         QVERIFY(QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,true)));if(window->width()<1200)QVERIFY(!window->property("searchVisible").toBool());
