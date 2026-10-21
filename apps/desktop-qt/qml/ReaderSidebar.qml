@@ -39,11 +39,6 @@ Pane {
                         key: "thumbnails",
                         name: qsTr("Thumbnails"),
                         icon: "overview"
-                    },
-                    {
-                        key: "ai",
-                        name: qsTr("AI Assistant"),
-                        icon: "ai"
                     }
                 ]
                 LyraToolButton {
@@ -67,8 +62,7 @@ Pane {
                         bookmarks: qsTr("Bookmarks"),
                         outline: qsTr("Outline"),
                         annotations: qsTr("Annotations"),
-                        thumbnails: qsTr("Thumbnails"),
-                        ai: qsTr("AI Assistant")
+                        thumbnails: qsTr("Thumbnails")
                     })[app.sidebarTab] || ""
                 font.weight: Font.DemiBold
                 Layout.fillWidth: true
@@ -92,8 +86,7 @@ Pane {
                     thumbnails: 0,
                     outline: 1,
                     bookmarks: 2,
-                    annotations: 3,
-                    ai: 4
+                    annotations: 3
                 })[app.sidebarTab] || 0
             ListView {
                 id: thumbnails
@@ -335,9 +328,6 @@ Pane {
                     wrapMode: Text.Wrap
                     color: app.colors.textSecondary
                 }
-            }
-            AiPanel {
-                app: sidebarPanel.app
             }
         }
     }

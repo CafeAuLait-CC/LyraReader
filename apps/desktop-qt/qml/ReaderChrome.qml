@@ -270,8 +270,8 @@ ColumnLayout {
                 visible: app.width >= 850
                 symbol: "ai"
                 text: qsTr("AI Assistant")
-                selected: app.sidebarVisible && app.sidebarTab === "ai"
-                onClicked: app.showSidebar("ai")
+                selected: app.aiPanelVisible
+                onClicked: app.showAiPanel(!app.aiPanelVisible)
             }
             LyraToolButton {
                 objectName: "moreCommands"

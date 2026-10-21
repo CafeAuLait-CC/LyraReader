@@ -30,6 +30,18 @@ ApplicationWindow {
     readonly property var pageList: canvas.view
     property string appearance: session ? session.preference("appearance", "light") : "light"
     property string sidebarTab: "thumbnails"
+    property bool aiPanelVisible: false
+    property real aiPanelWidth: session ? Number(session.preference("aiPanelWidth", 360)) : 360
+    function showAiPanel(show) {
+        aiPanelVisible = show;
+        if (show && width < 1200) searchVisible = false;
+    }
+    onSearchVisibleChanged: if (searchVisible && width < 1200) aiPanelVisible = false
+    onWidthChanged: if (width < 1200 && aiPanelVisible && searchVisible) searchVisible = false
+    function resizeAiPanel(value, save) {
+        aiPanelWidth = Math.max(280, Math.min(520, value));
+        if (save && session) session.setPreference("aiPanelWidth", aiPanelWidth);
+    }
     property bool annotationToolsVisible: false
     property bool overviewVisible: false
     property bool textViewVisible: false
@@ -395,6 +407,8 @@ ApplicationWindow {
         fileDialog.open();
     }
     function showSidebar(tab) {
+        if (tab === "ai") { showAiPanel(true); return; }
+        if (width < 1100) aiPanelVisible = false;
         sidebarTab = tab;
         sidebarVisible = true;
         overviewVisible = false;
@@ -1146,6 +1160,13 @@ ApplicationWindow {
     property var pendingAiPlan: null
 
     Action {
+        objectName: "toggleAiPanelAction"
+        text: qsTr("AI Assistant")
+        shortcut: "Ctrl+Shift+A"
+        enabled: currentReader.pageCount > 0
+        onTriggered: root.showAiPanel(!root.aiPanelVisible)
+    }
+    Action {
         id: openAction
         text: qsTr("Open PDF…")
         shortcut: StandardKey.Open
@@ -1411,13 +1432,13 @@ ApplicationWindow {
             ReaderSidebar {
                 objectName: "readerSidebar"
                 app: root
-                visible: root.sidebarVisible && currentReader.pageCount > 0 && !(root.searchVisible && root.width < 950)
+                visible: root.sidebarVisible && currentReader.pageCount > 0 && !(root.searchVisible && root.width < 950) && !(root.aiPanelVisible && root.width < 1100)
                 Layout.preferredWidth: root.width < 850 ? 210 : 246
                 Layout.fillHeight: true
             }
 
             Rectangle {
-                visible: root.sidebarVisible && currentReader.pageCount > 0 && !(root.searchVisible && root.width < 950)
+                visible: root.sidebarVisible && currentReader.pageCount > 0 && !(root.searchVisible && root.width < 950) && !(root.aiPanelVisible && root.width < 1100)
                 Layout.preferredWidth: 1
                 Layout.fillHeight: true
                 color: theme.separator
@@ -1481,6 +1502,56 @@ ApplicationWindow {
                 visible: root.searchVisible && currentReader.pageCount > 0
                 Layout.preferredWidth: Math.min(280, root.width / 3)
                 Layout.fillHeight: true
+            }
+            Pane {
+                id: aiDock
+                objectName: "aiDock"
+                visible: root.aiPanelVisible && currentReader.pageCount > 0
+                padding: 0
+                Layout.preferredWidth: Math.min(root.aiPanelWidth, Math.max(280, root.width - 360))
+                Layout.fillHeight: true
+                background: Rectangle { color: theme.sidebarBg }
+                ColumnLayout {
+                    anchors.fill: parent
+                    spacing: 0
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Layout.leftMargin: 14
+                        Layout.rightMargin: 8
+                        Label { text: qsTr("AI Assistant"); color: theme.textPrimary; font.weight: Font.DemiBold; Layout.fillWidth: true }
+                        LyraToolButton {
+                            objectName: "closeAiPanel"
+                            symbol: "close"
+                            text: qsTr("Close AI panel (Ctrl+Shift+A)")
+                            onClicked: root.showAiPanel(false)
+                        }
+                    }
+                    Rectangle { Layout.fillWidth: true; height: 1; color: theme.separator }
+                    AiPanel { app: root; Layout.fillWidth: true; Layout.fillHeight: true }
+                }
+                Rectangle {
+                    width: 1; height: parent.height; color: theme.separator
+                }
+                MouseArea {
+                    objectName: "aiPanelResizeHandle"
+                    anchors.left: parent.left
+                    width: 6; height: parent.height
+                    cursorShape: Qt.SizeHorCursor
+                    activeFocusOnTab: true
+                    Accessible.name: qsTr("Resize AI panel; Left widens, Right narrows")
+                    property real pressedX: 0
+                    property real initialWidth: 0
+                    onPressed: function(mouse) {
+                        pressedX = mapToItem(root.contentItem, mouse.x, mouse.y).x;
+                        initialWidth = aiDock.width;
+                    }
+                    onPositionChanged: function(mouse) {
+                        if (pressed) root.resizeAiPanel(initialWidth + pressedX - mapToItem(root.contentItem, mouse.x, mouse.y).x, false);
+                    }
+                    onReleased: root.resizeAiPanel(root.aiPanelWidth, true)
+                    Keys.onLeftPressed: root.resizeAiPanel(root.aiPanelWidth + 20, true)
+                    Keys.onRightPressed: root.resizeAiPanel(root.aiPanelWidth - 20, true)
+                }
             }
         }
     }

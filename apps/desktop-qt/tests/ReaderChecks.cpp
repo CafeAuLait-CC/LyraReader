@@ -934,6 +934,28 @@ private slots:
         QVERIFY(original.open(QIODevice::ReadOnly));QCOMPARE(original.readAll(),bytes);
         QVERIFY(QMetaObject::invokeMethod(window,"showSplitDialog"));dialog->setProperty("outputDirectory",QUrl::fromLocalFile(folder));QVERIFY(QMetaObject::invokeMethod(dialog,"requestPlan"));QTRY_VERIFY(!dialog->property("planning").toBool());QVERIFY(!dialog->property("canWrite").toBool());QCOMPARE(dialog->property("plan").toMap().value("conflicts").toList().size(),2);
     }
+    void aiDockIsIndependentResizableAndKeepsDraftsWhenClosed() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/dock.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",path));
+        WorkspaceController workspace;auto *reader=workspace.activeReader();QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);
+        engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",reader);engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        reader->openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(window,"showSidebar",Q_ARG(QVariant,"bookmarks")));QVERIFY(QMetaObject::invokeMethod(window,"showSidebar",Q_ARG(QVariant,"ai")));
+        auto *dock=visualItem(window->contentItem(),"aiDock"),*left=visualItem(window->contentItem(),"readerSidebar"),*view=visualItem(window->contentItem(),"pageList");QVERIFY(dock && left && view);QTRY_VERIFY(dock->isVisible());
+        QCOMPARE(window->property("sidebarTab").toString(),QStringLiteral("bookmarks"));
+        if(window->width()>=1100)QVERIFY(left->isVisible());
+        QTRY_VERIFY(dock->mapToScene(QPointF()).x()>=view->mapToScene(QPointF(view->width(),0)).x()-1);
+        reader->setAiInput("action",2);reader->setAiInput("question",QStringLiteral("Draft kept while reading"));
+        const auto evidence=qEnvironmentVariable("LYRA_READER_AI_EVIDENCE_DIR");
+        if(!evidence.isEmpty()){QVERIFY(QDir().mkpath(evidence));QTest::qWait(100);QVERIFY(window->grabWindow().save(evidence+"/ai-dock-wide.png"));}
+        auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);auto *close=window->findChild<QObject *>("closeAiPanel");QVERIFY(close);QVERIFY(QMetaObject::invokeMethod(close,"clicked"));QTRY_VERIFY(!dock->isVisible());
+        QCOMPARE(reader->aiState().value("input").toMap().value("question").toString(),QStringLiteral("Draft kept while reading"));
+        QVERIFY(QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,true)));QTRY_VERIFY(dock->isVisible());QCOMPARE(window->findChild<QObject *>("aiPanel"),panel);
+        QVERIFY(QMetaObject::invokeMethod(window,"resizeAiPanel",Q_ARG(QVariant,360),Q_ARG(QVariant,true)));auto *handle=visualItem(window->contentItem(),"aiPanelResizeHandle");QVERIFY(handle);handle->forceActiveFocus();QTest::keyClick(window,Qt::Key_Right);QTRY_COMPARE(window->property("aiPanelWidth").toInt(),340);QCOMPARE(workspace.preference("aiPanelWidth").toInt(),340);
+        window->resize(700,820);QTest::qWait(50);if(window->width()<1100){QVERIFY(!left->isVisible());QVERIFY(view->width()>=350);}
+        if(!evidence.isEmpty()){QTest::qWait(100);QVERIFY(window->grabWindow().save(evidence+"/ai-dock-narrow.png"));}
+        window->setProperty("searchVisible",true);if(window->width()<1200)QTRY_VERIFY(!dock->isVisible());
+        QVERIFY(QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,true)));if(window->width()<1200)QVERIFY(!window->property("searchVisible").toBool());
+    }
     void aiPreviewStreamingCancellationAndTabsUseTheRealLocalTransport() {
         MockChatServer server;QVERIFY2(server.listen(),"Loopback HTTP is required for this GUI check; no external service is contacted");
         const auto imageUrl=server.baseUrl()+"/unwanted-image";
@@ -1038,6 +1060,13 @@ private slots:
         const bool native=QGuiApplication::platformName()!="offscreen";
         if(native)window->setMaximumSize(QSize(1200,820));window->resize(1200,820);
         if(native) {
+            const auto windowToken=qEnvironmentVariable("LYRA_READER_PERF_WINDOW_TOKEN");
+            if(!windowToken.isEmpty())window->setTitle(QStringLiteral("LyraReader performance ")+windowToken.left(80));
+            // Optional grace for an external compositor-aware runner to activate this
+            // process's own window. Qt's X11 active flag alone can be stale on XWayland.
+            const auto activationGrace=qEnvironmentVariableIntValue("LYRA_READER_PERF_ACTIVATION_WAIT_MS");
+            QVERIFY(activationGrace>=0 && activationGrace<=5000);
+            if(activationGrace)QTest::qWait(activationGrace);
             const bool exposed=QTest::qWaitForWindowExposed(window,5000);
             if(exposed)window->requestActivate();
             if(!exposed || !QTest::qWaitForWindowActive(window,2500)) {
@@ -1061,7 +1090,10 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(textured(),30000);frames.arm();window->update();QTRY_VERIFY_WITH_TIMEOUT(frames.queued()>0,10000);
         const auto openMs=(frames.queued()-openStart)/1000.0;
         auto *view=window->findChild<QQuickItem *>("pageList");QVERIFY(view);window->setProperty("fitting",false);
-        constexpr int trials=30;
+        bool validTrialCount=true;
+        const auto trialSetting=qEnvironmentVariable("LYRA_READER_PERF_TRIALS");
+        const int trials=trialSetting.isEmpty()?30:trialSetting.toInt(&validTrialCount);
+        QVERIFY2(validTrialCount && trials>=3 && trials<=30,"Diagnostic trial count must be 3...30; default remains 30");
         for(int trial=0;trial<trials;++trial) {
             frames.clear();visibleFrames.clear();const auto begin=Performance::now();qint64 lastInput=begin;
             for(int step=0;step<12;++step) {
