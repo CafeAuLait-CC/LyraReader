@@ -167,6 +167,13 @@ impl DesktopDocument {
             None
         };
         let d = self.active()?;
+        if op.starts_with("ink_erase_") && op != "ink_erase_commit" {
+            return self
+                .marks
+                .lock()
+                .map_err(|_| "Annotation state is unavailable")?
+                .command(op, &r, &d);
+        }
         if op.starts_with("replace_") && d.path() != self.original_path.to_string_lossy() {
             return Err(
                 "Apply or discard the staged page changes before replacing the original PDF".into(),
@@ -188,6 +195,7 @@ impl DesktopDocument {
                 | "file_adopt"
                 | "marks_recover"
                 | "marks_erase"
+                | "ink_erase_commit"
         ) {
             let mut edits = self
                 .edits
@@ -199,7 +207,9 @@ impl DesktopDocument {
                 .map_err(|_| "Annotation state is unavailable")?;
             let active = self.active()?;
             let state = marks.command(op, &r, &active)?;
-            if !matches!(op, "marks" | "marks_undo" | "marks_redo") {
+            if !matches!(op, "marks" | "marks_undo" | "marks_redo")
+                && (op != "ink_erase_commit" || state["erase_changed"].as_u64().unwrap_or(0) > 0)
+            {
                 edits.clear_redo();
                 edits.collect_garbage(Path::new(&active.path()));
             }
@@ -436,6 +446,200 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.directory);
         }
+    }
+
+    #[test]
+    fn partial_ink_preview_is_transient_and_one_atomic_history_step() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let original = fs::read(&fixture.path).unwrap();
+        let created=doc.command(json!({"op":"mark_create","entry":{"kind":"ink","page":0,"version":1,"paths":[[{"x":100,"y":200},{"x":150,"y":200},{"x":250,"y":200},{"x":300,"y":200}]],"strokeWidth":2,"color":"#1B7F3BFF","note":"keep my ink note"}})).unwrap();
+        let id = created["selected_id"].as_str().unwrap();
+        let sidecar = format!("{}.lyra-reader-annotations.json", fixture.path.display());
+        let baseline = fs::read(&sidecar).unwrap();
+        let segments = json!([{"from":{"x":200,"y":170},"to":{"x":200,"y":230}}]);
+        let begin=doc.command(json!({"op":"ink_erase_begin","token":"first","page":0,"zoom":1,"segments":segments})).unwrap();
+        assert_eq!(begin["hidden"], json!([id]));
+        assert_eq!(begin["annotations"].as_array().unwrap().len(), 2);
+        assert_eq!(fs::read(&sidecar).unwrap(), baseline);
+        assert!(
+            (begin["annotations"][0]["paths"][0]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["x"]
+                .as_f64()
+                .unwrap()
+                - 191.)
+                .abs()
+                < 1e-9
+        );
+        doc.command(json!({"op":"ink_erase_cancel","token":"first"}))
+            .unwrap();
+        assert!(
+            doc.command(json!({"op":"ink_erase_commit","token":"first","segments":[]}))
+                .is_err()
+        );
+        assert_eq!(fs::read(&sidecar).unwrap(), baseline);
+        doc.command(
+            json!({"op":"ink_erase_begin","token":"cut","page":0,"zoom":1,"segments":segments}),
+        )
+        .unwrap();
+        let preview=doc.command(json!({"op":"ink_erase_preview","token":"cut","segments":[{"from":{"x":270,"y":180},"to":{"x":270,"y":220}}]})).unwrap();
+        let committed = doc
+            .command(json!({"op":"ink_erase_commit","token":"cut","segments":[]}))
+            .unwrap();
+        assert_eq!(committed["erase_changed"], 1);
+        assert_eq!(committed["annotations"].as_array().unwrap().len(), 3);
+        for (p, c) in preview["annotations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(committed["annotations"].as_array().unwrap())
+        {
+            assert_eq!(p["paths"], c["paths"]);
+            assert_eq!(c["note"], "keep my ink note");
+        }
+        let undo = doc.command(json!({"op":"marks_undo"})).unwrap();
+        assert_eq!(undo["annotations"].as_array().unwrap().len(), 1);
+        assert_eq!(undo["annotations"][0]["id"], id);
+        assert_eq!(fs::read(&sidecar).unwrap(), baseline);
+        doc.command(json!({"op":"ink_erase_begin","token":"miss","page":0,"zoom":2,"segments":[{"from":{"x":0,"y":0},"to":{"x":1,"y":1}}]})).unwrap();
+        let miss = doc
+            .command(json!({"op":"ink_erase_commit","token":"miss","segments":[]}))
+            .unwrap();
+        assert_eq!(miss["erase_changed"], 0);
+        assert_eq!(miss["can_redo"], true);
+        assert_eq!(fs::read(&sidecar).unwrap(), baseline);
+        let redo = doc.command(json!({"op":"marks_redo"})).unwrap();
+        assert_eq!(redo["annotations"], committed["annotations"]);
+        doc.command(json!({"op":"ink_erase_begin","token":"external","page":0,"zoom":1,"segments":[{"from":{"x":125,"y":180},"to":{"x":125,"y":220}}]})).unwrap();
+        let mut external = fs::read(&sidecar).unwrap();
+        external.extend_from_slice(b" ");
+        fs::write(&sidecar, &external).unwrap();
+        assert!(
+            doc.command(json!({"op":"ink_erase_commit","token":"external","segments":[]}))
+                .is_err()
+        );
+        assert_eq!(fs::read(&sidecar).unwrap(), external);
+        assert_eq!(
+            doc.command(json!({"op":"marks"})).unwrap()["annotations"],
+            committed["annotations"]
+        );
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+    }
+
+    #[test]
+    fn partial_ink_invalid_preview_or_intervening_edit_cannot_commit_a_stale_cut() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let created=doc.command(json!({"op":"mark_create","entry":{"kind":"ink","page":0,"version":1,"paths":[[{"x":100,"y":200},{"x":300,"y":200}]],"strokeWidth":2,"color":"#000000FF","note":""}})).unwrap();
+        let id = created["selected_id"].as_str().unwrap();
+        let sweep = json!([{"from":{"x":200,"y":150},"to":{"x":200,"y":250}}]);
+        let preview = doc
+            .command(
+                json!({"op":"ink_erase_begin","token":"zoom","page":0,"zoom":2,"segments":sweep}),
+            )
+            .unwrap();
+        let end = preview["annotations"][0]["paths"][0]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert!((end["x"].as_f64().unwrap() - 195.).abs() < 1e-9);
+        assert!(doc.command(json!({"op":"ink_erase_preview","token":"zoom","segments":[{"from":{"x":125,"y":200}}]})).is_err());
+        assert!(
+            doc.command(json!({"op":"ink_erase_commit","token":"zoom","segments":[]}))
+                .is_err()
+        );
+        doc.command(
+            json!({"op":"ink_erase_begin","token":"edit","page":0,"zoom":1,"segments":sweep}),
+        )
+        .unwrap();
+        doc.command(json!({"op":"mark_update","id":id,"patch":{"note":"new note"}}))
+            .unwrap();
+        assert!(
+            doc.command(json!({"op":"ink_erase_commit","token":"edit","segments":[]}))
+                .is_err()
+        );
+        let marks = doc.command(json!({"op":"marks"})).unwrap();
+        assert_eq!(marks["annotations"].as_array().unwrap().len(), 1);
+        assert_eq!(marks["annotations"][0]["note"], "new note");
+    }
+
+    #[test]
+    fn partial_ink_refuses_review_threads_but_splits_bare_file_ink_and_reopens() {
+        let fixture = Fixture::new("annotated-ink-review.pdf");
+        let doc = fixture.open();
+        let original = fs::read(&fixture.path).unwrap();
+        let raw = doc.command(json!({"op":"annotations"})).unwrap();
+        let records = raw.as_array().unwrap();
+        let review = records
+            .iter()
+            .find(|a| a["id"] == "nm:review-ink-commented")
+            .unwrap();
+        assert_eq!(review["has_popup"], true);
+        let sweep = json!([{"from":{"x":250,"y":0},"to":{"x":250,"y":1000}}]);
+        let preview = doc
+            .command(
+                json!({"op":"ink_erase_begin","token":"mixed","page":0,"zoom":1,"segments":sweep}),
+            )
+            .unwrap();
+        assert_eq!(preview["hidden"], json!(["nm:review-ink-bare"]));
+        assert_eq!(preview["refused"], json!([review["id"]]));
+        let state = doc
+            .command(json!({"op":"ink_erase_commit","token":"mixed","segments":[]}))
+            .unwrap();
+        assert_eq!(state["erase_changed"], 1);
+        assert_eq!(state["pending_deletions"], 1);
+        assert_eq!(state["annotations"].as_array().unwrap().len(), 2);
+        let output = fixture.directory.join("cut.pdf");
+        doc.command(json!({"op":"save_current_annotations","destination":output}))
+            .unwrap();
+        let saved = DesktopDocument::open(&output, None)
+            .unwrap()
+            .command(json!({"op":"annotations"}))
+            .unwrap();
+        let saved = saved.as_array().unwrap();
+        assert_eq!(saved.len(), records.len() + 1);
+        assert!(
+            saved
+                .iter()
+                .any(|a| a["id"] == review["id"] && a["has_popup"] == true)
+        );
+        assert!(!saved.iter().any(|a| a["id"] == "nm:review-ink-bare"));
+        for reply in records.iter().filter(|a| a["parent_id"] == review["id"]) {
+            assert!(saved.iter().any(|a| a["id"] == reply["id"]
+                && a["parent_id"] == reply["parent_id"]
+                && a["visible"] == reply["visible"]));
+        }
+        let undone = doc.command(json!({"op":"marks_undo"})).unwrap();
+        assert_eq!(undone["pending_deletions"], 0);
+        assert!(undone["annotations"].as_array().unwrap().is_empty());
+        let adopted = doc
+            .command(json!({"op":"file_adopt","id":review["id"]}))
+            .unwrap();
+        let id = adopted["selected_id"].as_str().unwrap();
+        doc.command(json!({"op":"mark_update","id":id,"patch":{"note":""}}))
+            .unwrap();
+        let preview=doc.command(json!({"op":"ink_erase_begin","token":"adopted","page":0,"zoom":1,"segments":sweep})).unwrap();
+        assert!(
+            preview["refused"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == id)
+        );
+        assert!(
+            !preview["hidden"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == id)
+        );
+        doc.command(json!({"op":"ink_erase_cancel","token":"adopted"}))
+            .unwrap();
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
     }
 
     #[test]

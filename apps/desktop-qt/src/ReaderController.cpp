@@ -193,7 +193,8 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
     auto request = QJsonObject::fromVariantMap(arguments);
     request.insert(QStringLiteral("op"), operation);
     const auto bytes = QJsonDocument(request).toJson(QJsonDocument::Compact);
-    const bool mutation=operation.startsWith(QStringLiteral("mark_")) || operation.startsWith(QStringLiteral("marks_")) || operation.startsWith(QStringLiteral("bookmark_")) || operation.startsWith(QStringLiteral("file_")) || operation.startsWith(QStringLiteral("page_")) || operation.startsWith(QStringLiteral("save_")) || operation.startsWith(QStringLiteral("replace_")) || operation==QStringLiteral("extract_pages");
+    const bool eraseControl=operation.startsWith(QStringLiteral("ink_erase_")) && operation!=QStringLiteral("ink_erase_commit");
+    const bool mutation=operation==QStringLiteral("ink_erase_commit") || operation.startsWith(QStringLiteral("mark_")) || operation.startsWith(QStringLiteral("marks_")) || operation.startsWith(QStringLiteral("bookmark_")) || operation.startsWith(QStringLiteral("file_")) || operation.startsWith(QStringLiteral("page_")) || operation.startsWith(QStringLiteral("save_")) || operation.startsWith(QStringLiteral("replace_")) || operation==QStringLiteral("extract_pages");
     if(mutation)++m_mutationSequence;
     const auto mutationSequence=m_mutationSequence;
     const auto generation = m_generation;
@@ -202,7 +203,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
     ++m_pendingCommands;
     emit commandsChanged();
     auto *watcher = new QFutureWatcher<CommandResult>(this);
-    connect(watcher, &QFutureWatcher<CommandResult>::finished, this, [this,watcher,id,operation,arguments,generation,latestOnly,document,mutation,mutationSequence,draftKey,savedDraft,draftMatchesRequest] {
+    connect(watcher, &QFutureWatcher<CommandResult>::finished, this, [this,watcher,id,operation,arguments,generation,latestOnly,document,mutation,eraseControl,mutationSequence,draftKey,savedDraft,draftMatchesRequest] {
         const auto outcome = watcher->result();
         watcher->deleteLater();
         --m_pendingCommands;
@@ -233,8 +234,8 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
             m_documentWidth = layout.value(QStringLiteral("width")).toDouble();
             m_documentHeight = layout.value(QStringLiteral("height")).toDouble();
             emit documentChanged();
-        } else {
-            const bool marks=operation==QStringLiteral("marks") || operation.startsWith(QStringLiteral("mark_")) || operation.startsWith(QStringLiteral("bookmark_")) || operation.startsWith(QStringLiteral("marks_")) || operation.startsWith(QStringLiteral("file_"));
+        } else if (!eraseControl) {
+            const bool marks=operation==QStringLiteral("ink_erase_commit") || operation==QStringLiteral("marks") || operation.startsWith(QStringLiteral("mark_")) || operation.startsWith(QStringLiteral("bookmark_")) || operation.startsWith(QStringLiteral("marks_")) || operation.startsWith(QStringLiteral("file_"));
             m_data.insert(marks ? QStringLiteral("marks") : operation, outcome.result);
             emit dataChanged();
         }
@@ -266,7 +267,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
             result.source=NativeRasterSource::prepare(document,false,&result.error);
         return result;
     };
-    if(mutation || operation==QStringLiteral("ai_start") || operation==QStringLiteral("ai_cancel")){
+    if(mutation || eraseControl || operation==QStringLiteral("ai_start") || operation==QStringLiteral("ai_cancel")){
         auto promise=std::make_shared<QPromise<CommandResult>>();promise->start();watcher->setFuture(promise->future());
         m_mutations->append([task,promise]{try{promise->addResult(task());}catch(...){promise->addResult(CommandResult{{},QStringLiteral("The command worker stopped unexpectedly.")});}promise->finish();});
     }else watcher->setFuture(QtConcurrent::run(std::move(task)));

@@ -56,6 +56,8 @@ ApplicationWindow {
     property string pendingStampStyle: ""
     property var pendingSignatureImage: null
     onAnnotationToolChanged: {
+        if (annotationTool !== "eraser")
+            cancelErase();
         if (annotationTool !== "stamp")
             pendingStampStyle = "";
         if (annotationTool !== "signature")
@@ -116,6 +118,7 @@ ApplicationWindow {
     onAppearanceChanged: if (session)
         session.setPreference("appearance", appearance)
     onCurrentReaderChanged: {
+        cancelErase();
         pendingArtworkRequest = -1;
         pendingStampStyle = "";
         pendingSignatureImage = null;
@@ -209,6 +212,7 @@ ApplicationWindow {
             session.closeTab(index, true);
     }
     onClosing: function (event) {
+        cancelErase();
         if (closeApproved)
             return;
         dialogs.flushAnnotation();
@@ -299,6 +303,7 @@ ApplicationWindow {
     palette.disabled.windowText: theme.textDisabled
     palette.inactive.highlight: theme.inactiveSelectionBg
     palette.inactive.highlightedText: theme.inactiveSelectionFg
+    onZoomChanged: if (eraserToken.length && !eraserCommitting) cancelErase()
     property real zoom: 1
     property bool fitting: true
     property bool sidebarVisible: true
@@ -747,28 +752,66 @@ ApplicationWindow {
         });
         selectedAnnotation = null;
     }
+    property var erasePreview: []
+    property string eraserToken: ""
+    property var eraserOwner: null
+    property int eraserSequence: 0
+    property double eraserPending: -1
+    property var eraserQueue: []
+    property bool eraserFinishing: false
+    property bool eraserCommitting: false
+    function cancelErase() {
+        if (eraserToken.length && eraserOwner && !eraserCommitting)
+            eraserOwner.submit("ink_erase_cancel", { token: eraserToken });
+        eraserToken = "";
+        eraserOwner = null;
+        eraserPending = -1;
+        eraserQueue = [];
+        eraserFinishing = false;
+        eraserCommitting = false;
+        eraseDraft = [];
+        erasePreview = [];
+    }
+    function beginErase(page, point) {
+        cancelErase();
+        dialogs.flushAnnotation();
+        selectedAnnotation = null;
+        selection = null;
+        eraserOwner = currentReader;
+        eraserToken = "erase-" + (++eraserSequence) + "-" + Date.now();
+        eraserPending = eraserOwner.submit("ink_erase_begin", {
+            token: eraserToken, page: page, zoom: zoom,
+            segments: canvas.eraserSegments(page, point, point)
+        });
+    }
     function eraseAlong(page, start, end) {
-        const ids = eraseDraft.slice();
-        for (const a of annotations) {
-            if (a.page !== page || a.kind !== "ink" || ids.indexOf(a.id) >= 0)
-                continue;
-            let hit = false;
-            for (const path of a.paths || [])
-                for (let i = 1; i < path.length; ++i)
-                    if (Logic.segmentsNear(start, end, path[i - 1], path[i], 10 + (a.strokeWidth || 2) / 2)) {
-                        hit = true;
-                        break;
-                    }
-            if (hit)
-                ids.push(a.id);
+        if (!eraserToken.length || eraserFinishing)
+            return;
+        if (eraserQueue.length >= 4096) {
+            cancelErase();
+            operationStatus = qsTr("The eraser is busy. Try a shorter stroke; no cut was saved.");
+            return;
         }
-        eraseDraft = ids;
+        eraserQueue = eraserQueue.concat(canvas.eraserSegments(page, start, end));
+        flushErase();
+    }
+    function flushErase() {
+        if (!eraserToken.length || !eraserOwner || eraserPending >= 0)
+            return;
+        if (eraserQueue.length) {
+            const batch = eraserQueue.slice(0, 512);
+            eraserQueue = eraserQueue.slice(512);
+            eraserPending = eraserOwner.submit("ink_erase_preview", {token: eraserToken, segments: batch});
+        } else if (eraserFinishing) {
+            eraserCommitting = true;
+            eraserPending = eraserOwner.submit("ink_erase_commit", {token: eraserToken, segments: []});
+        }
     }
     function commitErase() {
-        if (eraseDraft.length)
-            currentReader.submit("marks_erase", {
-                ids: eraseDraft.slice()
-            });
+        if (!eraserToken.length)
+            return;
+        eraserFinishing = true;
+        flushErase();
     }
     function selectPage(index, modifiers) {
         if (modifiers & Qt.ShiftModifier) {
@@ -1189,6 +1232,7 @@ ApplicationWindow {
         onActivated: {
             if (root.previewController && root.previewController.visible)
                 root.previewController.close();
+            root.cancelErase();
             root.annotationTool = "select";
             root.annotationDraft = null;
             root.redactionDraft = null;
@@ -1549,6 +1593,7 @@ ApplicationWindow {
     Connections {
         target: root.currentReader
         function onDocumentReset() {
+            root.cancelErase();
             ++root.positionRestoreEpoch;
             root.positionRestoring = true;
             root.selection = null;
@@ -1566,6 +1611,30 @@ ApplicationWindow {
             }
         }
         function onCommandFinished(id, op, result, error) {
+            if (op.indexOf("ink_erase_") === 0) {
+                if (id !== root.eraserPending || !root.eraserToken.length)
+                    return;
+                root.eraserPending = -1;
+                if (error.length || result.cancelled) {
+                    root.cancelErase();
+                    if (error.length) root.operationStatus = error;
+                    return;
+                }
+                if (op === "ink_erase_commit") {
+                    const changed = result.erase_changed || 0;
+                    const refused = (result.erase_refused || []).length;
+                    root.cancelErase();
+                    root.operationStatus = changed ? qsTr("Cut %1 ink strokes into %2 pieces. Saved in the sidecar; the PDF on disk is unchanged.").arg(changed).arg(result.erase_pieces || 0) : qsTr("No ink was changed.");
+                    if (refused) root.operationStatus += " " + qsTr("Left %1 protected PDF ink strokes unchanged. Comments and reply threads are preserved.").arg(refused);
+                } else {
+                    root.eraseDraft = result.hidden || [];
+                    root.erasePreview = result.annotations || [];
+                    if ((result.refused || []).length)
+                        root.operationStatus = qsTr("Protected PDF ink remains unchanged to preserve comments and reply threads.");
+                    root.flushErase();
+                }
+                return;
+            }
             if (id === root.pendingArtworkRequest) {
                 root.pendingArtworkRequest = -1;
                 if (!error.length) {

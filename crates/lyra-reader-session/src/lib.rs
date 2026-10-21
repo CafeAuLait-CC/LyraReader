@@ -7,6 +7,7 @@
 //! Task mapping: T1.8 (viewport/layout/anchoring), T2.8 (history), T1.4 (scroll approach decision).
 
 pub mod command;
+pub mod ink;
 pub mod keymap;
 pub mod layout;
 pub mod viewport;

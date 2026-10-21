@@ -8,6 +8,8 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+#[path = "ink_erase.rs"]
+mod ink_erase;
 const MAX_SIDECAR_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HISTORY_BYTES: usize = 32 * 1024 * 1024;
 static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -75,6 +77,7 @@ struct Snapshot {
 }
 #[derive(Clone)]
 pub struct Marks {
+    erase: Option<ink_erase::Gesture>,
     embedded_bookmarks: HashSet<String>,
     path: PathBuf,
     baseline: Option<Vec<u8>>,
@@ -386,6 +389,7 @@ impl Marks {
             Ok(b.id.clone())
         };
         let mut result = self.clone();
+        result.erase = None;
         result.path = PathBuf::from(format!("{}.lyra-reader-annotations.json", path.display()));
         result.baseline = None;
         result.page_count = new.page_count();
@@ -727,6 +731,7 @@ impl Marks {
             current
         };
         let mut result = Self {
+            erase: None,
             embedded_bookmarks: HashSet::new(),
             path,
             baseline: None,
@@ -806,6 +811,7 @@ impl Marks {
         }
     }
     fn restore(&mut self, s: Snapshot) {
+        self.erase = None;
         self.embedded_bookmarks = s.embedded_bookmarks;
         self.entries = s.entries;
         self.deletions = s.deletions;
@@ -874,6 +880,7 @@ impl Marks {
         Ok(())
     }
     fn change(&mut self, task: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), String> {
+        self.erase = None;
         if let Some(error) = &self.error {
             return Err(error.clone());
         }
@@ -994,6 +1001,9 @@ impl Marks {
         r: &Value,
         document: &LyraReaderDocument,
     ) -> Result<Value, String> {
+        if op.starts_with("ink_erase_") {
+            return self.erase_command(op, r, document);
+        }
         let mut selected_id = None;
         match op {
             "marks" => {}
@@ -1105,6 +1115,7 @@ impl Marks {
                 })?;
             }
             "marks_undo" | "marks_redo" => {
+                self.erase = None;
                 let previous = if op == "marks_undo" {
                     self.undo.pop()
                 } else {

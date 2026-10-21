@@ -16,7 +16,7 @@ Item {
         });
         return values.map(function (a) {
             return app.annotationDraft && app.annotationDraft.id === a.id ? app.annotationDraft : a;
-        });
+        }).concat(app.erasePreview.filter(function (a) { return a.page === page; }));
     }
     clip: true
     PdfAnnotations {

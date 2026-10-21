@@ -91,7 +91,7 @@ ToolBar {
                     {
                         kind: "eraser",
                         icon: "eraser",
-                        name: qsTr("Erase whole ink strokes")
+                        name: qsTr("Erase parts of ink strokes")
                     }
                 ]
                 LyraToolButton {

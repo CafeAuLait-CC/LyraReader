@@ -112,6 +112,8 @@ Item {
         }
         preventStealing: pressed
         function position(mouse) {
+            if (gestureTool === "eraser")
+                return {x: mouse.x / app.zoom, y: mouse.y / app.zoom};
             const size = app.currentReader.pages[page];
             return {
                 x: Math.max(0, Math.min(size.width, mouse.x / app.zoom)),
@@ -195,8 +197,7 @@ Item {
             }
             if (gestureTool === "eraser") {
                 app.selection = null;
-                app.eraseDraft = [];
-                app.eraseAlong(page, p, p);
+                app.beginErase(page, p);
                 return;
             }
             start = Logic.nearestCharacter(annotationLayer.textPage.chars, p.x, p.y);
@@ -213,6 +214,7 @@ Item {
                 };
         }
         Keys.onEscapePressed: {
+            app.cancelErase();
             if (app.annotationTool === "stamp" || app.annotationTool === "signature")
                 app.annotationTool = "select";
             gestureTool = "canceled";
@@ -290,6 +292,7 @@ Item {
                 return;
             }
             if (gestureTool === "eraser") {
+                app.eraseAlong(page, previousPoint, position(mouse));
                 app.commitErase();
                 return;
             }
@@ -302,7 +305,7 @@ Item {
         onCanceled: {
             app.annotationDraft = null;
             app.redactionDraft = null;
-            app.eraseDraft = [];
+            app.cancelErase();
         }
         onDoubleClicked: function (mouse) {
             const hit = app.annotationAt(page, mouse.x / app.zoom, mouse.y / app.zoom, false);

@@ -534,6 +534,67 @@ private slots:
         const auto edited=scratch.path()+"/edited.pdf";reader.submit("save_current_annotations",{{"destination",edited}});QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QVERIFY2(reader.error().isEmpty(),qPrintable(reader.error()));
         saved.openFile(QUrl::fromLocalFile(edited));QTRY_COMPARE_WITH_TIMEOUT(saved.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(saved.pendingCommands(),0,10000);QCOMPARE(saved.data().value("annotations").toList().size(),2);
     }
+    void partialInkErasurePreviewsCutsCancelsAndProtectsPdfReviewThreads() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/ink.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));QFile source(path);QVERIFY(source.open(QIODevice::ReadOnly));const auto original=source.readAll();source.close();
+        ReaderController reader;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("reader",&reader);engine.load(QUrl("qrc:/qml/Main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        const auto ready=[&]{auto *page=visualItem(window->contentItem(),"pdfPage0");return page && page->property("texturesReady").toBool();};
+        const auto point=[&](double x,double y){return visualItem(window->contentItem(),"pdfPage0")->mapToScene(QPointF(x,y)).toPoint();};
+        const auto state=[&]{return reader.data().value("marks").toMap();};const auto entries=[&]{return state().value("annotations").toList();};
+        const auto listProperty=[&](const char *name){const auto value=window->property(name);return value.metaType()==QMetaType::fromType<QJSValue>() ? value.value<QJSValue>().toVariant().toList() : value.toList();};
+        const auto preview=[&]{return listProperty("erasePreview");};
+        const auto hidden=[&]{return listProperty("eraseDraft");};
+        const auto idle=[&]{return reader.pendingCommands()==0 && window->property("eraserToken").toString().isEmpty();};
+        reader.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QTRY_VERIFY_WITH_TIMEOUT(ready(),10000);
+        window->setProperty("fitting",false);window->setProperty("paperAppearance","original");QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,1.0),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QTest::qWait(100);
+        reader.submit("mark_create",{{"entry",QVariantMap{{"kind","ink"},{"page",0},{"version",1},{"paths",QVariantList{QVariantList{QVariantMap{{"x",100},{"y",350}},QVariantMap{{"x",150},{"y",350}},QVariantMap{{"x",250},{"y",350}},QVariantMap{{"x",300},{"y",350}}}}},{"strokeWidth",2},{"color","#1B7F3BFF"},{"note","preserve ink note"}}}});QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QCOMPARE(entries().size(),1);
+        const auto before=entries().first();QFile sidecar(path+".lyra-reader-annotations.json");QVERIFY(sidecar.open(QIODevice::ReadOnly));const auto baseline=sidecar.readAll();sidecar.close();
+        window->setProperty("annotationTool","eraser");QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,point(200,320));QTest::mouseMove(window,point(200,380),30);
+        QTRY_COMPARE_WITH_TIMEOUT(preview().size(),2,10000);QCOMPARE(hidden().size(),1);QCOMPARE(entries().first(),before);
+        QVERIFY(sidecar.open(QIODevice::ReadOnly));QCOMPARE(sidecar.readAll(),baseline);sidecar.close();
+        const auto frame=window->grabWindow();QVERIFY(!frame.isNull());
+        const auto pixel=[&](double x,double y){const auto p=point(x,y);return frame.pixelColor(qRound(p.x()*frame.width()/double(window->width())),qRound(p.y()*frame.height()/double(window->height())));};
+        const auto gap=pixel(200,350),left=pixel(140,350);QVERIFY2(gap.red()>245 && gap.green()>245 && gap.blue()>245,qPrintable(gap.name()));QVERIFY2(left.green()>left.red()+30,qPrintable(left.name()));
+        QTest::mouseMove(window,point(270,380),30);QTest::mouseMove(window,point(270,320),30);QTRY_COMPARE_WITH_TIMEOUT(preview().size(),3,10000);
+        const auto expected=preview();QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,point(270,320));QTRY_VERIFY_WITH_TIMEOUT(idle(),10000);QCOMPARE(entries().size(),3);
+        for(int i=0;i<3;++i){QCOMPARE(entries()[i].toMap().value("paths"),expected[i].toMap().value("paths"));QCOMPARE(entries()[i].toMap().value("note").toString(),QString("preserve ink note"));}
+        reader.submit("marks_undo");QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QCOMPARE(entries(),QVariantList{before});QVERIFY(state().value("can_redo").toBool());
+        QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,point(200,320));QTest::mouseMove(window,point(200,380),30);QTRY_COMPARE_WITH_TIMEOUT(preview().size(),2,10000);QTest::keyClick(window,Qt::Key_Escape);QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,point(200,380));QTRY_VERIFY_WITH_TIMEOUT(idle(),10000);QCOMPARE(entries(),QVariantList{before});QVERIFY(state().value("can_redo").toBool());QVERIFY(preview().isEmpty());
+        window->setProperty("annotationTool","eraser");QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,point(200,320));QTest::mouseMove(window,point(200,380),30);QTRY_COMPARE_WITH_TIMEOUT(preview().size(),2,10000);window->setProperty("annotationTool","select");QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,point(200,380));QTRY_VERIFY_WITH_TIMEOUT(idle(),10000);QCOMPARE(entries(),QVariantList{before});
+        QVERIFY(sidecar.open(QIODevice::ReadOnly));QCOMPARE(sidecar.readAll(),baseline);sidecar.close();QVERIFY(source.open(QIODevice::ReadOnly));QCOMPARE(source.readAll(),original);source.close();
+        const auto reviewPath=scratch.path()+"/review.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/annotated-ink-review.pdf",reviewPath));reader.openFile(QUrl::fromLocalFile(reviewPath));QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QTRY_VERIFY_WITH_TIMEOUT(ready(),10000);
+        window->setProperty("fitting",false);QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,1.0),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QTest::qWait(100);
+        window->setProperty("annotationTool","eraser");QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,point(250,50));QTest::mouseMove(window,point(250,380),30);QTRY_COMPARE_WITH_TIMEOUT(hidden().size(),1,10000);QCOMPARE(hidden().first().toString(),QString("nm:review-ink-bare"));QCOMPARE(preview().size(),2);QVERIFY(window->property("operationStatus").toString().contains("Protected PDF ink"));
+        const auto snapshots=qEnvironmentVariable("LYRA_READER_CHECK_SNAPSHOTS");if(!snapshots.isEmpty())QVERIFY(window->grabWindow().save(snapshots+"/lyrareader-partial-ink-preview.png"));
+        QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,point(250,380));QTRY_VERIFY_WITH_TIMEOUT(idle(),10000);QCOMPARE(entries().size(),2);QCOMPARE(state().value("pending_deletions").toInt(),1);QVERIFY(window->property("operationStatus").toString().contains("protected PDF ink"));
+        const auto file=state().value("file_annotations").toList();QCOMPARE(file.size(),3);int replies=0;for(const auto &value:file){const auto a=value.toMap();if(a.value("is_reply").toBool()){++replies;QVERIFY(!a.value("visible").toBool());}}
+        QCOMPARE(replies,2);const auto output=scratch.path()+"/cut.pdf";reader.submit("save_current_annotations",{{"destination",output}});QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QVERIFY2(reader.error().isEmpty(),qPrintable(reader.error()));
+        ReaderController reopened;reopened.openFile(QUrl::fromLocalFile(output));QTRY_COMPARE_WITH_TIMEOUT(reopened.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reopened.pendingCommands(),0,10000);QCOMPARE(reopened.data().value("annotations").toList().size(),5);
+    }
+    void partialInkErasureCrossesPageGapsInOneUndo_data() {
+        QTest::addColumn<bool>("facing");QTest::newRow("facing")<<true;QTest::newRow("continuous")<<false;
+    }
+    void partialInkErasureCrossesPageGapsInOneUndo() {
+        QFETCH(bool,facing);QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/pages.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",path));
+        ReaderController reader;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("reader",&reader);engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        reader.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QTRY_VERIFY_WITH_TIMEOUT(visualItem(window->contentItem(),"pdfPage0") && visualItem(window->contentItem(),"pdfPage0")->property("texturesReady").toBool(),10000);
+        window->setProperty("fitting",false);QVERIFY(QMetaObject::invokeMethod(window,"setPageLayout",Q_ARG(QVariant,facing ? "Facing" : "Continuous")));QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,facing ? .5 : .25),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QTest::qWait(150);
+        QTRY_VERIFY(visualItem(window->contentItem(),"pdfPage1"));
+        const auto point=[&](int index,double x,double y){return visualItem(window->contentItem(),QString("pdfPage%1").arg(index))->mapToScene(QPointF(x*window->property("zoom").toDouble(),y*window->property("zoom").toDouble())).toPoint();};
+        const auto entries=[&]{return reader.data().value("marks").toMap().value("annotations").toList();};
+        const auto list=[&](const char *name){const auto v=window->property(name);return v.metaType()==QMetaType::fromType<QJSValue>()?v.value<QJSValue>().toVariant().toList():v.toList();};
+        for(int i=0;i<2;++i)reader.submit("mark_create",{{"entry",QVariantMap{{"kind","ink"},{"page",i},{"version",1},{"paths",QVariantList{QVariantList{QVariantMap{{"x",i ? 20 : 400},{"y",200}},QVariantMap{{"x",i ? 180 : 580},{"y",200}}}}},{"strokeWidth",2},{"color","#1B7F3BFF"},{"note",""}}}});
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QCOMPARE(entries().size(),2);const auto before=entries();
+        window->setProperty("annotationTool","eraser");QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,point(0,500,200));QTest::mouseMove(window,point(1,100,200),30);
+        QTRY_COMPARE_WITH_TIMEOUT(list("eraseDraft").size(),2,10000);const auto expected=list("erasePreview");QVERIFY(expected.size()>=2);QCOMPARE(entries(),before);
+        QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,point(1,100,200));QTRY_VERIFY_WITH_TIMEOUT(window->property("eraserToken").toString().isEmpty() && reader.pendingCommands()==0,10000);
+        QCOMPARE(entries().size(),expected.size());for(int i=0;i<expected.size();++i){QCOMPARE(entries()[i].toMap().value("page"),expected[i].toMap().value("page"));QCOMPARE(entries()[i].toMap().value("paths"),expected[i].toMap().value("paths"));}
+        reader.submit("marks_undo");QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QCOMPARE(entries(),before);
+        reader.submit("marks_redo");QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QCOMPARE(entries().size(),expected.size());QVERIFY2(reader.error().isEmpty(),qPrintable(reader.error()));
+    }
     void annotationGeometryUsesRealGesturesAndOneUndoPerGesture() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());
         const auto path=scratch.path()+"/geometry.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));

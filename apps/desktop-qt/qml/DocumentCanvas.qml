@@ -16,6 +16,28 @@ Item {
                 result[page.index] = row;
         return result;
     }
+    // Use actual instantiated sheets, including virtualized row origins and facing-page
+    // offsets. One captured pointer can sweep across a gap into another visible page.
+    function eraserSegments(sourcePage, from, to) {
+        let source = null;
+        const sheets = [];
+        for (const row of pageList.contentItem.children) {
+            if (row.objectName !== "pdfCanvasRow")
+                continue;
+            for (let i = 0; i < row.pageSheets.count; ++i) {
+                const sheet = row.pageSheets.itemAt(i);
+                if (!sheet) continue;
+                sheets.push(sheet);
+                if (sheet.modelData.index === sourcePage) source = sheet;
+            }
+        }
+        if (!source) return [];
+        return sheets.map(function(sheet) {
+            const a = source.mapToItem(sheet, from.x * app.zoom, from.y * app.zoom);
+            const b = source.mapToItem(sheet, to.x * app.zoom, to.y * app.zoom);
+            return {page: sheet.modelData.index, from: {x: a.x / app.zoom, y: a.y / app.zoom}, to: {x: b.x / app.zoom, y: b.y / app.zoom}};
+        });
+    }
     function clampY(value) {
         const first = pageList.originY - pageList.topMargin;
         return Math.max(first, Math.min(value, Math.max(first, pageList.originY + pageList.contentHeight - pageList.height + pageList.bottomMargin)));
@@ -146,10 +168,13 @@ Item {
             app.fitResize()
         delegate: Item {
             id: rowItem
+            objectName: "pdfCanvasRow"
+            property alias pageSheets: sheetRepeater
             required property var modelData
             width: pageList.contentWidth
             height: modelData.height * app.zoom
             Repeater {
+                id: sheetRepeater
                 model: parent.modelData.pages
                 delegate: Rectangle {
                     id: sheet
