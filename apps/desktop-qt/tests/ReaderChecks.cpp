@@ -569,7 +569,10 @@ private slots:
         const auto snapshots=qEnvironmentVariable("LYRA_READER_CHECK_SNAPSHOTS");if(!snapshots.isEmpty())QVERIFY(window->grabWindow().save(snapshots+"/lyrareader-partial-ink-preview.png"));
         QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,point(250,380));QTRY_VERIFY_WITH_TIMEOUT(idle(),10000);QCOMPARE(entries().size(),2);QCOMPARE(state().value("pending_deletions").toInt(),1);QVERIFY(window->property("operationStatus").toString().contains("protected PDF ink"));
         const auto file=state().value("file_annotations").toList();QCOMPARE(file.size(),3);int replies=0;for(const auto &value:file){const auto a=value.toMap();if(a.value("is_reply").toBool()){++replies;QVERIFY(!a.value("visible").toBool());}}
-        QCOMPARE(replies,2);const auto output=scratch.path()+"/cut.pdf";reader.submit("save_current_annotations",{{"destination",output}});QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QVERIFY2(reader.error().isEmpty(),qPrintable(reader.error()));
+        QCOMPARE(replies,2);
+        // A discarded/crashed reader must not leave detached pieces over the original PDF ink.
+        ReaderController discarded;discarded.openFile(QUrl::fromLocalFile(reviewPath));QTRY_COMPARE_WITH_TIMEOUT(discarded.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(discarded.pendingCommands(),0,10000);QVERIFY(discarded.data().value("marks").toMap().value("annotations").toList().isEmpty());QCOMPARE(discarded.data().value("annotations").toList().size(),4);
+        const auto output=scratch.path()+"/cut.pdf";reader.submit("save_current_annotations",{{"destination",output}});QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QVERIFY2(reader.error().isEmpty(),qPrintable(reader.error()));
         ReaderController reopened;reopened.openFile(QUrl::fromLocalFile(output));QTRY_COMPARE_WITH_TIMEOUT(reopened.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reopened.pendingCommands(),0,10000);QCOMPARE(reopened.data().value("annotations").toList().size(),5);
     }
     void partialInkErasureCrossesPageGapsInOneUndo_data() {
@@ -999,7 +1002,7 @@ private slots:
                 QSKIP("Native window was not exposed or active; input bursts were not attempted. Diagnostic JSON was saved.");
             }
         }
-        Performance::Frames frames(window);QList<double> inputIntervals,refinement,guiIntervals,inputPacing,burstDurations;
+        Performance::Frames frames(window),visibleFrames(window);QList<double> inputIntervals,refinement,visibleRefinement,guiIntervals,inputPacing,burstDurations,zoomApply,navigationApply,eventPump;
         qint64 peakRss=Performance::memory("VmRSS"),lastTick=Performance::now();
         bool focusMaintained=true;
         QTimer sampler;connect(window,&QWindow::activeChanged,&sampler,[&]{if(native && !window->isActive())focusMaintained=false;});
@@ -1015,17 +1018,23 @@ private slots:
         auto *view=window->findChild<QQuickItem *>("pageList");QVERIFY(view);window->setProperty("fitting",false);
         constexpr int trials=30;
         for(int trial=0;trial<trials;++trial) {
-            frames.clear();const auto begin=Performance::now();qint64 lastInput=begin;
+            frames.clear();visibleFrames.clear();const auto begin=Performance::now();qint64 lastInput=begin;
             for(int step=0;step<12;++step) {
                 const auto inputTime=Performance::now();if(step)inputPacing.append((inputTime-lastInput)/1000.0);lastInput=inputTime;
                 const auto scale=step%3==0?2.7:step%3==1?4.0:3.6;
                 QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,scale),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+                const auto zoomDone=Performance::now();zoomApply.append((zoomDone-inputTime)/1000.0);
                 view->setProperty("contentX",double((step+trial)%8*70));
                 QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,pageIndex),Q_ARG(QVariant,double(200+(step+trial)%8*70)/scale)));
-                if(step<11)QTest::qWait(16);
+                const auto navigationDone=Performance::now();navigationApply.append((navigationDone-zoomDone)/1000.0);
+                if(step<11){QTest::qWait(16);eventPump.append((Performance::now()-navigationDone)/1000.0);}
             }
-            const auto endInput=Performance::now();burstDurations.append((endInput-begin)/1000.0);bool armed=false;QTimer ready;ready.setInterval(5);
-            connect(&ready,&QTimer::timeout,window,[&]{if(!armed && textured() && reader.pendingRasters()==0){armed=true;frames.arm();window->update();}});ready.start();
+            const auto endInput=Performance::now();burstDurations.append((endInput-begin)/1000.0);bool armed=false,visibleArmed=false;QTimer ready;ready.setInterval(5);
+            connect(&ready,&QTimer::timeout,window,[&]{
+                if(!textured())return;
+                if(!visibleArmed){visibleArmed=true;visibleFrames.arm();window->update();}
+                if(!armed && reader.pendingRasters()==0){armed=true;frames.arm();window->update();}
+            });ready.start();
             QTimer::singleShot(2000,&ready,[&,trial] {
                 auto *page=visualItem(window->contentItem(),QString("pdfPage%1").arg(pageIndex));
                 QVariantMap state{{"trial",trial},{"currentPage",window->property("currentPage")},{"zoom",window->property("zoom")},{"contentY",view->property("contentY")},{"originY",view->property("originY")},{"pendingRasters",reader.pendingRasters()},{"error",reader.error()},{"jobs",RasterJobs::statistics()},{"budget",RenderBudget::statistics()}};
@@ -1033,18 +1042,20 @@ private slots:
                 qInfo().noquote()<<"lyra-reader-performance-pending:"<<QJsonDocument::fromVariant(state).toJson(QJsonDocument::Compact);
             });
             QTRY_VERIFY_WITH_TIMEOUT(frames.queued()>0,30000);ready.stop();
-            refinement.append((frames.queued()-lastInput)/1000.0);inputIntervals.append(frames.intervals(begin,endInput));
+            QTRY_VERIFY_WITH_TIMEOUT(visibleFrames.queued()>0,10000);
+            refinement.append((frames.queued()-lastInput)/1000.0);visibleRefinement.append((visibleFrames.queued()-lastInput)/1000.0);inputIntervals.append(frames.intervals(begin,endInput));
+            if(qEnvironmentVariableIsSet("LYRA_READER_PERF_TRACE"))qInfo()<<"lyra-reader-performance-trial:"<<trial+1<<"visible-ms"<<visibleRefinement.last()<<"drained-ms"<<refinement.last()<<"burst-ms"<<burstDurations.last()<<"active"<<window->isActive();
             if(!focusMaintained || (native && trial>=2 && inputIntervals.isEmpty()))break;
         }
         sampler.stop();
         QVariantMap report{{"schema",2},{"phase","bursts"},{"qt",qVersion()},{"platform",QGuiApplication::platformName()},{"graphicsApi",int(window->rendererInterface()->graphicsApi())},{"requestedBackend",qEnvironmentVariable("QSG_RHI_BACKEND")},
             {"architecture",QSysInfo::currentCpuArchitecture()},{"fixture",QFileInfo(input).fileName()},{"pages",reader.pageCount()},{"pageIndex",pageIndex},{"windowWidth",window->width()},{"windowHeight",window->height()},{"devicePixelRatio",window->effectiveDevicePixelRatio()},
-            {"pdfOpenToTexturedFrameQueueMs",openMs},{"lastInputToTexturedFrameQueueMs",Performance::distribution(refinement)},{"duringInputFrameQueueIntervalsMs",Performance::distribution(inputIntervals)},
+            {"pdfOpenToTexturedFrameQueueMs",openMs},{"lastInputToTexturedFrameQueueMs",Performance::distribution(refinement)},{"lastInputToVisibleTextureFrameQueueMs",Performance::distribution(visibleRefinement)},{"synchronousZoomApplyMs",Performance::distribution(zoomApply)},{"synchronousPanNavigateApplyMs",Performance::distribution(navigationApply)},{"requestedSixteenMsEventPumpMs",Performance::distribution(eventPump)},{"duringInputFrameQueueIntervalsMs",Performance::distribution(inputIntervals)},
             {"trialsRequested",trials},{"trialsCompleted",refinement.size()},{"inputsPerBurst",12},{"targetInputIntervalMs",16},{"actualInputIntervalsMs",Performance::distribution(inputPacing)},{"inputBurstDurationMs",Performance::distribution(burstDurations)},{"percentileMethod","lower order statistic"},
             {"guiTenMsTimerIntervalsMs",Performance::distribution(guiIntervals)},{"rssPeakSampledBytes",peakRss},{"rssFinalBytes",Performance::memory("VmRSS")},{"processLifetimeRssHighWaterBytes",Performance::memory("VmHWM")},
             {"renderResources",RenderBudget::statistics()},{"rasterJobs",RasterJobs::statistics()},{"cpuLruKiB",ReaderController::cpuCacheKiB()},
             {"interactivePresentationMeasured",inputIntervals.size()>=6 && focusMaintained},{"inputBurstsAttempted",true},{"nativeFocusRequired",native},{"focusMaintained",focusMaintained},{"windowExposed",window->isExposed()},{"windowActive",window->isActive()},
-            {"measurementNotes","Up to thirty 12-input zoom/pan bursts targeting 16 ms; actual delivery intervals are recorded. Last input starts before applying its zoom/pan change and includes GUI handling and 5 ms readiness polling. frameSwapped measures queued presentation, not physical display FPS. Insufficient input-period frame callbacks or lost native focus invalidate the sample and stop further bursts; no cause for missing callbacks is inferred. RSS includes Qt, PDFium, fonts and index memory; unsupported OS values are -1. The source ledger includes pre-raster capacity reservations. Driver allocations and Qt chrome are outside the pixel payload ledger."}};
+            {"measurementNotes","Up to thirty 12-input zoom/pan bursts targeting 16 ms; actual delivery intervals are recorded. Last input starts before applying its zoom/pan change and includes GUI handling and 5 ms readiness polling. The legacy textured latency also waits for all reader raster requests to drain; the additional visible-texture latency only waits for the current page textures and its next queued frame. Synchronous zoom/navigation calls and the requested 16 ms Qt event pump are timed separately; event-pump time includes GUI/render synchronization and queued event handling, not only sleep. Optional per-trial trace is emitted outside the input burst. frameSwapped measures queued presentation, not physical display FPS. Insufficient input-period frame callbacks or lost native focus invalidate the sample and stop further bursts; no cause for missing callbacks is inferred. RSS includes Qt, PDFium, fonts and index memory; unsupported OS values are -1. The source ledger includes pre-raster capacity reservations. Driver allocations and Qt chrome are outside the pixel payload ledger."}};
         QVERIFY(publish(report));
         QVERIFY(RenderBudget::statistics().value("residentPeakBytes").toLongLong()<=RenderBudget::residentLimit);
         QVERIFY(RenderBudget::statistics().value("texturePeakBytes").toLongLong()<=RenderBudget::textureLimit);

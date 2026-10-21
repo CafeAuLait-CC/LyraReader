@@ -1624,7 +1624,8 @@ ApplicationWindow {
                     const changed = result.erase_changed || 0;
                     const refused = (result.erase_refused || []).length;
                     root.cancelErase();
-                    root.operationStatus = changed ? qsTr("Cut %1 ink strokes into %2 pieces. Saved in the sidecar; the PDF on disk is unchanged.").arg(changed).arg(result.erase_pieces || 0) : qsTr("No ink was changed.");
+                    root.operationStatus = changed ? qsTr("Cut %1 ink strokes into %2 pieces.").arg(changed).arg(result.erase_pieces || 0) : qsTr("No ink was changed.");
+                    if (changed) root.operationStatus += " " + (result.erase_requires_pdf_save ? qsTr("PDF ink cuts are staged. Save to PDF to keep them; Discard and Close restores the original ink.") : qsTr("Saved in the annotation sidecar; the PDF on disk is unchanged."));
                     if (refused) root.operationStatus += " " + qsTr("Left %1 protected PDF ink strokes unchanged. Comments and reply threads are preserved.").arg(refused);
                 } else {
                     root.eraseDraft = result.hidden || [];

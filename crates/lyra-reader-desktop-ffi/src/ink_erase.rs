@@ -16,6 +16,7 @@ struct Target {
     base: Value,
     file: Option<AnnotationDeleteRecord>,
     splitters: Vec<InkStrokeSplitter>,
+    stage_only: bool,
     blocked: bool,
     changed: bool,
     refused: bool,
@@ -50,6 +51,7 @@ impl Target {
         file: Option<&AnnotationRecord>,
         records: &[AnnotationRecord],
         zoom: f64,
+        stage_only: bool,
     ) -> Result<Self, String> {
         let id = string(&base, "id")?;
         let blocked = file
@@ -68,6 +70,7 @@ impl Target {
                 page: a.page,
             }),
             splitters,
+            stage_only: stage_only || file.is_some(),
             blocked,
             changed: false,
             refused: false,
@@ -197,8 +200,14 @@ impl Marks {
                 if let Some(a) = source {
                     ignored.insert(a.id.clone());
                 }
-                if kind(v) == "ink" {
-                    targets.push(Target::new(v.clone(), source, &records, zoom)?);
+                if kind(v) == "ink" && !self.hidden_ink.contains(id) {
+                    targets.push(Target::new(
+                        v.clone(),
+                        source,
+                        &records,
+                        zoom,
+                        self.transient_ink.contains(id),
+                    )?);
                 }
             }
             for a in &records {
@@ -231,7 +240,7 @@ impl Marks {
                     })
                     .collect();
                 let base = json!({"id":a.id,"kind":"ink","page":a.page,"version":1,"paths":paths,"strokeWidth":a.border_width_pt.unwrap_or(2.0).max(0.1),"note":a.contents.clone().unwrap_or_default(),"color":color,"createdAt":now()});
-                targets.push(Target::new(base, Some(a), &records, zoom)?);
+                targets.push(Target::new(base, Some(a), &records, zoom, true)?);
             }
             for target in &targets {
                 points += paths(&target.base["paths"])?
@@ -279,6 +288,7 @@ impl Marks {
                 };
                 let gesture = self.erase.take().unwrap();
                 let changed = preview["changed"].as_u64().unwrap();
+                let requires_save = gesture.targets.iter().any(|t| t.changed && t.stage_only);
                 if changed > 0 {
                     self.change(|s| {
                         for target in gesture.targets.into_iter().filter(|t| t.changed) {
@@ -286,7 +296,13 @@ impl Marks {
                             for path in target.survivors() {
                                 let mut piece = target.piece(&path, uuid()?);
                                 piece["createdAt"] = json!(now());
-                                validate(&piece, s.page_count)?;
+                                if !validate(&piece, s.page_count)? {
+                                    return Err("Unsupported cut ink schema".into());
+                                }
+                                if target.stage_only {
+                                    s.transient_ink
+                                        .insert(piece["id"].as_str().unwrap().to_string());
+                                }
                                 pieces.push(Entry::Known(piece));
                             }
                             if let Some(index) = s
@@ -294,7 +310,13 @@ impl Marks {
                                 .iter()
                                 .position(|e| matches!(e,Entry::Known(v) if v["id"]==target.id))
                             {
-                                s.entries.splice(index..=index, pieces);
+                                if target.file.is_some() {
+                                    s.hidden_ink.insert(target.id.clone());
+                                    s.entries.splice(index + 1..index + 1, pieces);
+                                } else {
+                                    s.transient_ink.remove(&target.id);
+                                    s.entries.splice(index..=index, pieces);
+                                }
                             } else {
                                 s.entries.extend(pieces);
                             }
@@ -309,6 +331,7 @@ impl Marks {
                 }
                 let mut state = self.state(document)?;
                 state["erase_changed"] = json!(changed);
+                state["erase_requires_pdf_save"] = json!(requires_save);
                 state["erase_refused"] = preview["refused"].clone();
                 state["erase_pieces"] = preview["pieces"].clone();
                 state["erase_token"] = json!(token);

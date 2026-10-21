@@ -643,6 +643,61 @@ mod tests {
     }
 
     #[test]
+    fn pdf_owned_ink_pieces_are_staged_until_saved_and_discard_cannot_duplicate_them() {
+        let fixture = Fixture::new("annotated-ink-review.pdf");
+        let doc = fixture.open();
+        doc.command(json!({"op":"file_adopt","id":"nm:review-ink-bare"}))
+            .unwrap();
+        let sidecar = format!("{}.lyra-reader-annotations.json", fixture.path.display());
+        let before = fs::read(&sidecar).unwrap();
+        let original = doc.command(json!({"op":"marks"})).unwrap()["annotations"].clone();
+        doc.command(json!({"op":"ink_erase_begin","token":"cut","page":0,"zoom":1,"segments":[{"from":{"x":250,"y":200},"to":{"x":250,"y":350}}]})).unwrap();
+        let cut = doc
+            .command(json!({"op":"ink_erase_commit","token":"cut","segments":[]}))
+            .unwrap();
+        assert_eq!(cut["erase_requires_pdf_save"], true);
+        assert_eq!(cut["annotations"].as_array().unwrap().len(), 2);
+        assert_eq!(fs::read(&sidecar).unwrap(), before);
+        let reopened = fixture.open().command(json!({"op":"marks"})).unwrap();
+        assert_eq!(reopened["annotations"], original);
+        assert_eq!(reopened["pending_deletions"], 0);
+        // Cutting an already staged piece must keep its descendants staged too.
+        doc.command(json!({"op":"ink_erase_begin","token":"again","page":0,"zoom":1,"segments":[{"from":{"x":150,"y":200},"to":{"x":150,"y":350}}]})).unwrap();
+        let again = doc
+            .command(json!({"op":"ink_erase_commit","token":"again","segments":[]}))
+            .unwrap();
+        assert_eq!(again["erase_requires_pdf_save"], true);
+        assert_eq!(again["annotations"].as_array().unwrap().len(), 3);
+        assert_eq!(fs::read(&sidecar).unwrap(), before);
+        let undo = doc.command(json!({"op":"marks_undo"})).unwrap();
+        assert_eq!(undo["annotations"], cut["annotations"]);
+        doc.command(json!({"op":"marks_redo"})).unwrap();
+        assert_eq!(fs::read(&sidecar).unwrap(), before);
+        // Ordinary sidecar annotations made after the cut must still persist.
+        let created=doc.command(json!({"op":"mark_create","entry":{"kind":"square","page":0,"version":1,"rect":{"x":10,"y":10,"width":20,"height":20},"strokeWidth":2,"color":"#000000FF","note":"keep square"}})).unwrap();
+        assert_eq!(created["annotations"].as_array().unwrap().len(), 4);
+        let reopened = fixture.open().command(json!({"op":"marks"})).unwrap();
+        assert_eq!(reopened["annotations"].as_array().unwrap().len(), 2);
+        assert_eq!(reopened["annotations"][0], original[0]);
+        assert_eq!(reopened["annotations"][1]["kind"], "square");
+        doc.command(json!({"op":"replace_current_annotations"}))
+            .unwrap();
+        let reopened = fixture.open();
+        let file = reopened.command(json!({"op":"annotations"})).unwrap();
+        assert_eq!(file.as_array().unwrap().len(), 7);
+        assert!(
+            !file
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["id"] == "nm:review-ink-bare")
+        );
+        let state = reopened.command(json!({"op":"marks"})).unwrap();
+        assert!(state["annotations"].as_array().unwrap().is_empty());
+        assert_eq!(state["pending_deletions"], 0);
+    }
+
+    #[test]
     fn artwork_round_trips_through_sidecar_pdf_and_identity_preserving_adoption() {
         use image::{ExtendedColorType, ImageEncoder};
         let fixture = Fixture::new("text-page.pdf");

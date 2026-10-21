@@ -70,6 +70,8 @@ enum Entry {
 }
 #[derive(Clone)]
 struct Snapshot {
+    transient_ink: HashSet<String>,
+    hidden_ink: HashSet<String>,
     embedded_bookmarks: HashSet<String>,
     bytes: usize,
     entries: Vec<Entry>,
@@ -77,6 +79,10 @@ struct Snapshot {
 }
 #[derive(Clone)]
 pub struct Marks {
+    // PDF-owned cut pieces stay staged with their deletion. Persisting them alone
+    // would duplicate the original after a crash or an explicit discard-and-close.
+    transient_ink: HashSet<String>,
+    hidden_ink: HashSet<String>,
     erase: Option<ink_erase::Gesture>,
     embedded_bookmarks: HashSet<String>,
     path: PathBuf,
@@ -530,6 +536,9 @@ impl Marks {
             let Entry::Known(v) = entry else { continue };
             let id = string(v, "id")?;
             result.ids.insert(id.clone());
+            if self.hidden_ink.contains(&id) {
+                continue;
+            }
             if kind(v) == "bookmark" {
                 result.bookmarks.push(WriteBookmarkRecord {
                     id,
@@ -678,6 +687,8 @@ impl Marks {
             |e| !matches!(e,Entry::Known(v)if v["id"].as_str().is_some_and(|id|ids.contains(id))),
         );
         self.deletions.clear();
+        self.transient_ink.clear();
+        self.hidden_ink.clear();
         if let Err(error) = self.persist() {
             self.restore(old);
             return Err(error);
@@ -731,6 +742,8 @@ impl Marks {
             current
         };
         let mut result = Self {
+            transient_ink: HashSet::new(),
+            hidden_ink: HashSet::new(),
             erase: None,
             embedded_bookmarks: HashSet::new(),
             path,
@@ -778,6 +791,7 @@ impl Marks {
     }
     pub fn page_snapshot(&self) -> Self {
         let mut result = self.clone();
+        result.erase = None;
         result.undo.clear();
         result.redo.clear();
         result
@@ -804,6 +818,8 @@ impl Marks {
     }
     fn snapshot(&self) -> Snapshot {
         Snapshot {
+            transient_ink: self.transient_ink.clone(),
+            hidden_ink: self.hidden_ink.clone(),
             embedded_bookmarks: self.embedded_bookmarks.clone(),
             bytes: self.storage_bytes(),
             entries: self.entries.clone(),
@@ -812,6 +828,8 @@ impl Marks {
     }
     fn restore(&mut self, s: Snapshot) {
         self.erase = None;
+        self.transient_ink = s.transient_ink;
+        self.hidden_ink = s.hidden_ink;
         self.embedded_bookmarks = s.embedded_bookmarks;
         self.entries = s.entries;
         self.deletions = s.deletions;
@@ -835,6 +853,7 @@ impl Marks {
         let elements = self
             .entries
             .iter()
+            .filter(|e| !matches!(e,Entry::Known(v) if v["id"].as_str().is_some_and(|id|self.transient_ink.contains(id))))
             .map(|e| match e {
                 Entry::Known(v) => serde_json::to_string(v).unwrap(),
                 Entry::Opaque(raw) => raw.get().to_string(),
@@ -900,6 +919,12 @@ impl Marks {
         let mut bookmarks = vec![];
         for entry in &self.entries {
             if let Entry::Known(v) = entry {
+                if v["id"]
+                    .as_str()
+                    .is_some_and(|id| self.hidden_ink.contains(id))
+                {
+                    continue;
+                }
                 if kind(v) == "bookmark" {
                     bookmarks.push(v.clone())
                 } else {
@@ -1335,6 +1360,9 @@ impl Marks {
                 self.baseline = Some(bytes);
                 self.entries.clear();
                 self.deletions.clear();
+                self.transient_ink.clear();
+                self.hidden_ink.clear();
+                self.erase = None;
                 self.embedded_bookmarks.clear();
                 self.undo.clear();
                 self.redo.clear();
