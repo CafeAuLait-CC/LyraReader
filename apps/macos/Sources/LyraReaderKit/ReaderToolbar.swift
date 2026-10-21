@@ -196,7 +196,10 @@ struct ReaderToolbar: View {
             .buttonStyle(LyraReaderToolStyle(selected: state.annotationToolsVisible && !state.pageOverviewVisible))
             .help("Show annotation tools").accessibilityLabel("Annotation tools")
             .accessibilityValue(state.annotationToolsVisible ? "Expanded" : "Collapsed")
-            pending("Edit PDF", "character.cursor.ibeam")
+            Button { state.toggleContentEditing() } label: {
+                Label("Edit PDF",systemImage:"character.cursor.ibeam")
+            }.buttonStyle(LyraReaderToolStyle(selected:state.contentEditEnabled))
+                .disabled(!state.canPageEdit)
             LyraReaderMenu(title: "Organise pages", items: [
                 LyraReaderMenuItem("Rotate Clockwise", icon: "rotate.right", enabled: state.canPageEdit) { state.rotateSelectedPages(clockwise: true) },
                 LyraReaderMenuItem("Rotate Anticlockwise", icon: "rotate.left", enabled: state.canPageEdit) { state.rotateSelectedPages(clockwise: false) },
@@ -238,10 +241,11 @@ struct ReaderToolbar: View {
                      ? "Fill & Sign · click a field, Tab moves on, Esc leaves"
                      : "Fill & Sign · fill this PDF's form fields"))
             separator
-            tool("AI assistant", "sparkles", selected: state.sidebarVisible && state.sidebarTab == .ai) {
-                state.pageOverviewVisible = false
-                state.sidebarTab = .ai; state.sidebarVisible = true
+            tool("AI assistant (⇧⌘A)", "sparkles", selected: state.rightPanelVisible) {
+                state.toggleRightPanel()
             }
+            .accessibilityLabel("AI assistant panel")
+            .accessibilityValue(state.rightPanelVisible ? "Open" : "Closed")
             LyraReaderMenu(title: "More commands", items: [
                 LyraReaderMenuItem("Open PDF…", icon: "folder", shortcut: "⌘O") { state.showFileImporter = true },
                 LyraReaderMenuItem("Add Bookmark", icon: "bookmark.badge.plus", shortcut: "⌘D",

@@ -6,6 +6,11 @@ import ImageIO
 import UniformTypeIdentifiers
 
 /// Sidebar tabs (see `docs/04-ui-ux.md` §2.2).
+///
+/// The AI assistant used to be a tab here. It now lives in the reader's right-hand panel
+/// (``ReaderSidePanel``), so a window can show the document and the assistant at the same time.
+/// `.search` and `.metadata` remain because their content is reachable programmatically (search
+/// results and the information sheet), but they are not part of the picker.
 public enum SidebarTab: String, CaseIterable, Identifiable, Sendable {
     case thumbnails
     case outline
@@ -13,7 +18,6 @@ public enum SidebarTab: String, CaseIterable, Identifiable, Sendable {
     case annotations
     case metadata
     case search
-    case ai
 
     public var id: String { rawValue }
 
@@ -25,7 +29,6 @@ public enum SidebarTab: String, CaseIterable, Identifiable, Sendable {
         case .annotations: return "Annotations"
         case .metadata: return "Metadata"
         case .search: return "Search"
-        case .ai: return "AI"
         }
     }
 
@@ -37,7 +40,6 @@ public enum SidebarTab: String, CaseIterable, Identifiable, Sendable {
         case .annotations: return "highlighter"
         case .metadata: return "text.badge.checkmark"
         case .search: return "magnifyingglass"
-        case .ai: return "sparkles"
         }
     }
 
@@ -49,8 +51,34 @@ public enum SidebarTab: String, CaseIterable, Identifiable, Sendable {
         case .annotations: return "M3"
         case .metadata: return "M4"
         case .search: return "M2"
-        case .ai: return "M5"
         }
+    }
+
+    /// The tabs the left sidebar's picker offers, in reading order. No AI entry: it moved out.
+    public static let sidebarPickerTabs: [SidebarTab] = [
+        .bookmarks, .outline, .annotations, .thumbnails,
+    ]
+
+    public var isSidebarPickerTab: Bool { Self.sidebarPickerTabs.contains(self) }
+
+    /// `UserDefaults` key for the reader's last sidebar tab.
+    public static let persistedKey = "sidebarTab"
+
+    /// Reads the persisted picker tab, falling back to a valid tab when the stored value names a
+    /// tab that no longer exists.
+    ///
+    /// This is the migration path for a reader who left the sidebar on the old AI tab: the raw
+    /// value `"ai"` no longer decodes, and an unreadable or non-picker value must not leave the
+    /// sidebar blank. The fallback is written back so the next launch does not repeat the lookup.
+    public static func restored(defaults: UserDefaults = .standard) -> SidebarTab {
+        let stored = defaults.string(forKey: persistedKey)
+        let restored = stored.flatMap(SidebarTab.init(rawValue:))
+            .flatMap { $0.isSidebarPickerTab ? $0 : nil }
+            ?? .thumbnails
+        if stored != restored.rawValue {
+            defaults.set(restored.rawValue, forKey: persistedKey)
+        }
+        return restored
     }
 }
 
@@ -280,8 +308,27 @@ public final class AppState: ObservableObject {
     /// Enabled by the application entry point; library/check hosts never alter user history.
     public static var recordsRecentDocuments = false
     @Published public var document: LoadedDocument?
-    @Published public var sidebarTab: SidebarTab = .thumbnails
+    @Published public var sidebarTab: SidebarTab = .thumbnails {
+        didSet {
+            guard oldValue != sidebarTab, Self.usesStoredSidebarTab else { return }
+            UserDefaults.standard.set(sidebarTab.rawValue, forKey: SidebarTab.persistedKey)
+        }
+    }
     @Published public var sidebarVisible: Bool = true
+    /// Whether the right-hand panel (the AI assistant's new home) is open.
+    ///
+    /// The panel is a drawer, not a conditional view: this stays true while the window animates
+    /// it closed, so the content keeps its geometry and an answer is not thrown away by a toggle.
+    @Published public var rightPanelVisible: Bool = false {
+        didSet {
+            guard oldValue != rightPanelVisible, Self.usesStoredSidePanelPreferences else { return }
+            ReaderSidePanelPreferences.store(visible: rightPanelVisible, defaults: panelDefaults)
+        }
+    }
+    /// Content width of the right-hand panel, kept across launches and clamped on every write.
+    /// The 6 pt resize handle and 1 pt separator are added by ``ReaderSidePanelMetrics``.
+    @Published public private(set) var rightPanelWidthPt =
+        ReaderSidePanelMetrics.defaultContentWidthPt
     /// Test-only transition progress. The app never sets it; `TransitionChecks` pins a value and
     /// steps it so a "partly open" frame is a deterministic layout, not a race with the display
     /// link on a loaded runner.
@@ -314,13 +361,13 @@ public final class AppState: ObservableObject {
     /// Whether the annotation tools row is expanded. The row is an overlay on the canvas, not a
     /// layout row above it, so this is the value its show/hide transition animates.
     @Published public var annotationToolsVisible: Bool = false
-    /// The reader's zoom setting. 100% means **actual physical size**, not 72 dpi on a logical
-    /// point: ``zoomFactor`` multiplies it by the current screen's calibration.
-    @Published public var zoomPercent: Int = 100
-    /// The current screen's calibration. It starts uncalibrated (factor 1) until the canvas
-    /// attaches to a window and reports its screen; checks inject a known value instead.
+    /// 100% means actual physical size, scaled by the current screen's calibration.
+    @Published public var zoomPercent: Int = 100 {
+        willSet {if newValue != zoomPercent,contentTextEditing {commitContentText?()}}
+    }
     @Published public private(set) var displayCalibration = DisplayCalibration.uncalibratedDefault
     @Published public var currentPage: Int = 1 {
+        willSet {if newValue != currentPage,contentTextEditing {commitContentText?()}}
         didSet {
             // A selected mark belongs to the page it is on. Turning to another page drops it,
             // so Delete can never remove a mark the reader can no longer see.
@@ -347,6 +394,22 @@ public final class AppState: ObservableObject {
     @Published public private(set) var pageEditBusy: Bool = false
     /// The staged session. Nil means the file on disk is the document on screen.
     private var pageEditSession: PageEditSession?
+
+    @Published public var contentEditEnabled = false
+    @Published public var contentEditTool = "select"
+    @Published public var contentEditPage: PDFContentPage?
+    @Published public var contentEditSelection: String?
+    @Published public var contentEditLoading = false
+    @Published public var contentLinkDraft: CGRect?
+    @Published public var contentTextEditing = false
+    @Published public var contentTextRecovery: String?
+    @Published public private(set) var contentCommandInFlight = false
+    @Published public var contentCloseRequested = false
+    private var contentRecoveryCommand: (command: PDFContentCommand, page: Int, url: URL?)?
+    private var pendingContentClose: Int?
+    var commitContentText: (() -> Void)?
+    private var contentEditTask: Task<Bool,Never>?
+    private var contentLoadToken = UUID()
 
     /// Pages the canvas should draw right now (usually one or two while scrolling).
     @Published public private(set) var canvasPages: [CanvasPage] = []
@@ -391,6 +454,14 @@ public final class AppState: ObservableObject {
     /// The app never changes it.
     public static var usesStoredReadingLayoutPreferences = true
 
+    /// Whether this process restores and records the sidebar's selected tab. Checks turn it off
+    /// so a run cannot move the person's sidebar to whatever tab the checks exercise.
+    public static var usesStoredSidebarTab = true
+
+    /// Whether this process restores and records the right panel's width and visibility. Checks
+    /// turn it off and pass an isolated defaults suite where they need to prove persistence.
+    public static var usesStoredSidePanelPreferences = true
+
     /// Set while `AppState` listens for a preference change made in another window.
     private var layoutPreferencesObserver: NSObjectProtocol?
 
@@ -398,9 +469,24 @@ public final class AppState: ObservableObject {
     private var viewportSizePt: CGSize = .zero
     /// One coalesced rebuild for width-only changes that can move the visible columns.
     private var pendingViewportReload: DispatchWorkItem?
+    /// True while the right panel is sliding or being dragged. Its width changes arrive once per
+    /// display frame; on a loaded runner a frame can take longer than the ordinary coalescing
+    /// window, so those updates are held here and released as one rebuild when the movement ends.
+    private var rightPanelLayoutIsMoving = false
+    /// Set when a width-only update during that movement really could change the visible
+    /// columns. No rebuild is needed at all when the page fits every width in the range.
+    private var rightPanelDeferredReloadNeeded = false
+    private var rightPanelSettleTask: Task<Void, Never>?
     /// How many times the visible band was rebuilt. Read by the transition checks: a width-only
     /// slide that cannot move the band must leave this unchanged for the whole animation.
     public private(set) var viewportReloadCount = 0
+    /// The subset of ``viewportReloadCount`` that came from the width-only coalescing path.
+    ///
+    /// `viewportReloadCount` also moves when a raster arrives (the band is re-evaluated with the
+    /// finished image), so it cannot answer "did resizing the panel rebuild the band per frame?"
+    /// on a zoomed-in document. This counter only moves for a deferred width-only rebuild, which
+    /// is exactly the cost the panel must not pay per frame.
+    public private(set) var coalescedViewportReloadCount = 0
     /// Tile edge in device pixels at LOD 0 (matches `EngineConfig::tile_size`).
     private let tileSizePx = 512
 
@@ -1236,6 +1322,31 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     @Published public private(set) var selection: Selection?
+
+    /// A passage the AI chat is pointing at. This is deliberately **not** an annotation: it is
+    /// drawn for a moment, fades in three steps and disappears, and nothing is written to the
+    /// PDF or the sidecar. `id` makes two clicks on the same page restart the fade.
+    public struct AISourceHighlight: Identifiable, Equatable, Sendable {
+        public let id: UUID
+        public let page: Int
+        /// Page-local view space (points, top-left origin, 100% zoom).
+        public let rects: [CGRect]
+        public var phase: Phase
+
+        public enum Phase: Equatable, Sendable {
+            case full, soft, faint
+        }
+
+        public init(id: UUID = UUID(), page: Int, rects: [CGRect], phase: Phase = .full) {
+            self.id = id
+            self.page = page
+            self.rects = rects
+            self.phase = phase
+        }
+    }
+
+    @Published public private(set) var aiSourceHighlight: AISourceHighlight?
+    private var aiSourceHighlightTask: Task<Void, Never>?
 
     /// A rectangle the reader marked for redaction, pending until the explicit apply command.
     public struct PendingRedaction: Identifiable, Equatable, Sendable {
@@ -2474,6 +2585,30 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         generation: 1
     )
 
+    /// The AI source highlight fades through three 1×1 amber textures. They use the same
+    /// textured-quad pipeline as selection, so no overlay view or annotation path is involved.
+    private lazy var aiSourceFullImage = PageImage(
+        pixelWidth: 1,
+        pixelHeight: 1,
+        pointSize: .zero,
+        bgra: Data([0x00, 0xB0, 0xFF, 0x66]),
+        generation: 1
+    )
+    private lazy var aiSourceSoftImage = PageImage(
+        pixelWidth: 1,
+        pixelHeight: 1,
+        pointSize: .zero,
+        bgra: Data([0x00, 0xB0, 0xFF, 0x3D]),
+        generation: 1
+    )
+    private lazy var aiSourceFaintImage = PageImage(
+        pixelWidth: 1,
+        pixelHeight: 1,
+        pointSize: .zero,
+        bgra: Data([0x00, 0xB0, 0xFF, 0x1A]),
+        generation: 1
+    )
+
     /// Raster scale as a discrete pyramid level: the smallest LOD whose scale covers the
     /// zoom. Zooming therefore stops re-rasterizing anything — the GPU scales the quad from
     /// the nearest LOD, and only the tile *set* changes.
@@ -2571,6 +2706,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     public let engine: PDFEngine
 
+    /// Domain the right panel's width/visibility are remembered in. The app uses `.standard`; a
+    /// check can pass an isolated suite so "remembered across launches" is proved without
+    /// touching the reader's own preferences.
+    private let panelDefaults: UserDefaults
+
     /// Whether the `LYRA_READER_OPEN` launch hook has already opened its document.
     ///
     /// One process launches once. With a window per session there is an `AppState` per window, and
@@ -2581,7 +2721,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// environment and the `cacheBudgetMB` setting; the checks use it so their arithmetic does
     /// not depend on how the machine running them is configured.
     public init(engine: PDFEngine? = nil, tileCacheBudgetBytes: Int? = nil,
-                preferFullPageRasters: Bool? = nil) {
+                preferFullPageRasters: Bool? = nil,
+                panelDefaults: UserDefaults = .standard) {
+        self.panelDefaults = panelDefaults
         self.preferFullPageRasters = preferFullPageRasters
             ?? (ProcessInfo.processInfo.environment["LYRA_READER_SHARP_PAGE_RASTERS"] != "0")
         // Prefer the real engine; fall back to the mock so the window still works when
@@ -2595,6 +2737,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         statusMessage = self.engine.version
         if let tileCacheBudgetBytes { tileCache.setBudget(max(1, tileCacheBudgetBytes)) }
+
+        if Self.usesStoredSidebarTab {
+            sidebarTab = SidebarTab.restored()
+        }
+        if Self.usesStoredSidePanelPreferences {
+            rightPanelWidthPt = ReaderSidePanelPreferences.width(defaults: panelDefaults)
+            rightPanelVisible = ReaderSidePanelPreferences.isVisible(defaults: panelDefaults)
+        }
 
         if Self.usesStoredReadingLayoutPreferences {
             layoutMode = ReadingLayoutPreferences.layoutMode()
@@ -2960,6 +3110,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func open(url: URL) -> Bool {
+        if deferContentTransition({[weak self] in _ = self?.open(url:url)}) {return true}
         // Keep the document the reader left behind if it belongs to a tab. The snapshot is only
         // committed after the new document actually opens, so a refused open leaves the cache and
         // the screen exactly as they were.
@@ -2967,12 +3118,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // A direct open with no tab (the launch hook, a check) has nobody to bring the old
         // document back; its handle must go, or an untabbed open path would leak one per file.
         let orphanURL = previous == nil && activeTabIndex == nil ? document?.url : nil
-        guard loadDocument(url: url, restoringTabScroll: nil) else { return false }
+        let preserveSession = previous != nil && pageEditSession.map { !Self.resolvesToSameFile(url,$0.originalURL) } == true
+        guard loadDocument(url: url, restoringTabScroll: nil,preservingPageEditSessionInSnapshot:preserveSession) else { return false }
         if var previous {
             // The new open may have discarded a page-edit session on the previous document
             // (after the explicit alert). Its revision is gone, so the retained tab must not
             // bring a dead session back.
-            if previous.state.pageEditSession != nil && pageEditSession == nil {
+            if previous.state.pageEditSession != nil && pageEditSession == nil && !preserveSession {
                 previous.state.pageEditSession = nil
                 previous.state.pageEditPendingOperations = []
                 previous.state.pageEditIsApplied = false
@@ -2992,7 +3144,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func loadDocument(url: URL, restoringTabScroll: CGFloat?,
                               preservingPageEditSessionInSnapshot: Bool = false) -> Bool {
         openRequestCount += 1
-        if let session = pageEditSession {
+        if let session = pageEditSession, !preservingPageEditSessionInSnapshot {
             let same = Self.resolvesToSameFile(url, session.originalURL)
             let alert = NSAlert()
             alert.alertStyle = .warning
@@ -3064,6 +3216,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     private func resetDocumentState() {
+        contentLoadToken = UUID()
+        contentEditPage = nil
+        contentEditSelection = nil
+        contentLinkDraft = nil
+        contentEditLoading = false
+        contentTextEditing = false
         // Pending writes describe the document being replaced or closed, so they have to land
         // before the state that carries them (sidecar URL, scroll offset) is cleared.
         flushPendingWrites()
@@ -3137,6 +3295,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         isSearching = false
         selection = nil
         selectionAnchor = nil
+        clearAISourceHighlight()
         selectedAnnotationID = nil
         pendingMarkSelection = nil
         moveOriginalAnnotation = nil
@@ -3494,7 +3653,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         if !heightChanged {
             let contentWidth = contentWidthPt * max(zoomFactor, 0.01)
             let fitsBoth = contentWidth <= min(previous.width, size.width) + 0.5
-            if fitsBoth {
+            if rightPanelLayoutIsMoving {
+                // The panel is the source of this width change. Holding the update until the
+                // movement ends is what makes "no rebuild per frame" true even when a frame on a
+                // loaded machine is slower than the ordinary coalescing window. Re-arming on
+                // every frame is also what makes the release follow the animation's real end
+                // instead of a fixed timer that a loaded machine can outrun.
+                cancelPendingViewportReload()
+                if !fitsBoth { rightPanelDeferredReloadNeeded = true }
+                armRightPanelSettle(after: 0.15)
+            } else if fitsBoth {
                 cancelPendingViewportReload()
             } else {
                 scheduleViewportReload()
@@ -3504,19 +3672,121 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         reloadVisiblePages()
     }
 
+    /// The canvas width the engine last received, in points.
+    ///
+    /// Read-only on purpose: the canvas owns the viewport. The right-panel checks need the number
+    /// to prove that Fit Width fits the canvas and not the window, and that a panel resize lands
+    /// on the expected width after the layout settles.
+    public var canvasViewportWidthPt: CGFloat { viewportSizePt.width }
+
+    /// Opens or closes the right-hand panel.
+    ///
+    /// Opening it leaves page overview: the assistant is a reading surface and the overview
+    /// covers the whole content area, so keeping both on would show the assistant "open" behind
+    /// a grid. The left sidebar's old AI button had the same rule.
+    public func toggleRightPanel() {
+        if rightPanelVisible {
+            rightPanelVisible = false
+        } else {
+            pageOverviewVisible = false
+            rightPanelVisible = true
+        }
+    }
+
+    /// Sets the panel width and remembers it at once (one discrete change, not a gesture). A live
+    /// drag uses ``resizeRightPanel(to:)`` for every pointer sample and commits on release.
+    public func setRightPanelWidth(_ width: CGFloat) {
+        resizeRightPanel(to: width)
+        commitRightPanelWidth()
+    }
+
+    /// Follows the pointer during a resize. Deliberately does not write preferences per frame:
+    /// the drag commits once when it ends.
+    public func resizeRightPanel(to width: CGFloat) {
+        let clamped = ReaderSidePanelMetrics.clampedContentWidth(width)
+        guard abs(clamped - rightPanelWidthPt) > 0.01 else { return }
+        rightPanelWidthPt = clamped
+    }
+
+    /// Persists the settled panel width (the resize gesture's release).
+    public func commitRightPanelWidth() {
+        guard Self.usesStoredSidePanelPreferences else { return }
+        ReaderSidePanelPreferences.store(width: rightPanelWidthPt, defaults: panelDefaults)
+    }
+
+    /// Called by the window when the right panel's visibility changes. A real animation holds
+    /// width updates for its duration; Reduce Motion and a live window resize toggle at once, so
+    /// they take the instantaneous branch.
+    public func noteRightPanelVisibilityChange(animated: Bool) {
+        guard document != nil else { return }
+        beginRightPanelMovement()
+        guard animated else {
+            finishRightPanelMovement()
+            return
+        }
+        // Hold for at least the animation's nominal length. Every frame that arrives re-arms
+        // this, so a loaded machine that delivers the slide late does not release the hold early.
+        armRightPanelSettle(after: ReaderMotion.panelDuration + 0.15)
+    }
+
+    /// A drag of the panel's inner edge began. The view calls this once per gesture.
+    public func beginRightPanelResize() {
+        beginRightPanelMovement()
+    }
+
+    /// The drag ended (or was cancelled): release the single deferred rebuild, if one is needed.
+    ///
+    /// The release waits briefly for the last layout pass. The pointer can be released before
+    /// SwiftUI has laid out the final width; those trailing viewport reports belong to the drag
+    /// and must be held too, or a loaded machine turns them back into one rebuild per frame.
+    public func endRightPanelResize() {
+        armRightPanelSettle(after: 0.15)
+    }
+
+    /// Releases the movement once `seconds` pass without another width report. The timer is
+    /// replaced, not accumulated, so the rebuild happens after the last frame, not after the
+    /// first one.
+    private func armRightPanelSettle(after seconds: TimeInterval) {
+        rightPanelSettleTask?.cancel()
+        rightPanelSettleTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(Int(seconds * 1000)))
+            guard !Task.isCancelled, let self else { return }
+            self.finishRightPanelMovement()
+        }
+    }
+
+    private func beginRightPanelMovement() {
+        rightPanelLayoutIsMoving = true
+        rightPanelSettleTask?.cancel()
+        rightPanelSettleTask = nil
+        cancelPendingViewportReload()
+    }
+
+    private func finishRightPanelMovement() {
+        rightPanelSettleTask?.cancel()
+        rightPanelSettleTask = nil
+        guard rightPanelLayoutIsMoving else { return }
+        rightPanelLayoutIsMoving = false
+        if rightPanelDeferredReloadNeeded {
+            rightPanelDeferredReloadNeeded = false
+            scheduleViewportReload(after: 0.02)
+        }
+    }
+
     /// A width-only change that can move the visible columns (a zoomed-in page wider than the
     /// canvas) is rebuilt once after the width stops changing rather than on every frame.
-    private func scheduleViewportReload() {
+    private func scheduleViewportReload(after delay: TimeInterval = 0.08) {
         pendingViewportReload?.cancel()
         let work = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated {
                 guard let self else { return }
                 self.pendingViewportReload = nil
+                self.coalescedViewportReloadCount += 1
                 self.reloadVisiblePages()
             }
         }
         pendingViewportReload = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     private func cancelPendingViewportReload() {
@@ -6141,10 +6411,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var undoStack: [UndoableAction] = []
     @Published public private(set) var redoStack: [UndoableAction] = []
 
-    public var canUndo: Bool { !undoStack.isEmpty }
-    public var canRedo: Bool { !redoStack.isEmpty }
+    public var canUndo: Bool { contentTextEditing ? (NSApp.keyWindow?.firstResponder as? NSTextView)?.undoManager?.canUndo == true : (contentEditEnabled ? canUndoPageEdit : !undoStack.isEmpty) }
+    public var canRedo: Bool { contentTextEditing ? (NSApp.keyWindow?.firstResponder as? NSTextView)?.undoManager?.canRedo == true : (contentEditEnabled ? canRedoPageEdit : !redoStack.isEmpty) }
 
     public func undo() {
+        if contentTextEditing {(NSApp.keyWindow?.firstResponder as? NSTextView)?.undoManager?.undo();return}
+        if contentEditEnabled { undoPageEdit(); return }
         guard let action = undoStack.last else { return }
         if editingAnnotationID != nil { commitTextEditing() }
         flushPendingAnnotationWrite()
@@ -6195,6 +6467,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func redo() {
+        if contentTextEditing {(NSApp.keyWindow?.firstResponder as? NSTextView)?.undoManager?.redo();return}
+        if contentEditEnabled { redoPageEdit(); return }
         guard let action = redoStack.last else { return }
         if editingAnnotationID != nil { commitTextEditing() }
         flushPendingAnnotationWrite()
@@ -7202,6 +7476,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The Save Annotated Copy panel. The writer's only job is to produce a new file; the
     /// document on screen (and its sidecar) stays exactly where it is.
     public func presentSaveAnnotatedCopyPanel() {
+        if contentEditEnabled {presentSavePageEditsCopyPanel();return}
         guard let suggestion = suggestedAnnotatedCopyURL else { return }
         let panel = NSSavePanel()
         panel.title = "Save Annotated Copy"
@@ -8705,7 +8980,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Whether the page commands can run at all.
     public var canPageEdit: Bool {
-        document != nil && !annotationSaveInProgress && !pageEditBusy
+        document != nil && !annotationSaveInProgress && !pageEditBusy && !contentCommandInFlight
     }
 
     /// Page operations that write a new file (extract, merge, split).
@@ -8715,7 +8990,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public var canUndoPageEdit: Bool { pageEditSession?.undo.isEmpty == false && !pageEditBusy }
     public var canRedoPageEdit: Bool { pageEditSession?.redo.isEmpty == false && !pageEditBusy }
     public var canSavePageEditsCopy: Bool {
-        pageEditSession != nil && !pageEditBusy && !annotationSaveInProgress
+        (pageEditSession != nil || contentTextEditing) && !pageEditBusy && !annotationSaveInProgress
     }
 
     /// Applying the staged revision to the signed file itself. "Save Copy" stays available.
@@ -9414,7 +9689,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func presentSavePageEditsCopyPanel() {
-        guard let source = pageEditDisplayURL, pageEditSession != nil else { return }
+        guard let source = pageEditDisplayURL, pageEditSession != nil || contentTextEditing else { return }
         let panel = NSSavePanel()
         panel.title = "Save Edited Copy"
         panel.message =
@@ -9433,6 +9708,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func savePageEditsCopy(to destination: URL) async -> Bool {
+        guard contentTextRecovery == nil else {lastError="Finish or discard the recovered draft before saving.";return false}
+        commitContentText?()
+        if let task=contentEditTask {
+            let succeeded=await task.value
+            contentEditTask=nil
+            if !succeeded {return false}
+        }
         guard let session = pageEditSession, !pageEditBusy else { return false }
         if Self.resolvesToSameFile(destination, session.originalURL) {
             lastError = "The edited copy would be the original. Use “Replace Original with Page Changes” for that."
@@ -9484,6 +9766,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func presentReplaceOriginalWithPageEditsConfirmation() {
+        if contentTextEditing {
+            commitContentText?()
+            Task { @MainActor [weak self] in
+                guard let self, let task=contentEditTask, await task.value else{return}
+                contentEditTask=nil
+                presentReplaceOriginalWithPageEditsConfirmation()
+            }
+            return
+        }
         guard guardWritable() else { return }
         guard canReplaceOriginalWithPageEdits, let session = pageEditSession else { return }
         let alert = NSAlert()
@@ -9503,6 +9794,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func replaceOriginalWithPageEdits() async -> Bool {
+        guard contentTextRecovery == nil else {lastError="Finish or discard the recovered draft before saving.";return false}
+        commitContentText?()
+        if let task=contentEditTask {
+            let succeeded=await task.value
+            contentEditTask=nil
+            if !succeeded {return false}
+        }
         guard let session = pageEditSession, !pageEditBusy else { return false }
         let sidecarData: Data?
         do {
@@ -9575,12 +9873,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func undoPageEdit() {
+        if deferContentTransition({[weak self] in self?.undoPageEdit()}) {return}
         Task { @MainActor [weak self] in
             await self?.undoOrRedoPageEdit(redo: false)
         }
     }
 
     public func redoPageEdit() {
+        if deferContentTransition({[weak self] in self?.redoPageEdit()}) {return}
         Task { @MainActor [weak self] in
             await self?.undoOrRedoPageEdit(redo: true)
         }
@@ -11097,6 +11397,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// show the reader what happened.
     @discardableResult
     public func openDocumentInTab(_ url: URL) -> Bool {
+        if deferContentTransition({[weak self] in _ = self?.openDocumentInTab(url)}) {return true}
         saveActiveTabPosition()
         guard open(url: url) else { return false }
         let tab = OpenTab(url: url, title: url.deletingPathExtension().lastPathComponent,
@@ -11132,6 +11433,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// with a placeholder shown until its first raster arrives.
     public func selectTab(_ index: Int) {
         guard tabs.indices.contains(index), index != activeTabIndex else { return }
+        if deferContentTransition({[weak self] in self?.selectTab(index)}) {return}
         saveActiveTabPosition()
         flushPendingWrites()
         let previousID = activeTabIndex.flatMap { tabs.indices.contains($0) ? tabs[$0].id : nil }
@@ -11179,6 +11481,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     public func closeTab(_ index: Int) {
         guard tabs.indices.contains(index) else { return }
+        if deferContentTransition({[weak self] in self?.closeTab(index)}) {return}
+        if index != activeTabIndex, retainedTabs[tabs[index].id]?.state.pageEditSession?.operations.isEmpty == false {selectTab(index)}
+        if index == activeTabIndex, pageEditSession?.operations.isEmpty == false {
+            pendingContentClose=index;contentCloseRequested=true;return
+        }
         saveActiveTabPosition()
         let closing = tabs[index]
         if index != activeTabIndex {
@@ -11687,6 +11994,60 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard isDraggingScrollIndicator else { return }
         isDraggingScrollIndicator = false
         beginScrollActivity()
+    }
+
+    /// Jump to a chat citation's page and flash the passage it came from.
+    ///
+    /// This creates no annotation and writes no sidecar: the boxes live in `aiSourceHighlight`
+    /// for the length of the fade and are then dropped. The page is scrolled so the first line
+    /// of the passage is visible, not merely so the page top is.
+    public func revealAISource(page: Int, rects: [CGRect]) {
+        guard let document, page >= 0, page < document.pageCount else { return }
+        let clipped = rects.filter {
+            $0.width.isFinite && $0.height.isFinite && $0.width > 0 && $0.height > 0
+        }
+        let pageTop = engine.pageTopPt(page, gapPt: pageGapPt, layout: layoutMode)
+        let passageTop = clipped.map(\.minY).min() ?? 0
+        cancelScrollGlide()
+        scrollYPt = clampedScrollOffset(max(pageTop, pageTop + passageTop - 40))
+        let highlight = AISourceHighlight(page: page, rects: clipped)
+        aiSourceHighlight = highlight
+        reloadVisiblePages()
+        schedulePositionSave()
+        statusMessage = clipped.isEmpty
+            ? "Jumped to page \(page + 1). The source region has no text geometry."
+            : "Source highlighted on page \(page + 1); it fades and is not saved."
+        fadeAISourceHighlight(id: highlight.id)
+    }
+
+    /// Drop the transient highlight immediately (new document, panel closed, clear chat).
+    public func clearAISourceHighlight() {
+        aiSourceHighlightTask?.cancel()
+        aiSourceHighlightTask = nil
+        guard aiSourceHighlight != nil else { return }
+        aiSourceHighlight = nil
+        refreshSelectionOverlay()
+    }
+
+    private func fadeAISourceHighlight(id: UUID) {
+        aiSourceHighlightTask?.cancel()
+        aiSourceHighlightTask = Task { @MainActor [weak self] in
+            for (phase, delay) in [
+                (AISourceHighlight.Phase.soft, Duration.milliseconds(450)),
+                (.faint, .milliseconds(450)),
+            ] {
+                try? await Task.sleep(for: delay)
+                guard !Task.isCancelled, let self,
+                      self.aiSourceHighlight?.id == id else { return }
+                self.aiSourceHighlight?.phase = phase
+                self.refreshSelectionOverlay()
+            }
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !Task.isCancelled, let self,
+                  self.aiSourceHighlight?.id == id else { return }
+            self.aiSourceHighlight = nil
+            self.refreshSelectionOverlay()
+        }
     }
 
     /// Jumps so that `page` (0-based) sits at the top of the viewport.
@@ -12377,6 +12738,28 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Everything translucent — the selection and every highlight — is drawn by the same
     /// textured-quad pipeline as the pages, so annotation rendering needs no new GPU path.
     private func appendSelectionHighlights(to pages: inout [CanvasPage]) {
+        if let highlight = aiSourceHighlight,
+           let placement = visiblePagePlacements.first(where: { $0.index == highlight.page }) {
+            let image: PageImage = switch highlight.phase {
+            case .full: aiSourceFullImage
+            case .soft: aiSourceSoftImage
+            case .faint: aiSourceFaintImage
+            }
+            for (index, rect) in highlight.rects.enumerated() {
+                pages.append(CanvasPage(
+                    placement: PagePlacement(
+                        index: PlacementIndex.aiSource(index),
+                        topPt: placement.topPt + rect.minY,
+                        leftPt: placement.leftPt + rect.minX,
+                        widthPt: rect.width,
+                        heightPt: rect.height
+                    ),
+                    image: image,
+                    blend: .normal
+                ))
+            }
+        }
+
         if let selection, !isMarkingTextSelection {
             // While a markup tool is armed the selection *is* the mark about to be committed:
             // it is drawn with the same quads, colour and blend as the finished annotation, so
@@ -13526,5 +13909,361 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard tileCache.usedBytes + pageRasterCacheUsedBytes > tileCache.budgetBytes else { return }
         tileCache.evictToFit(pinned: wantedTiles.union(tilesInFlight), currentLod: rasterLod,
                             reservedBytes: pageRasterCacheUsedBytes)
+    }
+}
+
+extension AppState {
+    public var selectedContentItem: PDFContentItem? {
+        contentEditPage?.items.first { $0.id == contentEditSelection }
+    }
+
+    public func toggleContentEditing() {
+        if contentEditEnabled, deferContentTransition({[weak self] in self?.toggleContentEditing()}) {return}
+        contentEditEnabled.toggle()
+        annotationTool = .select
+        annotationToolsVisible = false
+        contentEditSelection = nil
+    }
+
+    public func reloadContentObjects() async {
+        guard contentEditEnabled, let url = document?.url else { return }
+        let token = UUID()
+        contentLoadToken = token
+        contentEditLoading = true
+        contentEditPage = nil
+        contentEditSelection = nil
+        let page = currentPage - 1
+        do {
+            let snapshot = try await engine.contentObjects(page: page)
+            guard token == contentLoadToken, document?.url == url, currentPage - 1 == page else {
+                return
+            }
+            contentEditPage = snapshot
+            contentEditLoading = false
+        } catch {
+            guard token == contentLoadToken else { return }
+            lastError = "Could not inspect page content: \(error.localizedDescription)"
+            contentEditLoading = false
+        }
+    }
+
+    public func transformContent(_ item: PDFContentItem, to rect: CGRect, rotation: Double = 0) {
+        guard let page = contentEditPage else { return }
+        var command = PDFContentCommand(action: "transform", revision: page.revision)
+        command.target = item.id
+        command.bounds = PDFContentBox(rect)
+        command.rotation = rotation
+        if item.can_edit_text, abs(rotation) < 0.001,
+            abs(rect.width - item.bounds.width) > 0.1 || abs(rect.height - item.bounds.height) > 0.1
+        {
+            command.action = "replaceText"
+            command.rotation = nil
+            command.text = item.text
+            command.font = "Original"
+            command.size = item.size
+            command.colour = item.colour
+            command.alignment = 0
+        }
+        stageContentEdit(command, page: page.page, label: "Move or resize \(item.kind)")
+    }
+
+    public func replaceContentText(
+        _ item: PDFContentItem, text: String, font: String = "Original", size: Double? = nil,
+        colour: [UInt8]? = nil, alignment: Int = 0
+    ) {
+        guard let page = contentEditPage else { return }
+        var command = PDFContentCommand(action: "replaceText", revision: page.revision)
+        command.target = item.id
+        command.bounds = item.bounds
+        command.text = text
+        command.font = font
+        command.size = size ?? item.size
+        command.colour = colour ?? item.colour
+        command.alignment = alignment
+        stageContentEdit(command, page: page.page, label: "Edit page text")
+    }
+
+    public func insertContentText(at rect: CGRect) {
+        guard let page = contentEditPage else { return }
+        var command = PDFContentCommand(action: "insertText", revision: page.revision)
+        command.bounds = PDFContentBox(rect)
+        command.text = "New text"
+        command.font = "Helvetica"
+        command.size = 12
+        command.colour = [0, 0, 0, 255]
+        command.alignment = 0
+        stageContentEdit(command, page: page.page, label: "Insert page text")
+    }
+
+    public func deleteContent(_ item: PDFContentItem) {
+        guard let page = contentEditPage else { return }
+        var command = PDFContentCommand(action: "delete", revision: page.revision)
+        command.target = item.id
+        stageContentEdit(command, page: page.page, label: "Delete \(item.kind)")
+    }
+
+    public func redactContent(in rect: CGRect, blackout: Bool) {
+        guard let page = contentEditPage else { return }
+        var command = PDFContentCommand(action: "redact", revision: page.revision)
+        command.bounds = PDFContentBox(rect)
+        command.blackout = blackout
+        stageContentEdit(
+            command, page: page.page,
+            label: blackout ? "Blackout page content" : "Erase page content")
+    }
+
+    public func setContentLink(_ item: PDFContentItem?, page: Int?, uri: String?) {
+        guard let snapshot = contentEditPage, let bounds = item?.bounds.rect ?? contentLinkDraft
+        else { return }
+        if let page, page < 0 || page >= (document?.pageCount ?? 0) {
+            lastError = "Choose a page inside this document."
+            return
+        }
+        var command = PDFContentCommand(action: "setLink", revision: snapshot.revision)
+        command.target = item?.id
+        command.bounds = PDFContentBox(bounds)
+        command.page = page
+        command.uri = uri
+        contentLinkDraft = nil
+        stageContentEdit(
+            command, page: snapshot.page, label: item == nil ? "Insert link" : "Edit link")
+    }
+
+    public func chooseContentImage(at rect: CGRect? = nil, replacing item: PDFContentItem? = nil) {
+        guard let page = contentEditPage else { return }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url, let image = NSImage(contentsOf: url),
+            let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
+            let png = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:])
+        else { return }
+        let path = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "LyraContentImage-\(UUID().uuidString).png")
+        do { try png.write(to: path, options: .atomic) } catch {
+            lastError = error.localizedDescription
+            return
+        }
+        var command = PDFContentCommand(
+            action: item == nil ? "insertImage" : "replaceImage", revision: page.revision)
+        command.target = item?.id
+        command.image_path = path.path
+        if let rect {
+            command.bounds = PDFContentBox(
+                CGRect(
+                    x: rect.minX, y: rect.minY, width: 180,
+                    height: 180 * Double(cg.height) / Double(cg.width)))
+        }
+        stageContentEdit(
+            command, page: page.page, label: item == nil ? "Insert image" : "Replace image")
+    }
+
+    public func cropContentImage(_ item: PDFContentItem, to crop: CGRect) {
+        guard let page = contentEditPage else { return }
+        var command = PDFContentCommand(action: "cropImage", revision: page.revision)
+        command.target = item.id
+        command.crop = PDFContentBox(crop)
+        stageContentEdit(command, page: page.page, label: "Crop image")
+    }
+
+    public func contentImageData(_ item: PDFContentItem) async throws -> Data {
+        guard let page = contentEditPage else { throw NSError(domain: "LyraReader", code: 1) }
+        if item.kind == "image" {
+            return try await engine.contentImagePNG(
+                page: page.page, target: item.id, revision: page.revision)
+        }
+        let r = item.bounds.rect
+        let image = try await engine.rasterizeRegion(
+            page: page.page, scale: 2, xPt: r.minX, yPt: r.minY, widthPt: r.width,
+            heightPt: r.height, transparentBackground: false)
+        guard let data = image.contentPNGData() else {
+            throw NSError(domain: "LyraReader", code: 2)
+        }
+        return data
+    }
+
+    public func exportContentImage(_ item: PDFContentItem) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let data = try await contentImageData(item)
+                let panel = NSSavePanel()
+                panel.allowedContentTypes = [.png]
+                panel.nameFieldStringValue = "image.png"
+                guard panel.runModal() == .OK, let url = panel.url else { return }
+                try data.write(to: url, options: .atomic)
+                statusMessage = "Image exported"
+            } catch { lastError = "Image export failed: \(error.localizedDescription)" }
+        }
+    }
+
+    private func preserveContentFailure(
+        _ command: PDFContentCommand, _ message: String, page: Int? = nil, url: URL? = nil
+    ) {
+        if command.action == "replaceText", let text = command.text {
+            contentRecoveryCommand = (
+                command, page ?? contentEditPage?.page ?? currentPage - 1, url ?? document?.url
+            )
+            contentTextRecovery = text
+            contentEditEnabled = true
+        }
+        lastError = message
+    }
+
+    public func retryContentText(font: String) {
+        guard let pending = contentRecoveryCommand, let text = contentTextRecovery,
+            let snapshot = contentEditPage
+        else { return }
+        var command = pending.command
+        guard snapshot.revision == command.revision, document?.url == pending.url else {
+            lastError = "This draft belongs to an older page. Copy it before discarding the draft."
+            return
+        }
+        command.text = text
+        command.font = font
+        contentTextRecovery = nil
+        stageContentEdit(command, page: pending.page, label: "Edit page text")
+    }
+    public func recoverDetachedContentText(
+        _ item: PDFContentItem, text: String, revision: String, page: Int, url: URL?
+    ) {
+        var command = PDFContentCommand(action: "replaceText", revision: revision)
+        command.target = item.id
+        command.bounds = item.bounds
+        command.text = text
+        command.font = "Original"
+        command.size = item.size
+        command.colour = item.colour
+        command.alignment = 0
+        preserveContentFailure(
+            command,
+            "The page changed before this text draft was committed. Your words are preserved in the Edit sidebar.",
+            page: page, url: url)
+    }
+    public func discardContentTextRecovery() {
+        contentTextRecovery = nil
+        contentRecoveryCommand = nil
+        contentEditTask = nil
+    }
+
+    private func deferContentTransition(_ action: @escaping @MainActor () -> Void) -> Bool {
+        guard contentTextRecovery == nil else {
+            lastError = "Finish or discard the recovered text draft before leaving this document."
+            return true
+        }
+        let hadDraft = contentTextEditing
+        if hadDraft { commitContentText?() }
+        if hadDraft || contentCommandInFlight, let task = contentEditTask {
+            Task { @MainActor in if await task.value { action() } }
+            return true
+        }
+        return false
+    }
+
+    public func cancelContentClose() {
+        contentCloseRequested = false
+        pendingContentClose = nil
+    }
+    public func discardContentAndClose() {
+        guard let index = pendingContentClose else { return }
+        cancelContentClose()
+        discardPageEdits()
+        closeTab(index)
+    }
+    public func saveContentAndClose() {
+        guard let index = pendingContentClose else { return }
+        contentCloseRequested = false
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.pdf]
+        panel.nameFieldStringValue = "Edited document.pdf"
+        guard panel.runModal() == .OK, let destination = panel.url else {
+            cancelContentClose()
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self, await savePageEditsCopy(to: destination) else { return }
+            pendingContentClose = nil
+            discardPageEdits()
+            closeTab(index)
+        }
+    }
+
+    private func stageContentEdit(_ command: PDFContentCommand, page: Int, label: String) {
+        guard contentTextRecovery == nil else {
+            lastError = "Finish or discard the recovered text draft before another edit."
+            return
+        }
+        guard !contentCommandInFlight, !pageEditBusy, !contentEditLoading else {
+            preserveContentFailure(
+                command, "Wait for the current page change to finish.", page: page)
+            return
+        }
+        contentCommandInFlight = true
+        let source = document?.url
+        contentEditTask = Task { @MainActor [weak self] in
+            defer {
+                self?.contentCommandInFlight = false
+                if let path = command.image_path,
+                    URL(fileURLWithPath: path).lastPathComponent.hasPrefix("LyraContentImage-")
+                {
+                    try? FileManager.default.removeItem(atPath: path)
+                }
+            }
+            guard let self else { return false }
+            guard !annotations.contains(where: { $0.page == page }),
+                !bookmarks.contains(where: { $0.page == page })
+            else {
+                preserveContentFailure(
+                    command,
+                    "This page has LyraReader marks stored as text positions. Save those marks into a PDF copy before editing its page content.",
+                    page: page)
+                return false
+            }
+            guard await ensurePageEditSession(), var session = pageEditSession,
+                let snapshot = pageEditSnapshot(label: label), document?.url == source
+            else {
+                preserveContentFailure(command, "Could not prepare the working copy.", page: page)
+                return false
+            }
+            pageEditBusy = true
+            defer { pageEditBusy = false }
+            let next = session.directory.appendingPathComponent("rev-\(UUID().uuidString).pdf")
+            do {
+                try await engine.applyContentEdit(page: page, command: command, to: next)
+                guard document?.url == source else {
+                    throw NSError(
+                        domain: "LyraReader", code: 2,
+                        userInfo: [
+                            NSLocalizedDescriptionKey: "The active document changed during the edit"
+                        ])
+                }
+                try loadPageEditRevision(
+                    at: next, title: session.title, sidecarURL: session.sidecarURL,
+                    annotations: annotations, bookmarks: bookmarks, slots: annotationSidecarSlots,
+                    currentPage: currentPage, selection: pageSelection)
+                session.revisionURL = next
+                session.revisionNumber += 1
+                session.operations.append(label)
+                session.undo.append(snapshot)
+                session.redo.removeAll()
+                pageEditSession = session
+                pageEditPendingOperations = session.operations
+                pageEditIsApplied = false
+                if command.action == "replaceText" {
+                    contentRecoveryCommand = nil
+                    contentTextRecovery = nil
+                }
+                statusMessage = "\(label) · staged in working copy; Save Edited Copy to publish"
+                await reloadContentObjects()
+                return true
+            } catch {
+                preserveContentFailure(
+                    command,
+                    "Content edit failed; the previous revision is unchanged: \(error.localizedDescription)",
+                    page: page, url: source)
+                try? FileManager.default.removeItem(at: next)
+                return false
+            }
+        }
     }
 }

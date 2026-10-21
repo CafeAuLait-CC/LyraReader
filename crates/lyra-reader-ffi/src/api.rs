@@ -16,8 +16,9 @@ use crate::index_cache::{
 };
 use lyra_reader_ai::MockProvider;
 use lyra_reader_ai::chat::{
-    Action as AiAction, ChatPlan, ChatSettings, MergePart, MergePlanRequest, PageChar, PageText,
-    PlanRequest, ReasoningEncoding, ReasoningMode, SelectionRange as AiSelectionRange,
+    Action as AiAction, ChatPlan, ChatSettings, ConversationTurn, DocumentChatRequest, MergePart,
+    MergePlanRequest, PageChar, PageText, PlanRequest, ReasoningEncoding, ReasoningMode,
+    SelectionRange as AiSelectionRange, SourceRect as AiSourceRect, build_document_chat_plan,
     build_merge_plan, build_plan, inspect_base_url, validate_model,
 };
 use lyra_reader_ai::openai::{
@@ -1699,6 +1700,104 @@ impl LyraReaderDocument {
         Ok(rotations)
     }
 
+    /// Actual page objects in top-left view points. Identity is bound to the file's SHA-256.
+    pub fn content_objects(&self, page: u32) -> Result<String, LyraReaderFfiError> {
+        let mut snapshot =
+            lyra_reader_pdfium::content_edit::inspect_content(Path::new(&self.path), page)?;
+        let transform = self
+            .backend
+            .page_info(PageIndex(page))?
+            .geometry
+            .page_to_view(1.0);
+        for item in &mut snapshot.items {
+            item.bounds = transform
+                .apply_rect(lyra_reader_core::Rect::new(
+                    item.bounds.x,
+                    item.bounds.y,
+                    item.bounds.width,
+                    item.bounds.height,
+                ))
+                .into();
+        }
+        serde_json::to_string(&snapshot).map_err(|e| LyraReaderFfiError::InvalidArgument {
+            message: e.to_string(),
+        })
+    }
+
+    pub fn content_image_png(
+        &self,
+        page: u32,
+        target: String,
+        revision: String,
+    ) -> Result<Vec<u8>, LyraReaderFfiError> {
+        Ok(lyra_reader_pdfium::content_edit::content_image(
+            Path::new(&self.path),
+            page,
+            &target,
+            &revision,
+        )?)
+    }
+
+    /// Stages a content edit in a separate working revision; publication uses the existing
+    /// signature-aware page-edit save transaction.
+    pub fn apply_content_edit(
+        &self,
+        page: u32,
+        command: String,
+        destination: String,
+    ) -> Result<(), LyraReaderFfiError> {
+        use lyra_reader_pdfium::content_edit::ContentCommand;
+        if self.replaced.load(std::sync::atomic::Ordering::Acquire) || self.backend.is_encrypted() {
+            return Err(LyraReaderFfiError::InvalidArgument {
+                message: "Reopen an unencrypted document before editing its contents.".into(),
+            });
+        }
+        let mut command: ContentCommand =
+            serde_json::from_str(&command).map_err(|e| LyraReaderFfiError::InvalidArgument {
+                message: e.to_string(),
+            })?;
+        let transform = self
+            .backend
+            .page_info(PageIndex(page))?
+            .geometry
+            .view_to_page(1.0)
+            .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
+                message: "Singular page geometry".into(),
+            })?;
+        match &mut command {
+            ContentCommand::Transform { bounds, .. }
+            | ContentCommand::ReplaceText { bounds, .. }
+            | ContentCommand::InsertText { bounds, .. }
+            | ContentCommand::Redact { bounds, .. }
+            | ContentCommand::InsertImage { bounds, .. }
+            | ContentCommand::SetLink { bounds, .. } => {
+                *bounds = transform
+                    .apply_rect(lyra_reader_core::Rect::new(
+                        bounds.x,
+                        bounds.y,
+                        bounds.width,
+                        bounds.height,
+                    ))
+                    .into();
+            }
+            ContentCommand::Delete { .. }
+            | ContentCommand::ReplaceImage { .. }
+            | ContentCommand::CropImage { .. } => {}
+        }
+        // The shell's positive angle turns clockwise in its Y-down view space. PDF content
+        // matrices use Y-up coordinates, including on pages with an intrinsic /Rotate.
+        if let ContentCommand::Transform { rotation, .. } = &mut command {
+            *rotation = -*rotation;
+        }
+        lyra_reader_pdfium::content_edit::edit_content(
+            Path::new(&self.path),
+            Path::new(&destination),
+            page,
+            &command,
+        )?;
+        Ok(())
+    }
+
     /// Applies a page operation to a **copy** of this document and writes it to `destination`.
     ///
     /// This object's file is never modified. The written file is verified to have the requested
@@ -2401,6 +2500,7 @@ impl LyraReaderDocument {
             AiActionRecord::SummarizeDocument => AiAction::SummarizeDocument,
             AiActionRecord::AskSelection => AiAction::AskSelection,
             AiActionRecord::TranslateSelection => AiAction::TranslateSelection,
+            AiActionRecord::DocumentChat => AiAction::DocumentChat,
         };
         let page_count = self.page_count();
         if page_count == 0 {
@@ -2494,17 +2594,36 @@ impl LyraReaderDocument {
             .and_then(|stem| stem.to_str())
             .unwrap_or("Document")
             .to_string();
-        let plan = build_plan(PlanRequest {
-            action,
-            document_title,
-            page_count,
-            current_page: request.current_page,
-            selection,
-            question: request.question,
-            language: request.language,
-            pages,
-            settings,
-        })?;
+        let plan = if action == AiAction::DocumentChat {
+            build_document_chat_plan(DocumentChatRequest {
+                document_title,
+                page_count,
+                current_page: request.current_page,
+                question: request.question.unwrap_or_default(),
+                history: request
+                    .history
+                    .into_iter()
+                    .map(|turn| ConversationTurn {
+                        question: turn.question,
+                        answer: turn.answer,
+                    })
+                    .collect(),
+                pages,
+                settings,
+            })?
+        } else {
+            build_plan(PlanRequest {
+                action,
+                document_title,
+                page_count,
+                current_page: request.current_page,
+                selection,
+                question: request.question,
+                language: request.language,
+                pages,
+                settings,
+            })?
+        };
         Ok(ai_plan_record(plan))
     }
 }
@@ -4888,6 +5007,7 @@ pub enum AiActionRecord {
     SummarizeDocument,
     AskSelection,
     TranslateSelection,
+    DocumentChat,
 }
 
 /// A selected character range on one page (0-based, inclusive).
@@ -4899,6 +5019,14 @@ pub struct AiSelectionRecord {
     pub end: u32,
 }
 
+/// One previous document-chat exchange. `answer` is what the reader saw; the shell trims the
+/// list to the bound before asking for a plan.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiConversationTurnRecord {
+    pub question: String,
+    pub answer: String,
+}
+
 /// Everything needed to build a preview. The API key is deliberately absent.
 #[derive(Debug, Clone, uniffi::Record)]
 #[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
@@ -4908,6 +5036,8 @@ pub struct AiPlanRequestRecord {
     pub selection: Option<AiSelectionRecord>,
     pub question: Option<String>,
     pub language: Option<String>,
+    /// Oldest first. Only used by document chat.
+    pub history: Vec<AiConversationTurnRecord>,
     pub base_url: String,
     pub model: String,
     pub temperature: Option<f64>,
@@ -4967,6 +5097,24 @@ pub struct AiPlanPartRecord {
     pub note: Option<String>,
 }
 
+/// A page-local rectangle of a retrieved passage, in 100% view space. The shell highlights these
+/// briefly when a citation chip is clicked; they are never written to the PDF or the sidecar.
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct AiSourceRectRecord {
+    pub x_pt: f64,
+    pub y_pt: f64,
+    pub width_pt: f64,
+    pub height_pt: f64,
+}
+
+/// One retrieved passage attached to a plan. `page` is 1-based and matches `[p.N]`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiSourceRecord {
+    pub page: u32,
+    pub snippet: String,
+    pub rects: Vec<AiSourceRectRecord>,
+}
+
 /// The complete, previewable plan for one action.
 #[derive(Debug, Clone, uniffi::Record)]
 #[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
@@ -4985,6 +5133,10 @@ pub struct AiPlanRecord {
     pub parts: Vec<AiPlanPartRecord>,
     pub source_pages: Vec<u32>,
     pub note: Option<String>,
+    /// Retrieved passages, with snippets and page geometry. Empty for consolidations.
+    pub sources: Vec<AiSourceRecord>,
+    /// Previous exchanges included in a document-chat request, after the bound.
+    pub history_turns: u32,
     pub preview_headers: Vec<AiHeaderRecord>,
     pub estimated_tokens: u64,
 }
@@ -5319,6 +5471,25 @@ pub fn build_ai_merge_plan(
 
 fn ai_plan_record(plan: ChatPlan) -> AiPlanRecord {
     let estimated_tokens = plan.estimated_tokens();
+    let history_turns = plan.history_turns;
+    let sources = plan
+        .sources
+        .into_iter()
+        .map(|source| AiSourceRecord {
+            page: source.page,
+            snippet: source.snippet,
+            rects: source
+                .rects
+                .into_iter()
+                .map(|rect| AiSourceRectRecord {
+                    x_pt: rect.x_pt,
+                    y_pt: rect.y_pt,
+                    width_pt: rect.width_pt,
+                    height_pt: rect.height_pt,
+                })
+                .collect(),
+        })
+        .collect();
     AiPlanRecord {
         action: ai_action_record(plan.action),
         action_label: plan.action.label().to_string(),
@@ -5350,6 +5521,8 @@ fn ai_plan_record(plan: ChatPlan) -> AiPlanRecord {
             .collect(),
         source_pages: plan.source_pages,
         note: plan.note,
+        sources,
+        history_turns,
         preview_headers: preview_headers()
             .into_iter()
             .map(|(name, value)| AiHeaderRecord { name, value })
@@ -5364,6 +5537,7 @@ fn ai_action_record(action: AiAction) -> AiActionRecord {
         AiAction::SummarizeDocument => AiActionRecord::SummarizeDocument,
         AiAction::AskSelection => AiActionRecord::AskSelection,
         AiAction::TranslateSelection => AiActionRecord::TranslateSelection,
+        AiAction::DocumentChat => AiActionRecord::DocumentChat,
     }
 }
 
@@ -5373,6 +5547,7 @@ fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, LyraReaderFfiEr
         AiActionRecord::SummarizeDocument => AiAction::SummarizeDocument,
         AiActionRecord::AskSelection => AiAction::AskSelection,
         AiActionRecord::TranslateSelection => AiAction::TranslateSelection,
+        AiActionRecord::DocumentChat => AiAction::DocumentChat,
     };
     if !(plan.endpoint.starts_with("http://") || plan.endpoint.starts_with("https://")) {
         return Err(LyraReaderFfiError::Ai {
@@ -5415,6 +5590,25 @@ fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, LyraReaderFfiEr
         parts,
         source_pages: plan.source_pages,
         note: plan.note,
+        sources: plan
+            .sources
+            .into_iter()
+            .map(|source| lyra_reader_ai::chat::ChatSource {
+                page: source.page,
+                snippet: source.snippet,
+                rects: source
+                    .rects
+                    .into_iter()
+                    .map(|rect| AiSourceRect {
+                        x_pt: rect.x_pt,
+                        y_pt: rect.y_pt,
+                        width_pt: rect.width_pt,
+                        height_pt: rect.height_pt,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        history_turns: plan.history_turns,
     })
 }
 

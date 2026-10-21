@@ -2,8 +2,10 @@ import AppKit
 import LyraReaderBindings
 import SwiftUI
 
-/// The AI sidebar tab. Everything visible here is local state until the reader presses Send:
-/// the action buttons only build a preview, and the preview is the exact plan Rust will execute.
+/// The AI assistant, hosted in the reader window's right-hand panel. Everything visible here is
+/// local state until the reader presses Send: the action buttons only build a preview, and the
+/// preview is the exact plan Rust will execute. The view's public surface is the panel's:
+/// `state` and `model` are supplied by the host, which owns the model for the window's lifetime.
 public struct AIAssistantPanel: View {
     @ObservedObject private var state: AppState
     @ObservedObject private var model: AIAssistantModel
@@ -29,7 +31,9 @@ public struct AIAssistantPanel: View {
                             keyMissing
                         }
                         actions
-                        if let note = model.statusNote, !note.isEmpty {
+                        if let note = model.statusNote, !note.isEmpty,
+                           !model.isDocumentChatPlan, !model.isChatStreaming,
+                           model.pendingChatQuestion == nil {
                             Text(note)
                                 .font(.caption)
                                 .foregroundStyle(
@@ -40,7 +44,7 @@ public struct AIAssistantPanel: View {
                                 )
                                 .fixedSize(horizontal: false, vertical: true)
                         }
-                        if model.isPreparing {
+                        if model.isPreparing, model.pendingChatQuestion == nil {
                             HStack(spacing: 6) {
                                 ProgressView().controlSize(.small)
                                 Text("Reading text and building the preview…")
@@ -48,7 +52,7 @@ public struct AIAssistantPanel: View {
                                     .foregroundStyle(LyraReaderTheme.textSecondary)
                             }
                         }
-                        if let plan = model.plan, model.phase != .preparing {
+                        if let plan = model.plan, model.phase != .preparing, !plan.isDocumentChat {
                             requestPreview(plan)
                         }
                         if let mergePlan = model.mergePlan {
@@ -61,7 +65,8 @@ public struct AIAssistantPanel: View {
                                     .foregroundStyle(LyraReaderTheme.textSecondary)
                             }
                         }
-                        if model.phase == .streaming || model.phase.isTerminal || model.phase == .mergePreview {
+                        if !model.isDocumentChatPlan, !model.isChatStreaming,
+                           model.phase == .streaming || model.phase.isTerminal || model.phase == .mergePreview {
                             answerSection
                         }
                         controls
@@ -70,6 +75,11 @@ public struct AIAssistantPanel: View {
                 }
             }
         }
+        // A zero-size AppKit marker is the stable way for the hosted-window checks to prove that
+        // the right panel's content really is this view. SwiftUI's accessibility tree is lazy
+        // and empty for a window no assistive client has queried, so asking it would be a check
+        // that depends on the machine, not on the layout.
+        .background(AIAssistantPanelMarkerHost())
         .onAppear(perform: sync)
         .onChange(of: state.document?.id) { _, _ in sync() }
     }
@@ -151,7 +161,7 @@ public struct AIAssistantPanel: View {
             Text("Actions")
                 .font(.caption.weight(.semibold))
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 6) {
-                ForEach(AIAssistantAction.allCases) { action in
+                ForEach(AIAssistantAction.allCases.filter { !$0.isDocumentChat }) { action in
                     Button {
                         prepare(action)
                     } label: {
@@ -467,6 +477,15 @@ public struct AIAssistantPanel: View {
 
     @ViewBuilder
     private var controls: some View {
+        if model.isDocumentChatPlan || model.isChatStreaming {
+            EmptyView()
+        } else {
+            controlButtons
+        }
+    }
+
+    @ViewBuilder
+    private var controlButtons: some View {
         switch model.phase {
         case .preview:
             HStack(spacing: 8) {
@@ -518,15 +537,50 @@ public struct AIAssistantPanel: View {
     }
 }
 
+/// The right panel's content: document chat fills the panel, and the existing single-shot
+/// actions keep their own scroll below it. Hosting the chat directly (rather than inside
+/// `AIAssistantPanel`) keeps one chat surface and one actions surface, so neither duplicates the
+/// other and the chat can use the whole remaining height instead of a fixed strip.
+public struct AIAssistantRightPanelContent: View {
+    @ObservedObject private var state: AppState
+    @ObservedObject private var model: AIAssistantModel
+
+    public init(state: AppState, model: AIAssistantModel) {
+        self.state = state
+        self.model = model
+    }
+
+    public var body: some View {
+        if state.document == nil {
+            AIAssistantPanel(state: state, model: model)
+        } else {
+            VStack(spacing: 0) {
+                AIDocumentChatView(state: state, model: model)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .layoutPriority(1)
+                Divider()
+                AIAssistantPanel(state: state, model: model)
+                    .frame(minHeight: 170, idealHeight: 220, maxHeight: 280)
+            }
+        }
+    }
+}
+
 /// Renders the streamed answer. Paragraphs, headings and lists are interpreted; citations are
 /// clickable only when they are the exact `[p.N]` form and name a page in this document.
 struct AIAnswerView: View {
     let text: String
     let pageCount: Int
+    /// `nil` keeps the single-shot actions' existing rule (any in-document page is clickable).
+    /// Document chat passes the pages that were actually sent, so an unverified citation stays
+    /// plain text and is explained below the answer instead of linking somewhere plausible.
+    var verifiedPages: Set<Int>? = nil
     let onJump: (Int) -> Void
 
     var body: some View {
-        let document = AIAnswerMarkdown.parse(text, pageCount: pageCount)
+        let document = AIAnswerMarkdown.parse(
+            text, pageCount: pageCount, verifiedPages: verifiedPages
+        )
         VStack(alignment: .leading, spacing: 7) {
             ForEach(Array(document.blocks.enumerated()), id: \.offset) { _, block in
                 blockView(block)
@@ -595,4 +649,30 @@ struct AIAnswerView: View {
         }
         return result
     }
+}
+
+/// A zero-size marker view for the hosted-window checks.
+///
+/// `NSHostingView` does not expose the SwiftUI view tree, and its accessibility children are not
+/// built until an assistive client asks for them. A real, empty `NSView` in the hierarchy is the
+/// same seam the canvas already provides: the checks can find the assistant content by type
+/// without inspecting SwiftUI internals.
+public final class AIAssistantPanelMarkerView: NSView {
+    public override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setAccessibilityLabel("AI assistant panel content")
+    }
+
+    public required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setAccessibilityLabel("AI assistant panel content")
+    }
+}
+
+private struct AIAssistantPanelMarkerHost: NSViewRepresentable {
+    func makeNSView(context: Context) -> AIAssistantPanelMarkerView {
+        AIAssistantPanelMarkerView(frame: .zero)
+    }
+
+    func updateNSView(_ nsView: AIAssistantPanelMarkerView, context: Context) {}
 }
