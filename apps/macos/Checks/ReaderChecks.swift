@@ -142,6 +142,14 @@ struct ReaderChecks {
             return
         }
         let fastRoot = checkRoot(CommandLine.arguments.dropFirst(2).first)
+        if CommandLine.arguments.contains("--capture-ai-plan-goldens") {
+            try await captureAIPlanGoldens(root: fastRoot)
+            return
+        }
+        if CommandLine.arguments.contains("--check-ai-plan-goldens") {
+            try await checkAIPlanGoldens(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--capture-annotation-codec-goldens") {
             try captureAnnotationCodecGoldens(root: fastRoot)
             return
@@ -1086,6 +1094,12 @@ struct ReaderChecks {
             }),
             ("plan-wire", {
                 try await planWireChecks(root: root)
+            }),
+            ("ai-plan-goldens", {
+                // Frozen pre-change bodies for the region question, document knowledge, the
+                // 120-page two-window abstract and every section. The snapshot also pins the
+                // character/token accounting and the outline section list.
+                try await checkAIPlanGoldens(root: root)
             }),
             ("appearance", {
                 await appearanceChecks()

@@ -110,6 +110,22 @@ private final class TearLayoutEngine: PreviewEngine {
                                       hasUnicodeMapError: false)
     }
 
+    override func regionText(page: Int, rect: CGRect, limit: Int) async throws
+        -> (text: String, truncated: Bool) {
+        let page = try await textPage(page)
+        var text = ""
+        for character in page.chars {
+            let box = CGRect(x: character.xPt, y: character.yPt,
+                             width: character.widthPt, height: character.heightPt)
+            let centre = CGPoint(x: box.midX, y: box.midY)
+            guard rect.intersects(box) || rect.contains(centre) else { continue }
+            if let scalar = Unicode.Scalar(character.unicode) {
+                text.append(Character(scalar))
+            }
+        }
+        return (text.trimmingCharacters(in: .whitespacesAndNewlines), false)
+    }
+
     override func captionMentions(page: Int) async throws -> [CaptionMention] { [] }
     override func figures() async throws -> [Figure] { planningFigures }
 

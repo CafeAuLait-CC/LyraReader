@@ -23,20 +23,21 @@ pub fn document_index_cache_path(path: String) -> String {
 use lyra_reader_ai::MockProvider;
 use lyra_reader_ai::chat::{
     Action as AiAction, CONNECTION_TEST_MAX_TOKENS, ChatImage, ChatPlan, ChatSettings,
-    ChatTransport, ChatWire, ConversationTurn, DocumentChatRequest, MergePart, MergePlanRequest,
-    NOTHING_RELEVANT_MESSAGE, PageChar, PageText, PlanRequest, ReasoningEncoding, ReasoningField,
-    ReasoningMode, RegionQuestionRequest, RegionRect, SUMMARY_ABSTRACT_MAX_CHARS,
-    SUMMARY_ABSTRACT_MAX_PAGES, SUMMARY_MAX_CONCURRENT_REQUESTS, SUMMARY_MAX_REQUESTS_PER_BATCH,
-    SUMMARY_PAGE_MAX_CHARS, SUMMARY_SECTION_MAX_CHARS, SelectionRange as AiSelectionRange,
-    SourceRect as AiSourceRect, SummaryLayer, SummaryLayerRequest, SummaryUnitRequest,
-    abstract_sample_page_indices, build_connection_test_plan, build_document_chat_plan,
-    build_document_knowledge_plan, build_merge_plan, build_plan, build_region_question_plan,
-    build_summary_layer, inspect_base_url, inspect_summary_layer, summary_coverage_note,
-    validate_model,
+    ChatTransport, ChatWire, ConversationTurn, DocumentChatRequest, DocumentKnowledgeInput,
+    MergePart, MergePlanRequest, NOTHING_RELEVANT_MESSAGE, PageChar, PageText, PlanRequest,
+    ReasoningEncoding, ReasoningField, ReasoningMode, RegionQuestionRequest, RegionRect,
+    SUMMARY_ABSTRACT_MAX_CHARS, SUMMARY_ABSTRACT_MAX_PAGES, SUMMARY_MAX_CONCURRENT_REQUESTS,
+    SUMMARY_MAX_REQUESTS_PER_BATCH, SUMMARY_PAGE_MAX_CHARS, SUMMARY_SECTION_MAX_CHARS,
+    SelectionRange as AiSelectionRange, SourceRect as AiSourceRect, SummaryLayer,
+    SummaryLayerRequest, SummaryUnitRequest, abstract_sample_page_indices,
+    build_connection_test_plan, build_document_chat_plan, build_document_knowledge_plan,
+    build_merge_plan, build_plan, build_region_question_plan, build_summary_layer,
+    inspect_base_url, inspect_summary_layer, summary_coverage_note, validate_model,
 };
 use lyra_reader_ai::openai::{
     CancellationToken, RunEvent, StreamDiagnostics, TokenUsage, preview_headers, run_plan,
 };
+use lyra_reader_ai::{SummaryOutlineEntry, plan_summary_sections};
 use lyra_reader_core::{
     AnnotationAlignment, AnnotationDrawing, DocumentBackend, ENGINE_VERSION, EngineConfig,
     ErrorCode, PageGeometry, PageIndex, Point, RasterRequest, RawAnnotationLine, Transform2D,
@@ -1292,6 +1293,13 @@ where
     sizes
 }
 
+fn document_knowledge_input(
+    text: Option<String>,
+    pages: Vec<u32>,
+) -> Option<DocumentKnowledgeInput> {
+    text.map(|text| DocumentKnowledgeInput { text, pages })
+}
+
 #[uniffi::export]
 impl LyraReaderDocument {
     /// The path this document was opened from.
@@ -1710,6 +1718,29 @@ impl LyraReaderDocument {
     ) -> Result<String, LyraReaderFfiError> {
         let page = self.selection_text_page(page)?;
         Ok(page.string_in_range(start, end))
+    }
+
+    /// Extract the text layer inside a page-local rectangle.
+    ///
+    /// This is the rectangle-coverage selection mode in `lyra-reader-text::selection`, the same
+    /// module that answers pointer hit-testing and box→range selection. Region cards use it so
+    /// their quotes and the copied text come from one page/whitespace model. The text is capped
+    /// at the region limit and the result says whether the cap cut it.
+    pub fn region_text(
+        &self,
+        page: u32,
+        x_pt: f64,
+        y_pt: f64,
+        width_pt: f64,
+        height_pt: f64,
+    ) -> Result<AiRegionTextRecord, LyraReaderFfiError> {
+        let model = self.extract_text_page(page)?;
+        let (text, truncated) = lyra_reader_text::region_text(
+            &model.chars,
+            lyra_reader_core::Rect::new(x_pt, y_pt, width_pt, height_pt),
+            lyra_reader_text::MAX_REGION_TEXT_CHARS,
+        );
+        Ok(AiRegionTextRecord { text, truncated })
     }
 
     /// Current text-page cache state; used by the cache regression checks.
@@ -3143,6 +3174,11 @@ impl LyraReaderDocument {
             });
         }
 
+        let knowledge = document_knowledge_input(
+            request.document_knowledge_text.clone(),
+            request.document_knowledge_pages.clone(),
+        );
+
         // A region image is exactly the selected rectangle. Once document knowledge has been
         // established, bounded related source passages can connect it to the full document.
         if action == AiAction::RegionQuestion {
@@ -3249,6 +3285,7 @@ impl LyraReaderDocument {
                     })
                     .collect(),
                 settings,
+                document_knowledge: knowledge,
             })?;
             return Ok(ai_plan_record(plan));
         }
@@ -3328,6 +3365,7 @@ impl LyraReaderDocument {
                     .collect(),
                 pages,
                 settings,
+                document_knowledge: knowledge,
             })?
         } else {
             let input = PlanRequest {
@@ -3340,6 +3378,7 @@ impl LyraReaderDocument {
                 language: request.language,
                 pages,
                 settings,
+                document_knowledge: knowledge,
             };
             if request.document_knowledge {
                 build_document_knowledge_plan(input)?
@@ -3383,6 +3422,7 @@ impl LyraReaderDocument {
             units,
             pages,
             settings,
+            document_knowledge: None,
         };
         let coverages = inspect_summary_layer(&core)?;
         Ok(core
@@ -3442,6 +3482,10 @@ impl LyraReaderDocument {
             units,
             pages,
             settings,
+            document_knowledge: document_knowledge_input(
+                request.document_knowledge_text,
+                request.document_knowledge_pages,
+            ),
         };
         let plan = build_summary_layer(core)?;
         Ok(ai_summary_plan_record(plan))
@@ -6964,6 +7008,13 @@ pub struct AiRegionRecord {
     pub include_document_context: bool,
 }
 
+/// Text extracted from a marquee-selected region, and whether the cap cut it.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AiRegionTextRecord {
+    pub text: String,
+    pub truncated: bool,
+}
+
 /// One previous document-chat exchange. `answer` is what the reader saw; the shell trims the
 /// list to the bound before asking for a plan.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -6993,6 +7044,11 @@ pub struct AiPlanRequestRecord {
     pub reasoning_mode: String,
     /// One of `none`, `thinking`, `reasoning_effort`, `output_config`, `reasoning.effort`.
     pub reasoning_encoding: String,
+    /// Shared document understanding from a completed reading, added by the planner. `None`
+    /// means this request carries no prior and the prompts are unchanged.
+    pub document_knowledge_text: Option<String>,
+    /// 1-based pages the reading covered; carried with the text as one input record.
+    pub document_knowledge_pages: Vec<u32>,
 }
 
 /// One part summary used by the consolidation request.
@@ -7015,6 +7071,9 @@ pub struct AiMergePlanRequestRecord {
     pub max_tokens: Option<u32>,
     pub reasoning_mode: String,
     pub reasoning_encoding: String,
+    /// Shared document understanding added to the consolidation request.
+    pub document_knowledge_text: Option<String>,
+    pub document_knowledge_pages: Vec<u32>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -7180,6 +7239,22 @@ pub enum AiSummaryLayerRecord {
     Page,
 }
 
+/// One planned outline-section row of the layered summary.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AiSummarySectionRecord {
+    /// Row title, including the outline number when there is one ("2.1 Method").
+    pub title: String,
+    /// Outline number when the row came from an outline; empty for fallback rows.
+    pub number: String,
+    pub depth: u32,
+    /// 1-based, inclusive.
+    pub page_start: u32,
+    /// 1-based, inclusive.
+    pub page_end: u32,
+    /// 0-based page a click on this row opens.
+    pub link_page: u32,
+}
+
 /// What the shell asks one layer to build. The outline lives in the shell's sidebar model, so
 /// the section ranges arrive here rather than being derived a second time.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -7213,6 +7288,9 @@ pub struct AiSummaryRequestRecord {
     pub reasoning_mode: String,
     /// One of `none`, `thinking`, `reasoning_effort`, `output_config`, `reasoning.effort`.
     pub reasoning_encoding: String,
+    /// Shared document understanding added to every unit's request.
+    pub document_knowledge_text: Option<String>,
+    pub document_knowledge_pages: Vec<u32>,
 }
 
 /// The text one unit sends and the hash the cache keys on, without prompts.
@@ -7288,6 +7366,40 @@ pub struct AiSummaryLimitsRecord {
     pub page_max_chars: u64,
     pub max_requests_per_batch: u32,
     pub max_concurrent_requests: u32,
+}
+
+/// Turn the shell's flattened outline into the layered summary's section rows.
+///
+/// This is the one implementation of the outline range/title rules: the shell's section layer
+/// calls it, and the Rust summary builder enriches the rows it returns. Reader bookmarks are
+/// excluded; a missing destination is filled from the next (then previous) entry; a section ends
+/// before the next entry that starts later; no usable outline falls back to ten-page ranges.
+#[uniffi::export]
+pub fn ai_summary_sections(
+    outline: Vec<OutlineEntry>,
+    page_count: u32,
+) -> Vec<AiSummarySectionRecord> {
+    let entries: Vec<SummaryOutlineEntry> = outline
+        .into_iter()
+        .map(|entry| SummaryOutlineEntry {
+            title: entry.title,
+            page: entry.page,
+            depth: entry.depth,
+            bookmark_id: entry.bookmark_id,
+            is_bookmark_subtree: entry.is_bookmark_subtree,
+        })
+        .collect();
+    plan_summary_sections(&entries, page_count)
+        .into_iter()
+        .map(|section| AiSummarySectionRecord {
+            title: section.title,
+            number: section.number,
+            depth: section.depth,
+            page_start: section.page_start,
+            page_end: section.page_end,
+            link_page: section.link_page,
+        })
+        .collect()
 }
 
 /// The layered-summary bounds, available before a plan is built so the panel can state them.
@@ -7657,6 +7769,10 @@ pub fn build_ai_merge_plan(
                 summary: part.summary,
             })
             .collect(),
+        document_knowledge: document_knowledge_input(
+            request.document_knowledge_text,
+            request.document_knowledge_pages,
+        ),
     })?;
     Ok(ai_plan_record(plan))
 }
@@ -7861,6 +7977,7 @@ fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, LyraReaderFfiEr
             })
             .collect(),
         history_turns: plan.history_turns,
+        estimated_tokens_override: None,
     })
 }
 

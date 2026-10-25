@@ -98,88 +98,9 @@ public enum AIRegionLimits {
     }
 }
 
-/// Extract the text layer inside a page-local rectangle.
-///
-/// Lines are assembled in the order the text layer emits them, with each line's glyphs sorted by
-/// x. This preserves column order for a region that spans two columns while still putting the
-/// words of one line back together. Missing spaces are reconstructed from glyph gaps; the raw
-/// text of the page is not used because it cannot be restricted to the rectangle.
+/// Describe the region text path to the reader. Extraction itself lives in
+/// `lyra-reader-text::selection` and the real engine, beside copied text and annotation quotes.
 public enum AIRegionText {
-    public static func extract(
-        from page: TextPage,
-        in region: CGRect,
-        limit: Int = AIRegionLimits.maximumTextCharacters
-    ) -> (text: String, truncated: Bool) {
-        struct Line {
-            var minY: CGFloat
-            var maxY: CGFloat
-            var height: CGFloat
-            var glyphs: [(x: CGFloat, maxX: CGFloat, text: String, isSpace: Bool)]
-        }
-        var lines: [Line] = []
-
-        for char in page.chars {
-            if char.unicode == 10 || char.unicode == 13 { continue }
-            let rect = CGRect(x: char.xPt, y: char.yPt,
-                              width: char.widthPt, height: char.heightPt)
-            guard rect.width > 0, rect.height > 0 else { continue }
-            let intersects = rect.intersects(region)
-            let centre = CGPoint(x: rect.midX, y: rect.midY)
-            let covered = intersects
-                ? rect.intersection(region).width * rect.intersection(region).height
-                    / max(rect.width * rect.height, 0.001)
-                : 0
-            guard region.contains(centre) || covered >= 0.45 else { continue }
-            let scalar = Unicode.Scalar(char.unicode) ?? Unicode.Scalar(0xFFFD)!
-            let isSpace = CharacterSet.whitespaces.contains(scalar)
-            let glyph = (x: rect.minX, maxX: rect.maxX, text: String(Character(scalar)),
-                         isSpace: isSpace)
-            let tolerance = max(2.5, rect.height * 0.45)
-            if let index = lines.indices.last(where: {
-                abs((lines[$0].minY + lines[$0].maxY) / 2 - rect.midY) <= tolerance
-            }) {
-                lines[index].minY = min(lines[index].minY, rect.minY)
-                lines[index].maxY = max(lines[index].maxY, rect.maxY)
-                lines[index].height = max(lines[index].height, rect.height)
-                lines[index].glyphs.append(glyph)
-            } else {
-                lines.append(Line(minY: rect.minY, maxY: rect.maxY, height: rect.height,
-                                  glyphs: [glyph]))
-            }
-        }
-
-        var result = ""
-        var truncated = false
-        for line in lines {
-            let sorted = line.glyphs.sorted { $0.x < $1.x }
-            var lineText = ""
-            var previousMaxX: CGFloat?
-            for glyph in sorted {
-                if glyph.isSpace {
-                    if !lineText.isEmpty, !lineText.hasSuffix(" ") { lineText.append(" ") }
-                    previousMaxX = max(previousMaxX ?? glyph.maxX, glyph.maxX)
-                    continue
-                }
-                if let previousMaxX, glyph.x - previousMaxX > max(1.2, line.height * 0.12),
-                   !lineText.isEmpty, !lineText.hasSuffix(" ") {
-                    lineText.append(" ")
-                }
-                lineText += glyph.text
-                previousMaxX = max(previousMaxX ?? glyph.maxX, glyph.maxX)
-            }
-            lineText = lineText.trimmingCharacters(in: .whitespaces)
-            guard !lineText.isEmpty else { continue }
-            if !result.isEmpty { result.append("\n") }
-            result += lineText
-            if result.count > limit {
-                result = String(result.prefix(limit))
-                truncated = true
-                break
-            }
-        }
-        return (result.trimmingCharacters(in: .whitespacesAndNewlines), truncated)
-    }
-
     /// Whether a captured page rectangle is only paper: no glyph, rule, picture edge or tint.
     ///
     /// Sampling keeps this cheap for a 4-megapixel capture. The threshold is deliberately below

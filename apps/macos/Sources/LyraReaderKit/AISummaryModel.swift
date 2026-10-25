@@ -191,72 +191,34 @@ public struct AISummarySection: Equatable, Sendable {
 }
 
 public enum AISummarySections {
-    /// Page ranges used when the document has no outline. Ten pages is one compact request and
-    /// keeps the section layer navigable for a scanned or outline-less paper.
-    public static let fallbackPagesPerSection = 10
-
     /// Turn a flattened outline into section page ranges.
     ///
-    /// * Reader bookmarks are excluded: they are marks, not document structure.
-    /// * An entry without its own destination starts where its first descendant does (the
-    ///   outline fixture's "Chapter Two" has children but no page).
-    /// * A section ends at the page before the next entry that starts on a later page. Leaf
-    ///   sections on the same page therefore overlap, which is honest: the outline says both
-    ///   start there.
+    /// The rules live in Rust (`lyra_reader_ai::sections`) so the summary builder and the panel
+    /// cannot disagree about which page range a section request carries. Reader bookmarks are
+    /// excluded; a missing destination is filled from a later (then earlier) entry; a section
+    /// ends before the next entry that starts later; no usable outline falls back to ten-page
+    /// ranges with page labels.
     public static func sections(outline: [OutlineEntry], pageCount: Int) -> [AISummarySection] {
-        guard pageCount > 0 else { return [] }
-        let usable = outline.filter { $0.bookmarkID == nil && !$0.isBookmarkSubtree }
-        let rows = OutlineNumbering.rows(for: usable)
-        if rows.isEmpty {
-            return fallbackSections(pageCount: pageCount)
-        }
-        var resolved: [Int?] = rows.map { row in
-            guard let page = row.entry.page, page >= 0, page < pageCount else { return nil }
-            return page
-        }
-        // Fill a missing destination from the next entry that has one; if none follows, use the
-        // previous destination so the entry still points somewhere sensible.
-        for index in resolved.indices where resolved[index] == nil {
-            if let next = resolved[(index + 1)...].first(where: { $0 != nil }) ?? nil {
-                resolved[index] = next
-            } else if index > 0 {
-                resolved[index] = resolved[..<index].last(where: { $0 != nil }) ?? nil
-            }
-        }
-        if resolved.allSatisfy({ $0 == nil }) {
-            return fallbackSections(pageCount: pageCount)
-        }
-        return rows.indices.compactMap { index in
-            guard let start = resolved[index] else { return nil }
-            let nextLater = resolved[(index + 1)...].compactMap { $0 }.first(where: { $0 > start })
-            let end = nextLater.map { min($0 - 1, pageCount - 1) } ?? (pageCount - 1)
-            let row = rows[index]
-            let title = row.number.isEmpty
-                ? row.entry.title
-                : "\(row.number) \(row.entry.title)"
-            return AISummarySection(
-                title: title,
-                number: row.number,
-                depth: max(0, Int(row.entry.depth)),
-                pageStart: start + 1,
-                pageEnd: max(start, end) + 1,
-                linkPage: start
-            )
-        }
-    }
-
-    static func fallbackSections(pageCount: Int) -> [AISummarySection] {
-        stride(from: 0, to: pageCount, by: fallbackPagesPerSection).map { start in
-            let end = min(pageCount - 1, start + fallbackPagesPerSection - 1)
-            let label = LyraReaderBindings.pageLabel(
-                pages: [UInt32(max(0, start + 1)), UInt32(max(0, end + 1))])
-            return AISummarySection(
-                title: label,
-                number: "",
-                depth: 0,
-                pageStart: start + 1,
-                pageEnd: end + 1,
-                linkPage: start
+        LyraReaderBindings.aiSummarySections(
+            outline: outline.map { entry in
+                LyraReaderBindings.OutlineEntry(
+                    title: entry.title,
+                    page: entry.page.map { UInt32(max(0, $0)) },
+                    depth: UInt32(max(0, entry.depth)),
+                    bookmarkId: entry.bookmarkID,
+                    yPt: entry.yPt,
+                    isBookmarkSubtree: entry.isBookmarkSubtree
+                )
+            },
+            pageCount: UInt32(max(0, pageCount))
+        ).map { section in
+            AISummarySection(
+                title: section.title,
+                number: section.number,
+                depth: Int(section.depth),
+                pageStart: Int(section.pageStart),
+                pageEnd: Int(section.pageEnd),
+                linkPage: Int(section.linkPage)
             )
         }
     }
@@ -1002,7 +964,9 @@ public final class LayeredSummaryModel: ObservableObject {
             temperature: settings.temperature,
             maxTokens: UInt32(max(0, settings.maxTokens)),
             reasoningMode: settings.reasoningMode.rawValue,
-            reasoningEncoding: settings.reasoningEncoding.rawValue
+            reasoningEncoding: settings.reasoningEncoding.rawValue,
+            documentKnowledgeText: nil,
+            documentKnowledgePages: []
         )
     }
 

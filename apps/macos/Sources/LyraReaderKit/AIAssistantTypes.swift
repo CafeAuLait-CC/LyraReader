@@ -418,6 +418,12 @@ public struct AIMakePlanRequest: Sendable {
     /// Whether the region picture should be included. Mirrors `settings.vision` and is explicit
     /// in the record so a text-only preview says why the image is absent.
     public let documentKnowledge: Bool
+    /// Shared document understanding from a completed reading. The Rust planner appends the
+    /// rules and prepends the generated-context block exactly as the shell used to; `nil` keeps
+    /// the request unchanged.
+    public let documentKnowledgeText: String?
+    /// 1-based pages the shared reading covered, carried with the text as one input record.
+    public let documentKnowledgePages: [Int]
     public let includeDocumentContext: Bool
     public let sendRegionImage: Bool
     public let settings: AIProviderSettings
@@ -433,6 +439,8 @@ public struct AIMakePlanRequest: Sendable {
         sendRegionImage: Bool = false,
         includeDocumentContext: Bool = false,
         documentKnowledge: Bool = false,
+        documentKnowledgeText: String? = nil,
+        documentKnowledgePages: [Int] = [],
         settings: AIProviderSettings
     ) {
         self.action = action
@@ -443,6 +451,8 @@ public struct AIMakePlanRequest: Sendable {
         self.history = history
         self.region = region
         self.documentKnowledge = documentKnowledge
+        self.documentKnowledgeText = documentKnowledgeText
+        self.documentKnowledgePages = documentKnowledgePages
         self.includeDocumentContext = includeDocumentContext
         self.sendRegionImage = sendRegionImage
         self.settings = settings
@@ -453,7 +463,17 @@ extension AIMakePlanRequest {
     func withDocumentContext() -> Self {
         Self(action: action, currentPage: currentPage, selection: selection, question: question,
              language: language, history: history, region: region, sendRegionImage: sendRegionImage,
-             includeDocumentContext: true, documentKnowledge: documentKnowledge, settings: settings)
+             includeDocumentContext: true, documentKnowledge: documentKnowledge,
+             documentKnowledgeText: documentKnowledgeText,
+             documentKnowledgePages: documentKnowledgePages, settings: settings)
+    }
+
+    /// Attach the shared document understanding the planner adds to every part.
+    package func withDocumentKnowledge(_ text: String, pages: [Int]) -> Self {
+        Self(action: action, currentPage: currentPage, selection: selection, question: question,
+             language: language, history: history, region: region, sendRegionImage: sendRegionImage,
+             includeDocumentContext: includeDocumentContext, documentKnowledge: documentKnowledge,
+             documentKnowledgeText: text, documentKnowledgePages: pages, settings: settings)
     }
 }
 
@@ -487,11 +507,28 @@ public struct AIMergePlanRequest: Sendable {
     public var documentTitle: String
     public var settings: AIProviderSettings
     public var parts: [AIMergePart]
+    public var documentKnowledgeText: String?
+    public var documentKnowledgePages: [Int]
 
-    public init(documentTitle: String, settings: AIProviderSettings, parts: [AIMergePart]) {
+    public init(
+        documentTitle: String,
+        settings: AIProviderSettings,
+        parts: [AIMergePart],
+        documentKnowledgeText: String? = nil,
+        documentKnowledgePages: [Int] = []
+    ) {
         self.documentTitle = documentTitle
         self.settings = settings
         self.parts = parts
+        self.documentKnowledgeText = documentKnowledgeText
+        self.documentKnowledgePages = documentKnowledgePages
+    }
+
+    package func withDocumentKnowledge(_ text: String, pages: [Int]) -> Self {
+        var copy = self
+        copy.documentKnowledgeText = text
+        copy.documentKnowledgePages = pages
+        return copy
     }
 }
 
@@ -707,7 +744,9 @@ public final class RustAIChatService: AIChatServicing {
             temperature: request.settings.temperature,
             maxTokens: request.settings.maxTokens.map { UInt32(max(0, $0)) },
             reasoningMode: request.settings.reasoningMode.rawValue,
-            reasoningEncoding: request.settings.reasoningEncoding.rawValue
+            reasoningEncoding: request.settings.reasoningEncoding.rawValue,
+            documentKnowledgeText: request.documentKnowledgeText,
+            documentKnowledgePages: request.documentKnowledgePages.map { UInt32(max(0, $0)) }
         )
         return try await engine.prepareAIPlan(record)
     }
@@ -729,7 +768,9 @@ public final class RustAIChatService: AIChatServicing {
                 temperature: request.settings.temperature,
                 maxTokens: request.settings.maxTokens.map { UInt32(max(0, $0)) },
                 reasoningMode: request.settings.reasoningMode.rawValue,
-                reasoningEncoding: request.settings.reasoningEncoding.rawValue
+                reasoningEncoding: request.settings.reasoningEncoding.rawValue,
+                documentKnowledgeText: request.documentKnowledgeText,
+                documentKnowledgePages: request.documentKnowledgePages.map { UInt32(max(0, $0)) }
             )
         )
     }
@@ -1365,5 +1406,77 @@ public enum AIPlanFormatting {
     /// in `lyra-reader-ffi::format`, and the preview and the summary panel share it.
     public static func pageLabel(_ pages: [Int]) -> String {
         LyraReaderBindings.pageLabel(pages: pages.map { UInt32(max(0, $0)) })
+    }
+}
+
+// MARK: - Plan-record conveniences
+//
+// The generated records gained the shared-reading input at the end. These overloads keep every
+// existing caller (and test double) source-compatible: no prior text means exactly the old plan.
+
+public extension AiPlanRequestRecord {
+    init(
+        action: AiActionRecord,
+        documentKnowledge: Bool,
+        currentPage: UInt32,
+        selection: AiSelectionRecord?,
+        question: String?,
+        language: String?,
+        history: [AiConversationTurnRecord],
+        region: AiRegionRecord?,
+        baseUrl: String,
+        model: String,
+        temperature: Double?,
+        maxTokens: UInt32?,
+        reasoningMode: String,
+        reasoningEncoding: String
+    ) {
+        self.init(
+            action: action, documentKnowledge: documentKnowledge, currentPage: currentPage,
+            selection: selection, question: question, language: language, history: history,
+            region: region, baseUrl: baseUrl, model: model, temperature: temperature,
+            maxTokens: maxTokens, reasoningMode: reasoningMode,
+            reasoningEncoding: reasoningEncoding, documentKnowledgeText: nil,
+            documentKnowledgePages: [])
+    }
+}
+
+public extension AiMergePlanRequestRecord {
+    init(
+        documentTitle: String,
+        parts: [AiMergePartRecord],
+        baseUrl: String,
+        model: String,
+        temperature: Double?,
+        maxTokens: UInt32?,
+        reasoningMode: String,
+        reasoningEncoding: String
+    ) {
+        self.init(
+            documentTitle: documentTitle, parts: parts, baseUrl: baseUrl, model: model,
+            temperature: temperature, maxTokens: maxTokens, reasoningMode: reasoningMode,
+            reasoningEncoding: reasoningEncoding, documentKnowledgeText: nil,
+            documentKnowledgePages: [])
+    }
+}
+
+public extension AiSummaryRequestRecord {
+    init(
+        layer: AiSummaryLayerRecord,
+        units: [AiSummaryUnitRequestRecord],
+        language: String?,
+        documentTitle: String,
+        baseUrl: String,
+        model: String,
+        temperature: Double?,
+        maxTokens: UInt32?,
+        reasoningMode: String,
+        reasoningEncoding: String
+    ) {
+        self.init(
+            layer: layer, units: units, language: language, documentTitle: documentTitle,
+            baseUrl: baseUrl, model: model, temperature: temperature, maxTokens: maxTokens,
+            reasoningMode: reasoningMode, reasoningEncoding: reasoningEncoding,
+            documentKnowledgeText: nil, documentKnowledgePages: [])
     }
 }

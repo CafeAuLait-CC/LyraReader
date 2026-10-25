@@ -1799,6 +1799,16 @@ public protocol PDFEngine: AnyObject {
     ) async throws -> TileImage
     /// Extracts the text layer of a page (character boxes in view space).
     func textPage(_ page: Int) async throws -> TextPage
+    /// Extracts the text inside one page-local rectangle.
+    ///
+    /// The real engine delegates to `lyra-reader-text`, where the rectangle-coverage selection
+    /// lives beside pointer hit-testing and range→string. A test double with no text layer
+    /// returns an empty extraction; the card still opens on a non-blank picture.
+    func regionText(
+        page: Int,
+        rect: CGRect,
+        limit: Int
+    ) async throws -> (text: String, truncated: Bool)
     /// Rasterizes one rectangle of a page, in view-space points.
     ///
     /// `transparentBackground` leaves the page's unpainted paper clear (alpha 0) instead of
@@ -1984,6 +1994,14 @@ public protocol PDFEngine: AnyObject {
 }
 
 public extension PDFEngine {
+    /// Test doubles without a text layer have no region text; the picture path still works.
+    func regionText(
+        page: Int,
+        rect: CGRect,
+        limit: Int = AIRegionLimits.maximumTextCharacters
+    ) async throws -> (text: String, truncated: Bool) {
+        ("", false)
+    }
     func contentImagePNG(page: Int, target: String, revision: String) async throws -> Data {
         throw NSError(domain:"LyraReader",code:2,userInfo:[NSLocalizedDescriptionKey:"This engine cannot export images"])
     }
@@ -2584,6 +2602,38 @@ public final class RustEngine: PDFEngine {
                             rust: TextPageRust(document: document, page: UInt32(page))
                         )
                     )
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    public func regionText(
+        page: Int,
+        rect: CGRect,
+        limit: Int = AIRegionLimits.maximumTextCharacters
+    ) async throws -> (text: String, truncated: Bool) {
+        guard let document else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        _ = limit
+        return try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    let extracted = try document.regionText(
+                        page: UInt32(page),
+                        xPt: Double(rect.minX),
+                        yPt: Double(rect.minY),
+                        widthPt: Double(rect.width),
+                        heightPt: Double(rect.height)
+                    )
+                    continuation.resume(
+                        returning: (text: extracted.text, truncated: extracted.truncated))
                 } catch {
                     continuation.resume(throwing: error)
                 }
@@ -4177,6 +4227,18 @@ public final class MockEngine: PDFEngine {
     }
 
     public func textPage(_ page: Int) async throws -> TextPage {
+        throw NSError(
+            domain: "LyraReader",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "The mock engine has no text layer"]
+        )
+    }
+
+    public func regionText(
+        page: Int,
+        rect: CGRect,
+        limit: Int
+    ) async throws -> (text: String, truncated: Bool) {
         throw NSError(
             domain: "LyraReader",
             code: 2,
