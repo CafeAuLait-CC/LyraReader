@@ -577,6 +577,9 @@ private struct ReaderWindowDragArea: NSViewRepresentable {
 /// reveal all come from ``ReaderSecondaryRow``/``ReaderSecondaryToolbar`` like the other four
 /// rows; adding them here is what made Lyra slide over a row that was already open while the
 /// other rows swapped in place.
+///
+/// All five controls are one group. Interleaf is a page action, but it reads as the row's first
+/// control, not as a separate toolbar: it uses the same 2 pt item spacing as every other pair.
 struct LyraToolRow: View {
     @ObservedObject var state: AppState
     @ObservedObject var model: AIAssistantModel
@@ -585,19 +588,10 @@ struct LyraToolRow: View {
             Button { state.rightPanelVisible = false; state.toggleRegionSelection() } label: {
                 ReaderToolbarLabel(title: "Interleaf", id: "lyra.interleaf") {
                     InterleafIcon()
-                        .frame(width: ReaderToolbarTypography.iconSize,
-                               height: ReaderToolbarTypography.iconSize)
                 }
             }.buttonStyle(LyraReaderToolStyle(selected: state.regionSelectionArmed))
                 .disabled(!state.canArmRegionSelection).help("Select & Ask").accessibilityLabel("Interleaf · Select & Ask")
                 .background(AnnotationToolbarFrameReader(id: "lyra.interleaf"))
-            // Interleaf is the one-off page action; the four workspace buttons are the row's
-            // group. They are separated by the same group gap as the annotation row's groups;
-            // the spacer's width discounts the HStack spacing on each side of it.
-            Color.clear
-                .frame(width: ReaderSecondaryRowMetrics.groupGapSpacerWidth, height: 1)
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
             workspace("Summary", icon: "text.alignleft", tab: .summary)
             workspace("Translate", icon: "character.bubble", tab: .translation)
             workspace("Chat", icon: "bubble.left.and.bubble.right", tab: .chat)
@@ -613,8 +607,6 @@ struct LyraToolRow: View {
             ReaderToolbarLabel(title: title, id: "lyra.\(tab.rawValue)") {
                 if tab == .translation {
                     TranslationIcon()
-                        .frame(width: ReaderToolbarTypography.iconSize,
-                               height: ReaderToolbarTypography.iconSize)
                 } else {
                     Image(systemName: icon)
                 }

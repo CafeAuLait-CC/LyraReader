@@ -365,6 +365,7 @@ struct AnnotationToolRow: View {
     ) -> some View {
         Button { state.toggleAnnotationTool(tool) } label: {
             Image(systemName: icon)
+                .modifier(ReaderToolbarIcon(id: "\(title).icon"))
         }
         .buttonStyle(LyraReaderToolStyle(selected: state.annotationTool == tool))
         .disabled(tool == .eraser ? !state.canUseEraserTool : !state.canEditAnnotations)
@@ -390,6 +391,7 @@ struct AnnotationToolRow: View {
             },
         ]) {
             Image(systemName: "square.on.circle")
+                .modifier(ReaderToolbarIcon(id: "Shapes.icon"))
         }
         .disabled(!state.canEditAnnotations)
         .help(writeHelp("Shapes: line, arrow, rectangle or ellipse; click the active shape again or press Escape to return to the pointer"))
@@ -401,6 +403,7 @@ struct AnnotationToolRow: View {
     private var stampMenu: some View {
         LyraReaderMenu(title: "Stamp", items: stampMenuItems) {
             Image(systemName: "seal")
+                .modifier(ReaderToolbarIcon(id: "Stamp.icon"))
         }
         .disabled(!state.canEditAnnotations)
         .help(writeHelp("Stamps: Approved, Reviewed, Draft, Confidential or a dated mark; click the page to place it"))
@@ -425,6 +428,7 @@ struct AnnotationToolRow: View {
     private var signatureMenu: some View {
         LyraReaderMenu(title: "Signature", items: signatureMenuItems) {
             Image(systemName: "signature")
+                .modifier(ReaderToolbarIcon(id: "Signature.icon"))
         }
         .disabled(!state.canEditAnnotations)
         .help(writeHelp("Signature: place a picture of a signature, or draw one with the pen"))

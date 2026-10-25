@@ -638,12 +638,16 @@ extension ReaderChecks {
             state.aiToolsVisible = false
         })
 
-        // ── 5b. All five rows use the same control metrics ──────────────────────────────
+        // ── 5b. All five rows use the same control and icon metrics ─────────────────────
         // The probes host the real rows through ReaderSecondaryRow, so these are the cells,
         // baselines and gaps a reader sees. Fill & Sign used to give every label a fixed 116 pt
         // cell, which centered a short label in a wide box and read as a much wider gap than
         // the other rows. The annotation row is the reference: 32 pt controls, a 2 pt item
         // spacing, a 34 pt group gap and 14 pt horizontal padding.
+        //
+        // Lyra is one group: Interleaf is not separated by a group gap from the four workspace
+        // buttons. Its custom glyph and the SF Symbols all go through ReaderToolbarIcon, so every
+        // icon reports the same 18 pt square and the same vertical centre.
         let spacingModel = AIAssistantModel()
         func spacingFrames(_ ids: [String], _ frames: [String: CGRect],
                            _ title: String) -> [CGRect] {
@@ -658,26 +662,28 @@ extension ReaderChecks {
         let lyraIDs = ["lyra.interleaf", "lyra.summary", "lyra.translation",
                        "lyra.chat", "lyra.regions"]
         let spacingSamples: [(title: String, ids: [String], frames: [CGRect],
-                              groupGapsAfter: Set<Int>)] = [
+                              iconIDs: [String], groupGapsAfter: Set<Int>)] = [
             ("Annotate", AnnotationToolbarLayout.annotationToolIDs,
              spacingFrames(AnnotationToolbarLayout.annotationToolIDs, annotationLayout, "Annotate"),
-             [2, 6]),
+             AnnotationToolbarLayout.annotationToolIDs, [2, 6]),
             ("Edit", AnnotationToolbarLayout.contentEditItemIDs,
              spacingFrames(AnnotationToolbarLayout.contentEditItemIDs, editLayout, "Edit"),
-             []),
+             AnnotationToolbarLayout.contentEditItemIDs, []),
             ("Fill & Sign", FillSignTool.rowOrder.map(\.title) + ["Clear Fill & Sign tool"],
              spacingFrames(FillSignTool.rowOrder.map(\.title) + ["Clear Fill & Sign tool"],
                            fillLayout, "Fill & Sign"),
-             [6]),
+             FillSignTool.rowOrder.map(\.title), [6]),
             ("Export", ExportCommand.all.map { "export.\($0.id)" },
              spacingFrames(ExportCommand.all.map { "export.\($0.id)" }, exportLayout, "Export"),
-             []),
-            ("Lyra", lyraIDs, spacingFrames(lyraIDs, lyraLayout, "Lyra"), [0]),
+             ExportCommand.all.map { "export.\($0.id)" }, []),
+            ("Lyra", lyraIDs, spacingFrames(lyraIDs, lyraLayout, "Lyra"), lyraIDs, []),
         ]
         var itemSpacings: [CGFloat] = []
         var groupSpacings: [CGFloat] = []
         var controlHeights: [CGFloat] = []
         var controlTops: [CGFloat] = []
+        var iconHeights: [CGFloat] = []
+        var iconCentres: [CGFloat] = []
         for sample in spacingSamples {
             require(sample.frames.count >= 2,
                     "\(sample.title) row has at least two measurable items")
@@ -711,11 +717,40 @@ extension ReaderChecks {
                         <= rowWidth - ReaderSecondaryRowMetrics.horizontalPadding + 0.5,
                     "\(sample.title) ends inside the row's trailing padding "
                         + "(\(sample.frames.last!.maxX) of \(rowWidth))")
-            print("ROW SPACING \(sample.title): "
-                  + zip(sample.ids, sample.frames).map {
-                        "\($0)=\(Int($1.minX))..\(Int($1.maxX))"
-                    }.joined(separator: " ")
-                  + " | gaps " + gaps.map { String(format: "%.1f", $0) }.joined(separator: ","))
+            // Every tool's icon is reported by ReaderToolbarIcon, including the glyph-only
+            // Annotate row and the compact fallback of Fill & Sign / Export. A row with a
+            // different icon font or an un-framed custom vector reports a different size here.
+            let rowLayout: [String: CGRect]
+            switch sample.title {
+            case "Annotate": rowLayout = annotationLayout
+            case "Edit": rowLayout = editLayout
+            case "Fill & Sign": rowLayout = fillLayout
+            case "Export": rowLayout = exportLayout
+            default: rowLayout = lyraLayout
+            }
+            let iconFrames = sample.iconIDs.map {
+                frame("\($0).icon", rowLayout, "\(sample.title) row icon")
+            }
+            let expectedIconFrame = ReaderToolbarTypography.iconFrameSize
+            require(iconFrames.allSatisfy {
+                        abs($0.width - expectedIconFrame) <= 0.5
+                            && abs($0.height - expectedIconFrame) <= 0.5
+                    }, "\(sample.title) icons all use the \(Int(expectedIconFrame)) pt square frame "
+                        + "(\(iconFrames.map { "\(Int($0.width))x\(Int($0.height))" }))")
+            require(iconFrames.allSatisfy {
+                        abs($0.midY - iconFrames[0].midY) <= 0.5
+                    }, "\(sample.title) icons share one vertical centre "
+                        + "(\(iconFrames.map { String(format: "%.1f", $0.midY) }))")
+            iconHeights.append(contentsOf: iconFrames.map(\.height))
+            iconCentres.append(contentsOf: iconFrames.map(\.midY))
+            let itemLog = zip(sample.ids, sample.frames).map {
+                "\($0)=\(Int($1.minX))..\(Int($1.maxX))"
+            }.joined(separator: " ")
+            let gapLog = gaps.map { String(format: "%.1f", $0) }.joined(separator: ",")
+            let iconLog = iconFrames.map {
+                "\(Int($0.width))x\(Int($0.height))@\(String(format: "%.1f", $0.midY))"
+            }.joined(separator: ",")
+            print("ROW SPACING \(sample.title): \(itemLog) | gaps \(gapLog) | icons \(iconLog)")
         }
         let spacingSpread = (itemSpacings.max() ?? 0) - (itemSpacings.min() ?? 0)
         require(spacingSpread <= 0.5,
@@ -730,6 +765,13 @@ extension ReaderChecks {
         require(controlTops.allSatisfy { abs($0 - controlTops[0]) <= 0.5 },
                 "all rows put their controls on the same baseline "
                     + "(\(controlTops.map { String(format: "%.1f", $0) }))")
+        require(iconHeights.allSatisfy {
+                    abs($0 - ReaderToolbarTypography.iconFrameSize) <= 0.5
+                }, "every row's icons use the same \(Int(ReaderToolbarTypography.iconFrameSize)) pt "
+                    + "frame height (\(iconHeights.map { Int($0) }))")
+        require(iconCentres.allSatisfy { abs($0 - iconCentres[0]) <= 0.5 },
+                "all rows put their icons on the same vertical centre "
+                    + "(\(iconCentres.map { String(format: "%.1f", $0) }))")
 
         // ── 5b(ii). Typography: the main toolbar and the rows swap their label sizes ─────
         // The rows used to render at the button style's 14 pt medium while the main toolbar
@@ -747,6 +789,8 @@ extension ReaderChecks {
                 "row labels use regular weight")
         require(ReaderToolbarTypography.iconSize == 14,
                 "icons keep the annotation row's 14 pt scale")
+        require(ReaderToolbarTypography.iconFrameSize == 18,
+                "every row icon occupies the same 18 pt square")
 
         let wideMainFonts = ReaderToolbarProbe.toolbarFonts(state: state, width: 1400)
         let mainLabelIDs = ["toolbar.annotate.label", "toolbar.edit.label",
