@@ -2,9 +2,8 @@ import Foundation
 
 /// Upgrade only storage that is safe to copy.
 ///
-/// `legacyAnnotationURL(for:)` names the old companion file the one-time import reads. It is
-/// kept as a small, testable helper even though the production load path goes through
-/// `DocumentEditCache.prepareAnnotations`, which applies the same suffix rule.
+/// `migratePreferences` copies preferences from the app's earlier bundle identifiers into the
+/// current defaults. It runs once, and a value the current installation already wrote wins.
 @MainActor public enum ReaderDataCompatibility {
     private static let migrationKey = "lyrareader.didMigratePreferences"
 
@@ -23,13 +22,5 @@ import Foundation
             }
         }
         defaults.set(true, forKey: migrationKey)
-    }
-
-    public static func legacyAnnotationURL(for document: URL) -> URL {
-        let current = document.appendingPathExtension("lyra-reader-annotations.json")
-        let legacy = document.appendingPathExtension("aris-annotations.json")
-        if !FileManager.default.fileExists(atPath: current.path),
-           FileManager.default.fileExists(atPath: legacy.path) { return legacy }
-        return current
     }
 }

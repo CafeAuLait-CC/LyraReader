@@ -137,7 +137,7 @@ struct ReaderChecks {
             return
         }
         if CommandLine.arguments.contains("--check-rename") {
-            try renameCompatibilityChecks(root: fastRoot)
+            renameCompatibilityChecks()
             return
         }
         if CommandLine.arguments.contains("--check-sidebar-polish") {
@@ -968,7 +968,7 @@ struct ReaderChecks {
                 try await prefetchBandChecks(url: b)
             }),
             ("rename-compatibility", {
-                try renameCompatibilityChecks(root: root)
+                renameCompatibilityChecks()
             }),
             ("ai-assistant", {
                 try await aiAssistantChecks(root: root)

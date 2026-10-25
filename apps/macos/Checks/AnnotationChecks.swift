@@ -10,12 +10,13 @@ extension ReaderChecks {
         let annotation = AppState.Annotation(id: UUID(), page: 0, start: 0, end: 3,
             color: AppState.highlightPalette[0].color, note: "old", createdAt: Date())
         let encoder = JSONEncoder()
-        var legacy = try JSONSerialization.jsonObject(with: encoder.encode(annotation)) as! [String: Any]
-        legacy.removeValue(forKey: "kind")
-        try JSONSerialization.data(withJSONObject: [legacy]).write(to: records)
+        var olderEntry = try JSONSerialization.jsonObject(with: encoder.encode(annotation)) as! [String: Any]
+        olderEntry.removeValue(forKey: "kind")
+        try JSONSerialization.data(withJSONObject: [olderEntry]).write(to: records)
         let state = AppState(engine: try RustEngine())
         state.open(url: a)
-        require(state.annotations.first?.kind == .highlight, "legacy annotation file defaults to highlight")
+        require(state.annotations.first?.kind == .highlight,
+                "an annotation record without a kind defaults to highlight")
         state.updateNote("n", for: annotation.id)
         state.updateNote("new", for: annotation.id)
         require(state.undoStack.count == 1, "note typing coalesces undo")
@@ -373,7 +374,7 @@ extension ReaderChecks {
         let lockedOnDisk = try JSONDecoder().decode([AppState.Annotation].self, from: lockedBytes)
         require(lockedOnDisk.first?.note == "first", "the cache bytes survive a refused write")
         let leftovers = try FileManager.default.contentsOfDirectory(atPath: lockedDirectory.path)
-            .filter { $0 != "locked.pdf" && $0 != "locked.pdf.lyra-reader-annotations.json" }
+            .filter { $0 != "locked.pdf" }
         require(leftovers.isEmpty, "a failed write leaves no temporary files behind")
     }
 

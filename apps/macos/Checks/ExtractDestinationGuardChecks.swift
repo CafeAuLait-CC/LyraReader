@@ -5,11 +5,11 @@ import Foundation
 extension ReaderChecks {
     /// The destination guard for `extractPages`, the page command that used to skip it.
     ///
-    /// Extracting into a destination that already held annotation records wrote the file and
-    /// left the stale records in place; opening the output later imported them next to the
-    /// annotations the extracted pages carried, so every mark appeared twice. These checks pin
-    /// the shared predicate's two distinct refusals, the clean-destination path, the explicit
-    /// replacement that retires the records to a backup first, and the no-duplicate reopen.
+    /// Extracting into a destination whose document cache already held annotation records wrote
+    /// the file and left the stale records in place; opening the output later showed them next
+    /// to the annotations the extracted pages carried, so every mark appeared twice. These
+    /// checks pin the shared predicate, the clean-destination path, the explicit replacement that
+    /// retires the records to a backup first, and the no-duplicate reopen.
     @MainActor static func extractDestinationGuardChecks(root: URL) async throws {
         let fileManager = FileManager.default
         let scratch = fileManager.temporaryDirectory
@@ -66,7 +66,7 @@ extension ReaderChecks {
         require((try? Data(contentsOf: source)) == sourceBytes,
                 "the refused same-file extraction leaves the source byte-identical")
 
-        // ── 2. A destination with only a document cache is refused, and says so ──────────
+        // ── 2. A destination with a document cache is refused, and says so ───────────────
         let cachedDestination = try fixture("text-page.pdf", as: "cached-destination.pdf")
         let cachedDestinationBytes = try Data(contentsOf: cachedDestination)
         let cachedRecords = DocumentEditCache.annotationsURL(for: cachedDestination)
@@ -79,8 +79,6 @@ extension ReaderChecks {
                 "the cache refusal names the document cache: \(cacheMessage)")
         require(cacheMessage.contains("already has annotations"),
                 "the cache refusal says the destination already has annotations: \(cacheMessage)")
-        require(!cacheMessage.contains("legacy annotation companion"),
-                "the cache refusal does not misreport a legacy companion: \(cacheMessage)")
         require(cacheMessage.contains("Choose another destination"),
                 "the cache refusal offers another destination: \(cacheMessage)")
         require(cacheMessage.contains("replace"),
@@ -123,60 +121,7 @@ extension ReaderChecks {
         require((try? Data(contentsOf: source)) == sourceBytes,
                 "the confirmed replacement leaves the source byte-identical")
 
-        // ── 4. A destination with only a legacy companion is refused, and says so ─────────
-        let legacyDestination = try fixture("text-page.pdf", as: "legacy-destination.pdf")
-        let legacyDestinationBytes = try Data(contentsOf: legacyDestination)
-        let legacyURL = DocumentEditCache.legacyURLs(for: legacyDestination)[0]
-        let legacyStaleBytes = try staleRecords("stale legacy mark")
-        try legacyStaleBytes.write(to: legacyURL)
-        let legacyExtractOK = await state.extractPages([0], to: legacyDestination)
-        require(!legacyExtractOK, "extracting onto a destination with only a legacy companion is refused")
-        let legacyMessage = state.lastError ?? ""
-        require(legacyMessage.contains("legacy annotation companion"),
-                "the legacy refusal names the legacy companion: \(legacyMessage)")
-        require(legacyMessage.contains("older copy"),
-                "the legacy refusal says the annotations belong to an older copy: \(legacyMessage)")
-        require(!legacyMessage.contains("document cache"),
-                "the legacy refusal does not misreport a destination cache: \(legacyMessage)")
-        require(!legacyMessage.contains("already has annotations"),
-                "the legacy refusal uses the companion remedy, not the cache one: \(legacyMessage)")
-        require(legacyMessage.contains("Choose another destination"),
-                "the legacy refusal offers another destination: \(legacyMessage)")
-        require(legacyMessage.contains("replace"),
-                "the legacy refusal offers the confirmed replacement: \(legacyMessage)")
-        require((try? Data(contentsOf: legacyDestination)) == legacyDestinationBytes,
-                "a refused legacy destination is not overwritten")
-        require((try? Data(contentsOf: legacyURL)) == legacyStaleBytes,
-                "a refused legacy companion keeps its bytes")
-
-        // ── 5. The confirmed replacement retires the legacy companion too ────────────────
-        let legacyReplaceOK = await state.extractPages(
-            [0], to: legacyDestination, replaceExistingRecords: true)
-        require(legacyReplaceOK,
-                "a confirmed replacement extracts over a legacy companion: \(state.lastError ?? "")")
-        require(!fileManager.fileExists(atPath: legacyURL.path),
-                "the confirmed replacement moves the legacy companion out of the way")
-        let retiredFiles = fileManager.enumerator(
-            at: cacheRoot, includingPropertiesForKeys: nil)?.compactMap { $0 as? URL } ?? []
-        require(retiredFiles.contains {
-                    $0.lastPathComponent.hasPrefix("replaced-")
-                        && (try? Data(contentsOf: $0)) == legacyStaleBytes
-                },
-                "the retired legacy companion is kept as a byte-identical backup")
-
-        let legacyReopen = AppState(engine: try RustEngine())
-        legacyReopen.setViewportSize(CGSize(width: 700, height: 500))
-        legacyReopen.newTab(url: legacyDestination)
-        require(legacyReopen.annotations.isEmpty,
-                "the replaced legacy destination imports no stale reader records")
-        try await eventually("the replaced legacy destination loads the extracted page's marks", {
-            legacyReopen.documentAnnotations.count == pageZeroAnnotations.count
-        })
-        require(Set(legacyReopen.documentAnnotations.map(\.id))
-                    == Set(pageZeroAnnotations.map(\.id)),
-                "the replaced legacy destination carries exactly the source page's identities")
-
-        // ── 6. A clean destination still extracts, with the same marks and no records ─────
+        // ── 4. A clean destination still extracts, with the same marks and no records ─────
         let cleanDestination = scratch.appendingPathComponent("clean-extract.pdf")
         let cleanExtractOK = await state.extractPages([0], to: cleanDestination)
         require(cleanExtractOK, "a clean destination still extracts: \(state.lastError ?? "")")
@@ -185,9 +130,6 @@ extension ReaderChecks {
         require(!fileManager.fileExists(
                     atPath: DocumentEditCache.annotationsURL(for: cleanDestination).path),
                 "a clean extraction creates no destination cache")
-        require(DocumentEditCache.legacyURLs(for: cleanDestination)
-                    .allSatisfy { !fileManager.fileExists(atPath: $0.path) },
-                "a clean extraction creates no legacy companion")
         let cleanProbe = try RustEngine()
         let cleanDocument = try cleanProbe.openDocument(at: cleanDestination)
         require(cleanDocument.pageCount == 1,

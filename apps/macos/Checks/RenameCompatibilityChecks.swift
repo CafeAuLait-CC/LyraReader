@@ -2,7 +2,7 @@ import Foundation
 import LyraReaderKit
 
 extension ReaderChecks {
-    @MainActor static func renameCompatibilityChecks(root: URL) throws {
+    @MainActor static func renameCompatibilityChecks() {
         let domain = "lyrareader.rename-check.\(UUID())"
         let oldDomain = domain + ".legacy"
         let defaults = UserDefaults(suiteName: domain)!
@@ -30,10 +30,6 @@ extension ReaderChecks {
         ReaderDataCompatibility.migratePreferences(defaults: defaults, legacyDomains: [oldDomain])
         require(defaults.data(forKey: "lyrareader.recentDocuments") == nil,
                 "rename does not resurrect history cleared after the first migration")
-
-        // The sidecar-era annotation companion import is being retired: the only store is the
-        // application cache. Legacy-file assertions were removed with it; the preference
-        // migration above is still covered.
         print("Rename compatibility checks passed")
     }
 }

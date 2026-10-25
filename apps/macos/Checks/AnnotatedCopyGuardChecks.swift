@@ -5,12 +5,10 @@ import Foundation
 extension ReaderChecks {
     /// The destination guard shared by every immediate-to-a-new-file command.
     ///
-    /// `saveAnnotatedCopy` used to look only at the destination's document cache, while the
-    /// other copy commands already looked at the cache **and** a legacy companion beside the
-    /// destination. Saving over a stale companion was therefore allowed, and opening the saved
-    /// file later imported that companion next to the annotations the PDF already carried:
-    /// every annotation appeared twice. These checks pin the shared predicate, the two distinct
-    /// refusals, the clean-save path and the explicitly confirmed replacement.
+    /// A destination whose document cache already holds annotation records is refused: opening
+    /// the saved copy later would show those stale records next to the annotations the PDF
+    /// already carried, so every annotation appeared twice. These checks pin the shared
+    /// predicate, the refusal, the clean-save path and the explicitly confirmed replacement.
     @MainActor static func annotatedCopyGuardChecks(root: URL) async throws {
         let fileManager = FileManager.default
         let scratch = fileManager.temporaryDirectory
@@ -100,7 +98,7 @@ extension ReaderChecks {
         require(state.annotations.count == 2 && state.bookmarks.count == 1,
                 "the annotated-copy guard source carries its seeded marks")
 
-        // ── 1. A destination with only a document cache is refused, and says so ──────────
+        // ── 1. A destination with a document cache is refused, and says so ──────────────
         let cachedDestination = try fixture("cached-destination.pdf")
         let cachedDestinationBytes = try Data(contentsOf: cachedDestination)
         let cachedRecords = DocumentEditCache.annotationsURL(for: cachedDestination)
@@ -122,58 +120,29 @@ extension ReaderChecks {
         require((try? Data(contentsOf: cachedRecords)) == staleBytes,
                 "a refused cache destination keeps its records byte-identical")
 
-        // ── 2. A destination with only a legacy companion is refused the same way ────────
-        let legacyDestination = try fixture("legacy-destination.pdf")
-        let legacyDestinationBytes = try Data(contentsOf: legacyDestination)
-        let legacyURL = DocumentEditCache.legacyURLs(for: legacyDestination)[0]
-        let legacyBytes = try records([stale])
-        try legacyBytes.write(to: legacyURL)
-        let legacySaved = await state.saveAnnotatedCopy(to: legacyDestination)
-        require(!legacySaved, "a destination with only a legacy companion is refused")
-        let legacyMessage = state.lastError ?? ""
-        require(legacyMessage.contains("legacy annotation companion"),
-                "the legacy refusal names the legacy companion: \(legacyMessage)")
-        require(legacyMessage.contains("older copy"),
-                "the legacy refusal says the annotations belong to an older copy: \(legacyMessage)")
-        require(!legacyMessage.contains("document cache"),
-                "the legacy refusal does not misreport a destination cache: \(legacyMessage)")
-        require(!legacyMessage.contains("already has annotations"),
-                "the legacy refusal uses the companion remedy, not the cache one: \(legacyMessage)")
-        require(legacyMessage.contains("Choose another destination"),
-                "the legacy refusal offers another destination: \(legacyMessage)")
-        require(legacyMessage.contains("replace"),
-                "the legacy refusal offers the confirmed replacement: \(legacyMessage)")
-        require((try? Data(contentsOf: legacyDestination)) == legacyDestinationBytes,
-                "a refused legacy destination is not overwritten")
-        require((try? Data(contentsOf: legacyURL)) == legacyBytes,
-                "a refused legacy companion keeps its bytes")
-
-        // The sibling commands share the same predicate: merge and split must still refuse the
-        // same companion-only destination.
+        // The sibling commands share the same predicate: merge and split must refuse a
+        // destination that already has a cache entry.
         let other = try fixture("append-me.pdf")
         let cleanMerge = scratch.appendingPathComponent("merge-clean.pdf")
         let cleanMergeSaved = await state.mergeDocuments([other], to: cleanMerge)
         require(cleanMergeSaved, "merge still writes a clean destination")
-        let mergedOntoLegacy = scratch.appendingPathComponent("merged-onto-legacy.pdf")
-        try records([stale]).write(to: DocumentEditCache.legacyURLs(for: mergedOntoLegacy)[0])
-        let mergeRefused = await state.mergeDocuments([other], to: mergedOntoLegacy)
-        require(!mergeRefused, "merge still refuses a legacy companion destination")
+        let mergedOntoCache = scratch.appendingPathComponent("merged-onto-cache.pdf")
+        try records([stale]).write(to: DocumentEditCache.annotationsURL(for: mergedOntoCache))
+        let mergeRefused = await state.mergeDocuments([other], to: mergedOntoCache)
+        require(!mergeRefused, "merge still refuses a destination with a document cache")
         require(state.lastError?.contains("annotation records") == true,
                 "merge reports the destination's annotation records")
-        let splitOntoLegacy = scratch.appendingPathComponent("split-onto-legacy.pdf")
-        try records([stale]).write(to: DocumentEditCache.legacyURLs(for: splitOntoLegacy)[0])
-        let splitRefused = await state.splitPages([[0]], to: [splitOntoLegacy])
-        require(!splitRefused, "split still refuses a legacy companion destination")
+        let splitOntoCache = scratch.appendingPathComponent("split-onto-cache.pdf")
+        try records([stale]).write(to: DocumentEditCache.annotationsURL(for: splitOntoCache))
+        let splitRefused = await state.splitPages([[0]], to: [splitOntoCache])
+        require(!splitRefused, "split still refuses a destination with a document cache")
 
-        // ── 3. A clean destination saves, and reopening it shows each annotation once ─────
+        // ── 2. A clean destination saves, and reopening it shows each annotation once ─────
         let cleanDestination = scratch.appendingPathComponent("clean-copy.pdf")
         let cleanSaved = await state.saveAnnotatedCopy(to: cleanDestination)
         require(cleanSaved, "a clean destination still saves: \(state.lastError ?? "")")
         require(!fileManager.fileExists(atPath: DocumentEditCache.annotationsURL(for: cleanDestination).path),
                 "a saved copy carries no destination cache")
-        require(DocumentEditCache.legacyURLs(for: cleanDestination)
-                    .allSatisfy { !fileManager.fileExists(atPath: $0.path) },
-                "a saved copy recreates no legacy companion")
 
         let cleanReopen = AppState(engine: try RustEngine())
         cleanReopen.setViewportSize(CGSize(width: 700, height: 500))
@@ -192,22 +161,7 @@ extension ReaderChecks {
             cleanReopen.bookmarks.map(\.id) == [bookmark.id]
         })
 
-        // ── 4. The confirmed replacement retires each kind of stale record, then saves ────
-        let replacedLegacy = await state.saveAnnotatedCopy(
-            to: legacyDestination, replaceExistingRecords: true)
-        require(replacedLegacy,
-                "a confirmed replacement can save over a legacy companion: \(state.lastError ?? "")")
-        require(!fileManager.fileExists(atPath: legacyURL.path),
-                "the confirmed replacement moves the legacy companion out of the way")
-        let legacyReopen = AppState(engine: try RustEngine())
-        legacyReopen.setViewportSize(CGSize(width: 700, height: 500))
-        legacyReopen.newTab(url: legacyDestination)
-        try await eventually("the replaced legacy destination exposes only the saved annotations", {
-            legacyReopen.documentAnnotations.count == 2
-        })
-        require(Set(legacyReopen.documentAnnotations.map(\.id)) == expectedIDs,
-                "the replaced legacy destination has no duplicate identities")
-
+        // ── 3. The confirmed replacement retires the stale cache, then saves ─────────────
         let replacedCache = await state.saveAnnotatedCopy(
             to: cachedDestination, replaceExistingRecords: true)
         require(replacedCache,
