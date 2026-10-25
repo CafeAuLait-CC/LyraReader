@@ -266,19 +266,36 @@ public struct TextChar: Sendable {
 }
 
 /// A page's text layer.
+///
+/// Pages the engine loaded carry ``rust``, a synchronous handle to the document's cached
+/// Swift-parity selection implementation. The public methods below stay the same for every
+/// call site and fall back to the original Swift implementation when there is no handle (tests,
+/// previews and benchmark pages constructed from a dataset). The Rust path is the interactive
+/// one; the Swift code remains the reference the parity fixture pins.
 public struct TextPage: Sendable {
     public let page: Int
     public let chars: [TextChar]
     public let text: String
     public let hasUnicodeMapError: Bool
     private let selectionLines: [SelectionLine]
+    private let rust: TextPageRust?
 
     public init(page: Int, chars: [TextChar], text: String, hasUnicodeMapError: Bool) {
+        self.init(
+            page: page, chars: chars, text: text, hasUnicodeMapError: hasUnicodeMapError,
+            rust: nil)
+    }
+
+    init(
+        page: Int, chars: [TextChar], text: String, hasUnicodeMapError: Bool,
+        rust: TextPageRust?
+    ) {
         self.page = page
         self.chars = chars
         self.text = text
         self.hasUnicodeMapError = hasUnicodeMapError
         self.selectionLines = SelectionLine.build(chars)
+        self.rust = rust
     }
 
     /// The text line touched by an annotation, excluding a separate line-number gutter.
@@ -292,7 +309,21 @@ public struct TextPage: Sendable {
 
     /// Resolve the visual line before resolving x. Ink-free spaces must never make
     /// a character on a neighbouring line win merely because its x is closer.
+    ///
+    /// This is a thin wrapper: an engine-loaded page asks the document's cached Rust
+    /// implementation (one synchronous call, no PDFium read after the first event); a page
+    /// built by a test or benchmark uses the Swift reference below.
     public func characterIndex(at point: CGPoint, extendingSelection: Bool = false) -> Int? {
+        if let rust,
+           let index = rust.characterIndex(at: point, extendingSelection: extendingSelection) {
+            return index
+        }
+        return localCharacterIndex(at: point, extendingSelection: extendingSelection)
+    }
+
+    private func localCharacterIndex(
+        at point: CGPoint, extendingSelection: Bool = false
+    ) -> Int? {
         func distance(_ value: CGFloat, _ low: CGFloat, _ high: CGFloat) -> CGFloat {
             max(low - value, value - high, 0)
         }
@@ -383,6 +414,53 @@ private struct SelectionLine: Sendable {
         }
         if let current { lines.append(current) }
         return lines
+    }
+}
+
+/// Synchronous page-scoped access to the document's cached Rust selection implementation.
+///
+/// The outer optional on the methods means "the engine could not answer" (for example the
+/// document handle is gone). A successful Rust `nil` is kept as `.some(nil)` so the Swift
+/// fallback does not silently replace a legitimate no-hit with a different answer.
+final class TextPageRust: Sendable {
+    private let document: LyraReaderDocument
+    private let page: UInt32
+
+    init(document: LyraReaderDocument, page: UInt32) {
+        self.document = document
+        self.page = page
+    }
+
+    func characterIndex(at point: CGPoint, extendingSelection: Bool) -> Int?? {
+        do {
+            return .some(
+                try document.textCharacterIndex(
+                    page: page, xPt: Double(point.x), yPt: Double(point.y),
+                    extendingSelection: extendingSelection).map(Int.init))
+        } catch {
+            return nil
+        }
+    }
+
+    func characterRange(in rect: CGRect) -> ClosedRange<Int>?? {
+        do {
+            guard let range = try document.textCharacterRange(
+                page: page, xPt: Double(rect.minX), yPt: Double(rect.minY),
+                widthPt: Double(rect.width), heightPt: Double(rect.height))
+            else {
+                return .some(nil)
+            }
+            return .some(Int(range.start)...Int(range.end))
+        } catch {
+            return nil
+        }
+    }
+
+    func string(in range: ClosedRange<Int>) -> String? {
+        guard let start = UInt32(exactly: range.lowerBound),
+              let end = UInt32(exactly: range.upperBound)
+        else { return "" }
+        return try? document.textRangeString(page: page, start: start, end: end)
     }
 }
 
@@ -2519,7 +2597,8 @@ public final class RustEngine: PDFEngine {
                                 )
                             },
                             text: extracted.text,
-                            hasUnicodeMapError: extracted.hasUnicodeMapError
+                            hasUnicodeMapError: extracted.hasUnicodeMapError,
+                            rust: TextPageRust(document: document, page: UInt32(page))
                         )
                     )
                 } catch {
@@ -4196,9 +4275,20 @@ public final class MockEngine: PDFEngine {
 // PDF glyph boxes describe ink, not a text selection. Join adjacent glyphs on each
 // line so spaces and the gaps between letters are included, without bridging columns.
 extension TextPage {
-    /// The text those characters spell, with the same Unicode-scalar mapping `copySelection`
-    /// uses. Empty when the range is empty or contains no decodable scalar.
+    /// The text those characters spell, with the same Unicode-scalar mapping the engine uses.
+    /// Empty when the range is empty or contains no decodable scalar.
+    ///
+    /// Thin wrapper over the cached Rust implementation for engine-loaded pages. This is the
+    /// **one** range→string entry point; `copySelection` and the annotation export call it
+    /// instead of decoding `chars` themselves.
     public func string(in range: ClosedRange<Int>) -> String {
+        if let rust, let text = rust.string(in: range) {
+            return text
+        }
+        return localString(in: range)
+    }
+
+    private func localString(in range: ClosedRange<Int>) -> String {
         guard !chars.isEmpty else { return "" }
         let clamped = range.clamped(to: 0...(chars.count - 1))
         guard !clamped.isEmpty else { return "" }
@@ -4211,7 +4301,17 @@ extension TextPage {
     ///
     /// Returns `nil` when no glyph overlaps, which is the honest answer for a box over a figure
     /// or over a page whose text layer could not be read.
+    ///
+    /// Thin wrapper over the cached Rust implementation for engine-loaded pages; see
+    /// ``characterIndex(at:extendingSelection:)``.
     public func characterRange(in rect: CGRect) -> ClosedRange<Int>? {
+        if let rust, let range = rust.characterRange(in: rect) {
+            return range
+        }
+        return localCharacterRange(in: rect)
+    }
+
+    private func localCharacterRange(in rect: CGRect) -> ClosedRange<Int>? {
         var first: Int?
         var last: Int?
         for line in selectionLines {

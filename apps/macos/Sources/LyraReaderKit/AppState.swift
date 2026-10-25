@@ -15510,8 +15510,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let range = selection.range.clamped(to: 0...(textPage.chars.count - 1))
         guard !range.isEmpty else { return }
 
-        let scalars = textPage.chars[range].compactMap { Unicode.Scalar($0.unicode) }
-        let string = String(String.UnicodeScalarView(scalars))
+        // One range→string entry point (Rust for engine-loaded pages, the same Swift rule for
+        // synthetic ones); decoding scalars here would be the second copy this task removed.
+        let string = textPage.string(in: range)
         guard !string.isEmpty else { return }
 
         NSPasteboard.general.clearContents()

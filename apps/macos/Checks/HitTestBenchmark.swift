@@ -107,6 +107,33 @@ extension ReaderChecks {
         }
         print("Swift FFI pageCount round-trip (overhead proxy): \(BenchmarkStats(ffiOverhead).line)")
 
+        // ── The interactive path after C1: one synchronous FFI call into the page cache ─────
+        // Path A above warmed the Rust pages, so these numbers are steady state, like a drag
+        // after the reader has pointed at the page once.
+        var ffiHitSamples: [String: [Double]] = [:]
+        for (group, points) in [("100% zoom", benchmark.timing100), ("200% zoom", benchmark.timing200)] {
+            for drag in [true, false] {
+                var samples: [Double] = []
+                samples.reserveCapacity(points.count)
+                for point in points {
+                    guard let document = documents[point.page], let info = paths[point.page] else {
+                        continue
+                    }
+                    let origin = mach_absolute_time()
+                    let index = try? document.textCharacterIndex(
+                        page: UInt32(info.pageIndex), xPt: point.x, yPt: point.y,
+                        extendingSelection: drag)
+                    let elapsed = microseconds(mach_absolute_time() - origin)
+                    sink &+= Int(index ?? 0)
+                    samples.append(elapsed)
+                }
+                ffiHitSamples["\(drag ? "drag" : "press") \(group)"] = samples
+                print(
+                    "Swift FFI textCharacterIndex cached \(drag ? "drag" : "press") \(group): "
+                        + BenchmarkStats(samples).line)
+            }
+        }
+
         // ── Parity: the same points and boxes the Rust half measured ───────────────────────
         var indexExactDiff = 0
         var indexNearestDiff = 0
@@ -122,6 +149,22 @@ extension ReaderChecks {
         var indexExamples: [String] = []
         var nearestExamples: [String] = []
         var boxExamples: [String] = []
+
+        // C1: the new line-aware Rust path, compared live (not via the dataset's old fields).
+        var newIndexDiff = 0
+        var newDragDiff = 0
+        var newBoxRangeDiff = 0
+        var newBoxSetDiff = 0
+        var newStringDiff = 0
+        var newNilPress = 0
+        var newNilDrag = 0
+        var swiftDragNil = 0
+        var newStringChecks = 0
+        var fixedStringChecks = 0
+        var fixedStringDiff = 0
+        var newExamples: [String] = []
+        var newStringExamples: [String] = []
+        var datasetNewDiff = 0
         for point in benchmark.parity {
             let page = benchmark.pages[point.page]!
             let location = CGPoint(x: point.x, y: point.y)
@@ -194,9 +237,140 @@ extension ReaderChecks {
             if coverageInfo.hash != rustSpan.hash {
                 coverageVsRustSpan += 1
             }
+
+            // ── C1: live cached Rust implementation on the identical point and box ─────────
+            guard let document = documents[point.page], let info = paths[point.page] else {
+                continue
+            }
+            let pageArgument = UInt32(info.pageIndex)
+            let flatRustIndex: Int?
+            do {
+                flatRustIndex = try document.textCharacterIndex(
+                    page: pageArgument, xPt: point.x, yPt: point.y,
+                    extendingSelection: false).map(Int.init)
+            } catch {
+                flatRustIndex = nil
+            }
+            let flatRustDrag: Int?
+            do {
+                flatRustDrag = try document.textCharacterIndex(
+                    page: pageArgument, xPt: point.x, yPt: point.y,
+                    extendingSelection: true).map(Int.init)
+            } catch {
+                flatRustDrag = nil
+            }
+            if flatRustIndex == nil { newNilPress += 1 }
+            if flatRustDrag == nil { newNilDrag += 1 }
+            if swiftIndex != flatRustIndex {
+                newIndexDiff += 1
+                if newExamples.count < 8 {
+                    newExamples.append(
+                        String(
+                            format: "    index p%d (%.2f, %.2f) Swift=%d Rust=%d",
+                            point.page, point.x, point.y, swiftIndex ?? -1,
+                            flatRustIndex ?? -1))
+                }
+            }
+            let swiftDrag = page.text.characterIndex(
+                at: location, extendingSelection: true)
+            if swiftDrag == nil { swiftDragNil += 1 }
+            if swiftDrag != flatRustDrag {
+                newDragDiff += 1
+            }
+
+            let flatRustBox: LyraReaderBindings.TextRange?
+            do {
+                flatRustBox = try document.textCharacterRange(
+                    page: pageArgument, xPt: Double(box.minX), yPt: Double(box.minY),
+                    widthPt: Double(box.width), heightPt: Double(box.height))
+            } catch {
+                flatRustBox = nil
+            }
+            let rustRange: ClosedRange<Int>?
+            if let flatRustBox {
+                rustRange = Int(flatRustBox.start)...Int(flatRustBox.end)
+            } else {
+                rustRange = nil
+            }
+            let rustRangeInfo = rangeInfo(rustRange)
+            if rustRangeInfo.first != swiftInfo.first || rustRangeInfo.last != swiftInfo.last {
+                newBoxRangeDiff += 1
+                if newExamples.count < 8 {
+                    newExamples.append(
+                        String(
+                            format: "    range p%d (%.2f, %.2f) Swift=%d…%d Rust=%d…%d",
+                            point.page, point.x, point.y, swiftInfo.first ?? -1,
+                            swiftInfo.last ?? -1, rustRangeInfo.first ?? -1,
+                            rustRangeInfo.last ?? -1))
+                }
+            }
+            if rustRangeInfo.hash != swiftInfo.hash {
+                newBoxSetDiff += 1
+            }
+
+            // Range→string: both implementations must spell the same Swift range identically.
+            if let swiftRange {
+                newStringChecks += 1
+                let swiftText = page.text.string(in: swiftRange)
+                let rustText = (try? document.textRangeString(
+                    page: pageArgument, start: UInt32(swiftRange.lowerBound),
+                    end: UInt32(swiftRange.upperBound))) ?? ""
+                let rustHash = stringHash(rustText)
+                if rustHash != stringHash(swiftText)
+                    || rustText.utf8.count != swiftText.utf8.count
+                {
+                    newStringDiff += 1
+                    if newStringExamples.count < 8 {
+                        newStringExamples.append(
+                            String(
+                                format: "    string p%d %d…%d Swift=%d bytes Rust=%d bytes",
+                                point.page, swiftRange.lowerBound, swiftRange.upperBound,
+                                swiftText.utf8.count, rustText.utf8.count))
+                    }
+                }
+            }
+
+            // Dataset fields are the Rust half's own view; they must agree with the live calls.
+            if point.rustNewIndex != flatRustIndex
+                || point.rustNewDragIndex != flatRustDrag
+                || point.rustNewBoxFirst != rustRangeInfo.first
+                || point.rustNewBoxLast != rustRangeInfo.last
+            {
+                datasetNewDiff += 1
+            }
+        }
+
+        // Fixed ranges per page: whole page, a short window and a cross-line window. These are
+        // not tied to a sampled box, so they catch a range→string rule that only shows up at
+        // the start/end of a page.
+        for id in benchmark.pages.keys.sorted() {
+            guard let page = benchmark.pages[id], let document = documents[id],
+                let info = paths[id]
+            else { continue }
+            let count = page.text.chars.count
+            guard count > 0 else { continue }
+            let ranges: [ClosedRange<Int>] = [
+                0...(count - 1),
+                0...min(40, count - 1),
+                max(0, count / 2 - 20)...min(count - 1, count / 2 + 120),
+                max(0, count - 2)...(count - 1),
+            ]
+            for range in ranges {
+                fixedStringChecks += 1
+                let swiftText = page.text.string(in: range)
+                let rustText = (try? document.textRangeString(
+                    page: UInt32(info.pageIndex), start: UInt32(range.lowerBound),
+                    end: UInt32(range.upperBound))) ?? ""
+                if stringHash(rustText) != stringHash(swiftText)
+                    || rustText.utf8.count != swiftText.utf8.count
+                {
+                    fixedStringDiff += 1
+                }
+            }
         }
         let total = benchmark.parity.count
         print("Parity (n=\(total), 5 pages):")
+        print("  — before C1 (Swift vs the old Rust containment path) —")
         print(percentLine("closest index vs Rust exact containment", indexExactDiff, total))
         print(percentLine("closest index vs Rust nearest-glyph reference", indexNearestDiff, total))
         print(percentLine("box→character range (Swift characterRange vs Rust first…last)",
@@ -206,6 +380,16 @@ extension ReaderChecks {
         print(percentLine("box→set: Swift >35% coverage vs characterRange", coverageVsIntersection, total))
         print(percentLine("box→set: Swift >35% coverage vs Rust first…last", coverageVsRustSpan, total))
         print(percentLine("box→set: Swift >35% coverage vs Rust per-char intersection", coverageVsRust, total))
+        print("  — after C1 (Swift reference vs cached line-aware Rust, live FFI) —")
+        print(percentLine("closest index (press)", newIndexDiff, total))
+        print(percentLine("closest index (drag / extendingSelection)", newDragDiff, total))
+        print(percentLine("box→character range (first…last)", newBoxRangeDiff, total))
+        print(percentLine("box→character set (span hash)", newBoxSetDiff, total))
+        print(percentLine("range→string (Swift box range)", newStringDiff, newStringChecks))
+        print(percentLine("range→string (fixed page ranges)", fixedStringDiff, fixedStringChecks))
+        print(percentLine("dataset Rust results vs live Rust", datasetNewDiff, total))
+        print("Swift press nil=\(swiftNil)/\(total)  Rust line-aware press nil=\(newNilPress)/\(total)")
+        print("Swift drag nil=\(swiftDragNil)/\(total)  Rust line-aware drag nil=\(newNilDrag)/\(total)")
         if indexMismatches > 0 {
             print(
                 "Of \(indexMismatches) exact-index mismatches, \(nearEdgeMismatches) "
@@ -224,8 +408,27 @@ extension ReaderChecks {
             print("Box mismatch examples:")
             for line in boxExamples { print(line) }
         }
+        if !newExamples.isEmpty {
+            print("C1 mismatch examples:")
+            for line in newExamples { print(line) }
+        }
+        if !newStringExamples.isEmpty {
+            print("C1 range→string mismatch examples:")
+            for line in newStringExamples { print(line) }
+        }
         if sink == Int.min { print(sink) } // keep the timed results observable
         print("Swift results: benchmark complete")
+
+        let c1Differences = newIndexDiff + newDragDiff + newBoxRangeDiff + newBoxSetDiff
+            + newStringDiff + fixedStringDiff + datasetNewDiff
+        guard c1Differences == 0 else {
+            throw NSError(
+                domain: "HitTestParity", code: 1,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "C1 parity failed: \(c1Differences) difference(s); see the table above"
+                ])
+        }
     }
 }
 
@@ -253,6 +456,14 @@ private struct BenchmarkDataset {
         let rustBoxLast: Int?
         let rustBoxCount: Int?
         let rustBoxHash: UInt64?
+        let rustNewIndex: Int?
+        let rustNewDragIndex: Int?
+        let rustNewBoxFirst: Int?
+        let rustNewBoxLast: Int?
+        let rustNewBoxCount: Int?
+        let rustNewBoxHash: UInt64?
+        let rustNewStringHash: UInt64?
+        let rustNewStringLen: Int?
 
         enum CodingKeys: String, CodingKey {
             case page, x, y
@@ -264,6 +475,14 @@ private struct BenchmarkDataset {
             case rustBoxLast = "rust_box_last"
             case rustBoxCount = "rust_box_count"
             case rustBoxHash = "rust_box_hash"
+            case rustNewIndex = "rust_new_index"
+            case rustNewDragIndex = "rust_new_drag_index"
+            case rustNewBoxFirst = "rust_new_box_first"
+            case rustNewBoxLast = "rust_new_box_last"
+            case rustNewBoxCount = "rust_new_box_count"
+            case rustNewBoxHash = "rust_new_box_hash"
+            case rustNewStringHash = "rust_new_string_hash"
+            case rustNewStringLen = "rust_new_string_len"
         }
 
         init(from decoder: Decoder) throws {
@@ -280,6 +499,16 @@ private struct BenchmarkDataset {
             rustBoxCount = try values.decodeIfPresent(Int.self, forKey: .rustBoxCount)
             let hash = try values.decodeIfPresent(String.self, forKey: .rustBoxHash)
             rustBoxHash = hash.flatMap { UInt64($0, radix: 16) }
+            rustNewIndex = try values.decodeIfPresent(Int.self, forKey: .rustNewIndex)
+            rustNewDragIndex = try values.decodeIfPresent(Int.self, forKey: .rustNewDragIndex)
+            rustNewBoxFirst = try values.decodeIfPresent(Int.self, forKey: .rustNewBoxFirst)
+            rustNewBoxLast = try values.decodeIfPresent(Int.self, forKey: .rustNewBoxLast)
+            rustNewBoxCount = try values.decodeIfPresent(Int.self, forKey: .rustNewBoxCount)
+            let newHash = try values.decodeIfPresent(String.self, forKey: .rustNewBoxHash)
+            rustNewBoxHash = newHash.flatMap { UInt64($0, radix: 16) }
+            let newStringHash = try values.decodeIfPresent(String.self, forKey: .rustNewStringHash)
+            rustNewStringHash = newStringHash.flatMap { UInt64($0, radix: 16) }
+            rustNewStringLen = try values.decodeIfPresent(Int.self, forKey: .rustNewStringLen)
         }
     }
 
@@ -409,6 +638,15 @@ private struct RangeInfo {
 
 private let fnvOffset: UInt64 = 0xcbf2_9ce4_8422_2325
 private let fnvPrime: UInt64 = 0x100_0000_01b3
+
+private func stringHash(_ value: String) -> UInt64 {
+    var hash = fnvOffset
+    for byte in value.utf8 {
+        hash ^= UInt64(byte)
+        hash = hash &* fnvPrime
+    }
+    return hash
+}
 
 private func rangeInfo(_ range: ClosedRange<Int>?) -> RangeInfo {
     guard let range else { return RangeInfo(first: nil, last: nil, count: 0, hash: fnvOffset) }

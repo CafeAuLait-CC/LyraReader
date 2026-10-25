@@ -360,12 +360,11 @@ public enum AnnotationExport {
         return normalized(raw)
     }
 
-    /// The characters in `range`, decoded the same way the reader's copy command decodes them.
+    /// The characters in `range`, through the reader's one range→string entry point.
     public static func text(in page: TextPage, range: ClosedRange<Int>) -> String? {
         guard range.lowerBound >= 0, range.upperBound < page.chars.count else { return nil }
-        let scalars = page.chars[range].compactMap { Unicode.Scalar($0.unicode) }
-        guard !scalars.isEmpty else { return nil }
-        return String(String.UnicodeScalarView(scalars))
+        let string = page.string(in: range)
+        return string.isEmpty ? nil : string
     }
 
     /// Normalizes line endings and trims surrounding blank space; whitespace-only becomes nil.

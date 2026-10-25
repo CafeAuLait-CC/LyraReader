@@ -99,6 +99,37 @@ struct ReaderChecks {
         AppState.usesStoredSidebarTab = false
         AppState.usesStoredSidePanelPreferences = false
 
+        if let flag = CommandLine.arguments.firstIndex(of: "--check-text-selection-cache") {
+            guard flag + 1 < CommandLine.arguments.count else {
+                FileHandle.standardError.write(
+                    Data("--check-text-selection-cache needs the repository root\n".utf8))
+                exit(2)
+            }
+            try checkTextSelectionCache(
+                fixture: URL(fileURLWithPath: CommandLine.arguments[flag + 1])
+                    .appendingPathComponent("tests/fixtures/multipage.pdf"))
+            return
+        }
+        if let flag = CommandLine.arguments.firstIndex(of: "--check-text-selection-parity") {
+            guard flag + 1 < CommandLine.arguments.count else {
+                FileHandle.standardError.write(
+                    Data("--check-text-selection-parity needs the fixture path\n".utf8))
+                exit(2)
+            }
+            try checkTextSelectionParity(
+                fixture: URL(fileURLWithPath: CommandLine.arguments[flag + 1]))
+            return
+        }
+        if let flag = CommandLine.arguments.firstIndex(of: "--write-text-selection-parity") {
+            guard flag + 1 < CommandLine.arguments.count else {
+                FileHandle.standardError.write(
+                    Data("--write-text-selection-parity needs the fixture path\n".utf8))
+                exit(2)
+            }
+            try writeTextSelectionParity(
+                fixture: URL(fileURLWithPath: CommandLine.arguments[flag + 1]))
+            return
+        }
         if let flag = CommandLine.arguments.firstIndex(of: "--bench-hit-test") {
             // Opt-in measurement only (`LyraReaderChecks --bench-hit-test dataset.jsonl`).
             guard flag + 1 < CommandLine.arguments.count else {
@@ -1117,6 +1148,19 @@ struct ReaderChecks {
             ("contract-cleanup", {
                 // Before xfa: pure value checks plus one scratch document; no window or GPU surface.
                 try await contractCleanupChecks(root: root)
+            }),
+            ("text-selection-cache", {
+                // The cache that makes a per-event hit test one synchronous call: second hit on
+                // the same page must not read PDFium again.
+                try checkTextSelectionCache(
+                    fixture: root.appendingPathComponent("tests/fixtures/multipage.pdf"))
+            }),
+            ("text-selection-parity", {
+                // No PDF, no window: the frozen synthetic pages exercise the selection rules
+                // that differ from exact containment (gutter, cross-column span, whitespace,
+                // thresholds, drag neighbours).
+                try checkTextSelectionParity(
+                    fixture: root.appendingPathComponent("tests/fixtures/text-selection-parity.json"))
             }),
             ("xfa", {
                 // Last: this check opens the local XFA sample and leaves no window behind, but it is

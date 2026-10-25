@@ -33,7 +33,7 @@ use lyra_reader_core::{PageIndex, Point, RawCharBox, Rect};
 use lyra_reader_ffi::api::{
     LyraReaderDocument, LyraReaderEngine, TextChar, TextPage as FfiTextPage,
 };
-use lyra_reader_text::{CharBox, CharIndex, TextPage};
+use lyra_reader_text::{CharBox, CharIndex, SelectionTextPage, TextPage};
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs::File;
@@ -59,6 +59,8 @@ struct PageData {
     /// `selection_rects`. Constructed test-only; the boxes are the FFI ones, so both paths and
     /// Swift address identical geometry.
     text_page: TextPage,
+    /// The Swift-parity line-aware view of the same page: the engine's interactive path.
+    selection: SelectionTextPage,
     /// `selection_rects(i, i)[0]` for every character; the Rust definition of "one rect per
     /// character" used by the box→character comparison.
     char_rects: Vec<Rect>,
@@ -255,6 +257,15 @@ fn main() {
         std::mem::size_of::<CharBox>(),
         std::mem::size_of::<TextChar>()
     );
+    let selection_cache_bytes: usize = pages
+        .iter()
+        .map(|page| page.selection.estimated_bytes())
+        .sum();
+    println!(
+        "five-page selection cache≈{:.1} KiB (budget {:.1} KiB, max 5 pages)",
+        selection_cache_bytes as f64 / 1024.0,
+        1536.0
+    );
     let mut page_json = Vec::new();
     for (index, page) in pages.iter().enumerate() {
         println!(
@@ -268,6 +279,11 @@ fn main() {
             page.text_bytes,
             page.estimated_text_page_bytes() as f64 / 1024.0,
             page.estimated_text_page_bytes() as f64 / page.chars.len().max(1) as f64
+        );
+        println!(
+            "          selection layout≈{:.1} KiB ({} lines)",
+            page.selection.estimated_bytes() as f64 / 1024.0,
+            page.selection.layout().lines().len()
         );
         page_json.push(json!({
             "page": index, "label": page.label, "page_index": page.page_index,
@@ -294,6 +310,7 @@ fn main() {
     // ── Path A: text_page per point, exact scan over its boxes ──────────────────────────────
     let mut path_a: HashMap<&'static str, Vec<f64>> = HashMap::new();
     let mut path_b: HashMap<&'static str, Vec<f64>> = HashMap::new();
+    let mut path_c: HashMap<&'static str, Vec<f64>> = HashMap::new();
     let mut mismatched_paths = 0usize;
     for (group, samples) in &timing {
         let mut by_page: Vec<Vec<&PointSample>> = vec![Vec::new(); pages.len()];
@@ -302,6 +319,7 @@ fn main() {
         }
         let mut read_times = Vec::with_capacity(samples.len());
         let mut cached_times = Vec::with_capacity(samples.len());
+        let mut line_aware_times = Vec::with_capacity(samples.len());
         for (page_index, page) in pages.iter().enumerate() {
             let document = open_document(&engine, &page.path);
             // Warm PDFium's per-page text extraction; the recorded loop measures the steady
@@ -342,10 +360,19 @@ fn main() {
                 if cached.map(|index| index.0 as usize) != index {
                     mismatched_paths += 1;
                 }
+
+                let started = Instant::now();
+                let line_aware = page
+                    .selection
+                    .char_index_at(Point::new(sample.x, sample.y), false);
+                let elapsed = started.elapsed().as_secs_f64() * 1e6;
+                std::hint::black_box(line_aware);
+                line_aware_times.push(elapsed);
             }
         }
         path_a.insert(group, read_times);
         path_b.insert(group, cached_times);
+        path_c.insert(group, line_aware_times);
     }
 
     let mut timing_json = serde_json::Map::new();
@@ -364,6 +391,15 @@ fn main() {
         print_stats(group_label(group), &stats);
         timing_json.insert(
             format!("path_b_{}", group.trim_start_matches("timing")),
+            stats.to_json(),
+        );
+    }
+    println!("\nPath C — cached line-aware (Swift-parity) char_index_at (per point)");
+    for group in ["timing100", "timing200"] {
+        let stats = Stats::of(&path_c[group]);
+        print_stats(group_label(group), &stats);
+        timing_json.insert(
+            format!("path_c_{}", group.trim_start_matches("timing")),
             stats.to_json(),
         );
     }
@@ -388,12 +424,31 @@ fn main() {
             sample.box_h,
         );
         let (first, last, count, hash) = box_set(page, box_rect);
+        let new_index = page
+            .selection
+            .char_index_at(Point::new(sample.x, sample.y), false)
+            .map(|index| index.0 as usize);
+        let new_drag = page
+            .selection
+            .char_index_at(Point::new(sample.x, sample.y), true)
+            .map(|index| index.0 as usize);
+        let (new_first, new_last, new_set_count, new_hash) = selection_box_set(page, box_rect);
+        let new_string = match (new_first, new_last) {
+            (Some(first), Some(last)) => page.selection.string_in_range(first as u32, last as u32),
+            _ => String::new(),
+        };
         parity_lines.push(json!({
             "kind": "point", "group": "parity", "page": sample.page,
             "x": sample.x, "y": sample.y, "box_w": sample.box_w, "box_h": sample.box_h,
             "rust_exact": exact, "rust_nearest": nearest,
             "rust_box_first": first, "rust_box_last": last,
             "rust_box_count": count, "rust_box_hash": format!("{hash:016x}"),
+            "rust_new_index": new_index, "rust_new_drag_index": new_drag,
+            "rust_new_box_first": new_first, "rust_new_box_last": new_last,
+            "rust_new_box_count": new_set_count,
+            "rust_new_box_hash": format!("{new_hash:016x}"),
+            "rust_new_string_hash": format!("{:016x}", string_hash(&new_string)),
+            "rust_new_string_len": new_string.len(),
         }));
     }
 
@@ -501,6 +556,41 @@ fn box_set(page: &PageData, box_rect: Rect) -> (Option<usize>, Option<usize>, us
     (first, last, count, hash)
 }
 
+/// The new line-aware box rule, expressed the same way as `box_set`: the contiguous span from
+/// the first to the last intersecting stop (Swift's `first...last`). The character *set* is
+/// every index in the span, so the hash walks the span.
+fn selection_box_set(
+    page: &PageData,
+    box_rect: Rect,
+) -> (Option<usize>, Option<usize>, usize, u64) {
+    let Some((first, last)) = page.selection.character_range(box_rect) else {
+        return (None, None, 0, 0xcbf2_9ce4_8422_2325);
+    };
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for index in first.0..=last.0 {
+        for byte in index.to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    (
+        Some(first.0 as usize),
+        Some(last.0 as usize),
+        (last.0 - first.0 + 1) as usize,
+        hash,
+    )
+}
+
+/// FNV-1a over UTF-8, used for the range→string parity comparison without storing the text.
+fn string_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
 fn sample_points(pages: &[PageData], total: usize, seed: u64) -> Vec<PointSample> {
     let mut rng = Lcg(seed);
     let mut samples = Vec::with_capacity(total);
@@ -575,6 +665,7 @@ fn build_page(path: &Path, page_index: u32, width: f64, height: f64, raw: FfiTex
         is_generated: false,
         has_unicode_map_error: raw.has_unicode_map_error,
     };
+    let selection = SelectionTextPage::new(text_page.clone());
     let char_rects = (0..text_page.chars.len())
         .map(|index| {
             let index = CharIndex(index as u32);
@@ -603,6 +694,7 @@ fn build_page(path: &Path, page_index: u32, width: f64, height: f64, raw: FfiTex
         text_bytes: text_page.text.len(),
         chars,
         text_page,
+        selection,
         char_rects,
         ink_indices,
     }
