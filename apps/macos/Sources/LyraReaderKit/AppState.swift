@@ -4071,8 +4071,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// When the content is wider than one of the widths the visible columns can change. Those
     /// changes are coalesced into one rebuild shortly after the width stops moving, so a slide or
     /// a live window resize still settles correctly without doing that work per frame.
-    public func setViewportSize(_ size: CGSize) {
-        guard size != viewportSizePt else { return }
+    // The inspector may cover part of a wider drawing surface. Fit commands use the visible
+    // viewport; tiles, hit-test anchors and torn-page overlays use the drawing transform.
+    private var presentationWidthPt: CGFloat?
+    public var canvasPresentationWidthPt: CGFloat { presentationWidthPt ?? viewportSizePt.width }
+
+    public func setViewportSize(_ size: CGSize, canvasWidth: CGFloat? = nil) {
+        let drawingWidth = canvasWidth ?? size.width
+        let drawingWidthChanged = abs(drawingWidth - canvasPresentationWidthPt) > 0.5
+        presentationWidthPt = drawingWidth
+        guard size != viewportSizePt else {
+            if drawingWidthChanged { scheduleViewportReload() }
+            return
+        }
         let previous = viewportSizePt
         viewportSizePt = size
 
@@ -13831,7 +13842,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// visible window is its left edge.
     private func visibleContentRect(viewportHeight: CGFloat) -> CGRect {
         let zoom = max(zoomFactor, 0.01)
-        let centreOffsetPt = max(0, (viewportSizePt.width - contentWidthPt * zoomFactor) / 2)
+        let centreOffsetPt = max(0, (canvasPresentationWidthPt - contentWidthPt * zoomFactor) / 2)
         return CGRect(
             x: (horizontalViewportOrigin - centreOffsetPt) / zoom,
             y: scrollYPt,
@@ -13884,7 +13895,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     pageTopPt: placement.topPt, pageLeftPt: placement.leftPt, region: region,
                     scrollYPt: scrollYPt, zoom: zoomFactor,
                     contentOffsetX: CanvasGeometry.contentOffsetX(
-                        viewportWidthPt: viewportSizePt.width,
+                        viewportWidthPt: canvasPresentationWidthPt,
                         contentWidthPt: contentWidthPt,
                         zoom: zoomFactor
                     )
@@ -13897,7 +13908,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             scrollYPt: scrollYPt,
             zoom: zoomFactor,
             contentOffsetX: CanvasGeometry.contentOffsetX(
-                viewportWidthPt: viewportSizePt.width,
+                viewportWidthPt: canvasPresentationWidthPt,
                 contentWidthPt: contentWidthPt,
                 zoom: zoomFactor
             )

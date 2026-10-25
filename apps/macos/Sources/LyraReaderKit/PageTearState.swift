@@ -215,7 +215,7 @@ extension AppState {
             scrollYPt: scrollYPt,
             zoom: zoomFactor,
             contentOffsetX: CanvasGeometry.contentOffsetX(
-                viewportWidthPt: viewportSizePt.width,
+                viewportWidthPt: canvasPresentationWidthPt,
                 contentWidthPt: contentWidthPt,
                 zoom: zoomFactor
             )

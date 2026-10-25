@@ -67,7 +67,8 @@ public struct ReaderWindow: View {
                     .accessibilityHidden(state.document == nil || !state.sidebarVisible)
                     HorizontalDocumentViewport(
                         contentWidth: state.contentWidthPt * state.zoomFactor,
-                        onViewport: { state.setViewportSize($0) },
+                        preservesHorizontalAnchor: state.contentEditInspectorVisible || state.fillSignInspectorVisible,
+                        onViewport: { size, canvasWidth in state.setViewportSize(size, canvasWidth: canvasWidth) },
                         onHorizontalScroll: { state.setHorizontalViewportOrigin($0) }
                     ) { canvas }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
