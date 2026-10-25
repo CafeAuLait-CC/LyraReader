@@ -46,7 +46,7 @@ use crate::writeback::{IncrementalSaveReport, SaveMode, save_incremental_with_co
 use lopdf::{
     Dictionary, Document, IncrementalDocument, LoadOptions, Object, ObjectId, Stream, StringFormat,
 };
-use lyra_reader_core::{ErrorCode, LyraReaderError, Rect, Result};
+use lyra_reader_core::{AnnotationAlignment, ErrorCode, LyraReaderError, Rect, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
@@ -126,6 +126,11 @@ pub struct FormField {
     /// `/DA`'s font size, or the AcroForm default, or 12 when nothing states one.
     pub font_size: f64,
     pub required: bool,
+    /// `/Q` quadding, used by the generated appearance. Left when the file states none.
+    pub(crate) alignment: AnnotationAlignment,
+    /// `/DA`'s text colour as RGB in 0..1 (black when it states none), used by the generated
+    /// appearance.
+    pub(crate) text_color: [f64; 3],
     pub(crate) object_id: ObjectId,
 }
 
@@ -384,6 +389,78 @@ fn font_size_from_da(da: &str) -> Option<f64> {
         }
     }
     None
+}
+
+/// The `/DA` text colour, as RGB in 0..1.
+///
+/// A `/DA` is a content-stream fragment, so its colour is the last complete `g`, `rg` or `k`
+/// operator before the text (PDF 32000-1 §12.7.4.3). The file's black default is kept when the
+/// fragment states no usable colour. CMYK is converted the usual naive way; this reader does
+/// not carry an output intent into an appearance stream.
+fn text_color_from_da(da: &str) -> [f64; 3] {
+    let clamp = |value: f64| value.clamp(0.0, 1.0);
+    let mut numbers: Vec<f64> = Vec::new();
+    let mut color = [0.0, 0.0, 0.0];
+    for token in da.split_whitespace() {
+        if let Ok(value) = token.parse::<f64>() {
+            numbers.push(value);
+            continue;
+        }
+        match token {
+            "g" | "G" if !numbers.is_empty() => {
+                let gray = clamp(numbers[numbers.len() - 1]);
+                color = [gray, gray, gray];
+            }
+            "rg" | "RG" if numbers.len() >= 3 => {
+                let base = numbers.len() - 3;
+                color = [
+                    clamp(numbers[base]),
+                    clamp(numbers[base + 1]),
+                    clamp(numbers[base + 2]),
+                ];
+            }
+            "k" | "K" if numbers.len() >= 4 => {
+                let base = numbers.len() - 4;
+                let c = clamp(numbers[base]);
+                let m = clamp(numbers[base + 1]);
+                let y = clamp(numbers[base + 2]);
+                let k = clamp(numbers[base + 3]);
+                color = [
+                    (1.0 - c) * (1.0 - k),
+                    (1.0 - m) * (1.0 - k),
+                    (1.0 - y) * (1.0 - k),
+                ];
+            }
+            _ => {}
+        }
+        numbers.clear();
+    }
+    color
+}
+
+/// A PDF text string's line endings, normalised for the shell and for `/V`.
+///
+/// PDF 32000-1 §7.9.2.2 recognises CR, LF and CRLF as end-of-line markers in a text string.
+/// `/V` is written with LF only; a file written by another tool may carry CR or CRLF, and the
+/// reader shows both as one newline.
+fn normalize_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// A single-line text field has no line breaks. One that arrives (from a paste, or from a file
+/// this reader did not write) becomes a space rather than being written into `/V`.
+fn single_line_text(text: &str) -> String {
+    normalize_newlines(text).replace('\n', " ")
+}
+
+/// The exact value a save writes for a text field: newline-preserving for a multiline field,
+/// newline-free for a single-line one.
+fn text_value_for_write(field: &FormField, text: &str) -> String {
+    if field.multiline {
+        normalize_newlines(text)
+    } else {
+        single_line_text(text)
+    }
 }
 
 /// A widget's on-state names, read from `/AP /N` (the keys other than `/Off`).
@@ -658,7 +735,9 @@ fn read_field_group(
         return None;
     }
 
-    let value = attribute(document, field, first_widget, b"V").and_then(read_string_object);
+    let value = attribute(document, field, first_widget, b"V")
+        .and_then(read_string_object)
+        .map(|value| normalize_newlines(&value));
     let mut options = read_options(document, field);
     let selected = if kind.is_choice() {
         selected_indices(document, field)
@@ -725,6 +804,13 @@ fn read_field_group(
     let da = attribute_string(document, field, first_widget, b"DA")
         .or_else(|| acroform_da.map(str::to_owned));
     let font_size = da.as_deref().and_then(font_size_from_da).unwrap_or(12.0);
+    let alignment = attribute_integer(document, field, first_widget, b"Q")
+        .map(AnnotationAlignment::from_quadding)
+        .unwrap_or_default();
+    let text_color = da
+        .as_deref()
+        .map(text_color_from_da)
+        .unwrap_or([0.0, 0.0, 0.0]);
 
     Some(FormField {
         id: format!("f{}", field_id.0),
@@ -749,6 +835,8 @@ fn read_field_group(
             .filter(|value| *value > 0),
         font_size,
         required: flags & (1 << 1) != 0,
+        alignment,
+        text_color,
         object_id: field_id,
     })
 }
@@ -1041,11 +1129,38 @@ fn widget_size(widget: &FormWidget) -> (f64, f64) {
     (widget.rect.size.width, widget.rect.size.height)
 }
 
+/// The `/DA` and `/Q` facts a generated text appearance has to honour.
+#[derive(Clone, Copy)]
+struct TextAppearanceStyle<'a> {
+    font: Option<&'a EmbeddedFreeTextFont>,
+    /// `/DA`'s size in points.
+    size: f64,
+    alignment: AnnotationAlignment,
+    /// `/DA`'s colour, RGB in 0..1.
+    color: [f64; 3],
+    /// A multiline field wraps each paragraph; a single-line field never wraps or breaks.
+    multiline: bool,
+}
+
+impl TextAppearanceStyle<'_> {
+    fn color_operator(self) -> String {
+        format!(
+            "{:.4} {:.4} {:.4} rg\n",
+            self.color[0], self.color[1], self.color[2]
+        )
+    }
+}
+
 /// A widget's field text, with the same white box and grey border the reader draws.
+///
+/// A multiline field's text is laid out as lines wrapped to the widget's inner width, starting
+/// at the top; a single-line field stays on one line. The text is clipped to the widget rect, so
+/// a long value or a short widget can never paint outside it. The size comes from `/DA`, the
+/// horizontal placement from `/Q`, and the glyph colour from `/DA`.
 fn text_appearance(
     widget: &FormWidget,
     text: &str,
-    font: Option<&EmbeddedFreeTextFont>,
+    style: TextAppearanceStyle<'_>,
     options: Option<(&[FormOption], Option<u32>)>,
 ) -> Vec<u8> {
     let (width, height) = widget_size(widget);
@@ -1061,39 +1176,68 @@ fn text_appearance(
             let top = height - row * (index + 1) as f64;
             if Some(index as u32) == selected {
                 content.push_str(&format!(
-                    "0.80 0.88 0.98 rg\n1 {:.3} {:.3} {:.3} re f\n0 0 0 rg\n",
+                    "0.80 0.88 0.98 rg\n1 {:.3} {:.3} {:.3} re f\n",
                     top + 0.5,
                     (width - 2.0).max(0.01),
                     (row - 1.0).max(0.01)
                 ));
             }
-            if let Some(font) = font {
+            if let Some(font) = style.font {
                 content.push_str(&format!(
-                    "BT\n/F1 {:.3} Tf\n0 0 0 rg\n1 0 0 1 4 {:.3} Tm\n{} Tj\nET\n",
+                    "BT\n/F1 {:.3} Tf\n{}1 0 0 1 4 {:.3} Tm\n{} Tj\nET\n",
                     font_size_for_row(row),
+                    style.color_operator(),
                     top + 5.5,
                     font.subset.hex_string(&option.label)
                 ));
             }
         }
     } else if !text.is_empty()
-        && let Some(font) = font
+        && let Some(font) = style.font
     {
-        let size = 11.0_f64.min((height - 4.0).max(6.0));
-        let lines = wrap_lines(text, size, (width - 8.0).max(1.0), font);
-        let mut baseline = height - size - 3.0;
-        for line in lines {
+        // A `/DA` size larger than the widget is scaled down so the one line it can show fits;
+        // otherwise the stated size is kept exactly.
+        let size = style.size.clamp(4.0, 400.0).min((height - 3.0).max(4.0));
+        let leading = size * 1.2;
+        let padding = 4.0;
+        let max_width = (width - 2.0 * padding).max(1.0);
+        let layout_text = normalize_newlines(text);
+        let lines = if style.multiline {
+            wrap_lines(&layout_text, size, max_width, font)
+        } else {
+            vec![single_line_text(&layout_text)]
+        };
+        // The inner clip keeps glyphs inside the field even when a wrapped line is wider than
+        // the box (one character wider than `max_width`) or the top line is taller than it.
+        content.push_str(&format!(
+            "q\n2 2 {:.3} {:.3} re W n\n",
+            (width - 4.0).max(0.01),
+            (height - 4.0).max(0.01)
+        ));
+        content.push_str("BT\n");
+        content.push_str(&format!("/F1 {:.3} Tf\n{}", size, style.color_operator()));
+        let mut baseline = (height - size - 3.0).max(2.0);
+        for line in &lines {
+            let line_width = font.subset.text_width(line, size);
+            let x = match style.alignment {
+                AnnotationAlignment::Left => padding,
+                AnnotationAlignment::Center => ((width - line_width) / 2.0).max(2.0),
+                AnnotationAlignment::Right => (width - padding - line_width).max(2.0),
+            };
+            content.push_str(&format!(
+                "1 0 0 1 {:.3} {:.3} Tm\n{} Tj\n",
+                x,
+                baseline,
+                font.subset.hex_string(line)
+            ));
+            baseline -= leading;
+            // The first line always paints inside the clip; later lines stop once their
+            // baseline would be below the widget.
             if baseline < 2.0 {
                 break;
             }
-            content.push_str(&format!(
-                "BT\n/F1 {:.3} Tf\n0 0 0 rg\n1 0 0 1 4 {:.3} Tm\n{} Tj\nET\n",
-                size,
-                baseline,
-                font.subset.hex_string(&line)
-            ));
-            baseline -= size * 1.2;
         }
+        content.push_str("ET\nQ\n");
     }
     content.push_str("Q\n");
     content.into_bytes()
@@ -1105,15 +1249,26 @@ fn font_size_for_row(row: f64) -> f64 {
 
 fn wrap_lines(text: &str, size: f64, width: f64, font: &EmbeddedFreeTextFont) -> Vec<String> {
     let mut lines = Vec::new();
-    for paragraph in text.replace('\r', "\n").split('\n') {
+    for paragraph in normalize_newlines(text).split('\n') {
         let characters: Vec<char> = paragraph.chars().collect();
         let mut line = String::new();
         for character in characters {
             let mut candidate = line.clone();
             candidate.push(character);
             if font.subset.text_width(&candidate, size) > width && !line.is_empty() {
-                lines.push(line);
-                line = character.to_string();
+                // Break at the last word boundary; a word wider than the field still has to
+                // break somewhere, so fall back to a character break.
+                if let Some(space) = line.rfind(' ')
+                    && space > 0
+                {
+                    let remainder = line[space + 1..].to_string();
+                    lines.push(line[..space].trim_end().to_string());
+                    line = remainder;
+                    line.push(character);
+                } else {
+                    lines.push(line);
+                    line = character.to_string();
+                }
             } else {
                 line = candidate;
             }
@@ -1296,19 +1451,24 @@ fn apply_update(
 
     match field.kind {
         FormFieldKind::Text => {
+            let value = text_value_for_write(&field, update.text.as_deref().unwrap_or(""));
+            let style = TextAppearanceStyle {
+                font,
+                size: field.font_size,
+                alignment: field.alignment,
+                color: field.text_color,
+                multiline: field.multiline,
+            };
             clone_dictionary(incremental, field.object_id)?;
             {
                 let dictionary = dictionary_mut(incremental, field.object_id)?;
-                dictionary.set(
-                    "V",
-                    text_string_object(update.text.as_deref().unwrap_or("")),
-                );
+                dictionary.set("V", text_string_object(&value));
             }
             for widget in &field.widgets {
                 clone_dictionary(incremental, widget.object_id)?;
                 let (width, height) = widget_size(widget);
                 let stream = stream_for_appearance(
-                    text_appearance(widget, update.text.as_deref().unwrap_or(""), font, None),
+                    text_appearance(widget, &value, style, None),
                     width,
                     height,
                     font.map(|font| font.type0),
@@ -1445,6 +1605,13 @@ fn apply_update(
                 dictionary.set("I", Object::Array(vec![Object::Integer(selected as i64)]));
             }
             let options = field.options.clone();
+            let style = TextAppearanceStyle {
+                font,
+                size: field.font_size,
+                alignment: field.alignment,
+                color: field.text_color,
+                multiline: false,
+            };
             for widget in &field.widgets {
                 clone_dictionary(incremental, widget.object_id)?;
                 let (width, height) = widget_size(widget);
@@ -1453,7 +1620,7 @@ fn apply_update(
                         text_appearance(
                             widget,
                             &option.label,
-                            font,
+                            style,
                             Some((options.as_slice(), Some(selected as u32))),
                         ),
                         width,
@@ -1469,7 +1636,7 @@ fn apply_update(
                         y - 4.0,
                         x + 8.0
                     );
-                    let mut content = text_appearance(widget, &option.label, font, None);
+                    let mut content = text_appearance(widget, &option.label, style, None);
                     content.extend_from_slice(chevron.as_bytes());
                     // `/Length` is fixed by `Stream::new`; build the final bytes first, never by
                     // appending to `content` afterwards.
@@ -1539,7 +1706,8 @@ fn verify_saved_form(
         if let Some(update) = update_by_id.get(id) {
             match before_field.kind {
                 FormFieldKind::Text => {
-                    let expected = update.text.clone().unwrap_or_default();
+                    let expected =
+                        text_value_for_write(before_field, update.text.as_deref().unwrap_or(""));
                     if after_field.value.as_deref() != Some(expected.as_str()) {
                         return Err(LyraReaderError::new(
                             ErrorCode::Internal,
@@ -1897,5 +2065,290 @@ mod tests {
         )
         .expect_err("signature fields cannot be filled");
         assert_eq!(error.code, ErrorCode::InvalidArgument);
+    }
+
+    // ── Multiline values and appearances ─────────────────────────────────────────
+
+    /// The content of the `/AP /N` stream a saved widget points at.
+    fn widget_appearance(document: &Document, widget_id: ObjectId) -> String {
+        let widget = document.get_dictionary(widget_id).unwrap();
+        let appearance = dict_get(document, widget, b"AP")
+            .unwrap()
+            .as_dict()
+            .unwrap();
+        let normal = resolve(document, appearance.get(b"N").unwrap()).unwrap();
+        let stream = normal.as_stream().unwrap();
+        String::from_utf8(stream.decompressed_content().unwrap()).unwrap()
+    }
+
+    /// The `(x, y)` of every `Tm` in an appearance stream.
+    fn text_matrices(content: &str) -> Vec<(f64, f64)> {
+        content
+            .lines()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() == 7 && parts[6] == "Tm" {
+                    Some((parts[4].parse().unwrap(), parts[5].parse().unwrap()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn count_text_shows(content: &str) -> usize {
+        content.matches(" Tj\n").count()
+    }
+
+    #[test]
+    fn da_colour_and_line_endings_are_normalised() {
+        assert_eq!(text_color_from_da("/Helv 12 Tf 0 g"), [0.0, 0.0, 0.0]);
+        assert_eq!(text_color_from_da("/Helv 12 Tf 1 0 0 rg"), [1.0, 0.0, 0.0]);
+        assert_eq!(
+            text_color_from_da("/Helv 12 Tf 0 0 0 1 k 0 1 1 0 K"),
+            [1.0, 0.0, 0.0]
+        );
+        assert_eq!(text_color_from_da("garbage"), [0.0, 0.0, 0.0]);
+        assert_eq!(normalize_newlines("a\r\nb\rc\nd"), "a\nb\nc\nd");
+        assert_eq!(single_line_text("a\r\nb\rc\nd"), "a b c d");
+    }
+
+    #[test]
+    fn multiline_value_preserves_lf_and_the_appearance_draws_each_line_in_the_widget() {
+        let scratch = ScratchDir::new("forms-multiline");
+        let source = fixture("form-fields.pdf");
+        let destination = scratch.join("multiline.pdf");
+        let form = form();
+        let notes = form
+            .fields
+            .iter()
+            .find(|field| field.name == "notes")
+            .unwrap();
+        let height = notes.widgets[0].rect.size.height;
+        let width = notes.widgets[0].rect.size.width;
+        save_form_pdf(
+            &source,
+            &destination,
+            &[FormValueUpdate {
+                field_id: notes.id.clone(),
+                text: Some("First line\r\nSecond\rThird".into()),
+                checked: None,
+                selected: None,
+            }],
+            None,
+            SaveMode::Copy,
+        )
+        .expect("save the multiline value");
+
+        let after = read_form_document(&destination, None).unwrap();
+        let saved = after
+            .fields
+            .iter()
+            .find(|field| field.name == "notes")
+            .unwrap();
+        assert_eq!(
+            saved.value.as_deref(),
+            Some("First line\nSecond\nThird"),
+            "CRLF and CR are read as LF and both newlines survive the save"
+        );
+
+        // `/V` is one PDF text string whose bytes use LF (0x0A) between the paragraphs.
+        let document = Document::load(&destination).unwrap();
+        let field = document.get_dictionary(saved.object_id).unwrap();
+        let value = resolve(&document, field.get(b"V").unwrap()).unwrap();
+        let Object::String(bytes, _) = value else {
+            panic!("/V must be a string");
+        };
+        assert_eq!(bytes, b"First line\nSecond\nThird");
+        assert!(!bytes.contains(&b'\r'));
+
+        let content = widget_appearance(&document, saved.widgets[0].object_id);
+        assert_eq!(count_text_shows(&content), 3, "one Tj per line: {content}");
+        assert!(
+            content.contains("/F1 11.000 Tf"),
+            "the appearance honours the /DA size: {content}"
+        );
+        assert!(
+            content.contains("re W n"),
+            "the appearance clips its text to the widget: {content}"
+        );
+        for (x, y) in text_matrices(&content) {
+            assert!(
+                (0.0..=width).contains(&x) && (0.0..=height).contains(&y),
+                "a text matrix ({x}, {y}) is outside the {width}x{height} widget"
+            );
+        }
+    }
+
+    #[test]
+    fn single_line_value_never_keeps_a_newline_and_paints_one_line() {
+        let scratch = ScratchDir::new("forms-single-line");
+        let source = fixture("form-fields.pdf");
+        let destination = scratch.join("single.pdf");
+        let form = form();
+        let full_name = form
+            .fields
+            .iter()
+            .find(|field| field.name == "fullName")
+            .unwrap();
+        save_form_pdf(
+            &source,
+            &destination,
+            &[FormValueUpdate {
+                field_id: full_name.id.clone(),
+                text: Some("One\nTwo\rThree".into()),
+                checked: None,
+                selected: None,
+            }],
+            None,
+            SaveMode::Copy,
+        )
+        .expect("save the single-line value");
+
+        let after = read_form_document(&destination, None).unwrap();
+        let saved = after
+            .fields
+            .iter()
+            .find(|field| field.name == "fullName")
+            .unwrap();
+        assert_eq!(saved.value.as_deref(), Some("One Two Three"));
+        assert!(!saved.value.as_deref().unwrap().contains('\n'));
+
+        let document = Document::load(&destination).unwrap();
+        let field = document.get_dictionary(saved.object_id).unwrap();
+        let value = resolve(&document, field.get(b"V").unwrap()).unwrap();
+        let Object::String(bytes, _) = value else {
+            panic!("/V must be a string");
+        };
+        assert!(!bytes.contains(&b'\n') && !bytes.contains(&b'\r'));
+        let content = widget_appearance(&document, saved.widgets[0].object_id);
+        assert_eq!(
+            count_text_shows(&content),
+            1,
+            "a single-line field has one line: {content}"
+        );
+    }
+
+    #[test]
+    fn multiline_appearance_wraps_a_long_paragraph() {
+        let scratch = ScratchDir::new("forms-wrap");
+        let source = fixture("form-fields.pdf");
+        let destination = scratch.join("wrapped.pdf");
+        let form = form();
+        let notes = form
+            .fields
+            .iter()
+            .find(|field| field.name == "notes")
+            .unwrap();
+        let width = notes.widgets[0].rect.size.width;
+        let height = notes.widgets[0].rect.size.height;
+        let paragraph = "A wrapped line has to break at the widget's inner width instead of \
+                         running off its right edge. "
+            .repeat(6);
+        save_form_pdf(
+            &source,
+            &destination,
+            &[FormValueUpdate {
+                field_id: notes.id.clone(),
+                text: Some(paragraph.clone()),
+                checked: None,
+                selected: None,
+            }],
+            None,
+            SaveMode::Copy,
+        )
+        .expect("save the long paragraph");
+
+        let document = Document::load(&destination).unwrap();
+        let after = read_form_document_from(&document);
+        let saved = after
+            .fields
+            .iter()
+            .find(|field| field.name == "notes")
+            .unwrap();
+        assert_eq!(saved.value.as_deref(), Some(paragraph.as_str()));
+        let content = widget_appearance(&document, saved.widgets[0].object_id);
+        let shows = count_text_shows(&content);
+        assert!(
+            shows > 6,
+            "a paragraph wider than the widget is drawn as several lines, got {shows}"
+        );
+        for (x, y) in text_matrices(&content) {
+            assert!(
+                (0.0..=width).contains(&x) && (0.0..=height).contains(&y),
+                "a wrapped line ({x}, {y}) escaped the {width}x{height} widget"
+            );
+        }
+        assert!(content.contains("re W n"));
+    }
+
+    #[test]
+    fn da_colour_and_alignment_reach_the_generated_appearance() {
+        let scratch = ScratchDir::new("forms-colour");
+        let source = fixture("form-fields.pdf");
+        let coloured = scratch.join("coloured.pdf");
+        let destination = scratch.join("coloured-filled.pdf");
+
+        let mut document = load_document(&source, None).unwrap();
+        let form = read_form_document_from(&document);
+        let notes = form
+            .fields
+            .iter()
+            .find(|field| field.name == "notes")
+            .unwrap()
+            .clone();
+        {
+            let field = document.get_dictionary_mut(notes.object_id).unwrap();
+            field.set(
+                "DA",
+                Object::String(b"/Helv 12 Tf 1 0 0 rg".to_vec(), StringFormat::Literal),
+            );
+            field.set("Q", Object::Integer(1));
+        }
+        document.save(&coloured).unwrap();
+        let read_back = read_form_document(&coloured, None).unwrap();
+        let coloured_notes = read_back
+            .fields
+            .iter()
+            .find(|field| field.name == "notes")
+            .unwrap();
+        assert_eq!(coloured_notes.alignment, AnnotationAlignment::Center);
+        assert_eq!(coloured_notes.text_color, [1.0, 0.0, 0.0]);
+
+        save_form_pdf(
+            &coloured,
+            &destination,
+            &[FormValueUpdate {
+                field_id: coloured_notes.id.clone(),
+                text: Some("Red".into()),
+                checked: None,
+                selected: None,
+            }],
+            None,
+            SaveMode::Copy,
+        )
+        .expect("save the coloured text");
+        let saved_document = Document::load(&destination).unwrap();
+        let after = read_form_document_from(&saved_document);
+        let saved = after
+            .fields
+            .iter()
+            .find(|field| field.name == "notes")
+            .unwrap();
+        let content = widget_appearance(&saved_document, saved.widgets[0].object_id);
+        assert!(
+            content.contains("1.0000 0.0000 0.0000 rg"),
+            "the /DA colour is painted: {content}"
+        );
+        assert!(
+            content.contains("/F1 12.000 Tf"),
+            "the appearance honours the modified /DA size: {content}"
+        );
+        let matrices = text_matrices(&content);
+        assert_eq!(matrices.len(), 1);
+        assert!(
+            matrices[0].0 > 4.0,
+            "/Q 1 centres the line instead of starting at the left padding: {content}"
+        );
     }
 }
