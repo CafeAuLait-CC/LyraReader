@@ -4,6 +4,7 @@ import SwiftUI
 public struct AISettingsView: View {
     @ObservedObject private var store: AISettingsStore
     @ObservedObject private var route = AISettingsRoute.shared
+    @StateObject private var connectionTest: AIConnectionTestModel
     @FocusState private var baseURLFocused: Bool
     @State private var baseURL = ""
     @State private var model = ""
@@ -15,8 +16,9 @@ public struct AISettingsView: View {
     @State private var keyDraft = ""
     @State private var savedMessage: String?
 
-    public init(store: AISettingsStore) {
+    public init(store: AISettingsStore, connectionTest: AIConnectionTestModel? = nil) {
         _store = ObservedObject(wrappedValue: store)
+        _connectionTest = StateObject(wrappedValue: connectionTest ?? AIConnectionTestModel())
     }
 
     public var body: some View {
@@ -35,6 +37,26 @@ public struct AISettingsView: View {
                     .focused($baseURLFocused)
                 TextField("Model", text: $model)
                     .textFieldStyle(.roundedBorder)
+                HStack(spacing: 8) {
+                    AIConnectionTestButton(isRunning: connectionTest.isRunning) {
+                        testConnection()
+                    }
+                    .fixedSize()
+                    if connectionTest.isRunning {
+                        ProgressView()
+                            .controlSize(.small)
+                        Button("Cancel") { connectionTest.cancel() }
+                            .help("Stops the connection test and closes the request")
+                    }
+                    Spacer()
+                }
+                if let text = connectionTest.statusText {
+                    Text(text)
+                        .font(.caption)
+                        .foregroundStyle(connectionTestStatusColor)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
                 Text("Examples: https://api.openai.com/v1, https://api.deepseek.com/v1, or http://localhost:11434/v1 for Ollama. LyraReader appends /chat/completions; do not include it here.")
                     .font(.caption)
                     .foregroundStyle(LyraReaderTheme.textSecondary)
@@ -177,9 +199,27 @@ public struct AISettingsView: View {
         .onChange(of: route.pendingBaseURLFocus) { _, pending in
             if pending { focusBaseURLIfRequested() }
         }
+        .onChange(of: store.connectionMode) { _, mode in
+            // A test for the previous connection mode must not keep running under another form.
+            if mode != .apiKey { connectionTest.cancel() }
+        }
+        .onDisappear {
+            // Closing Settings (or leaving the AI tab) cancels the worker and drops its handle.
+            connectionTest.cancel()
+        }
         .task(id: store.connectionMode) {
             if store.connectionMode == .chatGPT { await store.chatGPT.loadModels() }
         }
+    }
+
+    private var connectionTestStatusColor: Color {
+        if connectionTest.isSuccess {
+            return LyraReaderTheme.successFg
+        }
+        if case .failure = connectionTest.status {
+            return LyraReaderTheme.errorFg
+        }
+        return LyraReaderTheme.textSecondary
     }
 
     /// Consume a request from the offline hint. The field takes focus after the tab has been
@@ -214,6 +254,24 @@ public struct AISettingsView: View {
             reasoningEncoding: reasoningEncoding,
             vision: modelAcceptsImages
         )
+    }
+
+    /// Test the endpoint/model currently in the form, with a key typed here or the stored key.
+    /// The key is read only for this call; neither the model nor this view retains it.
+    private func testConnection() {
+        let typedKey = keyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key: String
+        if typedKey.isEmpty {
+            do {
+                key = try store.readKey() ?? ""
+            } catch {
+                connectionTest.reportFailure(AIReadableError.message(error))
+                return
+            }
+        } else {
+            key = typedKey
+        }
+        connectionTest.start(settings: previewSettings, apiKey: key)
     }
 
     private func save() {

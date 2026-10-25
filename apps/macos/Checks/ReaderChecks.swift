@@ -251,6 +251,11 @@ struct ReaderChecks {
             print("Offline hint checks passed")
             return
         }
+        if CommandLine.arguments.contains("--check-ai-test-connection") {
+            try await aiConnectionTestChecks(root: fastRoot)
+            print("AI connection test checks passed")
+            return
+        }
         if CommandLine.arguments.contains("--check-facing-layout") {
             try await facingLayoutChecks(
                 url: fastRoot.appendingPathComponent("tests/fixtures/multipage.pdf"))
@@ -990,6 +995,9 @@ struct ReaderChecks {
             }),
             ("offline-hint", {
                 try await offlineHintChecks(root: root)
+            }),
+            ("ai-test-connection", {
+                try await aiConnectionTestChecks(root: root)
             }),
             ("chatgpt", {
                 try await chatGPTChecks(root: root)
