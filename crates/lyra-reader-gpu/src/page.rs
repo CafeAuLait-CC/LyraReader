@@ -362,13 +362,7 @@ impl GpuContext {
         height: u32,
         bgra: &[u8],
     ) -> Result<TextureId> {
-        if width == 0 || height == 0 {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                "page texture must have a non-zero size",
-            ));
-        }
-        let expected = width as usize * height as usize * 4;
+        let expected = crate::rgba_byte_len(width, height)?;
         if bgra.len() < expected {
             return Err(LyraReaderError::new(
                 ErrorCode::InvalidArgument,
@@ -739,6 +733,7 @@ impl GpuContext {
                 "an offscreen probe needs a non-zero size",
             ));
         }
+        let pixel_bytes = crate::rgba_byte_len(width, height)?;
 
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
         let target = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -890,7 +885,7 @@ impl GpuContext {
         slice.map_async(wgpu::MapMode::Read, |_| {});
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
 
-        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        let mut pixels = Vec::with_capacity(pixel_bytes);
         {
             let data = slice
                 .get_mapped_range()

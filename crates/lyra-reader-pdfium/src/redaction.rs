@@ -206,7 +206,7 @@ pub fn preview_redactions(source: &Path, areas: &[RedactionArea]) -> Result<Reda
     reject_encrypted(&bytes)?;
     let api = redact_api()?;
     let document = RedactDocument::load(api, bytes, None)?;
-    let page_count = document.page_count();
+    let page_count = document.page_count()?;
     let grouped = group_areas(areas, page_count)?;
 
     let mut pages = Vec::with_capacity(grouped.len());
@@ -259,7 +259,7 @@ pub fn raster_pages_for_redaction(source: &Path, areas: &[RedactionArea]) -> Res
     reject_encrypted(&bytes)?;
     let api = redact_api()?;
     let original = RedactDocument::load(api, bytes.clone(), None)?;
-    let grouped = group_areas(areas, original.page_count())?;
+    let grouped = group_areas(areas, original.page_count()?)?;
     let analysis = analyse(
         &bytes,
         &grouped,
@@ -350,7 +350,7 @@ fn redact_with_fill(
     reject_encrypted(&source_bytes)?;
     let api = redact_api()?;
     let original = RedactDocument::load(api, source_bytes.clone(), None)?;
-    let page_count = original.page_count();
+    let page_count = original.page_count()?;
     let grouped = group_areas(areas, page_count)?;
 
     // Everything the verifier will look for, computed from the source before it is touched.
@@ -1971,15 +1971,13 @@ fn verify_redacted(
     let bytes = fs::read(path)
         .map_err(|error| io_error("could not reopen the redacted document", path, error))?;
     let document = RedactDocument::load(api, bytes, None)?;
-    if document.page_count() != page_count {
+    let found_page_count = document.page_count()?;
+    if found_page_count != page_count {
         return Err(LyraReaderError::new(
             ErrorCode::Internal,
             "the redacted document changed the page count",
         )
-        .with_detail(format!(
-            "expected {page_count}, found {}",
-            document.page_count()
-        )));
+        .with_detail(format!("expected {page_count}, found {found_page_count}")));
     }
 
     for (&page, rects) in grouped {
@@ -2306,6 +2304,7 @@ impl RedactDocument {
                     "the password contains a NUL byte",
                 )
             })?;
+        let length = crate::limits::document_len(bytes.len())?;
         let document = {
             let _guard = PDFIUM_LOCK
                 .lock()
@@ -2315,7 +2314,7 @@ impl RedactDocument {
             unsafe {
                 (api.load_mem_document)(
                     bytes.as_ptr().cast(),
-                    bytes.len() as std::ffi::c_int,
+                    length,
                     password
                         .as_ref()
                         .map_or(std::ptr::null(), |value| value.as_ptr()),
@@ -2335,12 +2334,12 @@ impl RedactDocument {
         })
     }
 
-    fn page_count(&self) -> u32 {
+    fn page_count(&self) -> Result<u32> {
         let _guard = PDFIUM_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // SAFETY: the document handle is live.
-        unsafe { (self.api.get_page_count)(self.document) }.max(0) as u32
+        crate::limits::page_count(unsafe { (self.api.get_page_count)(self.document) })
     }
 
     /// The real characters of a page, with degenerate boxes repaired and PDFium's synthetic line
@@ -2681,6 +2680,20 @@ fn render_page_locked(
         (api.render_page_bitmap)(bitmap, page_handle, 0, 0, width, height, 0, 0);
     }
     let stride = unsafe { (api.bitmap_get_stride)(bitmap) } as usize;
+    let row_bytes = match raster_row_bytes(stride, width) {
+        Ok(row_bytes) => row_bytes,
+        Err(error) => {
+            unsafe {
+                (api.destroy_bitmap)(bitmap);
+                (api.close_page)(page_handle);
+            }
+            return Err(error);
+        }
+    };
+    debug_assert!(
+        stride >= row_bytes,
+        "a bitmap row must hold every pixel: stride {stride}, row {row_bytes}"
+    );
     let buffer = unsafe { (api.bitmap_get_buffer)(bitmap) }.cast::<u8>();
     if buffer.is_null() {
         unsafe {
@@ -2694,12 +2707,13 @@ fn render_page_locked(
     }
     let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
     for row in 0..height as usize {
-        let row_start = buffer as usize + row * stride;
+        // SAFETY: PDFium documents that the bitmap buffer covers `stride * height` bytes;
+        // `row` is inside that height, and `raster_row_bytes` proved `stride >= width * 4`, so
+        // this row slice and every `offset .. offset + 3` below stay inside the allocation.
+        let row_pixels = unsafe { std::slice::from_raw_parts(buffer.add(row * stride), stride) };
         for column in 0..width as usize {
             let offset = column * 4;
-            // SAFETY: the bitmap buffer has `stride * height` bytes; `column` and `row` are
-            // inside the bitmap.
-            let pixel = unsafe { std::slice::from_raw_parts((row_start + offset) as *const u8, 3) };
+            let pixel = &row_pixels[offset..offset + 3];
             // BGRA on little-endian; `FPDFBitmap_BGRA` is what `FPDFBitmap_Create` produces.
             rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
         }
@@ -2717,6 +2731,32 @@ fn render_page_locked(
 }
 
 // ─── Small helpers ──────────────────────────────────────────────────────────────────────────
+
+/// Bytes one BGRA bitmap row must hold for `width` pixels.
+///
+/// PDFium returns the bitmap with its own stride. The pixel loop indexes every row as
+/// `column * 4 .. column * 4 + 3`, so a stride shorter than `width * 4` would read into the next
+/// row (and past the allocation for the last one). Refuse that instead of trusting it.
+fn raster_row_bytes(stride: usize, width: std::ffi::c_int) -> Result<usize> {
+    let row_bytes = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .ok_or_else(|| {
+            LyraReaderError::new(
+                ErrorCode::RenderFailed,
+                format!("PDFium returned a bitmap {width} pixels wide, which has no byte count"),
+            )
+        })?;
+    if stride < row_bytes {
+        return Err(LyraReaderError::new(
+            ErrorCode::RenderFailed,
+            format!(
+                "PDFium returned a bitmap stride of {stride} bytes for a {width}-pixel row, which needs {row_bytes}"
+            ),
+        ));
+    }
+    Ok(row_bytes)
+}
 
 fn matrix_operands(operands: &[Object]) -> Option<[f64; 6]> {
     let values: Vec<f64> = operands.iter().filter_map(number).collect();
@@ -2781,6 +2821,15 @@ mod tests {
     use super::*;
     use crate::redaction::RedactDocument;
     use crate::test_support::{copy_fixture, scratch};
+
+    #[test]
+    fn a_short_bitmap_stride_is_refused_before_the_pixel_loop() {
+        assert_eq!(raster_row_bytes(16, 4).expect("a full row"), 16);
+        let error = raster_row_bytes(15, 4).expect_err("a short stride must be refused");
+        assert_eq!(error.code, ErrorCode::RenderFailed);
+        assert!(error.message.contains("15"), "{error}");
+        assert!(error.message.contains("16"), "{error}");
+    }
 
     #[test]
     fn raster_redaction_respects_nonzero_crop_box_coordinates() {

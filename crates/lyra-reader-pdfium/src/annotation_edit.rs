@@ -53,8 +53,6 @@
 //! edited (the shell supplies its cached annotation UUID as `assign_name`), so the identity the reader
 //! shows after the save is stable too.
 
-#![allow(unsafe_code)]
-
 use crate::annotations::{WriteAnnotation, WriteAnnotationKind};
 use crate::geometry_write::{
     EmbeddedFreeTextFont, add_appearance_object, add_appearance_object_with_blend, annots_array,

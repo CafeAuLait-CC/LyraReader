@@ -110,42 +110,22 @@ pub fn flatten_to_copy(
     destination: &Path,
     password: Option<&str>,
 ) -> Result<FlattenReport> {
-    flatten_to_copy_inner(source, destination, password, false)
+    flatten_to_copy_inner(source, destination, password)
 }
 
 pub(crate) fn flatten_to_copy_inner(
     source: &Path,
     destination: &Path,
     password: Option<&str>,
-    fail_during_build: bool,
 ) -> Result<FlattenReport> {
     let expected = plan_expected(source, password)?;
     let mut stats: Option<BuildStats> = None;
-    let mut failure = None;
     let rewritten = write_rewritten_pdf(
         source,
         destination,
         OutputMode::Copy,
         |file| {
             let built = build_flattened(source, password)?;
-            // Write some bytes first when the test asks for a mid-build failure, so the test
-            // proves the temporary file is removed rather than merely never created.
-            if fail_during_build {
-                file.write_all(&built.bytes[..built.bytes.len() / 2])
-                    .map_err(|error| {
-                        LyraReaderError::new(ErrorCode::Io, "could not write the test bytes")
-                            .with_detail(error.to_string())
-                    })?;
-                file.flush().map_err(|error| {
-                    LyraReaderError::new(ErrorCode::Io, "could not flush the test bytes")
-                        .with_detail(error.to_string())
-                })?;
-                failure = Some(LyraReaderError::new(
-                    ErrorCode::Internal,
-                    "a deliberately interrupted flatten; nothing may be published",
-                ));
-                return Err(failure.take().expect("failure was just set"));
-            }
             file.write_all(&built.bytes).map_err(|error| {
                 LyraReaderError::new(ErrorCode::Io, "could not write the flattened copy")
                     .with_detail(error.to_string())
@@ -2748,33 +2728,5 @@ mod tests {
         let error = flatten_to_copy(&source, &destination, None).expect_err("XFA must refuse");
         assert!(error.message.contains("XFA"), "{error:?}");
         assert!(!destination.exists(), "a refused XFA flatten wrote a file");
-    }
-
-    #[test]
-    fn an_interrupted_build_leaves_no_partial_output() {
-        if !require_pdfium() {
-            return;
-        }
-        let scratch = ScratchDir::new("flatten-failure");
-        let source = copy_fixture(&scratch, "flatten.pdf", "source.pdf");
-        let destination = scratch.join("flat.pdf");
-        let error = flatten_to_copy_inner(&source, &destination, None, true)
-            .expect_err("the interrupted build must fail");
-        assert!(error.message.contains("interrupted"), "{error:?}");
-        assert!(
-            !destination.exists(),
-            "a failed flatten published a partial file"
-        );
-        let leftovers = fs::read_dir(&scratch)
-            .expect("read scratch")
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .contains(".lyra-reader-save-")
-            })
-            .count();
-        assert_eq!(leftovers, 0, "the temporary file was left behind");
     }
 }

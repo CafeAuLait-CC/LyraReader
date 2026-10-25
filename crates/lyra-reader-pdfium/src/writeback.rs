@@ -170,6 +170,11 @@ const TEMP_MARKER: &str = ".lyra-reader-save-";
 const TEMP_SUFFIX: &str = ".tmp";
 const BACKUP_MARKER: &str = ".lyra-reader-backup-";
 const COPY_BUFFER: usize = 64 * 1024;
+/// Attempts to find a free temporary/backup name beside the destination.
+///
+/// A collision means a concurrent save took the name in the last few microseconds. Three tries
+/// cover the realistic race; the previous 100 only delayed the same error by 97 stat calls.
+const FILE_NAME_ATTEMPTS: u32 = 3;
 
 /// Hard limits, so a malformed shell request cannot ask the writer to build an unreasonable PDF.
 const MAX_ANNOTATIONS: usize = 20_000;
@@ -2067,7 +2072,7 @@ fn write_backup(source: &Path) -> Result<PathBuf> {
         .unwrap_or(0);
 
     let mut last_error = None;
-    for attempt in 0..100 {
+    for attempt in 0..FILE_NAME_ATTEMPTS {
         let name = if attempt == 0 {
             format!("{stem}{BACKUP_MARKER}{seconds}.{extension}")
         } else {
@@ -2206,7 +2211,7 @@ impl TempFile {
                 "the destination has no file name",
             )
         })?;
-        for attempt in 0..100 {
+        for attempt in 0..FILE_NAME_ATTEMPTS {
             let path = parent.join(format!(
                 "{}{TEMP_MARKER}{}-{}-{attempt}{TEMP_SUFFIX}",
                 name.to_string_lossy(),

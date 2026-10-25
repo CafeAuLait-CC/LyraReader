@@ -760,7 +760,7 @@ fn band_ends(band: &[Rule]) -> Result<(f64, f64), GridOutcome> {
         return Err(GridOutcome::NotEnoughRows);
     };
     let top = first.position;
-    let bottom = band.last().expect("non-empty band").position;
+    let bottom = band[band.len() - 1].position;
     if top - bottom < MIN_LEVEL_GAP_PT * (MIN_HORIZONTAL_LEVELS - 1) as f64 {
         return Err(GridOutcome::NotEnoughRows);
     }

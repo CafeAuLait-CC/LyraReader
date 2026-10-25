@@ -61,6 +61,8 @@ mod forms;
 #[cfg(feature = "pdfium")]
 mod geometry_write;
 #[cfg(feature = "pdfium")]
+mod limits;
+#[cfg(feature = "pdfium")]
 mod outline_write;
 #[cfg(feature = "pdfium")]
 mod page_ops;

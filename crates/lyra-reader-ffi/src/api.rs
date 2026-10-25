@@ -646,9 +646,12 @@ pub struct LyraReaderDocument {
     /// handle lives (a replacement marks the handle stale), so the status cannot change. Worker
     /// copies inherit it instead of paying for a second structural read.
     signature: lyra_reader_pdfium::SignatureStatus,
-    /// Page sizes in points, filled on first layout request (a 2000-page manual would
-    /// otherwise pay for every box at open time).
-    page_sizes: Mutex<Option<Vec<(f64, f64)>>>,
+    /// Page sizes in points, measured once when the document is opened.
+    ///
+    /// Measuring lazily meant a page PDFium could not load had to become a default US Letter
+    /// box, which made a broken document look merely small. The size pass now belongs to the
+    /// open path, so its failure reaches the caller; worker copies inherit the measured list.
+    page_sizes: Vec<(f64, f64)>,
     /// Last computed layout, keyed by the mode and page gap it was built for.
     layout: Mutex<Option<(ReaderLayout, f64, Arc<DocumentLayout>)>>,
     /// Parsed reference list, with the citation style it implies (scanning the tail pages is
@@ -882,6 +885,37 @@ fn prepare_content_command(
     Ok(command)
 }
 
+/// The page a selection-only AI action sends.
+///
+/// The request validation already rejects a missing selection for these actions. Keeping the
+/// conversion fallible here means widening `requires_selection` (or adding an action to the
+/// selection-only set) can never turn a missing field into a process abort.
+fn selection_only_page(selection: Option<AiSelectionRange>) -> Result<u32, LyraReaderFfiError> {
+    selection
+        .map(|selection| selection.page)
+        .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
+            message: "a selection-only request has no selection".to_string(),
+        })
+}
+
+/// Page sizes in document order, propagating the first `page_info` failure.
+///
+/// This used to substitute US Letter for a page PDFium could not measure. A layout built from
+/// invented sizes is wrong in a way the reader cannot see; the error is the honest answer.
+fn collect_page_sizes<F>(
+    count: u32,
+    mut page_size: F,
+) -> Result<Vec<(f64, f64)>, LyraReaderFfiError>
+where
+    F: FnMut(u32) -> Result<(f64, f64), LyraReaderFfiError>,
+{
+    let mut sizes = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        sizes.push(page_size(index)?);
+    }
+    Ok(sizes)
+}
+
 #[uniffi::export]
 impl LyraReaderDocument {
     /// The path this document was opened from.
@@ -994,11 +1028,15 @@ impl LyraReaderDocument {
             });
         }
 
-        let size = self
-            .page_sizes()
-            .get(page as usize)
-            .copied()
-            .unwrap_or((612.0, 792.0));
+        let sizes = self.page_sizes();
+        let size = sizes.get(page as usize).copied().ok_or_else(|| {
+            LyraReaderFfiError::InvalidArgument {
+                message: format!(
+                    "page {page} is outside this document's {} page(s)",
+                    sizes.len()
+                ),
+            }
+        })?;
         let scale = clamp_scale(size, scale);
 
         let mut request = RasterRequest::full_page(PageIndex(page), scale);
@@ -1042,7 +1080,7 @@ impl LyraReaderDocument {
             password: self.password.clone(),
             xfa: self.xfa.clone(),
             signature: self.signature.clone(),
-            page_sizes: Mutex::new(None),
+            page_sizes: self.page_sizes.clone(),
             layout: Mutex::new(None),
             references: Mutex::new(None),
             figures: Mutex::new(None),
@@ -1665,9 +1703,11 @@ impl LyraReaderDocument {
         // The text boxes are in unrotated PDF user space; the footer band is measured there.
         let page_height = self
             .backend
-            .page_info(PageIndex(0))
-            .map(|info| info.geometry.crop_box.size.height)
-            .unwrap_or(842.0);
+            .page_info(PageIndex(0))?
+            .geometry
+            .crop_box
+            .size
+            .height;
         let recognized = recognize(&embedded, first_page.as_ref(), page_height);
         let report = metadata_report(&recognized);
         if let Ok(mut cache) = self.metadata.lock() {
@@ -2901,7 +2941,7 @@ impl LyraReaderDocument {
             action,
             AiAction::TranslateSelection | AiAction::SummarizeSelection
         ) {
-            vec![selection.expect("checked above").page]
+            vec![selection_only_page(selection)?]
         } else {
             (0..page_count).collect()
         };
@@ -3949,9 +3989,8 @@ impl LyraReaderDocument {
             return Arc::clone(placements);
         }
 
-        let sizes = self.page_sizes();
         let placements = Arc::new(DocumentLayout::new_with_mode(
-            sizes.iter().copied(),
+            self.page_sizes.iter().copied(),
             gap_pt,
             layout.session(),
         ));
@@ -3962,32 +4001,9 @@ impl LyraReaderDocument {
         placements
     }
 
-    /// Page sizes in points, computed once and cached.
-    fn page_sizes(&self) -> Vec<(f64, f64)> {
-        if let Ok(cache) = self.page_sizes.lock()
-            && let Some(sizes) = cache.as_ref()
-        {
-            return sizes.clone();
-        }
-
-        let count = self.backend.page_count();
-        let mut sizes = Vec::with_capacity(count as usize);
-        for index in 0..count {
-            let size = self
-                .backend
-                .page_info(PageIndex(index))
-                .map(|info| {
-                    let view = info.geometry.view_size(1.0);
-                    (view.width, view.height)
-                })
-                .unwrap_or((612.0, 792.0)); // US Letter as a safe fallback
-            sizes.push(size);
-        }
-
-        if let Ok(mut cache) = self.page_sizes.lock() {
-            *cache = Some(sizes.clone());
-        }
-        sizes
+    /// Page sizes in points, measured once by the open path.
+    fn page_sizes(&self) -> &[(f64, f64)] {
+        &self.page_sizes
     }
 
     /// The reference list plus the citation style it implies, parsed once.
@@ -5504,13 +5520,19 @@ impl LyraReaderEngine {
                 backend.signature_count(),
             ),
         };
+        // Measure every page now rather than inventing US Letter for one that fails later.
+        let page_sizes = collect_page_sizes(backend.page_count(), |index| {
+            let info = backend.page_info(PageIndex(index))?;
+            let view = info.geometry.view_size(1.0);
+            Ok((view.width, view.height))
+        })?;
         Ok(Arc::new(LyraReaderDocument {
             backend,
             path,
             password,
             xfa: xfa_state,
             signature,
-            page_sizes: Mutex::new(None),
+            page_sizes,
             layout: Mutex::new(None),
             references: Mutex::new(None),
             figures: Mutex::new(None),
@@ -6465,6 +6487,43 @@ mod tests {
     use super::*;
     use std::io::ErrorKind;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn a_missing_ai_selection_is_an_error_not_a_panic() {
+        let error = selection_only_page(None).expect_err("no selection must not panic");
+        match error {
+            LyraReaderFfiError::InvalidArgument { message } => {
+                assert!(message.contains("selection"), "{message}");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        assert_eq!(
+            selection_only_page(Some(AiSelectionRange {
+                page: 4,
+                start: 0,
+                end: 1,
+            }))
+            .expect("a present selection"),
+            4
+        );
+    }
+
+    #[test]
+    fn a_failed_page_info_is_an_error_not_us_letter() {
+        let error = collect_page_sizes(2, |index| match index {
+            0 => Ok((612.0, 792.0)),
+            _ => Err(LyraReaderFfiError::Document {
+                message: "page 2 could not be measured".to_string(),
+            }),
+        })
+        .expect_err("a failed page_info must not become a default size");
+        match error {
+            LyraReaderFfiError::Document { message } => {
+                assert!(message.contains("page 2"), "{message}");
+            }
+            other => panic!("expected Document, got {other:?}"),
+        }
+    }
 
     #[test]
     fn transport_failures_cross_the_ffi_as_fixed_categories() {
