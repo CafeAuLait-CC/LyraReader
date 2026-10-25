@@ -617,7 +617,7 @@ extension ReaderChecks {
 
     /// A PDF with a single text line per page. The conclusion exists only on the last page, so
     /// the two-window abstract has to send the end of the document to see it.
-    private static func writeLayeredFixture(to url: URL, pageCount: Int) throws {
+    static func writeLayeredFixture(to url: URL, pageCount: Int) throws {
         var mediaBox = CGRect(x: 0, y: 0, width: 612, height: 792)
         guard let consumer = CGDataConsumer(url: url as CFURL),
               let context = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else {

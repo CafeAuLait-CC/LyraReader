@@ -281,7 +281,7 @@ public final class AIAssistantModel: ObservableObject {
 
         do {
             let source = try await service.prepare(request)
-            let plan = try preparedConnection == .chatGPT ? ChatGPTResponses.plan(source) : source
+            let plan = try AIPlanWire.render(source, connection: preparedConnection)
             guard documentKey == context.documentKey else { return }
             self.plan = plan
             phase = .preview
@@ -369,7 +369,7 @@ public final class AIAssistantModel: ObservableObject {
         )
         do {
             let source = try await service.prepare(request)
-            let plan = try preparedConnection == .chatGPT ? ChatGPTResponses.plan(source) : source
+            let plan = try AIPlanWire.render(source, connection: preparedConnection)
             guard documentKey == context.documentKey, pendingChatQuestion == question else { return }
             self.plan = plan
             phase = .preview
@@ -509,7 +509,7 @@ public final class AIAssistantModel: ObservableObject {
         )
         do {
             let source = try await service.prepare(request)
-            let plan = try preparedConnection == .chatGPT ? ChatGPTResponses.plan(source) : source
+            let plan = try AIPlanWire.render(source, connection: preparedConnection)
             guard regionPreparationID == preparationID, documentKey == context.documentKey, regionAskedQuestion == question else { return }
             self.plan = plan
             phase = .preview
@@ -1105,7 +1105,7 @@ public final class AIAssistantModel: ObservableObject {
                     parts: parts
                 )
             )
-            self.mergePlan = try preparedConnection == .chatGPT ? ChatGPTResponses.plan(mergePlan) : mergePlan
+            self.mergePlan = try AIPlanWire.render(mergePlan, connection: preparedConnection)
             phase = .mergePreview
             statusNote = "Part summaries complete. Review the consolidation request below; sending it is a separate request."
         } catch {

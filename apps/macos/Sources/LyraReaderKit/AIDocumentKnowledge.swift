@@ -136,8 +136,8 @@ public final class AIDocumentKnowledge: ObservableObject {
     public func invalidate() { cancel(); record = nil }
 }
 
-/// Enrichment updates the inspectable plan and its exact JSON together, before either transport
-/// sees it. Generated document knowledge is explicitly data, with primary evidence authoritative.
+/// Enrichment updates the transport-neutral plan before either transport renders it. Generated
+/// document knowledge is explicitly data, with primary evidence authoritative.
 @MainActor
 package enum AIDocumentKnowledgePrompt {
     package static func enrich(_ original: AiPlanRecord, knowledge: String) throws -> AiPlanRecord {
@@ -148,24 +148,12 @@ package enum AIDocumentKnowledgePrompt {
             + "\n[End shared document understanding]\n\n"
         for index in plan.parts.indices {
             var part = plan.parts[index]
-            guard let data = part.wireBody.data(using: .utf8),
-                  var body = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  var messages = body["messages"] as? [[String: Any]],
-                  let systemIndex = messages.firstIndex(where: { $0["role"] as? String == "system" })
-            else { throw AISettingsError.invalid("The document context could not be added to this request.") }
-            guard let userIndex = messages.lastIndex(where: { $0["role"] as? String == "user" }) else {
-                throw AISettingsError.invalid("The request has no user context to enrich.")
+            if !part.wireBody.isEmpty {
+                throw AISettingsError.invalid(
+                    "The document context must be added before the request body is rendered.")
             }
             part.systemPrompt += rules
             part.userPrompt = addition + part.userPrompt
-            messages[systemIndex]["content"] = part.systemPrompt
-            if var content = messages[userIndex]["content"] as? [[String: Any]],
-               let textIndex = content.firstIndex(where: { $0["type"] as? String == "text" }) {
-                content[textIndex]["text"] = part.userPrompt
-                messages[userIndex]["content"] = content
-            } else { messages[userIndex]["content"] = part.userPrompt }
-            body["messages"] = messages
-            part.wireBody = String(decoding: try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys]), as: UTF8.self)
             part.requestCharacters += UInt64(addition.count + rules.count)
             plan.parts[index] = part
         }

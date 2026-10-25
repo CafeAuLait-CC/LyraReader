@@ -740,8 +740,14 @@ public final class RustAIChatService: AIChatServicing {
     }
 
     public func start(_ plan: AiPlanRecord, apiKey: String) throws -> any AIChatHandle {
+        // Paths without a preview (the connection test, a programmatic caller) still get exactly
+        // one chat-completions body, built at send time. A previewed plan already carries it, so
+        // those bytes are reused and the capture is not encoded a second time.
+        let rendered = plan.parts.allSatisfy { !$0.wireBody.isEmpty }
+            ? plan
+            : try renderAiPlan(plan: plan, transport: .chatCompletions)
         let handle = try startAiRequest(
-            plan: plan,
+            plan: rendered,
             apiKey: apiKey,
             useMockProvider: useMockProvider
         )
@@ -1333,9 +1339,9 @@ extension AiPlanPartRecord {
         "\(pageCharacters) page characters · \(requestCharacters) request characters"
     }
 
-    /// Whether this exact request carries the region PNG. The Rust planner sets it together with
-    /// the picture embedded in `wire_body`; both transports preserve the same capture, so the
-    /// preview can ask this instead of searching the JSON for a transport-specific key.
+    /// Whether this exact request carries the region PNG. The plan stores the capture bytes on
+    /// its own, before any transport renders them, so the preview can ask this instead of
+    /// searching the JSON for a transport-specific key.
     public var includesRegionImage: Bool { image != nil }
 }
 

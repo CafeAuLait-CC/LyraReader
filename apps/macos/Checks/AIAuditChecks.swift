@@ -357,9 +357,9 @@ extension ReaderChecks {
         }
         require(dataContains(raw, "region_question"), "the audit file names the action kind")
 
-        // Both connections carry the same capture. The ChatGPT plan transport rebuilds the
-        // wire body as the documented Responses content parts; the inventory and the audit
-        // record must agree with that, so both are asserted against the converted plan.
+        // Both connections carry the same capture. The ChatGPT plan transport renders the same
+        // neutral description as the documented Responses content parts; the inventory and the
+        // audit record must agree with that, so both are asserted against the converted plan.
         let convertedForChatGPT = try ChatGPTResponses.plan(regionPlan)
         require(convertedForChatGPT.parts.first?.image != nil,
                 "the ChatGPT plan carries the exact picture record")
@@ -718,6 +718,10 @@ extension ReaderChecks {
             model: "mock-model",
             temperature: 0.2,
             maxTokens: 900,
+            stream: true,
+            includeStreamOptions: true,
+            reasoningField: nil,
+            reasoningValue: nil,
             parts: [
                 part(0, label: "Pages 1-2", primary: 1, pages: [1, 2], characters: 200),
                 part(1, label: "Page 3", primary: 3, pages: [3], characters: 50),

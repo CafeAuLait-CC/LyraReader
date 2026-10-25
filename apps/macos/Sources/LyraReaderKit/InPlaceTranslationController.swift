@@ -597,10 +597,7 @@ final class InPlaceTranslationController {
             let sourcePlan = try await preparePlan(item)
             guard let activeItem = active[key], !activeItem.cancelled,
                   documentMatches(item.environment) else { return }
-            var plan = sourcePlan
-            if item.environment.connectionMode == .chatGPT {
-                plan = try ChatGPTResponses.plan(plan)
-            }
+            let plan = try AIPlanWire.render(sourcePlan, connection: item.environment.connectionMode)
             let handle = try AIAuditedRequestStart.start(
                 plan: plan, kind: .translation, audit: item.environment.audit
             ) {

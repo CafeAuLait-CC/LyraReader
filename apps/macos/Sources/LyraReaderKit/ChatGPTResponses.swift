@@ -9,8 +9,9 @@ import Foundation
 /// therefore surfaced as real errors, never silently downgraded to a text-only request.
 ///
 /// The Responses API takes each user message's `content` as an array of content parts. Text is
-/// `input_text`; a region capture is `input_image` with an inline PNG `data:` URL. Images travel
-/// in the request body, so the previewed `wire_body` is the body that is sent.
+/// `input_text`; a region capture is `input_image` with an inline PNG `data:` URL. The body is
+/// rendered by the Rust builder, which owns the exact bytes and encodes the capture once. The
+/// previewed `wire_body` is the body that is sent.
 @MainActor
 package enum ChatGPTResponses {
     package static let endpoint = "https://api.openai.com/v1/responses"
@@ -20,28 +21,17 @@ package enum ChatGPTResponses {
         plan.endpoint = endpoint
         plan.temperature = nil
         plan.maxTokens = nil
-        for index in plan.parts.indices {
-            let part = plan.parts[index]
-            var content: [[String: Any]] = [["type": "input_text", "text": part.userPrompt]]
-            if let image = part.image {
-                guard !image.png.isEmpty, image.widthPx > 0, image.heightPx > 0 else {
-                    throw AISettingsError.invalid("The region picture is empty, so there is nothing to send.")
-                }
-                guard image.png.count <= AIRegionLimits.maximumPNGBytes else {
-                    throw AISettingsError.invalid(
-                        "The region picture is larger than the \(AIRegionLimits.maximumPNGBytes / (1024 * 1024)) MiB attachment bound. Select a smaller region.")
-                }
-                content.append([
-                    "type": "input_image",
-                    "image_url": "data:image/png;base64,\(image.png.base64EncodedString())",
-                ])
+        for part in plan.parts {
+            guard let image = part.image else { continue }
+            guard !image.png.isEmpty, image.widthPx > 0, image.heightPx > 0 else {
+                throw AISettingsError.invalid("The region picture is empty, so there is nothing to send.")
             }
-            let body: [String: Any] = ["model": plan.model, "store": false, "stream": true,
-                "input": [["role": "system", "content": part.systemPrompt],
-                          ["role": "user", "content": content]]]
-            plan.parts[index].wireBody = String(decoding: try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys]), as: UTF8.self)
+            guard image.png.count <= AIRegionLimits.maximumPNGBytes else {
+                throw AISettingsError.invalid(
+                    "The region picture is larger than the \(AIRegionLimits.maximumPNGBytes / (1024 * 1024)) MiB attachment bound. Select a smaller region.")
+            }
         }
-        return plan
+        return try renderAiPlan(plan: plan, transport: .responses)
     }
 
     /// A non-2xx response is where an account or model that will not take an image shows up.
@@ -140,6 +130,10 @@ final class ChatGPTResponsesHandle: AIChatHandle {
                     request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
                     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
                     request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                    guard !part.wireBody.isEmpty else {
+                        throw AISettingsError.invalid(
+                            "The ChatGPT request was not prepared for the Responses transport. Nothing was sent.")
+                    }
                     request.httpBody = Data(part.wireBody.utf8)
                     let (bytes, response) = try await accounts.session.bytes(for: request)
                     try ChatGPTResponses.check(response, carryingImage: carriesImage)

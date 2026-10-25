@@ -23,12 +23,12 @@ pub fn document_index_cache_path(path: String) -> String {
 use lyra_reader_ai::MockProvider;
 use lyra_reader_ai::chat::{
     Action as AiAction, CONNECTION_TEST_MAX_TOKENS, ChatImage, ChatPlan, ChatSettings,
-    ConversationTurn, DocumentChatRequest, MergePart, MergePlanRequest, PageChar, PageText,
-    PlanRequest, ReasoningEncoding, ReasoningMode, RegionQuestionRequest, RegionRect,
-    SUMMARY_ABSTRACT_MAX_CHARS, SUMMARY_ABSTRACT_MAX_PAGES, SUMMARY_MAX_CONCURRENT_REQUESTS,
-    SUMMARY_MAX_REQUESTS_PER_BATCH, SUMMARY_PAGE_MAX_CHARS, SUMMARY_SECTION_MAX_CHARS,
-    SelectionRange as AiSelectionRange, SourceRect as AiSourceRect, SummaryLayer,
-    SummaryLayerRequest, SummaryUnitRequest, abstract_sample_page_indices,
+    ChatTransport, ChatWire, ConversationTurn, DocumentChatRequest, MergePart, MergePlanRequest,
+    PageChar, PageText, PlanRequest, ReasoningEncoding, ReasoningField, ReasoningMode,
+    RegionQuestionRequest, RegionRect, SUMMARY_ABSTRACT_MAX_CHARS, SUMMARY_ABSTRACT_MAX_PAGES,
+    SUMMARY_MAX_CONCURRENT_REQUESTS, SUMMARY_MAX_REQUESTS_PER_BATCH, SUMMARY_PAGE_MAX_CHARS,
+    SUMMARY_SECTION_MAX_CHARS, SelectionRange as AiSelectionRange, SourceRect as AiSourceRect,
+    SummaryLayer, SummaryLayerRequest, SummaryUnitRequest, abstract_sample_page_indices,
     build_connection_test_plan, build_document_chat_plan, build_document_knowledge_plan,
     build_merge_plan, build_plan, build_region_question_plan, build_summary_layer,
     inspect_base_url, inspect_summary_layer, summary_coverage_note, validate_model,
@@ -5632,9 +5632,8 @@ pub struct AiHeaderRecord {
     pub value: String,
 }
 
-/// The exact PNG one request carries. The same bytes are embedded in `wire_body`; the shell
-/// forwards them unchanged into the ChatGPT Responses content part, so the picture the preview
-/// names and the picture that is sent cannot differ.
+/// The exact PNG one request carries. The plan carries these captured bytes, not an encoded
+/// copy; the selected transport encodes them once into its own data URL.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AiPlanImageRecord {
     pub png: Vec<u8>,
@@ -5642,8 +5641,10 @@ pub struct AiPlanImageRecord {
     pub height_px: u32,
 }
 
-/// One request in the preview. `wire_body` is the exact JSON body; the key is added only when
-/// the reader presses Send, so it can never appear here.
+/// One request in the preview. The freshly built plan describes the text, the page labels and
+/// the capture; `wire_body` is empty until the shell materialises the body for the selected
+/// transport with [`render_ai_plan`]. The API key is added only when the reader presses Send, so
+/// it can never appear here.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AiPlanPartRecord {
     pub index: u32,
@@ -5655,10 +5656,21 @@ pub struct AiPlanPartRecord {
     pub request_characters: u64,
     pub system_prompt: String,
     pub user_prompt: String,
+    /// Empty in a freshly planned request. [`render_ai_plan`] fills it with the one body for the
+    /// selected transport; the preview and the send use that same string.
     pub wire_body: String,
     pub note: Option<String>,
     /// Present only when this exact request carries a region picture.
     pub image: Option<AiPlanImageRecord>,
+}
+
+/// The wire shape to materialise for a preview. Exactly one is selected per request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum AiWireTransport {
+    /// The OpenAI-compatible `chat/completions` body used by the API-key connection.
+    ChatCompletions,
+    /// The documented Responses body used by the ChatGPT plan connection.
+    Responses,
 }
 
 /// A page-local rectangle of a retrieved passage, in 100% view space. The shell highlights these
@@ -5693,6 +5705,15 @@ pub struct AiPlanRecord {
     pub model: String,
     pub temperature: Option<f64>,
     pub max_tokens: Option<u32>,
+    /// Whether the rendered body asks the provider to stream.
+    pub stream: bool,
+    /// Whether the rendered body includes the optional `stream_options` usage field. It is
+    /// false after this endpoint/model has rejected the field once.
+    pub include_stream_options: bool,
+    /// The one provider-specific reasoning field, or `None`. `reasoning_value` is the field's
+    /// JSON literal (for example `{"type":"disabled"}`), never a request body.
+    pub reasoning_field: Option<String>,
+    pub reasoning_value: Option<String>,
     pub parts: Vec<AiPlanPartRecord>,
     pub source_pages: Vec<u32>,
     pub note: Option<String>,
@@ -6091,6 +6112,30 @@ impl LyraReaderAiRequest {
     }
 }
 
+/// Materialise the exact body for the transport the reader selected.
+///
+/// This is the only place a body is built for a shell preview: one image is base64-encoded once
+/// for the selected transport, never for both. The returned plan's `wire_body` is the exact
+/// previewed string, and sending it reuses those bytes instead of encoding again. A freshly
+/// built plan has empty bodies, so it can never carry a stale chat-completions body into a
+/// ChatGPT request.
+#[uniffi::export]
+pub fn render_ai_plan(
+    plan: AiPlanRecord,
+    transport: AiWireTransport,
+) -> Result<AiPlanRecord, LyraReaderFfiError> {
+    let chat_plan = chat_plan_from_record(plan.clone())?;
+    let chat_transport = match transport {
+        AiWireTransport::ChatCompletions => ChatTransport::ChatCompletions,
+        AiWireTransport::Responses => ChatTransport::Responses,
+    };
+    let mut rendered = plan;
+    for (part, target) in chat_plan.parts.iter().zip(rendered.parts.iter_mut()) {
+        target.wire_body = chat_plan.render_body(part, chat_transport);
+    }
+    Ok(rendered)
+}
+
 /// Start a request for a previously previewed plan.
 ///
 /// `api_key` crosses the FFI boundary here and is moved into the worker thread; it is not stored
@@ -6219,6 +6264,18 @@ pub fn build_ai_merge_plan(
 fn ai_plan_record(plan: ChatPlan) -> AiPlanRecord {
     let estimated_tokens = plan.estimated_tokens();
     let history_turns = plan.history_turns;
+    let stream = plan.wire.stream;
+    let include_stream_options = plan.wire.include_stream_options;
+    let reasoning_field = plan
+        .wire
+        .reasoning
+        .as_ref()
+        .map(|field| field.field.clone());
+    let reasoning_value = plan
+        .wire
+        .reasoning
+        .as_ref()
+        .map(|field| field.value.to_string());
     let sources = plan
         .sources
         .into_iter()
@@ -6249,6 +6306,10 @@ fn ai_plan_record(plan: ChatPlan) -> AiPlanRecord {
         model: plan.model,
         temperature: plan.temperature.map(f64::from),
         max_tokens: plan.max_tokens,
+        stream,
+        include_stream_options,
+        reasoning_field,
+        reasoning_value,
         parts: plan
             .parts
             .into_iter()
@@ -6262,7 +6323,7 @@ fn ai_plan_record(plan: ChatPlan) -> AiPlanRecord {
                 request_characters: part.request_characters,
                 system_prompt: part.system_prompt,
                 user_prompt: part.user_prompt,
-                wire_body: part.wire_body,
+                wire_body: part.wire_body.unwrap_or_default(),
                 note: part.note,
                 image: part.image.map(|image| AiPlanImageRecord {
                     png: image.png,
@@ -6321,6 +6382,25 @@ fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, LyraReaderFfiEr
             message: "The request preview has no requests.".to_string(),
         });
     }
+    let reasoning = match (plan.reasoning_field.as_ref(), plan.reasoning_value.as_ref()) {
+        (Some(field), Some(value)) => Some(ReasoningField {
+            field: field.clone(),
+            value: serde_json::from_str(value).map_err(|_| LyraReaderFfiError::Ai {
+                message: "The request preview has an invalid reasoning field.".to_string(),
+            })?,
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(LyraReaderFfiError::Ai {
+                message: "The request preview names only half of its reasoning field.".to_string(),
+            });
+        }
+    };
+    let wire = ChatWire {
+        reasoning,
+        stream: plan.stream,
+        include_stream_options: plan.include_stream_options,
+    };
     let parts = plan
         .parts
         .into_iter()
@@ -6339,7 +6419,7 @@ fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, LyraReaderFfiEr
                 height_px: image.height_px,
                 png: image.png,
             }),
-            wire_body: part.wire_body,
+            wire_body: (!part.wire_body.is_empty()).then_some(part.wire_body),
             note: part.note,
         })
         .collect();
@@ -6354,6 +6434,7 @@ fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, LyraReaderFfiEr
         model: plan.model,
         temperature: plan.temperature.map(|value| value as f32),
         max_tokens: plan.max_tokens,
+        wire,
         parts,
         source_pages: plan.source_pages,
         note: plan.note,
