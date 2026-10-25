@@ -61,6 +61,8 @@ mod forms;
 #[cfg(feature = "pdfium")]
 mod geometry_write;
 #[cfg(feature = "pdfium")]
+mod limits;
+#[cfg(feature = "pdfium")]
 mod outline_write;
 #[cfg(feature = "pdfium")]
 mod page_ops;
@@ -89,7 +91,8 @@ pub use annotation_edit::{
 };
 #[cfg(feature = "pdfium")]
 pub use annotations::{
-    AnnotationAppender, AnnotationReader, WriteAnnotation, WriteAnnotationKind, WriteStampImage,
+    AnnotationAppender, AnnotationPageReport, AnnotationReader, UnreadableAnnotation,
+    WriteAnnotation, WriteAnnotationKind, WriteStampImage,
 };
 #[cfg(feature = "pdfium")]
 pub use appearance_font::{AppearanceCoverage, coverage as appearance_coverage, missing_glyphs};

@@ -731,11 +731,10 @@ fn build_revision(
     let sheet = crate::backend::page_geometry(&page)
         .page_to_view(1.0)
         .then(Transform2D::scale(1.0, -1.0));
-    let from_sheet = pdf_matrix(
-        sheet
-            .inverse()
-            .ok_or_else(|| failure("The page transform is singular."))?,
-    );
+    let sheet_inverse = sheet
+        .inverse()
+        .ok_or_else(|| failure("The page transform is singular."))?;
+    let from_sheet = pdf_matrix(sheet_inverse);
     page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
     match command {
         ContentCommand::Transform {
@@ -834,11 +833,7 @@ fn build_revision(
                     "This text reaches the page edge. Widen the frame or reduce the font size; your draft is preserved.",
                 ));
             }
-            *bounds = sheet
-                .inverse()
-                .unwrap()
-                .apply_rect(text_bounds.rect())
-                .into();
+            *bounds = sheet_inverse.apply_rect(text_bounds.rect()).into();
             if let Some(item) = item {
                 remove_top_level(&mut page, &item.paths)?;
             }

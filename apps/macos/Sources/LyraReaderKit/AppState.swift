@@ -1698,6 +1698,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         inPlaceTranslation.setNotice(nil)
     }
 
+    /// Dismiss the "some annotations could not be read" notice.
+    ///
+    /// Writes stay blocked: the notice is information, not the safety gate.
+    public func dismissAnnotationReadNotice() {
+        annotationReadNotice = nil
+    }
+
     /// A passage the AI chat is pointing at. This is deliberately **not** an annotation: it is
     /// drawn for a moment, fades in three steps and disappears, and nothing is written to the
     /// PDF or the annotation cache. `id` makes two clicks on the same page restart the fade.
@@ -2197,6 +2204,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var documentAnnotationsLoading = false
     /// Why the document's annotations could not be read, if they could not.
     @Published public private(set) var documentAnnotationsError: String?
+    /// A one-line, dismissible notice when some annotations inside the PDF could not be decoded.
+    ///
+    /// The readable annotations are still shown. The engine also blocks annotation writes while
+    /// this is set, so the unreadable ones cannot be dropped by a rewrite.
+    @Published public private(set) var annotationReadNotice: String?
     private var documentAnnotationsLoadCompleted = false
 
     /// One annotation the reader removed from the PDF's annotation list but has not written to a
@@ -2906,6 +2918,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var documentPopupFlags: [String: Bool]
         var pendingFileDeletions: [FileAnnotationDeletion]
         var documentAnnotationsError: String?
+        var annotationReadNotice: String?
         var documentAnnotationsLoadCompleted: Bool
         var outline: [OutlineEntry]
         var outlineLoadCompleted: Bool
@@ -3755,6 +3768,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         documentPopupFlags = [:]
         documentAnnotationsLoading = false
         documentAnnotationsError = nil
+        annotationReadNotice = nil
         annotationSaveInProgress = false
         pageEditIsApplied = false
         interruptedAnnotationSaveNotice = nil
@@ -7142,7 +7156,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
               let url = document.url else { return false }
         if annotationsURL == nil { loadAnnotations(for: url) }
         if annotationWritesBlockedReason != nil {
-            statusMessage = "Could not add the bookmark because the annotation cache could not be loaded"
+            statusMessage = "Could not add the bookmark because annotation writes are blocked"
             lastError = statusMessage
             return false
         }
@@ -9710,7 +9724,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return false
         }
         if let reason = annotationWritesBlockedReason {
-            statusMessage = "Could not save annotations because the annotation cache could not be loaded"
+            statusMessage = "Could not save annotations because annotation writes are blocked"
                 + " (\(reason)); it was left untouched"
             lastError = statusMessage
             FileHandle.standardError.write(
@@ -10806,7 +10820,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard !pageEditBusy && !annotationSaveInProgress else { return false }
         if let reason = annotationWritesBlockedReason {
             lastError =
-                "This document's annotation cache could not be read (\(reason)), so the merge "
+                "This document's annotation writes are blocked (\(reason)), so the merge "
                 + "was not started: it could not tell which marks the merged file should carry."
             return false
         }
@@ -10966,7 +10980,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard !pageEditBusy && !annotationSaveInProgress else { return false }
         if let reason = annotationWritesBlockedReason {
             lastError =
-                "This document's annotation cache could not be read (\(reason)), so the split "
+                "This document's annotation writes are blocked (\(reason)), so the split "
                 + "was not started: it could not tell which marks each output should carry."
             return false
         }
@@ -12188,8 +12202,28 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             guard epoch == self.documentEpoch else { return }
             defer { if epoch == self.documentEpoch { self.documentAnnotationsLoading = false } }
             do {
-                let found = try await self.engine.annotations()
+                let scan = try await self.engine.annotationScan()
                 guard epoch == self.documentEpoch else { return }
+                let found = scan.annotations
+                // One notice per document: the scan is document-wide and cached, so this
+                // block runs once rather than once per page. The readable marks still load.
+                if scan.unreadableAnnotations > 0 {
+                    let pages = scan.unreadablePages
+                        .map { String($0 + 1) }
+                        .joined(separator: ", ")
+                    let notice = "\(scan.unreadableAnnotations) annotation(s) could not be read"
+                        + " from this document (page(s) \(pages)); the rest are shown."
+                    self.annotationReadNotice = notice
+                    self.annotationWritesBlockedReason =
+                        "\(scan.unreadableAnnotations) annotation(s) on page(s) \(pages) could not"
+                        + " be read; saving new annotations would drop them."
+                    self.statusMessage = notice
+                    FileHandle.standardError.write(
+                        Data("lyra-reader-pdf-annotations: \(notice) \(scan.unreadableDetails.joined(separator: " | "))\n".utf8)
+                    )
+                } else {
+                    self.annotationReadNotice = nil
+                }
                 // An adopted entry is drawn from the editable model, and a pending deletion is
                 // drawn nowhere: hiding both here is what keeps a mark from appearing twice (or
                 // after the reader deleted it) until the save makes the change real.
@@ -13349,6 +13383,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             documentPopupFlags: documentPopupFlags,
             pendingFileDeletions: pendingFileDeletions,
             documentAnnotationsError: documentAnnotationsError,
+            annotationReadNotice: annotationReadNotice,
             documentAnnotationsLoadCompleted: documentAnnotationsLoadCompleted,
             outline: outline,
             outlineLoadCompleted: outlineLoadCompleted,
@@ -13472,6 +13507,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         documentPopupFlags = state.documentPopupFlags
         pendingFileDeletions = state.pendingFileDeletions
         documentAnnotationsError = state.documentAnnotationsError
+        annotationReadNotice = state.annotationReadNotice
         documentAnnotationsLoadCompleted = state.documentAnnotationsLoadCompleted
         outline = state.outline
         outlineLoadCompleted = state.outlineLoadCompleted

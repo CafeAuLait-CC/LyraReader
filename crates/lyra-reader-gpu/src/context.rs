@@ -497,6 +497,7 @@ impl GpuContext {
     /// shader compilation, the render pass and the readback, so the GPU pipeline can
     /// be checked on any machine (including CI) without a `CAMetalLayer`.
     pub fn offscreen_probe(&mut self, size: u32, clear: [f64; 4]) -> Result<Vec<u8>> {
+        let pixel_bytes = crate::rgba_byte_len(size, size)?;
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("offscreen-probe"),
@@ -585,7 +586,7 @@ impl GpuContext {
         slice.map_async(wgpu::MapMode::Read, |_| {});
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
 
-        let mut pixels = Vec::with_capacity((size * size * 4) as usize);
+        let mut pixels = Vec::with_capacity(pixel_bytes);
         {
             let data = slice
                 .get_mapped_range()

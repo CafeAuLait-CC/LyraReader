@@ -4,6 +4,13 @@
 //! TIFF is deliberately not guessed at: the sample's four TIFFs are 3 KB arrow glyphs, and a
 //! partly-decoded image would be worse than the triangle the layout draws in their place.
 
+/// The largest image, in pixels, an XFA template may embed. The BMP header is file-controlled;
+/// without this bound the RGB buffer was sized from `width * height * 3` before the row data was
+/// checked, so a 62-byte file could ask for (or overflow into) gigabytes.
+const MAX_IMAGE_PIXELS: u64 = 16_000_000;
+/// The largest side, in pixels, an XFA template may embed.
+const MAX_IMAGE_SIDE: u32 = 8_192;
+
 /// An image ready for the PDF writer.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Asset {
@@ -136,6 +143,16 @@ fn decode_bmp(bytes: &[u8]) -> Option<Asset> {
     let width = width as u32;
     let height = signed_height.unsigned_abs();
     let top_down = signed_height < 0;
+    // The header is the only source for these numbers, and the pixel buffer is sized from them.
+    // Refuse an implausible size before any allocation can run out of memory.
+    if width > MAX_IMAGE_SIDE
+        || height > MAX_IMAGE_SIDE
+        || u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS
+    {
+        return None;
+    }
+    let pixel_count = width as usize * height as usize;
+    let rgb_len = pixel_count.checked_mul(3)?;
 
     match bits {
         1 => {
@@ -149,13 +166,15 @@ fn decode_bmp(bytes: &[u8]) -> Option<Asset> {
                 *slot = (bytes[start + 2], bytes[start + 1], bytes[start]);
             }
             let row_bytes = (width as usize).div_ceil(32) * 4;
-            let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
+            // Check that every source row exists before claiming the RGB buffer.
+            let source_bytes = row_bytes.checked_mul(height as usize)?;
+            if offset.checked_add(source_bytes)? > bytes.len() {
+                return None;
+            }
+            let mut rgb = Vec::with_capacity(rgb_len);
             for row in 0..height {
                 let source_row = if top_down { row } else { height - 1 - row };
                 let start = offset + source_row as usize * row_bytes;
-                if start + row_bytes > bytes.len() {
-                    return None;
-                }
                 for x in 0..width {
                     let byte = bytes[start + (x as usize) / 8];
                     let bit = (byte >> (7 - (x % 8))) & 1;
@@ -171,13 +190,15 @@ fn decode_bmp(bytes: &[u8]) -> Option<Asset> {
         }
         24 => {
             let row_bytes = ((width as usize) * 3).div_ceil(4) * 4;
-            let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
+            // Check that every source row exists before claiming the RGB buffer.
+            let source_bytes = row_bytes.checked_mul(height as usize)?;
+            if offset.checked_add(source_bytes)? > bytes.len() {
+                return None;
+            }
+            let mut rgb = Vec::with_capacity(rgb_len);
             for row in 0..height {
                 let source_row = if top_down { row } else { height - 1 - row };
                 let start = offset + source_row as usize * row_bytes;
-                if start + row_bytes > bytes.len() {
-                    return None;
-                }
                 for x in 0..width {
                     let pixel = start + (x as usize) * 3;
                     rgb.extend_from_slice(&[bytes[pixel + 2], bytes[pixel + 1], bytes[pixel]]);
@@ -239,5 +260,48 @@ mod tests {
             }
             _ => panic!("expected RGB"),
         }
+    }
+
+    /// A 62-byte BMP whose header claims 2^31-1 × 2^31-1 pixels. The row data is absent.
+    fn malformed_bmp_with_huge_dimensions(bits: u16) -> Vec<u8> {
+        let mut bytes = vec![0u8; 62];
+        bytes[0..2].copy_from_slice(b"BM");
+        bytes[10..14].copy_from_slice(&(54u32).to_le_bytes());
+        bytes[14..18].copy_from_slice(&(40u32).to_le_bytes());
+        bytes[18..22].copy_from_slice(&i32::MAX.to_le_bytes());
+        bytes[22..26].copy_from_slice(&i32::MAX.to_le_bytes());
+        bytes[26..28].copy_from_slice(&(1u16).to_le_bytes());
+        bytes[28..30].copy_from_slice(&bits.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn a_tiny_malformed_bmp_cannot_size_a_gigabyte_buffer() {
+        for bits in [1u16, 24] {
+            let bytes = malformed_bmp_with_huge_dimensions(bits);
+            assert!(
+                decode_bmp(&bytes).is_none(),
+                "a {bits}-bit BMP with impossible dimensions must be refused"
+            );
+            // The path the XFA layout actually calls: it must report "unsupported", not abort.
+            assert!(matches!(
+                decode("image/bmp", &bytes),
+                Decoded::Unsupported(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_bmp_whose_rows_do_not_fit_is_refused_before_the_rgb_buffer() {
+        let mut bytes = vec![0u8; 14 + 40 + 8 + 4];
+        bytes[0..2].copy_from_slice(b"BM");
+        bytes[10..14].copy_from_slice(&(62u32).to_le_bytes());
+        bytes[14..18].copy_from_slice(&(40u32).to_le_bytes());
+        bytes[18..22].copy_from_slice(&4i32.to_le_bytes());
+        bytes[22..26].copy_from_slice(&4i32.to_le_bytes());
+        bytes[26..28].copy_from_slice(&(1u16).to_le_bytes());
+        bytes[28..30].copy_from_slice(&24u16.to_le_bytes());
+        // 4 × 4 pixels need 64 source bytes; only one row is present.
+        assert!(decode_bmp(&bytes).is_none());
     }
 }

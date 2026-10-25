@@ -480,7 +480,8 @@ public struct ReaderWindow: View {
                 || state.markSelectionRefusalNotice != nil
                 || state.eraserRefusalNotice != nil
                 || state.regionRefusalMessage != nil
-                || state.translationNotice != nil {
+                || state.translationNotice != nil
+                || state.annotationReadNotice != nil {
                 VStack(spacing: 8) {
                     if state.isReadOnlyDocument { readOnlyBanner }
                     if state.formHasPendingChanges { formBanner }
@@ -495,6 +496,9 @@ public struct ReaderWindow: View {
                     }
                     if state.translationNotice != nil {
                         translationBanner
+                    }
+                    if state.annotationReadNotice != nil {
+                        annotationReadBanner
                     }
                     if state.hasPendingInkErasure || state.hasPendingFileDeletions {
                         eraserPendingBanner
@@ -691,6 +695,43 @@ public struct ReaderWindow: View {
         .shadow(radius: 3, y: 1)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(state.translationNotice ?? "Translation status")
+    }
+
+    /// One line about annotations inside the PDF that the engine could not decode.
+    ///
+    /// The rest of the file's annotations are still shown. Dismissing this note is safe: the
+    /// engine keeps annotation writes blocked while the unreadable content exists, so a save
+    /// cannot silently drop it.
+    private var annotationReadBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle")
+                .foregroundStyle(LyraReaderTheme.warningFg)
+            Text(state.annotationReadNotice ?? "")
+                .font(.callout)
+                .frame(maxWidth: 640, alignment: .leading)
+            Spacer(minLength: 0)
+            Button {
+                state.dismissAnnotationReadNotice()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .frame(width: 20, height: 20)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss")
+            .accessibilityLabel("Dismiss annotation read notice")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(LyraReaderTheme.raisedBg, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(LyraReaderTheme.warningFg.opacity(0.45), lineWidth: 1)
+        )
+        .shadow(radius: 3, y: 1)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(state.annotationReadNotice ?? "Annotation read status")
     }
 
     /// The read-only explanation for a digitally signed document or an XFA form.

@@ -25,9 +25,10 @@
 //! alternative strategy described in `docs/adr/0003`.
 
 #![allow(clippy::missing_safety_doc)]
-// This is the **only** place in the project where `unsafe` is expected (raw pointers / foreign ABI),
-// so the workspace `unsafe_code` lint is explicitly waived here; every function must still document
-// its Safety contract.
+// The hand-written C ABI needs `unsafe` for raw pointers and foreign calls, so the workspace
+// `unsafe_code` lint is waived for this module. It is not the only such module: the PDFium crate
+// resolves C symbols in `annotations`, `page_ops` and `redaction` for the same reason. Every
+// function here must still document its Safety contract.
 #![allow(unsafe_code)]
 
 use lyra_reader_gpu::{GpuContext, QuadBlend, SurfaceConfig, SurfaceId, SurfaceTarget};
@@ -316,7 +317,10 @@ pub unsafe extern "C" fn lyra_reader_gpu_upload_texture(
     if pixels.is_null() || out_texture_id.is_null() {
         return code::ERR_INVALID_ARGUMENT;
     }
-    let expected = (width as usize) * (height as usize) * 4;
+    let expected = match lyra_reader_gpu::rgba_byte_len(width, height) {
+        Ok(expected) => expected,
+        Err(_) => return code::ERR_INVALID_ARGUMENT,
+    };
     if len < expected {
         return code::ERR_INVALID_ARGUMENT;
     }
@@ -802,6 +806,25 @@ mod tests {
             rc == code::ERR_NOT_INITIALIZED || rc == code::ERR_INVALID_ARGUMENT,
             "unexpected code {rc}"
         );
+    }
+
+    #[test]
+    fn wrapped_texture_dimensions_are_rejected_before_the_slice() {
+        let pixels = [0u8; 4];
+        let mut texture_id = 0u64;
+        // SAFETY: `pixels` and `texture_id` are valid locals. The dimensions overflow a pixel
+        // byte count, so the function must reject them before reading `pixels` as a texture.
+        let rc = unsafe {
+            lyra_reader_gpu_upload_texture(
+                u32::MAX,
+                u32::MAX,
+                pixels.as_ptr(),
+                pixels.len(),
+                &mut texture_id,
+            )
+        };
+        assert_eq!(rc, code::ERR_INVALID_ARGUMENT);
+        assert_eq!(texture_id, 0);
     }
 
     /// End-to-end GPU self-test through the C ABI, mirroring what the host does.

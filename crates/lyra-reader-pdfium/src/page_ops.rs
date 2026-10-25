@@ -1647,6 +1647,7 @@ impl RawDocument {
                 "the password contains a NUL byte",
             )
         })?;
+        let length = crate::limits::document_len(bytes.len())?;
         let document = {
             let _guard = PDFIUM_LOCK
                 .lock()
@@ -1656,7 +1657,7 @@ impl RawDocument {
             unsafe {
                 (api.load_mem_document)(
                     bytes.as_ptr().cast(),
-                    bytes.len() as c_int,
+                    length,
                     password
                         .as_ref()
                         .map_or(std::ptr::null(), |value| value.as_ptr()),

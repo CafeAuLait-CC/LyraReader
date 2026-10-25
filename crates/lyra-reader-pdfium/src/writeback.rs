@@ -170,6 +170,11 @@ const TEMP_MARKER: &str = ".lyra-reader-save-";
 const TEMP_SUFFIX: &str = ".tmp";
 const BACKUP_MARKER: &str = ".lyra-reader-backup-";
 const COPY_BUFFER: usize = 64 * 1024;
+/// Attempts to find a free temporary/backup name beside the destination.
+///
+/// A collision means a concurrent save took the name in the last few microseconds. Three tries
+/// cover the realistic race; the previous 100 only delayed the same error by 97 stat calls.
+const FILE_NAME_ATTEMPTS: u32 = 3;
 
 /// Hard limits, so a malformed shell request cannot ask the writer to build an unreasonable PDF.
 const MAX_ANNOTATIONS: usize = 20_000;
@@ -360,7 +365,11 @@ fn save_annotation_changes_with(
             .cloned()
             .partition(|annotation| annotation.kind.uses_pdfium());
 
-    let preexisting = read_annotations(&source, password, page_count)?;
+    let preexisting_scan = read_annotations_report(&source, password, page_count)?;
+    if !preexisting_scan.unreadable.is_empty() {
+        return Err(annotation_write_blocked(&preexisting_scan.unreadable));
+    }
+    let preexisting = preexisting_scan.pages;
     let preexisting_annotation_count: usize = preexisting.iter().map(Vec::len).sum();
     // Additions must not collide with an identity the file already has. Edits and deletions name
     // existing identities by definition.
@@ -477,7 +486,18 @@ fn save_annotation_changes_with(
             verify_prefix(&source, temp.path(), source_len)?;
         }
 
-        let saved = read_annotations(temp.path(), password, page_count)?;
+        let saved_scan = read_annotations_report(temp.path(), password, page_count)?;
+        if !saved_scan.unreadable.is_empty() {
+            return Err(LyraReaderError::new(
+                ErrorCode::Internal,
+                "the saved file contains annotations that could not be read back",
+            )
+            .with_detail(format!(
+                "{} unreadable annotation(s) after the rewrite",
+                saved_scan.unreadable.len()
+            )));
+        }
+        let saved = saved_scan.pages;
         verify_all(&preexisting, &saved, changes, &applied.deleted_ids)?;
         verify_direct_annotations(temp.path(), &direct_annotations, password)?;
         verify_changes(&source, temp.path(), changes, password)?;
@@ -1451,13 +1471,21 @@ fn reject_identities_already_in_the_pdf(
     Ok(())
 }
 
-/// Reads every content annotation, page by page. The `AnnotationReader` owns a second PDFium
-/// document handle, so this is safe to run before and after the write.
-fn read_annotations(
+/// One pass over the file's annotations: the readable pages and everything that did not decode.
+struct AnnotationScan {
+    pages: Vec<Vec<RawAnnotation>>,
+    unreadable: Vec<crate::annotations::UnreadableAnnotation>,
+}
+
+/// Reads every content annotation, page by page, keeping the unreadable ones as diagnostics.
+///
+/// The `AnnotationReader` owns a second PDFium document handle, so this is safe to run before and
+/// after the write. A damaged annotation is reported, not treated as absent.
+fn read_annotations_report(
     path: &Path,
     password: Option<&str>,
     page_count: u32,
-) -> Result<Vec<Vec<RawAnnotation>>> {
+) -> Result<AnnotationScan> {
     let reader = {
         let _guard = crate::backend::PDFIUM_LOCK
             .lock()
@@ -1465,18 +1493,67 @@ fn read_annotations(
         AnnotationReader::open_locked(path, password)?
     };
     let mut pages = Vec::with_capacity(page_count as usize);
+    let mut unreadable = Vec::new();
     for page in 0..page_count {
-        let annotations = {
+        let report = {
             let _guard = crate::backend::PDFIUM_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            reader.page_locked(PageIndex(page))?
+            reader.page_report_locked(PageIndex(page))?
         };
-        pages.push(annotations);
+        pages.push(report.annotations);
+        unreadable.extend(report.unreadable);
     }
     // `AnnotationReader::drop` takes `PDFIUM_LOCK` itself; every guard above is out of scope.
     drop(reader);
-    Ok(pages)
+    Ok(AnnotationScan { pages, unreadable })
+}
+
+/// Reads every content annotation, page by page, for tests that only need the readable records.
+#[cfg(test)]
+fn read_annotations(
+    path: &Path,
+    password: Option<&str>,
+    page_count: u32,
+) -> Result<Vec<Vec<RawAnnotation>>> {
+    read_annotations_report(path, password, page_count).map(|scan| scan.pages)
+}
+
+/// The explicit refusal used when a damaged annotation makes a rewrite unsafe.
+///
+/// Rewriting around an annotation we could not decode would drop the unknown content. The
+/// message names the count and pages so the shell can show the same sentence and block the write.
+fn annotation_write_blocked(
+    unreadable: &[crate::annotations::UnreadableAnnotation],
+) -> LyraReaderError {
+    let mut pages: Vec<u32> = unreadable.iter().map(|item| item.page.get() + 1).collect();
+    pages.sort_unstable();
+    pages.dedup();
+    let page_list = pages
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let details = unreadable
+        .iter()
+        .take(8)
+        .map(|item| {
+            let slot = item
+                .slot
+                .map(|slot| format!("annotation {slot}: "))
+                .unwrap_or_default();
+            format!("page {} {}{}", item.page.get() + 1, slot, item.reason)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    LyraReaderError::new(
+        ErrorCode::ReadOnly,
+        format!(
+            "saving annotations is blocked because {} annotation(s) on page(s) {page_list} could not be read; saving would drop them",
+            unreadable.len()
+        ),
+    )
+    .with_detail(details)
 }
 
 /// Reopens the temporary file and checks it really contains what was asked for.
@@ -2067,7 +2144,7 @@ fn write_backup(source: &Path) -> Result<PathBuf> {
         .unwrap_or(0);
 
     let mut last_error = None;
-    for attempt in 0..100 {
+    for attempt in 0..FILE_NAME_ATTEMPTS {
         let name = if attempt == 0 {
             format!("{stem}{BACKUP_MARKER}{seconds}.{extension}")
         } else {
@@ -2206,7 +2283,7 @@ impl TempFile {
                 "the destination has no file name",
             )
         })?;
-        for attempt in 0..100 {
+        for attempt in 0..FILE_NAME_ATTEMPTS {
             let path = parent.join(format!(
                 "{}{TEMP_MARKER}{}-{}-{attempt}{TEMP_SUFFIX}",
                 name.to_string_lossy(),
@@ -3073,6 +3150,35 @@ mod tests {
         let reopened =
             read_annotations(&source, None, 2).expect("original still opens after a failed save");
         assert_eq!(reopened.iter().map(Vec::len).sum::<usize>(), 7);
+    }
+
+    #[test]
+    fn a_damaged_annotation_blocks_the_save_and_writes_nothing() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("damaged-annotation-save");
+        let source =
+            crate::test_support::copy_fixture(&directory, "annotations-damaged.pdf", "source.pdf");
+        let destination = directory.join("saved.pdf");
+        let error = save_annotated_pdf(
+            &source,
+            &destination,
+            std::slice::from_ref(&highlight()),
+            &[],
+            None,
+            SaveMode::Copy,
+        )
+        .expect_err("a damaged annotation must block the rewrite");
+        assert_eq!(error.code, ErrorCode::ReadOnly, "{error:?}");
+        assert!(error.message.contains("could not be read"), "{error:?}");
+        assert!(error.message.contains("page(s) 1"), "{error:?}");
+        assert!(!destination.exists(), "a blocked save wrote a file");
+        assert!(
+            interrupted_save_temporaries(&destination).is_empty(),
+            "a blocked save left a temporary file"
+        );
     }
 
     #[test]
