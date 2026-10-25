@@ -87,6 +87,17 @@ public final class ReaderSession: ObservableObject, Identifiable {
         registry?.newWindow = action
     }
 
+    /// Installs the tear-off half of the tab drag. A drop outside every strip asks this window's
+    /// registry for a new reader window and hands it the prepared tab; the registry completes the
+    /// move when that window's session registers. The closure holds the session weakly, so the
+    /// process-wide coordinator never keeps a closed window alive.
+    public func installTabTearOffAction() {
+        TabDragCoordinator.shared.tearOff = { [weak self] transfer, source in
+            guard let self, let registry = self.registry else { return false }
+            return registry.requestNewWindow(moving: transfer, from: source)
+        }
+    }
+
     // MARK: - Window lifecycle
 
     /// This session's window appeared (or changed). Called by the window's view host.
@@ -228,6 +239,8 @@ public struct ReaderWindowRoot: View {
                 // second window in the registry). Every window installs the same action; it is
                 // idempotent and always refers to this scene's WindowGroup.
                 session.installNewWindowAction { openWindow(id: ReaderWindowRegistry.readerWindowID) }
+                // A tab dragged out of any tab strip is torn off through the same registry.
+                session.installTabTearOffAction()
             }
     }
 }

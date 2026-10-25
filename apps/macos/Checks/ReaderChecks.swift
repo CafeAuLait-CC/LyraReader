@@ -544,6 +544,9 @@ struct ReaderChecks {
             let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             tabRowLayoutChecks()
             titlebarResizeChecks()
+            titlebarDoubleClickChecks()
+            tabDragReorderChecks()
+            try await tabWindowMoveChecks(root: root)
             try await titlebarThemeChecks(root: root)
             try await titlebarLastTabChecks(root: root)
             try await tabRetentionChecks(root: root)
@@ -1020,6 +1023,15 @@ struct ReaderChecks {
             }),
             ("tab-row-layout", {
                 tabRowLayoutChecks()
+            }),
+            ("titlebar-double-click", {
+                titlebarDoubleClickChecks()
+            }),
+            ("tab-drag", {
+                tabDragReorderChecks()
+            }),
+            ("tab-window-move", {
+                try await tabWindowMoveChecks(root: root)
             }),
             ("titlebar-resize", {
                 titlebarResizeChecks()
