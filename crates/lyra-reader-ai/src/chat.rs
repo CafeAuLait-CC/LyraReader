@@ -678,6 +678,59 @@ pub const PROMPT_SYSTEM_PROMPT: &str =
 /// data-URL branch. The probe's request is therefore evidence about the real client, not about a
 /// hand-written HTTP call.
 pub fn build_prompt_plan(request: PromptPlanRequest) -> Result<ChatPlan, AiError> {
+    build_prompt_plan_with_system(
+        request,
+        PROMPT_SYSTEM_PROMPT,
+        "Manual endpoint probe",
+        "Probe prompt",
+    )
+}
+
+/// The exact user message Settings > AI sends when the reader presses Test Connection. It is a
+/// fixed token, never document text, so the request cannot carry the paper being read.
+pub const CONNECTION_TEST_PROMPT: &str = "ping";
+
+/// The fixed system message for the connection test. It is short enough that the whole request is
+/// a few hundred bytes, and it asks for the one word the test needs rather than an answer.
+const CONNECTION_TEST_SYSTEM_PROMPT: &str = "Reply OK.";
+
+/// Completion budget for the connection test. The smallest useful answer is one word; a larger
+/// budget would only make a failed endpoint burn more tokens before reporting the same failure.
+pub const CONNECTION_TEST_MAX_TOKENS: u32 = 16;
+
+/// Build the Settings > AI connection test: one ping through the same wire-body builder, with no
+/// document, history, retrieval or image. The endpoint and the model are still validated and
+/// normalised exactly as they are for a real request, so the plan names the model that would be
+/// used and the same `run_plan` transport sends it.
+pub fn build_connection_test_plan(mut settings: ChatSettings) -> Result<ChatPlan, AiError> {
+    // The test is a ping, not a generation request: a temperature, a large completion budget or
+    // a vendor reasoning extension from the form would test something else (and could make a
+    // healthy endpoint look broken). The builder enforces the fixed shape for every caller.
+    settings.temperature = None;
+    settings.max_tokens = Some(CONNECTION_TEST_MAX_TOKENS);
+    settings.reasoning_mode = ReasoningMode::Default;
+    settings.reasoning_encoding = ReasoningEncoding::None;
+    build_prompt_plan_with_system(
+        PromptPlanRequest {
+            prompt: CONNECTION_TEST_PROMPT.to_string(),
+            image: None,
+            stream: true,
+            settings,
+        },
+        CONNECTION_TEST_SYSTEM_PROMPT,
+        "Connection test",
+        "Connection test",
+    )
+}
+
+/// The shared plain-prompt builder. `build_prompt_plan` and `build_connection_test_plan` differ
+/// only in their fixed copy; the JSON encoder, validation and image handling are the same.
+fn build_prompt_plan_with_system(
+    request: PromptPlanRequest,
+    system_prompt: &str,
+    document_title: &str,
+    label: &str,
+) -> Result<ChatPlan, AiError> {
     let (endpoint, model, temperature, max_tokens, reasoning) =
         validate_settings(&request.settings)?;
     if request.prompt.trim().is_empty() {
@@ -702,7 +755,7 @@ pub fn build_prompt_plan(request: PromptPlanRequest) -> Result<ChatPlan, AiError
         }
     }
 
-    let system_prompt = PROMPT_SYSTEM_PROMPT.to_string();
+    let system_prompt = system_prompt.to_string();
     let request_characters =
         (system_prompt.chars().count() + request.prompt.chars().count()) as u64;
     let wire_body = make_wire_body_with_stream(
@@ -720,7 +773,7 @@ pub fn build_prompt_plan(request: PromptPlanRequest) -> Result<ChatPlan, AiError
         // A plain prompt has no one-shot document action; the variant is a preview label and a
         // mock-provider hint only, and `run_plan` never reads it.
         action: Action::DocumentChat,
-        document_title: "Manual endpoint probe".to_string(),
+        document_title: document_title.to_string(),
         page_count: 0,
         base_url: endpoint.base_url,
         endpoint: endpoint.endpoint,
@@ -732,7 +785,7 @@ pub fn build_prompt_plan(request: PromptPlanRequest) -> Result<ChatPlan, AiError
         parts: vec![ChatPart {
             index: 0,
             total: 1,
-            label: "Probe prompt".to_string(),
+            label: label.to_string(),
             pages: Vec::new(),
             primary_page: 0,
             page_characters: 0,
@@ -3452,6 +3505,68 @@ mod tests {
         assert!(part.wire_body.contains("\"model\":\"test-model\""));
         assert!(plan.endpoint.ends_with("/chat/completions"));
         assert!(plan.is_local);
+    }
+
+    #[test]
+    fn connection_test_plan_is_one_ping_with_no_document_text() {
+        let mut request = settings("https://api.example.com/v1");
+        // The test ignores generation settings on purpose; a different temperature or reasoning
+        // mode must not leak into the request.
+        request.model = "  resolved-model  ".to_string();
+        request.temperature = Some(1.5);
+        request.max_tokens = Some(4096);
+        let plan = build_connection_test_plan(request).unwrap();
+        assert_eq!(plan.model, "resolved-model");
+        assert_eq!(plan.endpoint, "https://api.example.com/v1/chat/completions");
+        assert_eq!(plan.document_title, "Connection test");
+        assert!(plan.source_pages.is_empty());
+        assert_eq!(plan.parts.len(), 1);
+        let part = &plan.parts[0];
+        assert_eq!(part.user_prompt, CONNECTION_TEST_PROMPT);
+        assert_eq!(part.user_prompt, "ping");
+        assert!(part.pages.is_empty());
+        assert_eq!(part.page_characters, 0);
+        assert!(part.image.is_none());
+        assert_eq!(part.system_prompt, CONNECTION_TEST_SYSTEM_PROMPT);
+        let body: serde_json::Value = serde_json::from_str(&part.wire_body).unwrap();
+        assert_eq!(body["model"], "resolved-model");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["max_tokens"], CONNECTION_TEST_MAX_TOKENS);
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(
+            body["messages"][0]["content"],
+            CONNECTION_TEST_SYSTEM_PROMPT
+        );
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][1]["content"], "ping");
+        let wire = &part.wire_body;
+        assert!(!wire.contains("Page "), "no page text in a connection test");
+        assert!(
+            !wire.contains("document"),
+            "no document context in a connection test"
+        );
+        assert_eq!(
+            part.request_characters,
+            (CONNECTION_TEST_SYSTEM_PROMPT.len() + 4) as u64
+        );
+    }
+
+    #[test]
+    fn a_scalar_prompt_still_uses_the_full_system_prompt() {
+        let plan = build_prompt_plan(PromptPlanRequest {
+            prompt: "Say pong.".to_string(),
+            image: None,
+            stream: false,
+            settings: settings("http://127.0.0.1:9/v1"),
+        })
+        .unwrap();
+        assert_eq!(plan.document_title, "Manual endpoint probe");
+        assert_eq!(plan.parts[0].label, "Probe prompt");
+        assert_eq!(plan.parts[0].system_prompt, PROMPT_SYSTEM_PROMPT);
+        assert_eq!(plan.parts[0].user_prompt, "Say pong.");
     }
 
     #[test]
