@@ -161,10 +161,20 @@ fn validate_api_key(api_key: &str) -> Result<(), AiError> {
     Ok(())
 }
 
+/// The body for one part. A shell that already rendered the preview stores it on the part and
+/// that exact string is sent; a plan built programmatically (the CLI, a direct runner call)
+/// renders it here, once, for the chat-completions transport.
+fn chat_completions_body(plan: &ChatPlan, part: &ChatPart) -> String {
+    match &part.wire_body {
+        Some(body) => body.clone(),
+        None => plan.chat_completions_body(part),
+    }
+}
+
 /// Validate the exact JSON shape this client produces. A record passed back across FFI is data,
 /// not a promise, so a malformed preview is refused rather than sent.
-fn validate_wire_body(part: &ChatPart) -> Result<Value, AiError> {
-    let parsed: Value = serde_json::from_str(&part.wire_body).map_err(|_| {
+fn validate_wire_body(body: &str) -> Result<Value, AiError> {
+    let parsed: Value = serde_json::from_str(body).map_err(|_| {
         AiError::InvalidSettings(
             "The request preview is not valid JSON, so nothing was sent.".to_string(),
         )
@@ -205,7 +215,8 @@ fn assemble_request_spec(plan: &ChatPlan, api_key: &str, body: Vec<u8>) -> Reque
 /// Build the request for one part.
 ///
 /// The key is checked for line breaks (header injection) and placed only in the `Authorization`
-/// header. The body is the plan's `wire_body`. If this endpoint/model previously rejected
+/// header. The body is the one rendered for the selected transport (or rendered here for a
+/// plan that has not been previewed). If this endpoint/model previously rejected
 /// `stream_options`, the optional field is removed so every later request goes straight through.
 pub fn build_request_spec(
     plan: &ChatPlan,
@@ -213,13 +224,14 @@ pub fn build_request_spec(
     api_key: &str,
 ) -> Result<RequestSpec, AiError> {
     validate_api_key(api_key)?;
-    let parsed = validate_wire_body(part)?;
+    let body = chat_completions_body(plan, part);
+    let parsed = validate_wire_body(&body)?;
     let body = if stream_options_unsupported(&plan.endpoint, &plan.model)
         && parsed.get("stream_options").is_some()
     {
         encode_without_stream_options(parsed)
     } else {
-        part.wire_body.as_bytes().to_vec()
+        body.into_bytes()
     };
     Ok(assemble_request_spec(plan, api_key, body))
 }
@@ -231,7 +243,8 @@ fn build_request_spec_without_stream_options(
     api_key: &str,
 ) -> Result<RequestSpec, AiError> {
     validate_api_key(api_key)?;
-    let parsed = validate_wire_body(part)?;
+    let body = chat_completions_body(plan, part);
+    let parsed = validate_wire_body(&body)?;
     Ok(assemble_request_spec(
         plan,
         api_key,
@@ -1876,18 +1889,12 @@ mod tests {
         })
         .unwrap();
         assert_eq!(plan.endpoint, "https://api.deepseek.com/chat/completions");
+        let body = plan.chat_completions_body(&plan.parts[0]);
+        assert!(body.contains("\"model\":\"deepseek-flash\""));
+        assert!(body.contains("\"stream\":true"));
         assert!(
-            plan.parts[0]
-                .wire_body
-                .contains("\"model\":\"deepseek-flash\"")
-        );
-        assert!(plan.parts[0].wire_body.contains("\"stream\":true"));
-        assert!(
-            plan.parts[0]
-                .wire_body
-                .contains("\"stream_options\":{\"include_usage\":true}"),
-            "body: {}",
-            plan.parts[0].wire_body
+            body.contains("\"stream_options\":{\"include_usage\":true}"),
+            "body: {body}"
         );
     }
 
@@ -2197,8 +2204,11 @@ mod tests {
         // The endpoint/model is remembered for this process: a plan built afterwards omits the
         // field in its preview, and the request carries that same body.
         let cached_plan = retry_plan(endpoint, &model);
+        assert!(cached_plan.parts[0].wire_body.is_none());
         assert!(
-            !cached_plan.parts[0].wire_body.contains("stream_options"),
+            !cached_plan
+                .chat_completions_body(&cached_plan.parts[0])
+                .contains("stream_options"),
             "the preview must already omit a field this endpoint/model rejected"
         );
         let transport = ScriptedTransport::new(vec![ScriptedReply::success("again")]);

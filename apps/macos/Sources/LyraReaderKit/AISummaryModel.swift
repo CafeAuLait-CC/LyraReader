@@ -760,25 +760,23 @@ public final class LayeredSummaryModel: ObservableObject {
             let request = request(layer: layer, entries: batch, model: provider.model)
             var plan = try await service.prepareSummary(request)
             guard currentEpoch == epoch else { return }
-            if settings.connectionMode == .chatGPT {
-                // The ChatGPT transport needs its own wire shape per request; the layer envelope
-                // (units, bounds, note) is unchanged.
-                let converted = try plan.units.map { unit -> AiSummaryUnitRecord in
-                    var copy = unit
-                    if let source = unit.plan {
-                        copy.plan = try ChatGPTResponses.plan(source)
-                    }
-                    return copy
+            // Each unit is materialised once for the selected connection. The layer envelope
+            // (units, bounds, note) is unchanged.
+            let converted = try plan.units.map { unit -> AiSummaryUnitRecord in
+                var copy = unit
+                if let source = unit.plan {
+                    copy.plan = try AIPlanWire.render(source, connection: settings.connectionMode)
                 }
-                plan = AiSummaryPlanRecord(
-                    layer: plan.layer,
-                    pageCount: plan.pageCount,
-                    units: converted,
-                    note: plan.note,
-                    maxRequestsPerBatch: plan.maxRequestsPerBatch,
-                    maxConcurrentRequests: plan.maxConcurrentRequests
-                )
+                return copy
             }
+            plan = AiSummaryPlanRecord(
+                layer: plan.layer,
+                pageCount: plan.pageCount,
+                units: converted,
+                note: plan.note,
+                maxRequestsPerBatch: plan.maxRequestsPerBatch,
+                maxConcurrentRequests: plan.maxConcurrentRequests
+            )
             var note = plan.note
             if skipped > 0 {
                 note += " \(skipped) more \(skipped == 1 ? "entry stays" : "entries stay") for the next batch."

@@ -213,6 +213,11 @@ struct ReaderChecks {
             try await chatGPTChecks(root: fastRoot)
             return
         }
+        if CommandLine.arguments.contains("--check-plan-wire") {
+            try await planWireChecks(root: fastRoot)
+            print("Plan wire checks passed")
+            return
+        }
         if CommandLine.arguments.contains("--check-ai-assistant") {
             try await aiAssistantChecks(root: fastRoot)
             print("AI assistant checks passed")
@@ -1018,6 +1023,9 @@ struct ReaderChecks {
             }),
             ("chatgpt", {
                 try await chatGPTChecks(root: root)
+            }),
+            ("plan-wire", {
+                try await planWireChecks(root: root)
             }),
             ("appearance", {
                 await appearanceChecks()

@@ -736,6 +736,10 @@ extension ReaderChecks {
             model: "mock-model",
             temperature: 0.2,
             maxTokens: 900,
+            stream: true,
+            includeStreamOptions: true,
+            reasoningField: nil,
+            reasoningValue: nil,
             parts: [
                 planPart(0, "Pages 1-2", 1, [1, 2]),
                 planPart(1, "Page 3", 3, [3]),
@@ -894,7 +898,12 @@ extension ReaderChecks {
         try await eventually("the AI preview is built locally", { model.phase == .preview })
         require(recording.startedPlans.isEmpty, "preparing a preview sends nothing")
         guard let preview = model.plan else { fatalError("expected a plan") }
-        require(recording.returnedPlans.last == preview, "the model holds the exact plan the service built")
+        guard let sourcePlan = recording.returnedPlans.last else { fatalError("expected a prepared plan") }
+        require(sourcePlan.parts.allSatisfy { $0.wireBody.isEmpty },
+                "the service returns the transport-neutral plan, not a pre-encoded body")
+        let renderedPlan = try AIPlanWire.render(sourcePlan, connection: .apiKey)
+        require(renderedPlan == preview,
+                "the model holds the service plan with the one rendered chat-completions body")
         require(preview.isLocal, "the local endpoint is shown as local")
         require(preview.pageCount == UInt32(document.pageCount), "the preview carries the document page count")
         require(preview.parts.count == 1, "a three-page summary needs one request")

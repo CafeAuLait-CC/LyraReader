@@ -164,7 +164,10 @@ extension ReaderChecks {
         require(model.statusText?.contains("\(milliseconds) ms.") == true,
                 "the result text shows the round-trip duration")
 
-        let plan = try service.prepare(settings)
+        let neutral = try service.prepare(settings)
+        require(neutral.parts.allSatisfy { $0.wireBody.isEmpty },
+                "the connection-test plan does not pre-encode a body")
+        let plan = try AIPlanWire.render(neutral, connection: .apiKey)
         require(plan.model == "resolved-connection-model",
                 "the connection-test plan carries the trimmed model name")
         require(plan.parts.count == 1, "the connection test is one request")

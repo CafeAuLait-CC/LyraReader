@@ -371,12 +371,13 @@ fn request_matches_the_preview_and_streams_split_sse() {
     );
     assert_eq!(recorded.header("content-type"), Some("application/json"));
     assert_eq!(recorded.header("accept"), Some("text/event-stream"));
+    let previewed = plan.chat_completions_body(&plan.parts[0]);
     assert_eq!(
         String::from_utf8(recorded.body).unwrap(),
-        plan.parts[0].wire_body,
+        previewed,
         "the bytes on the wire must be exactly the previewed body"
     );
-    assert!(plan.parts[0].wire_body.contains("\"stream\":true"));
+    assert!(previewed.contains("\"stream\":true"));
 }
 
 #[test]
@@ -418,7 +419,7 @@ fn connection_test_streams_one_ping_and_sends_no_document_text() {
     assert_eq!(recorded.path, "/v1/chat/completions");
     assert_eq!(
         String::from_utf8(recorded.body.clone()).unwrap(),
-        plan.parts[0].wire_body,
+        plan.chat_completions_body(&plan.parts[0]),
         "the bytes on the wire must be exactly the previewed body"
     );
     let body: serde_json::Value = serde_json::from_slice(&recorded.body).unwrap();
@@ -790,7 +791,7 @@ fn tls_streaming_round_trip_with_an_injected_ca() {
     assert_eq!(recorded.header("authorization"), Some(expected.as_str()));
     assert_eq!(
         String::from_utf8(recorded.body).unwrap(),
-        plan.parts[0].wire_body
+        plan.chat_completions_body(&plan.parts[0])
     );
 }
 

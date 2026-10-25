@@ -147,9 +147,14 @@ extension ReaderChecks {
                 "a new session reuses the content-matched prior without another request")
         let wrapped = DocumentKnowledgeService(base: service, knowledge: restored, context: context,
             sourceURL: source, cacheDocumentURL: source)
-        let plan = try await wrapped.prepare(AIMakePlanRequest(action: .documentChat, currentPage: 1,
+        let neutralPlan = try await wrapped.prepare(AIMakePlanRequest(action: .documentChat, currentPage: 1,
             selection: nil, question: card.attachment.text, language: nil, settings: try settings.providerSettings()))
-        require(plan.parts[0].userPrompt.contains(prior), "document chat receives the shared prior as context")
+        require(neutralPlan.parts[0].userPrompt.contains(prior), "document chat receives the shared prior as context")
+        require(neutralPlan.parts.allSatisfy { $0.wireBody.isEmpty },
+                "enrichment updates the neutral plan before a transport body is built")
+        require(neutralPlan.parts[0].systemPrompt.hasSuffix("cite supported source pages and state uncertainty."),
+                "the neutral plan carries the enriched system context")
+        let plan = try AIPlanWire.render(neutralPlan, connection: .apiKey)
         let body = try JSONSerialization.jsonObject(with: Data(plan.parts[0].wireBody.utf8)) as! [String: Any]
         let messages = body["messages"] as! [[String: Any]]
         require(messages[0]["content"] as? String == plan.parts[0].systemPrompt,

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use lyra_reader_ai::chat::{ReasoningEncoding, ReasoningMode};
+use lyra_reader_ai::chat::{ChatTransport, ReasoningEncoding, ReasoningMode};
 use lyra_reader_ai::openai::{
     CancellationToken, ClientConfig, RequestSpec, RunEvent, StreamDiagnostics, TokenUsage,
     Transport, build_request_spec, default_transport, run_plan_with_transport,
@@ -283,7 +283,9 @@ fn prepare(args: &ProbeArgs) -> Result<PreparedProbe, String> {
         Some(path) => Some(load_png(path)?),
         None => None,
     };
-    let plan = plan_for(args, image.clone()).map_err(|error| error.to_string())?;
+    let plan = plan_for(args, image.clone())
+        .map_err(|error| error.to_string())?
+        .rendered(ChatTransport::ChatCompletions);
     let key = args.api_key.clone().unwrap_or_default();
     let spec =
         build_request_spec(&plan, &plan.parts[0], &key).map_err(|error| error.to_string())?;
@@ -391,11 +393,7 @@ fn write_preview(
         sink,
         "  body     : {} bytes of JSON (stream: {})",
         spec.body.len(),
-        if plan.parts[0].wire_body.contains("\"stream\":true") {
-            "yes"
-        } else {
-            "no"
-        }
+        if plan.wire.stream { "yes" } else { "no" }
     )?;
     for (name, value) in &spec.headers {
         if name.eq_ignore_ascii_case("authorization") {
@@ -583,7 +581,10 @@ mod tests {
         assert!(body["messages"][1].get("image_url").is_none());
         assert_eq!(
             prepared.spec.body,
-            prepared.plan.parts[0].wire_body.as_bytes(),
+            prepared
+                .plan
+                .chat_completions_body(&prepared.plan.parts[0])
+                .as_bytes(),
             "the bytes on the wire must be exactly the previewed body"
         );
         assert!(prepared.plan.is_local);

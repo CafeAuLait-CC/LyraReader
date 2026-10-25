@@ -102,7 +102,7 @@ public final class AIConnectionTestModel: ObservableObject {
 
         let plan: AiPlanRecord
         do {
-            plan = try service.prepare(settings)
+            plan = try AIPlanWire.render(service.prepare(settings), connection: .apiKey)
         } catch {
             status = .failure(message: AIReadableError.message(error), hint: nil)
             return
