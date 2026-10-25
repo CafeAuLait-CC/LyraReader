@@ -180,6 +180,10 @@ package enum PageTearRendering {
         }
         let localTop = placement.topPt - pageTopPt
         let localBottom = localTop + placement.heightPt
+        // Later pages in this column already include the gap in their display placement.
+        // Only quads intersecting this page's paper band belong to its tear; shifting every
+        // quad below the split moves later paper a second time, away from its border.
+        guard localTop < pageHeightPt - 0.001, localBottom > 0.001 else { return [page] }
         let split = min(max(tear.splitPt, 0), pageHeightPt)
         guard split > 0.01, split < pageHeightPt - 0.01, placement.heightPt > 0.01 else {
             return [page]
