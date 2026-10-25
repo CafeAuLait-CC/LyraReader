@@ -1034,6 +1034,20 @@ extension ReaderChecks {
                     >= (minimumToolbar["toolbar.fillSign"]?.width ?? 0),
                 "hiding the label does not make the button wider at the minimum window")
 
+        // The Annotate button is a mode toggle too: it keeps its icon and text and has no
+        // trailing chevron, so the label is the button's last content. The tail after the text
+        // is just the label padding (6) plus the button style's padding (3); the chevron and its
+        // 6 pt gap would add ~12 more.
+        let wideAnnotateButton = wideToolbar["toolbar.annotate"]
+        let wideAnnotateLabel = wideToolbar["toolbar.annotate.label"]
+        require(wideAnnotateButton != nil && wideAnnotateLabel != nil,
+                "the Annotate button and its text are measurable")
+        if let button = wideAnnotateButton, let label = wideAnnotateLabel {
+            let tail = button.maxX - label.maxX
+            require(tail <= 12,
+                    "the Annotate button ends at its text with no chevron (tail \(tail) pt)")
+        }
+
         // The Lyra button keeps its icon and text but has no trailing chevron. The label is the
         // button's last content, so the tail after the text is just the label padding (6) plus
         // the button style's padding (3) - the chevron and its 6 pt gap would add ~12 more.
@@ -1073,6 +1087,27 @@ extension ReaderChecks {
         require(toolbarSource.contains("toggleFillAndSign()")
                     && toolbarSource.contains("toggleExport()"),
                 "the primary toolbar has buttons for both new rows")
+        // The Annotate button's own source: icon, text, selected style and tooltip, and no
+        // chevron between the label and the button's trailing edge.
+        if let start = toolbarSource.range(
+                of: "Button { state.toggleAnnotationTools() }")?.lowerBound,
+           let end = toolbarSource.range(
+                of: ".background(AnnotationToolbarFrameReader(id: \"toolbar.annotate\"))",
+                range: start..<toolbarSource.endIndex)?.upperBound {
+            let annotateButtonSource = toolbarSource[start..<end]
+            require(annotateButtonSource.contains("Image(systemName: \"highlighter\")")
+                        && annotateButtonSource.contains("Text(\"Annotate\")"),
+                    "the Annotate button keeps its icon and text")
+            require(annotateButtonSource.contains(
+                        ".buttonStyle(LyraReaderToolStyle(selected: state.annotationToolsVisible"),
+                    "the Annotate button keeps its selected state")
+            require(annotateButtonSource.contains(".help(\"Show annotation tools\")"),
+                    "the Annotate button keeps its tooltip")
+            require(!annotateButtonSource.contains("chevron"),
+                    "the Annotate button has no chevron glyph or its gap")
+        } else {
+            require(false, "the Annotate toolbar button source is locatable")
+        }
         // The Lyra button's own source: icon, text, and no chevron between the label and the
         // button's trailing edge.
         if let start = toolbarSource.range(of: "Button { state.toggleAITools() }")?.lowerBound,

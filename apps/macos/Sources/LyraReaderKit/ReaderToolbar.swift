@@ -197,6 +197,8 @@ struct ReaderToolbar: View {
                 tool("Zoom in (⌘+)", "plus") { state.zoomIn() }
             }.disabled(state.pageOverviewVisible)
             separator
+            // Annotate is a mode toggle, not a menu: the icon and label are the whole button,
+            // and the label is its last content (no trailing chevron, like Lyra).
             Button { state.toggleAnnotationTools() } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "highlighter")
@@ -204,7 +206,6 @@ struct ReaderToolbar: View {
                         Text("Annotate").modifier(ReaderToolbarFont(id: "toolbar.annotate.label", role: .main))
                             .background(AnnotationToolbarFrameReader(id: "toolbar.annotate.label"))
                     }
-                    Image(systemName: "chevron.down").font(.system(size: 8, weight: .bold))
                 }.padding(.horizontal, 6)
             }
             .buttonStyle(LyraReaderToolStyle(selected: state.annotationToolsVisible && !state.pageOverviewVisible))
