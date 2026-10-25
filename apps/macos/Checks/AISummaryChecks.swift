@@ -139,7 +139,7 @@ extension ReaderChecks {
             to: outlined
         )
         let truncatedFixture = scratch.appendingPathComponent("long-abstract.pdf")
-        try writeLayeredFixture(to: truncatedFixture, pageCount: 20)
+        try writeLayeredFixture(to: truncatedFixture, pageCount: 120)
         let failureFixture = scratch.appendingPathComponent("failure.pdf")
         try FileManager.default.copyItem(at: outlined, to: failureFixture)
         let cancelFixture = scratch.appendingPathComponent("cancel.pdf")
@@ -225,6 +225,14 @@ extension ReaderChecks {
                 "the previewed abstract is a streaming request body")
         require(abstractPart?.wireBody.contains("sk-layered-not-real") == false,
                 "the previewed abstract body never contains the key")
+        require(abstractPart?.wireBody.contains("[Page 1]") == true
+                    && abstractPart?.wireBody.contains("[Page 3]") == true,
+                "the short document's body labels its only page range")
+        require(abstractPart?.wireBody.contains("beginning of the document") == false,
+                "a short document has no second (tail) window")
+        require(abstractPreview.units[0].pages == [1, 2, 3],
+                "the short document sends one contiguous range "
+                    + "(\(abstractPreview.units[0].pages))")
         model.send()
         try await eventually("the abstract request finishes", {
             model.phase == .finished
@@ -367,8 +375,8 @@ extension ReaderChecks {
                 "editing one section sends exactly one new request (got \(recording.started.count) total)")
         recording.fingerprintOverride = nil
 
-        // 7. Truncation: a twenty-page document's abstract is cut at page 12 and says so with
-        // the real range.
+        // 7. Both ends: a 120-page document's abstract sends the beginning and the end in one
+        // request, names both ranges, and the conclusion on the last page is in the body.
         let longDocument = try engine.openDocument(at: truncatedFixture)
         let longContext = AIReaderContext(
             documentKey: truncatedFixture.standardizedFileURL.path,
@@ -377,7 +385,7 @@ extension ReaderChecks {
             currentPage: 1,
             selection: nil
         )
-        require(longDocument.pageCount == 20, "the truncation fixture has twenty pages")
+        require(longDocument.pageCount == 120, "the truncation fixture has 120 pages")
         let longService = LayeredSummaryRecordingService(
             base: RustAIChatService(engine: engine, useMockProvider: true)
         )
@@ -389,39 +397,65 @@ extension ReaderChecks {
             documentURL: truncatedFixture
         )
         try await eventually("the long document's coverage is inspected", {
-            !longModel.isRefreshing && longModel.entries.count == 23
+            !longModel.isRefreshing && longModel.entries.count == 133
                 && (longModel.entries(for: .abstract).first?.textHash.isEmpty == false)
         })
         let abstractRow = longModel.entries(for: .abstract)[0]
         require(abstractRow.truncated, "the abstract coverage is marked truncated")
-        require(abstractRow.coveredPageEnd == 12,
-                "the abstract sampled pages 1-12 (got \(abstractRow.coveredPageEnd))")
-        require(abstractRow.note == "Summarised from pages 1-12 of 20.",
-                "the truncation note names the real page range (\(abstractRow.note ?? "nil"))")
-        require(abstractRow.pageSpanLabel(pageCount: 20) == "Pages 1-12 of 20",
-                "the row names its page span (\(abstractRow.pageSpanLabel(pageCount: 20)))")
+        require(abstractRow.pages == Array(1...12) + Array(109...120),
+                "the abstract sampled both ends (got \(abstractRow.pages))")
+        require(abstractRow.coveredPageEnd == 120,
+                "the abstract's last sent page is the document's last page "
+                    + "(got \(abstractRow.coveredPageEnd))")
+        require(abstractRow.note == "Summarised from pages 1-12 and 109-120 of 120.",
+                "the note names both ranges (\(abstractRow.note ?? "nil"))")
+        require(abstractRow.pageSpanLabel(pageCount: 120) == "Pages 1-12 and 109-120 of 120",
+                "the row names both ranges (\(abstractRow.pageSpanLabel(pageCount: 120)))")
+        require(abstractRow.pageCountLabel(documentPageCount: 120) == "24 of 120 pages",
+                "the row counts the sent pages, not the gap "
+                    + "(\(abstractRow.pageCountLabel(documentPageCount: 120)))")
         await longModel.prepare(.abstract)
-        try await eventually("the truncated abstract is previewed", {
+        try await eventually("the two-window abstract is previewed", {
             longModel.phase == .preview && longModel.preview != nil
         })
         let longPreview = longModel.preview
         require(longPreview?.units.first?.truncated == true,
                 "the preview's unit is marked truncated")
-        require(longPreview?.units.first?.note == "Summarised from pages 1-12 of 20.",
-                "the preview carries the truncation note")
+        require(longPreview?.units.first?.note == "Summarised from pages 1-12 and 109-120 of 120.",
+                "the preview carries the two-range note")
+        require(longPreview?.note.contains("from each end") == true,
+                "the preview states the two-window sampling rule")
+        require(longPreview?.units.first?.textHash == abstractRow.textHash,
+                "the previewed cache key is the inspected one")
+        let longPart = longPreview?.units.first?.plan?.parts.first
+        require(longPart?.wireBody.contains("[Page 1]") == true,
+                "the request body labels the first page")
+        require(longPart?.wireBody.contains("[Page 120]") == true,
+                "the request body labels the last page")
+        require(longPart?.wireBody.contains("CONCLUSION") == true,
+                "the last page's conclusion is in the request body")
+        require(longPart?.wireBody.contains("[Pages 1-12: beginning of the document]") == true,
+                "the request body labels the beginning window")
+        require(longPart?.wireBody.contains("[Pages 109-120: end of the document]") == true,
+                "the request body labels the end window")
+        require(longPart?.wireBody.contains("[Page 60]") == false,
+                "the request body does not include the unsent middle")
         longModel.send()
-        try await eventually("the truncated abstract finishes", {
+        try await eventually("the two-window abstract finishes", {
             longModel.phase == .finished
                 && longModel.entries(for: .abstract).first?.state == .ready
         })
         require(longService.started.count == 1,
-                "the truncated abstract is still one request")
-        require(longModel.entries(for: .abstract)[0].note == "Summarised from pages 1-12 of 20.",
-                "the finished row keeps the truncation note")
-        require(longModel.entries(for: .sections).map(\.pageStart) == [1, 11],
+                "the two-window abstract is still one request")
+        require(longModel.entries(for: .abstract)[0].note
+                    == "Summarised from pages 1-12 and 109-120 of 120.",
+                "the finished row keeps the two-range note")
+        let expectedSectionStarts = stride(from: 1, through: 111, by: 10).map { $0 }
+        let expectedSectionEnds = stride(from: 10, through: 120, by: 10).map { $0 }
+        require(longModel.entries(for: .sections).map(\.pageStart) == expectedSectionStarts,
                 "without an outline the section layer falls back to page ranges ("
                     + "\(longModel.entries(for: .sections).map(\.pageStart)))")
-        require(longModel.entries(for: .sections).map(\.pageEnd) == [10, 20],
+        require(longModel.entries(for: .sections).map(\.pageEnd) == expectedSectionEnds,
                 "the fallback page ranges cover the document ("
                     + "\(longModel.entries(for: .sections).map(\.pageEnd)))")
 
@@ -562,7 +596,7 @@ extension ReaderChecks {
 
         print("AI-LAYERED abstract_requests=1 section_requests=8 page_requests=3 "
             + "reopen_requests=0 language_requests=1 edited_section_requests=1 "
-            + "truncated_pages=1-12/20 failed_rows=1 cancelled_rows=1 "
+            + "abstract_pages=1-12+109-120/120 failed_rows=1 cancelled_rows=1 "
             + "cache=\(cacheFile.lastPathComponent)")
     }
 
@@ -581,8 +615,8 @@ extension ReaderChecks {
         )
     }
 
-    /// A twenty-page PDF with a single text line per page. Long enough that the abstract page
-    /// budget (12) cuts it.
+    /// A PDF with a single text line per page. The conclusion exists only on the last page, so
+    /// the two-window abstract has to send the end of the document to see it.
     private static func writeLayeredFixture(to url: URL, pageCount: Int) throws {
         var mediaBox = CGRect(x: 0, y: 0, width: 612, height: 792)
         guard let consumer = CGDataConsumer(url: url as CFURL),
@@ -602,7 +636,9 @@ extension ReaderChecks {
             context.setFillColor(NSColor.white.cgColor)
             context.fill(mediaBox)
             context.setFillColor(NSColor.black.cgColor)
-            let line = "Page \(page) studies a separate result. The evaluation improved for method \(page)."
+            let line = page == pageCount
+                ? "Page \(page) CONCLUSION: the result holds only on the last page."
+                : "Page \(page) studies a separate result. The evaluation improved for method \(page)."
             let attributed = NSAttributedString(string: line, attributes: attributes)
             context.textPosition = CGPoint(x: 72, y: 720)
             CTLineDraw(CTLineCreateWithAttributedString(attributed), context)

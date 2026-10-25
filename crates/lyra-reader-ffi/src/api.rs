@@ -28,9 +28,10 @@ use lyra_reader_ai::chat::{
     SUMMARY_ABSTRACT_MAX_CHARS, SUMMARY_ABSTRACT_MAX_PAGES, SUMMARY_MAX_CONCURRENT_REQUESTS,
     SUMMARY_MAX_REQUESTS_PER_BATCH, SUMMARY_PAGE_MAX_CHARS, SUMMARY_SECTION_MAX_CHARS,
     SelectionRange as AiSelectionRange, SourceRect as AiSourceRect, SummaryLayer,
-    SummaryLayerRequest, SummaryUnitRequest, build_connection_test_plan, build_document_chat_plan,
-    build_document_knowledge_plan, build_merge_plan, build_plan, build_region_question_plan,
-    build_summary_layer, inspect_base_url, inspect_summary_layer, validate_model,
+    SummaryLayerRequest, SummaryUnitRequest, abstract_sample_page_indices,
+    build_connection_test_plan, build_document_chat_plan, build_document_knowledge_plan,
+    build_merge_plan, build_plan, build_region_question_plan, build_summary_layer,
+    inspect_base_url, inspect_summary_layer, summary_coverage_note, validate_model,
 };
 use lyra_reader_ai::openai::{
     CancellationToken, RunEvent, StreamDiagnostics, TokenUsage, preview_headers, run_plan,
@@ -2962,17 +2963,21 @@ impl LyraReaderDocument {
             .units
             .iter()
             .zip(coverages)
-            .map(|(unit, coverage)| AiSummaryFingerprintRecord {
-                index: unit.index,
-                kind: summary_layer_record(unit.kind),
-                requested_page_start: unit.page_start,
-                requested_page_end: unit.page_end,
-                covered_page_start: coverage.covered_page_start,
-                covered_page_end: coverage.covered_page_end,
-                pages: coverage.pages,
-                truncated: coverage.truncated,
-                text_hash: coverage.text_hash,
-                characters: coverage.characters,
+            .map(|(unit, coverage)| {
+                let note = summary_coverage_note(layer, unit, &coverage, page_count);
+                AiSummaryFingerprintRecord {
+                    index: unit.index,
+                    kind: summary_layer_record(unit.kind),
+                    requested_page_start: unit.page_start,
+                    requested_page_end: unit.page_end,
+                    covered_page_start: coverage.covered_page_start,
+                    covered_page_end: coverage.covered_page_end,
+                    pages: coverage.pages,
+                    truncated: coverage.truncated,
+                    text_hash: coverage.text_hash,
+                    characters: coverage.characters,
+                    note,
+                }
             })
             .collect())
     }
@@ -3016,8 +3021,8 @@ impl LyraReaderDocument {
     }
 }
 
-/// Page text for exactly the pages a layer can send. The abstract reads only its bounded
-/// prefix; section and page units read their own ranges. Deduplicated, so a 20-section
+/// Page text for exactly the pages a layer can send. The abstract reads only its two bounded
+/// end windows; section and page units read their own ranges. Deduplicated, so a 20-section
 /// document extracts each page once.
 fn summary_page_texts(
     document: &LyraReaderDocument,
@@ -3028,9 +3033,7 @@ fn summary_page_texts(
     let mut needed = std::collections::BTreeSet::new();
     match layer {
         SummaryLayer::Abstract => {
-            for page in 0..page_count.min(SUMMARY_ABSTRACT_MAX_PAGES as u32) {
-                needed.insert(page);
-            }
+            needed.extend(abstract_sample_page_indices(page_count));
         }
         SummaryLayer::Section | SummaryLayer::Page => {
             for unit in units {
@@ -5741,7 +5744,8 @@ pub struct AiSummaryFingerprintRecord {
     /// The pages the row asked for (1-based, inclusive).
     pub requested_page_start: u32,
     pub requested_page_end: u32,
-    /// The pages actually sent (1-based, inclusive).
+    /// The pages actually sent (1-based, inclusive). For a long document's abstract this is the
+    /// beginning window followed by the end window, with the middle absent.
     pub covered_page_start: u32,
     pub covered_page_end: u32,
     pub pages: Vec<u32>,
@@ -5749,6 +5753,9 @@ pub struct AiSummaryFingerprintRecord {
     /// SHA-256 of exactly the covered text. The cache key includes this.
     pub text_hash: String,
     pub characters: u64,
+    /// The honest coverage line, identical to the preview's ("Summarised from pages 1-12 and
+    /// 109-120 of 120."). `None` when the unit has no text.
+    pub note: Option<String>,
 }
 
 /// One previewable request of one layer.
@@ -5763,12 +5770,14 @@ pub struct AiSummaryUnitRecord {
     pub page_start: u32,
     pub page_end: u32,
     /// The last page actually sent; smaller than `page_end` when the budget cut the unit.
+    /// For an abstract that samples both ends this is the end window's last page; `pages`
+    /// lists the beginning window followed by the end window.
     pub covered_page_end: u32,
     pub pages: Vec<u32>,
     pub truncated: bool,
     pub text_hash: String,
     pub characters: u64,
-    /// The honest coverage line ("Summarised from pages 1-12 of 20.").
+    /// The honest coverage line ("Summarised from pages 1-12 and 109-120 of 120.").
     pub note: Option<String>,
     /// Exactly what one request will send. `None` when the unit has no extractable text.
     pub plan: Option<AiPlanRecord>,
@@ -5791,7 +5800,10 @@ pub struct AiSummaryPlanRecord {
 /// The bounds the panel states before anything is sent.
 #[derive(Debug, Clone, Copy, uniffi::Record)]
 pub struct AiSummaryLimitsRecord {
+    /// Per end of the document: the abstract reads up to this many pages from the beginning
+    /// and the same number from the end.
     pub abstract_max_pages: u32,
+    /// Per end, like `abstract_max_pages`.
     pub abstract_max_chars: u64,
     pub section_max_chars: u64,
     pub page_max_chars: u64,

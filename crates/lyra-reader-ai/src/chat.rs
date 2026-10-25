@@ -2754,11 +2754,11 @@ Keep the selected region central. Connect it to the related source passages when
 
 // ── Layered summaries ────────────────────────────────────────────────────────────────────────
 //
-// A navigable summary has three levels. The abstract reads a bounded sample of the document
-// (never every page first), each section reads its own outline range, and each page reads one
-// page. Every unit is one independently previewed request, so a failure or a cancel costs one
-// unit and the completed units stay. Each unit also reports a hash of the exact text it sends:
-// the shell stores that hash with the summary in the document cache, which is what makes an
+// A navigable summary has three levels. The abstract reads a bounded sample from both ends of
+// the document (never every page first), each section reads its own outline range, and each page
+// reads one page. Every unit is one independently previewed request, so a failure or a cancel
+// costs one unit and the completed units stay. Each unit also reports a hash of the exact text it
+// sends: the shell stores that hash with the summary in the document cache, which is what makes an
 // edited section invalidate only its own entry.
 
 /// One level of the layered summary.
@@ -2790,8 +2790,8 @@ impl SummaryLayer {
         }
     }
 
-    /// The largest number of pages the abstract sample may read. Sections and pages are bounded
-    /// by their own range instead.
+    /// The largest number of pages the abstract sample may read from each end. Sections and
+    /// pages are bounded by their own range instead.
     pub fn page_budget(self) -> Option<usize> {
         match self {
             Self::Abstract => Some(SUMMARY_ABSTRACT_MAX_PAGES),
@@ -2800,11 +2800,12 @@ impl SummaryLayer {
     }
 }
 
-/// The abstract reads the first pages, not the whole document. Twelve pages at typical paper
-/// density is enough for a research question, an approach and a headline result, and it keeps
-/// the abstract level one request even for a 300-page book.
+/// The abstract reads both ends, never the middle: at most twelve pages from the beginning and
+/// the same number from the end. Twelve pages at typical paper density is enough for a research
+/// question, an approach and a headline result; the tail catches a conclusion that only appears
+/// on the last page. It stays one request even for a 300-page book.
 pub const SUMMARY_ABSTRACT_MAX_PAGES: usize = 12;
-/// Character bound for the abstract sample (the page cap binds first at normal density).
+/// Character bound for each end's window (the page cap binds first at normal density).
 pub const SUMMARY_ABSTRACT_MAX_CHARS: usize = 48_000;
 /// Character bound for one section request. A long section is cut at a page boundary and says so.
 pub const SUMMARY_SECTION_MAX_CHARS: usize = 64_000;
@@ -2856,15 +2857,18 @@ pub struct SummaryCoverage {
     pub pages: Vec<u32>,
     /// 1-based page of the first sent character.
     pub covered_page_start: u32,
-    /// 1-based page of the last sent character.
+    /// 1-based page of the last sent character. When the abstract samples both ends this is the
+    /// last page of the end window, not a claim that every page in between was sent; `pages`
+    /// lists exactly what was.
     pub covered_page_end: u32,
-    /// True when the unit wanted more pages than the bound allowed.
+    /// True when any page of the unit was left out or any page text was cut at a bound.
     pub truncated: bool,
-    /// The covered text exactly as the request prompt embeds it, including `[Page N]` headings.
+    /// The covered text exactly as the request prompt embeds it, including `[Page N]` headings
+    /// and, for a two-window abstract, the range labels and the omitted-range marker.
     pub text: String,
     /// SHA-256 (hex) of `text`.
     pub text_hash: String,
-    /// Characters in `text`.
+    /// Characters of page text in `text` (the range labels are not counted).
     pub characters: u64,
 }
 
@@ -2873,7 +2877,8 @@ pub struct SummaryCoverage {
 pub struct SummaryUnitPlan {
     pub unit: SummaryUnitRequest,
     pub coverage: SummaryCoverage,
-    /// The honest coverage line, for the row and the preview ("Summarised from pages 1-12 of 20.").
+    /// The honest coverage line, for the row and the preview ("Summarised from pages 1-12 and
+    /// 109-120 of 120.").
     pub note: Option<String>,
     /// Present unless this unit has no extractable text.
     pub plan: Option<ChatPlan>,
@@ -2914,6 +2919,49 @@ fn empty_coverage(unit: &SummaryUnitRequest) -> SummaryCoverage {
     }
 }
 
+/// The 0-based page positions an abstract request may read. Both ends are bounded, so a caller
+/// can extract exactly this superset without touching the middle of a long document. The
+/// coverage builder still drops empty pages and stops at the character bound.
+pub fn abstract_sample_page_indices(page_count: u32) -> Vec<u32> {
+    let count = page_count as usize;
+    let head = SUMMARY_ABSTRACT_MAX_PAGES.min(count);
+    let tail_start = count.saturating_sub(SUMMARY_ABSTRACT_MAX_PAGES.min(count));
+    let mut indices: Vec<u32> = (0..head as u32).collect();
+    for page in tail_start..count {
+        if page >= head {
+            indices.push(page as u32);
+        }
+    }
+    indices
+}
+
+/// Collapse an ascending page list into inclusive ranges. Two windows of a long document become
+/// `[(1, 12), (109, 120)]`, which the notes render as "1-12 and 109-120".
+fn page_ranges(pages: &[u32]) -> Vec<(u32, u32)> {
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    for &page in pages {
+        match ranges.last_mut() {
+            Some((_, end)) if page == *end + 1 => *end = page,
+            _ => ranges.push((page, page)),
+        }
+    }
+    ranges
+}
+
+fn page_ranges_label(ranges: &[(u32, u32)]) -> String {
+    ranges
+        .iter()
+        .map(|(start, end)| {
+            if start == end {
+                start.to_string()
+            } else {
+                format!("{start}-{end}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
 /// Collect exactly the text one unit sends. The abstract stops at a page and character bound;
 /// a section cuts at a page boundary when its budget runs out; a page cuts one page's text.
 fn summary_coverage(
@@ -2949,37 +2997,120 @@ fn summary_coverage(
 
     match unit.kind {
         SummaryLayer::Abstract => {
-            // The abstract is deliberately a bounded prefix: one request, and an honest
-            // "summarised from pages 1-N of M" line when the document is longer.
-            let mut included = 0usize;
-            for page_index in 0..page_count {
-                if included >= SUMMARY_ABSTRACT_MAX_PAGES {
-                    truncated = true;
-                    break;
-                }
-                let remaining = SUMMARY_ABSTRACT_MAX_CHARS.saturating_sub(characters);
+            // The abstract deliberately samples both ends. The head keeps the opening pages;
+            // the tail is a second, equally bounded window that starts after the head, so a
+            // conclusion on the last page is sent even when the middle is not. Both windows
+            // share one request, and the labels say which parts of the document they are.
+            let head_limit = SUMMARY_ABSTRACT_MAX_PAGES.min(page_count as usize);
+            let mut head_body = String::new();
+            let mut head_pages = Vec::new();
+            let mut head_characters = 0usize;
+            // 0-based, exclusive: how many page positions the head window claimed.
+            let mut head_end = 0usize;
+            let mut head_cut = false;
+            for page_index in 0..head_limit {
+                let remaining = SUMMARY_ABSTRACT_MAX_CHARS.saturating_sub(head_characters);
                 if remaining == 0 {
-                    truncated = true;
+                    head_cut = true;
                     break;
                 }
-                let (count, cut) = push_page(page_index, remaining, &mut body, &mut used_pages);
+                head_end = page_index + 1;
+                let (count, cut) = push_page(
+                    page_index as u32,
+                    remaining,
+                    &mut head_body,
+                    &mut head_pages,
+                );
                 if count == 0 {
                     continue;
                 }
-                if covered_start == 0 {
-                    covered_start = page_index + 1;
-                }
-                covered_end = page_index + 1;
-                characters += count;
-                included += 1;
+                head_characters += count;
                 if cut {
-                    truncated = true;
+                    head_cut = true;
                     break;
                 }
             }
-            if covered_end < page_count {
-                truncated = true;
+
+            let mut tail_body = String::new();
+            let mut tail_pages = Vec::new();
+            let mut tail_characters = 0usize;
+            let mut tail_cut = false;
+            if head_end < page_count as usize {
+                // The tail is the last page window, never a copy of the head: start after it.
+                let nominal_start =
+                    page_count as usize - SUMMARY_ABSTRACT_MAX_PAGES.min(page_count as usize);
+                let tail_start = nominal_start.max(head_end);
+                let mut pieces: Vec<(u32, String, bool)> = Vec::new();
+                for page_index in (tail_start..page_count as usize).rev() {
+                    let remaining = SUMMARY_ABSTRACT_MAX_CHARS.saturating_sub(tail_characters);
+                    if remaining == 0 {
+                        tail_cut = true;
+                        break;
+                    }
+                    let Some(page) = pages.get(page_index).and_then(|page| *page) else {
+                        continue;
+                    };
+                    let text = page_context_text(page);
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    let (piece, cut) = truncate_chars(&text, remaining);
+                    tail_characters += piece.chars().count();
+                    pieces.push((page_index as u32, piece, cut));
+                    if cut {
+                        tail_cut = true;
+                        break;
+                    }
+                }
+                pieces.reverse();
+                for (page_index, piece, _) in &pieces {
+                    tail_body.push_str(&format!("[Page {}]\n{}\n\n", page_index + 1, piece));
+                    tail_pages.push(page_index + 1);
+                }
             }
+
+            let head_first = head_pages.first().copied().unwrap_or(0);
+            let head_last = head_pages.last().copied().unwrap_or(0);
+            let tail_first = tail_pages.first().copied().unwrap_or(0);
+            let tail_last = tail_pages.last().copied().unwrap_or(0);
+            if head_pages.is_empty() {
+                body = tail_body;
+            } else if tail_pages.is_empty() {
+                body = head_body;
+            } else if tail_first == head_last + 1 {
+                // The two windows meet: this is one contiguous range, so do not label it as two
+                // parts or imply a gap. A document that fits in both windows lands here.
+                body = head_body;
+                body.push_str(&tail_body);
+            } else {
+                let head_label = if head_first == head_last {
+                    format!("Page {head_first}: beginning of the document")
+                } else {
+                    format!("Pages {head_first}-{head_last}: beginning of the document")
+                };
+                body.push_str(&format!("[{head_label}]\n\n"));
+                body.push_str(&head_body);
+                body.push_str(&format!(
+                    "[Pages {}-{} omitted from this sample]\n\n",
+                    head_last + 1,
+                    tail_first - 1
+                ));
+                let tail_label = if tail_first == tail_last {
+                    format!("Page {tail_first}: end of the document")
+                } else {
+                    format!("Pages {tail_first}-{tail_last}: end of the document")
+                };
+                body.push_str(&format!("[{tail_label}]\n\n"));
+                body.push_str(&tail_body);
+            }
+
+            used_pages = head_pages;
+            used_pages.extend(tail_pages);
+            characters = head_characters + tail_characters;
+            covered_start = used_pages.first().copied().unwrap_or(0);
+            covered_end = used_pages.last().copied().unwrap_or(0);
+            // A blank page between the windows is a genuine gap too: it has no text to send.
+            truncated = head_cut || tail_cut || used_pages.len() < page_count as usize;
         }
         SummaryLayer::Section => {
             if unit.page_start == 0 || unit.page_end < unit.page_start || unit.page_end > page_count
@@ -3050,7 +3181,9 @@ fn summary_coverage(
     })
 }
 
-fn coverage_note(
+/// The honest coverage line for one unit. Public so the FFI fingerprint (which the shell uses
+/// to rebuild cached rows) carries exactly the same sentence as the preview.
+pub fn summary_coverage_note(
     layer: SummaryLayer,
     unit: &SummaryUnitRequest,
     coverage: &SummaryCoverage,
@@ -3058,13 +3191,17 @@ fn coverage_note(
 ) -> Option<String> {
     match layer {
         SummaryLayer::Abstract => {
-            if coverage.truncated {
-                Some(format!(
-                    "Summarised from pages {}-{} of {}.",
-                    coverage.covered_page_start, coverage.covered_page_end, page_count
-                ))
-            } else {
+            let ranges = page_ranges(&coverage.pages);
+            if !coverage.truncated && ranges.len() == 1 {
                 Some(format!("Covers all {page_count} pages."))
+            } else if ranges.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "Summarised from pages {} of {}.",
+                    page_ranges_label(&ranges),
+                    page_count
+                ))
             }
         }
         SummaryLayer::Section => {
@@ -3137,12 +3274,32 @@ fn summary_user_prompt(
 ) -> String {
     let coverage_sentence = match request.layer {
         SummaryLayer::Abstract => {
+            let ranges = page_ranges(&coverage.pages);
             if coverage.truncated {
-                format!(
-                    "Only pages {}-{} of {} are supplied here; the later pages were not sent. Do \
-                     not imply you read them.",
-                    coverage.covered_page_start, coverage.covered_page_end, request.page_count
-                )
+                match ranges.as_slice() {
+                    [(head_start, head_end), (tail_start, tail_end)] => format!(
+                        "Only pages {head_start}-{head_end} (the beginning) and \
+                         {tail_start}-{tail_end} (the end) of {} are supplied here; the pages \
+                         between them were not sent. Do not imply you read them.",
+                        request.page_count
+                    ),
+                    [(start, end)] if start == end => format!(
+                        "Only page {start} of {} is supplied here; the other pages were not sent. \
+                         Do not imply you read them.",
+                        request.page_count
+                    ),
+                    [(start, end)] => format!(
+                        "Only pages {start}-{end} of {} are supplied here; the pages outside that \
+                         range were not sent. Do not imply you read them.",
+                        request.page_count
+                    ),
+                    _ => format!(
+                        "Only pages {} of {} are supplied here; the other pages were not sent. Do \
+                         not imply you read them.",
+                        page_ranges_label(&ranges),
+                        request.page_count
+                    ),
+                }
             } else {
                 format!("All {} pages are supplied here.", request.page_count)
             }
@@ -3242,7 +3399,7 @@ fn build_summary_unit_plan(
         None,
         !stream_options_unsupported(&endpoint.endpoint, &model),
     );
-    let note = coverage_note(request.layer, unit, coverage, request.page_count);
+    let note = summary_coverage_note(request.layer, unit, coverage, request.page_count);
     let primary_page = coverage.pages.first().copied().unwrap_or(1);
     let part = ChatPart {
         index: 0,
@@ -3289,7 +3446,8 @@ fn summary_layer_note(
     let bound = match request.layer {
         SummaryLayer::Abstract => format!(
             "The abstract is one request over at most {SUMMARY_ABSTRACT_MAX_PAGES} pages and \
-             {SUMMARY_ABSTRACT_MAX_CHARS} characters; it never summarises every page first."
+             {SUMMARY_ABSTRACT_MAX_CHARS} characters from each end; a long document's middle is \
+             not sent."
         ),
         SummaryLayer::Section => format!(
             "Each section is one request over at most {SUMMARY_SECTION_MAX_CHARS} characters; a \
@@ -3371,7 +3529,7 @@ pub fn build_summary_layer(request: SummaryLayerRequest) -> Result<SummaryLayerP
             });
             continue;
         }
-        let note = coverage_note(request.layer, unit, &coverage, request.page_count);
+        let note = summary_coverage_note(request.layer, unit, &coverage, request.page_count);
         match build_summary_unit_plan(
             &request,
             unit,
@@ -4687,67 +4845,159 @@ mod tests {
     }
 
     #[test]
-    fn abstract_layer_is_one_bounded_request_and_names_its_page_span() {
-        let pages = summary_pages(20);
+    fn abstract_layer_is_one_bounded_request_and_reads_both_ends() {
+        let long_pages = || {
+            let mut pages = summary_pages(120);
+            pages[119]
+                .text
+                .push_str(" CONCLUSION: the only conclusion is stated on this last page.");
+            pages
+        };
         let request = summary_request(
             SummaryLayer::Abstract,
-            pages,
-            vec![summary_unit(SummaryLayer::Abstract, 1, 20)],
+            long_pages(),
+            vec![summary_unit(SummaryLayer::Abstract, 1, 120)],
             None,
         );
-        let plan = build_summary_layer(request.clone()).expect("abstract plan");
+        let plan = build_summary_layer(request).expect("abstract plan");
         assert_eq!(plan.units.len(), 1);
         let unit = &plan.units[0];
         let chat = unit.plan.as_ref().expect("one request");
-        assert_eq!(chat.parts.len(), 1, "the abstract is one request");
-        assert_eq!(chat.parts[0].pages, (1..=12).collect::<Vec<u32>>());
-        assert_eq!(unit.coverage.covered_page_end, 12);
+        assert_eq!(chat.parts.len(), 1, "the abstract is still one request");
+        assert_eq!(
+            chat.parts[0].pages,
+            (1..=12).chain(109..=120).collect::<Vec<u32>>(),
+            "the request sends the first and last windows, in page order"
+        );
+        assert_eq!(unit.coverage.covered_page_start, 1);
+        assert_eq!(unit.coverage.covered_page_end, 120);
         assert!(unit.coverage.truncated);
         assert_eq!(
             unit.note.as_deref(),
-            Some("Summarised from pages 1-12 of 20.")
+            Some("Summarised from pages 1-12 and 109-120 of 120.")
         );
+        assert_eq!(chat.parts[0].note.as_deref(), unit.note.as_deref());
         assert!(
             plan.note
                 .contains("At most 24 requests per batch and 2 in flight")
         );
         assert!(
-            chat.parts[0]
-                .user_prompt
-                .contains("Only pages 1-12 of 20 are supplied here")
+            plan.note.contains("from each end"),
+            "the preview states the sampling rule"
         );
 
-        // The hash covers exactly the sent text: an edit on page 5 invalidates the entry, an
-        // edit on page 15 (never sent) does not.
-        let mut edited_sent = summary_pages(20);
-        edited_sent[4].text.push_str(" A changed sentence.");
-        let edited_sent = build_summary_layer(summary_request(
-            SummaryLayer::Abstract,
-            edited_sent,
-            vec![summary_unit(SummaryLayer::Abstract, 1, 20)],
-            None,
-        ))
-        .unwrap()
-        .units[0]
-            .coverage
-            .text_hash
-            .clone();
-        assert_ne!(unit.coverage.text_hash, edited_sent);
+        let prompt = &chat.parts[0].user_prompt;
+        for page in [1, 12, 109, 120] {
+            assert!(
+                prompt.contains(&format!("[Page {page}]")),
+                "the request body labels page {page}"
+            );
+        }
+        assert!(!prompt.contains("[Page 60]"), "the middle is not sent");
+        assert!(prompt.contains("CONCLUSION"));
+        assert!(prompt.contains("[Pages 1-12: beginning of the document]"));
+        assert!(prompt.contains("[Pages 13-108 omitted from this sample]"));
+        assert!(prompt.contains("[Pages 109-120: end of the document]"));
+        assert!(
+            prompt.contains(
+                "Only pages 1-12 (the beginning) and 109-120 (the end) of 120 are supplied here"
+            ),
+            "the prompt names both sent ranges: {prompt}"
+        );
 
-        let mut edited_unsent = summary_pages(20);
-        edited_unsent[14].text.push_str(" A changed sentence.");
-        let edited_unsent = build_summary_layer(summary_request(
+        let hash_with = |pages: Vec<PageText>| {
+            build_summary_layer(summary_request(
+                SummaryLayer::Abstract,
+                pages,
+                vec![summary_unit(SummaryLayer::Abstract, 1, 120)],
+                None,
+            ))
+            .unwrap()
+            .units[0]
+                .coverage
+                .text_hash
+                .clone()
+        };
+        let baseline = unit.coverage.text_hash.clone();
+
+        // The cache lookup (inspect) and the preview (build) must hash the same coverage; the
+        // shell matches cached rows against the inspected hash.
+        let inspected = inspect_summary_layer(&summary_request(
             SummaryLayer::Abstract,
-            edited_unsent,
-            vec![summary_unit(SummaryLayer::Abstract, 1, 20)],
+            long_pages(),
+            vec![summary_unit(SummaryLayer::Abstract, 1, 120)],
             None,
         ))
-        .unwrap()
-        .units[0]
-            .coverage
-            .text_hash
-            .clone();
-        assert_eq!(unit.coverage.text_hash, edited_unsent);
+        .unwrap();
+        assert_eq!(inspected[0].text_hash, baseline);
+        assert_eq!(inspected[0].pages, chat.parts[0].pages);
+
+        // The hash covers exactly the sent text: an edit inside either window invalidates the
+        // entry, an edit in the unsent middle does not.
+        let mut edited_head = long_pages();
+        edited_head[4].text.push_str(" A changed sentence.");
+        assert_ne!(baseline, hash_with(edited_head));
+
+        let mut edited_tail = long_pages();
+        edited_tail[119]
+            .text
+            .push_str(" A changed sentence in the tail.");
+        assert_ne!(baseline, hash_with(edited_tail));
+
+        let mut edited_middle = long_pages();
+        edited_middle[59].text.push_str(" A changed sentence.");
+        assert_eq!(baseline, hash_with(edited_middle));
+    }
+
+    #[test]
+    fn a_document_that_fits_both_windows_is_one_contiguous_range() {
+        for page_count in [3u32, 20] {
+            let plan = build_summary_layer(summary_request(
+                SummaryLayer::Abstract,
+                summary_pages(page_count),
+                vec![summary_unit(SummaryLayer::Abstract, 1, page_count)],
+                None,
+            ))
+            .expect("abstract plan");
+            let unit = &plan.units[0];
+            let chat = unit.plan.as_ref().expect("one request");
+            assert_eq!(chat.parts.len(), 1);
+            assert_eq!(
+                unit.coverage.pages,
+                (1..=page_count).collect::<Vec<u32>>(),
+                "a {page_count}-page document has no duplicate tail"
+            );
+            assert!(
+                !unit.coverage.truncated,
+                "a {page_count}-page document fits the two windows"
+            );
+            assert_eq!(
+                unit.note.as_deref(),
+                Some(format!("Covers all {page_count} pages.").as_str())
+            );
+            let prompt = &chat.parts[0].user_prompt;
+            assert!(prompt.contains(&format!("All {page_count} pages are supplied here.")));
+            assert!(!prompt.contains("beginning of the document"));
+            assert!(!prompt.contains("end of the document"));
+            assert!(!prompt.contains("omitted from this sample"));
+            assert_eq!(prompt.matches("[Page 1]").count(), 1);
+            assert_eq!(prompt.matches(&format!("[Page {page_count}]")).count(), 1);
+        }
+    }
+
+    #[test]
+    fn abstract_sample_page_indices_cover_both_bounded_ends() {
+        assert_eq!(abstract_sample_page_indices(3), vec![0, 1, 2]);
+        assert_eq!(
+            abstract_sample_page_indices(20),
+            (0..20).collect::<Vec<u32>>()
+        );
+        let long = abstract_sample_page_indices(120);
+        assert_eq!(long.len(), 24);
+        assert_eq!(long.first(), Some(&0));
+        assert_eq!(long[11], 11);
+        assert_eq!(long[12], 108);
+        assert_eq!(long.last(), Some(&119));
     }
 
     #[test]
