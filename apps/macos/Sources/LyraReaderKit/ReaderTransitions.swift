@@ -196,11 +196,14 @@ struct ReaderSidebarTransition<Content: View>: View {
     }
 }
 
-/// The annotation / page-overview row as an overlay on the content.
+/// The one secondary sub-toolbar row (Annotate, Edit, Fill & Sign, Export, Lyra or page
+/// overview) as an overlay on the content.
 ///
 /// The row is laid out once at its full height and the container's height animates from 46 to 0
 /// with the content top-aligned and clipped. The controls therefore never see a shorter proposal:
-/// they do not squash, reflow or change their labels while the row expands.
+/// they do not squash, reflow or change their labels while the row expands. This slide is the
+/// row's *only* reveal: the row content is inserted with an identity transition, so no branch
+/// fades in while the height moves.
 ///
 /// The background and the row itself are inside the clipped container, so the overlay covers
 /// exactly the revealed height. `contentShape` makes that whole rectangle hit-testable, which is

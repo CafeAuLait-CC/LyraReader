@@ -17,9 +17,14 @@ public enum AnnotationToolbarLayout {
     public static let itemSpacing: CGFloat = 2
     /// Space between two groups: exactly one button width.
     public static var groupGap: CGFloat { buttonWidth }
-    /// The row's leading/trailing padding, applied by ``ReaderSecondaryToolbar`` and by the
-    /// hosted measurement so an absolute x is the same in both.
+    /// The row's leading/trailing padding, applied by ``ReaderSecondaryRow`` and by the hosted
+    /// measurement so an absolute x is the same in both.
     public static let horizontalPadding: CGFloat = 14
+    /// The row's top/bottom padding: the 46 pt slot around a 32 pt control. Applied by
+    /// ``ReaderSecondaryRow``; no row may add padding of its own.
+    public static var verticalPadding: CGFloat {
+        (ReaderChrome.secondaryToolbarHeightPt - buttonHeight) / 2
+    }
     /// Coordinate space the frame probe reports in.
     public static let coordinateSpace = "lyra.annotation-toolbar"
 
@@ -66,6 +71,47 @@ public enum AnnotationToolbarLayout {
     }
 }
 
+/// The metrics every secondary sub-toolbar row shares.
+///
+/// Annotate is the reference row: one control height, one inter-item spacing, one group gap and
+/// one horizontal padding. Edit, Fill & Sign, Export and Lyra use the same values, so their
+/// buttons sit on the same baseline and their gaps read as one family. The checks measure the
+/// hosted rows against these constants.
+public enum ReaderSecondaryRowMetrics {
+    public static let horizontalPadding = AnnotationToolbarLayout.horizontalPadding
+    public static let verticalPadding = AnnotationToolbarLayout.verticalPadding
+    public static let controlHeight = AnnotationToolbarLayout.buttonHeight
+    public static let itemSpacing = AnnotationToolbarLayout.itemSpacing
+    public static let groupGap = AnnotationToolbarLayout.groupGap
+
+    /// Width of an explicit group-gap view in a row whose `HStack` already inserts
+    /// ``itemSpacing`` on both sides of every child: `34 - 2 * 2 = 30`. The annotation row's
+    /// `HStack(spacing: 0)` uses ``groupGap`` directly instead.
+    public static var groupGapSpacerWidth: CGFloat { groupGap - 2 * itemSpacing }
+}
+
+/// Collects the resolved label fonts each host reports while a probe measurement is running.
+///
+/// Like the frame probe, it is nil in the app, so a reader builds none of the reporting views.
+final class ReaderTypographyProbe: @unchecked Sendable {
+    private(set) var fonts: [String: ReaderResolvedTypography] = [:]
+
+    func report(_ id: String, _ font: ReaderResolvedTypography) {
+        fonts[id] = font
+    }
+}
+
+private struct ReaderTypographyProbeKey: EnvironmentKey {
+    static let defaultValue: ReaderTypographyProbe? = nil
+}
+
+extension EnvironmentValues {
+    var readerTypographyProbe: ReaderTypographyProbe? {
+        get { self[ReaderTypographyProbeKey.self] }
+        set { self[ReaderTypographyProbeKey.self] = newValue }
+    }
+}
+
 /// Frames the hosted row reports to ``ReaderToolbarProbe``. Nil in the app, so no probe views are
 /// built for a reader. The probe is only touched on the main actor during a synchronous
 /// measurement; the unchecked conformance is what lets it sit in a SwiftUI environment value.
@@ -106,10 +152,11 @@ struct AnnotationToolbarFrameReader: View {
     }
 }
 
-/// A tool cell: the fixed button frame plus its frame report.
+/// A tool cell: the fixed button height and report, with either a fixed cell width (icon rows)
+/// or the control's natural width (labelled rows).
 struct AnnotationToolbarItemFrame: ViewModifier {
     let id: String
-    var width: CGFloat = AnnotationToolbarLayout.buttonWidth
+    var width: CGFloat? = AnnotationToolbarLayout.buttonWidth
     var height: CGFloat = AnnotationToolbarLayout.buttonHeight
 
     func body(content: Content) -> some View {
@@ -127,21 +174,47 @@ struct AnnotationToolbarItemFrame: ViewModifier {
 @MainActor
 public enum ReaderToolbarProbe {
     /// Frames for the annotation row, including `group.*` entries, at a given row width.
+    ///
+    /// The real ``ReaderSecondaryRow`` container is hosted, not a copy of its padding, so the
+    /// measured row is the row the reader sees.
     public static func annotationRowFrames(state: AppState, width: CGFloat) -> [String: CGRect] {
-        measure(
-            ReaderCenteredTools { AnnotationToolRow(state: state) }
-                .padding(.horizontal, AnnotationToolbarLayout.horizontalPadding),
-            width: width
-        )
+        measure(ReaderSecondaryRow { AnnotationToolRow(state: state) }, width: width)
     }
 
-    /// Frames for the Edit (content editing) row at a given row width.
+    /// Frames for the Edit (content editing) row at a given row width, through the row's real
+    /// container.
     public static func contentEditRowFrames(state: AppState, width: CGFloat) -> [String: CGRect] {
-        measure(
-            ReaderCenteredTools { ContentEditToolRow(state: state) }
-                .padding(.horizontal, AnnotationToolbarLayout.horizontalPadding),
-            width: width
-        )
+        measure(ReaderSecondaryRow { ContentEditToolRow(state: state) }, width: width)
+    }
+
+    /// The resolved label fonts each host reports, for the typography contract check.
+    ///
+    /// `row` selects the real row; the main toolbar is measured through ``toolbarFonts``. Every
+    /// label reports the font it applied, so a row that bypasses the shared label shows up as a
+    /// missing or different entry.
+    public static func rowFonts(row: SecondaryRow, state: AppState,
+                                model: AIAssistantModel,
+                                width: CGFloat) -> [String: ReaderResolvedTypography] {
+        let view: AnyView
+        switch row {
+        case .annotations:
+            view = AnyView(ReaderSecondaryRow { AnnotationToolRow(state: state) })
+        case .contentEdit:
+            view = AnyView(ReaderSecondaryRow { ContentEditToolRow(state: state) })
+        case .fillAndSign:
+            view = AnyView(ReaderSecondaryRow { FillSignToolRow(state: state) })
+        case .export:
+            view = AnyView(ReaderSecondaryRow { ExportToolRow(state: state) })
+        case .lyra:
+            view = AnyView(ReaderSecondaryRow { LyraToolRow(state: state, model: model) })
+        }
+        return host(view, width: width, height: ReaderChrome.secondaryToolbarHeightPt).fonts
+    }
+
+    /// The resolved label fonts in the primary toolbar at `width`.
+    public static func toolbarFonts(state: AppState,
+                                    width: CGFloat) -> [String: ReaderResolvedTypography] {
+        host(ReaderToolbar(state: state), width: width, height: 60).fonts
     }
 
     static func measure<V: View>(
@@ -149,9 +222,19 @@ public enum ReaderToolbarProbe {
         width: CGFloat,
         height: CGFloat = ReaderChrome.secondaryToolbarHeightPt
     ) -> [String: CGRect] {
-        let probe = AnnotationToolbarFrameProbe()
+        host(view, width: width, height: height).frames
+    }
+
+    private static func host<V: View>(
+        _ view: V,
+        width: CGFloat,
+        height: CGFloat
+    ) -> (frames: [String: CGRect], fonts: [String: ReaderResolvedTypography]) {
+        let frameProbe = AnnotationToolbarFrameProbe()
+        let fontProbe = ReaderTypographyProbe()
         let root = view
-            .environment(\.annotationToolbarFrameProbe, probe)
+            .environment(\.annotationToolbarFrameProbe, frameProbe)
+            .environment(\.readerTypographyProbe, fontProbe)
             .coordinateSpace(name: AnnotationToolbarLayout.coordinateSpace)
         let host = NSHostingView(rootView: root)
         host.frame = NSRect(x: 0, y: 0, width: width, height: height)
@@ -160,7 +243,7 @@ public enum ReaderToolbarProbe {
         // turn so a hosted row has the same frames it has in a window.
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
         host.layoutSubtreeIfNeeded()
-        return probe.frames
+        return (frameProbe.frames, fontProbe.fonts)
     }
 }
 
@@ -172,7 +255,7 @@ struct ContentEditToolRow: View {
     @ObservedObject var state: AppState
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: ReaderSecondaryRowMetrics.itemSpacing) {
             contentTool(
                 "Text", "textformat", "text",
                 help: "Select text to edit it, or click an empty area to add text.")
@@ -187,7 +270,6 @@ struct ContentEditToolRow: View {
                 help: "Drag a rectangle to remove the content under it and cover the area in black. "
                     + "Erase is in the inspector.")
         }
-        .font(.system(size: 12))
     }
 
     private func contentTool(_ title: String, _ icon: String, _ tool: String,
@@ -196,7 +278,9 @@ struct ContentEditToolRow: View {
             ? ["erase", "blackout"].contains(state.contentEditTool)
             : state.contentEditTool == tool
         return Button { state.selectContentTool(tool) } label: {
-            Label(title, systemImage: icon).padding(.horizontal, 7)
+            ReaderToolbarLabel(title: title, id: title) {
+                Image(systemName: icon)
+            }
         }
         .buttonStyle(LyraReaderToolStyle(selected: selected))
         .help(selected ? help + " Click it again to return to the pointer." : help)

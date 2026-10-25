@@ -123,7 +123,10 @@ struct LyraReaderToolStyle: ButtonStyle {
 
         var body: some View {
             configuration.label
-                .font(.system(size: 14, weight: .medium))
+                // Icon size only: a label that carries text applies ReaderToolbarFont to the Text
+                // itself, closer to the text than this style, so the label keeps its own
+                // toolbar/row typography.
+                .font(ReaderToolbarTypography.iconFont)
                 .frame(minWidth: 30, minHeight: 32)
                 .padding(.horizontal, 3)
                 .foregroundStyle(!enabled ? LyraReaderTheme.textDisabled :
