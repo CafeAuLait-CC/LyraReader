@@ -959,7 +959,12 @@ extension ReaderChecks {
                 "the row host has exactly one reveal animation transaction")
         require(windowCode.contains("ReaderSecondaryToolbar(state: state, model: aiAssistant)"),
                 "Annotate, Edit, Fill & Sign, Export and Lyra are one ReaderSecondaryToolbar")
-        let rowTransitions = rowCode.components(separatedBy: ".transition(").dropFirst()
+        // ReaderToolbar.swift also contains document tabs, whose move/drop feedback may fade.
+        // This guard belongs only to the secondary toolbar's six insertion branches.
+        let secondaryDeclarations = rowCode.components(separatedBy: "struct ReaderSecondaryToolbar: View {")
+        require(secondaryDeclarations.count == 2, "the secondary toolbar has one source declaration")
+        let secondaryCode = secondaryDeclarations[1].components(separatedBy: "\n}")[0]
+        let rowTransitions = secondaryCode.components(separatedBy: ".transition(").dropFirst()
         require(rowTransitions.count == 6,
                 "the six row branches each declare their insertion transition "
                     + "(found \(rowTransitions.count))")
