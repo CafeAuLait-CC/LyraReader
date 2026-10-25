@@ -44,9 +44,8 @@ final class AnnotationOverlayView: NSView {
 
     /// Top-left origin, like every other coordinate in this file and in the canvas.
     ///
-    /// `NSView` is bottom-left by default and a `CALayer` tree follows it unless told otherwise;
-    /// without both flips the marks were mirrored vertically against the page (a stroke drawn
-    /// near the top of page one appeared near the bottom).
+    /// The view and its backing layer agree on this orientation. Descendant clipping layers
+    /// must not flip again: their paths already use the same top-left page coordinates.
     override var isFlipped: Bool { true }
 
     override init(frame frameRect: NSRect) {
@@ -155,7 +154,8 @@ final class AnnotationOverlayView: NSView {
             let clip = CALayer()
             clip.frame = rect
             clip.masksToBounds = true
-            clip.isGeometryFlipped = true
+            // The overlay root already establishes y-down coordinates. Flipping this clip
+            // mirrors its shape within the segment, moving top-of-page ink to the bottom.
             clip.contentsScale = window?.backingScaleFactor ?? 2
             let shape = CAShapeLayer()
             shape.frame = CGRect(origin: .zero, size: rect.size)
