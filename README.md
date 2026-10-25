@@ -145,13 +145,13 @@ carries the overview, and the only documents that ship with the code are this fi
 | Milestone | Theme | Status |
 | --- | --- | --- |
 | M0 | Skeleton, FFI path, GPU interop | Complete |
-| M1 | Minimum readable loop | Core implemented; performance and memory budgets still measured by hand |
-| M2 | Reading experience | Complete: tabs, independent windows, outline, search, bookmarks, facing pages |
-| M3 | Annotation and editing | Complete for annotations, page operations, forms, redaction and printing; in-place body editing is its own feature with documented limits |
-| M4 | Advanced reading | Core implemented: previews, citations (including bare parenthetical numerals and multi-list attribution), captions, metadata and BibTeX |
-| M5 | AI assistant | Partial: summaries, selection Q&A, translation; document chat and vision are not done |
-| M6 | Cross-platform | Not started |
-| M7 | Polish: performance, accessibility, i18n, updates | Not started |
+| M1 | Minimum readable loop | Complete for reading; performance budgets are now visible in the in-app performance panel |
+| M2 | Reading experience | Complete: tabs, independent windows, outline, search, bookmarks, page-corner flags, facing pages |
+| M3 | Annotation and editing | Complete: annotations (incl. stamps, image signatures, typed/drawn/Continuity signatures), page operations, forms filling without a tool, redaction (Edit workspace), flattened copies, printing |
+| M4 | Advanced reading | Complete: citation/figure/table previews, citation attribution, captions, metadata and BibTeX |
+| M5 | AI assistant | Broadly complete: document chat, region questions with an inline card, layered summaries, in-place translation, vision on both connections, local request log; cross-document Q&A not done |
+| M6 | Cross-platform | Not started (Linux and Windows shells) |
+| M7 | Polish: accessibility, i18n, updates | Not started |
 
 Per-milestone detail, measurements and the remaining work live in the design notes, not here.
 
