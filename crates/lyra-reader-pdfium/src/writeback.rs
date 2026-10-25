@@ -1383,18 +1383,14 @@ fn read_annotations_report(
     page_count: u32,
 ) -> Result<AnnotationScan> {
     let reader = {
-        let _guard = crate::backend::PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         AnnotationReader::open_locked(path, password)?
     };
     let mut pages = Vec::with_capacity(page_count as usize);
     let mut unreadable = Vec::new();
     for page in 0..page_count {
         let report = {
-            let _guard = crate::backend::PDFIUM_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _guard = crate::backend::lock_pdfium()?;
             reader.page_report_locked(PageIndex(page))?
         };
         pages.push(report.annotations);

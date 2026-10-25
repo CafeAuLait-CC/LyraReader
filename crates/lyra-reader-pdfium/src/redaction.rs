@@ -55,7 +55,6 @@
 
 #![allow(unsafe_code)]
 
-use crate::backend::PDFIUM_LOCK;
 use crate::page_ops::replace_original_with_edit;
 use crate::rewrite::{TextComparison, verify_document_equivalence};
 use crate::writeback::{OutputMode, write_rewritten_pdf};
@@ -2306,9 +2305,7 @@ impl RedactDocument {
             })?;
         let length = crate::limits::document_len(bytes.len())?;
         let document = {
-            let _guard = PDFIUM_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _guard = crate::backend::lock_pdfium()?;
             // SAFETY: `bytes` lives in the returned struct; PDFium documents that the buffer must
             // stay valid while the document is open.
             unsafe {
@@ -2335,9 +2332,7 @@ impl RedactDocument {
     }
 
     fn page_count(&self) -> Result<u32> {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         // SAFETY: the document handle is live.
         crate::limits::page_count(unsafe { (self.api.get_page_count)(self.document) })
     }
@@ -2354,9 +2349,7 @@ impl RedactDocument {
     }
 
     fn page_chars(&self, page: u32) -> Result<Vec<PageChar>> {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         // SAFETY: the document is live and the page index comes from the caller's validated set.
         let page_handle = unsafe { (self.api.load_page)(self.document, page as std::ffi::c_int) };
         if page_handle.is_null() {
@@ -2451,7 +2444,7 @@ impl RedactDocument {
     }
 
     fn page_object_types(&self, page: u32) -> Result<Vec<i32>> {
-        let _guard = PDFIUM_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         let handle = unsafe { (self.api.load_page)(self.document, page as i32) };
         if handle.is_null() {
             return Err(page_error(page));
@@ -2465,9 +2458,7 @@ impl RedactDocument {
     }
 
     fn intersecting_graphics(&self, page: u32, rects: &[Rect]) -> Result<usize> {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         let page_handle = unsafe { (self.api.load_page)(self.document, page as std::ffi::c_int) };
         if page_handle.is_null() {
             return Err(page_error(page));
@@ -2516,18 +2507,14 @@ impl RedactDocument {
     }
 
     fn render_page(&self, page: u32, scale: f64) -> Result<RasterImage> {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         render_page_locked(self.api, self.document, page, scale)
     }
 }
 
 impl Drop for RedactDocument {
     fn drop(&mut self) {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium_for_cleanup();
         // SAFETY: the handle came from `load_mem_document` and is closed exactly once.
         unsafe { (self.api.close_document)(self.document) };
     }
@@ -2608,9 +2595,7 @@ fn render_raster(
 ) -> Result<RasterImage> {
     let scale = RASTER_DPI / 72.0;
     let mut raster = {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         render_page_locked(api, document.document, page, scale)?
     };
     for rect in rects {

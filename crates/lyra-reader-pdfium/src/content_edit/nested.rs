@@ -190,7 +190,7 @@ pub(super) fn rewrite_path(
 
 fn object_info(bytes: &[u8], index: u32, target: usize) -> Result<(PdfMatrix, usize)> {
     let pdfium = pdfium_instance()?;
-    let _guard = PDFIUM_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = crate::backend::lock_pdfium()?;
     let doc = pdfium
         .load_pdf_from_byte_slice(bytes, None)
         .map_err(pdf_error)?;
@@ -331,7 +331,7 @@ pub(super) fn crop_graphic(
     let (_, count) = object_info(bytes, index, item.paths[0][0])?;
     let geometry = {
         let pdfium = pdfium_instance()?;
-        let _guard = PDFIUM_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         let doc = pdfium
             .load_pdf_from_byte_slice(bytes, None)
             .map_err(pdf_error)?;

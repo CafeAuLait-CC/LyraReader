@@ -28,7 +28,7 @@ fn scratch() -> PathBuf {
 
 fn assert_encrypted_refusal(label: &str, error: LyraReaderFfiError) {
     let message = match error {
-        LyraReaderFfiError::Document { message } => message,
+        LyraReaderFfiError::Document { message, .. } => message,
         other => panic!("{label} gave a non-document error: {other:?}"),
     };
     let lower = message.to_ascii_lowercase();

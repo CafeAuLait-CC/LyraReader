@@ -265,29 +265,120 @@ impl AiErrorCode {
     }
 }
 
+/// How the shell should present an error.
+///
+/// This mirrors [`lyra_reader_core::Severity`] as a UniFFI enum so every thrown error carries the
+/// decision with it. The shell maps one severity to one presentation (`alert` for `Fatal` and
+/// `Document`, `banner`/`status` for `Recoverable`); it never re-derives severity from the
+/// message or from the error variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ErrorSeverity {
+    /// One feature failed; the document and reading are still usable.
+    Recoverable,
+    /// The requested document operation failed; the reader must be told.
+    Document,
+    /// The engine cannot be trusted until it is restarted.
+    Fatal,
+}
+
+impl From<lyra_reader_core::Severity> for ErrorSeverity {
+    fn from(severity: lyra_reader_core::Severity) -> Self {
+        match severity {
+            lyra_reader_core::Severity::Recoverable => Self::Recoverable,
+            lyra_reader_core::Severity::Document => Self::Document,
+            lyra_reader_core::Severity::Fatal => Self::Fatal,
+        }
+    }
+}
+
+impl From<ErrorSeverity> for lyra_reader_core::Severity {
+    fn from(severity: ErrorSeverity) -> Self {
+        match severity {
+            ErrorSeverity::Recoverable => Self::Recoverable,
+            ErrorSeverity::Document => Self::Document,
+            ErrorSeverity::Fatal => Self::Fatal,
+        }
+    }
+}
+
+impl AiErrorCode {
+    /// The presentation severity of an AI failure.
+    ///
+    /// AI failures are shown beside the request that failed (the assistant panel keeps its
+    /// conversation and its inline message), so most are `Recoverable`. A configuration or
+    /// authentication problem is `Document`: the reader has to fix the connection before the
+    /// feature works at all.
+    pub fn severity(self) -> ErrorSeverity {
+        match self {
+            Self::NotConfigured
+            | Self::Unauthorized
+            | Self::UnsupportedCapability
+            | Self::InvalidSettings => ErrorSeverity::Document,
+            Self::Unreachable
+            | Self::Offline
+            | Self::LocalServer
+            | Self::RateLimited
+            | Self::Cancelled
+            | Self::EmptyContext
+            | Self::NothingRelevant
+            | Self::VisionUnsupported
+            | Self::HttpStatus
+            | Self::Protocol
+            | Self::Timeout
+            | Self::Other => ErrorSeverity::Recoverable,
+        }
+    }
+}
+
 /// Errors crossing the FFI boundary (they surface as Swift `throws`).
 #[derive(Debug, uniffi::Error)]
 pub enum LyraReaderFfiError {
     /// The file could not be read or parsed.
-    Document { message: String },
+    Document {
+        message: String,
+        /// How the shell presents this failure.
+        severity: ErrorSeverity,
+    },
     /// No usable PDF backend (for example, PDFium could not be loaded).
-    Backend { message: String },
+    Backend {
+        message: String,
+        /// How the shell presents this failure.
+        severity: ErrorSeverity,
+    },
     /// The caller passed something invalid.
-    InvalidArgument { message: String },
+    InvalidArgument {
+        message: String,
+        /// How the shell presents this failure.
+        severity: ErrorSeverity,
+    },
     /// The AI layer could not build a plan or run a request.
     Ai {
         message: String,
         /// Stable category; the shell maps this to its audit vocabulary.
         code: AiErrorCode,
+        /// How the shell presents this failure; derived from `code`.
+        severity: ErrorSeverity,
     },
+}
+
+impl LyraReaderFfiError {
+    /// The presentation severity carried by this error.
+    pub fn severity(&self) -> ErrorSeverity {
+        match self {
+            Self::Document { severity, .. }
+            | Self::Backend { severity, .. }
+            | Self::InvalidArgument { severity, .. }
+            | Self::Ai { severity, .. } => *severity,
+        }
+    }
 }
 
 impl std::fmt::Display for LyraReaderFfiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Document { message } => write!(f, "document error: {message}"),
-            Self::Backend { message } => write!(f, "backend error: {message}"),
-            Self::InvalidArgument { message } => write!(f, "invalid argument: {message}"),
+            Self::Document { message, .. } => write!(f, "document error: {message}"),
+            Self::Backend { message, .. } => write!(f, "backend error: {message}"),
+            Self::InvalidArgument { message, .. } => write!(f, "invalid argument: {message}"),
             Self::Ai { message, .. } => write!(f, "AI error: {message}"),
         }
     }
@@ -295,8 +386,10 @@ impl std::fmt::Display for LyraReaderFfiError {
 
 impl From<lyra_reader_ai::AiError> for LyraReaderFfiError {
     fn from(error: lyra_reader_ai::AiError) -> Self {
+        let code = AiErrorCode::of(&error);
         Self::Ai {
-            code: AiErrorCode::of(&error),
+            severity: code.severity(),
+            code,
             message: error.to_string(),
         }
     }
@@ -306,16 +399,20 @@ impl std::error::Error for LyraReaderFfiError {}
 
 impl From<lyra_reader_core::LyraReaderError> for LyraReaderFfiError {
     fn from(error: lyra_reader_core::LyraReaderError) -> Self {
+        let severity = ErrorSeverity::from(error.severity);
         let message = error.to_string();
         match error.code {
-            ErrorCode::BackendUnavailable | ErrorCode::GpuUnavailable => Self::Backend { message },
-            ErrorCode::InvalidArgument => Self::InvalidArgument { message },
+            ErrorCode::BackendUnavailable | ErrorCode::GpuUnavailable => {
+                Self::Backend { message, severity }
+            }
+            ErrorCode::InvalidArgument => Self::InvalidArgument { message, severity },
             // A read-only document is a policy refusal, not a parse failure; keep the sentence
             // exactly as the signature status reports it (no `ReadOnly:` prefix).
             ErrorCode::ReadOnly => Self::Document {
                 message: error.message,
+                severity,
             },
-            _ => Self::Document { message },
+            _ => Self::Document { message, severity },
         }
     }
 }
@@ -1221,11 +1318,13 @@ fn prepare_content_command(
         || document.backend.needs_password()
     {
         return Err(LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
             message: "Reopen an unencrypted document before editing its contents.".into(),
         });
     }
     let mut command: ContentCommand =
         serde_json::from_str(&command).map_err(|e| LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
             message: e.to_string(),
         })?;
     let transform = document
@@ -1234,6 +1333,7 @@ fn prepare_content_command(
         .geometry
         .view_to_page(1.0)
         .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
             message: "Singular page geometry".into(),
         })?;
     match &mut command {
@@ -1273,6 +1373,7 @@ fn selection_only_page(selection: Option<AiSelectionRange>) -> Result<u32, LyraR
     selection
         .map(|selection| selection.page)
         .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
             message: "a selection-only request has no selection".to_string(),
         })
 }
@@ -1419,15 +1520,24 @@ impl LyraReaderDocument {
     ) -> Result<PageBitmap, LyraReaderFfiError> {
         if !(scale.is_finite() && scale > 0.0) {
             return Err(LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
                 message: format!("scale must be positive and finite, got {scale}"),
             });
         }
 
+        let page_count = self.backend.page_count();
+        lyra_reader_core::checked_page_index(page, page_count, |page| {
+            LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
+                message: lyra_reader_core::page_out_of_range_message(page, page_count),
+            }
+        })?;
         let sizes = self.page_sizes();
         let size = match sizes.get(page as usize).copied() {
             Some(Some(size)) => size,
             Some(None) => {
                 return Err(LyraReaderFfiError::Document {
+                    severity: ErrorSeverity::Document,
                     message: format!(
                         "page {page} has no measurable size; PDFium could not report its geometry"
                     ),
@@ -1435,10 +1545,8 @@ impl LyraReaderDocument {
             }
             None => {
                 return Err(LyraReaderFfiError::InvalidArgument {
-                    message: format!(
-                        "page {page} is outside this document's {} page(s)",
-                        sizes.len()
-                    ),
+                    severity: ErrorSeverity::Document,
+                    message: lyra_reader_core::page_out_of_range_message(page, page_count),
                 });
             }
         };
@@ -1518,19 +1626,23 @@ impl LyraReaderDocument {
         let max_lod = EngineConfig::default().max_lod;
         if lod > max_lod {
             return Err(LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
                 message: format!("lod {lod} exceeds the maximum of {max_lod}"),
             });
         }
         if tile_size == 0 || tile_size > 4096 {
             return Err(LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
                 message: format!("tile size {tile_size} is outside 1..=4096"),
             });
         }
-        if page >= self.backend.page_count() {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                message: format!("page {page} is out of range"),
-            });
-        }
+        let page_count = self.backend.page_count();
+        lyra_reader_core::checked_page_index(page, page_count, |page| {
+            LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
+                message: lyra_reader_core::page_out_of_range_message(page, page_count),
+            }
+        })?;
 
         let scale = 2f64.powi(i32::from(lod));
         let tile_size_pt = f64::from(tile_size) / scale;
@@ -1582,14 +1694,17 @@ impl LyraReaderDocument {
     ) -> Result<PageBitmap, LyraReaderFfiError> {
         if !(scale.is_finite() && scale > 0.0) {
             return Err(LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
                 message: format!("scale must be positive and finite, got {scale}"),
             });
         }
-        if page >= self.backend.page_count() {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                message: format!("page {page} is out of range"),
-            });
-        }
+        let page_count = self.backend.page_count();
+        lyra_reader_core::checked_page_index(page, page_count, |page| {
+            LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
+                message: lyra_reader_core::page_out_of_range_message(page, page_count),
+            }
+        })?;
         if !(x_pt.is_finite()
             && y_pt.is_finite()
             && width_pt.is_finite()
@@ -1600,6 +1715,7 @@ impl LyraReaderDocument {
             && (y_pt + height_pt).is_finite())
         {
             return Err(LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
                 message: format!(
                     "region ({x_pt}, {y_pt}, {width_pt}×{height_pt}) must be finite with positive dimensions"
                 ),
@@ -1614,6 +1730,7 @@ impl LyraReaderDocument {
             || y_pt + height_pt > page_size.height + tolerance
         {
             return Err(LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
                 message: format!(
                     "region ({x_pt}, {y_pt}, {width_pt}×{height_pt}) is outside the page bounds ({}, {})",
                     page_size.width, page_size.height
@@ -1626,6 +1743,7 @@ impl LyraReaderDocument {
         let scale = clamp_scale((width_pt, height_pt), scale);
         if !(scale.is_finite() && scale > 0.0 && (scale as f32) > 0.0) {
             return Err(LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
                 message: "region dimensions exceed the renderer's supported range".to_string(),
             });
         }
@@ -1747,6 +1865,7 @@ impl LyraReaderDocument {
     pub fn text_page_cache_stats(&self) -> TextPageCacheStats {
         let cache = self
             .text_pages
+            // Pure cache (immutable entries keyed by page): poisoning can only cost a miss.
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         TextPageCacheStats {
@@ -2260,6 +2379,7 @@ impl LyraReaderDocument {
                 .into();
         }
         serde_json::to_string(&snapshot).map_err(|e| LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
             message: e.to_string(),
         })
     }
@@ -2361,12 +2481,14 @@ impl LyraReaderDocument {
         self.ensure_not_xfa()?;
         if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
             return Err(LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
                 message: "the document was replaced on disk; reopen it before editing pages"
                     .to_string(),
             });
         }
         if self.backend.needs_password() {
             return Err(LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
                 message:
                     "this document is encrypted; page editing is not supported for encrypted files"
                         .to_string(),
@@ -2394,6 +2516,7 @@ impl LyraReaderDocument {
         self.ensure_not_xfa()?;
         if self.backend.needs_password() {
             return Err(LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
                 message:
                     "this document is encrypted; page editing is not supported for encrypted files"
                         .to_string(),
@@ -2425,7 +2548,7 @@ impl LyraReaderDocument {
     ) -> Result<MergeReportRecord, LyraReaderFfiError> {
         self.ensure_not_xfa()?;
         if self.backend.needs_password() {
-            return Err(LyraReaderFfiError::Document {
+            return Err(LyraReaderFfiError::Document { severity: ErrorSeverity::Document,
                 message:
                     "this document is encrypted; merging an encrypted document is refused and no output was written"
                         .to_string(),
@@ -2452,7 +2575,7 @@ impl LyraReaderDocument {
     ) -> Result<SplitReportRecord, LyraReaderFfiError> {
         self.ensure_not_xfa()?;
         if self.backend.needs_password() {
-            return Err(LyraReaderFfiError::Document {
+            return Err(LyraReaderFfiError::Document { severity: ErrorSeverity::Document,
                 message:
                     "this document is encrypted; splitting an encrypted document is refused and no output was written"
                         .to_string(),
@@ -2500,11 +2623,15 @@ impl LyraReaderDocument {
         if let Some(reason) =
             lyra_reader_pdfium::detect_signature(original, None, 0).read_only_reason()
         {
-            return Err(LyraReaderFfiError::Document { message: reason });
+            return Err(LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
+                message: reason,
+            });
         }
         self.ensure_writable()?;
         if self.backend.needs_password() {
             return Err(LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
                 message:
                     "this document is encrypted; page editing is not supported for encrypted files"
                         .to_string(),
@@ -2641,6 +2768,7 @@ impl LyraReaderDocument {
     pub fn form_info(&self) -> Result<FormInfoRecord, LyraReaderFfiError> {
         if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
             return Err(LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
                 message: "the document was replaced on disk; reopen it before reading its form"
                     .to_string(),
             });
@@ -2667,7 +2795,7 @@ impl LyraReaderDocument {
                 refusal: Some(reason),
             });
         }
-        if !self.backend.has_acro_form() {
+        if !self.backend.has_acro_form()? {
             // No AcroForm: skip the whole-file dictionary parse. The PDF version is still a
             // fact the information panel would ask for, and reading the header is cheap.
             return Ok(FormInfoRecord {
@@ -2818,6 +2946,7 @@ impl LyraReaderDocument {
         self.ensure_not_xfa()?;
         if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
             return Err(LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
                 message: "the document was replaced on disk; reopen it before flattening"
                     .to_string(),
             });
@@ -2872,7 +3001,7 @@ impl LyraReaderDocument {
             comments_not_carried: report.comments_not_carried,
             signature_fields_removed: report.signature_fields_removed,
             output_bytes: report.output_bytes,
-            cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
+            cleaned_temporary_files: lyra_reader_core::saturating_u32(report.cleaned_temporaries),
         })
     }
 
@@ -2891,6 +3020,7 @@ impl LyraReaderDocument {
     pub fn document_info(&self) -> Result<DocumentInfoRecord, LyraReaderFfiError> {
         if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
             return Err(LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
                 message: "the document was replaced on disk; reopen it to read its information"
                     .to_string(),
             });
@@ -3129,6 +3259,7 @@ impl LyraReaderDocument {
             | AiActionRecord::SummarizeSection
             | AiActionRecord::SummarizePageLine => {
                 return Err(LyraReaderFfiError::Ai {
+                    severity: AiErrorCode::Other.severity(),
                     code: AiErrorCode::Other,
                     message: "A layered summary uses its own per-unit request builder.".to_string(),
                 });
@@ -3137,12 +3268,14 @@ impl LyraReaderDocument {
         let page_count = self.page_count();
         if page_count == 0 {
             return Err(LyraReaderFfiError::Ai {
+                severity: AiErrorCode::EmptyContext.severity(),
                 code: AiErrorCode::EmptyContext,
                 message: "This document has no pages.".to_string(),
             });
         }
         if request.current_page >= page_count {
             return Err(LyraReaderFfiError::Ai {
+                severity: AiErrorCode::EmptyContext.severity(),
                 code: AiErrorCode::EmptyContext,
                 message: format!(
                     "The current page {} is outside this document ({} pages).",
@@ -3158,6 +3291,7 @@ impl LyraReaderDocument {
         });
         if action.requires_selection() && selection.is_none() {
             return Err(LyraReaderFfiError::Ai {
+                severity: AiErrorCode::Other.severity(),
                 code: AiErrorCode::Other,
                 message: "Select text first; there is no selection to send.".to_string(),
             });
@@ -3166,6 +3300,7 @@ impl LyraReaderDocument {
             && selection.page >= page_count
         {
             return Err(LyraReaderFfiError::Ai {
+                severity: AiErrorCode::EmptyContext.severity(),
                 code: AiErrorCode::EmptyContext,
                 message: format!(
                     "The selected page {} is outside this document.",
@@ -3183,11 +3318,13 @@ impl LyraReaderDocument {
         // established, bounded related source passages can connect it to the full document.
         if action == AiAction::RegionQuestion {
             let region = request.region.ok_or_else(|| LyraReaderFfiError::Ai {
+                severity: AiErrorCode::Other.severity(),
                 code: AiErrorCode::Other,
                 message: "The region question has no region; nothing was sent.".to_string(),
             })?;
             if region.page >= page_count {
                 return Err(LyraReaderFfiError::Ai {
+                    severity: AiErrorCode::EmptyContext.severity(),
                     code: AiErrorCode::EmptyContext,
                     message: format!(
                         "The selected region is on page {}, outside this document ({} pages).",
@@ -3211,6 +3348,7 @@ impl LyraReaderDocument {
             let reasoning_mode =
                 ReasoningMode::from_wire(&request.reasoning_mode).ok_or_else(|| {
                     LyraReaderFfiError::InvalidArgument {
+                        severity: ErrorSeverity::Document,
                         message: format!(
                             "Unknown reasoning mode {}. Use default, off, low, high or max.",
                             request.reasoning_mode
@@ -3218,7 +3356,7 @@ impl LyraReaderDocument {
                     }
                 })?;
             let reasoning_encoding = ReasoningEncoding::from_wire(&request.reasoning_encoding)
-                .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
+                .ok_or_else(|| LyraReaderFfiError::InvalidArgument { severity: ErrorSeverity::Document,
                     message: format!(
                         "Unknown reasoning encoding {}. Use none, thinking, reasoning_effort, output_config or reasoning.effort.",
                         request.reasoning_encoding
@@ -3250,6 +3388,7 @@ impl LyraReaderDocument {
                 (None, _, _) => None,
                 _ => {
                     return Err(LyraReaderFfiError::InvalidArgument {
+                        severity: ErrorSeverity::Document,
                         message: "The region picture is missing its pixel size.".to_string(),
                     });
                 }
@@ -3323,6 +3462,7 @@ impl LyraReaderDocument {
         let reasoning_mode =
             ReasoningMode::from_wire(&request.reasoning_mode).ok_or_else(|| {
                 LyraReaderFfiError::InvalidArgument {
+                    severity: ErrorSeverity::Document,
                     message: format!(
                         "Unknown reasoning mode {}. Use default, off, low, high or max.",
                         request.reasoning_mode
@@ -3330,7 +3470,7 @@ impl LyraReaderDocument {
                 }
             })?;
         let reasoning_encoding = ReasoningEncoding::from_wire(&request.reasoning_encoding)
-            .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
+            .ok_or_else(|| LyraReaderFfiError::InvalidArgument { severity: ErrorSeverity::Document,
                 message: format!(
                     "Unknown reasoning encoding {}. Use none, thinking, reasoning_effort, output_config or reasoning.effort.",
                     request.reasoning_encoding
@@ -3399,6 +3539,7 @@ impl LyraReaderDocument {
         let page_count = self.page_count();
         if page_count == 0 {
             return Err(LyraReaderFfiError::Ai {
+                severity: AiErrorCode::EmptyContext.severity(),
                 code: AiErrorCode::EmptyContext,
                 message: "This document has no pages.".to_string(),
             });
@@ -3457,6 +3598,7 @@ impl LyraReaderDocument {
         let page_count = self.page_count();
         if page_count == 0 {
             return Err(LyraReaderFfiError::Ai {
+                severity: AiErrorCode::EmptyContext.severity(),
                 code: AiErrorCode::EmptyContext,
                 message: "This document has no pages.".to_string(),
             });
@@ -3573,6 +3715,7 @@ fn summary_settings(request: &AiSummaryRequestRecord) -> Result<ChatSettings, Ly
     };
     let reasoning_mode = ReasoningMode::from_wire(&request.reasoning_mode).ok_or_else(|| {
         LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
             message: format!(
                 "Unknown reasoning mode {}. Use default, off, low, high or max.",
                 request.reasoning_mode
@@ -3581,7 +3724,7 @@ fn summary_settings(request: &AiSummaryRequestRecord) -> Result<ChatSettings, Ly
     })?;
     let reasoning_encoding =
         ReasoningEncoding::from_wire(&request.reasoning_encoding).ok_or_else(|| {
-            LyraReaderFfiError::InvalidArgument {
+            LyraReaderFfiError::InvalidArgument { severity: ErrorSeverity::Document,
                 message: format!(
                     "Unknown reasoning encoding {}. Use none, thinking, reasoning_effort, output_config or reasoning.effort.",
                     request.reasoning_encoding
@@ -3664,7 +3807,7 @@ fn page_edit_report(report: lyra_reader_pdfium::PageOperationReport) -> PageEdit
             .backup_path
             .map(|path| path.to_string_lossy().into_owned()),
         output_bytes: report.output_bytes,
-        cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
+        cleaned_temporary_files: lyra_reader_core::saturating_u32(report.cleaned_temporaries),
     }
 }
 
@@ -3677,15 +3820,14 @@ fn merge_report(report: lyra_reader_pdfium::MergeReport) -> MergeReportRecord {
         appended_annotation_counts: report
             .appended_annotation_counts
             .into_iter()
-            .map(|count| u32::try_from(count).unwrap_or(u32::MAX))
+            .map(lyra_reader_core::saturating_u32)
             .collect(),
         rotations: report.rotations,
-        first_outline_entries: u32::try_from(report.first_outline_entries).unwrap_or(u32::MAX),
-        appended_outline_entries: u32::try_from(report.appended_outline_entries)
-            .unwrap_or(u32::MAX),
+        first_outline_entries: lyra_reader_core::saturating_u32(report.first_outline_entries),
+        appended_outline_entries: lyra_reader_core::saturating_u32(report.appended_outline_entries),
         appended_outline_group_titles: report.appended_outline_group_titles,
         output_bytes: report.output_bytes,
-        cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
+        cleaned_temporary_files: lyra_reader_core::saturating_u32(report.cleaned_temporaries),
     }
 }
 
@@ -3703,7 +3845,7 @@ fn split_report(report: lyra_reader_pdfium::SplitReport) -> SplitReportRecord {
             })
             .collect(),
         source_page_count: report.source_page_count,
-        cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
+        cleaned_temporary_files: lyra_reader_core::saturating_u32(report.cleaned_temporaries),
     }
 }
 
@@ -3764,6 +3906,7 @@ impl LyraReaderDocument {
     ) {
         let bytes = value.estimated_bytes();
         self.text_pages
+            // Pure cache (immutable entries keyed by page): poisoning can only cost a miss.
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(page, value, bytes);
@@ -3776,6 +3919,7 @@ impl LyraReaderDocument {
     ) -> Result<Arc<lyra_reader_text::SelectionTextPage>, LyraReaderFfiError> {
         if let Some(value) = self
             .text_pages
+            // Pure cache (immutable entries keyed by page): poisoning can only cost a miss.
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(page)
@@ -3789,6 +3933,7 @@ impl LyraReaderDocument {
         {
             let mut cache = self
                 .text_pages
+                // Pure cache (immutable entries keyed by page): poisoning can only cost a miss.
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             cache.loads += 1;
@@ -3817,6 +3962,7 @@ impl LyraReaderDocument {
         }
         if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
             return Err(LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
                 message: "the document was replaced on disk; reopen it before reading annotations"
                     .to_string(),
             });
@@ -4113,7 +4259,7 @@ impl LyraReaderDocument {
             backup_path: report
                 .backup_path
                 .map(|path| path.to_string_lossy().into_owned()),
-            cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
+            cleaned_temporary_files: lyra_reader_core::saturating_u32(report.cleaned_temporaries),
             source_bytes_preserved: report.source_bytes_preserved,
         })
     }
@@ -4158,19 +4304,22 @@ impl LyraReaderDocument {
             backup_path: report
                 .backup_path
                 .map(|path| path.to_string_lossy().into_owned()),
-            cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
+            cleaned_temporary_files: lyra_reader_core::saturating_u32(report.cleaned_temporaries),
             source_bytes_preserved: report.source_bytes_preserved,
         })
     }
 
     fn ai_page(&self, page: u32) -> Result<(String, Vec<PageChar>), LyraReaderFfiError> {
-        if page >= self.backend.page_count() {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                message: format!("page {page} is outside the document"),
-            });
-        }
+        let page_count = self.backend.page_count();
+        lyra_reader_core::checked_page_index(page, page_count, |page| {
+            LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
+                message: lyra_reader_core::page_out_of_range_message(page, page_count),
+            }
+        })?;
         if let Some(cached) = self
             .ai_text
+            // Pure cache (immutable entries keyed by page): poisoning can only cost a miss.
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&page)
@@ -4199,6 +4348,7 @@ impl LyraReaderDocument {
             .collect();
         let text = text_of(&raw);
         self.ai_text
+            // Pure cache (immutable entries keyed by page): poisoning can only cost a miss.
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(page, (text.clone(), chars.clone()));
@@ -4259,12 +4409,13 @@ impl LyraReaderDocument {
         }
         if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
             return Err(LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
                 message: "the document was replaced on disk; reopen it before saving again"
                     .to_string(),
             });
         }
         if self.backend.needs_password() {
-            return Err(LyraReaderFfiError::Document {
+            return Err(LyraReaderFfiError::Document { severity: ErrorSeverity::Document,
                 message:
                     "this document is encrypted; saving annotations or bookmarks into it is not supported yet"
                         .to_string(),
@@ -4272,6 +4423,7 @@ impl LyraReaderDocument {
         }
         if !(zoom.is_finite() && zoom > 0.0 && zoom <= 64.0) {
             return Err(LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
                 message: format!("zoom must be positive, finite and at most 64, got {zoom}"),
             });
         }
@@ -4357,16 +4509,18 @@ impl LyraReaderDocument {
             backup_path: report
                 .backup_path
                 .map(|path| path.to_string_lossy().into_owned()),
-            preexisting_annotation_count: u32::try_from(report.preexisting_annotation_count)
-                .unwrap_or(u32::MAX),
+            preexisting_annotation_count: lyra_reader_core::saturating_u32(
+                report.preexisting_annotation_count,
+            ),
             written_bookmark_ids: report.written_bookmark_ids,
             bookmark_outline_title: report.bookmark_outline_title,
-            preexisting_outline_entry_count: u32::try_from(report.preexisting_outline_entry_count)
-                .unwrap_or(u32::MAX),
-            cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
+            preexisting_outline_entry_count: lyra_reader_core::saturating_u32(
+                report.preexisting_outline_entry_count,
+            ),
+            cleaned_temporary_files: lyra_reader_core::saturating_u32(report.cleaned_temporaries),
             deleted_file_ids: report.deleted_ids,
-            deleted_reply_count: u32::try_from(report.deleted_reply_count).unwrap_or(u32::MAX),
-            deleted_popup_count: u32::try_from(report.deleted_popup_count).unwrap_or(u32::MAX),
+            deleted_reply_count: lyra_reader_core::saturating_u32(report.deleted_reply_count),
+            deleted_popup_count: lyra_reader_core::saturating_u32(report.deleted_popup_count),
             assigned_names: report.assigned_names,
             source_bytes_preserved: report.source_bytes_preserved,
             full_rewrite: report.full_rewrite,
@@ -4410,6 +4564,7 @@ impl LyraReaderDocument {
             geometry
                 .view_to_page(zoom)
                 .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
+                    severity: ErrorSeverity::Document,
                     message: format!("page {} has no invertible geometry", record.page + 1),
                 })?;
         let quads = record
@@ -4467,6 +4622,7 @@ impl LyraReaderDocument {
                 | AnnotationWriteKind::Squiggly => {
                     if quads.is_empty() {
                         return Err(LyraReaderFfiError::InvalidArgument {
+                            severity: ErrorSeverity::Document,
                             message: format!("annotation {:?} has no quads to write", record.id),
                         });
                     }
@@ -4476,6 +4632,7 @@ impl LyraReaderDocument {
                     }
                     if !rects_close(union, supplied_rect) {
                         return Err(LyraReaderFfiError::InvalidArgument {
+                            severity: ErrorSeverity::Document,
                             message: format!(
                                 "annotation {:?} has a rect that does not cover its quads",
                                 record.id
@@ -4504,6 +4661,7 @@ impl LyraReaderDocument {
                 AnnotationWriteKind::Ink => {
                     if record.ink_paths.is_empty() {
                         return Err(LyraReaderFfiError::InvalidArgument {
+                            severity: ErrorSeverity::Document,
                             message: format!(
                                 "ink annotation {:?} has no strokes to write",
                                 record.id
@@ -4551,6 +4709,7 @@ impl LyraReaderDocument {
                     let border = geometry_border(&record.id, record.border_width_pt)?;
                     let (Some(start), Some(end)) = (record.line_start, record.line_end) else {
                         return Err(LyraReaderFfiError::InvalidArgument {
+                            severity: ErrorSeverity::Document,
                             message: format!(
                                 "line annotation {:?} has no endpoints to write",
                                 record.id
@@ -4592,6 +4751,7 @@ impl LyraReaderDocument {
                 AnnotationWriteKind::Signature => {
                     if !record.contents.is_empty() {
                         return Err(LyraReaderFfiError::InvalidArgument {
+                            severity: ErrorSeverity::Document,
                             message: format!(
                                 "signature annotation {:?} must not carry text",
                                 record.id
@@ -5604,6 +5764,7 @@ pub struct AnnotationRulesRecord {
 
 fn annotation_rule_error(error: annotation_rules::RuleError) -> LyraReaderFfiError {
     LyraReaderFfiError::InvalidArgument {
+        severity: ErrorSeverity::Document,
         message: error.message,
     }
 }
@@ -5860,6 +6021,7 @@ fn edit_annotation(
 ) -> Result<annotation_records::RecordAnnotation, LyraReaderFfiError> {
     let kind = TaxonomyKind::from_record_kind(&record.kind).ok_or_else(|| {
         LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
             message: format!("unknown annotation-cache kind {:?}", record.kind),
         }
     })?;
@@ -5976,6 +6138,7 @@ pub fn decode_annotation_cache(
     let contents =
         annotation_records::decode(&data, page_count as usize, &palette).map_err(|error| {
             LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
                 message: error.detail,
             }
         })?;
@@ -6008,6 +6171,7 @@ pub fn encode_annotation_cache(
     let palette: Vec<_> = palette.into_iter().map(edit_color).collect();
     annotation_records::encode(&annotations, &bookmarks, &slots, &palette).map_err(|error| {
         LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
             message: error.detail,
         }
     })
@@ -6027,6 +6191,7 @@ pub fn validate_cached_annotation(
     let annotation = edit_annotation(annotation)?;
     annotation_rules::validate_annotation(&annotation, page_count as usize, &existing_ids).map_err(
         |error| LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
             message: error.message,
         },
     )
@@ -6042,6 +6207,7 @@ pub fn validate_cached_bookmark(
     let bookmark = edit_bookmark(bookmark);
     annotation_rules::validate_bookmark(&bookmark, page_count as usize, &existing_ids).map_err(
         |error| LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
             message: error.message,
         },
     )
@@ -6511,6 +6677,7 @@ fn view_box_to_page_rect(
         || view.height_pt <= 0.0
     {
         return Err(LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
             message: format!(
                 "a view-space box has no area or is not finite: {:?}",
                 values
@@ -6536,6 +6703,7 @@ fn view_box_to_page_rect(
         || rect.size.height <= 0.0
     {
         return Err(LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
             message: "a view-space box converted to an empty page-space box".to_string(),
         });
     }
@@ -6547,6 +6715,7 @@ fn view_box_to_page_rect(
         || rect.max_y() > crop.max_y() + SLACK
     {
         return Err(LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
             message: format!("annotation box {rect:?} falls outside the page's crop box {crop:?}"),
         });
     }
@@ -6922,12 +7091,12 @@ impl LyraReaderEngine {
         let signature = match &structural {
             Ok(document) => lyra_reader_pdfium::detect_signature_in_document(
                 document,
-                backend.signature_count(),
+                backend.signature_count()?,
             ),
             Err(_) => lyra_reader_pdfium::detect_signature(
                 source,
                 password.as_deref(),
-                backend.signature_count(),
+                backend.signature_count()?,
             ),
         };
         // Page sizes stay lazy: opening a 900-page document must not pay 900 page loads
@@ -7574,6 +7743,7 @@ impl AiJob {
 
     fn push(&self, event: AiEventRecord) {
         self.events
+            // Append-only queue of independent records; no cross-event invariant is guarded.
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push_back(event);
@@ -7602,6 +7772,7 @@ impl LyraReaderAiRequest {
         let mut events = self
             .job
             .events
+            // Append-only queue of independent records; no cross-event invariant is guarded.
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::mem::take(&mut *events).into_iter().collect()
@@ -7655,6 +7826,7 @@ pub fn start_ai_request(
 ) -> Result<Arc<LyraReaderAiRequest>, LyraReaderFfiError> {
     if api_key.is_empty() {
         return Err(LyraReaderFfiError::Ai {
+            severity: AiErrorCode::Unauthorized.severity(),
             code: AiErrorCode::Unauthorized,
             message: "No API key is configured. Add one in Settings > AI; nothing was sent."
                 .to_string(),
@@ -7662,6 +7834,7 @@ pub fn start_ai_request(
     }
     if api_key.chars().any(|character| character.is_control()) {
         return Err(LyraReaderFfiError::Ai {
+            severity: AiErrorCode::InvalidSettings.severity(),
             code: AiErrorCode::InvalidSettings,
             message: "The API key contains a control character or line break, so it was not sent."
                 .to_string(),
@@ -7713,6 +7886,7 @@ pub fn start_ai_request(
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         })
         .map_err(|error| LyraReaderFfiError::Ai {
+            severity: AiErrorCode::Other.severity(),
             code: AiErrorCode::Other,
             message: format!("could not start the AI request worker: {error}"),
         })?;
@@ -7734,6 +7908,7 @@ pub fn build_ai_merge_plan(
     });
     let reasoning_mode = ReasoningMode::from_wire(&request.reasoning_mode).ok_or_else(|| {
         LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
             message: format!(
                 "Unknown reasoning mode {}. Use default, off, low, high or max.",
                 request.reasoning_mode
@@ -7742,7 +7917,7 @@ pub fn build_ai_merge_plan(
     })?;
     let reasoning_encoding =
         ReasoningEncoding::from_wire(&request.reasoning_encoding).ok_or_else(|| {
-            LyraReaderFfiError::InvalidArgument {
+            LyraReaderFfiError::InvalidArgument { severity: ErrorSeverity::Document,
                 message: format!(
                     "Unknown reasoning encoding {}. Use none, thinking, reasoning_effort, output_config or reasoning.effort.",
                     request.reasoning_encoding
@@ -7890,12 +8065,14 @@ fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, LyraReaderFfiEr
     };
     if !(plan.endpoint.starts_with("http://") || plan.endpoint.starts_with("https://")) {
         return Err(LyraReaderFfiError::Ai {
+            severity: AiErrorCode::InvalidSettings.severity(),
             code: AiErrorCode::InvalidSettings,
             message: "The request preview has an invalid endpoint.".to_string(),
         });
     }
     if plan.parts.is_empty() {
         return Err(LyraReaderFfiError::Ai {
+            severity: AiErrorCode::Other.severity(),
             code: AiErrorCode::Other,
             message: "The request preview has no requests.".to_string(),
         });
@@ -7904,6 +8081,7 @@ fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, LyraReaderFfiEr
         (Some(field), Some(value)) => Some(ReasoningField {
             field: field.clone(),
             value: serde_json::from_str(value).map_err(|_| LyraReaderFfiError::Ai {
+                severity: AiErrorCode::InvalidSettings.severity(),
                 code: AiErrorCode::InvalidSettings,
                 message: "The request preview has an invalid reasoning field.".to_string(),
             })?,
@@ -7911,6 +8089,7 @@ fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, LyraReaderFfiEr
         (None, None) => None,
         _ => {
             return Err(LyraReaderFfiError::Ai {
+                severity: AiErrorCode::InvalidSettings.severity(),
                 code: AiErrorCode::InvalidSettings,
                 message: "The request preview names only half of its reasoning field.".to_string(),
             });
@@ -7987,11 +8166,59 @@ mod tests {
     use std::io::ErrorKind;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    /// One representative error per severity class crosses the FFI boundary with its severity.
+    #[test]
+    fn every_severity_class_crosses_the_ffi_payload() {
+        let rows = [
+            (
+                lyra_reader_core::LyraReaderError::new(ErrorCode::RenderFailed, "a tile failed"),
+                ErrorSeverity::Recoverable,
+            ),
+            (
+                lyra_reader_core::LyraReaderError::new(
+                    ErrorCode::CorruptDocument,
+                    "the page tree is damaged",
+                ),
+                ErrorSeverity::Document,
+            ),
+            (
+                lyra_reader_core::LyraReaderError::new(
+                    ErrorCode::GpuDeviceLost,
+                    "the device was lost",
+                ),
+                ErrorSeverity::Fatal,
+            ),
+        ];
+        for (error, expected) in rows {
+            let converted: LyraReaderFfiError = error.into();
+            assert_eq!(converted.severity(), expected);
+        }
+
+        // Explicit per-path overrides survive the conversion too: a call site can classify a
+        // RenderFailed write failure as Document without changing its code or message.
+        let overridden =
+            lyra_reader_core::LyraReaderError::new(ErrorCode::RenderFailed, "the save failed")
+                .with_severity(lyra_reader_core::Severity::Document);
+        let converted: LyraReaderFfiError = overridden.into();
+        assert_eq!(converted.severity(), ErrorSeverity::Document);
+
+        // The AI payload derives its severity from the stable code, not from its message.
+        for (code, expected) in [
+            (AiErrorCode::RateLimited, ErrorSeverity::Recoverable),
+            (AiErrorCode::InvalidSettings, ErrorSeverity::Document),
+        ] {
+            assert_eq!(code.severity(), expected);
+        }
+        let ai: LyraReaderFfiError = lyra_reader_ai::AiError::RateLimited.into();
+        assert!(matches!(ai, LyraReaderFfiError::Ai { .. }));
+        assert_eq!(ai.severity(), ErrorSeverity::Recoverable);
+    }
+
     #[test]
     fn a_missing_ai_selection_is_an_error_not_a_panic() {
         let error = selection_only_page(None).expect_err("no selection must not panic");
         match error {
-            LyraReaderFfiError::InvalidArgument { message } => {
+            LyraReaderFfiError::InvalidArgument { message, .. } => {
                 assert!(message.contains("selection"), "{message}");
             }
             other => panic!("expected InvalidArgument, got {other:?}"),
@@ -8012,6 +8239,7 @@ mod tests {
         let sizes = collect_page_sizes(2, |index| match index {
             0 => Ok((612.0, 792.0)),
             _ => Err(LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
                 message: "page 2 could not be measured".to_string(),
             }),
         });
@@ -8188,6 +8416,69 @@ mod tests {
         assert!(engine.raster_threads() >= 1);
     }
 
+    /// Every page-taking entry point must read the same sentence for the same condition.
+    ///
+    /// The table is the contract: one canonical 1-based message for "page N is outside the
+    /// document", one severity (`Document`), and both numbers preserved. It covers the four
+    /// FFI-side call sites; the PDFium-side ones are covered by the backend's own table test.
+    #[test]
+    fn out_of_range_page_messages_are_one_canonical_sentence() {
+        if !lyra_reader_pdfium::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let path = fixture("multipage.pdf");
+        let engine = LyraReaderEngine::new();
+        let document = engine
+            .open_document(path.display().to_string(), None)
+            .expect("open fixture");
+        let page_count = document.page_count();
+        let page = page_count + 1;
+        let expected = lyra_reader_core::page_out_of_range_message(page, page_count);
+        assert!(expected.starts_with(&format!("page {} ", page + 1)));
+
+        let errors: Vec<(&str, LyraReaderFfiError)> = vec![
+            (
+                "rasterize_page",
+                document
+                    .rasterize_page(page, 1.0)
+                    .expect_err("out of range"),
+            ),
+            (
+                "rasterize_tile",
+                document
+                    .rasterize_tile(page, 0, 0, 0, 256)
+                    .expect_err("out of range"),
+            ),
+            (
+                "rasterize_region",
+                document
+                    .rasterize_region(page, 1.0, 0.0, 0.0, 10.0, 10.0, false)
+                    .expect_err("out of range"),
+            ),
+        ];
+        // `ai_page` is private to the document type; the test module is a child, so it can call
+        // it exactly as the AI plan builder does.
+        let ai_error = document.ai_page(page).expect_err("out of range");
+        let mut errors = errors;
+        errors.push(("ai_page", ai_error));
+
+        for (name, error) in errors {
+            let LyraReaderFfiError::InvalidArgument { message, severity } = &error else {
+                panic!("{name} must report InvalidArgument, got {error:?}");
+            };
+            assert_eq!(message, &expected, "{name} keeps the canonical sentence");
+            assert_eq!(*severity, ErrorSeverity::Document, "{name} severity");
+        }
+
+        // In-range pages still succeed: the helper must not reject page 0 or the last page.
+        for page in [0, page_count - 1] {
+            document
+                .rasterize_page(page, 1.0)
+                .unwrap_or_else(|error| panic!("page {page} is in range: {error:?}"));
+        }
+    }
+
     #[test]
     fn probing_a_missing_file_is_a_document_error() {
         // Without a PDFium library the engine fails before it can look at the path, so it
@@ -8202,7 +8493,7 @@ mod tests {
         let engine = LyraReaderEngine::new();
         let result = engine.probe_document("/nonexistent/lyra-reader.pdf".to_string(), None);
         match result {
-            Err(LyraReaderFfiError::Document { message }) => assert!(!message.is_empty()),
+            Err(LyraReaderFfiError::Document { message, .. }) => assert!(!message.is_empty()),
             other => panic!("expected a document error, got {other:?}"),
         }
     }
@@ -8403,7 +8694,7 @@ mod tests {
             )
             .expect_err("saving around an unreadable annotation must be refused");
         match error {
-            LyraReaderFfiError::Document { message } => {
+            LyraReaderFfiError::Document { message, .. } => {
                 assert!(message.contains("blocked"), "{message}");
                 assert!(message.contains("page(s) 1"), "{message}");
             }
@@ -9506,7 +9797,7 @@ mod ai_code_tests {
         let converted: LyraReaderFfiError =
             AiError::Timeout("The stream took too long.".into()).into();
         match converted {
-            LyraReaderFfiError::Ai { message, code } => {
+            LyraReaderFfiError::Ai { message, code, .. } => {
                 assert_eq!(code, AiErrorCode::Timeout);
                 assert_eq!(message, "The stream took too long.");
             }

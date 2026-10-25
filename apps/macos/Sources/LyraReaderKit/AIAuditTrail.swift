@@ -151,7 +151,7 @@ public enum AIAuditCode: String, Codable, CaseIterable, Sendable {
     static func classifyPreparationFailure(_ error: Error, baseURL: String) -> AIAuditCode {
         let engineCode: AiErrorCode? = {
             guard let engineError = error as? LyraReaderFfiError,
-                  case .Ai(_, let code) = engineError else { return nil }
+                  case .Ai(_, let code, _) = engineError else { return nil }
             return code
         }()
         // The refusal categories the engine can name exactly. These were checked before the

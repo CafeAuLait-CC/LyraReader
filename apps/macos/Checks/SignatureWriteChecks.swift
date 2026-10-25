@@ -88,8 +88,8 @@ extension ReaderChecks {
                 let message: String
                 if let ffi = error as? LyraReaderFfiError {
                     switch ffi {
-                    case .Document(let value), .Backend(let value),
-                         .InvalidArgument(let value), .Ai(let value, _):
+                    case .Document(let value, _), .Backend(let value, _),
+                         .InvalidArgument(let value, _), .Ai(let value, _, _):
                         message = value
                     }
                 } else {

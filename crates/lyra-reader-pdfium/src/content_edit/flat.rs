@@ -38,7 +38,7 @@ pub(super) fn append(bytes: &[u8], snapshot: &mut ContentPage) -> Result<()> {
     let content = Content::decode(&document.get_page_content(page_id)).map_err(pdf_error)?;
     let paints = nested::paints_with_matrices(&content)?;
     let pdfium = pdfium_instance()?;
-    let _guard = PDFIUM_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = crate::backend::lock_pdfium()?;
     let doc = pdfium
         .load_pdf_from_byte_slice(bytes, None)
         .map_err(pdf_error)?;

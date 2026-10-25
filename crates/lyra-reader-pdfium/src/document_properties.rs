@@ -114,7 +114,7 @@ fn properties_from(document: &Document) -> (DocumentProperties, bool) {
 
 fn facts_from(document: &Document, path: &Path) -> DocumentFacts {
     DocumentFacts {
-        page_count: u32::try_from(document.get_pages().len()).unwrap_or(u32::MAX),
+        page_count: lyra_reader_core::saturating_u32(document.get_pages().len()),
         pdf_version: pdf_header_version(path),
         is_encrypted: document_is_encrypted(document),
     }

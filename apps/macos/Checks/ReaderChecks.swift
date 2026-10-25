@@ -1175,6 +1175,11 @@ struct ReaderChecks {
                 // Before xfa: pure value checks plus one scratch document; no window or GPU surface.
                 try await contractCleanupChecks(root: root)
             }),
+            ("error-presentation", {
+                // The severity → surface table and the captured presentation of every existing
+                // error path. Pure state; no window or document is needed.
+                try await errorPresentationChecks()
+            }),
             ("text-selection-cache", {
                 // The cache that makes a per-event hit test one synchronous call: second hit on
                 // the same page must not read PDFium again.

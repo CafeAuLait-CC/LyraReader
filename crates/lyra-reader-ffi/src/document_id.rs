@@ -27,7 +27,7 @@
 //! directory into the new one on first use, and [`crate::index_cache`] falls back to the legacy
 //! path-hash cache and copies a hit forward. No old file is deleted by the read path.
 
-use crate::api::LyraReaderFfiError;
+use crate::api::{ErrorSeverity, LyraReaderFfiError};
 use crate::index_cache::ContentIdentity;
 use sha2::{Digest, Sha256};
 use std::io;
@@ -72,6 +72,7 @@ impl From<io::Error> for LyraReaderFfiError {
     fn from(error: io::Error) -> Self {
         LyraReaderFfiError::Document {
             message: error.to_string(),
+            severity: ErrorSeverity::Document,
         }
     }
 }

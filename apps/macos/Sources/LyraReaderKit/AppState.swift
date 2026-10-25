@@ -485,6 +485,12 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     }
     @Published public var statusMessage: String = "Drag in a PDF, or press ⌘O to open a document"
     @Published public var lastError: String?
+    /// A recoverable engine error, shown inline instead of in the blocking alert.
+    ///
+    /// `Severity.recoverable` means one feature failed while the document stays readable; the
+    /// shell shows the sentence in a dismissible banner (and mirrors it to the status line) so a
+    /// page-level failure never interrupts reading with a modal dialog.
+    @Published public private(set) var recoverableErrorBanner: String?
     @Published public var showFileImporter: Bool = false
 
     // ── Page editing (T3.9) ────────────────────────────────────────────────────
@@ -1715,6 +1721,49 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Writes stay blocked: the notice is information, not the safety gate.
     public func dismissAnnotationReadNotice() {
         annotationReadNotice = nil
+    }
+
+    // MARK: - Error presentation (single severity → surface table)
+
+    /// Whether the blocking error alert is on screen. `ReaderWindow` binds its alert to this,
+    /// so a check can assert the alert surface without opening a window.
+    public var isErrorAlertPresented: Bool { lastError != nil }
+
+    /// Whether the inline recoverable-error banner is on screen.
+    public var isRecoverableErrorBannerPresented: Bool { recoverableErrorBanner != nil }
+
+    /// Present a thrown error on the surface its severity names.
+    ///
+    /// This is the shell's **only** severity decision. The message stays the caller's (some
+    /// call sites add an operation prefix), so wiring this in cannot change any existing error
+    /// text. Errors that did not cross the FFI (Cocoa, Swift) are document-level today: they
+    /// have always been shown in the alert, and they still are.
+    public func present(_ error: Error, message: String? = nil) {
+        let severity = (error as? LyraReaderFfiError)?.severity ?? .document
+        present(message: message ?? AIReadableError.message(error), severity: severity)
+    }
+
+    /// Present one already-composed message at an explicit severity.
+    ///
+    /// `Severity.recoverable` is non-blocking: it is shown inline (banner) and mirrored to the
+    /// status line, because one degraded feature must not interrupt reading. `Document` and
+    /// `Fatal` keep the blocking alert that every engine error used before this table existed.
+    public func present(message: String, severity: ErrorSeverity) {
+        switch severity.presentation {
+        case .alert:
+            lastError = message
+        case .banner:
+            recoverableErrorBanner = message
+            statusMessage = message
+        case .status:
+            statusMessage = message
+        }
+    }
+
+    /// Dismiss the recoverable-error banner. The message stays in the status line, so the state
+    /// is still visible after the reader acknowledges it.
+    public func dismissRecoverableError() {
+        recoverableErrorBanner = nil
     }
 
     /// A passage the AI chat is pointing at. This is deliberately **not** an annotation: it is
@@ -3623,6 +3672,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             document = loaded
             DocumentEditCache.adopt(documentId: loaded.documentId, for: url)
             lastError = nil
+            recoverableErrorBanner = nil
             currentPage = 1
             if loaded.xfa.isXfa {
                 // A reading cue, not a diagnostics report: the structural facts (packets, field
@@ -3673,7 +3723,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return true
 
         } catch {
-            lastError = String(describing: error)
+            // The message is the historical one; `present` only chooses the surface, and an
+            // open failure is Document/Fatal, so this still lands in the alert exactly as before.
+            present(error, message: String(describing: error))
             statusMessage = "Couldn't open the document"
             return false
         }
@@ -3753,6 +3805,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         documentAnnotationsLoading = false
         documentAnnotationsError = nil
         annotationReadNotice = nil
+        recoverableErrorBanner = nil
         annotationSaveInProgress = false
         pageEditIsApplied = false
         interruptedAnnotationSaveNotice = nil

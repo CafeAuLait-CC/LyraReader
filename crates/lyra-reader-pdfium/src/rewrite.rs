@@ -1000,7 +1000,7 @@ fn verify_signature_strip(
             "the signature-free copy still reports signature evidence",
         ));
     }
-    if crate::PdfiumBackend::open(after, None)?.signature_count() != 0 {
+    if crate::PdfiumBackend::open(after, None)?.signature_count()? != 0 {
         return Err(LyraReaderError::new(
             ErrorCode::Internal,
             "PDFium still sees a signature in the signature-free copy",
@@ -1220,7 +1220,7 @@ mod tests {
                 crate::PdfiumBackend::open(&copy, None)
                     .expect("open after")
                     .signature_count(),
-                0,
+                Ok(0),
                 "{name}: PDFium still sees a signature"
             );
             // The bytes may legitimately contain the words "/Perms" or "SigFlags" in page

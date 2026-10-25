@@ -172,6 +172,18 @@ pub fn is_available() -> bool {
     }
 }
 
+/// Test-only hook: poison the process-wide PDFium lock, then let the next call report the
+/// explicit corruption error instead of continuing with a possibly inconsistent PDFium state.
+///
+/// Only a separate test process may call this: the poison marker lasts for the life of the
+/// process. Public because integration tests are separate crates; hidden from the documented API.
+#[cfg(feature = "pdfium")]
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn poison_pdfium_lock_for_test() {
+    backend::poison_pdfium_lock_for_test();
+}
+
 /// Human-readable description of the build-time backend selection, used by
 /// `--version` output and diagnostics.
 pub fn backend_description() -> &'static str {

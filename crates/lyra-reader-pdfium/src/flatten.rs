@@ -223,7 +223,7 @@ fn plan_expected(source: &Path, password: Option<&str>) -> Result<Expected> {
     }
     let kept_fields = collect_kept_fields(&plan.fields);
     let acro_form_expected = !kept_fields.is_empty();
-    let pages = u32::try_from(plan.pages.len()).unwrap_or(u32::MAX);
+    let pages = lyra_reader_core::saturating_u32(plan.pages.len());
     Ok(Expected {
         pages,
         remaining,
@@ -421,7 +421,7 @@ fn plan_document(document: &Document) -> Result<DocumentPlan> {
     let mut parent_of: HashMap<ObjectId, ObjectId> = HashMap::new();
 
     for (page_index, page_id) in pages_map.values().copied().enumerate() {
-        let page_number = u32::try_from(page_index).unwrap_or(u32::MAX);
+        let page_number = lyra_reader_core::saturating_u32(page_index);
         let annots = page_annots(document, page_id);
         let mut entries = Vec::new();
         for (annot_index, raw) in annots.iter().enumerate() {
@@ -1575,7 +1575,7 @@ fn build_flattened(source: &Path, password: Option<&str>) -> Result<Built> {
     let mut document = load_document(source, password)?;
     refuse_unflattenable(&document)?;
     let plan = plan_document(&document)?;
-    let pages = u32::try_from(plan.pages.len()).unwrap_or(u32::MAX);
+    let pages = lyra_reader_core::saturating_u32(plan.pages.len());
     let mut stats = BuildStats {
         pages,
         flattened_annotations: 0,
@@ -2331,7 +2331,7 @@ fn verify_flattened(
     let mut remaining: Vec<(u32, String)> = Vec::new();
     let mut widgets = 0usize;
     for (page_index, page_id) in document.get_pages().values().copied().enumerate() {
-        let page_number = u32::try_from(page_index).unwrap_or(u32::MAX);
+        let page_number = lyra_reader_core::saturating_u32(page_index);
         for object in page_annots(&document, page_id) {
             let dictionary = match &object {
                 Object::Reference(id) => document
