@@ -322,6 +322,151 @@ extension ReaderChecks {
         try await waitForInspector(false, "clearing the Fill & Sign tool closes its inspector")
         state.fillAndSignVisible = false
 
+        // ── 4a. Closing a row disarms the tool it owns ───────────────────────────────────
+        // A tool is only meaningful while its row is visible. Closing or collapsing the row must
+        // return the page to the implicit pointer state; otherwise a highlight, pen or Fill &
+        // Sign placement keeps applying with no visible control left to turn it off.
+        guard let firstPage = state.canvasPageFrames.first(where: { $0.index == 0 }) else {
+            require(false, "the toolbar-rows fixture lays out its first page")
+            return
+        }
+        let ringPoint = CGPoint(x: min(160, firstPage.widthPt / 2),
+                                y: min(220, firstPage.heightPt / 2))
+        func waitForCanvasTool(_ tool: AnnotationTool, _ message: String) async throws {
+            try await eventually(message, { harness.canvas.annotationTool == tool })
+        }
+
+        // Annotate: a note is placed by one click, so the same click is a positive control while
+        // the row is open and must be inert after it closes.
+        state.annotationToolsVisible = true
+        state.toggleAnnotationTool(.note)
+        require(state.annotationTool == .note, "the Note tool arms inside the Annotate row")
+        try await waitForCanvasTool(.note, "the hosted canvas receives the armed Note tool")
+        let notesBefore = state.annotations.count
+        require(harness.clickPage(0, at: ringPoint), "the hosted canvas receives a page click")
+        try await eventually("the armed Note tool places one annotation on that click", {
+            state.annotations.count == notesBefore + 1
+        })
+        guard state.deleteSelectedAnnotation() else {
+            require(false, "the positive-control note is removed")
+            return
+        }
+        try await eventually("the positive-control note is gone before the row closes", {
+            state.annotations.count == notesBefore
+        })
+        state.annotationToolsVisible = false
+        require(state.annotationTool == .select,
+                "closing the Annotate row returns the annotation tool to Select")
+        try await waitForCanvasTool(.select, "the canvas sees Select after Annotate closes")
+        require(harness.clickPage(0, at: ringPoint),
+                "the page click after closing Annotate is delivered")
+        require(state.annotations.count == notesBefore,
+                "a page click after Annotate closes no longer applies its tool")
+
+        // Edit: closing the row clears the armed content tool and closes its inspector. A click
+        // after it closes cannot select a page object for editing.
+        state.contentEditEnabled = true
+        state.selectContentTool("text")
+        require(state.contentEditInspectorVisible,
+                "Edit's Text tool opens the inspector before the row closes")
+        state.contentEditEnabled = false
+        require(state.contentEditTool == "select",
+                "closing the Edit row returns the content tool to Select")
+        require(!state.contentEditInspectorVisible,
+                "closing the Edit row closes its inspector")
+        let editsBefore = state.pageEditPendingOperations.count
+        require(harness.clickPage(0, at: ringPoint),
+                "the page click after closing Edit is delivered")
+        require(state.contentEditSelection == nil
+                    && state.pageEditPendingOperations.count == editsBefore,
+                "a page click after Edit closes no longer applies its content tool")
+
+        // Fill & Sign: closing the row clears the armed item and its inspector. Its Date item
+        // claims the next click, so the click is a positive control before the close and must
+        // place nothing after it.
+        state.fillAndSignVisible = true
+        state.selectFillSignTool(.date)
+        require(state.armedFillSignTool == .date && state.fillSignInspectorVisible,
+                "the Date item arms and opens the Fill & Sign inspector")
+        try await eventually("the hosted canvas receives the armed Date placement", {
+            harness.canvas.fillSignPlacementPending
+        })
+        let datesBefore = state.annotations.count
+        require(harness.clickPage(0, at: ringPoint),
+                "the page click with Date armed is delivered")
+        try await eventually("the armed Date item places one annotation on that click", {
+            state.annotations.count == datesBefore + 1
+        })
+        guard state.deleteSelectedAnnotation() else {
+            require(false, "the positive-control date is removed")
+            return
+        }
+        state.selectFillSignTool(.date)
+        require(state.pendingFillSignPlacement == .date,
+                "the Date item arms its one-click placement again")
+        state.fillAndSignVisible = false
+        require(state.armedFillSignTool == nil,
+                "closing the Fill & Sign row clears its armed item")
+        require(state.pendingFillSignPlacement == nil && !state.fillSignInspectorVisible,
+                "closing the Fill & Sign row drops its placement and closes its inspector")
+        try await eventually("the hosted canvas sees the closed Fill & Sign row", {
+            !harness.canvas.fillSignPlacementPending
+        })
+        let fillsBefore = state.annotations.count
+        require(harness.clickPage(0, at: ringPoint),
+                "the page click after closing Fill & Sign is delivered")
+        require(state.annotations.count == fillsBefore,
+                "a page click after Fill & Sign closes places nothing")
+
+        // Switching rows deactivates the old row's tool: Annotate -> Edit can never leave a
+        // highlight armed behind the Edit row.
+        state.annotationToolsVisible = true
+        state.toggleTextMarkupTool(.highlight)
+        require(state.annotationTool == .highlight, "Highlight arms inside the Annotate row")
+        state.contentEditEnabled = true
+        require(!state.annotationToolsVisible && state.openSecondaryRows == [.contentEdit],
+                "opening Edit switches the one row slot from Annotate")
+        require(state.annotationTool == .select,
+                "switching Annotate -> Edit clears the armed highlight")
+
+        // Closing Edit while its inspector is open is the same rule seen from the row's own
+        // toolbar button: the tool and the inspector go with the row.
+        state.selectContentTool("text")
+        require(state.contentEditInspectorVisible,
+                "the content tool reopened the Edit inspector")
+        state.contentEditEnabled = false
+        require(state.contentEditTool == "select" && !state.contentEditInspectorVisible,
+                "closing Edit clears the content tool and its inspector")
+
+        // Page overview covers the page, so opening it disarms an annotation tool while leaving
+        // the row state alone (the row returns in the pointer state when the overview closes).
+        state.annotationToolsVisible = true
+        state.toggleAnnotationTool(.pen)
+        require(state.annotationTool == .pen, "the Pen tool arms before page overview opens")
+        state.pageOverviewVisible = true
+        require(state.annotationTool == .select,
+                "opening page overview clears an armed annotation tool")
+        require(state.openSecondaryRows == [.annotations],
+                "page overview leaves the Annotate row open behind it")
+        state.pageOverviewVisible = false
+        require(state.annotationTool == .select,
+                "closing page overview does not re-arm the old tool")
+        state.annotationToolsVisible = false
+
+        // Export owns no persistent page tool. Closing its row is still checked, and the other
+        // rows' tools must stay in the implicit pointer state.
+        state.exportVisible = true
+        state.exportVisible = false
+        require(state.openSecondaryRows.isEmpty, "closing the Export row closes the row slot")
+        require(state.annotationTool == .select && state.armedFillSignTool == nil
+                    && state.contentEditTool == "select",
+                "closing Export leaves no tool armed")
+        let exportsBefore = state.annotations.count
+        require(harness.clickPage(0, at: ringPoint),
+                "the page click after closing Export is delivered")
+        require(state.annotations.count == exportsBefore,
+                "a page click after Export closes applies nothing")
+
         // ── 4b. One host for both tool inspectors ────────────────────────────────────────
         // By inspection there were two inspector hosts (ContentEditInspector and
         // FillSignInspector) that repeated the same header/scroll/footer scaffold and the same
@@ -1238,6 +1383,50 @@ extension ReaderChecks {
                 "the received sketch becomes the armed signature image")
         state.clearFillSignTool()
 
+        // ── 11. Closing the document closes the rows and disarms their tools ─────────────
+        // The tool belongs to the document's page. Closing the active tab must leave the next
+        // document—or the empty window—with no row or tool armed against a page that is gone.
+        let closeState = AppState(engine: try RustEngine())
+        closeState.setViewportSize(CGSize(width: 1000, height: 750))
+        func reopenCloseFixture(_ label: String) async throws {
+            closeState.newTab(url: fixture)
+            try await eventually("\(label): the fixture opens", { closeState.document != nil })
+        }
+
+        try await reopenCloseFixture("document-close annotation")
+        closeState.annotationToolsVisible = true
+        closeState.toggleAnnotationTool(.pen)
+        require(closeState.annotationTool == .pen,
+                "the Pen is armed before the document closes")
+        closeState.closeTab(0)
+        require(closeState.document == nil, "closing the only tab closes the document")
+        require(closeState.annotationTool == .select && closeState.openSecondaryRows.isEmpty,
+                "closing the document clears an armed annotation tool and its row")
+
+        try await reopenCloseFixture("document-close content")
+        closeState.contentEditEnabled = true
+        closeState.selectContentTool("text")
+        require(closeState.contentEditInspectorVisible,
+                "the Edit inspector is open before the document closes")
+        closeState.closeTab(0)
+        require(closeState.document == nil, "the reopened document closes")
+        require(closeState.contentEditTool == "select"
+                    && !closeState.contentEditInspectorVisible
+                    && closeState.openSecondaryRows.isEmpty,
+                "closing the document clears the content tool, its inspector and its row")
+
+        try await reopenCloseFixture("document-close fill")
+        closeState.fillAndSignVisible = true
+        closeState.selectFillSignTool(.date)
+        require(closeState.armedFillSignTool == .date && closeState.fillSignInspectorVisible,
+                "the Fill & Sign item and inspector are open before the document closes")
+        closeState.closeTab(0)
+        require(closeState.document == nil, "the Fill & Sign document closes")
+        require(closeState.armedFillSignTool == nil && closeState.pendingFillSignPlacement == nil
+                    && !closeState.fillSignInspectorVisible
+                    && closeState.openSecondaryRows.isEmpty,
+                "closing the document clears the Fill & Sign item, inspector and row")
+
         print("Toolbar row checks passed")
     }
 }
@@ -1339,6 +1528,44 @@ private final class ToolbarRowHarness {
             guard let parent = view.superview else { return true }
             view = parent
         }
+    }
+
+    /// Sends one left click to a page-local point through the real canvas.
+    ///
+    /// This drives the same `mouseDown`/`mouseUp` path a reader's click takes, including the
+    /// canvas's tool dispatch and the ReaderWindow closures, rather than calling an AppState
+    /// placement helper directly. It is how the row checks prove that a tool really stopped
+    /// applying after its row closed, not just that a boolean was reset.
+    @discardableResult
+    func clickPage(_ page: Int, at point: CGPoint) -> Bool {
+        host.layoutSubtreeIfNeeded()
+        guard let canvas,
+              let placement = state.canvasPageFrames.first(where: { $0.index == page }) else {
+            return false
+        }
+        let zoom = state.zoomFactor
+        let offsetX = CanvasGeometry.contentOffsetX(
+            viewportWidthPt: canvas.bounds.width,
+            contentWidthPt: state.contentWidthPt,
+            zoom: zoom)
+        let content = CGPoint(x: placement.leftPt + point.x, y: placement.topPt + point.y)
+        let viewPoint = CGPoint(
+            x: offsetX + content.x * zoom,
+            y: canvas.bounds.height - (content.y - state.scrollYPt) * zoom)
+        let location = canvas.convert(viewPoint, to: nil)
+        guard let down = NSEvent.mouseEvent(
+                with: .leftMouseDown, location: location, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 1,
+                clickCount: 1, pressure: 1),
+              let up = NSEvent.mouseEvent(
+                with: .leftMouseUp, location: location, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 1,
+                clickCount: 1, pressure: 0) else {
+            return false
+        }
+        canvas.mouseDown(with: down)
+        canvas.mouseUp(with: up)
+        return true
     }
 
     /// The right-hand drawer's marker, so the checks can compare its moving leading edge with

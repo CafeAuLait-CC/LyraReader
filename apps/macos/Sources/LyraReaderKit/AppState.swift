@@ -398,6 +398,11 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
             if pageOverviewVisible {
                 blurFormField()
                 cancelRegionSelection(reason: "Region selection cancelled: page overview opened.")
+                // Page overview covers the page an armed tool would act on. A tool is armed for
+                // that page, not for a row that happens to stay open behind the grid, so opening
+                // the overview disarms every row's tool. The rows themselves stay open and come
+                // back in the implicit pointer state when the overview closes.
+                deactivateAllSecondaryRowTools()
             }
         }
     }
@@ -405,7 +410,14 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     /// layout row above it, so this is the value its show/hide transition animates.
     @Published public var annotationToolsVisible: Bool = false {
         didSet {
-            if annotationToolsVisible { closeOtherSecondaryRows(except: .annotations) }
+            if annotationToolsVisible {
+                closeOtherSecondaryRows(except: .annotations)
+            } else {
+                // A tool lives in its row: closing Annotate returns the page to the implicit
+                // pointer state instead of leaving a pen or highlight armed with no visible
+                // control to turn it off.
+                deactivateSecondaryRowTool(.annotations)
+            }
         }
     }
     /// Whether the Fill & Sign row is expanded. It shares the one secondary-row slot with the
@@ -524,9 +536,7 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
             } else {
                 // Leaving Edit leaves its tool too. Reopening the row starts in the implicit
                 // pointer state, so the inspector (which follows an armed tool) stays closed.
-                contentEditTool = "select"
-                contentEditSelection = nil
-                contentLinkDraft = nil
+                deactivateSecondaryRowTool(.contentEdit)
             }
         }
     }
@@ -12799,6 +12809,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         retainedTabs.removeValue(forKey: closing.id)
         let closingDocumentURL = document?.url
         activeTabIndex = nil
+        // The rows and their armed tools belong to the document that is leaving. Close them
+        // before the state is reset so no tool can act on the next document's first page.
+        closeAllSecondaryRows()
         // Flush first: while the page-edit session is still current, its records path is the
         // working copy. Deleting the working directory before the flush would lose the note.
         resetDocumentState()
@@ -15484,8 +15497,49 @@ extension AppState {
         pendingSignatureIsPicture = false
     }
 
-    /// Closes every secondary row except one. Called by the four visibility setters, so a row
-    /// cannot be opened beside another one even when a caller assigns the boolean directly.
+    /// Clears the tool a secondary row owns, when that row closes or stops being the one on
+    /// screen. A tool is only meaningful while its row is visible: closing the row, switching
+    /// to another row, opening page overview or closing the document must all leave the page in
+    /// the implicit pointer state rather than keep applying a tool whose control is gone.
+    ///
+    /// Export and Lyra own no persistent page tool, so they have nothing to clear.
+    private func deactivateSecondaryRowTool(_ row: SecondaryRow) {
+        switch row {
+        case .annotations:
+            annotationTool = .select
+        case .contentEdit:
+            contentEditTool = "select"
+            contentEditSelection = nil
+            contentLinkDraft = nil
+        case .fillAndSign:
+            clearFillSignTool()
+        case .export, .lyra:
+            break
+        }
+    }
+
+    /// Disarms every row's tool without changing which rows are open. Page overview uses this:
+    /// it covers the page while leaving the row state alone, so closing the overview restores
+    /// the row in the implicit pointer state.
+    private func deactivateAllSecondaryRowTools() {
+        deactivateSecondaryRowTool(.annotations)
+        deactivateSecondaryRowTool(.contentEdit)
+        deactivateSecondaryRowTool(.fillAndSign)
+    }
+
+    /// Closes every secondary row, deactivating the tool each one owns as it closes. Closing the
+    /// document uses this: there is no page left for a row or its tool to act on.
+    private func closeAllSecondaryRows() {
+        pageOverviewVisible = false
+        annotationToolsVisible = false
+        contentEditEnabled = false
+        fillAndSignVisible = false
+        exportVisible = false
+        aiToolsVisible = false
+    }
+
+    /// Closes every secondary row except one. Called by the visibility setters, so a row cannot
+    /// be opened beside another one even when a caller assigns the boolean directly.
     private func closeOtherSecondaryRows(except row: SecondaryRow) {
         if row != .annotations, annotationToolsVisible { annotationToolsVisible = false }
         if row != .contentEdit, contentEditEnabled { contentEditEnabled = false }
