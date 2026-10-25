@@ -1006,24 +1006,6 @@ public struct AnnotationWriteRequest: Sendable, Equatable {
     }
 }
 
-/// One bookmark the shell asks the engine to write into the document's outline.
-///
-/// `yPt` is page-local view space (0 at the page top), the same value the annotation cache stores, so the
-/// written destination survives a zoom change, a resize and a layout switch.
-public struct BookmarkWriteRequest: Sendable, Equatable {
-    public let id: UUID
-    public let page: Int
-    public let title: String
-    public let yPt: CGFloat
-
-    public init(id: UUID, page: Int, title: String, yPt: CGFloat) {
-        self.id = id
-        self.page = page
-        self.title = title
-        self.yPt = yPt
-    }
-}
-
 /// What a successful PDF write did.
 public struct AnnotationWriteReport: Sendable, Equatable {
     public let destinationPath: String
@@ -1734,14 +1716,14 @@ public protocol PDFEngine: AnyObject {
     func saveAnnotatedCopy(
         to url: URL,
         annotations: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
+        bookmarks: [Bookmark],
         zoom: CGFloat
     ) async throws -> AnnotationWriteReport
     /// Applies additions, edits and deletions to a new PDF at `url`.
     func saveAnnotationChanges(
         to url: URL,
         additions: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
+        bookmarks: [Bookmark],
         updates: [AnnotationUpdateRequest],
         deletions: [AnnotationDeleteRequest],
         zoom: CGFloat
@@ -1751,14 +1733,14 @@ public protocol PDFEngine: AnyObject {
     /// written.
     func replaceWithAnnotations(
         _ annotations: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
+        bookmarks: [Bookmark],
         zoom: CGFloat
     ) async throws -> AnnotationWriteReport
     /// Replaces the open document with one carrying additions, edits and deletions, after a
     /// verified backup.
     func replaceWithAnnotationChanges(
         _ additions: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
+        bookmarks: [Bookmark],
         updates: [AnnotationUpdateRequest],
         deletions: [AnnotationDeleteRequest],
         zoom: CGFloat
@@ -1909,7 +1891,7 @@ public extension PDFEngine {
     func saveAnnotatedCopy(
         to url: URL,
         annotations: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
+        bookmarks: [Bookmark],
         zoom: CGFloat
     ) async throws -> AnnotationWriteReport {
         throw NSError(
@@ -1921,7 +1903,7 @@ public extension PDFEngine {
 
     func replaceWithAnnotations(
         _ annotations: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
+        bookmarks: [Bookmark],
         zoom: CGFloat
     ) async throws -> AnnotationWriteReport {
         throw NSError(
@@ -1934,7 +1916,7 @@ public extension PDFEngine {
     func saveAnnotationChanges(
         to url: URL,
         additions: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
+        bookmarks: [Bookmark],
         updates: [AnnotationUpdateRequest],
         deletions: [AnnotationDeleteRequest],
         zoom: CGFloat
@@ -1948,7 +1930,7 @@ public extension PDFEngine {
 
     func replaceWithAnnotationChanges(
         _ additions: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
+        bookmarks: [Bookmark],
         updates: [AnnotationUpdateRequest],
         deletions: [AnnotationDeleteRequest],
         zoom: CGFloat
@@ -2610,7 +2592,7 @@ public final class RustEngine: PDFEngine {
     public func saveAnnotatedCopy(
         to url: URL,
         annotations: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
+        bookmarks: [Bookmark],
         zoom: CGFloat
     ) async throws -> AnnotationWriteReport {
         guard let document else {
@@ -2649,7 +2631,7 @@ public final class RustEngine: PDFEngine {
     public func saveAnnotationChanges(
         to url: URL,
         additions: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
+        bookmarks: [Bookmark],
         updates: [AnnotationUpdateRequest],
         deletions: [AnnotationDeleteRequest],
         zoom: CGFloat
@@ -2695,7 +2677,7 @@ public final class RustEngine: PDFEngine {
 
     public func replaceWithAnnotationChanges(
         _ additions: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
+        bookmarks: [Bookmark],
         updates: [AnnotationUpdateRequest],
         deletions: [AnnotationDeleteRequest],
         zoom: CGFloat
@@ -2740,7 +2722,7 @@ public final class RustEngine: PDFEngine {
 
     public func replaceWithAnnotations(
         _ annotations: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
+        bookmarks: [Bookmark],
         zoom: CGFloat
     ) async throws -> AnnotationWriteReport {
         guard let document else {
@@ -3342,15 +3324,13 @@ public final class RustEngine: PDFEngine {
         }
     }
 
-    private static func writeBookmarkRecords(
-        from requests: [BookmarkWriteRequest]
-    ) -> [WriteBookmarkRecord] {
-        requests.map { request in
+    private static func writeBookmarkRecords(from bookmarks: [Bookmark]) -> [WriteBookmarkRecord] {
+        bookmarks.map { bookmark in
             WriteBookmarkRecord(
-                id: request.id.uuidString,
-                page: UInt32(request.page),
-                title: request.title,
-                yPt: Double(request.yPt)
+                id: bookmark.id.uuidString,
+                page: UInt32(bookmark.page),
+                title: bookmark.title,
+                yPt: Double(bookmark.yPt)
             )
         }
     }

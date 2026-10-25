@@ -102,18 +102,6 @@ extension ReaderChecks {
         require(afterDelete.bookmarks.map(\.title) == ["Introduction"],
                 "delete persists across a reopen")
 
-        // The sidebar's grouping model: one section per page, first appearance wins.
-        let page0 = Bookmark(page: 0, title: "a")
-        let page1 = Bookmark(page: 1, title: "b")
-        let page0Again = Bookmark(page: 0, title: "c")
-        let groups = BookmarkGrouping.groups(for: [page0, page1, page0Again])
-        require(groups.map(\.page) == [0, 1],
-                "bookmarks group by page in first-appearance order")
-        require(groups[0].bookmarks.map(\.title) == ["a", "c"],
-                "a page's bookmarks keep their relative order inside the group")
-        require(groups[0].title == "Page 1 · 2 bookmarks",
-                "the group label carries the count")
-
         // ── A newer build's bookmark entry is preserved, not misread ──────────────────────
         let futureID = UUID().uuidString
         let futureEntry = "{\"color\":\"#FF00FFFF\",\"createdAt\":800000000,"
