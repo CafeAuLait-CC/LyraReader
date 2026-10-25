@@ -87,6 +87,7 @@ fn update_from(record: &RawAnnotation, contents: &str) -> AnnotationUpdate {
         lyra_reader_core::RawAnnotationKind::Highlight => WriteAnnotationKind::Highlight,
         lyra_reader_core::RawAnnotationKind::Underline => WriteAnnotationKind::Underline,
         lyra_reader_core::RawAnnotationKind::Strikeout => WriteAnnotationKind::StrikeOut,
+        lyra_reader_core::RawAnnotationKind::Squiggly => WriteAnnotationKind::Squiggly,
         lyra_reader_core::RawAnnotationKind::Text => WriteAnnotationKind::Text,
         lyra_reader_core::RawAnnotationKind::FreeText => WriteAnnotationKind::FreeText,
         lyra_reader_core::RawAnnotationKind::Ink => WriteAnnotationKind::Ink,
@@ -408,9 +409,9 @@ fn a_kind_the_editor_cannot_change_is_refused_as_such() {
     }
     let scratch = Scratch::new("unsupported");
     let source = scratch.join("unsupported.pdf");
-    let squiggly = dictionary! {
+    let polygon = dictionary! {
         "Type" => "Annot",
-        "Subtype" => "Squiggly",
+        "Subtype" => "Polygon",
         "Rect" => vec![Object::Real(72.0), Object::Real(700.0), Object::Real(300.0), Object::Real(712.0)],
         "NM" => Object::string_literal("not-editable"),
         "Contents" => Object::string_literal("a kind this editor has no model for"),
@@ -426,7 +427,7 @@ fn a_kind_the_editor_cannot_change_is_refused_as_such() {
     };
     write_pdf(
         &source,
-        &[vec![Entry::Inline(squiggly), Entry::Indirect(link)]],
+        &[vec![Entry::Inline(polygon), Entry::Indirect(link)]],
     );
     let destination = scratch.join("refused.pdf");
 

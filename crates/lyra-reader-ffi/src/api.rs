@@ -3642,7 +3642,8 @@ impl LyraReaderDocument {
                 }
                 AnnotationWriteKind::Highlight
                 | AnnotationWriteKind::Underline
-                | AnnotationWriteKind::StrikeOut => {
+                | AnnotationWriteKind::StrikeOut
+                | AnnotationWriteKind::Squiggly => {
                     if quads.is_empty() {
                         return Err(LyraReaderFfiError::InvalidArgument {
                             message: format!("annotation {:?} has no quads to write", record.id),
@@ -3664,6 +3665,7 @@ impl LyraReaderDocument {
                         AnnotationWriteKind::Highlight => WriteAnnotationKind::Highlight,
                         AnnotationWriteKind::Underline => WriteAnnotationKind::Underline,
                         AnnotationWriteKind::StrikeOut => WriteAnnotationKind::StrikeOut,
+                        AnnotationWriteKind::Squiggly => WriteAnnotationKind::Squiggly,
                         _ => unreachable!("handled by the outer match"),
                     };
                     (
@@ -4544,15 +4546,18 @@ pub struct AnnotationColorRecord {
 /// The PDF annotation a pending write becomes.
 ///
 /// `Note` is a sticky note (`/Subtype /Text`): its `rect` is the icon box and its contents are
-/// the note. `Highlight`/`Underline`/`StrikeOut` are the quad-based text marks: their `quads`
-/// are the text boxes and `contents` is the comment attached to the mark (what the shell's
-/// `note` field is).
+/// the note. `Highlight`/`Underline`/`StrikeOut`/`Squiggly` are the quad-based text marks: their
+/// `quads` are the text boxes and `contents` is the comment attached to the mark (what the
+/// shell's `note` field is).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum AnnotationWriteKind {
     Highlight,
     Underline,
     /// `/StrikeOut`: a line through the middle of the selected glyphs.
     StrikeOut,
+    /// `/Squiggly`: a mark beside the text. The shell does not create it, but a foreign file may
+    /// carry one and this writer can re-emit it with an appearance stream.
+    Squiggly,
     Note,
     /// `/FreeText`: text in `rect`, at `font_size_pt`, aligned by `text_alignment`, with
     /// `/DA` and an appearance stream.

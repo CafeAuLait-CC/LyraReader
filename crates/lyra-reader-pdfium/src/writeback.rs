@@ -31,35 +31,29 @@
 //!    incremental save that disturbes an existing annotation fails instead of replacing the
 //!    original.
 //!
-//! # Appearance streams (honest limitation)
+//! # Appearance streams
 //!
-//! PDFium's C API has exactly one way to attach an appearance stream to an annotation:
-//! `FPDFAnnot_SetAP`. Its implementation creates the form XObject **and its `/ExtGState`**, and
-//! that graphics state is hard-coded to `/BM /Normal` (PDFium `fpdf_annot.cpp`,
-//! `SetExtGStateInResourceDict(doc, annot_dict, "Normal")`; measured against the vendored
-//! dylib, whose output contains `/BM/Normal`). There is no public call that puts `/BM /Multiply`
-//! in that state, and writing a `Normal` state for a translucent highlight would make Preview
-//! tint the glyphs instead of multiplying into the page — strictly worse than no appearance at
-//! all, because the two viewers would then disagree about the same file.
+//! Every annotation this writer adds carries a real `/AP /N` Form XObject, except `/Text` (whose
+//! icon is a viewer glyph selected by `/Name`). PDFium's C API cannot produce those streams
+//! faithfully: `FPDFAnnot_SetAP` encodes its argument as text, and the `/ExtGState` it creates is
+//! hard-coded to `/BM /Normal` (PDFium `fpdf_annot.cpp`,
+//! `SetExtGStateInResourceDict(doc, annot_dict, "Normal")`). A translucent highlight written with
+//! that state would tint the glyphs instead of multiplying into the page, so annotation
+//! dictionaries and appearances are written by [`crate::geometry_write`] (the direct lopdf
+//! writer, named for the first kinds it handled) into the same incremental temporary file.
 //!
-//! This writer therefore does **not** write `/AP` for the quad-based kinds, which now includes
-//! `/StrikeOut`: it has the same `/QuadPoints` and `/C` contract as an underline, just a
-//! different line position. Both PDFium and PDFKit synthesize the appearance from those keys;
-//! the macOS test suite renders a saved copy with PDFKit and asserts that the highlight covers
-//! the line while the glyph pixels stay black, which is the multiply-like result Preview is
-//! expected to show. A viewer that requires an explicit `/AP` (some older readers do) will show
-//! nothing; the alternative was to
-//! write a state that is knowingly wrong. See the task report and `README.md` for the measurement.
+//! A stroked mark gets its `/BS` geometry and a stream that strokes the same path; a text mark
+//! gets `/QuadPoints`, `/C`, `/CA`, `/BM` and a stream that fills the same bands the canvas
+//! draws. The stream's `/ExtGState` carries the blend and constant alpha, so a viewer that
+//! honours `/AP` and one that synthesises from the dictionary show the same mark. `/Text` gets
+//! `/Name /Comment`; `/FreeText` gets `/DA`, `/Q` and a stream in the embedded appearance font.
+//! The appearance objects are appended by the same save as the annotation dictionaries and are
+//! verified before the rename.
 //!
-//! Ink, shapes, sticky notes and free text are different: they have no blend mode to get wrong,
-//! and PDFium's C API cannot write the keys they need (`/BS`, `/L`, `/Name`, `/DA`, `/Q`, or a
-//! real `/AP` form XObject). They are written by [`crate::geometry_write`] (the direct lopdf
-//! writer, named for the first kinds it handled): a stroked mark gets a real `/AP /N` **and** its
-//! geometry, a sticky note gets `/Name /Comment`, and a text box gets `/DA`, `/Q` **and** an
-//! appearance stream. The appearance objects are appended by the same save as the annotation
-//! dictionaries and are verified before the rename. A viewer that ignores the appearance can
-//! still synthesize the stroke or the free text; a viewer that ignores both shows nothing, which
-//! no such viewer in this environment did.
+//! An edit of an annotation the file already carried keeps every key this writer does not own.
+//! A comment-only edit keeps the producer's own `/AP` untouched; a colour or opacity change
+//! replaces `/AP /N` (the old stream is stale) while `/R`, `/D`, `/Rect`, `/QuadPoints`,
+//! `/Popup`, `/Parent`, `/IRT` and unknown keys stay as they were.
 //!
 //! # Threading
 //!
@@ -355,12 +349,11 @@ fn save_annotation_changes_with(
             "there are no annotations or bookmarks to save",
         ));
     }
-    // Two writers, one save contract. PDFium creates the quad-based markup kinds; the rest need
-    // `/BS`, `/L`, `/Name`, `/DA`, `/Q` or a real appearance XObject, none of which its C API can
-    // write (see `geometry_write`). Edits and deletions always go through the incremental lopdf
-    // writer: PDFium has no accessor that preserves a foreign annotation's unknown keys, and its
-    // removal API cannot take a reply chain with it. Both write into the same temporary file and
-    // are verified together before the rename.
+    // One save contract. Every addition goes through the incremental lopdf writer (see
+    // `geometry_write`); PDFium's C API can write neither the dictionary keys nor the appearance
+    // graphics state these kinds need. Edits and deletions go through the same writer because
+    // PDFium has no accessor that preserves a foreign annotation's unknown keys, and its removal
+    // API cannot take a reply chain with it. The update is verified before the rename.
     let (pdfium_annotations, direct_annotations): (Vec<WriteAnnotation>, Vec<WriteAnnotation>) =
         annotations
             .iter()
@@ -1058,7 +1051,8 @@ fn validate(annotations: &[WriteAnnotation], page_count: u32) -> Result<()> {
             }
             WriteAnnotationKind::Highlight
             | WriteAnnotationKind::Underline
-            | WriteAnnotationKind::StrikeOut => {
+            | WriteAnnotationKind::StrikeOut
+            | WriteAnnotationKind::Squiggly => {
                 if annotation.quads.is_empty() {
                     return Err(LyraReaderError::new(
                         ErrorCode::InvalidArgument,
@@ -1555,7 +1549,7 @@ fn verify_all(
                 // geometry is the text selection's, not the editor's; `values` carries it only so
                 // the request is self-contained.
                 expected.author = original.author.clone();
-                if expected.kind.uses_pdfium() {
+                if expected.kind.is_markup() {
                     expected.rect = original.rect;
                     expected.quads = original.quads.clone();
                 }
@@ -1668,6 +1662,7 @@ fn verify_one(
         WriteAnnotationKind::Highlight => RawAnnotationKind::Highlight,
         WriteAnnotationKind::Underline => RawAnnotationKind::Underline,
         WriteAnnotationKind::StrikeOut => RawAnnotationKind::Strikeout,
+        WriteAnnotationKind::Squiggly => RawAnnotationKind::Squiggly,
         WriteAnnotationKind::Text => RawAnnotationKind::Text,
         WriteAnnotationKind::FreeText => RawAnnotationKind::FreeText,
         WriteAnnotationKind::Ink => RawAnnotationKind::Ink,
@@ -1688,7 +1683,7 @@ fn verify_one(
             format!("expected {:?}, got {:?}", expected.rect, record.rect),
         ));
     }
-    if expected.kind.uses_pdfium() {
+    if expected.kind.is_markup() {
         if record.quads.len() != expected.quads.len()
             || record
                 .quads
@@ -1749,6 +1744,7 @@ fn verify_one(
             WriteAnnotationKind::Highlight
             | WriteAnnotationKind::Underline
             | WriteAnnotationKind::StrikeOut => lyra_reader_core::AnnotationBlend::Multiply,
+            WriteAnnotationKind::Squiggly => lyra_reader_core::AnnotationBlend::Normal,
             WriteAnnotationKind::Text
             | WriteAnnotationKind::FreeText
             | WriteAnnotationKind::Ink
@@ -1953,6 +1949,7 @@ fn verify_geometry(
         WriteAnnotationKind::Highlight
         | WriteAnnotationKind::Underline
         | WriteAnnotationKind::StrikeOut
+        | WriteAnnotationKind::Squiggly
         | WriteAnnotationKind::Text
         | WriteAnnotationKind::FreeText
         | WriteAnnotationKind::Stamp
@@ -2457,7 +2454,7 @@ mod tests {
     }
 
     #[test]
-    fn a_mixed_save_keeps_the_pdfium_update_and_appends_the_stroked_objects() {
+    fn a_mixed_save_writes_every_kind_with_a_verified_appearance() {
         if !crate::is_available() {
             eprintln!("skipping: PDFium unavailable");
             return;
@@ -2575,8 +2572,8 @@ mod tests {
             }
         }
 
-        // The saved bytes name the PDF subtype explicitly. No appearance stream is written for
-        // any quad-based markup kind; the honesty note in `writeback` says what that costs.
+        // The saved bytes name the PDF subtype explicitly and carry a real appearance stream;
+        // the appearance's own blend and alpha are what the writeback contract verifies.
         let bytes = fs::read(&destination).expect("saved bytes");
         assert!(
             bytes

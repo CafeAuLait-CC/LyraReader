@@ -371,6 +371,10 @@ pub enum WriteAnnotationKind {
     /// `/StrikeOut`: the same quads and colour as an underline, drawn through the middle of the
     /// glyphs by the viewer that synthesises its appearance.
     StrikeOut,
+    /// `/Squiggly`: the same quads and colour as an underline, drawn as a ruled band beside the
+    /// text. The shell does not create this kind, but this reader's annotation model reports it
+    /// and a file may carry one; the writer can re-emit or refresh it.
+    Squiggly,
     /// `/Text`: a sticky note whose `/Contents` is the note and whose `/Rect` is its icon.
     Text,
     /// `/FreeText`: text laid out in `/Rect`, with `/DA`, `/Q` and an appearance stream.
@@ -398,6 +402,7 @@ impl WriteAnnotationKind {
             Self::Highlight => ANNOT_HIGHLIGHT,
             Self::Underline => ANNOT_UNDERLINE,
             Self::StrikeOut => ANNOT_STRIKEOUT,
+            Self::Squiggly => ANNOT_SQUIGGLY,
             Self::Text => ANNOT_TEXT,
             Self::FreeText => ANNOT_FREETEXT,
             Self::Ink => ANNOT_INK,
@@ -414,6 +419,7 @@ impl WriteAnnotationKind {
             Self::Highlight => "Highlight",
             Self::Underline => "Underline",
             Self::StrikeOut => "StrikeOut",
+            Self::Squiggly => "Squiggly",
             Self::Text => "Text",
             Self::FreeText => "FreeText",
             Self::Ink => "Ink",
@@ -430,6 +436,7 @@ impl WriteAnnotationKind {
             Self::Highlight => "Highlight",
             Self::Underline => "Underline",
             Self::StrikeOut => "StrikeOut",
+            Self::Squiggly => "Squiggly",
             Self::Text => "Note",
             Self::FreeText => "Free Text",
             Self::Ink => "Ink",
@@ -443,17 +450,21 @@ impl WriteAnnotationKind {
 
     /// Whether this kind is written through PDFium's `FPDFPage_CreateAnnot`.
     ///
-    /// PDFium will not create `/Line` at all (`FPDFPage_CreateAnnot` returns null), and none of
-    /// the stroked kinds can carry `/BS` or an appearance stream through its C API: the only
-    /// border setter writes `/Border`, and the only appearance setter stores a text string
-    /// rather than a form XObject. A sticky note has the same problem with `/Name` (the icon
-    /// name), and a free-text annotation needs `/DA`, `/Q` and a real `/AP` form XObject.
-    ///
-    /// Those facts are why highlights, underlines and strikeouts keep the PDFium path and every kind whose
-    /// appearance matters is written by the dictionary writer in `geometry_write` (which now
-    /// writes `/Text` and `/FreeText` too, despite the file's historical name).
+    /// No kind is, any more: PDFium's only appearance setter (`FPDFAnnot_SetAP`) hard-codes
+    /// `/BM /Normal`, and a translucent markup mark needs `/BM /Multiply` in its appearance's
+    /// graphics state. The direct writer in [`crate::geometry_write`] writes every annotation
+    /// dictionary and appearance stream. The method is kept because the save path still asks
+    /// the question when it plans and verifies a write.
     pub(crate) fn uses_pdfium(self) -> bool {
-        matches!(self, Self::Highlight | Self::Underline | Self::StrikeOut)
+        false
+    }
+
+    /// Whether this kind is one of the four quad-based text marks.
+    pub(crate) fn is_markup(self) -> bool {
+        matches!(
+            self,
+            Self::Highlight | Self::Underline | Self::StrikeOut | Self::Squiggly
+        )
     }
 
     /// Whether this kind is written by the direct (lopdf) writer.
@@ -879,8 +890,10 @@ impl AnnotationAppender {
             set_string(self.api, handle, c"M", annotation.modified.as_deref())?;
             set_string(self.api, handle, c"Subj", Some(annotation.kind.subject()))?;
 
-            // Preview and the review corpus write `/F 4` (print). No appearance stream is set:
-            // see the module-level note in `writeback` for why, and what other viewers show.
+            // Preview and the review corpus write `/F 4` (print). The save path writes every
+            // annotation dictionary and appearance stream itself (see `geometry_write`), so this
+            // PDFium writer is not the one used for a new mark; the call is kept for the
+            // dictionary accessors this type owns.
             if (self.api.set_flags)(handle, FLAG_PRINT) == 0 {
                 return Err(write_error("FPDFAnnot_SetFlags", &annotation.id));
             }

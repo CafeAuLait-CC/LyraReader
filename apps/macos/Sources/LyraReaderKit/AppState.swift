@@ -14406,13 +14406,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
                 for (boxIndex, box) in annotation.boxes.enumerated() {
                     // Underline, strikeout and squiggly are lines through or under the text, not
-                    // filled boxes: the same thin-bar trick our own annotations use, with the bar
-                    // placed at the bottom (underline, squiggly) or the middle (strikeout).
-                    let isLine = annotation.kind != "highlight"
-                    let scale: CGFloat = isLine ? 0.12 : 1.0
-                    let offset: CGFloat = annotation.kind == "strikeout" ? 0.45 : 0.85
+                    // filled boxes: the same thin-bar geometry the writer puts in `/AP`, so a
+                    // mark cannot move when it is saved and read back. A highlight fills its
+                    // quad; underline sits in the bottom tenth; strikeout crosses the middle;
+                    // squiggly sits just above the underline's band.
+                    let (scale, offset): (CGFloat, CGFloat) = switch annotation.kind {
+                    case "highlight": (1.0, 0.0)
+                    case "underline": (0.10, 0.90)
+                    case "strikeout": (0.12, 0.45)
+                    default: (0.12, 0.85)
+                    }
                     let index = PlacementIndex.documentAnnotation(annotationIndex, box: boxIndex)
-                    let topPt = placement.topPt + box.yPt + box.heightPt * (isLine ? offset : 0)
+                    let topPt = placement.topPt + box.yPt + box.heightPt * offset
 
                     pages.append(CanvasPage(
                         placement: PagePlacement(

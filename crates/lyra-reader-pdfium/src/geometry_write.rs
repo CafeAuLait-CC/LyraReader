@@ -1,34 +1,43 @@
-//! Writing the annotations whose dictionaries and appearance streams PDFium's C API cannot
-//! produce faithfully: `/Ink`, `/Square`, `/Circle`, `/Line`, `/Text` and `/FreeText`.
+//! Writing annotation dictionaries and appearance streams through PDFium's C API would not
+//! produce faithfully: every kind this reader writes, including the quad-based text marks
+//! (`/Highlight`, `/Underline`, `/StrikeOut`, `/Squiggly`), `/Ink`, `/Square`, `/Circle`,
+//! `/Line`, `/Text` and `/FreeText`.
 //!
 //! # Why this does not go through PDFium
 //!
-//! The quad-based kinds are created with `FPDFPage_CreateAnnot`. The others cannot be:
-//!
 //! * `FPDFPage_CreateAnnot` returns **null** for `FPDF_ANNOT_LINE` (measured on the vendored
 //!   build: subtypes 1, 2, 3, 5, 6, 9–13, 15–17 are creatable; 4, 7, 8, 14 and 18+ are not).
-//! * `FPDFAnnot_SetBorder` writes `/Border`, not the `/BS` dictionary this task requires.
+//! * `FPDFAnnot_SetBorder` writes `/Border`, not the `/BS` dictionary this writer promises.
 //! * `FPDFAnnot_SetAP` does not store an appearance content stream: it runs the argument through
 //!   `PDF_EncodeText`, producing a UTF-16 text string inside a form XObject. Measured on the
 //!   vendored dylib, a request to draw a line came back as `\xfe\xff q 1 0 0GR3 w 7...`, which
-//!   is not paint.
+//!   is not paint. Even its structural form is wrong for a markup: the `/ExtGState` it creates
+//!   is hard-coded to `/BM /Normal`, so a translucent highlight would tint the glyphs instead of
+//!   multiplying into the page.
 //! * PDFium's annotation API has no setter for `/Name`, the sticky note's icon name, and none
 //!   for `/DA` or `/Q`, the free-text fields a viewer that synthesises an appearance needs.
 //!
-//! So these kinds are written as PDF dictionary objects through lopdf's **incremental** writer:
+//! So every kind is written as PDF dictionary objects through lopdf's **incremental** writer:
 //! the page's `/Annots` array is copied into the new revision, one indirect annotation object and
-//! (for free text and the stroked kinds) one indirect appearance stream are appended per mark,
-//! and the original bytes stay the file's prefix. The safety contract around this call —
+//! one indirect appearance stream are appended per mark (except `/Text`, whose icon is a viewer
+//! glyph), and the original bytes stay the file's prefix. The safety contract around this call —
 //! temporary file, verification, backup, atomic rename — is still [`crate::writeback`]'s,
 //! unchanged.
 //!
-//! # Appearance streams, and where they stop
+//! # Appearance streams
 //!
 //! A stroked mark's appearance is a Form XObject that strokes the same path the dictionary
 //! describes. PDFKit, Preview and Acrobat use it; a viewer that ignores `/AP` still has
 //! `/InkList`, `/Rect`, `/L`, `/BS` and `/C` to synthesise from. The two descriptions agree
 //! because both are generated from the same [`WriteAnnotation`]; the `/BS` width is the width
 //! the stream strokes with.
+//!
+//! A text mark's appearance fills the same `/QuadPoints` boxes the canvas draws: the whole box
+//! for a highlight, and the canvas's thin band for an underline, strikeout or squiggly. Its
+//! `/ExtGState` states the blend (`/BM /Multiply` for the three multiplied kinds, `/Normal` for
+//! a squiggly) and the constant alpha from `/CA`, so a viewer that honours `/AP` composites the
+//! mark exactly as this reader's canvas does. A viewer that ignores it still has `/QuadPoints`,
+//! `/C` and `/CA`; the dictionary also states `/BM /Multiply` when the kind is multiplied.
 //!
 //! A `/FreeText` annotation gets the same treatment: `/Rect`, `/Contents`, `/DA`, `/Q` and an
 //! appearance stream that lays the exact text out in an embedded font at the requested size. The
@@ -58,7 +67,9 @@ use flate2::write::ZlibEncoder;
 use lopdf::{
     Dictionary, Document, IncrementalDocument, LoadOptions, Object, ObjectId, Stream, StringFormat,
 };
-use lyra_reader_core::{AnnotationAlignment, ErrorCode, LyraReaderError, Point, Rect, Result};
+use lyra_reader_core::{
+    AnnotationAlignment, AnnotationBlend, ErrorCode, LyraReaderError, Point, Rect, Result,
+};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
@@ -512,6 +523,9 @@ pub(crate) fn verify_direct_annotations(
                     _ => unreachable!("this arm only handles stamps"),
                 }
             }
+            kind if kind.is_markup() => {
+                verify_markup_annotation(&document, dictionary, expected)?;
+            }
             kind if kind.is_geometry() => {
                 let border = dictionary
                     .get(b"BS")
@@ -733,6 +747,190 @@ fn verify_stamp_image(
         .with_detail(expected.id.clone()));
     }
     Ok(())
+}
+
+/// Checks the dictionary and appearance of one written text-markup annotation.
+///
+/// The pixel contract is the appearance stream: it must carry an `/ExtGState` whose `/BM` is the
+/// mode the dictionary states (multiply for highlight/underline/strikeout, normal for squiggly)
+/// and whose `/ca` is the requested `/CA`. Without that state a translucent highlight would tint
+/// the glyphs instead of multiplying into them, which is the failure this appearance exists to
+/// prevent.
+fn verify_markup_annotation(
+    document: &Document,
+    dictionary: &Dictionary,
+    expected: &WriteAnnotation,
+) -> Result<()> {
+    let fail = |detail: String| {
+        Err(LyraReaderError::new(
+            ErrorCode::Internal,
+            "a written text-markup annotation does not match the request",
+        )
+        .with_detail(detail))
+    };
+    let subtype = dictionary
+        .get(b"Subtype")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_name().ok());
+    if subtype != Some(expected.kind.pdf_name().as_bytes()) {
+        return fail(format!(
+            "{}: /Subtype expected /{}, found {subtype:?}",
+            expected.id,
+            expected.kind.pdf_name()
+        ));
+    }
+    let quads = dictionary
+        .get(b"QuadPoints")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_array().ok());
+    let expected_quads: Vec<f32> = expected
+        .quads
+        .iter()
+        .flat_map(|quad| {
+            [
+                quad.min_x() as f32,
+                quad.max_y() as f32,
+                quad.max_x() as f32,
+                quad.max_y() as f32,
+                quad.min_x() as f32,
+                quad.min_y() as f32,
+                quad.max_x() as f32,
+                quad.min_y() as f32,
+            ]
+        })
+        .collect();
+    let written_quads: Option<Vec<f32>> = quads.map(|array| {
+        array
+            .iter()
+            .filter_map(|object| deref(document, object).and_then(number))
+            .collect()
+    });
+    if written_quads.as_deref() != Some(expected_quads.as_slice()) {
+        return fail(format!(
+            "{}: /QuadPoints expected {expected_quads:?}, found {written_quads:?}",
+            expected.id
+        ));
+    }
+    let color = dictionary
+        .get(b"C")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(colour_of);
+    if color != Some(expected.color) {
+        return fail(format!(
+            "{}: /C expected {:?}, found {color:?}",
+            expected.id, expected.color
+        ));
+    }
+    let opacity = dictionary
+        .get(b"CA")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(number)
+        .map(f64::from);
+    if opacity.is_none_or(|opacity| (opacity - expected.opacity).abs() > 1.0 / 255.0 + 1e-6) {
+        return fail(format!(
+            "{}: /CA expected {}, found {opacity:?}",
+            expected.id, expected.opacity
+        ));
+    }
+
+    let blend = default_markup_blend(expected.kind);
+    let dictionary_blend = dictionary
+        .get(b"BM")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_name().ok())
+        .map(String::from_utf8_lossy)
+        .map(|name| AnnotationBlend::from_pdf_name(&name));
+    let expected_dictionary_blend = match blend {
+        AnnotationBlend::Multiply => Some(AnnotationBlend::Multiply),
+        _ => None,
+    };
+    if dictionary_blend != expected_dictionary_blend {
+        return fail(format!(
+            "{}: /BM expected {expected_dictionary_blend:?}, found {dictionary_blend:?}",
+            expected.id
+        ));
+    }
+
+    verify_appearance(document, dictionary, expected)?;
+    let Some(stream) = appearance_of(document, dictionary) else {
+        return fail(format!("{}: no appearance stream to inspect", expected.id));
+    };
+    if !String::from_utf8_lossy(&stream.content).contains(" re f") {
+        return fail(format!(
+            "{}: the appearance does not fill a quad band",
+            expected.id
+        ));
+    }
+    let Some(state) = markup_appearance_state(document, stream) else {
+        return fail(format!(
+            "{}: the appearance has no /GS0 /ExtGState",
+            expected.id
+        ));
+    };
+    let state_blend = state
+        .get(b"BM")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_name().ok())
+        .map(String::from_utf8_lossy)
+        .map(|name| AnnotationBlend::from_pdf_name(&name));
+    if state_blend.as_ref() != Some(&blend) {
+        return fail(format!(
+            "{}: appearance /BM expected {blend:?}, found {state_blend:?}",
+            expected.id
+        ));
+    }
+    let state_alpha = state
+        .get(b"ca")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(number)
+        .map(f64::from);
+    if state_alpha.is_none_or(|alpha| (alpha - expected.opacity).abs() > 1.0 / 255.0 + 1e-6) {
+        return fail(format!(
+            "{}: appearance /ca expected {}, found {state_alpha:?}",
+            expected.id, expected.opacity
+        ));
+    }
+    Ok(())
+}
+
+/// The `/ExtGState` a markup appearance's `/GS0` names.
+fn markup_appearance_state<'a>(
+    document: &'a Document,
+    stream: &'a Stream,
+) -> Option<&'a Dictionary> {
+    stream
+        .dict
+        .get(b"Resources")
+        .ok()
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_dict().ok())
+        .and_then(|resources| resources.get(b"ExtGState").ok())
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_dict().ok())
+        .and_then(|states| states.get(b"GS0").ok())
+        .and_then(|object| deref(document, object))
+        .and_then(|object| object.as_dict().ok())
+}
+
+/// `/C` as 8-bit channels, for the save-time proof that the requested colour was written.
+fn colour_of(object: &Object) -> Option<[u8; 3]> {
+    let array = object.as_array().ok()?;
+    if array.len() < 3 {
+        return None;
+    }
+    let mut channels = [0u8; 3];
+    for (slot, object) in channels.iter_mut().zip(array) {
+        let value = number(object)?;
+        *slot = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    }
+    Some(channels)
 }
 
 /// Checks the form XObject every directly written kind except `/Text` carries.
@@ -1016,6 +1214,21 @@ pub(crate) fn add_appearance_object(
     annotation: &WriteAnnotation,
     free_text_font: Option<&EmbeddedFreeTextFont>,
 ) -> ObjectId {
+    add_appearance_object_with_blend(document, annotation, free_text_font, None)
+}
+
+/// [`add_appearance_object`], for a markup edit whose blend is the file's own rather than the
+/// kind's default.
+///
+/// The appearance stream is the one thing a viewer that honours `/AP` paints, so a markup's
+/// `/BM` has to be reproduced in the stream's `/ExtGState`: PDFium's own appearance setter
+/// hard-codes `/BM /Normal`, which is why this writer does not use it.
+pub(crate) fn add_appearance_object_with_blend(
+    document: &mut Document,
+    annotation: &WriteAnnotation,
+    free_text_font: Option<&EmbeddedFreeTextFont>,
+    blend: Option<AnnotationBlend>,
+) -> ObjectId {
     let mut resources = Dictionary::new();
     if matches!(
         annotation.kind,
@@ -1037,6 +1250,15 @@ pub(crate) fn add_appearance_object(
         images.set("Im0", Object::Reference(object));
         resources.set("XObject", Object::Dictionary(images));
     }
+    if annotation.kind.is_markup() {
+        let blend = blend
+            .clone()
+            .unwrap_or_else(|| default_markup_blend(annotation.kind));
+        resources.set(
+            "ExtGState",
+            Object::Dictionary(markup_extgstate_resources(annotation.opacity, &blend)),
+        );
+    }
     let mut stream_dictionary = Dictionary::new();
     stream_dictionary.set("Type", name("XObject"));
     stream_dictionary.set("Subtype", name("Form"));
@@ -1050,6 +1272,53 @@ pub(crate) fn add_appearance_object(
     // where its producer chose to compress it, and this stream is a few hundred bytes.
     stream.allows_compression = false;
     add_object(document, Object::Stream(stream))
+}
+
+/// The blend a markup annotation is composited with when its dictionary says nothing.
+///
+/// This mirrors `RawAnnotationKind::default_blend` on the reading side: highlight, underline
+/// and strikeout are multiplied (that is what PDFium, PDFKit and Preview do with the default),
+/// while a squiggly is drawn beside the text and composited alpha-over. `Normal` for every other
+/// kind; those do not consult this function.
+pub(crate) fn default_markup_blend(kind: WriteAnnotationKind) -> AnnotationBlend {
+    match kind {
+        WriteAnnotationKind::Highlight
+        | WriteAnnotationKind::Underline
+        | WriteAnnotationKind::StrikeOut => AnnotationBlend::Multiply,
+        WriteAnnotationKind::Squiggly => AnnotationBlend::Normal,
+        _ => AnnotationBlend::Normal,
+    }
+}
+
+/// The `/ExtGState` resources a markup appearance paints through (`/GS0`).
+///
+/// `/ca` is the constant alpha: with `/BM /Multiply` the PDF compositing equation is
+/// `backdrop × (alpha·colour + 1−alpha)`, which is exactly the tint our canvas bakes into a
+/// translucent highlight before uploading it. The constant alpha is stated in both `/ca` and
+/// `/CA` because colour and alpha are separate knobs in PDF.
+pub(crate) fn markup_extgstate_resources(opacity: f64, blend: &AnnotationBlend) -> Dictionary {
+    let mut extgstate = Dictionary::new();
+    extgstate.set("Type", name("ExtGState"));
+    // State the blend even when it is Normal. An appearance stream is a self-contained picture:
+    // a viewer must not have to look back at the annotation dictionary (or at a reader's
+    // default for the subtype) to know how the stream composites.
+    extgstate.set(
+        "BM",
+        name(match blend {
+            AnnotationBlend::Normal => "Normal",
+            AnnotationBlend::Multiply => "Multiply",
+            // A foreign file may state a blend this build does not model. Reproducing the name
+            // in the appearance is more honest than silently substituting Normal: the stream
+            // then composites exactly as the original dictionary asked.
+            AnnotationBlend::Other(name_value) => name_value,
+        }),
+    );
+    extgstate.set("ca", Object::Real(opacity.clamp(0.0, 1.0) as f32));
+    extgstate.set("CA", Object::Real(opacity.clamp(0.0, 1.0) as f32));
+    extgstate.set("AIS", Object::Boolean(false));
+    let mut states = Dictionary::new();
+    states.set("GS0", Object::Dictionary(extgstate));
+    states
 }
 
 pub(crate) fn append_one(
@@ -1191,11 +1460,18 @@ pub(crate) fn append_one(
         WriteAnnotationKind::Stamp | WriteAnnotationKind::Signature => {}
         WriteAnnotationKind::Highlight
         | WriteAnnotationKind::Underline
-        | WriteAnnotationKind::StrikeOut => {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                "a quad-based annotation reached the direct writer",
-            ));
+        | WriteAnnotationKind::StrikeOut
+        | WriteAnnotationKind::Squiggly => {
+            // `/QuadPoints` is the geometry every viewer uses to draw a text mark, and the
+            // appearance below fills exactly these quads. The order is the one PDFium writes
+            // (and PDFKit requires): upper-left, upper-right, lower-left, lower-right.
+            dictionary.set("QuadPoints", quad_points_array(&annotation.quads));
+            // A highlight, underline and strikeout are multiplied by every viewer when `/BM`
+            // is absent; stating the mode here keeps a reader that ignores `/AP` on the same
+            // picture as the appearance. A squiggly is alpha-over, so it states nothing.
+            if default_markup_blend(annotation.kind) == AnnotationBlend::Multiply {
+                dictionary.set("BM", name("Multiply"));
+            }
         }
     }
 
@@ -1299,7 +1575,7 @@ pub(crate) fn add_object(document: &mut Document, object: Object) -> ObjectId {
     id
 }
 
-pub(crate) fn appearance_content(
+fn appearance_content(
     annotation: &WriteAnnotation,
     free_text_font: Option<&AppearanceSubset>,
 ) -> Vec<u8> {
@@ -1311,6 +1587,9 @@ pub(crate) fn appearance_content(
     }
     if annotation.kind == WriteAnnotationKind::Signature {
         return signature_appearance(annotation);
+    }
+    if annotation.kind.is_markup() {
+        return markup_appearance(annotation);
     }
     let [red, green, blue] = annotation.color;
     let width = annotation.border_width.max(0.1);
@@ -1366,6 +1645,7 @@ pub(crate) fn appearance_content(
         WriteAnnotationKind::Highlight
         | WriteAnnotationKind::Underline
         | WriteAnnotationKind::StrikeOut
+        | WriteAnnotationKind::Squiggly
         | WriteAnnotationKind::Text => {}
         WriteAnnotationKind::FreeText
         | WriteAnnotationKind::Stamp
@@ -1375,6 +1655,66 @@ pub(crate) fn appearance_content(
     }
     content.push_str("Q\n");
     content.into_bytes()
+}
+
+/// The appearance of one text-markup annotation, painted the way this reader's canvas paints it.
+///
+/// A highlight fills every `/QuadPoints` box. Underline, strikeout and squiggly are thin bands:
+/// the canvas draws each mark as a textured quad of `scale × the box height` whose top edge sits
+/// `offset` down from the box's top. The same numbers are used here so the stream and the canvas
+/// cannot drift apart. The band is converted from the canvas's top-down view to PDF user space
+/// (bottom-up) by anchoring it below the box's top edge.
+///
+/// The blend and constant alpha live in `/GS0` (see [`markup_extgstate_resources`]); the fill is the
+/// annotation's `/C` unchanged, exactly as `/C` reads back from the file.
+fn markup_appearance(annotation: &WriteAnnotation) -> Vec<u8> {
+    let [red, green, blue] = annotation.color;
+    let mut content = String::from("q\n");
+    // `markup_extgstate_resources` always supplies GS0 for a markup appearance.
+    content.push_str("/GS0 gs\n");
+    content.push_str(&format!(
+        "{:.4} {:.4} {:.4} rg\n",
+        f64::from(red) / 255.0,
+        f64::from(green) / 255.0,
+        f64::from(blue) / 255.0
+    ));
+    for quad in &annotation.quads {
+        let x = quad.min_x();
+        let y = quad.min_y();
+        let width = quad.size.width.max(0.01);
+        let height = quad.size.height.max(0.01);
+        let top = y + height;
+        if annotation.kind == WriteAnnotationKind::Highlight {
+            content.push_str(&format!("{x:.4} {y:.4} {width:.4} {height:.4} re f\n"));
+            continue;
+        }
+        let (scale, offset) = markup_band(annotation.kind);
+        // The canvas places the band's top at `top − height·offset` and gives it
+        // `max(height·scale, 1)` points. PDF's user space has the same height, anchored at the
+        // band's lower edge.
+        let band_top = top - height * offset;
+        let band_height = (height * scale).max(1.0);
+        content.push_str(&format!(
+            "{x:.4} {:.4} {width:.4} {band_height:.4} re f\n",
+            band_top - band_height
+        ));
+    }
+    content.push_str("Q\n");
+    content.into_bytes()
+}
+
+/// The canvas's band geometry for the non-highlight markup kinds: height as a fraction of the
+/// quad, and the distance of the band's top from the quad's top.
+fn markup_band(kind: WriteAnnotationKind) -> (f64, f64) {
+    match kind {
+        // `AppState.textMarkupBar`: own underline (0.1, 0.9), strikeout (0.12, 0.45), and the
+        // loaded-markup rule squiggly uses (0.12, 0.85). A highlight fills the quad, handled
+        // before this is consulted.
+        WriteAnnotationKind::Underline => (0.10, 0.90),
+        WriteAnnotationKind::StrikeOut => (0.12, 0.45),
+        WriteAnnotationKind::Squiggly => (0.12, 0.85),
+        _ => (1.0, 0.0),
+    }
 }
 
 /// The appearance of a `/FreeText` annotation: the exact `/Contents` text, encoded as
@@ -1800,6 +2140,31 @@ pub(crate) fn rect_array(rect: Rect) -> Object {
         Object::Real(rect.max_x() as f32),
         Object::Real(rect.max_y() as f32),
     ])
+}
+
+/// `/QuadPoints` for a list of page-space boxes.
+///
+/// PDF 32000-1 table 179 orders each quadrilateral upper-left, upper-right, lower-left,
+/// lower-right; that is the order PDFium writes and the only one PDFKit fills as a highlight
+/// (measured 2026-10-16: any other order made it draw two thin bars).
+pub(crate) fn quad_points_array(quads: &[Rect]) -> Object {
+    Object::Array(
+        quads
+            .iter()
+            .flat_map(|quad| {
+                [
+                    Object::Real(quad.min_x() as f32),
+                    Object::Real(quad.max_y() as f32),
+                    Object::Real(quad.max_x() as f32),
+                    Object::Real(quad.max_y() as f32),
+                    Object::Real(quad.min_x() as f32),
+                    Object::Real(quad.min_y() as f32),
+                    Object::Real(quad.max_x() as f32),
+                    Object::Real(quad.min_y() as f32),
+                ]
+            })
+            .collect(),
+    )
 }
 
 pub(crate) fn colour_array(color: [u8; 3]) -> Object {
