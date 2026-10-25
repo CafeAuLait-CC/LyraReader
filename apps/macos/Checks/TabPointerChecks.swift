@@ -24,10 +24,10 @@ extension ReaderChecks {
             ReaderMotion.reduceMotionOverride = previousMotion
         }
 
-        func makeWindow(x: CGFloat, urls: [URL]) -> AppState {
+        func makeWindow(x: CGFloat, y: CGFloat = 250, urls: [URL]) -> AppState {
             let state = AppState(engine: MockEngine())
             for url in urls { state.newTab(url: url) }
-            let window = NSWindow(contentRect: CGRect(x: x, y: 250, width: 800, height: 150),
+            let window = NSWindow(contentRect: CGRect(x: x, y: y, width: 800, height: 150),
                 styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
                 backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
@@ -112,14 +112,21 @@ extension ReaderChecks {
         require(source.tabs.map(\.id) == ids, "dragging blank tab padding reorders by the same rules")
         require(windows[0].frame == sourceFrame, "dragging tab padding never drags the window")
 
-        let target = makeWindow(x: 1050, urls: [urls[3]])
+        let target = makeWindow(x: sourceFrame.minX + 80, y: sourceFrame.minY - 60, urls: [urls[3]])
         let targetTab = try await surface(target.tabs[0].id, host: hosts[1])
         let moving = try await surface(ids[0], host: hosts[0])
         let crossPoint = point(targetTab, x: targetTab.bounds.width - 2)
-        drag(moving, from: point(moving, x: moving.bounds.width - 40), to: crossPoint, release: false)
-        require(coordinator.hover?.state === target, "a real drag highlights the other window's insertion gap")
+        // AppKit may constrain new windows onto the small CI display, making the two frames
+        // overlap. Test escape from source clipping independently of the destination's position.
+        let belowSource = CGPoint(x: sourceFrame.midX, y: sourceFrame.minY - 100)
+        drag(moving, from: point(moving, x: moving.bounds.width - 40), to: belowSource, release: false)
         require(coordinator.feedbackFrame != nil && !sourceFrame.intersects(coordinator.feedbackFrame!),
-                "the floating tab preview remains visible outside its source window")
+                "the floating tab preview remains visible outside its source window "
+                    + "(source \(sourceFrame), preview \(String(describing: coordinator.feedbackFrame)))")
+        moving.mouseDragged(with: event(.leftMouseDragged, view: moving, screen: crossPoint))
+        require(coordinator.hover?.state === target, "a real drag highlights the other window's insertion gap")
+        require(coordinator.feedbackFrame != nil,
+                "the floating preview follows the pointer into the destination window")
         moving.mouseUp(with: event(.leftMouseUp, view: moving, screen: crossPoint))
         require(!source.containsTab(id: ids[0]) && target.containsTab(id: ids[0]),
                 "a padding-originated drag moves exactly one tab to the other window")
