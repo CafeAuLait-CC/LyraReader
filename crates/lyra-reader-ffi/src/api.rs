@@ -1967,11 +1967,12 @@ impl LyraReaderDocument {
     ///
     /// This document is not modified. Encrypted inputs, a document merged into itself, the same
     /// document selected twice, and an output that would overwrite an input are refused with a
-    /// readable error and no file. The first document's outline is kept; the appended documents'
-    /// outlines are not imported (`dropped_outline_entries` counts them). File-owned annotations
-    /// on appended pages travel with their pages. The reader's cached marks are the shell's
-    /// concern: appending does not move existing pages, so their page indices are unchanged and
-    /// the appended pages start with no cached marks.
+    /// readable error and no file. The first document's outline is kept; each appended document's
+    /// outline is imported as one labelled top-level group, its entries nested beneath it and its
+    /// destinations remapped to the merged pages. File-owned annotations on appended pages travel
+    /// with their pages. The reader's cached marks are the shell's concern: appending does not
+    /// move existing pages, so their page indices are unchanged and the appended pages start with
+    /// no cached marks.
     pub fn merge_documents(
         &self,
         others: Vec<String>,
@@ -3205,7 +3206,9 @@ fn merge_report(report: lyra_reader_pdfium::MergeReport) -> MergeReportRecord {
             .collect(),
         rotations: report.rotations,
         first_outline_entries: u32::try_from(report.first_outline_entries).unwrap_or(u32::MAX),
-        dropped_outline_entries: u32::try_from(report.dropped_outline_entries).unwrap_or(u32::MAX),
+        appended_outline_entries: u32::try_from(report.appended_outline_entries)
+            .unwrap_or(u32::MAX),
+        appended_outline_group_titles: report.appended_outline_group_titles,
         output_bytes: report.output_bytes,
         cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
     }
@@ -4794,8 +4797,10 @@ pub struct MergeReportRecord {
     pub rotations: Vec<u32>,
     /// Flattened outline entries kept from the first document.
     pub first_outline_entries: u32,
-    /// Flattened outline entries of the appended documents that were not imported.
-    pub dropped_outline_entries: u32,
+    /// Flattened entries imported from the appended documents (group labels are not counted).
+    pub appended_outline_entries: u32,
+    /// Titles of the top-level groups added for appended documents, in request order.
+    pub appended_outline_group_titles: Vec<String>,
     pub output_bytes: u64,
     pub cleaned_temporary_files: u32,
 }

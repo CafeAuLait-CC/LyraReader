@@ -1464,9 +1464,11 @@ public struct PageSplitReport: Sendable, Equatable {
 
 /// What a merge wrote.
 ///
-/// The first document's outline is kept; the appended documents' outlines are not imported, and
-/// `droppedOutlineEntries` counts what was left out. The appended pages' file-owned annotations
-/// travel with them. The first document's pages keep their indices.
+/// The first document's outline is kept. Each appended document's outline is imported as one
+/// labelled top-level group named after that file, with its entries nested beneath it and its
+/// destinations moved to the merged pages; `appendedOutlineEntries` and
+/// `appendedOutlineGroupTitles` describe what was added. The appended pages' file-owned
+/// annotations travel with them. The first document's pages keep their indices.
 public struct PageMergeReport: Sendable, Equatable {
     public let destination: URL
     public let pageCount: Int
@@ -1475,7 +1477,8 @@ public struct PageMergeReport: Sendable, Equatable {
     public let appendedAnnotationCounts: [Int]
     public let rotations: [Int]
     public let firstOutlineEntries: Int
-    public let droppedOutlineEntries: Int
+    public let appendedOutlineEntries: Int
+    public let appendedOutlineGroupTitles: [String]
     public let outputBytes: UInt64
     public let cleanedTemporaryFiles: Int
 }
@@ -1792,7 +1795,8 @@ public protocol PDFEngine: AnyObject {
     /// Extracts `pages` (0-based) from the open document into a new PDF.
     func extractPages(_ pages: [Int], to destination: URL) async throws -> PageOperationReport
     /// Appends `others` to the open document and writes a **new** file; the open document is
-    /// untouched. The first document's outline is kept, the appended outlines are not imported.
+    /// untouched. The first document's outline is kept, and each appended outline is imported as
+    /// a labelled top-level group with its destinations remapped to the merged pages.
     func mergeDocuments(others: [URL], to destination: URL) async throws -> PageMergeReport
     /// Splits the open document into `parts`, each an independently verified atomic write.
     func splitPages(_ parts: [PageSplitPart]) async throws -> PageSplitReport
@@ -3104,7 +3108,8 @@ public final class RustEngine: PDFEngine {
             appendedAnnotationCounts: report.appendedAnnotationCounts.map(Int.init),
             rotations: report.rotations.map(Int.init),
             firstOutlineEntries: Int(report.firstOutlineEntries),
-            droppedOutlineEntries: Int(report.droppedOutlineEntries),
+            appendedOutlineEntries: Int(report.appendedOutlineEntries),
+            appendedOutlineGroupTitles: report.appendedOutlineGroupTitles,
             outputBytes: report.outputBytes,
             cleanedTemporaryFiles: Int(report.cleanedTemporaryFiles)
         )

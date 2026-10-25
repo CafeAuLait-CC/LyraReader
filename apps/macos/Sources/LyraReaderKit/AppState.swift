@@ -10527,8 +10527,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         panel.title = "Merge PDFs"
         panel.message =
             "Writes the current document followed by the chosen PDFs' pages to a new file. "
-            + "The first document's outline is kept; the appended documents' outlines are not "
-            + "imported. Annotations stored inside the PDFs travel with their pages. Your "
+            + "The first document's outline is kept; each appended document's outline becomes "
+            + "a group named after its file, with its entries pointing at the merged pages. "
+            + "Annotations stored inside the PDFs travel with their pages. Your "
             + "LyraReader marks keep their pages; appended pages carry none."
         panel.nameFieldStringValue =
             "\(source.deletingPathExtension().lastPathComponent) (merged).pdf"
@@ -10583,12 +10584,23 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             defer { try? FileManager.default.removeItem(at: export.directory) }
             let report = try await export.engine.mergeDocuments(others: others, to: destination)
             let appendedNotes = report.appendedAnnotationCounts.reduce(0, +)
-            let outlineNote = report.droppedOutlineEntries == 0
-                ? "kept the first document's outline (\(report.firstOutlineEntries) entries); "
+            let outlineNote: String
+            if report.appendedOutlineEntries == 0 {
+                outlineNote =
+                    "kept the first document's outline (\(report.firstOutlineEntries) entries); "
                     + "the appended documents had no outline"
-                : "kept the first document's outline (\(report.firstOutlineEntries) entries) and "
-                    + "did not import \(report.droppedOutlineEntries) outline "
-                    + "entr\(report.droppedOutlineEntries == 1 ? "y" : "ies") from the appended documents"
+            } else {
+                let groupCount = report.appendedOutlineGroupTitles.count
+                let names = report.appendedOutlineGroupTitles
+                    .map { "“\($0)”" }
+                    .joined(separator: ", ")
+                outlineNote =
+                    "kept the first document's outline (\(report.firstOutlineEntries) entries) and "
+                    + "imported \(report.appendedOutlineEntries) appended outline "
+                    + "entr\(report.appendedOutlineEntries == 1 ? "y" : "ies") as "
+                    + "\(groupCount) group\(groupCount == 1 ? "" : "s")"
+                    + (names.isEmpty ? "" : " (\(names))")
+            }
             let marksNote: String
             if annotations.isEmpty && bookmarks.isEmpty {
                 marksNote = "there were no LyraReader marks to carry"
@@ -10605,7 +10617,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             FileHandle.standardError.write(Data((
                 "lyra-reader-pages: merged \(others.count) document(s) into \(destination.path) "
                 + "· \(report.pageCount) page(s), first \(report.firstPageCount) · "
-                + "dropped \(report.droppedOutlineEntries) outline entries · "
+                + "imported \(report.appendedOutlineEntries) outline entries as "
+                + "\(report.appendedOutlineGroupTitles.count) group(s) "
+                + "[\(report.appendedOutlineGroupTitles.joined(separator: ", "))] · "
                 + "\(report.outputBytes) bytes\n"
             ).utf8))
             return true
