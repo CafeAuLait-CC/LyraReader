@@ -1,0 +1,199 @@
+[
+  {
+    "colorIndex" : 1,
+    "createdAt" : 804000000.5,
+    "end" : 3,
+    "id" : "0000000B-1111-4222-8333-00000000000B",
+    "kind" : "highlight",
+    "note" : "highlight",
+    "page" : 0,
+    "start" : 0
+  },
+  {
+    "colorIndex" : 2,
+    "createdAt" : 804000000.5,
+    "end" : 8,
+    "id" : "0000000C-1111-4222-8333-00000000000C",
+    "kind" : "underline",
+    "note" : "underline",
+    "page" : 0,
+    "start" : 4
+  },
+  {
+    "color" : "#AABBCCFF",
+    "createdAt" : -1000.25,
+    "end" : 12,
+    "id" : "0000000D-1111-4222-8333-00000000000D",
+    "kind" : "strikeout",
+    "note" : "strikeout",
+    "page" : 0,
+    "start" : 9
+  },
+  {
+    "colorIndex" : 0,
+    "createdAt" : 804000000.5,
+    "id" : "0000000E-1111-4222-8333-00000000000E",
+    "kind" : "ink",
+    "note" : "ink",
+    "page" : 0,
+    "paths" : [
+      [
+        {
+          "x" : 10.5,
+          "y" : 20.25
+        },
+        {
+          "x" : 30,
+          "y" : 40.5
+        }
+      ],
+      [
+        {
+          "x" : 50,
+          "y" : 60
+        },
+        {
+          "x" : 70,
+          "y" : 80
+        }
+      ]
+    ],
+    "strokeWidth" : 2,
+    "version" : 1
+  },
+  {
+    "colorIndex" : 0,
+    "createdAt" : 804000000.5,
+    "id" : "0000000F-1111-4222-8333-00000000000F",
+    "kind" : "square",
+    "note" : "square",
+    "page" : 0,
+    "rect" : {
+      "height" : 50,
+      "width" : 100,
+      "x" : 12.5,
+      "y" : 22.25
+    },
+    "strokeWidth" : 1.5,
+    "version" : 1
+  },
+  {
+    "colorIndex" : 0,
+    "createdAt" : 804000000.5,
+    "id" : "00000010-1111-4222-8333-000000000010",
+    "kind" : "circle",
+    "note" : "circle",
+    "page" : 0,
+    "rect" : {
+      "height" : 80,
+      "width" : 40,
+      "x" : 200,
+      "y" : 300
+    },
+    "strokeWidth" : 2,
+    "version" : 1
+  },
+  {
+    "colorIndex" : 0,
+    "createdAt" : 804000000.5,
+    "id" : "00000011-1111-4222-8333-000000000011",
+    "kind" : "line",
+    "lineEnd" : {
+      "x" : 100.5,
+      "y" : 200.25
+    },
+    "lineStart" : {
+      "x" : 5,
+      "y" : 6
+    },
+    "note" : "line",
+    "page" : 0,
+    "strokeWidth" : 2,
+    "version" : 1
+  },
+  {
+    "colorIndex" : 0,
+    "createdAt" : 804000000.5,
+    "id" : "00000012-1111-4222-8333-000000000012",
+    "kind" : "arrow",
+    "lineEnd" : {
+      "x" : 90.75,
+      "y" : 120.5
+    },
+    "lineStart" : {
+      "x" : -2,
+      "y" : -3
+    },
+    "note" : "arrow",
+    "page" : 0,
+    "strokeWidth" : 3,
+    "version" : 1
+  },
+  {
+    "colorIndex" : 0,
+    "createdAt" : 804000000.123456,
+    "fontSize" : 0,
+    "id" : "00000013-1111-4222-8333-000000000013",
+    "kind" : "stickyNote",
+    "note" : "sticky note",
+    "page" : 0,
+    "rect" : {
+      "height" : 22,
+      "width" : 22,
+      "x" : 400,
+      "y" : 500
+    },
+    "version" : 1
+  },
+  {
+    "colorIndex" : 0,
+    "createdAt" : 804000000.5,
+    "fileIdentity" : "nm:text-box",
+    "fontSize" : 14,
+    "id" : "00000014-1111-4222-8333-000000000014",
+    "kind" : "textBox",
+    "note" : "body text",
+    "page" : 0,
+    "rect" : {
+      "height" : 100,
+      "width" : 200,
+      "x" : 50,
+      "y" : 60
+    },
+    "textAlignment" : "right",
+    "version" : 1
+  },
+  {
+    "color" : "#FF0000FF",
+    "createdAt" : 804000000.5,
+    "id" : "00000015-1111-4222-8333-000000000015",
+    "kind" : "stamp",
+    "note" : "CONFIDENTIAL",
+    "page" : 0,
+    "rect" : {
+      "height" : 50,
+      "width" : 150,
+      "x" : 300,
+      "y" : 400
+    },
+    "stampStyle" : "confidential",
+    "version" : 1
+  },
+  {
+    "color" : "#000000FF",
+    "createdAt" : 1729876543.123456,
+    "id" : "00000016-1111-4222-8333-000000000016",
+    "image" : "AAEC\/v8=",
+    "kind" : "signature",
+    "note" : "",
+    "page" : 0,
+    "rect" : {
+      "height" : 64,
+      "width" : 100,
+      "x" : 600,
+      "y" : 700
+    },
+    "stampStyle" : "signature",
+    "version" : 1
+  }
+]

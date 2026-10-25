@@ -26,6 +26,7 @@ lyra-reader-text = { path = "../lyra-reader-text" }
 lyra-reader-ai = { workspace = true }
 lyra-reader-metadata = { workspace = true }
 lyra-reader-core = { workspace = true }
+lyra-reader-edit = { workspace = true }
 lyra-reader-session = { workspace = true }
 lyra-reader-gpu = { workspace = true }
 lyra-reader-pdfium = { workspace = true }

@@ -1,10 +1,17 @@
 import Foundation
+import LyraReaderBindings
 
 /// Reading and writing the document's annotation records.
 ///
 /// The records are a JSON array of `AppState.Annotation` entries **and user bookmarks**, stored
 /// as `annotations.json` in the document cache (`DocumentEditCache`). Every session reads and
 /// writes that cache; nothing is read from or written beside the PDF.
+///
+/// The **format** lives in `lyra-reader-edit::records` and crosses the FFI: classification,
+/// key order and pretty printing, Foundation's `Date`/`UUID`/base64 encodings, and the exact
+/// text of an entry this version preserves. This file is the shell half — the cache directory,
+/// file I/O, and the corruption/backup policy — plus the conversion between the FFI records and
+/// the Swift model.
 ///
 /// Both kinds live in one file because they are the reader's marks on one document, and the
 /// array's per-entry compatibility rule keeps them safe together:
@@ -27,7 +34,7 @@ import Foundation
 ///   into a four-entry palette (`colorIndex`); it is now an `AnnotationColor` written as
 ///   `"color": "#RRGGBBAA"`, because a PDF annotated by somebody else carries colours no
 ///   four-entry palette can express. Both keys are read. Only one is written, and which one is
-///   decided by the colour itself (see `AppState.Annotation.encode(to:)`):
+///   decided by the colour itself (see `lyra-reader-edit::records`):
 ///
 ///   | records file | this build | the build that only knows `colorIndex` |
 ///   | --- | --- | --- |
@@ -104,387 +111,241 @@ enum AnnotationRecords {
         }
     }
 
-    /// Keys this version knows how to interpret on an annotation entry. An entry carrying
-    /// anything else is preserved rather than parsed: guessing at a newer schema risks writing
-    /// back a half-understood entry.
-    private static let knownAnnotationKeys: Set<String> = [
-        "id", "kind", "page", "start", "end", "color", "colorIndex", "note", "createdAt",
-        // Geometry entries (`ink`, `square`, `circle`, `line`, `arrow`) carry a schema version
-        // and page-space geometry. A build that does not know those keys — or that knows the
-        // kind but not this version — preserves the entry verbatim instead of guessing.
-        "version", "paths", "rect", "lineStart", "lineEnd", "strokeWidth",
-        // Placed text (`stickyNote`, `textBox`) carries its box, its font size (text box only)
-        // and the same versioning rule.
-        "fontSize",
-        // An entry that edits an annotation already in the PDF: its file identity, the fixed
-        // quads of a foreign text mark, and a free text box's `/Q`.
-        "fileIdentity", "quads", "textAlignment",
-        // A stamp's style and an image signature's picture. Both kinds carry a schema version
-        // of their own, so a newer build's change to either is preserved rather than guessed at.
-        "stampStyle", "image",
-    ]
+    /// The reader-facing text of an FFI error, without the binding's reflected enum wrapper.
+    static func message(_ error: Error) -> String {
+        if let ffi = error as? LyraReaderFfiError {
+            switch ffi {
+            case .Document(let message), .Backend(let message), .InvalidArgument(let message),
+                 .Ai(let message, _):
+                return message
+            }
+        }
+        return error.localizedDescription
+    }
 
-    /// The same rule for bookmark entries. `kind` is the discriminator and is required by the
-    /// encoder; a newer build's additional key makes this build preserve the whole entry.
-    private static let knownBookmarkKeys: Set<String> = [
-        "id", "kind", "page", "title", "yPt", "createdAt",
-    ]
+    // MARK: - The codec boundary
+
+    /// The legacy palette, as the Rust decoder needs it to read an older `colorIndex`.
+    static func palette() -> [AnnotationRecordColor] {
+        AppState.highlightPalette.map {
+            AnnotationRecordColor(
+                red: $0.color.red,
+                green: $0.color.green,
+                blue: $0.color.blue,
+                alpha: $0.color.alpha
+            )
+        }
+    }
+
+    /// One cached annotation as the FFI record. Public inside the module because the creation
+    /// validation uses the same conversion as the encoder.
+    static func entry(_ annotation: AppState.Annotation) -> CachedAnnotationRecord {
+        CachedAnnotationRecord(
+            id: annotation.id.uuidString,
+            kind: annotation.kind.rawValue,
+            page: Int64(annotation.page),
+            start: Int64(annotation.start),
+            end: Int64(annotation.end),
+            color: AnnotationRecordColor(
+                red: annotation.color.red,
+                green: annotation.color.green,
+                blue: annotation.color.blue,
+                alpha: annotation.color.alpha
+            ),
+            note: annotation.note,
+            createdAt: annotation.createdAt.timeIntervalSinceReferenceDate,
+            inkPaths: annotation.inkPaths.map { path in
+                path.map { AnnotationRecordPoint(x: Double($0.x), y: Double($0.y)) }
+            },
+            shapeRect: annotation.shapeRect.map {
+                AnnotationRecordRect(x: Double($0.minX), y: Double($0.minY),
+                                     width: Double($0.width), height: Double($0.height))
+            },
+            lineStart: annotation.lineStart.map {
+                AnnotationRecordPoint(x: Double($0.x), y: Double($0.y))
+            },
+            lineEnd: annotation.lineEnd.map {
+                AnnotationRecordPoint(x: Double($0.x), y: Double($0.y))
+            },
+            strokeWidth: Double(annotation.strokeWidth),
+            fontSize: Double(annotation.fontSize),
+            fileIdentity: annotation.fileIdentity,
+            fileQuads: annotation.fileQuads?.map {
+                AnnotationRecordRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
+            },
+            textAlignment: annotation.textAlignment,
+            stampStyle: annotation.stampStyle,
+            imageData: annotation.imageData
+        )
+    }
+
+    static func entry(_ bookmark: Bookmark) -> CachedBookmarkRecord {
+        CachedBookmarkRecord(
+            id: bookmark.id.uuidString,
+            page: Int64(bookmark.page),
+            title: bookmark.title,
+            yPt: Double(bookmark.yPt),
+            createdAt: bookmark.createdAt.timeIntervalSinceReferenceDate
+        )
+    }
+
+    private static func slot(_ slot: Slot) -> CachedAnnotationSlot {
+        switch slot {
+        case .annotation(let id): return .annotation(id: id.uuidString)
+        case .bookmark(let id): return .bookmark(id: id.uuidString)
+        case .opaque(let raw): return .opaque(raw: raw)
+        }
+    }
+
+    private static func slot(_ record: CachedAnnotationSlot) -> Slot {
+        switch record {
+        case .annotation(let id):
+            return .annotation(UUID(uuidString: id) ?? UUID())
+        case .bookmark(let id):
+            return .bookmark(UUID(uuidString: id) ?? UUID())
+        case .opaque(let raw):
+            return .opaque(raw)
+        }
+    }
+
+    private static func annotation(_ record: CachedAnnotationRecord) throws -> AppState.Annotation {
+        guard let id = UUID(uuidString: record.id) else {
+            throw RecordError.structure("field 'id' is invalid: expected a UUID string")
+        }
+        guard let kind = AppState.Annotation.Kind(rawValue: record.kind) else {
+            throw RecordError.structure("field 'kind' is invalid: \(record.kind)")
+        }
+        return AppState.Annotation(
+            id: id,
+            kind: kind,
+            page: Int(record.page),
+            start: Int(record.start),
+            end: Int(record.end),
+            color: AnnotationColor(
+                red: record.color.red,
+                green: record.color.green,
+                blue: record.color.blue,
+                alpha: record.color.alpha
+            ),
+            note: record.note,
+            createdAt: Date(timeIntervalSinceReferenceDate: record.createdAt),
+            inkPaths: record.inkPaths.map { path in
+                path.map { CGPoint(x: $0.x, y: $0.y) }
+            },
+            shapeRect: record.shapeRect.map {
+                CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
+            },
+            lineStart: record.lineStart.map { CGPoint(x: $0.x, y: $0.y) },
+            lineEnd: record.lineEnd.map { CGPoint(x: $0.x, y: $0.y) },
+            strokeWidth: CGFloat(record.strokeWidth),
+            fontSize: CGFloat(record.fontSize),
+            fileIdentity: record.fileIdentity,
+            fileQuads: record.fileQuads?.map {
+                AppState.Annotation.StoredRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
+            },
+            textAlignment: record.textAlignment,
+            stampStyle: record.stampStyle,
+            imageData: record.imageData
+        )
+    }
+
+    private static func bookmark(_ record: CachedBookmarkRecord) throws -> Bookmark {
+        guard let id = UUID(uuidString: record.id) else {
+            throw RecordError.structure("field 'id' is invalid: expected a UUID string")
+        }
+        return Bookmark(
+            id: id,
+            page: Int(record.page),
+            title: record.title,
+            yPt: CGFloat(record.yPt),
+            createdAt: Date(timeIntervalSinceReferenceDate: record.createdAt)
+        )
+    }
 
     // MARK: - Loading
 
+    /// Decodes through the Rust codec. The file I/O and the corruption/backup policy stay here;
+    /// the format — key order, date encoding, which entries this version can interpret — is
+    /// `lyra-reader-edit::records`.
     static func decode(_ data: Data, pageCount: Int, paletteCount: Int) throws -> Contents {
-        let elements = try JSONArrayElements.parse(data)
-
-        var annotations: [AppState.Annotation] = []
-        var bookmarks: [Bookmark] = []
-        var slots: [Slot] = []
-        var seenIDs = Set<UUID>()
-        var seenBookmarkIDs = Set<UUID>()
-
-        for (offset, element) in elements.enumerated() {
-            let entry = offset + 1
-            let elementData = Data(element.utf8)
-            guard let object = try? JSONSerialization.jsonObject(with: elementData) as? [String: Any] else {
-                throw RecordError.structure("entry \(entry) is not a JSON object")
-            }
-
-            let kindText = object["kind"] as? String
-
-            // A bookmark is classified before the annotation rules are applied. The `kind`
-            // tag is what an annotation-only build sees first too, and it preserves the
-            // entry because "bookmark" is a kind it cannot draw.
-            if kindText == Bookmark.recordKind {
-                let unknownKeys = Set(object.keys).subtracting(knownBookmarkKeys)
-                guard unknownKeys.isEmpty else {
-                    slots.append(.opaque(element))
-                    continue
-                }
-                let bookmark: Bookmark
-                do {
-                    bookmark = try JSONDecoder().decode(Bookmark.self, from: elementData)
-                } catch {
-                    throw RecordError.structure("entry \(entry): \(describe(error))")
-                }
-                guard bookmark.page >= 0, bookmark.page < pageCount else {
-                    throw RecordError.structure(
-                        "entry \(entry): field 'page' is \(bookmark.page + 1), outside the document's"
-                            + " \(pageCount) page(s)")
-                }
-                guard bookmark.yPt.isFinite, bookmark.yPt >= 0 else {
-                    throw RecordError.structure(
-                        "entry \(entry): field 'yPt' is \(bookmark.yPt), which is not a finite page position")
-                }
-                guard seenBookmarkIDs.insert(bookmark.id).inserted else {
-                    throw RecordError.structure(
-                        "entry \(entry): duplicate bookmark identity \(bookmark.id.uuidString)")
-                }
-                bookmarks.append(bookmark)
-                slots.append(.bookmark(bookmark.id))
-                continue
-            }
-
-            // Decide whether this version can interpret the entry at all. Anything it cannot
-            // interpret is kept verbatim and skipped while rendering — never dropped, and
-            // never a reason to reject the whole file.
-            let unknownKeys = Set(object.keys).subtracting(knownAnnotationKeys)
-            let kind = kindText.flatMap(AppState.Annotation.Kind.init(rawValue:))
-            let kindUnderstood = kindText == nil || kind != nil
-            // Either colour shape counts as understood: this version's `color`, or the older
-            // `colorIndex` when it names a palette entry. An entry with neither, or with an
-            // index outside the palette, is preserved rather than guessed at.
-            let colorUnderstood = (object["color"] as? String).map { AnnotationColor(hex: $0) != nil }
-                ?? (object["colorIndex"] as? Int).map { $0 >= 0 && $0 < paletteCount }
-                ?? false
-            // A geometry entry is versioned. Text entries are the shape every older build
-            // knows and carry no version; if one appears, a newer build wrote it and this one
-            // must preserve it rather than interpret fields it does not know.
-            let versionUnderstood: Bool = if let kind, kind.isGeometry {
-                (object["version"] as? Int) == AppState.Annotation.geometryVersion
-            } else if let kind, kind.isPlacedText {
-                (object["version"] as? Int) == AppState.Annotation.placedTextVersion
-            } else if let kind, kind.isStampArtwork {
-                (object["version"] as? Int) == (kind == .stamp
-                    ? AppState.Annotation.stampVersion
-                    : AppState.Annotation.signatureVersion)
-            } else {
-                object["version"] == nil
-            }
-
-            guard unknownKeys.isEmpty, kindUnderstood, colorUnderstood, versionUnderstood else {
-                slots.append(.opaque(element))
-                continue
-            }
-
-            // From here on the entry claims to be one this version understands, so it has to
-            // hold together: a structurally broken entry still fails the load (and therefore
-            // blocks writes) instead of being silently reinterpreted.
-            let annotation: AppState.Annotation
-            do {
-                annotation = try JSONDecoder().decode(AppState.Annotation.self, from: elementData)
-            } catch {
-                throw RecordError.structure("entry \(entry): \(describe(error))")
-            }
-            guard annotation.page >= 0, annotation.page < pageCount else {
-                throw RecordError.structure(
-                    "entry \(entry): field 'page' is \(annotation.page + 1), outside the document's"
-                        + " \(pageCount) page(s)")
-            }
-            if annotation.kind.isPlacement {
-                guard annotation.hasValidGeometry else {
-                    throw RecordError.structure(
-                        "entry \(entry): \(annotation.kind.rawValue) has incomplete or non-finite"
-                            + " geometry (fields 'paths'/'rect'/'lineStart'/'lineEnd'/'strokeWidth')")
-                }
-            } else {
-                guard annotation.start >= 0, annotation.end >= annotation.start else {
-                    throw RecordError.structure(
-                        "entry \(entry): fields 'start' (\(annotation.start)) and 'end' (\(annotation.end))"
-                            + " are not a valid character range")
-                }
-            }
-            guard seenIDs.insert(annotation.id).inserted else {
-                throw RecordError.structure(
-                    "entry \(entry): duplicate annotation identity \(annotation.id.uuidString)")
-            }
-
-            annotations.append(annotation)
-            slots.append(.annotation(annotation.id))
+        do {
+            let palette = Array(palette().prefix(max(0, paletteCount)))
+            let decoded = try decodeAnnotationCache(
+                data: data,
+                pageCount: UInt32(clamping: max(0, pageCount)),
+                palette: palette
+            )
+            return Contents(
+                annotations: try decoded.annotations.map(annotation),
+                bookmarks: try decoded.bookmarks.map(bookmark),
+                slots: decoded.slots.map(slot)
+            )
+        } catch let error as RecordError {
+            throw error
+        } catch {
+            throw RecordError.structure(message(error))
         }
-
-        return Contents(annotations: annotations, bookmarks: bookmarks, slots: slots)
     }
 
     // MARK: - Saving
 
     /// The bytes to write for `annotations` and `bookmarks`, in the annotation cache's original entry
     /// order, with the preserved entries reproduced verbatim.
-    ///
-    /// Note the shape of the output: entries this version understands go through `JSONEncoder`
-    /// (`.prettyPrinted, .sortedKeys`, as before this change), so a file with no foreign
-    /// entries is byte-identical to what the previous implementation wrote. Foreign entries are
-    /// spliced in as the exact text they had in the file they came from.
     static func encode(
         annotations: [AppState.Annotation],
         bookmarks: [Bookmark],
         slots: [Slot]
     ) throws -> Data {
-        var pieces: [Piece] = []
-        var pendingAnnotations: [AppState.Annotation] = []
-        var pendingBookmarks: [Bookmark] = []
-        var emittedAnnotations = Set<UUID>()
-        var emittedBookmarks = Set<UUID>()
-
-        func closePendingRuns() {
-            if !pendingAnnotations.isEmpty {
-                pieces.append(.annotations(pendingAnnotations))
-                pendingAnnotations = []
-            }
-            if !pendingBookmarks.isEmpty {
-                pieces.append(.bookmarks(pendingBookmarks))
-                pendingBookmarks = []
-            }
-        }
-
-        for slot in slots {
-            switch slot {
-            case .opaque(let raw):
-                closePendingRuns()
-                pieces.append(.foreign(raw))
-            case .annotation(let id):
-                // Leaving a bookmark run flushes it, so an interleaved file keeps its order.
-                if !pendingBookmarks.isEmpty { closePendingRuns() }
-                // Absent means the entry was deleted; a second slot for the same id (only
-                // possible in a hand-edited file) is ignored.
-                guard !emittedAnnotations.contains(id),
-                      let annotation = annotations.first(where: { $0.id == id }) else { continue }
-                emittedAnnotations.insert(id)
-                pendingAnnotations.append(annotation)
-            case .bookmark(let id):
-                if !pendingAnnotations.isEmpty { closePendingRuns() }
-                guard !emittedBookmarks.contains(id),
-                      let bookmark = bookmarks.first(where: { $0.id == id }) else { continue }
-                emittedBookmarks.insert(id)
-                pendingBookmarks.append(bookmark)
-            }
-        }
-        for annotation in annotations where !emittedAnnotations.contains(annotation.id) {
-            if !pendingBookmarks.isEmpty { closePendingRuns() }
-            pendingAnnotations.append(annotation)
-        }
-        closePendingRuns()
-        for bookmark in bookmarks where !emittedBookmarks.contains(bookmark.id) {
-            pendingBookmarks.append(bookmark)
-        }
-        closePendingRuns()
-
-        guard !pieces.isEmpty else {
-            return try encoder().encode([AppState.Annotation]())
-        }
-
-        var lines: [String] = []
-        for piece in pieces {
-            switch piece {
-            case .foreign(let raw):
-                // `raw` starts at the entry's first byte (`{`); the two spaces put it back at
-                // the array's indentation level. Its own interior text is untouched.
-                lines.append("  " + raw)
-            case .annotations(let run):
-                lines.append(try entriesBody(of: try encoder().encode(run)))
-            case .bookmarks(let run):
-                lines.append(try entriesBody(of: try encoder().encode(run)))
-            }
-        }
-        let file = "[\n" + lines.joined(separator: ",\n") + "\n]"
-        return Data(file.utf8)
-    }
-
-    private enum Piece {
-        case annotations([AppState.Annotation])
-        case bookmarks([Bookmark])
-        case foreign(String)
-    }
-
-    private static func encoder() -> JSONEncoder {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        return encoder
-    }
-
-    /// `JSONEncoder` writes an array as `"[\n" + entries + "\n]"`, with each entry already
-    /// indented by two spaces; that inner text is exactly what belongs in the assembled file.
-    private static func entriesBody(of data: Data) throws -> String {
-        let text = String(decoding: data, as: UTF8.self)
-        guard text.hasPrefix("[\n"), text.hasSuffix("\n]") else {
-            throw RecordError.structure("unexpected encoder output")
-        }
-        return String(text.dropFirst(2).dropLast(2))
-    }
-}
-
-/// Scanner for the top-level array of the annotation records file.
-///
-/// `JSONDecoder` cannot hand back the bytes of an element it does not understand, and a
-/// `JSONSerialization` round trip is *not* byte-faithful (`\/` escaping, number and date
-/// formatting, key order), so the only way to preserve a foreign entry exactly is to slice the
-/// original text. This scanner finds those slices; it validates enough structure to find them
-/// and leaves full JSON validation to `JSONSerialization`, which every retained entry goes
-/// through.
-enum JSONArrayElements {
-    enum ParseError: LocalizedError {
-        case message(String)
-
-        var errorDescription: String? {
-            switch self {
-            case .message(let detail): return "Invalid annotation records: \(detail)"
-            }
+        do {
+            return try encodeAnnotationCache(
+                annotations: annotations.map(entry),
+                bookmarks: bookmarks.map(entry),
+                slots: slots.map(slot),
+                palette: palette()
+            )
+        } catch let error as RecordError {
+            throw error
+        } catch {
+            throw RecordError.structure(message(error))
         }
     }
 
-    static func parse(_ data: Data) throws -> [String] {
-        let bytes = [UInt8](data)
-        var index = 0
-        let count = bytes.count
+    // MARK: - Creation-time validation
 
-        func skipWhitespace() {
-            while index < count, isWhitespace(bytes[index]) { index += 1 }
+    /// Why the cache would refuse this annotation when the PDF is saved, or `nil` when it is
+    /// valid. The shell calls this before it appends a new entry, so the reader is told at
+    /// creation with the writer's own sentence.
+    static func validationMessage(
+        for annotation: AppState.Annotation,
+        pageCount: Int,
+        existingIDs: [UUID]
+    ) -> String? {
+        do {
+            try validateCachedAnnotation(
+                annotation: entry(annotation),
+                pageCount: UInt32(clamping: max(0, pageCount)),
+                existingIds: existingIDs.map(\.uuidString)
+            )
+            return nil
+        } catch {
+            return message(error)
         }
-
-        func skipString() throws {
-            index += 1 // opening quote
-            while index < count {
-                switch bytes[index] {
-                case UInt8(ascii: "\\"):
-                    index += 2 // an escape can never end the string
-                case UInt8(ascii: "\""):
-                    index += 1
-                    return
-                default:
-                    index += 1
-                }
-            }
-            throw ParseError.message("byte \(index): unterminated string")
-        }
-
-        func skipComposite() throws {
-            var depth = 0
-            while index < count {
-                switch bytes[index] {
-                case UInt8(ascii: "\""):
-                    try skipString()
-                    continue
-                case UInt8(ascii: "{"), UInt8(ascii: "["):
-                    depth += 1
-                case UInt8(ascii: "}"), UInt8(ascii: "]"):
-                    depth -= 1
-                    if depth == 0 {
-                        index += 1
-                        return
-                    }
-                default:
-                    break
-                }
-                index += 1
-            }
-            throw ParseError.message("byte \(index): unterminated entry")
-        }
-
-        func skipValue() throws {
-            switch bytes[index] {
-            case UInt8(ascii: "{"), UInt8(ascii: "["):
-                try skipComposite()
-            case UInt8(ascii: "\""):
-                try skipString()
-            default:
-                let start = index
-                while index < count, !isWhitespace(bytes[index]),
-                      bytes[index] != UInt8(ascii: ","), bytes[index] != UInt8(ascii: "]"),
-                      bytes[index] != UInt8(ascii: "}") {
-                    index += 1
-                }
-                guard index > start else { throw ParseError.message("byte \(index): unexpected character") }
-            }
-        }
-
-        skipWhitespace()
-        guard index < count, bytes[index] == UInt8(ascii: "[") else {
-            throw ParseError.message("byte \(index): the annotation records must be a JSON array")
-        }
-        index += 1
-
-        var elements: [String] = []
-        skipWhitespace()
-        if index < count, bytes[index] == UInt8(ascii: "]") {
-            index += 1
-        } else {
-            while true {
-                skipWhitespace()
-                guard index < count else { throw ParseError.message("byte \(index): unexpected end of file") }
-                guard bytes[index] != UInt8(ascii: ","), bytes[index] != UInt8(ascii: "]") else {
-                    throw ParseError.message("byte \(index): empty array element")
-                }
-                let start = index
-                try skipValue()
-                elements.append(String(decoding: bytes[start..<index], as: UTF8.self))
-                skipWhitespace()
-                guard index < count else { throw ParseError.message("byte \(index): unexpected end of file") }
-                if bytes[index] == UInt8(ascii: ",") {
-                    index += 1
-                    continue
-                }
-                guard bytes[index] == UInt8(ascii: "]") else {
-                    throw ParseError.message("byte \(index): unexpected character after an entry")
-                }
-                index += 1
-                break
-            }
-        }
-
-        skipWhitespace()
-        guard index == count else { throw ParseError.message("byte \(index): unexpected trailing content") }
-        return elements
     }
 
-    private static func isWhitespace(_ byte: UInt8) -> Bool {
-        byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D
+    static func validationMessage(
+        for bookmark: Bookmark,
+        pageCount: Int,
+        existingIDs: [UUID]
+    ) -> String? {
+        do {
+            try validateCachedBookmark(
+                bookmark: entry(bookmark),
+                pageCount: UInt32(clamping: max(0, pageCount)),
+                existingIds: existingIDs.map(\.uuidString)
+            )
+            return nil
+        } catch {
+            return message(error)
+        }
     }
 }

@@ -930,6 +930,7 @@ name = "lyra-reader-edit"
 version = "0.0.0"
 dependencies = [
  "lyra-reader-core",
+ "serde_json",
 ]
 
 [[package]]
@@ -938,6 +939,7 @@ version = "0.0.0"
 dependencies = [
  "lyra-reader-ai",
  "lyra-reader-core",
+ "lyra-reader-edit",
  "lyra-reader-gpu",
  "lyra-reader-metadata",
  "lyra-reader-pdfium",
@@ -974,6 +976,7 @@ dependencies = [
  "libloading 0.8.9",
  "lopdf",
  "lyra-reader-core",
+ "lyra-reader-edit",
  "pdfium-render",
  "png",
  "serde",

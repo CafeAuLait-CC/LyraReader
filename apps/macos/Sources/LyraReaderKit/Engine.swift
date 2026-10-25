@@ -949,25 +949,29 @@ public struct DocumentAnnotation: Sendable, Identifiable, Equatable {
     public let skipReason: AnnotationSkipReason?
     /// False when the file marks the annotation hidden/invisible/`/NoView`.
     public let visible: Bool
+    /// Whether this is one of the four text-markup kinds, from the one kind table in Rust.
+    public let isMarkupAnnotation: Bool
+    /// Whether this is drawn from page-space geometry, from the same table.
+    public let isGeometryAnnotation: Bool
+    /// Whether this is a note (`/Text` or `/FreeText`), from the same table.
+    public let isNoteAnnotation: Bool
+    /// Why the reader cannot move, resize, recolour or delete this annotation, or `nil` when it
+    /// can. The engine computes the whole policy once (kind, reply, visibility, geometry and
+    /// stamp decoding), so no Swift surface re-derives it.
+    public let unsupportedEditReason: String?
 
     /// True when this is one of the four text-markup kinds, i.e. what the reader draws a tinted
     /// box per quad for. A statement about *what the annotation is*; what is actually drawn is
     /// `drawing`, which is `markup` for exactly these four when the file does not hide them.
-    public var isMarkup: Bool {
-        ["highlight", "underline", "strikeout", "squiggly"].contains(kind)
-    }
+    public var isMarkup: Bool { isMarkupAnnotation }
 
     /// True when this is a stroked mark drawn from its geometry rather than a text quad.
-    public var isGeometry: Bool {
-        ["ink", "square", "circle", "line", "arrow"].contains(kind)
-    }
+    public var isGeometry: Bool { isGeometryAnnotation }
 
     /// True when the annotation is a note rather than markup: something to *read*, listed in the
     /// sidebar. `/Text` (a sticky note) and `/FreeText` are the two kinds whose `/Contents` is
     /// the whole point of the annotation.
-    public var isNote: Bool {
-        kind == "text" || kind == "freeText"
-    }
+    public var isNote: Bool { isNoteAnnotation }
 
     /// A text-markup comment needs a label as well as its highlight/underline geometry.
     public var hasInlineNote: Bool {
@@ -1010,33 +1014,12 @@ public struct AnnotationQuadBox: Sendable, Equatable {
 /// crop box and rotation, so a highlight saved at 100% and one saved at 300% land in the same
 /// place.
 public struct AnnotationWriteRequest: Sendable, Equatable {
-    /// What the annotation becomes in the PDF.
-    public enum Kind: Sendable, Equatable {
-        /// `/Subtype /Highlight`.
-        case highlight
-        /// `/Subtype /Underline`.
-        case underline
-        /// `/Subtype /StrikeOut`: a line through the middle of the selected glyphs.
-        case strikeout
-        /// `/Subtype /Text`: a sticky note icon carrying the contents.
-        case note
-        /// `/Subtype /FreeText`: text in `rect`, laid out at `fontSizePt` and aligned by
-        /// `textAlignment`, with `/DA` and an appearance stream.
-        case freeText
-        /// `/Subtype /Ink`: the request's `inkPaths` are its `/InkList`.
-        case ink
-        /// `/Subtype /Square`.
-        case square
-        /// `/Subtype /Circle`.
-        case circle
-        /// `/Subtype /Line`, with `/LE` when `lineArrow` is true.
-        case line
-        /// `/Subtype /Stamp`: a text stamp in `rect`, with `stampStyle` and `contents` as the
-        /// words and an appearance stream that draws the border and text.
-        case stamp
-        /// `/Subtype /Stamp`: an image signature. The pixels are `signatureRGBA`.
-        case signature
-    }
+    /// What the annotation becomes in the PDF: the engine's write kind.
+    ///
+    /// This is the FFI enum, not a second Swift vocabulary. Which annotation kind becomes which
+    /// write kind is decided by the one kind table in `lyra-reader-edit`, so a new kind is a
+    /// table row rather than another `switch` here.
+    public typealias Kind = AnnotationWriteKind
 
     /// Written as `/NM`; the cached annotation's UUID string, so a saved annotation can be recognised.
     public let id: String
@@ -3503,19 +3486,7 @@ public final class RustEngine: PDFEngine {
                     heightPt: Double(rect.height)
                 )
             }
-            let kind: AnnotationWriteKind = switch request.kind {
-            case .highlight: .highlight
-            case .underline: .underline
-            case .strikeout: .strikeOut
-            case .note: .note
-            case .freeText: .freeText
-            case .ink: .ink
-            case .square: .square
-            case .circle: .circle
-            case .line: .line
-            case .stamp: .stamp
-            case .signature: .signature
-            }
+            let kind = request.kind
             let point = { (point: CGPoint) in
                 AnnotationPoint(xPt: Double(point.x), yPt: Double(point.y))
             }
@@ -3653,7 +3624,11 @@ public final class RustEngine: PDFEngine {
             // sidebar still lists it.
             drawing: AnnotationDrawing(rawValue: record.drawing) ?? .skipped,
             skipReason: record.skipReason.flatMap(AnnotationSkipReason.init(rawValue:)),
-            visible: record.visible
+            visible: record.visible,
+            isMarkupAnnotation: record.isMarkup,
+            isGeometryAnnotation: record.isGeometry,
+            isNoteAnnotation: record.isNote,
+            unsupportedEditReason: record.unsupportedReason
         )
     }
 

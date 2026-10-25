@@ -142,6 +142,15 @@ struct ReaderChecks {
             return
         }
         let fastRoot = checkRoot(CommandLine.arguments.dropFirst(2).first)
+        if CommandLine.arguments.contains("--capture-annotation-codec-goldens") {
+            try captureAnnotationCodecGoldens(root: fastRoot)
+            return
+        }
+        if CommandLine.arguments.contains("--check-annotation-codec") {
+            try await annotationCodecChecks(root: fastRoot)
+            print("Annotation codec checks passed")
+            return
+        }
         if CommandLine.arguments.contains("--check-preview-citation-card") {
             try await previewCitationCardChecks(root: fastRoot)
             return
@@ -835,6 +844,9 @@ struct ReaderChecks {
             }),
             ("annotation-recovery", {
                 try await annotationRecoveryChecks(a: a, b: b)
+            }),
+            ("annotation-codec", {
+                try await annotationCodecChecks(root: root)
             }),
             ("annotation-colour", {
                 try await annotationColourChecks(a: a)
