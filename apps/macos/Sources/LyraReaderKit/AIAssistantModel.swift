@@ -377,7 +377,11 @@ public final class AIAssistantModel: ObservableObject {
         } catch {
             guard documentKey == context.documentKey, pendingChatQuestion == question else { return }
             let message = AIReadableError.message(error)
-            if message.contains("Nothing in this document is relevant") {
+            let nothingRelevant = (error as? LyraReaderFfiError).map { ffi in
+                if case .Ai(_, let code) = ffi { return code == .nothingRelevant }
+                return false
+            } ?? false
+            if nothingRelevant {
                 recordRefusal(.documentChat, code: .nothingRelevant, startedAt: auditStart)
                 // Honest local answer: the provider is not called with an empty context.
                 appendChatTurn(AIChatTurn(
@@ -770,19 +774,25 @@ public final class AIAssistantModel: ObservableObject {
         ) {
             if preparedConnection == .chatGPT {
                 guard settings.connectionMode == preparedConnection else {
-                    throw AISettingsError.invalid("The AI connection changed. Prepare a new request before sending.")
+                    throw AISettingsError.refused(
+                        "The AI connection changed. Prepare a new request before sending.",
+                        .connectionChanged)
                 }
                 guard let id = preparedAccountID, settings.chatGPT.selectedID == id,
                       settings.chatGPT.isConnected else {
-                    throw AISettingsError.invalid("The ChatGPT account changed or signed out. Prepare a new request.")
+                    throw AISettingsError.refused(
+                        "The ChatGPT account changed or signed out. Prepare a new request.",
+                        .signedOut)
                 }
                 return ChatGPTResponsesHandle(plan: plan, accounts: settings.chatGPT, accountID: id)
             }
             guard settings.connectionMode == preparedConnection else {
-                throw AISettingsError.invalid("The AI connection changed. Prepare a new request before sending.")
+                throw AISettingsError.refused(
+                    "The AI connection changed. Prepare a new request before sending.",
+                    .connectionChanged)
             }
             guard let key = try settings.readKey() else {
-                throw AISettingsError.invalid(Self.noKeyMessage)
+                throw AISettingsError.refused(Self.noKeyMessage, .noApiKey)
             }
             return try service.start(plan, apiKey: key)
         }
@@ -859,7 +869,7 @@ public final class AIAssistantModel: ObservableObject {
                 diagnostics.append(reported)
             case .done:
                 handleDone()
-            case .error(let message, let cancelled, let failure):
+            case .error(let message, let cancelled, let failure, _):
                 if cancelled {
                     phase = .cancelled
                     statusNote = answer.isEmpty
@@ -924,7 +934,7 @@ public final class AIAssistantModel: ObservableObject {
                 diagnostics.append(reported)
             case .done:
                 finishChatTurn(.finished)
-            case .error(let message, let cancelled, let failure):
+            case .error(let message, let cancelled, let failure, _):
                 if cancelled {
                     finishChatTurn(.cancelled)
                 } else {

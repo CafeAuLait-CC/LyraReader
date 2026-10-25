@@ -12,7 +12,7 @@
 
 use crate::index_cache::{
     CacheRead, CachedReferenceList, CachedReferences, ContentIdentity, IndexCacheFile, cache_path,
-    disabled_by_environment, read_cache, write_cache,
+    disabled_by_environment, write_cache,
 };
 
 /// Cache-management location for the native shell; does not open or index the document.
@@ -24,14 +24,15 @@ use lyra_reader_ai::MockProvider;
 use lyra_reader_ai::chat::{
     Action as AiAction, CONNECTION_TEST_MAX_TOKENS, ChatImage, ChatPlan, ChatSettings,
     ChatTransport, ChatWire, ConversationTurn, DocumentChatRequest, MergePart, MergePlanRequest,
-    PageChar, PageText, PlanRequest, ReasoningEncoding, ReasoningField, ReasoningMode,
-    RegionQuestionRequest, RegionRect, SUMMARY_ABSTRACT_MAX_CHARS, SUMMARY_ABSTRACT_MAX_PAGES,
-    SUMMARY_MAX_CONCURRENT_REQUESTS, SUMMARY_MAX_REQUESTS_PER_BATCH, SUMMARY_PAGE_MAX_CHARS,
-    SUMMARY_SECTION_MAX_CHARS, SelectionRange as AiSelectionRange, SourceRect as AiSourceRect,
-    SummaryLayer, SummaryLayerRequest, SummaryUnitRequest, abstract_sample_page_indices,
-    build_connection_test_plan, build_document_chat_plan, build_document_knowledge_plan,
-    build_merge_plan, build_plan, build_region_question_plan, build_summary_layer,
-    inspect_base_url, inspect_summary_layer, summary_coverage_note, validate_model,
+    NOTHING_RELEVANT_MESSAGE, PageChar, PageText, PlanRequest, ReasoningEncoding, ReasoningField,
+    ReasoningMode, RegionQuestionRequest, RegionRect, SUMMARY_ABSTRACT_MAX_CHARS,
+    SUMMARY_ABSTRACT_MAX_PAGES, SUMMARY_MAX_CONCURRENT_REQUESTS, SUMMARY_MAX_REQUESTS_PER_BATCH,
+    SUMMARY_PAGE_MAX_CHARS, SUMMARY_SECTION_MAX_CHARS, SelectionRange as AiSelectionRange,
+    SourceRect as AiSourceRect, SummaryLayer, SummaryLayerRequest, SummaryUnitRequest,
+    abstract_sample_page_indices, build_connection_test_plan, build_document_chat_plan,
+    build_document_knowledge_plan, build_merge_plan, build_plan, build_region_question_plan,
+    build_summary_layer, inspect_base_url, inspect_summary_layer, summary_coverage_note,
+    validate_model,
 };
 use lyra_reader_ai::openai::{
     CancellationToken, RunEvent, StreamDiagnostics, TokenUsage, preview_headers, run_plan,
@@ -74,6 +75,82 @@ const UNKNOWN_LAYOUT_PAGE_SIZE: (f64, f64) = (612.0, 792.0);
 /// Lazy page-size cache. Each entry is `None` when PDFium could not measure that page.
 type CachedPageSizes = Vec<Option<(f64, f64)>>;
 
+/// The stable category of an AI failure, for the error record and for stream events.
+///
+/// This is the machine contract the shell maps to its audit vocabulary and to the offline hint.
+/// It is assigned **once**, from the Rust error variant that failed — never from a provider's
+/// message text. `NothingRelevant` and `VisionUnsupported` are split out of `EmptyContext` because
+/// the shell has always shown them as distinct refusal categories; they are still decided by the
+/// Rust builder that produced the error, not by the shell matching substrings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum AiErrorCode {
+    /// No provider configured.
+    NotConfigured,
+    /// A transport failure that is not one of the recognized categories below.
+    Unreachable,
+    /// The request never left this Mac: no route / network down / name resolution failed.
+    Offline,
+    /// The endpoint is loopback and nothing is listening there.
+    LocalServer,
+    /// Authentication failed (invalid or expired key).
+    Unauthorized,
+    /// Rate or quota limit exceeded.
+    RateLimited,
+    /// Cancelled by the user or the system.
+    Cancelled,
+    /// The model does not support the requested capability.
+    UnsupportedCapability,
+    /// The reader's settings are not usable.
+    InvalidSettings,
+    /// The requested context has nothing to send.
+    EmptyContext,
+    /// Retrieval found no passage relevant to the question.
+    NothingRelevant,
+    /// The question needs image input, which is off for this model.
+    VisionUnsupported,
+    /// The provider answered with a non-2xx HTTP status.
+    HttpStatus,
+    /// The response was not the streaming protocol this client speaks.
+    Protocol,
+    /// The connection or the stream took too long.
+    Timeout,
+    /// Any other error.
+    Other,
+}
+
+impl AiErrorCode {
+    /// The stable category of an [`lyra_reader_ai::AiError`]. This is the **only** place message
+    /// structure is interpreted, and only for the two refusals the Rust builder has no dedicated
+    /// variant for yet (`NothingRelevant`, `VisionUnsupported`).
+    fn of(error: &lyra_reader_ai::AiError) -> Self {
+        use lyra_reader_ai::AiError;
+        match error {
+            AiError::NotConfigured => Self::NotConfigured,
+            AiError::Unreachable(_) => Self::Unreachable,
+            AiError::Offline(_) => Self::Offline,
+            AiError::LocalServer(_) => Self::LocalServer,
+            AiError::Unauthorized => Self::Unauthorized,
+            AiError::RateLimited => Self::RateLimited,
+            AiError::Cancelled => Self::Cancelled,
+            AiError::UnsupportedCapability(_) => Self::UnsupportedCapability,
+            AiError::InvalidSettings(_) => Self::InvalidSettings,
+            AiError::EmptyContext(message) => {
+                if message == NOTHING_RELEVANT_MESSAGE {
+                    Self::NothingRelevant
+                } else if message.contains("Turn on image input") {
+                    Self::VisionUnsupported
+                } else {
+                    Self::EmptyContext
+                }
+            }
+            AiError::HttpStatus(_) => Self::HttpStatus,
+            AiError::Protocol(_) => Self::Protocol,
+            AiError::Timeout(_) => Self::Timeout,
+            AiError::Other(_) => Self::Other,
+        }
+    }
+}
+
 /// Errors crossing the FFI boundary (they surface as Swift `throws`).
 #[derive(Debug, uniffi::Error)]
 pub enum LyraReaderFfiError {
@@ -84,7 +161,11 @@ pub enum LyraReaderFfiError {
     /// The caller passed something invalid.
     InvalidArgument { message: String },
     /// The AI layer could not build a plan or run a request.
-    Ai { message: String },
+    Ai {
+        message: String,
+        /// Stable category; the shell maps this to its audit vocabulary.
+        code: AiErrorCode,
+    },
 }
 
 impl std::fmt::Display for LyraReaderFfiError {
@@ -93,7 +174,7 @@ impl std::fmt::Display for LyraReaderFfiError {
             Self::Document { message } => write!(f, "document error: {message}"),
             Self::Backend { message } => write!(f, "backend error: {message}"),
             Self::InvalidArgument { message } => write!(f, "invalid argument: {message}"),
-            Self::Ai { message } => write!(f, "AI error: {message}"),
+            Self::Ai { message, .. } => write!(f, "AI error: {message}"),
         }
     }
 }
@@ -101,6 +182,7 @@ impl std::fmt::Display for LyraReaderFfiError {
 impl From<lyra_reader_ai::AiError> for LyraReaderFfiError {
     fn from(error: lyra_reader_ai::AiError) -> Self {
         Self::Ai {
+            code: AiErrorCode::of(&error),
             message: error.to_string(),
         }
     }
@@ -129,6 +211,12 @@ impl From<lyra_reader_core::LyraReaderError> for LyraReaderFfiError {
 pub struct DocumentSummary {
     /// Absolute or user-supplied path the document was opened from.
     pub path: String,
+    /// The one identity every cache uses: canonical path + SHA-256 of the bytes.
+    ///
+    /// The shell gets the same value from [`LyraReaderDocument::document_id`] when it keeps the
+    /// document open; a probe returns it so one-shot callers (the CLI, checks) can compute the
+    /// same keys without opening twice.
+    pub document_id: String,
     pub page_count: u32,
     /// First page size in points, already accounting for `/Rotate` and `/UserUnit`.
     pub first_page_width_pt: f64,
@@ -419,8 +507,12 @@ impl LyraReaderEngine {
             (0.0, 0.0, 0)
         };
 
+        let document_id = crate::document_id::DocumentId::of(source)?
+            .key()
+            .to_string();
         Ok(DocumentSummary {
             path,
+            document_id,
             page_count,
             first_page_width_pt: width,
             first_page_height_pt: height,
@@ -433,6 +525,158 @@ impl LyraReaderEngine {
             backend: backend_description().to_string(),
         })
     }
+}
+
+/// Which fit preset a zoom request asks for.
+///
+/// `FitPage` is the shipping macOS "Fit Page": it fits the page's **height** only. Width is
+/// `FitWidth`'s job, and a page shorter than the window stays vertically scrollable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ZoomModeRecord {
+    /// A toolbar/pointer step from `percent` by `delta`, clamped to the reader's range.
+    Percent,
+    /// Fit the page width into the viewport width, leaving the preset inset per side.
+    FitWidth,
+    /// Fit the page height into the viewport height, leaving the preset inset per side.
+    FitPage,
+}
+
+/// One zoom resolution request.
+///
+/// All lengths are points. `calibration` is the display's physical-density factor (`1.0` for
+/// the uncalibrated convention); a fit divides the calibrated content size into the available
+/// viewport. Only the fields the selected mode needs are read.
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct ZoomPolicyRecord {
+    pub mode: ZoomModeRecord,
+    /// Current whole percentage, for `Percent`.
+    pub percent: u32,
+    /// Step in whole percent, for `Percent` (may be negative).
+    pub delta: i32,
+    /// Page (or facing-row) width at 100%, for `FitWidth`.
+    pub page_width_pt: f64,
+    /// Page (or facing-row) height at 100%, for `FitPage`.
+    pub page_height_pt: f64,
+    /// Viewport width, for `FitWidth`.
+    pub viewport_width_pt: f64,
+    /// Viewport height, for `FitPage`.
+    pub viewport_height_pt: f64,
+    /// Display calibration factor; `100%` is actual size when this is the physical factor.
+    pub calibration: f64,
+}
+
+/// The one zoom policy: integer percent, 25–400, fit inset 8 pt per side, floor rounding.
+///
+/// Returns `None` when a fit has no usable geometry (zero/non-finite sizes, viewport not larger
+/// than the inset, non-positive calibration), which is exactly when the shell's preset must
+/// leave the zoom alone.
+#[uniffi::export]
+pub fn resolve_zoom(policy: ZoomPolicyRecord) -> Option<u32> {
+    use lyra_reader_core::Size;
+    use lyra_reader_session::ZoomRequest;
+    let request = match policy.mode {
+        ZoomModeRecord::Percent => ZoomRequest::Step {
+            percent: policy.percent,
+            delta: policy.delta,
+        },
+        ZoomModeRecord::FitWidth => ZoomRequest::FitWidth,
+        ZoomModeRecord::FitPage => ZoomRequest::FitPage,
+    };
+    lyra_reader_session::resolve_zoom_percent(
+        request,
+        Size::new(policy.page_width_pt, policy.page_height_pt),
+        Size::new(policy.viewport_width_pt, policy.viewport_height_pt),
+        policy.calibration,
+    )
+}
+
+/// Clamp a scroll offset to `0 … max(0, content height − viewport height)`.
+#[uniffi::export]
+pub fn clamp_scroll(offset_pt: f64, content_height_pt: f64, viewport_height_pt: f64) -> f64 {
+    lyra_reader_session::clamp_scroll(offset_pt, content_height_pt, viewport_height_pt)
+}
+
+/// Lowest offered zoom percentage; the shell reads it instead of hard-coding 25.
+#[uniffi::export]
+pub fn zoom_min_percent() -> u32 {
+    lyra_reader_session::MIN_ZOOM_PERCENT
+}
+
+/// Highest offered zoom percentage; the shell reads it instead of hard-coding 400.
+#[uniffi::export]
+pub fn zoom_max_percent() -> u32 {
+    lyra_reader_session::MAX_ZOOM_PERCENT
+}
+
+/// Inset the fit presets leave on each side; the shell reads it instead of hard-coding 8.
+#[uniffi::export]
+pub fn zoom_preset_inset_pt() -> f64 {
+    lyra_reader_session::ZOOM_PRESET_INSET_PT
+}
+
+/// `Page 3`, `Pages 1-3`, `Pages 1, 3, 5` (1-based, sorted and de-duplicated).
+#[uniffi::export]
+pub fn page_label(pages: Vec<u32>) -> String {
+    crate::format::page_label(&pages)
+}
+
+/// `1-12 and 109-120` (1-based, sorted into inclusive runs).
+#[uniffi::export]
+pub fn page_ranges_label(pages: Vec<u32>) -> String {
+    crate::format::page_ranges_label(&pages)
+}
+
+/// `1-3, 5, 8-9` (1-based, sorted and de-duplicated).
+#[uniffi::export]
+pub fn compact_page_ranges(pages: Vec<u32>) -> String {
+    crate::format::compact_page_ranges(&pages)
+}
+
+/// `page 1`, `pages 1–3`, `pages 1, 3, 5` (**0-based** input, as the page menus hold it).
+#[uniffi::export]
+pub fn page_list(pages: Vec<u32>) -> String {
+    crate::format::page_list(&pages)
+}
+
+/// The layered-summary row's span label; `kind` is `abstract`, `sections` or `pages`.
+#[uniffi::export]
+#[allow(clippy::too_many_arguments)]
+pub fn page_span_label(
+    kind: String,
+    pages: Vec<u32>,
+    page_start: u32,
+    page_end: u32,
+    covered_page_end: u32,
+    truncated: bool,
+    page_count: u32,
+) -> String {
+    crate::format::page_span_label(
+        &kind,
+        &pages,
+        page_start,
+        page_end,
+        covered_page_end,
+        truncated,
+        page_count,
+    )
+}
+
+/// The historical sidebar/passages display of a PDF `/M` value: clock digits as written.
+///
+/// A zoned value is deliberately **not** converted; see the crate's format module. `None`
+/// means the annotation has no `/M`; an unrecognized string is returned unchanged.
+#[uniffi::export]
+pub fn pdf_date_display(value: String) -> Option<String> {
+    crate::format::pdf_date_display(&value)
+}
+
+/// The instant a PDF date names, in milliseconds since the Unix epoch, applying its offset.
+///
+/// `None` for a string that is not the PDF date shape (the export then sorts it last rather
+/// than inventing a time).
+#[uniffi::export]
+pub fn pdf_date_millis(value: String) -> Option<i64> {
+    crate::format::pdf_date_millis(&value)
 }
 
 /// Size of a page in points, already accounting for `/Rotate`.
@@ -645,6 +889,9 @@ pub struct XfaStatusRecord {
 pub struct LyraReaderDocument {
     backend: PdfiumBackend,
     path: String,
+    /// Canonical path + content hash, computed once at open. Every cache key and every tab
+    /// identity derives from this, so a symlink and its target are one document.
+    document_id: crate::document_id::DocumentId,
     /// Kept so [`LyraReaderDocument::reopen`] can hand a worker its own copy.
     password: Option<String>,
     /// XFA state, when this document is a form rendered from its XML. The synthetic bytes are
@@ -935,6 +1182,17 @@ impl LyraReaderDocument {
         self.path.clone()
     }
 
+    /// The document's stable identity: canonical path + SHA-256 of its bytes.
+    ///
+    /// Computed once when the document was opened and valid for this handle's lifetime. The
+    /// shell uses it as the key for the annotation/edit cache, AI conversations, translations,
+    /// summaries, document knowledge, recent covers and the index cache. Two paths that resolve
+    /// to the same file return the same value; a file whose bytes change gets a new one (the
+    /// open handle still describes the bytes it parsed, which is what its other records mean).
+    pub fn document_id(&self) -> String {
+        self.document_id.key().to_string()
+    }
+
     pub fn page_count(&self) -> u32 {
         self.backend.page_count()
     }
@@ -1099,6 +1357,7 @@ impl LyraReaderDocument {
         Ok(Arc::new(LyraReaderDocument {
             backend,
             path: self.path.clone(),
+            document_id: self.document_id.clone(),
             password: self.password.clone(),
             xfa: self.xfa.clone(),
             signature: self.signature.clone(),
@@ -2673,6 +2932,7 @@ impl LyraReaderDocument {
             | AiActionRecord::SummarizeSection
             | AiActionRecord::SummarizePageLine => {
                 return Err(LyraReaderFfiError::Ai {
+                    code: AiErrorCode::Other,
                     message: "A layered summary uses its own per-unit request builder.".to_string(),
                 });
             }
@@ -2680,11 +2940,13 @@ impl LyraReaderDocument {
         let page_count = self.page_count();
         if page_count == 0 {
             return Err(LyraReaderFfiError::Ai {
+                code: AiErrorCode::EmptyContext,
                 message: "This document has no pages.".to_string(),
             });
         }
         if request.current_page >= page_count {
             return Err(LyraReaderFfiError::Ai {
+                code: AiErrorCode::EmptyContext,
                 message: format!(
                     "The current page {} is outside this document ({} pages).",
                     request.current_page + 1,
@@ -2699,6 +2961,7 @@ impl LyraReaderDocument {
         });
         if action.requires_selection() && selection.is_none() {
             return Err(LyraReaderFfiError::Ai {
+                code: AiErrorCode::Other,
                 message: "Select text first; there is no selection to send.".to_string(),
             });
         }
@@ -2706,6 +2969,7 @@ impl LyraReaderDocument {
             && selection.page >= page_count
         {
             return Err(LyraReaderFfiError::Ai {
+                code: AiErrorCode::EmptyContext,
                 message: format!(
                     "The selected page {} is outside this document.",
                     selection.page + 1
@@ -2717,10 +2981,12 @@ impl LyraReaderDocument {
         // established, bounded related source passages can connect it to the full document.
         if action == AiAction::RegionQuestion {
             let region = request.region.ok_or_else(|| LyraReaderFfiError::Ai {
+                code: AiErrorCode::Other,
                 message: "The region question has no region; nothing was sent.".to_string(),
             })?;
             if region.page >= page_count {
                 return Err(LyraReaderFfiError::Ai {
+                    code: AiErrorCode::EmptyContext,
                     message: format!(
                         "The selected region is on page {}, outside this document ({} pages).",
                         region.page + 1,
@@ -2928,6 +3194,7 @@ impl LyraReaderDocument {
         let page_count = self.page_count();
         if page_count == 0 {
             return Err(LyraReaderFfiError::Ai {
+                code: AiErrorCode::EmptyContext,
                 message: "This document has no pages.".to_string(),
             });
         }
@@ -2984,6 +3251,7 @@ impl LyraReaderDocument {
         let page_count = self.page_count();
         if page_count == 0 {
             return Err(LyraReaderFfiError::Ai {
+                code: AiErrorCode::EmptyContext,
                 message: "This document has no pages.".to_string(),
             });
         }
@@ -3362,6 +3630,7 @@ impl LyraReaderDocument {
 
                 records.push(AnnotationRecord {
                     page,
+                    page_label: crate::format::page_label(&[page.saturating_add(1)]),
                     id: annotation.id,
                     parent_id: annotation.parent_id,
                     is_reply: annotation.is_reply,
@@ -3386,6 +3655,10 @@ impl LyraReaderDocument {
                     blend: annotation.blend.as_str().to_string(),
                     contents: annotation.contents,
                     author: annotation.author,
+                    display_date: annotation
+                        .modified
+                        .as_deref()
+                        .and_then(crate::format::pdf_date_display),
                     modified: annotation.modified,
                     font_size_pt: annotation.font_size_pt,
                     alignment: annotation.alignment.as_str().to_string(),
@@ -4328,9 +4601,10 @@ impl LyraReaderDocument {
 
     /// Looks the index cache up once and, on a hit, fills every in-memory index component with it.
     ///
-    /// Lazy by design: opening a document never hashes the file or reads the cache, so the page
-    /// raster and the first paint do not wait for the index. The shell's background loaders are
-    /// what call the accessors that reach this point.
+    /// Lazy with respect to the **cache file**: opening reads the bytes to compute the document
+    /// identity (the shell needs it for every cache), but does not read or validate the index
+    /// cache, so the first paint does not wait for the cache lookup. The shell's background
+    /// loaders are what call the accessors that reach this point.
     fn ensure_index_loaded(&self) {
         let mut runtime = match self.index.lock() {
             Ok(runtime) => runtime,
@@ -4341,7 +4615,7 @@ impl LyraReaderDocument {
         }
         runtime.attempted = true;
 
-        let path = cache_path(Path::new(&self.path));
+        let path = crate::index_cache::cache_path_for_key(self.document_id.key());
         runtime.cache_path = Some(path.clone());
         if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
             // The file on disk is no longer the file the backend parsed. A cache bound to
@@ -4360,22 +4634,27 @@ impl LyraReaderDocument {
         }
 
         let started = Instant::now();
-        let identity = match ContentIdentity::of(Path::new(&self.path)) {
-            Ok(identity) => identity,
-            Err(error) => {
-                runtime.outcome = IndexCacheOutcome::Unreadable;
-                runtime.write_disabled = true;
-                runtime.write_error = Some(format!("could not hash the PDF: {error}"));
-                runtime.validation = started.elapsed();
-                return;
-            }
-        };
+        let identity = self.document_id.content.clone();
+        runtime.identity = Some(identity.clone());
+
+        // The new key is authoritative. When it has no file, an older build's path-only cache
+        // is read and a hit is copied forward; the old file is left in place so a downgrade (or
+        // a user inspecting it) still has the cache it wrote. Reading the legacy file also
+        // preserves the "stale cache" outcome after an in-place byte change: the new key is
+        // missing, the old path still holds the previous bytes' values, and `read_cache` says
+        // `Stale` rather than silently claiming there was never a cache.
+        let legacy = crate::index_cache::legacy_cache_path(Path::new(&self.path));
+        let read = crate::index_cache::read_cache_with_migration(
+            &path,
+            &legacy,
+            &identity,
+            self.backend.page_count(),
+        );
         runtime.cache_bytes = std::fs::metadata(&path)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
-        runtime.identity = Some(identity.clone());
 
-        match read_cache(&path, &identity, self.backend.page_count()) {
+        match read {
             CacheRead::Hit(file) => {
                 let IndexCacheFile {
                     outline,
@@ -4548,6 +4827,13 @@ impl LyraReaderDocument {
         match write_cache(&path, &file) {
             Ok(bytes) => {
                 runtime.cache_bytes = bytes;
+                // Keep the historical path-only file in step. It is not read when the new key
+                // exists; it is the anchor that makes a later byte change report `Stale` and
+                // that a downgrade can still use. A failure to mirror is not a document failure.
+                let legacy = crate::index_cache::legacy_cache_path(Path::new(&self.path));
+                if legacy != path {
+                    let _ = write_cache(&legacy, &file);
+                }
                 eprintln!(
                     "lyra-reader-index: wrote {} ({} bytes, {:.1} ms)",
                     path.display(),
@@ -4667,6 +4953,8 @@ pub struct StampRecord {
 pub struct AnnotationRecord {
     /// Page the annotation is on (0-based).
     pub page: u32,
+    /// The reader-facing label for that page, from the one page formatter: `Page 4`.
+    pub page_label: String,
     /// The annotation's identity: `nm:<NM>` when the file names it, otherwise a stable
     /// fingerprint (`fp:<hex>`) of its dictionary. This is what `/IRT` entries name, and it is
     /// unique among the annotations this reader reports for one document.
@@ -4720,6 +5008,9 @@ pub struct AnnotationRecord {
     pub contents: Option<String>,
     /// `/T`.
     pub author: Option<String>,
+    /// The historical display string for `/M` (`YYYY-MM-DD HH:mm`, clock as written), or the
+    /// file's own string when it is not the PDF date shape. Computed by the one date parser.
+    pub display_date: Option<String>,
     /// `/M`, as the file writes it (`D:YYYYMMDDHHmmSS±HH'mm'`).
     pub modified: Option<String>,
     /// The font size `/DA` states for this annotation's text, in points; `None` when the file
@@ -5693,9 +5984,15 @@ impl LyraReaderEngine {
         };
         // Page sizes stay lazy: opening a 900-page document must not pay 900 page loads
         // before the first frame. The first layout request measures them (see `page_sizes`).
+
+        // One identity for every cache and every tab: canonical path + content hash. Hashing is
+        // the same sequential read the index cache needs later, and is done once here so the
+        // shell never has to derive a second key.
+        let document_id = crate::document_id::DocumentId::of(source)?;
         Ok(Arc::new(LyraReaderDocument {
             backend,
             path,
+            document_id,
             password,
             xfa: xfa_state,
             signature,
@@ -6174,6 +6471,9 @@ pub enum AiEventRecord {
         /// Why the transport failed, as a fixed category. `Other` for every error that is not a
         /// recognized offline/local-server transport failure.
         failure: AiFailureRecord,
+        /// Stable AI error category. Assigned once from the Rust error variant; the shell maps
+        /// it to its audit vocabulary instead of matching message text.
+        code: AiErrorCode,
     },
 }
 
@@ -6338,12 +6638,14 @@ pub fn start_ai_request(
 ) -> Result<Arc<LyraReaderAiRequest>, LyraReaderFfiError> {
     if api_key.is_empty() {
         return Err(LyraReaderFfiError::Ai {
+            code: AiErrorCode::Unauthorized,
             message: "No API key is configured. Add one in Settings > AI; nothing was sent."
                 .to_string(),
         });
     }
     if api_key.chars().any(|character| character.is_control()) {
         return Err(LyraReaderFfiError::Ai {
+            code: AiErrorCode::InvalidSettings,
             message: "The API key contains a control character or line break, so it was not sent."
                 .to_string(),
         });
@@ -6369,6 +6671,7 @@ pub fn start_ai_request(
                         message: "Cancelled".to_string(),
                         cancelled: true,
                         failure: AiFailureRecord::Other,
+                        code: AiErrorCode::Cancelled,
                     });
                 }
                 Ok(Err(error)) => {
@@ -6376,6 +6679,7 @@ pub fn start_ai_request(
                         message: error.to_string(),
                         cancelled: false,
                         failure: AiFailureRecord::from(error.failure()),
+                        code: AiErrorCode::of(&error),
                     });
                 }
                 Err(_) => {
@@ -6383,6 +6687,7 @@ pub fn start_ai_request(
                         message: "The AI request worker stopped unexpectedly.".to_string(),
                         cancelled: false,
                         failure: AiFailureRecord::Other,
+                        code: AiErrorCode::Other,
                     });
                 }
             }
@@ -6391,6 +6696,7 @@ pub fn start_ai_request(
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         })
         .map_err(|error| LyraReaderFfiError::Ai {
+            code: AiErrorCode::Other,
             message: format!("could not start the AI request worker: {error}"),
         })?;
     Ok(Arc::new(LyraReaderAiRequest { job }))
@@ -6563,11 +6869,13 @@ fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, LyraReaderFfiEr
     };
     if !(plan.endpoint.starts_with("http://") || plan.endpoint.starts_with("https://")) {
         return Err(LyraReaderFfiError::Ai {
+            code: AiErrorCode::InvalidSettings,
             message: "The request preview has an invalid endpoint.".to_string(),
         });
     }
     if plan.parts.is_empty() {
         return Err(LyraReaderFfiError::Ai {
+            code: AiErrorCode::Other,
             message: "The request preview has no requests.".to_string(),
         });
     }
@@ -6575,12 +6883,14 @@ fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, LyraReaderFfiEr
         (Some(field), Some(value)) => Some(ReasoningField {
             field: field.clone(),
             value: serde_json::from_str(value).map_err(|_| LyraReaderFfiError::Ai {
+                code: AiErrorCode::InvalidSettings,
                 message: "The request preview has an invalid reasoning field.".to_string(),
             })?,
         }),
         (None, None) => None,
         _ => {
             return Err(LyraReaderFfiError::Ai {
+                code: AiErrorCode::InvalidSettings,
                 message: "The request preview names only half of its reasoning field.".to_string(),
             });
         }
@@ -8107,5 +8417,78 @@ mod tests {
             1,
             "one subtree, not two"
         );
+    }
+}
+
+#[cfg(test)]
+mod ai_code_tests {
+    use super::*;
+    use lyra_reader_ai::AiError;
+
+    #[test]
+    fn the_stable_code_comes_from_the_error_variant_not_its_message() {
+        let cases = [
+            (AiError::NotConfigured, AiErrorCode::NotConfigured),
+            (
+                AiError::Unreachable("refused".into()),
+                AiErrorCode::Unreachable,
+            ),
+            (AiError::Offline("no route".into()), AiErrorCode::Offline),
+            (
+                AiError::LocalServer("nothing listening".into()),
+                AiErrorCode::LocalServer,
+            ),
+            (AiError::Unauthorized, AiErrorCode::Unauthorized),
+            (AiError::RateLimited, AiErrorCode::RateLimited),
+            (AiError::Cancelled, AiErrorCode::Cancelled),
+            (
+                AiError::UnsupportedCapability("image input"),
+                AiErrorCode::UnsupportedCapability,
+            ),
+            (
+                AiError::InvalidSettings("The model is not usable.".into()),
+                AiErrorCode::InvalidSettings,
+            ),
+            (
+                AiError::EmptyContext("This document has no pages.".into()),
+                AiErrorCode::EmptyContext,
+            ),
+            (
+                AiError::HttpStatus("HTTP 500".into()),
+                AiErrorCode::HttpStatus,
+            ),
+            (
+                AiError::Protocol("bad stream".into()),
+                AiErrorCode::Protocol,
+            ),
+            (AiError::Timeout("too long".into()), AiErrorCode::Timeout),
+            (AiError::Other("anything".into()), AiErrorCode::Other),
+        ];
+        for (error, code) in cases {
+            assert_eq!(AiErrorCode::of(&error), code, "{error:?}");
+        }
+        assert_eq!(
+            AiErrorCode::of(&AiError::EmptyContext(NOTHING_RELEVANT_MESSAGE.into())),
+            AiErrorCode::NothingRelevant
+        );
+        assert_eq!(
+            AiErrorCode::of(&AiError::EmptyContext(
+                "Turn on image input in Settings > AI.".into()
+            )),
+            AiErrorCode::VisionUnsupported
+        );
+    }
+
+    #[test]
+    fn the_ffi_error_carries_the_message_unchanged_and_the_code_beside_it() {
+        let converted: LyraReaderFfiError =
+            AiError::Timeout("The stream took too long.".into()).into();
+        match converted {
+            LyraReaderFfiError::Ai { message, code } => {
+                assert_eq!(code, AiErrorCode::Timeout);
+                assert_eq!(message, "The stream took too long.");
+            }
+            other => panic!("expected an AI error, got {other:?}"),
+        }
     }
 }

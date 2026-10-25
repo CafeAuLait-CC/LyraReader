@@ -130,7 +130,7 @@ struct AIRegionCardView: View {
                 .accessibilityLabel(card.isBusy || card.notesBusy ? "Lyra is responding" : "Lyra")
             Button { showingSelection.toggle() } label: {
                 HStack(spacing: 5) {
-                    Text("Page \(card.attachment.page + 1) · Region \(card.regionNumber)").font(.system(size: 12, weight: .semibold))
+                    Text("\(card.attachment.pageLabel) · Region \(card.regionNumber)").font(.system(size: 12, weight: .semibold))
                     Image(systemName: "chevron.down").font(.system(size: 8, weight: .semibold))
                 }
             }.buttonStyle(.plain).help("View selected region")
@@ -192,7 +192,7 @@ struct AIRegionCardView: View {
                 Image(nsImage: image).resizable().aspectRatio(contentMode: .fit)
                     .frame(maxWidth: 360, maxHeight: 230)
             }
-            Text("Page \(card.attachment.page + 1) · \(card.attachment.sizeLabel)")
+            Text("\(card.attachment.pageLabel) · \(card.attachment.sizeLabel)")
                 .font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
             Text(card.attachment.text).font(.caption).lineLimit(5).textSelection(.enabled)
         }.padding(14).frame(width: 360).background(LyraReaderTheme.raisedBg)

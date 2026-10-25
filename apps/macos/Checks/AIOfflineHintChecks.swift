@@ -136,7 +136,7 @@ extension ReaderChecks {
         return (
             engine,
             AIReaderContext(
-                documentKey: fixtureURL.standardizedFileURL.path,
+                documentKey: DocumentEditCache.documentIdentity(for: fixtureURL) ?? fixtureURL.standardizedFileURL.path,
                 documentTitle: document.title,
                 pageCount: document.pageCount,
                 currentPage: 1,
@@ -165,7 +165,8 @@ extension ReaderChecks {
             failure: .error(
                 message: "provider unreachable: no network route: No route to host",
                 cancelled: false,
-                failure: .offline
+                failure: .offline,
+                code: .offline
             )
         )
         let model = AIAssistantModel(settings: fixture.store, audit: audit)
@@ -201,7 +202,8 @@ extension ReaderChecks {
             failure: .error(
                 message: "provider unreachable: the local server did not accept the connection: Connection refused",
                 cancelled: false,
-                failure: .localServer
+                failure: .localServer,
+                code: .localServer
             )
         )
         let model = AIAssistantModel(settings: fixture.store)
@@ -237,7 +239,8 @@ extension ReaderChecks {
             failure: .error(
                 message: "provider unreachable: no network route",
                 cancelled: false,
-                failure: .offline
+                failure: .offline,
+                code: .offline
             )
         )
         let model = AIAssistantModel(settings: fixture.store)
@@ -307,7 +310,8 @@ extension ReaderChecks {
             failure: .error(
                 message: "provider unreachable: no network route: No route to host",
                 cancelled: false,
-                failure: .offline
+                failure: .offline,
+                code: .offline
             )
         )
         let model = AIAssistantModel(settings: fixture.store, audit: audit)

@@ -22,7 +22,7 @@ extension ReaderChecks {
     @MainActor static func bookmarkChecks(url: URL) async throws {
         let directory = url.deletingLastPathComponent()
         let document = directory.appendingPathComponent("bookmarks-\(UUID()).pdf")
-        let records = DocumentEditCache.annotationsURL(for: document)
+        var records = DocumentEditCache.annotationsURL(for: document)
         try? FileManager.default.removeItem(at: document)
         try? FileManager.default.removeItem(at: records)
         try FileManager.default.copyItem(at: url, to: document)
@@ -47,6 +47,9 @@ extension ReaderChecks {
         let state = AppState(engine: try RustEngine())
         state.setViewportSize(CGSize(width: 900, height: 300))
         state.open(url: document)
+        // The file now exists, so the live cache is keyed by its content identity; the file
+        // seeded above lived at the historical path-only key and was migrated on open.
+        records = DocumentEditCache.annotationsURL(for: document)
         require(state.annotations.count == 1 && state.bookmarks.isEmpty,
                 "an older-format annotation cache still loads, with no bookmarks to invent")
         require(state.annotations.first?.note == "kept from the old build",

@@ -10,7 +10,13 @@ extension AppState {
 
     public var regionDocumentKey: String? {
         guard let document else { return nil }
-        return (translationDocumentURL ?? document.url)?.standardizedFileURL.path ?? document.id.uuidString
+        let url = translationDocumentURL ?? document.url
+        if let url {
+            return DocumentEditCache.documentIdentity(for: url)
+                ?? document.documentId.nonEmpty
+                ?? url.standardizedFileURL.path
+        }
+        return document.documentId.nonEmpty ?? document.id.uuidString
     }
 
     public var currentRegionHistory: [AIRegionHistoryEntry] {
@@ -469,13 +475,17 @@ extension AppState {
     }
 
     func loadRegionHistory(for url: URL) {
-        let key = url.standardizedFileURL.path
+        let key = DocumentEditCache.documentIdentity(for: url)
+            ?? url.standardizedFileURL.path
         guard regionHistory[key] == nil else { return }
         let file = DocumentEditCache.directory(for: url).appendingPathComponent("region-conversations-v1.json")
         guard FileManager.default.fileExists(atPath: file.path) else { return }
         do {
-            let entries = try JSONDecoder().decode([AIRegionHistoryEntry].self, from: Data(contentsOf: file))
-            var migrated = entries.filter { $0.documentKey == key }
+            var entries = try JSONDecoder().decode([AIRegionHistoryEntry].self, from: Data(contentsOf: file))
+            // The file belongs to this document; entries written under the old path key are
+            // this document's conversations too, so re-target them rather than dropping them.
+            for index in entries.indices { entries[index].documentKey = key }
+            var migrated = entries
             var next = (migrated.compactMap(\.regionNumber).max() ?? 0) + 1
             for index in migrated.indices.sorted(by: { migrated[$0].createdAt == migrated[$1].createdAt ? migrated[$0].id.uuidString < migrated[$1].id.uuidString : migrated[$0].createdAt < migrated[$1].createdAt }) {
                 if migrated[index].regionNumber == nil {

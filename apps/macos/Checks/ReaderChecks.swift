@@ -1103,6 +1103,10 @@ struct ReaderChecks {
             ("frame-scheduling", {
                 try await frameSchedulingChecks()
             }),
+            ("contract-cleanup", {
+                // Before xfa: pure value checks plus one scratch document; no window or GPU surface.
+                try await contractCleanupChecks(root: root)
+            }),
             ("xfa", {
                 // Last: this check opens the local XFA sample and leaves no window behind, but it is
                 // kept after the long-lived surface/window checks so its raster timers cannot influence

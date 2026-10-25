@@ -128,41 +128,20 @@ public struct AISummaryEntry: Identifiable, Equatable, Sendable {
     /// "1-12 and 109-120". A two-window abstract has exactly two ranges; a document that fits
     /// the windows has one.
     public static func pageRangesLabel(_ pages: [Int]) -> String {
-        var ranges: [(start: Int, end: Int)] = []
-        for page in pages.sorted() where ranges.last?.end != page {
-            if let end = ranges.last?.end, page == end + 1 {
-                ranges[ranges.count - 1].end = page
-            } else {
-                ranges.append((start: page, end: page))
-            }
-        }
-        return ranges
-            .map { $0.start == $0.end ? "\($0.start)" : "\($0.start)-\($0.end)" }
-            .joined(separator: " and ")
+        LyraReaderBindings.pageRangesLabel(pages: pages.map { UInt32(max(0, $0)) })
     }
 
     /// "Page 3", "Pages 2-5", "Pages 1-12 and 109-120 of 120".
     public func pageSpanLabel(pageCount: Int) -> String {
-        switch kind {
-        case .abstract:
-            if !pages.isEmpty {
-                if pages.count == pageCount, pages.first == 1, pages.last == pageCount {
-                    return "All \(pageCount) pages"
-                }
-                return "Pages \(Self.pageRangesLabel(pages)) of \(pageCount)"
-            }
-            let end = coveredPageEnd > 0 ? coveredPageEnd : min(pageEnd, pageCount)
-            return end >= pageCount ? "All \(pageCount) pages" : "Pages 1-\(end) of \(pageCount)"
-        case .sections, .pages:
-            if pageStart == pageEnd {
-                return "Page \(pageStart) of \(pageCount)"
-            }
-            let end = coveredPageEnd > 0 ? min(coveredPageEnd, pageEnd) : pageEnd
-            if truncated, end < pageEnd {
-                return "Pages \(pageStart)-\(end) of \(pageStart)-\(pageEnd)"
-            }
-            return "Pages \(pageStart)-\(pageEnd) of \(pageCount)"
-        }
+        LyraReaderBindings.pageSpanLabel(
+            kind: kind.rawValue,
+            pages: pages.map { UInt32(max(0, $0)) },
+            pageStart: UInt32(max(0, pageStart)),
+            pageEnd: UInt32(max(0, pageEnd)),
+            coveredPageEnd: UInt32(max(0, coveredPageEnd)),
+            truncated: truncated,
+            pageCount: UInt32(max(0, pageCount))
+        )
     }
 
     /// How many pages this row covers.
@@ -269,7 +248,8 @@ public enum AISummarySections {
     static func fallbackSections(pageCount: Int) -> [AISummarySection] {
         stride(from: 0, to: pageCount, by: fallbackPagesPerSection).map { start in
             let end = min(pageCount - 1, start + fallbackPagesPerSection - 1)
-            let label = start == end ? "Page \(start + 1)" : "Pages \(start + 1)-\(end + 1)"
+            let label = LyraReaderBindings.pageLabel(
+                pages: [UInt32(max(0, start + 1)), UInt32(max(0, end + 1))])
             return AISummarySection(
                 title: label,
                 number: "",
@@ -961,7 +941,7 @@ public final class LayeredSummaryModel: ObservableObject {
                 id: "page:\(index + 1)",
                 kind: .pages,
                 unitIndex: index,
-                title: "Page \(index + 1)",
+                title: LyraReaderBindings.pageLabel(pages: [UInt32(max(0, index + 1))]),
                 number: nil,
                 depth: 0,
                 pageStart: index + 1,
@@ -1169,12 +1149,13 @@ public final class LayeredSummaryModel: ObservableObject {
         let attempt = audit.begin(plan: plan, kind: .summaryLayer)
         do {
             guard let service else {
-                throw AISettingsError.invalid(AIAssistantModel.noEngineMessage)
+                throw AISettingsError.refused(AIAssistantModel.noEngineMessage, .notConfigured)
             }
             let handle: any AIChatHandle
             if settings.connectionMode == .chatGPT {
                 guard let account = settings.chatGPT.selected, account.connected else {
-                    throw AISettingsError.invalid("Connect ChatGPT in Settings > AI first. Nothing was sent.")
+                    throw AISettingsError.refused(
+                        "Connect ChatGPT in Settings > AI first. Nothing was sent.", .signedOut)
                 }
                 handle = ChatGPTResponsesHandle(
                     plan: plan,
@@ -1183,7 +1164,7 @@ public final class LayeredSummaryModel: ObservableObject {
                 )
             } else {
                 guard let key = try settings.readKey() else {
-                    throw AISettingsError.invalid(AIAssistantModel.noKeyMessage)
+                    throw AISettingsError.refused(AIAssistantModel.noKeyMessage, .noApiKey)
                 }
                 handle = try service.start(plan, apiKey: key)
             }
@@ -1231,7 +1212,7 @@ public final class LayeredSummaryModel: ObservableObject {
                 case .done:
                     complete(id)
                     terminal = true
-                case .error(let message, let cancelled, let failure):
+                case .error(let message, let cancelled, let failure, _):
                     if cancelled {
                         updateEntry(id) {
                             $0.state = .cancelled

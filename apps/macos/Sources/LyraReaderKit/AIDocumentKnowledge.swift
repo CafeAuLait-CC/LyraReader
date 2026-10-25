@@ -33,7 +33,11 @@ public final class AIDocumentKnowledge: ObservableObject {
 
     public func ensure(service: any AIChatServicing, context: AIReaderContext,
                        sourceURL: URL, cacheDocumentURL: URL) async throws -> String {
-        let identity = sourceURL.standardizedFileURL.path + "|" + cacheDocumentURL.standardizedFileURL.path
+        let sourceKey = DocumentEditCache.documentIdentity(for: sourceURL)
+            ?? sourceURL.standardizedFileURL.path
+        let cacheKey = DocumentEditCache.documentIdentity(for: cacheDocumentURL)
+            ?? cacheDocumentURL.standardizedFileURL.path
+        let identity = sourceKey + "|" + cacheKey
         if let sourceIdentity, sourceIdentity != identity { invalidate() }
         sourceIdentity = identity
         if let pending { return try await pending.value }

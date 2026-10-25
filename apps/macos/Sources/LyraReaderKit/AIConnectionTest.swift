@@ -166,7 +166,7 @@ public final class AIConnectionTestModel: ObservableObject {
             case .done:
                 finishSuccessfully()
                 return true
-            case .error(let message, let cancelled, let failure):
+            case .error(let message, let cancelled, let failure, _):
                 handle = nil
                 startedAt = nil
                 if cancelled {

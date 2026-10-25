@@ -1,4 +1,5 @@
 import CoreGraphics
+import LyraReaderBindings
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
@@ -546,7 +547,7 @@ public struct SidebarView: View {
             HStack(spacing: 6) {
                 Image(systemName: collapsedAnnotationPages.contains(page.id) ? "chevron.right" : "chevron.down")
                     .font(.system(size: 9, weight: .semibold)).frame(width: 10)
-                Text("Page \(page.id + 1)").fontWeight(.semibold)
+                Text(LyraReaderBindings.pageLabel(pages: [UInt32(page.id + 1)])).fontWeight(.semibold)
                 Spacer(minLength: 2)
                 Text("\(page.annotationCount)").foregroundStyle(LyraReaderTheme.textSecondary)
             }
@@ -642,7 +643,7 @@ public struct SidebarView: View {
                             .foregroundStyle(LyraReaderTheme.textSecondary)
                     }
                     if row.showsPage {
-                        Text("On page \(row.annotation.page + 1)")
+                        Text("On " + LyraReaderBindings.pageLabel(pages: [UInt32(row.annotation.page + 1)]).lowercased())
                             .font(.caption2)
                             .foregroundStyle(LyraReaderTheme.textSecondary)
                     }
@@ -750,23 +751,23 @@ public struct SidebarView: View {
             let detail = annotation.kind == .textBox
                 ? "\(String(format: "%.0f", annotation.fontSize)) pt"
                 : "icon"
-            return "\(source)Page \(annotation.page + 1) · placed \(kind) · \(detail) · "
+            return "\(source)\(LyraReaderBindings.pageLabel(pages: [UInt32(annotation.page + 1)])) · placed \(kind) · \(detail) · "
                 + "\(characters) character\(characters == 1 ? "" : "s")"
         }
         if annotation.kind.isGeometry {
             let width = String(format: "%.1f pt", annotation.strokeWidth)
-            return "\(source)Page \(annotation.page + 1) · \(kind) · \(width) stroke"
+            return "\(source)\(LyraReaderBindings.pageLabel(pages: [UInt32(annotation.page + 1)])) · \(kind) · \(width) stroke"
         }
         if annotation.kind.isStampArtwork {
             let detail = annotation.kind == .signature
                 ? (annotation.stampStyle == "image" ? "picture" : "signature picture")
                 : "\(annotation.stampStyle ?? "custom") · \(annotation.note.count) character\(annotation.note.count == 1 ? "" : "s")"
-            return "\(source)Page \(annotation.page + 1) · \(kind) · \(detail)"
+            return "\(source)\(LyraReaderBindings.pageLabel(pages: [UInt32(annotation.page + 1)])) · \(kind) · \(detail)"
         }
         if annotation.isFileOwned {
-            return "\(source)Page \(annotation.page + 1) · \(kind)"
+            return "\(source)\(LyraReaderBindings.pageLabel(pages: [UInt32(annotation.page + 1)])) · \(kind)"
         }
-        return "Page \(annotation.page + 1) · \(kind) · "
+        return "\(LyraReaderBindings.pageLabel(pages: [UInt32(annotation.page + 1)])) · \(kind) · "
             + "\(annotation.end - annotation.start + 1) characters"
     }
 
@@ -788,7 +789,7 @@ public struct SidebarView: View {
     }
 
     private func documentAnnotationSubtitle(_ annotation: DocumentAnnotation) -> String {
-        var parts = ["Page \(annotation.page + 1)"]
+        var parts = [annotation.pageLabel]
         if let author = annotation.author, !author.isEmpty { parts.append(author) }
         if let date = annotation.displayDate { parts.append(date) }
         return parts.joined(separator: " · ")
@@ -836,7 +837,7 @@ private struct BookmarkSidebarRow: View {
                         Text(bookmark.displayTitle).font(.system(size: 13, weight: .medium))
                             .lineLimit(2)
                             .foregroundStyle(LyraReaderTheme.textPrimary)
-                        Text("Page \(bookmark.page + 1)").font(.caption)
+                        Text(LyraReaderBindings.pageLabel(pages: [UInt32(bookmark.page + 1)])).font(.caption)
                             .foregroundStyle(LyraReaderTheme.textSecondary)
                     }
                     Spacer(minLength: 0)

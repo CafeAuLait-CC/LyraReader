@@ -108,6 +108,9 @@ public struct DocumentXfa: Codable, Equatable, Sendable {
 /// (stable identity, display title) on top of it.
 public struct LoadedDocument: Identifiable, Equatable, Sendable {
     public let id: UUID
+    /// The engine's one document identity: canonical path + content hash. Empty only for the
+    /// mock engine, which has no file to hash.
+    public var documentId: String
     public var title: String
     public var pageCount: Int
     public var url: URL?
@@ -122,6 +125,7 @@ public struct LoadedDocument: Identifiable, Equatable, Sendable {
 
     public init(
         id: UUID = UUID(),
+        documentId: String = "",
         title: String,
         pageCount: Int,
         url: URL? = nil,
@@ -131,6 +135,7 @@ public struct LoadedDocument: Identifiable, Equatable, Sendable {
         xfa: DocumentXfa = .none
     ) {
         self.id = id
+        self.documentId = documentId
         self.title = title
         self.pageCount = pageCount
         self.url = url
@@ -835,7 +840,12 @@ public struct DocumentAnnotation: Sendable, Identifiable, Equatable {
     public let blend: String
     public let contents: String?
     public let author: String?
+    /// The reader-facing page label from the one Rust formatter: `Page 4`.
+    public let pageLabel: String
     public let modified: String?
+    /// The historical sidebar/passages display for `/M` (`YYYY-MM-DD HH:mm`, clock as written),
+    /// or the file's own string when it is not the PDF date shape. Computed by Rust once.
+    public let pdfDisplayDate: String?
     /// The font size `/DA` states for this annotation's text, in points; `nil` when the file
     /// states none. Only free text has one in practice, and it is the size its text is drawn at.
     public let fontSizePt: CGFloat?
@@ -2270,6 +2280,7 @@ public final class RustEngine: PDFEngine {
         // `Figure 3` click to the previous paper's artwork.
         let firstPage = opened.pageCount() > 0 ? try opened.pageSizePt(page: 0) : nil
         let loaded = LoadedDocument(
+            documentId: opened.documentId(),
             title: url.deletingPathExtension().lastPathComponent,
             pageCount: Int(opened.pageCount()),
             url: url,
@@ -3546,7 +3557,9 @@ public final class RustEngine: PDFEngine {
             blend: record.blend,
             contents: record.contents,
             author: record.author,
+            pageLabel: record.pageLabel,
             modified: record.modified,
+            pdfDisplayDate: record.displayDate,
             fontSizePt: record.fontSizePt.map { CGFloat($0) },
             alignment: record.alignment,
             stampText: record.stamp?.text,

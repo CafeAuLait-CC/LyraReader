@@ -605,7 +605,14 @@ public enum AIStreamEvent: Equatable, Sendable {
     case diagnostics(AIStreamDiagnostics)
     case done
     /// `failure` is the transport's fixed category; `.other` keeps the existing error display.
-    case error(message: String, cancelled: Bool, failure: AIRequestFailure = .other)
+    /// `code` is the stable AI error category assigned by Rust, so the audit trail never has to
+    /// match message text.
+    case error(
+        message: String,
+        cancelled: Bool,
+        failure: AIRequestFailure = .other,
+        code: AiErrorCode = .other
+    )
 }
 
 // MARK: - Service boundary
@@ -801,11 +808,12 @@ final class RustAIChatHandle: AIChatHandle {
                 ))
             case .done:
                 return .done
-            case .error(let message, let cancelled, let failure):
+            case .error(let message, let cancelled, let failure, let code):
                 return .error(
                     message: message,
                     cancelled: cancelled,
-                    failure: AIRequestFailure(failure)
+                    failure: AIRequestFailure(failure),
+                    code: code
                 )
             }
         }
@@ -960,11 +968,21 @@ public final class InMemoryAPIKeyStore: AIAPIKeyStore {
 
 public enum AISettingsError: LocalizedError, Equatable {
     case invalid(String)
+    /// A local refusal that already knows the audit category the old message classifier would
+    /// have derived. Carrying it on the error is what lets the audit trail stop matching text.
+    case refused(String, AIAuditCode)
 
     public var errorDescription: String? {
         switch self {
         case .invalid(let message): return message
+        case .refused(let message, _): return message
         }
+    }
+
+    /// The explicit category for a refusal, when the throw site knew it.
+    public var auditCode: AIAuditCode? {
+        if case .refused(_, let code) = self { return code }
+        return nil
     }
 }
 
@@ -1147,7 +1165,8 @@ public final class AISettingsStore: ObservableObject {
     public func providerSettings() throws -> AIProviderSettings {
         if connectionMode == .chatGPT {
             guard let account = chatGPT.selected, account.connected, !account.model.isEmpty else {
-                throw AISettingsError.invalid("Connect ChatGPT and select a model in Settings > AI first.")
+                throw AISettingsError.refused(
+                    "Connect ChatGPT and select a model in Settings > AI first.", .invalidSettings)
             }
             // The Responses transport carries an inline picture, so a region question always
             // asks for one. The catalog exposes no documented vision flag; sending the
@@ -1161,13 +1180,13 @@ public final class AISettingsStore: ObservableObject {
         let endpoint = try inspectAiBaseUrl(baseUrl: baseURL)
         let model = try validateAiModel(model: model)
         guard temperature.isFinite, Self.temperatureRange.contains(temperature) else {
-            throw AISettingsError.invalid("Temperature must be between 0 and 2.")
+            throw AISettingsError.refused("Temperature must be between 0 and 2.", .invalidSettings)
         }
         guard Self.maxTokensRange.contains(maxTokens) else {
-            throw AISettingsError.invalid("Max tokens must be between 1 and 32,768.")
+            throw AISettingsError.refused("Max tokens must be between 1 and 32,768.", .invalidSettings)
         }
         if let message = Self.reasoningValidationMessage(mode: reasoningMode, encoding: reasoningEncoding) {
-            throw AISettingsError.invalid(message)
+            throw AISettingsError.refused(message, .invalidSettings)
         }
         return AIProviderSettings(
             baseURL: endpoint.baseUrl,
@@ -1247,26 +1266,18 @@ extension Result where Success == Void, Failure == AISettingsError {
     }
 }
 
-/// Pull a reader-facing string out of a UniFFI-generated error. The generated error enum's
-/// `localizedDescription` is `String(reflecting:)` (`Ai(message: "...")`), which is not something
-/// to show in a panel, so the associated message is read structurally instead.
+/// Pull a reader-facing string out of an error.
+///
+/// The generated FFI error carries the message as a typed associated value, so this reads it
+/// structurally instead of reflecting over the enum or matching message text. Errors that did
+/// not come from the engine still fall through to their own description.
 public enum AIReadableError {
     public static func message(_ error: Error) -> String {
-        // The generated UniFFI error enum carries its message as the single associated String.
-        // `Mirror` reads it without depending on the generated case name or its reflection
-        // formatting ("LyraReaderBindings.LyraReaderFfiError.Ai(message: ...)").
-        let mirror = Mirror(reflecting: error)
-        for child in mirror.children {
-            if let text = child.value as? String, !text.isEmpty {
-                return text
-            }
-            // A generated enum case with one associated value reflects as a tuple such as
-            // `(message: "...")`, so look one level deeper for the labelled message.
-            let nested = Mirror(reflecting: child.value)
-            for associated in nested.children where associated.label == "message" {
-                if let text = associated.value as? String, !text.isEmpty {
-                    return text
-                }
+        if let ffi = error as? LyraReaderFfiError {
+            switch ffi {
+            case .Document(let message), .Backend(let message), .InvalidArgument(let message),
+                 .Ai(let message, _):
+                return message
             }
         }
         if let localized = (error as? LocalizedError)?.errorDescription,
@@ -1291,7 +1302,9 @@ extension AppState {
             )
         }
         return AIReaderContext(
-            documentKey: document.url?.standardizedFileURL.path ?? document.id.uuidString,
+            documentKey: document.documentId.nonEmpty
+                ?? document.url?.standardizedFileURL.path
+                ?? document.id.uuidString,
             documentTitle: document.title,
             pageCount: document.pageCount,
             currentPage: currentPage,
@@ -1347,14 +1360,10 @@ extension AiPlanPartRecord {
 
 public enum AIPlanFormatting {
     /// "Page 3", "Pages 1-3", "Pages 1, 3, 5" for 1-based pages.
+    ///
+    /// The grammar (dedupe, sort, collapse a contiguous run, comma-separate a gap) lives once,
+    /// in `lyra-reader-ffi::format`, and the preview and the summary panel share it.
     public static func pageLabel(_ pages: [Int]) -> String {
-        let pages = Array(Set(pages)).sorted()
-        guard let first = pages.first else { return "No pages" }
-        if pages.count == 1 { return "Page \(first)" }
-        let contiguous = zip(pages, pages.dropFirst()).allSatisfy { $0 + 1 == $1 }
-        if contiguous {
-            return "Pages \(first)-\(pages.last!)"
-        }
-        return "Pages " + pages.map(String.init).joined(separator: ", ")
+        LyraReaderBindings.pageLabel(pages: pages.map { UInt32(max(0, $0)) })
     }
 }

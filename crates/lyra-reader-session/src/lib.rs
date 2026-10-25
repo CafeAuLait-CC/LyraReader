@@ -14,7 +14,10 @@ pub mod viewport;
 pub use command::{Anchor, Command, Event, Layout, Zoom};
 pub use keymap::{CommandId, Key, KeyBinding, Modifiers, default_keymap, lookup};
 pub use layout::{DocumentLayout, LayoutMode, PagePlacement};
-pub use viewport::{Viewport, resolve_zoom};
+pub use viewport::{
+    MAX_ZOOM_PERCENT, MIN_ZOOM_PERCENT, Viewport, ZOOM_PRESET_INSET_PT, ZoomRequest, clamp_scroll,
+    resolve_zoom_percent,
+};
 
 use lyra_reader_core::{Destination, DocId, PageIndex, Rect, Size};
 

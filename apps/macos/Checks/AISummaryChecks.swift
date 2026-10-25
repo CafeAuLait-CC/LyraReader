@@ -153,7 +153,7 @@ extension ReaderChecks {
         let outline = try await engine.outline()
         require(outline.count == 8, "the layered fixture's outline has eight entries")
         let context = AIReaderContext(
-            documentKey: outlined.standardizedFileURL.path,
+            documentKey: DocumentEditCache.documentIdentity(for: outlined) ?? outlined.standardizedFileURL.path,
             documentTitle: document.title,
             pageCount: document.pageCount,
             currentPage: 1,
@@ -379,7 +379,7 @@ extension ReaderChecks {
         // request, names both ranges, and the conclusion on the last page is in the body.
         let longDocument = try engine.openDocument(at: truncatedFixture)
         let longContext = AIReaderContext(
-            documentKey: truncatedFixture.standardizedFileURL.path,
+            documentKey: DocumentEditCache.documentIdentity(for: truncatedFixture) ?? truncatedFixture.standardizedFileURL.path,
             documentTitle: longDocument.title,
             pageCount: longDocument.pageCount,
             currentPage: 1,
@@ -464,7 +464,7 @@ extension ReaderChecks {
         let failingDocument = try engine.openDocument(at: failureFixture)
         let failingOutline = try await engine.outline()
         let failingContext = AIReaderContext(
-            documentKey: failureFixture.standardizedFileURL.path,
+            documentKey: DocumentEditCache.documentIdentity(for: failureFixture) ?? failureFixture.standardizedFileURL.path,
             documentTitle: failingDocument.title,
             pageCount: failingDocument.pageCount,
             currentPage: 1,
@@ -532,7 +532,7 @@ extension ReaderChecks {
         let cancelDocument = try engine.openDocument(at: cancelFixture)
         let cancelOutline = try await engine.outline()
         let cancelContext = AIReaderContext(
-            documentKey: cancelFixture.standardizedFileURL.path,
+            documentKey: DocumentEditCache.documentIdentity(for: cancelFixture) ?? cancelFixture.standardizedFileURL.path,
             documentTitle: cancelDocument.title,
             pageCount: cancelDocument.pageCount,
             currentPage: 1,

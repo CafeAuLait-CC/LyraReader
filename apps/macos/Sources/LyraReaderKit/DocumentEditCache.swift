@@ -1,9 +1,143 @@
 import CryptoKit
 import Foundation
+import LyraReaderBindings
 
 /// Recoverable editor state lives in the application cache, never beside a user's PDF.
+///
+/// The directory is keyed by the engine's `DocumentId` — canonical path **and** content hash —
+/// so a symlink and its target share one cache, and a replaced file does not inherit the old
+/// bytes' records. The engine computes the id once at open (`LoadedDocument.documentId`); the
+/// helpers here memoise it by file stamp for the pre-open callers (checks seed a cache before
+/// opening the document) and for calls that only have a URL.
+///
+/// # Lazy migration
+///
+/// Older builds keyed the directory by SHA-256 of the canonical path alone. On first use the
+/// contents of that legacy directory are **copied** into the new one; the old files are left
+/// untouched, so a downgrade still finds them and nothing is lost if the copy is interrupted.
 @MainActor public enum DocumentEditCache {
     public static var rootOverride: URL?
+
+    private struct IdentityStamp: Equatable {
+        let size: UInt64
+        let modified: TimeInterval
+        let inode: UInt64
+    }
+
+    /// Memoised `DocumentId` values, keyed by canonical path and invalidated by a file stamp
+    /// change (size, mtime or inode). This keeps a cache-heavy check from hashing the PDF on
+    /// every `annotationsURL` call without ever serving a key for bytes that changed.
+    private static var identities: [String: (id: String, stamp: IdentityStamp)] = [:]
+
+    private static func canonicalURL(_ url: URL) -> URL {
+        url.standardizedFileURL.resolvingSymlinksInPath()
+    }
+
+    private static func stamp(for url: URL) -> IdentityStamp? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? NSNumber,
+              let modified = attributes[.modificationDate] as? Date,
+              let inode = attributes[.systemFileNumber] as? NSNumber else { return nil }
+        return IdentityStamp(
+            size: size.uint64Value,
+            modified: modified.timeIntervalSince1970,
+            inode: inode.uint64Value
+        )
+    }
+
+    /// The one document identity, or `nil` when the file does not exist / cannot be hashed.
+    ///
+    /// Callers that get `nil` (a recent entry whose file has been deleted, a cache path for a
+    /// document that has not been saved yet) fall back to the historical path-only key.
+    public static func documentIdentity(for url: URL) -> String? {
+        let canonical = canonicalURL(url)
+        guard let stamp = stamp(for: canonical) else { return nil }
+        let path = canonical.path
+        if let cached = identities[path], cached.stamp == stamp { return cached.id }
+        guard let id = try? documentIdForPath(path: path), !id.isEmpty else { return nil }
+        identities[path] = (id, stamp)
+        return id
+    }
+
+    /// Adopts the id the engine computed at open, so no second hash is paid for the same bytes.
+    public static func adopt(documentId: String, for url: URL) {
+        let canonical = canonicalURL(url)
+        guard !documentId.isEmpty, let stamp = stamp(for: canonical) else { return }
+        identities[canonical.path] = (documentId, stamp)
+    }
+
+    /// The historical directory key: SHA-256 of the canonical path, with no content component.
+    static func legacyKey(for url: URL) -> String {
+        let path = canonicalURL(url).path
+        return SHA256.hash(data: Data(path.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func legacyDirectory(for url: URL) -> URL {
+        root.appendingPathComponent(legacyKey(for: url), isDirectory: true)
+    }
+
+    /// A stable per-path pointer to the most recently used identity directory.
+    ///
+    /// The identity includes the bytes, so an external edit changes it. The pointer is what
+    /// lets the next open find the previous identity's `source.json` and annotations: it can
+    /// then report "the PDF changed outside LyraReader" and refuse to overwrite it, exactly as
+    /// before the identity existed, instead of silently starting from an empty cache.
+    private static func pointerURL(for url: URL) -> URL {
+        root.appendingPathComponent(legacyKey(for: url) + ".identity")
+    }
+
+    private static func previousIdentityDirectory(for url: URL) -> URL? {
+        guard let data = try? Data(contentsOf: pointerURL(for: url)),
+              let key = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !key.isEmpty else { return nil }
+        let directory = root.appendingPathComponent(key, isDirectory: true)
+        return FileManager.default.fileExists(atPath: directory.path) ? directory : nil
+    }
+
+    private static func recordIdentityPointer(_ identity: String, for url: URL) {
+        let pointer = pointerURL(for: url)
+        if let existing = try? Data(contentsOf: pointer),
+           String(data: existing, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) == identity {
+            return
+        }
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try? Data(identity.utf8).write(to: pointer, options: .atomic)
+    }
+
+    /// Copy the persistent reader state from the previous identity directory into this one when
+    /// it is not already present. Used on open: if the bytes changed outside the reader, the
+    /// old annotations and source stamp must still be found (so the shell can warn and refuse).
+    private static func adoptPreviousIdentityState(from previous: URL, to directory: URL) {
+        guard previous.path != directory.path else { return }
+        let manager = FileManager.default
+        try? manager.createDirectory(at: directory, withIntermediateDirectories: true)
+        for name in carriedFileNames {
+            let old = previous.appendingPathComponent(name)
+            let new = directory.appendingPathComponent(name)
+            guard manager.fileExists(atPath: old.path),
+                  !manager.fileExists(atPath: new.path) else { continue }
+            try? manager.copyItem(at: old, to: new)
+        }
+    }
+
+    /// Copy any file the legacy directory holds that the new one does not. Never deletes and
+    /// never overwrites: a new-key file is the reader's current state.
+    private static func migrateLegacyDirectory(for document: URL, to directory: URL) {
+        let legacy = legacyDirectory(for: document)
+        guard legacy.path != directory.path,
+              FileManager.default.fileExists(atPath: legacy.path) else { return }
+        let manager = FileManager.default
+        try? manager.createDirectory(at: directory, withIntermediateDirectories: true)
+        guard let names = try? manager.contentsOfDirectory(atPath: legacy.path) else { return }
+        for name in names {
+            let source = legacy.appendingPathComponent(name)
+            let destination = directory.appendingPathComponent(name)
+            guard !manager.fileExists(atPath: destination.path) else { continue }
+            try? manager.copyItem(at: source, to: destination)
+        }
+    }
 
     public static var root: URL {
         if let rootOverride { return rootOverride }
@@ -15,11 +149,61 @@ import Foundation
     }
 
     public static func directory(for document: URL) -> URL {
-        let path = document.standardizedFileURL.resolvingSymlinksInPath().path
-        let key = SHA256.hash(data: Data(path.utf8)).map { String(format: "%02x", $0) }.joined()
-        let directory = root.appendingPathComponent(key, isDirectory: true)
+        guard let identity = documentIdentity(for: document) else {
+            // No bytes to identify (a deleted recent file, a destination not written yet): keep
+            // the historical path-only directory so the caller still has a stable location.
+            let legacy = legacyDirectory(for: document)
+            try? FileManager.default.createDirectory(at: legacy, withIntermediateDirectories: true)
+            return legacy
+        }
+        let directory = root.appendingPathComponent(identity, isDirectory: true)
+        if let previous = previousIdentityDirectory(for: document) {
+            adoptPreviousIdentityState(from: previous, to: directory)
+        }
+        migrateLegacyDirectory(for: document, to: directory)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        recordIdentityPointer(identity, for: document)
         return directory
+    }
+
+    /// The persistent reader state that must survive an in-place save.
+    ///
+    /// The document's content hash changes when a command replaces the PDF, so the directory
+    /// key changes too. These are the files that are reader state rather than a picture of the
+    /// old bytes: annotations and their pending deletions, the source stamp, translations,
+    /// summaries, document knowledge, and region conversations. Transient page-edit sessions
+    /// (`session-*` directories and `session.json`) are deliberately not carried — the save that
+    /// changes the bytes is what retires them.
+    private static let carriedFileNames = [
+        "annotations.json",
+        "changes.json",
+        "source.json",
+        "translations.json",
+        "summaries.json",
+        "document-knowledge-v1.json",
+        "region-conversations-v1.json",
+    ]
+
+    /// Copy the persistent files from the previous identity's directory into the new one.
+    ///
+    /// Called by the shell immediately after an in-place write changed the bytes. Never
+    /// overwrites an existing new-key file and never deletes the old copy.
+    public static func carryDocumentState(from source: URL, to destination: URL) {
+        guard source.path != destination.path else { return }
+        let manager = FileManager.default
+        try? manager.createDirectory(at: destination, withIntermediateDirectories: true)
+        for name in carriedFileNames {
+            let old = source.appendingPathComponent(name)
+            let new = destination.appendingPathComponent(name)
+            guard manager.fileExists(atPath: old.path) else { continue }
+            // The new-key `source.json` was written *after* the replacement and describes the
+            // new bytes; never overwrite it with the pre-save stamp. Every other file is the
+            // cleaned post-save state, which is newer than the provisional copy a directory
+            // lookup may have made while the save was in flight.
+            if name == "source.json", manager.fileExists(atPath: new.path) { continue }
+            try? manager.removeItem(at: new)
+            try? manager.copyItem(at: old, to: new)
+        }
     }
 
     public static func annotationsURL(for document: URL) -> URL {
@@ -155,4 +339,9 @@ import Foundation
         try FileManager.default.createDirectory(at: result, withIntermediateDirectories: true)
         return result
     }
+}
+
+extension String {
+    /// This string when it is not empty, for `??` chains that prefer a non-empty cache key.
+    var nonEmpty: String? { isEmpty ? nil : self }
 }

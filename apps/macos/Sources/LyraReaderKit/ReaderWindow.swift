@@ -222,13 +222,20 @@ public struct ReaderWindow: View {
         }
         .onChange(of: activeDocumentURL, initial: true) { _, url in
             guard AppState.recordsRecentDocuments, let url else { return }
-            RecentDocumentStore.shared.record(url)
-            if let cover = state.thumbnails[0] { RecentDocumentStore.shared.saveCover(cover, for: url) }
+            // The cover belongs to the tab's URL. During page editing `state.document` is a
+            // working revision, so ask the identity helper for the URL actually recorded.
+            let documentId = DocumentEditCache.documentIdentity(for: url)
+                ?? state.document?.documentId.nonEmpty
+            RecentDocumentStore.shared.record(url, documentId: documentId)
+            if let cover = state.thumbnails[0] {
+                RecentDocumentStore.shared.saveCover(cover, for: url, documentId: documentId)
+            }
         }
         .onChange(of: state.thumbnails[0]?.generation) { _, _ in
             guard AppState.recordsRecentDocuments, let url = activeDocumentURL,
                   let cover = state.thumbnails[0] else { return }
-            RecentDocumentStore.shared.saveCover(cover, for: url)
+            RecentDocumentStore.shared.saveCover(
+                cover, for: url, documentId: state.document?.documentId.nonEmpty)
         }
         .onChange(of: state.document?.url) { _, url in
             if url == nil { state.pageOverviewVisible = false }

@@ -854,7 +854,7 @@ extension ReaderChecks {
         let engine = try RustEngine()
         let document = try engine.openDocument(at: fixtureURL)
         let context = AIReaderContext(
-            documentKey: fixtureURL.standardizedFileURL.path,
+            documentKey: DocumentEditCache.documentIdentity(for: fixtureURL) ?? fixtureURL.standardizedFileURL.path,
             documentTitle: document.title,
             pageCount: document.pageCount,
             currentPage: 1,
@@ -1173,7 +1173,7 @@ extension ReaderChecks {
             fatalError("the document-chat fixture did not produce 8 pages (got \(document.pageCount))")
         }
         let context = AIReaderContext(
-            documentKey: url.standardizedFileURL.path,
+            documentKey: DocumentEditCache.documentIdentity(for: url) ?? url.standardizedFileURL.path,
             documentTitle: document.title,
             pageCount: document.pageCount,
             currentPage: 1,
@@ -1543,7 +1543,7 @@ extension ReaderChecks {
         let engine = try RustEngine()
         _ = try engine.openDocument(at: url)
         let context = AIReaderContext(
-            documentKey: url.standardizedFileURL.path,
+            documentKey: DocumentEditCache.documentIdentity(for: url) ?? url.standardizedFileURL.path,
             documentTitle: "Long paper",
             pageCount: 8,
             currentPage: 1,
