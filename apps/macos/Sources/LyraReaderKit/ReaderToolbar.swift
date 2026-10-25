@@ -155,6 +155,7 @@ struct ReaderToolbar: View {
             primaryRow(compact: false)
             primaryRow(compact: true)
         }
+        .background(ReaderTypographySample(role: .main))
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
         .background(LyraReaderTheme.toolbarBg)
@@ -200,7 +201,7 @@ struct ReaderToolbar: View {
                 HStack(spacing: 6) {
                     Image(systemName: "highlighter")
                     if !compact {
-                        Text("Annotate").font(.system(size: 12, weight: .medium))
+                        Text("Annotate").modifier(ReaderToolbarFont(id: "toolbar.annotate.label", role: .main))
                             .background(AnnotationToolbarFrameReader(id: "toolbar.annotate.label"))
                     }
                     Image(systemName: "chevron.down").font(.system(size: 8, weight: .bold))
@@ -214,7 +215,7 @@ struct ReaderToolbar: View {
                 HStack(spacing: 6) {
                     Image(systemName: "character.cursor.ibeam")
                     if !compact {
-                        Text("Edit").font(.system(size: 12, weight: .medium))
+                        Text("Edit").modifier(ReaderToolbarFont(id: "toolbar.edit.label", role: .main))
                             .background(AnnotationToolbarFrameReader(id: "toolbar.edit.label"))
                     }
                 }.padding(.horizontal, 6)
@@ -230,7 +231,7 @@ struct ReaderToolbar: View {
                 HStack(spacing: 6) {
                     Image(systemName: AnnotationToolbarLayout.fillAndSignIcon)
                     if !compact {
-                        Text("Fill & Sign").font(.system(size: 12, weight: .medium))
+                        Text("Fill & Sign").modifier(ReaderToolbarFont(id: "toolbar.fillSign.label", role: .main))
                             .background(AnnotationToolbarFrameReader(id: "toolbar.fillSign.label"))
                     }
                 }.padding(.horizontal, 6)
@@ -247,7 +248,7 @@ struct ReaderToolbar: View {
                 HStack(spacing: 6) {
                     Image(systemName: AnnotationToolbarLayout.exportIcon)
                     if !compact {
-                        Text("Export").font(.system(size: 12, weight: .medium))
+                        Text("Export").modifier(ReaderToolbarFont(id: "toolbar.export.label", role: .main))
                             .background(AnnotationToolbarFrameReader(id: "toolbar.export.label"))
                     }
                 }.padding(.horizontal, 6)
@@ -260,11 +261,17 @@ struct ReaderToolbar: View {
             .accessibilityValue(state.exportVisible ? "Expanded" : "Collapsed")
             .background(AnnotationToolbarFrameReader(id: "toolbar.export"))
             separator
+            // The Lyra button is a mode toggle, not a menu: it keeps the icon and text and has
+            // no trailing chevron. A chevron here read as a third control and stretched the
+            // button's label past its text.
             Button { state.toggleAITools() } label: {
                 HStack(spacing: 6) {
                     LyraAIIcon().frame(width: 20, height: 20)
-                    if !compact { Text("Lyra").font(.system(size: 12, weight: .medium)) }
-                    Image(systemName: "chevron.down").font(.system(size: 8, weight: .bold))
+                        .background(AnnotationToolbarFrameReader(id: "toolbar.lyra.icon"))
+                    if !compact {
+                        Text("Lyra").modifier(ReaderToolbarFont(id: "toolbar.lyra.label", role: .main))
+                            .background(AnnotationToolbarFrameReader(id: "toolbar.lyra.label"))
+                    }
                 }.padding(.horizontal, 6)
             }
             .buttonStyle(LyraReaderToolStyle(selected: state.aiToolsVisible))
@@ -272,6 +279,7 @@ struct ReaderToolbar: View {
             .accessibilityLabel("Lyra tools")
             .accessibilityValue(state.aiToolsVisible ? "Expanded" : "Collapsed")
             .keyboardShortcut("a", modifiers: [.command, .shift])
+            .background(AnnotationToolbarFrameReader(id: "toolbar.lyra"))
             Spacer(minLength: 4)
             search(compact: compact)
         }
@@ -325,36 +333,63 @@ struct ReaderToolbar: View {
     }
 }
 
+/// The one centered container every secondary sub-toolbar row is laid out in.
+///
+/// It owns the row's horizontal and vertical padding and its full slot height, and it puts the
+/// controls in the scrollable, horizontally centered ``ReaderCenteredTools`` area. The reveal
+/// belongs to ``ReaderSecondaryToolbarTransition``; this view only owns layout, and the hosted
+/// probes measure this same view. A row must not bring another container, padding, frame,
+/// background or animation of its own: that is what made the rows reveal differently.
+struct ReaderSecondaryRow<Content: View>: View {
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        ReaderCenteredTools { content() }
+            .background(ReaderTypographySample(role: .row))
+            .padding(.horizontal, ReaderSecondaryRowMetrics.horizontalPadding)
+            .padding(.vertical, ReaderSecondaryRowMetrics.verticalPadding)
+            .frame(height: ReaderChrome.secondaryToolbarHeightPt)
+    }
+}
+
 /// The contextual second row, drawn **over** the canvas instead of above it.
 ///
-/// It is one view with one selection rule, exactly like the row that used to sit in
-/// ``ReaderToolbar``'s `VStack`: page overview wins over the annotation tools. Because both states
-/// feed the same view, turning page overview on while the annotation row is open swaps the
-/// content in place - it cannot stack a second overlay or leave the row's height empty.
+/// Annotate, Edit, Fill & Sign, Export and Lyra are five branches of this one view, inside the
+/// same ``ReaderSecondaryRow`` container, so they share one layout, one padding, one height and
+/// one reveal. Page overview is the sixth branch and wins over the others, exactly like the row
+/// that used to sit in ``ReaderToolbar``'s `VStack`: because every state feeds the same view,
+/// turning page overview on while another row is open swaps the content in place - it cannot
+/// stack a second overlay or leave the row's height empty.
 ///
 /// The row is always laid out at `ReaderChrome.secondaryToolbarHeightPt` with an opaque panel
 /// background and a bottom separator, so it reads as a floating row over the page and catches
 /// clicks for its whole rectangle.
 struct ReaderSecondaryToolbar: View {
     @ObservedObject var state: AppState
+    @ObservedObject var model: AIAssistantModel
 
     var body: some View {
-        Group {
+        ReaderSecondaryRow {
+            // Every branch is inserted with an identity transition. The host's moving, clipped
+            // height is the row's only reveal: without this, SwiftUI's default insertion
+            // transition fades a branch in while the row slides, which is why Edit, Fill & Sign
+            // and Export ghosted over the page while Annotate (the branch already on screen)
+            // slid cleanly. The transition affects content insertion only; the 46 pt slot still
+            // animates through the host.
             if state.pageOverviewVisible {
-                ReaderCenteredTools { overviewRow }
+                overviewRow.transition(.identity)
             } else if state.contentEditEnabled {
-                ReaderCenteredTools { contentEditRow }
+                contentEditRow.transition(.identity)
             } else if state.fillAndSignVisible {
-                fillSignRow
+                fillSignRow.transition(.identity)
             } else if state.exportVisible {
-                exportRow
+                exportRow.transition(.identity)
+            } else if state.aiToolsVisible {
+                lyraRow.transition(.identity)
             } else {
-                ReaderCenteredTools { annotationRow }
+                annotationRow.transition(.identity)
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 7)
-        .frame(height: ReaderChrome.secondaryToolbarHeightPt)
         .background(ReaderChromeMarkerHost(kind: .secondaryToolbar))
         .background(LyraReaderTheme.panelBg)
         .overlay(alignment: .bottom) { LyraReaderTheme.separator.frame(height: 1) }
@@ -370,26 +405,37 @@ struct ReaderSecondaryToolbar: View {
     }
 
     private var overviewRow: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: ReaderSecondaryRowMetrics.itemSpacing) {
             Button { state.insertBlankPage(before: false) } label: {
-                Label("Insert Page", systemImage: "doc.badge.plus").padding(.horizontal, 7)
+                ReaderToolbarLabel(title: "Insert Page", id: "overview.insert") {
+                    Image(systemName: "doc.badge.plus")
+                }
             }.disabled(!state.canPageEdit)
             Button { state.rotateSelectedPages(clockwise: true) } label: {
-                Label("Rotate", systemImage: "rotate.right").padding(.horizontal, 7)
+                ReaderToolbarLabel(title: "Rotate", id: "overview.rotate") {
+                    Image(systemName: "rotate.right")
+                }
             }.disabled(!state.canPageEdit)
             Button { state.presentExtractPagesPanel() } label: {
-                Label("Extract", systemImage: "square.and.arrow.up").padding(.horizontal, 7)
+                ReaderToolbarLabel(title: "Extract", id: "overview.extract") {
+                    Image(systemName: "square.and.arrow.up")
+                }
             }.disabled(!state.canPageOperations)
              .help(writeHelp("Write the selected pages to a new PDF"))
             Button { state.confirmDeleteSelectedPages() } label: {
-                Label("Delete", systemImage: "trash").padding(.horizontal, 7)
+                ReaderToolbarLabel(title: "Delete", id: "overview.delete") {
+                    Image(systemName: "trash")
+                }
             }.disabled(!state.canPageEdit || state.selectedPageIndices.count >= (state.document?.pageCount ?? 0))
             Text("\(state.selectedPageIndices.count) selected")
+                .font(ReaderToolbarTypography.rowLabelFont)
                 .foregroundStyle(LyraReaderTheme.textSecondary)
             Button { state.pageOverviewVisible = false } label: {
-                Label("Done", systemImage: "checkmark").padding(.horizontal, 7)
+                ReaderToolbarLabel(title: "Done", id: "overview.done") {
+                    Image(systemName: "checkmark")
+                }
             }.accessibilityLabel("Close page overview")
-        }.font(.system(size: 12))
+        }
     }
 
     private var contentEditRow: some View {
@@ -402,6 +448,10 @@ struct ReaderSecondaryToolbar: View {
 
     private var exportRow: some View {
         ExportToolRow(state: state)
+    }
+
+    private var lyraRow: some View {
+        LyraToolRow(state: state, model: model)
     }
 
     private var annotationRow: some View {
@@ -422,26 +472,37 @@ private struct ReaderWindowDragArea: NSViewRepresentable {
 }
 
 /// AI actions share the reader's contextual row; the sidebar displays only the chosen workspace.
-struct ReaderAIToolbar: View {
+///
+/// This is the row's content only. The centered container, padding, height, background and
+/// reveal all come from ``ReaderSecondaryRow``/``ReaderSecondaryToolbar`` like the other four
+/// rows; adding them here is what made Lyra slide over a row that was already open while the
+/// other rows swapped in place.
+struct LyraToolRow: View {
     @ObservedObject var state: AppState
     @ObservedObject var model: AIAssistantModel
     var body: some View {
-        ReaderCenteredTools {
-            HStack(spacing: 8) {
-                Button { state.rightPanelVisible = false; state.toggleRegionSelection() } label: {
-                    Label { Text("Interleaf") } icon: { InterleafIcon().frame(width: 18, height: 18) }.padding(.horizontal, 7)
-                }.buttonStyle(LyraReaderToolStyle(selected: state.regionSelectionArmed))
-                    .disabled(!state.canArmRegionSelection).help("Select & Ask").accessibilityLabel("Interleaf · Select & Ask")
-                workspace("Summary", icon: "text.alignleft", tab: .summary)
-                workspace("Translate", icon: "character.bubble", tab: .translation)
-                workspace("Chat", icon: "bubble.left.and.bubble.right", tab: .chat)
-                workspace("Reading notes", icon: "note.text", tab: .regions)
-            }
-        }.font(.system(size: 12, weight: .medium))
-            .padding(.horizontal, 14).frame(height: ReaderChrome.secondaryToolbarHeightPt)
-            .background(ReaderChromeMarkerHost(kind: .secondaryToolbar))
-            .background(LyraReaderTheme.toolbarBg)
-            .overlay(alignment: .bottom) { Rectangle().fill(LyraReaderTheme.separator).frame(height: 1) }
+        HStack(spacing: ReaderSecondaryRowMetrics.itemSpacing) {
+            Button { state.rightPanelVisible = false; state.toggleRegionSelection() } label: {
+                ReaderToolbarLabel(title: "Interleaf", id: "lyra.interleaf") {
+                    InterleafIcon()
+                        .frame(width: ReaderToolbarTypography.iconSize,
+                               height: ReaderToolbarTypography.iconSize)
+                }
+            }.buttonStyle(LyraReaderToolStyle(selected: state.regionSelectionArmed))
+                .disabled(!state.canArmRegionSelection).help("Select & Ask").accessibilityLabel("Interleaf · Select & Ask")
+                .background(AnnotationToolbarFrameReader(id: "lyra.interleaf"))
+            // Interleaf is the one-off page action; the four workspace buttons are the row's
+            // group. They are separated by the same group gap as the annotation row's groups;
+            // the spacer's width discounts the HStack spacing on each side of it.
+            Color.clear
+                .frame(width: ReaderSecondaryRowMetrics.groupGapSpacerWidth, height: 1)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+            workspace("Summary", icon: "text.alignleft", tab: .summary)
+            workspace("Translate", icon: "character.bubble", tab: .translation)
+            workspace("Chat", icon: "bubble.left.and.bubble.right", tab: .chat)
+            workspace("Reading notes", icon: "note.text", tab: .regions)
+        }
     }
     private func workspace(_ title: String, icon: String, tab: AIAssistantTab) -> some View {
         Button {
@@ -449,23 +510,49 @@ struct ReaderAIToolbar: View {
             model.selectedTab = tab
             state.rightPanelVisible = true
         } label: {
-            Label { Text(title) } icon: {
-                if tab == .translation { TranslationIcon().frame(width: 18, height: 18) }
-                else { Image(systemName: icon) }
-            }.padding(.horizontal, 7)
+            ReaderToolbarLabel(title: title, id: "lyra.\(tab.rawValue)") {
+                if tab == .translation {
+                    TranslationIcon()
+                        .frame(width: ReaderToolbarTypography.iconSize,
+                               height: ReaderToolbarTypography.iconSize)
+                } else {
+                    Image(systemName: icon)
+                }
+            }
         }
             .buttonStyle(LyraReaderToolStyle(selected: state.rightPanelVisible && model.selectedTab == tab))
             .disabled(state.document == nil).help(title)
+            .background(AnnotationToolbarFrameReader(id: "lyra.\(tab.rawValue)"))
+    }
+}
+
+/// The row's inside width, so a labelled row can choose its compact layout instead of relying
+/// on the scroll view's unbounded horizontal proposal.
+private struct ReaderRowWidthKey: EnvironmentKey {
+    static let defaultValue: CGFloat? = nil
+}
+
+extension EnvironmentValues {
+    var readerRowWidth: CGFloat? {
+        get { self[ReaderRowWidthKey.self] }
+        set { self[ReaderRowWidthKey.self] = newValue }
     }
 }
 
 /// Centred at normal widths, horizontally scrollable when every tool cannot fit.
+///
+/// The scroll view proposes an unbounded width along its axis, so `ViewThatFits` rows would
+/// always pick their label layout and then scroll. The viewport width is exposed to the content
+/// as ``EnvironmentValues/readerRowWidth`` so the Fill & Sign and Export rows can constrain
+/// their adaptive row to it and fall back to icons exactly when the labels do not fit.
 struct ReaderCenteredTools<Content: View>: View {
     @ViewBuilder var content: () -> Content
     var body: some View {
         GeometryReader { geometry in
             ScrollView(.horizontal, showsIndicators: false) {
-                content().frame(minWidth: geometry.size.width, minHeight: geometry.size.height)
+                content()
+                    .frame(minWidth: geometry.size.width, minHeight: geometry.size.height)
+                    .environment(\.readerRowWidth, geometry.size.width)
             }
         }
     }

@@ -33,40 +33,27 @@ struct ContentEditInspector: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text(title).font(.system(size: 13, weight: .semibold))
-                Spacer()
-                Button { state.toggleContentEditing() } label: { Image(systemName: "xmark") }
-                    .buttonStyle(LyraReaderToolStyle())
-                    .accessibilityLabel("Close PDF editing")
-            }.padding(.horizontal, 16).padding(.vertical, 9)
-            Divider().overlay(LyraReaderTheme.separator)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                    if state.contentEditLoading || state.pageEditBusy { ProgressView().controlSize(.small) }
-                    if state.contentTextRecovery != nil { recovery }
-                    if redacting { redactionOptions }
-                    if state.contentEditTool == "link" { linkOptions }
-                    if let item = state.selectedContentItem {
-                        if ["image", "graphic"].contains(item.kind) { imageOptions(item) }
-                        if item.kind == "text" { textOptions(item) }
-                        geometry(item)
-                    } else if !redacting {
-                        emptySelection
-                    }
-                }.padding(16)
-            }
-            Divider().overlay(LyraReaderTheme.separator)
-            footer.padding(16)
-        }
-        .frame(width: 292).frame(maxHeight: .infinity)
-        .background(ReaderChromeMarkerHost(kind: .editingInspector))
-        .background(LyraReaderTheme.panelBg)
-        .overlay(alignment: .leading) { LyraReaderTheme.separator.frame(width: 1) }
-        .foregroundStyle(LyraReaderTheme.textPrimary)
-        .textFieldStyle(ReaderPanelFieldStyle())
-        .buttonStyle(ReaderPanelButtonStyle())
+        ReaderInspectorHost(
+            title: title,
+            closeAccessibilityLabel: "Close PDF editing",
+            close: { state.toggleContentEditing() },
+            marker: .editingInspector,
+            isBusy: state.pageEditBusy || state.contentCommandInFlight,
+            bodyContent: {
+                if state.contentEditLoading || state.pageEditBusy { ProgressView().controlSize(.small) }
+                if state.contentTextRecovery != nil { recovery }
+                if redacting { redactionOptions }
+                if state.contentEditTool == "link" { linkOptions }
+                if let item = state.selectedContentItem {
+                    if ["image", "graphic"].contains(item.kind) { imageOptions(item) }
+                    if item.kind == "text" { textOptions(item) }
+                    geometry(item)
+                } else if !redacting {
+                    emptySelection
+                }
+            },
+            footer: { footer }
+        )
         .task(id: "\(state.contentEditPage?.revision ?? "")-\(state.contentEditSelection ?? "")") {
             syncSelection()
             imagePreview = nil
@@ -76,24 +63,22 @@ struct ContentEditInspector: View {
                   let data = try? await state.contentImageData(item), !Task.isCancelled else { return }
             imagePreview = NSImage(data: data)
         }
-        .disabled(state.pageEditBusy || state.contentCommandInFlight)
     }
 
     private var emptySelection: some View {
-        VStack(spacing: 12) {
-            Image(systemName: state.contentEditTool == "image" ? "photo.badge.plus" : "cursorarrow.click")
-                .font(.system(size: 28, weight: .light)).foregroundStyle(LyraReaderTheme.iconSecondary)
-            Text(state.contentEditTool == "image" ? "Click a page to insert an image, or select an existing image." :
-                state.contentEditTool == "text" ? "Select text to edit it, or click an empty area to add text." :
-                state.contentEditTool == "link" ? "Drag a region to add a link, or select an existing link." :
-                "Select text, an image or a graphic on the page to edit its properties.")
-                .font(.system(size: 12)).multilineTextAlignment(.center)
-            if state.contentEditTool != "image" && state.contentEditTool != "link" {
-                Text("Click selected text again to type. ⌘Return applies; Escape cancels.")
-                    .font(.caption).foregroundStyle(LyraReaderTheme.textTertiary).multilineTextAlignment(.center)
-            }
-        }.foregroundStyle(LyraReaderTheme.textSecondary)
-            .frame(maxWidth: .infinity).padding(.vertical, 34)
+        ReaderInspectorEmptyState(
+            icon: state.contentEditTool == "image" ? "photo.badge.plus" : "cursorarrow.click",
+            message: state.contentEditTool == "image"
+                ? "Click a page to insert an image, or select an existing image."
+                : state.contentEditTool == "text"
+                    ? "Select text to edit it, or click an empty area to add text."
+                    : state.contentEditTool == "link"
+                        ? "Drag a region to add a link, or select an existing link."
+                        : "Select text, an image or a graphic on the page to edit its properties.",
+            detail: state.contentEditTool != "image" && state.contentEditTool != "link"
+                ? "Click selected text again to type. ⌘Return applies; Escape cancels."
+                : nil
+        )
     }
 
     private var redactionOptions: some View {
@@ -234,7 +219,7 @@ struct ContentEditInspector: View {
     }
 
     private var footer: some View {
-        VStack(spacing: 8) {
+        ReaderInspectorFooter {
             if state.isReadOnlyDocument {
                 Text("Signed original is read-only. Save an unsigned copy to keep changes.")
                     .font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)

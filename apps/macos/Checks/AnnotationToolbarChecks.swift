@@ -134,8 +134,12 @@ extension ReaderChecks {
         // ── The Edit row has no Select button ───────────────────────────────────────
         let contentFrames = ReaderToolbarProbe.contentEditRowFrames(
             state: state, width: minimumRowWidth)
-        require(Set(contentFrames.keys) == Set(AnnotationToolbarLayout.contentEditItemIDs),
-                "the Edit row contains exactly Text, Image, Link and Redact")
+        // ReaderToolbarLabel reports each item's text and icon sub-frames too; the item cells
+        // themselves are the unprefixed ids.
+        let contentIDs = Set(contentFrames.keys.filter { !$0.contains(".") })
+        require(contentIDs == Set(AnnotationToolbarLayout.contentEditItemIDs),
+                "the Edit row contains exactly Text, Image, Link and Redact "
+                    + "(\(contentIDs.sorted()))")
         let contentOrder = AnnotationToolbarLayout.contentEditItemIDs.map {
             frame($0, contentFrames, "Edit row").minX
         }

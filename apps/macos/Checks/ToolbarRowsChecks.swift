@@ -322,13 +322,57 @@ extension ReaderChecks {
         try await waitForInspector(false, "clearing the Fill & Sign tool closes its inspector")
         state.fillAndSignVisible = false
 
+        // ── 4b. One host for both tool inspectors ────────────────────────────────────────
+        // By inspection there were two inspector hosts (ContentEditInspector and
+        // FillSignInspector) that repeated the same header/scroll/footer scaffold and the same
+        // 16 / 22 / 9 / 292 numbers. Each Fill & Sign tool's options were already content
+        // selected by one switch, not separate inspectors; now both hosts are ReaderInspectorHost
+        // and the metrics live in ReaderInspectorMetrics.
+        let contentEditInspectorSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "apps/macos/Sources/LyraReaderKit/ContentEditInspector.swift"),
+            encoding: .utf8)
+        let fillSignInspectorSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "apps/macos/Sources/LyraReaderKit/FillSignInspector.swift"),
+            encoding: .utf8)
+        let inspectorChromeSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "apps/macos/Sources/LyraReaderKit/ReaderInspectorChrome.swift"),
+            encoding: .utf8)
+        for (name, source) in [("Edit", contentEditInspectorSource),
+                               ("Fill & Sign", fillSignInspectorSource)] {
+            require(source.contains("ReaderInspectorHost("),
+                    "the \(name) inspector uses the shared inspector host")
+            require(!source.contains("ReaderChromeMarkerHost(kind:"),
+                    "the \(name) inspector does not add its own chrome/background")
+            require(!source.contains(".padding(16)") && !source.contains(".frame(width: 292)"),
+                    "the \(name) inspector does not repeat the host's padding or width")
+            require(!source.contains(".font(.system(size: 13, weight: .semibold))"),
+                    "the \(name) inspector does not repeat the host's title font")
+        }
+        require(inspectorChromeSource.contains("public enum ReaderInspectorMetrics")
+                    && inspectorChromeSource.contains("struct ReaderInspectorHost"),
+                "the inspector host and its metrics have one definition")
+        require(ReaderInspectorMetrics.width == ReaderChrome.editingPanelWidthPt
+                    && ReaderInspectorMetrics.bodySpacing == 22,
+                "the inspector width and section spacing are the shared numbers")
+        print("INSPECTOR HOST: both inspectors use ReaderInspectorHost; width "
+              + "\(Int(ReaderInspectorMetrics.width)) pt, section spacing "
+              + "\(Int(ReaderInspectorMetrics.bodySpacing)) pt, padding "
+              + "\(Int(ReaderInspectorMetrics.bodyPadding)) pt")
+
         // ── 5. The rows slide with the pinned progress ──────────────────────────────────
-        // One harness, one document, three rows: the canvas frame and the page top must be
-        // identical while each row reveals. The pinned progress is the test seam the sidebar
-        // and annotation row already use, so this never races the display link.
+        // One harness, one document, all five rows: the canvas frame and the page top must be
+        // identical while each row reveals, and each row must move through Annotate's exact
+        // content heights/offsets at the same pinned steps. The pinned progress is the test seam
+        // the sidebar and annotation row already use, so this never races the display link.
         state.transitionProgressOverride = ReaderTransitionProgress(row: 0)
         let frameBefore = harness.canvasRect
         let pageTopBefore = harness.pageTopInHost(page: 0) ?? .nan
+        /// Annotate's row-content frames at [0.25, 0.5, 0.75, 1.0], the reference every other
+        /// row must match.
+        var annotateReveal: [(slot: CGRect, content: CGRect)] = []
         func assertSlide(row: SecondaryRow, open: @escaping () -> Void,
                          close: @escaping () -> Void) async throws {
             state.transitionProgressOverride = ReaderTransitionProgress(row: 0)
@@ -337,7 +381,7 @@ extension ReaderChecks {
                 harness.rowHeight == 0
             })
             var samples: [CGFloat] = []
-            for progress in [0.25, 0.5, 0.75, 1.0] {
+            for (step, progress) in [0.25, 0.5, 0.75, 1.0].enumerated() {
                 state.transitionProgressOverride = ReaderTransitionProgress(row: progress)
                 let expected = ReaderChrome.secondaryToolbarHeightPt * CGFloat(progress)
                 try await eventually("\(row.title) lays out at progress \(progress)", {
@@ -350,6 +394,48 @@ extension ReaderChecks {
                 let pageTop = harness.pageTopInHost(page: 0) ?? .nan
                 require(abs(pageTop - pageTopBefore) < 0.01,
                         "\(row.title) at progress \(progress) leaves the page top unchanged")
+
+                // The row content is always the same 46 pt view and the reveal is its offset
+                // into the clipped slot; only the slot's height changes. These are the numbers
+                // the five rows must share.
+                guard let slot = harness.chromeRect(.secondaryRowSlot),
+                      let content = harness.chromeRect(.secondaryToolbar) else {
+                    require(false, "\(row.title) at progress \(progress) has no row markers")
+                    continue
+                }
+                let expectedOffset = -ReaderChrome.secondaryToolbarHeightPt * CGFloat(1 - progress)
+                do {
+                    require(abs(content.height - ReaderChrome.secondaryToolbarHeightPt) < 0.5,
+                            "\(row.title) keeps its full 46 pt content at progress \(progress) "
+                                + "(\(content.height) pt)")
+                    require(abs((content.minY - slot.minY) - expectedOffset) <= 0.5,
+                            "\(row.title)'s content sits at Annotate's offset at progress "
+                                + "\(progress) (offset \(content.minY - slot.minY), "
+                                + "expected \(expectedOffset))")
+                    require(abs(content.maxY - slot.maxY) <= 0.5,
+                            "\(row.title)'s content bottom follows the revealed edge at progress "
+                                + "\(progress) (\(content.maxY) vs \(slot.maxY))")
+                    require(abs(content.width - slot.width) <= 0.5,
+                            "\(row.title)'s content spans the row slot at progress \(progress)")
+                }
+                // No row may fade: at each intermediate layout the whole content must be fully
+                // opaque. The old branch insertion used SwiftUI's default opacity transition,
+                // which ghosted Edit / Fill & Sign / Export / Lyra over the page.
+                let visible = harness.rowContentIsOpaque
+                require(visible,
+                        "\(row.title) has opacity 1 on every ancestor at progress \(progress)")
+                if row == .annotations {
+                    annotateReveal.append((slot, content))
+                } else if step < annotateReveal.count {
+                    let reference = annotateReveal[step]
+                    require(abs(content.minY - reference.content.minY) <= 0.5
+                                && abs(content.height - reference.content.height) <= 0.5
+                                && abs(content.width - reference.content.width) <= 0.5,
+                            "\(row.title) at progress \(progress) uses Annotate's row content "
+                                + "frame (y \(content.minY), h \(content.height), "
+                                + "w \(content.width); Annotate y \(reference.content.minY), "
+                                + "h \(reference.content.height), w \(reference.content.width))")
+                }
             }
             print("ROW SLIDE \(row.title): \(samples.map { Int($0) }) pt")
             require(samples.contains { $0 > 2 && $0 < 44 },
@@ -400,6 +486,443 @@ extension ReaderChecks {
             state.exportVisible = true
         }, close: {
             state.exportVisible = false
+        })
+        try await assertSlide(row: .lyra, open: {
+            state.aiToolsVisible = true
+        }, close: {
+            state.aiToolsVisible = false
+        })
+
+        // ── 5b. All five rows use the same control metrics ──────────────────────────────
+        // The probes host the real rows through ReaderSecondaryRow, so these are the cells,
+        // baselines and gaps a reader sees. Fill & Sign used to give every label a fixed 116 pt
+        // cell, which centered a short label in a wide box and read as a much wider gap than
+        // the other rows. The annotation row is the reference: 32 pt controls, a 2 pt item
+        // spacing, a 34 pt group gap and 14 pt horizontal padding.
+        let spacingModel = AIAssistantModel()
+        func spacingFrames(_ ids: [String], _ frames: [String: CGRect],
+                           _ title: String) -> [CGRect] {
+            ids.map { frame($0, frames, "\(title) row") }
+        }
+        let annotationLayout = ReaderToolbarProbe.annotationRowFrames(state: state, width: rowWidth)
+        let editLayout = ReaderToolbarProbe.contentEditRowFrames(state: state, width: rowWidth)
+        let fillLayout = ReaderToolbarProbe.fillSignRowFrames(state: state, width: rowWidth)
+        let exportLayout = ReaderToolbarProbe.exportRowFrames(state: state, width: rowWidth)
+        let lyraLayout = ReaderToolbarProbe.lyraRowFrames(
+            state: state, model: spacingModel, width: rowWidth)
+        let lyraIDs = ["lyra.interleaf", "lyra.summary", "lyra.translation",
+                       "lyra.chat", "lyra.regions"]
+        let spacingSamples: [(title: String, ids: [String], frames: [CGRect],
+                              groupGapsAfter: Set<Int>)] = [
+            ("Annotate", AnnotationToolbarLayout.annotationToolIDs,
+             spacingFrames(AnnotationToolbarLayout.annotationToolIDs, annotationLayout, "Annotate"),
+             [2, 6]),
+            ("Edit", AnnotationToolbarLayout.contentEditItemIDs,
+             spacingFrames(AnnotationToolbarLayout.contentEditItemIDs, editLayout, "Edit"),
+             []),
+            ("Fill & Sign", FillSignTool.rowOrder.map(\.title) + ["Clear Fill & Sign tool"],
+             spacingFrames(FillSignTool.rowOrder.map(\.title) + ["Clear Fill & Sign tool"],
+                           fillLayout, "Fill & Sign"),
+             [6]),
+            ("Export", ExportCommand.all.map { "export.\($0.id)" },
+             spacingFrames(ExportCommand.all.map { "export.\($0.id)" }, exportLayout, "Export"),
+             []),
+            ("Lyra", lyraIDs, spacingFrames(lyraIDs, lyraLayout, "Lyra"), [0]),
+        ]
+        var itemSpacings: [CGFloat] = []
+        var groupSpacings: [CGFloat] = []
+        var controlHeights: [CGFloat] = []
+        var controlTops: [CGFloat] = []
+        for sample in spacingSamples {
+            require(sample.frames.count >= 2,
+                    "\(sample.title) row has at least two measurable items")
+            let gaps = zip(sample.frames, sample.frames.dropFirst())
+                .map { $1.minX - $0.maxX }
+            require(gaps.allSatisfy { $0 >= -0.01 },
+                    "\(sample.title) row items do not overlap (\(gaps.map { String(format: "%.1f", $0) }))")
+            for (index, gap) in gaps.enumerated() {
+                let grouped = sample.groupGapsAfter.contains(index)
+                let expected = grouped
+                    ? ReaderSecondaryRowMetrics.groupGap
+                    : ReaderSecondaryRowMetrics.itemSpacing
+                require(abs(gap - expected) <= 0.5,
+                        "\(sample.title): \(sample.ids[index]) → \(sample.ids[index + 1]) "
+                            + "gap is \(gap), expected \(expected)")
+                if grouped { groupSpacings.append(gap) } else { itemSpacings.append(gap) }
+            }
+            let heights = sample.frames.map(\.height)
+            require(heights.allSatisfy {
+                        abs($0 - ReaderSecondaryRowMetrics.controlHeight) <= 0.5
+                    }, "\(sample.title) controls are all 32 pt high (\(heights.map { Int($0) }))")
+            controlHeights.append(contentsOf: heights)
+            let tops = sample.frames.map(\.minY)
+            require(tops.allSatisfy { abs($0 - tops[0]) <= 0.5 },
+                    "\(sample.title) controls share one baseline (\(tops.map { Int($0) }))")
+            controlTops.append(tops[0])
+            require(sample.frames[0].minX >= ReaderSecondaryRowMetrics.horizontalPadding - 0.5,
+                    "\(sample.title) starts inside the row's leading padding "
+                        + "(\(sample.frames[0].minX))")
+            require(sample.frames.last!.maxX
+                        <= rowWidth - ReaderSecondaryRowMetrics.horizontalPadding + 0.5,
+                    "\(sample.title) ends inside the row's trailing padding "
+                        + "(\(sample.frames.last!.maxX) of \(rowWidth))")
+            print("ROW SPACING \(sample.title): "
+                  + zip(sample.ids, sample.frames).map {
+                        "\($0)=\(Int($1.minX))..\(Int($1.maxX))"
+                    }.joined(separator: " ")
+                  + " | gaps " + gaps.map { String(format: "%.1f", $0) }.joined(separator: ","))
+        }
+        let spacingSpread = (itemSpacings.max() ?? 0) - (itemSpacings.min() ?? 0)
+        require(spacingSpread <= 0.5,
+                "all five rows share one inter-item spacing "
+                    + "(\(itemSpacings.map { String(format: "%.1f", $0) }))")
+        require(groupSpacings.allSatisfy {
+                    abs($0 - ReaderSecondaryRowMetrics.groupGap) <= 0.5
+                }, "every group gap is 34 pt (\(groupSpacings.map { String(format: "%.1f", $0) }))")
+        require(controlHeights.allSatisfy {
+                    abs($0 - ReaderSecondaryRowMetrics.controlHeight) <= 0.5
+                }, "all rows use the same 32 pt control height")
+        require(controlTops.allSatisfy { abs($0 - controlTops[0]) <= 0.5 },
+                "all rows put their controls on the same baseline "
+                    + "(\(controlTops.map { String(format: "%.1f", $0) }))")
+
+        // ── 5b(ii). Typography: the main toolbar and the rows swap their label sizes ─────
+        // The rows used to render at the button style's 14 pt medium while the main toolbar
+        // rendered its explicit 12 pt medium. The user wants the two exchanged: main 14 medium,
+        // rows 12 regular, icons 14 medium everywhere.
+        let expectedMainTypography = ReaderResolvedTypography(size: 14, weight: .medium)
+        let expectedRowTypography = ReaderResolvedTypography(size: 12, weight: .regular)
+        require(ReaderToolbarTypography.mainLabelSize == expectedMainTypography.size,
+                "the main toolbar takes the rows' previous \(expectedMainTypography.size) pt size")
+        require(ReaderToolbarTypography.mainLabelWeight == expectedMainTypography.weight,
+                "the main toolbar takes the rows' previous medium weight")
+        require(ReaderToolbarTypography.rowLabelSize == expectedRowTypography.size,
+                "row labels take the main toolbar's previous \(expectedRowTypography.size) pt size")
+        require(ReaderToolbarTypography.rowLabelWeight == expectedRowTypography.weight,
+                "row labels use regular weight")
+        require(ReaderToolbarTypography.iconSize == 14,
+                "icons keep the annotation row's 14 pt scale")
+
+        let wideMainFonts = ReaderToolbarProbe.toolbarFonts(state: state, width: 1400)
+        let mainLabelIDs = ["toolbar.annotate.label", "toolbar.edit.label",
+                            "toolbar.fillSign.label", "toolbar.export.label",
+                            "toolbar.lyra.label"]
+        for id in mainLabelIDs {
+            require(wideMainFonts[id] == expectedMainTypography,
+                    "the main toolbar label \(id) resolves to 14 pt medium "
+                        + "(\(String(describing: wideMainFonts[id])))")
+        }
+        let rowLabelIDs: [SecondaryRow: [String]] = [
+            .contentEdit: ["Text.label", "Image.label", "Link.label", "Redact.label"],
+            .fillAndSign: FillSignTool.rowOrder.map { "\($0.title).label" },
+            .export: ExportCommand.all.map { "export.\($0.id).label" },
+            .lyra: ["lyra.interleaf.label", "lyra.summary.label", "lyra.translation.label",
+                    "lyra.chat.label", "lyra.regions.label"],
+        ]
+        for row in [SecondaryRow.contentEdit, .fillAndSign, .export, .lyra] {
+            let fonts = ReaderToolbarProbe.rowFonts(
+                row: row, state: state, model: spacingModel, width: rowWidth)
+            for id in rowLabelIDs[row] ?? [] {
+                require(fonts[id] == expectedRowTypography,
+                        "\(row.title) label \(id) resolves to 12 pt regular "
+                            + "(\(String(describing: fonts[id])))")
+            }
+        }
+        // Annotate has icons only; it must not grow a text label. The row's typography sample is
+        // the only font report there.
+        require(Set(ReaderToolbarProbe.rowFonts(
+                    row: .annotations, state: state, model: spacingModel, width: rowWidth).keys)
+                == ["typography.font"],
+                "the Annotate row has no text label to restyle")
+
+        // The rendered sample uses the same string and symbol in every host, so equal frames
+        // prove the hosts resolve the same font. Main (14 pt) must render wider than any row
+        // label (12 pt), while every icon box stays identical.
+        let mainSample = ReaderToolbarProbe.toolbarFrames(state: state, width: 1400)
+        guard let mainSampleLabel = mainSample["typography.label"],
+              let mainSampleIcon = mainSample["typography.icon"] else {
+            require(false, "the main toolbar reports its typography sample frames")
+            return
+        }
+        var rowSampleLabels: [CGRect] = []
+        var rowSampleIcons: [CGRect] = []
+        for sample in spacingSamples {
+            let frames: [String: CGRect]
+            switch sample.title {
+            case "Annotate": frames = annotationLayout
+            case "Edit": frames = editLayout
+            case "Fill & Sign": frames = fillLayout
+            case "Export": frames = exportLayout
+            default: frames = lyraLayout
+            }
+            guard let label = frames["typography.label"],
+                  let icon = frames["typography.icon"] else {
+                require(false, "\(sample.title) reports its typography sample frames")
+                continue
+            }
+            rowSampleLabels.append(label)
+            rowSampleIcons.append(icon)
+        }
+        require(rowSampleLabels.allSatisfy {
+                    abs($0.width - rowSampleLabels[0].width) <= 0.5
+                        && abs($0.height - rowSampleLabels[0].height) <= 0.5
+                }, "every row renders the sample label at one size "
+                    + "(\(rowSampleLabels.map { "\(Int($0.width))x\(Int($0.height))" }))")
+        require(mainSampleLabel.height > rowSampleLabels[0].height + 0.5,
+                "the main toolbar's sample label is larger than the row labels "
+                    + "(\(mainSampleLabel.height) vs \(rowSampleLabels[0].height))")
+        require(abs(mainSampleIcon.width - rowSampleIcons[0].width) <= 0.5
+                    && abs(mainSampleIcon.height - rowSampleIcons[0].height) <= 0.5,
+                "the shared 14 pt icon renders the same in the main toolbar and every row "
+                    + "(\(mainSampleIcon.size) vs \(rowSampleIcons[0].size))")
+        print("ROW TYPOGRAPHY main: label \(Int(mainSampleLabel.width))x"
+              + "\(Int(mainSampleLabel.height)) pt, icon \(Int(mainSampleIcon.width))x"
+              + "\(Int(mainSampleIcon.height)) pt")
+        for (sample, label) in zip(spacingSamples, rowSampleLabels) {
+            print("ROW TYPOGRAPHY \(sample.title): label \(Int(label.width))x"
+                  + "\(Int(label.height)) pt")
+        }
+
+        // ── 5c. One reveal, no fade ─────────────────────────────────────────────────────
+        // A clean slide means opacity 1 at every intermediate layout (5) and no per-row
+        // transition/animation in the code that could fade or double-move the content. The old
+        // branch insertion used SwiftUI's default opacity transition; the Lyra branch also had
+        // an explicit move+opacity transition and a second .animation.
+        func codeOnly(_ source: String) -> String {
+            source.split(separator: "\n", omittingEmptySubsequences: false)
+                .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+                .joined(separator: "\n")
+        }
+        let windowSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "apps/macos/Sources/LyraReaderKit/ReaderWindow.swift"),
+            encoding: .utf8)
+        let rowSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "apps/macos/Sources/LyraReaderKit/ReaderToolbar.swift"),
+            encoding: .utf8)
+        let rowsSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "apps/macos/Sources/LyraReaderKit/SecondaryToolbarRows.swift"),
+            encoding: .utf8)
+        let layoutSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "apps/macos/Sources/LyraReaderKit/AnnotationToolbarLayout.swift"),
+            encoding: .utf8)
+        let windowCode = codeOnly(windowSource)
+        let rowCode = codeOnly(rowSource)
+        let rowsCode = codeOnly(rowsSource)
+        let layoutCode = codeOnly(layoutSource)
+        require(!windowCode.contains(".transition(.move(edge: .top)"),
+                "the row host adds no second move transition")
+        require(!windowCode.contains(".animation(secondaryRowAnimation, value: state.aiToolsVisible)"),
+                "the Lyra row has no second animation")
+        require(windowCode.components(
+                    separatedBy: ".animation(secondaryRowAnimation, value: secondaryToolbarVisible)")
+                .count == 2,
+                "the row host has exactly one reveal animation transaction")
+        require(windowCode.contains("ReaderSecondaryToolbar(state: state, model: aiAssistant)"),
+                "Annotate, Edit, Fill & Sign, Export and Lyra are one ReaderSecondaryToolbar")
+        let rowTransitions = rowCode.components(separatedBy: ".transition(").dropFirst()
+        require(rowTransitions.count == 6,
+                "the six row branches each declare their insertion transition "
+                    + "(found \(rowTransitions.count))")
+        require(rowTransitions.allSatisfy { $0.hasPrefix(".identity)") },
+                "every row branch uses an identity transition, never opacity")
+        require(!rowsCode.contains(".transition(") && !rowsCode.contains(".animation("),
+                "the Fill & Sign and Export rows bring no transition or animation")
+        require(!rowsCode.contains("ReaderCenteredTools")
+                    && !layoutCode.contains("ReaderCenteredTools"),
+                "the rows do not wrap themselves in their own centered container")
+        require(!rowsCode.contains(".frame(maxWidth: .infinity"),
+                "the rows do not bring their own full-width container")
+        require(rowCode.components(separatedBy: "ReaderCenteredTools").count == 3,
+                "ReaderCenteredTools is used once, by the shared row container")
+        require(!layoutCode.contains("ReaderCenteredTools")
+                    && !layoutCode.contains(".transition("),
+                "the Edit and Annotate probes host the shared row container, not their own")
+
+        // ── 5d. The row's width follows the panels frame by frame ───────────────────────
+        // A settled leading/trailing inset made the row's background snap to its final edge
+        // while the drawer was still sliding, leaving a strip of page visible for a frame
+        // ("white sliver"). The pinned progress steps the drawer and the row together, so an
+        // inset that ignores the animated width fails at an intermediate step, not only at the
+        // endpoints. Every sample also asserts that the row's opaque background spans the
+        // canvas and ends flush against the moving panel edge.
+        state.transitionProgressOverride = nil
+        state.aiToolsVisible = false
+        state.contentEditEnabled = false
+        state.fillAndSignVisible = false
+        state.exportVisible = false
+        state.clearFillSignTool()
+        state.searchSidebarVisible = false
+        state.rightPanelVisible = false
+        state.sidebarVisible = false
+        state.annotationToolsVisible = true
+        try await eventually("the row is open for the width checks", {
+            harness.rowHeight >= 44
+        })
+
+        // Right tool inspector: it slides out of the same slot and the row must end on its edge.
+        state.annotationToolsVisible = false
+        state.fillAndSignVisible = true
+        state.selectFillSignTool(.signature)
+        try await eventually("the Fill & Sign inspector is open for the width check", {
+            state.fillSignInspectorVisible
+        })
+        // Let the opening inspector's own animation finish before pinning its width; otherwise
+        // the row is still easing toward the 292 pt inset at the first sampled step.
+        try await eventually("the row settles against the full-height inspector", {
+            guard let row = harness.chromeRect(.secondaryToolbar) else { return false }
+            return abs(row.minX) <= 0.5
+                && abs(row.maxX - (harness.host.bounds.width
+                                   - ReaderChrome.editingPanelWidthPt)) <= 0.5
+        })
+        var inspectorRowWidths: [CGFloat] = []
+        for progress in [0.0, 0.25, 0.5, 0.75, 1.0] + [0.75, 0.5, 0.25, 0.0] {
+            state.transitionProgressOverride = ReaderTransitionProgress(
+                row: 1, panel: 0, editingPanel: progress)
+            let expectedInspector = ReaderChrome.editingPanelWidthPt * CGFloat(progress)
+            try await eventually("the Fill & Sign inspector is pinned at \(progress)", {
+                abs((harness.chromeRect(.fillSignInspectorSlot)?.width ?? -1)
+                    - expectedInspector) <= 1
+            })
+            harness.host.layoutSubtreeIfNeeded()
+            guard let row = harness.chromeRect(.secondaryToolbar),
+                  let slot = harness.chromeRect(.secondaryRowSlot),
+                  let inspector = harness.chromeRect(.fillSignInspectorSlot) else {
+                require(false, "the row, slot and inspector markers exist at \(progress)")
+                continue
+            }
+            let canvas = harness.canvasRect
+            require(abs(row.maxX - inspector.minX) <= 0.5,
+                    "the row ends flush against the moving Fill & Sign inspector at "
+                        + "progress \(progress) (row \(row.maxX), inspector \(inspector.minX))")
+            require(abs(row.minX) <= 0.5,
+                    "the row starts at the content edge with the sidebar closed at "
+                        + "\(progress) (row minX \(row.minX))")
+            require(abs(row.width - slot.width) <= 0.5,
+                    "the row background spans its whole slot at progress \(progress) "
+                        + "(\(row.width) vs \(slot.width))")
+            require(row.minX <= canvas.minX + 0.5 && row.maxX >= canvas.maxX - 0.5,
+                    "the row background covers the canvas at inspector progress \(progress) "
+                        + "(row \(row.minX)..\(row.maxX), canvas \(canvas.minX)..\(canvas.maxX))")
+            require(abs(row.height - ReaderChrome.secondaryToolbarHeightPt) <= 0.5,
+                    "the row stays 46 pt high at inspector progress \(progress)")
+            inspectorRowWidths.append(row.width)
+        }
+        require(zip(inspectorRowWidths, inspectorRowWidths.dropFirst()).allSatisfy {
+                    abs($1 - $0) > 1
+                },
+                "the row width changes on every sampled inspector frame "
+                    + "(\(inspectorRowWidths.map { Int($0) }))")
+        print("ROW WIDTH inspector: \(inspectorRowWidths.map { Int($0) }) pt")
+        state.clearFillSignTool()
+        state.fillAndSignVisible = false
+        state.transitionProgressOverride = nil
+
+        // Right assistant drawer: same rule, through its own transition.
+        state.rightPanelVisible = true
+        try await eventually("the assistant panel is open for the width check", {
+            harness.sidePanelRect() != nil
+        })
+        let fullPanelWidth = ReaderSidePanelMetrics.totalWidth(
+            contentWidth: state.rightPanelWidthPt)
+        try await eventuallyExplaining(
+            "the row settles against the full assistant panel",
+            {
+                let row = harness.chromeRect(.secondaryToolbar)
+                return "row=\(String(describing: row)) width=\(harness.host.bounds.width) "
+                    + "panel=\(String(describing: harness.sidePanelRect())) "
+                    + "visible=\(state.rightPanelVisible) full=\(fullPanelWidth)"
+            },
+            {
+                guard let row = harness.chromeRect(.secondaryToolbar) else { return false }
+                return abs(row.minX) <= 0.5
+                    && abs(row.maxX - (harness.host.bounds.width - fullPanelWidth)) <= 0.5
+            })
+        var panelRowWidths: [CGFloat] = []
+        for progress in [0.0, 0.25, 0.5, 0.75, 1.0] + [0.75, 0.5, 0.25, 0.0] {
+            state.transitionProgressOverride = ReaderTransitionProgress(
+                row: 1, panel: progress, editingPanel: 0)
+            let expectedWidth = ReaderSidePanelMetrics.totalWidth(
+                contentWidth: state.rightPanelWidthPt) * CGFloat(progress)
+            try await eventually("the assistant panel is pinned at \(progress)", {
+                abs((harness.sidePanelRect()?.width ?? -1) - expectedWidth) <= 1
+            })
+            harness.host.layoutSubtreeIfNeeded()
+            guard let row = harness.chromeRect(.secondaryToolbar),
+                  let panel = harness.sidePanelRect() else {
+                require(false, "the row and assistant panel markers exist at \(progress)")
+                continue
+            }
+            require(abs(row.maxX - panel.minX) <= 0.5,
+                    "the row ends flush against the moving assistant panel at progress "
+                        + "\(progress) (row \(row.maxX), panel \(panel.minX))")
+            require(abs(row.minX) <= 0.5,
+                    "the row starts at the content edge with the sidebar closed at "
+                        + "\(progress) (row minX \(row.minX))")
+            panelRowWidths.append(row.width)
+        }
+        require(zip(panelRowWidths, panelRowWidths.dropFirst()).allSatisfy {
+                    abs($1 - $0) > 1
+                },
+                "the row width changes on every sampled assistant-panel frame "
+                    + "(\(panelRowWidths.map { Int($0) }))")
+        print("ROW WIDTH assistant: \(panelRowWidths.map { Int($0) }) pt")
+        state.transitionProgressOverride = nil
+        state.rightPanelVisible = false
+
+        // Left sidebar: the row's leading edge must follow the drawer's moving trailing edge.
+        state.annotationToolsVisible = true
+        state.sidebarVisible = true
+        try await eventually("the sidebar and row are open for the width check", {
+            harness.rowHeight >= 44
+        })
+        try await eventually("the row settles against the open sidebar", {
+            guard let row = harness.chromeRect(.secondaryToolbar) else { return false }
+            return abs(row.minX - ReaderChrome.sidebarTotalWidthPt) <= 0.5
+        })
+        var sidebarRowWidths: [CGFloat] = []
+        var sidebarLeftEdges: [CGFloat] = []
+        for progress in [0.0, 0.25, 0.5, 0.75, 1.0] + [0.75, 0.5, 0.25, 0.0] {
+            state.transitionProgressOverride = ReaderTransitionProgress(
+                sidebar: progress, row: 1, panel: 0, editingPanel: 0)
+            let expectedInset = ReaderChrome.sidebarTotalWidthPt * CGFloat(progress)
+            try await eventually("the sidebar is pinned at \(progress)", {
+                guard let row = harness.chromeRect(.secondaryToolbar) else { return false }
+                return abs(row.minX - expectedInset) <= 0.5
+            })
+            harness.host.layoutSubtreeIfNeeded()
+            guard let row = harness.chromeRect(.secondaryToolbar) else {
+                require(false, "the row and canvas exist at sidebar progress \(progress)")
+                continue
+            }
+            let canvas = harness.canvasRect
+            require(abs(row.minX - ReaderChrome.sidebarTotalWidthPt * CGFloat(progress)) <= 0.5,
+                    "the row starts on the moving sidebar edge at progress \(progress) "
+                        + "(\(row.minX) vs "
+                        + "\(ReaderChrome.sidebarTotalWidthPt * CGFloat(progress)))")
+            require(abs(row.maxX - harness.host.bounds.width) <= 0.5,
+                    "the row still reaches the window's trailing edge at progress \(progress)")
+            require(row.minX <= canvas.minX + 0.5 && row.maxX >= canvas.maxX - 0.5,
+                    "the row background covers the canvas at sidebar progress \(progress) "
+                        + "(row \(row.minX)..\(row.maxX), canvas \(canvas.minX)..\(canvas.maxX))")
+            sidebarRowWidths.append(row.width)
+            sidebarLeftEdges.append(row.minX)
+        }
+        require(zip(sidebarRowWidths, sidebarRowWidths.dropFirst()).allSatisfy {
+                    abs($1 - $0) > 1
+                },
+                "the row width changes on every sampled sidebar frame "
+                    + "(\(sidebarRowWidths.map { Int($0) }))")
+        print("ROW WIDTH sidebar: \(sidebarRowWidths.map { Int($0) }) pt at x "
+              + "\(sidebarLeftEdges.map { Int($0) })")
+        state.transitionProgressOverride = nil
+        state.sidebarVisible = false
+        state.annotationToolsVisible = false
+        try await eventually("the width checks leave the row closed", {
+            harness.rowHeight == 0
         })
 
         // ── 6. No animation on first layout, during a live resize, or with Reduce Motion ─
@@ -511,6 +1034,29 @@ extension ReaderChecks {
                     >= (minimumToolbar["toolbar.fillSign"]?.width ?? 0),
                 "hiding the label does not make the button wider at the minimum window")
 
+        // The Lyra button keeps its icon and text but has no trailing chevron. The label is the
+        // button's last content, so the tail after the text is just the label padding (6) plus
+        // the button style's padding (3) - the chevron and its 6 pt gap would add ~12 more.
+        let wideLyraButton = wideToolbar["toolbar.lyra"]
+        let wideLyraIcon = wideToolbar["toolbar.lyra.icon"]
+        let wideLyraLabel = wideToolbar["toolbar.lyra.label"]
+        require(wideToolbar["toolbar.lyra.label"] != nil,
+                "the Lyra button keeps its text at a wide window")
+        require(minimumToolbar["toolbar.lyra.label"] == nil,
+                "the Lyra label follows the other labels and hides at the 900 pt minimum")
+        require(wideLyraButton != nil && wideLyraIcon != nil,
+                "the Lyra button and its icon are measurable")
+        if let button = wideLyraButton, let icon = wideLyraIcon, let label = wideLyraLabel {
+            require(icon.maxX <= label.minX + 0.01,
+                    "the Lyra icon precedes the text (\(icon.maxX) <= \(label.minX))")
+            require(abs((label.minX - icon.maxX) - 6) <= 1,
+                    "the Lyra icon and text keep their 6 pt spacing "
+                        + "(\(label.minX - icon.maxX))")
+            let tail = button.maxX - label.maxX
+            require(tail <= 12,
+                    "the Lyra button ends at its text with no chevron (tail \(tail) pt)")
+        }
+
         // ── 8. Organise pages is gone; every command has a menu-bar home ───────────────
         let toolbarSource = try String(
             contentsOf: root.appendingPathComponent(
@@ -527,6 +1073,20 @@ extension ReaderChecks {
         require(toolbarSource.contains("toggleFillAndSign()")
                     && toolbarSource.contains("toggleExport()"),
                 "the primary toolbar has buttons for both new rows")
+        // The Lyra button's own source: icon, text, and no chevron between the label and the
+        // button's trailing edge.
+        if let start = toolbarSource.range(of: "Button { state.toggleAITools() }")?.lowerBound,
+           let end = toolbarSource.range(
+                of: ".keyboardShortcut(\"a\"", range: start..<toolbarSource.endIndex)?.upperBound {
+            let lyraButtonSource = toolbarSource[start..<end]
+            require(lyraButtonSource.contains("LyraAIIcon()")
+                        && lyraButtonSource.contains("Text(\"Lyra\")"),
+                    "the Lyra button keeps its icon and text")
+            require(!lyraButtonSource.contains("chevron"),
+                    "the Lyra button has no chevron glyph or its gap")
+        } else {
+            require(false, "the Lyra toolbar button source is locatable")
+        }
 
         let appMenuSource = try String(
             contentsOf: root.appendingPathComponent(
@@ -765,14 +1325,47 @@ private final class ToolbarRowHarness {
         chromeRect(.secondaryRowSlot)?.height ?? 0
     }
 
-    /// Any of the chrome markers by kind, in host coordinates.
-    func chromeRect(_ kind: ReaderChromeMarkerView.Kind) -> CGRect? {
+    /// Whether the row content and every view between it and the host are fully opaque.
+    ///
+    /// A fade during the reveal would leave one of these ancestors or the content itself below
+    /// opacity 1 at a pinned intermediate height; a clean slide keeps them all at 1.
+    var rowContentIsOpaque: Bool {
+        guard let marker = chromeView(.secondaryToolbar) else { return false }
+        var view: NSView = marker
+        while true {
+            if view.alphaValue < 0.999 { return false }
+            if view.isHidden { return false }
+            if let opacity = view.layer?.opacity, opacity < 0.999 { return false }
+            guard let parent = view.superview else { return true }
+            view = parent
+        }
+    }
+
+    /// The right-hand drawer's marker, so the checks can compare its moving leading edge with
+    /// the secondary row's trailing edge.
+    func sidePanelRect() -> CGRect? {
+        func find(_ view: NSView) -> ReaderSidePanelMarkerView? {
+            if let found = view as? ReaderSidePanelMarkerView { return found }
+            return view.subviews.lazy.compactMap { find($0) }.first
+        }
+        host.layoutSubtreeIfNeeded()
+        guard let marker = find(host) else { return nil }
+        return host.convert(marker.bounds, from: marker)
+    }
+
+    /// Any of the chrome markers by kind, as the view itself.
+    func chromeView(_ kind: ReaderChromeMarkerView.Kind) -> ReaderChromeMarkerView? {
         func find(_ view: NSView) -> ReaderChromeMarkerView? {
             if let found = view as? ReaderChromeMarkerView, found.kind == kind { return found }
             return view.subviews.lazy.compactMap { find($0) }.first
         }
         host.layoutSubtreeIfNeeded()
-        guard let marker = find(host) else { return nil }
+        return find(host)
+    }
+
+    /// Any of the chrome markers by kind, in host coordinates.
+    func chromeRect(_ kind: ReaderChromeMarkerView.Kind) -> CGRect? {
+        guard let marker = chromeView(kind) else { return nil }
         return host.convert(marker.bounds, from: marker)
     }
 }

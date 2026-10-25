@@ -475,17 +475,25 @@ public struct ReaderWindow: View {
 
     // MARK: - Secondary toolbar row
 
-    /// The contextual row (annotation tools or page overview) drawn over the content.
+    /// The contextual row (the six sub-toolbars) drawn over the content.
     ///
     /// It is a sibling of the content, not a row inside the `VStack` above it, so its height never
     /// participates in the canvas's layout: showing it cannot push the document down, and the
     /// canvas frame and page position are identical before, during and after the reveal.
     ///
+    /// All six rows are one `ReaderSecondaryToolbar` inside one
+    /// ``ReaderSecondaryToolbarTransition``. Its height animation is the row's only reveal: no
+    /// branch adds a visible transition, a frame, a padding or an animation of its own (the
+    /// branches use `.transition(.identity)`), so Annotate, Edit, Fill & Sign, Export and Lyra
+    /// cannot look like different effects. Switching from one open row to another swaps the
+    /// content at the same 46 pt height, exactly like the other rows, instead of sliding a second
+    /// view over the first.
+    ///
     /// While the sidebar is open the row starts at the sidebar's width and spans only the canvas,
     /// so it never covers the sidebar's tab picker. Page overview draws its grid over the sidebar,
-    /// so there the row spans the full content area like the grid does. The inset uses the
-    /// sidebar's target width rather than its animated width, which keeps the row's own contents
-    /// from reflowing on every frame if the sidebar is toggled while the row is open.
+    /// so there the row spans the full content area like the grid does. The leading and trailing
+    /// insets track the drawers' animated widths, so the row's background stays flush with them
+    /// on every frame instead of snapping to the settled edge.
     private var secondaryToolbarLayer: some View {
         let inset = secondaryToolbarInset
         // Top alignment matters while the row is only partly revealed: a centred HStack would
@@ -502,13 +510,7 @@ public struct ReaderWindow: View {
                 isVisible: secondaryToolbarVisible,
                 progressOverride: state.transitionProgressOverride?.row
             ) {
-                if state.aiToolsVisible && !state.pageOverviewVisible {
-                    ReaderAIToolbar(state: state, model: aiAssistant)
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                } else {
-                    ReaderSecondaryToolbar(state: state)
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                }
+                ReaderSecondaryToolbar(state: state, model: aiAssistant)
             }
             // The slot's animated height, not its 46 pt content: the checks read this instead
             // of hit-testing, because the Edit workspace's content editor covers the canvas
@@ -516,15 +518,21 @@ public struct ReaderWindow: View {
             .background(ReaderChromeMarkerHost(kind: .secondaryRowSlot))
         }
         // Same rule as the sidebar: the animation has to own the layout that changes. The row
-        // covers the scroll lane and ends flush against the right panel; the
-        // trailing inset uses their settled widths (like the leading sidebar inset) so the row's
-        // own controls do not reflow on every animation frame.
+        // covers the scroll lane and ends flush against the right panel, so its leading and
+        // trailing insets follow the drawers' *animated* widths with their own duration/curve.
+        // A settled inset would snap the row's edge away from a sliding panel for a frame or
+        // two and leave a strip of page visible ("white sliver").
         .padding(.trailing, secondaryToolbarTrailingInset)
         // Include the slot marker and leading spacer in the hit gate: neither the row's
         // native scroll host nor its closing animation may leave a transparent hit surface.
         .allowsHitTesting(secondaryToolbarVisible || state.transitionProgressOverride?.row != nil)
         .animation(secondaryRowAnimation, value: secondaryToolbarVisible)
-        .animation(secondaryRowAnimation, value: state.aiToolsVisible)
+        .animation(sidebarAnimation, value: state.sidebarVisible)
+        .animation(sidebarAnimation, value: state.searchSidebarVisible)
+        .animation(panelAnimation, value: state.rightPanelVisible)
+        .animation(panelAnimation, value: state.performancePanelVisible)
+        .animation(panelAnimation, value: state.contentEditInspectorVisible)
+        .animation(panelAnimation, value: state.fillSignInspectorVisible)
     }
 
     /// A toggle made while the window edge is being dragged changes layout without animating:
@@ -554,23 +562,46 @@ public struct ReaderWindow: View {
             || state.fillAndSignVisible || state.exportVisible || state.aiToolsVisible
     }
 
+    /// The row's leading inset: the sidebar's *animated* width, not its settled width.
+    ///
+    /// ``ReaderSidebarTransition`` lays the drawer out at `sidebarTotalWidthPt * progress`.
+    /// The row uses the same progress (including the checks' pinned override), so its background
+    /// begins exactly at the drawer's moving trailing edge instead of jumping out from under it.
     private var secondaryToolbarInset: CGFloat {
-        guard !state.pageOverviewVisible, state.sidebarVisible else { return 0 }
-        return ReaderChrome.sidebarTotalWidthPt
+        guard !state.pageOverviewVisible else { return 0 }
+        let sidebarVisible = state.sidebarVisible && state.document != nil
+        let progress = state.transitionProgressOverride?.sidebar
+            ?? (sidebarVisible ? 1 : 0)
+        return ReaderChrome.sidebarTotalWidthPt * CGFloat(min(max(progress, 0), 1))
     }
 
     /// The search results and right panels. The row covers the scroll lane, preventing a strip
-    /// of track between the tools and the inspector. Page overview draws over the whole area, so it
-    /// suppresses all three like it suppresses the leading inset.
+    /// of track between the tools and the inspector. Page overview draws over the whole area, so
+    /// it suppresses all three like it suppresses the leading inset.
+    ///
+    /// Every term is the *animated* width, mirroring the view that owns it: the right drawer is
+    /// `totalWidth * panelProgress`, the editing inspector is `292 * editingPanelProgress`, and
+    /// the search column appears at its settled width under the sidebar animation. Using the
+    /// settled widths here snapped the row while a panel slid, which is the white-sliver bug.
     private var secondaryToolbarTrailingInset: CGFloat {
         guard !state.pageOverviewVisible, state.document != nil else { return 0 }
-        return state.secondaryInspectorWidth + ReaderChrome.trailingChromeWidth(
-            documentOpen: state.document != nil,
-            pageOverviewVisible: state.pageOverviewVisible,
-            searchVisible: state.searchSidebarVisible,
-            rightPanelVisible: state.rightPanelVisible || state.performancePanelVisible,
-            rightPanelContentWidth: state.rightPanelWidthPt
-        )
+        var inset: CGFloat = 0
+
+        let panelVisible = state.rightPanelVisible || state.performancePanelVisible
+        let panelProgress = state.transitionProgressOverride?.panel
+            ?? (panelVisible ? 1 : 0)
+        inset += ReaderSidePanelMetrics.totalWidth(contentWidth: state.rightPanelWidthPt)
+            * CGFloat(min(max(panelProgress, 0), 1))
+
+        if state.searchSidebarVisible {
+            inset += ReaderChrome.sidebarTotalWidthPt
+        }
+        if state.secondaryInspectorWidth > 0 {
+            let inspectorProgress = state.transitionProgressOverride?.editingPanel ?? 1
+            inset += ReaderChrome.editingPanelWidthPt
+                * CGFloat(min(max(inspectorProgress, 0), 1))
+        }
+        return inset
     }
 
     /// What the in-place translation layer just did, including why an overlay disappeared after

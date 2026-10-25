@@ -28,74 +28,41 @@ struct FillSignInspector: View {
     private var tool: FillSignTool? { state.armedFillSignTool }
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider().overlay(LyraReaderTheme.separator)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                    if let tool {
-                        switch tool {
-                        case .text: textOptions
-                        case .signature: signatureOptions
-                        case .date: dateOptions
-                        case .checkmark, .cross: markOptions(tool)
-                        case .stamp: stampOptions
-                        case .image: imageOptions
-                        }
-                    } else {
-                        emptySelection
-                    }
-                    formSection
-                }.padding(16)
-            }
-            Divider().overlay(LyraReaderTheme.separator)
-            footer.padding(16)
-        }
-        .frame(width: ReaderChrome.editingPanelWidthPt)
-        .frame(maxHeight: .infinity)
-        .background(ReaderChromeMarkerHost(kind: .fillSignInspector))
-        .background(LyraReaderTheme.panelBg)
-        .overlay(alignment: .leading) { LyraReaderTheme.separator.frame(width: 1) }
-        .foregroundStyle(LyraReaderTheme.textPrimary)
-        .textFieldStyle(ReaderPanelFieldStyle())
-        .buttonStyle(ReaderPanelButtonStyle())
-        .disabled(state.pageEditBusy || state.contentCommandInFlight)
-    }
-
-    private var header: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Fill & Sign").font(.system(size: 13, weight: .semibold))
+        ReaderInspectorHost(
+            title: "Fill & Sign",
+            subtitle: tool?.inspectorTitle,
+            closeAccessibilityLabel: "Clear Fill & Sign tool",
+            closeHelp: "Clear the tool and close this inspector",
+            close: { state.clearFillSignTool() },
+            marker: .fillSignInspector,
+            isBusy: state.pageEditBusy || state.contentCommandInFlight,
+            bodyContent: {
+                // The armed tool selects its options here; every case is content for the same
+                // host, not a separate inspector with its own padding.
                 if let tool {
-                    Text(tool.inspectorTitle)
-                        .font(.caption)
-                        .foregroundStyle(LyraReaderTheme.textSecondary)
+                    switch tool {
+                    case .text: textOptions
+                    case .signature: signatureOptions
+                    case .date: dateOptions
+                    case .checkmark, .cross: markOptions(tool)
+                    case .stamp: stampOptions
+                    case .image: imageOptions
+                    }
+                } else {
+                    emptySelection
                 }
-            }
-            Spacer()
-            Button { state.clearFillSignTool() } label: { Image(systemName: "xmark") }
-                .buttonStyle(LyraReaderToolStyle())
-                .accessibilityLabel("Clear Fill & Sign tool")
-                .help("Clear the tool and close this inspector")
-        }.padding(.horizontal, 16).padding(.vertical, 9)
+                formSection
+            },
+            footer: { footer }
+        )
     }
 
     private var emptySelection: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "list.bullet.rectangle")
-                .font(.system(size: 28, weight: .light))
-                .foregroundStyle(LyraReaderTheme.iconSecondary)
-            Text("Choose a Fill & Sign tool in the row above.")
-                .font(.system(size: 12))
-                .multilineTextAlignment(.center)
-            Text("The tool's options appear here until the mark is placed or the tool is cleared.")
-                .font(.caption)
-                .foregroundStyle(LyraReaderTheme.textTertiary)
-                .multilineTextAlignment(.center)
-        }
-        .foregroundStyle(LyraReaderTheme.textSecondary)
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 34)
+        ReaderInspectorEmptyState(
+            icon: "list.bullet.rectangle",
+            message: "Choose a Fill & Sign tool in the row above.",
+            detail: "The tool's options appear here until the mark is placed or the tool is cleared."
+        )
     }
 
     // MARK: - Text
@@ -326,7 +293,7 @@ struct FillSignInspector: View {
     }
 
     private var footer: some View {
-        VStack(spacing: 8) {
+        ReaderInspectorFooter {
             if state.isReadOnlyDocument {
                 Text("Signed original is read-only. Save a copy to keep Fill & Sign marks.")
                     .font(.caption)
