@@ -9,6 +9,43 @@ extension ReaderChecks {
         fixture: URL, picture: Data
     ) async throws {
         _ = NSApplication.shared
+        let menu = NSMenu()
+        require(ContinuitySignatureRequestor.deviceGroupItem(in: menu) == nil,
+                "an empty unavailable-device menu keeps the system fallback")
+        let importItem = NSMenuItem(title: "Device import", action: nil, keyEquivalent: "")
+        importItem.identifier = NSMenuItem.importFromDeviceIdentifier
+        let devices = NSMenu()
+        let heading = NSMenuItem(title: "Test device", action: nil, keyEquivalent: "")
+        heading.isEnabled = false
+        let action = NSMenuItem(title: "Sketch", action: #selector(getter: NSObject.description), keyEquivalent: "")
+        let payload = NSObject()
+        action.representedObject = payload
+        action.target = payload
+        devices.addItem(heading); devices.addItem(action); devices.addItem(.separator())
+        importItem.submenu = devices
+        menu.addItem(.separator()); menu.addItem(importItem)
+        let originalItems = devices.items
+        require(ContinuitySignatureRequestor.deviceGroupItem(in: menu) === importItem,
+                "the public device-import marker identifies the sole system group")
+        ContinuitySignatureRequestor.showDeviceGroups(in: menu, from: importItem)
+        require(menu.items.count == 3 && zip(menu.items, originalItems).allSatisfy { $0 === $1 },
+                "direct device groups retain original headings, actions, order and separators")
+        require(action.target === payload && action.representedObject as? NSObject === payload
+                    && action.action == #selector(getter: NSObject.description),
+                "flattening preserves the system action target and device payload")
+        require(!heading.isEnabled, "device group labels remain noninteractive")
+        require(ContinuitySignatureRequestor.deviceGroupItem(in: menu) == nil,
+                "already-expanded device menus are not expanded again")
+        let mixed = NSMenu()
+        mixed.addItem(NSMenuItem(title: "Other", action: nil, keyEquivalent: ""))
+        let marker = NSMenuItem(title: "Import", action: nil, keyEquivalent: "")
+        marker.identifier = NSMenuItem.importFromDeviceIdentifier
+        marker.submenu = NSMenu()
+        marker.submenu!.addItem(NSMenuItem(title: "Device", action: nil, keyEquivalent: ""))
+        mixed.addItem(marker)
+        require(ContinuitySignatureRequestor.deviceGroupItem(in: mixed) == nil,
+                "unrelated or mixed menus are never modified")
+
         let controller = FillSignCommandController(state: state)
         let button = ContinuitySignatureRequestor(controller: controller)
         let window = NSWindow(

@@ -222,6 +222,14 @@ public final class MetalCanvasView: NSView {
     /// eraser). Returns whether a mode was left, so Escape is only consumed when it did something.
     public var onCancelTool: (() -> Bool)?
 
+    private let bookmarkHost = PageBookmarkCanvasHost()
+    package var pageBookmarkFrames: [Int: CGRect] { bookmarkHost.markerFrames }
+    package func configurePageBookmarks(state: AppState?) {
+        if bookmarkHost.superview == nil { addSubview(bookmarkHost) }
+        if state != nil { window?.acceptsMouseMovedEvents = true }
+        if bookmarkHost.configure(state: state) { markNeedsRender() }
+    }
+
     private let regionHost = AIRegionCanvasHost()
     package var regionCardFrames: [CGRect] { regionHost.cardFrames }
     public func configureRegionCards(state: AppState?,
@@ -507,7 +515,7 @@ public final class MetalCanvasView: NSView {
         if window == nil {
             detachSurface()
         } else {
-            if annotationTool == .eraser { window?.acceptsMouseMovedEvents = true }
+            window?.acceptsMouseMovedEvents = true
             installScreenObservers()
             attachSurfaceIfNeeded()
             // `attachSurfaceIfNeeded` reports it too, but a view added to an already-attached
@@ -550,10 +558,10 @@ public final class MetalCanvasView: NSView {
         screenObservers.removeAll()
     }
 
-    // MARK: - Pointer hover (eraser indication)
+    // MARK: - Pointer hover (page bookmarks and eraser indication)
 
-    /// The eraser shows which stroke a press would remove, so pointer movement matters only
-    /// while it is armed. `.inVisibleRect` keeps the area correct across scrolling and resizing.
+    /// Pointer movement reveals page bookmarks and previews the armed eraser.
+    /// `.inVisibleRect` keeps the area correct across scrolling and resizing.
     public override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let hoverTrackingArea { removeTrackingArea(hoverTrackingArea) }
@@ -567,7 +575,13 @@ public final class MetalCanvasView: NSView {
         hoverTrackingArea = area
     }
 
+    public override func mouseEntered(with event: NSEvent) {
+        bookmarkHost.updateHover(at: bookmarkHost.convert(event.locationInWindow, from: nil))
+        super.mouseEntered(with: event)
+    }
+
     public override func mouseMoved(with event: NSEvent) {
+        bookmarkHost.updateHover(at: bookmarkHost.convert(event.locationInWindow, from: nil))
         guard annotationTool == .eraser, !eraserGestureActive else {
             super.mouseMoved(with: event)
             return
@@ -576,6 +590,7 @@ public final class MetalCanvasView: NSView {
     }
 
     public override func mouseExited(with event: NSEvent) {
+        bookmarkHost.updateHover(at: nil)
         if annotationTool == .eraser, !eraserGestureActive { onEraserHover?(nil) }
         super.mouseExited(with: event)
     }
@@ -1483,6 +1498,8 @@ public final class MetalCanvasView: NSView {
         let offsetX = max(0, (CGFloat(surfaceWidth) - contentWidthPx) / 2)
         contentOffsetX = offsetX / scale
         regionHost.sync(size: bounds.size, viewport: visibleRect, scroll: scrollYPt, zoom: zoom, pageFrames: annotationPageFrames)
+        bookmarkHost.sync(size: bounds.size, viewport: visibleRect, scroll: scrollYPt, zoom: zoom,
+                          contentWidth: contentWidthPt, pages: annotationPageFrames)
 
         var textureIds: [UInt64] = []
         var rects: [Float] = []
@@ -1931,6 +1948,7 @@ public struct PDFCanvasView: NSViewRepresentable {
     }
 
     private func configure(_ view: MetalCanvasView) {
+        view.configurePageBookmarks(state: regionState)
         view.configureRegionCards(state: regionState, onOpenInPanel: onOpenRegionInPanel,
                                   onShowHistory: onShowRegionHistory)
         view.interactionSnapshot = interactionSnapshot

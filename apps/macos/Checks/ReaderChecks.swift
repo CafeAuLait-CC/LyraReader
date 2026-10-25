@@ -148,6 +148,10 @@ struct ReaderChecks {
             try await readingPolishChecks(root: fastRoot)
             return
         }
+        if CommandLine.arguments.contains("--check-page-bookmarks") {
+            try await pageBookmarkChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-bookmarks") {
             let scratch = FileManager.default.temporaryDirectory
                 .appendingPathComponent("lyra-reader-bookmarks-\(UUID())")
@@ -874,6 +878,7 @@ struct ReaderChecks {
             }),
             ("bookmarks", {
                 try await bookmarkChecks(url: a)
+                try await pageBookmarkChecks(root: root)
             }),
             ("metadata", {
                 try await metadataChecks(root: root)

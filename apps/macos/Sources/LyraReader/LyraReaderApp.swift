@@ -272,6 +272,11 @@ struct ReaderCommands: Commands {
                 .keyboardShortcut("d", modifiers: .command)
                 .disabled(focusedState?.document == nil)
 
+            Button("Close Reference Preview") { session?.state.closeReferencePreview() }
+                .disabled(session?.state.referencePreview == nil)
+            Button("Export Region Questions…") { session?.state.presentRegionHistoryExportPanel() }
+                .disabled(session?.state.hasExportableRegionHistory != true)
+
             Divider()
 
             // The payload is the panel's generated entry, not a fresh extraction: edit the

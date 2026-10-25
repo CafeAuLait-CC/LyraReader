@@ -7052,20 +7052,27 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// window resize and a continuous↔facing switch without drifting inside the page.
     @discardableResult
     public func addBookmarkAtCurrentPage(name: String? = nil) -> Bool {
-        guard let document, document.pageCount > 0, let url = document.url else { return false }
-        if annotationsURL == nil { loadAnnotations(for: url) }
-        if annotationWritesBlockedReason != nil {
-            statusMessage = "Could not add the bookmark because the annotation cache could not be loaded"
-            lastError = statusMessage
-            return false
-        }
-
+        guard let document, document.pageCount > 0 else { return false }
         let page = min(max(currentPage - 1, 0), document.pageCount - 1)
         // A bookmark stores page-local Y. In a tear's gap the viewport top names the tear, so
         // the bookmark lands at the split rather than jumping a card-height away.
         let yPt = pageLocalY(forContentY: scrollYPt, onPage: page)
             ?? pageTear(forPage: page)?.splitPt
             ?? max(0, scrollYPt - displayPageTop(page))
+        return addBookmark(onPage: page, yPt: yPt, name: name)
+    }
+
+    /// Adds a bookmark to an explicit page without moving the viewport or changing selection.
+    @discardableResult
+    package func addBookmark(onPage page: Int, yPt: CGFloat = 0, name: String? = nil) -> Bool {
+        guard let document, (0..<document.pageCount).contains(page), yPt.isFinite, yPt >= 0,
+              let url = document.url else { return false }
+        if annotationsURL == nil { loadAnnotations(for: url) }
+        if annotationWritesBlockedReason != nil {
+            statusMessage = "Could not add the bookmark because the annotation cache could not be loaded"
+            lastError = statusMessage
+            return false
+        }
         let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let title = trimmed.isEmpty ? "Page \(page + 1)" : trimmed
 
