@@ -53,6 +53,7 @@ def build_pdf(
     catalog_extra: bytes = b"",
     font_object: bytes | None = None,
     page_resources_extra: bytes = b"",
+    page_sizes: list[tuple[float, float]] | None = None,
 ) -> bytes:
     """Assemble a PDF from (content_stream, rotation_degrees) pairs.
 
@@ -81,6 +82,9 @@ def build_pdf(
     `font_object` replaces the default Helvetica dictionary (object 3), and
     `page_resources_extra` is appended verbatim to every page's `/Resources` dictionary.
     Both default to the old output, so only the text-edit fixture uses them.
+
+    `page_sizes` gives each page its own `/MediaBox`; the default is A4 for every page, so a
+    file that does not pass it stays byte-for-byte what this generator always wrote.
     """
     annotations = annotations or {}
     extra_objects = extra_objects or []
@@ -118,6 +122,8 @@ def build_pdf(
         )
     )
 
+    if page_sizes is not None and len(page_sizes) != len(pages):
+        raise ValueError("page_sizes must name exactly one size per page")
     for index, (content, rotation) in enumerate(pages):
         content_id = page_object_ids[index] + 1
         rotate = f" /Rotate {rotation}" if rotation else ""
@@ -125,10 +131,15 @@ def build_pdf(
         if annot_ids[index]:
             refs = " ".join(f"{aid} 0 R" for aid in annot_ids[index])
             annots = f" /Annots [{refs}]"
+        if page_sizes is None:
+            media_box = f"{A4_WIDTH} {A4_HEIGHT}"
+        else:
+            width, height = page_sizes[index]
+            media_box = f"{width:g} {height:g}"
         objects.append(
             (
                 f"<< /Type /Page /Parent 2 0 R "
-                f"/MediaBox [0 0 {A4_WIDTH} {A4_HEIGHT}] "
+                f"/MediaBox [0 0 {media_box}] "
                 f"/Resources << /Font << /F1 3 0 R >>{page_resources_extra.decode('latin-1')} >> "
                 f"/Contents {content_id} 0 R{rotate}{annots} >>"
             ).encode("ascii")
@@ -1611,6 +1622,34 @@ def text_page(title: str, subtitle: str, body_lines: list[str]) -> str:
     return "\n".join(parts)
 
 
+def print_paper_probe_page(label: str, width: float, height: float) -> str:
+    """A page whose geometry makes mixed-paper printing observable.
+
+    A red square sits at the top-left, a blue square at the bottom-right and a green diagonal
+    runs between them. If a page is rotated, cropped, or printed on another page's paper, those
+    marks land in the wrong place (or disappear); `PrintingChecks` samples them on the rendered
+    300 dpi bitmap. The label is at the top so a page printed upside-down is obvious too.
+    """
+    margin = 24
+    square = 48
+    return "\n".join(
+        [
+            "1 0 0 rg",
+            f"{margin} {height - margin - square} {square} {square} re f",
+            "0 0 1 rg",
+            f"{width - margin - square} {margin} {square} {square} re f",
+            "0 0.55 0 RG 5 w",
+            f"{margin + square} {height - margin - square} m "
+            f"{width - margin - square} {margin + square} l S",
+            "0 0 0 rg",
+            f"BT /F1 22 Tf {margin + 8} {height - 120} Td "
+            f"({escape_pdf_string(label)}) Tj ET",
+            f"BT /F1 12 Tf {margin + 8} {height - 144} Td "
+            f"({width:g} x {height:g} pt) Tj ET",
+        ]
+    )
+
+
 def numbered_margin_page() -> str:
     """A page with a real line-number gutter and body text that wraps.
 
@@ -2544,6 +2583,33 @@ def main() -> int:
         path = out_dir / name
         path.write_bytes(build_pdf(pages))
         print(f"  {path}  ({path.stat().st_size} bytes, {len(pages)} page(s))")
+
+    # 13) Mixed paper sizes: A4, US Letter and a page just inside A4's tolerance but smaller
+    #     than the stock, plus a landscape Letter page. Printing must choose paper per page,
+    #     never the first page's size; the red/blue/green probes make rotation and cropping
+    #     visible to the headless print check.
+    mixed_pages = [
+        (print_paper_probe_page("A4 portrait", 595, 842), 0),
+        (print_paper_probe_page("US Letter", 612, 792), 0),
+        (print_paper_probe_page("A4 again", 595, 842), 0),
+        (print_paper_probe_page("Small A4-ish", 590, 835), 0),
+        (print_paper_probe_page("Letter landscape", 792, 612), 0),
+        (print_paper_probe_page("Custom 300 x 400", 300, 400), 0),
+    ]
+    mixed_sizes = [
+        (595, 842),
+        (612, 792),
+        (595, 842),
+        (590, 835),
+        (792, 612),
+        (300, 400),
+    ]
+    path = out_dir / "mixed-paper.pdf"
+    path.write_bytes(build_pdf(mixed_pages, page_sizes=mixed_sizes))
+    print(
+        f"  {path}  ({path.stat().st_size} bytes, 6 pages,"
+        " A4 + US Letter + landscape + custom)"
+    )
 
     path = out_dir / "text-edit.pdf"
     path.write_bytes(text_edit_pdf())
