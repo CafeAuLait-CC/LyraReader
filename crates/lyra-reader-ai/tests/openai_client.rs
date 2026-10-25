@@ -281,7 +281,8 @@ fn plan_for_base(base_url: &str) -> lyra_reader_ai::ChatPlan {
 
             reasoning_mode: ReasoningMode::Off,
             reasoning_encoding: ReasoningEncoding::Thinking,},
-    })
+            document_knowledge: None,
+})
     .expect("plan")
 }
 
@@ -1029,6 +1030,7 @@ fn every_action_streams_the_same_content_fixture_through_the_same_runner() {
                 reasoning_mode: ReasoningMode::Off,
                 reasoning_encoding: ReasoningEncoding::Thinking,
             },
+            document_knowledge: None,
         })
         .unwrap();
         let transport = UreqTransport::system(fast_config());
@@ -1214,6 +1216,7 @@ fn the_request_spec_never_prints_its_key_or_body() {
             reasoning_mode: ReasoningMode::Off,
             reasoning_encoding: ReasoningEncoding::Thinking,
         },
+        document_knowledge: None,
     })
     .unwrap();
     let spec: RequestSpec =

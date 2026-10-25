@@ -1654,7 +1654,8 @@ mod tests {
 
                 reasoning_mode: ReasoningMode::Off,
                 reasoning_encoding: ReasoningEncoding::Thinking,},
-        })
+                    document_knowledge: None,
+})
         .unwrap()
     }
 
@@ -1886,6 +1887,7 @@ mod tests {
                 reasoning_mode: ReasoningMode::Off,
                 reasoning_encoding: ReasoningEncoding::Thinking,
             },
+            document_knowledge: None,
         })
         .unwrap();
         assert_eq!(plan.endpoint, "https://api.deepseek.com/chat/completions");

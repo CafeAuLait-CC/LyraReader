@@ -80,6 +80,12 @@ private class RegionLayoutEngine: PreviewEngine {
         return LyraReaderKit.TextPage(page: page, chars: chars, text: text, hasUnicodeMapError: false)
     }
 
+    override func regionText(page: Int, rect: CGRect, limit: Int) async throws
+        -> (text: String, truncated: Bool) {
+        let page = try await textPage(page)
+        return (page.text, false)
+    }
+
     override func renderPage(_ page: Int, scale: CGFloat) async throws -> PageImage {
         PageImage(pixelWidth: 1, pixelHeight: 1, pointSize: pageSize,
                   bgra: Data([255, 255, 255, 255]), generation: UInt64(page + 200))
@@ -1069,5 +1075,10 @@ private final class BlankRegionEngine: RegionLayoutEngine {
 
     override func textPage(_ page: Int) async throws -> LyraReaderKit.TextPage {
         TextPage(page: page, chars: [], text: "", hasUnicodeMapError: false)
+    }
+
+    override func regionText(page: Int, rect: CGRect, limit: Int) async throws
+        -> (text: String, truncated: Bool) {
+        ("", false)
     }
 }

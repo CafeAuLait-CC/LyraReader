@@ -24,6 +24,8 @@ import Foundation
         throw NSError(domain: "PreviewChecks", code: 2)
     }
     func textPage(_ page: Int) async throws -> TextPage { throw NSError(domain: "PreviewChecks", code: 3) }
+    func regionText(page: Int, rect: CGRect, limit: Int) async throws
+        -> (text: String, truncated: Bool) { ("", false) }
     func links(_ page: Int) async throws -> [DocumentLink] { [] }
     func citations(_ page: Int) async throws -> [Citation] { [] }
     func captionMentions(page: Int) async throws -> [CaptionMention] { [] }

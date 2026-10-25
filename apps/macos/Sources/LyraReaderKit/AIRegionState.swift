@@ -196,9 +196,9 @@ extension AppState {
         let extracted: (text: String, truncated: Bool)
         var textPage: TextPage?
         do {
-            let page = try await engine.textPage(page)
-            textPage = page
-            extracted = AIRegionText.extract(from: page, in: rect)
+            textPage = try await engine.textPage(page)
+            extracted = try await engine.regionText(
+                page: page, rect: rect, limit: AIRegionLimits.maximumTextCharacters)
         } catch {
             // A page with no text layer still has a picture. The request builder refuses only
             // if both are empty or the model is text-only.

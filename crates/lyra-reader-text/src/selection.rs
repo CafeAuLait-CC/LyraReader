@@ -437,6 +437,170 @@ pub(crate) fn intersects(a: Rect, b: Rect) -> bool {
     a.min_x() < b.max_x() && b.min_x() < a.max_x() && a.min_y() < b.max_y() && b.min_y() < a.max_y()
 }
 
+/// The text cap the shell applies to one marquee-selected region.
+///
+/// The same number bounds the AI planner's `MAX_REGION_TEXT_CHARS`; extraction stops at it and
+/// reports that it did, never silently sending a longer region.
+pub const MAX_REGION_TEXT_CHARS: usize = 12_000;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RegionGlyph {
+    x: f64,
+    max_x: f64,
+    text: char,
+    is_space: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct RegionLine {
+    min_y: f64,
+    max_y: f64,
+    height: f64,
+    glyphs: Vec<RegionGlyph>,
+}
+
+/// `CGRect.contains`: a point on the minimum edges is inside, a point on the maximum edges is
+/// outside. A zero-area rectangle contains nothing.
+fn contains_point(rect: Rect, point: Point) -> bool {
+    rect.size.width > 0.0
+        && rect.size.height > 0.0
+        && point.x >= rect.min_x()
+        && point.x < rect.max_x()
+        && point.y >= rect.min_y()
+        && point.y < rect.max_y()
+}
+
+/// `CharacterSet.whitespacesAndNewlines` for one scalar. The set is `whitespaces` plus the line
+/// separators Swift also trims at the ends of an extracted region.
+pub fn is_swift_whitespace_or_newline(unicode: u32) -> bool {
+    is_swift_whitespace(unicode) || matches!(unicode, 0x000A..=0x000D | 0x0085 | 0x2028 | 0x2029)
+}
+
+fn trim_region(text: &str) -> &str {
+    text.trim_matches(|character: char| is_swift_whitespace(character as u32))
+}
+
+fn trim_region_ends(text: &str) -> &str {
+    text.trim_matches(|character: char| is_swift_whitespace_or_newline(character as u32))
+}
+
+/// Extract the text layer inside a page-local rectangle.
+///
+/// This is the rectangle-coverage selection mode that used to live in Swift
+/// (`AIRegionText.extract`). It is kept in the same module as the pointer selection so the
+/// shell's copied text, annotation quotes and region text all resolve against one page model
+/// and one whitespace/glyph vocabulary; the acceptance rule differs deliberately:
+///
+/// * a glyph counts when its centre is inside the rectangle or at least 45% of its area is
+///   covered (the pointer path uses hit-testing, not rectangle coverage);
+/// * lines are assembled with a vertical-centre tolerance of `max(2.5, height × 0.45)`, in the
+///   text layer's emission order (the pointer path builds visual lines once per page);
+/// * glyphs in a line are sorted by x, and a space is inserted when the gap exceeds
+///   `max(1.2, line height × 0.12)`; real whitespace glyphs collapse to one space.
+///
+/// The result is exactly the string the shell extracted before this moved to Rust: at most
+/// `limit` characters, joined with a newline per line and trimmed at both ends. `truncated` means
+/// the limit cut the assembled text.
+pub fn region_text(chars: &[CharBox], region: Rect, limit: usize) -> (String, bool) {
+    let mut lines: Vec<RegionLine> = Vec::new();
+    for character in chars {
+        if character.unicode == 10 || character.unicode == 13 {
+            continue;
+        }
+        let rect = character.rect;
+        if !(rect.size.width > 0.0 && rect.size.height > 0.0) {
+            continue;
+        }
+        let intersects_region = intersects(rect, region);
+        let centre = rect.center();
+        let covered = if intersects_region {
+            let intersection = Rect::new(
+                rect.min_x().max(region.min_x()),
+                rect.min_y().max(region.min_y()),
+                (rect.max_x().min(region.max_x()) - rect.min_x().max(region.min_x())).max(0.0),
+                (rect.max_y().min(region.max_y()) - rect.min_y().max(region.min_y())).max(0.0),
+            );
+            intersection.size.width * intersection.size.height
+                / (rect.size.width * rect.size.height).max(0.001)
+        } else {
+            0.0
+        };
+        if !(contains_point(region, centre) || covered >= 0.45) {
+            continue;
+        }
+        let scalar = char::from_u32(character.unicode).unwrap_or('\u{FFFD}');
+        let glyph = RegionGlyph {
+            x: rect.min_x(),
+            max_x: rect.max_x(),
+            text: scalar,
+            is_space: is_swift_whitespace(character.unicode),
+        };
+        let tolerance = (rect.size.height * 0.45).max(2.5);
+        let existing = lines
+            .iter()
+            .rposition(|line| ((line.min_y + line.max_y) / 2.0 - centre.y).abs() <= tolerance);
+        if let Some(index) = existing {
+            let line = &mut lines[index];
+            line.min_y = line.min_y.min(rect.min_y());
+            line.max_y = line.max_y.max(rect.max_y());
+            line.height = line.height.max(rect.size.height);
+            line.glyphs.push(glyph);
+        } else {
+            lines.push(RegionLine {
+                min_y: rect.min_y(),
+                max_y: rect.max_y(),
+                height: rect.size.height,
+                glyphs: vec![glyph],
+            });
+        }
+    }
+
+    let mut result = String::new();
+    let mut truncated = false;
+    for line in &mut lines {
+        line.glyphs
+            .sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+        let mut line_text = String::new();
+        let mut previous_max_x: Option<f64> = None;
+        for glyph in &line.glyphs {
+            if glyph.is_space {
+                if !line_text.is_empty() && !line_text.ends_with(' ') {
+                    line_text.push(' ');
+                }
+                previous_max_x =
+                    Some(previous_max_x.map_or(glyph.max_x, |previous| previous.max(glyph.max_x)));
+                continue;
+            }
+            if let Some(previous) = previous_max_x {
+                let gap = glyph.x - previous;
+                if gap > (line.height * 0.12).max(1.2)
+                    && !line_text.is_empty()
+                    && !line_text.ends_with(' ')
+                {
+                    line_text.push(' ');
+                }
+            }
+            line_text.push(glyph.text);
+            previous_max_x =
+                Some(previous_max_x.map_or(glyph.max_x, |previous| previous.max(glyph.max_x)));
+        }
+        let trimmed = trim_region(&line_text);
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(trimmed);
+        if result.chars().count() > limit {
+            result = result.chars().take(limit).collect();
+            truncated = true;
+            break;
+        }
+    }
+    (trim_region_ends(&result).to_string(), truncated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

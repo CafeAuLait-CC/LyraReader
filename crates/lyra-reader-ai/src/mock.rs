@@ -142,6 +142,7 @@ mod tests {
                 reasoning_mode: ReasoningMode::Off,
                 reasoning_encoding: ReasoningEncoding::Thinking,
             },
+            document_knowledge: None,
         })
         .unwrap()
     }
