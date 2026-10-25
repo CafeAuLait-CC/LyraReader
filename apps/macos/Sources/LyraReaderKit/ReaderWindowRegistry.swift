@@ -220,6 +220,10 @@ public final class ReaderWindowRegistry: ObservableObject {
                     pending.source.reportTabTransferFailure(
                         "“\(pending.transfer.title)” was opened in a new window, but the old window "
                         + "kept it (it has unsaved changes). The move was rolled back.")
+                } else {
+                    // The tear-off is complete: the new window owns the document and the source
+                    // has no tabs left, so the empty source window goes away with its last tab.
+                    closeWindowAfterTabMove(from: pending.source)
                 }
             } else {
                 let reason = session.state.lastTabTransferRefusal
@@ -265,6 +269,28 @@ public final class ReaderWindowRegistry: ObservableObject {
     public func noteFocused(_ session: ReaderSession) {
         guard sessions.contains(where: { $0 === session }) else { return }
         focusedSession = session
+    }
+
+    /// Closes a source window after a successful tab move left it with no tabs.
+    ///
+    /// Both tab-window move paths call this once the destination has accepted the document and
+    /// the source has given the tab up: a tear-off (``register(_:)`` finishing its
+    /// `pendingTransfer`) and a drop on another window's strip (``TabDragCoordinator``). It
+    /// deliberately does nothing unless the source is empty, so a refused or failed transfer can
+    /// never close the window that still owns its tab.
+    ///
+    /// The close goes through `performClose`, the same `windowShouldClose` → `willClose` path as
+    /// the red close button. The reader is not asked to save: the move already refused a dirty
+    /// tab, and the source has no tabs left to ask about. ``ReaderSession/close()`` unregisters
+    /// the session from its normal `willClose` observer. If this was the last reader window,
+    /// AppKit's ordinary no-window state applies — the app does not terminate itself here, and
+    /// has no “terminate after last window closes” policy to trigger.
+    public func closeWindowAfterTabMove(from source: AppState) {
+        guard source.tabs.isEmpty,
+              let session = sessions.first(where: { $0.state === source }),
+              let window = session.window
+        else { return }
+        window.performClose(nil)
     }
 
     /// The app is up: queued documents may be opened, and sessions created from now on are ready

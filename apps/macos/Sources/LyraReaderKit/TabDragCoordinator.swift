@@ -51,6 +51,12 @@ public final class TabDragCoordinator: ObservableObject {
     /// `nil` (checks, or a build without window creation) refuses the tear-off with a sentence.
     public var tearOff: ((TabTransfer, AppState) -> Bool)?
 
+    /// Closes a source window after a drop on another window's strip moved its last tab out.
+    /// Installed next to ``tearOff`` and backed by
+    /// ``ReaderWindowRegistry/closeWindowAfterTabMove(from:)``; only called after ``TabMove``
+    /// reports success, so a refused move never closes the window that still owns its tab.
+    public var closeEmptiedSource: ((AppState) -> Void)?
+
     /// The strip the pointer is over while a drag is in flight, unless it is the source strip
     /// (the source draws its own local insertion indicator). Published so the target strip can
     /// show the same indicator before the drop.
@@ -180,7 +186,8 @@ public final class TabDragCoordinator: ObservableObject {
     /// the pointer over a strip?" and the side effect cannot disagree.
     ///
     /// - over the source strip: reorder at `localInsertionIndex`;
-    /// - over another window's strip: move the tab there at that strip's insertion index;
+    /// - over another window's strip: move the tab there at that strip's insertion index, and
+    ///   close the source window if that was its last tab;
     /// - over no strip at all: tear the tab off into a new window.
     @discardableResult
     public func finishDrag(
@@ -202,6 +209,7 @@ public final class TabDragCoordinator: ObservableObject {
                 from: source, tabAtIndex: sourceIndex,
                 to: target.state, insertionIndex: target.insertionIndex
             ) {
+                closeEmptiedSourceIfNeeded(source)
                 return .moved
             }
             return .refused(source.lastError ?? "The tab could not be moved to the other window.")
@@ -217,6 +225,13 @@ public final class TabDragCoordinator: ObservableObject {
         }
         if tearOff(transfer, source) { return .toreOff }
         return .refused(source.lastError ?? "The new window could not be created.")
+    }
+
+    /// The cross-window move is complete and the source has no tabs left: the window goes with
+    /// them. Called only after ``TabMove`` succeeded, so a refused or failed move changes nothing.
+    private func closeEmptiedSourceIfNeeded(_ source: AppState) {
+        guard source.tabs.isEmpty else { return }
+        closeEmptiedSource?(source)
     }
 
     // MARK: - Escape
