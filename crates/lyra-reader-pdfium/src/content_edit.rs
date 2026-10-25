@@ -5,7 +5,7 @@
 //! The caller keeps these working revisions for undo; final publication uses the existing
 //! signature-aware page-edit transaction. Paragraphs are spatial groups, not single Tj strings.
 
-use crate::backend::{PDFIUM_LOCK, pdfium_instance};
+use crate::backend::pdfium_instance;
 use crate::rewrite::{TextComparison, verify_document_equivalence};
 use crate::writeback::{OutputMode, write_rewritten_pdf};
 use lyra_reader_core::{
@@ -171,7 +171,7 @@ pub fn inspect_content(source: &Path, page_index: u32) -> Result<ContentPage> {
     let pdfium = pdfium_instance()?;
     let frames = layout::frames(&bytes, page_index)?;
     let mut snapshot = {
-        let _guard = PDFIUM_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         let doc = pdfium
             .load_pdf_from_byte_slice(&bytes, None)
             .map_err(pdf_error)?;
@@ -720,7 +720,7 @@ fn build_revision(
         }
     }
     let pdfium = pdfium_instance()?;
-    let _guard = PDFIUM_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = crate::backend::lock_pdfium()?;
     let mut doc = pdfium
         .load_pdf_from_byte_slice(bytes, None)
         .map_err(pdf_error)?;
@@ -1066,7 +1066,7 @@ pub fn content_image(source: &Path, index: u32, target: &str, revision: &str) ->
         return Err(failure("The source changed while exporting this image."));
     }
     let pdfium = pdfium_instance()?;
-    let _guard = PDFIUM_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = crate::backend::lock_pdfium()?;
     let doc = pdfium
         .load_pdf_from_byte_slice(&bytes, None)
         .map_err(pdf_error)?;

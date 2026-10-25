@@ -439,7 +439,7 @@ pub(crate) fn append_bookmarks(
     })?;
     let document = load_document(base, password)?;
     let pages = document.get_pages();
-    let page_count = u32::try_from(pages.len()).unwrap_or(u32::MAX);
+    let page_count = lyra_reader_core::saturating_u32(pages.len());
     validate_bookmarks(bookmarks, page_count)?;
     let pages_by_id: std::collections::HashMap<ObjectId, u32> =
         pages.iter().map(|(index, id)| (*id, index - 1)).collect();

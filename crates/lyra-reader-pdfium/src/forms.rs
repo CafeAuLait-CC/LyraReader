@@ -849,7 +849,7 @@ pub(crate) fn read_form_document_from(document: &Document) -> FormDocument {
         document.version.clone()
     };
     let pages = document.get_pages();
-    let page_count = u32::try_from(pages.len()).unwrap_or(u32::MAX);
+    let page_count = lyra_reader_core::saturating_u32(pages.len());
     let mut annotation_counts = vec![0usize; pages.len()];
     for (page_number, page_id) in &pages {
         if let Ok(page) = document.get_dictionary(*page_id)
@@ -913,8 +913,11 @@ pub(crate) fn read_form_document_from(document: &Document) -> FormDocument {
         }
     }
     fields.sort_by(|left, right| {
-        let left_page = left.page().unwrap_or(u32::MAX);
-        let right_page = right.page().unwrap_or(u32::MAX);
+        // A widget without a /P page has no natural position; the sentinel sorts it last
+        // instead of defaulting it to page 1, which would put an unknown-location field first.
+        const UNKNOWN_PAGE_SORTS_LAST: u32 = u32::MAX;
+        let left_page = left.page().unwrap_or(UNKNOWN_PAGE_SORTS_LAST);
+        let right_page = right.page().unwrap_or(UNKNOWN_PAGE_SORTS_LAST);
         let left_rect = left.widgets.first().map(|widget| widget.rect);
         let right_rect = right.widgets.first().map(|widget| widget.rect);
         left_page

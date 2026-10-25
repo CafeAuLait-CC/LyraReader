@@ -2486,7 +2486,7 @@ pub fn build_document_chat_plan(request: DocumentChatRequest) -> Result<ChatPlan
         source_pages,
         note,
         sources,
-        history_turns: u32::try_from(history.len()).unwrap_or(u32::MAX),
+        history_turns: lyra_reader_core::saturating_u32(history.len()),
         estimated_tokens_override: None,
     };
     apply_document_knowledge(&mut plan, document_knowledge.as_ref());

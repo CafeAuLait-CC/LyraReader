@@ -37,7 +37,7 @@ fn scratch(name: &str) -> PathBuf {
 
 fn expect_read_only(label: &str, result: Result<(), LyraReaderFfiError>) {
     match result {
-        Err(LyraReaderFfiError::Document { message }) => {
+        Err(LyraReaderFfiError::Document { message, .. }) => {
             assert!(
                 message.contains("XFA form") && message.contains("read-only"),
                 "{label} refused with the wrong sentence: {message}"
@@ -336,7 +336,7 @@ fn a_genuinely_password_protected_pdf_still_refuses_to_open() {
     let engine = LyraReaderEngine::new();
     let result = engine.open_document(protected.to_string_lossy().into_owned(), None);
     match result {
-        Err(LyraReaderFfiError::Document { message }) => {
+        Err(LyraReaderFfiError::Document { message, .. }) => {
             assert!(
                 message.to_ascii_lowercase().contains("password"),
                 "the refusal names the password: {message}"

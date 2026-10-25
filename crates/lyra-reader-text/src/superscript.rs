@@ -160,11 +160,14 @@ impl CitationStyle {
             .count();
         let alphanumeric = alpha_count >= 2 && alpha_count * 2 >= references.len();
         let numbered = labels.len() >= 2 && labels.len() * 2 >= references.len();
+        // An empty reference list has no first body page; the sentinel makes `page < body_end`
+        // true for every page, which is the historical behaviour for that (defensive) case.
+        const NO_BODY_PAGE: u32 = u32::MAX;
         let body_end = references
             .iter()
             .map(|entry| entry.page)
             .min()
-            .unwrap_or(u32::MAX);
+            .unwrap_or(NO_BODY_PAGE);
         let bracketed = pages
             .iter()
             .filter(|(page, _)| *page < body_end)

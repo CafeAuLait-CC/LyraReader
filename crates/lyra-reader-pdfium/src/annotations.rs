@@ -725,9 +725,7 @@ impl AnnotationAppender {
 
         // SAFETY: the C strings outlive the call and the library is initialised above.
         let document = {
-            let _guard = crate::backend::PDFIUM_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _guard = crate::backend::lock_pdfium()?;
             unsafe {
                 (api.load_document)(
                     path.as_ptr(),
@@ -747,9 +745,7 @@ impl AnnotationAppender {
 
         // SAFETY: `document` is a live document handle.
         let page_count = {
-            let _guard = crate::backend::PDFIUM_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _guard = crate::backend::lock_pdfium()?;
             match crate::limits::page_count(unsafe { (api.get_page_count)(document) }) {
                 Ok(count) => count,
                 Err(error) => {
@@ -773,27 +769,20 @@ impl AnnotationAppender {
 
     /// Appends one annotation. The caller has already validated the geometry and identity.
     pub fn add(&mut self, annotation: &WriteAnnotation) -> Result<()> {
-        if annotation.page.get() >= self.page_count {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!(
-                    "annotation {} names page {}, but the document has {} page(s)",
-                    annotation.id,
-                    annotation.page.get(),
-                    self.page_count
-                ),
-            ));
-        }
-        let page_index = c_int::try_from(annotation.page.get()).map_err(|_| {
+        // The page-range sentence is shared with every other entry point; the annotation's
+        // identity goes in `detail`, where diagnostics can use it without changing what the
+        // reader sees.
+        let page_count = self.page_count;
+        lyra_reader_core::checked_page_index(annotation.page.get(), page_count, |page| {
             LyraReaderError::new(
                 ErrorCode::InvalidArgument,
-                format!("page {} is out of range for PDFium", annotation.page.get()),
+                lyra_reader_core::page_out_of_range_message(page, page_count),
             )
+            .with_detail(format!("annotation {}", annotation.id))
         })?;
+        let page_index = pdfium_page_index(annotation.page.get())?;
 
-        let _guard = crate::backend::PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
 
         // SAFETY: `document` is live and `page_index` was checked against the page count.
         let page = unsafe { (self.api.load_page)(self.document, page_index) };
@@ -914,9 +903,7 @@ impl AnnotationAppender {
     pub fn save_incremental(&mut self, file: std::fs::File) -> Result<u64> {
         let mut sink = FileSink::new(file);
         let ok = {
-            let _guard = crate::backend::PDFIUM_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _guard = crate::backend::lock_pdfium()?;
             // SAFETY: `self.document` is live, and `sink.header` is an `FPDF_FILEWRITE` whose
             // callback writes into `sink`. PDFium only calls it during this call.
             unsafe {
@@ -950,11 +937,23 @@ impl AnnotationAppender {
 impl Drop for AnnotationAppender {
     fn drop(&mut self) {
         // SAFETY: the handle came from `load_document` and is closed exactly once, here.
-        let _guard = crate::backend::PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium_for_cleanup();
         unsafe { (self.api.close_document)(self.document) };
     }
+}
+
+/// Converts a validated 0-based page index to PDFium's `c_int` page type.
+///
+/// This is not a page-count check (the callers have already compared against the document); it
+/// is the separate limit of the C API's page index. The sentence is therefore its own class and
+/// is shared by both annotation call sites.
+fn pdfium_page_index(page: u32) -> Result<c_int> {
+    c_int::try_from(page).map_err(|_| {
+        LyraReaderError::new(
+            ErrorCode::InvalidArgument,
+            format!("page {} is out of range for PDFium", page),
+        )
+    })
 }
 
 fn write_error(call: &str, id: &str) -> LyraReaderError {
@@ -1051,9 +1050,7 @@ impl AnnotationReader {
     /// turning into "this document has no annotations".
     pub fn open(path: &Path, password: Option<&str>) -> Result<Self> {
         crate::backend::pdfium_instance()?;
-        let _guard = crate::backend::PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         Self::open_locked(path, password)
     }
 
@@ -1120,9 +1117,7 @@ impl AnnotationReader {
     /// skipped rather than failing the whole page: a reader must not refuse to show the other
     /// twenty highlights because the twenty-first is broken.
     pub fn page(&self, page: PageIndex) -> Result<Vec<RawAnnotation>> {
-        let _guard = crate::backend::PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         self.page_report_locked(page)
             .map(|report| report.annotations)
     }
@@ -1133,20 +1128,13 @@ impl AnnotationReader {
     /// unreadable ones are counted so the caller can warn and block writes instead of silently
     /// dropping them.
     pub fn page_report(&self, page: PageIndex) -> Result<AnnotationPageReport> {
-        let _guard = crate::backend::PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         self.page_report_locked(page)
     }
 
     /// The caller already holds `PDFIUM_LOCK` for a larger PDFium transaction.
     pub(crate) fn page_report_locked(&self, page: PageIndex) -> Result<AnnotationPageReport> {
-        let index = c_int::try_from(page.get()).map_err(|_| {
-            LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!("page {} is out of range for PDFium", page.get()),
-            )
-        })?;
+        let index = pdfium_page_index(page.get())?;
 
         // SAFETY: the document handle is live for as long as `self`, and every call here is
         // serialised by the caller's `PDFIUM_LOCK`.
@@ -1718,9 +1706,7 @@ impl Drop for AnnotationReader {
         // lock: the neighbouring raster backend serialises its own teardown the same way, and a
         // close racing a load is exactly the kind of cross-document interaction this build has
         // crashed on before (see the `PDFIUM_LOCK` note in `backend.rs`).
-        let _guard = crate::backend::PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium_for_cleanup();
         // SAFETY: the handle came from `FPDF_LoadDocument` and is closed exactly once, here.
         unsafe { (self.api.close_document)(self.document) };
     }

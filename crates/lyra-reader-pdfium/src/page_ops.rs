@@ -94,7 +94,7 @@
 #![allow(unsafe_code)]
 
 use crate::annotations::AnnotationReader;
-use crate::backend::{PDFIUM_LOCK, PdfiumBackend};
+use crate::backend::PdfiumBackend;
 use crate::outline_write::{MergeOutlineGroup, append_merge_outline_groups};
 use crate::writeback::{OutputMode, RewrittenOutput, TempFile, write_rewritten_pdf};
 use libloading::Library;
@@ -268,7 +268,7 @@ fn apply_page_operation_with_mode(
     reject_password(password)?;
     let api = api()?;
     let document = open_editable(api, source, "the document being edited")?;
-    let page_count = document.page_count();
+    let page_count = document.page_count()?;
     let rotations = document.rotations()?;
     let sizes = document.sizes()?;
     let expected = plan(operation, page_count, &rotations, &sizes)?;
@@ -330,7 +330,7 @@ pub fn extract_pages(
     reject_password(password)?;
     let api = api()?;
     let document = open_editable(api, source, "the document being extracted")?;
-    let page_count = document.page_count();
+    let page_count = document.page_count()?;
     let rotations = document.rotations()?;
     let sizes = document.sizes()?;
     let selected = validate_pages(pages, page_count, "extract")?;
@@ -437,7 +437,7 @@ pub fn merge_documents(
 
     let api = api()?;
     let merged = open_editable(api, &source, "the document to append to")?;
-    let first_page_count = merged.page_count();
+    let first_page_count = merged.page_count()?;
     if first_page_count == 0 {
         return Err(empty_document_error(&source));
     }
@@ -459,11 +459,11 @@ pub fn merge_documents(
 
     for other in inputs.iter().skip(1) {
         let appended = open_editable(api, other, "a document being appended")?;
-        let count = appended.page_count();
+        let count = appended.page_count()?;
         if count == 0 {
             return Err(empty_document_error(other));
         }
-        let offset = merged.page_count();
+        let offset = merged.page_count()?;
         let outline_nodes = read_outline(other)?;
         let pages: Vec<u32> = (0..count).collect();
         merged.import_pages(&appended, &pages, offset)?;
@@ -579,7 +579,7 @@ pub fn split_pages(
     let source = canonical_input(source, "the document being split")?;
     let api = api()?;
     let document = open_editable(api, &source, "the document being split")?;
-    let page_count = document.page_count();
+    let page_count = document.page_count()?;
     if page_count == 0 {
         return Err(empty_document_error(&source));
     }
@@ -1005,11 +1005,7 @@ fn plan(
 fn page_out_of_range(page: u32, page_count: u32) -> LyraReaderError {
     LyraReaderError::new(
         ErrorCode::InvalidArgument,
-        format!(
-            "page {} is outside the document ({} page(s))",
-            page + 1,
-            page_count
-        ),
+        lyra_reader_core::page_out_of_range_message(page, page_count),
     )
 }
 
@@ -1117,7 +1113,7 @@ fn open_editable(api: &'static PageApi, path: &Path, role: &str) -> Result<RawDo
             };
         }
     };
-    if document.security_revision() >= 0 {
+    if document.security_revision()? >= 0 {
         return Err(encrypted_refusal(role, path));
     }
     Ok(document)
@@ -1172,16 +1168,9 @@ fn validate_split_pages(
         }
     }
     for page in &unique {
-        if *page >= page_count {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!(
-                    "page {} is outside the document ({} page(s))",
-                    page + 1,
-                    page_count
-                ),
-            ));
-        }
+        lyra_reader_core::checked_page_index(*page, page_count, |page| {
+            page_out_of_range(page, page_count)
+        })?;
     }
     Ok(unique)
 }
@@ -1214,7 +1203,8 @@ fn split_output_error(
 /// higher-level `text.all()` representation can come back empty.
 fn page_texts(path: &Path) -> Result<Vec<String>> {
     let backend = PdfiumBackend::open(path, None)?;
-    (0..backend.page_count())
+    let count = backend.page_count();
+    (0..count)
         .map(|page| {
             let raw = backend.raw_text_page(PageIndex(page))?;
             Ok(raw
@@ -1235,9 +1225,7 @@ fn page_annotations(path: &Path) -> Result<Vec<Vec<RawAnnotation>>> {
     let mut pages = Vec::with_capacity(count as usize);
     for page in 0..count {
         let records = {
-            let _guard = PDFIUM_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _guard = crate::backend::lock_pdfium()?;
             reader.page_locked(PageIndex(page))?
         };
         pages.push(records);
@@ -1649,9 +1637,7 @@ impl RawDocument {
         })?;
         let length = crate::limits::document_len(bytes.len())?;
         let document = {
-            let _guard = PDFIUM_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _guard = crate::backend::lock_pdfium()?;
             // SAFETY: `bytes` lives in the returned struct and the library is initialised by
             // `pdfium_instance` (called by the backend open path).
             unsafe {
@@ -1681,9 +1667,7 @@ impl RawDocument {
         // Make sure the library is initialised the same way the rest of the backend does it.
         crate::backend::pdfium_instance()?;
         let document = {
-            let _guard = PDFIUM_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _guard = crate::backend::lock_pdfium()?;
             // SAFETY: no arguments, returns a new document or null.
             unsafe { (api.create_new_document)() }
         };
@@ -1700,12 +1684,10 @@ impl RawDocument {
         })
     }
 
-    fn page_count(&self) -> u32 {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fn page_count(&self) -> Result<u32> {
+        let _guard = crate::backend::lock_pdfium()?;
         // SAFETY: `document` is live.
-        unsafe { (self.api.get_page_count)(self.document) }.max(0) as u32
+        Ok(unsafe { (self.api.get_page_count)(self.document) }.max(0) as u32)
     }
 
     /// `FPDF_GetSecurityHandlerRevision`: -1 when the PDF carries no encryption dictionary.
@@ -1713,19 +1695,15 @@ impl RawDocument {
     /// Unlike `PdfiumBackend::is_encrypted` (which records whether a password was supplied),
     /// this detects a document encrypted with an empty user password, which PDFium opens
     /// without asking. That is the case the merge/split refusal must not miss.
-    fn security_revision(&self) -> c_int {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fn security_revision(&self) -> Result<c_int> {
+        let _guard = crate::backend::lock_pdfium()?;
         // SAFETY: `document` is live and the API is documented to accept it.
-        unsafe { (self.api.security_revision)(self.document) }
+        Ok(unsafe { (self.api.security_revision)(self.document) })
     }
 
     fn rotations(&self) -> Result<Vec<u32>> {
-        let count = self.page_count();
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = self.page_count()?;
+        let _guard = crate::backend::lock_pdfium()?;
         let mut rotations = Vec::with_capacity(count as usize);
         for index in 0..count {
             // SAFETY: `document` is live and `index` is below the page count.
@@ -1748,10 +1726,8 @@ impl RawDocument {
     }
 
     fn sizes(&self) -> Result<Vec<PageSize>> {
-        let count = self.page_count();
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = self.page_count()?;
+        let _guard = crate::backend::lock_pdfium()?;
         let mut sizes = Vec::with_capacity(count as usize);
         for index in 0..count {
             // SAFETY: `document` is live and `index` is below the page count.
@@ -1779,9 +1755,7 @@ impl RawDocument {
         if delta == 0 {
             return Ok(());
         }
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         for page_index in pages {
             let page = self.load_page_locked(*page_index)?;
             // SAFETY: `page` is live; the rotation is written before the handle is closed.
@@ -1815,9 +1789,7 @@ impl RawDocument {
     }
 
     fn set_rotation(&self, pages: &[u32], rotations: &[u32]) -> Result<()> {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         for (page_index, rotation) in pages.iter().zip(rotations) {
             let page = self.load_page_locked(*page_index)?;
             let value = (*rotation % 4) as c_int;
@@ -1840,9 +1812,7 @@ impl RawDocument {
     }
 
     fn delete(&self, pages: &[u32]) -> Result<()> {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         // Descending order: deleting a lower index first would shift the higher ones.
         let mut descending = pages.to_vec();
         descending.sort_unstable_by(|left, right| right.cmp(left));
@@ -1855,9 +1825,7 @@ impl RawDocument {
 
     fn move_pages(&self, pages: &[u32], destination: u32) -> Result<()> {
         let indices: Vec<c_int> = pages.iter().map(|page| *page as c_int).collect();
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         // SAFETY: `document` is live and `indices` outlives the call; the API copies the list.
         let moved = unsafe {
             (self.api.move_pages)(
@@ -1877,9 +1845,7 @@ impl RawDocument {
     }
 
     fn insert_blank(&self, index: u32, size: PageSize) -> Result<()> {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         // SAFETY: `document` is live; width/height are finite and positive (checked by `plan`).
         let page =
             unsafe { (self.api.page_new)(self.document, index as c_int, size.width, size.height) };
@@ -1901,9 +1867,7 @@ impl RawDocument {
     /// front and every page (and outline destination) shifts.
     fn import_pages(&self, source: &RawDocument, pages: &[u32], index: u32) -> Result<()> {
         let indices: Vec<c_int> = pages.iter().map(|page| *page as c_int).collect();
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         // SAFETY: both documents are live; `indices` outlives the call and PDFium copies it.
         let imported = unsafe {
             (self.api.import_pages_by_index)(
@@ -1943,9 +1907,7 @@ impl RawDocument {
             failed: false,
         };
         let ok = {
-            let _guard = PDFIUM_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _guard = crate::backend::lock_pdfium()?;
             // SAFETY: `document` is live and `sink.header` is the FPDF_FILEWRITE whose callback
             // writes into `sink`. PDFium calls it only during this call.
             unsafe {
@@ -1982,9 +1944,7 @@ impl RawDocument {
 
 impl Drop for RawDocument {
     fn drop(&mut self) {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium_for_cleanup();
         // SAFETY: the handle came from `load_mem_document`/`create_new_document` and is closed
         // exactly once, here.
         unsafe { (self.api.close_document)(self.document) };
@@ -2074,9 +2034,7 @@ mod tests {
         let mut pages = Vec::with_capacity(count as usize);
         for page in 0..count {
             let records = {
-                let _guard = PDFIUM_LOCK
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let _guard = crate::backend::lock_pdfium().expect("PDFium lock");
                 reader
                     .page_locked(PageIndex(page))
                     .expect("annotation page")

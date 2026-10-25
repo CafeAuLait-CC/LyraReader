@@ -378,7 +378,7 @@ extension ReaderChecks {
             ("AI provider not configured", "", .notConfigured),
         ]
         for (message, baseURL, code) in preparationCases {
-            let error = LyraReaderFfiError.Ai(message: message, code: code)
+            let error = LyraReaderFfiError.Ai(message: message, code: code, severity: .recoverable)
             require(AIAuditCode.classifyPreparationFailure(error, baseURL: baseURL)
                         == legacyPreparationCategory(message, baseURL: baseURL),
                     "preparation code \(code) keeps the category for \(message) (base \(baseURL))")

@@ -107,6 +107,19 @@ pub struct LyraReaderFrameStats {
 /// batch per frame. T1.7 moves this to a dedicated GPU thread with a command queue.
 static GPU: Mutex<Option<GpuContext>> = Mutex::new(None);
 
+/// Acquires [`GPU`], failing fast when an earlier panic poisoned it.
+///
+/// The C ABI cannot throw, so the failure is reported as [`code::ERR_INTERNAL`] after logging
+/// the same document-level sentence the throwing API uses. Continuing through `into_inner()`
+/// would hand out a GPU context whose surface table (and wgpu state) a panic may have left
+/// half-updated.
+fn lock_gpu() -> std::result::Result<std::sync::MutexGuard<'static, Option<GpuContext>>, i32> {
+    lyra_reader_core::sync::lock(&GPU).map_err(|error| {
+        eprintln!("lyra-reader-gpu: {error}");
+        code::ERR_INTERNAL
+    })
+}
+
 /// Returns the ABI version (checked by Swift at startup to avoid random crashes caused by bindings that do not match the library).
 ///
 /// # Safety
@@ -124,9 +137,8 @@ pub extern "C" fn lyra_reader_abi_version() -> u32 {
 pub extern "C" fn lyra_reader_gpu_init(flags: u32) -> i32 {
     let validation = flags & 1 != 0;
 
-    let mut guard = match GPU.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+    let Ok(mut guard) = lock_gpu() else {
+        return code::ERR_INTERNAL;
     };
     if guard.is_some() {
         return code::OK; // Idempotent: Swift may call this from every canvas view.
@@ -177,9 +189,8 @@ pub unsafe extern "C" fn lyra_reader_surface_attach(
         return code::ERR_INVALID_ARGUMENT;
     }
 
-    let mut guard = match GPU.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+    let Ok(mut guard) = lock_gpu() else {
+        return code::ERR_INTERNAL;
     };
     let Some(context) = guard.as_mut() else {
         return code::ERR_NOT_INITIALIZED;
@@ -710,9 +721,8 @@ pub unsafe extern "C" fn lyra_reader_gpu_offscreen_probe(
 /// Shuts down the GPU (releases the device and all surfaces; call before the process exits).
 #[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_gpu_shutdown() -> i32 {
-    let mut guard = match GPU.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+    let Ok(mut guard) = lock_gpu() else {
+        return code::ERR_INTERNAL;
     };
     *guard = None;
     code::OK
@@ -733,9 +743,8 @@ fn with_context<F>(body: F) -> i32
 where
     F: FnOnce(&mut GpuContext) -> lyra_reader_core::Result<()>,
 {
-    let mut guard = match GPU.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+    let Ok(mut guard) = lock_gpu() else {
+        return code::ERR_INTERNAL;
     };
     let Some(context) = guard.as_mut() else {
         return code::ERR_NOT_INITIALIZED;
@@ -746,7 +755,7 @@ where
             use lyra_reader_core::ErrorCode;
             eprintln!("lyra-reader-gpu: {error}");
             match error.code {
-                ErrorCode::InvalidArgument | ErrorCode::NotReady => code::ERR_INVALID_ARGUMENT,
+                ErrorCode::InvalidArgument => code::ERR_INVALID_ARGUMENT,
                 ErrorCode::GpuUnavailable | ErrorCode::BackendUnavailable => {
                     code::ERR_GPU_UNAVAILABLE
                 }

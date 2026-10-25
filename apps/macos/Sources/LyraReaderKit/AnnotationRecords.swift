@@ -115,8 +115,8 @@ enum AnnotationRecords {
     static func message(_ error: Error) -> String {
         if let ffi = error as? LyraReaderFfiError {
             switch ffi {
-            case .Document(let message), .Backend(let message), .InvalidArgument(let message),
-                 .Ai(let message, _):
+            case .Document(let message, _), .Backend(let message, _),
+                 .InvalidArgument(let message, _), .Ai(let message, _, _):
                 return message
             }
         }

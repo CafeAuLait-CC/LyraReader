@@ -56,13 +56,57 @@ fn library_candidates_with(env_override: Option<&str>) -> Vec<PathBuf> {
 /// crash disappeared once every page-handle path (rendering, `page_info`, text extraction,
 /// link and outline reads) took this one lock, which is the honest conclusion: this PDFium
 /// build does not tolerate concurrent use across documents for anything that loads a handle.
+///
+/// **Poisoning policy: fail fast.** A panic while this lock is held means a PDFium call stopped
+/// half-way; continuing with `into_inner()` could render from a torn document state. Normal code
+/// therefore takes it only through [`lock_pdfium`], which turns poisoning into the
+/// [`ErrorCode::CorruptDocument`](lyra_reader_core::ErrorCode) "reopen the document" error shown to
+/// the reader. Destructors, which cannot return an error, take it through
+/// [`lock_pdfium_for_cleanup`] and only release a handle.
 pub(crate) static PDFIUM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquires [`PDFIUM_LOCK`], failing fast when an earlier panic poisoned it.
+///
+/// This is the only way normal (non-destructor) code takes the lock. A poisoned lock means a
+/// PDFium call panicked half-way through; PDFium's process-global state (and any document handle
+/// the panic was touching) cannot be trusted, so the operation reports
+/// [`lyra_reader_core::Severity::Document`] "reopen the document" instead of continuing with
+/// `into_inner()` and risking a silent wrong render or a second crash. Destructors use
+/// [`lock_pdfium_for_cleanup`] instead because they cannot report an error.
+pub(crate) fn lock_pdfium() -> Result<std::sync::MutexGuard<'static, ()>> {
+    lyra_reader_core::sync::lock(&PDFIUM_LOCK)
+}
+
+/// Cleanup-only acquisition of [`PDFIUM_LOCK`] for `Drop` implementations.
+///
+/// A destructor must release the handle even after an earlier panic; leaking a PDFium document
+/// or page for the life of the process is worse than taking the lock through the poison marker.
+/// The mutex guards `()`, not user data, so `into_inner` cannot observe a torn value here.
+pub(crate) fn lock_pdfium_for_cleanup() -> std::sync::MutexGuard<'static, ()> {
+    lyra_reader_core::sync::lock_for_cleanup(&PDFIUM_LOCK)
+}
 
 /// Serialises the one-time load of the PDFium library.
 ///
 /// This is not paranoia: two threads opening their first document at the same time ran
 /// PDFium's global initialisation concurrently and crashed the test binary with SIGSEGV.
 static PDFIUM_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Test-only hook: panics while holding [`PDFIUM_LOCK`], leaving it poisoned.
+///
+/// The integration test that needs a poisoned lock runs in its own process, because poisoning is
+/// permanent for the process; a unit test here would make every concurrently running PDFium test
+/// fail. `debug_assertions` keeps the hook out of release builds.
+#[doc(hidden)]
+#[cfg(debug_assertions)]
+pub fn poison_pdfium_lock_for_test() {
+    let _ = std::panic::catch_unwind(|| {
+        let _guard = PDFIUM_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        panic!("poison the PDFium lock for the fail-fast test");
+    });
+}
 
 /// Loads (once) and returns the process-wide PDFium facade.
 pub(crate) fn pdfium_instance() -> Result<&'static Pdfium> {
@@ -72,9 +116,7 @@ pub(crate) fn pdfium_instance() -> Result<&'static Pdfium> {
 
     // Fast path missed, so take the initialisation lock and check again: the loser of the
     // race must not run `bind_to_library` a second time.
-    let _initialising = PDFIUM_INIT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _initialising = lyra_reader_core::sync::lock(&PDFIUM_INIT)?;
     if let Some(pdfium) = PDFIUM.get() {
         return Ok(pdfium);
     }
@@ -247,9 +289,7 @@ impl PdfiumBackend {
 
         // Loading, page operations and destruction share one transaction lock. The
         // wrapper's per-call mutex does not protect a multi-call page operation.
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         let document = pdfium.load_pdf_from_file(path, password);
 
         match document {
@@ -305,9 +345,7 @@ impl PdfiumBackend {
     /// of the reader, the cache and the shell keep one identity for the document.
     pub fn open_bytes(bytes: Vec<u8>, display_path: &Path) -> Result<Self> {
         let pdfium = pdfium_instance()?;
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         let document = pdfium.load_pdf_from_byte_vec(bytes, None);
         match document {
             Ok(document) => Ok(Self {
@@ -354,9 +392,7 @@ impl PdfiumBackend {
     /// bounds live in the form's coordinate system, so the **form's** bounds (which are in page
     /// space) are what gets reported — geometrically right, and enough to place a preview.
     pub fn page_object_summary(&self, page: PageIndex) -> Result<(Vec<Rect>, usize)> {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         let pdf_page = self.page(page)?;
 
         let mut images = Vec::new();
@@ -372,9 +408,7 @@ impl PdfiumBackend {
     /// a path whose bounding box is a long thin rectangle; separating the two orientations is what
     /// makes a grid detectable instead of a pile of vector art.
     pub fn page_rules(&self, page: PageIndex) -> Result<(Vec<Rect>, Vec<Rect>)> {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         let pdf_page = self.page(page)?;
 
         let mut horizontal = Vec::new();
@@ -411,9 +445,7 @@ impl PdfiumBackend {
     /// which is a known limit (measured on the sample corpus: tables are drawn in the page
     /// content stream, so this does not bite — see the module notes on `table_region`).
     pub fn page_line_segments(&self, page: PageIndex) -> Result<Vec<LineSegment>> {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         let pdf_page = self.page(page)?;
 
         let mut segments = Vec::new();
@@ -427,9 +459,7 @@ impl PdfiumBackend {
     /// the denominator: comparing the two is how a missing capability (named destinations,
     /// remote destinations) shows up as a number instead of a guess.
     pub fn link_annotation_count(&self, page: PageIndex) -> Result<usize> {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         let pdf_page = self.page(page)?;
         Ok(pdf_page.links().len())
     }
@@ -439,9 +469,7 @@ impl PdfiumBackend {
     /// Measurement first: before guessing why links do not resolve, ask the document what
     /// they actually are. Returns one short label per unresolved annotation.
     pub fn unresolved_link_actions(&self, page: PageIndex) -> Result<Vec<String>> {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         let pdf_page = self.page(page)?;
         let mut labels = Vec::new();
 
@@ -487,9 +515,7 @@ impl PdfiumBackend {
     /// Links on a page, reduced to what navigation needs.
     pub fn link_targets(&self, page: PageIndex) -> Result<Vec<RawLink>> {
         // Link actions live in document state (see `PDFIUM_LOCK`).
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
 
         let pdf_page = self.page(page)?;
         let mut links = Vec::new();
@@ -585,20 +611,19 @@ impl PdfiumBackend {
     /// The `annotations` list contains the readable records; `unreadable` names each damaged
     /// annotation so the shell can warn and refuse writes rather than silently dropping it.
     pub fn annotation_page_report(&self, page: PageIndex) -> Result<AnnotationPageReport> {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
 
-        if page.get() >= self.page_count() {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!(
-                    "page {} is out of range (document has {} pages)",
-                    page.get(),
-                    self.page_count()
-                ),
-            ));
-        }
+        let page_count = self.page_count();
+        let page = PageIndex(lyra_reader_core::checked_page_index(
+            page.get(),
+            page_count,
+            |page| {
+                LyraReaderError::new(
+                    ErrorCode::InvalidArgument,
+                    lyra_reader_core::page_out_of_range_message(page, page_count),
+                )
+            },
+        )?);
 
         let reader = self.annotation_reader.get_or_init(|| {
             AnnotationReader::open_locked(&self.path, self.password.as_deref())
@@ -631,15 +656,16 @@ impl PdfiumBackend {
 
     fn page(&self, index: PageIndex) -> Result<PdfPage<'_>> {
         let count = self.page_count();
-        if index.get() >= count {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!(
-                    "page {} is out of range (document has {count} pages)",
-                    index.get()
-                ),
-            ));
-        }
+        let index = PageIndex(lyra_reader_core::checked_page_index(
+            index.get(),
+            count,
+            |page| {
+                LyraReaderError::new(
+                    ErrorCode::InvalidArgument,
+                    lyra_reader_core::page_out_of_range_message(page, count),
+                )
+            },
+        )?);
         // `PdfPageIndex` is pdfium-render's own alias for the page index type; the
         // range check above guarantees the cast is lossless.
         let raw_index = index.get() as PdfPageIndex;
@@ -687,10 +713,7 @@ impl PdfiumBackend {
         index: PageIndex,
         include_content: bool,
     ) -> Result<()> {
-        let mut modes = self
-            .annotation_rendering
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut modes = lyra_reader_core::sync::lock(&self.annotation_rendering)?;
         let state = modes.entry(index).or_insert_with(|| AnnotationRenderState {
             visible_non_links: page
                 .annotations()
@@ -822,9 +845,7 @@ impl PdfiumBackend {
 
 impl Drop for PdfiumBackend {
     fn drop(&mut self) {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium_for_cleanup();
         // Explicitly destroy the handle while the guard is alive. Automatic field
         // destruction would run after this method releases the lock.
         drop(self.document.take());
@@ -839,17 +860,15 @@ impl PdfiumBackend {
     /// so `LyraReaderDocument::form_info` asks PDFium first: `FPDF_GetFormType` is a document-state
     /// read with no parse. `false` (including an XFA-only form, which has no AcroForm widget
     /// dictionaries) means there is nothing this reader can fill.
-    pub fn has_acro_form(&self) -> bool {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    pub fn has_acro_form(&self) -> Result<bool> {
+        let _guard = crate::backend::lock_pdfium()?;
         let Some(document) = self.document.as_ref() else {
-            return false;
+            return Ok(false);
         };
-        document
+        Ok(document
             .form()
             .map(|form| matches!(form.form_type(), PdfFormType::Acrobat))
-            .unwrap_or(false)
+            .unwrap_or(false))
     }
 
     /// How many digital signatures PDFium sees in this document.
@@ -857,14 +876,12 @@ impl PdfiumBackend {
     /// A document-state read with no parse: PDFium has already built the document when it was
     /// opened. [`crate::detect_signature`] uses it as a fallback signal when the dictionary
     /// read finds nothing (or cannot run), never as the only evidence.
-    pub fn signature_count(&self) -> u32 {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    pub fn signature_count(&self) -> Result<u32> {
+        let _guard = crate::backend::lock_pdfium()?;
         let Some(document) = self.document.as_ref() else {
-            return 0;
+            return Ok(0);
         };
-        u32::from(document.signatures().len())
+        Ok(u32::from(document.signatures().len()))
     }
 }
 
@@ -876,9 +893,7 @@ impl DocumentBackend for PdfiumBackend {
 
     fn page_info(&self, index: PageIndex) -> Result<PageInfo> {
         // See `PDFIUM_LOCK`: loading a page handle is document state, exactly like rendering.
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
 
         let page = self.page(index)?;
 
@@ -893,9 +908,7 @@ impl DocumentBackend for PdfiumBackend {
 
     fn outline(&self) -> Result<Vec<OutlineNode>> {
         // Bookmarks live in the document's own state (see `PDFIUM_LOCK`).
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
 
         let bookmarks = self.document.as_ref().expect("live document").bookmarks();
         let mut visited = std::collections::HashSet::new();
@@ -929,9 +942,7 @@ impl DocumentBackend for PdfiumBackend {
 
     fn raw_text_page(&self, page: PageIndex) -> Result<RawTextPage> {
         // Text extraction walks the same document state as rendering (see `PDFIUM_LOCK`).
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
 
         let pdf_page = self.page(page)?;
         let text = pdf_page.text().map_err(|error| {
@@ -1059,9 +1070,7 @@ impl DocumentBackend for PdfiumBackend {
     fn embedded_metadata(&self) -> Result<EmbeddedMetadata> {
         // `FPDF_GetMetaText` reads document state, exactly like the text layer.
         let info = {
-            let _guard = PDFIUM_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _guard = crate::backend::lock_pdfium()?;
             let document = self.document.as_ref().expect("live document");
             let metadata = document.metadata();
             let tag = |kind: PdfDocumentMetadataTagType| {
@@ -1093,13 +1102,8 @@ impl DocumentBackend for PdfiumBackend {
         // See `PDFIUM_LOCK`: rendering is serialised process-wide until this PDFium build's
         // cross-document behaviour is understood. The raster pool therefore buys a responsive
         // main thread, not overlapped work.
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _document_guard = self
-            .raster_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
+        let _document_guard = lyra_reader_core::sync::lock(&self.raster_lock)?;
 
         let page = self.page(request.page)?;
         self.prepare_annotation_rendering(&page, request.page, request.flags.annotations)?;
@@ -2532,5 +2536,85 @@ mod tests {
         eprintln!(
             "transparent region: {clear} clear, {solid} opaque, {antialiased} antialiased pixels; worst composite delta {worst_delta}/255"
         );
+    }
+
+    /// The PDFium-side page entry points share one out-of-range sentence with the FFI side.
+    ///
+    /// Table-driven on purpose: the table is the contract. The appender is a write destination
+    /// whose message used to name the annotation and the page; its identity now lives in
+    /// `detail` so the reader sees the same sentence everywhere.
+    #[test]
+    fn out_of_range_page_messages_are_one_canonical_sentence() {
+        let Some(backend) = backend_for_fixture("multipage.pdf") else {
+            return;
+        };
+        let page_count = backend.page_count();
+        let page = PageIndex(page_count + 1);
+        let expected = lyra_reader_core::page_out_of_range_message(page.get(), page_count);
+
+        let errors = [
+            (
+                "annotation_page_report",
+                backend
+                    .annotation_page_report(page)
+                    .expect_err("out of range"),
+            ),
+            (
+                "page_info",
+                backend.page_info(page).expect_err("out of range"),
+            ),
+        ];
+        for (name, error) in errors {
+            assert_eq!(error.code, ErrorCode::InvalidArgument, "{name}");
+            assert_eq!(error.message, expected, "{name} sentence");
+            assert_eq!(
+                error.severity,
+                lyra_reader_core::Severity::Document,
+                "{name}"
+            );
+        }
+
+        let scratch = crate::test_support::scratch("page-range-messages");
+        let copy = crate::test_support::copy_fixture(&scratch, "multipage.pdf", "source.pdf");
+        let Ok(mut appender) = crate::AnnotationAppender::open(&copy, None) else {
+            eprintln!("skipping the annotation-writer half: this PDFium has no write API");
+            return;
+        };
+        let id = "page-range-check";
+        let annotation = crate::WriteAnnotation {
+            id: id.to_string(),
+            page,
+            kind: crate::WriteAnnotationKind::Highlight,
+            rect: Rect::new(10.0, 10.0, 20.0, 5.0),
+            quads: vec![Rect::new(10.0, 10.0, 20.0, 5.0)],
+            ink_paths: Vec::new(),
+            line: None,
+            line_arrow: false,
+            border_width: 1.0,
+            font_size: 0.0,
+            stamp_style: None,
+            stamp_image: None,
+            alignment: lyra_reader_core::AnnotationAlignment::Left,
+            color: [255, 220, 0],
+            opacity: 1.0,
+            contents: None,
+            author: None,
+            modified: None,
+        };
+        let error = appender.add(&annotation).expect_err("out of range");
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert_eq!(error.message, expected, "appender sentence");
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains(id)),
+            "the annotation identity stays in detail: {:?}",
+            error.detail
+        );
+        // The in-range case is unchanged: page 0 is accepted by the same writer.
+        let mut accepted = annotation.clone();
+        accepted.page = PageIndex(0);
+        appender.add(&accepted).expect("page 0 is in range");
     }
 }

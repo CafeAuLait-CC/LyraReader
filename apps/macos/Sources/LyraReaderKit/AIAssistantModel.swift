@@ -378,7 +378,7 @@ public final class AIAssistantModel: ObservableObject {
             guard documentKey == context.documentKey, pendingChatQuestion == question else { return }
             let message = AIReadableError.message(error)
             let nothingRelevant = (error as? LyraReaderFfiError).map { ffi in
-                if case .Ai(_, let code) = ffi { return code == .nothingRelevant }
+                if case .Ai(_, let code, _) = ffi { return code == .nothingRelevant }
                 return false
             } ?? false
             if nothingRelevant {

@@ -134,6 +134,8 @@ fn stream_options_rejections() -> &'static Mutex<HashSet<(String, String)>> {
 /// byte-identical after a fallback.
 pub fn stream_options_unsupported(endpoint: &str, model: &str) -> bool {
     let cache = stream_options_rejections()
+        // Pure cache of "this endpoint rejected stream_options": a poisoned guard can only
+        // cause the next request to try the field again, which is the safe direction.
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     cache.contains(&(endpoint.to_string(), model.to_string()))
@@ -141,6 +143,8 @@ pub fn stream_options_unsupported(endpoint: &str, model: &str) -> bool {
 
 fn remember_stream_options_unsupported(endpoint: &str, model: &str) {
     let mut cache = stream_options_rejections()
+        // Pure cache of "this endpoint rejected stream_options": a poisoned guard can only
+        // cause the next request to try the field again, which is the safe direction.
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     cache.insert((endpoint.to_string(), model.to_string()));
