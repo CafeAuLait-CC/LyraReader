@@ -148,7 +148,9 @@ struct FormOverlay: View {
                             set: { state.updateFormText(field.id, text: $0) }),
                             fontSize: scaledFont(field), color: .labelColor,
                             onCommit: { state.blurFormField() }, onCancel: { state.blurFormField() },
-                            onTab: { state.focusNextFormField(backwards: $0) }, accessibilityName: field.displayName, useAppearanceFont: false)
+                            onTab: { state.focusNextFormField(backwards: $0) },
+                            accessibilityName: field.displayName, useAppearanceFont: false,
+                            scrollsVertically: true)
                     } else {
                         FormFieldTextEditor(
                             text: Binding(
@@ -157,7 +159,8 @@ struct FormOverlay: View {
                             ),
                             fontSize: scaledFont(field),
                             onTab: { backwards in state.focusNextFormField(backwards: backwards) },
-                            onEscape: { state.blurFormField() }
+                            onEscape: { state.blurFormField() },
+                            accessibilityName: field.displayName
                         )
                     }
                 }
@@ -172,6 +175,7 @@ struct FormOverlay: View {
                     .truncationMode(.tail)
                     .frame(width: max(1, rect.width - 8), height: max(1, rect.height - 4),
                            alignment: .topLeading)
+                    .clipped()
                     .offset(x: 4, y: 2)
                     .allowsHitTesting(false)
             }
@@ -451,6 +455,7 @@ private struct FormFieldTextEditor: NSViewRepresentable {
     var fontSize: CGFloat
     var onTab: (Bool) -> Void
     var onEscape: () -> Void
+    var accessibilityName: String = ""
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -467,6 +472,9 @@ private struct FormFieldTextEditor: NSViewRepresentable {
         field.font = .systemFont(ofSize: fontSize)
         field.textColor = NSColor.labelColor
         field.stringValue = text
+        if !accessibilityName.isEmpty {
+            field.setAccessibilityLabel(accessibilityName)
+        }
         field.onTab = onTab
         field.onEscape = onEscape
         field.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -486,6 +494,9 @@ private struct FormFieldTextEditor: NSViewRepresentable {
         nsView.onTab = onTab
         nsView.onEscape = onEscape
         nsView.font = .systemFont(ofSize: fontSize)
+        if !accessibilityName.isEmpty {
+            nsView.setAccessibilityLabel(accessibilityName)
+        }
         if nsView.stringValue != text, nsView.currentEditor() == nil {
             nsView.stringValue = text
         } else if nsView.stringValue != text {

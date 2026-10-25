@@ -8041,9 +8041,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// One text edit. `maxLength` is enforced as characters, matching how PDF `/MaxLen` counts.
+    ///
+    /// A multiline field keeps the reader's line breaks (the save normalises CR/CRLF to LF). A
+    /// single-line field cannot hold one: a paste that carries a line break becomes a space, the
+    /// same rule the writer applies to `/V`, so the draft never promises a line the file cannot
+    /// keep.
     public func updateFormText(_ id: String, text: String) {
         guard let field = formField(id: id), field.kind == .text, field.editable else { return }
         var value = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        if !field.multiline {
+            value = value.replacingOccurrences(of: "\n", with: " ")
+        }
         if let maxLength = field.maxLength, value.count > maxLength {
             value = String(value.prefix(maxLength))
         }
