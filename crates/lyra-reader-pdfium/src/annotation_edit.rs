@@ -20,7 +20,7 @@
 //!
 //! | kind | appearance |
 //! | --- | --- |
-//! | `/Highlight`, `/Underline`, `/StrikeOut` | no `/AP` is written; when colour or opacity changes the old `/AP` is **removed**, so every viewer synthesises the mark from the new `/C` with the multiply default those kinds have. A comment-only edit keeps the file's own `/AP` untouched. |
+//! | `/Highlight`, `/Underline`, `/StrikeOut`, `/Squiggly` | regenerated when colour or opacity changes, from the file's own `/Rect`, `/QuadPoints` and `/BM`; the new `/AP /N` states the same blend and constant alpha. A comment-only edit keeps the producer's `/AP` untouched. |
 //! | `/Text` (sticky note) | untouched. The icon is the viewer's glyph, selected by `/Name`; moving `/Rect` keeps it. |
 //! | `/FreeText` | regenerated: a form XObject with the exact new text, colour, size and alignment, in the bundled font. |
 //! | `/Ink`, `/Square`, `/Circle`, `/Line` | regenerated when colour, opacity, geometry or border width changes; a comment-only edit keeps the producer's own appearance. |
@@ -57,12 +57,14 @@
 
 use crate::annotations::{WriteAnnotation, WriteAnnotationKind};
 use crate::geometry_write::{
-    EmbeddedFreeTextFont, add_appearance_object, annots_array, build_free_text_font, colour_array,
-    deref, line_array, load_document, lopdf_error, name, number, quadding, rect_array,
-    stamp_icon_name, text_string,
+    EmbeddedFreeTextFont, add_appearance_object, add_appearance_object_with_blend, annots_array,
+    build_free_text_font, colour_array, default_markup_blend, deref, line_array, load_document,
+    lopdf_error, name, number, quadding, rect_array, stamp_icon_name, text_string,
 };
 use lopdf::{Dictionary, Document, IncrementalDocument, Object, ObjectId};
-use lyra_reader_core::{ErrorCode, LyraReaderError, Point, RawAnnotationLine, Rect, Result};
+use lyra_reader_core::{
+    AnnotationBlend, ErrorCode, LyraReaderError, Point, RawAnnotationLine, Rect, Result,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Write;
@@ -693,7 +695,7 @@ fn apply_removals(incremental: &mut IncrementalDocument, plan: &RemovalPlan) -> 
 
 /// Whether the editor owns this annotation subtype.
 ///
-/// A file may carry kinds this editor does not model (`/Link`, `/Widget`, `/Squiggly`, …). They
+/// A file may carry kinds this editor does not model (`/Link`, `/Widget`, `/Polygon`, …). They
 /// still belong to the document, so naming one in an edit is a deliberate refusal: the problem is
 /// the kind, not that the annotation is missing.
 fn is_editable_subtype(subtype: Option<&str>) -> bool {
@@ -703,6 +705,7 @@ fn is_editable_subtype(subtype: Option<&str>) -> bool {
             "Highlight"
                 | "Underline"
                 | "StrikeOut"
+                | "Squiggly"
                 | "Text"
                 | "FreeText"
                 | "Ink"
@@ -827,11 +830,30 @@ fn update_one(
         WriteAnnotationKind::Highlight
         | WriteAnnotationKind::Underline
         | WriteAnnotationKind::StrikeOut
-        | WriteAnnotationKind::Text => false,
+        | WriteAnnotationKind::Squiggly => visual_changed,
+        WriteAnnotationKind::Text => false,
     };
-    // The appearance is appended before the dictionary is borrowed mutably.
-    let appearance = regenerate
-        .then(|| add_appearance_object(&mut incremental.new_document, &update.values, font));
+    // The appearance is appended before the dictionary is borrowed mutably. A text mark keeps
+    // the file's own `/Rect` and `/QuadPoints` (its geometry is the text selection's, not this
+    // editor's), so the new stream is laid out from those values and from the file's own `/BM`.
+    let appearance = regenerate.then(|| {
+        if !kind.is_markup() {
+            return add_appearance_object(&mut incremental.new_document, &update.values, font);
+        }
+        let mut values = update.values.clone();
+        if let Some(rect) = source_rect(&source) {
+            values.rect = rect;
+        }
+        if let Some(quads) = source_quads(&source) {
+            if !quads.is_empty() {
+                values.quads = quads;
+            }
+        } else if values.quads.is_empty() {
+            values.quads = vec![values.rect];
+        }
+        let blend = source_blend(&source).unwrap_or_else(|| default_markup_blend(kind));
+        add_appearance_object_with_blend(&mut incremental.new_document, &values, font, Some(blend))
+    });
 
     let dictionary = annotation_dictionary_mut(incremental, key)?;
 
@@ -858,11 +880,16 @@ fn update_one(
         }
         WriteAnnotationKind::Highlight
         | WriteAnnotationKind::Underline
-        | WriteAnnotationKind::StrikeOut => {
+        | WriteAnnotationKind::StrikeOut
+        | WriteAnnotationKind::Squiggly => {
             // Geometry is the text's, not the editor's. Colour and opacity are the only visual
-            // fields, so only those can make the file's own appearance stale.
+            // fields, so only those can make the file's own appearance stale. A comment-only
+            // edit keeps the producer's appearance untouched.
             if visual_changed {
-                dictionary.remove(b"AP");
+                set_normal_appearance(
+                    dictionary,
+                    appearance.expect("markup annotations regenerate /AP when colour changes"),
+                );
             }
         }
         WriteAnnotationKind::Text => {
@@ -949,6 +976,7 @@ fn visual_change(source: &Dictionary, values: &WriteAnnotation) -> bool {
         WriteAnnotationKind::Highlight
         | WriteAnnotationKind::Underline
         | WriteAnnotationKind::StrikeOut
+        | WriteAnnotationKind::Squiggly
         | WriteAnnotationKind::Text => false,
         WriteAnnotationKind::FreeText
         | WriteAnnotationKind::Stamp
@@ -996,6 +1024,43 @@ fn source_rect(dictionary: &Dictionary) -> Option<Rect> {
         f64::from(values[2] - values[0]),
         f64::from(values[3] - values[1]),
     ))
+}
+
+/// A text mark's `/QuadPoints`, one page-space box per quadrilateral.
+///
+/// The editor never changes them; they are read back only so a regenerated appearance paints the
+/// same geometry the annotation dictionary describes. A malformed array falls back to `/Rect`.
+fn source_quads(dictionary: &Dictionary) -> Option<Vec<Rect>> {
+    let array = dictionary.get(b"QuadPoints").ok()?.as_array().ok()?;
+    if array.len() % 8 != 0 {
+        return None;
+    }
+    let values: Option<Vec<f32>> = array.iter().map(number).collect();
+    let values = values?;
+    let mut quads = Vec::with_capacity(values.len() / 8);
+    for chunk in values.as_chunks::<8>().0 {
+        let min_x = chunk.iter().copied().fold(f32::INFINITY, f32::min);
+        let max_x = chunk.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let min_y = chunk.iter().copied().fold(f32::INFINITY, f32::min);
+        let max_y = chunk.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        if min_x.is_finite() && max_x.is_finite() && min_y.is_finite() && max_y.is_finite() {
+            quads.push(Rect::new(
+                f64::from(min_x),
+                f64::from(min_y),
+                f64::from(max_x - min_x),
+                f64::from(max_y - min_y),
+            ));
+        }
+    }
+    Some(quads)
+}
+
+/// The file's own `/BM`, for an appearance that has to reproduce it.
+fn source_blend(dictionary: &Dictionary) -> Option<AnnotationBlend> {
+    let bytes = dictionary.get(b"BM").ok()?.as_name().ok()?;
+    Some(AnnotationBlend::from_pdf_name(&String::from_utf8_lossy(
+        bytes,
+    )))
 }
 
 fn source_ink(dictionary: &Dictionary) -> Vec<Vec<Point>> {
@@ -1421,7 +1486,8 @@ fn verify_update(
         }
         WriteAnnotationKind::Highlight
         | WriteAnnotationKind::Underline
-        | WriteAnnotationKind::StrikeOut => {
+        | WriteAnnotationKind::StrikeOut
+        | WriteAnnotationKind::Squiggly => {
             for key in [b"Rect".as_slice(), b"QuadPoints".as_slice()] {
                 if before.get(key).ok() != after.get(key).ok() {
                     return Err(fail(format!(
@@ -1431,6 +1497,9 @@ fn verify_update(
                     )));
                 }
             }
+            // A colour/opacity edit replaces `/AP /N`; a comment-only edit leaves the
+            // producer's stream byte-for-byte alone.
+            verify_appearance_policy(before, after, update, saved_document, &fail)?;
         }
         WriteAnnotationKind::Text => {
             verify_rect(after, values.rect, &fail, &update.target)?;

@@ -212,12 +212,12 @@ extension ReaderChecks {
             viewSpaceRect: firstRects[0],
             scale: 2
         )
-        require(pixels.yellow > 100,
-                "PDFKit shows the highlight without an appearance stream (\(pixels.yellow) yellow px)")
+        require(pixels.tinted > 100,
+                "PDFKit paints the written highlight appearance (\(pixels.tinted) tinted px)")
         require(pixels.dark > 20,
                 "PDFKit keeps the glyphs black under the highlight (\(pixels.dark) dark px)")
         FileHandle.standardError.write(Data(
-            "lyra-reader-writeback: PDFKit highlight pixels yellow=\(pixels.yellow) dark=\(pixels.dark)\n".utf8
+            "lyra-reader-writeback: PDFKit highlight pixels tinted=\(pixels.tinted) dark=\(pixels.dark)\n".utf8
         ))
 
         // ── 3b. A /Text note: the writer supports it, and Preview shows an icon ────────
@@ -360,7 +360,7 @@ extension ReaderChecks {
         url: URL,
         viewSpaceRect: CGRect,
         scale: CGFloat
-    ) throws -> (yellow: Int, dark: Int) {
+    ) throws -> (tinted: Int, dark: Int) {
         guard let document = PDFDocument(url: url), let page = document.page(at: 0) else {
             throw NSError(
                 domain: "LyraReader",
@@ -405,7 +405,11 @@ extension ReaderChecks {
         let maxX = min(Int(viewSpaceRect.maxX * scale) - 6, width - 1)
         let minY = max(Int(viewSpaceRect.minY * scale) + 2, 0)
         let maxY = min(Int(viewSpaceRect.maxY * scale) - 2, height - 1)
-        var yellow = 0
+        // The appearance paints the palette colour at `/CA 0.4` with `/BM /Multiply`, so over
+        // white paper the yellow palette entry becomes the same pale tint the canvas draws
+        // (`#FFD840` at 40% → `#FFEFB2`). Counting only saturated yellow would now count zero:
+        // that is the appearance working, not the mark disappearing.
+        var tinted = 0
         var dark = 0
         guard minX < maxX, minY < maxY else { return (0, 0) }
         for y in minY...maxY {
@@ -414,15 +418,15 @@ extension ReaderChecks {
                 let red = UInt16(png[offset])
                 let green = UInt16(png[offset + 1])
                 let blue = UInt16(png[offset + 2])
-                if red > 180 && green > 150 && blue < 120 {
-                    yellow += 1
+                if red > 220 && green > 200 && blue > 120 && blue < 220 {
+                    tinted += 1
                 }
                 if red < 40 && green < 40 && blue < 40 {
                     dark += 1
                 }
             }
         }
-        return (yellow, dark)
+        return (tinted, dark)
     }
     /// Counts non-white pixels in `viewSpaceRect`, for "did another viewer draw the note icon?".
     @MainActor
