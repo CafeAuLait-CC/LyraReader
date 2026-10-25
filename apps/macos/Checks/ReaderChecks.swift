@@ -403,6 +403,7 @@ struct ReaderChecks {
         if CommandLine.arguments.contains("--check-eraser") {
             let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await eraserChecks(
+                root: root,
                 drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
                 strokes: root.appendingPathComponent("tests/fixtures/annotated-strokes.pdf"))
             try await partialEraseChecks(
@@ -838,6 +839,7 @@ struct ReaderChecks {
             }),
             ("eraser", {
                 try await eraserChecks(
+                    root: root,
                     drawing: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
                     strokes: root.appendingPathComponent("tests/fixtures/annotated-strokes.pdf"))
             }),
