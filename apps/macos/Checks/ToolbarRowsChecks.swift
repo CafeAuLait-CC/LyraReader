@@ -992,8 +992,14 @@ extension ReaderChecks {
                 row: 1, panel: progress, editingPanel: 0)
             let expectedWidth = ReaderSidePanelMetrics.totalWidth(
                 contentWidth: state.rightPanelWidthPt) * CGFloat(progress)
+            // Wait for the pinned frame *and* the row/panel edge together. The width alone can
+            // reach its target one layout pass before the marker's leading edge settles after a
+            // close, which made this assertion depend on how loaded the run loop was.
             try await eventually("the assistant panel is pinned at \(progress)", {
-                abs((harness.sidePanelRect()?.width ?? -1) - expectedWidth) <= 1
+                guard let panel = harness.sidePanelRect(),
+                      let row = harness.chromeRect(.secondaryToolbar) else { return false }
+                return abs(panel.width - expectedWidth) <= 1
+                    && abs(row.maxX - panel.minX) <= 0.5
             })
             harness.host.layoutSubtreeIfNeeded()
             guard let row = harness.chromeRect(.secondaryToolbar),
@@ -1034,9 +1040,13 @@ extension ReaderChecks {
             state.transitionProgressOverride = ReaderTransitionProgress(
                 sidebar: progress, row: 1, panel: 0, editingPanel: 0)
             let expectedInset = ReaderChrome.sidebarTotalWidthPt * CGFloat(progress)
+            // The row reaches its pinned edge before the canvas has finished following it; wait
+            // for both so the coverage assertion is a fact about the settled frame.
             try await eventually("the sidebar is pinned at \(progress)", {
                 guard let row = harness.chromeRect(.secondaryToolbar) else { return false }
+                let canvas = harness.canvasRect
                 return abs(row.minX - expectedInset) <= 0.5
+                    && row.minX <= canvas.minX + 0.5 && row.maxX >= canvas.maxX - 0.5
             })
             harness.host.layoutSubtreeIfNeeded()
             guard let row = harness.chromeRect(.secondaryToolbar) else {
