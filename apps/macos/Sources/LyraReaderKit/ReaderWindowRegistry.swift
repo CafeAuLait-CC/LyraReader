@@ -222,9 +222,10 @@ public final class ReaderWindowRegistry: ObservableObject {
                         + "kept it (it has unsaved changes). The move was rolled back.")
                 }
             } else {
+                let reason = session.state.lastTabTransferRefusal
+                    ?? "The new window could not open the document."
                 pending.source.reportTabTransferFailure(
-                    "Couldn’t open “\(pending.transfer.title)” in a new window. "
-                    + "\(pending.source.lastError ?? "")")
+                    "Couldn’t open “\(pending.transfer.title)” in a new window. \(reason)")
             }
             return
         }

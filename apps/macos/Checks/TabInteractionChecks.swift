@@ -417,7 +417,32 @@ extension ReaderChecks {
         require(allTabURLs(in: [sourceState, torn]).filter { $0 == "window-a.pdf" }.count == 1,
                 "the returned document is open in exactly one window")
 
-        // 5. Escape cancels: no order change, no window, no document opened.
+        // 5. A destination that already has the document refuses the move: accepting it would
+        //    put the same file in two windows. The source tab stays exactly where it was.
+        torn.newTab(url: a)
+        registerZones()
+        let targetTabsWithDuplicate = torn.tabs.map(\.url.lastPathComponent)
+        let sourceTabsWithDuplicate = sourceState.tabs.map(\.url.lastPathComponent)
+        coordinator.beginDrag()
+        let duplicateOutcome = coordinator.finishDrag(
+            source: sourceState, sourceIndex: 0, localInsertionIndex: 0,
+            screenPoint: point(in: targetZone, contentX: 0))
+        guard case let .refused(duplicateReason) = duplicateOutcome else {
+            fatalError("FAIL: a duplicate document was not refused: \(duplicateOutcome)")
+        }
+        require(duplicateReason.contains("already open in the other window"),
+                "the duplicate refusal names the other window: \(duplicateReason)")
+        require(sourceState.tabs.map(\.url.lastPathComponent) == sourceTabsWithDuplicate,
+                "a duplicate refusal leaves the source tab in place")
+        require(torn.tabs.map(\.url.lastPathComponent) == targetTabsWithDuplicate,
+                "a duplicate refusal leaves the target window unchanged")
+        // Remove the duplicate again so the escape check below starts from the one-copy state.
+        torn.closeTab(torn.tabs.count - 1)
+        registerZones()
+        require(torn.tabs.map(\.url.lastPathComponent) == ["window-b.pdf"],
+                "the duplicate tab closes again for the remaining checks")
+
+        // 6. Escape cancels: no order change, no window, no document opened.
         let windowsBeforeEscape = registry.sessions.count
         let sourceTabsBeforeEscape = sourceState.tabs.map(\.url.lastPathComponent)
         let targetTabsBeforeEscape = torn.tabs.map(\.url.lastPathComponent)
@@ -439,7 +464,7 @@ extension ReaderChecks {
                 "a cancelled drag creates no window")
         require(!coordinator.isDragging, "the cancelled drag is over")
 
-        // 6. Unsaved changes block the move, with a reason and no window. `contentTextEditing` is
+        // 7. Unsaved changes block the move, with a reason and no window. `contentTextEditing` is
         //    part of `hasUnsavedDocumentChanges`; the same guard covers page, form and annotation
         //    writes. The tab stays in its window.
         sourceState.contentTextEditing = true

@@ -12896,6 +12896,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         )
     }
 
+    /// The reason the last incoming transfer was refused.
+    ///
+    /// Not `lastError`: the destination window is usually not the key window during a drag, so an
+    /// alert there would appear late and in the wrong window. The caller (``TabMove`` or the
+    /// window registry) reads this and reports it in the source window, where the reader let go.
+    public private(set) var lastTabTransferRefusal: String?
+
+    @discardableResult
+    private func refuseTabTransfer(_ message: String) -> Bool {
+        lastTabTransferRefusal = message
+        statusMessage = "Couldn’t receive the tab"
+        FileHandle.standardError.write(Data("lyra-reader-tabs: \(message)\n".utf8))
+        return false
+    }
+
     /// Receives a tab from another window and inserts it at `insertionIndex` (the gap in this
     /// window's order before the move, or the end when `nil`). The reader ends up looking at the
     /// arriving tab, at its saved reading position.
@@ -12908,27 +12923,23 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func acceptTabTransfer(_ transfer: TabTransfer, atInsertionIndex insertionIndex: Int? = nil) -> Bool {
         if contentTextEditing || contentTextRecovery != nil || contentCommandInFlight
             || pageEditBusy || annotationSaveInProgress {
-            reportTabTransferFailure(
+            return refuseTabTransfer(
                 "The other window is still editing or saving. Finish there, then move the tab again.")
-            return false
         }
         if hasUnsavedDocumentChanges {
-            reportTabTransferFailure(
+            return refuseTabTransfer(
                 "The other window has unsaved changes. Save or discard them before moving a tab into it.")
-            return false
         }
         // Opening a second copy of a document this window already has would leave it open twice
         // for the same drop. Refuse, so the source tab stays where it is.
         if tabs.contains(where: { Self.resolvesToSameFile($0.url, transfer.url) }) {
-            reportTabTransferFailure(
+            return refuseTabTransfer(
                 "“\(transfer.title)” is already open in the other window. "
                 + "Close that tab before moving this one there.")
-            return false
         }
         guard open(url: transfer.url, restoringTabScroll: transfer.scrollYPt) else {
-            reportTabTransferFailure(
+            return refuseTabTransfer(
                 "Couldn’t open “\(transfer.title)” in this window. \(lastError ?? "")")
-            return false
         }
         let index = min(max(insertionIndex ?? tabs.count, 0), tabs.count)
         tabs.insert(OpenTab(

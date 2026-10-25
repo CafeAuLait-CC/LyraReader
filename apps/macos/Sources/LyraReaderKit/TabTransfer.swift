@@ -67,8 +67,10 @@ public enum TabMove {
         insertionIndex: Int
     ) -> Bool {
         guard target.acceptTabTransfer(transfer, atInsertionIndex: insertionIndex) else {
+            let reason = target.lastTabTransferRefusal
+                ?? "The other window refused the tab."
             source.reportTabTransferFailure(
-                "Couldn’t move “\(transfer.title)” to the other window. \(source.lastError ?? "")")
+                "Couldn’t move “\(transfer.title)” to the other window. \(reason)")
             return false
         }
         // A tab that vanished with its source window is already gone; that is a completed move,
