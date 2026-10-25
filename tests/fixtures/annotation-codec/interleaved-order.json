@@ -1,0 +1,38 @@
+[
+  {
+    "colorIndex" : 0,
+    "createdAt" : 804000000.5,
+    "end" : 2,
+    "id" : "00000029-1111-4222-8333-000000000029",
+    "kind" : "highlight",
+    "note" : "first",
+    "page" : 0,
+    "start" : 0
+  },
+  {
+    "createdAt" : 804000000.5,
+    "id" : "00000067-1111-4222-8333-000000000067",
+    "kind" : "bookmark",
+    "page" : 0,
+    "title" : "between",
+    "yPt" : 4.5
+  },
+  {
+    "colorIndex" : 0,
+    "createdAt" : 804000000.5,
+    "end" : 5,
+    "id" : "0000002A-1111-4222-8333-00000000002A",
+    "kind" : "highlight",
+    "note" : "second",
+    "page" : 0,
+    "start" : 3
+  },
+  {
+    "createdAt" : 804000000.5,
+    "id" : "00000068-1111-4222-8333-000000000068",
+    "kind" : "bookmark",
+    "page" : 0,
+    "title" : "after",
+    "yPt" : 9.75
+  }
+]

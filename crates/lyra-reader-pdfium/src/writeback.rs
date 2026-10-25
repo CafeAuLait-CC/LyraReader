@@ -178,16 +178,10 @@ const FILE_NAME_ATTEMPTS: u32 = 3;
 
 /// Hard limits, so a malformed shell request cannot ask the writer to build an unreasonable PDF.
 const MAX_ANNOTATIONS: usize = 20_000;
-const MAX_QUADS: usize = 1_000;
 const MAX_INK_PATHS: usize = 256;
 const MAX_INK_POINTS: usize = 100_000;
-const MAX_TEXT_BYTES: usize = 100_000;
-const MAX_AUTHOR_BYTES: usize = 1_024;
+/// An `/NM` assigned to an annotation that had none.
 const MAX_ID_BYTES: usize = 128;
-/// A stamp is a short mark, not a text box; a longer string is a request mistake.
-const MAX_STAMP_TEXT_BYTES: usize = 512;
-/// The largest image signature the writer will store, per side.
-const MAX_STAMP_IMAGE_SIDE: u32 = 8_192;
 
 /// Appends `annotations` to `source` and writes the result to `destination`.
 ///
@@ -1000,6 +994,10 @@ pub fn suggested_copy_path(source: &Path) -> PathBuf {
     source.with_file_name(format!("{stem} (annotated).{extension}"))
 }
 
+fn rule_error(error: lyra_reader_edit::rules::RuleError) -> LyraReaderError {
+    LyraReaderError::new(ErrorCode::InvalidArgument, error.message)
+}
+
 fn validate(annotations: &[WriteAnnotation], page_count: u32) -> Result<()> {
     if annotations.len() > MAX_ANNOTATIONS {
         return Err(LyraReaderError::new(
@@ -1008,40 +1006,21 @@ fn validate(annotations: &[WriteAnnotation], page_count: u32) -> Result<()> {
         ));
     }
 
-    let mut ids = HashSet::new();
+    let ids: Vec<String> = annotations
+        .iter()
+        .map(|annotation| annotation.id.clone())
+        .collect();
+    lyra_reader_edit::rules::validate_unique_annotation_ids(&ids).map_err(rule_error)?;
     for annotation in annotations {
         let id = &annotation.id;
-        if id.is_empty()
-            || id.len() > MAX_ID_BYTES
-            || !id.bytes().all(|byte| byte.is_ascii_graphic())
-        {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                "an annotation identity must be 1–128 printable ASCII characters",
-            )
-            .with_detail(format!("id: {id:?}")));
-        }
-        if !ids.insert(id.clone()) {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!("two annotations in one save share the identity {id:?}"),
-            ));
-        }
-        if annotation.page.0 >= page_count {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!(
-                    "annotation {id:?} names page {}, but the document has {page_count} page(s)",
-                    annotation.page.get()
-                ),
-            ));
-        }
-        if !annotation.opacity.is_finite() || !(0.0..=1.0).contains(&annotation.opacity) {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!("annotation {id:?} has an opacity outside 0…1"),
-            ));
-        }
+        lyra_reader_edit::rules::validate_annotation_identity(id).map_err(rule_error)?;
+        lyra_reader_edit::rules::validate_page(
+            id,
+            i64::from(annotation.page.0),
+            page_count as usize,
+        )
+        .map_err(rule_error)?;
+        lyra_reader_edit::rules::validate_opacity(id, annotation.opacity).map_err(rule_error)?;
         validate_rect(&annotation.rect, id, "rect")?;
         match annotation.kind {
             WriteAnnotationKind::Text => {
@@ -1059,15 +1038,8 @@ fn validate(annotations: &[WriteAnnotation], page_count: u32) -> Result<()> {
                         format!("free-text annotation {id:?} must not carry /QuadPoints"),
                     ));
                 }
-                if !annotation.font_size.is_finite()
-                    || annotation.font_size < 1.0
-                    || annotation.font_size > 400.0
-                {
-                    return Err(LyraReaderError::new(
-                        ErrorCode::InvalidArgument,
-                        format!("free-text annotation {id:?} has a font size outside 1…400 pt"),
-                    ));
-                }
+                lyra_reader_edit::rules::validate_font_size(id, annotation.font_size)
+                    .map_err(rule_error)?;
             }
             WriteAnnotationKind::Highlight
             | WriteAnnotationKind::Underline
@@ -1079,12 +1051,8 @@ fn validate(annotations: &[WriteAnnotation], page_count: u32) -> Result<()> {
                         format!("markup annotation {id:?} has no /QuadPoints"),
                     ));
                 }
-                if annotation.quads.len() > MAX_QUADS {
-                    return Err(LyraReaderError::new(
-                        ErrorCode::InvalidArgument,
-                        format!("annotation {id:?} has more than {MAX_QUADS} quads"),
-                    ));
-                }
+                lyra_reader_edit::rules::validate_quads(id, annotation.quads.len())
+                    .map_err(rule_error)?;
                 for quad in &annotation.quads {
                     validate_rect(quad, id, "quad")?;
                 }
@@ -1097,32 +1065,12 @@ fn validate(annotations: &[WriteAnnotation], page_count: u32) -> Result<()> {
                     ));
                 }
                 let text = annotation.contents.as_deref().unwrap_or("");
-                if text.trim().is_empty() {
-                    return Err(LyraReaderError::new(
-                        ErrorCode::InvalidArgument,
-                        format!("stamp annotation {id:?} has no text"),
-                    ));
-                }
-                if text.len() > MAX_STAMP_TEXT_BYTES {
-                    return Err(LyraReaderError::new(
-                        ErrorCode::InvalidArgument,
-                        format!(
-                            "stamp annotation {id:?} has more than {MAX_STAMP_TEXT_BYTES} bytes of text"
-                        ),
-                    ));
-                }
-                if !matches!(
-                    annotation.stamp_style.as_deref(),
-                    Some("approved" | "reviewed" | "draft" | "confidential" | "date" | "custom")
-                ) {
-                    return Err(LyraReaderError::new(
-                        ErrorCode::InvalidArgument,
-                        format!(
-                            "stamp annotation {id:?} has an unknown style {:?}",
-                            annotation.stamp_style
-                        ),
-                    ));
-                }
+                lyra_reader_edit::rules::validate_stamp_text(id, text).map_err(rule_error)?;
+                lyra_reader_edit::rules::validate_stamp_style(
+                    id,
+                    annotation.stamp_style.as_deref().unwrap_or(""),
+                )
+                .map_err(rule_error)?;
                 if annotation.stamp_image.is_some() {
                     return Err(LyraReaderError::new(
                         ErrorCode::InvalidArgument,
@@ -1143,25 +1091,13 @@ fn validate(annotations: &[WriteAnnotation], page_count: u32) -> Result<()> {
                         format!("signature annotation {id:?} has no image"),
                     ));
                 };
-                if image.width == 0
-                    || image.height == 0
-                    || image.width > MAX_STAMP_IMAGE_SIDE
-                    || image.height > MAX_STAMP_IMAGE_SIDE
-                {
-                    return Err(LyraReaderError::new(
-                        ErrorCode::InvalidArgument,
-                        format!(
-                            "signature annotation {id:?} has dimensions {}×{}; the limit is {MAX_STAMP_IMAGE_SIDE} on a side",
-                            image.width, image.height
-                        ),
-                    ));
-                }
-                if image.rgba.len() != image.width as usize * image.height as usize * 4 {
-                    return Err(LyraReaderError::new(
-                        ErrorCode::InvalidArgument,
-                        format!("signature annotation {id:?} has a pixel buffer of the wrong size"),
-                    ));
-                }
+                lyra_reader_edit::rules::validate_signature_dimensions(
+                    id,
+                    image.width,
+                    image.height,
+                    image.rgba.len(),
+                )
+                .map_err(rule_error)?;
                 if annotation
                     .contents
                     .as_deref()
@@ -1245,44 +1181,13 @@ fn validate(annotations: &[WriteAnnotation], page_count: u32) -> Result<()> {
             }
         }
         if let Some(contents) = &annotation.contents {
-            if contents.len() > MAX_TEXT_BYTES {
-                return Err(LyraReaderError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("annotation {id:?} has more than {MAX_TEXT_BYTES} bytes of text"),
-                ));
-            }
-            if contents.contains('\0') {
-                return Err(LyraReaderError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("annotation {id:?} has a NUL in its contents"),
-                ));
-            }
+            lyra_reader_edit::rules::validate_note(id, contents).map_err(rule_error)?;
         }
         if let Some(author) = &annotation.author {
-            if author.len() > MAX_AUTHOR_BYTES {
-                return Err(LyraReaderError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("annotation {id:?} has an author longer than {MAX_AUTHOR_BYTES} bytes"),
-                ));
-            }
-            if author.contains('\0') {
-                return Err(LyraReaderError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("annotation {id:?} has a NUL in its author"),
-                ));
-            }
+            lyra_reader_edit::rules::validate_author(id, author).map_err(rule_error)?;
         }
-        if let Some(modified) = &annotation.modified
-            && (!modified.starts_with("D:")
-                || !modified.is_ascii()
-                || modified.len() > 64
-                || modified.contains('\0'))
-        {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!("annotation {id:?} has a malformed PDF date"),
-            )
-            .with_detail(format!("{modified:?}")));
+        if let Some(modified) = &annotation.modified {
+            lyra_reader_edit::rules::validate_pdf_date(id, modified).map_err(rule_error)?;
         }
     }
     Ok(())
@@ -1408,16 +1313,7 @@ fn validate_rect(rect: &lyra_reader_core::Rect, id: &str, what: &str) -> Result<
 
 /// The checks every stroked kind shares: a positive border width and no quads.
 fn validate_geometry_common(annotation: &WriteAnnotation, id: &str) -> Result<()> {
-    if !annotation.border_width.is_finite()
-        || annotation.border_width <= 0.0
-        || annotation.border_width > 200.0
-    {
-        return Err(LyraReaderError::new(
-            ErrorCode::InvalidArgument,
-            format!("annotation {id:?} has a border width outside 0…200 pt"),
-        ));
-    }
-    Ok(())
+    lyra_reader_edit::rules::validate_border_width(id, annotation.border_width).map_err(rule_error)
 }
 
 /// A point must be finite and inside the annotation's own box (with half a point of slack for

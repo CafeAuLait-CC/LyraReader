@@ -41,6 +41,10 @@ use lyra_reader_core::{
     AnnotationAlignment, AnnotationDrawing, DocumentBackend, ENGINE_VERSION, EngineConfig,
     ErrorCode, PageGeometry, PageIndex, Point, RasterRequest, RawAnnotationLine, Transform2D,
 };
+use lyra_reader_edit::{
+    kind::{AnnotationKind as TaxonomyKind, WriteKind as TaxonomyWriteKind},
+    records as annotation_records, rules as annotation_rules,
+};
 use lyra_reader_metadata::{BibEntry, MetadataSource, RecognizedMetadata, recognize};
 use lyra_reader_pdfium::{
     DEFAULT_BOOKMARK_TITLE, EmbeddedBookmarks, PageOperation, PdfiumBackend, SaveMode, SplitPart,
@@ -3886,6 +3890,27 @@ impl LyraReaderDocument {
                 } else {
                     annotation.kind.as_str().to_string()
                 };
+                let kind_flags = TaxonomyKind::from_document_kind(&kind).flags();
+                let (editable, unsupported_reason) =
+                    document_editability(AnnotationEditabilityInput {
+                        kind: &kind,
+                        is_reply: annotation.is_reply,
+                        visible: annotation.visible,
+                        ink_paths_empty: annotation.ink_paths.is_empty(),
+                        line_missing: annotation.line.is_none(),
+                        stamp_text_empty: annotation.stamp.as_ref().is_none_or(|stamp| {
+                            stamp.text.as_deref().unwrap_or("").trim().is_empty()
+                        }),
+                        stamp_has_image: annotation
+                            .stamp
+                            .as_ref()
+                            .is_some_and(|stamp| stamp.image.is_some()),
+                        stamp_image_error: annotation
+                            .stamp
+                            .as_ref()
+                            .and_then(|stamp| stamp.image_error.as_deref()),
+                        drawing,
+                    });
 
                 records.push(AnnotationRecord {
                     page,
@@ -3944,6 +3969,11 @@ impl LyraReaderDocument {
                         _ => None,
                     },
                     visible: annotation.visible,
+                    is_markup: kind_flags.is_markup,
+                    is_geometry: kind_flags.is_geometry,
+                    is_note: kind_flags.is_note,
+                    editable,
+                    unsupported_reason,
                 });
             }
         }
@@ -4202,19 +4232,22 @@ impl LyraReaderDocument {
             });
         }
         let page_count = self.backend.page_count();
+        // One rule set with the outline writer and the shell's creation-time check.
+        let bookmark_limits: Vec<annotation_rules::BookmarkSpec<'_>> = bookmarks
+            .iter()
+            .map(|record| annotation_rules::BookmarkSpec {
+                id: &record.id,
+                page: i64::from(record.page),
+                title: &record.title,
+                y_pt: record.y_pt,
+            })
+            .collect();
+        annotation_rules::validate_bookmarks(&bookmark_limits, page_count as usize)
+            .map_err(annotation_rule_error)?;
         let mut geometries: std::collections::HashMap<u32, PageGeometry> =
             std::collections::HashMap::new();
         let mut bookmark_specs = Vec::with_capacity(bookmarks.len());
         for record in bookmarks {
-            if record.page >= page_count {
-                return Err(LyraReaderFfiError::InvalidArgument {
-                    message: format!(
-                        "bookmark {:?} names page {}, but the document has {page_count} page(s)",
-                        record.id,
-                        record.page + 1
-                    ),
-                });
-            }
             bookmark_specs.push(WriteBookmark {
                 id: record.id,
                 page: PageIndex(record.page),
@@ -4309,15 +4342,18 @@ impl LyraReaderDocument {
         zoom: f64,
         geometries: &mut std::collections::HashMap<u32, PageGeometry>,
     ) -> Result<WriteAnnotation, LyraReaderFfiError> {
-        if record.page >= page_count {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                message: format!(
-                    "annotation {:?} names page {}, but the document has {page_count} page(s)",
-                    record.id,
-                    record.page + 1
-                ),
-            });
-        }
+        annotation_rules::validate_page(&record.id, i64::from(record.page), page_count as usize)
+            .map_err(annotation_rule_error)?;
+        // The text/opacity/date limits the write-back used to discover later; refused here with
+        // the same sentence the shell now uses at creation.
+        annotation_rules::validate_opacity(&record.id, record.opacity)
+            .map_err(annotation_rule_error)?;
+        annotation_rules::validate_note(&record.id, &record.contents)
+            .map_err(annotation_rule_error)?;
+        annotation_rules::validate_author(&record.id, &record.author)
+            .map_err(annotation_rule_error)?;
+        annotation_rules::validate_pdf_date(&record.id, &record.modified)
+            .map_err(annotation_rule_error)?;
         let geometry = match geometries.get(&record.page) {
             Some(geometry) => *geometry,
             None => {
@@ -4339,11 +4375,7 @@ impl LyraReaderDocument {
             .collect::<Result<Vec<_>, _>>()?;
         let supplied_rect = view_box_to_page_rect(&record.rect, inverse, &geometry)?;
         let geometry_border = |id: &str, width: f64| -> Result<f64, LyraReaderFfiError> {
-            if !width.is_finite() || width <= 0.0 || width > 200.0 {
-                return Err(LyraReaderFfiError::InvalidArgument {
-                    message: format!("annotation {id:?} has a border width outside 0…200 pt"),
-                });
-            }
+            annotation_rules::validate_border_width(id, width).map_err(annotation_rule_error)?;
             Ok(width)
         };
         let view_point = |point: &AnnotationPoint| -> Point {
@@ -4363,29 +4395,15 @@ impl LyraReaderDocument {
                     AnnotationAlignment::Left,
                 ),
                 AnnotationWriteKind::FreeText => {
-                    if !record.font_size_pt.is_finite()
-                        || record.font_size_pt < 1.0
-                        || record.font_size_pt > 400.0
-                    {
-                        return Err(LyraReaderFfiError::InvalidArgument {
-                            message: format!(
-                                "annotation {:?} has a font size outside 1…400 pt",
-                                record.id
-                            ),
-                        });
-                    }
+                    annotation_rules::validate_font_size(&record.id, record.font_size_pt)
+                        .map_err(annotation_rule_error)?;
+                    annotation_rules::validate_alignment(&record.id, &record.text_alignment)
+                        .map_err(annotation_rule_error)?;
                     let alignment = match record.text_alignment.as_str() {
                         "left" => AnnotationAlignment::Left,
                         "center" => AnnotationAlignment::Center,
                         "right" => AnnotationAlignment::Right,
-                        other => {
-                            return Err(LyraReaderFfiError::InvalidArgument {
-                                message: format!(
-                                    "annotation {:?} has an alignment {other:?}; expected left, center or right",
-                                    record.id
-                                ),
-                            });
-                        }
+                        _ => unreachable!("validated above"),
                     };
                     (
                         WriteAnnotationKind::FreeText,
@@ -4511,22 +4529,10 @@ impl LyraReaderDocument {
                     )
                 }
                 AnnotationWriteKind::Stamp => {
-                    if record.contents.trim().is_empty() {
-                        return Err(LyraReaderFfiError::InvalidArgument {
-                            message: format!("stamp annotation {:?} has no text", record.id),
-                        });
-                    }
-                    if !matches!(
-                        record.stamp_style.as_str(),
-                        "approved" | "reviewed" | "draft" | "confidential" | "date" | "custom"
-                    ) {
-                        return Err(LyraReaderFfiError::InvalidArgument {
-                            message: format!(
-                                "stamp annotation {:?} has an unknown style {:?}",
-                                record.id, record.stamp_style
-                            ),
-                        });
-                    }
+                    annotation_rules::validate_stamp_text(&record.id, &record.contents)
+                        .map_err(annotation_rule_error)?;
+                    annotation_rules::validate_stamp_style(&record.id, &record.stamp_style)
+                        .map_err(annotation_rule_error)?;
                     (
                         WriteAnnotationKind::Stamp,
                         supplied_rect,
@@ -4548,31 +4554,13 @@ impl LyraReaderDocument {
                             ),
                         });
                     }
-                    if record.signature_width == 0
-                        || record.signature_height == 0
-                        || record.signature_width > 8192
-                        || record.signature_height > 8192
-                    {
-                        return Err(LyraReaderFfiError::InvalidArgument {
-                            message: format!(
-                                "signature annotation {:?} has dimensions {}×{}; the limit is 8192 on a side",
-                                record.id, record.signature_width, record.signature_height
-                            ),
-                        });
-                    }
-                    let expected =
-                        record.signature_width as usize * record.signature_height as usize * 4;
-                    if record.signature_rgba.len() != expected {
-                        return Err(LyraReaderFfiError::InvalidArgument {
-                            message: format!(
-                                "signature annotation {:?} has {} RGBA byte(s); {}×{} needs {expected}",
-                                record.id,
-                                record.signature_rgba.len(),
-                                record.signature_width,
-                                record.signature_height
-                            ),
-                        });
-                    }
+                    annotation_rules::validate_signature_dimensions(
+                        &record.id,
+                        record.signature_width,
+                        record.signature_height,
+                        record.signature_rgba.len(),
+                    )
+                    .map_err(annotation_rule_error)?;
                     (
                         WriteAnnotationKind::Signature,
                         supplied_rect,
@@ -5301,6 +5289,21 @@ pub struct AnnotationRecord {
     pub skip_reason: Option<String>,
     /// False when the file marks the annotation hidden/invisible/`/NoView`.
     pub visible: bool,
+    /// Whether this is one of the four text-markup kinds, as the one kind table states it.
+    pub is_markup: bool,
+    /// Whether this is drawn from page-space geometry rather than a text quad.
+    pub is_geometry: bool,
+    /// Whether this is a note (`/Text` or `/FreeText`), something to read rather than markup.
+    pub is_note: bool,
+    /// Whether the reader can move, resize, recolour or delete this annotation.
+    ///
+    /// This is the whole policy the shell used to re-derive: the kind half comes from the one
+    /// kind table, and the instance half (a reply, a hidden annotation, empty ink, a line with no
+    /// endpoints, an unreadable stamp picture, an annotation the reader does not draw) is applied
+    /// here so every surface asks one question.
+    pub editable: bool,
+    /// Why [`Self::editable`] is false; the reader-facing sentence.
+    pub unsupported_reason: Option<String>,
 }
 
 /// What a document-wide annotation read could not decode.
@@ -5383,6 +5386,621 @@ pub enum AnnotationWriteKind {
     /// `/Stamp`: an image signature. `signature_width`, `signature_height` and
     /// `signature_rgba` are the decoded picture; `contents` must be empty.
     Signature,
+}
+
+/// One RGBA colour of the durable annotation cache (`#RRGGBBAA` in the file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct AnnotationRecordColor {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub alpha: u8,
+}
+
+/// One page-space point of a stored ink stroke or line.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct AnnotationRecordPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// One page-space rectangle of a stored shape, box or fixed quad.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct AnnotationRecordRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// One annotation as `annotations.json` stores it.
+///
+/// This mirrors the shell's `AppState.Annotation` field for field; `created_at` is seconds since
+/// 2001-01-01 because that is the number Foundation's `JSONEncoder` writes. The codec in
+/// `lyra-reader-edit` owns the file format; this record is only the boundary.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct CachedAnnotationRecord {
+    /// UUID text. The codec normalises it to the upper-case hyphenated shape Foundation writes.
+    pub id: String,
+    /// The `"kind"` value: `highlight`, `underline`, `strikeout`, `ink`, `square`, `circle`,
+    /// `line`, `arrow`, `stickyNote`, `textBox`, `stamp` or `signature`.
+    pub kind: String,
+    pub page: i64,
+    pub start: i64,
+    pub end: i64,
+    pub color: AnnotationRecordColor,
+    pub note: String,
+    /// Seconds since 2001-01-01 (Foundation's `Date` interval).
+    pub created_at: f64,
+    pub ink_paths: Vec<Vec<AnnotationRecordPoint>>,
+    pub shape_rect: Option<AnnotationRecordRect>,
+    pub line_start: Option<AnnotationRecordPoint>,
+    pub line_end: Option<AnnotationRecordPoint>,
+    pub stroke_width: f64,
+    pub font_size: f64,
+    pub file_identity: Option<String>,
+    pub file_quads: Option<Vec<AnnotationRecordRect>>,
+    pub text_alignment: Option<String>,
+    pub stamp_style: Option<String>,
+    /// The picture of an image signature, exactly the bytes the reader chose (PNG or JPEG).
+    pub image_data: Option<Vec<u8>>,
+}
+
+/// One user bookmark as `annotations.json` stores it.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct CachedBookmarkRecord {
+    pub id: String,
+    pub page: i64,
+    pub title: String,
+    /// Page-local Y in points, 0 at the top of the page.
+    pub y_pt: f64,
+    /// Seconds since 2001-01-01.
+    pub created_at: f64,
+}
+
+/// Where an entry came from, so a save can reproduce the file's original order.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum CachedAnnotationSlot {
+    Annotation {
+        id: String,
+    },
+    Bookmark {
+        id: String,
+    },
+    /// The verbatim JSON text of an entry this version does not understand.
+    Opaque {
+        raw: String,
+    },
+}
+
+/// A decoded `annotations.json`.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct CachedAnnotationContents {
+    pub annotations: Vec<CachedAnnotationRecord>,
+    pub bookmarks: Vec<CachedBookmarkRecord>,
+    pub slots: Vec<CachedAnnotationSlot>,
+    /// How many entries were preserved verbatim because this version cannot interpret them.
+    pub preserved_count: u32,
+}
+
+/// The flags every surface derives from one annotation kind.
+///
+/// This is the FFI projection of `lyra_reader_edit::kind`: the shell's display enum no longer
+/// computes `isGeometry`/`isTextMarkup`/… itself, and the write-request mapping is a field rather
+/// than a second `switch`.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct AnnotationKindFlagsRecord {
+    /// The stable table key: the cache kind name (`highlight` … `signature`).
+    pub kind: String,
+    /// The `"kind"` value written to the cache, when this kind can be stored there.
+    pub record_kind: Option<String>,
+    /// The name the PDF reader reports (`text`, `freeText`, `arrow`, …).
+    pub document_kind: String,
+    /// The write request this kind becomes, when this build can write it.
+    pub write_kind: Option<AnnotationWriteKind>,
+    pub is_markup: bool,
+    /// The shell's text-markup creation predicate (it excludes `squiggly`).
+    pub is_text_markup: bool,
+    pub is_geometry: bool,
+    pub is_note: bool,
+    pub is_placed_text: bool,
+    pub is_stamp_artwork: bool,
+    pub is_placement: bool,
+    /// `markup`, `noteIcon`, `freeText`, `geometry`, `stamp` or `skipped`.
+    pub drawing: String,
+    /// The annotation-cache schema version written for this kind; `None` for text markup.
+    pub schema_version: Option<u32>,
+    pub in_records: bool,
+    /// The kind half of the file-annotation editability policy.
+    pub editable: bool,
+    /// Why a `squiggly` or an unmodelled subtype cannot be edited; instance reasons are applied
+    /// by [`AnnotationRecord::unsupported_reason`].
+    pub unsupported_reason: Option<String>,
+}
+
+/// The limits and defaults of the durable annotation model.
+///
+/// The shell reads these instead of restating them, so a change to a limit or a default is one
+/// Rust edit and both sides move together.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct AnnotationRulesRecord {
+    pub max_annotations: u32,
+    pub max_bookmarks: u32,
+    pub max_id_bytes: u32,
+    pub max_bookmark_title_bytes: u32,
+    pub max_note_bytes: u32,
+    pub max_author_bytes: u32,
+    pub max_stamp_text_bytes: u32,
+    pub max_quads: u32,
+    pub max_ink_paths: u32,
+    pub max_ink_points: u32,
+    pub max_stamp_image_side: u32,
+    pub max_border_width_pt: f64,
+    pub min_font_size_pt: f64,
+    pub max_font_size_pt: f64,
+    pub min_opacity: f64,
+    pub max_opacity: f64,
+    /// The record schema versions the cache writes.
+    pub geometry_version: u32,
+    pub placed_text_version: u32,
+    pub stamp_version: u32,
+    pub signature_version: u32,
+    /// The shell's creation defaults, in points.
+    pub default_stroke_width_pt: f64,
+    pub default_text_box_font_size_pt: f64,
+    pub sticky_note_width_pt: f64,
+    pub sticky_note_height_pt: f64,
+    pub default_stamp_width_pt: f64,
+    pub default_stamp_height_pt: f64,
+    pub default_signature_height_pt: f64,
+    pub default_picture_height_pt: f64,
+    pub min_text_box_width_pt: f64,
+    pub min_text_box_height_pt: f64,
+}
+
+fn annotation_rule_error(error: annotation_rules::RuleError) -> LyraReaderFfiError {
+    LyraReaderFfiError::InvalidArgument {
+        message: error.message,
+    }
+}
+
+fn taxonomy_write_kind(kind: TaxonomyWriteKind) -> AnnotationWriteKind {
+    match kind {
+        TaxonomyWriteKind::Highlight => AnnotationWriteKind::Highlight,
+        TaxonomyWriteKind::Underline => AnnotationWriteKind::Underline,
+        TaxonomyWriteKind::StrikeOut => AnnotationWriteKind::StrikeOut,
+        TaxonomyWriteKind::Squiggly => AnnotationWriteKind::Squiggly,
+        TaxonomyWriteKind::Note => AnnotationWriteKind::Note,
+        TaxonomyWriteKind::FreeText => AnnotationWriteKind::FreeText,
+        TaxonomyWriteKind::Ink => AnnotationWriteKind::Ink,
+        TaxonomyWriteKind::Square => AnnotationWriteKind::Square,
+        TaxonomyWriteKind::Circle => AnnotationWriteKind::Circle,
+        TaxonomyWriteKind::Line => AnnotationWriteKind::Line,
+        TaxonomyWriteKind::Stamp => AnnotationWriteKind::Stamp,
+        TaxonomyWriteKind::Signature => AnnotationWriteKind::Signature,
+    }
+}
+
+/// One read annotation's facts that the editability policy needs beyond its kind.
+struct AnnotationEditabilityInput<'a> {
+    kind: &'a str,
+    is_reply: bool,
+    visible: bool,
+    ink_paths_empty: bool,
+    line_missing: bool,
+    stamp_text_empty: bool,
+    stamp_has_image: bool,
+    stamp_image_error: Option<&'a str>,
+    drawing: AnnotationDrawing,
+}
+
+/// The whole file-annotation editability policy, in the shell's historical order and wording.
+fn document_editability(input: AnnotationEditabilityInput<'_>) -> (bool, Option<String>) {
+    let AnnotationEditabilityInput {
+        kind,
+        is_reply,
+        visible,
+        ink_paths_empty,
+        line_missing,
+        stamp_text_empty,
+        stamp_has_image,
+        stamp_image_error,
+        drawing,
+    } = input;
+    if is_reply {
+        return (
+            false,
+            Some(
+                "This is a reply. Edit or delete the annotation at the top of the thread; the \
+                 replies stay attached to it."
+                    .to_string(),
+            ),
+        );
+    }
+    if !visible {
+        return (
+            false,
+            Some("This annotation is hidden by the file (/F).".to_string()),
+        );
+    }
+    let kind = TaxonomyKind::from_document_kind(kind);
+    let (editable, reason) = kind.kind_editability();
+    if !editable {
+        return (editable, reason);
+    }
+    if kind == TaxonomyKind::Ink && ink_paths_empty {
+        return (
+            false,
+            Some("This ink annotation carries no /InkList to move or draw.".to_string()),
+        );
+    }
+    if kind == TaxonomyKind::Line && line_missing {
+        return (
+            false,
+            Some("This line annotation carries no /L endpoints.".to_string()),
+        );
+    }
+    if kind == TaxonomyKind::Stamp
+        && !stamp_has_image
+        && stamp_text_empty
+        && let Some(reason) = stamp_image_error
+    {
+        return (
+            false,
+            Some(format!(
+                "This stamp's picture could not be decoded ({reason}), so it can be deleted here \
+                 but not moved, resized or edited."
+            )),
+        );
+    }
+    if matches!(drawing, AnnotationDrawing::Skipped(_)) {
+        return (
+            false,
+            Some("This annotation is not drawn by the reader.".to_string()),
+        );
+    }
+    (true, None)
+}
+
+fn kind_flags_record(kind: &TaxonomyKind) -> AnnotationKindFlagsRecord {
+    let flags = kind.flags();
+    let (editable, unsupported_reason) = kind.kind_editability();
+    AnnotationKindFlagsRecord {
+        kind: kind
+            .record_name()
+            .unwrap_or(kind.document_name())
+            .to_string(),
+        record_kind: kind.record_name().map(str::to_string),
+        document_kind: kind.document_name().to_string(),
+        write_kind: flags.write_kind.map(taxonomy_write_kind),
+        is_markup: flags.is_markup,
+        is_text_markup: flags.is_text_markup,
+        is_geometry: flags.is_geometry,
+        is_note: flags.is_note,
+        is_placed_text: flags.is_placed_text,
+        is_stamp_artwork: flags.is_stamp_artwork,
+        is_placement: flags.is_placement,
+        drawing: flags.drawing.as_str().to_string(),
+        schema_version: flags.schema_version,
+        in_records: flags.in_records,
+        editable,
+        unsupported_reason,
+    }
+}
+
+/// The one kind table: every kind the durable model can store.
+///
+/// The shell builds its `Annotation.Kind` flag lookups from this once; nothing re-derives
+/// `isGeometry`, `isTextMarkup` or the write-request mapping.
+#[uniffi::export]
+pub fn annotation_kind_flags() -> Vec<AnnotationKindFlagsRecord> {
+    const RECORD_KINDS: &[&str] = &[
+        "highlight",
+        "underline",
+        "strikeout",
+        "ink",
+        "square",
+        "circle",
+        "line",
+        "arrow",
+        "stickyNote",
+        "textBox",
+        "stamp",
+        "signature",
+    ];
+    RECORD_KINDS
+        .iter()
+        .filter_map(|name| TaxonomyKind::from_record_kind(name))
+        .map(|kind| kind_flags_record(&kind))
+        .collect()
+}
+
+/// The kind table for a PDF annotation's reported kind (`text`, `freeText`, `squiggly`, …).
+#[uniffi::export]
+pub fn document_annotation_kind_flags(kind: String) -> AnnotationKindFlagsRecord {
+    kind_flags_record(&TaxonomyKind::from_document_kind(&kind))
+}
+
+/// The limits and defaults of the durable annotation model.
+#[uniffi::export]
+pub fn annotation_rules() -> AnnotationRulesRecord {
+    AnnotationRulesRecord {
+        max_annotations: annotation_rules::MAX_ANNOTATIONS as u32,
+        max_bookmarks: annotation_rules::MAX_BOOKMARKS as u32,
+        max_id_bytes: annotation_rules::MAX_ID_BYTES as u32,
+        max_bookmark_title_bytes: annotation_rules::MAX_BOOKMARK_TITLE_BYTES as u32,
+        max_note_bytes: annotation_rules::MAX_NOTE_BYTES as u32,
+        max_author_bytes: annotation_rules::MAX_AUTHOR_BYTES as u32,
+        max_stamp_text_bytes: annotation_rules::MAX_STAMP_TEXT_BYTES as u32,
+        max_quads: annotation_rules::MAX_QUADS as u32,
+        max_ink_paths: annotation_rules::MAX_INK_PATHS as u32,
+        max_ink_points: annotation_rules::MAX_INK_POINTS as u32,
+        max_stamp_image_side: annotation_rules::MAX_STAMP_IMAGE_SIDE,
+        max_border_width_pt: annotation_rules::MAX_BORDER_WIDTH_PT,
+        min_font_size_pt: annotation_rules::MIN_FONT_SIZE_PT,
+        max_font_size_pt: annotation_rules::MAX_FONT_SIZE_PT,
+        min_opacity: annotation_rules::MIN_OPACITY,
+        max_opacity: annotation_rules::MAX_OPACITY,
+        geometry_version: 1,
+        placed_text_version: 1,
+        stamp_version: 1,
+        signature_version: 1,
+        default_stroke_width_pt: 2.0,
+        default_text_box_font_size_pt: 14.0,
+        sticky_note_width_pt: 22.0,
+        sticky_note_height_pt: 22.0,
+        default_stamp_width_pt: 150.0,
+        default_stamp_height_pt: 50.0,
+        default_signature_height_pt: 64.0,
+        default_picture_height_pt: 140.0,
+        min_text_box_width_pt: 24.0,
+        min_text_box_height_pt: 24.0,
+    }
+}
+
+/// `/CA` as the reader draws it: a malformed opacity becomes the nearest legal one.
+#[uniffi::export]
+pub fn clamp_annotation_opacity(opacity: f64) -> f64 {
+    annotation_rules::clamp_opacity(opacity)
+}
+
+#[uniffi::export]
+pub fn clamp_annotation_border_width(width: f64) -> f64 {
+    annotation_rules::clamp_border_width(width)
+}
+
+#[uniffi::export]
+pub fn clamp_annotation_font_size(size: f64) -> f64 {
+    annotation_rules::clamp_font_size(size)
+}
+
+fn edit_color(color: AnnotationRecordColor) -> annotation_records::PaletteColor {
+    annotation_records::PaletteColor::new(color.red, color.green, color.blue, color.alpha)
+}
+
+fn cached_color(color: annotation_records::PaletteColor) -> AnnotationRecordColor {
+    AnnotationRecordColor {
+        red: color.red,
+        green: color.green,
+        blue: color.blue,
+        alpha: color.alpha,
+    }
+}
+
+fn edit_point(point: AnnotationRecordPoint) -> annotation_records::StoredPoint {
+    annotation_records::StoredPoint::new(point.x, point.y)
+}
+
+fn cached_point(point: annotation_records::StoredPoint) -> AnnotationRecordPoint {
+    AnnotationRecordPoint {
+        x: point.x,
+        y: point.y,
+    }
+}
+
+fn edit_rect(rect: AnnotationRecordRect) -> annotation_records::StoredRect {
+    annotation_records::StoredRect::new(rect.x, rect.y, rect.width, rect.height)
+}
+
+fn cached_rect(rect: annotation_records::StoredRect) -> AnnotationRecordRect {
+    AnnotationRecordRect {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+    }
+}
+
+fn edit_annotation(
+    record: CachedAnnotationRecord,
+) -> Result<annotation_records::RecordAnnotation, LyraReaderFfiError> {
+    let kind = TaxonomyKind::from_record_kind(&record.kind).ok_or_else(|| {
+        LyraReaderFfiError::InvalidArgument {
+            message: format!("unknown annotation-cache kind {:?}", record.kind),
+        }
+    })?;
+    Ok(annotation_records::RecordAnnotation {
+        id: record.id,
+        kind,
+        page: record.page,
+        start: record.start,
+        end: record.end,
+        color: edit_color(record.color),
+        note: record.note,
+        created_at: record.created_at,
+        ink_paths: record
+            .ink_paths
+            .into_iter()
+            .map(|path| path.into_iter().map(edit_point).collect())
+            .collect(),
+        shape_rect: record.shape_rect.map(edit_rect),
+        line_start: record.line_start.map(edit_point),
+        line_end: record.line_end.map(edit_point),
+        stroke_width: record.stroke_width,
+        font_size: record.font_size,
+        file_identity: record.file_identity,
+        file_quads: record
+            .file_quads
+            .map(|quads| quads.into_iter().map(edit_rect).collect()),
+        text_alignment: record.text_alignment,
+        stamp_style: record.stamp_style,
+        image_data: record.image_data,
+    })
+}
+
+fn cached_annotation(record: &annotation_records::RecordAnnotation) -> CachedAnnotationRecord {
+    CachedAnnotationRecord {
+        id: record.id.clone(),
+        kind: record.kind.record_name().unwrap_or("highlight").to_string(),
+        page: record.page,
+        start: record.start,
+        end: record.end,
+        color: cached_color(record.color),
+        note: record.note.clone(),
+        created_at: record.created_at,
+        ink_paths: record
+            .ink_paths
+            .iter()
+            .map(|path| path.iter().copied().map(cached_point).collect())
+            .collect(),
+        shape_rect: record.shape_rect.map(cached_rect),
+        line_start: record.line_start.map(cached_point),
+        line_end: record.line_end.map(cached_point),
+        stroke_width: record.stroke_width,
+        font_size: record.font_size,
+        file_identity: record.file_identity.clone(),
+        file_quads: record
+            .file_quads
+            .as_ref()
+            .map(|quads| quads.iter().copied().map(cached_rect).collect()),
+        text_alignment: record.text_alignment.clone(),
+        stamp_style: record.stamp_style.clone(),
+        image_data: record.image_data.clone(),
+    }
+}
+
+fn edit_bookmark(record: CachedBookmarkRecord) -> annotation_records::RecordBookmark {
+    annotation_records::RecordBookmark {
+        id: record.id,
+        page: record.page,
+        title: record.title,
+        y_pt: record.y_pt,
+        created_at: record.created_at,
+    }
+}
+
+fn cached_bookmark(record: &annotation_records::RecordBookmark) -> CachedBookmarkRecord {
+    CachedBookmarkRecord {
+        id: record.id.clone(),
+        page: record.page,
+        title: record.title.clone(),
+        y_pt: record.y_pt,
+        created_at: record.created_at,
+    }
+}
+
+fn edit_slot(slot: CachedAnnotationSlot) -> annotation_records::Slot {
+    match slot {
+        CachedAnnotationSlot::Annotation { id } => annotation_records::Slot::Annotation(id),
+        CachedAnnotationSlot::Bookmark { id } => annotation_records::Slot::Bookmark(id),
+        CachedAnnotationSlot::Opaque { raw } => annotation_records::Slot::Opaque(raw),
+    }
+}
+
+fn cached_slot(slot: &annotation_records::Slot) -> CachedAnnotationSlot {
+    match slot {
+        annotation_records::Slot::Annotation(id) => {
+            CachedAnnotationSlot::Annotation { id: id.clone() }
+        }
+        annotation_records::Slot::Bookmark(id) => CachedAnnotationSlot::Bookmark { id: id.clone() },
+        annotation_records::Slot::Opaque(raw) => CachedAnnotationSlot::Opaque { raw: raw.clone() },
+    }
+}
+
+/// Decodes `annotations.json` through the one Rust codec.
+///
+/// `page_count` is the open document's page count; `palette` is the shell's legacy highlight
+/// palette in order, which is how an older entry's `colorIndex` becomes a colour. The returned
+/// slots are the file's entry order, with foreign entries carrying their exact source text.
+#[uniffi::export]
+pub fn decode_annotation_cache(
+    data: Vec<u8>,
+    page_count: u32,
+    palette: Vec<AnnotationRecordColor>,
+) -> Result<CachedAnnotationContents, LyraReaderFfiError> {
+    let palette: Vec<_> = palette.into_iter().map(edit_color).collect();
+    let contents =
+        annotation_records::decode(&data, page_count as usize, &palette).map_err(|error| {
+            LyraReaderFfiError::InvalidArgument {
+                message: error.detail,
+            }
+        })?;
+    Ok(CachedAnnotationContents {
+        annotations: contents.annotations.iter().map(cached_annotation).collect(),
+        bookmarks: contents.bookmarks.iter().map(cached_bookmark).collect(),
+        slots: contents.slots.iter().map(cached_slot).collect(),
+        preserved_count: contents.preserved_count() as u32,
+    })
+}
+
+/// Encodes `annotations.json` through the one Rust codec.
+///
+/// The output is byte-for-byte what the Swift encoder wrote before this moved: same key order,
+/// same two-space pretty printing, same `Date`/`UUID`/base64 shapes, and foreign entries spliced
+/// back exactly as they were read.
+#[uniffi::export]
+pub fn encode_annotation_cache(
+    annotations: Vec<CachedAnnotationRecord>,
+    bookmarks: Vec<CachedBookmarkRecord>,
+    slots: Vec<CachedAnnotationSlot>,
+    palette: Vec<AnnotationRecordColor>,
+) -> Result<Vec<u8>, LyraReaderFfiError> {
+    let annotations: Vec<_> = annotations
+        .into_iter()
+        .map(edit_annotation)
+        .collect::<Result<_, _>>()?;
+    let bookmarks: Vec<_> = bookmarks.into_iter().map(edit_bookmark).collect();
+    let slots: Vec<_> = slots.into_iter().map(edit_slot).collect();
+    let palette: Vec<_> = palette.into_iter().map(edit_color).collect();
+    annotation_records::encode(&annotations, &bookmarks, &slots, &palette).map_err(|error| {
+        LyraReaderFfiError::InvalidArgument {
+            message: error.detail,
+        }
+    })
+}
+
+/// The creation-time validation of one cached annotation.
+///
+/// The shell calls this before it appends a new entry, so the limits that used to be discovered
+/// only when saving into the PDF are refused at creation with the same sentence. `existing_ids`
+/// are the annotations already in the cache (uniqueness is checked across them).
+#[uniffi::export]
+pub fn validate_cached_annotation(
+    annotation: CachedAnnotationRecord,
+    page_count: u32,
+    existing_ids: Vec<String>,
+) -> Result<(), LyraReaderFfiError> {
+    let annotation = edit_annotation(annotation)?;
+    annotation_rules::validate_annotation(&annotation, page_count as usize, &existing_ids).map_err(
+        |error| LyraReaderFfiError::InvalidArgument {
+            message: error.message,
+        },
+    )
+}
+
+/// The creation-time validation of one cached bookmark, with the outline writer's rules.
+#[uniffi::export]
+pub fn validate_cached_bookmark(
+    bookmark: CachedBookmarkRecord,
+    page_count: u32,
+    existing_ids: Vec<String>,
+) -> Result<(), LyraReaderFfiError> {
+    let bookmark = edit_bookmark(bookmark);
+    annotation_rules::validate_bookmark(&bookmark, page_count as usize, &existing_ids).map_err(
+        |error| LyraReaderFfiError::InvalidArgument {
+            message: error.message,
+        },
+    )
 }
 
 /// One bookmark the shell asks the writer to put into the document's `/Outlines`.

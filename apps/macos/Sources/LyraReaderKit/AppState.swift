@@ -308,6 +308,13 @@ public enum ReadingLayoutPreferences {
 public final class AppState: ObservableObject, InPlaceTranslationHost {
     /// Enabled by the application entry point; library/check hosts never alter user history.
     public static var recordsRecentDocuments = false
+    /// Test seam: makes the identity and timestamp of a UI-created text mark deterministic.
+    ///
+    /// Production leaves this nil, so creation keeps using `UUID()` and `Date()`. The
+    /// annotation-codec check pins both because they are the only nondeterministic inputs to
+    /// `annotations.json`; everything else about the entry comes from the model.
+    nonisolated(unsafe) package static var annotationCreationStamp:
+        (() -> (id: UUID, createdAt: Date))?
     @Published public var document: LoadedDocument?
     @Published public var sidebarTab: SidebarTab = .thumbnails {
         didSet {
@@ -988,43 +995,36 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case signature
 
         /// Whether this kind is stored as geometry rather than as a character range.
-        public var isGeometry: Bool {
-            switch self {
-            case .highlight, .underline, .strikeout: return false
-            case .ink, .square, .circle, .line, .arrow: return true
-            case .stickyNote, .textBox, .stamp, .signature: return false
-            }
-        }
+        ///
+        /// The answer comes from the one kind table in `lyra-reader-edit`; this enum is the UI's
+        /// display vocabulary, not a second set of rules.
+        public var isGeometry: Bool { flags.isGeometry }
 
-        public var isTextMarkup: Bool { self == .highlight || self == .underline || self == .strikeout }
+        /// Whether this kind is one the selection can turn into a text mark.
+        public var isTextMarkup: Bool { flags.isTextMarkup }
 
         /// Whether this kind is a placed text annotation (a sticky note or a text box).
-        ///
-        /// These carry page-space geometry like an ink stroke, but they are drawn from a glyph
-        /// bitmap rather than a vector path and they carry their text in `note`. They are
-        /// versioned separately from the stroked kinds so a newer schema is preserved rather
-        /// than partially read.
-        public var isPlacedText: Bool {
-            switch self {
-            case .stickyNote, .textBox: return true
-            case .highlight, .underline, .strikeout, .ink, .square, .circle, .line, .arrow,
-                 .stamp, .signature:
-                return false
-            }
-        }
+        public var isPlacedText: Bool { flags.isPlacedText }
 
         /// Whether this kind is an image or a stamp badge whose box is placed, moved and
         /// resized like a note's but whose content is not text to be edited in a text view.
-        public var isStampArtwork: Bool {
-            self == .stamp || self == .signature
-        }
+        public var isStampArtwork: Bool { flags.isStampArtwork }
 
         /// Whether this kind occupies a page box that the select tool can move and resize.
         ///
         /// This is the union the canvas needs, not a statement about how the content is drawn:
         /// ink and shapes move by their geometry, placed text by its box, and a stamp by the box
         /// its appearance fills.
-        public var isPlacement: Bool { isGeometry || isPlacedText || isStampArtwork }
+        public var isPlacement: Bool { flags.isPlacement }
+
+        /// The write request this kind becomes, from the same table that decides the write
+        /// request mapping on the Rust side.
+        package var writeKind: AnnotationWriteKind? { flags.writeKind }
+
+        /// The FFI kind-table row for this kind.
+        private var flags: AnnotationKindFlagsRecord {
+            AnnotationRecordRules.flags(for: self)
+        }
     }
 
     /// One point of a stored ink stroke or line, as the cache writes it.
@@ -1062,45 +1062,56 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Text-markup entries have no version: they are the shape every older build already knows.
     /// Geometry entries do, so a newer build can change them without an older one guessing at
     /// the new meaning. `AnnotationRecords` preserves any entry it cannot interpret verbatim.
-    public static let geometryVersion = 1
+    ///
+    /// The value comes from `lyra-reader-edit` so the codec and the Swift model cannot drift.
+    public static let geometryVersion = Int(AnnotationRecordRules.limits.geometryVersion)
 
     /// The annotation-record schema version of a placed-text entry (sticky note or text box).
     ///
     /// Separate from `geometryVersion` on purpose: the two kinds are drawn and written by
     /// different code, and a future change to one must never make the other's entries look
     /// half-understood. `AnnotationRecords` preserves any version it does not know.
-    public static let placedTextVersion = 1
+    public static let placedTextVersion = Int(AnnotationRecordRules.limits.placedTextVersion)
 
     /// The annotation-record schema version of a text stamp entry.
-    public static let stampVersion = 1
+    public static let stampVersion = Int(AnnotationRecordRules.limits.stampVersion)
 
     /// The annotation-record schema version of an image-signature entry.
-    public static let signatureVersion = 1
+    public static let signatureVersion = Int(AnnotationRecordRules.limits.signatureVersion)
 
     /// The size a newly placed sticky note icon occupies on the page, in points.
-    public static let stickyNoteSize = CGSize(width: 22, height: 22)
+    public static let stickyNoteSize = CGSize(
+        width: CGFloat(AnnotationRecordRules.limits.stickyNoteWidthPt),
+        height: CGFloat(AnnotationRecordRules.limits.stickyNoteHeightPt))
 
     /// The default font size of a new text box, in points.
-    public static let defaultTextBoxFontSize: CGFloat = 14
+    public static let defaultTextBoxFontSize =
+        CGFloat(AnnotationRecordRules.limits.defaultTextBoxFontSizePt)
 
     /// The size a newly placed stamp occupies, in page points. Wide enough for `CONFIDENTIAL`
     /// at a readable size; the reader can move and resize it afterwards.
-    public static let defaultStampSize = CGSize(width: 150, height: 50)
+    public static let defaultStampSize = CGSize(
+        width: CGFloat(AnnotationRecordRules.limits.defaultStampWidthPt),
+        height: CGFloat(AnnotationRecordRules.limits.defaultStampHeightPt))
 
     /// The height a newly placed image signature occupies, in page points. Its width follows the
     /// picture's aspect ratio, so a tall signature is not stretched on the way in.
-    public static let defaultSignatureHeight: CGFloat = 64
+    public static let defaultSignatureHeight =
+        CGFloat(AnnotationRecordRules.limits.defaultSignatureHeightPt)
 
     /// The height a newly placed ordinary picture occupies, in page points. Larger than a
     /// signature: a picture is content the reader is placing, not a mark that stays out of the way.
-    public static let defaultPictureHeight: CGFloat = 140
+    public static let defaultPictureHeight =
+        CGFloat(AnnotationRecordRules.limits.defaultPictureHeightPt)
 
     /// The smallest text box the reader may create or resize to, in points.
     ///
     /// The width is wide enough for a few narrow glyphs but small enough for the box a
     /// double-click creates (about three characters, see `TextBoxLayout.creationSize`); the
     /// height is one line at the smallest font. Older cached annotations' larger boxes stay valid.
-    public static let minimumTextBoxSize = CGSize(width: 24, height: 24)
+    public static let minimumTextBoxSize = CGSize(
+        width: CGFloat(AnnotationRecordRules.limits.minTextBoxWidthPt),
+        height: CGFloat(AnnotationRecordRules.limits.minTextBoxHeightPt))
 
     public let id: UUID
     /// Defaults to `.highlight` for cached annotations written before kinds existed.
@@ -2270,45 +2281,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// The one editability decision. Called by the canvas, the eraser, the sidebar and the
     /// writer; nothing re-derives it.
+    ///
+    /// The engine computes the whole policy (reply, hidden, kind, empty geometry, unreadable
+    /// stamp picture, not drawn) and carries the sentence across the FFI. The shell only maps it
+    /// to its display type.
     public static func documentAnnotationEditability(
         _ annotation: DocumentAnnotation
     ) -> DocumentAnnotationEditability {
-        if annotation.isReply {
-            return .unsupported(
-                reason: "This is a reply. Edit or delete the annotation at the top of the thread; "
-                    + "the replies stay attached to it.")
-        }
-        guard annotation.visible else {
-            return .unsupported(reason: "This annotation is hidden by the file (/F).")
-        }
-        switch annotation.kind {
-        case "highlight", "underline", "strikeout", "text", "freeText",
-             "ink", "square", "circle", "line", "stamp":
-            break
-        case "squiggly":
-            return .unsupported(
-                reason: "LyraReader has no editable model for /Squiggly; editing it would have to "
-                    + "change the mark's subtype.")
-        default:
-            return .unsupported(
-                reason: "LyraReader has no editable model for a /\(annotation.kind) annotation yet.")
-        }
-        if annotation.kind == "ink" && annotation.inkPaths.isEmpty {
-            return .unsupported(reason: "This ink annotation carries no /InkList to move or draw.")
-        }
-        if annotation.kind == "line" && (annotation.lineStart == nil || annotation.lineEnd == nil) {
-            return .unsupported(reason: "This line annotation carries no /L endpoints.")
-        }
-        if annotation.kind == "stamp",
-           annotation.stampImageData == nil,
-           (annotation.stampText ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-           let reason = annotation.stampImageError {
-            return .unsupported(
-                reason: "This stamp's picture could not be decoded (\(reason)), so it can be "
-                    + "deleted here but not moved, resized or edited.")
-        }
-        if annotation.drawing == .skipped {
-            return .unsupported(reason: "This annotation is not drawn by the reader.")
+        if let reason = annotation.unsupportedEditReason {
+            return .unsupported(reason: reason)
         }
         return .editable
     }
@@ -2346,7 +2327,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             }
         default: return nil
         }
-        let opacity = min(max(document.opacity ?? 1.0, 0.0), 1.0)
+        let opacity = AnnotationRecordRules.clampOpacity(document.opacity ?? 1.0)
         let alpha = UInt8(min(max((opacity * 255.0).rounded(), 0), 255))
         let box = CGRect(x: document.xPt, y: document.yPt,
                          width: document.widthPt, height: document.heightPt)
@@ -4596,16 +4577,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard let selection, let url = document?.url else { return false }
         if annotationsURL == nil { loadAnnotations(for: url) }
 
+        let stamp = Self.annotationCreationStamp?()
+            ?? (id: UUID(), createdAt: Date())
         let annotation = Annotation(
-            id: UUID(),
+            id: stamp.id,
             kind: kind,
             page: selection.page,
             start: selection.range.lowerBound,
             end: selection.range.upperBound,
             color: color,
             note: note,
-            createdAt: Date()
+            createdAt: stamp.createdAt
         )
+        guard validateNewAnnotation(annotation) else { return false }
         var updated = annotations
         updated.append(annotation)
         guard saveAnnotations(updated, trigger: "add-\(kind.rawValue)") else { return false }
@@ -4884,7 +4868,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// freehand line look like one stroke rather than a pressure-sensitive brush this reader
     /// does not model; `strokeWidth` is stored per annotation so a future width control can
     /// change it without changing the schema.
-    public static let defaultAnnotationStrokeWidth: CGFloat = 2
+    public static let defaultAnnotationStrokeWidth =
+        CGFloat(AnnotationRecordRules.limits.defaultStrokeWidthPt)
 
     /// Adds a geometry mark whose coordinates are already **page space** (page-local, top-left,
     /// 100% points). This is the one creation entry point the canvas uses; all validation and
@@ -4937,7 +4922,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lineEnd: lineEnd,
             strokeWidth: strokeWidth
         )
-        guard annotation.hasValidGeometry else { return false }
+        guard validateNewAnnotation(annotation), annotation.hasValidGeometry else { return false }
 
         var updated = annotations
         updated.append(annotation)
@@ -5365,7 +5350,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// The one commit path for a placed stamp or signature: one cache write, then one undo step.
     private func appendPlacedArtwork(_ annotation: Annotation) -> Bool {
-        guard annotation.hasValidGeometry else { return false }
+        guard validateNewAnnotation(annotation), annotation.hasValidGeometry else { return false }
         var updated = annotations
         updated.append(annotation)
         guard saveAnnotations(updated, trigger: "add-\(annotation.kind.rawValue)") else {
@@ -5676,7 +5661,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             strokeWidth: 0,
             fontSize: 0
         )
-        guard annotation.hasValidGeometry else { return false }
+        guard validateNewAnnotation(annotation), annotation.hasValidGeometry else { return false }
         var updated = annotations
         updated.append(annotation)
         guard saveAnnotations(updated, trigger: "add-stickyNote") else { return false }
@@ -5762,7 +5747,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             strokeWidth: 0,
             fontSize: Annotation.defaultTextBoxFontSize
         )
-        guard annotation.hasValidGeometry else { return false }
+        guard validateNewAnnotation(annotation), annotation.hasValidGeometry else { return false }
         var updated = annotations
         updated.append(annotation)
         guard saveAnnotations(updated, trigger: "add-textBox") else { return false }
@@ -7201,8 +7186,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Adds a bookmark to an explicit page without moving the viewport or changing selection.
     @discardableResult
     package func addBookmark(onPage page: Int, yPt: CGFloat = 0, name: String? = nil) -> Bool {
-        guard let document, (0..<document.pageCount).contains(page), yPt.isFinite, yPt >= 0,
-              let url = document.url else { return false }
+        guard let document, let url = document.url else { return false }
         if annotationsURL == nil { loadAnnotations(for: url) }
         if annotationWritesBlockedReason != nil {
             statusMessage = "Could not add the bookmark because annotation writes are blocked"
@@ -7213,6 +7197,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let title = trimmed.isEmpty ? Bookmark.defaultTitle(forPage: page) : trimmed
 
         let bookmark = Bookmark(page: page, title: title, yPt: yPt)
+        guard validateNewBookmark(bookmark) else { return false }
         var updated = bookmarks
         updated.append(bookmark)
         var slots = annotationRecordSlots
@@ -9264,12 +9249,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 }
             }
             let union = quads.dropFirst().reduce(quads[0]) { $0.union($1) }
-            let writeKind: AnnotationWriteRequest.Kind = switch annotation.kind {
-            case .highlight: .highlight
-            case .underline: .underline
-            case .strikeout: .strikeout
-            default: .highlight
-            }
+            // The kind table is the one statement of which mark becomes which write kind.
+            let writeKind: AnnotationWriteKind = AnnotationRecordRules.writeKind(
+                for: annotation.kind) ?? .highlight
             record(AnnotationWriteRequest(
                 id: annotation.id.uuidString,
                 page: annotation.page,
@@ -9398,16 +9380,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         func scaled(_ point: CGPoint) -> CGPoint {
             CGPoint(x: point.x * zoom, y: point.y * zoom)
         }
-        let kind: AnnotationWriteRequest.Kind
-        switch annotation.kind {
-        case .ink: kind = .ink
-        case .square: kind = .square
-        case .circle: kind = .circle
-        case .line, .arrow: kind = .line
-        case .highlight: kind = .highlight
-        case .underline: kind = .underline
-        case .strikeout: kind = .strikeout
-        case .stickyNote, .textBox, .stamp, .signature:
+        guard annotation.kind.isGeometry,
+              let kind = AnnotationRecordRules.writeKind(for: annotation.kind) else {
             throw NSError(
                 domain: "LyraReader",
                 code: 3,
@@ -9762,6 +9736,35 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// `trigger` only labels the stderr instrumentation line, so a run can show *why* a write
     /// happened (a keystroke, a coalesced flush, a tab switch, …).
+    /// Refuses a creation the PDF writer would later refuse, with the writer's own sentence.
+    ///
+    /// The limits used to be discovered at save time (or after the entry was already on disk);
+    /// asking the Rust rule set here means the reader is told at creation. A message is also
+    /// published so the status line and the alert say the same thing as an engine refusal.
+    private func validateNewAnnotation(_ annotation: Annotation) -> Bool {
+        guard let document else { return false }
+        guard let message = AnnotationRecords.validationMessage(
+            for: annotation,
+            pageCount: document.pageCount,
+            existingIDs: annotations.map(\.id)
+        ) else { return true }
+        statusMessage = message
+        lastError = message
+        return false
+    }
+
+    private func validateNewBookmark(_ bookmark: Bookmark) -> Bool {
+        guard let document else { return false }
+        guard let message = AnnotationRecords.validationMessage(
+            for: bookmark,
+            pageCount: document.pageCount,
+            existingIDs: bookmarks.compactMap { $0.id == bookmark.id ? nil : $0.id }
+        ) else { return true }
+        statusMessage = message
+        lastError = message
+        return false
+    }
+
     @discardableResult
     private func saveAnnotations(_ candidate: [Annotation], trigger: String) -> Bool {
         writeAnnotationRecords(

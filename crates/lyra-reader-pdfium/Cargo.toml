@@ -11,6 +11,9 @@ workspace = true
 
 [dependencies]
 lyra-reader-core = { workspace = true }
+# The bookmark/annotation limits and their messages are one rule set shared with the shell
+# (audit C2): the outline writer calls it rather than keeping its own copy.
+lyra-reader-edit = { workspace = true }
 
 # Safe wrapper around Chromium's PDFium. The dynamic library is loaded at runtime
 # (see `library_candidates()`), so nothing is linked at build time and no PDFium

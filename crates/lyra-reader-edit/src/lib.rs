@@ -1,6 +1,8 @@
-//! Edit layer: annotation model, undo stack, page operations and save policies.
+//! Edit layer: annotation model, durable annotation cache, undo stack, page operations and save
+//! policies.
 //!
-//! Task mapping: T3.1 (model + undo stack), T3.7 (incremental save), T3.9 (page operations).
+//! Task mapping: T3.1 (model + undo stack), T3.7 (incremental save), T3.9 (page operations),
+//! audit C2 (durable annotation model: codec, kind taxonomy and validation).
 //!
 //! # Design notes
 //!
@@ -10,8 +12,23 @@
 //!   (see `docs/03-rendering.md` §6).
 //! - Saving uses **incremental save** by default (append-only writes): the original bytes are not
 //!   rewritten, so an existing digital signature stays valid.
+//! - The durable annotation cache (`annotations.json`) is decoded and encoded here
+//!   ([`records`]), its kind vocabulary is stated once ([`kind`]), and the limits both the shell
+//!   and the PDF writer enforce live in [`rules`]. The shell keeps the file I/O and the
+//!   corruption/backup policy; the undo stack and save reconciliation stay in the shell for now.
 
 use lyra_reader_core::{DocId, PageIndex, Rect};
+
+pub mod kind;
+pub mod records;
+pub mod rules;
+
+pub use kind::{Drawing, KindFlags, WriteKind};
+pub use records::{
+    Contents, PaletteColor, RecordAnnotation, RecordBookmark, RecordError, Slot, StoredPoint,
+    StoredRect,
+};
+pub use rules::RuleError;
 
 /// Annotation identifier (unique within the process; after saving it maps to the PDF object number).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

@@ -81,10 +81,7 @@ const MARKER_VALUE: &str = "lyra-reader-bookmarks:v1";
 /// the file's bookmarks with their identities intact.
 pub(crate) const ID_KEY: &[u8] = b"LyraReaderID";
 
-/// Hard limits, so a malformed shell request cannot ask the writer to build an unreasonable tree.
-pub(crate) const MAX_BOOKMARKS: usize = 5_000;
-const MAX_ID_BYTES: usize = 128;
-const MAX_TITLE_BYTES: usize = 4_096;
+/// The bookmark limits themselves live in `lyra_reader_edit::rules`; this file only traverses.
 const MAX_OUTLINE_DEPTH: usize = 64;
 
 /// One bookmark the shell asks the writer to put into the outline.
@@ -403,67 +400,22 @@ pub struct EmbeddedBookmarks {
 }
 
 /// Refuses a bookmark list the writer cannot represent faithfully.
+///
+/// The rules and the sentences live in `lyra-reader-edit::rules`, together with the shell's
+/// creation-time check, so the outline writer, the FFI save path and the UI cannot disagree
+/// about what a bookmark may be (audit C2).
 pub(crate) fn validate_bookmarks(bookmarks: &[WriteBookmark], page_count: u32) -> Result<()> {
-    if bookmarks.len() > MAX_BOOKMARKS {
-        return Err(LyraReaderError::new(
-            ErrorCode::InvalidArgument,
-            format!("{MAX_BOOKMARKS} bookmarks is the most one save can write"),
-        ));
-    }
-    let mut ids = HashSet::new();
-    for bookmark in bookmarks {
-        if bookmark.id.is_empty()
-            || bookmark.id.len() > MAX_ID_BYTES
-            || !bookmark.id.bytes().all(|byte| byte.is_ascii_graphic())
-        {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                "a bookmark identity must be 1–128 printable ASCII characters",
-            )
-            .with_detail(format!("id: {:?}", bookmark.id)));
-        }
-        if !ids.insert(bookmark.id.clone()) {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!(
-                    "two bookmarks in one save share the identity {:?}",
-                    bookmark.id
-                ),
-            ));
-        }
-        if bookmark.page.0 >= page_count {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!(
-                    "bookmark {:?} names page {}, but the document has {page_count} page(s)",
-                    bookmark.id,
-                    bookmark.page.get()
-                ),
-            ));
-        }
-        if !bookmark.y_pt.is_finite() {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!("bookmark {:?} has a non-finite Y", bookmark.id),
-            ));
-        }
-        if bookmark.title.len() > MAX_TITLE_BYTES {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!(
-                    "bookmark {:?} has a title longer than {MAX_TITLE_BYTES} bytes",
-                    bookmark.id
-                ),
-            ));
-        }
-        if bookmark.title.contains('\0') {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!("bookmark {:?} has a NUL in its title", bookmark.id),
-            ));
-        }
-    }
-    Ok(())
+    let specs: Vec<lyra_reader_edit::rules::BookmarkSpec<'_>> = bookmarks
+        .iter()
+        .map(|bookmark| lyra_reader_edit::rules::BookmarkSpec {
+            id: &bookmark.id,
+            page: i64::from(bookmark.page.0),
+            title: &bookmark.title,
+            y_pt: bookmark.y_pt,
+        })
+        .collect();
+    lyra_reader_edit::rules::validate_bookmarks(&specs, page_count as usize)
+        .map_err(|error| LyraReaderError::new(ErrorCode::InvalidArgument, error.message))
 }
 
 /// Adds the reader's bookmark subtree to `base`, writing the complete document to `output`.
