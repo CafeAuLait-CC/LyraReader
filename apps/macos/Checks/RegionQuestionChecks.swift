@@ -1046,7 +1046,7 @@ extension ReaderChecks {
         ).sorted()
         require(before == after, "the PDF bytes are unchanged by a region question")
         require(filesBefore == filesAfter,
-                "no annotation or sidecar file appears beside the PDF: \(filesBefore) -> \(filesAfter)")
+                "no annotation file appears beside the PDF: \(filesBefore) -> \(filesAfter)")
         require(state.annotations.isEmpty, "the reader's annotation model is unchanged")
         require(state.documentAnnotations.isEmpty, "no PDF annotation was added")
     }

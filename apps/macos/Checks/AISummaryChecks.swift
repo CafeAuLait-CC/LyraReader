@@ -558,7 +558,7 @@ extension ReaderChecks {
         require(Set(siblingsAfter) == Set(siblingNames + ["long-abstract.pdf", "failure.pdf", "cancel.pdf"]),
                 "no summary file appears beside the PDFs (\(siblingsAfter))")
         require(!siblingsAfter.contains { $0.hasSuffix(".json") },
-                "the cache is not a sidecar next to the PDF")
+                "the cache is not stored next to the PDF")
 
         print("AI-LAYERED abstract_requests=1 section_requests=8 page_requests=3 "
             + "reopen_requests=0 language_requests=1 edited_section_requests=1 "

@@ -22,9 +22,9 @@
 //!
 //! # File and compatibility
 //!
-//! The cache path is keyed by the canonical PDF path inside the platform application cache.
-//! Legacy adjacent index files are disposable and no longer read or written. Each record is a JSON object with
-//! a `kind` tag and a `format_version`. The contract is:
+//! The cache path is keyed by the canonical PDF path inside the platform application cache;
+//! nothing is read from or written beside the PDF. Each record is a JSON object with a `kind`
+//! tag and a `format_version`. The contract is:
 //!
 //! * **Older or same format, same bytes** — read. Unknown top-level keys make the file
 //!   *incompatible*: it is ignored and preserved untouched, because another LyraReader may own it.

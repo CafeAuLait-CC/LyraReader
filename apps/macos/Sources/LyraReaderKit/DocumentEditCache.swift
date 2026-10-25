@@ -2,7 +2,6 @@ import CryptoKit
 import Foundation
 
 /// Recoverable editor state lives in the application cache, never beside a user's PDF.
-/// Legacy adjacent records are imported once, validated and backed up before removal.
 @MainActor public enum DocumentEditCache {
     public static var rootOverride: URL?
 
@@ -34,11 +33,6 @@ import Foundation
         directory(for: document).appendingPathComponent("translations.json")
     }
 
-    static func legacyURLs(for document: URL) -> [URL] {
-        [document.appendingPathExtension("lyra-reader-annotations.json"),
-         document.appendingPathExtension("aris-annotations.json")]
-    }
-
     struct SourceStamp: Codable, Equatable {
         let size: Int
         let modified: Date?
@@ -57,13 +51,13 @@ import Foundation
 
     enum CacheError: LocalizedError {
         case sourceChanged
-        case importVerification
+        case backupVerification
         var errorDescription: String? {
             switch self {
             case .sourceChanged:
                 return "The PDF changed outside LyraReader. Its recovery data was kept; back it up before starting fresh."
-            case .importVerification:
-                return "The legacy annotation import could not be verified. The original records were kept."
+            case .backupVerification:
+                return "The recovery data could not be verified. The original files were kept."
             }
         }
     }
@@ -82,7 +76,7 @@ import Foundation
         guard try SourceStamp(document) == expected else { throw CacheError.sourceChanged }
     }
 
-    static func prepareAnnotations(for document: URL, pageCount: Int, paletteCount: Int) throws -> URL {
+    static func prepareAnnotations(for document: URL) throws -> URL {
         let cache = annotationsURL(for: document)
         if FileManager.default.fileExists(atPath: cache.path)
             || FileManager.default.fileExists(atPath: pendingStateURL(for: document).path)
@@ -93,28 +87,8 @@ import Foundation
             }
             return cache
         }
-        let legacy = legacyURLs(for: document).filter { FileManager.default.fileExists(atPath: $0.path) }
-        if let source = legacy.first {
-            let data = try Data(contentsOf: source)
-            _ = try AnnotationRecords.decode(data, pageCount: pageCount, paletteCount: paletteCount)
-            try data.write(to: cache, options: .atomic)
-            guard try Data(contentsOf: cache) == data else { throw CacheError.importVerification }
-            for source in legacy {
-                let backup = directory(for: document).appendingPathComponent("import-\(UUID().uuidString).json")
-                let original = try Data(contentsOf: source)
-                try original.write(to: backup, options: .atomic)
-                guard try Data(contentsOf: backup) == original else { throw CacheError.importVerification }
-                try FileManager.default.removeItem(at: source)
-            }
-        }
         try recordSource(for: document)
         return cache
-    }
-
-    static func unreadableRecordsURL(for document: URL) -> URL {
-        let cache = annotationsURL(for: document)
-        if FileManager.default.fileExists(atPath: cache.path) { return cache }
-        return legacyURLs(for: document).first { FileManager.default.fileExists(atPath: $0.path) } ?? cache
     }
 
     static func recoveryURL(for document: URL) -> URL {

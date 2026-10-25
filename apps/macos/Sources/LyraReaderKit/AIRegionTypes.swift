@@ -222,7 +222,7 @@ public enum AIRegionAnswerState: String, Codable, Equatable, Sendable {
 
 /// One finished conversation, kept in memory for this window's lifetime.
 ///
-/// It is deliberately not a PDF annotation and not a sidecar: no file beside the PDF is created.
+/// It is deliberately not a PDF annotation and not stored in a file beside the PDF.
 /// The PNG lives in memory only; it is written to disk only when the reader exports the
 /// knowledge document and chooses a destination.
 public struct AIRegionHistoryEntry: Codable, Identifiable, Equatable, Sendable {

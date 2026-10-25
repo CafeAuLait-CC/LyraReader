@@ -3,9 +3,8 @@ import Foundation
 /// Reading and writing the document's annotation records.
 ///
 /// The records are a JSON array of `AppState.Annotation` entries **and user bookmarks**, stored
-/// as `annotations.json` in the document cache (`DocumentEditCache`). A legacy
-/// `<doc>.pdf.lyra-reader-annotations.json` companion is imported once with a verified backup and
-/// then removed, and every later session reads and writes the cache instead.
+/// as `annotations.json` in the document cache (`DocumentEditCache`). Every session reads and
+/// writes that cache; nothing is read from or written beside the PDF.
 ///
 /// Both kinds live in one file because they are the reader's marks on one document, and the
 /// array's per-entry compatibility rule keeps them safe together:
