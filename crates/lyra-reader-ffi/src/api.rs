@@ -75,6 +75,115 @@ const UNKNOWN_LAYOUT_PAGE_SIZE: (f64, f64) = (612.0, 792.0);
 /// Lazy page-size cache. Each entry is `None` when PDFium could not measure that page.
 type CachedPageSizes = Vec<Option<(f64, f64)>>;
 
+/// How many pages of line-aware selection geometry one document keeps.
+///
+/// The cache exists so a pointer event is one synchronous FFI call: the alternative is a
+/// `text_page` round trip per event (measured at ~1.4 ms in Rust and ~4.8 ms through the
+/// Swift boundary, versus ~0.7 µs for the cached line-aware hit). Five pages covers the pages
+/// a reader is actually pointing at, including the previous/next page during a scroll. The
+/// five corpus pages measured by `hit_bench` total ~858 KiB of selection geometry, so all five
+/// fit under the byte ceiling; larger pages evict oldest-first instead of exceeding it.
+const TEXT_PAGE_CACHE_MAX_ENTRIES: usize = 5;
+/// Byte ceiling for the same cache (~1.5 MiB). A page that cannot fit alone is still usable;
+/// it is simply not retained.
+const TEXT_PAGE_CACHE_MAX_BYTES: usize = 3 * 512 * 1024;
+
+/// One cached page: the Swift-parity line decomposition plus the per-character Unicode
+/// scalars range→string needs, and its estimated heap cost.
+struct CachedTextPage {
+    page: u32,
+    value: Arc<lyra_reader_text::SelectionTextPage>,
+    bytes: usize,
+    last_used: u64,
+}
+
+/// Per-document LRU of page text geometry.
+///
+/// `loads` counts hit-test cache misses that had to extract the page through PDFium; `hits`
+/// counts cache reads. The counters exist so the regression check can prove that a second
+/// pointer event on the same page never re-enters PDFium.
+#[derive(Default)]
+struct TextPageCache {
+    entries: Vec<CachedTextPage>,
+    tick: u64,
+    loads: u64,
+    hits: u64,
+    evictions: u64,
+}
+
+impl TextPageCache {
+    fn get(&mut self, page: u32) -> Option<Arc<lyra_reader_text::SelectionTextPage>> {
+        self.tick += 1;
+        let tick = self.tick;
+        let entry = self.entries.iter_mut().find(|entry| entry.page == page)?;
+        entry.last_used = tick;
+        self.hits += 1;
+        Some(Arc::clone(&entry.value))
+    }
+
+    fn insert(&mut self, page: u32, value: Arc<lyra_reader_text::SelectionTextPage>, bytes: usize) {
+        if bytes > TEXT_PAGE_CACHE_MAX_BYTES {
+            // A single page larger than the whole budget is never retained; the caller still
+            // gets the value it just built.
+            return;
+        }
+        self.tick += 1;
+        self.entries.retain(|entry| entry.page != page);
+        self.entries.push(CachedTextPage {
+            page,
+            value,
+            bytes,
+            last_used: self.tick,
+        });
+        while self.entries.len() > TEXT_PAGE_CACHE_MAX_ENTRIES
+            || self.entries.iter().map(|entry| entry.bytes).sum::<usize>()
+                > TEXT_PAGE_CACHE_MAX_BYTES
+        {
+            let Some((oldest, _)) = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_used)
+            else {
+                break;
+            };
+            self.entries.remove(oldest);
+            self.evictions += 1;
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        self.entries.iter().map(|entry| entry.bytes).sum()
+    }
+
+    fn pages_oldest_first(&self) -> Vec<u32> {
+        let mut entries: Vec<&CachedTextPage> = self.entries.iter().collect();
+        entries.sort_by_key(|entry| entry.last_used);
+        entries.iter().map(|entry| entry.page).collect()
+    }
+}
+
+/// Facts about one document's text-page cache, for the regression checks and diagnostics.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TextPageCacheStats {
+    /// Pages currently retained.
+    pub entries: u32,
+    /// Entry limit (5).
+    pub max_entries: u32,
+    /// Estimated retained bytes, including per-character scalars and the line decomposition.
+    pub bytes: u64,
+    /// Byte ceiling (~1.5 MiB).
+    pub max_bytes: u64,
+    /// Hit-test cache misses that extracted a page through PDFium.
+    pub loads: u64,
+    /// Hit-test calls served from the cache.
+    pub hits: u64,
+    /// Entries removed to stay under the entry or byte limit.
+    pub evictions: u64,
+    /// Retained pages, least recently used first.
+    pub pages: Vec<u32>,
+}
+
 /// The stable category of an AI failure, for the error record and for stream events.
 ///
 /// This is the machine contract the shell maps to its audit vocabulary and to the offline hint.
@@ -946,6 +1055,10 @@ pub struct LyraReaderDocument {
     /// the document is open (the annotation writer replaces the file, and then the shell
     /// reopens it), so this cache has the document's lifetime.
     ai_text: Mutex<std::collections::HashMap<u32, (String, Vec<PageChar>)>>,
+    /// Line-aware selection geometry, one small LRU per document. Kept separate from the AI
+    /// text cache (which has the document's lifetime) because the selection structure is
+    /// rebuilt per page and is much larger.
+    text_pages: Mutex<TextPageCache>,
 }
 
 /// The XFA handle state: the shell-facing facts plus the in-memory synthetic PDF.
@@ -1372,6 +1485,7 @@ impl LyraReaderDocument {
             index: Mutex::new(IndexRuntime::default()),
             replaced: std::sync::atomic::AtomicBool::new(false),
             ai_text: Mutex::new(std::collections::HashMap::new()),
+            text_pages: Mutex::new(TextPageCache::default()),
         }))
     }
 
@@ -1529,39 +1643,87 @@ impl LyraReaderDocument {
     /// Character boxes come back in **view space** (points, top-left origin), which is what
     /// hit-testing needs, so the shell never touches page space. The order is the engine's
     /// character order, not necessarily visual reading order (see `docs/03-rendering.md`).
+    ///
+    /// This method deliberately stays *uncached*: a caller asking for the text layer gets a
+    /// fresh read, and the build also warms the selection cache as a side effect, so the page
+    /// the shell just loaded answers its first pointer event without another PDFium read.
     pub fn text_page(&self, page: u32) -> Result<TextPage, LyraReaderFfiError> {
-        let raw = self.backend.raw_text_page(PageIndex(page))?;
-        let geometry = self.backend.page_info(PageIndex(page))?.geometry;
+        let model = self.extract_text_page(page)?;
+        let selection = Arc::new(lyra_reader_text::SelectionTextPage::new(model.clone()));
+        self.retain_selection_text_page(page, selection);
+        Ok(text_page_record(page, &model))
+    }
 
-        let chars: Vec<TextChar> = raw
-            .chars
-            .iter()
-            .map(|character| {
-                // Page boxes use a bottom-left origin, so the glyph's *top* edge is what
-                // maps to the view-space y after the single Y-flip.
-                let top_left = Point::new(
-                    character.rect.origin.x,
-                    character.rect.origin.y + character.rect.size.height,
-                );
-                // `page_to_view(1.0)` is the page→view transform at 100%: character boxes are
-                // reported in content points, and the canvas applies the zoom itself.
-                let view = geometry.page_to_view(1.0).apply(top_left);
-                TextChar {
-                    unicode: character.unicode,
-                    x_pt: view.x,
-                    y_pt: view.y,
-                    width_pt: character.rect.size.width,
-                    height_pt: character.rect.size.height,
-                }
-            })
-            .collect();
+    /// Line-aware hit test (Swift `TextPage.characterIndex`), served from the page cache.
+    ///
+    /// Synchronous by design: a pointer event is one FFI call and, after the page's first
+    /// event, no PDFium read. The returned index addresses the same `chars` array as
+    /// [`LyraReaderDocument::text_page`].
+    pub fn text_character_index(
+        &self,
+        page: u32,
+        x_pt: f64,
+        y_pt: f64,
+        extending_selection: bool,
+    ) -> Result<Option<u32>, LyraReaderFfiError> {
+        let page = self.selection_text_page(page)?;
+        Ok(page
+            .char_index_at(Point::new(x_pt, y_pt), extending_selection)
+            .map(|index| index.0))
+    }
 
-        Ok(TextPage {
-            page,
-            chars,
-            text: raw.text,
-            has_unicode_map_error: raw.has_unicode_map_error,
-        })
+    /// Box→range with Swift's acceptance rule (`TextPage.characterRange`), from the cache.
+    ///
+    /// The result is the span from the first to the last intersecting stop; see
+    /// [`lyra_reader_text::SelectionLayout::character_range`] for the cross-column caveat.
+    pub fn text_character_range(
+        &self,
+        page: u32,
+        x_pt: f64,
+        y_pt: f64,
+        width_pt: f64,
+        height_pt: f64,
+    ) -> Result<Option<TextRange>, LyraReaderFfiError> {
+        let page = self.selection_text_page(page)?;
+        Ok(page
+            .character_range(lyra_reader_core::Rect::new(x_pt, y_pt, width_pt, height_pt))
+            .map(|(first, last)| TextRange {
+                start: first.0,
+                end: last.0,
+            }))
+    }
+
+    /// Range→string with Swift's `TextPage.string(in:)` semantics, from the cache.
+    ///
+    /// This is the single Rust implementation the shell's copy command, annotation export and
+    /// reference extraction call. Invalid Unicode scalars are dropped and the range is clamped
+    /// exactly like Swift.
+    pub fn text_range_string(
+        &self,
+        page: u32,
+        start: u32,
+        end: u32,
+    ) -> Result<String, LyraReaderFfiError> {
+        let page = self.selection_text_page(page)?;
+        Ok(page.string_in_range(start, end))
+    }
+
+    /// Current text-page cache state; used by the cache regression checks.
+    pub fn text_page_cache_stats(&self) -> TextPageCacheStats {
+        let cache = self
+            .text_pages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        TextPageCacheStats {
+            entries: cache.entries.len() as u32,
+            max_entries: TEXT_PAGE_CACHE_MAX_ENTRIES as u32,
+            bytes: cache.bytes() as u64,
+            max_bytes: TEXT_PAGE_CACHE_MAX_BYTES as u64,
+            loads: cache.loads,
+            hits: cache.hits,
+            evictions: cache.evictions,
+            pages: cache.pages_oldest_first(),
+        }
     }
 
     /// Searches every page for `pattern` (ASCII-case-insensitive).
@@ -3494,6 +3656,103 @@ fn split_report(report: lyra_reader_pdfium::SplitReport) -> SplitReportRecord {
             .collect(),
         source_page_count: report.source_page_count,
         cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
+    }
+}
+
+impl LyraReaderDocument {
+    /// Extracts a page and builds its Swift-parity line decomposition.
+    ///
+    /// This is the one place that performs the page-space→view-space Y flip for selection; the
+    /// cache, the hit test and the box→range methods all read the same geometry.
+    fn extract_text_page(
+        &self,
+        page: u32,
+    ) -> Result<lyra_reader_text::TextPage, LyraReaderFfiError> {
+        let raw = self.backend.raw_text_page(PageIndex(page))?;
+        let geometry = self.backend.page_info(PageIndex(page))?.geometry;
+
+        let chars = raw
+            .chars
+            .iter()
+            .map(|character| {
+                // Page boxes use a bottom-left origin, so the glyph's *top* edge is what
+                // maps to the view-space y after the single Y-flip.
+                let top_left = Point::new(
+                    character.rect.origin.x,
+                    character.rect.origin.y + character.rect.size.height,
+                );
+                // `page_to_view(1.0)` is the page→view transform at 100%: character boxes are
+                // reported in content points, and the canvas applies the zoom itself.
+                let view = geometry.page_to_view(1.0).apply(top_left);
+                lyra_reader_text::CharBox {
+                    rect: lyra_reader_core::Rect::new(
+                        view.x,
+                        view.y,
+                        character.rect.size.width,
+                        character.rect.size.height,
+                    ),
+                    origin: view,
+                    unicode: character.unicode,
+                    font_size: character.rect.size.height,
+                    logical_order: 0,
+                }
+            })
+            .collect();
+
+        Ok(lyra_reader_text::TextPage {
+            page: PageIndex(page),
+            chars,
+            blocks: Vec::new(),
+            text: raw.text,
+            is_generated: raw.is_generated,
+            has_unicode_map_error: raw.has_unicode_map_error,
+        })
+    }
+
+    fn retain_selection_text_page(
+        &self,
+        page: u32,
+        value: Arc<lyra_reader_text::SelectionTextPage>,
+    ) {
+        let bytes = value.estimated_bytes();
+        self.text_pages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(page, value, bytes);
+    }
+
+    /// The cache read path: a hit avoids PDFium entirely, a miss extracts the page once.
+    fn selection_text_page(
+        &self,
+        page: u32,
+    ) -> Result<Arc<lyra_reader_text::SelectionTextPage>, LyraReaderFfiError> {
+        if let Some(value) = self
+            .text_pages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(page)
+        {
+            return Ok(value);
+        }
+
+        let value = Arc::new(lyra_reader_text::SelectionTextPage::new(
+            self.extract_text_page(page)?,
+        ));
+        {
+            let mut cache = self
+                .text_pages
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.loads += 1;
+            // Another thread may have filled the page while PDFium was extracting. Keep the
+            // first value so both callers hold the same geometry.
+            if let Some(existing) = cache.get(page) {
+                return Ok(existing);
+            }
+            let bytes = value.estimated_bytes();
+            cache.insert(page, Arc::clone(&value), bytes);
+        }
+        Ok(value)
     }
 }
 
@@ -5865,6 +6124,33 @@ pub struct TextPage {
     pub has_unicode_map_error: bool,
 }
 
+/// One closed character range into a page's text layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct TextRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// Convert the Rust text model into the FFI record.
+fn text_page_record(page: u32, model: &lyra_reader_text::TextPage) -> TextPage {
+    TextPage {
+        page,
+        chars: model
+            .chars
+            .iter()
+            .map(|character| TextChar {
+                unicode: character.unicode,
+                x_pt: character.rect.origin.x,
+                y_pt: character.rect.origin.y,
+                width_pt: character.rect.size.width,
+                height_pt: character.rect.size.height,
+            })
+            .collect(),
+        text: model.text.clone(),
+        has_unicode_map_error: model.has_unicode_map_error,
+    }
+}
+
 /// One rasterized tile of a page.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct TileBitmap {
@@ -6007,6 +6293,7 @@ impl LyraReaderEngine {
             index: Mutex::new(IndexRuntime::default()),
             replaced: std::sync::atomic::AtomicBool::new(false),
             ai_text: Mutex::new(std::collections::HashMap::new()),
+            text_pages: Mutex::new(TextPageCache::default()),
         }))
     }
 }

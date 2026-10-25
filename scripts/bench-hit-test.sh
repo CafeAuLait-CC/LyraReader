@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
 # Repeatable text-selection hit-test benchmark (measurement only, no app behaviour).
 #
-# Runs the Rust half (uncached FFI text_page vs cached text page) and the Swift half
-# (TextPage.characterIndex, SelectionLine.build, the real UniFFI text_page call, and the
-# Swift↔Rust parity comparison) on the same corpus pages and points.
+# Runs the Rust half (uncached FFI text_page, the legacy exact scan, the cached line-aware
+# Swift-parity scan) and the Swift half (TextPage.characterIndex, SelectionLine.build, the real
+# UniFFI text_page call, the cached FFI hit test) on the same corpus pages and points.
+#
+# Then it runs the frozen 2,500-point parity fixture through both implementations
+# (tests/fixtures/text-selection-parity.json). The corpus comparison is the live gate; the
+# fixture pins the tricky rules without needing a PDF or the sample corpus.
 #
 # Usage:
 #   ./scripts/bench-hit-test.sh [--repeat N] [--points N] [--parity N]
+#
+# Exit status is non-zero when the live Swift↔Rust parity comparison has any difference or the
+# frozen fixture disagrees.
 #
 # Environment (the same variables the rest of the gates use):
 #   CARGO_HOME              shared Cargo home (e.g. <repo>/.cargo-home)
@@ -15,7 +22,8 @@
 #   LYRA_READER_INDEX_CACHE=disabled is set for the run.
 #
 # Outputs under build/hit-bench/run-N/: dataset.jsonl (inputs + Rust results), rust.txt,
-# swift.txt, load.txt. The datasets are never committed.
+# swift.txt, load.txt. Those per-run datasets are never committed; the small frozen parity
+# fixture (`tests/fixtures/text-selection-parity.json`) is.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -107,11 +115,17 @@ for run in $(seq 1 "$REPEAT"); do
 done
 
 echo
+echo "==> frozen 2,500-point parity fixture"
+cargo test -q -p lyra-reader-ffi --test text_selection_parity
+"$SWIFT_CHECKS" --check-text-selection-parity \
+  "$ROOT/tests/fixtures/text-selection-parity.json"
+
+echo
 echo "==> summary (mean microseconds; see logs for p50/p95/max)"
 for run in $(seq 1 "$REPEAT"); do
   dir="$ROOT/build/hit-bench/run-$run"
   echo "run $run"
-  grep -E "Path A|Path B|100% zoom|200% zoom|Parity|closest index|box→|Swift FFI text_page|Swift FFI pageCount|SelectionLine" \
+  grep -E "Path A|Path B|Path C|100% zoom|200% zoom|Parity|closest index|box→|range→string|dataset Rust|Swift FFI text_page|Swift FFI textCharacterIndex|Swift FFI pageCount|SelectionLine|press nil|drag nil" \
     "$dir/rust.txt" "$dir/swift.txt" | sed 's/^/  /' || true
 done
 echo
