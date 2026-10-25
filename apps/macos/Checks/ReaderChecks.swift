@@ -99,6 +99,17 @@ struct ReaderChecks {
         AppState.usesStoredSidebarTab = false
         AppState.usesStoredSidePanelPreferences = false
 
+        if let flag = CommandLine.arguments.firstIndex(of: "--bench-hit-test") {
+            // Opt-in measurement only (`LyraReaderChecks --bench-hit-test dataset.jsonl`).
+            guard flag + 1 < CommandLine.arguments.count else {
+                FileHandle.standardError.write(
+                    Data("--bench-hit-test needs the dataset.jsonl written by the Rust example\n".utf8))
+                exit(2)
+            }
+            try hitTestBenchmark(
+                dataset: URL(fileURLWithPath: CommandLine.arguments[flag + 1]))
+            return
+        }
         let fastRoot = checkRoot(CommandLine.arguments.dropFirst(2).first)
         if CommandLine.arguments.contains("--check-preview-citation-card") {
             try await previewCitationCardChecks(root: fastRoot)
