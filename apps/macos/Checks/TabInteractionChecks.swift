@@ -342,9 +342,9 @@ extension ReaderChecks {
             tornState = state
             registry.register(session)
         }
-        coordinator.tearOff = { transfer, source in
-            registry.requestNewWindow(moving: transfer, from: source)
-        }
+        // The app's own wiring, not a test-local closure: the session installs the registry
+        // action the coordinator calls.
+        sourceSession.installTabTearOffAction()
         coordinator.beginDrag()
         require(coordinator.finishDrag(
             source: sourceState, sourceIndex: 1, localInsertionIndex: 1,

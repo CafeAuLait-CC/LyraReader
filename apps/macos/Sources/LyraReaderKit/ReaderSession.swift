@@ -87,13 +87,18 @@ public final class ReaderSession: ObservableObject, Identifiable {
         registry?.newWindow = action
     }
 
-    /// Installs the tear-off half of the tab drag. A drop outside every strip asks this window's
+    /// Installs the tear-off half of the tab drag. A drop outside every strip asks the app's
     /// registry for a new reader window and hands it the prepared tab; the registry completes the
-    /// move when that window's session registers. The closure holds the session weakly, so the
-    /// process-wide coordinator never keeps a closed window alive.
+    /// move when that window's session registers.
+    ///
+    /// The closure holds the *registry* weakly, not this session: every window installs the same
+    /// action, but the one that installed last is the one the process-wide coordinator keeps. A
+    /// session-owned closure would stop tearing tabs off as soon as that particular window closed;
+    /// the registry lives for the app, so tear-off keeps working from any remaining window.
     public func installTabTearOffAction() {
-        TabDragCoordinator.shared.tearOff = { [weak self] transfer, source in
-            guard let self, let registry = self.registry else { return false }
+        guard let registry else { return }
+        TabDragCoordinator.shared.tearOff = { [weak registry] transfer, source in
+            guard let registry else { return false }
             return registry.requestNewWindow(moving: transfer, from: source)
         }
     }
