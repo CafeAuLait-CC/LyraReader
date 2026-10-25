@@ -218,17 +218,24 @@ extension ReaderChecks {
 
     // MARK: - Moving tabs between windows
 
-    /// The three drop destinations of a tab drag:
+    /// The drop destinations of a tab drag, and what happens to the emptied window:
     ///
     /// * outside every strip: a new window opens with the same document, the same reading
-    ///   position and one tab removed from the source;
-    /// * another window's strip: the tab moves there and is inserted at the drop gap;
-    /// * back into the strip it came from: the same move, in the other direction.
+    ///   position and one tab removed from the source; a source with other tabs stays open, a
+    ///   single-tab source closes;
+    /// * another window's strip: the tab moves there and is inserted at the drop gap; moving the
+    ///   last tab out of a window closes that window;
+    /// * back into the strip it came from: the same move, in the other direction, with a target
+    ///   that still has a tab so no window closes;
+    /// * refused (dirty source tab, duplicate destination): the source window and its tab stay
+    ///   exactly where they were.
     ///
     /// The check drives the real `TabDragCoordinator` with registered strip rectangles and real
     /// `NSWindow`s, so the screen-point hit test that decides "another window vs. outside every
-    /// window" is exercised, not just the state-level move. Escape and a dirty source tab are
-    /// asserted to change nothing.
+    /// window" is exercised, not just the state-level move. The source sessions are attached to
+    /// their windows the way `ReaderWindowRoot` attaches them, so closing an emptied window is
+    /// asserted on the actual `NSWindow` (closed, not hidden) and the registry, not just on the
+    /// tabs array.
     @MainActor static func tabWindowMoveChecks(root: URL) async throws {
         let fileManager = FileManager.default
         let scratch = fileManager.temporaryDirectory
@@ -247,14 +254,14 @@ extension ReaderChecks {
 
         let a = try copyFixture("multipage.pdf", to: "window-a.pdf")
         let b = try copyFixture("outlined.pdf", to: "window-b.pdf")
+        let c = try copyFixture("multipage.pdf", to: "window-c.pdf")
+        let d = try copyFixture("multipage.pdf", to: "window-d.pdf")
 
         let registry = ReaderWindowRegistry()
         registry.markReady()
         let sourceState = AppState(engine: try RustEngine())
         sourceState.setViewportSize(CGSize(width: 700, height: 500))
         let sourceSession = ReaderSession(state: sourceState, registry: registry)
-        registry.register(sourceSession)
-        registry.noteFocused(sourceSession)
 
         // The drop-zone geometry is normally reported by each tab strip's reporter; the check
         // registers plain views at the same kind of frame, so `target(atScreenPoint:)` exercises
@@ -262,14 +269,23 @@ extension ReaderChecks {
         // give the coordinator a screen rectangle to hit-test against.
         let sourceWindow = NSWindow(
             contentRect: NSRect(x: 80, y: 80, width: 700, height: 500),
-            styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        // This check closes a window through `performClose`, so AppKit must not release it a
+        // second time when it closes: the Swift reference owns it, and an autorelease-pool drain
+        // after an over-release would crash the rest of the suite.
+        sourceWindow.isReleasedWhenClosed = false
         sourceWindow.contentView = NSView(frame: NSRect(x: 0, y: 0, width: 700, height: 500))
         let sourceZone = NSView(frame: NSRect(x: 20, y: 380, width: 500, height: TabRowLayout.height))
         sourceWindow.contentView?.addSubview(sourceZone)
+        // The app's real wiring: the session owns the window, installs the close delegate and
+        // registers itself. Without this a close would be a no-op in a headless check.
+        sourceSession.attach(window: sourceWindow)
+        registry.noteFocused(sourceSession)
 
         let targetWindow = NSWindow(
             contentRect: NSRect(x: 820, y: 80, width: 700, height: 500),
-            styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        targetWindow.isReleasedWhenClosed = false
         targetWindow.contentView = NSView(frame: NSRect(x: 0, y: 0, width: 700, height: 500))
         let targetZone = NSView(frame: NSRect(x: 20, y: 380, width: 500, height: TabRowLayout.height))
         targetWindow.contentView?.addSubview(targetZone)
@@ -278,22 +294,38 @@ extension ReaderChecks {
 
         let coordinator = TabDragCoordinator.shared
         var tornState: AppState?
+        // Every destination state that was given the stand-in target strip. Kept so the defer
+        // unregisters each one: the single-tab tear-off creates a second destination after the
+        // first one has finished with the strip.
+        var tornStates: [AppState] = []
+        // Windows and sessions made after the first source closes; cleaned up at the end so the
+        // process-wide coordinator and registry keep no drop zones from this check.
+        var extraWindows: [NSWindow] = []
+        var extraSessions: [ReaderSession] = []
         defer {
             coordinator.endDrag()
             coordinator.tearOff = nil
+            coordinator.closeEmptiedSource = nil
             coordinator.unregisterDropZone(for: sourceState)
-            if let tornState { coordinator.unregisterDropZone(for: tornState) }
+            for state in tornStates { coordinator.unregisterDropZone(for: state) }
+            for session in extraSessions { session.close() }
+            for window in extraWindows { window.orderOut(nil) }
             registry.newWindow = nil
             sourceWindow.orderOut(nil)
             targetWindow.orderOut(nil)
         }
 
         /// Re-registers both strips. The real `TabStrip` re-registers on every SwiftUI update,
-        /// so this keeps the test's zone counts in step with the tabs after each move.
+        /// so this keeps the test's zone counts in step with the tabs after each move. A source
+        /// window that has closed is skipped: its strip is no longer a drop target.
         func registerZones() {
-            coordinator.registerDropZone(
-                for: sourceState, view: sourceZone,
-                tabWidth: 100, tabCount: sourceState.tabs.count)
+            if sourceSession.window != nil {
+                coordinator.registerDropZone(
+                    for: sourceState, view: sourceZone,
+                    tabWidth: 100, tabCount: sourceState.tabs.count)
+            } else {
+                coordinator.unregisterDropZone(for: sourceState)
+            }
             if let tornState {
                 coordinator.registerDropZone(
                     for: tornState, view: targetZone,
@@ -327,8 +359,8 @@ extension ReaderChecks {
                 "the reorder can be put back for the move checks")
         registerZones()
 
-        // 2. Tear off outside every strip. Keep b active with a non-zero scroll offset so the new
-        //    window has a reading position to preserve.
+        // 2. Tear a tab out of a two-tab window. The new window opens with the same document and
+        //    reading position; the source keeps its other tab and stays open.
         sourceState.selectTab(1)
         sourceState.gotoPage(1)
         let scrollBeforeTearOff = sourceState.scrollYPt
@@ -340,11 +372,12 @@ extension ReaderChecks {
             let session = ReaderSession(state: state, registry: registry)
             createdStates.append(state)
             tornState = state
+            tornStates.append(state)
             registry.register(session)
         }
         // The app's own wiring, not a test-local closure: the session installs the registry
-        // action the coordinator calls.
-        sourceSession.installTabTearOffAction()
+        // actions the coordinator calls, including the one that closes an emptied source window.
+        sourceSession.installTabDragActions()
         coordinator.beginDrag()
         require(coordinator.finishDrag(
             source: sourceState, sourceIndex: 1, localInsertionIndex: 1,
@@ -365,86 +398,141 @@ extension ReaderChecks {
                 "the source window no longer has the torn-off tab")
         require(sourceState.document?.url?.lastPathComponent == "window-a.pdf",
                 "the source window switched to its remaining tab")
+        require(sourceWindow.isVisible && sourceSession.window === sourceWindow
+                    && registry.sessions.contains(where: { $0 === sourceSession }),
+                "a two-tab source keeps its window open with the remaining tab")
         require(registry.pendingTransferCount == 0,
                 "no torn-off tab is left waiting for its window")
         registerZones()
 
-        // 3. Move across windows: drag the source's only tab onto the torn-off window's strip, at
-        //    the gap after its tab. The document must exist in exactly one window afterwards.
-        sourceState.selectTab(0)
+        // 3. Give the torn-off window a second tab, then drag its original tab back: the same
+        //    cross-window path in reverse. The target keeps a tab, so no window closes here.
+        torn.newTab(url: c)
+        registerZones()
+        guard let movedBackIndex = torn.tabs.firstIndex(where: {
+            $0.url.lastPathComponent == "window-b.pdf"
+        }) else {
+            fatalError("FAIL: the torn-off tab is not in the target window")
+        }
+        coordinator.beginDrag()
+        require(coordinator.finishDrag(
+            source: torn, sourceIndex: movedBackIndex, localInsertionIndex: 0,
+            screenPoint: point(in: sourceZone, contentX: 0)) == .moved,
+            "dragging the tab back onto the original strip moves it back")
+        require(sourceState.tabs.map(\.url.lastPathComponent) == ["window-b.pdf", "window-a.pdf"],
+                "the tab returned to the original window at the drop gap")
+        require(sourceState.document?.url?.lastPathComponent == "window-b.pdf",
+                "the returned document is on screen in the original window")
+        require(torn.tabs.map(\.url.lastPathComponent) == ["window-c.pdf"],
+                "the target window no longer has the returned tab and keeps its own")
+        require(abs(sourceState.scrollYPt - scrollBeforeTearOff) < 0.5,
+                "the returned tab keeps its reading position")
+        require(allTabURLs(in: [sourceState, torn]).filter { $0 == "window-b.pdf" }.count == 1,
+                "the returned document is open in exactly one window")
+
+        // 4. Move the source's last tab onto the other window's strip. The drop succeeds and the
+        //    now-empty source window must close through the normal window-close path; the
+        //    destination keeps its tab and gains the moved one.
+        sourceState.closeTab(0)
+        require(sourceState.tabs.map(\.url.lastPathComponent) == ["window-a.pdf"],
+                "the source has one tab left for the emptied-window check")
+        registerZones()
         sourceState.gotoPage(1)
         let scrollOfA = sourceState.scrollYPt
         require(scrollOfA > 0, "the tab to move is scrolled away from the top")
-        let targetTabsBefore = torn.tabs.map(\.url.lastPathComponent)
+        let targetTabsBeforeMove = torn.tabs.map(\.url.lastPathComponent)
+        let targetSessionsBeforeMove = registry.sessions.count
         coordinator.beginDrag()
         require(coordinator.finishDrag(
             source: sourceState, sourceIndex: 0, localInsertionIndex: 0,
             screenPoint: point(in: targetZone, contentX: 110)) == .moved,
-            "a release over another window's strip moves the tab there")
+            "a release over another window's strip moves the last tab there")
         require(torn.tabs.map(\.url.lastPathComponent)
-                    == [targetTabsBefore[0], "window-a.pdf"],
+                    == targetTabsBeforeMove + ["window-a.pdf"],
                 "the moved tab is inserted at the drop gap in the target window")
-        require(torn.activeTabIndex == 1
+        require(torn.activeTabIndex == torn.tabs.count - 1
                     && torn.document?.url?.lastPathComponent == "window-a.pdf",
                 "the moved tab is active in the target window")
         require(abs(torn.scrollYPt - scrollOfA) < 0.5,
                 "the moved tab keeps its reading position")
         require(sourceState.tabs.isEmpty && sourceState.document == nil,
-                "the source window gave the tab up")
+                "the source window gave its last tab up")
+        require(!sourceState.contentCloseRequested,
+                "the emptied source closes without a Save / Discard prompt")
         require(allTabURLs(in: [sourceState, torn]).filter { $0 == "window-a.pdf" }.count == 1,
                 "the moved document is open in exactly one window")
-
-        // 4. Drag it back to the original window: the same cross-window path in reverse.
+        try await eventually("the emptied source window closes after its last tab moved out", {
+            !sourceWindow.isVisible
+                && sourceSession.window == nil
+                && !registry.sessions.contains(where: { $0 === sourceSession })
+        })
+        require(registry.sessions.count == targetSessionsBeforeMove - 1,
+                "only the emptied source session left the registry")
+        require(registry.sessions.contains(where: { $0.state === torn }),
+                "the destination window is untouched and still open")
         registerZones()
-        guard let movedIndex = torn.tabs.firstIndex(where: {
-            $0.url.lastPathComponent == "window-a.pdf"
-        }) else {
-            fatalError("FAIL: the moved tab is not in the target window")
-        }
+
+        // 5. Refused moves leave the source window and its tab intact.
+        //
+        // 5a. A dirty tab is refused before a window is even asked for.
+        let refusedState = AppState(engine: try RustEngine())
+        refusedState.setViewportSize(CGSize(width: 700, height: 500))
+        let refusedSession = ReaderSession(state: refusedState, registry: registry)
+        let refusedWindow = NSWindow(
+            contentRect: NSRect(x: 80, y: 80, width: 700, height: 500),
+            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        refusedWindow.isReleasedWhenClosed = false
+        refusedWindow.contentView = NSView(frame: NSRect(x: 0, y: 0, width: 700, height: 500))
+        refusedSession.attach(window: refusedWindow)
+        refusedWindow.orderFront(nil)
+        extraWindows.append(refusedWindow)
+        extraSessions.append(refusedSession)
+        refusedState.newTab(url: b)
+        refusedState.contentTextEditing = true
+        let blockedTabs = refusedState.tabs.map(\.url.lastPathComponent)
+        let windowsBeforeBlocked = registry.sessions.count
         coordinator.beginDrag()
-        require(coordinator.finishDrag(
-            source: torn, sourceIndex: movedIndex, localInsertionIndex: 0,
-            screenPoint: point(in: sourceZone, contentX: 0)) == .moved,
-            "dragging the tab back onto the original strip moves it back")
-        require(sourceState.tabs.map(\.url.lastPathComponent) == ["window-a.pdf"],
-                "the tab returned to the original window")
-        require(sourceState.document?.url?.lastPathComponent == "window-a.pdf",
-                "the returned document is on screen in the original window")
-        require(!torn.tabs.contains { $0.url.lastPathComponent == "window-a.pdf" },
-                "the target window no longer has the returned tab")
-        require(abs(sourceState.scrollYPt - scrollOfA) < 0.5,
-                "the returned tab keeps its reading position")
-        require(allTabURLs(in: [sourceState, torn]).filter { $0 == "window-a.pdf" }.count == 1,
-                "the returned document is open in exactly one window")
+        let blockedOutcome = coordinator.finishDrag(
+            source: refusedState, sourceIndex: 0, localInsertionIndex: 0,
+            screenPoint: outsideEveryStrip)
+        refusedState.contentTextEditing = false
+        guard case let .refused(reason) = blockedOutcome else {
+            fatalError("FAIL: moving a dirty tab was not refused: \(blockedOutcome)")
+        }
+        require(reason.contains("unsaved changes"),
+                "the refusal names unsaved changes: \(reason)")
+        require(refusedState.tabs.map(\.url.lastPathComponent) == blockedTabs,
+                "a refused move leaves the source tab in place")
+        require(registry.sessions.count == windowsBeforeBlocked
+                    && refusedWindow.isVisible && refusedSession.window === refusedWindow,
+                "a refused move creates no window and leaves the source window open")
 
-        // 5. A destination that already has the document refuses the move: accepting it would
-        //    put the same file in two windows. The source tab stays exactly where it was.
-        torn.newTab(url: a)
-        registerZones()
+        // 5b. A destination that already has the document refuses the move: accepting it would
+        //     put the same file in two windows. The source window and tab stay exactly as they
+        //     were.
+        refusedState.newTab(url: a)
         let targetTabsWithDuplicate = torn.tabs.map(\.url.lastPathComponent)
-        let sourceTabsWithDuplicate = sourceState.tabs.map(\.url.lastPathComponent)
+        let sourceTabsWithDuplicate = refusedState.tabs.map(\.url.lastPathComponent)
         coordinator.beginDrag()
         let duplicateOutcome = coordinator.finishDrag(
-            source: sourceState, sourceIndex: 0, localInsertionIndex: 0,
-            screenPoint: point(in: targetZone, contentX: 0))
+            source: refusedState, sourceIndex: refusedState.tabs.count - 1,
+            localInsertionIndex: 0, screenPoint: point(in: targetZone, contentX: 0))
         guard case let .refused(duplicateReason) = duplicateOutcome else {
             fatalError("FAIL: a duplicate document was not refused: \(duplicateOutcome)")
         }
         require(duplicateReason.contains("already open in the other window"),
                 "the duplicate refusal names the other window: \(duplicateReason)")
-        require(sourceState.tabs.map(\.url.lastPathComponent) == sourceTabsWithDuplicate,
+        require(refusedState.tabs.map(\.url.lastPathComponent) == sourceTabsWithDuplicate,
                 "a duplicate refusal leaves the source tab in place")
         require(torn.tabs.map(\.url.lastPathComponent) == targetTabsWithDuplicate,
                 "a duplicate refusal leaves the target window unchanged")
-        // Remove the duplicate again so the escape check below starts from the one-copy state.
-        torn.closeTab(torn.tabs.count - 1)
-        registerZones()
-        require(torn.tabs.map(\.url.lastPathComponent) == ["window-b.pdf"],
-                "the duplicate tab closes again for the remaining checks")
+        require(refusedWindow.isVisible && refusedSession.window === refusedWindow
+                    && registry.sessions.contains(where: { $0 === refusedSession }),
+                "a duplicate refusal leaves the source window open")
 
-        // 6. Escape cancels: no order change, no window, no document opened.
+        // 6. Escape cancels: no order change, no window, no document opened, no window closed.
         let windowsBeforeEscape = registry.sessions.count
-        let sourceTabsBeforeEscape = sourceState.tabs.map(\.url.lastPathComponent)
+        let sourceTabsBeforeEscape = refusedState.tabs.map(\.url.lastPathComponent)
         let targetTabsBeforeEscape = torn.tabs.map(\.url.lastPathComponent)
         let tearOffsBeforeEscape = registry.newWindowRequestCount
         let cancelsBeforeEscape = coordinator.cancelGeneration
@@ -453,39 +541,71 @@ extension ReaderChecks {
         require(coordinator.cancelGeneration == cancelsBeforeEscape + 1,
                 "Escape marks the drag cancelled")
         require(coordinator.finishDrag(
-            source: sourceState, sourceIndex: 0, localInsertionIndex: 0,
+            source: refusedState, sourceIndex: 0, localInsertionIndex: 0,
             screenPoint: point(in: targetZone, contentX: 0)) == .cancelled,
             "a cancelled drag commits nothing even over a valid target")
-        require(sourceState.tabs.map(\.url.lastPathComponent) == sourceTabsBeforeEscape
+        require(refusedState.tabs.map(\.url.lastPathComponent) == sourceTabsBeforeEscape
                     && torn.tabs.map(\.url.lastPathComponent) == targetTabsBeforeEscape,
                 "a cancelled drag changes neither window's tabs")
         require(registry.sessions.count == windowsBeforeEscape
                     && registry.newWindowRequestCount == tearOffsBeforeEscape,
                 "a cancelled drag creates no window")
+        require(refusedWindow.isVisible, "a cancelled drag closes no window")
         require(!coordinator.isDragging, "the cancelled drag is over")
 
-        // 7. Unsaved changes block the move, with a reason and no window. `contentTextEditing` is
-        //    part of `hasUnsavedDocumentChanges`; the same guard covers page, form and annotation
-        //    writes. The tab stays in its window.
-        sourceState.contentTextEditing = true
-        let blockedTabs = sourceState.tabs.map(\.url.lastPathComponent)
-        let windowsBeforeBlocked = registry.sessions.count
+        // 7. Tear off a single-tab window: the source window closes and the new window gets both
+        //    the document and the tab.
+        let loneState = AppState(engine: try RustEngine())
+        loneState.setViewportSize(CGSize(width: 700, height: 500))
+        let loneSession = ReaderSession(state: loneState, registry: registry)
+        let loneWindow = NSWindow(
+            contentRect: NSRect(x: 80, y: 80, width: 700, height: 500),
+            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        loneWindow.isReleasedWhenClosed = false
+        loneWindow.contentView = NSView(frame: NSRect(x: 0, y: 0, width: 700, height: 500))
+        loneSession.attach(window: loneWindow)
+        loneWindow.orderFront(nil)
+        extraWindows.append(loneWindow)
+        extraSessions.append(loneSession)
+        loneState.newTab(url: d)
+        loneState.gotoPage(1)
+        let scrollOfD = loneState.scrollYPt
+        require(scrollOfD > 0, "the single tab starts scrolled away from the top")
+        let createdBeforeLoneTearOff = createdStates.count
+        let sessionsBeforeLoneTearOff = registry.sessions.count
         coordinator.beginDrag()
-        let blockedOutcome = coordinator.finishDrag(
-            source: sourceState, sourceIndex: 0, localInsertionIndex: 0,
-            screenPoint: outsideEveryStrip)
-        sourceState.contentTextEditing = false
-        guard case let .refused(reason) = blockedOutcome else {
-            fatalError("FAIL: moving a dirty tab was not refused: \(blockedOutcome)")
+        require(coordinator.finishDrag(
+            source: loneState, sourceIndex: 0, localInsertionIndex: 0,
+            screenPoint: outsideEveryStrip) == .toreOff,
+            "a release outside every strip tears off the only tab")
+        require(createdStates.count == createdBeforeLoneTearOff + 1,
+                "the single-tab tear-off created exactly one new window")
+        guard let loneDestination = createdStates.last else {
+            fatalError("FAIL: the single-tab tear-off created no state")
         }
-        require(reason.contains("unsaved changes"),
-                "the refusal names unsaved changes: \(reason)")
-        require(sourceState.tabs.map(\.url.lastPathComponent) == blockedTabs,
-                "a refused move leaves the source tab in place")
-        require(registry.sessions.count == windowsBeforeBlocked,
-                "a refused move creates no window")
+        require(loneDestination.tabs.count == 1
+                    && loneDestination.tabs[0].url.lastPathComponent == "window-d.pdf",
+                "the destination holds the torn-off tab")
+        require(loneDestination.document?.url?.lastPathComponent == "window-d.pdf",
+                "the destination shows the torn-off document")
+        require(abs(loneDestination.scrollYPt - scrollOfD) < 0.5,
+                "the destination keeps the reading position")
+        require(loneState.tabs.isEmpty && loneState.document == nil,
+                "the single-tab source gave its tab up")
+        require(!loneState.contentCloseRequested,
+                "a single-tab tear-off closes the source without a Save / Discard prompt")
+        try await eventually("the single-tab source window closes after its last tab tore off", {
+            !loneWindow.isVisible
+                && loneSession.window == nil
+                && !registry.sessions.contains(where: { $0 === loneSession })
+        })
+        require(registry.sessions.count == sessionsBeforeLoneTearOff,
+                "the closed source is replaced by the destination, so one window remains")
+        require(registry.sessions.contains(where: { $0.state === loneDestination }),
+                "the destination window is registered and open")
 
-        print("PASS: tab tear-off, cross-window move, move back, Escape cancel and dirty-tab refusal")
+        print("PASS: tab tear-off, cross-window move, emptied-source close, "
+                + "two-tab keep-open, Escape and refused moves")
     }
 
     /// Every tab URL, by file name, in a set of window states. Used to prove a moved document is

@@ -44,6 +44,11 @@ public struct TabTransfer: Equatable, Sendable {
 /// source removal fails *after* the destination opened the document (it became dirty between the
 /// two calls), the destination's new tab is closed again so the document is never open in two
 /// windows.
+///
+/// Completing a move that leaves the source with no tabs also removes the source *window*. That
+/// lives outside this type because it is an AppKit window operation: ``TabDragCoordinator`` asks
+/// ``ReaderWindowRegistry`` to close the emptied window after a successful move, and the registry
+/// does the same when a torn-off tab arrives in its new window.
 @MainActor
 public enum TabMove {
     @discardableResult

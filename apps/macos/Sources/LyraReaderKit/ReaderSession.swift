@@ -87,19 +87,25 @@ public final class ReaderSession: ObservableObject, Identifiable {
         registry?.newWindow = action
     }
 
-    /// Installs the tear-off half of the tab drag. A drop outside every strip asks the app's
-    /// registry for a new reader window and hands it the prepared tab; the registry completes the
-    /// move when that window's session registers.
+    /// Installs the window-moving halves of the tab drag.
     ///
-    /// The closure holds the *registry* weakly, not this session: every window installs the same
-    /// action, but the one that installed last is the one the process-wide coordinator keeps. A
-    /// session-owned closure would stop tearing tabs off as soon as that particular window closed;
-    /// the registry lives for the app, so tear-off keeps working from any remaining window.
-    public func installTabTearOffAction() {
+    /// A drop outside every strip asks the app's registry for a new reader window and hands it the
+    /// prepared tab; the registry completes the move when that window's session registers. A drop
+    /// on another window's strip completes through ``TabMove`` and asks the registry to close the
+    /// source window when its last tab left it.
+    ///
+    /// Both closures hold the *registry* weakly, not this session: every window installs the same
+    /// actions, but the ones installed last are the ones the process-wide coordinator keeps. A
+    /// session-owned closure would stop moving tabs as soon as that particular window closed; the
+    /// registry lives for the app, so tab moves keep working from any remaining window.
+    public func installTabDragActions() {
         guard let registry else { return }
         TabDragCoordinator.shared.tearOff = { [weak registry] transfer, source in
             guard let registry else { return false }
             return registry.requestNewWindow(moving: transfer, from: source)
+        }
+        TabDragCoordinator.shared.closeEmptiedSource = { [weak registry] source in
+            registry?.closeWindowAfterTabMove(from: source)
         }
     }
 
@@ -244,8 +250,8 @@ public struct ReaderWindowRoot: View {
                 // second window in the registry). Every window installs the same action; it is
                 // idempotent and always refers to this scene's WindowGroup.
                 session.installNewWindowAction { openWindow(id: ReaderWindowRegistry.readerWindowID) }
-                // A tab dragged out of any tab strip is torn off through the same registry.
-                session.installTabTearOffAction()
+                // A tab dragged out of any tab strip is torn off or moved through the registry.
+                session.installTabDragActions()
             }
     }
 }
