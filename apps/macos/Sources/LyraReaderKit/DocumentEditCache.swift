@@ -50,16 +50,61 @@ import Foundation
     }
 
     enum CacheError: LocalizedError {
-        case sourceChanged
+        /// The PDF's identity no longer matches the one recorded with the cache. The message
+        /// names the recorded and current `size`/`sha256` so a reader can tell which file moved.
+        case sourceChanged(String)
+        /// `source.json` exists but cannot be decoded. This is metadata, not annotation
+        /// records: it never blocks loading the annotations themselves.
+        case sourceMetadata(String)
         case backupVerification
         var errorDescription: String? {
             switch self {
-            case .sourceChanged:
-                return "The PDF changed outside LyraReader. Its recovery data was kept; back it up before starting fresh."
+            case .sourceChanged(let detail):
+                return detail
+            case .sourceMetadata(let detail):
+                return "The PDF's saved source stamp could not be read: \(detail)"
             case .backupVerification:
                 return "The recovery data could not be verified. The original files were kept."
             }
         }
+    }
+
+    /// How today's PDF compares with the `source.json` recorded beside the annotation cache.
+    ///
+    /// Loading is deliberately separated from this check. A changed PDF means the cache may
+    /// describe a different revision of the document, which is a reason to refuse replacing
+    /// that PDF (see ``validateSource``), not a reason to call a perfectly readable annotation
+    /// cache corrupt. Only a decode failure of `annotations.json`/`changes.json` blocks writes.
+    enum SourceStatus: Equatable {
+        case missing
+        case matches
+        case changed(saved: SourceStamp, current: SourceStamp)
+        case unreadable(String)
+    }
+
+    static func sourceStatus(for document: URL) -> SourceStatus {
+        let metadata = directory(for: document).appendingPathComponent("source.json")
+        guard FileManager.default.fileExists(atPath: metadata.path),
+              FileManager.default.fileExists(atPath: document.path) else { return .missing }
+        let expected: SourceStamp
+        do {
+            expected = try JSONDecoder().decode(SourceStamp.self, from: Data(contentsOf: metadata))
+        } catch {
+            return .unreadable(AnnotationRecords.describe(error))
+        }
+        do {
+            let current = try SourceStamp(document)
+            return current == expected ? .matches : .changed(saved: expected, current: current)
+        } catch {
+            return .unreadable(error.localizedDescription)
+        }
+    }
+
+    static func sourceChangeMessage(saved: SourceStamp, current: SourceStamp) -> String {
+        "The PDF changed outside LyraReader (recorded size \(saved.size), sha256 \(saved.sha256.prefix(12))…;"
+            + " current size \(current.size), sha256 \(current.sha256.prefix(12))…)."
+            + " Its saved annotations were kept; restore the recorded file or back up the recovery data"
+            + " before starting fresh."
     }
 
     static func recordSource(for document: URL) throws {
@@ -69,11 +114,14 @@ import Foundation
     }
 
     static func validateSource(for document: URL) throws {
-        let metadata = directory(for: document).appendingPathComponent("source.json")
-        guard FileManager.default.fileExists(atPath: metadata.path),
-              FileManager.default.fileExists(atPath: document.path) else { return }
-        let expected = try JSONDecoder().decode(SourceStamp.self, from: Data(contentsOf: metadata))
-        guard try SourceStamp(document) == expected else { throw CacheError.sourceChanged }
+        switch sourceStatus(for: document) {
+        case .missing, .matches:
+            return
+        case .changed(let saved, let current):
+            throw CacheError.sourceChanged(sourceChangeMessage(saved: saved, current: current))
+        case .unreadable(let detail):
+            throw CacheError.sourceMetadata(detail)
+        }
     }
 
     static func prepareAnnotations(for document: URL) throws -> URL {
@@ -81,7 +129,10 @@ import Foundation
         if FileManager.default.fileExists(atPath: cache.path)
             || FileManager.default.fileExists(atPath: pendingStateURL(for: document).path)
             || FileManager.default.fileExists(atPath: recoveryURL(for: document).path) {
-            try validateSource(for: document)
+            // Reading the cache is not the moment to judge the PDF's identity. `loadAnnotations`
+            // decodes the records first and decides separately whether a changed PDF is safe to
+            // adopt (nothing cached yet) or needs the explicit recovery choice (cached work).
+            // `validateSource` still guards every operation that would replace the PDF itself.
             if !FileManager.default.fileExists(atPath: directory(for: document).appendingPathComponent("source.json").path) {
                 try recordSource(for: document)
             }
