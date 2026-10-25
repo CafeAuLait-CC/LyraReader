@@ -550,6 +550,11 @@ struct ReaderChecks {
             print("Titlebar theme checks passed")
             return
         }
+        if CommandLine.arguments.contains("--check-tab-pointer") {
+            try await tabPointerChecks()
+            print("Tab pointer checks passed")
+            return
+        }
         // Lets the tab-row and tab-switching checks be run on their own while they are being
         // worked on (`LyraReaderChecks --check-tab-row .`).
         if CommandLine.arguments.contains("--check-tab-row") {
@@ -558,6 +563,7 @@ struct ReaderChecks {
             titlebarResizeChecks()
             titlebarDoubleClickChecks()
             tabDragReorderChecks()
+            try await tabPointerChecks()
             try await tabWindowMoveChecks(root: root)
             try await titlebarThemeChecks(root: root)
             try await titlebarLastTabChecks(root: root)
@@ -1048,6 +1054,9 @@ struct ReaderChecks {
             }),
             ("tab-drag", {
                 tabDragReorderChecks()
+            }),
+            ("tab-pointer", {
+                try await tabPointerChecks()
             }),
             ("tab-window-move", {
                 try await tabWindowMoveChecks(root: root)

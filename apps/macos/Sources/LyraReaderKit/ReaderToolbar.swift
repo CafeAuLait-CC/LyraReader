@@ -52,6 +52,7 @@ public struct TabStrip: View {
                             ForEach(Array(state.tabs.enumerated()), id: \.element.id) { index, tab in
                                 tabItem(tab, index: index, width: tabWidth)
                                     .id(tab.id)
+                                    .transition(.opacity)
                             }
                             Button { state.showFileImporter = true } label: { Image(systemName: "plus") }
                                 .buttonStyle(LyraReaderToolStyle())
@@ -83,6 +84,7 @@ public struct TabStrip: View {
                             }
                         }
                     }
+                    .frame(height: TabRowLayout.height)
                     .onChange(of: state.activeTabIndex) { _, index in
                         guard let index, state.tabs.indices.contains(index) else { return }
                         if index == state.tabs.count - 1 { scroll.scrollTo("new-tab", anchor: .trailing) }
@@ -99,16 +101,15 @@ public struct TabStrip: View {
         .frame(height: Self.height)
         .background(LyraReaderTheme.tabbarBg)
         .overlay(alignment: .bottom) { LyraReaderTheme.separator.frame(height: 1) }
-        // Escape may cancel the SwiftUI gesture without delivering `onEnded`; clear the local
-        // preview so the insertion line cannot outlive the cancelled drag.
+        // Clear the source placeholder and insertion line immediately when Escape cancels.
         .onChange(of: dragCoordinator.cancelGeneration) { _, _ in
             tabDrag = nil
         }
     }
 
     /// One tab. The selection surface covers the whole rectangle; the close button is drawn on
-    /// top of its right-hand end and takes only its own 24 pt. A drag wins over the tap gesture
-    /// at 3 pt, so a click still selects while a drag never half-switches. The drag reorders the
+    /// top of its right-hand end and takes only its own 24 pt. A native drag starts at 3 pt,
+    /// so a click still selects while a drag never half-switches. The drag reorders the
     /// tab on drop; the empty part of the row is still an AppKit window-drag area.
     private func tabItem(_ tab: AppState.OpenTab, index: Int, width: CGFloat) -> some View {
         let active = index == state.activeTabIndex
@@ -134,8 +135,6 @@ public struct TabStrip: View {
                      + TabRowLayout.closeButtonTrailingInset + 6)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
             .contentShape(Rectangle())
-            .onTapGesture { state.selectTab(index) }
-            .highPriorityGesture(tabDragGesture(index: index, width: width))
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(tab.title)
             .accessibilityAddTraits(.isButton)
@@ -164,10 +163,8 @@ public struct TabStrip: View {
             .accessibilityLabel("Close \(tab.title)")
         }
         .frame(width: width, height: TabRowLayout.height)
-        // The dragged tab follows the pointer above its neighbours. Its layout slot stays where
-        // it was, so the other tabs do not move until the drop commits the new order.
-        .offset(x: tabDrag?.sourceIndex == index ? tabDrag?.translation.width ?? 0 : 0)
-        .zIndex(tabDrag?.sourceIndex == index ? 1 : 0)
+        // Keep a dimmed source slot while the floating preview follows the pointer.
+        .opacity(tabDrag?.sourceIndex == index ? 0.35 : 1)
         .foregroundStyle(active ? LyraReaderTheme.textPrimary : LyraReaderTheme.textSecondary)
         .background {
             if active {
@@ -185,63 +182,14 @@ public struct TabStrip: View {
                     .frame(width: 1, height: 22).padding(.trailing, -2)
             }
         }
+        .overlay {
+            TabDragInput(state: state, tabID: tab.id) { tabDrag = $0 }
+                .frame(width: width, height: TabRowLayout.height)
+                .accessibilityHidden(true)
+        }
         .help(tab.title)
     }
 
-    /// The tab drag. `TabDragSession` owns the local arithmetic (which gap, whether the pointer is
-    /// still on this strip); `TabDragCoordinator` owns the part that looks outside this window:
-    /// another window's strip at the release point, or no strip at all (a tear-off).
-    ///
-    /// The local session is followed by a target-window indicator in the strip being hovered. A
-    /// drop is committed only by the coordinator, so the visible indicator and the side effect
-    /// use the same target: this strip reorders, another strip receives the tab, and no strip
-    /// tears the tab off into a new window.
-    private func tabDragGesture(index: Int, width: CGFloat) -> some Gesture {
-        DragGesture(minimumDistance: 3, coordinateSpace: .named(TabReorder.coordinateSpaceName))
-            .onChanged { value in
-                // A cancelled drag ignores the rest of its own movement: the gesture can keep
-                // reporting locations after Escape until the button comes up.
-                guard !dragCoordinator.isCancelled else { return }
-                if tabDrag == nil { dragCoordinator.beginDrag() }
-                // Continue this tab's session, or start a fresh one. A session left behind by an
-                // interrupted gesture must not block the next drag on another tab.
-                var session: TabDragSession
-                if let current = tabDrag, current.sourceIndex == index {
-                    session = current
-                } else {
-                    session = TabDragSession(
-                        sourceIndex: index, tabCount: state.tabs.count, tabWidth: width)
-                }
-                session.update(location: value.location, translation: value.translation)
-                tabDrag = session
-                // Screen coordinates are what a drop in another window (or on the desktop) is
-                // expressed in; the local `value.location` cannot see past this view.
-                dragCoordinator.updateHover(screenPoint: NSEvent.mouseLocation, source: state)
-            }
-            .onEnded { value in
-                guard var session = tabDrag, session.sourceIndex == index else {
-                    tabDrag = nil
-                    dragCoordinator.endDrag()
-                    return
-                }
-                // Use the release location for the local arithmetic, but the screen point for
-                // deciding where the drop actually lands: the pointer can leave the strip between
-                // the last onChanged event and the release.
-                session.update(location: value.location, translation: value.translation)
-                let screenPoint = NSEvent.mouseLocation
-                tabDrag = nil
-                if dragCoordinator.isCancelled {
-                    dragCoordinator.endDrag()
-                    return
-                }
-                _ = dragCoordinator.finishDrag(
-                    source: state,
-                    sourceIndex: index,
-                    localInsertionIndex: session.insertionIndex,
-                    screenPoint: screenPoint
-                )
-            }
-    }
 }
 
 /// Reader controls and tool categories. Unimplemented commands have reserved, disabled

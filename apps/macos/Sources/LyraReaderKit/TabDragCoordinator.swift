@@ -35,10 +35,8 @@ public enum TabDragOutcome: Equatable {
 ///
 /// A tab drag is the one gesture that has to look outside its own window: dropping on another
 /// window's strip moves the tab there, and dropping on no strip at all tears the tab off into a
-/// new window. SwiftUI's `DragGesture` keeps receiving events while the pointer is outside the
-/// source view, so the gesture asks this coordinator what is under the pointer (from
-/// `NSEvent.mouseLocation`) and the coordinator answers from the drop zones each `TabStrip`
-/// registers.
+/// new window. The tab's AppKit input view retains pointer tracking beyond the source window
+/// and asks this coordinator to resolve the event's screen point against registered strips.
 ///
 /// It also owns the escape key. A cancelled drag must not commit the last on-strip position, so a
 /// local key monitor marks the drag cancelled; the gesture checks that mark before deciding.
@@ -62,8 +60,8 @@ public final class TabDragCoordinator: ObservableObject {
     /// show the same indicator before the drop.
     @Published public private(set) var hover: TabDropTarget?
 
-    /// Incremented when Escape cancels the drag. Tab strips observe it to clear the drag preview
-    /// even when SwiftUI does not deliver an `onEnded` callback for the cancelled gesture.
+    /// Incremented when Escape cancels the drag. Tab strips clear their source placeholder
+    /// immediately, before the pointer is released.
     @Published public private(set) var cancelGeneration = 0
 
     public private(set) var isDragging = false
@@ -79,9 +77,10 @@ public final class TabDragCoordinator: ObservableObject {
 
     private var zones: [ObjectIdentifier: Zone] = [:]
     private var escapeMonitor: Any?
-    /// Installed on cancel: if SwiftUI does not deliver `onEnded` for a cancelled gesture, the
-    /// mouse-up still ends the coordinator's drag so the next drag starts clean.
+    /// Installed on cancel so mouse-up ends tracking even if the source input view disappears.
     private var mouseUpMonitor: Any?
+    private var feedback: TabDragFeedback?
+    package var feedbackFrame: CGRect? { feedback?.isVisible == true ? feedback?.frame : nil }
 
     public init() {}
 
@@ -117,13 +116,13 @@ public final class TabDragCoordinator: ObservableObject {
         var best: (window: NSWindow, target: TabDropTarget)?
         for zone in zones.values {
             guard let state = zone.state, let view = zone.view, let window = view.window,
-                  window.isVisible else { continue }
+                  window.isVisible, !window.isMiniaturized, !view.isHiddenOrHasHiddenAncestor else { continue }
             let rect = window.convertToScreen(view.convert(view.bounds, to: nil))
             // The strip's reporting view spans the full (possibly scrolled) content, which can be
-            // wider than the window and clipped by the ScrollView. Intersect with the window so a
-            // point outside the window never counts; use the unclipped origin for the x mapping so
-            // a scrolled strip still maps to the same gap.
-            let visible = rect.intersection(window.frame)
+            // wider than the viewport. Only the visible portion can accept a drop; keep the
+            // unclipped origin for insertion math after horizontal scrolling.
+            let visible = window.convertToScreen(view.convert(view.visibleRect, to: nil))
+                .intersection(rect).intersection(window.frame)
             guard !visible.isNull, visible.contains(point) else { continue }
             if let best, best.window.orderedIndex <= window.orderedIndex { continue }
             let insertion = TabReorder.insertionIndex(
@@ -135,6 +134,33 @@ public final class TabDragCoordinator: ObservableObject {
             best = (window, TabDropTarget(state: state, insertionIndex: insertion))
         }
         return best?.target
+    }
+
+    /// Convert through the stable strip reporter, never through the moving preview/input view.
+    func localLocation(atScreenPoint point: CGPoint, in state: AppState) -> CGPoint? {
+        guard let view = zones[ObjectIdentifier(state)]?.view, let window = view.window else { return nil }
+        let local = view.convert(window.convertPoint(fromScreen: point), from: nil)
+        return CGPoint(x: local.x - view.bounds.minX,
+                       y: view.isFlipped ? local.y - view.bounds.minY : view.bounds.maxY - local.y)
+    }
+
+    private func tabFrame(in state: AppState, index: Int) -> CGRect? {
+        guard let zone = zones[ObjectIdentifier(state)], let view = zone.view, let window = view.window else { return nil }
+        let strip = window.convertToScreen(view.convert(view.bounds, to: nil))
+        return CGRect(x: strip.minX + CGFloat(index) * (zone.tabWidth + zone.spacing),
+                      y: strip.maxY - TabRowLayout.height, width: zone.tabWidth, height: TabRowLayout.height)
+    }
+
+    func beginFeedback(title: String, sourceFrame: CGRect, pressPoint: CGPoint, appearance: NSAppearance) {
+        feedback?.dismiss()
+        feedback = TabDragFeedback(title: title, sourceFrame: sourceFrame,
+                                   pressPoint: pressPoint, appearance: appearance)
+    }
+
+    func updateFeedback(screenPoint: CGPoint, source: AppState) {
+        let target = target(atScreenPoint: screenPoint)
+        let hint = target == nil ? "New window" : target?.state === source ? "Reorder tab" : "Move to this window"
+        feedback?.update(at: screenPoint, hint: hint)
     }
 
     // MARK: - Drag lifecycle
@@ -153,12 +179,17 @@ public final class TabDragCoordinator: ObservableObject {
         guard isDragging else { return }
         isCancelled = true
         hover = nil
+        let returning = feedback
+        feedback = nil
+        returning?.settle(at: returning?.sourceFrame)
         cancelGeneration &+= 1
         removeEscapeMonitor()
         installMouseUpMonitor()
     }
 
     public func endDrag() {
+        feedback?.dismiss()
+        feedback = nil
         isDragging = false
         isCancelled = false
         hover = nil
@@ -196,12 +227,23 @@ public final class TabDragCoordinator: ObservableObject {
         localInsertionIndex: Int,
         screenPoint: CGPoint
     ) -> TabDragOutcome {
-        defer { endDrag() }
+        var landing: CGRect?
+        var returnToSource = true
+        defer {
+            let preview = feedback
+            feedback = nil
+            preview?.settle(at: returnToSource ? preview?.sourceFrame : landing)
+            endDrag()
+        }
         if isCancelled { return .cancelled }
         guard source.tabs.indices.contains(sourceIndex) else { return .nothing }
 
         if let target = target(atScreenPoint: screenPoint) {
             if target.state === source {
+                let destination = TabReorder.destinationIndex(sourceIndex: sourceIndex,
+                    insertionIndex: localInsertionIndex, tabCount: source.tabs.count) ?? sourceIndex
+                landing = tabFrame(in: source, index: destination)
+                returnToSource = false
                 return source.moveTab(
                     from: sourceIndex, toInsertionIndex: localInsertionIndex) ? .reordered : .nothing
             }
@@ -209,6 +251,8 @@ public final class TabDragCoordinator: ObservableObject {
                 from: source, tabAtIndex: sourceIndex,
                 to: target.state, insertionIndex: target.insertionIndex
             ) {
+                landing = tabFrame(in: target.state, index: target.insertionIndex)
+                returnToSource = false
                 closeEmptiedSourceIfNeeded(source)
                 return .moved
             }
@@ -223,7 +267,7 @@ public final class TabDragCoordinator: ObservableObject {
             source.reportTabTransferFailure(reason)
             return .refused(reason)
         }
-        if tearOff(transfer, source) { return .toreOff }
+        if tearOff(transfer, source) { returnToSource = false; return .toreOff }
         return .refused(source.lastError ?? "The new window could not be created.")
     }
 
