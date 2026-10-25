@@ -230,6 +230,30 @@ fn xfa_form_is_detected_rendered_five_pages_and_read_only() {
                 .map(|_| ()),
         ),
     );
+    expect_read_only(
+        "content_redaction_raster_pages",
+        read_only(
+            document
+                .content_redaction_raster_pages(
+                    0,
+                    "{\"action\":\"redact\",\"revision\":\"x\",\"bounds\":{\"x\":0,\"y\":0,\"width\":1,\"height\":1},\"blackout\":true}"
+                        .to_string(),
+                )
+                .map(|_| ()),
+        ),
+    );
+    expect_read_only(
+        "apply_content_edit_allowing_raster",
+        read_only(
+            document
+                .apply_content_edit_allowing_raster(
+                    0,
+                    "{\"kind\":\"insert_text\"}".to_string(),
+                    dest(),
+                )
+                .map(|_| ()),
+        ),
+    );
 
     // The source file is byte-identical after every refusal.
     assert_eq!(

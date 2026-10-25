@@ -536,6 +536,12 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
             } else {
                 // Leaving Edit leaves its tool too. Reopening the row starts in the implicit
                 // pointer state, so the inspector (which follows an armed tool) stays closed.
+                if rasterRedactionPrompt != nil {
+                    rasterRedactionPrompt = nil
+                    pendingRasterRedaction = nil
+                    contentCommandInFlight = false
+                    contentEditTask = nil
+                }
                 deactivateSecondaryRowTool(.contentEdit)
             }
         }
@@ -550,6 +556,11 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     @Published public private(set) var contentTextNotice: String?
     @Published public private(set) var contentCommandInFlight = false
     @Published public var contentCloseRequested = false
+    /// Set when a redaction needs the whole-page raster fallback and the reader has not chosen
+    /// yet. The Edit workspace presents Cancel/Continue from this value; clearing it without
+    /// staging is the Cancel path and writes nothing.
+    @Published public private(set) var rasterRedactionPrompt: RasterRedactionPrompt?
+    private var pendingRasterRedaction: (command: PDFContentCommand, page: Int, label: String)?
     private var contentRecoveryCommand: (command: PDFContentCommand, page: Int, url: URL?)?
     private var pendingContentClose: Int?
     var commitContentText: (() -> Void)?
@@ -16022,9 +16033,104 @@ extension AppState {
         var command = PDFContentCommand(action: "redact", revision: page.revision)
         command.bounds = PDFContentBox(rect)
         command.blackout = blackout
-        stageContentEdit(
+        preflightContentRedaction(
             command, page: page.page,
             label: blackout ? "Blackout page content" : "Erase page content")
+    }
+
+    /// Looks for the whole-page raster fallback before creating a working revision.
+    ///
+    /// Ordinary text redactions continue straight into the existing staging path, so nothing
+    /// about them changes. If the engine would have to replace pages with images, the command is
+    /// held here and ``rasterRedactionPrompt`` asks: Cancel drops the command and writes
+    /// nothing; Continue stages it with the fallback allowed.
+    private func preflightContentRedaction(
+        _ command: PDFContentCommand, page: Int, label: String
+    ) {
+        guard rasterRedactionPrompt == nil else { return }
+        guard contentTextRecovery == nil else {
+            contentTextNotice = "Finish or discard the recovered text draft before another edit."
+            return
+        }
+        guard !contentCommandInFlight, !pageEditBusy, !contentEditLoading else {
+            preserveContentFailure(
+                command, "Wait for the current page change to finish.", page: page)
+            return
+        }
+        guard contentEditPage?.revision == command.revision else {
+            preserveContentFailure(
+                command, "The page changed before this edit. Reload the page before retrying.",
+                page: page)
+            return
+        }
+        contentCommandInFlight = true
+        let source = document?.url
+        contentEditTask = Task { @MainActor [weak self] in
+            guard let self else { return false }
+            defer { self.contentCommandInFlight = false }
+            do {
+                let pages = try await self.engine.contentRedactionRasterPages(
+                    page: page, command: command)
+                guard self.document?.url == source, self.contentEditPage?.page == page else {
+                    throw NSError(
+                        domain: "LyraReader", code: 2,
+                        userInfo: [
+                            NSLocalizedDescriptionKey: "The active document changed during the edit"
+                        ])
+                }
+                if pages.isEmpty {
+                    return await self.performContentStage(
+                        command, page: page, label: label, allowRaster: false, source: source)
+                }
+                self.pendingRasterRedaction = (command, page, label)
+                self.rasterRedactionPrompt = Self.rasterRedactionPrompt(pages: pages)
+                return false
+            } catch {
+                self.preserveContentFailure(
+                    command,
+                    "Content edit failed; the previous revision is unchanged: \(error.localizedDescription)",
+                    page: page, url: self.document?.url)
+                self.discardEmptyPageEditSession()
+                return false
+            }
+        }
+    }
+
+    /// The confirmation's Continue action: stage the held redaction with the fallback.
+    public func confirmRasterRedaction() {
+        guard rasterRedactionPrompt != nil, let pending = pendingRasterRedaction else { return }
+        rasterRedactionPrompt = nil
+        pendingRasterRedaction = nil
+        stageContentEdit(
+            pending.command, page: pending.page, label: pending.label, allowRaster: true)
+    }
+
+    /// The confirmation's Cancel action: drop the held command before any revision exists.
+    public func cancelRasterRedaction() {
+        guard rasterRedactionPrompt != nil else { return }
+        rasterRedactionPrompt = nil
+        pendingRasterRedaction = nil
+        contentCommandInFlight = false
+        contentEditTask = nil
+        statusMessage = "Redaction cancelled · nothing was written; the document is unchanged"
+    }
+
+    /// Builds the words the reader sees. The page list is 1-based, as everywhere in the UI.
+    private static func rasterRedactionPrompt(pages: [Int]) -> RasterRedactionPrompt {
+        let zeroBased = pages.sorted()
+        let list = pageList(zeroBased)
+        let one = zeroBased.count == 1
+        let images = one ? "an image" : "images"
+        let possessive = one ? "its" : "their"
+        let title = "Replace \(list) with \(images)?"
+        let message =
+            "This redaction can only remove the content by rasterising \(list), which replaces "
+            + "\(one ? "the page" : "those pages") with \(images). The text layer on \(list) is "
+            + "gone afterwards, so \(possessive) text is no longer selectable or searchable. "
+            + "Other pages keep their text. Cancel leaves the document unchanged; Continue "
+            + "stages the redaction in the working copy."
+        return RasterRedactionPrompt(
+            pages: zeroBased.map { $0 + 1 }, title: title, message: message)
     }
 
     public func setContentLink(_ item: PDFContentItem?, page: Int?, uri: String?) {
@@ -16254,7 +16360,10 @@ extension AppState {
         }
     }
 
-    private func stageContentEdit(_ command: PDFContentCommand, page: Int, label: String) {
+    private func stageContentEdit(
+        _ command: PDFContentCommand, page: Int, label: String, allowRaster: Bool = false
+    ) {
+        guard rasterRedactionPrompt == nil else { return }
         guard contentTextRecovery == nil else {
             contentTextNotice = "Finish or discard the recovered text draft before another edit."
             return
@@ -16280,81 +16389,113 @@ extension AppState {
                 }
             }
             guard let self else { return false }
-            guard await ensurePageEditSession(),
-                let snapshot = pageEditSnapshot(label: label), document?.url == source
-            else {
-                preserveContentFailure(command, "Could not prepare the working copy.", page: page)
-                return false
+            return await self.performContentStage(
+                command, page: page, label: label, allowRaster: allowRaster, source: source)
+        }
+    }
+
+    /// The shared staging body: prepares the working copy, writes one revision, and adopts it.
+    ///
+    /// `allowRaster` is only true after the reader accepted ``rasterRedactionPrompt``. The
+    /// engine's report, not the confirmation's prediction, decides which pages the status names.
+    private func performContentStage(
+        _ command: PDFContentCommand, page: Int, label: String, allowRaster: Bool, source: URL?
+    ) async -> Bool {
+        guard await ensurePageEditSession(),
+            let snapshot = pageEditSnapshot(label: label), document?.url == source
+        else {
+            preserveContentFailure(command, "Could not prepare the working copy.", page: page)
+            return false
+        }
+        var next: URL?
+        var effectiveCommand = command
+        let translationSnapshot = inPlaceTranslation.snapshot()
+        do {
+            if try await materializeAnnotationsInWorkingCopy() {
+                effectiveCommand.revision = try await engine.contentObjects(page: page).revision
             }
-            var next: URL?
-            var effectiveCommand = command
-            let translationSnapshot = inPlaceTranslation.snapshot()
-            do {
-                if try await materializeAnnotationsInWorkingCopy() {
-                    effectiveCommand.revision = try await engine.contentObjects(page: page).revision
-                }
-                guard var session = pageEditSession else { return false }
-                pageEditBusy = true
-                defer { pageEditBusy = false }
-                let destination = session.directory.appendingPathComponent("rev-\(UUID().uuidString).pdf")
-                next = destination
-                let editingSource = document?.url
-                try await engine.applyContentEdit(page: page, command: effectiveCommand, to: destination)
-                guard document?.url == editingSource else {
-                    throw NSError(
-                        domain: "LyraReader", code: 2,
-                        userInfo: [
-                            NSLocalizedDescriptionKey: "The active document changed during the edit"
-                        ])
-                }
-                try loadPageEditRevision(
-                    at: destination, title: session.title, annotationRecordsURL: session.annotationRecordsURL,
-                    annotations: annotations, bookmarks: bookmarks, slots: annotationRecordSlots,
-                    currentPage: currentPage, selection: pageSelection)
-                // The edit may have changed one block's words or reflowed it. Entries on this
-                // page are re-checked individually; translations on every other page survive.
-                await inPlaceTranslation.restoreAfterPageEdit(
-                    translationSnapshot,
-                    pageMap: nil,
-                    rotatedPages: [],
-                    editedPages: [page],
-                    reason: "The edited page changed."
-                )
-                session.revisionURL = destination
-                session.revisionNumber += 1
-                session.operations.append(label)
-                session.undo.append(snapshot)
-                session.redo.removeAll()
-                pageEditSession = session
-                pageEditPendingOperations = session.operations
-                pageEditIsApplied = false
-                if command.action == "replaceText" {
-                    contentRecoveryCommand = nil
-                    contentTextRecovery = nil
-                    contentTextNotice = nil
-                }
+            guard var session = pageEditSession else { return false }
+            pageEditBusy = true
+            defer { pageEditBusy = false }
+            let destination = session.directory.appendingPathComponent("rev-\(UUID().uuidString).pdf")
+            next = destination
+            let editingSource = document?.url
+            let rasterizedPages: [Int]
+            if allowRaster {
+                rasterizedPages = try await engine.applyContentEditAllowingRaster(
+                    page: page, command: effectiveCommand, to: destination)
+            } else {
+                try await engine.applyContentEdit(
+                    page: page, command: effectiveCommand, to: destination)
+                rasterizedPages = []
+            }
+            guard document?.url == editingSource else {
+                throw NSError(
+                    domain: "LyraReader", code: 2,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "The active document changed during the edit"
+                    ])
+            }
+            try loadPageEditRevision(
+                at: destination, title: session.title, annotationRecordsURL: session.annotationRecordsURL,
+                annotations: annotations, bookmarks: bookmarks, slots: annotationRecordSlots,
+                currentPage: currentPage, selection: pageSelection)
+            // The edit may have changed one block's words or reflowed it. Entries on this
+            // page are re-checked individually; translations on every other page survive.
+            await inPlaceTranslation.restoreAfterPageEdit(
+                translationSnapshot,
+                pageMap: nil,
+                rotatedPages: [],
+                editedPages: [page],
+                reason: "The edited page changed."
+            )
+            session.revisionURL = destination
+            session.revisionNumber += 1
+            session.operations.append(label)
+            session.undo.append(snapshot)
+            session.redo.removeAll()
+            pageEditSession = session
+            pageEditPendingOperations = session.operations
+            pageEditIsApplied = false
+            if command.action == "replaceText" {
+                contentRecoveryCommand = nil
+                contentTextRecovery = nil
+                contentTextNotice = nil
+            }
+            if rasterizedPages.isEmpty {
                 statusMessage = "\(label) · unsaved PDF changes"
-                await reloadContentObjects()
-                return true
-            } catch {
-                // The edit did not land, so the blocks and their cached translations are still
-                // the ones on screen. Restore them rather than making a failed command discard
-                // overlays.
-                await inPlaceTranslation.restoreAfterPageEdit(
-                    translationSnapshot, pageMap: nil, rotatedPages: [], editedPages: [],
-                    reason: nil)
-                await reloadContentObjects()
-                preserveContentFailure(
-                    effectiveCommand,
-                    "Content edit failed; the previous revision is unchanged: \(error.localizedDescription)",
-                    page: page, url: document?.url)
-                if let next { try? FileManager.default.removeItem(at: next) }
-                // A failed first edit leaves a prepared working copy with zero operations. It is
-                // not a pending page change, so close it: there is nothing to confirm or save,
-                // and the edit error is the only thing the reader must see.
-                discardEmptyPageEditSession()
-                return false
+            } else {
+                let pages = rasterizedPages.map { $0 + 1 }.sorted()
+                let one = pages.count == 1
+                let list = Self.pageList(rasterizedPages.sorted())
+                let consequence =
+                    one
+                    ? "its text layer is gone (no longer selectable or searchable)"
+                    : "their text layers are gone (no longer selectable or searchable)"
+                statusMessage =
+                    "\(label) · \(list) \(one ? "is" : "are") now \(one ? "an image" : "images"): "
+                    + "\(consequence) · unsaved PDF changes"
             }
+            await reloadContentObjects()
+            return true
+        } catch {
+            // The edit did not land, so the blocks and their cached translations are still
+            // the ones on screen. Restore them rather than making a failed command discard
+            // overlays.
+            await inPlaceTranslation.restoreAfterPageEdit(
+                translationSnapshot, pageMap: nil, rotatedPages: [], editedPages: [],
+                reason: nil)
+            await reloadContentObjects()
+            preserveContentFailure(
+                effectiveCommand,
+                "Content edit failed; the previous revision is unchanged: \(error.localizedDescription)",
+                page: page, url: document?.url)
+            if let next { try? FileManager.default.removeItem(at: next) }
+            // A failed first edit leaves a prepared working copy with zero operations. It is
+            // not a pending page change, so close it: there is nothing to confirm or save,
+            // and the edit error is the only thing the reader must see.
+            discardEmptyPageEditSession()
+            return false
         }
     }
 }

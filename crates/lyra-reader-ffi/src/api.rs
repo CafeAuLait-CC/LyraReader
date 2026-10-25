@@ -823,6 +823,65 @@ impl Default for IndexRuntime {
     }
 }
 
+/// Decodes a content command and converts its view-space rectangle to PDF user space.
+///
+/// Shared by the staging methods so the pre-flight and the write it confirms address exactly the
+/// same region, including rotated and cropped pages. A free function (not a method) so UniFFI's
+/// export of [`LyraReaderDocument`] does not ask its internal command type to cross the FFI.
+fn prepare_content_command(
+    document: &LyraReaderDocument,
+    page: u32,
+    command: String,
+) -> Result<lyra_reader_pdfium::content_edit::ContentCommand, LyraReaderFfiError> {
+    use lyra_reader_pdfium::content_edit::ContentCommand;
+    document.ensure_not_xfa()?;
+    if document.replaced.load(std::sync::atomic::Ordering::Acquire)
+        || document.backend.needs_password()
+    {
+        return Err(LyraReaderFfiError::InvalidArgument {
+            message: "Reopen an unencrypted document before editing its contents.".into(),
+        });
+    }
+    let mut command: ContentCommand =
+        serde_json::from_str(&command).map_err(|e| LyraReaderFfiError::InvalidArgument {
+            message: e.to_string(),
+        })?;
+    let transform = document
+        .backend
+        .page_info(PageIndex(page))?
+        .geometry
+        .view_to_page(1.0)
+        .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
+            message: "Singular page geometry".into(),
+        })?;
+    match &mut command {
+        ContentCommand::Transform { bounds, .. }
+        | ContentCommand::ReplaceText { bounds, .. }
+        | ContentCommand::InsertText { bounds, .. }
+        | ContentCommand::Redact { bounds, .. }
+        | ContentCommand::InsertImage { bounds, .. }
+        | ContentCommand::SetLink { bounds, .. } => {
+            *bounds = transform
+                .apply_rect(lyra_reader_core::Rect::new(
+                    bounds.x,
+                    bounds.y,
+                    bounds.width,
+                    bounds.height,
+                ))
+                .into();
+        }
+        ContentCommand::Delete { .. }
+        | ContentCommand::ReplaceImage { .. }
+        | ContentCommand::CropImage { .. } => {}
+    }
+    // The shell's positive angle turns clockwise in its Y-down view space. PDF content matrices
+    // use Y-up coordinates, including on pages with an intrinsic /Rotate.
+    if let ContentCommand::Transform { rotation, .. } = &mut command {
+        *rotation = -*rotation;
+    }
+    Ok(command)
+}
+
 #[uniffi::export]
 impl LyraReaderDocument {
     /// The path this document was opened from.
@@ -1845,57 +1904,16 @@ impl LyraReaderDocument {
 
     /// Stages a content edit in a separate working revision; publication uses the existing
     /// signature-aware page-edit save transaction.
+    ///
+    /// A redaction that would need the whole-page raster fallback is refused: the shell must
+    /// ask first and then call [`Self::apply_content_edit_allowing_raster`].
     pub fn apply_content_edit(
         &self,
         page: u32,
         command: String,
         destination: String,
     ) -> Result<(), LyraReaderFfiError> {
-        use lyra_reader_pdfium::content_edit::ContentCommand;
-        self.ensure_not_xfa()?;
-        if self.replaced.load(std::sync::atomic::Ordering::Acquire) || self.backend.needs_password()
-        {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                message: "Reopen an unencrypted document before editing its contents.".into(),
-            });
-        }
-        let mut command: ContentCommand =
-            serde_json::from_str(&command).map_err(|e| LyraReaderFfiError::InvalidArgument {
-                message: e.to_string(),
-            })?;
-        let transform = self
-            .backend
-            .page_info(PageIndex(page))?
-            .geometry
-            .view_to_page(1.0)
-            .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
-                message: "Singular page geometry".into(),
-            })?;
-        match &mut command {
-            ContentCommand::Transform { bounds, .. }
-            | ContentCommand::ReplaceText { bounds, .. }
-            | ContentCommand::InsertText { bounds, .. }
-            | ContentCommand::Redact { bounds, .. }
-            | ContentCommand::InsertImage { bounds, .. }
-            | ContentCommand::SetLink { bounds, .. } => {
-                *bounds = transform
-                    .apply_rect(lyra_reader_core::Rect::new(
-                        bounds.x,
-                        bounds.y,
-                        bounds.width,
-                        bounds.height,
-                    ))
-                    .into();
-            }
-            ContentCommand::Delete { .. }
-            | ContentCommand::ReplaceImage { .. }
-            | ContentCommand::CropImage { .. } => {}
-        }
-        // The shell's positive angle turns clockwise in its Y-down view space. PDF content
-        // matrices use Y-up coordinates, including on pages with an intrinsic /Rotate.
-        if let ContentCommand::Transform { rotation, .. } = &mut command {
-            *rotation = -*rotation;
-        }
+        let command = prepare_content_command(self, page, command)?;
         lyra_reader_pdfium::content_edit::edit_content(
             Path::new(&self.path),
             Path::new(&destination),
@@ -1903,6 +1921,55 @@ impl LyraReaderDocument {
             &command,
         )?;
         Ok(())
+    }
+
+    /// The pages staging this redaction would replace with a raster image, computed without
+    /// writing anything.
+    ///
+    /// This is what the Edit workspace asks before showing its confirmation. The engine still
+    /// decides the actual outcome when the edit is staged; this method only names the pages that
+    /// would lose their text layer.
+    pub fn content_redaction_raster_pages(
+        &self,
+        page: u32,
+        command: String,
+    ) -> Result<Vec<u32>, LyraReaderFfiError> {
+        let command = prepare_content_command(self, page, command)?;
+        Ok(
+            lyra_reader_pdfium::content_edit::content_redaction_raster_pages(
+                Path::new(&self.path),
+                page,
+                &command,
+            )?,
+        )
+    }
+
+    /// Stages a content edit after the reader has accepted the raster fallback.
+    ///
+    /// Returns the 0-based pages that were actually replaced by an image, in ascending order.
+    /// Empty for an ordinary edit and for a redaction that needed no fallback.
+    pub fn apply_content_edit_allowing_raster(
+        &self,
+        page: u32,
+        command: String,
+        destination: String,
+    ) -> Result<Vec<u32>, LyraReaderFfiError> {
+        let command = prepare_content_command(self, page, command)?;
+        let report = lyra_reader_pdfium::content_edit::edit_content_allowing_raster(
+            Path::new(&self.path),
+            Path::new(&destination),
+            page,
+            &command,
+        )?;
+        let mut pages: Vec<u32> = report
+            .into_iter()
+            .flat_map(|report| report.pages)
+            .filter(|page| page.rasterized)
+            .map(|page| page.page)
+            .collect();
+        pages.sort_unstable();
+        pages.dedup();
+        Ok(pages)
     }
 
     /// Applies a page operation to a **copy** of this document and writes it to `destination`.

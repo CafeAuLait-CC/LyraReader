@@ -47,6 +47,31 @@ public struct PDFContentCommand: Encodable, Sendable {
   public var uri: String? = nil
 }
 
+/// A redaction the Edit workspace must ask about before it stages anything.
+///
+/// Some content cannot be removed from a page's operators at all: text inside a form XObject,
+/// or a page whose content uses an inline image or shading. The writer's only safe answer is to
+/// paint the page to an image and burn the marks in, which loses that page's entire text layer.
+/// The shell shows this prompt first. `pages` is 1-based and names exactly the pages that would
+/// become images; the user's decision is then either no write at all or the explicitly accepted
+/// fallback for those pages.
+public struct RasterRedactionPrompt: Identifiable, Sendable {
+  public let id = UUID()
+  /// The 1-based page numbers that would become images.
+  public let pages: [Int]
+  /// The alert title; it names the pages. Kept here so the check can assert the same words the
+  /// reader sees.
+  public let title: String
+  /// The consequence in plain language: the pages lose their text layer, so their text is no
+  /// longer selectable or searchable.
+  public let message: String
+  public init(pages: [Int], title: String, message: String) {
+    self.pages = pages
+    self.title = title
+    self.message = message
+  }
+}
+
 /// A native overlay owns pointer interaction only while Edit is active. The PDF itself stays
 /// rendered by the regular canvas; selection chrome and a real NSTextView sit above it.
 struct PDFContentEditor: NSViewRepresentable {

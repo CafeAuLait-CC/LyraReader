@@ -2115,6 +2115,63 @@ def text_edit_pdf() -> bytes:
     )
 
 
+def form_text_pages_pdf() -> bytes:
+    """Two pages: page one has text inside a shared Form XObject, page two is ordinary.
+
+    Removing text that lives inside a form XObject forces the redaction writer to replace the
+    whole page with a raster image, because its glyphs cannot be attributed to a page-level
+    content operator. Page two exists so the check can prove the fallback stops at the page the
+    redaction names: it keeps its ordinary, selectable text layer.
+    """
+    page_count = 2
+    form_id = first_extra_object_id(page_count, 0)
+    tounicode_id = form_id + 1
+    widths = " ".join("500" for _ in range(32, 127))
+    font = (
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+        b"/FirstChar 32 /LastChar 126 /Widths [" + widths.encode("ascii") + b"] "
+        b"/Encoding /WinAnsiEncoding /ToUnicode "
+        + str(tounicode_id).encode("ascii") + b" 0 R >>"
+    )
+    form_content = b"BT /F1 12 Tf 0 0 Td (In shared form) Tj ET"
+    form = (
+        b"<< /Type /XObject /Subtype /Form /BBox [0 0 240 40] "
+        b"/Resources << /Font << /F1 3 0 R >> >> /Length "
+        + str(len(form_content)).encode("ascii")
+        + b" >>\nstream\n" + form_content + b"\nendstream"
+    )
+    cmap = (
+        b"/CIDInit /ProcSet findresource begin\n"
+        b"12 dict begin\nbegincmap\n"
+        b"/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n"
+        b"/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n"
+        b"1 begincodespacerange\n<00> <FF>\nendcodespacerange\n"
+        b"1 beginbfrange\n<20> <7E> <0020>\nendbfrange\n"
+        b"endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n"
+    )
+    tounicode = (
+        b"<< /Length " + str(len(cmap)).encode("ascii") + b" >>\nstream\n"
+        + cmap + b"\nendstream"
+    )
+    first_page = text_page(
+        "Shared form",
+        "page one draws one Form XObject twice",
+        ["Ordinary page-one text stays selectable until the fallback."],
+    )
+    first_page += "\nq 1 0 0 1 72 520 cm /Fm1 Do Q\nq 1 0 0 1 72 470 cm /Fm1 Do Q"
+    second_page = text_page(
+        "Untouched page",
+        "ordinary page-level text on page two",
+        ["Page two keeps its selectable text."],
+    )
+    return build_pdf(
+        [(first_page, 0), (second_page, 0)],
+        extra_objects=[form, tounicode],
+        font_object=font,
+        page_resources_extra=f" /XObject << /Fm1 {form_id} 0 R >>".encode("ascii"),
+    )
+
+
 def narrative_citation_pdf() -> bytes:
     """A year-only internal link must open the complete author-year entry as text."""
     body = text_page("Narrative citations", "author names outside the year parentheses", [
@@ -2614,6 +2671,10 @@ def main() -> int:
     path = out_dir / "text-edit.pdf"
     path.write_bytes(text_edit_pdf())
     print(f"  {path}  ({path.stat().st_size} bytes, text-edit analysis shapes)")
+
+    path = out_dir / "form-text-pages.pdf"
+    path.write_bytes(form_text_pages_pdf())
+    print(f"  {path}  ({path.stat().st_size} bytes, 2 pages, shared-form text)")
 
     path = out_dir / "narrative-citation.pdf"
     path.write_bytes(narrative_citation_pdf())
