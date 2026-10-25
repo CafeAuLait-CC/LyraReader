@@ -423,6 +423,12 @@ struct ReaderChecks {
             print("Partial erase checks passed")
             return
         }
+        if CommandLine.arguments.contains("--check-ink-canvas") {
+            try await inkCanvasChecks()
+            print("Ink canvas checks passed")
+            return
+        }
+
         // Ink and shapes on their own (`LyraReaderChecks --check-ink-annotations .`).
         if CommandLine.arguments.contains("--check-ink-annotations") {
             let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
@@ -820,6 +826,9 @@ struct ReaderChecks {
                 try await crossReaderAnnotationChecks(
                     replies: root.appendingPathComponent("tests/fixtures/annotated-replies.pdf"),
                     notes: root.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
+            }),
+            ("ink-canvas", {
+                try await inkCanvasChecks()
             }),
             ("ink-annotations", {
                 try await inkAnnotationChecks(
