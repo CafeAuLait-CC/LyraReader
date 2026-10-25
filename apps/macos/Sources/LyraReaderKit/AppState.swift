@@ -7100,19 +7100,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return false
         }
         let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let title = trimmed.isEmpty ? "Page \(page + 1)" : trimmed
+        let title = trimmed.isEmpty ? Bookmark.defaultTitle(forPage: page) : trimmed
 
         let bookmark = Bookmark(page: page, title: title, yPt: yPt)
         var updated = bookmarks
         updated.append(bookmark)
         var slots = annotationRecordSlots
         slots.append(.bookmark(bookmark.id))
-        guard writeAnnotationRecords(
-            annotations: annotations,
-            bookmarks: updated,
-            slots: slots,
-            trigger: "bookmark-add"
-        ) else { return false }
+        guard writeBookmarks(updated, slots: slots, trigger: "bookmark-add") else { return false }
 
         statusMessage = "Added bookmark “\(title)”"
         return true
@@ -7125,12 +7120,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let title = bookmarks[index].title
         var updated = bookmarks
         updated.remove(at: index)
-        guard writeAnnotationRecords(
-            annotations: annotations,
-            bookmarks: updated,
-            slots: annotationRecordSlots,
-            trigger: "bookmark-remove"
-        ) else { return }
+        guard writeBookmarks(updated, trigger: "bookmark-remove") else { return }
         statusMessage = "Deleted bookmark “\(title)”"
     }
 
@@ -7141,12 +7131,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
               bookmarks[index].title != title else { return }
         var updated = bookmarks
         updated[index].title = title
-        guard writeAnnotationRecords(
-            annotations: annotations,
-            bookmarks: updated,
-            slots: annotationRecordSlots,
-            trigger: "bookmark-rename"
-        ) else { return }
+        guard writeBookmarks(updated, trigger: "bookmark-rename") else { return }
     }
 
     /// Moves a bookmark by `offset` places in the reader's order. The order is the array's,
@@ -7160,9 +7145,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var updated = bookmarks
         let bookmark = updated.remove(at: index)
         updated.insert(bookmark, at: target)
-        guard writeAnnotationRecords(
-            annotations: annotations,
-            bookmarks: updated,
+        guard writeBookmarks(
+            updated,
             slots: bookmarkSlots(matching: updated),
             trigger: "bookmark-move"
         ) else { return }
@@ -7171,27 +7155,41 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Jumps so the bookmarked page position is at the top of the viewport.
     public func jump(to bookmark: Bookmark) {
-        guard let document, bookmark.page >= 0, bookmark.page < document.pageCount else { return }
-        cancelScrollGlide()
-        guard let target = contentY(forPageLocalY: bookmark.yPt, onPage: bookmark.page) else { return }
-        scrollYPt = clampedScrollOffset(target)
-        reloadVisiblePages()
-        schedulePositionSave()
+        guard jumpToSavedPosition(page: bookmark.page, yPt: bookmark.yPt) else { return }
         statusMessage = "Jumped to “\(bookmark.title)”"
     }
 
-    /// The display name for a bookmark with an empty custom title.
-    public static func defaultBookmarkTitle(page: Int) -> String {
-        "Page \(page + 1)"
+    /// Moves the viewport to a page-local position saved on `page`.
+    ///
+    /// The bookmark list and the reader's outline rows both address the same saved marks, so
+    /// both entry points land through this one method. Returns whether the jump happened.
+    @discardableResult
+    private func jumpToSavedPosition(page: Int, yPt: CGFloat) -> Bool {
+        guard let document, page >= 0, page < document.pageCount else { return false }
+        cancelScrollGlide()
+        guard let target = contentY(forPageLocalY: yPt, onPage: page) else { return false }
+        scrollYPt = clampedScrollOffset(target)
+        reloadVisiblePages()
+        schedulePositionSave()
+        return true
     }
 
-    /// The current bookmark list split into one section per page, in the reader's order.
+    /// Writes the reader's bookmark list and its slots to the one annotation cache.
     ///
-    /// Grouping by page is what makes a list of named places readable; the order *within* and
-    /// *between* sections is still the reader's (first appearance wins), which is what the
-    /// move commands manipulate.
-    public var bookmarkGroups: [BookmarkGroup] {
-        BookmarkGrouping.groups(for: bookmarks)
+    /// Every bookmark command goes through here so add, rename, remove and move cannot drift
+    /// apart in which arrays they publish or which trigger they record.
+    @discardableResult
+    private func writeBookmarks(
+        _ updated: [Bookmark],
+        slots: [AnnotationRecords.Slot]? = nil,
+        trigger: String
+    ) -> Bool {
+        writeAnnotationRecords(
+            annotations: annotations,
+            bookmarks: updated,
+            slots: slots ?? annotationRecordSlots,
+            trigger: trigger
+        )
     }
 
     /// Rebuilds the `.bookmark` slots in the current order while leaving every other slot in
@@ -8834,7 +8832,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
         do {
             let changes = try await pendingAnnotationChanges()
-            let bookmarkRequests = bookmarkWriteRequests()
+            let bookmarkRequests = bookmarks
             if changes.isEmpty && bookmarkRequests.isEmpty {
                 // The eraser removed the last annotation and there is no bookmark to write, or
                 // the document is signed and has nothing the reader may add: the engine
@@ -8945,7 +8943,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         do {
             try DocumentEditCache.validateSource(for: url)
             let changes = try await pendingAnnotationChanges()
-            let bookmarkRequests = bookmarkWriteRequests()
+            let bookmarkRequests = bookmarks
             let report = try await engine.replaceWithAnnotationChanges(
                 changes.additions,
                 bookmarks: bookmarkRequests,
@@ -9037,18 +9035,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 Data("lyra-reader-annotate: replace failed: \(error)\n".utf8)
             )
             return false
-        }
-    }
-
-    /// The current bookmarks as writer requests, in the order the sidebar shows them.
-    private func bookmarkWriteRequests() -> [BookmarkWriteRequest] {
-        bookmarks.map { bookmark in
-            BookmarkWriteRequest(
-                id: bookmark.id,
-                page: bookmark.page,
-                title: bookmark.title,
-                yPt: bookmark.yPt
-            )
         }
     }
 
@@ -10778,7 +10764,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 userInfo: [NSLocalizedDescriptionKey: "The active annotation could not be cached."])
         }
         let changes = try await pendingAnnotationChanges()
-        let marks = includeBookmarks ? bookmarkWriteRequests() : []
+        let marks = includeBookmarks ? bookmarks : []
         guard document?.url == source else {
             throw NSError(domain: "LyraReader", code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "The active document changed before exporting."])
@@ -10802,9 +10788,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let export = try RustEngine()
         _ = try export.openDocument(at: source)
         let positions = Dictionary(uniqueKeysWithValues: pages.enumerated().map { ($0.element, $0.offset) })
-        let marks = snapshot.compactMap { bookmark -> BookmarkWriteRequest? in
+        let marks = snapshot.compactMap { bookmark -> Bookmark? in
             guard let page = positions[bookmark.page] else { return nil }
-            return BookmarkWriteRequest(id: bookmark.id, page: page, title: bookmark.title, yPt: bookmark.yPt)
+            var mapped = bookmark
+            mapped.page = page
+            return mapped
         }
         if marks.isEmpty { _ = try await export.saveEditedCopy(to: destination) }
         else { _ = try await export.saveAnnotationChanges(to: destination, additions: [], bookmarks: marks,
@@ -11424,7 +11412,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 userInfo: [NSLocalizedDescriptionKey: "Could not cache the active annotation"])
         }
         let changes = try await pendingAnnotationChanges()
-        let marks = bookmarkWriteRequests()
+        let marks = bookmarks
         guard !changes.isEmpty || !marks.isEmpty else { return false }
         let next = session.directory.appendingPathComponent("marks-\(UUID().uuidString).pdf")
         _ = try await engine.saveAnnotationChanges(to: next, additions: changes.additions,
@@ -13410,18 +13398,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// click lands on the bookmarked paragraph; a document node without one goes to the page top.
     public func gotoOutlineEntry(_ entry: OutlineEntry) {
         guard document != nil, let page = entry.page else { return }
-        guard let y = entry.yPt, y.isFinite, y > 0 else {
+        guard let y = entry.yPt, y.isFinite, y > 0,
+              jumpToSavedPosition(page: max(0, page), yPt: CGFloat(y)) else {
             gotoPage(page)
             return
         }
-        cancelScrollGlide()
-        guard let target = contentY(forPageLocalY: CGFloat(y), onPage: max(0, page)) else {
-            gotoPage(page)
-            return
-        }
-        scrollYPt = clampedScrollOffset(target)
-        reloadVisiblePages()
-        schedulePositionSave()
         statusMessage = "Jumped to “\(entry.title)”"
     }
 

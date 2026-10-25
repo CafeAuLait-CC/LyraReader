@@ -223,7 +223,6 @@ public final class MetalCanvasView: NSView {
     public var onCancelTool: (() -> Bool)?
 
     private let bookmarkHost = PageBookmarkCanvasHost()
-    package var pageBookmarkFrames: [Int: CGRect] { bookmarkHost.markerFrames }
     package func configurePageBookmarks(state: AppState?) {
         if bookmarkHost.superview == nil { addSubview(bookmarkHost) }
         if state != nil { window?.acceptsMouseMovedEvents = true }

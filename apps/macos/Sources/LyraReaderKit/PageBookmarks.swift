@@ -2,8 +2,16 @@ import AppKit
 import SwiftUI
 
 extension Bookmark {
+    /// The one display name for a bookmark without a custom title. The persisted default and
+    /// the sidebar fallback both use it, so a page-corner bookmark and a sidebar row never
+    /// disagree about what an unnamed bookmark is called.
+    package static func defaultTitle(forPage page: Int) -> String {
+        "Page \(page + 1)"
+    }
+
     package var displayTitle: String {
-        title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Page \(page + 1)" : title
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? Self.defaultTitle(forPage: page) : title
     }
 }
 
@@ -145,7 +153,6 @@ package final class PageBookmarkCanvasHost: NSView {
     private var snapshot: [Bookmark] = []
     private var markers: [Int: PageBookmarkFlagView] = [:]
     private var popover: NSPopover?
-    package var markerFrames: [Int: CGRect] { markers.mapValues(\.frame) }
 
     package func updateHover(at point: CGPoint?) {
         for flag in markers.values { flag.setHovered(point.map { flag.frame.contains($0) } ?? false) }
