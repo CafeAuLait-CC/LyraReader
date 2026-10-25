@@ -140,6 +140,7 @@ extension ReaderChecks {
     static func insidePageTearChecks(root: URL) async throws {
         try await tearPlacementRuleChecks()
         try await tearLayoutChecks()
+        try await tearFollowingPageChecks()
         try await tearPixelCompositionChecks()
         try await tearMappingChecks()
         try await tearSelectionChecks()
@@ -271,6 +272,48 @@ extension ReaderChecks {
             ], selectionHasText: false)
         require(textlessPage.splitPt == 200,
                 "an indexed figure elsewhere on the page lets a textless selection tear at its bottom edge")
+    }
+
+    @MainActor
+    private static func tearFollowingPageChecks() async throws {
+        for fullPage in [true, false] {
+            let (state, _) = makeTearState(preferFullPageRasters: fullPage)
+            state.setViewportSize(CGSize(width: 900, height: 1800))
+            state.reloadVisiblePages()
+            func nextPageTop() -> CGFloat? {
+                state.canvasPages.filter {
+                    $0.placement.index == PlacementIndex.pageRaster(1)
+                        || ($0.placement.index >= 0 && $0.placement.index >> 24 == 1)
+                }.map(\.placement.topPt).min()
+            }
+            try await eventually("the following page's source pixels are visible (full page: \(fullPage))") {
+                nextPageTop() != nil
+            }
+            let originalTop = state.canvasPageSegments.first { $0.index == 1 }!.topPt
+            let card = try await openCard(state, rect: CGRect(x: 100, y: 100, width: 220, height: 90),
+                                         measuredViewHeight: 300)
+            for height: CGFloat in [300, 420] {
+                state.updateRegionCardHeight(cardID: card.id, viewHeight: height)
+                state.reloadVisiblePages()
+                let nextSegment = state.canvasPageSegments.first { $0.index == 1 }!
+                require(abs(nextSegment.topPt - originalTop - height) < 0.001,
+                        "the following page moves once when the note grows to \(height) points")
+                require(abs((nextPageTop() ?? -1) - nextSegment.topPt) < 0.001,
+                        "following-page pixels and border share one gap shift (full page: \(fullPage), pixels \(nextPageTop() ?? -1), border \(nextSegment.topPt))")
+                for zoom: CGFloat in [1, 1.5, 2] {
+                    let scroll = nextSegment.topPt - 100
+                    let rects = PageChromeGeometry.rectangles(frames: [nextSegment],
+                        viewport: CGSize(width: 900, height: 1800), contentWidthPt: 600,
+                        zoom: zoom, scrollYPt: scroll)
+                    require(abs(rects.first!.minY - ((nextPageTop() ?? -1) - scroll) * zoom) < 0.001,
+                            "following-page border and pixels remain aligned at zoom \(zoom) after scrolling")
+                }
+            }
+            state.closeRegionCard(id: card.id, keepHistory: true)
+            state.reloadVisiblePages()
+            require(abs((nextPageTop() ?? -1) - originalTop) < 0.001,
+                    "collapsing the note restores the following page's pixels and border")
+        }
     }
 
     // MARK: - Layout, segments and exact removal
@@ -463,6 +506,17 @@ extension ReaderChecks {
         require(both.contains { $0.placement.index == 1 && $0.placement.leftPt == 8
             && $0.source == CGRect(x: 0, y: 0, width: 1, height: 1) },
                 "the facing partner page keeps its whole texture and position")
+
+        for index in [PlacementIndex.pageRaster(1), 1 << 24, PlacementIndex.ownNote(0)] {
+            let next = CanvasPage(placement: PagePlacement(index: index, topPt: 18, leftPt: 0,
+                                                           widthPt: 8, heightPt: 12), image: image,
+                                  source: CGRect(x: 0, y: 0.25, width: 1, height: 0.5))
+            let output = PageTearRendering.quads(for: next, pageTopPt: 0, pageLeftPt: 0,
+                pageWidthPt: 8, pageHeightPt: 12, tear: tear)
+            require(output.count == 1 && output[0].placement == next.placement
+                        && output[0].source == next.source && output[0].image.generation == image.generation,
+                    "a later page's raster, tile or note keeps its existing position, texture and crop (\(index))")
+        }
 
         // 150%: the same mapping, with each content point becoming 1.5 pixels.
         let zoom: CGFloat = 1.5
