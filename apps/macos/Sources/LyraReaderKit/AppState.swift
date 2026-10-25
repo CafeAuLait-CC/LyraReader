@@ -2790,10 +2790,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// One tab. The document itself lives in the tab-retention cache below; a tab whose document
     /// is beyond the keep-limit keeps only its URL and reading position and reloads on selection.
     public struct OpenTab: Identifiable, Sendable {
-        public let id = UUID()
+        public let id: UUID
         public let url: URL
         public var title: String
         public var scrollYPt: CGFloat
+
+        /// `id` is a parameter so a tab moved to another window keeps the identity it had in the
+        /// old one: retained documents, the transfer's completion check and the undo story are all
+        /// keyed by it. A normal open lets it default to a fresh UUID.
+        public init(id: UUID = UUID(), url: URL, title: String, scrollYPt: CGFloat) {
+            self.id = id
+            self.url = url
+            self.title = title
+            self.scrollYPt = scrollYPt
+        }
     }
 
     @Published public private(set) var tabs: [OpenTab] = []
@@ -3517,7 +3527,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func open(url: URL) -> Bool {
-        if deferContentTransition({[weak self] in _ = self?.open(url:url)}) {return true}
+        open(url: url, restoringTabScroll: nil)
+    }
+
+    /// The shared open path. `restoringTabScroll` is non-nil for a tab arriving from another
+    /// window: the saved offset is applied while the document loads, exactly as for a tab whose
+    /// document was evicted, so the arriving tab does not flash the top of the file first.
+    @discardableResult
+    private func open(url: URL, restoringTabScroll: CGFloat?) -> Bool {
+        if deferContentTransition({[weak self] in _ = self?.open(url: url, restoringTabScroll: restoringTabScroll)}) {return true}
         finishRegionCardsForDocumentSwitch(reason: "The document changed. The region conversation was moved to Region questions.")
         // Keep the document the reader left behind if it belongs to a tab. The snapshot is only
         // committed after the new document actually opens, so a refused open leaves the cache and
@@ -3527,7 +3545,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // document back; its handle must go, or an untabbed open path would leak one per file.
         let orphanURL = previous == nil && activeTabIndex == nil ? document?.url : nil
         let preserveSession = previous != nil && pageEditSession.map { !Self.resolvesToSameFile(url,$0.originalURL) } == true
-        guard loadDocument(url: url, restoringTabScroll: nil,preservingPageEditSessionInSnapshot:preserveSession) else { return false }
+        guard loadDocument(url: url, restoringTabScroll: restoringTabScroll,preservingPageEditSessionInSnapshot:preserveSession) else { return false }
         if var previous {
             // The new open may have discarded a page-edit session on the previous document
             // (after the explicit alert). Its revision is gone, so the retained tab must not
@@ -12778,6 +12796,208 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         isRestoringDocument = true
         restoreDerivedDataIfNeeded()
         trimRetainedDocuments()
+    }
+
+    /// Moves a tab to a new position in the strip and activates it.
+    ///
+    /// `insertionIndex` is a gap in the order *before* the move: 0 is before the first tab and
+    /// `tabs.count` is after the last one. The tab keeps its identity, so its retained document,
+    /// reading position and pending page-edit session move with it; only the array order and the
+    /// active index follow. The moved tab becomes active, which is what a reader sees after a
+    /// drop. Returns whether the order changed: dropping on either side of the tab itself, or
+    /// passing an out-of-range index, is a no-op.
+    ///
+    /// The reordered array *is* the persisted order. Every later read of the strip, a tab switch
+    /// or a close uses `tabs` in this order, so the new order survives the next layout pass and
+    /// the next document operation rather than existing only for the duration of the drag.
+    @discardableResult
+    public func moveTab(from sourceIndex: Int, toInsertionIndex insertionIndex: Int) -> Bool {
+        guard tabs.indices.contains(sourceIndex) else { return false }
+        guard insertionIndex >= 0, insertionIndex <= tabs.count else { return false }
+        guard let destination = TabReorder.destinationIndex(
+            sourceIndex: sourceIndex, insertionIndex: insertionIndex, tabCount: tabs.count
+        ) else { return false }
+
+        // The document on screen must stay on screen while the tabs shift under it. Recompute the
+        // active index from the tab id instead of shifting the number: a move in either direction
+        // changes the index by a different amount.
+        let activeID = activeTabIndex.flatMap { tabs.indices.contains($0) ? tabs[$0].id : nil }
+        let moved = tabs.remove(at: sourceIndex)
+        tabs.insert(moved, at: destination)
+        if let activeID {
+            activeTabIndex = tabs.firstIndex(where: { $0.id == activeID })
+        }
+        // The dragged tab is the one the reader let go of, so a drop selects it. This is a no-op
+        // when the moved tab was already active.
+        selectTab(destination)
+        return true
+    }
+
+    // MARK: - Moving a tab to another window
+
+    /// Why the tab at `index` cannot be moved to another window right now, or `nil` when it can.
+    ///
+    /// A tab is portable when its document is clean. Unsaved page/content/form edits live in this
+    /// window's `AppState` (a working revision, an in-flight command, a form draft) and have no
+    /// owner in the target window, so the move is refused with this sentence instead of silently
+    /// dropping the work. Annotation writes are part of `tabHasUnsavedChanges` too: their dirty
+    /// state lives in this state's cache snapshot, so the safe answer is the same sentence once
+    /// the automatic write has landed.
+    public func transferBlockReason(forTabAt index: Int) -> String? {
+        guard tabs.indices.contains(index) else {
+            return "That tab is no longer open."
+        }
+        if tabHasUnsavedChanges(index) {
+            return "“\(tabs[index].title)” has unsaved changes. Save or discard them before moving it to another window."
+        }
+        if index == activeTabIndex,
+           contentCommandInFlight || pageEditBusy || annotationSaveInProgress {
+            return "“\(tabs[index].title)” is still being written. Wait for the save to finish, then move the tab."
+        }
+        // Moving one of two copies out of this window would leave the same document open in two
+        // windows, which the transfer exists to prevent. Ask the reader to pick one copy first.
+        if tabs.contains(where: {
+            $0.id != tabs[index].id && Self.resolvesToSameFile($0.url, tabs[index].url)
+        }) {
+            return "“\(tabs[index].title)” is also open in another tab in this window. "
+                + "Close one of the copies before moving it to another window."
+        }
+        return nil
+    }
+
+    /// Everything the target window needs to continue this tab: the file, the title and the
+    /// reading position. The tab itself is not removed here — the target opens the document
+    /// first, and only then does the source give it up (``removeTransferredTab(id:)``), so a
+    /// failed open cannot lose the reader's place.
+    public func prepareTabTransfer(at index: Int) -> TabTransfer? {
+        guard tabs.indices.contains(index) else { return nil }
+        if let reason = transferBlockReason(forTabAt: index) {
+            reportTabTransferFailure(reason)
+            return nil
+        }
+        saveActiveTabPosition()
+        let tab = tabs[index]
+        let page: Int?
+        if index == activeTabIndex {
+            page = currentPage
+        } else {
+            // An inactive retained tab knows its page; an evicted one does not, and the target
+            // derives it from the restored scroll offset after the document opens.
+            page = retainedTabs[tab.id]?.state.currentPage
+        }
+        return TabTransfer(
+            tabID: tab.id,
+            url: tab.url,
+            title: tab.title,
+            scrollYPt: tab.scrollYPt,
+            currentPage: page
+        )
+    }
+
+    /// The reason the last incoming transfer was refused.
+    ///
+    /// Not `lastError`: the destination window is usually not the key window during a drag, so an
+    /// alert there would appear late and in the wrong window. The caller (``TabMove`` or the
+    /// window registry) reads this and reports it in the source window, where the reader let go.
+    public private(set) var lastTabTransferRefusal: String?
+
+    @discardableResult
+    private func refuseTabTransfer(_ message: String) -> Bool {
+        lastTabTransferRefusal = message
+        statusMessage = "Couldn’t receive the tab"
+        FileHandle.standardError.write(Data("lyra-reader-tabs: \(message)\n".utf8))
+        return false
+    }
+
+    /// Receives a tab from another window and inserts it at `insertionIndex` (the gap in this
+    /// window's order before the move, or the end when `nil`). The reader ends up looking at the
+    /// arriving tab, at its saved reading position.
+    ///
+    /// The document is opened through the same path as a normal open, so the tab that was on
+    /// screen becomes a retained tab exactly as it would after any other tab switch. The target
+    /// refuses while it is writing or editing its own document: opening over a live edit would
+    /// either discard it or show a confirmation sheet in the middle of a drag.
+    @discardableResult
+    public func acceptTabTransfer(_ transfer: TabTransfer, atInsertionIndex insertionIndex: Int? = nil) -> Bool {
+        if contentTextEditing || contentTextRecovery != nil || contentCommandInFlight
+            || pageEditBusy || annotationSaveInProgress {
+            return refuseTabTransfer(
+                "The other window is still editing or saving. Finish there, then move the tab again.")
+        }
+        if hasUnsavedDocumentChanges {
+            return refuseTabTransfer(
+                "The other window has unsaved changes. Save or discard them before moving a tab into it.")
+        }
+        // Opening a second copy of a document this window already has would leave it open twice
+        // for the same drop. Refuse, so the source tab stays where it is.
+        if tabs.contains(where: { Self.resolvesToSameFile($0.url, transfer.url) }) {
+            return refuseTabTransfer(
+                "“\(transfer.title)” is already open in the other window. "
+                + "Close that tab before moving this one there.")
+        }
+        guard open(url: transfer.url, restoringTabScroll: transfer.scrollYPt) else {
+            return refuseTabTransfer(
+                "Couldn’t open “\(transfer.title)” in this window. \(lastError ?? "")")
+        }
+        let index = min(max(insertionIndex ?? tabs.count, 0), tabs.count)
+        tabs.insert(OpenTab(
+            id: transfer.tabID,
+            url: transfer.url,
+            title: transfer.title,
+            scrollYPt: transfer.scrollYPt
+        ), at: index)
+        activeTabIndex = index
+        if let page = transfer.currentPage,
+           page >= 0, page < (document?.pageCount ?? 0) {
+            currentPage = page
+        } else if (document?.pageCount ?? 0) > 0 {
+            currentPage = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt)
+        }
+        trimRetainedDocuments()
+        statusMessage = "Moved “\(transfer.title)” from another window"
+        return true
+    }
+
+    /// Whether this window still has the tab with `id`. Used when a transfer completes: a tab
+    /// that disappeared with its source window is not a failure, while a tab that is still here
+    /// after the target accepted the document is a duplicate and must be rolled back.
+    public func containsTab(id: UUID) -> Bool {
+        tabs.contains { $0.id == id }
+    }
+
+    /// Removes the tab after its document has been opened in another window. The tab must still
+    /// be clean; the target rolls back if it is not. No document is left open in this window and
+    /// no cache or working file is deleted: the annotations and reading position belong to the
+    /// file, and the target now owns the screen.
+    @discardableResult
+    public func removeTransferredTab(id: UUID) -> Bool {
+        guard let index = tabs.firstIndex(where: { $0.id == id }) else { return false }
+        if let reason = transferBlockReason(forTabAt: index) {
+            reportTabTransferFailure(reason)
+            return false
+        }
+        saveActiveTabPosition()
+        if index != activeTabIndex {
+            // An inactive tab can be removed without touching the document the reader is actually
+            // editing in this window. `closeTab` would run the content-transition path first.
+            let closing = tabs.remove(at: index)
+            if let active = activeTabIndex, index < active {
+                activeTabIndex = active - 1
+            }
+            if let retained = retainedTabs.removeValue(forKey: closing.id) {
+                releaseEngineDocumentIfUnused(retained.state.document.url ?? retained.url)
+            }
+            return !tabs.contains(where: { $0.id == id })
+        }
+        closeTab(index)
+        return !tabs.contains(where: { $0.id == id })
+    }
+
+    /// Reports a refused or failed tab move in the same place every other shell error appears.
+    public func reportTabTransferFailure(_ message: String) {
+        lastError = message
+        statusMessage = "Couldn’t move the tab"
+        FileHandle.standardError.write(Data("lyra-reader-tabs: \(message)\n".utf8))
     }
 
     public func closeTab(_ index: Int) {
