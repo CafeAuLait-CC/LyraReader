@@ -30,7 +30,7 @@ public struct TabStrip: View {
             HStack(spacing: 6) {
                 ScrollViewReader { scroll in
                     ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: TabRowLayout.tabSpacing) {
+                        HStack(alignment: .center, spacing: TabRowLayout.tabSpacing) {
                             ForEach(Array(state.tabs.enumerated()), id: \.element.id) { index, tab in
                                 tabItem(tab, index: index, width: tabWidth)
                                     .id(tab.id)
@@ -38,7 +38,7 @@ public struct TabStrip: View {
                             Button { state.showFileImporter = true } label: { Image(systemName: "plus") }
                                 .buttonStyle(LyraReaderToolStyle())
                                 .frame(width: TabRowLayout.plusButtonSize,
-                                       height: TabRowLayout.plusButtonSize)
+                                       height: TabRowLayout.plusButtonSize, alignment: .center)
                                 .help("Open a PDF in a new tab (⌘O)")
                                 .accessibilityLabel("Open PDF").id("new-tab")
                         }
@@ -101,8 +101,8 @@ public struct TabStrip: View {
             Button { state.closeTab(index) } label: {
                 Group {
                     if state.tabHasUnsavedChanges(index) {
-                        // Match the lowercase title letters, independently of SF Symbol bounds.
-                        let diameter = NSFont.systemFont(ofSize: 12, weight: active ? .medium : .regular).xHeight
+                        // A little larger than lowercase title letters for a readable visual weight.
+                        let diameter = NSFont.systemFont(ofSize: 12, weight: active ? .medium : .regular).xHeight * 1.15
                         Circle().fill(LyraReaderTheme.accent)
                             .frame(width: diameter, height: diameter)
                     } else {
@@ -111,7 +111,7 @@ public struct TabStrip: View {
                             .foregroundStyle(active ? LyraReaderTheme.textPrimary : LyraReaderTheme.textSecondary)
                     }
                 }
-                .frame(width: TabRowLayout.closeButtonWidth, height: TabRowLayout.contentHeight)
+                .frame(width: TabRowLayout.closeButtonWidth, height: TabRowLayout.contentHeight, alignment: .center)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
