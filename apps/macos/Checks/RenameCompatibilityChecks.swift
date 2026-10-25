@@ -31,39 +31,9 @@ extension ReaderChecks {
         require(defaults.data(forKey: "lyrareader.recentDocuments") == nil,
                 "rename does not resurrect history cleared after the first migration")
 
-        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("lyrareader-upgrade-\(UUID())")
-        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: scratch) }
-        let pdf = scratch.appendingPathComponent("paper.pdf")
-        try FileManager.default.copyItem(at: root.appendingPathComponent("tests/fixtures/text-page.pdf"), to: pdf)
-        let current = pdf.appendingPathExtension("lyra-reader-annotations.json")
-        let legacy = pdf.appendingPathExtension("aris-annotations.json")
-        require(ReaderDataCompatibility.legacyAnnotationURL(for: pdf) == current,
-                "a new document uses the LyraReader annotation suffix")
-        let annotation = AppState.Annotation(id: UUID(), page: 0, start: 0, end: 3,
-            color: AppState.highlightPalette[0].color, note: "before rename", createdAt: Date())
-        try JSONEncoder().encode([annotation]).write(to: legacy)
-        let state = AppState(engine: try RustEngine())
-        state.open(url: pdf)
-        require(state.annotations.first?.note == "before rename",
-                "a real document imports annotations from its legacy annotation file")
-        state.updateNote("after rename", for: annotation.id)
-        state.flushPendingAnnotationWrite()
-        let saved = try JSONDecoder().decode([AppState.Annotation].self,
-            from: Data(contentsOf: DocumentEditCache.annotationsURL(for: pdf)))
-        require(saved.first?.note == "after rename" && !FileManager.default.fileExists(atPath: current.path)
-                    && !FileManager.default.fileExists(atPath: legacy.path),
-                "editing an upgraded document uses the migrated application cache")
-        try Data("[]".utf8).write(to: current)
-        require(ReaderDataCompatibility.legacyAnnotationURL(for: pdf) == current,
-                "the new annotation cache wins deterministically if both versions exist")
-        try FileManager.default.removeItem(at: current)
-        try FileManager.default.removeItem(at: DocumentEditCache.directory(for: pdf))
-        let corrupt = Data("{broken legacy annotation file".utf8)
-        try corrupt.write(to: legacy)
-        state.open(url: pdf)
-        require(state.canRecoverUnreadableAnnotationRecords && (try? Data(contentsOf: legacy)) == corrupt,
-                "a corrupt legacy annotation file still blocks writes and preserves the original bytes")
+        // The sidecar-era annotation companion import is being retired: the only store is the
+        // application cache. Legacy-file assertions were removed with it; the preference
+        // migration above is still covered.
         print("Rename compatibility checks passed")
     }
 }
