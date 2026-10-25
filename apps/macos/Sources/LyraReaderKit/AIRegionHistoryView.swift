@@ -1,4 +1,5 @@
 import AppKit
+import LyraReaderBindings
 import SwiftUI
 
 /// Durable reading conversations and editable distilled notes, scoped to the source document.
@@ -69,7 +70,7 @@ struct AIRegionHistoryView: View {
             }
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
-                    Text("Page \(entry.attachment.page + 1) · Region \(entry.regionNumber ?? 1)").font(.caption2.weight(.semibold))
+                    Text("\(entry.attachment.pageLabel) · Region \(entry.regionNumber ?? 1)").font(.caption2.weight(.semibold))
                         .foregroundStyle(LyraReaderTheme.accent)
                     Spacer()
                     Text("\(entry.allTurns.count) turns").font(.caption2).foregroundStyle(LyraReaderTheme.textSecondary)
@@ -104,7 +105,7 @@ struct AIRegionHistoryView: View {
                     } else if entry.attachment.page >= 0, entry.attachment.page < (state.document?.pageCount ?? 0) {
                         Button {
                             state.gotoPage(entry.attachment.page)
-                        } label: { Label("Page \(entry.attachment.page + 1)", systemImage: "doc.text") }
+                        } label: { Label(entry.attachment.pageLabel, systemImage: "doc.text") }
                             .buttonStyle(.plain).foregroundStyle(LyraReaderTheme.accent)
                     } else {
                         Label("Original page is no longer in this PDF", systemImage: "doc.text")

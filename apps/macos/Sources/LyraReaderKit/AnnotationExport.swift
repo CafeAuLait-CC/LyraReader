@@ -1,4 +1,5 @@
 import AppKit
+import LyraReaderBindings
 import CoreGraphics
 import Foundation
 import UniformTypeIdentifiers
@@ -283,7 +284,7 @@ public enum AnnotationExport {
         for row in document.rows {
             if row.sectionPage != currentPage {
                 currentPage = row.sectionPage
-                blocks.append("## Page \(row.sectionPage + 1)")
+                blocks.append("## " + LyraReaderBindings.pageLabel(pages: [UInt32(row.sectionPage + 1)]))
             }
             blocks.append(markdownBlock(row, document: document))
         }
@@ -331,27 +332,8 @@ public enum AnnotationExport {
     /// dated annotations, without inventing a time. A date with no zone is read as UTC, which is
     /// the same convention `DocumentAnnotation.displayDate` already uses.
     public static func date(fromPDFDate value: String?) -> Date? {
-        guard var text = value else { return nil }
-        if text.hasPrefix("D:") { text.removeFirst(2) }
-        guard text.count >= 14 else { return nil }
-        let stamp = String(text.prefix(14))
-        guard stamp.allSatisfy(\.isNumber) else { return nil }
-
-        let parser = DateFormatter()
-        parser.locale = Locale(identifier: "en_US_POSIX")
-        parser.timeZone = TimeZone(secondsFromGMT: 0)
-        parser.dateFormat = "yyyyMMddHHmmss"
-        guard let base = parser.date(from: stamp) else { return nil }
-
-        let remainder = text.dropFirst(14)
-        guard let sign = remainder.first, sign == "+" || sign == "-" else { return base }
-        let digits = remainder.dropFirst().filter(\.isNumber)
-        guard digits.count >= 2, let hours = Int(digits.prefix(2)) else { return base }
-        let minutes = digits.count >= 4 ? Int(digits.dropFirst(2).prefix(2)) ?? 0 : 0
-        // `+02'00'` means the clock reads UTC+2, so the instant is two hours earlier than the
-        // same digits read as UTC. A negative offset is the other way round.
-        let offset = TimeInterval(hours * 3600 + minutes * 60) * (sign == "+" ? -1 : 1)
-        return base.addingTimeInterval(offset)
+        guard let value, let millis = pdfDateMillis(value: value) else { return nil }
+        return Date(timeIntervalSince1970: TimeInterval(millis) / 1000)
     }
 
     /// A quote recovered from the page's text layer for a box on that page.

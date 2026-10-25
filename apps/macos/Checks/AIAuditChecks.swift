@@ -586,7 +586,7 @@ extension ReaderChecks {
         let failTrail = AIAuditTrail(directory: failDirectory)
         let failService = AuditFailingService(engine: engine, events: [
             .partStarted(index: 0, total: 1, label: "Page 1"),
-            .error(message: "HTTP 500 from the provider.", cancelled: false),
+            .error(message: "HTTP 500 from the provider.", cancelled: false, code: .httpStatus),
         ])
         let failModel = AIAssistantModel(settings: failFixture.store, audit: failTrail)
         failModel.attach(service: failService, context: context)
@@ -790,7 +790,7 @@ extension ReaderChecks {
         let document = try engine.openDocument(at: documentURL)
         let outline = try await engine.outline()
         let context = AIReaderContext(
-            documentKey: documentURL.standardizedFileURL.path,
+            documentKey: DocumentEditCache.documentIdentity(for: documentURL) ?? documentURL.standardizedFileURL.path,
             documentTitle: document.title,
             pageCount: document.pageCount,
             currentPage: 1,

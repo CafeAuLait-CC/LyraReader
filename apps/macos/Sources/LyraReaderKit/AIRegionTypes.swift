@@ -1,4 +1,5 @@
 import AppKit
+import LyraReaderBindings
 import Combine
 import CoreGraphics
 import Foundation
@@ -42,7 +43,9 @@ public struct AIRegionAttachment: Codable, Equatable, Sendable {
     }
 
     public var characterCount: Int { text.count }
-    public var pageLabel: String { "Page \(page + 1)" }
+    public var pageLabel: String {
+        LyraReaderBindings.pageLabel(pages: [UInt32(max(0, page + 1))])
+    }
     public var sizeLabel: String {
         String(format: "%.0f × %.0f pt", Double(rect.width), Double(rect.height))
     }
@@ -227,7 +230,7 @@ public enum AIRegionAnswerState: String, Codable, Equatable, Sendable {
 /// knowledge document and chooses a destination.
 public struct AIRegionHistoryEntry: Codable, Identifiable, Equatable, Sendable {
     public let id: UUID
-    public let documentKey: String
+    public var documentKey: String
     public let attachment: AIRegionAttachment
     public let question: String
     public let answer: String
@@ -334,7 +337,7 @@ public final class AIRegionCard: ObservableObject, Identifiable {
         min(420, max(150, viewport * 0.55))
     }
     public let id: UUID
-    public let documentKey: String
+    public var documentKey: String
     public let attachment: AIRegionAttachment
     public let assistant: AIAssistantModel
     public let notesAssistant: AIAssistantModel

@@ -1,4 +1,5 @@
 import LyraReaderFFI
+import LyraReaderBindings
 import Combine
 import AppKit
 import Foundation
@@ -3392,7 +3393,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     for (index, level) in levels.enumerated() {
                         if index > 0 { try? await Task.sleep(for: .milliseconds(stepMs)) }
                         guard let self, self.document != nil else { return }
-                        self.zoomPercent = min(400, max(25, level))
+                        self.zoomPercent = self.resolvedZoomPercent(
+                            mode: .percent, percent: level) ?? self.zoomPercent
                         self.reloadVisiblePages()
                         // Report the counters once this leg's band has settled: read at the
                         // instant of the zoom they would bill the *next* leg for this leg's
@@ -3638,6 +3640,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 pageEditIsApplied = false
             }
             document = loaded
+            DocumentEditCache.adopt(documentId: loaded.documentId, for: url)
             lastError = nil
             currentPage = 1
             if loaded.xfa.isXfa {
@@ -3853,23 +3856,53 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func zoomIn() {
-        zoomPercent = min(Self.maximumZoomPercent, zoomPercent + 10)
+        zoomPercent = resolvedZoomPercent(mode: .percent, percent: zoomPercent, delta: 10)
+            ?? zoomPercent
         reloadVisiblePages()
     }
 
     public func zoomOut() {
-        zoomPercent = max(Self.minimumZoomPercent, zoomPercent - 10)
+        zoomPercent = resolvedZoomPercent(mode: .percent, percent: zoomPercent, delta: -10)
+            ?? zoomPercent
         reloadVisiblePages()
     }
 
     /// The zoom range the toolbar buttons and the pointer gestures share.
-    public static let minimumZoomPercent = 25
-    public static let maximumZoomPercent = 400
+    ///
+    /// Read from the session policy through the FFI. These are conveniences for UI checks and
+    /// labels; every production clamp goes through ``resolvedZoomPercent``/``clampScroll``.
+    public static let minimumZoomPercent = Int(LyraReaderBindings.zoomMinPercent())
+    public static let maximumZoomPercent = Int(LyraReaderBindings.zoomMaxPercent())
 
     /// The inset the Fit Width and Fit Page presets leave between a page edge and the viewport
-    /// edge, measured on each side. 8 logical points is small enough that a fitted page still
-    /// reads as "fit" and large enough that it does not touch the window chrome.
-    public static let zoomPresetInsetPt: CGFloat = 8
+    /// edge, measured on each side. The value lives in the session policy; this reads it.
+    public static let zoomPresetInsetPt = CGFloat(LyraReaderBindings.zoomPresetInsetPt())
+
+    /// Ask the Rust session policy for the one integer zoom percentage.
+    ///
+    /// A step is clamped to 25…400; a fit floors the calibrated content size into the viewport
+    /// minus 16 pt and clamps the same way. Returning `nil` means the fit has no usable geometry
+    /// and the caller must leave the zoom alone — the same contract the old Swift formula had.
+    private func resolvedZoomPercent(
+        mode: LyraReaderBindings.ZoomModeRecord,
+        percent: Int,
+        delta: Int = 0,
+        page: CGSize = .zero,
+        viewport: CGSize = .zero
+    ) -> Int? {
+        let policy = ZoomPolicyRecord(
+            mode: mode,
+            percent: UInt32(clamping: percent),
+            delta: Int32(clamping: delta),
+            pageWidthPt: Double(page.width),
+            pageHeightPt: Double(page.height),
+            viewportWidthPt: Double(viewport.width),
+            viewportHeightPt: Double(viewport.height),
+            calibration: Double(displayCalibration.factor)
+        )
+        guard let resolved = resolveZoom(policy: policy) else { return nil }
+        return Int(resolved)
+    }
 
     /// The current page's row geometry in content points.
     ///
@@ -3935,17 +3968,27 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Flooring is deliberate: a fit that rounds up would leave a sliver of the page outside the
     /// viewport (there is no horizontal scrolling to reach it, and the vertical one would show a
     /// scrollbar for a page that was supposed to fit).
-    private func fitZoomPercent(fittingContentPt contentPt: CGFloat,
+    private func fitZoomPercent(_ mode: LyraReaderBindings.ZoomModeRecord,
+                                fittingContentPt contentPt: CGFloat,
                                 intoViewportPt viewportPt: CGFloat) -> Int? {
-        let available = viewportPt - 2 * Self.zoomPresetInsetPt
-        guard contentPt.isFinite, contentPt > 0,
-              available.isFinite, available > 0,
-              displayCalibration.factor.isFinite, displayCalibration.factor > 0
-        else { return nil }
-        let percent = available / (contentPt * displayCalibration.factor) * 100
-        guard percent.isFinite else { return nil }
-        return min(Self.maximumZoomPercent,
-                   max(Self.minimumZoomPercent, Int(percent.rounded(.down))))
+        switch mode {
+        case .fitWidth:
+            return resolvedZoomPercent(
+                mode: .fitWidth,
+                percent: 100,
+                page: CGSize(width: contentPt, height: 1),
+                viewport: CGSize(width: viewportPt, height: 1)
+            )
+        case .fitPage:
+            return resolvedZoomPercent(
+                mode: .fitPage,
+                percent: 100,
+                page: CGSize(width: 1, height: contentPt),
+                viewport: CGSize(width: 1, height: viewportPt)
+            )
+        case .percent:
+            return nil
+        }
     }
 
     private enum ZoomPresetAnchor {
@@ -3990,7 +4033,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// the content point at the viewport top is kept.
     public func zoomFitWidth() {
         guard let geometry = pageFitGeometry(),
-              let target = fitZoomPercent(fittingContentPt: geometry.widthToFitPt,
+              let target = fitZoomPercent(.fitWidth,
+                                          fittingContentPt: geometry.widthToFitPt,
                                           intoViewportPt: viewportSizePt.width)
         else { return }
         applyZoomPreset(target, anchoring: .viewportTop)
@@ -4005,7 +4049,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// and the target is recomputed from the page geometry and the viewport.
     public func zoomFitPage() {
         guard let geometry = pageFitGeometry(),
-              let target = fitZoomPercent(fittingContentPt: geometry.pageHeightPt,
+              let target = fitZoomPercent(.fitPage,
+                                          fittingContentPt: geometry.pageHeightPt,
                                           intoViewportPt: viewportSizePt.height)
         else { return }
         applyZoomPreset(target, anchoring: .pageTop(page: geometry.page))
@@ -4064,8 +4109,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard whole != 0 else { return false }
         pointerZoomRemainder -= whole
 
-        let target = min(Self.maximumZoomPercent,
-                         max(Self.minimumZoomPercent, zoomPercent + Int(whole)))
+        let target = resolvedZoomPercent(mode: .percent, percent: zoomPercent, delta: Int(whole))
+            ?? zoomPercent
         guard target != zoomPercent else {
             // At a limit the remainder must not pile up, or the first step back would jump.
             pointerZoomRemainder = 0
@@ -4097,7 +4142,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// The scroll offset clamped to the document (shared by every path that sets it).
     private func clampedScrollOffset(_ value: CGFloat) -> CGFloat {
-        min(max(0, value), max(0, contentHeightPt - viewportHeightContentPt))
+        CGFloat(clampScroll(
+            offsetPt: Double(value),
+            contentHeightPt: Double(contentHeightPt),
+            viewportHeightPt: Double(viewportHeightContentPt)
+        ))
     }
 
     /// Actual physical size: 100% of the calibrated scale (⌘0).
@@ -8248,6 +8297,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         defer { formSaveInProgress = false }
         do {
             let report = try await engine.replaceWithFilledForm(values)
+            carryDocumentCacheAfterReplacement(at: url)
             let backup = report.backupPath?.lastPathComponent ?? "none"
             formDraft = [:]
             formInfo = .empty
@@ -8575,6 +8625,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         defer { propertiesSaveInProgress = false }
         do {
             let report = try await engine.replaceWithDocumentProperties(documentPropertiesDraft)
+            carryDocumentCacheAfterReplacement(at: url)
             let backup = report.backupPath?.lastPathComponent ?? "none"
             documentInfo = nil
             _ = open(url: url)
@@ -9013,6 +9064,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
         do {
             try DocumentEditCache.validateSource(for: url)
+            let previousCacheDirectory = annotationsURL?.deletingLastPathComponent()
             let changes = try await pendingAnnotationChanges()
             let bookmarkRequests = bookmarks
             let report = try await engine.replaceWithAnnotationChanges(
@@ -9022,7 +9074,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 deletions: changes.deletions,
                 zoom: zoomFactor
             )
-
             try? DocumentEditCache.recordSource(for: url)
 
             // The PDF is now the source of truth. Remove exactly the written entries and the
@@ -9043,6 +9094,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             pendingFileDeletions.removeAll()
             annotationCacheIsDirty = false
             persistPendingAnnotationState()
+            carryDocumentCacheAfterReplacement(at: url, from: previousCacheDirectory)
 
             // The engine marks the old handle stale; reopen the file in place, keeping the
             // reading position and zoom.
@@ -9538,6 +9590,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let firstPath = first.standardizedFileURL.resolvingSymlinksInPath().path
         let secondPath = second.standardizedFileURL.resolvingSymlinksInPath().path
         return firstPath == secondPath
+    }
+
+    /// After a command rewrote the PDF in place, carry the reader state to the new content
+    /// identity before anything reads or writes the cache again.
+    ///
+    /// The document id includes the bytes, so a save changes the directory key. The annotation
+    /// cache, summaries, translations, knowledge and region conversations are reader state and
+    /// must survive exactly as they did before the id existed; a transient page-edit session is
+    /// retired by the save and is not carried.
+    private func carryDocumentCacheAfterReplacement(at url: URL, from oldDirectory: URL? = nil) {
+        guard let source = oldDirectory ?? annotationsURL?.deletingLastPathComponent() else {
+            return
+        }
+        let newDirectory = DocumentEditCache.directory(for: url)
+        DocumentEditCache.carryDocumentState(from: source, to: newDirectory)
     }
 
     /// The cached annotation records file for `document`.
@@ -10279,28 +10346,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Compresses one-based document pages into "1-3, 5, 8-9" for the print job title and the
     /// mixed-paper explanation. Sorted; duplicate pages are ignored.
     private static func pageRanges(_ pages: [Int]) -> String {
-        let sorted = Array(Set(pages)).sorted()
-        var parts: [String] = []
-        var start: Int?
-        var previous = Int.min
-        func appendRange(_ first: Int, _ last: Int) {
-            parts.append(first == last ? "\(first + 1)" : "\(first + 1)-\(last + 1)")
-        }
-        for page in sorted {
-            if let first = start {
-                if page == previous + 1 {
-                    previous = page
-                    continue
-                }
-                appendRange(first, previous)
-            }
-            start = page
-            previous = page
-        }
-        if let first = start {
-            appendRange(first, previous)
-        }
-        return parts.joined(separator: ", ")
+        LyraReaderBindings.compactPageRanges(pages: pages.map { UInt32(max(0, $0) + 1) })
     }
 
     // MARK: - Page editing (T3.9)
@@ -11761,12 +11807,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     private static func pageList(_ pages: [Int]) -> String {
-        guard let first = pages.first, let last = pages.last else { return "no pages" }
-        if pages.count == 1 { return "page \(first + 1)" }
-        if last - first + 1 == pages.count {
-            return first == last ? "page \(first + 1)" : "pages \(first + 1)–\(last + 1)"
-        }
-        return "pages " + pages.map { String($0 + 1) }.joined(separator: ", ")
+        LyraReaderBindings.pageList(pages: pages.map { UInt32(max(0, $0)) })
     }
 
     // MARK: - Recovery from an annotation cache that cannot be read
@@ -13924,11 +13965,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// 100% zoom is still one ⌘+ away.
     private func fitSpreadToViewportIfNeeded() {
         guard layoutMode == .facing, contentWidthPt > 0, viewportSizePt.width > 0 else { return }
-        guard let fitPercent = fitZoomPercent(fittingContentPt: contentWidthPt,
+        guard let fitPercent = fitZoomPercent(.fitWidth,
+                                              fittingContentPt: contentWidthPt,
                                               intoViewportPt: viewportSizePt.width)
         else { return }
         guard fitPercent < zoomPercent else { return }
-        let target = max(Self.minimumZoomPercent, fitPercent)
+        let target = resolvedZoomPercent(mode: .percent, percent: fitPercent) ?? fitPercent
         guard target < zoomPercent else { return }
 
         cancelScrollGlide()

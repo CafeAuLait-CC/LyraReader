@@ -319,8 +319,13 @@ extension ReaderChecks {
         // This is the failure mode a PDF-first save leaves: the PDF is written, the annotation cache
         // write is not. Reopening must show the PDF's copy once, not the PDF's copy plus the
         // annotation cache's.
+        // The document's identity now includes its bytes, so the current annotation cache is the
+        // one under the replaced file's key; the old pre-replacement key still holds the cleaned
+        // records (and is left readable). Writing the stale records to the current key is the
+        // same failure mode this check has always described.
+        let reconciledRecords = DocumentEditCache.annotationsURL(for: replaceSource)
         let staleText = "[\n" + [try entry(first), try entry(second)].joined(separator: ",\n") + "\n]"
-        try Data(staleText.utf8).write(to: replaceRecords)
+        try Data(staleText.utf8).write(to: reconciledRecords)
         let reconciled = AppState(engine: try RustEngine())
         reconciled.setViewportSize(CGSize(width: 700, height: 500))
         reconciled.newTab(url: replaceSource)
@@ -341,7 +346,7 @@ extension ReaderChecks {
 
         // The next ordinary cache write drops the reconciled entries from the file too.
         reconciled.addBookmarkAtCurrentPage(name: "after reconciliation")
-        let cleanedText = String(decoding: try Data(contentsOf: replaceRecords), as: UTF8.self)
+        let cleanedText = String(decoding: try Data(contentsOf: reconciledRecords), as: UTF8.self)
         require(!cleanedText.contains(firstID.uuidString)
                     && !cleanedText.contains(secondID.uuidString),
                 "a later cache write removes the reconciled entries")

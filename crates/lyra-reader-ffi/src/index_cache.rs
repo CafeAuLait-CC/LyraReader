@@ -51,6 +51,7 @@
 use crate::api::{
     CitationRecord, DocumentMetadataRecord, FigureRecord, OutlineEntry, ReferenceRecord,
 };
+use crate::document_id::DocumentId;
 use lyra_reader_text::CitationStyle;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -227,16 +228,40 @@ const KNOWN_KEYS: [&str; 10] = [
 ];
 
 /// Derived indexes belong to the user's platform cache, including PDFs in read-only folders.
+///
+/// The path is keyed by the [`DocumentId`] — canonical path **and** content hash — so a symlink
+/// and its target share one index, while a replaced file at the same path does not inherit the
+/// old bytes' index. If the identity cannot be computed (an unreadable file), the historical
+/// path-only key is used; the caller will fail to parse the document anyway.
 pub(crate) fn cache_path(document_path: &Path) -> PathBuf {
-    let root = std::env::var_os("LYRA_READER_INDEX_CACHE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(platform_cache_root);
+    match DocumentId::of(document_path) {
+        Ok(id) => cache_path_for_key(id.key()),
+        Err(_) => legacy_cache_path(document_path),
+    }
+}
+
+/// The index cache path for an already-computed [`DocumentId`] key.
+pub(crate) fn cache_path_for_key(key: &str) -> PathBuf {
+    cache_root().join(format!("{key}.json"))
+}
+
+/// The historical cache path: SHA-256 of the canonical path, with no content component.
+///
+/// Kept for lazy migration: a cache written by an older build is still read when the new key
+/// has no file, and a hit is copied forward. Nothing deletes the old file.
+pub(crate) fn legacy_cache_path(document_path: &Path) -> PathBuf {
     let canonical = document_path
         .canonicalize()
         .unwrap_or_else(|_| document_path.to_path_buf());
     let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
     let key: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    root.join(format!("{key}.json"))
+    cache_root().join(format!("{key}.json"))
+}
+
+fn cache_root() -> PathBuf {
+    std::env::var_os("LYRA_READER_INDEX_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(platform_cache_root)
 }
 
 fn platform_cache_root() -> PathBuf {
@@ -363,6 +388,31 @@ pub(crate) fn read_cache(path: &Path, identity: &ContentIdentity, page_count: u3
         return CacheRead::Stale;
     }
     CacheRead::Hit(Box::new(file))
+}
+
+/// Reads the new-key cache, falling back to the legacy path-only cache.
+///
+/// A legacy hit is copied to `primary` and returned. Every other legacy outcome is reported
+/// unchanged: a stale legacy cache must still say "the bytes changed" (so the shell derives a
+/// fresh index and replaces the cache) rather than pretending no cache ever existed. The legacy
+/// file is never deleted; a downgrade and a curious user both still find it.
+pub(crate) fn read_cache_with_migration(
+    primary: &Path,
+    legacy: &Path,
+    identity: &ContentIdentity,
+    page_count: u32,
+) -> CacheRead {
+    let read = read_cache(primary, identity, page_count);
+    if !matches!(read, CacheRead::Missing) || legacy == primary {
+        return read;
+    }
+    match read_cache(legacy, identity, page_count) {
+        CacheRead::Hit(file) => {
+            let _ = write_cache(primary, &file);
+            CacheRead::Hit(file)
+        }
+        other => other,
+    }
 }
 
 /// Writes `file` atomically at `path`, returning the number of bytes written.
@@ -572,6 +622,38 @@ mod tests {
         fs::write(&path, br#"{"kind":"lyra-reader-document-index","#).expect("write truncated");
         let cache = read_cache(&path, &identity(b"x"), 1);
         assert!(matches!(cache, CacheRead::Corrupt { .. }));
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_legacy_path_only_cache_is_copied_forward_and_stays_readable() {
+        let directory = std::env::temp_dir().join(format!(
+            "lyra-reader-index-cache-migrate-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("scratch");
+        let primary = directory.join("new-key.json");
+        let legacy = directory.join("old-path-key.json");
+        let same = identity(b"same bytes");
+        write_cache(&legacy, &minimal_file(identity(b"same bytes"))).expect("legacy cache");
+        assert!(matches!(read_cache(&primary, &same, 1), CacheRead::Missing));
+        let migrated = read_cache_with_migration(&primary, &legacy, &same, 1);
+        assert!(matches!(migrated, CacheRead::Hit(_)));
+        assert!(
+            primary.is_file(),
+            "the legacy hit was copied to the new-key path"
+        );
+        assert!(legacy.is_file(), "the legacy cache is kept readable");
+        assert!(matches!(read_cache(&primary, &same, 1), CacheRead::Hit(_)));
+
+        // A legacy cache for different bytes keeps its honest Stale outcome; it must not be
+        // silently treated as a missing cache (the shell needs to rebuild and replace it).
+        let other = directory.join("other-key.json");
+        let changed = identity(b"changed bytes");
+        let stale = read_cache_with_migration(&primary, &legacy, &changed, 1);
+        assert!(matches!(stale, CacheRead::Stale));
+        assert!(!other.is_file());
         let _ = fs::remove_dir_all(&directory);
     }
 

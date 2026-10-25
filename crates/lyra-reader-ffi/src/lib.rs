@@ -40,6 +40,8 @@ use std::sync::Mutex;
 uniffi::setup_scaffolding!();
 
 pub mod api;
+mod document_id;
+pub mod format;
 mod index_cache;
 pub use api::{DocumentSummary, LyraReaderDocument, LyraReaderEngine, LyraReaderFfiError};
 

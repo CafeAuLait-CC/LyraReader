@@ -136,70 +136,70 @@ public enum AIAuditCode: String, Codable, CaseIterable, Sendable {
     static func classifyStartFailure(_ error: Error) -> AIAuditCode {
         guard let settingsError = error as? AISettingsError else { return .other }
         switch settingsError {
-        case .invalid(let message):
-            if message.contains("No API key") { return .noApiKey }
-            if message.contains("connection changed") { return .connectionChanged }
-            if message.contains("ChatGPT account") || message.contains("Connect ChatGPT") {
-                return .signedOut
-            }
-            if message.contains("engine is not available") { return .notConfigured }
-            if message.contains("Keychain") { return .keychainUnavailable }
-            return .invalidSettings
+        case .invalid: return .invalidSettings
+        case .refused(_, let code): return code
         }
     }
 
     /// Classify an error thrown while building a plan locally. Nothing was sent; the code says
     /// which local guard refused.
+    ///
+    /// The stable categories come from Rust's [`AiErrorCode`]; the two contexts map it
+    /// differently because the audit vocabulary predates the structured code (a preparation
+    /// failure is a refusal category, while a stream failure is a transport category). The
+    /// mapping is table-driven, never a message substring.
     static func classifyPreparationFailure(_ error: Error, baseURL: String) -> AIAuditCode {
-        let message = AIReadableError.message(error)
-        if message.contains("Nothing in this document is relevant") { return .nothingRelevant }
-        if message.contains("Turn on image input") { return .visionUnsupported }
-        if message.contains("no text layer") || message.contains("not available")
-            || message.contains("too large") || message.contains("too long")
-            || message.contains("nothing to send") || message.contains("nothing to ask")
-            || message.contains("has no pages") || message.contains("outside this document")
-        {
-            return .emptyContext
+        let engineCode: AiErrorCode? = {
+            guard let engineError = error as? LyraReaderFfiError,
+                  case .Ai(_, let code) = engineError else { return nil }
+            return code
+        }()
+        // The refusal categories the engine can name exactly. These were checked before the
+        // endpoint guard historically and must stay ahead of it.
+        switch engineCode {
+        case .nothingRelevant: return .nothingRelevant
+        case .visionUnsupported: return .visionUnsupported
+        case .emptyContext: return .emptyContext
+        default: break
         }
+        // Historical order: an empty endpoint was reported as "no endpoint" before the message
+        // keyword checks, whatever the message said.
         if baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return .noEndpoint
         }
-        if message.contains("base URL") || message.contains("endpoint")
-            || message.contains("model") || message.contains("Temperature")
-            || message.contains("Max tokens") || message.contains("reasoning")
-        {
-            return .invalidSettings
+        switch engineCode {
+        case .invalidSettings, .unsupportedCapability: return .invalidSettings
+        default: break
+        }
+        if let settingsError = error as? AISettingsError, let code = settingsError.auditCode {
+            return code
         }
         return .other
     }
 
-    /// Classify a stream error event. The transport's fixed category is used first; provider
-    /// messages are inspected only here, in memory, when that category is `.other`. No substring
-    /// of a message is ever written to disk.
-    static func classifyStreamFailure(
-        message: String,
-        failure: AIRequestFailure = .other
-    ) -> AIAuditCode {
-        switch failure {
+    /// Classify a stream error event from the stable AI code Rust assigned to it.
+    ///
+    /// The transport category (`offline`/`localServer`) still crosses separately for the offline
+    /// hint, but the audit category is now the code's job. The mapping mirrors the old categories
+    /// exactly: codes the audit vocabulary has no stream category for stay `providerError`.
+    static func classifyStreamFailure(code: AiErrorCode) -> AIAuditCode {
+        switch code {
         case .offline: return .offline
         case .localServer: return .localServer
-        case .other: break
+        case .unauthorized: return .unauthorized
+        case .rateLimited: return .rateLimited
+        case .timeout: return .timeout
+        case .httpStatus: return .httpError
+        case .protocol: return .protocolError
+        case .unreachable: return .unreachable
+        // Rust's unsupported-capability message is "model lacks capability: …", which the old
+        // stream classifier classified as providerError (it looked for "unsupported"). Keeping
+        // that category is the behaviour-preserving mapping; the separate preparation path still
+        // reports it as invalidSettings, as before.
+        case .unsupportedCapability, .notConfigured, .invalidSettings, .emptyContext,
+             .nothingRelevant, .visionUnsupported, .cancelled, .other:
+            return .providerError
         }
-        let lower = message.lowercased()
-        if lower.contains("unauthorized") || lower.contains("401") || lower.contains("api key") {
-            return .unauthorized
-        }
-        if lower.contains("rate limit") || lower.contains("429") { return .rateLimited }
-        if lower.contains("timed out") || lower.contains("timeout") { return .timeout }
-        if lower.contains("http ") { return .httpError }
-        if lower.contains("stream") || lower.contains("protocol") || lower.contains("malformed") {
-            return .protocolError
-        }
-        if lower.contains("unreachable") || lower.contains("connection") { return .unreachable }
-        if lower.contains("unsupported") || lower.contains("does not support") {
-            return .unsupportedCapability
-        }
-        return .providerError
     }
 }
 
@@ -659,17 +659,11 @@ final class AIAuditedChatHandle: AIChatHandle {
                 attempt.markPartStarted(Int(index))
             case .done:
                 record(.sent, code: nil)
-            case .error(let message, let cancelled, let failure):
+            case .error(_, let cancelled, _, let code):
                 if cancelled {
                     record(.cancelled, code: nil)
                 } else {
-                    record(
-                        .failed,
-                        code: AIAuditCode.classifyStreamFailure(
-                            message: message,
-                            failure: failure
-                        )
-                    )
+                    record(.failed, code: AIAuditCode.classifyStreamFailure(code: code))
                 }
             default:
                 break

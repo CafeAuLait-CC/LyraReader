@@ -548,7 +548,8 @@ final class InPlaceTranslationController {
                 return nil
             }
         }
-        let documentKey = url.standardizedFileURL.path
+        let documentKey = DocumentEditCache.documentIdentity(for: url)
+            ?? url.standardizedFileURL.path
         return Environment(
             documentKey: documentKey,
             documentURL: url,
@@ -603,7 +604,8 @@ final class InPlaceTranslationController {
             ) {
                 if item.environment.connectionMode == .chatGPT {
                     guard let accountID = item.environment.accountID else {
-                        throw AISettingsError.invalid("The ChatGPT account is no longer selected. Nothing was sent.")
+                        throw AISettingsError.refused(
+                            "The ChatGPT account is no longer selected. Nothing was sent.", .signedOut)
                     }
                     startCount += 1
                     return ChatGPTResponsesHandle(plan: plan,
@@ -611,10 +613,10 @@ final class InPlaceTranslationController {
                                                   accountID: accountID)
                 }
                 guard let service = item.environment.service else {
-                    throw AISettingsError.invalid(AIAssistantModel.noEngineMessage)
+                    throw AISettingsError.refused(AIAssistantModel.noEngineMessage, .notConfigured)
                 }
                 guard let apiKey = item.environment.apiKey else {
-                    throw AISettingsError.invalid(AIAssistantModel.noKeyMessage)
+                    throw AISettingsError.refused(AIAssistantModel.noKeyMessage, .noApiKey)
                 }
                 startCount += 1
                 return try service.start(plan, apiKey: apiKey)
@@ -644,7 +646,7 @@ final class InPlaceTranslationController {
                         text += delta
                     case .done:
                         done = true
-                    case .error(let message, let cancelled, let failure):
+                    case .error(let message, let cancelled, let failure, _):
                         if cancelled { return }
                         throw TranslationTransportFailure(message: message, failure: failure)
                     case .partStarted, .reasoningDelta, .usage, .diagnostics:
@@ -736,7 +738,7 @@ final class InPlaceTranslationController {
 
     private func documentMatches(_ environment: Environment) -> Bool {
         guard let host, let url = host.translationDocumentURL else { return false }
-        return url.standardizedFileURL.path == environment.documentKey
+        return url.standardizedFileURL == environment.documentURL.standardizedFileURL
     }
 
     // MARK: - Cache and invalidation

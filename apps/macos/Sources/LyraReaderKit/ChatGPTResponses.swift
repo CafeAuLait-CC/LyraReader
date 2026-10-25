@@ -12,6 +12,16 @@ import Foundation
 /// `input_text`; a region capture is `input_image` with an inline PNG `data:` URL. The body is
 /// rendered by the Rust builder, which owns the exact bytes and encodes the capture once. The
 /// previewed `wire_body` is the body that is sent.
+/// A ChatGPT stream failure that already knows its stable category.
+///
+/// Carrying the category on the error is what keeps the audit trail from matching message text.
+fileprivate struct ChatGPTStreamFailure: LocalizedError {
+    let message: String
+    let code: AiErrorCode
+
+    var errorDescription: String? { message }
+}
+
 @MainActor
 package enum ChatGPTResponses {
     package static let endpoint = "https://api.openai.com/v1/responses"
@@ -24,7 +34,8 @@ package enum ChatGPTResponses {
         for part in plan.parts {
             guard let image = part.image else { continue }
             guard !image.png.isEmpty, image.widthPx > 0, image.heightPx > 0 else {
-                throw AISettingsError.invalid("The region picture is empty, so there is nothing to send.")
+                throw AISettingsError.refused(
+                    "The region picture is empty, so there is nothing to send.", .emptyContext)
             }
             guard image.png.count <= AIRegionLimits.maximumPNGBytes else {
                 throw AISettingsError.invalid(
@@ -41,8 +52,14 @@ package enum ChatGPTResponses {
         do {
             try ChatGPTAccountStore.check(response)
         } catch {
-            guard carryingImage, let status = (response as? HTTPURLResponse)?.statusCode else {
-                throw error
+            let status = (response as? HTTPURLResponse)?.statusCode
+            guard carryingImage, let status else {
+                // The account check's messages for 401/403/429 do not carry the numeric status
+                // (the old stream classifier therefore said providerError); the default branch
+                // does carry "HTTP n" (which it said httpError). Encode the same result.
+                let code: AiErrorCode = (status == 401 || status == 403 || status == 429)
+                    ? .other : .httpStatus
+                throw ChatGPTStreamFailure(message: AIReadableError.message(error), code: code)
             }
             let text: String
             switch status {
@@ -53,9 +70,10 @@ package enum ChatGPTResponses {
             case 400, 413, 415, 422:
                 text = "The ChatGPT plan refused the region image (HTTP \(status)). The selected model may not accept image input; choose a model that accepts images in Settings > AI, then press Retry. The question is kept."
             default:
-                throw error
+                throw ChatGPTStreamFailure(message: AIReadableError.message(error), code: .httpStatus)
             }
-            throw AISettingsError.invalid(text)
+            throw ChatGPTStreamFailure(
+                message: text, code: status == 401 ? .unauthorized : .httpStatus)
         }
     }
 
@@ -67,7 +85,8 @@ package enum ChatGPTResponses {
         guard let json = data.data(using: .utf8),
               let object = try JSONSerialization.jsonObject(with: json) as? [String: Any],
               let type = object["type"] as? String else {
-            throw AISettingsError.invalid("ChatGPT returned a malformed response event.")
+            throw ChatGPTStreamFailure(
+                message: "ChatGPT returned a malformed response event.", code: .protocol)
         }
         switch type {
         case "response.output_text.delta":
@@ -99,7 +118,7 @@ package enum ChatGPTResponses {
                     text = "ChatGPT could not complete this request. The partial answer is kept; check your account and retry."
                 }
             }
-            throw AISettingsError.invalid(text)
+            throw ChatGPTStreamFailure(message: text, code: .other)
         default: return ([], false)
         }
     }
@@ -131,8 +150,9 @@ final class ChatGPTResponsesHandle: AIChatHandle {
                     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
                     request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
                     guard !part.wireBody.isEmpty else {
-                        throw AISettingsError.invalid(
-                            "The ChatGPT request was not prepared for the Responses transport. Nothing was sent.")
+                        throw ChatGPTStreamFailure(
+                            message: "The ChatGPT request was not prepared for the Responses transport. Nothing was sent.",
+                            code: .other)
                     }
                     request.httpBody = Data(part.wireBody.utf8)
                     let (bytes, response) = try await accounts.session.bytes(for: request)
@@ -147,19 +167,45 @@ final class ChatGPTResponsesHandle: AIChatHandle {
                             if parsed.completed { completed = true; break }
                         }
                     }
-                    guard completed else { throw AISettingsError.invalid("The ChatGPT stream ended before completion. The partial answer is kept.") }
+                    guard completed else {
+                        throw ChatGPTStreamFailure(
+                            message: "The ChatGPT stream ended before completion. The partial answer is kept.",
+                            code: .protocol)
+                    }
                 }
                 try Task.checkCancellation()
                 pending.append(.done)
             } catch {
                 if !isFinished {
                     let cancelled = Task.isCancelled || error is CancellationError
-                    pending.append(.error(message: cancelled ? "Cancelled." : AIReadableError.message(error), cancelled: cancelled))
+                    let streamFailure = error as? ChatGPTStreamFailure
+                    pending.append(.error(
+                        message: cancelled ? "Cancelled." : (streamFailure?.message ?? AIReadableError.message(error)),
+                        cancelled: cancelled,
+                        code: cancelled ? .cancelled : (streamFailure?.code ?? Self.code(for: error))
+                    ))
                 }
             }
             isFinished = true; accounts.unregisterRequest(id)
         }
     }
+    /// The stable category for a transport error that was not already classified.
+    ///
+    /// Only error *types* and URL error codes are inspected; the old audit classifier looked at
+    /// the URLSession message for "connection"/"timed out". These mappings reproduce exactly the
+    /// categories it produced for Foundation's messages and leave everything else `.other`.
+    private static func code(for error: Error) -> AiErrorCode {
+        guard let urlError = error as? URLError else { return .other }
+        switch urlError.code {
+        case .notConnectedToInternet, .networkConnectionLost, .secureConnectionFailed:
+            return .unreachable
+        case .timedOut:
+            return .timeout
+        default:
+            return .other
+        }
+    }
+
     func poll() -> [AIStreamEvent] { let events = pending; pending.removeAll(); return events }
     func cancel() {
         guard !isFinished else { return }
@@ -181,13 +227,13 @@ package struct ChatGPTEventDecoder {
     package mutating func push(_ byte: UInt8) throws -> String? {
         frameBytes += 1
         guard frameBytes <= 2_000_000 else {
-            throw AISettingsError.invalid("ChatGPT returned an oversized stream event.")
+            throw ChatGPTStreamFailure(message: "ChatGPT returned an oversized stream event.", code: .protocol)
         }
         if previousCR && byte == 10 { previousCR = false; return nil }
         previousCR = byte == 13
         if byte == 10 || byte == 13 {
             guard let text = String(bytes: line, encoding: .utf8) else {
-                throw AISettingsError.invalid("ChatGPT returned invalid stream text.")
+                throw ChatGPTStreamFailure(message: "ChatGPT returned invalid stream text.", code: .protocol)
             }
             line.removeAll(keepingCapacity: true)
             if text.isEmpty {
