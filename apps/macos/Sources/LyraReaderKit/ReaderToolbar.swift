@@ -100,6 +100,9 @@ public struct TabStrip: View {
 
             Button { state.closeTab(index) } label: {
                 Image(systemName: state.tabHasUnsavedChanges(index) ? "circle.fill" : "xmark")
+                    .foregroundStyle(state.tabHasUnsavedChanges(index)
+                        ? LyraReaderTheme.accent
+                        : (active ? LyraReaderTheme.textPrimary : LyraReaderTheme.textSecondary))
                     .font(.system(size: 10, weight: .semibold))
                     .frame(width: TabRowLayout.closeButtonWidth,
                            height: TabRowLayout.contentHeight)

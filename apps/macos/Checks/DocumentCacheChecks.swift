@@ -17,6 +17,21 @@ extension ReaderChecks {
             try fm.copyItem(at: root.appendingPathComponent("tests/fixtures/text-page.pdf"), to: url)
             return url
         }
+        let cleanTab = try fixture("clean-tab.pdf")
+        let otherTab = try fixture("other-tab.pdf")
+        let tracked = AppState(engine: try RustEngine())
+        tracked.setViewportSize(CGSize(width: 1000, height: 800))
+        require(tracked.newTab(url: cleanTab), "the saved-state check opens a clean tab")
+        require(tracked.addGeometryAnnotation(kind: .square, page: 0,
+            shapeRect: CGRect(x: 40, y: 60, width: 30, height: 30)), "the first tab gains a pending mark")
+        require(tracked.newTab(url: otherTab) && tracked.tabHasUnsavedChanges(0),
+                "the inactive tab retains its pending-change indicator")
+        tracked.selectTab(0)
+        tracked.undo()
+        require(!tracked.tabHasUnsavedChanges(0), "returning to a tab retains its saved baseline for Undo")
+        tracked.selectTab(1)
+        require(!tracked.tabHasUnsavedChanges(0), "the now-clean inactive tab stays clean")
+
         let source = try fixture("paper.pdf")
         let original = try Data(contentsOf: source)
         let mark = AppState.Annotation(id: UUID(), page: 0, start: 0, end: 3,
@@ -85,6 +100,21 @@ extension ReaderChecks {
                 "saving does not recreate the legacy annotation files")
         try await eventually("saved bookmarks reload from the PDF outline") { resumed.bookmarks.count == 1 }
         require(!resumed.annotationCacheIsDirty, "embedded bookmarks do not mark a saved document dirty")
+        require(resumed.addGeometryAnnotation(kind: .square, page: 0,
+            shapeRect: CGRect(x: 40, y: 60, width: 30, height: 30)),
+            "a saved bookmark document accepts an undoable mark")
+        require(resumed.hasUnsavedDocumentChanges, "a mark differs from the saved bookmark baseline")
+        resumed.undo()
+        require(!resumed.hasUnsavedDocumentChanges && resumed.bookmarks.count == 1,
+                "undo returns to clean even when the PDF already contains a bookmark")
+        resumed.redo()
+        let recoveredMarks = AppState(engine: try RustEngine())
+        require(recoveredMarks.open(url: source) && recoveredMarks.annotationCacheIsDirty,
+                "reopening retains an unsaved annotation and its dirty status")
+        for annotation in recoveredMarks.annotations { recoveredMarks.removeAnnotation(annotation.id) }
+        require(!recoveredMarks.hasUnsavedDocumentChanges,
+                "the persisted saved baseline recognizes restored PDF contents after reopening")
+
 
         let conflict = try fixture("external.pdf")
         let editing = AppState(engine: try RustEngine())

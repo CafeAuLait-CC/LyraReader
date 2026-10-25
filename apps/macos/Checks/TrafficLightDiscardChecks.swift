@@ -128,6 +128,17 @@ extension ReaderChecks {
         require(state.hasUnsavedDocumentChanges, "the document has unsaved changes")
         try await waitForLayout("document dirty")
 
+        try await eventually("the native window reflects the unsaved annotation", { window.isDocumentEdited })
+        state.undo()
+        require(!state.hasUnsavedDocumentChanges && !state.tabHasUnsavedChanges(0),
+                "undoing every change restores the clean tab state")
+        try await eventually("undo clears the native traffic-light edited marker", { !window.isDocumentEdited })
+        try await waitForLayout("all edits undone")
+        state.redo()
+        require(state.hasUnsavedDocumentChanges && state.tabHasUnsavedChanges(0),
+                "redo marks the same tab dirty again")
+        try await eventually("redo restores the native window edited marker", { window.isDocumentEdited })
+
         state.closeTab(0)
         require(state.contentCloseRequested && state.tabs.count == 1,
                 "closing the dirty tab asks Save / Discard / Cancel")

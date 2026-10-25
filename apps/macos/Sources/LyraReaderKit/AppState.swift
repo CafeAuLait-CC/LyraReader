@@ -489,7 +489,21 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     }
     private static var pageEditOwners: [String: WeakState] = [:]
     private var isChangingDocumentState = false
-    @Published public private(set) var annotationCacheIsDirty = false
+    /// The saved record state, independent of Undo stack depth and carried with recovery/tabs.
+    /// Older dirty caches without a baseline stay dirty until their contents are saved.
+    struct AnnotationCleanSnapshot: Codable, Equatable {
+        let annotations: [Annotation]
+        let bookmarks: [Bookmark]
+    }
+    private var annotationCleanSnapshot: AnnotationCleanSnapshot?
+    private var currentAnnotationSnapshot: AnnotationCleanSnapshot {
+        AnnotationCleanSnapshot(annotations: annotations, bookmarks: bookmarks)
+    }
+    @Published public private(set) var annotationCacheIsDirty = false {
+        didSet {
+            if !annotationCacheIsDirty { annotationCleanSnapshot = currentAnnotationSnapshot }
+        }
+    }
 
     @Published public var contentEditEnabled = false {
         didSet {
@@ -2866,6 +2880,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var preservedAnnotationEntryCount: Int
         var annotationWriteCount: Int
         var annotationCacheIsDirty: Bool
+        var annotationCleanSnapshot: AnnotationCleanSnapshot?
         var lastAnnotationWriteReport: AnnotationWriteReport?
         var interruptedAnnotationSaveNotice: String?
         var lastAnnotationBackupURL: URL?
@@ -9400,6 +9415,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         guard !adopted.isEmpty else { return }
         bookmarks.append(contentsOf: adopted)
+        if !annotationCacheIsDirty { annotationCleanSnapshot = currentAnnotationSnapshot }
         let line = "lyra-reader-annotate: adopted \(adopted.count) bookmark(s) from the document outline\n"
         FileHandle.standardError.write(Data(line.utf8))
     }
@@ -9477,6 +9493,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         isChangingDocumentState = true
         defer { isChangingDocumentState = wasChanging }
         annotationCacheIsDirty = false
+        annotationCleanSnapshot = nil
         let recordsURL = Self.annotationRecordsURL(for: url)
         annotationsURL = recordsURL
         annotationWritesBlockedReason = nil
@@ -9536,17 +9553,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 pendingFileDeletions = saved.deletions
                 erasedInkStrokeIDs = saved.erasedInk
                 annotationCacheIsDirty = saved.dirty
+                annotationCleanSnapshot = saved.cleanSnapshot
             } catch {
                 annotationWritesBlockedReason = error.localizedDescription
                 lastError = "Pending PDF changes could not be restored; the cache was kept."
             }
         }
+        if !annotationCacheIsDirty { annotationCleanSnapshot = currentAnnotationSnapshot }
     }
 
     private struct PendingAnnotationState: Codable {
         let dirty: Bool
         let deletions: [FileAnnotationDeletion]
         let erasedInk: Set<UUID>
+        let cleanSnapshot: AnnotationCleanSnapshot?
     }
 
     private func persistPendingAnnotationState() {
@@ -9554,7 +9574,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
               document != nil, let records = annotationsURL else { return }
         do {
             let saved = PendingAnnotationState(dirty: annotationCacheIsDirty,
-                deletions: pendingFileDeletions, erasedInk: erasedInkStrokeIDs)
+                deletions: pendingFileDeletions, erasedInk: erasedInkStrokeIDs,
+                cleanSnapshot: annotationCleanSnapshot)
             try JSONEncoder().encode(saved).write(to:
                 records.deletingLastPathComponent().appendingPathComponent("changes.json"), options: .atomic)
         } catch { lastError = "Could not cache pending PDF changes: \(error.localizedDescription)" }
@@ -9603,6 +9624,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
 
         do {
+            let clean = annotationCacheIsDirty ? annotationCleanSnapshot : currentAnnotationSnapshot
             let data = try AnnotationRecords.encode(
                 annotations: candidateAnnotations,
                 bookmarks: candidateBookmarks,
@@ -9613,7 +9635,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             bookmarks = candidateBookmarks
             annotationRecordSlots = slots
             if !["page-edit-session", "page-edit-revision", "saved-to-pdf", "bookmarks-saved-to-pdf", "recovery"].contains(trigger) {
-                annotationCacheIsDirty = true
+                annotationCleanSnapshot = clean
+                annotationCacheIsDirty = clean.map { $0 != currentAnnotationSnapshot } ?? true
+            } else if !annotationCacheIsDirty {
+                annotationCleanSnapshot = currentAnnotationSnapshot
             }
             persistPendingAnnotationState()
             persistPageEditRecovery()
@@ -10951,7 +10976,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             var cleanupError: String?
             do {
                 try Data("[]".utf8).write(to: DocumentEditCache.annotationsURL(for: original), options: .atomic)
-                try JSONEncoder().encode(PendingAnnotationState(dirty: false, deletions: [], erasedInk: [])).write(
+                try JSONEncoder().encode(PendingAnnotationState(dirty: false, deletions: [], erasedInk: [], cleanSnapshot: nil)).write(
                     to: DocumentEditCache.pendingStateURL(for: original), options: .atomic)
                 try DocumentEditCache.recordSource(for: original)
             } catch { cleanupError = error.localizedDescription }
@@ -12927,6 +12952,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             preservedAnnotationEntryCount: preservedAnnotationEntryCount,
             annotationWriteCount: annotationWriteCount,
             annotationCacheIsDirty: annotationCacheIsDirty,
+            annotationCleanSnapshot: annotationCleanSnapshot,
             lastAnnotationWriteReport: lastAnnotationWriteReport,
             interruptedAnnotationSaveNotice: interruptedAnnotationSaveNotice,
             lastAnnotationBackupURL: lastAnnotationBackupURL,
@@ -13053,6 +13079,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         preservedAnnotationEntryCount = state.preservedAnnotationEntryCount
         annotationWriteCount = state.annotationWriteCount
         annotationCacheIsDirty = state.annotationCacheIsDirty
+        annotationCleanSnapshot = state.annotationCleanSnapshot
         lastAnnotationWriteReport = state.lastAnnotationWriteReport
         interruptedAnnotationSaveNotice = state.interruptedAnnotationSaveNotice
         lastAnnotationBackupURL = state.lastAnnotationBackupURL
