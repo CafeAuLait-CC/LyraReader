@@ -1683,6 +1683,12 @@ public protocol PDFEngine: AnyObject {
     /// progress panel visible) instead of deadlocking. Test doubles return nil, which the print
     /// view draws as a missing-page notice.
     func renderPageForPrint(_ page: Int, scale: CGFloat) -> PageImage?
+    /// Page size in points with `/Rotate` applied, for choosing that page's print paper.
+    ///
+    /// Synchronous for the same reason as `renderPageForPrint`: the print plan is built before
+    /// the operation starts, and paper must be chosen per page. `nil` when the engine cannot
+    /// report sizes; the caller falls back to the document's first-page size.
+    func pageSizeForPrint(_ page: Int) -> CGSize?
     /// Rasterizes one tile of a page at a discrete LOD (`scale = 2^lod`).
     func rasterizeTile(
         page: Int,
@@ -1886,6 +1892,9 @@ public extension PDFEngine {
 
     /// Engines with no synchronous renderer let the print view show a missing-page notice.
     func renderPageForPrint(_ page: Int, scale: CGFloat) -> PageImage? { nil }
+
+    /// Test doubles do not report page sizes; the print planner falls back to page one.
+    func pageSizeForPrint(_ page: Int) -> CGSize? { nil }
 
     /// Engines without a PDF writer refuse the operation instead of pretending to save.
     func saveAnnotatedCopy(
@@ -2257,6 +2266,18 @@ public final class RustEngine: PDFEngine {
     /// multiply pipeline; a thumbnail is a preview of where the file's marks are.
     public func renderThumbnail(_ page: Int, scale: CGFloat) async throws -> PageImage {
         try await renderPage(page, scale: scale, withAnnotations: true)
+    }
+
+    /// The page's own size (with `/Rotate` applied), read synchronously while the print plan is
+    /// built. A failure to read one page must not abort printing: `nil` makes the caller use the
+    /// document's first-page size for that page.
+    public func pageSizeForPrint(_ page: Int) -> CGSize? {
+        guard let document else { return nil }
+        guard let size = try? document.pageSizePt(page: UInt32(clamping: page)) else { return nil }
+        let width = CGFloat(size.widthPt)
+        let height = CGFloat(size.heightPt)
+        guard width.isFinite, height.isFinite, width > 1, height > 1 else { return nil }
+        return CGSize(width: width, height: height)
     }
 
     public func renderPageForPrint(_ page: Int, scale: CGFloat) -> PageImage? {

@@ -9959,7 +9959,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// File > Print: a print operation over a view that renders one page at print resolution
     /// when the print system asks for it.
     ///
-    /// The view the print operation paginates, built from the document's own pages.
+    /// The view the print operation paginates, built from the document's own pages. Every page
+    /// carries its own paper (`PrintPageSpec.plan`); this full view is what the checks render and
+    /// what a uniform document prints.
     ///
     /// Printing is independent of the display layout on purpose: a torn page's gap, its two
     /// segments and its card are display-only, so the printer is handed one page per document
@@ -9967,33 +9969,67 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// view `Print` would and compare it with a torn state's output.
     package func makePrintView(texts: [Int: TextPage]? = nil) -> ReaderPrintView? {
         guard let document, document.pageCount > 0 else { return nil }
-        let pageSize = document.firstPageSize.width > 1 && document.firstPageSize.height > 1
-            ? document.firstPageSize
-            : CGSize(width: 612, height: 792)
-        let engine = self.engine
-        let layers = texts ?? textPages
-        return ReaderPrintView(
-            pageCount: document.pageCount,
-            pageSizePt: pageSize,
+        let pages = printPageSpecs()
+        guard !pages.isEmpty else { return nil }
+        return makePrintView(
+            pages: pages,
             annotations: annotations.map(PrintAnnotation.init),
-            pageImage: { page, scale in
-                engine.renderPageForPrint(page, scale: scale)
-            },
-            textPage: { layers[$0] }
+            texts: texts ?? textPages
         )
     }
 
-    /// The page range and the copy count are the print panel's own, because the panel is the
-    /// system's; the view supplies the page count through `knowsPageRange`. Only the pages the
-    /// panel selected are rendered, one at a time, by [`ReaderPrintView`].
+    /// The per-page paper plan for the open document.
+    ///
+    /// The engine reports each page's own size; a page whose size cannot be read falls back to
+    /// the document's first-page size so one unreadable page never aborts the print.
+    private func printPageSpecs() -> [PrintPageSpec] {
+        guard let document, document.pageCount > 0 else { return [] }
+        let fallback = document.firstPageSize.width > 1 && document.firstPageSize.height > 1
+            ? document.firstPageSize
+            : CGSize(width: 612, height: 792)
+        let sizes = (0..<document.pageCount).map { page in
+            engine.pageSizeForPrint(page) ?? fallback
+        }
+        return PrintPageSpec.plan(pageSizes: sizes)
+    }
+
+    /// A print view for an explicit page list, with the marks and text layers snapshotted when
+    /// Print was chosen. One view is built per paper-size group.
+    private func makePrintView(
+        pages: [PrintPageSpec],
+        annotations snapshot: [PrintAnnotation],
+        texts: [Int: TextPage]
+    ) -> ReaderPrintView {
+        let engine = self.engine
+        return ReaderPrintView(
+            pages: pages,
+            annotations: snapshot,
+            pageImage: { page, scale in
+                engine.renderPageForPrint(page, scale: scale)
+            },
+            textPage: { texts[$0] }
+        )
+    }
+
+    /// Prints the document, one page at a time, at each page's own paper size.
+    ///
+    /// A uniform document is a single `NSPrintOperation` with its single paper size, exactly as
+    /// before. A mixed-size document becomes one operation per distinct paper size: AppKit binds
+    /// one `NSPrintInfo.paperSize` to an operation, and honors it for every page in that
+    /// operation (verified against a real save-to-PDF job, not assumed). Each group is printed
+    /// in document order; the system print panel is shown for each group because copies and the
+    /// page range are per job. The status line says how many jobs were sent.
     public func printDocument() {
         guard let document, document.pageCount > 0 else {
             lastError = "Open a document before printing."
             return
         }
-        let pageSize = document.firstPageSize.width > 1 && document.firstPageSize.height > 1
-            ? document.firstPageSize
-            : CGSize(width: 612, height: 792)
+        let pages = printPageSpecs()
+        guard !pages.isEmpty else {
+            lastError = "The document could not be prepared for printing."
+            return
+        }
+        let groups = PrintPageSpec.groupedByPaper(pages)
         let snapshot = annotations.map(PrintAnnotation.init)
         let markupPages = Set(snapshot.filter { $0.kind.isTextMarkup }.map(\.page))
         let engine = self.engine
@@ -10007,36 +10043,150 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 }
             }
             guard let self else { return }
-            guard let view = self.makePrintView(texts: texts) else {
-                self.lastError = "The document could not be prepared for printing."
-                return
+            if groups.count > 1 {
+                // Say why one Cmd-P turns into several panels. AppKit gives an operation one
+                // paper size, so this is a real split, not a bug the reader should have to guess.
+                let summary = groups.map { group in
+                    let name = group.paper.standardName
+                        ?? "custom \(Int(group.paper.size.width))×\(Int(group.paper.size.height))"
+                    return "\(name): pages \(Self.pageRanges(group.documentPages))"
+                }.joined(separator: "\n")
+                let alert = NSAlert()
+                alert.alertStyle = .informational
+                alert.messageText = "This document uses \(groups.count) paper sizes"
+                alert.informativeText =
+                    "macOS prints one paper size per job, so this document prints as"
+                    + " \(groups.count) jobs, one after another:\n\n\(summary)\n\n"
+                    + "The print panel appears once per job; the copy count carries over."
+                alert.addButton(withTitle: "Print \(groups.count) Jobs")
+                alert.addButton(withTitle: "Cancel")
+                guard alert.runModal() == .alertFirstButtonReturn else {
+                    self.statusMessage = "Printing cancelled"
+                    return
+                }
+                self.statusMessage =
+                    "Printing \(document.pageCount) pages in \(groups.count) jobs"
+                    + " (one per paper size: \(groups.map { $0.paper.standardName ?? "custom" }.joined(separator: ", ")))"
             }
-            let info = NSPrintInfo.shared.copy() as! NSPrintInfo
-            info.paperSize = pageSize
-            info.topMargin = 0
-            info.bottomMargin = 0
-            info.leftMargin = 0
-            info.rightMargin = 0
-            info.horizontalPagination = .fit
-            info.verticalPagination = .fit
-            info.orientation = pageSize.width > pageSize.height ? .landscape : .portrait
-            let operation = NSPrintOperation(view: view, printInfo: info)
-            operation.showsPrintPanel = true
-            operation.showsProgressPanel = true
-            let printed = operation.run()
-            guard printed else {
-                self.statusMessage = "Printing cancelled"
-                return
+            var totalPrinted = 0
+            var jobsPrinted = 0
+            var panelSettings: NSPrintInfo?
+            for (index, group) in groups.enumerated() {
+                let view = self.makePrintView(
+                    pages: group.pages,
+                    annotations: snapshot,
+                    texts: texts
+                )
+                let info = self.printInfo(for: group.paper, panelSettings: panelSettings)
+                let operation = NSPrintOperation(view: view, printInfo: info)
+                operation.jobTitle = self.printJobTitle(document: document, group: group, index: index, count: groups.count)
+                operation.showsPrintPanel = true
+                operation.showsProgressPanel = true
+                guard operation.run() else {
+                    if jobsPrinted == 0 {
+                        self.statusMessage = "Printing cancelled"
+                    } else {
+                        self.statusMessage =
+                            "Printing cancelled after \(jobsPrinted) of \(groups.count) jobs"
+                    }
+                    return
+                }
+                // The panel's copies (and any paper-independent settings) carry over to the
+                // next paper group; the page range does not, because it is per job.
+                panelSettings = operation.printInfo
+                totalPrinted += view.printedPages.count
+                jobsPrinted += 1
             }
-            let count = view.printedPages.count
-            self.statusMessage =
-                "Sent \(count) page\(count == 1 ? "" : "s") to the printer"
-                + " · rendered at \(Int(ReaderPrintView.printDPI)) dpi as the printer asked"
+            let count = totalPrinted
+            if groups.count == 1 {
+                self.statusMessage =
+                    "Sent \(count) page\(count == 1 ? "" : "s") to the printer"
+                    + " · rendered at \(Int(ReaderPrintView.printDPI)) dpi as the printer asked"
+            } else {
+                self.statusMessage =
+                    "Sent \(count) page\(count == 1 ? "" : "s") to the printer in \(jobsPrinted) job"
+                    + "\(jobsPrinted == 1 ? "" : "s")"
+                    + " (one per paper size) · rendered at \(Int(ReaderPrintView.printDPI)) dpi"
+            }
             FileHandle.standardError.write(Data((
-                "lyra-reader-print: \(count) page(s) rendered at \(Int(ReaderPrintView.printDPI)) dpi"
+                "lyra-reader-print: \(count) page(s) in \(jobsPrinted) job(s) at "
+                + "\(Int(ReaderPrintView.printDPI)) dpi · papers "
+                + groups.map { $0.paper.standardName ?? "custom \(Int($0.paper.size.width))×\(Int($0.paper.size.height))" }
+                    .joined(separator: ", ")
                 + " · peak cached pages \(ReaderPrintView.maximumCachedPages)\n"
             ).utf8))
         }
+    }
+
+    /// The operation's print info for one paper group.
+    ///
+    /// The first group uses the shared settings (all pages); later groups inherit the first
+    /// panel's copies but reset the page range to all of their own pages, since the system panel
+    /// only ever edits one operation's range. Paper size and orientation always come from the
+    /// group, never from the first page.
+    private func printInfo(
+        for paper: PrintPaper,
+        panelSettings: NSPrintInfo?
+    ) -> NSPrintInfo {
+        let info = (panelSettings?.copy() as? NSPrintInfo)
+            ?? (NSPrintInfo.shared.copy() as! NSPrintInfo)
+        info.paperSize = paper.size
+        info.topMargin = 0
+        info.bottomMargin = 0
+        info.leftMargin = 0
+        info.rightMargin = 0
+        info.horizontalPagination = .fit
+        info.verticalPagination = .fit
+        info.orientation = paper.size.width > paper.size.height ? .landscape : .portrait
+        if panelSettings != nil {
+            // The copies from the previous panel stay; the page range starts fresh because it
+            // is a range over this job's pages, not the document's.
+            info.dictionary()[NSPrintInfo.AttributeKey.allPages] = true
+            info.dictionary().removeObject(forKey: NSPrintInfo.AttributeKey.firstPage)
+            info.dictionary().removeObject(forKey: NSPrintInfo.AttributeKey.lastPage)
+        }
+        info.dictionary()[NSPrintInfo.AttributeKey.jobSavingURL] = nil
+        info.jobDisposition = .spool
+        return info
+    }
+
+    /// A queue-visible title that says which paper this job is and which pages it carries.
+    private func printJobTitle(
+        document: LoadedDocument,
+        group: PrintPageGroup,
+        index: Int,
+        count: Int
+    ) -> String {
+        let paper = group.paper.standardName ?? "Custom paper"
+        let suffix = count > 1 ? " · paper \(index + 1)/\(count)" : ""
+        return "\(document.title) — \(paper), pages \(Self.pageRanges(group.documentPages))\(suffix)"
+    }
+
+    /// Compresses one-based document pages into "1-3, 5, 8-9" for the print job title and the
+    /// mixed-paper explanation. Sorted; duplicate pages are ignored.
+    private static func pageRanges(_ pages: [Int]) -> String {
+        let sorted = Array(Set(pages)).sorted()
+        var parts: [String] = []
+        var start: Int?
+        var previous = Int.min
+        func appendRange(_ first: Int, _ last: Int) {
+            parts.append(first == last ? "\(first + 1)" : "\(first + 1)-\(last + 1)")
+        }
+        for page in sorted {
+            if let first = start {
+                if page == previous + 1 {
+                    previous = page
+                    continue
+                }
+                appendRange(first, previous)
+            }
+            start = page
+            previous = page
+        }
+        if let first = start {
+            appendRange(first, previous)
+        }
+        return parts.joined(separator: ", ")
     }
 
     // MARK: - Page editing (T3.9)
