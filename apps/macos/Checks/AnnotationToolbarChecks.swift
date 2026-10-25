@@ -6,8 +6,10 @@ import Foundation
 ///
 /// The layout checks measure the real SwiftUI row through `ReaderToolbarProbe`, not a mirror of
 /// the numbers: they assert the group frames, the one-button-width gaps, the order inside each
-/// group, and that the trailing chrome still fits at the minimum window width. The state checks
-/// drive the same `AppState` transitions the buttons and the canvas call.
+/// group, and that the row ends flush with its trailing colour picker at the minimum window
+/// width. They also assert that no row carries its own close control: the main toolbar's button
+/// is the only way to close a row. The state checks drive the same `AppState` transitions the
+/// buttons and the canvas call.
 extension ReaderChecks {
     @MainActor static func annotationToolbarChecks(root: URL) async throws {
         let state = AppState(engine: try RustEngine())
@@ -113,13 +115,23 @@ extension ReaderChecks {
                 $0.caseInsensitiveCompare("Select") != .orderedSame && $0 != "Redact"
             }, "at \(label) the built row contains no Select or annotation Redact control")
             let color = frame("Annotation color", frames, label)
-            let close = frame("Hide annotation tools", frames, label)
-            require(placement.maxX < color.minX && color.maxX <= close.minX,
-                    "at \(label) the colour picker and close button are trailing chrome")
-            require(close.maxX <= width - AnnotationToolbarLayout.horizontalPadding + 0.01,
-                    "at \(label) the trailing chrome fits inside the row (\(close.maxX) of \(width) pt)")
-            require(abs((markup.minX + close.maxX) / 2 - width / 2) < 0.5,
-                    "at \(label) the complete tool group is centred")
+            require(!frames.keys.contains("Hide annotation tools"),
+                    "at \(label) the row no longer hosts a close button")
+            require(frames.keys.allSatisfy {
+                !$0.localizedCaseInsensitiveContains("close")
+                    && !$0.localizedCaseInsensitiveContains("xmark")
+            }, "at \(label) no close control is reported anywhere in the row")
+            require(placement.maxX < color.minX,
+                    "at \(label) the colour picker is the trailing chrome")
+            require(color.maxX <= width - AnnotationToolbarLayout.horizontalPadding + 0.01,
+                    "at \(label) the trailing colour picker fits inside the row "
+                        + "(\(color.maxX) of \(width) pt)")
+            require(abs((markup.minX + color.maxX) / 2 - width / 2) < 0.5,
+                    "at \(label) the complete row is centred")
+            require(abs(markup.minX - (width - color.maxX)) < 0.5,
+                    "at \(label) the row's trailing edge is flush: the colour picker is the "
+                        + "last control and the leading/trailing gaps match "
+                        + "(\(markup.minX) vs \(width - color.maxX))")
             return frames
         }
 
@@ -145,6 +157,22 @@ extension ReaderChecks {
         }
         require(contentOrder == contentOrder.sorted(),
                 "the Edit row lays its tools out left to right")
+
+        // ── No row has its own close control ────────────────────────────────────────
+        // Closing a row is the main toolbar button's toggle and nothing else. The two rows that
+        // used to carry an xmark (Annotate and Fill & Sign) must not keep its action, icon or
+        // tooltip either: those would be dead code behind a control that no longer exists.
+        for name in ["AnnotationToolbarLayout.swift", "SecondaryToolbarRows.swift"] {
+            let source = try String(
+                contentsOf: root.appendingPathComponent(
+                    "apps/macos/Sources/LyraReaderKit/\(name)"),
+                encoding: .utf8)
+            require(!source.contains("xmark"),
+                    "\(name) no longer draws a close glyph")
+            require(!source.contains("Hide annotation tools")
+                        && !source.contains("Clear Fill & Sign tool"),
+                    "\(name) keeps no help or accessibility text for a removed close control")
+        }
 
         // ── Clicking the active tool again returns to selection ─────────────────────
         require(state.annotationTool == .select, "the row starts in the implicit pointer state")

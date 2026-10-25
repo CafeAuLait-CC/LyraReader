@@ -49,6 +49,26 @@ extension ReaderChecks {
         state.toggleFillAndSign()
         require(state.openSecondaryRows.isEmpty, "clicking the selected row's button closes it")
 
+        // Every row's main toolbar button is its only close control: clicking it again closes
+        // the row (the row itself has no xmark). Fill & Sign is covered above; the other four
+        // buttons are exercised through the same toggle rule here.
+        state.toggleAnnotationTools()
+        require(state.openSecondaryRows == [.annotations], "the Annotate button opens Annotate")
+        state.toggleAnnotationTools()
+        require(state.openSecondaryRows.isEmpty, "the Annotate button closes Annotate")
+        state.toggleContentEditing()
+        require(state.openSecondaryRows == [.contentEdit], "the Edit button opens Edit")
+        state.toggleContentEditing()
+        require(state.openSecondaryRows.isEmpty, "the Edit button closes Edit")
+        state.toggleExport()
+        require(state.openSecondaryRows == [.export], "the Export button opens Export")
+        state.toggleExport()
+        require(state.openSecondaryRows.isEmpty, "the Export button closes Export")
+        state.toggleAITools()
+        require(state.openSecondaryRows == [.lyra], "the Lyra button opens Lyra")
+        state.toggleAITools()
+        require(state.openSecondaryRows.isEmpty, "the Lyra button closes Lyra")
+
         // Direct assignments take the same path: no caller can open a second row.
         state.contentEditEnabled = true
         state.fillAndSignVisible = true
@@ -103,11 +123,14 @@ extension ReaderChecks {
                     "\(label): every Fill & Sign item has a measurable control")
             require(ordered[0].minX >= AnnotationToolbarLayout.horizontalPadding - 0.01,
                     "\(label): the Text item starts at the row's leading padding")
-            let close = frame("Clear Fill & Sign tool", frames, label)
-            require(ordered.last!.maxX <= close.minX + 0.01,
-                    "\(label): the clear button is trailing chrome, after Image")
-            require(close.maxX <= width - AnnotationToolbarLayout.horizontalPadding + 0.01,
-                    "\(label): the row fits inside the canvas width (\(close.maxX) of \(width))")
+            require(!frames.keys.contains("Clear Fill & Sign tool"),
+                    "\(label): the Fill & Sign row has no close control")
+            require(ordered.last!.maxX <= width - AnnotationToolbarLayout.horizontalPadding + 0.01,
+                    "\(label): the row fits inside the canvas width "
+                        + "(\(ordered.last!.maxX) of \(width))")
+            require(abs(ordered[0].minX - (width - ordered.last!.maxX)) < 0.5,
+                    "\(label): the row's trailing edge is flush after the Image item "
+                        + "(leading \(ordered[0].minX), trailing \(width - ordered.last!.maxX))")
             return frames
         }
         _ = assertFillSignFrames(width: rowWidth, label: "1200 pt window")
@@ -661,6 +684,21 @@ extension ReaderChecks {
             state: state, model: spacingModel, width: rowWidth)
         let lyraIDs = ["lyra.interleaf", "lyra.summary", "lyra.translation",
                        "lyra.chat", "lyra.regions"]
+        // No row has an xmark of its own. The Annotate and Fill & Sign rows used to end with
+        // one; those controls and every frame they reported are gone, and the row ends at its
+        // last real control. Closing is the main toolbar button's toggle alone.
+        for (title, frames) in [("Annotate", annotationLayout), ("Edit", editLayout),
+                                ("Fill & Sign", fillLayout), ("Export", exportLayout),
+                                ("Lyra", lyraLayout)] {
+            require(!frames.keys.contains("Hide annotation tools")
+                        && !frames.keys.contains("Clear Fill & Sign tool")
+                        && !frames.keys.contains("Clear Fill & Sign"),
+                    "\(title) row reports no close-control frame")
+            require(frames.keys.allSatisfy {
+                !$0.localizedCaseInsensitiveContains("close")
+                    && !$0.localizedCaseInsensitiveContains("xmark")
+            }, "\(title) row has no close control anywhere in its frames")
+        }
         let spacingSamples: [(title: String, ids: [String], frames: [CGRect],
                               iconIDs: [String], groupGapsAfter: Set<Int>)] = [
             ("Annotate", AnnotationToolbarLayout.annotationToolIDs,
@@ -669,10 +707,9 @@ extension ReaderChecks {
             ("Edit", AnnotationToolbarLayout.contentEditItemIDs,
              spacingFrames(AnnotationToolbarLayout.contentEditItemIDs, editLayout, "Edit"),
              AnnotationToolbarLayout.contentEditItemIDs, []),
-            ("Fill & Sign", FillSignTool.rowOrder.map(\.title) + ["Clear Fill & Sign tool"],
-             spacingFrames(FillSignTool.rowOrder.map(\.title) + ["Clear Fill & Sign tool"],
-                           fillLayout, "Fill & Sign"),
-             FillSignTool.rowOrder.map(\.title), [6]),
+            ("Fill & Sign", FillSignTool.rowOrder.map(\.title),
+             spacingFrames(FillSignTool.rowOrder.map(\.title), fillLayout, "Fill & Sign"),
+             FillSignTool.rowOrder.map(\.title), []),
             ("Export", ExportCommand.all.map { "export.\($0.id)" },
              spacingFrames(ExportCommand.all.map { "export.\($0.id)" }, exportLayout, "Export"),
              ExportCommand.all.map { "export.\($0.id)" }, []),
@@ -717,6 +754,16 @@ extension ReaderChecks {
                         <= rowWidth - ReaderSecondaryRowMetrics.horizontalPadding + 0.5,
                     "\(sample.title) ends inside the row's trailing padding "
                         + "(\(sample.frames.last!.maxX) of \(rowWidth))")
+            // Annotate's trailing colour picker is chrome outside the tool ids; the layout check
+            // in AnnotationToolbarChecks covers it. Every other row's last item is its trailing
+            // edge, so the leading and trailing margins must match exactly.
+            if sample.title != "Annotate" {
+                require(abs(sample.frames[0].minX
+                            - (rowWidth - sample.frames.last!.maxX)) <= 0.5,
+                        "\(sample.title) row ends flush at its last control "
+                            + "(leading \(sample.frames[0].minX), "
+                            + "trailing \(rowWidth - sample.frames.last!.maxX))")
+            }
             // Every tool's icon is reported by ReaderToolbarIcon, including the glyph-only
             // Annotate row and the compact fallback of Fill & Sign / Export. A row with a
             // different icon font or an un-framed custom vector reports a different size here.
