@@ -183,7 +183,7 @@ extension ReaderChecks {
         protected.open(url: invalid)
         require(protected.annotations.isEmpty, "a corrupt current cache shows no annotations")
         require(protected.canRecoverUnreadableAnnotationRecords
-                    && protected.lastError == "Could not restore annotations; recovery data was kept"
+                    && protected.lastError?.hasPrefix("Could not restore annotations; recovery data was kept") == true
                     && (try? Data(contentsOf: invalidRecords)) == corrupt,
                 "a corrupt current cache raises the kept-data alert, blocks writes and is not replaced")
         let pendingCorrupt = Data("{invalid pending deletions".utf8)
@@ -196,6 +196,127 @@ extension ReaderChecks {
                 "explicit recovery also preserves unreadable pending deletion metadata")
         require(!protected.canRecoverUnreadableAnnotationRecords && protected.annotations.isEmpty,
                 "verified backup permits a fresh annotation cache")
+
+        // ── A readable cache whose PDF identity moved is not a corrupt cache ──
+        //
+        // This is the shape of the reported failing cache: `annotations.json` is a valid empty
+        // array, `changes.json` is clean, and `source.json` records a different revision of the
+        // same path (the sample PDF was replaced after the cache was made). The records decode,
+        // so the app must not claim they could not be restored or block new annotations; with
+        // nothing cached yet it adopts the current bytes as the document's identity.
+        func writeStaleSource(_ document: URL) throws {
+            let stamp: [String: Any] = [
+                "size": 1,
+                "modified": 0.0,
+                "sha256": String(repeating: "0", count: 64),
+            ]
+            try JSONSerialization.data(withJSONObject: stamp).write(
+                to: DocumentEditCache.directory(for: document).appendingPathComponent("source.json"))
+        }
+        let movedSource = try fixture("stale-source.pdf")
+        try Data("[]".utf8).write(to: DocumentEditCache.annotationsURL(for: movedSource))
+        try Data(#"{"erasedInk":[],"deletions":[],"dirty":false}"#.utf8)
+            .write(to: DocumentEditCache.pendingStateURL(for: movedSource))
+        try writeStaleSource(movedSource)
+        let movedSourceState = AppState(engine: try RustEngine())
+        movedSourceState.setViewportSize(CGSize(width: 1000, height: 800))
+        require(movedSourceState.open(url: movedSource), "a readable cache with a stale source stamp opens")
+        require(movedSourceState.annotations.isEmpty && movedSourceState.lastError == nil
+                    && !movedSourceState.canRecoverUnreadableAnnotationRecords,
+                "a readable empty cache with a stale stamp shows no recovery alert")
+        require(movedSourceState.addGeometryAnnotation(kind: .square, page: 0,
+            shapeRect: CGRect(x: 40, y: 60, width: 30, height: 30)),
+                "a readable cache with a stale stamp accepts an annotation")
+        try DocumentEditCache.validateSource(for: movedSource)
+        require(true, "adopting the current identity makes later in-place saves possible")
+
+        // One unknown-extra record beside a known one must load, round-trip verbatim, and not
+        // stop new annotations from being written.
+        let future = try fixture("future-record.pdf")
+        let known = AppState.Annotation(id: UUID(), page: 0, start: 0, end: 3,
+            color: AppState.highlightPalette[0].color, note: "known", createdAt: Date())
+        let futureEncoder = JSONEncoder()
+        futureEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let knownArray = String(decoding: try futureEncoder.encode([known]), as: UTF8.self)
+        let knownBody = String(knownArray.dropFirst(2).dropLast(2))
+        let foreignEntry = """
+{
+  "extraLayer" : {
+    "version" : 7
+  },
+  "id" : "\(UUID().uuidString)",
+  "kind" : "futureMark",
+  "page" : 0,
+  "strokeWidth" : 3
+}
+"""
+        try Data("[\n\(knownBody),\n\(foreignEntry)\n]".utf8)
+            .write(to: DocumentEditCache.annotationsURL(for: future))
+        let futureState = AppState(engine: try RustEngine())
+        futureState.setViewportSize(CGSize(width: 1000, height: 800))
+        require(futureState.open(url: future), "a cache with an unknown-extra record opens")
+        require(futureState.annotations.count == 1 && futureState.preservedAnnotationEntryCount == 1,
+                "the unknown-extra record is preserved beside the known entry, not fatal")
+        require(futureState.addGeometryAnnotation(kind: .circle, page: 0,
+            shapeRect: CGRect(x: 60, y: 80, width: 24, height: 24)),
+                "a cache with an unknown-extra record accepts a new annotation")
+        let rewritten = String(decoding: try Data(
+            contentsOf: DocumentEditCache.annotationsURL(for: future)), as: UTF8.self)
+        require(rewritten.contains(foreignEntry),
+                "the unknown-extra record is written back byte-for-byte")
+        require(rewritten.contains(known.id.uuidString), "the known record is still written")
+
+        // A changed PDF with cached work still loads that work and offers the explicit backup
+        // action, but the document's own bytes are never replaced by the stale cache.
+        let changed = try fixture("changed-source.pdf")
+        try futureEncoder.encode([known]).write(to: DocumentEditCache.annotationsURL(for: changed))
+        try writeStaleSource(changed)
+        let changedState = AppState(engine: try RustEngine())
+        changedState.setViewportSize(CGSize(width: 1000, height: 800))
+        require(changedState.open(url: changed), "a changed PDF with cached annotations opens")
+        require(changedState.annotations == [known] && changedState.lastError != nil
+                    && changedState.canRecoverUnreadableAnnotationRecords,
+                "a changed PDF keeps readable annotations and offers backup-and-start-fresh")
+        require(changedState.lastError?.contains("PDF changed outside LyraReader") == true,
+                "the changed-PDF alert names the source change")
+        require(changedState.addGeometryAnnotation(kind: .square, page: 0,
+            shapeRect: CGRect(x: 20, y: 30, width: 20, height: 20)),
+                "a changed PDF still accepts cached annotation edits")
+        let before = try Data(contentsOf: changed)
+        let replaced = await changedState.saveDocumentToOriginal()
+        require(!replaced && (try? Data(contentsOf: changed)) == before,
+                "a changed PDF refuses an in-place save and keeps the original bytes")
+        let sourceBackup = changedState.recoverUnreadableAnnotationRecords()
+        require(sourceBackup != nil, "the changed-PDF alert's backup action runs")
+        require(changedState.addGeometryAnnotation(kind: .circle, page: 0,
+            shapeRect: CGRect(x: 25, y: 35, width: 20, height: 20)),
+                "backing up a changed-PDF cache starts a fresh writable identity")
+
+        // A truly truncated cache is still corruption: the alert names the byte, writes are
+        // refused, the bytes are untouched, and only the explicit backup clears the block.
+        let truncated = try fixture("truncated.pdf")
+        let truncatedBytes = Data(
+            #"[{"id":"\#(UUID().uuidString)","kind":"highlight","page":0,"start":0,"end":1"#.utf8)
+        try truncatedBytes.write(to: DocumentEditCache.annotationsURL(for: truncated))
+        let truncatedState = AppState(engine: try RustEngine())
+        truncatedState.setViewportSize(CGSize(width: 1000, height: 800))
+        require(truncatedState.open(url: truncated), "a document with a truncated cache still opens")
+        require(truncatedState.annotations.isEmpty && truncatedState.canRecoverUnreadableAnnotationRecords,
+                "a truncated cache shows the recovery alert")
+        require(truncatedState.lastError?.contains("byte") == true,
+                "the recovery alert names the corrupt byte")
+        require(!truncatedState.addGeometryAnnotation(kind: .square, page: 0,
+            shapeRect: CGRect(x: 10, y: 20, width: 30, height: 30)),
+                "a truncated cache refuses writes")
+        require((try? Data(contentsOf: DocumentEditCache.annotationsURL(for: truncated))) == truncatedBytes,
+                "a refused write leaves the truncated bytes untouched")
+        let truncatedBackup = truncatedState.recoverUnreadableAnnotationRecords()
+        require(truncatedBackup != nil
+                    && (try? Data(contentsOf: truncatedBackup!)) == truncatedBytes,
+                "explicit recovery backs up the truncated bytes exactly")
+        require(truncatedState.addGeometryAnnotation(kind: .square, page: 0,
+            shapeRect: CGRect(x: 10, y: 20, width: 30, height: 30)),
+                "explicit recovery permits a fresh annotation")
         print("Document cache checks passed")
     }
 }

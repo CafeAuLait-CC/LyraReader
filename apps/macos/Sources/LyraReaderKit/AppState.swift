@@ -2634,6 +2634,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// A failed read permanently blocks writes for this document, protecting its annotation cache.
     /// The only way out is the explicit recovery action, which backs the file up first.
     private var annotationWritesBlockedReason: String?
+    /// Set when the annotation cache decoded but the PDF's identity changed since it was saved.
+    ///
+    /// This is *not* a read failure: the records are loaded and may be edited. The stamp still
+    /// guards replacing the original PDF (``DocumentEditCache/validateSource(for:)``), so the
+    /// only explicit way out is the same backup-and-start-fresh action, which resets the stamp.
+    private var annotationSourceChangedReason: String?
     /// The order entries had in the annotation cache, so foreign entries keep their place across saves.
     private var annotationRecordSlots: [AnnotationRecords.Slot] = []
     /// Open coalescing window for note typing; see `updateNote`.
@@ -2906,6 +2912,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var lastAnnotationBackupURL: URL?
         var annotationsURL: URL?
         var annotationWritesBlockedReason: String?
+        var annotationSourceChangedReason: String?
         var annotationRecordSlots: [AnnotationRecords.Slot]
         var selectedDocumentAnnotationID: String?
         var openDocumentNoteID: String?
@@ -3796,6 +3803,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         pageSelectionAnchor = nil
         annotationsURL = nil
         annotationWritesBlockedReason = nil
+        annotationSourceChangedReason = nil
         annotationRecordSlots = []
         preservedAnnotationEntryCount = 0
         hasPendingAnnotationWrite = false
@@ -9511,6 +9519,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let recordsURL = Self.annotationRecordsURL(for: url)
         annotationsURL = recordsURL
         annotationWritesBlockedReason = nil
+        annotationSourceChangedReason = nil
         preservedAnnotationEntryCount = 0
         annotationRecordSlots = []
         annotationWriteCount = 0
@@ -9519,6 +9528,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         pendingFileDeletions = []
         eraserHoverMarkID = nil
 
+        // Reading the annotation records comes first. A readable cache is a successful load
+        // even when the PDF's identity moved; only a real decode failure below blocks writes.
         do {
             let prepared = try DocumentEditCache.prepareAnnotations(for: url)
             annotationsURL = prepared
@@ -9552,7 +9563,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             redoStack.removeAll()
             annotationWritesBlockedReason = error.localizedDescription
             statusMessage = "Could not restore annotations; recovery data was kept"
-            lastError = statusMessage
+            lastError = "Could not restore annotations; recovery data was kept. \(error.localizedDescription)"
             FileHandle.standardError.write(
                 Data("lyra-reader-annotate: read failed; writes blocked: \(error)\n".utf8)
             )
@@ -9566,9 +9577,60 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 erasedInkStrokeIDs = saved.erasedInk
                 annotationCacheIsDirty = saved.dirty
                 annotationCleanSnapshot = saved.cleanSnapshot
+            } catch let error as DecodingError {
+                annotationWritesBlockedReason = AnnotationRecords.describe(error)
+                lastError = "Pending PDF changes could not be restored; the cache was kept. \(annotationWritesBlockedReason ?? "")"
             } catch {
                 annotationWritesBlockedReason = error.localizedDescription
-                lastError = "Pending PDF changes could not be restored; the cache was kept."
+                lastError = "Pending PDF changes could not be restored; the cache was kept. \(error.localizedDescription)"
+            }
+        }
+        // A readable cache whose PDF identity moved is not a corrupt cache. If there is nothing
+        // to lose, adopt the current bytes as the new identity and carry on silently. Otherwise
+        // keep every record, allow annotation editing, and let the explicit recovery action
+        // reset the identity: replacing the original PDF stays blocked by `validateSource`.
+        if annotationWritesBlockedReason == nil,
+           let source = document?.url {
+            let status = DocumentEditCache.sourceStatus(for: source)
+            let hasCachedWork = !annotations.isEmpty || !bookmarks.isEmpty
+                || preservedAnnotationEntryCount > 0
+                || !pendingFileDeletions.isEmpty || !erasedInkStrokeIDs.isEmpty
+                || annotationCacheIsDirty || annotationCleanSnapshot != nil
+                || FileManager.default.fileExists(atPath: DocumentEditCache.recoveryURL(for: source).path)
+            switch status {
+            case .missing, .matches:
+                break
+            case .changed(let saved, let current):
+                if hasCachedWork {
+                    let detail = DocumentEditCache.sourceChangeMessage(saved: saved, current: current)
+                    annotationSourceChangedReason = detail
+                    statusMessage = "The PDF changed outside LyraReader; its saved annotations were kept"
+                    lastError = "The PDF changed outside LyraReader. Its saved annotations were kept and loaded,"
+                        + " but saving into this PDF is blocked. Restore the recorded file, or back up the"
+                        + " recovery data and start fresh.\n\n\(detail)"
+                    FileHandle.standardError.write(
+                        Data("lyra-reader-annotate: source changed; records loaded, PDF replacement blocked: \(detail)\n".utf8)
+                    )
+                } else {
+                    do {
+                        try DocumentEditCache.recordSource(for: source)
+                        FileHandle.standardError.write(Data(
+                            "lyra-reader-annotate: adopted the current PDF identity for an empty annotation cache\n".utf8))
+                    } catch {
+                        annotationSourceChangedReason = error.localizedDescription
+                        lastError = "The PDF changed outside LyraReader and its new identity could not be recorded:"
+                            + " \(error.localizedDescription)"
+                    }
+                }
+            case .unreadable(let detail):
+                if hasCachedWork {
+                    annotationSourceChangedReason = detail
+                    lastError = "The PDF's saved source stamp could not be read (\(detail))."
+                        + " Its annotations were kept and loaded, but saving into this PDF is blocked."
+                        + " Back up the recovery data and start fresh if the file is the one you expect."
+                } else {
+                    try? DocumentEditCache.recordSource(for: source)
+                }
             }
         }
         if !annotationCacheIsDirty { annotationCleanSnapshot = currentAnnotationSnapshot }
@@ -9627,7 +9689,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return false
         }
         if let reason = annotationWritesBlockedReason {
-            statusMessage = "Could not save annotations because the annotation cache could not be loaded; it was left untouched"
+            statusMessage = "Could not save annotations because the annotation cache could not be loaded"
+                + " (\(reason)); it was left untouched"
             lastError = statusMessage
             FileHandle.standardError.write(
                 Data("lyra-reader-annotate: write blocked [\(trigger)]: \(reason)\n".utf8)
@@ -11457,6 +11520,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         translationCacheDocumentURL = translationURL
         annotationsURL = annotationRecordsURL
         annotationWritesBlockedReason = nil
+        annotationSourceChangedReason = nil
         preservedAnnotationEntryCount = 0
         annotations = newAnnotations
         bookmarks = newBookmarks
@@ -11582,7 +11646,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                   session.sourceStamp == (try DocumentEditCache.SourceStamp(original)),
                   session.directory.standardizedFileURL.path.hasPrefix(directory),
                   session.annotationRecordsURL.standardizedFileURL.path.hasPrefix(session.directory.path + "/") else {
-                throw DocumentEditCache.CacheError.sourceChanged
+                throw DocumentEditCache.CacheError.sourceChanged(
+                    "The PDF or its cached editing session changed outside LyraReader. The cached page edits were kept.")
             }
             func validRevision(_ url: URL) -> Bool {
                 url.standardizedFileURL == original.standardizedFileURL ||
@@ -11590,7 +11655,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             }
             guard validRevision(saved.snapshot.revisionURL),
                   (session.undo + session.redo).allSatisfy({ validRevision($0.revisionURL) }) else {
-                throw DocumentEditCache.CacheError.sourceChanged
+                throw DocumentEditCache.CacheError.sourceChanged(
+                    "The PDF or its cached editing session changed outside LyraReader. The cached page edits were kept.")
             }
             try loadPageEditRevision(at: saved.snapshot.revisionURL, title: session.title,
                 annotationRecordsURL: session.annotationRecordsURL, annotations: saved.snapshot.annotations,
@@ -11670,10 +11736,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     // MARK: - Recovery from an annotation cache that cannot be read
 
-    /// True when this document's annotation cache failed to load, so writes are refused until the
-    /// reader explicitly decides what to do with the file.
+    /// True when this document needs the explicit backup-and-reset decision: its annotation
+    /// cache failed to decode (writes are refused), or it decoded but the PDF's identity moved
+    /// (writes are allowed, replacing that PDF is refused) so the reader must choose what to
+    /// do with the saved data.
     public var canRecoverUnreadableAnnotationRecords: Bool {
-        annotationsURL != nil && annotationWritesBlockedReason != nil
+        annotationsURL != nil && (annotationWritesBlockedReason != nil || annotationSourceChangedReason != nil)
     }
 
     /// The explicit way out of the blocked state.
@@ -11685,8 +11753,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// reason is reported).
     @discardableResult
     public func recoverUnreadableAnnotationRecords() -> URL? {
-        guard let annotationRecordsURL = annotationsURL, annotationWritesBlockedReason != nil else { return nil }
+        guard let annotationRecordsURL = annotationsURL,
+              annotationWritesBlockedReason != nil || annotationSourceChangedReason != nil else { return nil }
         guard let original = pageEditSession?.originalURL ?? document?.url else { return nil }
+        // Readable records whose PDF identity moved use the same explicit backup-and-reset
+        // path, but they are not "unreadable": the status line should not claim they were.
+        let recordsWereReadable = annotationWritesBlockedReason == nil
 
         let fileManager = FileManager.default
         var backupURL: URL?
@@ -11718,8 +11790,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return nil
         }
 
-        // The path is free now, so a stale blocked flag must not stop the fresh write.
+        // The path is free now, so a stale blocked/source flag must not stop the fresh write.
         annotationWritesBlockedReason = nil
+        annotationSourceChangedReason = nil
         annotationsURL = DocumentEditCache.annotationsURL(for: original)
         do { try DocumentEditCache.recordSource(for: original) }
         catch { annotationWritesBlockedReason = error.localizedDescription; lastError = error.localizedDescription; return nil }
@@ -11739,7 +11812,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
 
         statusMessage = backupURL.map {
-            "Backed up the unreadable annotations to \($0.lastPathComponent) and started a fresh annotation cache"
+            recordsWereReadable
+                ? "Backed up the annotation recovery data to \($0.lastPathComponent) and started fresh"
+                : "Backed up the unreadable annotations to \($0.lastPathComponent) and started a fresh annotation cache"
         } ?? "Started a fresh annotation cache"
         return backupURL
     }
@@ -13269,6 +13344,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lastAnnotationBackupURL: lastAnnotationBackupURL,
             annotationsURL: annotationsURL,
             annotationWritesBlockedReason: annotationWritesBlockedReason,
+            annotationSourceChangedReason: annotationSourceChangedReason,
             annotationRecordSlots: annotationRecordSlots,
             selectedDocumentAnnotationID: selectedDocumentAnnotationID,
             openDocumentNoteID: openDocumentNoteID,
@@ -13396,6 +13472,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         lastAnnotationBackupURL = state.lastAnnotationBackupURL
         annotationsURL = state.annotationsURL
         annotationWritesBlockedReason = state.annotationWritesBlockedReason
+        annotationSourceChangedReason = state.annotationSourceChangedReason
         annotationRecordSlots = state.annotationRecordSlots
         selectedDocumentAnnotationID = state.selectedDocumentAnnotationID
         openDocumentNoteID = state.openDocumentNoteID

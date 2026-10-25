@@ -78,6 +78,32 @@ enum AnnotationRecords {
         }
     }
 
+    /// A decoding failure as "field 'name' …", used by both the annotation records and the
+    /// document-cache metadata so a corrupt file says which field is wrong, not just that it
+    /// could not be read.
+    static func describe(_ error: Error) -> String {
+        guard let error = error as? DecodingError else { return error.localizedDescription }
+        func path(_ context: DecodingError.Context) -> String {
+            let keys = context.codingPath.map(\.stringValue)
+            return keys.isEmpty ? "the record" : "field '\(keys.joined(separator: "."))'"
+        }
+        switch error {
+        case .keyNotFound(let key, let context):
+            let parent = context.codingPath.map(\.stringValue).joined(separator: ".")
+            return parent.isEmpty
+                ? "field '\(key.stringValue)' is missing"
+                : "field '\(parent).\(key.stringValue)' is missing"
+        case .typeMismatch(let type, let context):
+            return "\(path(context)) has the wrong type (expected \(type))"
+        case .valueNotFound(let type, let context):
+            return "\(path(context)) has no value (expected \(type))"
+        case .dataCorrupted(let context):
+            return "\(path(context)) is invalid: \(context.debugDescription)"
+        @unknown default:
+            return error.localizedDescription
+        }
+    }
+
     /// Keys this version knows how to interpret on an annotation entry. An entry carrying
     /// anything else is preserved rather than parsed: guessing at a newer schema risks writing
     /// back a half-understood entry.
@@ -115,10 +141,11 @@ enum AnnotationRecords {
         var seenIDs = Set<UUID>()
         var seenBookmarkIDs = Set<UUID>()
 
-        for element in elements {
+        for (offset, element) in elements.enumerated() {
+            let entry = offset + 1
             let elementData = Data(element.utf8)
             guard let object = try? JSONSerialization.jsonObject(with: elementData) as? [String: Any] else {
-                throw RecordError.structure("an entry is not a JSON object")
+                throw RecordError.structure("entry \(entry) is not a JSON object")
             }
 
             let kindText = object["kind"] as? String
@@ -132,17 +159,24 @@ enum AnnotationRecords {
                     slots.append(.opaque(element))
                     continue
                 }
-                guard let bookmark = try? JSONDecoder().decode(Bookmark.self, from: elementData) else {
-                    throw RecordError.structure("a bookmark is missing a required field")
+                let bookmark: Bookmark
+                do {
+                    bookmark = try JSONDecoder().decode(Bookmark.self, from: elementData)
+                } catch {
+                    throw RecordError.structure("entry \(entry): \(describe(error))")
                 }
                 guard bookmark.page >= 0, bookmark.page < pageCount else {
-                    throw RecordError.structure("bookmark page \(bookmark.page + 1) is outside the document")
+                    throw RecordError.structure(
+                        "entry \(entry): field 'page' is \(bookmark.page + 1), outside the document's"
+                            + " \(pageCount) page(s)")
                 }
                 guard bookmark.yPt.isFinite, bookmark.yPt >= 0 else {
-                    throw RecordError.structure("bookmark position \(bookmark.yPt) is invalid")
+                    throw RecordError.structure(
+                        "entry \(entry): field 'yPt' is \(bookmark.yPt), which is not a finite page position")
                 }
                 guard seenBookmarkIDs.insert(bookmark.id).inserted else {
-                    throw RecordError.structure("duplicate bookmark identity")
+                    throw RecordError.structure(
+                        "entry \(entry): duplicate bookmark identity \(bookmark.id.uuidString)")
                 }
                 bookmarks.append(bookmark)
                 slots.append(.bookmark(bookmark.id))
@@ -184,24 +218,33 @@ enum AnnotationRecords {
             // From here on the entry claims to be one this version understands, so it has to
             // hold together: a structurally broken entry still fails the load (and therefore
             // blocks writes) instead of being silently reinterpreted.
-            guard let annotation = try? JSONDecoder().decode(AppState.Annotation.self, from: elementData) else {
-                throw RecordError.structure("an entry is missing a required field")
+            let annotation: AppState.Annotation
+            do {
+                annotation = try JSONDecoder().decode(AppState.Annotation.self, from: elementData)
+            } catch {
+                throw RecordError.structure("entry \(entry): \(describe(error))")
             }
             guard annotation.page >= 0, annotation.page < pageCount else {
-                throw RecordError.structure("page \(annotation.page + 1) is outside the document")
+                throw RecordError.structure(
+                    "entry \(entry): field 'page' is \(annotation.page + 1), outside the document's"
+                        + " \(pageCount) page(s)")
             }
             if annotation.kind.isPlacement {
                 guard annotation.hasValidGeometry else {
                     throw RecordError.structure(
-                        "an \(annotation.kind.rawValue) entry has incomplete or non-finite geometry")
+                        "entry \(entry): \(annotation.kind.rawValue) has incomplete or non-finite"
+                            + " geometry (fields 'paths'/'rect'/'lineStart'/'lineEnd'/'strokeWidth')")
                 }
             } else {
                 guard annotation.start >= 0, annotation.end >= annotation.start else {
-                    throw RecordError.structure("invalid character range \(annotation.start)…\(annotation.end)")
+                    throw RecordError.structure(
+                        "entry \(entry): fields 'start' (\(annotation.start)) and 'end' (\(annotation.end))"
+                            + " are not a valid character range")
                 }
             }
             guard seenIDs.insert(annotation.id).inserted else {
-                throw RecordError.structure("duplicate annotation identity")
+                throw RecordError.structure(
+                    "entry \(entry): duplicate annotation identity \(annotation.id.uuidString)")
             }
 
             annotations.append(annotation)
@@ -359,7 +402,7 @@ enum JSONArrayElements {
                     index += 1
                 }
             }
-            throw ParseError.message("unterminated string")
+            throw ParseError.message("byte \(index): unterminated string")
         }
 
         func skipComposite() throws {
@@ -382,7 +425,7 @@ enum JSONArrayElements {
                 }
                 index += 1
             }
-            throw ParseError.message("unterminated entry")
+            throw ParseError.message("byte \(index): unterminated entry")
         }
 
         func skipValue() throws {
@@ -398,13 +441,13 @@ enum JSONArrayElements {
                       bytes[index] != UInt8(ascii: "}") {
                     index += 1
                 }
-                guard index > start else { throw ParseError.message("unexpected character") }
+                guard index > start else { throw ParseError.message("byte \(index): unexpected character") }
             }
         }
 
         skipWhitespace()
         guard index < count, bytes[index] == UInt8(ascii: "[") else {
-            throw ParseError.message("the annotation records must be a JSON array")
+            throw ParseError.message("byte \(index): the annotation records must be a JSON array")
         }
         index += 1
 
@@ -415,21 +458,21 @@ enum JSONArrayElements {
         } else {
             while true {
                 skipWhitespace()
-                guard index < count else { throw ParseError.message("unexpected end of file") }
+                guard index < count else { throw ParseError.message("byte \(index): unexpected end of file") }
                 guard bytes[index] != UInt8(ascii: ","), bytes[index] != UInt8(ascii: "]") else {
-                    throw ParseError.message("empty array element")
+                    throw ParseError.message("byte \(index): empty array element")
                 }
                 let start = index
                 try skipValue()
                 elements.append(String(decoding: bytes[start..<index], as: UTF8.self))
                 skipWhitespace()
-                guard index < count else { throw ParseError.message("unexpected end of file") }
+                guard index < count else { throw ParseError.message("byte \(index): unexpected end of file") }
                 if bytes[index] == UInt8(ascii: ",") {
                     index += 1
                     continue
                 }
                 guard bytes[index] == UInt8(ascii: "]") else {
-                    throw ParseError.message("unexpected character after an entry")
+                    throw ParseError.message("byte \(index): unexpected character after an entry")
                 }
                 index += 1
                 break
@@ -437,7 +480,7 @@ enum JSONArrayElements {
         }
 
         skipWhitespace()
-        guard index == count else { throw ParseError.message("unexpected trailing content") }
+        guard index == count else { throw ParseError.message("byte \(index): unexpected trailing content") }
         return elements
     }
 
