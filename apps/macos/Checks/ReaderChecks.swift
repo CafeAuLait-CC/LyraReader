@@ -908,6 +908,9 @@ struct ReaderChecks {
             ("forms", {
                 try await formChecks(root: root)
             }),
+            ("multiline-forms", {
+                try await multilineFormChecks(root: root)
+            }),
             ("annotation-editing", {
                 try await annotationEditingChecks(root: root)
             }),
