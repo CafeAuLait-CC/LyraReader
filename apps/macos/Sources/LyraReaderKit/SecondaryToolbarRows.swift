@@ -51,21 +51,6 @@ struct FillSignToolRow: View {
                     id: tool.title,
                     width: labels ? nil : AnnotationToolbarLayout.buttonWidth))
             }
-            // The clear button is trailing chrome, not another tool: separate it with the same
-            // group gap the annotation row uses between its tool groups. The spacer's width
-            // discounts the HStack spacing on each side of it.
-            Color.clear
-                .frame(width: ReaderSecondaryRowMetrics.groupGapSpacerWidth, height: 1)
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
-            Button { state.clearFillSignTool() } label: {
-                Image(systemName: "xmark").font(.system(size: 11))
-            }
-            .disabled(state.armedFillSignTool == nil)
-            .help("Clear the Fill & Sign tool")
-            .accessibilityLabel("Clear Fill & Sign tool")
-            .modifier(AnnotationToolbarItemFrame(
-                id: "Clear Fill & Sign tool", width: 30))
         }
     }
 }

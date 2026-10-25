@@ -298,6 +298,15 @@ public enum AnnotationGeometry {
         strokeWidth / 2 + eraserToleranceViewPt / max(zoom, 0.01)
     }
 
+    /// The same reach as a radius in **view** points, which is what the eraser's cursor ring
+    /// draws: the ring's circle is swept by the pointer, so its radius must be the distance on
+    /// screen within which a `strokeWidth`-wide stroke is removed. That is the page-space
+    /// ``eraserReach(strokeWidth:zoom:)`` scaled back by `zoom`, i.e. the fixed 8 view points
+    /// plus half the stroke's on-screen width: 9 pt for the default 2 pt pen at 100%.
+    public static func eraserCursorRadiusViewPt(strokeWidth: CGFloat, zoom: CGFloat) -> CGFloat {
+        eraserReach(strokeWidth: strokeWidth, zoom: zoom) * max(zoom, 0.01)
+    }
+
     /// A path through `points`, smoothed with the midpoint-quadratic rule.
     ///
     /// A live pen delivers one sample per pointer event, which is dense but still visibly

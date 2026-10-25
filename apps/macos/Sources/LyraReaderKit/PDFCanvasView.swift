@@ -181,13 +181,17 @@ public final class MetalCanvasView: NSView {
             }
             eraserGestureActive = false
             eraserLastContentPoint = nil
+            eraserRing.hideRing()
         }
     }
 
     /// Colour and width of the mark a drag creates. `AppState` owns both; the canvas only draws.
     public var annotationColor = AnnotationColor(red: 0xE8, green: 0xBC, blue: 0x55, alpha: 255)
     public var annotationStrokeWidth: CGFloat = 2 {
-        didSet { syncAnnotationOverlay() }
+        didSet {
+            syncAnnotationOverlay()
+            refreshEraserRing()
+        }
     }
 
     /// A finished stroke or shape, handed to the shell once, on mouse-up.
@@ -261,6 +265,8 @@ public final class MetalCanvasView: NSView {
     /// An eraser drag is in flight, and where its last sample landed (content points).
     private var eraserGestureActive = false
     private var eraserLastContentPoint: CGPoint?
+    /// The click-through reach circle drawn while the eraser is armed.
+    private let eraserRing = EraserCursorRingView(frame: .zero)
     /// Delivers pointer movement for the eraser's pre-erase halo. Installed once; AppKit
     /// re-creates tracking areas when the view moves or resizes.
     private var hoverTrackingArea: NSTrackingArea?
@@ -373,6 +379,7 @@ public final class MetalCanvasView: NSView {
         didSet {
             guard zoom != oldValue else { return }
             syncAnnotationOverlay()
+            refreshEraserRing()
             markNeedsRender()
         }
     }
@@ -496,6 +503,11 @@ public final class MetalCanvasView: NSView {
         marquee.autoresizingMask = [.width, .height]
         addSubview(marquee)
         regionMarquee = marquee
+        // The eraser's reach circle is the topmost canvas overlay. It is click-through
+        // (`hitTest` is nil), so adding it here cannot take a press from the eraser underneath.
+        eraserRing.frame = bounds
+        eraserRing.autoresizingMask = [.width, .height]
+        addSubview(eraserRing)
     }
 
     @available(*, unavailable)
@@ -576,20 +588,29 @@ public final class MetalCanvasView: NSView {
 
     public override func mouseEntered(with event: NSEvent) {
         bookmarkHost.updateHover(at: bookmarkHost.convert(event.locationInWindow, from: nil))
+        if annotationTool == .eraser, !eraserGestureActive {
+            showEraserRing(for: event)
+            onEraserHover?(contentPoint(for: event))
+        } else {
+            eraserRing.hideRing()
+        }
         super.mouseEntered(with: event)
     }
 
     public override func mouseMoved(with event: NSEvent) {
         bookmarkHost.updateHover(at: bookmarkHost.convert(event.locationInWindow, from: nil))
         guard annotationTool == .eraser, !eraserGestureActive else {
+            eraserRing.hideRing()
             super.mouseMoved(with: event)
             return
         }
+        showEraserRing(for: event)
         onEraserHover?(contentPoint(for: event))
     }
 
     public override func mouseExited(with event: NSEvent) {
         bookmarkHost.updateHover(at: nil)
+        eraserRing.hideRing()
         if annotationTool == .eraser, !eraserGestureActive { onEraserHover?(nil) }
         super.mouseExited(with: event)
     }
@@ -615,9 +636,41 @@ public final class MetalCanvasView: NSView {
         annotationOverlay?.frame = bounds
         translationOverlay?.frame = bounds
         regionMarquee?.frame = bounds
+        eraserRing.frame = bounds
         syncAnnotationOverlay()
         resizeSurfaceIfNeeded()
         onViewportSize?(bounds.size)
+    }
+
+    // MARK: - Eraser cursor ring
+
+    /// The eraser's reach at the reader's current ink width and the live zoom, in view points.
+    private var eraserRingRadiusViewPt: CGFloat {
+        AnnotationGeometry.eraserCursorRadiusViewPt(strokeWidth: annotationStrokeWidth, zoom: zoom)
+    }
+
+    /// The ring in view coordinates (bottom-left origin), for the checks and the cursor path.
+    package var eraserCursorRing: EraserCursorRingView { eraserRing }
+
+    /// Shows the ring under a point in this view's coordinates, or hides it when the eraser is
+    /// disarmed, a drag owns the pointer, or the point is outside the canvas.
+    private func showEraserRing(atViewPoint point: CGPoint) {
+        guard annotationTool == .eraser, !eraserGestureActive, bounds.contains(point) else {
+            eraserRing.hideRing()
+            return
+        }
+        eraserRing.show(at: eraserRing.convert(point, from: self),
+                        radius: eraserRingRadiusViewPt)
+    }
+
+    private func showEraserRing(for event: NSEvent) {
+        showEraserRing(atViewPoint: convert(event.locationInWindow, from: nil))
+    }
+
+    /// Keeps an already-visible ring's radius in step with a zoom or ink-width change. The
+    /// pointer has not moved, so the centre stays put.
+    private func refreshEraserRing() {
+        eraserRing.updateRadius(eraserRingRadiusViewPt)
     }
 
     // MARK: - File drag and drop (T2.12)
@@ -851,6 +904,9 @@ public final class MetalCanvasView: NSView {
         pointerMoved = false
         let content = contentPoint(for: event)
         annotationDoubleClickConsumed = false
+        // The cursor ring is an indicator, not part of the gesture: a press always takes the
+        // same path with or without it, and the ring disappears while a drag is in flight.
+        eraserRing.hideRing()
 
         // The region marquee owns the gesture while it is armed. It is checked before every
         // other path so a text handle, a mark or a drawing tool can never start underneath it.
@@ -1021,6 +1077,9 @@ public final class MetalCanvasView: NSView {
             eraserGestureActive = false
             eraserLastContentPoint = nil
             onEraseGestureEnded?()
+            // The pointer is still over the canvas and the eraser is still armed: restore the
+            // reach circle where the drag ended (a release outside the canvas keeps it hidden).
+            showEraserRing(for: event)
             pressLocation = nil
             pointerMoved = false
             syncInteraction()

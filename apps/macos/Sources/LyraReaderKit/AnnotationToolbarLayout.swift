@@ -6,8 +6,8 @@ import SwiftUI
 /// The row has three tool groups, left to right, separated by exactly one button width. The
 /// buttons have a fixed width so "one button width" is a number rather than a side effect of the
 /// widest SF Symbol: at every window width the gap is ``groupGap`` and every tool occupies
-/// ``buttonWidth`` points. The trailing colour picker and the row's close button are chrome, not
-/// tool groups, and sit after a flexible spacer.
+/// ``buttonWidth`` points. The trailing colour picker is chrome, not a tool group; the row ends
+/// there, with no close control of its own.
 public enum AnnotationToolbarLayout {
     /// One tool button's outer frame. The toolbar's button style asks for at least 30 × 32; a
     /// fixed 34 pt cell gives the icon breathing room and makes the group gap exact.
@@ -300,7 +300,8 @@ struct ContentEditToolRow: View {
 ///
 /// There is no Select button: the absence of an armed tool is the pointer state. Redaction is
 /// not here at all - it is a destructive content operation and lives in Edit's Redact tool.
-/// The colour picker and the close button are trailing chrome, not a fourth tool group.
+/// The colour picker is trailing chrome, not a fourth tool group. The row has no close button:
+/// the Annotate button in the main toolbar is the row's only open/close control.
 struct AnnotationToolRow: View {
     @ObservedObject var state: AppState
 
@@ -340,7 +341,6 @@ struct AnnotationToolRow: View {
             }
             Color.clear.frame(width: 8, height: 1).allowsHitTesting(false)
             colorMenu
-            closeButton
         }
     }
 
@@ -470,15 +470,6 @@ struct AnnotationToolRow: View {
         }
         .help("Annotation color")
         .modifier(AnnotationToolbarItemFrame(id: "Annotation color", width: 32))
-    }
-
-    private var closeButton: some View {
-        Button { state.annotationToolsVisible = false } label: {
-            Image(systemName: "xmark").font(.system(size: 11))
-        }
-        .help("Hide annotation tools")
-        .accessibilityLabel("Hide annotation tools")
-        .modifier(AnnotationToolbarItemFrame(id: "Hide annotation tools", width: 30))
     }
 
     private var annotationColor: AnnotationColor { state.annotationColor }
