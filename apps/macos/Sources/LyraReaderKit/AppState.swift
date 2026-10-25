@@ -489,7 +489,21 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     }
     private static var pageEditOwners: [String: WeakState] = [:]
     private var isChangingDocumentState = false
-    @Published public private(set) var annotationCacheIsDirty = false
+    /// The saved record state, independent of Undo stack depth and carried with recovery/tabs.
+    /// Older dirty caches without a baseline stay dirty until their contents are saved.
+    struct AnnotationCleanSnapshot: Codable, Equatable {
+        let annotations: [Annotation]
+        let bookmarks: [Bookmark]
+    }
+    private var annotationCleanSnapshot: AnnotationCleanSnapshot?
+    private var currentAnnotationSnapshot: AnnotationCleanSnapshot {
+        AnnotationCleanSnapshot(annotations: annotations, bookmarks: bookmarks)
+    }
+    @Published public private(set) var annotationCacheIsDirty = false {
+        didSet {
+            if !annotationCacheIsDirty { annotationCleanSnapshot = currentAnnotationSnapshot }
+        }
+    }
 
     @Published public var contentEditEnabled = false {
         didSet {
@@ -2866,6 +2880,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var preservedAnnotationEntryCount: Int
         var annotationWriteCount: Int
         var annotationCacheIsDirty: Bool
+        var annotationCleanSnapshot: AnnotationCleanSnapshot?
         var lastAnnotationWriteReport: AnnotationWriteReport?
         var interruptedAnnotationSaveNotice: String?
         var lastAnnotationBackupURL: URL?
@@ -4071,8 +4086,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// When the content is wider than one of the widths the visible columns can change. Those
     /// changes are coalesced into one rebuild shortly after the width stops moving, so a slide or
     /// a live window resize still settles correctly without doing that work per frame.
-    public func setViewportSize(_ size: CGSize) {
-        guard size != viewportSizePt else { return }
+    // The inspector may cover part of a wider drawing surface. Fit commands use the visible
+    // viewport; tiles, hit-test anchors and torn-page overlays use the drawing transform.
+    private var presentationWidthPt: CGFloat?
+    public var canvasPresentationWidthPt: CGFloat { presentationWidthPt ?? viewportSizePt.width }
+
+    public func setViewportSize(_ size: CGSize, canvasWidth: CGFloat? = nil) {
+        let drawingWidth = canvasWidth ?? size.width
+        let drawingWidthChanged = abs(drawingWidth - canvasPresentationWidthPt) > 0.5
+        presentationWidthPt = drawingWidth
+        guard size != viewportSizePt else {
+            if drawingWidthChanged { scheduleViewportReload() }
+            return
+        }
         let previous = viewportSizePt
         viewportSizePt = size
 
@@ -7052,20 +7078,27 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// window resize and a continuous↔facing switch without drifting inside the page.
     @discardableResult
     public func addBookmarkAtCurrentPage(name: String? = nil) -> Bool {
-        guard let document, document.pageCount > 0, let url = document.url else { return false }
-        if annotationsURL == nil { loadAnnotations(for: url) }
-        if annotationWritesBlockedReason != nil {
-            statusMessage = "Could not add the bookmark because the annotation cache could not be loaded"
-            lastError = statusMessage
-            return false
-        }
-
+        guard let document, document.pageCount > 0 else { return false }
         let page = min(max(currentPage - 1, 0), document.pageCount - 1)
         // A bookmark stores page-local Y. In a tear's gap the viewport top names the tear, so
         // the bookmark lands at the split rather than jumping a card-height away.
         let yPt = pageLocalY(forContentY: scrollYPt, onPage: page)
             ?? pageTear(forPage: page)?.splitPt
             ?? max(0, scrollYPt - displayPageTop(page))
+        return addBookmark(onPage: page, yPt: yPt, name: name)
+    }
+
+    /// Adds a bookmark to an explicit page without moving the viewport or changing selection.
+    @discardableResult
+    package func addBookmark(onPage page: Int, yPt: CGFloat = 0, name: String? = nil) -> Bool {
+        guard let document, (0..<document.pageCount).contains(page), yPt.isFinite, yPt >= 0,
+              let url = document.url else { return false }
+        if annotationsURL == nil { loadAnnotations(for: url) }
+        if annotationWritesBlockedReason != nil {
+            statusMessage = "Could not add the bookmark because the annotation cache could not be loaded"
+            lastError = statusMessage
+            return false
+        }
         let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let title = trimmed.isEmpty ? "Page \(page + 1)" : trimmed
 
@@ -9382,6 +9415,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         guard !adopted.isEmpty else { return }
         bookmarks.append(contentsOf: adopted)
+        if !annotationCacheIsDirty { annotationCleanSnapshot = currentAnnotationSnapshot }
         let line = "lyra-reader-annotate: adopted \(adopted.count) bookmark(s) from the document outline\n"
         FileHandle.standardError.write(Data(line.utf8))
     }
@@ -9459,6 +9493,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         isChangingDocumentState = true
         defer { isChangingDocumentState = wasChanging }
         annotationCacheIsDirty = false
+        annotationCleanSnapshot = nil
         let recordsURL = Self.annotationRecordsURL(for: url)
         annotationsURL = recordsURL
         annotationWritesBlockedReason = nil
@@ -9518,17 +9553,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 pendingFileDeletions = saved.deletions
                 erasedInkStrokeIDs = saved.erasedInk
                 annotationCacheIsDirty = saved.dirty
+                annotationCleanSnapshot = saved.cleanSnapshot
             } catch {
                 annotationWritesBlockedReason = error.localizedDescription
                 lastError = "Pending PDF changes could not be restored; the cache was kept."
             }
         }
+        if !annotationCacheIsDirty { annotationCleanSnapshot = currentAnnotationSnapshot }
     }
 
     private struct PendingAnnotationState: Codable {
         let dirty: Bool
         let deletions: [FileAnnotationDeletion]
         let erasedInk: Set<UUID>
+        let cleanSnapshot: AnnotationCleanSnapshot?
     }
 
     private func persistPendingAnnotationState() {
@@ -9536,7 +9574,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
               document != nil, let records = annotationsURL else { return }
         do {
             let saved = PendingAnnotationState(dirty: annotationCacheIsDirty,
-                deletions: pendingFileDeletions, erasedInk: erasedInkStrokeIDs)
+                deletions: pendingFileDeletions, erasedInk: erasedInkStrokeIDs,
+                cleanSnapshot: annotationCleanSnapshot)
             try JSONEncoder().encode(saved).write(to:
                 records.deletingLastPathComponent().appendingPathComponent("changes.json"), options: .atomic)
         } catch { lastError = "Could not cache pending PDF changes: \(error.localizedDescription)" }
@@ -9585,6 +9624,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
 
         do {
+            let clean = annotationCacheIsDirty ? annotationCleanSnapshot : currentAnnotationSnapshot
             let data = try AnnotationRecords.encode(
                 annotations: candidateAnnotations,
                 bookmarks: candidateBookmarks,
@@ -9595,7 +9635,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             bookmarks = candidateBookmarks
             annotationRecordSlots = slots
             if !["page-edit-session", "page-edit-revision", "saved-to-pdf", "bookmarks-saved-to-pdf", "recovery"].contains(trigger) {
-                annotationCacheIsDirty = true
+                annotationCleanSnapshot = clean
+                annotationCacheIsDirty = clean.map { $0 != currentAnnotationSnapshot } ?? true
+            } else if !annotationCacheIsDirty {
+                annotationCleanSnapshot = currentAnnotationSnapshot
             }
             persistPendingAnnotationState()
             persistPageEditRecovery()
@@ -10933,7 +10976,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             var cleanupError: String?
             do {
                 try Data("[]".utf8).write(to: DocumentEditCache.annotationsURL(for: original), options: .atomic)
-                try JSONEncoder().encode(PendingAnnotationState(dirty: false, deletions: [], erasedInk: [])).write(
+                try JSONEncoder().encode(PendingAnnotationState(dirty: false, deletions: [], erasedInk: [], cleanSnapshot: nil)).write(
                     to: DocumentEditCache.pendingStateURL(for: original), options: .atomic)
                 try DocumentEditCache.recordSource(for: original)
             } catch { cleanupError = error.localizedDescription }
@@ -12909,6 +12952,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             preservedAnnotationEntryCount: preservedAnnotationEntryCount,
             annotationWriteCount: annotationWriteCount,
             annotationCacheIsDirty: annotationCacheIsDirty,
+            annotationCleanSnapshot: annotationCleanSnapshot,
             lastAnnotationWriteReport: lastAnnotationWriteReport,
             interruptedAnnotationSaveNotice: interruptedAnnotationSaveNotice,
             lastAnnotationBackupURL: lastAnnotationBackupURL,
@@ -13035,6 +13079,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         preservedAnnotationEntryCount = state.preservedAnnotationEntryCount
         annotationWriteCount = state.annotationWriteCount
         annotationCacheIsDirty = state.annotationCacheIsDirty
+        annotationCleanSnapshot = state.annotationCleanSnapshot
         lastAnnotationWriteReport = state.lastAnnotationWriteReport
         interruptedAnnotationSaveNotice = state.interruptedAnnotationSaveNotice
         lastAnnotationBackupURL = state.lastAnnotationBackupURL
@@ -13824,7 +13869,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// visible window is its left edge.
     private func visibleContentRect(viewportHeight: CGFloat) -> CGRect {
         let zoom = max(zoomFactor, 0.01)
-        let centreOffsetPt = max(0, (viewportSizePt.width - contentWidthPt * zoomFactor) / 2)
+        let centreOffsetPt = max(0, (canvasPresentationWidthPt - contentWidthPt * zoomFactor) / 2)
         return CGRect(
             x: (horizontalViewportOrigin - centreOffsetPt) / zoom,
             y: scrollYPt,
@@ -13877,7 +13922,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     pageTopPt: placement.topPt, pageLeftPt: placement.leftPt, region: region,
                     scrollYPt: scrollYPt, zoom: zoomFactor,
                     contentOffsetX: CanvasGeometry.contentOffsetX(
-                        viewportWidthPt: viewportSizePt.width,
+                        viewportWidthPt: canvasPresentationWidthPt,
                         contentWidthPt: contentWidthPt,
                         zoom: zoomFactor
                     )
@@ -13890,7 +13935,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             scrollYPt: scrollYPt,
             zoom: zoomFactor,
             contentOffsetX: CanvasGeometry.contentOffsetX(
-                viewportWidthPt: viewportSizePt.width,
+                viewportWidthPt: canvasPresentationWidthPt,
                 contentWidthPt: contentWidthPt,
                 zoom: zoomFactor
             )

@@ -4,13 +4,15 @@ import SwiftUI
 /// AppKit owns horizontal overflow; AppState keeps vertical scrolling and the page band.
 struct HorizontalDocumentViewport<Content: View>: NSViewRepresentable {
     let contentWidth: CGFloat
-    let onViewport: (CGSize) -> Void
+    let preservesHorizontalAnchor: Bool
+    let onViewport: (CGSize, CGFloat) -> Void
     let onHorizontalScroll: (CGFloat) -> Void
     @ViewBuilder let content: () -> Content
 
     func makeNSView(context: Context) -> Viewport { Viewport(content: content()) }
     func updateNSView(_ view: Viewport, context: Context) {
         view.host.rootView = content()
+        view.preservesHorizontalAnchor = preservesHorizontalAnchor
         view.documentWidth = contentWidth
         view.onViewport = onViewport
         view.onHorizontalScroll = onHorizontalScroll
@@ -19,12 +21,31 @@ struct HorizontalDocumentViewport<Content: View>: NSViewRepresentable {
 
     final class Viewport: NSScrollView {
         let host: NSHostingView<Content>
-        var documentWidth: CGFloat = 0
-        var onViewport: ((CGSize) -> Void)?
+        // An inspector clips the existing drawing surface instead of recentering its paper.
+        // Keep the uncovered width through both halves of the slide. Explicit zoom/layout
+        // changes release that anchor so Fit Width can still use the visible viewport.
+        var preservesHorizontalAnchor = false {
+            didSet {
+                if preservesHorizontalAnchor && !oldValue {
+                    anchoredWidth = max(lastUncoveredWidth, contentSize.width)
+                }
+            }
+        }
+        private var anchoredWidth: CGFloat = 0
+        private var lastUncoveredWidth: CGFloat = 0
+        var documentWidth: CGFloat = 0 {
+            didSet {
+                if abs(documentWidth - oldValue) > 0.5, anchoredWidth > 0 {
+                    anchoredWidth = contentSize.width
+                }
+            }
+        }
+        var onViewport: ((CGSize, CGFloat) -> Void)?
         var onHorizontalScroll: ((CGFloat) -> Void)?
         nonisolated(unsafe) private var observer: NSObjectProtocol?
         private var reportedSize: CGSize = .zero
         private var reportedX: CGFloat = -1
+        private var reportedCanvasWidth: CGFloat = 0
 
         init(content: Content) {
             host = NSHostingView(rootView: content)
@@ -62,7 +83,11 @@ struct HorizontalDocumentViewport<Content: View>: NSViewRepresentable {
         override func layout() {
             super.layout()
             let size = contentSize
-            let width = max(size.width, documentWidth)
+            if !preservesHorizontalAnchor, size.width >= anchoredWidth - 0.5 {
+                anchoredWidth = 0
+                lastUncoveredWidth = size.width
+            }
+            let width = max(size.width, documentWidth, anchoredWidth)
             let target = CGSize(width: width, height: size.height)
             if host.frame.size != target { host.setFrameSize(target) }
             let x = min(max(0, contentView.bounds.minX), max(0, width - size.width))
@@ -76,11 +101,13 @@ struct HorizontalDocumentViewport<Content: View>: NSViewRepresentable {
         private func reportViewport() {
             let size = contentSize
             let x = contentView.bounds.minX
-            guard size != reportedSize || x != reportedX else { return }
+            let canvasWidth = host.frame.width
+            guard size != reportedSize || x != reportedX || canvasWidth != reportedCanvasWidth else { return }
             reportedSize = size
             reportedX = x
+            reportedCanvasWidth = canvasWidth
             DispatchQueue.main.async { [weak self] in
-                self?.onViewport?(size)
+                self?.onViewport?(size, canvasWidth)
                 self?.onHorizontalScroll?(x)
             }
         }

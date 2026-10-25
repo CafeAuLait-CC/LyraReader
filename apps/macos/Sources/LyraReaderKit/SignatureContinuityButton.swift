@@ -32,6 +32,7 @@ package final class ContinuitySignatureRequestor: NSButton,
         let tabID: UUID?
     }
     private var requestedDestination: Destination?
+    private var keyboardFocusVisible = false
 
     private var currentDestination: Destination? {
         guard let documentID = controller.state.document?.id else { return nil }
@@ -44,7 +45,7 @@ package final class ContinuitySignatureRequestor: NSButton,
 
     package init(controller: FillSignCommandController) {
         self.controller = controller
-        super.init(frame: NSRect(x: 0, y: 0, width: 240, height: 26))
+        super.init(frame: NSRect(x: 0, y: 0, width: 240, height: 32))
         title = "From iPhone or iPad"
         bezelStyle = .rounded
         isBordered = false
@@ -60,7 +61,7 @@ package final class ContinuitySignatureRequestor: NSButton,
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     package override var intrinsicContentSize: NSSize {
-        NSSize(width: NSView.noIntrinsicMetric, height: 26)
+        NSSize(width: NSView.noIntrinsicMetric, height: 32)
     }
 
     package override var acceptsFirstResponder: Bool { isEnabled }
@@ -91,7 +92,7 @@ package final class ContinuitySignatureRequestor: NSButton,
         let shape = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 6, yRadius: 6)
         NSColor(isHighlighted ? LyraReaderTheme.pressedBg : LyraReaderTheme.fieldBg).setFill()
         shape.fill()
-        let focused = window?.firstResponder === self
+        let focused = keyboardFocusVisible && window?.firstResponder === self
         NSColor(focused ? LyraReaderTheme.focusRing : LyraReaderTheme.controlBorder).setStroke()
         shape.lineWidth = focused ? 2 : 1
         shape.stroke()
@@ -137,13 +138,14 @@ package final class ContinuitySignatureRequestor: NSButton,
 
     package override func resignFirstResponder() -> Bool {
         let resigned = super.resignFirstResponder()
-        if resigned { invalidateRequest() }
+        if resigned { invalidateRequest(); keyboardFocusVisible = false }
         needsDisplay = true
         return resigned
     }
 
     package override func becomeFirstResponder() -> Bool {
         let focused = super.becomeFirstResponder()
+        keyboardFocusVisible = NSApp.currentEvent?.type == .keyDown
         needsDisplay = true
         return focused
     }
@@ -154,6 +156,7 @@ package final class ContinuitySignatureRequestor: NSButton,
     }
 
     package override func mouseDown(with event: NSEvent) {
+        keyboardFocusVisible = false
         highlight(true)
         defer { highlight(false) }
         presentDeviceMenu(with: event)
@@ -169,11 +172,51 @@ package final class ContinuitySignatureRequestor: NSButton,
         presentDeviceMenu(with: event)
     }
 
+    // Retain the original system item for the duration of tracking, including its service data.
+    private var deviceSourceItem: NSMenuItem?
+
+    @objc private func deviceMenuDidAddItem(_ notification: Notification) {
+        guard deviceSourceItem == nil, canReceiveSketch,
+              let menu = notification.object as? NSMenu else { return }
+        // Stop nested didAdd notifications from reentering while moving the original items.
+        guard let item = Self.deviceGroupItem(in: menu) else { return }
+        deviceSourceItem = item
+        Self.showDeviceGroups(in: menu, from: item)
+    }
+
+    package static func deviceGroupItem(in menu: NSMenu) -> NSMenuItem? {
+        let items = menu.items.filter { !$0.isSeparatorItem }
+        guard items.count == 1, let item = items.first,
+              item.identifier == NSMenuItem.importFromDeviceIdentifier,
+              let actions = item.submenu, !actions.items.isEmpty else { return nil }
+        return item
+    }
+
+    package static func showDeviceGroups(in menu: NSMenu, from item: NSMenuItem) {
+        guard let actions = item.submenu else { return }
+        let deviceItems = actions.items
+        menu.removeAllItems()
+        for action in deviceItems {
+            actions.removeItem(action)
+            menu.addItem(action)
+        }
+    }
+
     private func presentDeviceMenu(with event: NSEvent) {
         guard beginRequest() else { return }
+        deviceSourceItem = nil
+        NotificationCenter.default.addObserver(self,
+            selector: #selector(deviceMenuDidAddItem(_:)),
+            name: NSMenu.didAddItemNotification, object: nil)
+        defer {
+            NotificationCenter.default.removeObserver(self,
+                name: NSMenu.didAddItemNotification, object: nil)
+            deviceSourceItem = nil
+        }
         let menu = NSMenu(title: "From iPhone or iPad")
-        // Do not add a marker with our own target/action. AppKit inserts and manages the
-        // actual device services here, including Add Sketch when a device is available.
+        // AppKit builds a separate contextual menu after menuWillOpen. Observe only during
+        // this synchronous request and expand its public import marker in that live menu.
+        // Moving the actual items preserves device targets, payloads and system validation.
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 }

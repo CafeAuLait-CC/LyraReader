@@ -145,7 +145,7 @@ struct FillSignInspector: View {
             }.disabled(!state.canPlaceFillSignAnnotation)
             SignatureContinuityButton(
                 controller: controller, enabled: state.canPlaceFillSignAnnotation)
-                .frame(height: 26)
+                .frame(height: 32)
             if let hint = signaturePlacementHint {
                 Text(hint)
                     .font(.caption)

@@ -30,7 +30,7 @@ public struct TabStrip: View {
             HStack(spacing: 6) {
                 ScrollViewReader { scroll in
                     ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: TabRowLayout.tabSpacing) {
+                        HStack(alignment: .center, spacing: TabRowLayout.tabSpacing) {
                             ForEach(Array(state.tabs.enumerated()), id: \.element.id) { index, tab in
                                 tabItem(tab, index: index, width: tabWidth)
                                     .id(tab.id)
@@ -38,7 +38,7 @@ public struct TabStrip: View {
                             Button { state.showFileImporter = true } label: { Image(systemName: "plus") }
                                 .buttonStyle(LyraReaderToolStyle())
                                 .frame(width: TabRowLayout.plusButtonSize,
-                                       height: TabRowLayout.plusButtonSize)
+                                       height: TabRowLayout.plusButtonSize, alignment: .center)
                                 .help("Open a PDF in a new tab (⌘O)")
                                 .accessibilityLabel("Open PDF").id("new-tab")
                         }
@@ -99,11 +99,20 @@ public struct TabStrip: View {
             .accessibilityAction { state.selectTab(index) }
 
             Button { state.closeTab(index) } label: {
-                Image(systemName: state.tabHasUnsavedChanges(index) ? "circle.fill" : "xmark")
-                    .font(.system(size: 10, weight: .semibold))
-                    .frame(width: TabRowLayout.closeButtonWidth,
-                           height: TabRowLayout.contentHeight)
-                    .contentShape(Rectangle())
+                Group {
+                    if state.tabHasUnsavedChanges(index) {
+                        // A little larger than lowercase title letters for a readable visual weight.
+                        let diameter = NSFont.systemFont(ofSize: 12, weight: active ? .medium : .regular).xHeight * 1.15
+                        Circle().fill(LyraReaderTheme.accent)
+                            .frame(width: diameter, height: diameter)
+                    } else {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(active ? LyraReaderTheme.textPrimary : LyraReaderTheme.textSecondary)
+                    }
+                }
+                .frame(width: TabRowLayout.closeButtonWidth, height: TabRowLayout.contentHeight, alignment: .center)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .padding(.trailing, TabRowLayout.closeButtonTrailingInset)
@@ -140,7 +149,6 @@ public struct TabStrip: View {
 /// move the document. The primary row keeps its position and height.
 struct ReaderToolbar: View {
     @ObservedObject var state: AppState
-    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         ViewThatFits(in: .horizontal) {
@@ -264,28 +272,6 @@ struct ReaderToolbar: View {
             .accessibilityLabel("Lyra tools")
             .accessibilityValue(state.aiToolsVisible ? "Expanded" : "Collapsed")
             .keyboardShortcut("a", modifiers: [.command, .shift])
-            LyraReaderMenu(title: "More commands", items: [
-                LyraReaderMenuItem("Open PDF…", icon: "folder", shortcut: "⌘O") { state.showFileImporter = true },
-                LyraReaderMenuItem("Add Bookmark", icon: "bookmark.badge.plus", shortcut: "⌘D",
-                                   enabled: state.document != nil) { state.addBookmarkAtCurrentPage() },
-                LyraReaderMenuItem("Previous Page", icon: "chevron.up", enabled: state.document != nil) { state.previousPage() },
-                LyraReaderMenuItem("Next Page", icon: "chevron.down", enabled: state.document != nil) { state.nextPage() },
-                .separator("more"),
-                LyraReaderMenuItem("Undo", icon: "arrow.uturn.backward", shortcut: "⌘Z", enabled: state.canUndo) { state.undo() },
-                LyraReaderMenuItem("Close Reference Preview", icon: "rectangle.on.rectangle", enabled: state.referencePreview != nil) { state.closeReferencePreview() },
-                LyraReaderMenuItem("Ask about a Region", icon: "rectangle.dashed",
-                                   enabled: state.canArmRegionSelection) {
-                    state.toggleRegionSelection()
-                },
-                LyraReaderMenuItem("Export Region Questions…", icon: "square.and.arrow.up",
-                                   enabled: state.hasExportableRegionHistory) {
-                    state.presentRegionHistoryExportPanel()
-                },
-                LyraReaderMenuItem("Document Information…", icon: "info.circle", shortcut: "⌥⌘I", enabled: state.document != nil) {
-                    state.showDocumentInformation = true
-                },
-                LyraReaderMenuItem("Settings…", icon: "gearshape", shortcut: "⌘,") { openSettings() },
-            ]) { Image(systemName: "ellipsis.circle") }
             Spacer(minLength: 4)
             search(compact: compact)
         }

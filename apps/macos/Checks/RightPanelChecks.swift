@@ -111,6 +111,81 @@ extension ReaderChecks {
         try rightPanelShortcutChecks()
         try sidebarAIMigrationChecks()
         try await rightPanelWindowChecks(root: root)
+        try await editInspectorAnchorChecks(root: root)
+    }
+
+    @MainActor
+    private static func editInspectorAnchorChecks(root: URL) async throws {
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("lyra-edit-anchor-\(UUID())")
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let fixture = scratch.appendingPathComponent("pages.pdf")
+        try FileManager.default.copyItem(at: root.appendingPathComponent("tests/fixtures/multipage.pdf"), to: fixture)
+        let state = AppState(engine: try RustEngine())
+        require(state.open(url: fixture), "the inspector-anchor fixture opens")
+        state.sidebarVisible = true; state.rightPanelVisible = false
+        state.transitionProgressOverride = ReaderTransitionProgress(sidebar: 1, panel: 0, editingPanel: 0)
+        let defaults = UserDefaults(suiteName: "lyra-edit-anchor-\(UUID())")!
+        let model = AIAssistantModel(settings: AISettingsStore(defaults: defaults, keyStore: InMemoryAPIKeyStore(key: nil)))
+        let harness = RightPanelHarness(state: state, aiAssistant: model)
+        defer { harness.close() }
+        try await harness.mount()
+        state.setDisplayCalibration(.uncalibratedDefault)
+        state.zoomPercent = 130
+        try await eventually("the closed inspector establishes its drawing width", {
+            harness.host.layoutSubtreeIfNeeded()
+            return state.canvasViewportWidthPt > 800
+                && abs(state.canvasPresentationWidthPt - state.canvasViewportWidthPt) < 0.5
+                && !state.canvasPageSegments.isEmpty
+        })
+        let surfaceWidth = harness.canvas.bounds.width
+        let viewportWidth = state.canvasViewportWidthPt
+        let zoom = state.zoomFactor
+        let placement = state.canvasPageSegments[0]
+        let region = CGRect(x: 10, y: 20, width: 100, height: 80)
+        let anchor = state.viewRect(local: region, on: placement)
+        require(anchor.minX > region.minX * zoom,
+                "the fixture begins with a centered page and a real left margin")
+        state.contentEditEnabled = true
+        state.transitionProgressOverride = ReaderTransitionProgress(sidebar: 1, panel: 0, editingPanel: 0.5)
+        state.selectContentTool("text")
+        try await eventually("the half-open inspector retains the drawing surface", {
+            harness.host.layoutSubtreeIfNeeded()
+            return abs(state.canvasViewportWidthPt - (viewportWidth - ReaderChrome.editingPanelWidthPt / 2)) < 0.5
+        })
+        require(abs(harness.canvas.bounds.width - surfaceWidth) < 0.5
+                    && state.viewRect(local: region, on: placement) == anchor,
+                "the opening slide neither recenters nor stretches the paper at its midpoint")
+        state.transitionProgressOverride = ReaderTransitionProgress(sidebar: 1, panel: 0, editingPanel: 1)
+        try await eventually("the inspector clips the established drawing surface", {
+            harness.host.layoutSubtreeIfNeeded()
+            return abs(state.canvasViewportWidthPt - (viewportWidth - ReaderChrome.editingPanelWidthPt)) < 0.5
+                && abs(state.canvasPresentationWidthPt - surfaceWidth) < 0.5
+        })
+        require(abs(harness.canvas.bounds.width - surfaceWidth) < 0.5,
+                "opening Edit does not resize the Metal surface or stretch its last frame")
+        require(state.zoomFactor == zoom && state.viewRect(local: region, on: placement) == anchor,
+                "Edit preserves the zoom, page margin and page-local hit-test anchor")
+        state.selectContentTool("text")
+        try await eventually("closing the inspector reveals the same surface", {
+            harness.host.layoutSubtreeIfNeeded()
+            return abs(state.canvasViewportWidthPt - viewportWidth) < 0.5
+        })
+        require(state.viewRect(local: region, on: placement) == anchor,
+                "closing Edit restores the paper without a horizontal jump")
+        state.selectContentTool("text")
+        try await eventually("the inspector reopens for explicit Fit Width", {
+            harness.host.layoutSubtreeIfNeeded()
+            return abs(state.canvasViewportWidthPt - (viewportWidth - ReaderChrome.editingPanelWidthPt)) < 0.5
+        })
+        state.zoomFitWidth()
+        try await eventually("explicit Fit Width releases the preserved margin", {
+            harness.host.layoutSubtreeIfNeeded()
+            return abs(state.canvasPresentationWidthPt - state.canvasViewportWidthPt) < 0.5
+        })
+        require(state.contentWidthPt * state.zoomFactor <= state.canvasViewportWidthPt + 1,
+                "Fit Width still fits the visible viewport beside the inspector")
+        state.contentEditEnabled = false
     }
 
     // MARK: - Preferences, geometry and persistence
