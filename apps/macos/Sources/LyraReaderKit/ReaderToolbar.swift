@@ -99,14 +99,20 @@ public struct TabStrip: View {
             .accessibilityAction { state.selectTab(index) }
 
             Button { state.closeTab(index) } label: {
-                Image(systemName: state.tabHasUnsavedChanges(index) ? "circle.fill" : "xmark")
-                    .foregroundStyle(state.tabHasUnsavedChanges(index)
-                        ? LyraReaderTheme.accent
-                        : (active ? LyraReaderTheme.textPrimary : LyraReaderTheme.textSecondary))
-                    .font(.system(size: state.tabHasUnsavedChanges(index) ? 8.5 : 10, weight: .semibold))
-                    .frame(width: TabRowLayout.closeButtonWidth,
-                           height: TabRowLayout.contentHeight)
-                    .contentShape(Rectangle())
+                Group {
+                    if state.tabHasUnsavedChanges(index) {
+                        // Match the lowercase title letters, independently of SF Symbol bounds.
+                        let diameter = NSFont.systemFont(ofSize: 12, weight: active ? .medium : .regular).xHeight
+                        Circle().fill(LyraReaderTheme.accent)
+                            .frame(width: diameter, height: diameter)
+                    } else {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(active ? LyraReaderTheme.textPrimary : LyraReaderTheme.textSecondary)
+                    }
+                }
+                .frame(width: TabRowLayout.closeButtonWidth, height: TabRowLayout.contentHeight)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .padding(.trailing, TabRowLayout.closeButtonTrailingInset)
