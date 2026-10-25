@@ -36,6 +36,7 @@ struct FillSignToolRow: View {
                         }
                     } else {
                         Image(systemName: tool.icon)
+                            .modifier(ReaderToolbarIcon(id: "\(tool.title).icon"))
                     }
                 }
                 .buttonStyle(LyraReaderToolStyle(selected: state.armedFillSignTool == tool))
@@ -105,6 +106,7 @@ struct ExportToolRow: View {
                         }
                     } else {
                         Image(systemName: command.icon)
+                            .modifier(ReaderToolbarIcon(id: "export.\(command.id).icon"))
                     }
                 }
                 .buttonStyle(LyraReaderToolStyle())

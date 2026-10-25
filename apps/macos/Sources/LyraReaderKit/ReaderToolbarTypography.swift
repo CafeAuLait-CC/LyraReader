@@ -37,6 +37,14 @@ public enum ReaderToolbarTypography {
     public static let iconSize: CGFloat = 14
     public static let iconWeight: Font.Weight = .medium
 
+    /// The square every secondary-row icon occupies.
+    ///
+    /// SF Symbols at 14 pt have different intrinsic boxes, and the Interleaf / Translation
+    /// vectors bring their own 24 pt view box. Left intrinsic, those boxes differ and make one
+    /// glyph read smaller than its neighbours. Every row icon is given this one square instead,
+    /// so the item's icon height and vertical centre no longer depend on the glyph.
+    public static let iconFrameSize: CGFloat = 18
+
     /// Gap between a button's icon and its text, and the label's own horizontal padding.
     public static let labelIconSpacing: CGFloat = 5
     public static let labelHorizontalPadding: CGFloat = 7
@@ -91,12 +99,30 @@ struct ReaderToolbarFont: ViewModifier {
     }
 }
 
+/// One secondary-row icon: the shared symbol configuration in the shared square frame.
+///
+/// Applying this in one place is what keeps an SF Symbol and a custom vector glyph on the same
+/// baseline. The frame reader reports the square, not the symbol's intrinsic bounds, so the
+/// checks can prove every item in every row has the same icon height and vertical centre.
+struct ReaderToolbarIcon: ViewModifier {
+    let id: String
+
+    func body(content: Content) -> some View {
+        content
+            .font(ReaderToolbarTypography.iconFont)
+            .symbolRenderingMode(.monochrome)
+            .frame(width: ReaderToolbarTypography.iconFrameSize,
+                   height: ReaderToolbarTypography.iconFrameSize)
+            .background(AnnotationToolbarFrameReader(id: id))
+    }
+}
+
 /// One toolbar button's text and icon, shared by all five rows.
 ///
 /// `Label` gives the icon the text's font (12 pt row label), which would make a row icon smaller
-/// than the annotation row's 14 pt icon; the two are laid out explicitly instead. The frame
-/// readers let the checks compare the actual rendered label height and icon box with the main
-/// toolbar.
+/// than the annotation row's 14 pt icon; the two are laid out explicitly instead. Every icon goes
+/// through ``ReaderToolbarIcon`` so its height does not depend on the glyph. The frame readers
+/// let the checks compare the actual rendered label height and icon box with the main toolbar.
 struct ReaderToolbarLabel<Icon: View>: View {
     let title: String
     var id: String
@@ -105,8 +131,7 @@ struct ReaderToolbarLabel<Icon: View>: View {
     var body: some View {
         HStack(spacing: ReaderToolbarTypography.labelIconSpacing) {
             icon()
-                .font(ReaderToolbarTypography.iconFont)
-                .background(AnnotationToolbarFrameReader(id: "\(id).icon"))
+                .modifier(ReaderToolbarIcon(id: "\(id).icon"))
             Text(title)
                 .modifier(ReaderToolbarFont(id: "\(id).label", role: .row))
                 .background(AnnotationToolbarFrameReader(id: "\(id).label"))
