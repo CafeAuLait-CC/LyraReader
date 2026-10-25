@@ -103,7 +103,7 @@ public struct TabStrip: View {
                     .foregroundStyle(state.tabHasUnsavedChanges(index)
                         ? LyraReaderTheme.accent
                         : (active ? LyraReaderTheme.textPrimary : LyraReaderTheme.textSecondary))
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(.system(size: state.tabHasUnsavedChanges(index) ? 8.5 : 10, weight: .semibold))
                     .frame(width: TabRowLayout.closeButtonWidth,
                            height: TabRowLayout.contentHeight)
                     .contentShape(Rectangle())
