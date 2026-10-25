@@ -430,12 +430,69 @@ fn merge_item(a: &mut ContentItem, b: ContentItem, separator: &str) {
 
 /// Build and verify a working revision. Never writes to the source or silently rebases stale
 /// object indices onto a newer file. Final save/replace is the page-edit publisher's job.
+///
+/// A redaction that would have to replace a page with an image is refused: the confirmation
+/// belongs to the caller, which can ask and then call [`edit_content_allowing_raster`]. The
+/// returned report is `Some` for a redaction and `None` for every other command.
 pub fn edit_content(
     source: &Path,
     destination: &Path,
     page_index: u32,
     command: &ContentCommand,
-) -> Result<()> {
+) -> Result<Option<crate::RedactionReport>> {
+    edit_content_with_redaction(source, destination, page_index, command, false)
+}
+
+/// Stages a content edit, allowing a redaction to rasterise the pages that need it.
+///
+/// This is [`edit_content`] after the reader has explicitly accepted that the affected pages
+/// lose their text layer. The returned report is the engine's own record of which pages were
+/// actually rasterised, not a prediction.
+pub fn edit_content_allowing_raster(
+    source: &Path,
+    destination: &Path,
+    page_index: u32,
+    command: &ContentCommand,
+) -> Result<Option<crate::RedactionReport>> {
+    edit_content_with_redaction(source, destination, page_index, command, true)
+}
+
+/// The pages `command` would have to rasterise, without writing anything.
+pub fn content_redaction_raster_pages(
+    source: &Path,
+    page_index: u32,
+    command: &ContentCommand,
+) -> Result<Vec<u32>> {
+    let (bounds, revision) = match command {
+        ContentCommand::Redact {
+            bounds, revision, ..
+        } => (bounds, revision),
+        _ => return Err(failure("Only a redaction can rasterise a page.")),
+    };
+    let snapshot = inspect_content(source, page_index)?;
+    if revision != &snapshot.revision {
+        return Err(failure(
+            "The document changed; reload its edit objects before trying again.",
+        ));
+    }
+    if !bounds.valid() {
+        return Err(failure(
+            "The edited region must have finite coordinates and a positive size.",
+        ));
+    }
+    crate::redaction::raster_pages_for_redaction(
+        source,
+        &[crate::RedactionArea::new(page_index, bounds.rect())],
+    )
+}
+
+fn edit_content_with_redaction(
+    source: &Path,
+    destination: &Path,
+    page_index: u32,
+    command: &ContentCommand,
+    allow_raster: bool,
+) -> Result<Option<crate::RedactionReport>> {
     let snapshot = inspect_content(source, page_index)?;
     let (revision, target) = match command {
         ContentCommand::Transform {
@@ -525,14 +582,15 @@ pub fn edit_content(
         } else {
             crate::redaction::RedactionFill::Erase
         };
-        crate::redaction::stage_content_redaction(
+        let report = crate::redaction::stage_content_redaction(
             source,
             destination,
             &[crate::RedactionArea::new(page_index, bounds.rect())],
             fill,
             &bytes,
+            allow_raster,
         )?;
-        return Ok(());
+        return Ok(Some(report));
     }
     // The writer can grow a text frame while keeping its top and wrapping width stable.
     // Persist and verify that actual frame, rather than the original ink-sized rectangle.
@@ -601,7 +659,7 @@ pub fn edit_content(
             Ok(())
         },
     )?;
-    Ok(())
+    Ok(None)
 }
 
 fn build_revision(

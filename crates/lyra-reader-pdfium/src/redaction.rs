@@ -97,12 +97,18 @@ impl RedactionFill {
 }
 
 /// Stage either redaction style for the content editor's reversible working-copy session.
+///
+/// `allow_raster` is the content editor's explicit user decision: when false, a page that can
+/// only be erased by replacing it with an image is refused (the caller must first ask). When
+/// true, exactly those pages are rasterised and the removed text layer is the caller's stated
+/// consequence. The CLI's [`redact_pdf`] has no working copy and always allows the fallback.
 pub fn stage_content_redaction(
     source: &Path,
     destination: &Path,
     areas: &[RedactionArea],
     fill: RedactionFill,
     expected_source: &[u8],
+    allow_raster: bool,
 ) -> Result<RedactionReport> {
     redact_with_fill(
         source,
@@ -112,6 +118,7 @@ pub fn stage_content_redaction(
         RedactionMode::Copy,
         fill,
         Some(expected_source),
+        allow_raster,
     )
 }
 
@@ -239,6 +246,35 @@ pub fn preview_redactions(source: &Path, areas: &[RedactionArea]) -> Result<Reda
     })
 }
 
+/// The pages applying `areas` would have to replace with a raster image, without writing.
+///
+/// This is the pre-flight for the content editor's confirmation. It runs the same page analysis
+/// as [`redact_pdf`] but stops before rendering the fallback image: a page listed here loses its
+/// entire text layer when the redaction is applied. The answer is a prediction, not a promise —
+/// the verified write is still the source of truth for what was actually rasterised — but the
+/// analysis that decides it is shared with the writer, so the list cannot drift from the result.
+pub fn raster_pages_for_redaction(source: &Path, areas: &[RedactionArea]) -> Result<Vec<u32>> {
+    validate_areas(areas)?;
+    let bytes = read_source(source)?;
+    reject_encrypted(&bytes)?;
+    let api = redact_api()?;
+    let original = RedactDocument::load(api, bytes.clone(), None)?;
+    let grouped = group_areas(areas, original.page_count())?;
+    let analysis = analyse(
+        &bytes,
+        &grouped,
+        &original,
+        api,
+        RedactionFill::Blackout,
+        false,
+    )?;
+    Ok(analysis
+        .pages
+        .iter()
+        .filter_map(|(&page, page_analysis)| page_analysis.rasterize.then_some(page))
+        .collect())
+}
+
 /// Applies `areas` and writes the result according to `mode`.
 ///
 /// See the module documentation for exactly what is removed, what the fallback rasterisation
@@ -258,9 +294,11 @@ pub fn redact_pdf(
         mode,
         RedactionFill::Blackout,
         None,
+        true,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn redact_with_fill(
     source: &Path,
     destination: &Path,
@@ -269,6 +307,7 @@ fn redact_with_fill(
     mode: RedactionMode,
     fill: RedactionFill,
     expected_source: Option<&[u8]>,
+    allow_raster: bool,
 ) -> Result<RedactionReport> {
     let working = expected_source.is_some();
     validate_areas(areas)?;
@@ -321,14 +360,14 @@ fn redact_with_fill(
         expected.insert(page, outside_text(&chars, rects));
     }
 
-    let analysis = analyse(&source_bytes, &grouped, &original, api, fill)?;
+    let analysis = analyse(&source_bytes, &grouped, &original, api, fill, true)?;
     let stats = collect_stats(&analysis);
     let rasterized: HashSet<u32> = stats
         .iter()
         .filter(|(_, report)| report.rasterized)
         .map(|(&page, _)| page)
         .collect();
-    if working && !rasterized.is_empty() {
+    if working && !allow_raster && !rasterized.is_empty() {
         return Err(refusal(
             "this region needs a raster redaction",
             "the content editor keeps surviving text editable; this page's nested or unsupported content cannot yet be erased without rasterising the page",
@@ -487,6 +526,7 @@ fn analyse(
     original: &RedactDocument,
     api: &'static RedactApi,
     fill: RedactionFill,
+    render_rasters: bool,
 ) -> Result<Analysis> {
     // The lopdf document is the rewrite target; PDFium is only the microscope (char boxes,
     // object bounds, the fallback raster). The two are loaded from the same bytes.
@@ -554,8 +594,13 @@ fn analyse(
                     }
                 } else {
                     // Text did not map one-to-one: fall back to a raster. The page's whole text
-                    // layer is lost, which the confirmation has warned about.
-                    let raster = render_raster(original, api, page, rects, fill)?;
+                    // layer is lost, which the confirmation has warned about. A pre-flight asks
+                    // for the decision without rendering the image it would discard.
+                    let raster = if render_rasters {
+                        Some(render_raster(original, api, page, rects, fill)?)
+                    } else {
+                        None
+                    };
                     PageAnalysis {
                         stats: PageBuildStats {
                             fill_marks: rects.len(),
@@ -566,14 +611,18 @@ fn analyse(
                         rasterize: true,
                         page_width: width,
                         page_height: height,
-                        raster: Some(raster),
+                        raster,
                         content: None,
                         crop: parsed.crop,
                     }
                 }
             }
             _ => {
-                let raster = render_raster(original, api, page, rects, fill)?;
+                let raster = if render_rasters {
+                    Some(render_raster(original, api, page, rects, fill)?)
+                } else {
+                    None
+                };
                 PageAnalysis {
                     stats: PageBuildStats {
                         fill_marks: rects.len(),
@@ -584,7 +633,7 @@ fn analyse(
                     rasterize: true,
                     page_width: width,
                     page_height: height,
-                    raster: Some(raster),
+                    raster,
                     content: None,
                     crop: None,
                 }
@@ -3010,6 +3059,76 @@ mod tests {
             rect.origin.y + rect.size.height / 2.0,
         );
         assert!(red < 40 && green < 40 && blue < 40);
+    }
+
+    #[test]
+    fn a_form_text_page_is_predicted_before_the_fallback_is_rendered() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("redact-raster-plan");
+        let source = directory.join("form-text.pdf");
+        write_form_text_fixture(&source);
+        let bytes = fs::read(&source).expect("source bytes");
+        let rect = word_rect(&source, 0, "Secret");
+        let area = [RedactionArea::new(0, rect)];
+
+        let predicted = raster_pages_for_redaction(&source, &area).expect("plan");
+        assert_eq!(predicted, vec![0], "the form text needs the whole page");
+
+        let refused = directory.join("refused.pdf");
+        let error = stage_content_redaction(
+            &source,
+            &refused,
+            &area,
+            RedactionFill::Blackout,
+            &bytes,
+            false,
+        )
+        .expect_err("staging without the reader's confirmation must refuse");
+        assert!(error.to_string().contains("raster redaction"), "{error}");
+        assert!(
+            !refused.exists(),
+            "a refused stage must not leave an output file"
+        );
+
+        let confirmed = directory.join("confirmed.pdf");
+        let report = stage_content_redaction(
+            &source,
+            &confirmed,
+            &area,
+            RedactionFill::Blackout,
+            &bytes,
+            true,
+        )
+        .expect("the confirmed stage uses the fallback");
+        assert_eq!(report.pages.len(), 1);
+        assert!(
+            report.pages[0].rasterized,
+            "the written report marks page 1"
+        );
+        assert!(
+            text_of(&confirmed, 0).trim().is_empty(),
+            "the page is an image after the confirmed stage"
+        );
+    }
+
+    #[test]
+    fn a_text_page_needs_no_raster_fallback() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("redact-no-raster-plan");
+        let source = copy_fixture(&directory, "text-page.pdf", "page.pdf");
+        let rect = word_rect(&source, 0, "brown");
+        let predicted =
+            raster_pages_for_redaction(&source, &[RedactionArea::new(0, rect)]).expect("plan");
+        assert!(
+            predicted.is_empty(),
+            "an ordinary text redaction must not ask to rasterise: {predicted:?}"
+        );
     }
 
     #[test]

@@ -15,13 +15,15 @@ extension ReaderChecks {
     ///   survives, for both fills;
     /// * Blackout paints the mark black and Erase leaves the page white;
     /// * the source file is byte-identical while the edit is staged and after Save Copy;
-    /// * a page that would need the writer's rasterisation fallback is refused by the Edit
-    ///   workspace (it must keep surviving text editable) and the refusal is reported;
+    /// * a page that needs the writer's rasterisation fallback first asks, naming the pages and
+    ///   stating that their text layer is gone. Cancel writes nothing; Continue stages the
+    ///   fallback, after which that page has no selectable text and the other pages still do;
+    /// * an ordinary text redaction never shows that prompt;
     /// * a failed redaction writes no revision and leaves the previous revision intact.
     ///
-    /// The rasterised-report assertion itself stays in `redaction.rs`'s unit test
-    /// (`a_page_with_form_text_is_rasterised_and_loses_its_whole_text_layer`): the Edit workspace
-    /// never emits that report because it refuses the fallback instead of silently flattening.
+    /// The engine-side report is also pinned in `redaction.rs`
+    /// (`a_page_with_form_text_is_rasterised_and_loses_its_whole_text_layer`); this check covers
+    /// the Edit workspace's decision around it.
     @MainActor static func contentRedactionChecks(root: URL) async throws {
         let fileManager = FileManager.default
         let scratch = fileManager.temporaryDirectory
@@ -72,6 +74,8 @@ extension ReaderChecks {
                 && !state.contentEditLoading && !state.pageEditBusy
         })
         require(state.document?.pageCount == 1, "the redaction keeps the page count")
+        require(state.rasterRedactionPrompt == nil,
+                "an ordinary text blackout needs no rasterisation confirmation")
         let afterBlackout = try Data(contentsOf: source)
         require(afterBlackout == originalBytes,
                 "staging a blackout does not touch the source file")
@@ -98,6 +102,8 @@ extension ReaderChecks {
             state.pageEditPendingOperations.count == 2 && !state.contentCommandInFlight
                 && !state.contentEditLoading && !state.pageEditBusy
         })
+        require(state.rasterRedactionPrompt == nil,
+                "an ordinary text erase needs no rasterisation confirmation")
         let afterErase = try Data(contentsOf: source)
         require(afterErase == originalBytes,
                 "staging an erase does not touch the source file")
@@ -149,53 +155,184 @@ extension ReaderChecks {
         require(copyMark.red < 40 && copyMark.green < 40 && copyMark.blue < 40,
                 "the saved copy keeps the blackout mark (\(copyMark))")
 
-        // ── A region that needs whole-page rasterisation is refused, honestly ──────────
-        // `text-edit.pdf` places "In form" inside a form XObject. The writer cannot remove those
-        // glyphs without rasterising the page, and the Edit workspace refuses that (surviving
-        // text must stay editable) rather than flattening the page silently.
-        let rasterSource = scratch.appendingPathComponent("form-text.pdf")
-        try fileManager.copyItem(
-            at: root.appendingPathComponent("tests/fixtures/text-edit.pdf"), to: rasterSource)
-        let rasterBytes = try Data(contentsOf: rasterSource)
-        let rasterEngine = try RustEngine()
-        let rasterState = AppState(engine: rasterEngine)
-        rasterState.setViewportSize(CGSize(width: 1000, height: 800))
-        rasterState.newTab(url: rasterSource)
-        try await eventually("the form-text fixture opens", { rasterState.document != nil })
-        rasterState.openRedactionWorkspace()
-        await rasterState.reloadContentObjects()
-        try await eventually("the form-text fixture's content objects load", {
-            rasterState.contentEditPage != nil && !rasterState.contentEditLoading
-        })
-        let formPage = try await rasterEngine.textPage(0)
-        let inForm = {
-            let range = rangeWhile(in: formPage, needle: "In form")
+        // ── A fallback redaction asks first, then writes exactly the page it named ─────
+        // `form-text-pages.pdf` puts "In shared form" inside a Form XObject on page 1 and keeps
+        // ordinary page-level text on page 2. The writer cannot attribute the form glyphs to a
+        // page operator, so removing them safely means replacing page 1 with an image. The
+        // confirmation is the only path to that write; Cancel must leave no trace at all.
+        let formFixture = root.appendingPathComponent("tests/fixtures/form-text-pages.pdf")
+
+        func textRect(in page: TextPage, needle: String) -> CGRect {
+            let range = rangeWhile(in: page, needle: needle)
             var rect = CGRect.zero
-            for character in formPage.chars[range] {
+            for character in page.chars[range] {
                 let box = CGRect(
                     x: character.xPt, y: character.yPt,
                     width: character.widthPt, height: character.heightPt)
                 rect = rect.isEmpty ? box : rect.union(box)
             }
             return rect.insetBy(dx: -3, dy: -3)
-        }()
-        let revisionBefore = rasterState.contentEditPage?.revision
-        rasterState.redactContent(in: inForm, blackout: rasterState.contentEditTool == "blackout")
-        try await eventually("the raster-requiring redaction is refused", {
-            rasterState.lastError != nil && !rasterState.contentCommandInFlight
-                && !rasterState.pageEditBusy
+        }
+
+        /// Opens a fresh copy of the two-page fixture and returns (state, engine, source).
+        func openFormDocument(_ name: String) async throws -> (AppState, RustEngine, URL) {
+            let source = scratch.appendingPathComponent(name)
+            try fileManager.copyItem(at: formFixture, to: source)
+            let engine = try RustEngine()
+            let state = AppState(engine: engine)
+            state.setViewportSize(CGSize(width: 1000, height: 800))
+            state.newTab(url: source)
+            try await eventually("the two-page form fixture opens", {
+                state.document?.pageCount == 2
+            })
+            state.openRedactionWorkspace()
+            await state.reloadContentObjects()
+            try await eventually("the two-page form fixture's content objects load", {
+                state.contentEditPage != nil && !state.contentEditLoading
+            })
+            return (state, engine, source)
+        }
+
+        // Cancel: the prompt names page 1 and its cost; nothing is staged or written.
+        let (cancelState, cancelEngine, cancelSource) = try await openFormDocument(
+            "form-text-cancel.pdf")
+        let cancelBytes = try Data(contentsOf: cancelSource)
+        let cancelPage = try await cancelEngine.textPage(0)
+        let cancelRect = textRect(in: cancelPage, needle: "In shared form")
+        let revisionBefore = cancelState.contentEditPage?.revision
+        let scratchBefore = try fileManager.contentsOfDirectory(atPath: scratch.path).sorted()
+        cancelState.redactContent(in: cancelRect, blackout: true)
+        try await eventually("the raster fallback asks before staging", {
+            cancelState.rasterRedactionPrompt != nil && !cancelState.contentCommandInFlight
         })
-        require(rasterState.lastError?.localizedCaseInsensitiveContains("raster") == true,
-                "the refusal says the region needs a raster redaction: \(rasterState.lastError ?? "nil")")
-        require(rasterState.pageEditPendingOperations.isEmpty,
-                "the refused redaction stages nothing")
-        require(rasterState.contentEditPage?.revision == revisionBefore,
-                "the refused redaction leaves the previous revision in place")
-        require(!rasterState.pageEditSessionActive,
-                "the refused first edit does not leave an empty working session")
-        let afterRefusal = try Data(contentsOf: rasterSource)
-        require(afterRefusal == rasterBytes,
-                "the refused redaction leaves the source file untouched")
+        let prompt = try requireUnwrap(
+            cancelState.rasterRedactionPrompt, "the confirmation prompt exists")
+        require(prompt.pages == [1],
+                "the confirmation names page 1 as the page that becomes an image (\(prompt.pages))")
+        let promptText = prompt.title + " " + prompt.message
+        require(promptText.localizedCaseInsensitiveContains("page 1"),
+                "the confirmation text names page 1: \(promptText)")
+        require(promptText.localizedCaseInsensitiveContains("text layer"),
+                "the confirmation says the text layer is gone: \(promptText)")
+        require(promptText.localizedCaseInsensitiveContains("selectable")
+                    && promptText.localizedCaseInsensitiveContains("searchable"),
+                "the confirmation says the text is no longer selectable or searchable: \(promptText)")
+        require(!cancelState.pageEditSessionActive,
+                "the confirmation creates no working session")
+        require(cancelState.pageEditPendingOperations.isEmpty,
+                "the confirmation stages no page change")
+        require(cancelState.contentEditPage?.revision == revisionBefore,
+                "the confirmation leaves the current revision in place")
+        let afterConfirmation = try Data(contentsOf: cancelSource)
+        let confirmationFiles = try fileManager.contentsOfDirectory(atPath: scratch.path).sorted()
+        require(afterConfirmation == cancelBytes,
+                "the confirmation leaves the source byte-identical")
+        require(confirmationFiles == scratchBefore,
+                "the confirmation writes no output file")
+        cancelState.cancelRasterRedaction()
+        require(cancelState.rasterRedactionPrompt == nil,
+                "Cancel clears the raster confirmation")
+        require(!cancelState.pageEditSessionActive
+                    && cancelState.pageEditPendingOperations.isEmpty,
+                "Cancel leaves no session or revision")
+        require(cancelState.contentEditPage?.revision == revisionBefore,
+                "Cancel keeps the current revision")
+        let afterCancel = try Data(contentsOf: cancelSource)
+        let filesAfterCancel = try fileManager.contentsOfDirectory(atPath: scratch.path).sorted()
+        require(afterCancel == cancelBytes,
+                "Cancel leaves the source file untouched")
+        require(filesAfterCancel == scratchBefore,
+                "Cancel writes no output file")
+        require(cancelState.statusMessage.localizedCaseInsensitiveContains("cancel"),
+                "Cancel says the redaction wrote nothing: \(cancelState.statusMessage)")
+
+        // Continue (Blackout): page 1 becomes an image, page 2 keeps its text.
+        let (blackoutState, blackoutEngine, blackoutSource) = try await openFormDocument(
+            "form-text-blackout.pdf")
+        let blackoutBytes = try Data(contentsOf: blackoutSource)
+        let blackoutPage = try await blackoutEngine.textPage(0)
+        let blackoutRect = textRect(in: blackoutPage, needle: "In shared form")
+        blackoutState.redactContent(in: blackoutRect, blackout: true)
+        try await eventually("the blackout raster confirmation appears", {
+            blackoutState.rasterRedactionPrompt != nil && !blackoutState.contentCommandInFlight
+        })
+        blackoutState.confirmRasterRedaction()
+        try await eventually("the confirmed raster blackout is staged", {
+            blackoutState.pageEditPendingOperations.count == 1
+                && !blackoutState.contentCommandInFlight
+                && !blackoutState.contentEditLoading && !blackoutState.pageEditBusy
+        })
+        require(blackoutState.rasterRedactionPrompt == nil,
+                "Continue clears the raster confirmation")
+        require(blackoutState.statusMessage.localizedCaseInsensitiveContains("page 1"),
+                "the success status names the rasterised page: \(blackoutState.statusMessage)")
+        require(blackoutState.statusMessage.localizedCaseInsensitiveContains("text layer"),
+                "the success status repeats that the text layer is gone: \(blackoutState.statusMessage)")
+        let blackoutAfterStage = try Data(contentsOf: blackoutSource)
+        require(blackoutAfterStage == blackoutBytes,
+                "the confirmed blackout leaves the source file untouched")
+        let blackoutTargetText = try await blackoutEngine.textPage(0)
+        require(blackoutTargetText.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                "the rasterised page has no extractable text: \(blackoutTargetText.text)")
+        let blackoutOtherText = try await blackoutEngine.textPage(1)
+        require(blackoutOtherText.text.contains("Page two keeps its selectable text"),
+                "the page the redaction did not name keeps its text")
+        let rasterBlackoutImage = try await blackoutEngine.renderPage(0, scale: scale)
+        let blackoutMark = pixel(
+            rasterBlackoutImage,
+            atPagePoint: CGPoint(x: blackoutRect.midX, y: blackoutRect.midY))
+        require(blackoutMark.red < 40 && blackoutMark.green < 40 && blackoutMark.blue < 40,
+                "the rasterised blackout still paints black (\(blackoutMark))")
+
+        let rasterCopy = scratch.appendingPathComponent("form-text-blackout-copy.pdf")
+        let rasterPublished = await blackoutState.savePageEditsCopy(to: rasterCopy)
+        require(rasterPublished,
+                "the confirmed raster redaction publishes to a copy")
+        let rasterCopyEngine = try RustEngine()
+        _ = try rasterCopyEngine.openDocument(at: rasterCopy)
+        let rasterCopyTarget = try await rasterCopyEngine.textPage(0)
+        require(rasterCopyTarget.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                "the saved copy's target page has no selectable text: \(rasterCopyTarget.text)")
+        let rasterCopyOther = try await rasterCopyEngine.textPage(1)
+        require(rasterCopyOther.text.contains("Page two keeps its selectable text"),
+                "the saved copy keeps text on the pages that were not rasterised")
+        let rasterCopyImage = try await rasterCopyEngine.renderPage(0, scale: scale)
+        let rasterCopyMark = pixel(
+            rasterCopyImage,
+            atPagePoint: CGPoint(x: blackoutRect.midX, y: blackoutRect.midY))
+        require(rasterCopyMark.red < 40 && rasterCopyMark.green < 40 && rasterCopyMark.blue < 40,
+                "the saved copy keeps the black mark (\(rasterCopyMark))")
+
+        // Continue (Erase): the same fallback, with the white fill.
+        let (eraseState, eraseEngine, eraseSource) = try await openFormDocument(
+            "form-text-erase.pdf")
+        let eraseBytes = try Data(contentsOf: eraseSource)
+        let erasePage = try await eraseEngine.textPage(0)
+        let eraseRect = textRect(in: erasePage, needle: "In shared form")
+        eraseState.redactContent(in: eraseRect, blackout: false)
+        try await eventually("the erase raster confirmation appears", {
+            eraseState.rasterRedactionPrompt != nil && !eraseState.contentCommandInFlight
+        })
+        eraseState.confirmRasterRedaction()
+        try await eventually("the confirmed raster erase is staged", {
+            eraseState.pageEditPendingOperations.count == 1
+                && !eraseState.contentCommandInFlight
+                && !eraseState.contentEditLoading && !eraseState.pageEditBusy
+        })
+        let eraseAfterStage = try Data(contentsOf: eraseSource)
+        require(eraseAfterStage == eraseBytes,
+                "the confirmed erase leaves the source file untouched")
+        let eraseTargetText = try await eraseEngine.textPage(0)
+        require(eraseTargetText.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                "the erased page has no extractable text: \(eraseTargetText.text)")
+        let eraseOtherText = try await eraseEngine.textPage(1)
+        require(eraseOtherText.text.contains("Page two keeps its selectable text"),
+                "the erase leaves the other page's text alone")
+        let eraseImage = try await eraseEngine.renderPage(0, scale: scale)
+        let eraseMark = pixel(
+            eraseImage, atPagePoint: CGPoint(x: eraseRect.midX, y: eraseRect.midY))
+        require(eraseMark.red > 220 && eraseMark.green > 220 && eraseMark.blue > 220,
+                "the rasterised erase leaves white paper (\(eraseMark))")
 
         // ── A signed document keeps its read-only rule; redaction goes to a copy ───────
         // The retired reading-view path offered "Apply to Copy" directly. The Edit workspace
@@ -237,6 +374,8 @@ extension ReaderChecks {
                 && !signedState.contentCommandInFlight && !signedState.contentEditLoading
                 && !signedState.pageEditBusy
         })
+        require(signedState.rasterRedactionPrompt == nil,
+                "the signed fixture's text redaction needs no raster confirmation")
         let signedAfterStage = try Data(contentsOf: signedSource)
         require(signedAfterStage == signedBytes,
                 "staging redaction on a signed document leaves the original untouched")

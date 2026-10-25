@@ -127,7 +127,7 @@ pub use page_ops::{
 #[cfg(feature = "pdfium")]
 pub use redaction::{
     RASTER_DPI, RedactionArea, RedactionMode, RedactionPagePreview, RedactionPageReport,
-    RedactionPreview, RedactionReport, preview_redactions, redact_pdf,
+    RedactionPreview, RedactionReport, preview_redactions, raster_pages_for_redaction, redact_pdf,
     suggested_redaction_copy_path,
 };
 #[cfg(feature = "pdfium")]

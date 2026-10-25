@@ -2,6 +2,62 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// The window's explicit confirmations: pending PDF changes before closing, and the Edit
+/// workspace's raster-redaction warning.
+///
+/// They share one `confirmationDialog` on purpose: two dialog modifiers on the same view are not
+/// reliably presented by SwiftUI, and losing "save before closing" to a second dialog would be a
+/// serious regression. The state always decides which one is live, so the view only picks the
+/// matching title, message and buttons. Kept out of `ReaderWindow.body` because the dynamic title
+/// and message pushed that already-large expression past the type-checker's budget.
+private struct ReaderConfirmationModifier: ViewModifier {
+    @ObservedObject var state: AppState
+
+    private var title: String {
+        if let prompt = state.rasterRedactionPrompt { return prompt.title }
+        return "Save PDF changes before closing?"
+    }
+
+    private var isPresented: Binding<Bool> {
+        Binding(
+            get: { state.rasterRedactionPrompt != nil || state.contentCloseRequested },
+            set: { presented in
+                guard !presented else { return }
+                if state.rasterRedactionPrompt != nil { state.cancelRasterRedaction() }
+                if state.contentCloseRequested { state.cancelContentClose() }
+            }
+        )
+    }
+
+    func body(content: Content) -> some View {
+        content.confirmationDialog(
+            title, isPresented: isPresented, titleVisibility: .visible
+        ) {
+            if state.rasterRedactionPrompt != nil {
+                // Cancel is the safe default: nothing exists until Continue stages the revision.
+                Button("Continue", role: .destructive) { state.confirmRasterRedaction() }
+                Button("Cancel", role: .cancel) { state.cancelRasterRedaction() }
+            } else {
+                if state.closeRequiresReview {
+                    Button("Review Changes") { state.reviewChangesBeforeClosing() }
+                } else {
+                    Button(state.isReadOnlyDocument ? "Save a Copy…" : "Save") {
+                        state.saveContentAndClose()
+                    }
+                }
+                Button("Discard Changes", role: .destructive) { state.discardContentAndClose() }
+                Button("Cancel", role: .cancel) { state.cancelContentClose() }
+            }
+        } message: {
+            if let prompt = state.rasterRedactionPrompt {
+                Text(prompt.message)
+            } else {
+                Text(state.closeChangesMessage)
+            }
+        }
+    }
+}
+
 /// Main window: toolbar + collapsible sidebar + canvas + optional right-hand side panel
 /// (`docs/04-ui-ux.md` §2). The right panel is the AI assistant's home; the left sidebar keeps
 /// thumbnails, outline, annotations and bookmarks, so both can be open at once.
@@ -138,15 +194,7 @@ public struct ReaderWindow: View {
             AIDocumentKnowledgeSheet(knowledge: documentKnowledge)
         }
         .sheet(isPresented: $state.showDocumentInformation) { DocumentInformationView(state: state) }
-        .confirmationDialog("Save PDF changes before closing?",isPresented:$state.contentCloseRequested,titleVisibility:.visible) {
-            if state.closeRequiresReview {
-                Button("Review Changes") { state.reviewChangesBeforeClosing() }
-            } else {
-                Button(state.isReadOnlyDocument ? "Save a Copy…" : "Save") {state.saveContentAndClose()}
-            }
-            Button("Discard Changes",role:.destructive) {state.discardContentAndClose()}
-            Button("Cancel",role:.cancel) {state.cancelContentClose()}
-        } message: { Text(state.closeChangesMessage) }
+        .modifier(ReaderConfirmationModifier(state: state))
         .onAppear {
             state.installTerminationHandling()
             documentKnowledge.settings = aiAssistant.settings
