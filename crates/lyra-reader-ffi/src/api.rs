@@ -22,12 +22,13 @@ pub fn document_index_cache_path(path: String) -> String {
 }
 use lyra_reader_ai::MockProvider;
 use lyra_reader_ai::chat::{
-    Action as AiAction, ChatImage, ChatPlan, ChatSettings, ConversationTurn, DocumentChatRequest,
-    MergePart, MergePlanRequest, PageChar, PageText, PlanRequest, ReasoningEncoding, ReasoningMode,
-    RegionQuestionRequest, RegionRect, SUMMARY_ABSTRACT_MAX_CHARS, SUMMARY_ABSTRACT_MAX_PAGES,
-    SUMMARY_MAX_CONCURRENT_REQUESTS, SUMMARY_MAX_REQUESTS_PER_BATCH, SUMMARY_PAGE_MAX_CHARS,
-    SUMMARY_SECTION_MAX_CHARS, SelectionRange as AiSelectionRange, SourceRect as AiSourceRect,
-    SummaryLayer, SummaryLayerRequest, SummaryUnitRequest, build_document_chat_plan,
+    Action as AiAction, CONNECTION_TEST_MAX_TOKENS, ChatImage, ChatPlan, ChatSettings,
+    ConversationTurn, DocumentChatRequest, MergePart, MergePlanRequest, PageChar, PageText,
+    PlanRequest, ReasoningEncoding, ReasoningMode, RegionQuestionRequest, RegionRect,
+    SUMMARY_ABSTRACT_MAX_CHARS, SUMMARY_ABSTRACT_MAX_PAGES, SUMMARY_MAX_CONCURRENT_REQUESTS,
+    SUMMARY_MAX_REQUESTS_PER_BATCH, SUMMARY_PAGE_MAX_CHARS, SUMMARY_SECTION_MAX_CHARS,
+    SelectionRange as AiSelectionRange, SourceRect as AiSourceRect, SummaryLayer,
+    SummaryLayerRequest, SummaryUnitRequest, build_connection_test_plan, build_document_chat_plan,
     build_document_knowledge_plan, build_merge_plan, build_plan, build_region_question_plan,
     build_summary_layer, inspect_base_url, inspect_summary_layer, validate_model,
 };
@@ -5640,6 +5641,30 @@ pub struct AiEndpointRecord {
     pub endpoint: String,
     pub host: String,
     pub is_local: bool,
+}
+
+/// Build the Settings > AI connection test without touching the network.
+///
+/// The plan carries one fixed `ping` user message and no document, history, image or retrieval.
+/// It goes through the same prompt/body builder as every other request, so `start_ai_request`
+/// sends it with the same transport, SSE parser and error mapping. The key is never part of this
+/// record; it crosses the FFI only when the test starts.
+#[uniffi::export]
+pub fn build_ai_connection_test_plan(
+    base_url: String,
+    model: String,
+) -> Result<AiPlanRecord, LyraReaderFfiError> {
+    let plan = build_connection_test_plan(ChatSettings {
+        base_url,
+        model,
+        // A connection test measures reachability, not generation quality: no temperature and a
+        // small completion budget keep the request as close to a ping as the protocol allows.
+        temperature: None,
+        max_tokens: Some(CONNECTION_TEST_MAX_TOKENS),
+        reasoning_mode: ReasoningMode::Default,
+        reasoning_encoding: ReasoningEncoding::None,
+    })?;
+    Ok(ai_plan_record(plan))
 }
 
 /// Validate and normalise a base URL without touching the network.

@@ -750,7 +750,7 @@ public final class RustAIChatService: AIChatServicing {
 }
 
 @MainActor
-private final class RustAIChatHandle: AIChatHandle {
+final class RustAIChatHandle: AIChatHandle {
     private let handle: LyraReaderAiRequest
 
     init(handle: LyraReaderAiRequest) {

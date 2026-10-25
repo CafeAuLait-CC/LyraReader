@@ -16,14 +16,15 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use ureq::tls::Certificate;
 
-use lyra_reader_ai::AiError;
 use lyra_reader_ai::chat::{
-    Action, ChatSettings, PageText, PlanRequest, ReasoningEncoding, ReasoningMode, build_plan,
+    Action, ChatSettings, PageText, PlanRequest, ReasoningEncoding, ReasoningMode,
+    build_connection_test_plan, build_plan,
 };
 use lyra_reader_ai::openai::{
     CancellationToken, ClientConfig, RequestSpec, RunEvent, StreamDiagnostics, TokenUsage,
     UreqTransport, run_plan_with_transport,
 };
+use lyra_reader_ai::{AiError, AiFailure};
 
 #[derive(Clone, Debug)]
 struct RecordedRequest {
@@ -284,6 +285,23 @@ fn plan_for_base(base_url: &str) -> lyra_reader_ai::ChatPlan {
     .expect("plan")
 }
 
+/// The Settings > AI connection test plan: one fixed ping, no document, no history.
+fn connection_plan_for(base_url: &str) -> lyra_reader_ai::ChatPlan {
+    build_connection_test_plan(ChatSettings {
+        base_url: base_url.to_string(),
+        model: "test-model".to_string(),
+        temperature: None,
+        max_tokens: Some(16),
+        reasoning_mode: ReasoningMode::Default,
+        reasoning_encoding: ReasoningEncoding::None,
+    })
+    .expect("connection test plan")
+}
+
+fn connection_plan_for_server(server: &Server) -> lyra_reader_ai::ChatPlan {
+    connection_plan_for(&server.base_url)
+}
+
 fn fast_config() -> ClientConfig {
     ClientConfig {
         connect_timeout: Duration::from_secs(2),
@@ -359,6 +377,110 @@ fn request_matches_the_preview_and_streams_split_sse() {
         "the bytes on the wire must be exactly the previewed body"
     );
     assert!(plan.parts[0].wire_body.contains("\"stream\":true"));
+}
+
+#[test]
+fn connection_test_streams_one_ping_and_sends_no_document_text() {
+    let mut server = Server::start(Behavior::Chunked {
+        chunks: vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n".to_vec(),
+            b"data: [DONE]\n\n".to_vec(),
+        ],
+        delay: Duration::from_millis(5),
+        watch_close: false,
+    });
+    let plan = connection_plan_for_server(&server);
+    let transport = UreqTransport::system(fast_config());
+    let cancel = CancellationToken::new();
+    let started = Instant::now();
+    let mut text = String::new();
+    let mut done = false;
+    run_plan_with_transport(
+        &plan,
+        key(),
+        &transport,
+        &cancel,
+        &mut |event| match event {
+            RunEvent::Delta(delta) => text.push_str(&delta),
+            RunEvent::Done => done = true,
+            _ => {}
+        },
+    )
+    .expect("connection test stream");
+    let elapsed = started.elapsed();
+    server.join();
+
+    assert_eq!(text, "OK");
+    assert!(done);
+    assert!(elapsed > Duration::ZERO);
+    let recorded = server.recorded.lock().unwrap().clone().expect("request");
+    assert_eq!(recorded.method, "POST");
+    assert_eq!(recorded.path, "/v1/chat/completions");
+    assert_eq!(
+        String::from_utf8(recorded.body.clone()).unwrap(),
+        plan.parts[0].wire_body,
+        "the bytes on the wire must be exactly the previewed body"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&recorded.body).unwrap();
+    assert_eq!(body["messages"][1]["content"], "ping");
+    assert!(
+        body["messages"].as_array().unwrap().len() == 2,
+        "one system message and one ping only: {body}"
+    );
+    assert!(!String::from_utf8_lossy(&recorded.body).contains("Mock-server paper"));
+    assert!(plan.parts[0].pages.is_empty());
+    assert_eq!(plan.parts[0].page_characters, 0);
+}
+
+#[test]
+fn connection_test_reports_401_and_500_with_the_client_mapping() {
+    for (status, reason, expected) in [
+        (401, "Unauthorized", "Authentication failed"),
+        (500, "Internal Server Error", "The provider failed"),
+    ] {
+        let mut server = Server::start(Behavior::Error {
+            status,
+            reason,
+            body: format!("{{\"error\":{{\"message\":\"connection test refused {status}\"}}}}")
+                .into_bytes(),
+        });
+        let plan = connection_plan_for_server(&server);
+        let transport = UreqTransport::system(fast_config());
+        let cancel = CancellationToken::new();
+        let error = run_plan_with_transport(&plan, key(), &transport, &cancel, &mut |_| {})
+            .expect_err("the status must fail");
+        server.join();
+        let message = error.to_string();
+        assert!(message.contains(expected), "status {status}: {message}");
+        assert!(
+            message.contains(&format!("HTTP {status}")),
+            "status {status}: {message}"
+        );
+        assert!(
+            message.contains(&format!("connection test refused {status}")),
+            "status {status}: {message}"
+        );
+        assert_eq!(error.failure(), AiFailure::Other, "status {status}");
+        assert!(!message.contains(key()), "the key leaked: {message}");
+    }
+}
+
+#[test]
+fn a_refused_loopback_connection_test_is_classified_as_a_local_server() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve a port");
+    let port = listener.local_addr().expect("port").port();
+    drop(listener);
+    let plan = connection_plan_for(&format!("http://127.0.0.1:{port}/v1"));
+    let transport = UreqTransport::system(fast_config());
+    let cancel = CancellationToken::new();
+    let error = run_plan_with_transport(&plan, key(), &transport, &cancel, &mut |_| {})
+        .expect_err("a closed loopback port must fail");
+    assert!(
+        matches!(error, AiError::LocalServer(_)),
+        "expected LocalServer, got {error:?}"
+    );
+    assert_eq!(error.failure(), AiFailure::LocalServer);
+    assert!(!error.to_string().contains(key()));
 }
 
 #[test]
