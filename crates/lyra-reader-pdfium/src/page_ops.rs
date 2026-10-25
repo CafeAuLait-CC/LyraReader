@@ -37,13 +37,15 @@
 //! reopened and checked, and only then renamed. The inputs are never modified.
 //!
 //! **Outline rule.** A merge keeps the first document's outline exactly as it was (its page
-//! numbers do not move because pages are appended), and does **not** import the other documents'
-//! outlines: PDFium's page-import call copies page dictionaries, not a document-level bookmark
-//! tree, and inventing destinations for another author's outline would be worse than leaving it
-//! out. [`MergeReport::dropped_outline_entries`] counts what was left out so the shell can say
-//! so. A split keeps no outline in any output for the same reason: the source outline's
-//! destinations refer to pages that may be in a different output; the shell's cached bookmarks
-//! are remapped per output instead.
+//! numbers do not move because pages are appended) and imports each other document's outline as
+//! one clearly-labelled top-level group named after that file. The appended document's own
+//! entries become the group's children, so their relative nesting, titles and order survive.
+//! Every destination is moved by the pages already appended, which makes it point at the page
+//! that entry named in its own document. A destination that did not resolve to a page in its
+//! source is written without one rather than as a dangling reference. [`MergeReport`] counts the
+//! imported entries and names the groups. A split keeps no outline in any output for the same
+//! reason: the source outline's destinations refer to pages that may be in a different output;
+//! the shell's cached bookmarks are remapped per output instead.
 //!
 //! **Annotation-cache rule.** The reader's own annotations/bookmarks live outside this module,
 //! in the application's document cache, keyed by page index. Merge only appends, so the first document's pages keep their
@@ -93,7 +95,8 @@
 
 use crate::annotations::AnnotationReader;
 use crate::backend::{PDFIUM_LOCK, PdfiumBackend};
-use crate::writeback::{OutputMode, RewrittenOutput, write_rewritten_pdf};
+use crate::outline_write::{MergeOutlineGroup, append_merge_outline_groups};
+use crate::writeback::{OutputMode, RewrittenOutput, TempFile, write_rewritten_pdf};
 use libloading::Library;
 use lyra_reader_core::{
     DocumentBackend, ErrorCode, LyraReaderError, OutlineNode, PageIndex, RawAnnotation, Result,
@@ -214,8 +217,11 @@ pub struct MergeReport {
     pub page_sizes: Vec<(f64, f64)>,
     /// Flattened outline entries the first document had and the output kept.
     pub first_outline_entries: usize,
-    /// Flattened outline entries in the other documents that were **not** imported.
-    pub dropped_outline_entries: usize,
+    /// Flattened outline entries imported from the appended documents (the synthetic group
+    /// labels are not counted).
+    pub appended_outline_entries: usize,
+    /// Titles of the top-level groups added for appended documents, in input order.
+    pub appended_outline_group_titles: Vec<String>,
     pub output_bytes: u64,
     pub cleaned_temporaries: usize,
 }
@@ -377,12 +383,14 @@ pub fn extract_pages(
 /// The first document's pages keep their indices; every other document's pages follow in the
 /// order given. The source and every appended document are never modified, and the output may
 /// not be any of them. The result is verified before its atomic rename: page count, rotations,
-/// sizes, per-page text, per-page file-owned annotations, and the first document's outline.
+/// sizes, per-page text, per-page file-owned annotations, the first document's outline, and every
+/// appended outline group and destination.
 ///
-/// What happens to the second document's outline, and to the reader's cached annotations, is documented at
-/// the top of this module. In short: its outline is not imported (and is counted in the report),
-/// its embedded annotations travel, and the first document's cached marks keep their page
-/// indices because nothing before the appended pages moves.
+/// Each appended outline is imported as one top-level group named after the appended file, with
+/// that document's own entries nested beneath it and destinations moved to the merged pages. The
+/// shape is documented at the top of this module. The reader's cached marks are the shell's
+/// concern: appending does not move existing pages, so their page indices are unchanged because
+/// nothing before the appended pages moves.
 pub fn merge_documents(
     source: &Path,
     others: &[PathBuf],
@@ -437,10 +445,17 @@ pub fn merge_documents(
     let mut expected_sizes = merged.sizes()?;
     let mut expected_texts = page_texts(&source)?;
     let mut expected_annotations = page_annotations(&source)?;
-    let first_outline = outline_signature(&source)?;
+    let first_nodes = read_outline(&source)?;
+    let mut first_outline = Vec::new();
+    flatten_outline(&first_nodes, 0, &mut first_outline);
+    // A group label must still be distinguishable from the target's existing top-level entries
+    // (and from an earlier group with the same file name).
+    let mut used_outline_titles: HashSet<String> =
+        first_nodes.iter().map(|node| node.title.clone()).collect();
+    let mut outline_groups = Vec::new();
     let mut appended_page_counts = Vec::with_capacity(others.len());
     let mut appended_annotation_counts = Vec::with_capacity(others.len());
-    let mut dropped_outline_entries = 0usize;
+    let mut appended_outline_entries = 0usize;
 
     for other in inputs.iter().skip(1) {
         let appended = open_editable(api, other, "a document being appended")?;
@@ -448,8 +463,10 @@ pub fn merge_documents(
         if count == 0 {
             return Err(empty_document_error(other));
         }
+        let offset = merged.page_count();
+        let outline_nodes = read_outline(other)?;
         let pages: Vec<u32> = (0..count).collect();
-        merged.import_pages(&appended, &pages, merged.page_count())?;
+        merged.import_pages(&appended, &pages, offset)?;
         expected_rotations.extend(appended.rotations()?);
         expected_sizes.extend(appended.sizes()?);
         expected_texts.extend(page_texts(other)?);
@@ -457,23 +474,60 @@ pub fn merge_documents(
         appended_annotation_counts.push(annotations.iter().map(Vec::len).sum::<usize>());
         expected_annotations.extend(annotations);
         appended_page_counts.push(count);
-        dropped_outline_entries += outline_signature(other)?.len();
+        if !outline_nodes.is_empty() {
+            let title = appended_group_title(other, &mut used_outline_titles);
+            let group = MergeOutlineGroup {
+                title,
+                first_page: offset,
+                page_count: count,
+                nodes: outline_nodes,
+            };
+            appended_outline_entries += group.entry_count();
+            outline_groups.push(group);
+        }
     }
 
     let page_count = expected_rotations.len() as u32;
     let first_outline_entries = first_outline.len();
+    let mut expected_outline = first_outline.clone();
+    for group in &outline_groups {
+        group.flatten(&mut expected_outline);
+    }
+    let appended_outline_group_titles = outline_groups
+        .iter()
+        .map(|group| group.title.clone())
+        .collect();
     let rotations_for_report = expected_rotations.clone();
     let sizes_for_report = expected_sizes.clone();
     let rewritten = write_rewritten_pdf(
         &source,
         destination,
         OutputMode::Copy,
-        |file| merged.save(file),
+        |file| {
+            if outline_groups.is_empty() {
+                return merged.save(file);
+            }
+            // PDFium has no bookmark-writing API, so its merged bytes are saved to a scratch
+            // file first and the outline writer adds the groups in one incremental update that
+            // lands in the verified temporary file.
+            let (scratch, mut scratch_file) = TempFile::create(destination)?;
+            merged.save(&mut scratch_file)?;
+            scratch_file.flush().map_err(|error| {
+                io_error(
+                    "could not flush the merged document before adding its outlines",
+                    scratch.path(),
+                    error,
+                )
+            })?;
+            drop(scratch_file);
+            append_merge_outline_groups(scratch.path(), file, &outline_groups, None)?;
+            Ok(())
+        },
         |path| {
             verify_output(path, page_count, &expected_rotations, &expected_sizes)?;
             verify_text_pages(path, &expected_texts)?;
             verify_annotation_pages(path, &expected_annotations)?;
-            verify_outline(path, &first_outline)?;
+            verify_outline(path, &expected_outline)?;
             Ok(())
         },
     )?;
@@ -490,7 +544,8 @@ pub fn merge_documents(
             .map(|size| (size.width, size.height))
             .collect(),
         first_outline_entries,
-        dropped_outline_entries,
+        appended_outline_entries,
+        appended_outline_group_titles,
         output_bytes: rewritten.output_bytes,
         cleaned_temporaries: rewritten.cleaned_temporaries,
     })
@@ -1258,14 +1313,39 @@ fn verify_annotation_pages(path: &Path, expected: &[Vec<RawAnnotation>]) -> Resu
     Ok(())
 }
 
+/// The document's outline tree, read through the normal backend.
+fn read_outline(path: &Path) -> Result<Vec<OutlineNode>> {
+    PdfiumBackend::open(path, None)?.outline()
+}
+
 /// A flattened outline: title, target page and depth. Enough to prove structure and destinations
 /// survived, while ignoring destination view coordinates PDFium may normalise.
 fn outline_signature(path: &Path) -> Result<Vec<(String, Option<u32>, usize)>> {
-    let backend = PdfiumBackend::open(path, None)?;
-    let nodes = backend.outline()?;
+    let nodes = read_outline(path)?;
     let mut flattened = Vec::new();
     flatten_outline(&nodes, 0, &mut flattened);
     Ok(flattened)
+}
+
+/// A unique, human-readable group label for an appended document: its file name, with a numbered
+/// suffix only when the target outline (or an earlier group) already uses that title.
+fn appended_group_title(path: &Path, used: &mut HashSet<String>) -> String {
+    let base = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| path.display().to_string());
+    if used.insert(base.clone()) {
+        return base;
+    }
+    let mut suffix = 2u32;
+    loop {
+        let candidate = format!("{base} ({suffix})");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        suffix = suffix.saturating_add(1);
+    }
 }
 
 fn flatten_outline(
@@ -1289,7 +1369,7 @@ fn verify_outline(path: &Path, expected: &[(String, Option<u32>, usize)]) -> Res
             .unwrap_or_else(|| actual.len().min(expected.len()));
         return Err(LyraReaderError::new(
             ErrorCode::Internal,
-            "the merged document's outline does not match the first document's outline",
+            "the merged document's outline does not match the planned outline",
         )
         .with_detail(format!(
             "expected {} entr(ies), reopened {}; first difference at entry {}: expected {:?}, reopened {:?}",
@@ -2651,7 +2731,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_appends_pages_annotations_and_keeps_the_first_outline() {
+    fn merge_appends_pages_annotations_and_imports_the_appended_outline() {
         if !crate::is_available() {
             eprintln!("skipping: PDFium unavailable");
             return;
@@ -2690,7 +2770,11 @@ mod tests {
             vec![second_annotations.iter().map(Vec::len).sum::<usize>(), 0]
         );
         assert_eq!(report.first_outline_entries, first_outline.len());
-        assert_eq!(report.dropped_outline_entries, third_outline.len());
+        assert_eq!(report.appended_outline_entries, third_outline.len());
+        assert_eq!(
+            report.appended_outline_group_titles,
+            vec!["outlined-again.pdf".to_string()]
+        );
         assert_eq!(
             report.rotations,
             rotations(&merged),
@@ -2725,16 +2809,91 @@ mod tests {
         );
         assert!(merged_annotations[5].is_empty() && merged_annotations[7].is_empty());
 
-        // The first document's outline survives unchanged; the appended outline was not imported.
+        // The first document's outline survives unchanged, and the appended document's outline is
+        // one labelled group whose entries move to its pages in the merged file (offset 5).
+        let mut expected_outline = first_outline;
+        expected_outline.push(("outlined-again.pdf".to_string(), Some(5), 0));
+        for (title, page, depth) in third_outline {
+            expected_outline.push((title, page.map(|page| page + 5), depth + 1));
+        }
         assert_eq!(
             outline_signature(&merged).expect("merged outline"),
-            first_outline
+            expected_outline
         );
+        for (title, page, _) in &expected_outline {
+            if let Some(page) = page {
+                assert!(
+                    *page < 8,
+                    "the outline entry {title:?} points at page {page}, outside the merged file"
+                );
+            }
+        }
 
         // Every input is byte-identical.
         assert_eq!(fs::read(&first).expect("first after"), first_bytes);
         assert_eq!(fs::read(&second).expect("second after"), second_bytes);
         assert_eq!(fs::read(&third).expect("third after"), third_bytes);
+    }
+
+    #[test]
+    fn merge_imports_each_appended_outline_as_its_own_labelled_group() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("merge-outlines");
+        let first = copy_fixture(&directory, "outlined.pdf");
+        let second = copy_named(&directory, "outlined.pdf", "chapter-b.pdf");
+        let third = copy_named(&directory, "outlined.pdf", "chapter-c.pdf");
+        let first_outline = outline_signature(&first).expect("first outline");
+        let second_outline = outline_signature(&second).expect("second outline");
+        let third_outline = outline_signature(&third).expect("third outline");
+        let merged = directory.join("merge-outlines.pdf");
+
+        let report = merge_documents(&first, &[second.clone(), third.clone()], &merged, None)
+            .expect("merge three outlined documents");
+
+        assert_eq!(report.page_count, 9);
+        assert_eq!(report.first_page_count, 3);
+        assert_eq!(report.appended_page_counts, vec![3, 3]);
+        assert_eq!(
+            report.appended_outline_entries,
+            second_outline.len() + third_outline.len()
+        );
+        assert_eq!(
+            report.appended_outline_group_titles,
+            vec!["chapter-b.pdf".to_string(), "chapter-c.pdf".to_string()],
+            "each appended document gets its own top-level group"
+        );
+
+        let mut expected = first_outline;
+        for (label, outline, offset) in [
+            ("chapter-b.pdf", second_outline, 3u32),
+            ("chapter-c.pdf", third_outline, 6u32),
+        ] {
+            expected.push((label.to_string(), Some(offset), 0));
+            for (title, page, depth) in outline {
+                expected.push((title, page.map(|page| page + offset), depth + 1));
+            }
+        }
+        assert_eq!(
+            outline_signature(&merged).expect("merged outline"),
+            expected,
+            "the first outline is unchanged, then one group per appended document"
+        );
+        let top_level_titles: Vec<&str> = expected
+            .iter()
+            .filter(|(_, _, depth)| *depth == 0)
+            .map(|(title, _, _)| title.as_str())
+            .collect();
+        let mut unique = top_level_titles.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            top_level_titles.len(),
+            "group labels do not collide with the existing outline or each other"
+        );
     }
 
     #[test]

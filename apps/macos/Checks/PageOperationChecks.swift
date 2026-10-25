@@ -300,8 +300,8 @@ extension ReaderChecks {
         //
         // The first document has an outline and reader marks; the appended annotated.pdf
         // carries another viewer's annotations; the third document has an outline of its own,
-        // which a merge must NOT import. Every input is copied into the scratch directory, so
-        // the committed fixtures are never written.
+        // which the merge imports as one labelled top-level group after the first outline. Every
+        // input is copied into the scratch directory, so the committed fixtures are never written.
         let mergeFirst = try copyFixture("outlined.pdf", to: "merge-first.pdf")
         let mergeAnnotated = try copyFixture("annotated.pdf", to: "merge-annotated.pdf")
         let mergeThird = try copyFixture("outlined.pdf", to: "merge-third.pdf")
@@ -332,8 +332,9 @@ extension ReaderChecks {
                 "merge leaves the first document byte-identical")
         require(mergeRecordsAfter == mergeRecordsBytes,
                 "merge leaves the first document's cache byte-identical")
-        require(mergeState.statusMessage.contains("did not import 8 outline entries"),
-                "the merge message says what happened to the appended outlines")
+        require(mergeState.statusMessage.contains(
+                    "imported 8 appended outline entries as 1 group (“merge-third.pdf”)"),
+                "the merge message names the appended outline group")
         require(mergeState.statusMessage.contains("start without LyraReader marks"),
                 "the merge message says what happens to marks on appended pages")
 
@@ -354,11 +355,38 @@ extension ReaderChecks {
         require(mergedState.annotations.isEmpty,
                 "the merged file embeds marks without requiring cache records")
         try await eventually("the merged outline loads", {
-            mergedState.outline.filter { !$0.isBookmarkSubtree && $0.bookmarkID == nil }.count == 8
+            mergedState.outline.filter { !$0.isBookmarkSubtree && $0.bookmarkID == nil }.count == 17
         })
-        require(mergedState.outline.filter { $0.depth == 0 && !$0.isBookmarkSubtree }.map(\.title)
-                    == ["Chapter One", "Chapter Two", "Chapter Three"],
-                "the first document's outline survives the merge")
+        let mergedOutline = mergedState.outline
+        let authorEntries = mergedOutline.filter { !$0.isBookmarkSubtree && $0.bookmarkID == nil }
+        require(authorEntries.prefix(8).map(\.title)
+                    == ["Chapter One", "Background", "Prior work", "Chapter Two",
+                        "Method", "Detail", "Setup", "Chapter Three"],
+                "the first document's outline entries survive the merge unchanged")
+        require(mergedOutline.filter { $0.depth == 0 && !$0.isBookmarkSubtree }.map(\.title)
+                    == ["Chapter One", "Chapter Two", "Chapter Three", "merge-third.pdf"],
+                "the appended outline is one labelled top-level group after the first outline")
+        require(mergedOutline.allSatisfy { entry in
+                    entry.page.map { (0..<8).contains($0) } ?? true
+                },
+                "every outline destination points into the merged page range")
+        let groupIndex = mergedOutline.firstIndex(where: {
+            $0.depth == 0 && !$0.isBookmarkSubtree && $0.title == "merge-third.pdf"
+        })
+        require(groupIndex != nil, "the appended outline group is in the merged outline")
+        let groupEntries = groupIndex.map { index in
+            Array(mergedOutline[(index + 1)...].prefix { $0.depth > 0 })
+        } ?? []
+        require(groupEntries.count == 8,
+                "the appended document's eight entries are nested under its group")
+        require(groupEntries.map(\.title)
+                    == ["Chapter One", "Background", "Prior work", "Chapter Two",
+                        "Method", "Detail", "Setup", "Chapter Three"],
+                "the appended entries keep their titles")
+        require(groupEntries.map(\.page) == [5, 5, 6, nil, 6, 7, 7, 7],
+                "the appended entries point at their pages in the merged document")
+        require(groupEntries.map(\.depth) == [1, 2, 3, 1, 2, 3, 2, 1],
+                "the appended entries keep their nesting under the group")
         let mergedProbe = try RustEngine()
         _ = try mergedProbe.openDocument(at: merged)
         let lastFirstText = try await mergedProbe.textPage(2).text
