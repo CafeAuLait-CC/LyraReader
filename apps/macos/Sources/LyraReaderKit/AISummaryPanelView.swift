@@ -26,7 +26,8 @@ public struct AISummaryPanelView: View {
         "Each Generate sends at most \(model.bounds.maxRequestsPerBatch) requests, "
             + "\(model.bounds.maxConcurrentRequests) at a time. The abstract reads at most "
             + "\(model.bounds.abstractMaxPages) pages / "
-            + "\(model.bounds.abstractMaxChars.formatted()) characters; a section at most "
+            + "\(model.bounds.abstractMaxChars.formatted()) characters from each end of the "
+            + "document; a section at most "
             + "\(model.bounds.sectionMaxChars.formatted()) characters; a page at most "
             + "\(model.bounds.pageMaxChars.formatted()) characters."
     }
@@ -259,7 +260,7 @@ public struct AISummaryPanelView: View {
                             .font(.system(size: 9))
                             .foregroundStyle(LyraReaderTheme.errorFg)
                     } else {
-                        Text("\(unit.characters.formatted()) chars · page span \(unit.pageStart)-\(unit.coveredPageEnd)")
+                        Text("\(unit.characters.formatted()) chars · pages \(AISummaryEntry.pageRangesLabel(unit.pages.map(Int.init)))")
                             .font(.system(size: 9))
                             .foregroundStyle(LyraReaderTheme.textTertiary)
                     }

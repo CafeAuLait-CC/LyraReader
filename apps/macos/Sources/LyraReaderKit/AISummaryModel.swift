@@ -104,11 +104,15 @@ public struct AISummaryEntry: Identifiable, Equatable, Sendable {
     /// The fixed transport category when this row failed. Nil for local refusals and after a
     /// successful retry.
     public var failure: AIRequestFailure?
-    /// The honest coverage line from the builder, e.g. "Summarised from pages 1-12 of 20."
+    /// The honest coverage line from the builder, e.g. "Summarised from pages 1-12 and
+    /// 109-120 of 120."
     public var note: String?
-    /// The page actually reached when the budget cut the unit.
+    /// The last page actually sent. For an abstract that samples both ends this is the end
+    /// window's last page; `pages` lists both windows.
     public var coveredPageEnd: Int = 0
     public var truncated = false
+    /// 1-based pages actually sent, in order. A long document's abstract holds the beginning
+    /// window followed by the end window.
     public var pages: [Int] = []
     /// SHA-256 of exactly the text this unit sends; part of the cache key.
     public var textHash: String = ""
@@ -120,10 +124,33 @@ public struct AISummaryEntry: Identifiable, Equatable, Sendable {
 
     public var isLinkable: Bool { kind != .abstract }
 
-    /// "Page 3", "Pages 2-5", "Pages 1-12 (of 120)".
+    /// Collapse an ascending page list into inclusive ranges: `[1...12, 109...120]` becomes
+    /// "1-12 and 109-120". A two-window abstract has exactly two ranges; a document that fits
+    /// the windows has one.
+    public static func pageRangesLabel(_ pages: [Int]) -> String {
+        var ranges: [(start: Int, end: Int)] = []
+        for page in pages.sorted() where ranges.last?.end != page {
+            if let end = ranges.last?.end, page == end + 1 {
+                ranges[ranges.count - 1].end = page
+            } else {
+                ranges.append((start: page, end: page))
+            }
+        }
+        return ranges
+            .map { $0.start == $0.end ? "\($0.start)" : "\($0.start)-\($0.end)" }
+            .joined(separator: " and ")
+    }
+
+    /// "Page 3", "Pages 2-5", "Pages 1-12 and 109-120 of 120".
     public func pageSpanLabel(pageCount: Int) -> String {
         switch kind {
         case .abstract:
+            if !pages.isEmpty {
+                if pages.count == pageCount, pages.first == 1, pages.last == pageCount {
+                    return "All \(pageCount) pages"
+                }
+                return "Pages \(Self.pageRangesLabel(pages)) of \(pageCount)"
+            }
             let end = coveredPageEnd > 0 ? coveredPageEnd : min(pageEnd, pageCount)
             return end >= pageCount ? "All \(pageCount) pages" : "Pages 1-\(end) of \(pageCount)"
         case .sections, .pages:
@@ -142,6 +169,9 @@ public struct AISummaryEntry: Identifiable, Equatable, Sendable {
     public func pageCountLabel(documentPageCount: Int) -> String {
         switch kind {
         case .abstract:
+            if !pages.isEmpty {
+                return "\(pages.count) of \(documentPageCount) pages"
+            }
             let end = coveredPageEnd > 0 ? coveredPageEnd : min(pageEnd, documentPageCount)
             return "\(max(0, end)) of \(documentPageCount) pages"
         case .sections, .pages:
@@ -515,8 +545,10 @@ public final class LayeredSummaryModel: ObservableObject {
         let rows = entries(for: layer)
         switch layer {
         case .abstract:
-            let end = rows.first?.coveredPageEnd ?? 0
-            let bound = end > 0 ? end : min(Int(bounds.abstractMaxPages), pageCount)
+            let pages = rows.first?.pages.count ?? 0
+            let bound = pages > 0
+                ? pages
+                : min(Int(bounds.abstractMaxPages), pageCount)
             return pageCount > 0 ? "\(bound) of \(pageCount) pages" : "No pages"
         case .sections:
             guard let first = rows.first, let last = rows.last else { return "No sections" }
@@ -1025,12 +1057,9 @@ public final class LayeredSummaryModel: ObservableObject {
                     return
                 }
                 entry.textHash = hash
-                entry.note = Self.coverageNote(
-                    kind: layer,
-                    entry: entry,
-                    fingerprint: fingerprint,
-                    pageCount: pageCount
-                )
+                // The builder owns the coverage sentence: speak with one authority for fresh
+                // previews and for rows rebuilt from the cache.
+                entry.note = fingerprint.note
                 if let cached = cache?.summary(
                     layer: layer,
                     unit: id,
@@ -1063,38 +1092,6 @@ public final class LayeredSummaryModel: ObservableObject {
         cacheError = cache?.lastError
     }
 
-    /// The same coverage sentence the Rust builder writes into a fresh preview. Rebuilding it
-    /// for cached rows keeps the truncation note when a document is reopened.
-    private static func coverageNote(
-        kind: AISummaryLayer,
-        entry: AISummaryEntry,
-        fingerprint: AiSummaryFingerprintRecord,
-        pageCount: Int
-    ) -> String? {
-        let start = Int(fingerprint.coveredPageStart)
-        let end = Int(fingerprint.coveredPageEnd)
-        switch kind {
-        case .abstract:
-            if fingerprint.truncated {
-                return "Summarised from pages \(start)-\(end) of \(pageCount)."
-            }
-            return "Covers all \(pageCount) pages."
-        case .sections:
-            if fingerprint.truncated {
-                return "Summarised from pages \(start)-\(end) of the section's \(entry.pageStart)-\(entry.pageEnd)."
-            }
-            if entry.pageStart == entry.pageEnd {
-                return "Covers page \(entry.pageStart)."
-            }
-            return "Covers pages \(entry.pageStart)-\(entry.pageEnd) (\(entry.pageEnd - entry.pageStart + 1) pages)."
-        case .pages:
-            if fingerprint.truncated {
-                return "Page \(entry.pageStart) text was truncated for this request."
-            }
-            return nil
-        }
-    }
-
     private func apply(unit: AiSummaryUnitRecord, id: String, layer: AISummaryLayer) {
         fingerprints[id] = AiSummaryFingerprintRecord(
             index: unit.index,
@@ -1106,7 +1103,8 @@ public final class LayeredSummaryModel: ObservableObject {
             pages: unit.pages,
             truncated: unit.truncated,
             textHash: unit.textHash,
-            characters: unit.characters
+            characters: unit.characters,
+            note: unit.note
         )
         updateEntry(id) { entry in
             entry.note = unit.note
