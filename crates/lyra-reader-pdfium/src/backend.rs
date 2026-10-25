@@ -3,7 +3,7 @@
 //! See the crate-level docs for the task map, threading rules and library search
 //! order. Everything in this module is compiled only with `feature = "pdfium"`.
 
-use crate::annotations::AnnotationReader;
+use crate::annotations::{AnnotationPageReport, AnnotationReader};
 use lyra_reader_core::{
     DocMetadata, DocumentBackend, EmbeddedMetadata, ErrorCode, LineSegment, LinkInfo,
     LyraReaderError, OutlineNode, PageGeometry, PageIndex, PageInfo, Point, RasterFormat,
@@ -580,7 +580,11 @@ impl PdfiumBackend {
     /// The reader is opened on the first call, under the process-wide lock, and its failure is
     /// cached — a document whose annotations cannot be read reports the same error every time
     /// instead of retrying a file that is not going to change.
-    pub fn annotation_page(&self, page: PageIndex) -> Result<Vec<RawAnnotation>> {
+    /// Reads every annotation on `page`, including the ones that could not be decoded.
+    ///
+    /// The `annotations` list contains the readable records; `unreadable` names each damaged
+    /// annotation so the shell can warn and refuse writes rather than silently dropping it.
+    pub fn annotation_page_report(&self, page: PageIndex) -> Result<AnnotationPageReport> {
         let _guard = PDFIUM_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -602,13 +606,18 @@ impl PdfiumBackend {
         });
 
         match reader {
-            Ok(reader) => reader.page_locked(page),
+            Ok(reader) => reader.page_report_locked(page),
             Err(detail) => Err(LyraReaderError::new(
                 ErrorCode::BackendUnavailable,
                 "could not read the document's annotations",
             )
             .with_detail(detail.clone())),
         }
+    }
+
+    pub fn annotation_page(&self, page: PageIndex) -> Result<Vec<RawAnnotation>> {
+        self.annotation_page_report(page)
+            .map(|report| report.annotations)
     }
 
     pub fn reopen(&self) -> Result<Self> {

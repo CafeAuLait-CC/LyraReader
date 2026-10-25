@@ -989,6 +989,29 @@ fn set_string(
     Ok(())
 }
 
+/// One annotation the reader could not decode, kept for the caller instead of being dropped
+/// silently.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnreadableAnnotation {
+    /// Page the annotation sits on.
+    pub page: PageIndex,
+    /// 0-based slot in PDFium's annotation list for that page. `None` when the page itself
+    /// could not be read, so no slot exists.
+    pub slot: Option<i32>,
+    /// What failed, naming the field or dictionary pass when it can be diagnosed.
+    pub reason: String,
+}
+
+/// What one page's annotation read produced.
+///
+/// `annotations` is everything that did decode. `unreadable` is everything that did not; the
+/// caller decides how to surface it, but it must never be mistaken for "there is nothing there".
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AnnotationPageReport {
+    pub annotations: Vec<RawAnnotation>,
+    pub unreadable: Vec<UnreadableAnnotation>,
+}
+
 /// Reads annotations from one open document.
 ///
 /// Owns its own `FPDF_DOCUMENT`: PDFium has no way to hand out the handle behind the
@@ -1100,11 +1123,24 @@ impl AnnotationReader {
         let _guard = crate::backend::PDFIUM_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.page_locked(page)
+        self.page_report_locked(page)
+            .map(|report| report.annotations)
+    }
+
+    /// Every annotation on `page`, plus the ones that could not be decoded.
+    ///
+    /// This is the interface the shell uses: the successfully read records are shown, and the
+    /// unreadable ones are counted so the caller can warn and block writes instead of silently
+    /// dropping them.
+    pub fn page_report(&self, page: PageIndex) -> Result<AnnotationPageReport> {
+        let _guard = crate::backend::PDFIUM_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.page_report_locked(page)
     }
 
     /// The caller already holds `PDFIUM_LOCK` for a larger PDFium transaction.
-    pub(crate) fn page_locked(&self, page: PageIndex) -> Result<Vec<RawAnnotation>> {
+    pub(crate) fn page_report_locked(&self, page: PageIndex) -> Result<AnnotationPageReport> {
         let index = c_int::try_from(page.get()).map_err(|_| {
             LyraReaderError::new(
                 ErrorCode::InvalidArgument,
@@ -1123,7 +1159,7 @@ impl AnnotationReader {
         }
 
         let mut annotations = Vec::new();
-        let mut failure = None;
+        let mut unreadable = Vec::new();
         // SAFETY: `page_handle` is a loaded page and stays valid until `close_page` below.
         let count = unsafe { (self.api.get_annot_count)(page_handle) }.max(0);
         for slot in 0..count {
@@ -1138,26 +1174,33 @@ impl AnnotationReader {
             match result {
                 Ok(Some(annotation)) => annotations.push(annotation),
                 Ok(None) => {}
-                Err(error) => {
-                    failure = Some(error);
-                    break;
-                }
+                Err(error) => unreadable.push(UnreadableAnnotation {
+                    page,
+                    slot: Some(slot),
+                    reason: error.to_string(),
+                }),
             }
         }
         // SAFETY: the handle came from `load_page` and holds no borrowed data after this point.
         unsafe { (self.api.close_page)(page_handle) };
-        if let Some(error) = failure {
-            return Err(error);
-        }
 
-        Ok(annotations)
+        Ok(AnnotationPageReport {
+            annotations,
+            unreadable,
+        })
+    }
+
+    /// The caller already holds `PDFIUM_LOCK`; successful annotations only.
+    pub(crate) fn page_locked(&self, page: PageIndex) -> Result<Vec<RawAnnotation>> {
+        self.page_report_locked(page)
+            .map(|report| report.annotations)
     }
 
     /// Reads one annotation, or `None` when it is not content or its `/Rect` is unreadable.
     ///
     /// A failure of the second (lopdf) pass is an error: the file already opened in PDFium, so a
     /// line ending or stamp dictionary that cannot be read is not the same as "no arrowhead" or
-    /// "no stamp content".
+    /// "no stamp content". The page loop records it as unreadable instead of failing the page.
     fn read(&self, handle: FpdfAnnotation, page: PageIndex) -> Result<Option<RawAnnotation>> {
         // SAFETY: `handle` is a live annotation for the duration of `read`.
         let subtype = unsafe { (self.api.get_subtype)(handle) };
@@ -1168,7 +1211,11 @@ impl AnnotationReader {
         let mut raw_rect = FsRectF::default();
         // SAFETY: `handle` is a live annotation; `raw_rect` is a valid out-pointer.
         if unsafe { (self.api.get_rect)(handle, &mut raw_rect) } == 0 {
-            return Ok(None);
+            return Err(LyraReaderError::new(
+                ErrorCode::CorruptDocument,
+                "the annotation has no readable /Rect",
+            )
+            .with_detail(format!("page {}", page.get())));
         }
         let rect = Rect::new(
             f64::from(raw_rect.left),
@@ -1188,7 +1235,13 @@ impl AnnotationReader {
             Vec::new()
         };
         let line = if kind == RawAnnotationKind::Line {
-            self.line(handle)
+            Some(self.line(handle).ok_or_else(|| {
+                LyraReaderError::new(
+                    ErrorCode::CorruptDocument,
+                    "the /Line annotation has no readable /L segment",
+                )
+                .with_detail(format!("page {}", page.get()))
+            })?)
         } else {
             None
         };
@@ -1970,6 +2023,35 @@ mod tests {
             .err()
             .expect("a missing file must not read as 'no stamp content'");
         assert_eq!(error.code, ErrorCode::CorruptDocument);
+    }
+
+    #[test]
+    fn one_damaged_annotation_does_not_discard_the_valid_ones() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let path = crate::test_support::fixture("annotations-damaged.pdf");
+        let reader = AnnotationReader::open(&path, None).expect("open the annotation reader");
+        let report = reader
+            .page_report(PageIndex(0))
+            .expect("the page itself must stay readable");
+        let ids: Vec<&str> = report
+            .annotations
+            .iter()
+            .map(|annotation| annotation.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["nm:good1", "nm:good2"]);
+        assert_eq!(report.unreadable.len(), 1);
+        assert_eq!(report.unreadable[0].page, PageIndex(0));
+        assert_eq!(report.unreadable[0].slot, Some(2));
+        assert!(
+            report.unreadable[0].reason.contains("/L"),
+            "the reason names the unreadable field: {}",
+            report.unreadable[0].reason
+        );
+        // The old `page()` API still returns the readable half; the count is the other half.
+        assert_eq!(reader.page(PageIndex(0)).expect("readable page").len(), 2);
     }
 
     #[test]

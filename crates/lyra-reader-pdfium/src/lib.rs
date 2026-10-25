@@ -91,7 +91,8 @@ pub use annotation_edit::{
 };
 #[cfg(feature = "pdfium")]
 pub use annotations::{
-    AnnotationAppender, AnnotationReader, WriteAnnotation, WriteAnnotationKind, WriteStampImage,
+    AnnotationAppender, AnnotationPageReport, AnnotationReader, UnreadableAnnotation,
+    WriteAnnotation, WriteAnnotationKind, WriteStampImage,
 };
 #[cfg(feature = "pdfium")]
 pub use appearance_font::{AppearanceCoverage, coverage as appearance_coverage, missing_glyphs};

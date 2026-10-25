@@ -64,6 +64,16 @@ use std::time::{Duration, Instant};
 /// the page shapes alone. Captions have no such window; see [`LyraReaderDocument::figures`].
 const REFERENCE_SCAN_PAGES: u32 = 120;
 
+/// Size used only to keep the scrolling layout stable for a page PDFium could not measure.
+///
+/// This is the historical US Letter fallback. It is not reported as the page's size:
+/// [`PagePlacementRecord`] carries `None` for such a page and the shell applies its own
+/// fallback, which is the same 612 × 792 box users see today.
+const UNKNOWN_LAYOUT_PAGE_SIZE: (f64, f64) = (612.0, 792.0);
+
+/// Lazy page-size cache. Each entry is `None` when PDFium could not measure that page.
+type CachedPageSizes = Vec<Option<(f64, f64)>>;
+
 /// Errors crossing the FFI boundary (they surface as Swift `throws`).
 #[derive(Debug, uniffi::Error)]
 pub enum LyraReaderFfiError {
@@ -646,12 +656,14 @@ pub struct LyraReaderDocument {
     /// handle lives (a replacement marks the handle stale), so the status cannot change. Worker
     /// copies inherit it instead of paying for a second structural read.
     signature: lyra_reader_pdfium::SignatureStatus,
-    /// Page sizes in points, measured once when the document is opened.
+    /// Page sizes in points, measured lazily on the first layout request.
     ///
-    /// Measuring lazily meant a page PDFium could not load had to become a default US Letter
-    /// box, which made a broken document look merely small. The size pass now belongs to the
-    /// open path, so its failure reaches the caller; worker copies inherit the measured list.
-    page_sizes: Vec<(f64, f64)>,
+    /// `None` means PDFium could not measure that page. The engine must not invent a size for
+    /// it: layout still uses [`UNKNOWN_LAYOUT_PAGE_SIZE`] to keep the scrolling geometry users
+    /// already see, but placement records report the size as absent and the shell applies the
+    /// fallback explicitly. Measuring is deliberately not part of open: a 900-page document
+    /// would pay 900 PDFium page loads before its first frame.
+    page_sizes: Mutex<Option<CachedPageSizes>>,
     /// Last computed layout, keyed by the mode and page gap it was built for.
     layout: Mutex<Option<(ReaderLayout, f64, Arc<DocumentLayout>)>>,
     /// Parsed reference list, with the citation style it implies (scanning the tail pages is
@@ -663,7 +675,9 @@ pub struct LyraReaderDocument {
     /// Figure/table captions with their preview regions; same caching rule as `references`.
     figures: Mutex<Option<Vec<FigureRecord>>>,
     /// Annotations already stored in the PDF, in view space; same caching rule as `figures`.
-    annotations: Mutex<Option<Vec<AnnotationRecord>>>,
+    /// The cached scan also carries what could not be decoded, so callers cannot see the
+    /// readable half without being able to ask for the unreadable count.
+    annotations: Mutex<Option<AnnotationScanCache>>,
     /// Recognised metadata; page one does not change while the document is open.
     metadata: Mutex<Option<DocumentMetadataRecord>>,
     /// Outline, flattened once. Cheap to store and part of the cached index, so a warm open does
@@ -898,22 +912,20 @@ fn selection_only_page(selection: Option<AiSelectionRange>) -> Result<u32, LyraR
         })
 }
 
-/// Page sizes in document order, propagating the first `page_info` failure.
+/// Page sizes in document order. `None` is an explicit "PDFium could not measure this page".
 ///
-/// This used to substitute US Letter for a page PDFium could not measure. A layout built from
-/// invented sizes is wrong in a way the reader cannot see; the error is the honest answer.
-fn collect_page_sizes<F>(
-    count: u32,
-    mut page_size: F,
-) -> Result<Vec<(f64, f64)>, LyraReaderFfiError>
+/// A failed lookup must not become a fabricated US Letter size. Layout keeps the historical
+/// fallback so existing documents scroll exactly as before, but the per-page record says the
+/// size is unknown and the shell chooses the fallback on its side.
+fn collect_page_sizes<F>(count: u32, mut page_size: F) -> Vec<Option<(f64, f64)>>
 where
     F: FnMut(u32) -> Result<(f64, f64), LyraReaderFfiError>,
 {
     let mut sizes = Vec::with_capacity(count as usize);
     for index in 0..count {
-        sizes.push(page_size(index)?);
+        sizes.push(page_size(index).ok());
     }
-    Ok(sizes)
+    sizes
 }
 
 #[uniffi::export]
@@ -1029,14 +1041,24 @@ impl LyraReaderDocument {
         }
 
         let sizes = self.page_sizes();
-        let size = sizes.get(page as usize).copied().ok_or_else(|| {
-            LyraReaderFfiError::InvalidArgument {
-                message: format!(
-                    "page {page} is outside this document's {} page(s)",
-                    sizes.len()
-                ),
+        let size = match sizes.get(page as usize).copied() {
+            Some(Some(size)) => size,
+            Some(None) => {
+                return Err(LyraReaderFfiError::Document {
+                    message: format!(
+                        "page {page} has no measurable size; PDFium could not report its geometry"
+                    ),
+                });
             }
-        })?;
+            None => {
+                return Err(LyraReaderFfiError::InvalidArgument {
+                    message: format!(
+                        "page {page} is outside this document's {} page(s)",
+                        sizes.len()
+                    ),
+                });
+            }
+        };
         let scale = clamp_scale(size, scale);
 
         let mut request = RasterRequest::full_page(PageIndex(page), scale);
@@ -1080,7 +1102,7 @@ impl LyraReaderDocument {
             password: self.password.clone(),
             xfa: self.xfa.clone(),
             signature: self.signature.clone(),
-            page_sizes: self.page_sizes.clone(),
+            page_sizes: Mutex::new(None),
             layout: Mutex::new(None),
             references: Mutex::new(None),
             figures: Mutex::new(None),
@@ -1731,162 +1753,20 @@ impl LyraReaderDocument {
     /// Cached for the lifetime of the open document, like [`LyraReaderDocument::figures`]: a PDF cannot
     /// change under us while it is open, and the canvas would otherwise re-scan on every rebuild.
     ///
-    /// A page whose annotations cannot be read fails the whole call rather than quietly
-    /// disappearing from the answer — "the file has no annotations" and "we could not read them"
-    /// are different things, and the shell says so.
+    /// This returns every annotation that reads. An annotation that cannot be decoded is not a
+    /// reason to fail the document: it is counted by [`Self::annotation_read_status`] and the
+    /// shell warns and blocks rewrites around content the engine could not see.
     pub fn annotations(&self) -> Result<Vec<AnnotationRecord>, LyraReaderFfiError> {
-        if self.xfa.is_some() {
-            // The synthetic PDF is a picture of the form, not an annotation carrier. Reading the
-            // source's annotations through a handle whose page count is the rendering's would
-            // ask the original one-page file for page 2. There is nothing to offer: annotation
-            // tools are disabled for an XFA document.
-            return Ok(Vec::new());
-        }
-        if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(LyraReaderFfiError::Document {
-                message: "the document was replaced on disk; reopen it before reading annotations"
-                    .to_string(),
-            });
-        }
-        if let Ok(cache) = self.annotations.lock()
-            && let Some(cached) = cache.as_ref()
-        {
-            return Ok(cached.clone());
-        }
+        Ok(self.annotation_scan()?.0)
+    }
 
-        let mut records = Vec::new();
-        let mut geometries: std::collections::HashMap<u32, lyra_reader_core::PageGeometry> =
-            std::collections::HashMap::new();
-
-        for page in 0..self.backend.page_count() {
-            let geometry = match geometries.get(&page) {
-                Some(geometry) => *geometry,
-                None => {
-                    let geometry = self.backend.page_info(PageIndex(page))?.geometry;
-                    geometries.insert(page, geometry);
-                    geometry
-                }
-            };
-
-            for annotation in self.backend.annotations(PageIndex(page))? {
-                let view = page_region_to_view(annotation.rect, geometry);
-                // Classified before the record is built: the answer travels with the annotation
-                // rather than being re-derived by every consumer from `kind` and `visible`.
-                let drawing = annotation.drawing();
-                let quads = annotation
-                    .quads
-                    .into_iter()
-                    .map(|quad| {
-                        let view = page_region_to_view(quad, geometry);
-                        AnnotationQuad {
-                            x_pt: view.origin.x,
-                            y_pt: view.origin.y,
-                            width_pt: view.size.width,
-                            height_pt: view.size.height,
-                        }
-                    })
-                    .collect();
-                let to_view = geometry.page_to_view(1.0);
-                let ink_paths = annotation
-                    .ink_paths
-                    .iter()
-                    .map(|path| {
-                        path.iter()
-                            .map(|point| {
-                                let view = to_view.apply(*point);
-                                AnnotationPoint {
-                                    x_pt: view.x,
-                                    y_pt: view.y,
-                                }
-                            })
-                            .collect()
-                    })
-                    .collect();
-                let (line_start, line_end) = match annotation.line {
-                    Some(line) => {
-                        let start = to_view.apply(line.start);
-                        let end = to_view.apply(line.end);
-                        (
-                            Some(AnnotationPoint {
-                                x_pt: start.x,
-                                y_pt: start.y,
-                            }),
-                            Some(AnnotationPoint {
-                                x_pt: end.x,
-                                y_pt: end.y,
-                            }),
-                        )
-                    }
-                    None => (None, None),
-                };
-                let kind = if annotation.kind == lyra_reader_core::RawAnnotationKind::Line
-                    && annotation.line_arrow
-                {
-                    "arrow".to_string()
-                } else {
-                    annotation.kind.as_str().to_string()
-                };
-
-                records.push(AnnotationRecord {
-                    page,
-                    id: annotation.id,
-                    parent_id: annotation.parent_id,
-                    is_reply: annotation.is_reply,
-                    has_popup: annotation.has_popup,
-                    kind,
-                    x_pt: view.origin.x,
-                    y_pt: view.origin.y,
-                    width_pt: view.size.width,
-                    height_pt: view.size.height,
-                    quads,
-                    ink_paths,
-                    line_start,
-                    line_end,
-                    line_arrow: annotation.line_arrow,
-                    border_width_pt: annotation.border_width,
-                    color: annotation.color.map(|color| AnnotationColorRecord {
-                        red: color.red,
-                        green: color.green,
-                        blue: color.blue,
-                    }),
-                    opacity: annotation.opacity,
-                    blend: annotation.blend.as_str().to_string(),
-                    contents: annotation.contents,
-                    author: annotation.author,
-                    modified: annotation.modified,
-                    font_size_pt: annotation.font_size_pt,
-                    alignment: annotation.alignment.as_str().to_string(),
-                    stamp: annotation.stamp.as_ref().map(|stamp| StampRecord {
-                        text: stamp.text.clone(),
-                        style: stamp.style.clone(),
-                        image: stamp
-                            .image
-                            .as_ref()
-                            .map(|image| image.data.clone())
-                            .unwrap_or_default(),
-                        image_encoding: stamp
-                            .image
-                            .as_ref()
-                            .map(|image| image.encoding.as_str().to_string())
-                            .unwrap_or_default(),
-                        image_width: stamp.image.as_ref().map_or(0, |image| image.width),
-                        image_height: stamp.image.as_ref().map_or(0, |image| image.height),
-                        image_error: stamp.image_error.clone(),
-                    }),
-                    drawing: drawing.as_str().to_string(),
-                    skip_reason: match drawing {
-                        AnnotationDrawing::Skipped(reason) => Some(reason.as_str().to_string()),
-                        _ => None,
-                    },
-                    visible: annotation.visible,
-                });
-            }
-        }
-
-        if let Ok(mut cache) = self.annotations.lock() {
-            *cache = Some(records.clone());
-        }
-        Ok(records)
+    /// What the document-wide annotation read could not decode.
+    ///
+    /// Shares the cache with [`Self::annotations`], so the count and the readable records come
+    /// from exactly one scan. The shell calls this after `annotations()` and shows the count as
+    /// a one-line notice instead of failing the page.
+    pub fn annotation_read_status(&self) -> Result<AnnotationReadStatus, LyraReaderFfiError> {
+        Ok(self.annotation_scan()?.1)
     }
 
     /// The `/Rotate` of every page, in quarter turns (0–3).
@@ -2736,15 +2616,21 @@ impl LyraReaderDocument {
         gap_pt: f64,
         margin_pt: f64,
     ) -> Vec<PagePlacementRecord> {
+        // Ensure the lazy size pass has run; the placement then reports whether this page's
+        // width/height are real or unknown. Geometry still uses the historical fallback.
+        let sizes = self.page_sizes();
         self.layout(layout, gap_pt)
             .visible_pages(scroll_y_pt, viewport_height_pt, margin_pt)
             .iter()
-            .map(|page| PagePlacementRecord {
-                index: page.index,
-                top_pt: page.top_pt,
-                left_pt: page.left_pt,
-                width_pt: page.width_pt,
-                height_pt: page.height_pt,
+            .map(|page| {
+                let size = sizes.get(page.index as usize).copied().flatten();
+                PagePlacementRecord {
+                    index: page.index,
+                    top_pt: page.top_pt,
+                    left_pt: page.left_pt,
+                    width_pt: size.map(|(width, _)| width),
+                    height_pt: size.map(|(_, height)| height),
+                }
             })
             .collect()
     }
@@ -3344,6 +3230,202 @@ fn split_report(report: lyra_reader_pdfium::SplitReport) -> SplitReportRecord {
 }
 
 impl LyraReaderDocument {
+    fn annotation_scan(
+        &self,
+    ) -> Result<(Vec<AnnotationRecord>, AnnotationReadStatus), LyraReaderFfiError> {
+        if self.xfa.is_some() {
+            // The synthetic PDF is a picture of the form, not an annotation carrier. Reading the
+            // source's annotations through a handle whose page count is the rendering's would
+            // ask the original one-page file for page 2. There is nothing to offer: annotation
+            // tools are disabled for an XFA document.
+            return Ok((Vec::new(), AnnotationReadStatus::default()));
+        }
+        if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(LyraReaderFfiError::Document {
+                message: "the document was replaced on disk; reopen it before reading annotations"
+                    .to_string(),
+            });
+        }
+        if let Ok(cache) = self.annotations.lock()
+            && let Some(cached) = cache.as_ref()
+        {
+            return Ok((cached.records.clone(), cached.status.clone()));
+        }
+
+        let mut records = Vec::new();
+        let mut status = AnnotationReadStatus::default();
+        let mut geometries: std::collections::HashMap<u32, lyra_reader_core::PageGeometry> =
+            std::collections::HashMap::new();
+
+        for page in 0..self.backend.page_count() {
+            let geometry = match geometries.get(&page) {
+                Some(geometry) => *geometry,
+                None => match self.backend.page_info(PageIndex(page)) {
+                    Ok(info) => {
+                        let geometry = info.geometry;
+                        geometries.insert(page, geometry);
+                        geometry
+                    }
+                    Err(error) => {
+                        // No geometry means even the annotations that read could not be placed.
+                        // Count the page and keep the other pages readable.
+                        status.unreadable_annotations =
+                            status.unreadable_annotations.saturating_add(1);
+                        status.pages.push(page);
+                        status.details.push(format!("page {}: {error}", page + 1));
+                        continue;
+                    }
+                },
+            };
+
+            let report = match self.backend.annotation_page_report(PageIndex(page)) {
+                Ok(report) => report,
+                Err(error) => {
+                    status.unreadable_annotations = status.unreadable_annotations.saturating_add(1);
+                    status.pages.push(page);
+                    status.details.push(format!("page {}: {error}", page + 1));
+                    continue;
+                }
+            };
+            for unreadable in report.unreadable {
+                status.unreadable_annotations = status.unreadable_annotations.saturating_add(1);
+                if status.pages.last().copied() != Some(page) {
+                    status.pages.push(page);
+                }
+                let slot = unreadable
+                    .slot
+                    .map(|slot| format!(" annotation {slot}"))
+                    .unwrap_or_default();
+                status
+                    .details
+                    .push(format!("page {}{slot}: {}", page + 1, unreadable.reason));
+            }
+
+            for annotation in report.annotations {
+                let view = page_region_to_view(annotation.rect, geometry);
+                // Classified before the record is built: the answer travels with the annotation
+                // rather than being re-derived by every consumer from `kind` and `visible`.
+                let drawing = annotation.drawing();
+                let quads = annotation
+                    .quads
+                    .into_iter()
+                    .map(|quad| {
+                        let view = page_region_to_view(quad, geometry);
+                        AnnotationQuad {
+                            x_pt: view.origin.x,
+                            y_pt: view.origin.y,
+                            width_pt: view.size.width,
+                            height_pt: view.size.height,
+                        }
+                    })
+                    .collect();
+                let to_view = geometry.page_to_view(1.0);
+                let ink_paths = annotation
+                    .ink_paths
+                    .iter()
+                    .map(|path| {
+                        path.iter()
+                            .map(|point| {
+                                let view = to_view.apply(*point);
+                                AnnotationPoint {
+                                    x_pt: view.x,
+                                    y_pt: view.y,
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let (line_start, line_end) = match annotation.line {
+                    Some(line) => {
+                        let start = to_view.apply(line.start);
+                        let end = to_view.apply(line.end);
+                        (
+                            Some(AnnotationPoint {
+                                x_pt: start.x,
+                                y_pt: start.y,
+                            }),
+                            Some(AnnotationPoint {
+                                x_pt: end.x,
+                                y_pt: end.y,
+                            }),
+                        )
+                    }
+                    None => (None, None),
+                };
+                let kind = if annotation.kind == lyra_reader_core::RawAnnotationKind::Line
+                    && annotation.line_arrow
+                {
+                    "arrow".to_string()
+                } else {
+                    annotation.kind.as_str().to_string()
+                };
+
+                records.push(AnnotationRecord {
+                    page,
+                    id: annotation.id,
+                    parent_id: annotation.parent_id,
+                    is_reply: annotation.is_reply,
+                    has_popup: annotation.has_popup,
+                    kind,
+                    x_pt: view.origin.x,
+                    y_pt: view.origin.y,
+                    width_pt: view.size.width,
+                    height_pt: view.size.height,
+                    quads,
+                    ink_paths,
+                    line_start,
+                    line_end,
+                    line_arrow: annotation.line_arrow,
+                    border_width_pt: annotation.border_width,
+                    color: annotation.color.map(|color| AnnotationColorRecord {
+                        red: color.red,
+                        green: color.green,
+                        blue: color.blue,
+                    }),
+                    opacity: annotation.opacity,
+                    blend: annotation.blend.as_str().to_string(),
+                    contents: annotation.contents,
+                    author: annotation.author,
+                    modified: annotation.modified,
+                    font_size_pt: annotation.font_size_pt,
+                    alignment: annotation.alignment.as_str().to_string(),
+                    stamp: annotation.stamp.as_ref().map(|stamp| StampRecord {
+                        text: stamp.text.clone(),
+                        style: stamp.style.clone(),
+                        image: stamp
+                            .image
+                            .as_ref()
+                            .map(|image| image.data.clone())
+                            .unwrap_or_default(),
+                        image_encoding: stamp
+                            .image
+                            .as_ref()
+                            .map(|image| image.encoding.as_str().to_string())
+                            .unwrap_or_default(),
+                        image_width: stamp.image.as_ref().map_or(0, |image| image.width),
+                        image_height: stamp.image.as_ref().map_or(0, |image| image.height),
+                        image_error: stamp.image_error.clone(),
+                    }),
+                    drawing: drawing.as_str().to_string(),
+                    skip_reason: match drawing {
+                        AnnotationDrawing::Skipped(reason) => Some(reason.as_str().to_string()),
+                        _ => None,
+                    },
+                    visible: annotation.visible,
+                });
+            }
+        }
+
+        let scan = AnnotationScanCache {
+            records: records.clone(),
+            status: status.clone(),
+        };
+        if let Ok(mut cache) = self.annotations.lock() {
+            *cache = Some(scan);
+        }
+        Ok((records, status))
+    }
+
     /// The one gate for every command that would **rewrite the signed file itself**.
     ///
     /// The policy is "a signed document must not be modified", not "nothing may be derived from
@@ -3517,6 +3599,33 @@ impl LyraReaderDocument {
         Ok((text, chars))
     }
 
+    /// Refuses a rewrite when the annotation scan found content it could not decode.
+    ///
+    /// The shell has the same sentence on its copy button: rewriting around an annotation this
+    /// engine could not read would drop somebody else's content. The engine enforces it too, so
+    /// a caller that skipped the status check cannot lose the annotation.
+    fn annotation_write_gate(&self) -> Result<(), LyraReaderFfiError> {
+        let (_, status) = self.annotation_scan()?;
+        if status.unreadable_annotations == 0 {
+            return Ok(());
+        }
+        let pages = status
+            .pages
+            .iter()
+            .map(|page| (page + 1).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = format!(
+            "saving annotations is blocked because {} annotation(s) on page(s) {pages} could not be read; saving would drop them",
+            status.unreadable_annotations
+        );
+        Err(
+            lyra_reader_core::LyraReaderError::new(ErrorCode::ReadOnly, message)
+                .with_detail(status.details.join("; "))
+                .into(),
+        )
+    }
+
     // The result of merging three independent write-back features (annotations, edits/deletes,
     // bookmarks) into one verified save: one argument per record list, plus the destination,
     // zoom and mode. Splitting it would only move the same values into a struct.
@@ -3535,6 +3644,10 @@ impl LyraReaderDocument {
         // would invalidate the signature, so it is refused here; the copy is then stripped of
         // the signature material it would otherwise carry. An XFA form allows neither.
         self.ensure_not_xfa()?;
+        // A document with an annotation the reader could not decode must not be rewritten:
+        // the unknown content would be dropped. This is the engine half of the shell's
+        // "annotation writes blocked" state; it also covers callers that never read the status.
+        self.annotation_write_gate()?;
         if mode == SaveMode::ReplaceOriginal {
             self.ensure_writable()?;
         }
@@ -3989,8 +4102,13 @@ impl LyraReaderDocument {
             return Arc::clone(placements);
         }
 
+        let sizes = self.page_sizes();
         let placements = Arc::new(DocumentLayout::new_with_mode(
-            self.page_sizes.iter().copied(),
+            // Unknown pages keep the historical fallback here so existing documents scroll
+            // exactly as before. The placement record below still reports them as unknown.
+            sizes
+                .iter()
+                .map(|size| size.unwrap_or(UNKNOWN_LAYOUT_PAGE_SIZE)),
             gap_pt,
             layout.session(),
         ));
@@ -4001,9 +4119,35 @@ impl LyraReaderDocument {
         placements
     }
 
-    /// Page sizes in points, measured once by the open path.
-    fn page_sizes(&self) -> &[(f64, f64)] {
-        &self.page_sizes
+    /// Page sizes in points, measured lazily on the first layout/raster request.
+    fn page_sizes(&self) -> CachedPageSizes {
+        if let Ok(cache) = self.page_sizes.lock()
+            && let Some(sizes) = cache.as_ref()
+        {
+            return sizes.clone();
+        }
+
+        let count = self.backend.page_count();
+        let sizes = collect_page_sizes(count, |index| {
+            let info = self.backend.page_info(PageIndex(index))?;
+            let view = info.geometry.view_size(1.0);
+            Ok((view.width, view.height))
+        });
+        let unknown = sizes.iter().filter(|size| size.is_none()).count();
+        if unknown > 0 {
+            // Once per document: the size list is cached, and the fallback is applied by the
+            // shell. Logging every layout would repeat the same fact on every scroll frame.
+            eprintln!(
+                "lyra-reader-ffi: {unknown} of {count} page(s) in {} have no measurable size; \
+                 their placement records report an unknown size (layout keeps the historical fallback)",
+                self.path,
+            );
+        }
+
+        if let Ok(mut cache) = self.page_sizes.lock() {
+            *cache = Some(sizes.clone());
+        }
+        sizes
     }
 
     /// The reference list plus the citation style it implies, parsed once.
@@ -4607,6 +4751,29 @@ pub struct AnnotationRecord {
     pub skip_reason: Option<String>,
     /// False when the file marks the annotation hidden/invisible/`/NoView`.
     pub visible: bool,
+}
+
+/// What a document-wide annotation read could not decode.
+///
+/// The readable annotations are still returned by [`LyraReaderDocument::annotations`]. This
+/// record is the explicit remainder: the shell shows a one-line notice and blocks writes that
+/// would rewrite around content the engine could not see.
+#[derive(Debug, Clone, Default, PartialEq, uniffi::Record)]
+pub struct AnnotationReadStatus {
+    /// Total annotations that could not be read, across all pages.
+    pub unreadable_annotations: u32,
+    /// Pages carrying at least one unreadable annotation (0-based, document order).
+    pub pages: Vec<u32>,
+    /// Human-readable reason per unreadable annotation, naming the page, slot and field when
+    /// the reader could diagnose it.
+    pub details: Vec<String>,
+}
+
+/// The cached result of one document-wide annotation scan.
+#[derive(Clone)]
+struct AnnotationScanCache {
+    records: Vec<AnnotationRecord>,
+    status: AnnotationReadStatus,
 }
 
 /// One point of an ink stroke or a line, in view space (points, top-left origin).
@@ -5421,13 +5588,17 @@ pub struct TileBitmap {
 }
 
 /// Where one page sits in the scrolling content (mirrors `PagePlacement`).
+///
+/// `width_pt`/`height_pt` are `None` when PDFium could not measure the page. The shell applies
+/// its own fallback for those pages, so the visible geometry matches the historical US Letter
+/// box while the engine no longer reports a size it does not have.
 #[derive(Debug, Clone, Copy, uniffi::Record)]
 pub struct PagePlacementRecord {
     pub index: u32,
     pub top_pt: f64,
     pub left_pt: f64,
-    pub width_pt: f64,
-    pub height_pt: f64,
+    pub width_pt: Option<f64>,
+    pub height_pt: Option<f64>,
 }
 
 #[uniffi::export]
@@ -5520,19 +5691,15 @@ impl LyraReaderEngine {
                 backend.signature_count(),
             ),
         };
-        // Measure every page now rather than inventing US Letter for one that fails later.
-        let page_sizes = collect_page_sizes(backend.page_count(), |index| {
-            let info = backend.page_info(PageIndex(index))?;
-            let view = info.geometry.view_size(1.0);
-            Ok((view.width, view.height))
-        })?;
+        // Page sizes stay lazy: opening a 900-page document must not pay 900 page loads
+        // before the first frame. The first layout request measures them (see `page_sizes`).
         Ok(Arc::new(LyraReaderDocument {
             backend,
             path,
             password,
             xfa: xfa_state,
             signature,
-            page_sizes,
+            page_sizes: Mutex::new(None),
             layout: Mutex::new(None),
             references: Mutex::new(None),
             figures: Mutex::new(None),
@@ -6509,20 +6676,23 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_page_info_is_an_error_not_us_letter() {
-        let error = collect_page_sizes(2, |index| match index {
+    fn a_failed_page_info_is_unknown_not_us_letter() {
+        let sizes = collect_page_sizes(2, |index| match index {
             0 => Ok((612.0, 792.0)),
             _ => Err(LyraReaderFfiError::Document {
                 message: "page 2 could not be measured".to_string(),
             }),
-        })
-        .expect_err("a failed page_info must not become a default size");
-        match error {
-            LyraReaderFfiError::Document { message } => {
-                assert!(message.contains("page 2"), "{message}");
-            }
-            other => panic!("expected Document, got {other:?}"),
-        }
+        });
+        assert_eq!(
+            sizes,
+            vec![Some((612.0, 792.0)), None],
+            "a failed page_info must be reported as unknown, not as a default size"
+        );
+        assert_ne!(
+            sizes[1],
+            Some((612.0, 792.0)),
+            "US Letter must not be fabricated for an unmeasured page"
+        );
     }
 
     #[test]
@@ -6859,6 +7029,58 @@ mod tests {
     }
 
     #[test]
+    fn a_damaged_annotation_is_reported_and_blocks_saves() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/annotations-damaged.pdf");
+        if !fixture.exists() || !lyra_reader_pdfium::is_available() {
+            eprintln!("skipping: damaged-annotation fixture or PDFium unavailable");
+            return;
+        }
+
+        let engine = LyraReaderEngine::new();
+        let document = engine
+            .open_document(fixture.display().to_string(), None)
+            .expect("open fixture");
+        let annotations = document.annotations().expect("the valid annotations load");
+        assert_eq!(annotations.len(), 2, "the two valid annotations are kept");
+
+        let status = document
+            .annotation_read_status()
+            .expect("the unreadable count is available");
+        assert_eq!(status.unreadable_annotations, 1);
+        assert_eq!(status.pages, vec![0]);
+        assert!(
+            status.details.iter().any(|detail| detail.contains("/L")),
+            "the detail names the field: {:?}",
+            status.details
+        );
+        // The status is cached with the scan: asking again does not grow the count per page.
+        assert_eq!(
+            document.annotation_read_status().expect("cached status"),
+            status
+        );
+
+        let scratch = scratch("ffi-damaged-annotation");
+        let destination = scratch.join("saved.pdf");
+        let error = document
+            .save_annotations_copy(
+                destination.display().to_string(),
+                Vec::new(),
+                Vec::new(),
+                1.0,
+            )
+            .expect_err("saving around an unreadable annotation must be refused");
+        match error {
+            LyraReaderFfiError::Document { message } => {
+                assert!(message.contains("blocked"), "{message}");
+                assert!(message.contains("page(s) 1"), "{message}");
+            }
+            other => panic!("expected a document refusal, got {other:?}"),
+        }
+        assert!(!destination.exists(), "the refused save wrote a file");
+    }
+
+    #[test]
     fn annotations_already_in_the_pdf_cross_the_ffi_intact() {
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/annotated.pdf");
@@ -6872,6 +7094,14 @@ mod tests {
             .open_document(fixture.display().to_string(), None)
             .expect("open fixture");
         let records = document.annotations().expect("annotations");
+        assert_eq!(
+            document
+                .annotation_read_status()
+                .expect("healthy status")
+                .unreadable_annotations,
+            0,
+            "a fully readable fixture reports no unreadable annotations"
+        );
 
         assert_eq!(records.len(), 7, "five on page 1, two on page 2");
         assert_eq!(

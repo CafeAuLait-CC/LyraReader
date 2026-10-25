@@ -2729,4 +2729,46 @@ mod tests {
         assert!(error.message.contains("XFA"), "{error:?}");
         assert!(!destination.exists(), "a refused XFA flatten wrote a file");
     }
+
+    #[test]
+    fn an_interrupted_rewrite_build_leaves_no_partial_output() {
+        let scratch = ScratchDir::new("rewrite-interrupted");
+        let source = scratch.join("source.pdf");
+        let original = b"%PDF-1.7\nsource bytes".to_vec();
+        fs::write(&source, &original).expect("write source");
+        let destination = scratch.join("output.pdf");
+
+        let error = write_rewritten_pdf(
+            &source,
+            &destination,
+            OutputMode::Copy,
+            |file| {
+                // The build takes the production path and fails after bytes reached the
+                // temporary, exactly like a writer interrupted mid-save.
+                file.write_all(b"%PDF-1.7\npartial").expect("write partial");
+                file.flush().expect("flush partial");
+                Err(LyraReaderError::new(
+                    ErrorCode::Internal,
+                    "a deliberately interrupted build; nothing may be published",
+                ))
+            },
+            |_| panic!("verification must not run after a failed build"),
+        )
+        .expect_err("the interrupted build must fail");
+
+        assert!(error.message.contains("interrupted"), "{error:?}");
+        assert!(
+            !destination.exists(),
+            "a failed build published a partial file"
+        );
+        assert_eq!(
+            fs::read(&source).expect("source after a failed build"),
+            original,
+            "a failed build leaves the source untouched"
+        );
+        assert!(
+            crate::writeback::interrupted_save_temporaries(&destination).is_empty(),
+            "the temporary file was left behind"
+        );
+    }
 }

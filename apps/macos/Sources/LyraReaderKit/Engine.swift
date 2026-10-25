@@ -762,6 +762,32 @@ public enum AnnotationSkipReason: String, Sendable {
     case stampImageUnreadable = "stamp-image-unreadable"
 }
 
+/// The readable file-owned annotations plus what the engine could not decode.
+///
+/// A damaged annotation is not a failed read: the rest are shown, the count and pages are
+/// surfaced once, and annotation writes are blocked so the unknown content is not dropped.
+public struct DocumentAnnotationScan: Sendable {
+    public let annotations: [DocumentAnnotation]
+    public let unreadableAnnotations: Int
+    public let unreadablePages: [Int]
+    public let unreadableDetails: [String]
+
+    public init(
+        annotations: [DocumentAnnotation],
+        unreadableAnnotations: Int,
+        unreadablePages: [Int],
+        unreadableDetails: [String]
+    ) {
+        self.annotations = annotations
+        self.unreadableAnnotations = unreadableAnnotations
+        self.unreadablePages = unreadablePages
+        self.unreadableDetails = unreadableDetails
+    }
+
+    public static let empty = DocumentAnnotationScan(
+        annotations: [], unreadableAnnotations: 0, unreadablePages: [], unreadableDetails: [])
+}
+
 /// An annotation that was **already inside the PDF**, in view space (points, top-left origin).
 ///
 /// The counterpart of `AppState.Annotation`: that one is what this reader wrote and keeps in a
@@ -1721,6 +1747,8 @@ public protocol PDFEngine: AnyObject {
     /// Annotations the document **already carries** (highlights, notes, free text), from every
     /// page, in view space. Document-wide, so implementations cache it.
     func annotations() async throws -> [DocumentAnnotation]
+    /// The same annotations plus the count of damaged ones the engine could not decode.
+    func annotationScan() async throws -> DocumentAnnotationScan
     /// Writes `annotations` into a new PDF at `url`. Never touches the open document.
     func saveAnnotatedCopy(
         to url: URL,
@@ -1917,6 +1945,17 @@ public extension PDFEngine {
 
     /// Engines with no synchronous renderer let the print view show a missing-page notice.
     func renderPageForPrint(_ page: Int, scale: CGFloat) -> PageImage? { nil }
+
+    /// Test doubles have no damaged-annotation diagnostics; their readable annotations are the
+    /// whole answer.
+    func annotationScan() async throws -> DocumentAnnotationScan {
+        DocumentAnnotationScan(
+            annotations: try await annotations(),
+            unreadableAnnotations: 0,
+            unreadablePages: [],
+            unreadableDetails: []
+        )
+    }
 
     /// Test doubles do not report page sizes; the print planner falls back to page one.
     func pageSizeForPrint(_ page: Int) -> CGSize? { nil }
@@ -2618,21 +2657,33 @@ public final class RustEngine: PDFEngine {
     }
 
     public func annotations() async throws -> [DocumentAnnotation] {
-        // Document-wide and cached in Rust for the lifetime of the open document, so the shell
-        // fetches it once per document and only converts it here.
-        guard let document else { return [] }
+        try await annotationScan().annotations
+    }
 
-        let records: [AnnotationRecord] = try await withCheckedThrowingContinuation { continuation in
-            rasterQueue.async {
-                do {
-                    continuation.resume(returning: try document.annotations())
-                } catch {
-                    continuation.resume(throwing: error)
+    public func annotationScan() async throws -> DocumentAnnotationScan {
+        // Document-wide and cached in Rust for the lifetime of the open document, so the shell
+        // fetches the readable records and their unreadable count in one scan.
+        guard let document else { return .empty }
+
+        let (records, status): ([AnnotationRecord], AnnotationReadStatus) =
+            try await withCheckedThrowingContinuation { continuation in
+                rasterQueue.async {
+                    do {
+                        let records = try document.annotations()
+                        let status = try document.annotationReadStatus()
+                        continuation.resume(returning: (records, status))
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
                 }
             }
-        }
 
-        return records.map(Self.documentAnnotation(from:))
+        return DocumentAnnotationScan(
+            annotations: records.map(Self.documentAnnotation(from:)),
+            unreadableAnnotations: Int(status.unreadableAnnotations),
+            unreadablePages: status.pages.map(Int.init),
+            unreadableDetails: status.details
+        )
     }
 
     public func saveAnnotatedCopy(
@@ -3869,12 +3920,15 @@ public final class RustEngine: PDFEngine {
                 marginPt: Double(marginPt)
             )
             .map { record in
+                // The engine reports `nil` when PDFium could not measure a page. This is the
+                // shell's existing fallback (US Letter), so the visible layout is unchanged;
+                // the engine itself no longer claims that size.
                 PagePlacement(
                     index: Int(record.index),
                     topPt: CGFloat(record.topPt),
                     leftPt: CGFloat(record.leftPt),
-                    widthPt: CGFloat(record.widthPt),
-                    heightPt: CGFloat(record.heightPt)
+                    widthPt: CGFloat(record.widthPt ?? 612),
+                    heightPt: CGFloat(record.heightPt ?? 792)
                 )
             }
     }
@@ -4086,6 +4140,8 @@ public final class MockEngine: PDFEngine {
     public func captionMentions(page: Int) async throws -> [CaptionMention] { [] }
 
     public func annotations() async throws -> [DocumentAnnotation] { [] }
+
+    public func annotationScan() async throws -> DocumentAnnotationScan { .empty }
 
     public func figures() async throws -> [Figure] { [] }
 
