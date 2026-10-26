@@ -1212,52 +1212,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Whether the annotation's geometry is complete and finite.
     ///
-    /// The annotation-record encoder and the write-back path both rely on this: a mark that cannot be
-    /// drawn or written must be refused before it reaches a file, not turned into an empty
-    /// annotation on the page.
+    /// The thresholds live in `lyra-reader-edit::records::RecordAnnotation::has_valid_geometry`
+    /// and cross the FFI; this property only supplies the shell's typed record. The
+    /// annotation-record encoder and the write-back path both rely on the answer: a mark that
+    /// cannot be drawn or written must be refused before it reaches a file, not turned into an
+    /// empty annotation on the page.
     public var hasValidGeometry: Bool {
-        guard strokeWidth.isFinite, strokeWidth >= 0, strokeWidth <= 200 else { return false }
-        switch kind {
-        case .ink:
-            return !inkPaths.isEmpty && inkPaths.allSatisfy { path in
-                path.count >= 2 && path.allSatisfy { $0.x.isFinite && $0.y.isFinite }
-            }
-        case .square, .circle:
-            guard let rect = shapeRect else { return false }
-            return rect.minX.isFinite && rect.minY.isFinite
-                && rect.width.isFinite && rect.height.isFinite
-                && rect.width > 0 && rect.height > 0
-        case .line, .arrow:
-            guard let start = lineStart, let end = lineEnd else { return false }
-            return start.x.isFinite && start.y.isFinite && end.x.isFinite && end.y.isFinite
-                && hypot(end.x - start.x, end.y - start.y) > 0.01
-        case .stickyNote:
-            guard let rect = shapeRect else { return false }
-            return rect.minX.isFinite && rect.minY.isFinite
-                && rect.width.isFinite && rect.height.isFinite
-                && rect.width >= 1 && rect.height >= 1
-        case .stamp:
-            guard let rect = shapeRect else { return false }
-            return rect.minX.isFinite && rect.minY.isFinite
-                && rect.width.isFinite && rect.height.isFinite
-                && rect.width >= 12 && rect.height >= 8
-                && !note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        case .signature:
-            guard let rect = shapeRect else { return false }
-            return rect.minX.isFinite && rect.minY.isFinite
-                && rect.width.isFinite && rect.height.isFinite
-                && rect.width >= 6 && rect.height >= 6
-                && !(imageData?.isEmpty ?? true)
-        case .textBox:
-            guard let rect = shapeRect else { return false }
-            return rect.minX.isFinite && rect.minY.isFinite
-                && rect.width.isFinite && rect.height.isFinite
-                && rect.width >= Self.minimumTextBoxSize.width
-                && rect.height >= Self.minimumTextBoxSize.height
-                && fontSize.isFinite && fontSize >= 1 && fontSize <= 400
-        case .highlight, .underline, .strikeout:
-            return false
-        }
+        cachedAnnotationHasValidGeometry(annotation: AnnotationRecords.entry(self))
     }
 
     /// The page-space box the geometry occupies, for hit testing and the canvas overlay.

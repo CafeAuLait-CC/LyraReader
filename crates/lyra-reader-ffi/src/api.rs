@@ -6299,16 +6299,11 @@ fn cached_rect(rect: annotation_records::StoredRect) -> AnnotationRecordRect {
     }
 }
 
-fn edit_annotation(
+fn edit_annotation_with_kind(
     record: CachedAnnotationRecord,
-) -> Result<annotation_records::RecordAnnotation, LyraReaderFfiError> {
-    let kind = TaxonomyKind::from_record_kind(&record.kind).ok_or_else(|| {
-        LyraReaderFfiError::InvalidArgument {
-            severity: ErrorSeverity::Document,
-            message: format!("unknown annotation-cache kind {:?}", record.kind),
-        }
-    })?;
-    Ok(annotation_records::RecordAnnotation {
+    kind: TaxonomyKind,
+) -> annotation_records::RecordAnnotation {
+    annotation_records::RecordAnnotation {
         id: record.id,
         kind,
         page: record.page,
@@ -6334,7 +6329,19 @@ fn edit_annotation(
         text_alignment: record.text_alignment,
         stamp_style: record.stamp_style,
         image_data: record.image_data,
-    })
+    }
+}
+
+fn edit_annotation(
+    record: CachedAnnotationRecord,
+) -> Result<annotation_records::RecordAnnotation, LyraReaderFfiError> {
+    let kind = TaxonomyKind::from_record_kind(&record.kind).ok_or_else(|| {
+        LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
+            message: format!("unknown annotation-cache kind {:?}", record.kind),
+        }
+    })?;
+    Ok(edit_annotation_with_kind(record, kind))
 }
 
 fn cached_annotation(record: &annotation_records::RecordAnnotation) -> CachedAnnotationRecord {
@@ -6458,6 +6465,20 @@ pub fn encode_annotation_cache(
             message: error.detail,
         }
     })
+}
+
+/// Whether one cached annotation's geometry is complete and finite.
+///
+/// `RecordAnnotation::has_valid_geometry` is the one implementation; the shell's
+/// `AppState.Annotation.hasValidGeometry` calls this instead of restating the thresholds. A cache
+/// kind this build does not know has no valid geometry: the shell's display enum cannot produce
+/// one, and a future kind must be added to the table before it can be considered valid.
+#[uniffi::export]
+pub fn cached_annotation_has_valid_geometry(annotation: CachedAnnotationRecord) -> bool {
+    match TaxonomyKind::from_record_kind(&annotation.kind) {
+        Some(kind) => edit_annotation_with_kind(annotation, kind).has_valid_geometry(),
+        None => false,
+    }
 }
 
 /// The creation-time validation of one cached annotation.

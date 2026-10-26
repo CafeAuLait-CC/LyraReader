@@ -169,6 +169,15 @@ struct ReaderChecks {
             print("Annotation codec checks passed")
             return
         }
+        if CommandLine.arguments.contains("--capture-annotation-geometry-matrix") {
+            try captureAnnotationGeometryMatrix(root: fastRoot)
+            return
+        }
+        if CommandLine.arguments.contains("--check-annotation-geometry") {
+            try annotationGeometryChecks(root: fastRoot)
+            print("Annotation geometry checks passed")
+            return
+        }
         if CommandLine.arguments.contains("--capture-document-transaction-goldens") {
             try await captureDocumentTransactionGoldens(root: fastRoot)
             return
@@ -898,6 +907,9 @@ struct ReaderChecks {
             }),
             ("annotation-codec", {
                 try await annotationCodecChecks(root: root)
+            }),
+            ("annotation-geometry", {
+                try annotationGeometryChecks(root: root)
             }),
             ("annotation-colour", {
                 try await annotationColourChecks(a: a)
