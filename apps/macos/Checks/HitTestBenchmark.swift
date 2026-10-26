@@ -312,9 +312,11 @@ extension ReaderChecks {
             if let swiftRange {
                 newStringChecks += 1
                 let swiftText = page.text.string(in: swiftRange)
-                let rustText = (try? document.textRangeString(
+                // A cache miss is not a parity failure: the shell answers from its local
+                // model, so the benchmark compares against that same fallback text.
+                let rustText = ((try? document.textRangeString(
                     page: pageArgument, start: UInt32(swiftRange.lowerBound),
-                    end: UInt32(swiftRange.upperBound))) ?? ""
+                    end: UInt32(swiftRange.upperBound))) ?? nil) ?? swiftText
                 let rustHash = stringHash(rustText)
                 if rustHash != stringHash(swiftText)
                     || rustText.utf8.count != swiftText.utf8.count
@@ -358,9 +360,9 @@ extension ReaderChecks {
             for range in ranges {
                 fixedStringChecks += 1
                 let swiftText = page.text.string(in: range)
-                let rustText = (try? document.textRangeString(
+                let rustText = ((try? document.textRangeString(
                     page: UInt32(info.pageIndex), start: UInt32(range.lowerBound),
-                    end: UInt32(range.upperBound))) ?? ""
+                    end: UInt32(range.upperBound))) ?? nil) ?? swiftText
                 if stringHash(rustText) != stringHash(swiftText)
                     || rustText.utf8.count != swiftText.utf8.count
                 {

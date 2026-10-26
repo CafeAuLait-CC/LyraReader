@@ -90,8 +90,13 @@ type CachedPageSizes = Vec<Option<(f64, f64)>>;
 /// five corpus pages measured by `hit_bench` total ~858 KiB of selection geometry, so all five
 /// fit under the byte ceiling; larger pages evict oldest-first instead of exceeding it.
 const TEXT_PAGE_CACHE_MAX_ENTRIES: usize = 5;
-/// Byte ceiling for the same cache (~1.5 MiB). A page that cannot fit alone is still usable;
-/// it is simply not retained.
+/// Byte ceiling for the same cache (~1.5 MiB).
+///
+/// The ceiling is soft for exactly one case: a page whose own geometry exceeds it is retained
+/// as the cache's **only** entry. Dropping it instead would make every pointer event fall back
+/// to the Swift model and every background warm re-extract the same page, so the reader would
+/// thrash on the one page it is actually pointing at. Keeping it alone bounds the overshoot to
+/// that page, and the next page that fits drops the exception (see [`TextPageCache::insert`]).
 const TEXT_PAGE_CACHE_MAX_BYTES: usize = 3 * 512 * 1024;
 
 /// One cached page: the Swift-parity line decomposition plus the per-character Unicode
@@ -105,15 +110,18 @@ struct CachedTextPage {
 
 /// Per-document LRU of page text geometry.
 ///
-/// `loads` counts hit-test cache misses that had to extract the page through PDFium; `hits`
-/// counts cache reads. The counters exist so the regression check can prove that a second
-/// pointer event on the same page never re-enters PDFium.
+/// `loads` counts pages the loading path (`text_page`) extracted through PDFium; `hits` counts
+/// synchronous cache reads; `misses` counts synchronous lookups that found the page not
+/// prepared. The counters exist so the regression check can prove that hit-test, box→range and
+/// range→string never extract a page, and that a cache miss is a typed answer rather than an
+/// implicit PDFium read.
 #[derive(Default)]
 struct TextPageCache {
     entries: Vec<CachedTextPage>,
     tick: u64,
     loads: u64,
     hits: u64,
+    misses: u64,
     evictions: u64,
 }
 
@@ -127,19 +135,44 @@ impl TextPageCache {
         Some(Arc::clone(&entry.value))
     }
 
+    /// Whether `page` is prepared, without counting a hit or a miss.
+    fn contains(&self, page: u32) -> bool {
+        self.entries.iter().any(|entry| entry.page == page)
+    }
+
     fn insert(&mut self, page: u32, value: Arc<lyra_reader_text::SelectionTextPage>, bytes: usize) {
+        self.tick += 1;
+        let tick = self.tick;
+        self.entries.retain(|entry| entry.page != page);
         if bytes > TEXT_PAGE_CACHE_MAX_BYTES {
-            // A single page larger than the whole budget is never retained; the caller still
-            // gets the value it just built.
+            // Single-entry exception to the byte ceiling: retain this one page by itself and
+            // drop the pages it cannot share a budget with. Re-extracting it on every event is
+            // worse than keeping one page over a *soft* budget.
+            self.evictions += self.entries.len() as u64;
+            self.entries.clear();
+            self.entries.push(CachedTextPage {
+                page,
+                value,
+                bytes,
+                last_used: tick,
+            });
             return;
         }
-        self.tick += 1;
-        self.entries.retain(|entry| entry.page != page);
+        // A page that fits drops an oversized exception instead of being evicted by it, so a
+        // single huge page cannot become a permanent resident and starve ordinary pages.
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.bytes > TEXT_PAGE_CACHE_MAX_BYTES)
+        {
+            self.evictions += self.entries.len() as u64;
+            self.entries.clear();
+        }
         self.entries.push(CachedTextPage {
             page,
             value,
             bytes,
-            last_used: self.tick,
+            last_used: tick,
         });
         while self.entries.len() > TEXT_PAGE_CACHE_MAX_ENTRIES
             || self.entries.iter().map(|entry| entry.bytes).sum::<usize>()
@@ -177,14 +210,18 @@ pub struct TextPageCacheStats {
     /// Entry limit (5).
     pub max_entries: u32,
     /// Estimated retained bytes, including per-character scalars and the line decomposition.
+    /// Exceeds `max_bytes` only for the single-entry oversized-page exception.
     pub bytes: u64,
-    /// Byte ceiling (~1.5 MiB).
+    /// Byte ceiling (~1.5 MiB); soft for one above-budget page.
     pub max_bytes: u64,
-    /// Hit-test cache misses that extracted a page through PDFium.
+    /// Pages the loading path (`text_page`) extracted through PDFium.
     pub loads: u64,
-    /// Hit-test calls served from the cache.
+    /// Synchronous cache reads served without PDFium.
     pub hits: u64,
-    /// Entries removed to stay under the entry or byte limit.
+    /// Synchronous lookups that returned the typed "not prepared" answer.
+    pub misses: u64,
+    /// Entries removed to stay under the entry or byte limit, or to make room for an oversized
+    /// page's single-entry exception.
     pub evictions: u64,
     /// Retained pages, least recently used first.
     pub pages: Vec<u32>,
@@ -2033,8 +2070,12 @@ impl LyraReaderDocument {
     /// character order, not necessarily visual reading order (see `docs/03-rendering.md`).
     ///
     /// This method deliberately stays *uncached*: a caller asking for the text layer gets a
-    /// fresh read, and the build also warms the selection cache as a side effect, so the page
-    /// the shell just loaded answers its first pointer event without another PDFium read.
+    /// fresh read, and the build also prepares the selection cache as a side effect, so the
+    /// page the shell just loaded answers its first pointer event without another PDFium read.
+    ///
+    /// This is the **only** method that extracts a page for the selection cache. The
+    /// synchronous hit-test/range/string entry points below never call PDFium; on a cache miss
+    /// they return `Ok(None)` ("not prepared") and the shell answers from its own page model.
     pub fn text_page(&self, page: u32) -> Result<TextPage, LyraReaderFfiError> {
         let model = self.extract_text_page(page)?;
         let selection = Arc::new(lyra_reader_text::SelectionTextPage::new(model.clone()));
@@ -2044,9 +2085,11 @@ impl LyraReaderDocument {
 
     /// Line-aware hit test (Swift `TextPage.characterIndex`), served from the page cache.
     ///
-    /// Synchronous by design: a pointer event is one FFI call and, after the page's first
-    /// event, no PDFium read. The returned index addresses the same `chars` array as
-    /// [`LyraReaderDocument::text_page`].
+    /// Synchronous and extraction-free: a pointer event is one lock-protected lookup. `Ok(Some)`
+    /// is the answer; `Ok(None)` means the page is not prepared yet (the shell falls back to the
+    /// parity-tested Swift model and may warm the cache in the background). Real failures stay
+    /// `Err`; a miss is never dressed up as one. The returned index addresses the same `chars`
+    /// array as [`LyraReaderDocument::text_page`].
     pub fn text_character_index(
         &self,
         page: u32,
@@ -2054,7 +2097,9 @@ impl LyraReaderDocument {
         y_pt: f64,
         extending_selection: bool,
     ) -> Result<Option<u32>, LyraReaderFfiError> {
-        let page = self.selection_text_page(page)?;
+        let Some(page) = self.prepared_selection_text_page(page)? else {
+            return Ok(None);
+        };
         Ok(page
             .char_index_at(Point::new(x_pt, y_pt), extending_selection)
             .map(|index| index.0))
@@ -2062,6 +2107,7 @@ impl LyraReaderDocument {
 
     /// Box→range with Swift's acceptance rule (`TextPage.characterRange`), from the cache.
     ///
+    /// `Ok(None)` is the typed "not prepared" answer; this call never extracts a page.
     /// The result is the span from the first to the last intersecting stop; see
     /// [`lyra_reader_text::SelectionLayout::character_range`] for the cross-column caveat.
     pub fn text_character_range(
@@ -2072,7 +2118,9 @@ impl LyraReaderDocument {
         width_pt: f64,
         height_pt: f64,
     ) -> Result<Option<TextRange>, LyraReaderFfiError> {
-        let page = self.selection_text_page(page)?;
+        let Some(page) = self.prepared_selection_text_page(page)? else {
+            return Ok(None);
+        };
         Ok(page
             .character_range(lyra_reader_core::Rect::new(x_pt, y_pt, width_pt, height_pt))
             .map(|(first, last)| TextRange {
@@ -2083,6 +2131,7 @@ impl LyraReaderDocument {
 
     /// Range→string with Swift's `TextPage.string(in:)` semantics, from the cache.
     ///
+    /// `Ok(None)` is the typed "not prepared" answer; this call never extracts a page.
     /// This is the single Rust implementation the shell's copy command, annotation export and
     /// reference extraction call. Invalid Unicode scalars are dropped and the range is clamped
     /// exactly like Swift.
@@ -2091,9 +2140,24 @@ impl LyraReaderDocument {
         page: u32,
         start: u32,
         end: u32,
-    ) -> Result<String, LyraReaderFfiError> {
-        let page = self.selection_text_page(page)?;
-        Ok(page.string_in_range(start, end))
+    ) -> Result<Option<String>, LyraReaderFfiError> {
+        let Some(page) = self.prepared_selection_text_page(page)? else {
+            return Ok(None);
+        };
+        Ok(Some(page.string_in_range(start, end)))
+    }
+
+    /// Whether `page` is currently prepared in this document's selection cache.
+    ///
+    /// Cheap on purpose: one mutex lookup and no PDFium. The shell asks this after a synchronous
+    /// miss before scheduling a background `text_page` warm-up, so a legitimate no-hit on an
+    /// already prepared page does not trigger a pointless extraction.
+    pub fn text_page_prepared(&self, page: u32) -> bool {
+        self.text_pages
+            // Pure cache (immutable entries keyed by page): poisoning can only cost a miss.
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(page)
     }
 
     /// Extract the text layer inside a page-local rectangle.
@@ -2133,6 +2197,7 @@ impl LyraReaderDocument {
             max_bytes: TEXT_PAGE_CACHE_MAX_BYTES as u64,
             loads: cache.loads,
             hits: cache.hits,
+            misses: cache.misses,
             evictions: cache.evictions,
             pages: cache.pages_oldest_first(),
         }
@@ -4151,53 +4216,51 @@ impl LyraReaderDocument {
         })
     }
 
+    /// Prepares `page` and counts the PDFium extraction that produced it.
+    ///
+    /// Only [`LyraReaderDocument::text_page`] calls this; the synchronous selection entry points
+    /// deliberately cannot, so `loads` also proves that a pointer event never extracts.
     fn retain_selection_text_page(
         &self,
         page: u32,
         value: Arc<lyra_reader_text::SelectionTextPage>,
     ) {
         let bytes = value.estimated_bytes();
-        self.text_pages
-            // Pure cache (immutable entries keyed by page): poisoning can only cost a miss.
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(page, value, bytes);
-    }
-
-    /// The cache read path: a hit avoids PDFium entirely, a miss extracts the page once.
-    fn selection_text_page(
-        &self,
-        page: u32,
-    ) -> Result<Arc<lyra_reader_text::SelectionTextPage>, LyraReaderFfiError> {
-        if let Some(value) = self
+        let mut cache = self
             .text_pages
             // Pure cache (immutable entries keyed by page): poisoning can only cost a miss.
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(page)
-        {
-            return Ok(value);
-        }
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.loads += 1;
+        cache.insert(page, value, bytes);
+    }
 
-        let value = Arc::new(lyra_reader_text::SelectionTextPage::new(
-            self.extract_text_page(page)?,
-        ));
-        {
-            let mut cache = self
-                .text_pages
-                // Pure cache (immutable entries keyed by page): poisoning can only cost a miss.
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            cache.loads += 1;
-            // Another thread may have filled the page while PDFium was extracting. Keep the
-            // first value so both callers hold the same geometry.
-            if let Some(existing) = cache.get(page) {
-                return Ok(existing);
+    /// The synchronous lookup: a hit avoids PDFium entirely and a miss is a typed `Ok(None)`.
+    ///
+    /// This method never extracts. The only failure it can report is an out-of-range page,
+    /// which is an InvalidArgument rather than "not prepared"; keeping real failures as `Err`
+    /// is what lets the shell tell a missing page from a page it merely has not loaded yet.
+    fn prepared_selection_text_page(
+        &self,
+        page: u32,
+    ) -> Result<Option<Arc<lyra_reader_text::SelectionTextPage>>, LyraReaderFfiError> {
+        let page_count = self.backend.page_count();
+        lyra_reader_core::checked_page_index(page, page_count, |page| {
+            LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
+                message: lyra_reader_core::page_out_of_range_message(page, page_count),
             }
-            let bytes = value.estimated_bytes();
-            cache.insert(page, Arc::clone(&value), bytes);
+        })?;
+        let mut cache = self
+            .text_pages
+            // Pure cache (immutable entries keyed by page): poisoning can only cost a miss.
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(value) = cache.get(page) {
+            return Ok(Some(value));
         }
-        Ok(value)
+        cache.misses += 1;
+        Ok(None)
     }
 }
 

@@ -111,9 +111,9 @@ struct ReaderChecks {
                     Data("--check-text-selection-cache needs the repository root\n".utf8))
                 exit(2)
             }
-            try checkTextSelectionCache(
-                fixture: URL(fileURLWithPath: CommandLine.arguments[flag + 1])
-                    .appendingPathComponent("tests/fixtures/multipage.pdf"))
+            try await checkTextSelectionCache(
+                fixtures: URL(fileURLWithPath: CommandLine.arguments[flag + 1])
+                    .appendingPathComponent("tests/fixtures"))
             return
         }
         if let flag = CommandLine.arguments.firstIndex(of: "--check-text-selection-parity") {
@@ -1231,10 +1231,11 @@ struct ReaderChecks {
                 try await errorPresentationChecks()
             }),
             ("text-selection-cache", {
-                // The cache that makes a per-event hit test one synchronous call: second hit on
-                // the same page must not read PDFium again.
-                try checkTextSelectionCache(
-                    fixture: root.appendingPathComponent("tests/fixtures/multipage.pdf"))
+                // The cache that makes a per-event hit test one synchronous call: the three
+                // synchronous entry points never read PDFium, an evicted or oversized page
+                // answers from the local Swift model, and a miss warms the Rust cache.
+                try await checkTextSelectionCache(
+                    fixtures: root.appendingPathComponent("tests/fixtures"))
             }),
             ("text-selection-parity", {
                 // No PDF, no window: the frozen synthetic pages exercise the selection rules
