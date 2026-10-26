@@ -66,7 +66,7 @@ separate features with their own documented limits.
 | --- | --- | --- |
 | Rendering & compositing | **wgpu 30** (macOS → Metal; future Windows → DX12, Linux → Vulkan) | One GPU layer reused across all three platforms · [ADR-0003](docs/adr/0003-gpu-wgpu-shared-device.md) |
 | PDF engine | **Backend trait abstraction + PDFium as the first implementation** (BSD-3), with a slot reserved for a pure-Rust backend | The only engine that supports rendering, per-glyph text boxes, links, forms and incremental save at once · [ADR-0002](docs/adr/0002-pdf-engine-backend.md) |
-| UI | **SwiftUI + AppKit** (native macOS), with the portable layout, zoom and viewport rules in the platform-independent `lyra-reader-session` | Native look and feel, input methods and accessibility; a future shell swap reuses those rules instead of rewriting them · [ADR-0001](docs/adr/0001-native-ui-stack.md) |
+| UI | **SwiftUI + AppKit** (native macOS), with the portable layout, zoom, viewport and navigation-history rules in the platform-independent `lyra-reader-session` | Native look and feel, input methods and accessibility; a future shell swap reuses those rules instead of rewriting them · [ADR-0001](docs/adr/0001-native-ui-stack.md) |
 | Bridging | **UniFFI** (control plane) + hand-written C ABI (GPU surface/device handoff) | Generates Swift bindings automatically, supports async and callback streams · [ADR-0004](docs/adr/0004-rust-swift-ffi.md) |
 | License | This project is **MIT**; all dependencies use permissive licenses | [ADR-0005](docs/adr/0005-licensing.md) |
 | Build | Cargo workspace + SwiftPM (**Command Line Tools only**, CLT 26.3 on this machine) | Develop without a full Xcode install · [ADR-0006](docs/adr/0006-build-without-xcode.md) |
@@ -84,7 +84,7 @@ LyraReader/
 │   ├── lyra-reader-edit/              # Annotation model, page operations, forms, incremental save, page-edit transaction
 │   ├── lyra-reader-render/            # Tile pyramid, LOD, batch tile planning (cache stays in Swift, ADR-0007)
 │   ├── lyra-reader-gpu/               # wgpu device/surface/compositor, shares MTLDevice with the native layer
-│   ├── lyra-reader-session/           # Session and viewport state machine, command/event bus (platform-independent)
+│   ├── lyra-reader-session/           # Layout, zoom, viewport and navigation-history rules (platform-independent)
 │   ├── lyra-reader-ai/                # LLM provider abstraction, context building, citation index
 │   ├── lyra-reader-metadata/          # Info/XMP/first-page metadata recognition and BibTeX generation
 │   ├── lyra-reader-xfa/               # Read-only XFA rendering and form-data display
