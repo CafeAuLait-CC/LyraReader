@@ -11,9 +11,15 @@
 //! ```
 
 pub mod cache;
+pub mod plan;
 pub mod tile;
 
 pub use cache::{CacheEntry, CacheStats, TileCache};
+pub use plan::{
+    CachedTile, MAX_PREFETCH_RING_VH, MIN_PREFETCH_RING_VH, PREFETCH_RING_LADDER, PlanPage,
+    PlanRect, PlanRequest, PlannedKey, PlannedPage, PlannedTile, PriorTile, TilePlan, TilePriority,
+    plan_tiles,
+};
 pub use tile::{
     LOD_DOWNGRADE_FACTOR, LOD_UPGRADE_FACTOR, Lod, RenderPriority, RenderRequest, TileKey,
     gesture_lod, select_lod, tile_dims, visible_tiles,

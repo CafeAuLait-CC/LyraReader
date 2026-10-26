@@ -173,6 +173,22 @@ struct ReaderChecks {
             try await documentTransactionChecks(root: fastRoot)
             return
         }
+        if CommandLine.arguments.contains("--capture-tile-plan-fixtures") {
+            try await captureTilePlanFixtures(root: fastRoot)
+            return
+        }
+        if CommandLine.arguments.contains("--check-tile-plan-fixtures") {
+            try await tilePlanFixtureChecks(root: fastRoot)
+            return
+        }
+        if let flag = CommandLine.arguments.firstIndex(of: "--measure-tile-plan") {
+            let scenario = flag + 1 < CommandLine.arguments.count
+                ? CommandLine.arguments[flag + 1] : ""
+            let root = checkRoot(flag + 2 < CommandLine.arguments.count
+                ? CommandLine.arguments[flag + 2] : nil)
+            try await measureTilePlan(scenario: scenario, root: root)
+            return
+        }
         if CommandLine.arguments.contains("--check-preview-citation-card") {
             try await previewCitationCardChecks(root: fastRoot)
             return
@@ -1075,6 +1091,9 @@ struct ReaderChecks {
             }),
             ("prefetch-band", {
                 try await prefetchBandChecks(url: b)
+            }),
+            ("tile-plan-equivalence", {
+                try await tilePlanFixtureChecks(root: root)
             }),
             ("rename-compatibility", {
                 renameCompatibilityChecks()
