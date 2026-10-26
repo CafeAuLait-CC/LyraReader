@@ -89,15 +89,17 @@ pub struct ContentPage {
     pub items: Vec<ContentItem>,
 }
 
-/// Typed wire format used by the FFI and CLI. All rectangles are PDF user space.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "camelCase", deny_unknown_fields)]
+/// A content edit, in the engine's own terms. All rectangles are PDF user space.
+///
+/// The FFI's `ContentCommandRecord` is a field-for-field mirror of this enum; this type is not
+/// serialized. Keeping the conversion at the boundary means the engine never sees a command that
+/// was assembled from a JSON string.
+#[derive(Clone, Debug, PartialEq)]
 pub enum ContentCommand {
     Transform {
         revision: String,
         target: String,
         bounds: ContentBox,
-        #[serde(default)]
         rotation: f64,
     },
     ReplaceText {

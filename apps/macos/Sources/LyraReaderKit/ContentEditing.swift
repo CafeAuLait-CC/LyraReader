@@ -1,4 +1,5 @@
 import AppKit
+import LyraReaderBindings
 import SwiftUI
 
 public struct PDFContentBox: Codable, Equatable, Sendable {
@@ -24,27 +25,90 @@ public struct PDFContentPage: Codable, Equatable, Sendable {
   public var revision: String, page: Int, items: [PDFContentItem]
 }
 
-public struct PDFContentCommand: Encodable, Sendable {
-  public var action: String, revision: String
-  /// A command names its action and the revision it was built against; the remaining fields are
-  /// filled per tool. Public so the native checks can exercise a stale or malformed command.
-  public init(action: String, revision: String) {
-    self.action = action
-    self.revision = revision
+public extension ContentBoxRecord {
+  init(_ rect: CGRect) {
+    self.init(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height)
   }
-  public var target: String? = nil
-  public var bounds: PDFContentBox? = nil
-  public var rotation: Double? = nil
-  public var text: String? = nil
-  public var font: String? = nil
-  public var size: Double? = nil
-  public var colour: [UInt8]? = nil
-  public var alignment: Int? = nil
-  public var blackout: Bool? = nil
-  public var image_path: String? = nil
-  public var crop: PDFContentBox? = nil
-  public var page: Int? = nil
-  public var uri: String? = nil
+  init(_ box: PDFContentBox) {
+    self.init(x: box.x, y: box.y, width: box.width, height: box.height)
+  }
+}
+
+extension ContentCommandRecord {
+  /// The source revision this command was built against.
+  var revision: String {
+    switch self {
+    case let .transform(revision, _, _, _),
+      let .replaceText(revision, _, _, _, _, _, _, _),
+      let .insertText(revision, _, _, _, _, _, _),
+      let .delete(revision, _),
+      let .redact(revision, _, _),
+      let .insertImage(revision, _, _),
+      let .replaceImage(revision, _, _),
+      let .cropImage(revision, _, _),
+      let .setLink(revision, _, _, _, _):
+      return revision
+    }
+  }
+
+  var isReplaceText: Bool {
+    if case .replaceText = self { return true }
+    return false
+  }
+
+  /// The text draft a failed replace-text command preserves for retry.
+  var replaceTextPayload: (text: String, font: String)? {
+    guard case let .replaceText(_, _, text, _, font, _, _, _) = self else { return nil }
+    return (text, font)
+  }
+
+  /// The temporary image a staged command owns, so it can be removed after the attempt.
+  var imagePath: String? {
+    switch self {
+    case let .insertImage(_, _, path), let .replaceImage(_, _, path):
+      return path
+    default:
+      return nil
+    }
+  }
+
+  /// Rebase a command after annotations were materialised into the working copy.
+  func replacingRevision(_ revision: String) -> Self {
+    switch self {
+    case let .transform(_, target, bounds, rotation):
+      return .transform(revision: revision, target: target, bounds: bounds, rotation: rotation)
+    case let .replaceText(_, target, text, bounds, font, size, colour, alignment):
+      return .replaceText(
+        revision: revision, target: target, text: text, bounds: bounds, font: font, size: size,
+        colour: colour, alignment: alignment)
+    case let .insertText(_, text, bounds, font, size, colour, alignment):
+      return .insertText(
+        revision: revision, text: text, bounds: bounds, font: font, size: size, colour: colour,
+        alignment: alignment)
+    case let .delete(_, target):
+      return .delete(revision: revision, target: target)
+    case let .redact(_, bounds, blackout):
+      return .redact(revision: revision, bounds: bounds, blackout: blackout)
+    case let .insertImage(_, bounds, imagePath):
+      return .insertImage(revision: revision, bounds: bounds, imagePath: imagePath)
+    case let .replaceImage(_, target, imagePath):
+      return .replaceImage(revision: revision, target: target, imagePath: imagePath)
+    case let .cropImage(_, target, crop):
+      return .cropImage(revision: revision, target: target, crop: crop)
+    case let .setLink(_, target, bounds, page, uri):
+      return .setLink(
+        revision: revision, target: target, bounds: bounds, page: page, uri: uri)
+    }
+  }
+
+  /// Replace the words and font of a preserved replace-text draft.
+  func replacingText(_ text: String, font: String) -> Self {
+    guard case let .replaceText(revision, target, _, bounds, _, size, colour, alignment) = self
+    else { return self }
+    return .replaceText(
+      revision: revision, target: target, text: text, bounds: bounds, font: font, size: size,
+      colour: colour, alignment: alignment)
+  }
 }
 
 /// A redaction the Edit workspace must ask about before it stages anything.

@@ -574,8 +574,8 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     /// yet. The Edit workspace presents Cancel/Continue from this value; clearing it without
     /// staging is the Cancel path and writes nothing.
     @Published public private(set) var rasterRedactionPrompt: RasterRedactionPrompt?
-    private var pendingRasterRedaction: (command: PDFContentCommand, page: Int, label: String)?
-    private var contentRecoveryCommand: (command: PDFContentCommand, page: Int, url: URL?)?
+    private var pendingRasterRedaction: (command: ContentCommandRecord, page: Int, label: String)?
+    private var contentRecoveryCommand: (command: ContentCommandRecord, page: Int, url: URL?)?
     private var pendingContentClose: Int?
     var commitContentText: (() -> Void)?
     private var pendingWindowCloseAction: (() -> Void)?
@@ -16196,64 +16196,52 @@ extension AppState {
 
     public func transformContent(_ item: PDFContentItem, to rect: CGRect, rotation: Double = 0) {
         guard let page = contentEditPage else { return }
-        var command = PDFContentCommand(action: "transform", revision: page.revision)
-        command.target = item.id
-        command.bounds = PDFContentBox(rect)
-        command.rotation = rotation
+        let command: ContentCommandRecord
         if item.can_edit_text, abs(rotation) < 0.001,
             abs(rect.width - item.bounds.width) > 0.1 || abs(rect.height - item.bounds.height) > 0.1
         {
-            command.action = "replaceText"
-            command.rotation = nil
-            command.text = item.text
-            command.font = "Original"
-            command.size = item.size
-            command.colour = item.colour
-            command.alignment = 0
+            command = .replaceText(
+                revision: page.revision, target: item.id, text: item.text,
+                bounds: ContentBoxRecord(rect), font: "Original", size: item.size,
+                colour: Data(item.colour), alignment: 0)
+        } else {
+            command = .transform(
+                revision: page.revision, target: item.id, bounds: ContentBoxRecord(rect),
+                rotation: rotation)
         }
         stageContentEdit(command, page: page.page, label: "Move or resize \(item.kind)")
     }
 
     public func replaceContentText(
         _ item: PDFContentItem, text: String, font: String = "Original", size: Double? = nil,
-        colour: [UInt8]? = nil, alignment: Int = 0
+        colour: [UInt8]? = nil, alignment: UInt8 = 0
     ) {
         guard let page = contentEditPage else { return }
-        var command = PDFContentCommand(action: "replaceText", revision: page.revision)
-        command.target = item.id
-        command.bounds = item.bounds
-        command.text = text
-        command.font = font
-        command.size = size ?? item.size
-        command.colour = colour ?? item.colour
-        command.alignment = alignment
+        let command = ContentCommandRecord.replaceText(
+            revision: page.revision, target: item.id, text: text,
+            bounds: ContentBoxRecord(item.bounds), font: font, size: size ?? item.size,
+            colour: Data(colour ?? item.colour), alignment: alignment)
         stageContentEdit(command, page: page.page, label: "Edit page text")
     }
 
     public func insertContentText(at rect: CGRect) {
         guard let page = contentEditPage else { return }
-        var command = PDFContentCommand(action: "insertText", revision: page.revision)
-        command.bounds = PDFContentBox(rect)
-        command.text = "New text"
-        command.font = "Helvetica"
-        command.size = 12
-        command.colour = [0, 0, 0, 255]
-        command.alignment = 0
+        let command = ContentCommandRecord.insertText(
+            revision: page.revision, text: "New text", bounds: ContentBoxRecord(rect),
+            font: "Helvetica", size: 12, colour: Data([0, 0, 0, 255]), alignment: 0)
         stageContentEdit(command, page: page.page, label: "Insert page text")
     }
 
     public func deleteContent(_ item: PDFContentItem) {
         guard let page = contentEditPage else { return }
-        var command = PDFContentCommand(action: "delete", revision: page.revision)
-        command.target = item.id
+        let command = ContentCommandRecord.delete(revision: page.revision, target: item.id)
         stageContentEdit(command, page: page.page, label: "Delete \(item.kind)")
     }
 
     public func redactContent(in rect: CGRect, blackout: Bool) {
         guard let page = contentEditPage else { return }
-        var command = PDFContentCommand(action: "redact", revision: page.revision)
-        command.bounds = PDFContentBox(rect)
-        command.blackout = blackout
+        let command = ContentCommandRecord.redact(
+            revision: page.revision, bounds: ContentBoxRecord(rect), blackout: blackout)
         preflightContentRedaction(
             command, page: page.page,
             label: blackout ? "Blackout page content" : "Erase page content")
@@ -16266,7 +16254,7 @@ extension AppState {
     /// held here and ``rasterRedactionPrompt`` asks: Cancel drops the command and writes
     /// nothing; Continue stages it with the fallback allowed.
     private func preflightContentRedaction(
-        _ command: PDFContentCommand, page: Int, label: String
+        _ command: ContentCommandRecord, page: Int, label: String
     ) {
         guard rasterRedactionPrompt == nil else { return }
         guard contentTextRecovery == nil else {
@@ -16361,11 +16349,9 @@ extension AppState {
             lastError = "Choose a page inside this document."
             return
         }
-        var command = PDFContentCommand(action: "setLink", revision: snapshot.revision)
-        command.target = item?.id
-        command.bounds = PDFContentBox(bounds)
-        command.page = page
-        command.uri = uri
+        let command = ContentCommandRecord.setLink(
+            revision: snapshot.revision, target: item?.id, bounds: ContentBoxRecord(bounds),
+            page: page.map { UInt32($0) }, uri: uri)
         contentLinkDraft = nil
         stageContentEdit(
             command, page: snapshot.page, label: item == nil ? "Insert link" : "Edit link")
@@ -16386,15 +16372,22 @@ extension AppState {
             lastError = error.localizedDescription
             return
         }
-        var command = PDFContentCommand(
-            action: item == nil ? "insertImage" : "replaceImage", revision: page.revision)
-        command.target = item?.id
-        command.image_path = path.path
-        if let rect {
-            command.bounds = PDFContentBox(
-                CGRect(
-                    x: rect.minX, y: rect.minY, width: 180,
-                    height: 180 * Double(cg.height) / Double(cg.width)))
+        let command: ContentCommandRecord
+        if let item {
+            command = .replaceImage(
+                revision: page.revision, target: item.id, imagePath: path.path)
+        } else {
+            // The canvas passes the insertion point; the 180 pt width keeps the image's aspect
+            // ratio. An insert without a point cannot name a region, so the empty box is refused
+            // by the same region validation as any other invalid bounds.
+            let place = rect ?? .zero
+            command = .insertImage(
+                revision: page.revision,
+                bounds: ContentBoxRecord(
+                    CGRect(
+                        x: place.minX, y: place.minY, width: 180,
+                        height: 180 * Double(cg.height) / Double(cg.width))),
+                imagePath: path.path)
         }
         stageContentEdit(
             command, page: page.page, label: item == nil ? "Insert image" : "Replace image")
@@ -16402,9 +16395,8 @@ extension AppState {
 
     public func cropContentImage(_ item: PDFContentItem, to crop: CGRect) {
         guard let page = contentEditPage else { return }
-        var command = PDFContentCommand(action: "cropImage", revision: page.revision)
-        command.target = item.id
-        command.crop = PDFContentBox(crop)
+        let command = ContentCommandRecord.cropImage(
+            revision: page.revision, target: item.id, crop: ContentBoxRecord(crop))
         stageContentEdit(command, page: page.page, label: "Crop image")
     }
 
@@ -16440,16 +16432,16 @@ extension AppState {
     }
 
     private func preserveContentFailure(
-        _ command: PDFContentCommand, _ message: String, page: Int? = nil, url: URL? = nil
+        _ command: ContentCommandRecord, _ message: String, page: Int? = nil, url: URL? = nil
     ) {
-        if command.action == "replaceText", let text = command.text {
+        if let payload = command.replaceTextPayload {
             contentRecoveryCommand = (
                 command, page ?? contentEditPage?.page ?? currentPage - 1, url ?? document?.url
             )
-            contentTextRecovery = text
+            contentTextRecovery = payload.text
             contentEditEnabled = true
         }
-        if command.action == "replaceText" {
+        if command.isReplaceText {
             contentTextNotice = message
             statusMessage = "Text draft preserved · see the Edit sidebar"
         } else {
@@ -16461,27 +16453,20 @@ extension AppState {
         guard let pending = contentRecoveryCommand, let text = contentTextRecovery,
             let snapshot = contentEditPage
         else { return }
-        var command = pending.command
+        let command = pending.command.replacingText(text, font: font)
         guard snapshot.revision == command.revision, document?.url == pending.url else {
             lastError = "This draft belongs to an older page. Copy it before discarding the draft."
             return
         }
-        command.text = text
-        command.font = font
         contentTextRecovery = nil
         stageContentEdit(command, page: pending.page, label: "Edit page text")
     }
     public func recoverDetachedContentText(
         _ item: PDFContentItem, text: String, revision: String, page: Int, url: URL?
     ) {
-        var command = PDFContentCommand(action: "replaceText", revision: revision)
-        command.target = item.id
-        command.bounds = item.bounds
-        command.text = text
-        command.font = "Original"
-        command.size = item.size
-        command.colour = item.colour
-        command.alignment = 0
+        let command = ContentCommandRecord.replaceText(
+            revision: revision, target: item.id, text: text, bounds: ContentBoxRecord(item.bounds),
+            font: "Original", size: item.size, colour: Data(item.colour), alignment: 0)
         preserveContentFailure(
             command,
             "The page changed before this text draft was committed. Your words are preserved in the Edit sidebar.",
@@ -16582,7 +16567,7 @@ extension AppState {
     }
 
     private func stageContentEdit(
-        _ command: PDFContentCommand, page: Int, label: String, allowRaster: Bool = false
+        _ command: ContentCommandRecord, page: Int, label: String, allowRaster: Bool = false
     ) {
         guard rasterRedactionPrompt == nil else { return }
         guard contentTextRecovery == nil else {
@@ -16603,7 +16588,7 @@ extension AppState {
         contentEditTask = Task { @MainActor [weak self] in
             defer {
                 self?.contentCommandInFlight = false
-                if let path = command.image_path,
+                if let path = command.imagePath,
                     URL(fileURLWithPath: path).lastPathComponent.hasPrefix("LyraContentImage-")
                 {
                     try? FileManager.default.removeItem(atPath: path)
@@ -16620,7 +16605,8 @@ extension AppState {
     /// `allowRaster` is only true after the reader accepted ``rasterRedactionPrompt``. The
     /// engine's report, not the confirmation's prediction, decides which pages the status names.
     private func performContentStage(
-        _ command: PDFContentCommand, page: Int, label: String, allowRaster: Bool, source: URL?
+        _ command: ContentCommandRecord, page: Int, label: String, allowRaster: Bool,
+        source: URL?
     ) async -> Bool {
         guard await ensurePageEditSession(), document?.url == source else {
             preserveContentFailure(command, "Could not prepare the working copy.", page: page)
@@ -16640,7 +16626,8 @@ extension AppState {
             guard let transaction = pageEditSession?.transaction else { return false }
             try transaction.prepare(label: label, input: snapshotInput)
             if try await materializeAnnotationsInWorkingCopy() {
-                effectiveCommand.revision = try await engine.contentObjects(page: page).revision
+                effectiveCommand = effectiveCommand.replacingRevision(
+                    try await engine.contentObjects(page: page).revision)
             }
             guard var session = pageEditSession else { return false }
             pageEditBusy = true
@@ -16690,7 +16677,7 @@ extension AppState {
             pageEditPendingOperations = session.operations
             pageEditIsApplied = false
             if let recoveryError = state.recoveryError { lastError = recoveryError }
-            if command.action == "replaceText" {
+            if command.isReplaceText {
                 contentRecoveryCommand = nil
                 contentTextRecovery = nil
                 contentTextNotice = nil

@@ -1,5 +1,7 @@
 import AppKit
 import Foundation
+import enum LyraReaderBindings.ContentCommandRecord
+import struct LyraReaderBindings.ContentBoxRecord
 import LyraReaderKit
 
 extension ReaderChecks {
@@ -119,9 +121,11 @@ extension ReaderChecks {
                 "the erase leaves white paper, not a black mark (\(erasedPixel))")
 
         // ── A stale command fails and writes no revision ───────────────────────────────
-        var stale = PDFContentCommand(action: "redact", revision: "not-the-current-revision")
-        stale.bounds = PDFContentBox(CGRect(x: 10, y: 10, width: 40, height: 20))
-        stale.blackout = true
+        let stale = ContentCommandRecord.redact(
+            revision: "not-the-current-revision",
+            bounds: ContentBoxRecord(
+                x: 10, y: 10, width: 40, height: 20),
+            blackout: true)
         let failedOutput = scratch.appendingPathComponent("failed-redaction.pdf")
         do {
             try await engine.applyContentEdit(page: 0, command: stale, to: failedOutput)
