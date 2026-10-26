@@ -310,13 +310,21 @@ public struct TextPage: Sendable {
     /// Resolve the visual line before resolving x. Ink-free spaces must never make
     /// a character on a neighbouring line win merely because its x is closer.
     ///
-    /// This is a thin wrapper: an engine-loaded page asks the document's cached Rust
-    /// implementation (one synchronous call, no PDFium read after the first event); a page
-    /// built by a test or benchmark uses the Swift reference below.
+    /// This is a thin wrapper: an engine-loaded page asks the document's prepared Rust cache
+    /// with one synchronous, extraction-free call. On a miss (or on a legitimate Rust "no hit")
+    /// the Swift reference below answers immediately, and a miss also schedules a background
+    /// warm so later events can hit the Rust cache. A page built by a test or benchmark has no
+    /// `rust` handle and always uses the Swift reference.
     public func characterIndex(at point: CGPoint, extendingSelection: Bool = false) -> Int? {
-        if let rust,
-           let index = rust.characterIndex(at: point, extendingSelection: extendingSelection) {
-            return index
+        if let rust {
+            switch rust.characterIndex(at: point, extendingSelection: extendingSelection) {
+            case .some(let index):
+                if let index { return index }
+                rust.warmIfNeeded()
+            case .none:
+                // The engine could not answer; the local model is the fallback.
+                break
+            }
         }
         return localCharacterIndex(at: point, extendingSelection: extendingSelection)
     }
@@ -420,15 +428,38 @@ private struct SelectionLine: Sendable {
 /// Synchronous page-scoped access to the document's cached Rust selection implementation.
 ///
 /// The outer optional on the methods means "the engine could not answer" (for example the
-/// document handle is gone). A successful Rust `nil` is kept as `.some(nil)` so the Swift
-/// fallback does not silently replace a legitimate no-hit with a different answer.
+/// document handle is gone). A successful Rust `nil` means either "no hit" or "not prepared";
+/// both fall back to Swift's parity-tested page model, and only the miss is worth warming.
 final class TextPageRust: Sendable {
     private let document: LyraReaderDocument
     private let page: UInt32
+    /// Requests one background `text_page` warm-up. `Engine.textPage` supplies a closure that
+    /// runs it on the engine's serial raster queue and deduplicates in-flight pages.
+    private let warm: @Sendable () -> Void
 
-    init(document: LyraReaderDocument, page: UInt32) {
+    init(
+        document: LyraReaderDocument,
+        page: UInt32,
+        warm: @escaping @Sendable () -> Void
+    ) {
         self.document = document
         self.page = page
+        self.warm = warm
+    }
+
+    /// Whether the Rust cache currently holds this page. One mutex lookup; no PDFium.
+    var isPrepared: Bool {
+        document.textPagePrepared(page: page)
+    }
+
+    /// Ask for a background warm after a synchronous miss.
+    ///
+    /// A page that is already prepared (or whose warm is in flight) is left alone, so hit
+    /// testing a blank area of a prepared page cannot trigger an extraction. The pointer event
+    /// never waits for the warm; the caller answers from Swift's model immediately.
+    func warmIfNeeded() {
+        guard !isPrepared else { return }
+        warm()
     }
 
     func characterIndex(at point: CGPoint, extendingSelection: Bool) -> Int?? {
@@ -456,11 +487,43 @@ final class TextPageRust: Sendable {
         }
     }
 
-    func string(in range: ClosedRange<Int>) -> String? {
+    func string(in range: ClosedRange<Int>) -> String?? {
         guard let start = UInt32(exactly: range.lowerBound),
               let end = UInt32(exactly: range.upperBound)
-        else { return "" }
-        return try? document.textRangeString(page: page, start: start, end: end)
+        else { return nil }
+        do {
+            return .some(
+                try document.textRangeString(page: page, start: start, end: end))
+        } catch {
+            return nil
+        }
+    }
+}
+
+/// Deduplicates background text-page warm-ups per document and page.
+///
+/// Without it, every pointer event during a page's ~1 ms extraction would queue another
+/// extraction on the serial raster queue. The lock only guards the in-flight key set; no FFI
+/// call happens while it is held.
+final class TextPageWarmTracker: @unchecked Sendable {
+    private struct Key: Hashable {
+        let document: ObjectIdentifier
+        let page: UInt32
+    }
+
+    private let lock = NSLock()
+    private var warming: Set<Key> = []
+
+    func begin(document: LyraReaderDocument, page: UInt32) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return warming.insert(Key(document: ObjectIdentifier(document), page: page)).inserted
+    }
+
+    func end(document: LyraReaderDocument, page: UInt32) {
+        lock.lock()
+        defer { lock.unlock() }
+        warming.remove(Key(document: ObjectIdentifier(document), page: page))
     }
 }
 
@@ -2320,6 +2383,8 @@ public final class RustEngine: PDFEngine {
     /// Serialises PDFium: the library is not thread-safe, so rasterizations run one at a
     /// time on a dedicated queue and never on the main thread.
     private let rasterQueue = DispatchQueue(label: "com.lyrareader.raster", qos: .userInitiated)
+    /// In-flight background selection-cache warm-ups; see `TextPageRust.warmIfNeeded`.
+    private let textPageWarms = TextPageWarmTracker()
     /// The document's caption index. `figures()` walks up to 120 pages, so it is fetched
     /// once per open document (the caption set cannot change while the file is open) and
     /// dropped by `openDocument` — the same lifetime the Rust side gives its own cache.
@@ -2332,6 +2397,15 @@ public final class RustEngine: PDFEngine {
 
     public var version: String {
         "\(engine.version()) · \(engine.backend()) · \(engine.rasterThreads()) raster threads"
+    }
+
+    /// Diagnostic counters for the active document's selection cache.
+    ///
+    /// The checks use this to prove that a pointer query on an evicted page answered from the
+    /// Swift fallback and then warmed the Rust cache in the background. `nil` before a document
+    /// is open. Not used by the reader UI.
+    public func textPageCacheStats() -> LyraReaderBindings.TextPageCacheStats? {
+        document?.textPageCacheStats()
     }
 
     public func openDocument(at url: URL) throws -> LoadedDocument {
@@ -2575,9 +2649,21 @@ public final class RustEngine: PDFEngine {
         }
 
         return try await withCheckedThrowingContinuation { continuation in
+            let pageID = UInt32(page)
+            let warmQueue = rasterQueue
+            let warms = textPageWarms
+            let rust = TextPageRust(document: document, page: pageID) {
+                guard warms.begin(document: document, page: pageID) else { return }
+                warmQueue.async {
+                    defer { warms.end(document: document, page: pageID) }
+                    // The pointer event already answered from Swift's model, so a failed warm
+                    // only means the next event takes the same fallback again.
+                    _ = try? document.textPage(page: pageID)
+                }
+            }
             rasterQueue.async {
                 do {
-                    let extracted = try document.textPage(page: UInt32(page))
+                    let extracted = try document.textPage(page: pageID)
                     continuation.resume(
                         returning: TextPage(
                             page: page,
@@ -2592,7 +2678,7 @@ public final class RustEngine: PDFEngine {
                             },
                             text: extracted.text,
                             hasUnicodeMapError: extracted.hasUnicodeMapError,
-                            rust: TextPageRust(document: document, page: UInt32(page))
+                            rust: rust
                         )
                     )
                 } catch {
@@ -4297,12 +4383,19 @@ extension TextPage {
     /// The text those characters spell, with the same Unicode-scalar mapping the engine uses.
     /// Empty when the range is empty or contains no decodable scalar.
     ///
-    /// Thin wrapper over the cached Rust implementation for engine-loaded pages. This is the
-    /// **one** range→string entry point; `copySelection` and the annotation export call it
-    /// instead of decoding `chars` themselves.
+    /// Thin wrapper over the cached Rust implementation for engine-loaded pages. Rust answers
+    /// only from its prepared cache; a miss falls back to the Swift reference immediately and
+    /// schedules a background warm. This is the **one** range→string entry point;
+    /// `copySelection` and the annotation export call it instead of decoding `chars` themselves.
     public func string(in range: ClosedRange<Int>) -> String {
-        if let rust, let text = rust.string(in: range) {
-            return text
+        if let rust {
+            switch rust.string(in: range) {
+            case .some(let text):
+                if let text { return text }
+                rust.warmIfNeeded()
+            case .none:
+                break
+            }
         }
         return localString(in: range)
     }
@@ -4322,10 +4415,16 @@ extension TextPage {
     /// or over a page whose text layer could not be read.
     ///
     /// Thin wrapper over the cached Rust implementation for engine-loaded pages; see
-    /// ``characterIndex(at:extendingSelection:)``.
+    /// ``characterIndex(at:extendingSelection:)`` for the miss fallback and background warm.
     public func characterRange(in rect: CGRect) -> ClosedRange<Int>? {
-        if let rust, let range = rust.characterRange(in: rect) {
-            return range
+        if let rust {
+            switch rust.characterRange(in: rect) {
+            case .some(let range):
+                if let range { return range }
+                rust.warmIfNeeded()
+            case .none:
+                break
+            }
         }
         return localCharacterRange(in: rect)
     }
