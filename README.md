@@ -90,7 +90,7 @@ LyraReader/
 │   ├── lyra-reader-xfa/               # Read-only XFA rendering and form-data display
 │   ├── lyra-reader-ffi/               # UniFFI interface definitions + C ABI exports
 │   └── lyra-reader-cli/               # Headless CLI: render/text/metadata/benchmarks (also the golden test entry point)
-├── apps/macos/                 # SwiftPM package: LyraReaderKit (UI library) + LyraReader (executable app)
+├── apps/macos/                 # SwiftPM package: LyraReaderKit (UI library) + LyraReader (app) + LyraReaderChecks (native regression runner)
 ├── scripts/                    # Build, packaging, PDFium fetch and check scripts
 ├── docs/                       # Design and planning documents (see below)
 └── vendor/                     # Third-party binaries (pdfium, git-ignored)
