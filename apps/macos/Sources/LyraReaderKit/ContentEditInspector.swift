@@ -6,7 +6,7 @@ struct ContentEditInspector: View {
     @ObservedObject var state: AppState
     @State private var font = "Original"
     @State private var size = 12.0
-    @State private var alignment = 0
+    @State private var alignment: UInt8 = 0
     @State private var colour = Color.black
     @State private var x = 0.0
     @State private var y = 0.0
@@ -159,9 +159,9 @@ struct ContentEditInspector: View {
                     .labelsHidden().frame(maxWidth: .infinity)
                 number("Size (pt)", $size)
                 Picker("Alignment", selection: $alignment) {
-                    Image(systemName: "text.alignleft").tag(0)
-                    Image(systemName: "text.aligncenter").tag(1)
-                    Image(systemName: "text.alignright").tag(2)
+                    Image(systemName: "text.alignleft").tag(UInt8(0))
+                    Image(systemName: "text.aligncenter").tag(UInt8(1))
+                    Image(systemName: "text.alignright").tag(UInt8(2))
                 }.pickerStyle(.segmented)
                 ColorPicker("Text Color", selection: $colour, supportsOpacity: false).font(.system(size: 12))
                 Button("Apply Text Style") {

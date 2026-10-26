@@ -7,6 +7,7 @@
 //! Run with:
 //!   LYRA_READER_XFA_SAMPLE=~/Downloads/xml_form.pdf cargo test -p lyra-reader-ffi --test xfa_readonly -- --nocapture
 
+use lyra_reader_ffi::api::{ContentBoxRecord, ContentCommandRecord};
 use lyra_reader_ffi::{LyraReaderDocument, LyraReaderEngine, LyraReaderFfiError};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -222,11 +223,37 @@ fn xfa_form_is_detected_rendered_five_pages_and_read_only() {
                 .map(|_| ()),
         ),
     );
+    // The XFA refusal happens before the command payload is inspected, so these unchecked
+    // values only need to be well-formed types; the test is that every write path refuses.
+    let insert_text = ContentCommandRecord::InsertText {
+        revision: "x".into(),
+        text: "x".into(),
+        bounds: ContentBoxRecord {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        },
+        font: "Helvetica".into(),
+        size: 12.0,
+        colour: vec![0, 0, 0, 255],
+        alignment: 0,
+    };
+    let redact = ContentCommandRecord::Redact {
+        revision: "x".into(),
+        bounds: ContentBoxRecord {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        },
+        blackout: true,
+    };
     expect_read_only(
         "apply_content_edit",
         read_only(
             document
-                .apply_content_edit(0, "{\"kind\":\"insert_text\"}".to_string(), dest())
+                .apply_content_edit(0, insert_text.clone(), dest())
                 .map(|_| ()),
         ),
     );
@@ -234,11 +261,7 @@ fn xfa_form_is_detected_rendered_five_pages_and_read_only() {
         "content_redaction_raster_pages",
         read_only(
             document
-                .content_redaction_raster_pages(
-                    0,
-                    "{\"action\":\"redact\",\"revision\":\"x\",\"bounds\":{\"x\":0,\"y\":0,\"width\":1,\"height\":1},\"blackout\":true}"
-                        .to_string(),
-                )
+                .content_redaction_raster_pages(0, redact)
                 .map(|_| ()),
         ),
     );
@@ -246,11 +269,7 @@ fn xfa_form_is_detected_rendered_five_pages_and_read_only() {
         "apply_content_edit_allowing_raster",
         read_only(
             document
-                .apply_content_edit_allowing_raster(
-                    0,
-                    "{\"kind\":\"insert_text\"}".to_string(),
-                    dest(),
-                )
+                .apply_content_edit_allowing_raster(0, insert_text, dest())
                 .map(|_| ()),
         ),
     );

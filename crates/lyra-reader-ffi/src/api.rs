@@ -1562,7 +1562,7 @@ impl Default for IndexRuntime {
     }
 }
 
-/// Decodes a content command and converts its view-space rectangle to PDF user space.
+/// Converts a typed content command and its view-space rectangle to PDF user space.
 ///
 /// Shared by the staging methods so the pre-flight and the write it confirms address exactly the
 /// same region, including rotated and cropped pages. A free function (not a method) so UniFFI's
@@ -1570,7 +1570,7 @@ impl Default for IndexRuntime {
 fn prepare_content_command(
     document: &LyraReaderDocument,
     page: u32,
-    command: String,
+    command: ContentCommandRecord,
 ) -> Result<lyra_reader_pdfium::content_edit::ContentCommand, LyraReaderFfiError> {
     use lyra_reader_pdfium::content_edit::ContentCommand;
     document.ensure_not_xfa()?;
@@ -1582,11 +1582,9 @@ fn prepare_content_command(
             message: "Reopen an unencrypted document before editing its contents.".into(),
         });
     }
-    let mut command: ContentCommand =
-        serde_json::from_str(&command).map_err(|e| LyraReaderFfiError::InvalidArgument {
-            severity: ErrorSeverity::Document,
-            message: e.to_string(),
-        })?;
+    // Convert after the read-only pre-flight: a refused document keeps its exact refusal even if
+    // the (unused) command payload is malformed.
+    let mut command = content_command(command)?;
     let transform = document
         .backend
         .page_info(PageIndex(page))?
@@ -2666,7 +2664,7 @@ impl LyraReaderDocument {
     pub fn apply_content_edit(
         &self,
         page: u32,
-        command: String,
+        command: ContentCommandRecord,
         destination: String,
     ) -> Result<(), LyraReaderFfiError> {
         let command = prepare_content_command(self, page, command)?;
@@ -2688,7 +2686,7 @@ impl LyraReaderDocument {
     pub fn content_redaction_raster_pages(
         &self,
         page: u32,
-        command: String,
+        command: ContentCommandRecord,
     ) -> Result<Vec<u32>, LyraReaderFfiError> {
         let command = prepare_content_command(self, page, command)?;
         Ok(
@@ -2707,7 +2705,7 @@ impl LyraReaderDocument {
     pub fn apply_content_edit_allowing_raster(
         &self,
         page: u32,
-        command: String,
+        command: ContentCommandRecord,
         destination: String,
     ) -> Result<Vec<u32>, LyraReaderFfiError> {
         let command = prepare_content_command(self, page, command)?;
@@ -6590,6 +6588,220 @@ pub struct AnnotationSaveReport {
     pub full_rewrite: bool,
 }
 
+/// A rectangle used by a content command.
+///
+/// `bounds` arrives in the shell's top-left view space; [`prepare_content_command`] converts it
+/// with the open page's own geometry before the engine sees it. `crop` is the exception: it is a
+/// normalized fraction of the image and is already independent of page space.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct ContentBoxRecord {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl From<ContentBoxRecord> for lyra_reader_pdfium::content_edit::ContentBox {
+    fn from(value: ContentBoxRecord) -> Self {
+        Self {
+            x: value.x,
+            y: value.y,
+            width: value.width,
+            height: value.height,
+        }
+    }
+}
+
+/// The shell's request to edit page content.
+///
+/// This is a typed, field-for-field mirror of [`lyra_reader_pdfium::content_edit::ContentCommand`].
+/// Every variant carries the source revision it was built against; the engine refuses a command
+/// whose revision does not match the page it inspected. `colour` is RGBA with four components,
+/// validated by [`content_command`] because UniFFI has no fixed-length array type. `alignment`
+/// stays the engine's integer form (0 left, 1 centre, 2 right), validated by the layout writer.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum ContentCommandRecord {
+    Transform {
+        revision: String,
+        target: String,
+        bounds: ContentBoxRecord,
+        /// Clockwise degrees in the shell's Y-down view space; the FFI negates it for PDF Y-up.
+        rotation: f64,
+    },
+    ReplaceText {
+        revision: String,
+        target: String,
+        text: String,
+        bounds: ContentBoxRecord,
+        font: String,
+        size: f64,
+        colour: Vec<u8>,
+        alignment: u8,
+    },
+    InsertText {
+        revision: String,
+        text: String,
+        bounds: ContentBoxRecord,
+        font: String,
+        size: f64,
+        colour: Vec<u8>,
+        alignment: u8,
+    },
+    Delete {
+        revision: String,
+        target: String,
+    },
+    Redact {
+        revision: String,
+        bounds: ContentBoxRecord,
+        blackout: bool,
+    },
+    InsertImage {
+        revision: String,
+        bounds: ContentBoxRecord,
+        image_path: String,
+    },
+    ReplaceImage {
+        revision: String,
+        target: String,
+        image_path: String,
+    },
+    CropImage {
+        revision: String,
+        target: String,
+        crop: ContentBoxRecord,
+    },
+    SetLink {
+        revision: String,
+        target: Option<String>,
+        bounds: ContentBoxRecord,
+        page: Option<u32>,
+        uri: Option<String>,
+    },
+}
+
+/// Converts the typed shell request into the engine command.
+///
+/// The only structural check left is the colour length; everything else (revision, geometry,
+/// text style, target identity) is validated by the engine with the same sentences as before.
+fn content_command(
+    record: ContentCommandRecord,
+) -> Result<lyra_reader_pdfium::content_edit::ContentCommand, LyraReaderFfiError> {
+    use lyra_reader_pdfium::content_edit::ContentCommand;
+    fn colour(value: Vec<u8>) -> Result<[u8; 4], LyraReaderFfiError> {
+        value
+            .try_into()
+            .map_err(|value: Vec<u8>| LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
+                message: format!(
+                    "The text colour must have exactly four components (red, green, blue, alpha); got {}.",
+                    value.len()
+                ),
+            })
+    }
+    Ok(match record {
+        ContentCommandRecord::Transform {
+            revision,
+            target,
+            bounds,
+            rotation,
+        } => ContentCommand::Transform {
+            revision,
+            target,
+            bounds: bounds.into(),
+            rotation,
+        },
+        ContentCommandRecord::ReplaceText {
+            revision,
+            target,
+            text,
+            bounds,
+            font,
+            size,
+            colour: value,
+            alignment,
+        } => ContentCommand::ReplaceText {
+            revision,
+            target,
+            text,
+            bounds: bounds.into(),
+            font,
+            size,
+            colour: colour(value)?,
+            alignment,
+        },
+        ContentCommandRecord::InsertText {
+            revision,
+            text,
+            bounds,
+            font,
+            size,
+            colour: value,
+            alignment,
+        } => ContentCommand::InsertText {
+            revision,
+            text,
+            bounds: bounds.into(),
+            font,
+            size,
+            colour: colour(value)?,
+            alignment,
+        },
+        ContentCommandRecord::Delete { revision, target } => {
+            ContentCommand::Delete { revision, target }
+        }
+        ContentCommandRecord::Redact {
+            revision,
+            bounds,
+            blackout,
+        } => ContentCommand::Redact {
+            revision,
+            bounds: bounds.into(),
+            blackout,
+        },
+        ContentCommandRecord::InsertImage {
+            revision,
+            bounds,
+            image_path,
+        } => ContentCommand::InsertImage {
+            revision,
+            bounds: bounds.into(),
+            image_path,
+        },
+        ContentCommandRecord::ReplaceImage {
+            revision,
+            target,
+            image_path,
+        } => ContentCommand::ReplaceImage {
+            revision,
+            target,
+            image_path,
+        },
+        ContentCommandRecord::CropImage {
+            revision,
+            target,
+            crop,
+        } => ContentCommand::CropImage {
+            revision,
+            target,
+            crop: crop.into(),
+        },
+        ContentCommandRecord::SetLink {
+            revision,
+            target,
+            bounds,
+            page,
+            uri,
+        } => ContentCommand::SetLink {
+            revision,
+            target,
+            bounds: bounds.into(),
+            page,
+            uri,
+        },
+    })
+}
+
 /// A destructive-ish page operation requested by the shell.
 ///
 /// Every variant operates on a copy; the source path is this document's file. Page numbers are
@@ -10087,6 +10299,260 @@ mod ai_code_tests {
                 assert_eq!(message, "The stream took too long.");
             }
             other => panic!("expected an AI error, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod content_command_tests {
+    use super::*;
+    use lyra_reader_pdfium::content_edit::{ContentBox, ContentCommand};
+
+    fn revision() -> String {
+        "sha256:the-page-revision".into()
+    }
+
+    /// Every typed variant must produce exactly the engine variant and payload it replaced.
+    ///
+    /// The expected values are written literally rather than round-tripped through the record, so
+    /// a renamed, dropped or added field fails here even when the conversion itself was updated
+    /// consistently.
+    #[test]
+    fn every_content_command_record_maps_to_its_engine_command() {
+        let bounds = ContentBoxRecord {
+            x: 12.5,
+            y: -3.25,
+            width: 40.0,
+            height: 18.0,
+        };
+        let crop = ContentBoxRecord {
+            x: 0.1,
+            y: 0.2,
+            width: 0.3,
+            height: 0.4,
+        };
+        let cases: Vec<(ContentCommandRecord, ContentCommand)> = vec![
+            (
+                ContentCommandRecord::Transform {
+                    revision: revision(),
+                    target: "1.2".into(),
+                    bounds,
+                    rotation: 12.5,
+                },
+                ContentCommand::Transform {
+                    revision: revision(),
+                    target: "1.2".into(),
+                    bounds: ContentBox {
+                        x: 12.5,
+                        y: -3.25,
+                        width: 40.0,
+                        height: 18.0,
+                    },
+                    rotation: 12.5,
+                },
+            ),
+            (
+                ContentCommandRecord::ReplaceText {
+                    revision: revision(),
+                    target: "2".into(),
+                    text: "new words".into(),
+                    bounds,
+                    font: "Helvetica".into(),
+                    size: 11.5,
+                    colour: vec![10, 20, 30, 40],
+                    alignment: 2,
+                },
+                ContentCommand::ReplaceText {
+                    revision: revision(),
+                    target: "2".into(),
+                    text: "new words".into(),
+                    bounds: ContentBox {
+                        x: 12.5,
+                        y: -3.25,
+                        width: 40.0,
+                        height: 18.0,
+                    },
+                    font: "Helvetica".into(),
+                    size: 11.5,
+                    colour: [10, 20, 30, 40],
+                    alignment: 2,
+                },
+            ),
+            (
+                ContentCommandRecord::InsertText {
+                    revision: revision(),
+                    text: "inserted".into(),
+                    bounds,
+                    font: "Original".into(),
+                    size: 9.0,
+                    colour: vec![0, 0, 0, 255],
+                    alignment: 0,
+                },
+                ContentCommand::InsertText {
+                    revision: revision(),
+                    text: "inserted".into(),
+                    bounds: ContentBox {
+                        x: 12.5,
+                        y: -3.25,
+                        width: 40.0,
+                        height: 18.0,
+                    },
+                    font: "Original".into(),
+                    size: 9.0,
+                    colour: [0, 0, 0, 255],
+                    alignment: 0,
+                },
+            ),
+            (
+                ContentCommandRecord::Delete {
+                    revision: revision(),
+                    target: "3.1".into(),
+                },
+                ContentCommand::Delete {
+                    revision: revision(),
+                    target: "3.1".into(),
+                },
+            ),
+            (
+                ContentCommandRecord::Redact {
+                    revision: revision(),
+                    bounds,
+                    blackout: true,
+                },
+                ContentCommand::Redact {
+                    revision: revision(),
+                    bounds: ContentBox {
+                        x: 12.5,
+                        y: -3.25,
+                        width: 40.0,
+                        height: 18.0,
+                    },
+                    blackout: true,
+                },
+            ),
+            (
+                ContentCommandRecord::InsertImage {
+                    revision: revision(),
+                    bounds,
+                    image_path: "/tmp/insert.png".into(),
+                },
+                ContentCommand::InsertImage {
+                    revision: revision(),
+                    bounds: ContentBox {
+                        x: 12.5,
+                        y: -3.25,
+                        width: 40.0,
+                        height: 18.0,
+                    },
+                    image_path: "/tmp/insert.png".into(),
+                },
+            ),
+            (
+                ContentCommandRecord::ReplaceImage {
+                    revision: revision(),
+                    target: "4".into(),
+                    image_path: "/tmp/replace.png".into(),
+                },
+                ContentCommand::ReplaceImage {
+                    revision: revision(),
+                    target: "4".into(),
+                    image_path: "/tmp/replace.png".into(),
+                },
+            ),
+            (
+                ContentCommandRecord::CropImage {
+                    revision: revision(),
+                    target: "5".into(),
+                    crop,
+                },
+                ContentCommand::CropImage {
+                    revision: revision(),
+                    target: "5".into(),
+                    crop: ContentBox {
+                        x: 0.1,
+                        y: 0.2,
+                        width: 0.3,
+                        height: 0.4,
+                    },
+                },
+            ),
+            (
+                ContentCommandRecord::SetLink {
+                    revision: revision(),
+                    target: Some("6".into()),
+                    bounds,
+                    page: Some(7),
+                    uri: Some("https://example.test/".into()),
+                },
+                ContentCommand::SetLink {
+                    revision: revision(),
+                    target: Some("6".into()),
+                    bounds: ContentBox {
+                        x: 12.5,
+                        y: -3.25,
+                        width: 40.0,
+                        height: 18.0,
+                    },
+                    page: Some(7),
+                    uri: Some("https://example.test/".into()),
+                },
+            ),
+            (
+                ContentCommandRecord::SetLink {
+                    revision: revision(),
+                    target: None,
+                    bounds,
+                    page: None,
+                    uri: None,
+                },
+                ContentCommand::SetLink {
+                    revision: revision(),
+                    target: None,
+                    bounds: ContentBox {
+                        x: 12.5,
+                        y: -3.25,
+                        width: 40.0,
+                        height: 18.0,
+                    },
+                    page: None,
+                    uri: None,
+                },
+            ),
+        ];
+        for (record, expected) in cases {
+            assert_eq!(
+                content_command(record.clone()).expect("a well-formed record converts"),
+                expected,
+                "{record:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_content_colour_must_have_exactly_four_components() {
+        let bounds = ContentBoxRecord {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        for colour in [vec![], vec![0, 0, 0], vec![0, 0, 0, 0, 0]] {
+            let command = ContentCommandRecord::InsertText {
+                revision: revision(),
+                text: "x".into(),
+                bounds,
+                font: "Helvetica".into(),
+                size: 12.0,
+                colour,
+                alignment: 0,
+            };
+            match content_command(command) {
+                Err(LyraReaderFfiError::InvalidArgument { severity, message }) => {
+                    assert_eq!(severity, ErrorSeverity::Document);
+                    assert!(message.contains("exactly four components"), "{message}");
+                }
+                other => panic!("expected an invalid-argument error, got {other:?}"),
+            }
         }
     }
 }

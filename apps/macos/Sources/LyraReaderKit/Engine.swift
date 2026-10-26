@@ -1903,14 +1903,14 @@ public protocol PDFEngine: AnyObject {
     func pageRotations() async throws -> [Int]
     func contentObjects(page: Int) async throws -> PDFContentPage
     func contentImagePNG(page: Int, target: String, revision: String) async throws -> Data
-    func applyContentEdit(page: Int, command: PDFContentCommand, to destination: URL) async throws
+    func applyContentEdit(page: Int, command: ContentCommandRecord, to destination: URL) async throws
     /// The 0-based pages a redaction would have to replace with a raster image, computed without
     /// writing anything. Non-empty means the Edit workspace must ask before staging.
-    func contentRedactionRasterPages(page: Int, command: PDFContentCommand) async throws -> [Int]
+    func contentRedactionRasterPages(page: Int, command: ContentCommandRecord) async throws -> [Int]
     /// Stages a redaction after the reader accepted the raster fallback. Returns the 0-based
     /// pages that were actually replaced by an image (empty for an ordinary stage).
     func applyContentEditAllowingRaster(
-        page: Int, command: PDFContentCommand, to destination: URL
+        page: Int, command: ContentCommandRecord, to destination: URL
     ) async throws -> [Int]
     /// Applies a page operation to a copy of the open document and writes it to `destination`.
     /// The open document is not modified.
@@ -2008,18 +2008,18 @@ public extension PDFEngine {
     func contentObjects(page: Int) async throws -> PDFContentPage {
         throw NSError(domain:"LyraReader",code:2,userInfo:[NSLocalizedDescriptionKey:"This engine cannot inspect page content"])
     }
-    func applyContentEdit(page: Int, command: PDFContentCommand, to destination: URL) async throws {
+    func applyContentEdit(page: Int, command: ContentCommandRecord, to destination: URL) async throws {
         throw NSError(domain:"LyraReader",code:2,userInfo:[NSLocalizedDescriptionKey:"This engine cannot edit page content"])
     }
     /// Engines that cannot predict the raster fallback never prompt: their ordinary
     /// `applyContentEdit` either handles the command or refuses it as before.
-    func contentRedactionRasterPages(page: Int, command: PDFContentCommand) async throws -> [Int] {
+    func contentRedactionRasterPages(page: Int, command: ContentCommandRecord) async throws -> [Int] {
         []
     }
     /// Engines that cannot rasterise a page fall back to the ordinary staging path, which keeps
     /// the old refusal behaviour for test doubles.
     func applyContentEditAllowingRaster(
-        page: Int, command: PDFContentCommand, to destination: URL
+        page: Int, command: ContentCommandRecord, to destination: URL
     ) async throws -> [Int] {
         try await applyContentEdit(page: page, command: command, to: destination)
         return []
@@ -3217,14 +3217,15 @@ public final class RustEngine: PDFEngine {
         }
     }
 
-    public func applyContentEdit(page: Int, command: PDFContentCommand, to destination: URL) async throws {
+    public func applyContentEdit(
+        page: Int, command: ContentCommandRecord, to destination: URL
+    ) async throws {
         guard let document else { throw NSError(domain:"LyraReader",code:1) }
-        let data=try JSONEncoder().encode(command)
-        let json=String(decoding:data,as:UTF8.self)
         try await withCheckedThrowingContinuation { (continuation:CheckedContinuation<Void,Error>) in
             rasterQueue.async {
                 do {
-                    try document.applyContentEdit(page:UInt32(page),command:json,destination:destination.path)
+                    try document.applyContentEdit(
+                        page: UInt32(page), command: command, destination: destination.path)
                     continuation.resume()
                 } catch { continuation.resume(throwing:error) }
             }
@@ -3233,17 +3234,15 @@ public final class RustEngine: PDFEngine {
     }
 
     public func contentRedactionRasterPages(
-        page: Int, command: PDFContentCommand
+        page: Int, command: ContentCommandRecord
     ) async throws -> [Int] {
         guard let document else { throw NSError(domain:"LyraReader",code:1) }
-        let data = try JSONEncoder().encode(command)
-        let json = String(decoding: data, as: UTF8.self)
         let pages: [UInt32] = try await withCheckedThrowingContinuation { continuation in
             rasterQueue.async {
                 do {
                     continuation.resume(
                         returning: try document.contentRedactionRasterPages(
-                            page: UInt32(page), command: json))
+                            page: UInt32(page), command: command))
                 } catch { continuation.resume(throwing: error) }
             }
         }
@@ -3251,17 +3250,15 @@ public final class RustEngine: PDFEngine {
     }
 
     public func applyContentEditAllowingRaster(
-        page: Int, command: PDFContentCommand, to destination: URL
+        page: Int, command: ContentCommandRecord, to destination: URL
     ) async throws -> [Int] {
         guard let document else { throw NSError(domain:"LyraReader",code:1) }
-        let data = try JSONEncoder().encode(command)
-        let json = String(decoding: data, as: UTF8.self)
         let pages: [UInt32] = try await withCheckedThrowingContinuation { continuation in
             rasterQueue.async {
                 do {
                     continuation.resume(
                         returning: try document.applyContentEditAllowingRaster(
-                            page: UInt32(page), command: json, destination: destination.path))
+                            page: UInt32(page), command: command, destination: destination.path))
                 } catch { continuation.resume(throwing: error) }
             }
         }
