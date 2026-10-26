@@ -65,10 +65,10 @@ pub const MAX_INPUT_ITEMS: usize = 1 << 18;
 
 /// What class of work a planned tile belongs to.
 ///
-/// The vocabulary is the one the scheduler documents (`docs/03-rendering.md` §4), but this
+/// The vocabulary is the one `docs/03-rendering.md` §4 describes, but this
 /// planner emits only the first two: the shell schedules the target LOD's visible tiles and
 /// its prefetch ring. Lower-LOD previews are drawn from the cache while a LOD change settles,
-/// and thumbnails never go through the tile scheduler — both would be empty variants of the
+/// and thumbnails never go through the tile planner — both would be empty variants of the
 /// plan, and inventing work for them here would change what the reader sees.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TilePriority {

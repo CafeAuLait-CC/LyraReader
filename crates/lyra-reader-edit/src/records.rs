@@ -211,7 +211,8 @@ impl RecordAnnotation {
     ///
     /// The record encoder and the write-back path both rely on this: a mark that cannot be drawn
     /// or written must be refused before it reaches a file, not turned into an empty annotation
-    /// on the page. The thresholds are the Swift model's (`Annotation.hasValidGeometry`).
+    /// on the page. The shell's Swift property delegates here through the FFI, so this is the only
+    /// copy of the thresholds.
     pub fn has_valid_geometry(&self) -> bool {
         if !self.stroke_width.is_finite() || !(0.0..=200.0).contains(&self.stroke_width) {
             return false;
