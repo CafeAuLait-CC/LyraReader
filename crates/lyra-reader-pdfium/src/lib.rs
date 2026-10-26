@@ -53,6 +53,8 @@ mod backend;
 #[cfg(feature = "pdfium")]
 pub mod content_edit;
 #[cfg(feature = "pdfium")]
+mod copy_path;
+#[cfg(feature = "pdfium")]
 mod document_properties;
 #[cfg(feature = "pdfium")]
 mod flatten;
@@ -100,6 +102,8 @@ pub use appearance_font::{AppearanceCoverage, coverage as appearance_coverage, m
 pub use backend::{
     PdfiumBackend, destination_region_view_space as destination_view_rect, library_candidates,
 };
+#[cfg(feature = "pdfium")]
+pub use copy_path::{CopyPathExtension, suggest_copy_path};
 #[cfg(feature = "pdfium")]
 pub use document_properties::{
     DocumentFacts, DocumentInfo, DocumentProperties, PropertiesSaveReport,

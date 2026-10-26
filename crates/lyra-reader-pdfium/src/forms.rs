@@ -41,6 +41,7 @@
 //! a distinct, non-editable kind. Choice fields are single-select in this build (the widget and
 //! `/V` are preserved for a multi-select field, but the editor chooses one item).
 
+use crate::copy_path::{CopyPathExtension, suggest_copy_path};
 use crate::geometry_write::{EmbeddedFreeTextFont, build_appearance_font};
 use crate::writeback::{IncrementalSaveReport, SaveMode, save_incremental_with_contract};
 use lopdf::{
@@ -1853,21 +1854,11 @@ pub fn save_form_pdf(
     })
 }
 
-/// The default output name for a filled copy: `<name> (filled).pdf`.
+/// The default output name for a filled copy: `<name> (filled).<extension>`.
+///
+/// The source's extension is kept (`pdf` when it has none).
 pub fn suggested_filled_copy_path(source: &Path) -> PathBuf {
-    suggest(source, "filled")
-}
-
-pub(crate) fn suggest(source: &Path, suffix: &str) -> PathBuf {
-    let stem = source
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "document".to_string());
-    let extension = source
-        .extension()
-        .map(|extension| extension.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "pdf".to_string());
-    source.with_file_name(format!("{stem} ({suffix}).{extension}"))
+    suggest_copy_path(source, "filled", CopyPathExtension::Preserve)
 }
 
 #[cfg(test)]

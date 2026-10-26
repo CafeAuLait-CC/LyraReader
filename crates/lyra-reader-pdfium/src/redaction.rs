@@ -55,6 +55,7 @@
 
 #![allow(unsafe_code)]
 
+use crate::copy_path::{CopyPathExtension, suggest_copy_path};
 use crate::page_ops::replace_original_with_edit;
 use crate::rewrite::{TextComparison, verify_document_equivalence};
 use crate::writeback::{OutputMode, write_rewritten_pdf};
@@ -187,12 +188,12 @@ pub struct RedactionReport {
 }
 
 /// The name to offer when saving a redacted copy: `<name> (redacted).pdf`.
+///
+/// This is the one copy suggestion that does not preserve the source's extension: the
+/// redaction writer always produces a PDF, so `paper.txt` is offered as
+/// `paper (redacted).pdf`, not `paper (redacted).txt`.
 pub fn suggested_redaction_copy_path(source: &Path) -> PathBuf {
-    let stem = source
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "document".to_string());
-    source.with_file_name(format!("{stem} (redacted).pdf"))
+    suggest_copy_path(source, "redacted", CopyPathExtension::Pdf)
 }
 
 /// Reports what applying `areas` would remove, without writing.

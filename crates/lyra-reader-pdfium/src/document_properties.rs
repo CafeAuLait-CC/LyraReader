@@ -8,6 +8,7 @@
 //! rename is atomic. An encrypted document is refused with a reason instead of being written
 //! with a broken envelope.
 
+use crate::copy_path::{CopyPathExtension, suggest_copy_path};
 use crate::forms::{
     decode_text_string, dict_get, document_is_encrypted, load_document, pdf_header_version,
     resolve, text_string_object,
@@ -479,9 +480,11 @@ fn apply_metadata_update(
     Ok(())
 }
 
-/// The default output name for a properties copy: `<name> (properties).pdf`.
+/// The default output name for a properties copy: `<name> (properties).<extension>`.
+///
+/// The source's extension is kept (`pdf` when it has none).
 pub fn suggested_properties_copy_path(source: &Path) -> PathBuf {
-    crate::forms::suggest(source, "properties")
+    suggest_copy_path(source, "properties", CopyPathExtension::Preserve)
 }
 
 #[cfg(test)]
