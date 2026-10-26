@@ -11,6 +11,9 @@ workspace = true
 
 [dependencies]
 lyra-reader-core = { workspace = true }
+# Region extraction keeps the pre-change Swift truncation unit: `String.prefix(limit)` and
+# `String.count` are extended grapheme clusters. MIT OR Apache-2.0 (ADR-0005).
+unicode-segmentation = { workspace = true }
 # CitationStyle is persisted in the document index cache; the cache is invalidated by
 # content hash, so a style can only be read back for the bytes that produced it.
 serde = { version = "1", features = ["derive"] }

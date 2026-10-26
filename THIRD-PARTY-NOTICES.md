@@ -9,6 +9,8 @@ LyraReader itself is MIT-licensed (see [LICENSE](LICENSE)). It ships or links th
 - wgpu / naga — MIT OR Apache-2.0
 - pdfium-render — MIT OR Apache-2.0
 - png (Rust) — MIT OR Apache-2.0 (re-encodes an image stamp's samples for the reader)
+- unicode-segmentation (Rust) — MIT OR Apache-2.0 (extended grapheme clusters for the
+  document-knowledge cap and region text)
 - UniFFI / cbindgen — MPL-2.0 (build-time tooling only; their sources are not modified)
 
 This project contains no AGPL/GPL components (MuPDF and friends are explicitly excluded).

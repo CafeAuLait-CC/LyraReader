@@ -11,6 +11,9 @@ workspace = true
 
 [dependencies]
 lyra-reader-core = { workspace = true }
+# The document-knowledge block and its character counters keep the pre-refactor Swift unit:
+# extended grapheme clusters, not Unicode scalars.
+unicode-segmentation = { workspace = true }
 serde_json = "1"
 # The layered summary cache is keyed by a hash of exactly the page text a request sends, so
 # editing one section invalidates that section and nothing else. SHA-256 is already in the
