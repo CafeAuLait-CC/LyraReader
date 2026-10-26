@@ -1826,19 +1826,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Where the reader was before a jump the preview started.
     ///
     /// `scrollYPt` is the **exact** content offset, not a page number rounded to a page top: a
-    /// reader halfway down a long page must come back halfway down it. `selection` and `preview`
-    /// ride along because both are already values in memory — returning to a highlighted
-    /// paragraph should not lose the highlight — and they cost a copy of references, not a
-    /// re-render.
+    /// reader halfway down a long page must come back halfway down it. `selection` rides along
+    /// because it is already a value in memory — returning to a highlighted paragraph should not
+    /// lose the highlight — and it costs a copy, not a re-render.
+    ///
+    /// This is the shell's **mirror** of the record owned by the Rust navigation history
+    /// (`LyraReaderNavigationHistory`). The old `preview` field is gone: nothing ever restored
+    /// it (Back does not reopen a panel), so the payload was written and never read.
     public struct ReaderLocation: Equatable, Sendable {
         /// 0-based, the page under the viewport's top edge.
         public let page: Int
         /// Content offset in points, exactly as ``AppState/scrollYPt`` held it.
         public let scrollYPt: CGFloat
         public let selection: Selection?
-        /// The preview that was open when the jump was made. Kept for context; Back does not
-        /// reopen a panel the reader has since closed.
-        public let preview: ReferencePreview?
     }
 
     @Published public private(set) var referencePreview: ReferencePreview?
@@ -2100,16 +2100,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// How many past (and future) locations one window remembers.
     ///
-    /// Each direction's stack is trimmed to this many entries when a jump or a back would exceed
-    /// it, so a reader who follows the same preview twenty-five times keeps the twenty most
-    /// recent places. Twenty entries of value types is bounded memory, and far more than a
-    /// preview jump normally needs.
-    public static let navigationHistoryLimit = 20
+    /// The limit and the trimming live in Rust (`lyra-reader-session`); this read-only mirror
+    /// exists so the checks and log messages can name the documented cap without keeping a
+    /// second constant. Each direction keeps the most recent entries.
+    public static let navigationHistoryLimit =
+        Int(LyraReaderBindings.navigationHistoryLimit())
 
+    /// The canonical stacks live in `lyra-reader-session`, behind
+    /// `LyraReaderNavigationHistory`. These arrays are **published mirrors** refreshed from the
+    /// object after every mutation so SwiftUI observation and ``canGoBack`` keep working; the
+    /// shell must never push, pop, clear or trim them itself.
     @Published public private(set) var backHistory: [ReaderLocation] = []
     @Published public private(set) var forwardHistory: [ReaderLocation] = []
     public var canGoBack: Bool { !backHistory.isEmpty }
     public var canGoForward: Bool { !forwardHistory.isEmpty }
+    /// The canonical Back/Forward state machine: record, back, forward and clear all run here.
+    private let navigationHistory = LyraReaderNavigationHistory()
 
     /// A jump the **preview** started: record where the reader is, then move.
     ///
@@ -2125,28 +2131,32 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Returns to the reader's previous location. True when there was one.
     @discardableResult
     public func goBack() -> Bool {
-        guard let target = backHistory.popLast() else { return false }
-        forwardHistory.append(currentReaderLocation())
-        trimNavigationHistory()
-        applyReaderLocation(target, message: "Back to page")
+        guard let target = navigationHistory.goBack(current: currentReaderLocationRecord()) else {
+            return false
+        }
+        refreshNavigationHistoryMirrors()
+        applyReaderLocation(Self.readerLocation(from: target), message: "Back to page")
         return true
     }
 
     /// Moves forward again. True when the forward branch had an entry.
     @discardableResult
     public func goForward() -> Bool {
-        guard let target = forwardHistory.popLast() else { return false }
-        backHistory.append(currentReaderLocation())
-        trimNavigationHistory()
-        applyReaderLocation(target, message: "Forward to page")
+        guard let target = navigationHistory.goForward(current: currentReaderLocationRecord()) else {
+            return false
+        }
+        refreshNavigationHistoryMirrors()
+        applyReaderLocation(Self.readerLocation(from: target), message: "Forward to page")
         return true
     }
 
     /// Leaving a document throws its history away; the document reset path calls this.
     public func clearNavigationHistory() {
+        // Keep the pre-change no-op when there is no history, so closing a document that never
+        // recorded a jump does not publish an empty-array change.
         guard !backHistory.isEmpty || !forwardHistory.isEmpty else { return }
-        backHistory = []
-        forwardHistory = []
+        navigationHistory.clear()
+        refreshNavigationHistoryMirrors()
     }
 
     /// Whether a page's text layer is already in memory.
@@ -2161,23 +2171,45 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     private func currentReaderLocation() -> ReaderLocation {
         ReaderLocation(page: max(0, currentPage - 1), scrollYPt: scrollYPt,
-                       selection: selection, preview: referencePreview)
+                       selection: selection)
+    }
+
+    private func currentReaderLocationRecord() -> ReaderLocationRecord {
+        let location = currentReaderLocation()
+        return ReaderLocationRecord(
+            page: UInt32(location.page),
+            scrollYPt: Double(location.scrollYPt),
+            selection: location.selection.map { selection in
+                ReaderSelectionRecord(
+                    page: UInt32(selection.page),
+                    start: UInt32(selection.range.lowerBound),
+                    end: UInt32(selection.range.upperBound))
+            })
+    }
+
+    private static func readerLocation(from record: ReaderLocationRecord) -> ReaderLocation {
+        let selection = record.selection.flatMap { selection -> Selection? in
+            // The pre-change value held a `ClosedRange`, which cannot be inverted. The FFI record
+            // is the only place an inverted pair could enter; treating it as no selection keeps a
+            // malformed record from trapping while the mirror is rebuilt.
+            guard selection.start <= selection.end else { return nil }
+            return Selection(page: Int(selection.page),
+                             range: Int(selection.start)...Int(selection.end))
+        }
+        return ReaderLocation(page: Int(record.page),
+                              scrollYPt: CGFloat(record.scrollYPt),
+                              selection: selection)
+    }
+
+    private func refreshNavigationHistoryMirrors() {
+        let snapshot = navigationHistory.snapshot()
+        backHistory = snapshot.back.map(Self.readerLocation(from:))
+        forwardHistory = snapshot.forward.map(Self.readerLocation(from:))
     }
 
     private func recordReaderLocation() {
-        backHistory.append(currentReaderLocation())
-        // A new jump has a new future: the forward branch it replaced is stale.
-        forwardHistory.removeAll()
-        trimNavigationHistory()
-    }
-
-    private func trimNavigationHistory() {
-        if backHistory.count > Self.navigationHistoryLimit {
-            backHistory.removeFirst(backHistory.count - Self.navigationHistoryLimit)
-        }
-        if forwardHistory.count > Self.navigationHistoryLimit {
-            forwardHistory.removeFirst(forwardHistory.count - Self.navigationHistoryLimit)
-        }
+        navigationHistory.record(location: currentReaderLocationRecord())
+        refreshNavigationHistoryMirrors()
     }
 
     /// Restores a remembered **offset**, not just its page. `reloadVisiblePages` then re-derives

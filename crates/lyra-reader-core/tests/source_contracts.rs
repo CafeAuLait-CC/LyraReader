@@ -85,14 +85,18 @@ fn deleted_error_items_stay_deleted() {
     );
 }
 
-/// `poisoned.into_inner()` may only remain where the guarded data is a pure cache or a queue.
+/// `poisoned.into_inner()` may only remain where the guarded data is a pure cache, a
+/// rebuildable queue, or disposable UI state whose empty value is a defined result.
 #[test]
-fn lock_poisoning_is_only_ignored_for_caches() {
+fn lock_poisoning_is_only_ignored_for_rebuildable_state() {
     const ALLOWED: &[&str] = &[
         // Page-text/selection and AI-text caches: immutable entries, a miss is defined.
         "crates/lyra-reader-ffi/src/api.rs",
         // AI request event queue and its "provider rejected stream_options" cache.
         "crates/lyra-reader-ai/src/openai.rs",
+        // Back/Forward stacks: value records only, and an empty history is exactly the state a
+        // freshly opened document has; no durable user data can be lost.
+        "crates/lyra-reader-ffi/src/navigation.rs",
     ];
     let mut offenders = Vec::new();
     for path in rust_sources() {
