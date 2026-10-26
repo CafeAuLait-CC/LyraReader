@@ -9,8 +9,26 @@
 //!
 //! This module states the table once. [`AnnotationKind`] is the union of every vocabulary;
 //! [`AnnotationKind::flags`] is the answer a caller needs; and the two conversion functions
-//! ([`AnnotationKind::from_record_kind`], [`AnnotationKind::from_document_kind`]) are the only
-//! places a name is turned into a kind.
+//! ([`AnnotationKind::from_record_kind`], [`AnnotationKind::from_document_kind`]) are where this
+//! table turns a name into a kind.
+//!
+//! The kind half of each predicate is stated once, here. `lyra-reader-ffi` mirrors the vocabulary
+//! across UniFFI ([`WriteKind`] is re-declared there as `AnnotationWriteKind`, because uniffi
+//! exports the enums of the crate that derives them) and projects [`AnnotationKind::RECORD_KINDS`]
+//! row by row through `annotation_kind_flags()`; the shell's `AppState.Annotation.Kind` is the
+//! display vocabulary, so it decodes a cache name and draws the mark but reads every predicate
+//! from that projection.
+//!
+//! # Adding a kind
+//!
+//! A cache kind is one edit here: a variant, its name in [`AnnotationKind::record_name`] and
+//! [`AnnotationKind::from_record_kind`], a [`AnnotationKind::flags`] row, and an entry in
+//! [`AnnotationKind::RECORD_KINDS`]. A kind this build only reads from a PDF (the way `squiggly`
+//! is) needs [`AnnotationKind::from_document_kind`] and [`AnnotationKind::document_name`] instead
+//! of the cache names. A new *write* kind also adds a [`WriteKind`] variant; the exhaustive
+//! conversion in `lyra-reader-ffi` then fails to compile until its arm is added. The shell adds
+//! its `Kind` case and its drawing arm, and `AnnotationCodecChecks` fails if the table and that
+//! enum stop naming the same cache kinds.
 //!
 //! The flags deliberately preserve today's answers, including two asymmetries that are part of
 //! the current behaviour rather than accidents to fix here:
@@ -144,6 +162,27 @@ pub struct KindFlags {
 }
 
 impl AnnotationKind {
+    /// Every kind the durable annotation cache can store, in the table's order.
+    ///
+    /// This is the table's key set: the cache's `"kind"` names, the shell's
+    /// `AppState.Annotation.Kind` cases and the rows `annotation_kind_flags()` exports are the
+    /// same list. A kind this build only reads from a PDF (`squiggly`, an unmodelled subtype) is
+    /// deliberately absent: it has no cache entry and no write request.
+    pub const RECORD_KINDS: &'static [AnnotationKind] = &[
+        Self::Highlight,
+        Self::Underline,
+        Self::Strikeout,
+        Self::Ink,
+        Self::Square,
+        Self::Circle,
+        Self::Line,
+        Self::Arrow,
+        Self::StickyNote,
+        Self::TextBox,
+        Self::Stamp,
+        Self::Signature,
+    ];
+
     /// The name the annotation cache stores in `"kind"`, or `None` when the kind is not a cache
     /// kind (a `squiggly` and an unknown PDF subtype are read from a PDF, not written by this
     /// reader).
@@ -420,7 +459,8 @@ impl AnnotationKind {
 mod tests {
     use super::*;
 
-    const RECORD_KINDS: &[(&str, AnnotationKind)] = &[
+    /// The golden cache-kind names, so the table and the wire vocabulary cannot move alone.
+    const GOLDEN_RECORD_KINDS: &[(&str, AnnotationKind)] = &[
         ("highlight", AnnotationKind::Highlight),
         ("underline", AnnotationKind::Underline),
         ("strikeout", AnnotationKind::Strikeout),
@@ -437,12 +477,48 @@ mod tests {
 
     #[test]
     fn record_kind_names_round_trip() {
-        for (name, kind) in RECORD_KINDS {
+        for (name, kind) in GOLDEN_RECORD_KINDS {
             assert_eq!(kind.record_name(), Some(*name));
             assert_eq!(AnnotationKind::from_record_kind(name).as_ref(), Some(kind));
         }
         assert_eq!(AnnotationKind::from_record_kind("squiggly"), None);
         assert_eq!(AnnotationKind::from_record_kind("futureMark"), None);
+    }
+
+    #[test]
+    fn record_kinds_is_the_table_key_set() {
+        // The public list is what the flags rows and the FFI projection are keyed by. Comparing
+        // it with the golden names forces both to move for a new kind; the shell check then
+        // forces `AppState.Annotation.Kind`.
+        let listed: Vec<Option<&str>> = AnnotationKind::RECORD_KINDS
+            .iter()
+            .map(AnnotationKind::record_name)
+            .collect();
+        let golden: Vec<Option<&str>> = GOLDEN_RECORD_KINDS
+            .iter()
+            .map(|(name, _)| Some(*name))
+            .collect();
+        assert_eq!(listed, golden);
+        for kind in AnnotationKind::RECORD_KINDS {
+            assert!(
+                kind.flags().in_records,
+                "{kind:?} is listed as a cache kind but its flags say it is not"
+            );
+            let name = kind.record_name().expect("a cache kind has a name");
+            assert_eq!(
+                AnnotationKind::from_record_kind(name),
+                Some(kind.clone()),
+                "{kind:?}"
+            );
+        }
+        // A read-only kind is not a cache kind, in either direction.
+        for kind in [
+            AnnotationKind::Squiggly,
+            AnnotationKind::Other("Polygon".into()),
+        ] {
+            assert!(!AnnotationKind::RECORD_KINDS.contains(&kind), "{kind:?}");
+            assert!(kind.record_name().is_none(), "{kind:?}");
+        }
     }
 
     #[test]
@@ -567,7 +643,7 @@ mod tests {
 
     #[test]
     fn write_kinds_cover_every_creatable_record_kind() {
-        for (_, kind) in RECORD_KINDS {
+        for (_, kind) in GOLDEN_RECORD_KINDS {
             assert!(kind.flags().write_kind.is_some(), "{kind:?}");
         }
         for kind in [AnnotationKind::Squiggly, AnnotationKind::Other("X".into())] {
@@ -594,7 +670,7 @@ mod tests {
 
     #[test]
     fn editability_matches_the_swift_policy() {
-        for (_, kind) in RECORD_KINDS {
+        for (_, kind) in GOLDEN_RECORD_KINDS {
             let (editable, reason) = kind.kind_editability();
             let expected = *kind != AnnotationKind::Arrow;
             assert_eq!(editable, expected, "{kind:?}");

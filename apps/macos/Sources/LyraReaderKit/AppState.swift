@@ -958,7 +958,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// origin at the page's top-left corner at 100% zoom), so a mark lands on the same place at
     /// every zoom. The four shapes are stroked, never filled: they are outlines, and keeping the
     /// interior transparent is what lets the text behind them stay selectable.
-    public enum Kind: String, Codable, Sendable {
+    public enum Kind: String, Codable, Sendable, CaseIterable {
         case highlight
         case underline
         /// A line through the middle of the selected glyphs. A text-markup kind like the two
