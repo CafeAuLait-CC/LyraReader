@@ -1,13 +1,14 @@
-//! Render scheduling layer (**no GPU code**): translates "viewport changes" into "which tiles to rasterize and in what order".
+//! Render planning layer (**no GPU code**): turns one viewport update into the tiles the shell
+//! should rasterize, at which LOD and in which order.
 //!
-//! Task mapping: T1.5 (pyramid + LOD + priority + banded cancellation), T1.6 (cache).
-//!
-//! Data flow (see `docs/03-rendering.md` §3–§5 for details):
+//! [`plan::plan_tiles`] is the production entry point: one request returns the visible and
+//! prefetched tiles, their priority and the columns to retain. The shell owns the hot path — the
+//! tile cache, texture upload, per-frame submission and cancellation (ADR-0007) — so this crate
+//! holds no scheduler or task queue. [`cache::TileCache`] is a historical sketch, not the shipping
+//! cache (see that module's documentation).
 //!
 //! ```text
-//! viewport ──▶ visible_tiles() ──▶ select_lod() ──▶ cache lookup ──▶ task enqueue (priority)
-//!                                                       │                           │
-//!                                                  hit ─┘                           └─▶ raster thread pool
+//! viewport request ──▶ plan_tiles() ──▶ tiles + LOD + priority + retain columns
 //! ```
 
 pub mod cache;
@@ -38,29 +39,4 @@ pub struct RenderStats {
     pub last_frame_ms: f32,
     pub average_frame_ms: f32,
     pub cache: CacheStats,
-}
-
-/// Raster task scheduler.
-///
-/// TODO(T1.5): priority queue (binary heap) + in-flight deduplication + epoch invalidation + per-frame submit cap (K=8).
-#[derive(Default)]
-pub struct RenderScheduler {
-    _private: (),
-}
-
-impl RenderScheduler {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Recompute the pending task set when the viewport changes.
-    ///
-    /// TODO(T1.5): implement the three-tier priority split "visible → target LOD / one LOD lower / prefetch".
-    pub fn on_viewport_changed(&mut self, _epoch: u64) {}
-
-    /// Maximum number of tasks submitted to the raster thread pool per frame (avoids dropped frames caused by momentary CPU saturation while scrolling).
-    pub const MAX_RASTER_SUBMITS_PER_FRAME: usize = 8;
-
-    /// Task queue capacity (backpressure; when exceeded, tasks with priority ≥ [`RenderPriority::Thumbnail`] are dropped).
-    pub const MAX_QUEUE_LEN: usize = 512;
 }
