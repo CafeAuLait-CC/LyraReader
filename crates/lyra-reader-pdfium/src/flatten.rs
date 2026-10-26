@@ -43,6 +43,7 @@
 //! apply it. No appearance stream is copied or rewritten; the page resources gain one named
 //! reference to the original object.
 
+use crate::copy_path::{CopyPathExtension, suggest_copy_path};
 use crate::forms::{decode_text_string, document_is_encrypted, load_document, resolve};
 use crate::rewrite::verify_flatten_equivalence;
 use crate::writeback::{OutputMode, write_rewritten_pdf};
@@ -178,9 +179,11 @@ pub(crate) fn flatten_to_copy_inner(
     })
 }
 
-/// The name to offer for a flattened copy: `<name> (flattened).pdf`.
+/// The name to offer for a flattened copy: `<name> (flattened).<extension>`.
+///
+/// The source's extension is kept (`pdf` when it has none).
 pub fn suggested_flatten_copy_path(source: &Path) -> PathBuf {
-    crate::forms::suggest(source, "flattened")
+    suggest_copy_path(source, "flattened", CopyPathExtension::Preserve)
 }
 
 // ── Planning ────────────────────────────────────────────────────────────────────────────────

@@ -67,6 +67,7 @@ use crate::annotation_edit::{
 use crate::annotations::{
     AnnotationAppender, AnnotationReader, WriteAnnotation, WriteAnnotationKind,
 };
+use crate::copy_path::{CopyPathExtension, suggest_copy_path};
 use crate::geometry_write::{append_direct_annotations, verify_direct_annotations};
 use crate::outline_write::{
     WriteBookmark, append_bookmarks, has_bookmark_subtree, validate_bookmarks, verify_outline,
@@ -981,17 +982,12 @@ pub fn cleanup_interrupted_save_temporaries(target: &Path) -> Result<usize> {
     Ok(removed)
 }
 
-/// The default name a copy is offered as: `<name> (annotated).pdf`.
+/// The default name a copy is offered as: `<name> (annotated).<extension>`.
+///
+/// The source's extension is kept (`pdf` when it has none), so an annotated copy of
+/// `paper.PDF` is still offered as `paper (annotated).PDF`.
 pub fn suggested_copy_path(source: &Path) -> PathBuf {
-    let stem = source
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "document".to_string());
-    let extension = source
-        .extension()
-        .map(|extension| extension.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "pdf".to_string());
-    source.with_file_name(format!("{stem} (annotated).{extension}"))
+    suggest_copy_path(source, "annotated", CopyPathExtension::Preserve)
 }
 
 fn rule_error(error: lyra_reader_edit::rules::RuleError) -> LyraReaderError {
