@@ -10414,29 +10414,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     // deleted content) and means a crash or a discarded session leaves the PDF and its cached
     // annotations exactly as they were.
 
-    /// One revision plus the reader's marks at that revision. Undo/redo restore both together:
-    /// an annotation added to a page that a later undo removes must disappear, and come back on
-    /// redo, rather than being pushed onto a neighbour.
-    private struct PageEditSnapshot: Codable {
-        let revisionURL: URL
-        let revisionNumber: Int
-        let currentToOriginal: [Int]
-        let operations: [String]
-        let annotations: [Annotation]
-        let bookmarks: [Bookmark]
-        let slots: [AnnotationRecords.Slot]
-        let deletions: [FileAnnotationDeletion]
-        let erasedInk: Set<UUID>
-        let annotationDirty: Bool
-        let currentPage: Int
-        let selection: Set<Int>
-        let label: String
-    }
-
-    private struct PageEditSession: Codable {
+    /// The shell's mirror of one `DocumentTransaction` plus the values the interface reads.
+    ///
+    /// The Rust transaction owns the revision chain, the page map, the undo/redo snapshots and
+    /// the recovery manifest. This value mirrors just the current state so the banners, menus and
+    /// tab snapshots do not need an FFI call per frame; every mutation goes through the
+    /// transaction and refreshes the mirror from its answer.
+    private struct PageEditSession {
         let originalURL: URL
         let originalSignature: DocumentSignature
-        let sourceStamp: DocumentEditCache.SourceStamp
         let originalRecordsURL: URL
         let title: String
         let directory: URL
@@ -10448,8 +10434,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         /// current page index → index in `originalRotations`; -1 for an inserted blank page.
         var currentToOriginal: [Int]
         var operations: [String]
-        var undo: [PageEditSnapshot]
-        var redo: [PageEditSnapshot]
+        let transaction: DocumentTransactionSession
     }
 
     /// Whether the page commands can run at all.
@@ -10474,8 +10459,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         pageEditSession?.operations.isEmpty == false
     }
 
-    public var canUndoPageEdit: Bool { pageEditSession?.undo.isEmpty == false && !pageEditBusy }
-    public var canRedoPageEdit: Bool { pageEditSession?.redo.isEmpty == false && !pageEditBusy }
+    public var canUndoPageEdit: Bool { pageEditSession?.transaction.canUndo == true && !pageEditBusy }
+    public var canRedoPageEdit: Bool { pageEditSession?.transaction.canRedo == true && !pageEditBusy }
     public var canSavePageEditsCopy: Bool {
         (pageEditHasPendingChanges || contentTextEditing) && !pageEditBusy && !annotationSaveInProgress
     }
@@ -10505,6 +10490,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The most recent pending action, for the banner's second line.
     public var pageEditLastAction: String? {
         pageEditSession?.operations.last
+    }
+
+    /// Test visibility for the equivalence freeze: the original the session started from.
+    package var pageEditOriginalURLForChecks: URL? { pageEditSession?.originalURL }
+    /// Test visibility for the equivalence freeze: the revision the session currently shows.
+    package var pageEditRevisionNumberForChecks: Int { pageEditSession?.revisionNumber ?? 0 }
+    /// Test visibility for the equivalence freeze: current page → original page.
+    package var pageEditCurrentToOriginalForChecks: [Int] {
+        pageEditSession?.currentToOriginal ?? []
     }
 
     /// The pages a command acts on: the thumbnail selection, or the current page when there is
@@ -11369,27 +11363,40 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     private func undoOrRedoPageEdit(redo: Bool) async {
         guard var session = pageEditSession, !pageEditBusy else { return }
-        let target = redo ? session.redo.last : session.undo.last
-        guard let target, let current = pageEditSnapshot(label: redo ? "redo" : "undo") else { return }
         let hadTranslations = !inPlaceTranslation.snapshot().isEmpty
         pageEditBusy = true
         defer { pageEditBusy = false }
-        if redo {
-            session.redo.removeLast()
-            session.undo.append(current)
-        } else {
-            session.undo.removeLast()
-            session.redo.append(current)
+        let target: DocumentTransactionStateRecord?
+        do {
+            let input = try pageEditInputRecord()
+            target = redo
+                ? try session.transaction.redo(input: input)
+                : try session.transaction.undo(input: input)
+        } catch {
+            lastError = "Could not \(redo ? "redo" : "undo") the page change: \(AnnotationRecords.message(error))"
+            return
+        }
+        guard let target else { return }
+        guard let revision = URL(string: target.revisionUrl) else {
+            lastError = "Could not reopen the revision for \(redo ? "redo" : "undo")"
+            return
+        }
+        let payload: PageEditTransactionPayload
+        do {
+            payload = try decodedPageEditPayload(target)
+        } catch {
+            lastError = "Could not reopen the revision for \(redo ? "redo" : "undo"): \(AnnotationRecords.message(error))"
+            return
         }
         guard (try? loadPageEditRevision(
-            at: target.revisionURL,
+            at: revision,
             title: session.title,
             annotationRecordsURL: session.annotationRecordsURL,
-            annotations: target.annotations,
-            bookmarks: target.bookmarks,
-            slots: target.slots,
-            currentPage: target.currentPage,
-            selection: target.selection
+            annotations: payload.annotations,
+            bookmarks: payload.bookmarks,
+            slots: payload.slots,
+            currentPage: payload.currentPage,
+            selection: payload.selection
         )) != nil else {
             lastError = "Could not reopen the revision for \(redo ? "redo" : "undo")"
             return
@@ -11400,39 +11407,96 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 + "removed because their blocks may have moved; the PDF was not modified."
             )
         }
-        session.revisionURL = target.revisionURL
-        session.revisionNumber = target.revisionNumber
-        session.currentToOriginal = target.currentToOriginal
+        session.revisionURL = revision
+        session.revisionNumber = Int(target.revisionNumber)
+        session.currentToOriginal = target.currentToOriginal.map(Int.init)
         session.operations = target.operations
         pageEditSession = session
-        pendingFileDeletions = target.deletions
-        erasedInkStrokeIDs = target.erasedInk
-        annotationCacheIsDirty = target.annotationDirty
+        pendingFileDeletions = payload.deletions
+        erasedInkStrokeIDs = payload.erasedInk
+        annotationCacheIsDirty = payload.annotationDirty
         persistPendingAnnotationState()
         persistPageEditRecovery()
         pageEditPendingOperations = session.operations
         pageEditIsApplied = false
-        statusMessage = "\(redo ? "Redid" : "Undid") \(target.label) · \(session.operations.count) page change(s) still pending"
+        statusMessage = "\(redo ? "Redid" : "Undid") \(target.lastLabel ?? (redo ? "redo" : "undo"))"
+            + " · \(session.operations.count) page change(s) still pending"
     }
 
     // MARK: Session plumbing
 
-    private func pageEditSnapshot(label: String) -> PageEditSnapshot? {
-        guard let session = pageEditSession, let url = document?.url else { return nil }
-        return PageEditSnapshot(
-            revisionURL: url,
-            revisionNumber: session.revisionNumber,
-            currentToOriginal: session.currentToOriginal,
-            operations: session.operations,
-            annotations: annotations,
-            bookmarks: bookmarks,
-            slots: annotationRecordSlots,
-            deletions: pendingFileDeletions,
-            erasedInk: erasedInkStrokeIDs,
+    /// One value-typed view of what the transaction stores as JSON. Decoding is the shell's own
+    /// model decode; the transaction never reinterprets an annotation kind or a colour.
+    private struct PageEditTransactionPayload {
+        let annotations: [Annotation]
+        let bookmarks: [Bookmark]
+        let slots: [AnnotationRecords.Slot]
+        let deletions: [FileAnnotationDeletion]
+        let erasedInk: Set<UUID>
+        let annotationDirty: Bool
+        let currentPage: Int
+        let selection: Set<Int>
+    }
+
+    private func decodedPageEditPayload(
+        _ state: DocumentTransactionStateRecord
+    ) throws -> PageEditTransactionPayload {
+        PageEditTransactionPayload(
+            annotations: try DocumentTransactionJSON.value(
+                [Annotation].self, from: state.annotationsJson),
+            bookmarks: try DocumentTransactionJSON.value(
+                [Bookmark].self, from: state.bookmarksJson),
+            slots: try DocumentTransactionJSON.value(
+                [AnnotationRecords.Slot].self, from: state.slotsJson),
+            deletions: try DocumentTransactionJSON.value(
+                [FileAnnotationDeletion].self, from: state.deletionsJson),
+            erasedInk: Set(try DocumentTransactionJSON.value(
+                [UUID].self, from: state.erasedInkJson)),
+            annotationDirty: state.annotationDirty,
+            currentPage: Int(state.currentPage),
+            selection: Set(state.selection.map(Int.init))
+        )
+    }
+
+    private func pageEditInputRecord() throws -> DocumentTransactionInputRecord {
+        DocumentTransactionInputRecord(
+            annotationsJson: try DocumentTransactionJSON.string(annotations),
+            bookmarksJson: try DocumentTransactionJSON.string(bookmarks),
+            slotsJson: try DocumentTransactionJSON.string(annotationRecordSlots),
+            deletionsJson: try DocumentTransactionJSON.string(pendingFileDeletions),
+            erasedInkJson: try DocumentTransactionJSON.string(Array(erasedInkStrokeIDs)),
             annotationDirty: annotationCacheIsDirty,
-            currentPage: currentPage,
-            selection: pageSelection,
-            label: label
+            currentPage: UInt32(clamping: max(0, currentPage)),
+            selection: pageSelection.sorted().map { UInt32(clamping: max(0, $0)) }
+        )
+    }
+
+    private func pageEditSession(
+        from state: DocumentTransactionStateRecord,
+        originalURL: URL,
+        signature: DocumentSignature,
+        title: String,
+        directory: URL,
+        transaction: DocumentTransactionSession
+    ) throws -> PageEditSession {
+        guard let revision = URL(string: state.revisionUrl) else {
+            throw NSError(
+                domain: "LyraReader", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "the editing session has no valid revision URL"])
+        }
+        return PageEditSession(
+            originalURL: originalURL,
+            originalSignature: signature,
+            originalRecordsURL: URL(string: state.originalRecordsUrl) ?? originalURL,
+            title: title,
+            directory: directory,
+            annotationRecordsURL: URL(string: state.annotationRecordsUrl) ?? directory,
+            originalRotations: state.originalRotations.map(Int.init),
+            revisionURL: revision,
+            revisionNumber: Int(state.revisionNumber),
+            currentToOriginal: state.currentToOriginal.map(Int.init),
+            operations: state.operations,
+            transaction: transaction
         )
     }
 
@@ -11465,21 +11529,41 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             let directory = try DocumentEditCache.newSessionDirectory(for: url)
             let originalRotations = try await engine.pageRotations()
             let pageCount = document?.pageCount ?? 0
-            let session = PageEditSession(
+            let signature = documentSignature
+            let sourceStamp = try DocumentEditCache.SourceStamp(url)
+            let title = document?.title ?? url.deletingPathExtension().lastPathComponent
+            let request = DocumentTransactionStartRecord(
+                originalUrl: url.absoluteString,
+                directoryUrl: directory.absoluteString,
+                recoveryPath: DocumentEditCache.recoveryURL(for: url).path,
+                originalRecordsUrl: Self.annotationRecordsURL(for: url).absoluteString,
+                title: title,
+                pageCount: UInt32(clamping: max(0, pageCount)),
+                originalRotations: originalRotations.map { UInt32(clamping: max(0, $0)) },
+                originalSignatureJson: try DocumentTransactionJSON.string(signature),
+                sourceSize: UInt64(max(0, sourceStamp.size)),
+                sourceModified: sourceStamp.modified?.timeIntervalSinceReferenceDate,
+                sourceSha256: sourceStamp.sha256,
+                annotationsJson: try DocumentTransactionJSON.string(annotations),
+                bookmarksJson: try DocumentTransactionJSON.string(bookmarks),
+                slotsJson: try DocumentTransactionJSON.string(annotationRecordSlots),
+                deletionsJson: try DocumentTransactionJSON.string(pendingFileDeletions),
+                erasedInkJson: try DocumentTransactionJSON.string(Array(erasedInkStrokeIDs)),
+                annotationDirty: annotationCacheIsDirty,
+                currentPage: UInt32(clamping: max(0, currentPage)),
+                selection: pageSelection.sorted().map { UInt32(clamping: max(0, $0)) },
+                cacheDirectoryPrefix: DocumentEditCache.directory(for: url).path + "/",
+                restore: false,
+                xfaReadOnlyReason: isXfaDocument ? readOnlyReason : nil
+            )
+            let (transaction, state) = try DocumentTransactionSession.start(request)
+            let session = try pageEditSession(
+                from: state,
                 originalURL: url,
-                originalSignature: documentSignature,
-                sourceStamp: try DocumentEditCache.SourceStamp(url),
-                originalRecordsURL: Self.annotationRecordsURL(for: url),
-                title: document?.title ?? url.deletingPathExtension().lastPathComponent,
+                signature: signature,
+                title: title,
                 directory: directory,
-                annotationRecordsURL: directory.appendingPathComponent("annotations.json"),
-                originalRotations: originalRotations,
-                revisionURL: url,
-                revisionNumber: 0,
-                currentToOriginal: Array(0..<pageCount),
-                operations: [],
-                undo: [],
-                redo: []
+                transaction: transaction
             )
             pageEditSession = session
             annotationsURL = session.annotationRecordsURL
@@ -11490,9 +11574,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 trigger: "page-edit-session"
             )
             guard wrote else {
+                transaction.close(deleteFiles: true)
                 pageEditSession = nil
                 annotationsURL = session.originalRecordsURL
-                try? FileManager.default.removeItem(at: directory)
                 return false
             }
             pageEditPendingOperations = []
@@ -11500,7 +11584,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             statusMessage = "Page editing: changes are staged in a working copy; the file on disk is unchanged"
             return true
         } catch {
-            lastError = "Could not start the page-editing session: \(error.localizedDescription)"
+            lastError = "Could not start the page-editing session: \(AnnotationRecords.message(error))"
             return false
         }
     }
@@ -11518,90 +11602,73 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         guard await ensurePageEditSession() else { return false }
         guard var session = pageEditSession, !pageEditBusy else { return false }
-        guard let snapshot = pageEditSnapshot(label: label) else { return false }
+        let input: DocumentTransactionInputRecord
+        do {
+            input = try pageEditInputRecord()
+        } catch {
+            lastError = "Page change failed; nothing was written: \(AnnotationRecords.message(error))"
+            return false
+        }
         // A page edit can rotate, move, insert or delete the rectangles a translation covers.
         // The complete entries travel through the revision and are filtered afterwards; the PDF
         // itself is never touched by the translation layer.
         let translationSnapshot = inPlaceTranslation.snapshot()
-        let nextNumber = session.revisionNumber + 1
-        let nextURL = session.directory.appendingPathComponent("rev-\(nextNumber).pdf")
         pageEditBusy = true
         defer { pageEditBusy = false }
         do {
+            // Snapshot before materialisation: undo across a rotation that had to write cached
+            // marks into the PDF must return to the revision the reader actually saw.
+            try session.transaction.prepare(label: label, input: input)
             if let rotating, rotationConflict(on: rotating) != nil {
                 if try await materializeAnnotationsInWorkingCopy(), let updated = pageEditSession {
                     session = updated
                 }
             }
-            let report = try await engine.applyPageOperation(operation, to: nextURL)
-            let mappedAnnotations = Self.remap(annotations, with: report.pageMap)
-            let mappedBookmarks = Self.remap(bookmarks, with: report.pageMap)
-            let annotationIDs = Set(mappedAnnotations.map(\.id))
-            let bookmarkIDs = Set(mappedBookmarks.map(\.id))
-            let mappedSlots = annotationRecordSlots.filter { slot in
-                switch slot {
-                case .annotation(let id): return annotationIDs.contains(id)
-                case .bookmark(let id): return bookmarkIDs.contains(id)
-                case .opaque: return true
-                }
+            let result = try await session.transaction.apply(operation)
+            let state = result.state
+            guard let revision = URL(string: state.revisionUrl) else {
+                throw NSError(
+                    domain: "LyraReader", code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "the revision has no valid URL"])
             }
-            var mapping = [Int](repeating: -1, count: Int(report.pageCount))
-            for (old, new) in report.pageMap.enumerated() {
-                guard let new, new >= 0, new < mapping.count else { continue }
-                mapping[new] = old < session.currentToOriginal.count ? session.currentToOriginal[old] : -1
+            let payload = try decodedPageEditPayload(state)
+            if let inserted = result.insertedPage {
+                pageSelectionAnchor = Int(inserted)
             }
-            let previousPage = min(max(currentPage - 1, 0), max(report.pageMap.count - 1, 0))
-            var newPage = report.insertedPage
-                ?? report.pageMap[previousPage]
-                ?? min(previousPage, max(Int(report.pageCount) - 1, 0))
-            if let inserted = report.insertedPage {
-                newPage = inserted
-            }
-            var newSelection = Set<Int>()
-            for selected in pageSelection {
-                if selected < report.pageMap.count, let mapped = report.pageMap[selected] {
-                    newSelection.insert(mapped)
-                }
-            }
-            if let inserted = report.insertedPage {
-                newSelection = [inserted]
-                pageSelectionAnchor = inserted
-            }
-
             guard (try? loadPageEditRevision(
-                at: nextURL,
+                at: revision,
                 title: session.title,
                 annotationRecordsURL: session.annotationRecordsURL,
-                annotations: mappedAnnotations,
-                bookmarks: mappedBookmarks,
-                slots: mappedSlots,
-                currentPage: newPage + 1,
-                selection: newSelection
+                annotations: payload.annotations,
+                bookmarks: payload.bookmarks,
+                slots: payload.slots,
+                currentPage: payload.currentPage,
+                selection: payload.selection
             )) != nil else {
                 lastError = "The page change was written, but the revision could not be reopened; the original is unchanged"
                 return false
             }
             await inPlaceTranslation.restoreAfterPageEdit(
                 translationSnapshot,
-                pageMap: report.pageMap,
+                pageMap: result.pageMap.map { $0.map(Int.init) },
                 rotatedPages: Set(rotating ?? []),
                 editedPages: [],
                 reason: "The page layout changed (\(label))."
             )
-            session.revisionURL = nextURL
-            session.revisionNumber = nextNumber
-            session.currentToOriginal = mapping
-            session.operations.append(label)
-            session.undo.append(snapshot)
-            session.redo.removeAll()
+            session.revisionURL = revision
+            session.revisionNumber = Int(state.revisionNumber)
+            session.currentToOriginal = state.currentToOriginal.map(Int.init)
+            session.operations = state.operations
             pageEditSession = session
+            persistPageEditRecovery()
+            if let recoveryError = state.recoveryError { lastError = recoveryError }
             pageEditPendingOperations = session.operations
             pageEditIsApplied = false
             statusMessage =
                 "\(label) · \(Self.annotationRule(for: operation)) · pending "
                 + "(the file on disk is unchanged)"
             FileHandle.standardError.write(Data((
-                "lyra-reader-pages: \(label) · revision \(nextNumber) · "
+                "lyra-reader-pages: \(label) · revision \(session.revisionNumber) · "
                 + "\(session.operations.count) pending change(s)\n"
             ).utf8))
             // A page rotation, insertion or deletion changes what the captured rectangle means.
@@ -11610,6 +11677,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             invalidateRegionLocationsAfterPageEdit()
             return true
         } catch {
+            pageEditSession?.transaction.cancelPrepared()
             // The revision was not adopted. Put the translation overlays that were on screen
             // back when they still describe the document that is still open.
             await inPlaceTranslation.restoreAfterPageEdit(
@@ -11617,11 +11685,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 reason: nil)
             lastError = "Page change failed; nothing was written: \(error.localizedDescription)"
             statusMessage = "Page change failed"
-            // A failed operation may have created a partial revision file; it is never referenced
-            // by the session, so remove it best-effort.
-            try? FileManager.default.removeItem(at: nextURL)
-            // If this was the session's first operation, no page change exists; close the
-            // prepared working copy instead of leaving an "editing" state with nothing pending.
+            // The transaction removes a partial revision it wrote and forgets the prepared
+            // snapshot. If this was the session's first operation, no page change exists; close
+            // the prepared working copy instead of leaving an "editing" state.
             discardEmptyPageEditSession()
             return false
         }
@@ -11689,29 +11755,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     private func endPageEditSession(deleteFiles: Bool) {
-        let directory = pageEditSession?.directory
-        let revisionURL = pageEditSession?.revisionURL
-        let originalURL = pageEditSession?.originalURL
-        if let originalURL {
+        let session = pageEditSession
+        if let originalURL = session?.originalURL {
             let key = DocumentEditCache.recoveryURL(for: originalURL).path
             if Self.pageEditOwners[key]?.value === self { Self.pageEditOwners.removeValue(forKey: key) }
         }
         pageEditSession = nil
         pageEditPendingOperations = []
         pageEditIsApplied = false
-        if let revisionURL, revisionURL != originalURL {
+        if let revisionURL = session?.revisionURL, revisionURL != session?.originalURL {
             engine.closeDocument(at: revisionURL)
         }
-        if deleteFiles, let directory {
-            if let originalURL { try? FileManager.default.removeItem(at: DocumentEditCache.recoveryURL(for: originalURL)) }
-            try? FileManager.default.removeItem(at: directory)
-        }
-    }
-
-    private struct PageEditRecovery: Codable {
-        let version: Int
-        let session: PageEditSession
-        let snapshot: PageEditSnapshot
+        // The Rust transaction owns the session directory and the recovery manifest; closing it
+        // is the one place either is removed.
+        session?.transaction.close(deleteFiles: deleteFiles)
     }
 
     /// Closes a session a command prepared but left with nothing staged.
@@ -11727,14 +11784,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         endPageEditSession(deleteFiles: true)
     }
 
+    /// Rewrites `session.json` from the shell's current state.
+    ///
+    /// The transaction writes the bytes (shape, key order, number spelling); this only supplies
+    /// the current annotation/bookmark snapshot and the revision the reader is showing. A write
+    /// failure is reported but, as before, does not undo a page change that already landed.
     private func persistPageEditRecovery() {
-        guard let session = pageEditSession,
-              let snapshot = pageEditSnapshot(label: "Recovered editing session") else { return }
+        guard let session = pageEditSession else { return }
         do {
-            let recovery = PageEditRecovery(version: 1, session: session, snapshot: snapshot)
-            try JSONEncoder().encode(recovery).write(to: DocumentEditCache.recoveryURL(for: session.originalURL), options: .atomic)
+            let state = try session.transaction.persist(
+                input: try pageEditInputRecord(),
+                revisionURL: document?.url ?? session.revisionURL,
+                revisionNumber: session.revisionNumber,
+                recoveryPath: DocumentEditCache.recoveryURL(for: session.originalURL))
+            if let recoveryError = state.recoveryError { lastError = recoveryError }
         } catch {
-            lastError = "Could not cache the editing session: \(error.localizedDescription)"
+            lastError = "Could not cache the editing session: \(AnnotationRecords.message(error))"
         }
     }
 
@@ -11765,48 +11830,77 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         pendingFileDeletions = []
         erasedInkStrokeIDs = []
         pageEditSession = session
+        persistPageEditRecovery()
         scrollYPt = clampedScrollOffset(oldScroll)
         reloadVisiblePages()
         return true
     }
 
+    /// Restores the session recorded in `session.json` after a crash or a quit.
+    ///
+    /// The Rust transaction reads and validates the manifest (the PDF it names, its source
+    /// stamp, the session directory and every revision URL); this reloads the revision it names
+    /// and hands the saved annotations/bookmarks back to the model.
     private func restoreCachedPageEdits(for original: URL) {
         guard pageEditSession == nil else { return }
         let recoveryURL = DocumentEditCache.recoveryURL(for: original)
         if let owner = Self.pageEditOwners[recoveryURL.path]?.value, owner !== self { return }
         guard FileManager.default.fileExists(atPath: recoveryURL.path) else { return }
         do {
-            let saved = try JSONDecoder().decode(PageEditRecovery.self, from: Data(contentsOf: recoveryURL))
-            let session = saved.session
-            let directory = DocumentEditCache.directory(for: original).standardizedFileURL.path + "/"
-            guard saved.version == 1, Self.resolvesToSameFile(session.originalURL, original),
-                  session.sourceStamp == (try DocumentEditCache.SourceStamp(original)),
-                  session.directory.standardizedFileURL.path.hasPrefix(directory),
-                  session.annotationRecordsURL.standardizedFileURL.path.hasPrefix(session.directory.path + "/") else {
-                throw DocumentEditCache.CacheError.sourceChanged(
-                    "The PDF or its cached editing session changed outside LyraReader. The cached page edits were kept.")
-            }
-            func validRevision(_ url: URL) -> Bool {
-                url.standardizedFileURL == original.standardizedFileURL ||
-                    url.standardizedFileURL.path.hasPrefix(session.directory.standardizedFileURL.path + "/")
-            }
-            guard validRevision(saved.snapshot.revisionURL),
-                  (session.undo + session.redo).allSatisfy({ validRevision($0.revisionURL) }) else {
-                throw DocumentEditCache.CacheError.sourceChanged(
-                    "The PDF or its cached editing session changed outside LyraReader. The cached page edits were kept.")
-            }
-            try loadPageEditRevision(at: saved.snapshot.revisionURL, title: session.title,
-                annotationRecordsURL: session.annotationRecordsURL, annotations: saved.snapshot.annotations,
-                bookmarks: saved.snapshot.bookmarks, slots: saved.snapshot.slots,
-                currentPage: saved.snapshot.currentPage, selection: saved.snapshot.selection)
-            pendingFileDeletions = saved.snapshot.deletions
-            erasedInkStrokeIDs = saved.snapshot.erasedInk
-            annotationCacheIsDirty = saved.snapshot.annotationDirty
+            let sourceStamp = try DocumentEditCache.SourceStamp(original)
+            let title = document?.title ?? original.deletingPathExtension().lastPathComponent
+            let pageCount = document?.pageCount ?? 0
+            let request = DocumentTransactionStartRecord(
+                originalUrl: original.absoluteString,
+                directoryUrl: "",
+                recoveryPath: recoveryURL.path,
+                originalRecordsUrl: Self.annotationRecordsURL(for: original).absoluteString,
+                title: title,
+                pageCount: UInt32(clamping: max(0, pageCount)),
+                originalRotations: [],
+                originalSignatureJson: try DocumentTransactionJSON.string(documentSignature),
+                sourceSize: UInt64(max(0, sourceStamp.size)),
+                sourceModified: sourceStamp.modified?.timeIntervalSinceReferenceDate,
+                sourceSha256: sourceStamp.sha256,
+                annotationsJson: try DocumentTransactionJSON.string(annotations),
+                bookmarksJson: try DocumentTransactionJSON.string(bookmarks),
+                slotsJson: try DocumentTransactionJSON.string(annotationRecordSlots),
+                deletionsJson: try DocumentTransactionJSON.string(pendingFileDeletions),
+                erasedInkJson: try DocumentTransactionJSON.string(Array(erasedInkStrokeIDs)),
+                annotationDirty: annotationCacheIsDirty,
+                currentPage: UInt32(clamping: max(0, currentPage)),
+                selection: pageSelection.sorted().map { UInt32(clamping: max(0, $0)) },
+                cacheDirectoryPrefix: DocumentEditCache.directory(for: original).path + "/",
+                restore: true,
+                xfaReadOnlyReason: nil
+            )
+            let (transaction, state) = try DocumentTransactionSession.start(request)
+            let signature = try DocumentTransactionJSON.value(
+                DocumentSignature.self, from: state.originalSignatureJson)
+            let directory = URL(string: state.directoryUrl) ?? recoveryURL.deletingLastPathComponent()
+            let session = try pageEditSession(
+                from: state,
+                originalURL: original,
+                signature: signature,
+                title: state.title,
+                directory: directory,
+                transaction: transaction
+            )
+            let payload = try decodedPageEditPayload(state)
+            try loadPageEditRevision(at: session.revisionURL, title: session.title,
+                annotationRecordsURL: session.annotationRecordsURL,
+                annotations: payload.annotations,
+                bookmarks: payload.bookmarks, slots: payload.slots,
+                currentPage: payload.currentPage, selection: payload.selection)
+            pendingFileDeletions = payload.deletions
+            erasedInkStrokeIDs = payload.erasedInk
+            annotationCacheIsDirty = payload.annotationDirty
             pageEditSession = session
             pageEditPendingOperations = session.operations
+            persistPageEditRecovery()
             statusMessage = "Recovered unsaved PDF changes · Save to update \(original.lastPathComponent)"
         } catch {
-            lastError = "The cached editing session was kept but could not be restored: \(error.localizedDescription)"
+            lastError = "The cached editing session was kept but could not be restored: \(AnnotationRecords.message(error))"
         }
     }
 
@@ -11839,26 +11933,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return "the blank page carries no annotations"
         case .rotate, .setRotation:
             return "marks stay on their pages"
-        }
-    }
-
-    private static func remap(_ annotations: [Annotation], with pageMap: [Int?]) -> [Annotation] {
-        annotations.compactMap { annotation in
-            guard annotation.page >= 0, annotation.page < pageMap.count,
-                  let page = pageMap[annotation.page] else { return nil }
-            var copy = annotation
-            copy.page = page
-            return copy
-        }
-    }
-
-    private static func remap(_ bookmarks: [Bookmark], with pageMap: [Int?]) -> [Bookmark] {
-        bookmarks.compactMap { bookmark in
-            guard bookmark.page >= 0, bookmark.page < pageMap.count,
-                  let page = pageMap[bookmark.page] else { return nil }
-            var copy = bookmark
-            copy.page = page
-            return copy
         }
     }
 
@@ -16546,9 +16620,14 @@ extension AppState {
     private func performContentStage(
         _ command: PDFContentCommand, page: Int, label: String, allowRaster: Bool, source: URL?
     ) async -> Bool {
-        guard await ensurePageEditSession(),
-            let snapshot = pageEditSnapshot(label: label), document?.url == source
-        else {
+        guard await ensurePageEditSession(), document?.url == source else {
+            preserveContentFailure(command, "Could not prepare the working copy.", page: page)
+            return false
+        }
+        let snapshotInput: DocumentTransactionInputRecord
+        do {
+            snapshotInput = try pageEditInputRecord()
+        } catch {
             preserveContentFailure(command, "Could not prepare the working copy.", page: page)
             return false
         }
@@ -16556,6 +16635,8 @@ extension AppState {
         var effectiveCommand = command
         let translationSnapshot = inPlaceTranslation.snapshot()
         do {
+            guard let transaction = pageEditSession?.transaction else { return false }
+            try transaction.prepare(label: label, input: snapshotInput)
             if try await materializeAnnotationsInWorkingCopy() {
                 effectiveCommand.revision = try await engine.contentObjects(page: page).revision
             }
@@ -16594,14 +16675,19 @@ extension AppState {
                 editedPages: [page],
                 reason: "The edited page changed."
             )
+            let state = try session.transaction.commitRevision(
+                url: destination,
+                revisionNumber: session.revisionNumber + 1,
+                label: label,
+                input: try pageEditInputRecord())
             session.revisionURL = destination
-            session.revisionNumber += 1
-            session.operations.append(label)
-            session.undo.append(snapshot)
-            session.redo.removeAll()
+            session.revisionNumber = Int(state.revisionNumber)
+            session.operations = state.operations
+            session.currentToOriginal = state.currentToOriginal.map(Int.init)
             pageEditSession = session
             pageEditPendingOperations = session.operations
             pageEditIsApplied = false
+            if let recoveryError = state.recoveryError { lastError = recoveryError }
             if command.action == "replaceText" {
                 contentRecoveryCommand = nil
                 contentTextRecovery = nil
@@ -16624,6 +16710,7 @@ extension AppState {
             await reloadContentObjects()
             return true
         } catch {
+            pageEditSession?.transaction.cancelPrepared()
             // The edit did not land, so the blocks and their cached translations are still
             // the ones on screen. Restore them rather than making a failed command discard
             // overlays.
