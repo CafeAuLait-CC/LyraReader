@@ -6588,11 +6588,11 @@ pub struct AnnotationSaveReport {
     pub full_rewrite: bool,
 }
 
-/// A rectangle in PDF user space (origin at the page's bottom-left corner).
+/// A rectangle used by a content command.
 ///
-/// Content command bounds arrive in the shell's top-left view space; [`prepare_content_command`]
-/// converts them with the open page's own geometry before the engine sees them. `crop` is the
-/// exception: it is a normalized fraction of the image and is already independent of page space.
+/// `bounds` arrives in the shell's top-left view space; [`prepare_content_command`] converts it
+/// with the open page's own geometry before the engine sees it. `crop` is the exception: it is a
+/// normalized fraction of the image and is already independent of page space.
 #[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
 pub struct ContentBoxRecord {
     pub x: f64,
