@@ -755,23 +755,10 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
 
     // MARK: - Prefetch band
 
-    /// Longest prefetch ring the band may use, in viewport heights (ADR 0007 shipped 3.5
-    /// viewports of *band*, i.e. a 2.5-viewport ring plus the viewport itself).
-    ///
-    /// This is the ceiling, not the value: `prefetchRingVh` shortens the ring whenever the
-    /// band it would produce does not fit `prefetchBandBudgetBytes`. The reason is measured — at
-    /// 400% zoom the fixed band pinned 110 tiles / 99.2 MiB, of which the viewport showed 16
-    /// tiles: the band, not the cache budget, was most of what the peak RSS was made of.
-    static let maxPrefetchRingVh: CGFloat = 2.5
-    /// Ring distance below which the band is not shortened further.
-    ///
-    /// The floor is measured, not chosen: the bench's step scroll (`phase_scroll`) records the
-    /// raster time the viewport spent *waiting* for tiles that were not ready — p95 0.00 ms and
-    /// 9 misses over 120 steps at a 1.0-viewport ring, but p95 8.1 ms and 141 misses (worst
-    /// 120 ms) at 0.5. A ring shorter than a viewport cannot cover one step of the bench's
-    /// scroll (half a viewport) plus raster time, so the reader starts seeing the preview
-    /// instead of the page. 0.75 is the shortest ring that measured no worse than 1.0.
-    static let minPrefetchRingVh: CGFloat = 0.75
+    /// The ring ladder, the band's byte target and the row/column rules live in
+    /// `lyra-reader-render`'s `plan` module (ADR 0007 / audit C5). The shell resolves the
+    /// measurement overrides here and sends them as inputs; it no longer derives the plan.
+
     /// Columns kept ready beyond the ones on screen.
     ///
     /// Zero, deliberately. The canvas left-aligns a page that is wider than the viewport and
@@ -785,24 +772,6 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     static let defaultMaxPreviewPages = 7
     private static let maxPreviewPages = ProcessInfo.processInfo.environment["LYRA_READER_PREVIEW_PAGES"]
         .flatMap(Int.init).map { min(max($0, 0), 32) } ?? defaultMaxPreviewPages
-
-    /// Byte target for the whole wanted band (visible + ring + the ready columns).
-    ///
-    /// The band is the *pinned* set — `TileCache.evictToFit` never drops it — so a fixed band
-    /// in viewport heights is an unbounded commitment in bytes: the same 3.5 viewports cost
-    /// 27 MiB at 100% zoom and 99 MiB at 400%, and the peak followed (measured on a real
-    /// 115-page paper: 417.7 MiB and 515.1 MiB). A third of the cache budget is the rule, with
-    /// an 8 MiB floor so that a reader who shrinks the cache in Settings still gets a band:
-    /// the pinned third keeps scrolling fed, the rest stays for what the reader scrolled *away*
-    /// from and for the previous LOD — which is what makes scrolling and zooming back cache
-    /// hits — and raising the budget raises both together.
-    ///
-    /// 16 MiB at the default 48 MB budget is the measured operating point; the curve it was
-    /// chosen from is in the pull request (peak RSS against the bench's raster wait at 8, 16,
-    /// 24 and 48 MiB, and against the fixed 3.5-viewport band).
-    public static func prefetchBandBudgetBytes(cacheBudgetBytes: Int) -> Int {
-        max(8 * 1024 * 1024, cacheBudgetBytes / 3)
-    }
 
     /// `LYRA_READER_PREFETCH_RING_VH=<viewports>`: measurement override that pins the ring to
     /// exactly that distance instead of deriving it from the byte target (`2.5` reproduces the
@@ -839,8 +808,7 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     }
 
     /// The `LYRA_READER_PREFETCH_*` overrides are read once: they are constants for the
-    /// process, and the band is rebuilt (with `bandSpans` several times inside it) on every
-    /// viewport update, i.e. on the scrolling path.
+    /// process, and the plan is recomputed on every viewport update, i.e. on the scrolling path.
     private static let prefetchRingOverride = configuredPrefetchRingOverride()
     private static let wantAllColumns = configuredWantAllColumns()
     private static let prefetchColumns = configuredPrefetchColumns()
@@ -14260,10 +14228,94 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // the visible window is the left one.
         let viewport = visibleContentRect(viewportHeight: viewportHeight)
 
-        // The band: viewport + ring, where the ring is picked so the band's bytes fit the
-        // band budget (see `prefetchRingVh`).
-        let ringVh = prefetchRingVh(viewportHeight: viewportHeight, tilePt: tilePt, pages: visible)
-        let band = bandSpans(ringVh: ringVh, viewportHeight: viewportHeight, tilePt: tilePt, pages: visible)
+        // The scheduler's decision for this update (ADR 0007 / audit C5): one batch plan from
+        // `lyra-reader-render`, not one query per tile. The plan owns the prefetch ring, the band
+        // rows and columns, the pinned set and the raster order; the cache, the eviction, the
+        // texture upload and rasterization all stay in the shell.
+        let drawerWidth = (rightPanelVisible || performancePanelVisible
+            ? ReaderSidePanelMetrics.totalWidth(contentWidth: rightPanelWidthPt) : 0)
+            + secondaryInspectorWidth
+        // The env override wins over the fixture/bench property; `nil` lets the planner derive
+        // the measured third-of-the-budget target.
+        let bandBudgetOverride: Int? = Self.prefetchBandMiB.flatMap(Int.init)
+            .map { min(max($0, 1), 512) * 1024 * 1024 }
+            ?? prefetchBandBudgetOverrideBytes
+        let planRequest = TilePlanRequestRecord(
+            viewportXPt: Double(viewport.minX),
+            viewportYPt: Double(viewport.minY),
+            viewportWidthPt: Double(viewport.width),
+            viewportHeightPt: Double(viewport.height),
+            scrollDirection: Double(scrollDirection),
+            zoom: Double(zoomFactor),
+            tileSizePx: UInt32(tileSizePx),
+            lod: lod,
+            cacheBudgetBytes: UInt64(max(0, tileCache.budgetBytes)),
+            bandBudgetOverrideBytes: bandBudgetOverride.map { UInt64(max(0, $0)) },
+            ringOverrideVh: Self.prefetchRingOverride.map(Double.init),
+            prefetchColumns: UInt32(Self.prefetchColumns),
+            wantAllColumns: Self.wantAllColumns,
+            drawerWidthPt: Double(drawerWidth),
+            rightPanelLayoutMoving: rightPanelLayoutIsMoving,
+            pages: visible.map { placement in
+                let tear = pageTear(forPage: placement.index)
+                return TilePlanPageRecord(
+                    page: UInt32(placement.index),
+                    topPt: Double(placement.topPt),
+                    leftPt: Double(placement.leftPt),
+                    widthPt: Double(placement.widthPt),
+                    heightPt: Double(placement.heightPt),
+                    displayTopPt: Double(displayPageTop(placement.index)),
+                    tearSplitPt: tear.map { Double($0.splitPt) },
+                    tearGapPt: Double(tear?.gapPt ?? 0)
+                )
+            },
+            cachedTiles: tileCache.keys().compactMap { key in
+                guard let bytes = tileCache.bytes(for: key) else { return nil }
+                return TilePlanCachedTileRecord(
+                    page: UInt32(key.page), lod: key.lod,
+                    x: UInt32(key.x), y: UInt32(key.y), bytes: UInt64(bytes))
+            },
+            priorTiles: canvasTiles.compactMap { tile in
+                let id = tile.placement.index
+                guard id >= 0 else { return nil }
+                return TilePlanPriorTileRecord(
+                    page: UInt32(id >> 24), lod: UInt8((id >> 20) & 15),
+                    x: UInt32(id & 1023), y: UInt32((id >> 10) & 1023),
+                    leftPt: Double(tile.placement.leftPt))
+            }
+        )
+        guard let plan = planTiles(request: planRequest) else {
+            // The shell cannot produce an invalid request; report it rather than draw a
+            // fabricated plan. The previous canvas stays as it was.
+            lastTilePlan = nil
+            lastError = "Tile plan rejected: invalid viewport geometry"
+            return
+        }
+
+        var placementsByPage: [Int: PagePlacement] = [:]
+        for placement in visible { placementsByPage[placement.index] = placement }
+        guard plan.pages.allSatisfy({ placementsByPage[Int($0.page)] != nil }) else {
+            lastTilePlan = nil
+            lastError = "Tile plan named a page outside the visible band"
+            return
+        }
+        // The plan's rows and columns are the band the page assembly and the band HUD use. The
+        // guard above makes the `compactMap` total.
+        let band: [BandSpan] = plan.pages.compactMap { page in
+            guard let placement = placementsByPage[Int(page.page)] else { return nil }
+            return BandSpan(
+                placement: placement,
+                columns: Int(page.firstColumn)...Int(page.lastColumn),
+                rows: Int(page.firstRow)...Int(page.lastRow)
+            )
+        }
+        let ringVh = CGFloat(plan.ringVh)
+        let wanted = Set(plan.pinned.map {
+            TileKey(page: Int($0.page), lod: $0.lod, x: Int($0.x), y: Int($0.y))
+        })
+        let retainedTiles = Set(plan.retained.map {
+            TileKey(page: Int($0.page), lod: $0.lod, x: Int($0.x), y: Int($0.y))
+        })
 
         visiblePagePlacements = Array(visible)
 
@@ -14288,9 +14340,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         configurePagePreviews(visible: visible, band: band, viewport: viewport,
                               viewportHeight: viewportHeight, screenScale: screenScale)
         schedulePagePreview()
-        var wanted = Set<TileKey>()
         var pages: [CanvasPage] = []
         var bandReport = BandReport()
+        // Tiles this update missed, with the placement the plan named. They are queued after the
+        // page assembly, in the plan's submission order.
+        var missedTiles = Set<TileKey>()
+        var tilePlacements: [TileKey: PagePlacement] = [:]
+        var queuedTiles: [TilePlanSnapshot.Tile] = []
 
         for span in band {
             let placement = span.placement
@@ -14317,29 +14373,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // The pinned set is the *shown* band plus the ring the byte budget allows: a tile
             // outside the band may be re-rasterized, a visible one may not be dropped.
 
-            // A drawer hides already sharp columns; it does not invalidate them. Keep those
-            // bitmaps in both the pinned CPU set and the submitted quads, so Metal also keeps
-            // their textures. Closing the drawer can then reveal them without raster/upload
-            // work. Retention is limited to this LOD, the current vertical band and the strip
-            // the trailing drawers can cover; scrolling to another band or zooming releases it.
-            let drawerWidth = (rightPanelVisible || performancePanelVisible
-                ? ReaderSidePanelMetrics.totalWidth(contentWidth: rightPanelWidthPt) : 0)
-                + secondaryInspectorWidth
-            if drawerWidth > 0 || rightPanelLayoutIsMoving {
-                let coveredRight = viewport.maxX + drawerWidth / max(zoomFactor, 0.01)
-                    + CGFloat(Self.prefetchColumns + 1) * tilePt
-                for tile in previous {
-                    let id = tile.placement.index
-                    let tx = id & 1023
-                    let ty = (id >> 10) & 1023
-                    guard (id >> 20) & 15 == Int(lod), span.rows.contains(ty),
-                          tx > span.columns.upperBound,
-                          rightPanelLayoutIsMoving || tile.placement.leftPt < coveredRight
-                    else { continue }
-                    wanted.insert(TileKey(page: placement.index, lod: lod, x: tx, y: ty))
-                    sharpRows.append(tile)
-                    bandReport.record(.offscreenColumn, bytes: tile.image.bgra.count)
-                }
+            // A drawer hides already sharp columns; it does not invalidate them. The plan
+            // already decided which of them are pinned (`retained`); append those quads in their
+            // old order, so Metal keeps their textures and closing the drawer can reveal them
+            // without raster or upload work.
+            for tile in previous {
+                let id = tile.placement.index
+                guard (id >> 20) & 15 == Int(lod) else { continue }
+                let key = TileKey(page: placement.index, lod: lod,
+                                  x: id & 1023, y: (id >> 10) & 1023)
+                guard retainedTiles.contains(key) else { continue }
+                sharpRows.append(tile)
+                bandReport.record(.offscreenColumn, bytes: tile.image.bgra.count)
             }
 
             for ty in span.rows {
@@ -14347,7 +14392,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 var rowComplete = true
                 for tx in span.columns {
                     let key = TileKey(page: placement.index, lod: lod, x: tx, y: ty)
-                    wanted.insert(key)
 
                     let tilePlacement = PagePlacement(
                         index: tileIdentifier(key),
@@ -14376,7 +14420,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                             complete = false
                             bandReport.visibleMisses += 1
                         }
-                        scheduleTile(key, placement: tilePlacement)
+                        missedTiles.insert(key)
+                        tilePlacements[key] = tilePlacement
                     }
                 }
                 if rowComplete {
@@ -14405,22 +14450,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 pages.append(contentsOf: sharpRows)
             }
         }
-        let viewportTop = scrollYPt
-        pendingTiles.sort { a, b in
-            func priority(_ item: (TileKey, PagePlacement)) -> (Int, CGFloat) {
-                let rect = item.1
-                let visible = CGRect(x: rect.leftPt, y: rect.topPt,
-                                     width: rect.widthPt, height: rect.heightPt).intersects(viewport)
-                let distance = max(viewportTop - rect.topPt - rect.heightPt,
-                    rect.topPt - viewportTop - viewportHeight, 0)
-                // An offscreen neighbor touching the viewport also has distance zero.
-                // A page jump must fill its destination before that prefetch work.
-                return (visible ? 0 : 1, distance)
+        // Submit in the plan's order: visible tiles first, then the ring by distance. The
+        // planner's sort is stable, so equal distances keep the band's page/row/column order —
+        // the same order the shell's own sort produced before the plan moved to Rust.
+        for tile in plan.tiles {
+            let key = TileKey(page: Int(tile.page), lod: tile.lod,
+                              x: Int(tile.x), y: Int(tile.y))
+            guard missedTiles.contains(key), !tilesInFlight.contains(key),
+                  !failedTiles.contains(key), let placement = tilePlacements[key] else {
+                continue
             }
-            return priority(a) < priority(b)
+            scheduleTile(key, placement: placement)
+            queuedTiles.append(TilePlanSnapshot.Tile(key: key, prefetch: tile.prefetch))
         }
-        recordTilePlan(lod: lod, ringVh: ringVh, band: band, wanted: wanted,
-                       scheduled: pendingTiles, viewport: viewport)
+        recordTilePlan(plan, scheduled: queuedTiles)
         pumpTiles()
 
         canvasTiles = pages
@@ -14492,34 +14535,29 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Freezes the update's scheduling decision for `TilePlanFixtureChecks`.
     ///
-    /// It reads exactly what the scheduler is about to act on — the band spans, the chosen ring,
-    /// the pinned set and the queued order — and stores a value copy. Nothing downstream consumes
-    /// it; the equivalence suite is the only reader.
-    private func recordTilePlan(lod: UInt8, ringVh: CGFloat, band: [BandSpan],
-                                wanted: Set<TileKey>, scheduled: [(TileKey, PagePlacement)],
-                                viewport: CGRect) {
-        let pages = band.map { span in
+    /// It reads exactly what the update is about to act on — the Rust plan's band, ring, pinned
+    /// set and prefetch flags, plus the tiles actually queued for rasterization — and stores a
+    /// value copy. Nothing downstream consumes it; the equivalence suite is the only reader.
+    private func recordTilePlan(_ plan: TilePlanRecord, scheduled: [TilePlanSnapshot.Tile]) {
+        let pages = plan.pages.map { page in
             TilePlanSnapshot.Page(
-                page: span.placement.index,
-                firstColumn: span.columns.lowerBound,
-                lastColumn: span.columns.upperBound,
-                firstRow: span.rows.lowerBound,
-                lastRow: span.rows.upperBound
+                page: Int(page.page),
+                firstColumn: Int(page.firstColumn),
+                lastColumn: Int(page.lastColumn),
+                firstRow: Int(page.firstRow),
+                lastRow: Int(page.lastRow)
             )
         }
-        let pinned = wanted.sorted { a, b in
+        let pinned = plan.pinned.map {
+            TileKey(page: Int($0.page), lod: $0.lod, x: Int($0.x), y: Int($0.y))
+        }.sorted { a, b in
             if a.page != b.page { return a.page < b.page }
             if a.lod != b.lod { return a.lod < b.lod }
             if a.y != b.y { return a.y < b.y }
             return a.x < b.x
         }
-        let tiles = scheduled.map { key, placement in
-            let rect = CGRect(x: placement.leftPt, y: placement.topPt,
-                              width: placement.widthPt, height: placement.heightPt)
-            return TilePlanSnapshot.Tile(key: key, prefetch: !rect.intersects(viewport))
-        }
-        lastTilePlan = TilePlanSnapshot(lod: lod, ringVh: ringVh, pages: pages,
-                                        pinned: pinned, scheduled: tiles)
+        lastTilePlan = TilePlanSnapshot(lod: plan.lod, ringVh: CGFloat(plan.ringVh),
+                                        pages: pages, pinned: pinned, scheduled: scheduled)
     }
 
     /// The part of the content the viewport shows, in content points. The canvas centres the
@@ -14601,118 +14639,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         )
     }
 
-    /// The ring above and below the viewport, in viewport heights.
-    ///
-    /// Both numbers are distances from the viewport's *top* edge (`scrollYPt`), which is how
-    /// ADR 0007 wrote them: the viewport itself is the interval [0, 1], so a ring of `R`
-    /// viewports is `above + below = 1 + R` and never less than 1 — the band must contain the
-    /// viewport whatever the budget says, or the reader stares at tiles the scheduler decided
-    /// not to want.
-    ///
-    /// The ring is asymmetric on purpose — most of it points the way the reader is scrolling —
-    /// and the shape ADR 0007 shipped (0.5 above / 2.0 below the viewport going down, 2.0/0.5
-    /// going up) is kept as the *ratio* for every shorter ring, so shortening the band never
-    /// changes which side it favours, only how far it reaches.
-    private func ringSplit(_ ringVh: CGFloat) -> (above: CGFloat, below: CGFloat) {
-        if scrollDirection < 0 {
-            return (ringVh * 2.0 / Self.maxPrefetchRingVh, 1 + ringVh * 0.5 / Self.maxPrefetchRingVh)
-        }
-        return (ringVh * 0.5 / Self.maxPrefetchRingVh, 1 + ringVh * 2.0 / Self.maxPrefetchRingVh)
-    }
-
-    /// Rungs the ring is chosen from, longest first, ending at the floor. The ladder is coarse
-    /// on purpose: each rung is a whole row of tiles at ordinary geometries, so a finer ladder
-    /// would buy bytes the band HUD cannot even show.
-    static let prefetchRingLadder: [CGFloat] = [2.5, 2.0, 1.5, 1.25, 1.0, minPrefetchRingVh]
-
-    /// Picks the ring distance: the longest rung whose band fits `prefetchBandBudgetBytes`.
-    ///
-    /// The estimate is the band this update is about to build, tile for tile — cached tiles at
-    /// their real (often cropped) size, the rest at a full tile — so the choice and the
-    /// scheduling loop cannot drift apart.
-    private func prefetchRingVh(
-        viewportHeight: CGFloat,
-        tilePt: CGFloat,
-        pages: [PagePlacement]
-    ) -> CGFloat {
-        if let override = Self.prefetchRingOverride {
-            return min(override, Self.maxPrefetchRingVh)
-        }
-        let budget = Self.prefetchBandMiB.flatMap(Int.init)
-            .map { min(max($0, 1), 512) * 1024 * 1024 }
-            ?? prefetchBandBudgetOverrideBytes
-            ?? Self.prefetchBandBudgetBytes(cacheBudgetBytes: tileCache.budgetBytes)
-        let lod = rasterLod
-        let fullTileBytes = tileSizePx * tileSizePx * 4
-        for rung in Self.prefetchRingLadder {
-            let bytes = bandSpans(ringVh: rung, viewportHeight: viewportHeight, tilePt: tilePt, pages: pages)
-                .reduce(0) { bandBytes, span in
-                    bandBytes + span.rows.reduce(0) { rowBytes, ty in
-                        rowBytes + span.columns.reduce(0) { columnBytes, tx in
-                            columnBytes + (tileCache.bytes(for: TileKey(page: span.placement.index, lod: lod, x: tx, y: ty))
-                                ?? fullTileBytes)
-                        }
-                    }
-                }
-            if bytes <= budget { return rung }
-        }
-        return Self.prefetchRingLadder.last ?? Self.minPrefetchRingVh
-    }
-
     /// The tile rows and columns the band covers, per visible page.
+    ///
+    /// The rows and columns now come from `lyra-reader-render`'s plan (ADR 0007 / audit C5);
+    /// this type only pairs them with the placement the page assembly needs.
     private struct BandSpan {
         let placement: PagePlacement
         let columns: ClosedRange<Int>
         let rows: ClosedRange<Int>
-    }
-
-    /// The rows and columns of every visible page that the band covers.
-    ///
-    /// Rows come from the ring; columns come from what the viewport can reveal. ADR 0007 wanted
-    /// *every* column, on the grounds that "a page is a handful of columns wide" — true at 100%
-    /// zoom (3 columns, all on screen), false at 400% (10 columns, 3 on screen), where the
-    /// unreachable ones were 24 of the 110 tiles (22.2 of 99.2 MiB). There is no horizontal
-    /// scrolling, so the columns off to the right can only be revealed by a widening window,
-    /// which rasterizes them on demand behind the whole-page preview that is already there for
-    /// an incomplete page — that trade is measured, not assumed: see `minPrefetchRingVh`.
-    private func bandSpans(
-        ringVh: CGFloat,
-        viewportHeight: CGFloat,
-        tilePt: CGFloat,
-        pages: [PagePlacement]
-    ) -> [BandSpan] {
-        let (above, below) = ringSplit(ringVh)
-        let top = scrollYPt - viewportHeight * above
-        let bottom = scrollYPt + viewportHeight * below
-        let viewport = visibleContentRect(viewportHeight: viewportHeight)
-        let allColumns = Self.wantAllColumns
-
-        return pages.compactMap { placement in
-            let rows = max(1, Int(ceil(placement.heightPt / tilePt)))
-            // A torn page's display extends past its paper by the gap, and its paper is split:
-            // convert the wanted content band back to page-local Y before choosing rows. Without
-            // this, a viewport scrolled into the bottom segment (which sits below the paper's
-            // nominal bottom) would name row indices past the page and schedule nothing.
-            guard let localBounds = pageLocalBand(top: top, bottom: bottom, for: placement)
-            else { return nil }
-            let firstRow = max(0, Int(floor(localBounds.lowerBound / tilePt)))
-            let lastRow = min(rows - 1, Int(floor((localBounds.upperBound - 0.001) / tilePt)))
-            guard firstRow <= lastRow else { return nil }
-
-            let columns = max(1, Int(ceil(placement.widthPt / tilePt)))
-            var firstColumn = 0
-            var lastColumn = columns - 1
-            if !allColumns {
-                firstColumn = max(0, min(columns - 1, Int(floor((viewport.minX - placement.leftPt) / tilePt))))
-                lastColumn = min(columns - 1, max(firstColumn, Int(floor((viewport.maxX - placement.leftPt) / tilePt))
-                    + Self.prefetchColumns))
-            }
-            return BandSpan(
-                placement: placement,
-                columns: firstColumn...lastColumn,
-                rows: firstRow...lastRow
-            )
-        }
     }
 
     /// `LYRA_READER_RENDER_STATS=1`: the shell's half of the HUD documented in docs/09 §9 —

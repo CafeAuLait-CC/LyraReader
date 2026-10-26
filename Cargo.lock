@@ -943,6 +943,7 @@ dependencies = [
  "lyra-reader-gpu",
  "lyra-reader-metadata",
  "lyra-reader-pdfium",
+ "lyra-reader-render",
  "lyra-reader-session",
  "lyra-reader-text",
  "lyra-reader-xfa",

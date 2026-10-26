@@ -52,6 +52,7 @@ use lyra_reader_pdfium::{
     WriteAnnotation, WriteAnnotationKind, WriteBookmark, backend_description, merge_documents,
     read_embedded_bookmarks, split_pages,
 };
+use lyra_reader_render::plan as render_plan;
 use lyra_reader_session::{DocumentLayout, LayoutMode};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -823,6 +824,265 @@ pub fn zoom_max_percent() -> u32 {
 #[uniffi::export]
 pub fn zoom_preset_inset_pt() -> f64 {
     lyra_reader_session::ZOOM_PRESET_INSET_PT
+}
+
+/// One page placement for [`plan_tiles`], in content points (top-left origin).
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct TilePlanPageRecord {
+    pub page: u32,
+    pub top_pt: f64,
+    pub left_pt: f64,
+    /// Display width; a facing spread's second page carries its horizontal offset in `left_pt`.
+    pub width_pt: f64,
+    /// Display height (a torn page's paper height, without the gap).
+    pub height_pt: f64,
+    /// The page's display top with region-card gaps applied. Only the torn branch reads it.
+    pub display_top_pt: f64,
+    /// Page-local Y of an inside-page tear, when one is open on this page.
+    pub tear_split_pt: Option<f64>,
+    /// Height of the tear's gap, in content points (0 when the page is not torn).
+    pub tear_gap_pt: f64,
+}
+
+/// One tile the shell's cache holds right now, with its real bitmap size.
+///
+/// The prefetch ring's byte estimate uses these instead of a full-tile estimate: an edge tile
+/// is a fraction of a full one, and the ring decision is about bytes (ADR 0007).
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct TilePlanCachedTileRecord {
+    pub page: u32,
+    pub lod: u8,
+    pub x: u32,
+    pub y: u32,
+    /// Exact `PageImage.bgra.count`, not a size inferred from the tile edge.
+    pub bytes: u64,
+}
+
+/// One tile quad the shell drew last update, for the drawer-retention rule.
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct TilePlanPriorTileRecord {
+    pub page: u32,
+    pub lod: u8,
+    pub x: u32,
+    pub y: u32,
+    /// Content-space left edge of the quad (not the page's).
+    pub left_pt: f64,
+}
+
+/// Everything one viewport update needs for its tile plan.
+///
+/// Lengths are points, `zoom` is the viewer scale, `lod` the tile-pyramid level (`2^lod` is the
+/// raster scale), and `tile_size_px` the LOD-0 tile edge in device pixels. The prefetch settings
+/// are the shell's resolved values for its measurement environment overrides; `None` means the
+/// measured default (`max(8 MiB, cache_budget / 3)` for the band, the ladder for the ring).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TilePlanRequestRecord {
+    /// The visible content rect: what the reader can actually see.
+    pub viewport_x_pt: f64,
+    pub viewport_y_pt: f64,
+    pub viewport_width_pt: f64,
+    pub viewport_height_pt: f64,
+    /// `+1` while moving down, `-1` while moving up; only the sign is read.
+    pub scroll_direction: f64,
+    /// Viewer scale (`zoomPercent / 100 × calibration`).
+    pub zoom: f64,
+    pub tile_size_px: u32,
+    pub lod: u8,
+    pub cache_budget_bytes: u64,
+    /// `LYRA_READER_PREFETCH_BAND_MIB` in bytes, when the measurement override is set.
+    pub band_budget_override_bytes: Option<u64>,
+    /// `LYRA_READER_PREFETCH_RING_VH`, when the measurement override is set.
+    pub ring_override_vh: Option<f64>,
+    /// `LYRA_READER_PREFETCH_COLUMNS` (columns kept ready beyond the on-screen ones).
+    pub prefetch_columns: u32,
+    /// `LYRA_READER_PREFETCH_ALL_COLUMNS=1`: the pre-change "every column" measurement mode.
+    pub want_all_columns: bool,
+    /// Width of the open right drawer in screen points (0 when no drawer is open).
+    pub drawer_width_pt: f64,
+    /// True while the drawer is still animating.
+    pub right_panel_layout_moving: bool,
+    pub pages: Vec<TilePlanPageRecord>,
+    pub cached_tiles: Vec<TilePlanCachedTileRecord>,
+    pub prior_tiles: Vec<TilePlanPriorTileRecord>,
+}
+
+/// What class of work a planned tile belongs to.
+///
+/// The planner emits `Visible` and `TargetLodPrefetch`; the other two are the scheduler's
+/// vocabulary for tasks the shell does not queue today (a lower-LOD preview is drawn from the
+/// cache, thumbnails never go through this path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum TilePriorityRecord {
+    Visible,
+    TargetLodPrefetch,
+    OneLodLower,
+    Thumbnail,
+}
+
+/// A tile identity without its payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct TilePlanKeyRecord {
+    pub page: u32,
+    pub lod: u8,
+    pub x: u32,
+    pub y: u32,
+}
+
+/// One page's band, in tile rows and columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct TilePlanPageSpansRecord {
+    pub page: u32,
+    pub first_column: u32,
+    pub last_column: u32,
+    pub first_row: u32,
+    pub last_row: u32,
+}
+
+/// One tile to rasterize, in submission order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct TilePlanTileRecord {
+    pub page: u32,
+    pub lod: u8,
+    pub x: u32,
+    pub y: u32,
+    pub priority: TilePriorityRecord,
+    /// True when the tile is outside the viewport (ring work).
+    pub prefetch: bool,
+}
+
+/// The batch plan for one viewport update.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TilePlanRecord {
+    pub lod: u8,
+    /// The chosen prefetch-ring distance, in viewport heights.
+    pub ring_vh: f64,
+    /// Every page the band covers, in placement order.
+    pub pages: Vec<TilePlanPageSpansRecord>,
+    /// Every tile of the band, visible first, then the ring by distance.
+    pub tiles: Vec<TilePlanTileRecord>,
+    /// The pinned set: every band tile plus the drawer-retained columns.
+    pub pinned: Vec<TilePlanKeyRecord>,
+    /// Prior tile quads kept because an open drawer covers them (pinned, not scheduled).
+    pub retained: Vec<TilePlanKeyRecord>,
+}
+
+/// Compute the tile plan for **one** viewport update (ADR 0007 / audit C5).
+///
+/// The shell keeps the cache, the eviction order, the texture upload and rasterization; this
+/// call owns the decision — the prefetch ring, each page's band rows and columns, the pinned
+/// set and the raster submission order. One call per viewport update, never one per tile.
+///
+/// `None` means the request violated an invariant the shell cannot produce (non-finite
+/// geometry, a zero tile edge, an out-of-range LOD, oversized lists). The caller reports it
+/// instead of fabricating a plan.
+#[uniffi::export]
+pub fn plan_tiles(request: TilePlanRequestRecord) -> Option<TilePlanRecord> {
+    let plan_request = render_plan::PlanRequest {
+        viewport: render_plan::PlanRect::new(
+            request.viewport_x_pt,
+            request.viewport_y_pt,
+            request.viewport_width_pt,
+            request.viewport_height_pt,
+        ),
+        scroll_direction: request.scroll_direction,
+        zoom: request.zoom,
+        tile_size_px: request.tile_size_px,
+        lod: request.lod,
+        cache_budget_bytes: request.cache_budget_bytes,
+        band_budget_override_bytes: request.band_budget_override_bytes,
+        ring_override_vh: request.ring_override_vh,
+        prefetch_columns: request.prefetch_columns,
+        want_all_columns: request.want_all_columns,
+        drawer_width_pt: request.drawer_width_pt,
+        right_panel_layout_moving: request.right_panel_layout_moving,
+        pages: request
+            .pages
+            .iter()
+            .map(|page| render_plan::PlanPage {
+                page: page.page,
+                top_pt: page.top_pt,
+                left_pt: page.left_pt,
+                width_pt: page.width_pt,
+                height_pt: page.height_pt,
+                display_top_pt: page.display_top_pt,
+                tear_split_pt: page.tear_split_pt,
+                tear_gap_pt: page.tear_gap_pt,
+            })
+            .collect(),
+        cached_tiles: request
+            .cached_tiles
+            .iter()
+            .map(|tile| render_plan::CachedTile {
+                page: tile.page,
+                lod: tile.lod,
+                x: tile.x,
+                y: tile.y,
+                bytes: tile.bytes,
+            })
+            .collect(),
+        prior_tiles: request
+            .prior_tiles
+            .iter()
+            .map(|tile| render_plan::PriorTile {
+                page: tile.page,
+                lod: tile.lod,
+                x: tile.x,
+                y: tile.y,
+                left_pt: tile.left_pt,
+            })
+            .collect(),
+    };
+    let plan = render_plan::plan_tiles(&plan_request)?;
+    let key = |key: render_plan::PlannedKey| TilePlanKeyRecord {
+        page: key.page,
+        lod: key.lod,
+        x: key.x,
+        y: key.y,
+    };
+    Some(TilePlanRecord {
+        lod: plan.lod,
+        ring_vh: plan.ring_vh,
+        pages: plan
+            .pages
+            .iter()
+            .map(|page| TilePlanPageSpansRecord {
+                page: page.page,
+                first_column: page.first_column,
+                last_column: page.last_column,
+                first_row: page.first_row,
+                last_row: page.last_row,
+            })
+            .collect(),
+        tiles: plan
+            .tiles
+            .iter()
+            .map(|tile| TilePlanTileRecord {
+                page: tile.page,
+                lod: tile.lod,
+                x: tile.x,
+                y: tile.y,
+                priority: match tile.priority {
+                    render_plan::TilePriority::Visible => TilePriorityRecord::Visible,
+                    render_plan::TilePriority::TargetLodPrefetch => {
+                        TilePriorityRecord::TargetLodPrefetch
+                    }
+                    render_plan::TilePriority::OneLodLower => TilePriorityRecord::OneLodLower,
+                    render_plan::TilePriority::Thumbnail => TilePriorityRecord::Thumbnail,
+                },
+                prefetch: tile.prefetch,
+            })
+            .collect(),
+        pinned: plan
+            .pinned
+            .iter()
+            .map(|key_value| key(*key_value))
+            .collect(),
+        retained: plan
+            .retained
+            .iter()
+            .map(|key_value| key(*key_value))
+            .collect(),
+    })
 }
 
 /// `Page 3`, `Pages 1-3`, `Pages 1, 3, 5` (1-based, sorted and de-duplicated).
