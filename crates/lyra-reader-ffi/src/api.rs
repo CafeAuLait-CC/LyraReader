@@ -3772,7 +3772,7 @@ fn ai_summary_plan_record(plan: lyra_reader_ai::SummaryLayerPlan) -> AiSummaryPl
     }
 }
 
-fn page_operation(record: PageOperationRecord) -> PageOperation {
+pub(crate) fn page_operation(record: PageOperationRecord) -> PageOperation {
     match record {
         PageOperationRecord::Rotate {
             pages,
