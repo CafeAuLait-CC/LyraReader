@@ -176,7 +176,7 @@ fn xfa_form_is_detected_rendered_five_pages_and_read_only() {
         "save_annotations_copy",
         read_only(
             document
-                .save_annotations_copy(dest(), vec![], vec![], 1.0)
+                .save_annotations_copy(dest(), vec![], vec![])
                 .map(|_| ()),
         ),
     );
@@ -184,7 +184,7 @@ fn xfa_form_is_detected_rendered_five_pages_and_read_only() {
         "replace_with_annotations",
         read_only(
             document
-                .replace_with_annotations(vec![], vec![], 1.0)
+                .replace_with_annotations(vec![], vec![])
                 .map(|_| ()),
         ),
     );

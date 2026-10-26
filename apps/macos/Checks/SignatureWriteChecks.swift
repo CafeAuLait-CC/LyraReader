@@ -101,11 +101,11 @@ extension ReaderChecks {
         }
 
         await expectRefusal("replaceWithAnnotations") {
-            _ = try await gateEngine.replaceWithAnnotations([], bookmarks: [], zoom: 1)
+            _ = try await gateEngine.replaceWithAnnotations([], bookmarks: [])
         }
         await expectRefusal("replaceWithAnnotationChanges") {
             _ = try await gateEngine.replaceWithAnnotationChanges(
-                [], bookmarks: [], updates: [], deletions: [], zoom: 1)
+                [], bookmarks: [], updates: [], deletions: [])
         }
         await expectRefusal("replaceWithFilledForm") {
             _ = try await gateEngine.replaceWithFilledForm([])
@@ -187,8 +187,7 @@ extension ReaderChecks {
             additions: [highlight],
             bookmarks: [],
             updates: [],
-            deletions: [],
-            zoom: 1)
+            deletions: [])
         require(annotationReport.writtenIDs == [highlight.id],
                 "the annotated copy reports the annotation it wrote")
         try requireUnsignedCopy(annotatedCopy, "annotation copy")

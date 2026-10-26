@@ -241,8 +241,7 @@ extension ReaderChecks {
         let noteReport = try await probe.saveAnnotatedCopy(
             to: noteURL,
             annotations: [noteRequest],
-            bookmarks: [],
-            zoom: 1.0
+            bookmarks: []
         )
         require(noteReport.writtenIDs == [noteRequest.id], "the note is written once")
         let noteReopen = AppState(engine: try RustEngine())
