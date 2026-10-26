@@ -1,4 +1,5 @@
 import AppKit
+import CoreGraphics
 import SwiftUI
 @testable import LyraReaderKit
 
@@ -43,6 +44,7 @@ extension ReaderChecks {
         var windows: [NSWindow] = []
         defer {
             ReaderTitlebarDragView.mouseDownHook = nil
+            ReaderTitlebarDoubleClick.preferenceOverride = nil
             ReaderMotion.reduceMotionOverride = previousMotion
             coordinator.endDrag(); coordinator.tearOff = nil; coordinator.closeEmptiedSource = nil
             registry.newWindow = nil
@@ -68,6 +70,9 @@ extension ReaderChecks {
             return nil
         }
         func frameInWindow(_ view: NSView) -> CGRect { view.convert(view.bounds, to: nil) }
+        func pump(_ seconds: TimeInterval) {
+            RunLoop.current.run(until: Date().addingTimeInterval(seconds))
+        }
         /// `NSView.hitTest` takes the point in the receiver's superview coordinates. The hosting
         /// view is flipped, so passing a converted local point would test the row mirrored.
         func hitTest(_ host: NSView, windowPoint: NSPoint) -> NSView? {
@@ -276,6 +281,21 @@ extension ReaderChecks {
                 }
                 expect(document.frame.width > scroll.contentView.bounds.width + 1,
                        "8 tabs overflow the visible strip (content \(document.frame.width) > clip \(scroll.contentView.bounds.width))")
+                // A two-finger horizontal scroll over a guarded 4 pt gap must still scroll the
+                // strip; the guard owns the pointer, not the scroll gesture.
+                let scrollGap = (tabFrames[0].maxX + tabFrames[1].minX) / 2
+                let scrollHit = hitTest(host, windowPoint: NSPoint(x: scrollGap, y: rowMid))
+                expect(scrollHit?.mouseDownCanMoveWindow == false
+                            && !(scrollHit is ReaderTitlebarDragView),
+                       "the gap used for the scroll test is owned by a non-movable view; got \(hitDescription(scrollHit))")
+                let beforeScrollX = scroll.contentView.bounds.origin.x
+                if let scrollEvent = tabHitScrollEvent(deltaX: -60) {
+                    scrollHit?.scrollWheel(with: scrollEvent)
+                    pump(0.1)
+                }
+                let afterScrollX = scroll.contentView.bounds.origin.x
+                expect(abs(afterScrollX - beforeScrollX) > 1,
+                       "horizontal scrolling over a 4 pt gap scrolls the 8-tab strip (before \(beforeScrollX), after \(afterScrollX))")
                 let offset = NSPoint(x: document.frame.width - scroll.contentView.bounds.width, y: 0)
                 scroll.contentView.scroll(to: offset)
                 scroll.reflectScrolledClipView(scroll.contentView)
@@ -370,6 +390,55 @@ extension ReaderChecks {
             }
         }
 
+        // Guarded whitespace keeps the system titlebar double-click action while a single press
+        // there is still swallowed. A separate window keeps the zoom out of the tab probes above.
+        let failuresBeforeDoubleClick = failures.count
+        let (_, titlebarWindow, titlebarHost) = makeWindow(tabs: 3)
+        alignTitlebar(titlebarWindow, titlebarHost)
+        let titlebarFrames = inputs(titlebarHost)
+            .sorted { frameInWindow($0).minX < frameInWindow($1).minX }
+            .map(frameInWindow)
+        let titlebarMidY = titlebarFrames[0].midY
+        let titlebarGap = NSPoint(
+            x: (titlebarFrames[0].maxX + titlebarFrames[1].minX) / 2, y: titlebarMidY)
+        let titlebarPadding = NSPoint(
+            x: TabRowLayout.tabStripLeadingInset + TabRowLayout.tabStripHorizontalPadding / 2,
+            y: titlebarMidY)
+        ReaderTitlebarDoubleClick.preferenceOverride = "Maximize"
+        for (name, point) in [("inter-tab gap", titlebarGap),
+                              ("strip leading padding", titlebarPadding)] {
+            if titlebarWindow.isZoomed { titlebarWindow.performZoom(nil); pump(0.05) }
+            let hit = hitTest(titlebarHost, windowPoint: point)
+            expect(hit?.mouseDownCanMoveWindow == false && !(hit is ReaderTitlebarDragView),
+                   "\(name) is owned by a non-movable tab-strip view; got \(hitDescription(hit))")
+            let before = titlebarWindow.frame
+            let single = press(titlebarWindow, at: point)
+            expect(single.drags == 0 && single.hook == 0 && !single.moved
+                        && titlebarWindow.frame == before && !titlebarWindow.isZoomed,
+                   "a single press in the \(name) neither moves nor zooms the window")
+            titlebarWindow.resetDrags()
+            hook.count = 0
+            titlebarWindow.sendEvent(tabHitEvent(.leftMouseDown, at: point, in: titlebarWindow, clickCount: 2))
+            titlebarWindow.sendEvent(tabHitEvent(.leftMouseUp, at: point, in: titlebarWindow, clickCount: 2))
+            expect(titlebarWindow.isZoomed,
+                   "a double-click in the \(name) performs the Maximize titlebar action")
+            expect(titlebarWindow.dragEvents.isEmpty && hook.count == 0,
+                   "a double-click in the \(name) does not start a window drag")
+        }
+        if titlebarWindow.isZoomed { titlebarWindow.performZoom(nil); pump(0.05) }
+        ReaderTitlebarDoubleClick.preferenceOverride = "None"
+        let beforeNone = titlebarWindow.frame
+        titlebarWindow.resetDrags()
+        titlebarWindow.sendEvent(tabHitEvent(.leftMouseDown, at: titlebarGap, in: titlebarWindow, clickCount: 2))
+        titlebarWindow.sendEvent(tabHitEvent(.leftMouseUp, at: titlebarGap, in: titlebarWindow, clickCount: 2))
+        expect(!titlebarWindow.isZoomed && !titlebarWindow.isMiniaturized
+                    && titlebarWindow.frame == beforeNone && titlebarWindow.dragEvents.isEmpty,
+               "the None preference makes a gap double-click inert")
+        ReaderTitlebarDoubleClick.preferenceOverride = nil
+        if failures.count == failuresBeforeDoubleClick {
+            print("PASS: gap and padding double-clicks keep the titlebar action; single presses stay swallowed")
+        }
+
         // The same reorder through a press that starts on the title and one that starts on the
         // tab's trailing padding. The press goes through the window; AppKit does not deliver a
         // synthetic `leftMouseDragged` to the input in this headless harness, so the drag and
@@ -415,13 +484,20 @@ extension ReaderChecks {
     }
 
     @MainActor static func tabHitEvent(
-        _ type: NSEvent.EventType, at point: NSPoint, in window: NSWindow
+        _ type: NSEvent.EventType, at point: NSPoint, in window: NSWindow, clickCount: Int = 1
     ) -> NSEvent {
         NSEvent.mouseEvent(
             with: type, location: point, modifierFlags: [],
             timestamp: ProcessInfo.processInfo.systemUptime,
             windowNumber: window.windowNumber, context: nil, eventNumber: 1,
-            clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)!
+            clickCount: clickCount, pressure: type == .leftMouseUp ? 0 : 1)!
+    }
+
+    @MainActor static func tabHitScrollEvent(deltaX: CGFloat) -> NSEvent? {
+        guard let event = CGEvent(
+            scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2,
+            wheel1: 0, wheel2: Int32(deltaX), wheel3: 0) else { return nil }
+        return NSEvent(cgEvent: event)
     }
 }
 
