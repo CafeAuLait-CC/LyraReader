@@ -7,7 +7,9 @@ import UniformTypeIdentifiers
 /// The row uses one set of numbers, ``TabRowLayout``: the traffic lights (positioned by
 /// ``ReaderTitlebarLayout``), the tab titles, their close affordances and the plus button all
 /// share the 44 pt row's centre line. The tab's *whole* rectangle selects it; only the 24 pt
-/// close affordance on the right closes it, and its 4 pt right-hand padding still selects.
+/// close affordance on the right closes it, and its 4 pt right-hand padding still selects. The
+/// gaps and the strip's own padding are owned by ``TabStripPressGuard``; only the explicit
+/// ``ReaderWindowDragArea`` to the right of the tab strip starts an AppKit window drag.
 public struct TabStrip: View {
     public static let height: CGFloat = TabRowLayout.height
 
@@ -45,14 +47,23 @@ public struct TabStrip: View {
                 if let tabDrag, tabDrag.isInsideStrip { return tabDrag.indicatorX }
                 return nil
             }()
-            HStack(spacing: 6) {
+            HStack(spacing: 0) {
+                TabStripPressGuard()
+                    .frame(width: TabRowLayout.tabStripHorizontalPadding,
+                           height: TabRowLayout.height)
                 ScrollViewReader { scroll in
                     ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(alignment: .center, spacing: TabRowLayout.tabSpacing) {
+                        HStack(alignment: .center, spacing: 0) {
                             ForEach(Array(state.tabs.enumerated()), id: \.element.id) { index, tab in
                                 tabItem(tab, index: index, width: tabWidth)
                                     .id(tab.id)
                                     .transition(.opacity)
+                                // The 4 pt between two tabs, and between the last tab and the
+                                // + button, is tab-row whitespace: it swallows presses instead
+                                // of letting AppKit move the window from it.
+                                TabStripPressGuard()
+                                    .frame(width: TabRowLayout.tabSpacing,
+                                           height: TabRowLayout.height)
                             }
                             Button { state.showFileImporter = true } label: { Image(systemName: "plus") }
                                 .buttonStyle(LyraReaderToolStyle())
@@ -92,11 +103,17 @@ public struct TabStrip: View {
                     }
                 }
                 .frame(width: stripWidth)
+                // The 6 pt between the scrolling tabs and the explicit drag area is part of the
+                // tab strip too: a press there must not move the window.
+                TabStripPressGuard()
+                    .frame(width: 6, height: TabRowLayout.height)
                 ReaderWindowDragArea().frame(minWidth: 24, maxWidth: .infinity, maxHeight: .infinity)
                     .accessibilityHidden(true)
+                TabStripPressGuard()
+                    .frame(width: TabRowLayout.tabStripHorizontalPadding,
+                           height: TabRowLayout.height)
             }
             .frame(height: TabRowLayout.height)
-            .padding(.horizontal, TabRowLayout.tabStripHorizontalPadding)
         }
         .frame(height: Self.height)
         .background(LyraReaderTheme.tabbarBg)
@@ -109,8 +126,9 @@ public struct TabStrip: View {
 
     /// One tab. The selection surface covers the whole rectangle; the close button is drawn on
     /// top of its right-hand end and takes only its own 24 pt. A native drag starts at 3 pt,
-    /// so a click still selects while a drag never half-switches. The drag reorders the
-    /// tab on drop; the empty part of the row is still an AppKit window-drag area.
+    /// so a click still selects while a drag never half-switches. The drag reorders the tab on
+    /// drop. The row's blank space is owned by ``TabStripPressGuard``; the only AppKit
+    /// window-drag area is the explicit one to the right of the strip.
     private func tabItem(_ tab: AppState.OpenTab, index: Int, width: CGFloat) -> some View {
         let active = index == state.activeTabIndex
         return ZStack(alignment: .trailing) {
@@ -508,6 +526,48 @@ struct ReaderSecondaryToolbar: View {
 
     private var annotationRow: some View {
         AnnotationToolRow(state: state)
+    }
+}
+
+/// A press in the tab row's own whitespace — the gaps between tabs, the strip's 10 pt horizontal
+/// padding and the 6 pt before the explicit drag area — is swallowed here.
+///
+/// The row sits under a transparent titlebar. When a press lands on a view that does not opt out,
+/// AppKit treats it as window background and moves the window, which is what made dragging from
+/// blank tab-row space look like dragging the tab. A tab input already opts out for the tab's own
+/// rectangle; this view owns the rest of the strip, so no gap falls through to the window. It does
+/// nothing on press: the requirement is that the tab area never drags the window, not that a gap
+/// selects a neighbouring tab.
+struct TabStripPressGuard: NSViewRepresentable {
+    func makeNSView(context: Context) -> TabStripPressGuardView { TabStripPressGuardView() }
+    func updateNSView(_ nsView: TabStripPressGuardView, context: Context) {}
+}
+
+final class TabStripPressGuardView: NSView {
+    override var mouseDownCanMoveWindow: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        return bounds.contains(local) ? self : nil
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        // A single press in the row's whitespace is swallowed. A double-click is the system
+        // titlebar action, not a tab gesture, so it keeps working here just as it does in the
+        // explicit drag area.
+        if event.clickCount >= 2 { ReaderTitlebarDoubleClick.perform(on: window) }
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        // The guard owns the pointer, not the scroll gesture. Two-finger horizontal scrolling
+        // over a 4 pt gap must still move the strip; the padding guards outside the scroll view
+        // fall back to the normal responder chain.
+        if let scrollView = enclosingScrollView {
+            scrollView.scrollWheel(with: event)
+        } else {
+            super.scrollWheel(with: event)
+        }
     }
 }
 

@@ -156,6 +156,36 @@ extension ReaderChecks {
         require(coordinator.feedbackFrame == nil && !coordinator.isDragging,
                 "a completed tear-off leaves no drag state or preview")
 
+        // A drop on a guarded 4 pt gap between two tabs must still resolve to that insertion
+        // index. The guard owns the press, not the drop target: the coordinator resolves a drop
+        // through the registered strip rectangle, not through the AppKit hit view.
+        let gapSourceURLs = (0..<2).map { URL(fileURLWithPath: "/tmp/lyra-gap-source-\(UUID())-\($0).pdf") }
+        let gapTargetURLs = (0..<2).map { URL(fileURLWithPath: "/tmp/lyra-gap-target-\(UUID())-\($0).pdf") }
+        let gapSource = makeWindow(x: 120, y: 320, urls: gapSourceURLs)
+        sessions[sessions.count - 1].installTabDragActions()
+        let gapTarget = makeWindow(x: 700, y: 320, urls: gapTargetURLs)
+        let gapSourceHost = hosts[hosts.count - 2]
+        let gapTargetHost = hosts[hosts.count - 1]
+        let gapTargetWindow = windows[windows.count - 1]
+        let gapSourceIDs = gapSource.tabs.map(\.id)
+        let gapTargetIDs = gapTarget.tabs.map(\.id)
+        let gapSourceTab = try await surface(gapSourceIDs[1], host: gapSourceHost)
+        let gapTargetFirst = try await surface(gapTargetIDs[0], host: gapTargetHost)
+        let gapTargetSecond = try await surface(gapTargetIDs[1], host: gapTargetHost)
+        let firstFrame = gapTargetFirst.convert(gapTargetFirst.bounds, to: nil)
+        let secondFrame = gapTargetSecond.convert(gapTargetSecond.bounds, to: nil)
+        let gapScreen = gapTargetWindow.convertPoint(toScreen: CGPoint(
+            x: (firstFrame.maxX + secondFrame.minX) / 2,
+            y: firstFrame.midY))
+        drag(gapSourceTab, from: point(gapSourceTab, x: gapSourceTab.bounds.width - 40),
+             to: gapScreen)
+        require(gapTarget.tabs.map(\.id) == [gapTargetIDs[0], gapSourceIDs[1], gapTargetIDs[1]],
+                "a cross-window drop on a guarded 4 pt gap inserts between those two tabs")
+        require(!gapSource.containsTab(id: gapSourceIDs[1]),
+                "the tab dropped on a guarded gap leaves its source window")
+        require(coordinator.feedbackFrame == nil && !coordinator.isDragging,
+                "the gap drop leaves no drag state or preview")
+
         ReaderMotion.reduceMotionOverride = true
         coordinator.beginDrag()
         coordinator.beginFeedback(title: "Reduced motion", sourceFrame: CGRect(x: 100, y: 100, width: 200, height: 44),
