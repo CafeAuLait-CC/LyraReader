@@ -66,7 +66,7 @@ separate features with their own documented limits.
 | --- | --- | --- |
 | Rendering & compositing | **wgpu 30** (macOS → Metal; future Windows → DX12, Linux → Vulkan) | One GPU layer reused across all three platforms · [ADR-0003](docs/adr/0003-gpu-wgpu-shared-device.md) |
 | PDF engine | **Backend trait abstraction + PDFium as the first implementation** (BSD-3), with a slot reserved for a pure-Rust backend | The only engine that supports rendering, per-glyph text boxes, links, forms and incremental save at once · [ADR-0002](docs/adr/0002-pdf-engine-backend.md) |
-| UI | **SwiftUI + AppKit** (native macOS), with UI logic pushed down into the platform-independent `lyra-reader-session` | Native look and feel, input methods and accessibility; a future shell swap won't require rewriting the engine · [ADR-0001](docs/adr/0001-native-ui-stack.md) |
+| UI | **SwiftUI + AppKit** (native macOS), with the portable layout, zoom and viewport rules in the platform-independent `lyra-reader-session` | Native look and feel, input methods and accessibility; a future shell swap reuses those rules instead of rewriting them · [ADR-0001](docs/adr/0001-native-ui-stack.md) |
 | Bridging | **UniFFI** (control plane) + hand-written C ABI (GPU surface/device handoff) | Generates Swift bindings automatically, supports async and callback streams · [ADR-0004](docs/adr/0004-rust-swift-ffi.md) |
 | License | This project is **MIT**; all dependencies use permissive licenses | [ADR-0005](docs/adr/0005-licensing.md) |
 | Build | Cargo workspace + SwiftPM (**Command Line Tools only**, CLT 26.3 on this machine) | Develop without a full Xcode install · [ADR-0006](docs/adr/0006-build-without-xcode.md) |
@@ -139,6 +139,11 @@ carries the overview, and the only documents that ship with the code are this fi
 | [12](docs/12-readme-feature-notes.md) / [13](docs/13-readme-measurements.md) / [14](docs/14-readme-intro-archive.md) | Material moved out of this README: feature implementation notes, measurement recipes, the former overview |
 | [15](docs/15-document-saving.md) | The save model: working copies, the annotation cache, backups and what a failed save leaves behind |
 | [16](docs/16-renaming.md) | The ArisReader to LyraReader rename: scope, compatibility kept, and what migrates on first open |
+| [17](docs/17-review-notes.md) / [18](docs/18-eval-latest.md) / [19](docs/19-eval-audit.md) / [20](docs/20-m4-previews-notes.md) / [21](docs/21-review-pr9-notes.md) | Historical reviews and evaluation audits, kept for context — not the current state |
+| [22](docs/22-architecture-and-rust-audit.md) | Architecture and Rust-robustness audit: the counterexample catalogue behind the refactor |
+| [23](docs/23-audit-todo.md) | The audit's remediation list: what was moved, with PR numbers and the evidence each entry requires |
+| [24](docs/24-drift-checklist.md) | Periodic drift checklist and the measured baselines (line counts, unsafe/unwrap, goldens, corpora) |
+| [25](docs/25-post-refactor-independent-audit.md) | Independent post-refactor audit: the three regressions it found, their fixes, and what remains |
 | [ADR](docs/adr/) | Architecture decision records |
 
 ## Milestones at a glance
