@@ -737,6 +737,12 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     /// whole wanted band keeps scrolling smooth and still bounds what the budget is for: the
     /// tiles the reader has scrolled *away* from, and the previous LOD's tiles after a zoom.
     private var wantedTiles: Set<TileKey> = []
+    /// The plan the last viewport update produced, in the order it will be rasterized.
+    ///
+    /// Observation only: nothing reads it to schedule, rasterize or draw. `TilePlanFixtureChecks`
+    /// freezes what the shell planned before the decision moved to `lyra-reader-render` and then
+    /// requires the Rust plan to reproduce the same rows, ring, pinned set and submission order.
+    public private(set) var lastTilePlan: TilePlanSnapshot?
     /// The scheduler's wanted set from the last viewport update (visible + prefetch band): the
     /// tiles the byte cache may not evict.
     ///
@@ -839,6 +845,13 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     private static let wantAllColumns = configuredWantAllColumns()
     private static let prefetchColumns = configuredPrefetchColumns()
     private static let prefetchBandMiB = ProcessInfo.processInfo.environment["LYRA_READER_PREFETCH_BAND_MIB"]
+    /// Byte target for the prefetch band, for the equivalence fixtures and the ADR 0007 bench.
+    ///
+    /// `nil` (every app path) uses the `LYRA_READER_PREFETCH_BAND_MIB` measurement override or
+    /// the measured third-of-the-budget rule. A check may set this before its viewport updates
+    /// to exercise several ring rungs without re-launching the process. It is not a setting: no
+    /// UI writes it and nothing persists it.
+    public var prefetchBandBudgetOverrideBytes: Int?
     private static let renderStatsEnabled =
         ProcessInfo.processInfo.environment["LYRA_READER_RENDER_STATS"] == "1"
     private var pendingTiles: [(TileKey, PagePlacement)] = []
@@ -3076,6 +3089,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         tileCache.removeAll()
         tilesInFlight.removeAll()
         wantedTiles.removeAll()
+        lastTilePlan = nil
         pendingTiles = []
         failedTiles = []
         pagePreviews = [:]
@@ -14217,6 +14231,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             canvasPages = []
             canvasTiles = []
             contentHeightPt = 0
+            lastTilePlan = nil
             return
         }
 
@@ -14404,6 +14419,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             }
             return priority(a) < priority(b)
         }
+        recordTilePlan(lod: lod, ringVh: ringVh, band: band, wanted: wanted,
+                       scheduled: pendingTiles, viewport: viewport)
         pumpTiles()
 
         canvasTiles = pages
@@ -14471,6 +14488,38 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
         func tiles(_ kind: BandClass) -> Int { tileCounts[index(kind)] }
         func bytes(_ kind: BandClass) -> Int { byteCounts[index(kind)] }
+    }
+
+    /// Freezes the update's scheduling decision for `TilePlanFixtureChecks`.
+    ///
+    /// It reads exactly what the scheduler is about to act on — the band spans, the chosen ring,
+    /// the pinned set and the queued order — and stores a value copy. Nothing downstream consumes
+    /// it; the equivalence suite is the only reader.
+    private func recordTilePlan(lod: UInt8, ringVh: CGFloat, band: [BandSpan],
+                                wanted: Set<TileKey>, scheduled: [(TileKey, PagePlacement)],
+                                viewport: CGRect) {
+        let pages = band.map { span in
+            TilePlanSnapshot.Page(
+                page: span.placement.index,
+                firstColumn: span.columns.lowerBound,
+                lastColumn: span.columns.upperBound,
+                firstRow: span.rows.lowerBound,
+                lastRow: span.rows.upperBound
+            )
+        }
+        let pinned = wanted.sorted { a, b in
+            if a.page != b.page { return a.page < b.page }
+            if a.lod != b.lod { return a.lod < b.lod }
+            if a.y != b.y { return a.y < b.y }
+            return a.x < b.x
+        }
+        let tiles = scheduled.map { key, placement in
+            let rect = CGRect(x: placement.leftPt, y: placement.topPt,
+                              width: placement.widthPt, height: placement.heightPt)
+            return TilePlanSnapshot.Tile(key: key, prefetch: !rect.intersects(viewport))
+        }
+        lastTilePlan = TilePlanSnapshot(lod: lod, ringVh: ringVh, pages: pages,
+                                        pinned: pinned, scheduled: tiles)
     }
 
     /// The part of the content the viewport shows, in content points. The canvas centres the
@@ -14591,6 +14640,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         let budget = Self.prefetchBandMiB.flatMap(Int.init)
             .map { min(max($0, 1), 512) * 1024 * 1024 }
+            ?? prefetchBandBudgetOverrideBytes
             ?? Self.prefetchBandBudgetBytes(cacheBudgetBytes: tileCache.budgetBytes)
         let lod = rasterLod
         let fullTileBytes = tileSizePx * tileSizePx * 4
