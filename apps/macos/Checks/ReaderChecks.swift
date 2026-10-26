@@ -678,6 +678,11 @@ struct ReaderChecks {
             print("Tab pointer checks passed")
             return
         }
+        if CommandLine.arguments.contains("--check-tab-hit-regions") {
+            try await tabHitRegionChecks()
+            print("Tab hit-region checks passed")
+            return
+        }
         // Lets the tab-row and tab-switching checks be run on their own while they are being
         // worked on (`LyraReaderChecks --check-tab-row .`).
         if CommandLine.arguments.contains("--check-tab-row") {
@@ -1218,6 +1223,9 @@ struct ReaderChecks {
             }),
             ("tab-pointer", {
                 try await tabPointerChecks()
+            }),
+            ("tab-hit-regions", {
+                try await tabHitRegionChecks()
             }),
             ("tab-window-move", {
                 try await tabWindowMoveChecks(root: root)

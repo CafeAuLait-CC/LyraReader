@@ -74,9 +74,17 @@ public enum ReaderTitlebarDoubleClick {
 /// double-click performs the user's titlebar action instead. The tab titles, their close buttons
 /// and the add button are separate SwiftUI views above this one and never reach it.
 public final class ReaderTitlebarDragView: NSView {
+    /// A check seam: called when this view receives a press, before the window drag is handed to
+    /// the Window Server. `performDrag(with:)` returns immediately and the Window Server performs
+    /// the actual move, so a headless check cannot observe a moved frame; this closure lets the
+    /// check distinguish "the explicit drag area received the press" from "AppKit dragged the
+    /// window from some other view". It is `nil` in the app and does nothing when unset.
+    public static var mouseDownHook: (() -> Void)?
+
     public override var mouseDownCanMoveWindow: Bool { true }
 
     public override func mouseDown(with event: NSEvent) {
+        ReaderTitlebarDragView.mouseDownHook?()
         if event.clickCount >= 2 {
             ReaderTitlebarDoubleClick.perform(on: window)
             return
