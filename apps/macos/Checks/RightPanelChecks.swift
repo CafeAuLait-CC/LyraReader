@@ -312,8 +312,8 @@ extension ReaderChecks {
         require(ReaderShortcuts.toggleAIPanelLabel == "Toggle Lyra Tools",
                 "the menu command is named Toggle Lyra Tools")
 
-        // The chords already on ReaderCommands, the toolbar menus and the Rust keymap. A new
-        // shortcut has to be absent from every one of them.
+        // The chords already on ReaderCommands and the toolbar menus. A new shortcut has to be
+        // absent from every one of them.
         let taken: [(name: String, key: Character, modifiers: EventModifiers)] = [
             ("Open", "o", [.command]),
             ("Save", "s", [.command]),

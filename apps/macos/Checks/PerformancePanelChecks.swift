@@ -96,9 +96,10 @@ extension ReaderChecks {
         require(PerformancePanelShortcut.key == "p", "performance panel uses P")
         require(PerformancePanelShortcut.modifiers == [.command, .option],
                 "performance panel uses Option-Command-P, which neither menu uses")
-        // The native menu binds ⌘P (Print); the Rust keymap binds ⇧⌘P (PreviewCitation). ⌥⌘P is
-        // a different chord because Option is part of the modifier set; keep the three distinct
-        // here so a future menu/keymap edit that takes Option-Command-P trips this check.
+        // The native menu binds ⌘P (Print); ⇧⌘P is the design's citation-preview chord and is
+        // not registered natively. ⌥⌘P is a different chord because Option is part of the
+        // modifier set; keep the three distinct here so a future menu edit that takes
+        // Option-Command-P trips this check.
         let printChord: EventModifiers = [.command]
         let previewChord: EventModifiers = [.command, .shift]
         require(PerformancePanelShortcut.modifiers != printChord
