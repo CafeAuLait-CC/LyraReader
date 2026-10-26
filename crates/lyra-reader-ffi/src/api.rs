@@ -6433,6 +6433,77 @@ pub fn validate_cached_bookmark(
     )
 }
 
+/// The creation/rename check for one bookmark title, with the writer's own sentence.
+///
+/// Renaming replaces exactly one stored field, so it asks the field's rule rather than the whole
+/// record: a bookmark already in the cache must not become unrenamable because some unrelated
+/// field would nowadays be refused.
+#[uniffi::export]
+pub fn validate_cached_bookmark_title(id: String, title: String) -> Result<(), LyraReaderFfiError> {
+    annotation_rules::validate_bookmark_title(&id, &title).map_err(annotation_rule_error)
+}
+
+/// The title a new bookmark stores: the reader's trimmed name, or the page's default label.
+///
+/// `page` is zero-based, like every stored bookmark page. The default is the same page label the
+/// sidebar shows, so an unnamed bookmark cannot be called two different things.
+#[uniffi::export]
+pub fn bookmark_title(name: Option<String>, page: i64) -> String {
+    match name.as_deref().map(|name| name.trim()) {
+        Some(title) if !title.is_empty() => title.to_string(),
+        _ => {
+            let page_number = page.saturating_add(1).clamp(0, i64::from(u32::MAX)) as u32;
+            crate::format::page_label(&[page_number])
+        }
+    }
+}
+
+/// Where a new bookmark lands in the reader's persisted order.
+///
+/// The list is the reader's manual order; a new mark is appended even when another mark is on
+/// the same page. The shell asks this instead of deciding an index, so the rule has one home.
+#[uniffi::export]
+pub fn bookmark_insertion_index(bookmarks: Vec<CachedBookmarkRecord>, page: i64, y_pt: f64) -> u32 {
+    let specs: Vec<annotation_rules::BookmarkSpec<'_>> = bookmarks
+        .iter()
+        .map(|bookmark| annotation_rules::BookmarkSpec {
+            id: &bookmark.id,
+            page: bookmark.page,
+            title: &bookmark.title,
+            y_pt: bookmark.y_pt,
+        })
+        .collect();
+    lyra_reader_core::saturating_u32(annotation_rules::bookmark_insertion_index(
+        &specs, page, y_pt,
+    ))
+}
+
+/// The index a Move Up/Down request lands on, clamped to the list rather than wrapped.
+#[uniffi::export]
+pub fn bookmark_move_index(index: u32, offset: i32, count: u32) -> u32 {
+    lyra_reader_core::saturating_u32(annotation_rules::moved_bookmark_index(
+        index as usize,
+        i64::from(offset),
+        count as usize,
+    ))
+}
+
+/// The `annotations.json` entry order after the bookmark list is reordered.
+///
+/// Bookmark slots keep their places around annotations and preserved foreign entries; a deleted
+/// bookmark's slot disappears and a bookmark adopted after load is appended.
+#[uniffi::export]
+pub fn reorder_bookmark_slots(
+    slots: Vec<CachedAnnotationSlot>,
+    ordered_ids: Vec<String>,
+) -> Vec<CachedAnnotationSlot> {
+    let slots: Vec<annotation_records::Slot> = slots.into_iter().map(edit_slot).collect();
+    annotation_rules::reorder_bookmark_slots(&slots, &ordered_ids)
+        .iter()
+        .map(cached_slot)
+        .collect()
+}
+
 /// One bookmark the shell asks the writer to put into the document's `/Outlines`.
 ///
 /// `y_pt` is page-local view space (0 at the page top), the same value the annotation cache stores, so a

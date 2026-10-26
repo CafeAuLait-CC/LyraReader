@@ -3,16 +3,14 @@ import SwiftUI
 import LyraReaderBindings
 
 extension Bookmark {
-    /// The one display name for a bookmark without a custom title. The persisted default and
-    /// the sidebar fallback both use it, so a page-corner bookmark and a sidebar row never
-    /// disagree about what an unnamed bookmark is called.
-    package static func defaultTitle(forPage page: Int) -> String {
-        LyraReaderBindings.pageLabel(pages: [UInt32(max(0, page + 1))])
-    }
-
+    /// The page label shown for a bookmark the reader never named (and for an empty rename).
+    ///
+    /// The stored default title and this display fallback ask the same Rust rule, so a page-corner
+    /// bookmark and a sidebar row cannot disagree about what an unnamed bookmark is called.
     package var displayTitle: String {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? Self.defaultTitle(forPage: page) : title
+        guard trimmed.isEmpty else { return title }
+        return LyraReaderBindings.bookmarkTitle(name: nil, page: Int64(page))
     }
 }
 

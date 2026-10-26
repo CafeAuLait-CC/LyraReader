@@ -9,6 +9,9 @@
 //!
 //! * [`validate_bookmark`] / [`validate_bookmarks`] — the outline writer, the FFI save path and
 //!   the shell's bookmark entry point all call one of these.
+//! * [`bookmark_insertion_index`], [`moved_bookmark_index`] and [`reorder_bookmark_slots`] —
+//!   the reader's durable bookmark order, which the shell used to restate when adding, moving
+//!   and persisting bookmarks.
 //! * [`validate_annotation`] — the shell's annotation entry points, with the same messages the
 //!   write path produces.
 //! * the per-field helpers ([`validate_page`], [`validate_border_width`],
@@ -25,7 +28,7 @@
 use std::fmt;
 
 use crate::kind::AnnotationKind;
-use crate::records::{RecordAnnotation, RecordBookmark};
+use crate::records::{RecordAnnotation, RecordBookmark, Slot};
 
 /// Hard limits, with the values the write path already enforced.
 pub const MAX_ANNOTATIONS: usize = 20_000;
@@ -370,11 +373,77 @@ pub fn validate_bookmark(
     let mut all: Vec<String> = existing_ids.to_vec();
     all.push(bookmark.id.clone());
     validate_unique_bookmark_ids(&all)?;
+    if all.len() > MAX_BOOKMARKS {
+        return refuse(format!(
+            "{MAX_BOOKMARKS} bookmarks is the most one save can write"
+        ));
+    }
     validate_bookmark_identity(&bookmark.id)?;
     validate_bookmark_page(&bookmark.id, bookmark.page, page_count)?;
     validate_bookmark_y(&bookmark.id, bookmark.y_pt)?;
     validate_bookmark_title(&bookmark.id, &bookmark.title)?;
     Ok(())
+}
+
+// ── Bookmark order ──────────────────────────────────────────────────────────
+
+/// Where a new bookmark lands in the reader's persisted order.
+///
+/// The order is the reader's manual order. The sidebar shows the list as it is, Move Up/Down
+/// changes it, `annotations.json` stores it under the interleaved entry slots, and the outline
+/// writer writes it. A new mark is therefore **appended**, even when another mark already sits
+/// on the same page: `page` and `y_pt` decide where inside a page a bookmark jumps, never where
+/// it sits in the list. Sorting the list by them would silently reorder marks the reader placed.
+///
+/// The page and position are still part of the rule's input so the shell asks one function
+/// instead of deciding an index itself, and a future positional rule can change this one place.
+pub fn bookmark_insertion_index(existing: &[BookmarkSpec<'_>], page: i64, y_pt: f64) -> usize {
+    // Both are stored facts about the new mark, not sort keys; see the doc comment.
+    let _ = (page, y_pt);
+    existing.len()
+}
+
+/// The index a Move Up/Down request lands on.
+///
+/// A move past either end stays at that end instead of wrapping; the caller compares the result
+/// with the current index and skips the write when they match. `count` is the list length the
+/// index refers to, so the shell computes the target before it removes the bookmark.
+pub fn moved_bookmark_index(index: usize, offset: i64, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let current = index.min(count - 1);
+    let target = (current as i64).saturating_add(offset);
+    target.clamp(0, count as i64 - 1) as usize
+}
+
+/// The entry order `annotations.json` stores after the bookmark list has been reordered.
+///
+/// Bookmark slots keep their places around every annotation and every preserved foreign entry;
+/// the bookmark in position `n` of `ordered_ids` fills the `n`th bookmark slot. A slot left over
+/// from a deleted bookmark disappears, and bookmarks added after the file was loaded (adopted
+/// from the outline, for example) get a new slot at the end. This is the rule the shell used to
+/// apply by hand; it is what keeps a move from shuffling annotations or foreign entries.
+///
+/// Adding a bookmark is deliberately *not* expressed through this function: it appends a new
+/// slot, which keeps a deleted bookmark's slot from being reused before an opaque entry and
+/// moving the new mark ahead of it.
+pub fn reorder_bookmark_slots(slots: &[Slot], ordered_ids: &[String]) -> Vec<Slot> {
+    let mut remaining = ordered_ids.iter();
+    let mut reordered = Vec::with_capacity(slots.len());
+    for slot in slots {
+        if matches!(slot, Slot::Bookmark(_)) {
+            if let Some(id) = remaining.next() {
+                reordered.push(Slot::Bookmark(id.clone()));
+            }
+        } else {
+            reordered.push(slot.clone());
+        }
+    }
+    for id in remaining {
+        reordered.push(Slot::Bookmark(id.clone()));
+    }
+    reordered
 }
 
 // ── Annotations ─────────────────────────────────────────────────────────────
@@ -614,6 +683,25 @@ mod tests {
                 .message,
             "two bookmarks in one save share the identity \"id\""
         );
+        // The creation-time check enforces the list limit the writer already enforced, so the
+        // shell cannot append a 5,001st bookmark that only fails when the PDF is saved.
+        let existing: Vec<String> = (0..MAX_BOOKMARKS)
+            .map(|index| format!("existing-{index}"))
+            .collect();
+        assert_eq!(
+            validate_bookmark(&bookmark("new", 0, "t", 0.0), 1, &existing)
+                .unwrap_err()
+                .message,
+            "5000 bookmarks is the most one save can write"
+        );
+        assert!(
+            validate_bookmark(
+                &bookmark("new", 0, "t", 0.0),
+                1,
+                &existing[..MAX_BOOKMARKS - 1]
+            )
+            .is_ok()
+        );
         let many: Vec<RecordBookmark> = (0..=MAX_BOOKMARKS)
             .map(|index| bookmark(&format!("id-{index}"), 0, "t", 0.0))
             .collect();
@@ -630,6 +718,85 @@ mod tests {
             validate_bookmarks(&specs, 1).unwrap_err().message,
             "5000 bookmarks is the most one save can write"
         );
+    }
+
+    #[test]
+    fn bookmark_order_is_manual_and_moves_clamp_at_the_ends() {
+        let one = bookmark("one", 0, "one", 10.0);
+        let two = bookmark("two", 0, "two", 20.0);
+        let three = bookmark("three", 1, "three", 0.0);
+        let specs: Vec<BookmarkSpec<'_>> = [&one, &two, &three]
+            .into_iter()
+            .map(|bookmark| BookmarkSpec {
+                id: &bookmark.id,
+                page: bookmark.page,
+                title: &bookmark.title,
+                y_pt: bookmark.y_pt,
+            })
+            .collect();
+        // A new mark on the same page — above or below the others — still goes last.
+        assert_eq!(bookmark_insertion_index(&specs, 0, 0.0), 3);
+        assert_eq!(bookmark_insertion_index(&specs, 0, 999.0), 3);
+        assert_eq!(bookmark_insertion_index(&specs, 1, 0.0), 3);
+        assert_eq!(bookmark_insertion_index(&[], 0, 0.0), 0);
+
+        // Moving by one at either end is a no-op; a large offset clamps to the end.
+        assert_eq!(moved_bookmark_index(0, -1, 3), 0);
+        assert_eq!(moved_bookmark_index(2, 1, 3), 2);
+        assert_eq!(moved_bookmark_index(1, 1, 3), 2);
+        assert_eq!(moved_bookmark_index(1, -1, 3), 0);
+        assert_eq!(moved_bookmark_index(0, 100, 3), 2);
+        assert_eq!(moved_bookmark_index(2, -100, 3), 0);
+        assert_eq!(moved_bookmark_index(0, 0, 0), 0);
+        // A stale index cannot leave the list.
+        assert_eq!(moved_bookmark_index(9, 0, 3), 2);
+    }
+
+    #[test]
+    fn reordering_bookmarks_keeps_other_entries_in_place() {
+        let slots = vec![
+            Slot::Annotation("a1".into()),
+            Slot::Bookmark("b1".into()),
+            Slot::Opaque("{\"kind\":\"future\"}".into()),
+            Slot::Bookmark("b2".into()),
+            Slot::Bookmark("deleted".into()),
+            Slot::Annotation("a2".into()),
+        ];
+        // b2 and b1 swap; the deleted bookmark's slot disappears; annotations and the foreign
+        // entry keep their positions.
+        assert_eq!(
+            reorder_bookmark_slots(&slots, &["b2".into(), "b1".into()]),
+            vec![
+                Slot::Annotation("a1".into()),
+                Slot::Bookmark("b2".into()),
+                Slot::Opaque("{\"kind\":\"future\"}".into()),
+                Slot::Bookmark("b1".into()),
+                Slot::Annotation("a2".into()),
+            ]
+        );
+        // A bookmark adopted after load has no slot yet and is appended when every slot is used.
+        let without_deleted = vec![
+            Slot::Annotation("a1".into()),
+            Slot::Bookmark("b1".into()),
+            Slot::Opaque("{\"kind\":\"future\"}".into()),
+            Slot::Bookmark("b2".into()),
+            Slot::Annotation("a2".into()),
+        ];
+        assert_eq!(
+            reorder_bookmark_slots(
+                &without_deleted,
+                &["b1".into(), "b2".into(), "adopted".into()]
+            ),
+            vec![
+                Slot::Annotation("a1".into()),
+                Slot::Bookmark("b1".into()),
+                Slot::Opaque("{\"kind\":\"future\"}".into()),
+                Slot::Bookmark("b2".into()),
+                Slot::Annotation("a2".into()),
+                Slot::Bookmark("adopted".into()),
+            ]
+        );
+        assert_eq!(reorder_bookmark_slots(&[], &[]), Vec::<Slot>::new());
     }
 
     #[test]
