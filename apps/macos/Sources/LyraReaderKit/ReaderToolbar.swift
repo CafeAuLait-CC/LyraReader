@@ -552,7 +552,23 @@ final class TabStripPressGuardView: NSView {
         return bounds.contains(local) ? self : nil
     }
 
-    override func mouseDown(with event: NSEvent) {}
+    override func mouseDown(with event: NSEvent) {
+        // A single press in the row's whitespace is swallowed. A double-click is the system
+        // titlebar action, not a tab gesture, so it keeps working here just as it does in the
+        // explicit drag area.
+        if event.clickCount >= 2 { ReaderTitlebarDoubleClick.perform(on: window) }
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        // The guard owns the pointer, not the scroll gesture. Two-finger horizontal scrolling
+        // over a 4 pt gap must still move the strip; the padding guards outside the scroll view
+        // fall back to the normal responder chain.
+        if let scrollView = enclosingScrollView {
+            scrollView.scrollWheel(with: event)
+        } else {
+            super.scrollWheel(with: event)
+        }
+    }
 }
 
 /// An explicit empty tab-bar region owns window dragging and the titlebar double-click action;
