@@ -348,4 +348,56 @@ enum AnnotationRecords {
             return message(error)
         }
     }
+
+    // MARK: - Bookmark rules the shell used to restate
+
+    /// The title a new bookmark stores: the reader's trimmed name, or the page's default label.
+    static func titleForNewBookmark(name: String?, page: Int) -> String {
+        bookmarkTitle(name: name, page: Int64(page))
+    }
+
+    /// Where the rule set puts a new bookmark in the reader's order.
+    ///
+    /// The shell used to append and decide that itself; asking keeps the sidebar order, the
+    /// cache's slot order and the outline order on one rule.
+    static func insertionIndexForNewBookmark(
+        page: Int,
+        yPt: CGFloat,
+        among bookmarks: [Bookmark]
+    ) -> Int {
+        Int(bookmarkInsertionIndex(
+            bookmarks: bookmarks.map(entry),
+            page: Int64(page),
+            yPt: Double(yPt)))
+    }
+
+    /// The target of a Move Up/Down request, clamped to the list rather than wrapped.
+    static func movedBookmarkIndex(index: Int, offset: Int, count: Int) -> Int {
+        Int(bookmarkMoveIndex(
+            index: UInt32(clamping: index),
+            offset: Int32(clamping: offset),
+            count: UInt32(clamping: count)))
+    }
+
+    /// The cache's entry order after a bookmark move: bookmark slots keep their places around
+    /// annotations and preserved foreign entries, and a deleted bookmark's slot disappears.
+    static func slotsAfterBookmarkReorder(
+        _ slots: [Slot],
+        orderedIDs: [UUID]
+    ) -> [Slot] {
+        reorderBookmarkSlots(
+            slots: slots.map(slot),
+            orderedIds: orderedIDs.map(\.uuidString)
+        ).map(slot)
+    }
+
+    /// Why the writer would refuse this rename, or `nil` when the title is valid.
+    static func validationMessage(forBookmarkTitle title: String, id: UUID) -> String? {
+        do {
+            try validateCachedBookmarkTitle(id: id.uuidString, title: title)
+            return nil
+        } catch {
+            return message(error)
+        }
+    }
 }

@@ -7243,13 +7243,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lastError = statusMessage
             return false
         }
-        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let title = trimmed.isEmpty ? Bookmark.defaultTitle(forPage: page) : trimmed
-
+        let title = AnnotationRecords.titleForNewBookmark(name: name, page: page)
         let bookmark = Bookmark(page: page, title: title, yPt: yPt)
         guard validateNewBookmark(bookmark) else { return false }
+        let index = AnnotationRecords.insertionIndexForNewBookmark(
+            page: page, yPt: yPt, among: bookmarks)
+        guard index >= 0, index <= bookmarks.count else {
+            // The rule set takes the current list as its input, so this cannot happen; refuse
+            // rather than trap or clamp a rule the shell does not understand.
+            statusMessage = "Could not add the bookmark: the bookmark rule set returned an invalid position"
+            lastError = statusMessage
+            return false
+        }
         var updated = bookmarks
-        updated.append(bookmark)
+        updated.insert(bookmark, at: index)
+        // A new bookmark's cache slot is appended, not reordered into a removed bookmark's slot:
+        // that keeps the new mark from jumping ahead of an entry this version preserves verbatim.
         var slots = annotationRecordSlots
         slots.append(.bookmark(bookmark.id))
         guard writeBookmarks(updated, slots: slots, trigger: "bookmark-add") else { return false }
@@ -7271,28 +7280,41 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Renames a bookmark. An empty title is allowed; the sidebar falls back to "Page N" when
     /// displaying it, and nothing is silently rewritten.
-    public func renameBookmark(_ id: UUID, to title: String) {
+    ///
+    /// A title the outline writer would refuse is refused here with the writer's own sentence,
+    /// rather than being written into the cache and failing only when the PDF is saved.
+    @discardableResult
+    public func renameBookmark(_ id: UUID, to title: String) -> Bool {
         guard let index = bookmarks.firstIndex(where: { $0.id == id }),
-              bookmarks[index].title != title else { return }
+              bookmarks[index].title != title else { return false }
+        if let message = AnnotationRecords.validationMessage(forBookmarkTitle: title, id: id) {
+            statusMessage = message
+            lastError = message
+            return false
+        }
         var updated = bookmarks
         updated[index].title = title
-        guard writeBookmarks(updated, trigger: "bookmark-rename") else { return }
+        guard writeBookmarks(updated, trigger: "bookmark-rename") else { return false }
+        return true
     }
 
     /// Moves a bookmark by `offset` places in the reader's order. The order is the array's,
     /// and it is persisted by reordering the bookmark slots in the annotation cache in place, so
-    /// foreign entries keep their positions.
+    /// foreign entries keep their positions. A move past either end stays at that end.
     public func moveBookmark(_ id: UUID, by offset: Int) {
         guard let index = bookmarks.firstIndex(where: { $0.id == id }), offset != 0 else { return }
-        let target = min(max(index + offset, 0), bookmarks.count - 1)
+        let target = AnnotationRecords.movedBookmarkIndex(
+            index: index, offset: offset, count: bookmarks.count)
         guard target != index else { return }
 
         var updated = bookmarks
         let bookmark = updated.remove(at: index)
         updated.insert(bookmark, at: target)
+        let slots = AnnotationRecords.slotsAfterBookmarkReorder(
+            annotationRecordSlots, orderedIDs: updated.map(\.id))
         guard writeBookmarks(
             updated,
-            slots: bookmarkSlots(matching: updated),
+            slots: slots,
             trigger: "bookmark-move"
         ) else { return }
         statusMessage = "Moved bookmark “\(bookmark.title)”"
@@ -7335,26 +7357,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             slots: slots ?? annotationRecordSlots,
             trigger: trigger
         )
-    }
-
-    /// Rebuilds the `.bookmark` slots in the current order while leaving every other slot in
-    /// place. Appending covers bookmarks added after the file was loaded.
-    private func bookmarkSlots(matching ordered: [Bookmark]) -> [AnnotationRecords.Slot] {
-        var remaining = ordered.makeIterator()
-        var slots: [AnnotationRecords.Slot] = []
-        for slot in annotationRecordSlots {
-            if case .bookmark = slot {
-                if let next = remaining.next() {
-                    slots.append(.bookmark(next.id))
-                }
-            } else {
-                slots.append(slot)
-            }
-        }
-        while let next = remaining.next() {
-            slots.append(.bookmark(next.id))
-        }
-        return slots
     }
 
     // MARK: - Undo / redo
