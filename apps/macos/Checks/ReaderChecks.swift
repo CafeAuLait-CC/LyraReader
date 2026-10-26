@@ -156,6 +156,10 @@ struct ReaderChecks {
             try await checkAIPlanGoldens(root: fastRoot)
             return
         }
+        if CommandLine.arguments.contains("--check-ai-plan-unicode") {
+            try await checkAIUnicodeKnowledge(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--capture-annotation-codec-goldens") {
             try captureAnnotationCodecGoldens(root: fastRoot)
             return
@@ -1145,6 +1149,12 @@ struct ReaderChecks {
                 // 120-page two-window abstract and every section. The snapshot also pins the
                 // character/token accounting and the outline section list.
                 try await checkAIPlanGoldens(root: root)
+            }),
+            ("ai-plan-unicode", {
+                // The document-knowledge cap is measured in Swift's `Character` (extended
+                // grapheme cluster), not a Unicode scalar. Recomputes the expected block,
+                // counters and body with `prefix`/`count`, including a ZWJ cut and NFD/flags.
+                try await checkAIUnicodeKnowledge(root: root)
             }),
             ("appearance", {
                 await appearanceChecks()

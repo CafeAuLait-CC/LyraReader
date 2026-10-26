@@ -28,6 +28,8 @@
 //! [`crate::TextPage::char_index_at`] remains the legacy exact-containment scan used by older
 //! callers; it is deliberately **not** the interactive path.
 
+use unicode_segmentation::UnicodeSegmentation;
+
 use crate::{CharBox, CharIndex, TextPage};
 use lyra_reader_core::{Point, Rect};
 
@@ -437,7 +439,8 @@ pub(crate) fn intersects(a: Rect, b: Rect) -> bool {
     a.min_x() < b.max_x() && b.min_x() < a.max_x() && a.min_y() < b.max_y() && b.min_y() < a.max_y()
 }
 
-/// The text cap the shell applies to one marquee-selected region.
+/// The cap the shell applies to one marquee-selected region, measured in extended grapheme
+/// clusters (Swift `Character`s), the unit of the removed `String.prefix(limit)`.
 ///
 /// The same number bounds the AI planner's `MAX_REGION_TEXT_CHARS`; extraction stops at it and
 /// reports that it did, never silently sending a longer region.
@@ -499,8 +502,9 @@ fn trim_region_ends(text: &str) -> &str {
 ///   `max(1.2, line height × 0.12)`; real whitespace glyphs collapse to one space.
 ///
 /// The result is exactly the string the shell extracted before this moved to Rust: at most
-/// `limit` characters, joined with a newline per line and trimmed at both ends. `truncated` means
-/// the limit cut the assembled text.
+/// `limit` extended grapheme clusters (Swift `Character`s), joined with a newline per line and
+/// trimmed at both ends. `truncated` means the limit cut the assembled text; a cluster is never
+/// split.
 pub fn region_text(chars: &[CharBox], region: Rect, limit: usize) -> (String, bool) {
     let mut lines: Vec<RegionLine> = Vec::new();
     for character in chars {
@@ -592,8 +596,10 @@ pub fn region_text(chars: &[CharBox], region: Rect, limit: usize) -> (String, bo
             result.push('\n');
         }
         result.push_str(trimmed);
-        if result.chars().count() > limit {
-            result = result.chars().take(limit).collect();
+        // Swift checked `result.count` and took `prefix(limit)`: both count extended grapheme
+        // clusters. Counting scalars would cut a decomposed accent or a ZWJ sequence here.
+        if result.graphemes(true).count() > limit {
+            result = result.graphemes(true).take(limit).collect();
             truncated = true;
             break;
         }
@@ -625,6 +631,26 @@ mod tests {
             cursor += if scalar == ' ' { size * 0.25 } else { width };
         }
         chars
+    }
+
+    #[test]
+    fn region_text_truncates_at_a_grapheme_boundary() {
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+        // Six thousand decomposed accents are 12,000 scalars; the family and tail follow.
+        let nfd = "e\u{301}".repeat(6_000);
+        let text = format!("{nfd}{family}tail");
+        let chars = word(&text, 0.0, 0.0, 10.0);
+        let region = Rect::new(-1.0, -1.0, 400_000.0, 20.0);
+
+        let (capped, truncated) = region_text(&chars, region, 6_000);
+        assert!(truncated);
+        assert_eq!(capped, nfd, "the scalar cut used to return 3,000 accents");
+        assert_eq!(capped.graphemes(true).count(), 6_000);
+
+        let (with_family, truncated) = region_text(&chars, region, 6_001);
+        assert!(truncated);
+        assert_eq!(with_family, format!("{nfd}{family}"));
+        assert!(with_family.ends_with(family), "a ZWJ run is never split");
     }
 
     #[test]

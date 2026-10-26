@@ -14,6 +14,8 @@
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
+use unicode_segmentation::UnicodeSegmentation;
+
 use crate::openai::stream_options_unsupported;
 use crate::provider::AiError;
 
@@ -34,9 +36,10 @@ pub const RETRIEVED_BLOCKS: usize = 4;
 pub const CHAT_RETRIEVED_BLOCKS: usize = 6;
 /// Largest amount of retrieved document text sent with one chat question.
 pub const MAX_CHAT_CONTEXT_CHARS: usize = 4_000;
-/// Largest amount of text extracted from one marquee-selected region. A region is a smaller
-/// unit than a page, so this is deliberately tighter than the page bound: a table or a figure
-/// caption fits, a whole page of prose is truncated with a note rather than sent silently.
+/// Largest amount of text extracted from one marquee-selected region, measured in extended
+/// grapheme clusters like the pre-refactor `String.prefix(limit)`. A region is a smaller unit
+/// than a page, so this is deliberately tighter than the page bound: a table or a figure caption
+/// fits, a whole page of prose is truncated with a note rather than sent silently.
 pub const MAX_REGION_TEXT_CHARS: usize = 12_000;
 /// A region question longer than this is refused, like an ordinary chat question.
 pub const MAX_REGION_QUESTION_CHARS: usize = 4_000;
@@ -388,7 +391,9 @@ pub struct DocumentKnowledgeInput {
     pub pages: Vec<u32>,
 }
 
-/// The character cap the shell has always applied to the generated reading before sending it.
+/// The cap the shell has always applied to the generated reading before sending it, measured in
+/// extended grapheme clusters (Swift `Character`s), exactly like the pre-refactor
+/// `String.prefix(16_000)`.
 pub const DOCUMENT_KNOWLEDGE_MAX_CHARS: usize = 16_000;
 
 /// The exact rule text appended to every system prompt. Kept as one constant so the shell can
@@ -403,16 +408,15 @@ pub const DOCUMENT_KNOWLEDGE_RULES: &str = "\nUse shared document understanding 
 /// carry a wire body, so there is no rendered body to invalidate.
 fn apply_document_knowledge(plan: &mut ChatPlan, knowledge: Option<&DocumentKnowledgeInput>) {
     let Some(knowledge) = knowledge else { return };
-    let prior: String = knowledge
-        .text
-        .chars()
-        .take(DOCUMENT_KNOWLEDGE_MAX_CHARS)
-        .collect();
+    // The pre-refactor Swift enrichment used `String.prefix(16_000)` and `.count`, whose unit is
+    // an extended grapheme cluster. A scalar cut makes decomposed accents, ZWJ emoji and flags
+    // count several times, truncating the block early and splitting a cluster at the cap.
+    let prior = grapheme_prefix(&knowledge.text, DOCUMENT_KNOWLEDGE_MAX_CHARS);
     let addition = format!(
         "[Shared document understanding — generated context]\n{prior}\n[End shared document understanding]\n\n"
     );
-    let addition_chars = addition.chars().count() as u64;
-    let rule_chars = DOCUMENT_KNOWLEDGE_RULES.chars().count() as u64;
+    let addition_chars = grapheme_count(&addition);
+    let rule_chars = grapheme_count(DOCUMENT_KNOWLEDGE_RULES);
     let extra_chars = addition_chars + rule_chars;
     let previous_tokens = plan.estimated_tokens();
     for part in &mut plan.parts {
@@ -2092,6 +2096,28 @@ fn truncate_chars(text: &str, limit: usize) -> (String, bool) {
     (truncated, true)
 }
 
+/// At most `limit` extended grapheme clusters, never splitting a cluster.
+///
+/// This is the unit of Swift's `String.prefix(limit)`. It is used where that exact
+/// pre-refactor contract is preserved (the shared document-knowledge block and region text);
+/// [`truncate_chars`] remains the older scalar policy for page and summary text.
+fn grapheme_prefix(text: &str, limit: usize) -> String {
+    text.graphemes(true).take(limit).collect()
+}
+
+/// One extended grapheme cluster per Swift `Character`, matching `String.count`.
+fn grapheme_count(text: &str) -> u64 {
+    text.graphemes(true).count() as u64
+}
+
+fn truncate_graphemes(text: &str, limit: usize) -> (String, bool) {
+    let count = text.graphemes(true).count();
+    if count <= limit {
+        return (text.to_string(), false);
+    }
+    (grapheme_prefix(text, limit), true)
+}
+
 fn selection_text(page_text: &str, selection: SelectionRange) -> Result<String, AiError> {
     let characters: Vec<char> = page_text.chars().collect();
     let start = selection.start as usize;
@@ -2709,7 +2735,10 @@ pub fn build_region_question_plan(request: RegionQuestionRequest) -> Result<Chat
         }
     }
     let text = request.text.trim();
-    let (text, truncated) = truncate_chars(text, MAX_REGION_TEXT_CHARS);
+    // `selection::region_text` already stops at MAX_REGION_TEXT_CHARS graphemes; this second
+    // guard must use the same unit, otherwise a region made of decomposed accents or emoji is
+    // cut a second time in the planner.
+    let (text, truncated) = truncate_graphemes(text, MAX_REGION_TEXT_CHARS);
     let text_is_empty = text.trim().is_empty();
     let image_used = request.send_image && request.image.is_some();
     if text_is_empty && !image_used {
@@ -3792,6 +3821,144 @@ mod tests {
     }
 
     #[test]
+    fn grapheme_tables_match_the_pinned_swift_unicode_version() {
+        // The pin in the workspace manifest exists because grapheme-break data is versioned
+        // behavior. If this changes, re-run the native `--check-ai-plan-unicode` suite and
+        // check that Swift's `Character` still agrees before updating the pin.
+        assert_eq!(
+            unicode_segmentation::UNICODE_VERSION,
+            (16, 0, 0),
+            "the grapheme tables must match Swift 6.2's Unicode 16 behavior"
+        );
+        // Unicode 16 added U+0897 as an Extend mark; Unicode 17 added U+1ACF the same way.
+        // Swift 6.2.4 groups the former and still splits the latter, and so must these tables.
+        assert_eq!("a\u{0897}".graphemes(true).count(), 1);
+        assert_eq!("a\u{1ACF}".graphemes(true).count(), 2);
+    }
+
+    #[test]
+    fn document_knowledge_truncates_by_extended_grapheme_clusters() {
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+        let flag = "\u{1F1E8}\u{1F1E6}";
+        let nfd = "e\u{301}".repeat(9_000);
+        let mixed = format!(
+            "{nfd}{}{}{}{}",
+            flag.repeat(500),
+            family.repeat(100),
+            "abc\u{4E2D}\u{6587}".repeat(1_200),
+            "z".repeat(1_000),
+        );
+        assert!(
+            grapheme_count(&mixed) > DOCUMENT_KNOWLEDGE_MAX_CHARS as u64,
+            "graphemes={} scalars={}",
+            grapheme_count(&mixed),
+            mixed.chars().count(),
+        );
+        assert!(mixed.chars().count() > DOCUMENT_KNOWLEDGE_MAX_CHARS);
+
+        let request = PlanRequest {
+            action: Action::SummarizePage,
+            document_title: "A Paper".to_string(),
+            page_count: 3,
+            current_page: 1,
+            selection: None,
+            question: None,
+            language: None,
+            pages: pages(3),
+            settings: settings("http://localhost:11434/v1"),
+            document_knowledge: Some(DocumentKnowledgeInput {
+                text: mixed.clone(),
+                pages: vec![1, 2],
+            }),
+        };
+        let base = build_plan(PlanRequest {
+            action: Action::SummarizePage,
+            document_title: "A Paper".to_string(),
+            page_count: 3,
+            current_page: 1,
+            selection: None,
+            question: None,
+            language: None,
+            pages: pages(3),
+            settings: settings("http://localhost:11434/v1"),
+            document_knowledge: None,
+        })
+        .unwrap();
+        let plan = build_plan(request).unwrap();
+        let prior = grapheme_prefix(&mixed, DOCUMENT_KNOWLEDGE_MAX_CHARS);
+        let addition = format!(
+            "[Shared document understanding — generated context]\n{prior}\n[End shared document understanding]\n\n"
+        );
+        assert_eq!(
+            grapheme_count(&prior),
+            DOCUMENT_KNOWLEDGE_MAX_CHARS as u64,
+            "the cap is measured in grapheme clusters, like Swift's prefix(16_000)"
+        );
+        // Every ingredient survives whole: the scalar cut used to stop inside the accents.
+        assert!(prior.contains(nfd.as_str()));
+        assert!(prior.contains(flag));
+        assert!(prior.contains(family));
+        assert!(prior.contains("abc\u{4E2D}\u{6587}"));
+        assert!(plan.parts[0].user_prompt.starts_with(&addition));
+        let extra = grapheme_count(&addition) + grapheme_count(DOCUMENT_KNOWLEDGE_RULES);
+        assert_eq!(
+            plan.parts[0].request_characters,
+            base.parts[0].request_characters + extra,
+            "the knowledge delta counts the same graphemes the block was cut in"
+        );
+        assert_eq!(
+            plan.estimated_tokens(),
+            base.estimated_tokens() + extra.div_ceil(4) * plan.parts.len() as u64
+        );
+    }
+
+    #[test]
+    fn document_knowledge_keeps_a_zwj_family_that_straddles_the_scalar_cut() {
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+        let flag = "\u{1F1E8}\u{1F1E6}";
+        // 15,999 one-scalar graphemes, then the family. Grapheme 16,000 is the whole family;
+        // scalar 16,000 is its first component. The scalar cut splits the ZWJ run.
+        let boundary = format!(
+            "{}{}{family}{flag}e\u{301}tail",
+            "a".repeat(15_000),
+            "\u{4E2D}".repeat(999),
+        );
+        let grapheme_prior = grapheme_prefix(&boundary, DOCUMENT_KNOWLEDGE_MAX_CHARS);
+        let scalar_prior: String = boundary
+            .chars()
+            .take(DOCUMENT_KNOWLEDGE_MAX_CHARS)
+            .collect();
+        assert!(grapheme_prior.ends_with(family));
+        assert!(scalar_prior.ends_with("\u{1F468}"));
+        assert!(!scalar_prior.ends_with(family));
+        assert_ne!(scalar_prior, grapheme_prior);
+
+        let plan = build_plan(PlanRequest {
+            action: Action::SummarizePage,
+            document_title: "A Paper".to_string(),
+            page_count: 3,
+            current_page: 1,
+            selection: None,
+            question: None,
+            language: None,
+            pages: pages(3),
+            settings: settings("http://localhost:11434/v1"),
+            document_knowledge: Some(DocumentKnowledgeInput {
+                text: boundary,
+                pages: Vec::new(),
+            }),
+        })
+        .unwrap();
+        let addition = format!(
+            "[Shared document understanding — generated context]\n{grapheme_prior}\n[End shared document understanding]\n\n"
+        );
+        assert!(
+            plan.parts[0].user_prompt.starts_with(&addition),
+            "the truncated block ends after the whole family, not inside it"
+        );
+    }
+
+    #[test]
     fn document_knowledge_keeps_the_shell_prompt_order_and_accounting() {
         let knowledge_text = "Shared reading: attention is budgeted — café 🎯.";
         let make_request = |knowledge: Option<DocumentKnowledgeInput>| PlanRequest {
@@ -3816,8 +3983,7 @@ mod tests {
         let addition = format!(
             "[Shared document understanding — generated context]\n{knowledge_text}\n[End shared document understanding]\n\n"
         );
-        let extra =
-            addition.chars().count() as u64 + DOCUMENT_KNOWLEDGE_RULES.chars().count() as u64;
+        let extra = grapheme_count(&addition) + grapheme_count(DOCUMENT_KNOWLEDGE_RULES);
         for (before, after) in base.parts.iter().zip(&enriched.parts) {
             assert_eq!(
                 after.system_prompt,
@@ -5110,6 +5276,28 @@ mod tests {
         let error =
             build_region_question_plan(region_request("", Some(png(10, 10)), false)).unwrap_err();
         assert!(error.to_string().contains("configured as text only"));
+    }
+
+    #[test]
+    fn region_question_truncates_by_extended_graphemes_without_splitting_a_zwj_run() {
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+        // 6,000 + 5,999 = 11,999 graphemes, then the family as grapheme 12,000.
+        let text = format!(
+            "{}{}{family}xyz",
+            "e\u{301}".repeat(6_000),
+            "z".repeat(5_999)
+        );
+        let plan = build_region_question_plan(region_request(&text, None, false)).unwrap();
+        let expected = grapheme_prefix(&text, MAX_REGION_TEXT_CHARS);
+        assert!(expected.ends_with(family));
+        assert_eq!(grapheme_count(&expected), MAX_REGION_TEXT_CHARS as u64);
+        assert!(plan.parts[0].user_prompt.contains(&expected));
+        assert_eq!(
+            plan.parts[0].page_characters,
+            expected.chars().count() as u64,
+            "page characters keep the scalar accounting of the text actually sent"
+        );
+        assert!(plan.note.as_deref().unwrap_or("").contains("truncated"));
     }
 
     #[test]
