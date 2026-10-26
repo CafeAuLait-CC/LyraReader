@@ -15,8 +15,31 @@ import LyraReaderBindings
 /// Older builds keyed the directory by SHA-256 of the canonical path alone. On first use the
 /// contents of that legacy directory are **copied** into the new one; the old files are left
 /// untouched, so a downgrade still finds them and nothing is lost if the copy is interrupted.
+///
+/// The page-edit recovery manifest (`session.json`) is the one file that cannot be copied as-is:
+/// its URLs name the legacy directory, which recovery would reject against the new cache prefix.
+/// It is retargeted by the Rust edit crate, written atomically into the new directory, and only
+/// then is the legacy manifest renamed to `session.json.migrated` (never deleted) and a
+/// completion marker recorded. If retargeting fails, no manifest is imported, the old files stay
+/// exactly where they are, and ``migrationFailure(for:)`` reports the reason to the recovery
+/// path so it can be shown instead of silently losing the staged edits.
 @MainActor public enum DocumentEditCache {
     public static var rootOverride: URL?
+
+    /// The legacy manifest is retired under this name, never deleted. A second migration must
+    /// not import it again (the audit's `retiredManifestReimported` case).
+    private static let recoveryManifestName = "session.json"
+    private static let retiredRecoveryManifestName = "session.json.migrated"
+
+    private struct MigrationMarker: Codable {
+        let version: Int
+        let legacyDirectory: String
+        let documentId: String
+        let retiredManifest: String
+    }
+
+    /// Why the last legacy-cache migration of `document` could not import its staged page edits.
+    private static var migrationFailures: [String: String] = [:]
 
     private struct IdentityStamp: Equatable {
         let size: UInt64
@@ -124,18 +147,122 @@ import LyraReaderBindings
 
     /// Copy any file the legacy directory holds that the new one does not. Never deletes and
     /// never overwrites: a new-key file is the reader's current state.
-    private static func migrateLegacyDirectory(for document: URL, to directory: URL) {
+    ///
+    /// `session.json` is skipped here and handled by ``importLegacyRecoveryManifest``: copying it
+    /// verbatim would leave its URLs in the old directory and make the session unrestorable.
+    private static func migrateLegacyDirectory(for document: URL, to directory: URL) throws {
         let legacy = legacyDirectory(for: document)
         guard legacy.path != directory.path,
               FileManager.default.fileExists(atPath: legacy.path) else { return }
         let manager = FileManager.default
-        try? manager.createDirectory(at: directory, withIntermediateDirectories: true)
+        try manager.createDirectory(at: directory, withIntermediateDirectories: true)
         guard let names = try? manager.contentsOfDirectory(atPath: legacy.path) else { return }
         for name in names {
+            if name == recoveryManifestName || name == retiredRecoveryManifestName { continue }
             let source = legacy.appendingPathComponent(name)
             let destination = directory.appendingPathComponent(name)
             guard !manager.fileExists(atPath: destination.path) else { continue }
             try? manager.copyItem(at: source, to: destination)
+        }
+        try importLegacyRecoveryManifest(for: document, from: legacy, to: directory)
+    }
+
+    /// Moves the legacy `session.json` into the new directory after retargeting its URLs.
+    ///
+    /// The new manifest is written only after the Rust retargeter accepted every URL. If any
+    /// later step fails, the imported copy is removed and the legacy file is left (or moved
+    /// back) exactly where it was: a failed migration must not look successful on the next
+    /// lookup, and it must not make recovery read a half-imported session.
+    private static func importLegacyRecoveryManifest(
+        for document: URL,
+        from legacy: URL,
+        to directory: URL
+    ) throws {
+        let manager = FileManager.default
+        let legacyManifest = legacy.appendingPathComponent(recoveryManifestName)
+        let newManifest = directory.appendingPathComponent(recoveryManifestName)
+        let marker = migrationMarkerURL(for: document)
+        // A completion marker means this manifest was already retired. A manifest already in
+        // the new directory is the reader's current state and must win; both cases leave the
+        // legacy file alone and import nothing.
+        guard manager.fileExists(atPath: legacyManifest.path),
+              !manager.fileExists(atPath: marker.path),
+              !manager.fileExists(atPath: newManifest.path) else { return }
+
+        let source = try Data(contentsOf: legacyManifest)
+        guard let text = String(data: source, encoding: .utf8) else {
+            throw LegacyMigrationError(detail: "the legacy manifest is not UTF-8")
+        }
+        let retargeted: String
+        do {
+            retargeted = try retargetRecoveryManifest(
+                manifestJson: text,
+                oldDirectoryUrl: legacy.absoluteString,
+                newDirectoryUrl: directory.absoluteString)
+        } catch {
+            throw LegacyMigrationError(detail: AnnotationRecords.message(error))
+        }
+        try Data(retargeted.utf8).write(to: newManifest, options: .atomic)
+
+        let retired = retiredRecoveryManifestURL(in: legacy)
+        do {
+            try manager.moveItem(at: legacyManifest, to: retired)
+        } catch {
+            // The new copy is not a successful import without the retirement: remove it so the
+            // next lookup retries instead of treating a partial migration as complete.
+            try? manager.removeItem(at: newManifest)
+            throw LegacyMigrationError(
+                detail: "the previous manifest could not be retired: \(error.localizedDescription)")
+        }
+        do {
+            let record = MigrationMarker(
+                version: 1,
+                legacyDirectory: legacy.lastPathComponent,
+                documentId: directory.lastPathComponent,
+                retiredManifest: retired.lastPathComponent)
+            try JSONEncoder().encode(record).write(to: marker, options: .atomic)
+        } catch {
+            // Completion could not be recorded: undo the import + retirement and report it.
+            try? manager.removeItem(at: newManifest)
+            try? manager.moveItem(at: retired, to: legacyManifest)
+            throw LegacyMigrationError(
+                detail: "migration completion could not be recorded: \(error.localizedDescription)")
+        }
+    }
+
+    /// The name the legacy manifest is retired under. Never reuses an existing file: the first
+    /// retirement keeps the expected name and a later one gets a unique suffix.
+    private static func retiredRecoveryManifestURL(in legacy: URL) -> URL {
+        let preferred = legacy.appendingPathComponent(retiredRecoveryManifestName)
+        guard FileManager.default.fileExists(atPath: preferred.path) else { return preferred }
+        return legacy.appendingPathComponent(
+            "\(retiredRecoveryManifestName)-\(UUID().uuidString)")
+    }
+
+    /// The durable marker that records a completed legacy-directory migration.
+    ///
+    /// It names the legacy directory and the destination identity, so a later lookup (or a human
+    /// reading the cache) can tell why `session.json` is no longer imported from the old layout.
+    static func migrationMarkerURL(for document: URL) -> URL {
+        root.appendingPathComponent(legacyKey(for: document) + ".migration")
+    }
+
+    /// The reason the last legacy-cache migration of `document` could not import its staged page
+    /// edits, or `nil` when there is nothing to report.
+    ///
+    /// The recovery path turns this into `AppState.lastError`; it is deliberately not consumed
+    /// here, so every lookup that retries a failed migration reports the same cause.
+    public static func migrationFailure(for document: URL) -> String? {
+        migrationFailures[canonicalURL(document).path]
+    }
+
+    /// One migration failure. The sentence names the consequence (the staged edits were kept) so
+    /// the recovery path can show it without inventing a second explanation.
+    private struct LegacyMigrationError: LocalizedError {
+        let detail: String
+        var errorDescription: String? {
+            "The cached page-editing session in the previous cache location could not be moved "
+                + "to the current one; its files were left untouched: \(detail)"
         }
     }
 
@@ -160,7 +287,13 @@ import LyraReaderBindings
         if let previous = previousIdentityDirectory(for: document) {
             adoptPreviousIdentityState(from: previous, to: directory)
         }
-        migrateLegacyDirectory(for: document, to: directory)
+        let path = canonicalURL(document).path
+        migrationFailures.removeValue(forKey: path)
+        do {
+            try migrateLegacyDirectory(for: document, to: directory)
+        } catch {
+            migrationFailures[path] = error.localizedDescription
+        }
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         recordIdentityPointer(identity, for: document)
         return directory

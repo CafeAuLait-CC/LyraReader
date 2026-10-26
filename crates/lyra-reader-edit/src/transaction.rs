@@ -1143,6 +1143,227 @@ pub fn canonical_json(value: &Value) -> String {
     text.replace('/', "\\/")
 }
 
+/// Which manifest URLs name the editing session rather than the original document.
+///
+/// The session directory and the records inside it move with the cache; the original document
+/// stays where it is. A revision URL that still equals the original document URL is the "no page
+/// operation yet" form and is left untouched.
+struct ManifestRetarget<'a> {
+    old_directory_url: &'a str,
+    old_directory: &'a Path,
+    new_directory_url: &'a str,
+    new_directory: &'a Path,
+    original_url: &'a str,
+}
+
+impl ManifestRetarget<'_> {
+    fn url(
+        &self,
+        url: &str,
+        field: &str,
+        allow_original: bool,
+    ) -> Result<String, TransactionError> {
+        if allow_original && url == self.original_url {
+            return Ok(url.to_string());
+        }
+        let path = file_url_path(url).ok_or_else(|| {
+            error(format!(
+                "The cached editing session's {field} is not a local file URL: {url}"
+            ))
+        })?;
+        // A manifest that was already retargeted is returned unchanged; this is what makes the
+        // helper safe to call again when a migration was interrupted after writing the new copy.
+        if path_has_prefix(&path, self.new_directory) {
+            return Ok(url.to_string());
+        }
+        if !path_has_prefix(&path, self.old_directory) {
+            return Err(error(format!(
+                "The cached editing session's {field} is outside the previous cache directory, so it cannot be retargeted safely: {url}"
+            )));
+        }
+        let relative = path.strip_prefix(self.old_directory).map_err(|_| {
+            error(format!(
+                "The cached editing session's {field} is not a plain file below the previous cache directory: {url}"
+            ))
+        })?;
+        if relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(error(format!(
+                "The cached editing session's {field} is not a plain file below the previous cache directory: {url}"
+            )));
+        }
+        // Prefer splicing the raw URL string: it preserves the encoding Foundation used for the
+        // unchanged part of the path. The decoded fallback handles a prefix spelled with
+        // different percent escapes.
+        if let Some(suffix) = url.strip_prefix(self.old_directory_url) {
+            return Ok(format!("{}{suffix}", self.new_directory_url));
+        }
+        append_relative_url(self.new_directory_url, relative, field)
+    }
+}
+
+/// Appends a decoded relative path to a directory URL, percent-encoding bytes that are not safe
+/// in a path. The names the transaction generates (`session-<uuid>/rev-N.pdf`) are unaffected;
+/// this exists so a cache under a path with spaces still gets a valid URL.
+fn append_relative_url(
+    directory_url: &str,
+    relative: &Path,
+    field: &str,
+) -> Result<String, TransactionError> {
+    let mut encoded = String::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(error(format!(
+                "The cached editing session's {field} is not a plain file below the previous cache directory."
+            )));
+        };
+        let text = component.to_str().ok_or_else(|| {
+            error(format!(
+                "The cached editing session's {field} is not valid UTF-8."
+            ))
+        })?;
+        if !encoded.is_empty() {
+            encoded.push('/');
+        }
+        for byte in text.bytes() {
+            let unreserved = byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b','
+                        | b';'
+                        | b'='
+                        | b':'
+                        | b'@'
+                );
+            if unreserved {
+                encoded.push(char::from(byte));
+            } else {
+                encoded.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    Ok(format!("{directory_url}{encoded}"))
+}
+
+/// Rewrites the URLs in one `session.json` recovery manifest from the previous cache directory
+/// to the current `DocumentId` directory.
+///
+/// The old layout keyed the cache by the canonical path alone; the current one appends the
+/// document's content hash. A verbatim copy of the manifest would still name the old session
+/// directory, and the restore path would reject it against the new cache prefix (its
+/// directory-boundary check is deliberately strict). This function is the migration step:
+/// it retargets `session.directory`, `annotationRecordsURL`, `originalRecordsURL`, `revisionURL`
+/// and every undo/redo `revisionURL`. `originalURL` is never touched, and a revision URL that is
+/// still the original document URL is kept as-is.
+///
+/// A URL that is neither below the old directory nor already below the new one is a foreign
+/// path. Guessing what the reader meant would risk importing an unrestorable session, so that
+/// case is an error and the caller must leave the legacy manifest in place.
+///
+/// The result uses the same canonical serialisation [`DocumentTransaction`] writes for
+/// `session.json` (sorted object keys, compact separators, Foundation's `\/` escapes), so values
+/// keep their meaning and a second call targeting the same directory is byte-identical.
+pub fn retarget_recovery_manifest(
+    manifest_json: &str,
+    old_directory_url: &str,
+    new_directory_url: &str,
+) -> Result<String, TransactionError> {
+    let mut document: Value = serde_json::from_str(manifest_json)
+        .map_err(|parse| error(format!("The cached editing session is not JSON: {parse}")))?;
+    let old_directory_url = directory_form(old_directory_url);
+    let new_directory_url = directory_form(new_directory_url);
+    let old_directory = file_url_path(&old_directory_url).ok_or_else(|| {
+        error("The previous cache location is not a local file URL and cannot be migrated.")
+    })?;
+    let new_directory = file_url_path(&new_directory_url).ok_or_else(|| {
+        error("The current cache location is not a local file URL and cannot receive the session.")
+    })?;
+
+    // A manifest this build cannot restore must not be imported and retired: refusing here
+    // leaves the old files untouched and makes the shell report the shape it could not migrate.
+    let version = document.get("version").and_then(Value::as_u64).unwrap_or(0);
+    if version != u64::from(RECOVERY_VERSION) {
+        return Err(error(format!(
+            "The cached editing session uses version {version}; this build only migrates version {RECOVERY_VERSION}. The cached page edits were kept."
+        )));
+    }
+    if !document.get("snapshot").is_some_and(Value::is_object) {
+        return Err(error(
+            "The cached editing session has no snapshot object and cannot be restored.",
+        ));
+    }
+    let session = document
+        .get_mut("session")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| error("The cached editing session has no session object."))?;
+    let original_url = session
+        .get("originalURL")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| error("The cached editing session names no original document URL."))?;
+    let retarget = ManifestRetarget {
+        old_directory_url: &old_directory_url,
+        old_directory: &old_directory,
+        new_directory_url: &new_directory_url,
+        new_directory: &new_directory,
+        original_url: &original_url,
+    };
+
+    for (field, allow_original) in [
+        ("directory", false),
+        ("annotationRecordsURL", false),
+        ("originalRecordsURL", false),
+        ("revisionURL", true),
+    ] {
+        let url = session
+            .get(field)
+            .and_then(Value::as_str)
+            .ok_or_else(|| error(format!("The cached editing session has no {field}.")))?;
+        let rewritten = retarget.url(url, field, allow_original)?;
+        session.insert(field.to_string(), Value::String(rewritten));
+    }
+
+    for stack in ["undo", "redo"] {
+        let snapshots = session
+            .get_mut(stack)
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                error(format!(
+                    "The cached editing session has no {stack} snapshot array."
+                ))
+            })?;
+        for (index, snapshot) in snapshots.iter_mut().enumerate() {
+            let snapshot = snapshot.as_object_mut().ok_or_else(|| {
+                error(format!(
+                    "The cached editing session's {stack}[{index}] is not an object."
+                ))
+            })?;
+            let field = format!("{stack}[{index}].revisionURL");
+            let url = snapshot
+                .get("revisionURL")
+                .and_then(Value::as_str)
+                .ok_or_else(|| error(format!("The cached editing session has no {field}.")))?;
+            let rewritten = retarget.url(url, &field, true)?;
+            snapshot.insert("revisionURL".to_string(), Value::String(rewritten));
+        }
+    }
+
+    Ok(canonical_json(&document))
+}
+
 fn number(value: f64) -> Value {
     if value.is_finite()
         && value.fract() == 0.0
@@ -1458,6 +1679,219 @@ mod tests {
         );
         assert!(text.contains("\"n\":700000000"), "{text}");
         assert!(text.contains("\"d\":12.5"), "{text}");
+    }
+
+    const LEGACY_DIRECTORY: &str = "file:///tmp/lyra-migration/legacy-key/";
+    const NEW_DIRECTORY: &str = "file:///tmp/lyra-migration/new-identity/";
+    const ORIGINAL_URL: &str = "file:///tmp/lyra-migration/paper.pdf";
+
+    /// A manifest with every URL-bearing field the old layout wrote, plus one unknown key that
+    /// the migration must pass through untouched.
+    fn migration_manifest() -> String {
+        serde_json::json!({
+            "version": RECOVERY_VERSION,
+            "session": {
+                "originalURL": ORIGINAL_URL,
+                "originalSignature": {"evidence": [], "readOnlyReason": null, "signed": false},
+                "sourceStamp": {"size": 1234, "sha256": "abc"},
+                "originalRecordsURL": "file:///tmp/lyra-migration/legacy-key/annotations.json",
+                "title": "paper",
+                "directory": "file:///tmp/lyra-migration/legacy-key/session-AAAA/",
+                "annotationRecordsURL": "file:///tmp/lyra-migration/legacy-key/session-AAAA/annotations.json",
+                "originalRotations": [0, 0, 0],
+                "revisionURL": "file:///tmp/lyra-migration/legacy-key/session-AAAA/rev-1.pdf",
+                "revisionNumber": 1,
+                "currentToOriginal": [0, -1, 1, 2],
+                "operations": ["Insert a blank page before page 2"],
+                "undo": [{
+                    "revisionURL": ORIGINAL_URL,
+                    "revisionNumber": 0,
+                    "currentToOriginal": [0, 1, 2],
+                    "operations": [],
+                    "annotations": [],
+                    "bookmarks": [],
+                    "slots": [],
+                    "deletions": [],
+                    "erasedInk": [],
+                    "annotationDirty": false,
+                    "currentPage": 1,
+                    "selection": [],
+                    "label": "Original"
+                }],
+                "redo": [{
+                    "revisionURL": "file:///tmp/lyra-migration/legacy-key/session-AAAA/rev-2.pdf",
+                    "revisionNumber": 2,
+                    "currentToOriginal": [0, -1, 1, 2],
+                    "operations": ["Insert a blank page before page 2"],
+                    "annotations": [],
+                    "bookmarks": [],
+                    "slots": [],
+                    "deletions": [],
+                    "erasedInk": [],
+                    "annotationDirty": false,
+                    "currentPage": 1,
+                    "selection": [],
+                    "label": "Redo"
+                }],
+                "futureSessionField": {"keep": [1, 2, 3]}
+            },
+            "snapshot": {
+                "revisionURL": "file:///tmp/lyra-migration/legacy-key/session-AAAA/rev-1.pdf",
+                "revisionNumber": 1,
+                "currentToOriginal": [0, -1, 1, 2],
+                "operations": ["Insert a blank page before page 2"],
+                "annotations": [],
+                "bookmarks": [],
+                "slots": [],
+                "deletions": [],
+                "erasedInk": [],
+                "annotationDirty": false,
+                "currentPage": 1,
+                "selection": [],
+                "label": "Insert a blank page before page 2"
+            }
+        })
+        .to_string()
+    }
+
+    fn migrate(json: &str) -> Result<String, TransactionError> {
+        retarget_recovery_manifest(json, LEGACY_DIRECTORY, NEW_DIRECTORY)
+    }
+
+    #[test]
+    fn retarget_rewrites_every_session_url_and_preserves_other_values() {
+        let migrated = migrate(&migration_manifest()).unwrap();
+        let value: Value = serde_json::from_str(&migrated).unwrap();
+        let session = &value["session"];
+        assert_eq!(
+            session["directory"],
+            "file:///tmp/lyra-migration/new-identity/session-AAAA/"
+        );
+        assert_eq!(
+            session["annotationRecordsURL"],
+            "file:///tmp/lyra-migration/new-identity/session-AAAA/annotations.json"
+        );
+        assert_eq!(
+            session["originalRecordsURL"],
+            "file:///tmp/lyra-migration/new-identity/annotations.json"
+        );
+        assert_eq!(
+            session["revisionURL"],
+            "file:///tmp/lyra-migration/new-identity/session-AAAA/rev-1.pdf"
+        );
+        assert_eq!(
+            session["undo"][0]["revisionURL"], ORIGINAL_URL,
+            "a revision URL that is still the original document stays the original"
+        );
+        assert_eq!(
+            session["redo"][0]["revisionURL"],
+            "file:///tmp/lyra-migration/new-identity/session-AAAA/rev-2.pdf"
+        );
+        assert_eq!(
+            session["originalURL"], ORIGINAL_URL,
+            "the original document URL is never rewritten"
+        );
+        assert_eq!(
+            session["futureSessionField"],
+            serde_json::json!({"keep": [1, 2, 3]}),
+            "unknown fields pass through with their value"
+        );
+        assert_eq!(
+            value["snapshot"]["revisionURL"],
+            "file:///tmp/lyra-migration/legacy-key/session-AAAA/rev-1.pdf",
+            "the snapshot is the transaction's data, not a URL the shell restores from"
+        );
+        // The output is the crate's canonical `session.json` shape: compact, sorted keys, `/`
+        // escaped the way Foundation writes a URL.
+        assert!(
+            migrated.contains("\\/tmp\\/lyra-migration\\/new-identity\\/session-AAAA\\/rev-1.pdf"),
+            "{migrated}"
+        );
+    }
+
+    #[test]
+    fn retarget_rejects_a_foreign_url_instead_of_guessing() {
+        let mut value: Value = serde_json::from_str(&migration_manifest()).unwrap();
+        value["session"]["revisionURL"] =
+            Value::String("file:///tmp/somewhere-else/rev-1.pdf".to_string());
+        let failure = migrate(&value.to_string()).unwrap_err();
+        assert!(
+            failure.0.contains("outside the previous cache directory"),
+            "{failure}"
+        );
+
+        let mut value: Value = serde_json::from_str(&migration_manifest()).unwrap();
+        value["session"]["undo"][0]["revisionURL"] =
+            Value::String("file:///tmp/somewhere-else/rev-0.pdf".to_string());
+        let failure = migrate(&value.to_string()).unwrap_err();
+        assert!(failure.0.contains("undo[0].revisionURL"), "{failure}");
+
+        // A sibling directory that merely shares the string prefix is not inside the old cache.
+        let mut value: Value = serde_json::from_str(&migration_manifest()).unwrap();
+        value["session"]["annotationRecordsURL"] = Value::String(
+            "file:///tmp/lyra-migration/legacy-key-evil/annotations.json".to_string(),
+        );
+        let failure = migrate(&value.to_string()).unwrap_err();
+        assert!(failure.0.contains("annotationRecordsURL"), "{failure}");
+    }
+
+    #[test]
+    fn retarget_leaves_the_original_document_url_untouched() {
+        let migrated = migrate(&migration_manifest()).unwrap();
+        let value: Value = serde_json::from_str(&migrated).unwrap();
+        assert_eq!(value["session"]["originalURL"], ORIGINAL_URL);
+        assert_eq!(value["session"]["undo"][0]["revisionURL"], ORIGINAL_URL);
+        assert!(
+            !migrated.contains("new-identity/paper.pdf"),
+            "the original document must not be redirected into the cache: {migrated}"
+        );
+    }
+
+    #[test]
+    fn retarget_rejects_invalid_json_and_unsupported_shapes() {
+        let failure = migrate("{this is not json").unwrap_err();
+        assert!(failure.0.contains("not JSON"), "{failure}");
+
+        let failure = migrate(r#"{"version":1}"#).unwrap_err();
+        assert!(failure.0.contains("snapshot"), "{failure}");
+
+        let mut future: Value = serde_json::from_str(&migration_manifest()).unwrap();
+        future["version"] = serde_json::json!(RECOVERY_VERSION + 1);
+        let failure = migrate(&future.to_string()).unwrap_err();
+        assert!(failure.0.contains("version"), "{failure}");
+
+        let mut missing: Value = serde_json::from_str(&migration_manifest()).unwrap();
+        missing["session"]
+            .as_object_mut()
+            .unwrap()
+            .remove("directory");
+        let failure = migrate(&missing.to_string()).unwrap_err();
+        assert!(failure.0.contains("directory"), "{failure}");
+    }
+
+    #[test]
+    fn retarget_is_idempotent_once_the_prefix_is_new() {
+        let once = migrate(&migration_manifest()).unwrap();
+        let twice = retarget_recovery_manifest(&once, LEGACY_DIRECTORY, NEW_DIRECTORY).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn retarget_handles_percent_escaped_and_spaced_directories() {
+        let manifest = migration_manifest()
+            .replace("legacy-key", "legacy%20key")
+            .replace(ORIGINAL_URL, "file:///tmp/lyra-migration/paper.pdf");
+        let migrated = retarget_recovery_manifest(
+            &manifest,
+            "file:///tmp/lyra-migration/legacy%20key/",
+            "file:///tmp/lyra-migration/new%20identity/",
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&migrated).unwrap();
+        assert_eq!(
+            value["session"]["revisionURL"],
+            "file:///tmp/lyra-migration/new%20identity/session-AAAA/rev-1.pdf"
+        );
     }
 
     fn tempdir() -> PathBuf {

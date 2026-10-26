@@ -21,6 +21,27 @@ use lyra_reader_pdfium::stage_page_operation;
 
 use crate::api::{ErrorSeverity, LyraReaderFfiError, PageOperationRecord, page_operation};
 
+/// Retargets a legacy-layout `session.json` into the current `DocumentId` cache directory.
+///
+/// The old cache was keyed by the canonical path alone; its manifest names that old directory,
+/// and the restore path deliberately rejects a session directory outside the cache prefix. This
+/// wrapper exposes the pure string rewriting in `lyra-reader-edit` so the shell can migrate the
+/// manifest after copying the session files. It does no file I/O: a failure leaves the caller's
+/// files exactly where they are.
+#[uniffi::export]
+pub fn retarget_recovery_manifest(
+    manifest_json: String,
+    old_directory_url: String,
+    new_directory_url: String,
+) -> Result<String, LyraReaderFfiError> {
+    lyra_reader_edit::transaction::retarget_recovery_manifest(
+        &manifest_json,
+        &old_directory_url,
+        &new_directory_url,
+    )
+    .map_err(document_error)
+}
+
 /// Everything the shell knows when it prepares a page-editing session, plus the pieces needed to
 /// restore one from `session.json`.
 #[derive(Debug, Clone, uniffi::Record)]

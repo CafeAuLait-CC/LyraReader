@@ -205,6 +205,10 @@ struct ReaderChecks {
             try await documentCacheChecks(root: fastRoot)
             return
         }
+        if CommandLine.arguments.contains("--check-legacy-recovery") {
+            try await legacyRecoveryMigrationChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-annotated-copy-guard") {
             try await annotatedCopyGuardChecks(root: fastRoot)
             return
