@@ -75,18 +75,19 @@ separate features with their own documented limits.
 
 ```
 LyraReader/
-├── Cargo.toml                  # Rust workspace (11 crates)
+├── Cargo.toml                  # Rust workspace (12 crates)
 ├── rust-toolchain.toml         # Pinned toolchain
 ├── crates/
 │   ├── lyra-reader-core/              # Document model, geometry/coordinates, errors, backend traits (zero platform deps)
 │   ├── lyra-reader-pdfium/            # PDFium implementation of DocumentBackend (feature-gated)
 │   ├── lyra-reader-text/              # Text pages, per-glyph boxes, selection, search, reading order
-│   ├── lyra-reader-edit/              # Annotation model, page operations, forms, incremental save
-│   ├── lyra-reader-render/            # Tile pyramid, LOD, scheduling, cache, prefetch
+│   ├── lyra-reader-edit/              # Annotation model, page operations, forms, incremental save, page-edit transaction
+│   ├── lyra-reader-render/            # Tile pyramid, LOD, batch tile planning (cache stays in Swift, ADR-0007)
 │   ├── lyra-reader-gpu/               # wgpu device/surface/compositor, shares MTLDevice with the native layer
 │   ├── lyra-reader-session/           # Session and viewport state machine, command/event bus (platform-independent)
 │   ├── lyra-reader-ai/                # LLM provider abstraction, context building, citation index
 │   ├── lyra-reader-metadata/          # Info/XMP/first-page metadata recognition and BibTeX generation
+│   ├── lyra-reader-xfa/               # Read-only XFA rendering and form-data display
 │   ├── lyra-reader-ffi/               # UniFFI interface definitions + C ABI exports
 │   └── lyra-reader-cli/               # Headless CLI: render/text/metadata/benchmarks (also the golden test entry point)
 ├── apps/macos/                 # SwiftPM package: LyraReaderKit (UI library) + LyraReader (executable app)
@@ -162,7 +163,8 @@ listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md); all of them are perm
 included (MuPDF is excluded on purpose). The decision record is [ADR-0005](docs/adr/0005-licensing.md).
 
 Notable components: PDFium (BSD-3-Clause), wgpu (Apache-2.0), pdfium-render (MIT OR Apache-2.0), UniFFI
-(MPL-2.0, build-time only), ureq (MIT OR Apache-2.0), rustls (Apache-2.0 OR ISC OR MIT), Noto Sans SC (SIL Open
+(MPL-2.0, build-time only), ureq (MIT OR Apache-2.0), rustls (Apache-2.0 OR ISC OR MIT), unicode-segmentation
+(MIT OR Apache-2.0, pinned to the Unicode 16 tables that match the Swift runtime), Noto Sans SC (SIL Open
 Font License 1.1, shipped subsetted as `LyraReader Sans SC`), rcgen (tests only). Interface icons are SF Symbols,
 used under Apple's licence for in-app use on Apple platforms only: they may not become an application icon or
 mark, may not be redistributed as an icon set, and a Linux or Windows shell must bring its own icons. The
