@@ -60,6 +60,12 @@ struct ReaderChecks {
     }
 
     @MainActor static func main() async throws {
+        // The killed-process check re-executes this binary; it must handle its arguments before
+        // the normal check cache and fixture setup.
+        if CommandLine.arguments.contains("--document-transaction-crash-child") {
+            try await documentTransactionCrashChild()
+            return
+        }
         // `--shard i/n` partitions the registered suites across n processes. Parse and validate
         // it before anything else so a typo fails loudly instead of silently running the whole
         // suite in every shard (which would be slow and would make the shard jobs meaningless).
@@ -157,6 +163,14 @@ struct ReaderChecks {
         if CommandLine.arguments.contains("--check-annotation-codec") {
             try await annotationCodecChecks(root: fastRoot)
             print("Annotation codec checks passed")
+            return
+        }
+        if CommandLine.arguments.contains("--capture-document-transaction-goldens") {
+            try await captureDocumentTransactionGoldens(root: fastRoot)
+            return
+        }
+        if CommandLine.arguments.contains("--check-document-transaction") {
+            try await documentTransactionChecks(root: fastRoot)
             return
         }
         if CommandLine.arguments.contains("--check-preview-citation-card") {
@@ -1114,6 +1128,11 @@ struct ReaderChecks {
                 // Registered before the frame-scheduling checks: those need a presentable surface and
                 // stop the run where the display is unavailable (an occluded window never presents).
                 try await pageOperationChecks(root: root)
+            }),
+            ("document-transaction", {
+                // The pre-change freeze for the page-edit transaction/recovery state, compared
+                // byte for byte against the Rust-owned implementation.
+                try await documentTransactionChecks(root: root)
             }),
             ("redaction", {
                 try await contentRedactionChecks(root: root)

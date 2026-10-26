@@ -1,0 +1,1027 @@
+{
+  "crash" : {
+    "annotations" : [
+      {
+        "end" : 4,
+        "id" : "11111111-1111-4111-8111-111111111111",
+        "kind" : "highlight",
+        "note" : "first page mark",
+        "page" : 0,
+        "start" : 0
+      },
+      {
+        "end" : 5,
+        "id" : "22222222-2222-4222-8222-222222222222",
+        "kind" : "underline",
+        "note" : "second page mark",
+        "page" : 2,
+        "start" : 1
+      }
+    ],
+    "bookmarks" : [
+      {
+        "id" : "33333333-3333-4333-8333-333333333333",
+        "page" : 2,
+        "title" : "second page bookmark",
+        "yPt" : 12
+      }
+    ],
+    "canRedo" : false,
+    "canUndo" : true,
+    "currentPage" : 2,
+    "currentToOriginal" : [
+      0,
+      -1,
+      1,
+      2
+    ],
+    "lastAction" : "Insert a blank page before page 2",
+    "operations" : [
+      "Insert a blank page before page 2"
+    ],
+    "pageCount" : 4,
+    "partialRevisionVisible" : false,
+    "pending" : 1,
+    "recovery" : "crash-restored.json",
+    "recoveryBeforeRestore" : true,
+    "revision" : "$SCRATCH\/cache\/$IDENTITY\/session-$SESSION\/rev-1.pdf",
+    "revisionNumber" : 1,
+    "selection" : [
+      0
+    ],
+    "sessionActive" : true
+  },
+  "delete-page" : {
+    "after" : {
+      "annotations" : [
+        {
+          "end" : 4,
+          "id" : "11111111-1111-4111-8111-111111111111",
+          "kind" : "highlight",
+          "note" : "first page mark",
+          "page" : 0,
+          "start" : 0
+        }
+      ],
+      "bookmarks" : [
+
+      ],
+      "canRedo" : false,
+      "canUndo" : true,
+      "currentPage" : 1,
+      "currentToOriginal" : [
+        0,
+        2
+      ],
+      "lastAction" : "Delete page 2",
+      "operations" : [
+        "Delete page 2"
+      ],
+      "pageCount" : 2,
+      "pending" : 1,
+      "recovery" : "delete-page-after.json",
+      "revision" : "$SCRATCH\/cache\/$IDENTITY\/session-$SESSION\/rev-1.pdf",
+      "revisionNumber" : 1,
+      "selection" : [
+        0
+      ],
+      "sessionActive" : true
+    },
+    "before" : {
+      "annotations" : [
+        {
+          "end" : 4,
+          "id" : "11111111-1111-4111-8111-111111111111",
+          "kind" : "highlight",
+          "note" : "first page mark",
+          "page" : 0,
+          "start" : 0
+        },
+        {
+          "end" : 5,
+          "id" : "22222222-2222-4222-8222-222222222222",
+          "kind" : "underline",
+          "note" : "second page mark",
+          "page" : 1,
+          "start" : 1
+        }
+      ],
+      "bookmarks" : [
+        {
+          "id" : "33333333-3333-4333-8333-333333333333",
+          "page" : 1,
+          "title" : "second page bookmark",
+          "yPt" : 12
+        }
+      ],
+      "canRedo" : false,
+      "canUndo" : false,
+      "currentPage" : 1,
+      "currentToOriginal" : [
+
+      ],
+      "operations" : [
+
+      ],
+      "pageCount" : 3,
+      "pending" : 0,
+      "recovery" : "delete-page-before.json",
+      "revision" : "$SCRATCH\/delete-page.pdf",
+      "revisionNumber" : 0,
+      "selection" : [
+        0
+      ],
+      "sessionActive" : false
+    },
+    "revisionFiles" : [
+      "rev-1.pdf"
+    ]
+  },
+  "exports" : {
+    "extract" : {
+      "pageCount" : 2,
+      "pageMap" : [
+        0,
+        null,
+        1
+      ],
+      "rotations" : [
+        0,
+        0
+      ]
+    },
+    "merge" : {
+      "appendedAnnotationCounts" : [
+        7
+      ],
+      "appendedOutlineEntries" : 0,
+      "appendedOutlineGroupTitles" : [
+
+      ],
+      "appendedPageCounts" : [
+        2
+      ],
+      "firstOutlineEntries" : 0,
+      "firstPageCount" : 3,
+      "pageCount" : 5,
+      "rotations" : [
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "split" : {
+      "parts" : [
+        {
+          "pageCount" : 1,
+          "rotations" : [
+            0
+          ],
+          "sourcePages" : [
+            0
+          ]
+        },
+        {
+          "pageCount" : 2,
+          "rotations" : [
+            0,
+            0
+          ],
+          "sourcePages" : [
+            1,
+            2
+          ]
+        }
+      ],
+      "sourcePageCount" : 3
+    }
+  },
+  "insert-blank" : {
+    "after" : {
+      "annotations" : [
+        {
+          "end" : 4,
+          "id" : "11111111-1111-4111-8111-111111111111",
+          "kind" : "highlight",
+          "note" : "first page mark",
+          "page" : 0,
+          "start" : 0
+        },
+        {
+          "end" : 5,
+          "id" : "22222222-2222-4222-8222-222222222222",
+          "kind" : "underline",
+          "note" : "second page mark",
+          "page" : 2,
+          "start" : 1
+        }
+      ],
+      "bookmarks" : [
+        {
+          "id" : "33333333-3333-4333-8333-333333333333",
+          "page" : 2,
+          "title" : "second page bookmark",
+          "yPt" : 12
+        }
+      ],
+      "canRedo" : false,
+      "canUndo" : true,
+      "currentPage" : 2,
+      "currentToOriginal" : [
+        0,
+        -1,
+        1,
+        2
+      ],
+      "lastAction" : "Insert a blank page before page 2",
+      "operations" : [
+        "Insert a blank page before page 2"
+      ],
+      "pageCount" : 4,
+      "pending" : 1,
+      "recovery" : "insert-blank-after.json",
+      "revision" : "$SCRATCH\/cache\/$IDENTITY\/session-$SESSION\/rev-1.pdf",
+      "revisionNumber" : 1,
+      "selection" : [
+        1
+      ],
+      "sessionActive" : true
+    },
+    "before" : {
+      "annotations" : [
+        {
+          "end" : 4,
+          "id" : "11111111-1111-4111-8111-111111111111",
+          "kind" : "highlight",
+          "note" : "first page mark",
+          "page" : 0,
+          "start" : 0
+        },
+        {
+          "end" : 5,
+          "id" : "22222222-2222-4222-8222-222222222222",
+          "kind" : "underline",
+          "note" : "second page mark",
+          "page" : 1,
+          "start" : 1
+        }
+      ],
+      "bookmarks" : [
+        {
+          "id" : "33333333-3333-4333-8333-333333333333",
+          "page" : 1,
+          "title" : "second page bookmark",
+          "yPt" : 12
+        }
+      ],
+      "canRedo" : false,
+      "canUndo" : false,
+      "currentPage" : 1,
+      "currentToOriginal" : [
+
+      ],
+      "operations" : [
+
+      ],
+      "pageCount" : 3,
+      "pending" : 0,
+      "recovery" : "insert-blank-before.json",
+      "revision" : "$SCRATCH\/insert-blank.pdf",
+      "revisionNumber" : 0,
+      "selection" : [
+        0
+      ],
+      "sessionActive" : false
+    },
+    "revisionFiles" : [
+      "rev-1.pdf"
+    ]
+  },
+  "move-page" : {
+    "after" : {
+      "annotations" : [
+        {
+          "end" : 4,
+          "id" : "11111111-1111-4111-8111-111111111111",
+          "kind" : "highlight",
+          "note" : "first page mark",
+          "page" : 2,
+          "start" : 0
+        },
+        {
+          "end" : 5,
+          "id" : "22222222-2222-4222-8222-222222222222",
+          "kind" : "underline",
+          "note" : "second page mark",
+          "page" : 0,
+          "start" : 1
+        }
+      ],
+      "bookmarks" : [
+        {
+          "id" : "33333333-3333-4333-8333-333333333333",
+          "page" : 0,
+          "title" : "second page bookmark",
+          "yPt" : 12
+        }
+      ],
+      "canRedo" : false,
+      "canUndo" : true,
+      "currentPage" : 3,
+      "currentToOriginal" : [
+        1,
+        2,
+        0
+      ],
+      "lastAction" : "Move page 1 to position 3",
+      "operations" : [
+        "Move page 1 to position 3"
+      ],
+      "pageCount" : 3,
+      "pending" : 1,
+      "recovery" : "move-page-after.json",
+      "revision" : "$SCRATCH\/cache\/$IDENTITY\/session-$SESSION\/rev-1.pdf",
+      "revisionNumber" : 1,
+      "selection" : [
+        2
+      ],
+      "sessionActive" : true
+    },
+    "before" : {
+      "annotations" : [
+        {
+          "end" : 4,
+          "id" : "11111111-1111-4111-8111-111111111111",
+          "kind" : "highlight",
+          "note" : "first page mark",
+          "page" : 0,
+          "start" : 0
+        },
+        {
+          "end" : 5,
+          "id" : "22222222-2222-4222-8222-222222222222",
+          "kind" : "underline",
+          "note" : "second page mark",
+          "page" : 1,
+          "start" : 1
+        }
+      ],
+      "bookmarks" : [
+        {
+          "id" : "33333333-3333-4333-8333-333333333333",
+          "page" : 1,
+          "title" : "second page bookmark",
+          "yPt" : 12
+        }
+      ],
+      "canRedo" : false,
+      "canUndo" : false,
+      "currentPage" : 1,
+      "currentToOriginal" : [
+
+      ],
+      "operations" : [
+
+      ],
+      "pageCount" : 3,
+      "pending" : 0,
+      "recovery" : "move-page-before.json",
+      "revision" : "$SCRATCH\/move-page.pdf",
+      "revisionNumber" : 0,
+      "selection" : [
+        0
+      ],
+      "sessionActive" : false
+    },
+    "revisionFiles" : [
+      "rev-1.pdf"
+    ]
+  },
+  "rotate-page" : {
+    "after" : {
+      "annotations" : [
+        {
+          "end" : 4,
+          "id" : "11111111-1111-4111-8111-111111111111",
+          "kind" : "highlight",
+          "note" : "first page mark",
+          "page" : 0,
+          "start" : 0
+        },
+        {
+          "end" : 5,
+          "id" : "22222222-2222-4222-8222-222222222222",
+          "kind" : "underline",
+          "note" : "second page mark",
+          "page" : 1,
+          "start" : 1
+        }
+      ],
+      "bookmarks" : [
+        {
+          "id" : "33333333-3333-4333-8333-333333333333",
+          "page" : 1,
+          "title" : "second page bookmark",
+          "yPt" : 12
+        }
+      ],
+      "canRedo" : false,
+      "canUndo" : true,
+      "currentPage" : 1,
+      "currentToOriginal" : [
+        0,
+        1,
+        2
+      ],
+      "lastAction" : "Rotate page 3 90° clockwise",
+      "operations" : [
+        "Rotate page 3 90° clockwise"
+      ],
+      "pageCount" : 3,
+      "pending" : 1,
+      "recovery" : "rotate-page-after.json",
+      "revision" : "$SCRATCH\/cache\/$IDENTITY\/session-$SESSION\/rev-1.pdf",
+      "revisionNumber" : 1,
+      "selection" : [
+        0
+      ],
+      "sessionActive" : true
+    },
+    "before" : {
+      "annotations" : [
+        {
+          "end" : 4,
+          "id" : "11111111-1111-4111-8111-111111111111",
+          "kind" : "highlight",
+          "note" : "first page mark",
+          "page" : 0,
+          "start" : 0
+        },
+        {
+          "end" : 5,
+          "id" : "22222222-2222-4222-8222-222222222222",
+          "kind" : "underline",
+          "note" : "second page mark",
+          "page" : 1,
+          "start" : 1
+        }
+      ],
+      "bookmarks" : [
+        {
+          "id" : "33333333-3333-4333-8333-333333333333",
+          "page" : 1,
+          "title" : "second page bookmark",
+          "yPt" : 12
+        }
+      ],
+      "canRedo" : false,
+      "canUndo" : false,
+      "currentPage" : 1,
+      "currentToOriginal" : [
+
+      ],
+      "operations" : [
+
+      ],
+      "pageCount" : 3,
+      "pending" : 0,
+      "recovery" : "rotate-page-before.json",
+      "revision" : "$SCRATCH\/rotate-page.pdf",
+      "revisionNumber" : 0,
+      "selection" : [
+        0
+      ],
+      "sessionActive" : false
+    },
+    "revisionFiles" : [
+      "rev-1.pdf"
+    ]
+  },
+  "sequence" : [
+    {
+      "annotations" : [
+        {
+          "end" : 4,
+          "id" : "11111111-1111-4111-8111-111111111111",
+          "kind" : "highlight",
+          "note" : "first page mark",
+          "page" : 0,
+          "start" : 0
+        },
+        {
+          "end" : 5,
+          "id" : "22222222-2222-4222-8222-222222222222",
+          "kind" : "underline",
+          "note" : "second page mark",
+          "page" : 1,
+          "start" : 1
+        }
+      ],
+      "bookmarks" : [
+        {
+          "id" : "33333333-3333-4333-8333-333333333333",
+          "page" : 1,
+          "title" : "second page bookmark",
+          "yPt" : 12
+        }
+      ],
+      "canRedo" : false,
+      "canUndo" : false,
+      "currentPage" : 1,
+      "currentToOriginal" : [
+
+      ],
+      "operations" : [
+
+      ],
+      "pageCount" : 3,
+      "pending" : 0,
+      "recovery" : "sequence-step-0-clean.json",
+      "revision" : "$SCRATCH\/sequence.pdf",
+      "revisionNumber" : 0,
+      "selection" : [
+        0
+      ],
+      "sessionActive" : false
+    },
+    {
+      "annotations" : [
+        {
+          "end" : 4,
+          "id" : "11111111-1111-4111-8111-111111111111",
+          "kind" : "highlight",
+          "note" : "first page mark",
+          "page" : 0,
+          "start" : 0
+        },
+        {
+          "end" : 5,
+          "id" : "22222222-2222-4222-8222-222222222222",
+          "kind" : "underline",
+          "note" : "second page mark",
+          "page" : 2,
+          "start" : 1
+        }
+      ],
+      "bookmarks" : [
+        {
+          "id" : "33333333-3333-4333-8333-333333333333",
+          "page" : 2,
+          "title" : "second page bookmark",
+          "yPt" : 12
+        }
+      ],
+      "canRedo" : false,
+      "canUndo" : true,
+      "currentPage" : 2,
+      "currentToOriginal" : [
+        0,
+        -1,
+        1,
+        2
+      ],
+      "lastAction" : "Insert a blank page before page 2",
+      "operations" : [
+        "Insert a blank page before page 2"
+      ],
+      "pageCount" : 4,
+      "pending" : 1,
+      "recovery" : "sequence-step-1-insert.json",
+      "revision" : "$SCRATCH\/cache\/$IDENTITY\/session-$SESSION\/rev-1.pdf",
+      "revisionNumber" : 1,
+      "selection" : [
+        1
+      ],
+      "sessionActive" : true
+    },
+    {
+      "annotations" : [
+        {
+          "end" : 4,
+          "id" : "11111111-1111-4111-8111-111111111111",
+          "kind" : "highlight",
+          "note" : "first page mark",
+          "page" : 0,
+          "start" : 0
+        },
+        {
+          "end" : 5,
+          "id" : "22222222-2222-4222-8222-222222222222",
+          "kind" : "underline",
+          "note" : "second page mark",
+          "page" : 2,
+          "start" : 1
+        }
+      ],
+      "bookmarks" : [
+        {
+          "id" : "33333333-3333-4333-8333-333333333333",
+          "page" : 2,
+          "title" : "second page bookmark",
+          "yPt" : 12
+        }
+      ],
+      "canRedo" : false,
+      "canUndo" : true,
+      "currentPage" : 2,
+      "currentToOriginal" : [
+        0,
+        -1,
+        1,
+        2
+      ],
+      "lastAction" : "Rotate page 2 90° clockwise",
+      "operations" : [
+        "Insert a blank page before page 2",
+        "Rotate page 2 90° clockwise"
+      ],
+      "pageCount" : 4,
+      "pending" : 2,
+      "recovery" : "sequence-step-2-rotate.json",
+      "revision" : "$SCRATCH\/cache\/$IDENTITY\/session-$SESSION\/rev-2.pdf",
+      "revisionNumber" : 2,
+      "selection" : [
+        1
+      ],
+      "sessionActive" : true
+    },
+    {
+      "annotations" : [
+        {
+          "end" : 4,
+          "id" : "11111111-1111-4111-8111-111111111111",
+          "kind" : "highlight",
+          "note" : "first page mark",
+          "page" : 2,
+          "start" : 0
+        },
+        {
+          "end" : 5,
+          "id" : "22222222-2222-4222-8222-222222222222",
+          "kind" : "underline",
+          "note" : "second page mark",
+          "page" : 1,
+          "start" : 1
+        }
+      ],
+      "bookmarks" : [
+        {
+          "id" : "33333333-3333-4333-8333-333333333333",
+          "page" : 1,
+          "title" : "second page bookmark",
+          "yPt" : 12
+        }
+      ],
+      "canRedo" : false,
+      "canUndo" : true,
+      "currentPage" : 1,
+      "currentToOriginal" : [
+        -1,
+        1,
+        0,
+        2
+      ],
+      "lastAction" : "Move page 1 to position 3",
+      "operations" : [
+        "Insert a blank page before page 2",
+        "Rotate page 2 90° clockwise",
+        "Move page 1 to position 3"
+      ],
+      "pageCount" : 4,
+      "pending" : 3,
+      "recovery" : "sequence-step-3-move.json",
+      "revision" : "$SCRATCH\/cache\/$IDENTITY\/session-$SESSION\/rev-3.pdf",
+      "revisionNumber" : 3,
+      "selection" : [
+        0
+      ],
+      "sessionActive" : true
+    },
+    {
+      "annotations" : [
+        {
+          "end" : 4,
+          "id" : "11111111-1111-4111-8111-111111111111",
+          "kind" : "highlight",
+          "note" : "first page mark",
+          "page" : 0,
+          "start" : 0
+        },
+        {
+          "end" : 5,
+          "id" : "22222222-2222-4222-8222-222222222222",
+          "kind" : "underline",
+          "note" : "second page mark",
+          "page" : 2,
+          "start" : 1
+        }
+      ],
+      "bookmarks" : [
+        {
+          "id" : "33333333-3333-4333-8333-333333333333",
+          "page" : 2,
+          "title" : "second page bookmark",
+          "yPt" : 12
+        }
+      ],
+      "canRedo" : true,
+      "canUndo" : true,
+      "currentPage" : 2,
+      "currentToOriginal" : [
+        0,
+        -1,
+        1,
+        2
+      ],
+      "lastAction" : "Rotate page 2 90° clockwise",
+      "operations" : [
+        "Insert a blank page before page 2",
+        "Rotate page 2 90° clockwise"
+      ],
+      "pageCount" : 4,
+      "pending" : 2,
+      "recovery" : "sequence-step-4-undo.json",
+      "revision" : "$SCRATCH\/cache\/$IDENTITY\/session-$SESSION\/rev-2.pdf",
+      "revisionNumber" : 2,
+      "selection" : [
+        1
+      ],
+      "sessionActive" : true
+    },
+    {
+      "annotations" : [
+        {
+          "end" : 4,
+          "id" : "11111111-1111-4111-8111-111111111111",
+          "kind" : "highlight",
+          "note" : "first page mark",
+          "page" : 0,
+          "start" : 0
+        },
+        {
+          "end" : 5,
+          "id" : "22222222-2222-4222-8222-222222222222",
+          "kind" : "underline",
+          "note" : "second page mark",
+          "page" : 2,
+          "start" : 1
+        }
+      ],
+      "bookmarks" : [
+        {
+          "id" : "33333333-3333-4333-8333-333333333333",
+          "page" : 2,
+          "title" : "second page bookmark",
+          "yPt" : 12
+        }
+      ],
+      "canRedo" : true,
+      "canUndo" : true,
+      "currentPage" : 2,
+      "currentToOriginal" : [
+        0,
+        -1,
+        1,
+        2
+      ],
+      "lastAction" : "Insert a blank page before page 2",
+      "operations" : [
+        "Insert a blank page before page 2"
+      ],
+      "pageCount" : 4,
+      "pending" : 1,
+      "recovery" : "sequence-step-5-undo.json",
+      "revision" : "$SCRATCH\/cache\/$IDENTITY\/session-$SESSION\/rev-1.pdf",
+      "revisionNumber" : 1,
+      "selection" : [
+        1
+      ],
+      "sessionActive" : true
+    },
+    {
+      "annotations" : [
+        {
+          "end" : 4,
+          "id" : "11111111-1111-4111-8111-111111111111",
+          "kind" : "highlight",
+          "note" : "first page mark",
+          "page" : 0,
+          "start" : 0
+        },
+        {
+          "end" : 5,
+          "id" : "22222222-2222-4222-8222-222222222222",
+          "kind" : "underline",
+          "note" : "second page mark",
+          "page" : 1,
+          "start" : 1
+        }
+      ],
+      "bookmarks" : [
+        {
+          "id" : "33333333-3333-4333-8333-333333333333",
+          "page" : 1,
+          "title" : "second page bookmark",
+          "yPt" : 12
+        }
+      ],
+      "canRedo" : true,
+      "canUndo" : false,
+      "currentPage" : 1,
+      "currentToOriginal" : [
+        0,
+        1,
+        2
+      ],
+      "operations" : [
+
+      ],
+      "pageCount" : 3,
+      "pending" : 0,
+      "recovery" : "sequence-step-6-undo-all.json",
+      "revision" : "$SCRATCH\/sequence.pdf",
+      "revisionNumber" : 0,
+      "selection" : [
+        0
+      ],
+      "sessionActive" : true
+    },
+    {
+      "annotations" : [
+        {
+          "end" : 4,
+          "id" : "11111111-1111-4111-8111-111111111111",
+          "kind" : "highlight",
+          "note" : "first page mark",
+          "page" : 0,
+          "start" : 0
+        },
+        {
+          "end" : 5,
+          "id" : "22222222-2222-4222-8222-222222222222",
+          "kind" : "underline",
+          "note" : "second page mark",
+          "page" : 2,
+          "start" : 1
+        }
+      ],
+      "bookmarks" : [
+        {
+          "id" : "33333333-3333-4333-8333-333333333333",
+          "page" : 2,
+          "title" : "second page bookmark",
+          "yPt" : 12
+        }
+      ],
+      "canRedo" : true,
+      "canUndo" : true,
+      "currentPage" : 2,
+      "currentToOriginal" : [
+        0,
+        -1,
+        1,
+        2
+      ],
+      "lastAction" : "Insert a blank page before page 2",
+      "operations" : [
+        "Insert a blank page before page 2"
+      ],
+      "pageCount" : 4,
+      "pending" : 1,
+      "recovery" : "sequence-step-7-redo.json",
+      "revision" : "$SCRATCH\/cache\/$IDENTITY\/session-$SESSION\/rev-1.pdf",
+      "revisionNumber" : 1,
+      "selection" : [
+        1
+      ],
+      "sessionActive" : true
+    },
+    {
+      "annotations" : [
+        {
+          "end" : 4,
+          "id" : "11111111-1111-4111-8111-111111111111",
+          "kind" : "highlight",
+          "note" : "first page mark",
+          "page" : 0,
+          "start" : 0
+        },
+        {
+          "end" : 5,
+          "id" : "22222222-2222-4222-8222-222222222222",
+          "kind" : "underline",
+          "note" : "second page mark",
+          "page" : 2,
+          "start" : 1
+        }
+      ],
+      "bookmarks" : [
+        {
+          "id" : "33333333-3333-4333-8333-333333333333",
+          "page" : 2,
+          "title" : "second page bookmark",
+          "yPt" : 12
+        }
+      ],
+      "canRedo" : true,
+      "canUndo" : true,
+      "currentPage" : 2,
+      "currentToOriginal" : [
+        0,
+        -1,
+        1,
+        2
+      ],
+      "lastAction" : "Rotate page 2 90° clockwise",
+      "operations" : [
+        "Insert a blank page before page 2",
+        "Rotate page 2 90° clockwise"
+      ],
+      "pageCount" : 4,
+      "pending" : 2,
+      "recovery" : "sequence-step-8-redo.json",
+      "revision" : "$SCRATCH\/cache\/$IDENTITY\/session-$SESSION\/rev-2.pdf",
+      "revisionNumber" : 2,
+      "selection" : [
+        1
+      ],
+      "sessionActive" : true
+    },
+    {
+      "annotations" : [
+        {
+          "end" : 5,
+          "id" : "22222222-2222-4222-8222-222222222222",
+          "kind" : "underline",
+          "note" : "second page mark",
+          "page" : 1,
+          "start" : 1
+        }
+      ],
+      "bookmarks" : [
+        {
+          "id" : "33333333-3333-4333-8333-333333333333",
+          "page" : 1,
+          "title" : "second page bookmark",
+          "yPt" : 12
+        }
+      ],
+      "canRedo" : false,
+      "canUndo" : true,
+      "currentPage" : 1,
+      "currentToOriginal" : [
+        -1,
+        1,
+        2
+      ],
+      "lastAction" : "Delete page 1",
+      "operations" : [
+        "Insert a blank page before page 2",
+        "Rotate page 2 90° clockwise",
+        "Delete page 1"
+      ],
+      "pageCount" : 3,
+      "pending" : 3,
+      "recovery" : "sequence-step-9-new-after-redo.json",
+      "revision" : "$SCRATCH\/cache\/$IDENTITY\/session-$SESSION\/rev-3.pdf",
+      "revisionNumber" : 3,
+      "selection" : [
+        0
+      ],
+      "sessionActive" : true
+    }
+  ],
+  "signed" : {
+    "before" : {
+      "canPageEdit" : true,
+      "canReplace" : false,
+      "readOnly" : true,
+      "readOnlyReason" : "This document is digitally signed (signature flags in the form dictionary; a signed signature field); it opens read-only in place — edits can be saved to a copy, and the signed original is never modified. A modified copy has its signature fields removed, because the copy's bytes are no longer covered by the signature.",
+      "signed" : true
+    },
+    "refusal" : {
+      "error" : "This document is digitally signed (signature flags in the form dictionary; a signed signature field); it opens read-only in place — edits can be saved to a copy, and the signed original is never modified. A modified copy has its signature fields removed, because the copy's bytes are no longer covered by the signature.",
+      "originalUnchanged" : true,
+      "replaced" : false,
+      "status" : "Signed PDF · read-only"
+    },
+    "staged" : {
+      "applied" : true,
+      "canReplace" : false,
+      "canSaveCopy" : true,
+      "pending" : 1
+    }
+  },
+  "xfa" : {
+    "applied" : false,
+    "canPageEdit" : false,
+    "canPageOperations" : false,
+    "error" : "Page change failed; nothing was written: LyraReaderBindings.LyraReaderFfiError.Document(message: \"This PDF is an XFA form. LyraReader renders it read-only from its XML; the file is never modified. Form filling, annotation, editing and saving edits are unavailable. Reading, zoom, search, selection and summaries still work.\", severity: LyraReaderBindings.ErrorSeverity.document)",
+    "originalUnchanged" : true,
+    "readOnlyReason" : "This PDF is an XFA form. LyraReader renders it read-only from its XML; the file is never modified. Form filling, annotation, editing and saving edits are unavailable. Reading, zoom, search, selection and summaries still work.",
+    "sessionActive" : false,
+    "xfa" : true
+  }
+}

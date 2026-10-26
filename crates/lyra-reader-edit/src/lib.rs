@@ -22,6 +22,7 @@ use lyra_reader_core::{DocId, PageIndex, Rect};
 pub mod kind;
 pub mod records;
 pub mod rules;
+pub mod transaction;
 
 pub use kind::{Drawing, KindFlags, WriteKind};
 pub use records::{
@@ -29,6 +30,10 @@ pub use records::{
     StoredRect,
 };
 pub use rules::RuleError;
+pub use transaction::{
+    AnnotationState, AnnotationStateJson, DocumentTransaction, PageMap, PageOperationReport,
+    RevisionTarget, Snapshot, StartRequest, State as TransactionState, TransactionError,
+};
 
 /// Annotation identifier (unique within the process; after saving it maps to the PDF object number).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

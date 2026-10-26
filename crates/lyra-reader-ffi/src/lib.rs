@@ -43,7 +43,12 @@ pub mod api;
 mod document_id;
 pub mod format;
 mod index_cache;
+pub mod transaction;
 pub use api::{DocumentSummary, LyraReaderDocument, LyraReaderEngine, LyraReaderFfiError};
+pub use transaction::{
+    DocumentTransactionApplyRecord, DocumentTransactionInputRecord, DocumentTransactionStartRecord,
+    DocumentTransactionStateRecord, LyraReaderDocumentTransaction, start_document_transaction,
+};
 
 /// Location of a document's disposable derived index, for cache management and diagnostics.
 pub fn document_index_cache_path(document: &std::path::Path) -> std::path::PathBuf {
