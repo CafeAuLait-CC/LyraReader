@@ -6156,27 +6156,13 @@ fn kind_flags_record(kind: &TaxonomyKind) -> AnnotationKindFlagsRecord {
 /// The one kind table: every kind the durable model can store.
 ///
 /// The shell builds its `Annotation.Kind` flag lookups from this once; nothing re-derives
-/// `isGeometry`, `isTextMarkup` or the write-request mapping.
+/// `isGeometry`, `isTextMarkup` or the write-request mapping. The row order and key set are
+/// `AnnotationKind::RECORD_KINDS`, so this projection cannot grow a second list of kind names.
 #[uniffi::export]
 pub fn annotation_kind_flags() -> Vec<AnnotationKindFlagsRecord> {
-    const RECORD_KINDS: &[&str] = &[
-        "highlight",
-        "underline",
-        "strikeout",
-        "ink",
-        "square",
-        "circle",
-        "line",
-        "arrow",
-        "stickyNote",
-        "textBox",
-        "stamp",
-        "signature",
-    ];
-    RECORD_KINDS
+    TaxonomyKind::RECORD_KINDS
         .iter()
-        .filter_map(|name| TaxonomyKind::from_record_kind(name))
-        .map(|kind| kind_flags_record(&kind))
+        .map(kind_flags_record)
         .collect()
 }
 
@@ -9989,6 +9975,45 @@ mod tests {
                 .count(),
             1,
             "one subtree, not two"
+        );
+    }
+
+    /// The FFI table is a projection of the taxonomy, not a second list of kind names.
+    ///
+    /// The shell compares the same rows with `AppState.Annotation.Kind`, so between the two
+    /// checks a cache kind cannot exist on one side only, and a renamed wire value fails here
+    /// rather than reaching `AnnotationRecordRules.flags`, which traps.
+    #[test]
+    fn the_kind_table_projects_every_cache_kind_once() {
+        let rows = annotation_kind_flags();
+        assert_eq!(rows.len(), TaxonomyKind::RECORD_KINDS.len());
+        let kinds: Vec<&str> = rows.iter().map(|row| row.kind.as_str()).collect();
+        assert_eq!(
+            kinds.iter().collect::<std::collections::HashSet<_>>().len(),
+            kinds.len(),
+            "each cache kind appears once: {kinds:?}"
+        );
+        for kind in TaxonomyKind::RECORD_KINDS {
+            let record_name = kind.record_name().expect("a cache kind is named");
+            let row = rows
+                .iter()
+                .find(|row| row.record_kind.as_deref() == Some(record_name))
+                .unwrap_or_else(|| panic!("no row for {kind:?}"));
+            assert_eq!(row.kind, record_name);
+            assert_eq!(row.document_kind, kind.document_name());
+            if *kind != TaxonomyKind::Signature {
+                // A `/Stamp` is the one subtype whose cache kind depends on the instance (words
+                // or a picture), so its document name cannot round-trip to `signature`.
+                assert_eq!(
+                    document_annotation_kind_flags(kind.document_name().to_string()).record_kind,
+                    Some(record_name.to_string()),
+                    "{kind:?}"
+                );
+            }
+        }
+        assert_eq!(
+            document_annotation_kind_flags("stamp".to_string()).record_kind,
+            Some("stamp".to_string())
         );
     }
 }

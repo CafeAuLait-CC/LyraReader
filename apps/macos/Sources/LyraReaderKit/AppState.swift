@@ -958,7 +958,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// origin at the page's top-left corner at 100% zoom), so a mark lands on the same place at
     /// every zoom. The four shapes are stroked, never filled: they are outlines, and keeping the
     /// interior transparent is what lets the text behind them stay selectable.
-    public enum Kind: String, Codable, Sendable {
+    public enum Kind: String, Codable, Sendable, CaseIterable {
         case highlight
         case underline
         /// A line through the middle of the selected glyphs. A text-markup kind like the two
@@ -5480,6 +5480,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// One stamp or signature as a write request: a `/Stamp` with text or an image.
+    /// The wire kind a write request carries, from the one kind table.
+    ///
+    /// The builders below still choose their payload from the kind (words, a picture, a box);
+    /// the kind the request names is the table's answer, never a second mapping here.
+    private func writeRequestKind(for annotation: Annotation) throws -> AnnotationWriteKind {
+        guard let kind = AnnotationRecordRules.writeKind(for: annotation.kind) else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Annotation \(annotation.id.uuidString) has no write kind"]
+            )
+        }
+        return kind
+    }
+
     private func stampWriteRequest(
         _ annotation: Annotation,
         zoom: CGFloat,
@@ -5503,6 +5519,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     "Annotation \(annotation.id.uuidString) has a box too small to write"]
             )
         }
+        let writeKind = try writeRequestKind(for: annotation)
         if annotation.kind == .stamp {
             guard !annotation.note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw NSError(
@@ -5515,7 +5532,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return AnnotationWriteRequest(
                 id: annotation.id.uuidString,
                 page: annotation.page,
-                kind: .stamp,
+                kind: writeKind,
                 rect: rect,
                 quads: [],
                 color: annotation.color,
@@ -5538,7 +5555,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return AnnotationWriteRequest(
             id: annotation.id.uuidString,
             page: annotation.page,
-            kind: .signature,
+            kind: writeKind,
             rect: rect,
             quads: [],
             color: annotation.color,
@@ -9345,10 +9362,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     "Annotation \(annotation.id.uuidString) has a box too small to write"]
             )
         }
+        let writeKind = try writeRequestKind(for: annotation)
         return AnnotationWriteRequest(
             id: annotation.id.uuidString,
             page: annotation.page,
-            kind: annotation.kind == .stickyNote ? .note : .freeText,
+            kind: writeKind,
             rect: rect,
             quads: [],
             color: annotation.color,

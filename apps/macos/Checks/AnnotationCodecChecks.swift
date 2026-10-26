@@ -527,6 +527,26 @@ extension ReaderChecks {
             require(flags.schemaVersion == expectedVersion,
                     "\(row.kind.rawValue): the record schema version matches")
         }
+
+        // The table and the shell's display enum are one model split across two languages:
+        // adding a cache kind on one side only fails here, not at the first lookup (where
+        // `AnnotationRecordRules.flags(for:)` traps), and a renamed wire value fails before it
+        // can make an existing cache entry unreadable.
+        let tableRows = annotationKindFlags()
+        let tableKinds = tableRows.compactMap(\.recordKind)
+        let modelKinds = AppState.Annotation.Kind.allCases.map(\.rawValue)
+        require(tableKinds.count == Set(tableKinds).count,
+                "the Rust kind table names each cache kind exactly once")
+        require(Set(tableKinds) == Set(modelKinds),
+                "every AppState.Annotation.Kind raw value has one row in the Rust kind table")
+        for row in tableRows where row.kind != "signature" {
+            // A `/Stamp`'s cache kind depends on its payload (words or a picture), so its
+            // document name maps back to the generic stamp row; every other kind round-trips.
+            require(AnnotationRecordRules.flags(forDocumentKind: row.documentKind).recordKind
+                        == row.recordKind,
+                    "\(row.kind): '\(row.documentKind)' maps back to the same cache kind")
+        }
+
         let squiggly = AnnotationRecordRules.flags(forDocumentKind: "squiggly")
         require(squiggly.isMarkup && !squiggly.isTextMarkup && !squiggly.editable,
                 "squiggly is markup but not an editable model")
@@ -559,6 +579,14 @@ extension ReaderChecks {
                         && annotation.isGeometry == flags.isGeometry
                         && annotation.isNote == flags.isNote,
                     "the engine's \(annotation.kind) flags match the one kind table")
+            // The engine's own per-file classification uses the same drawing vocabulary: a
+            // drawable annotation is drawn as its kind's preset, and only a hidden, empty or
+            // unmodelled one is `skipped` (which is a per-instance answer the table does not
+            // carry).
+            if annotation.drawing != .skipped {
+                require(annotation.drawing.rawValue == flags.drawing,
+                        "the engine draws \(annotation.kind) as '\(flags.drawing)'")
+            }
         }
         if let editable = fileAnnotations.first(where: { $0.isMarkup }) {
             require(AppState.documentAnnotationEditability(editable) == .editable,
