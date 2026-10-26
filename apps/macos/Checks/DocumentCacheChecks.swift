@@ -317,6 +317,9 @@ extension ReaderChecks {
         require(truncatedState.addGeometryAnnotation(kind: .square, page: 0,
             shapeRect: CGRect(x: 10, y: 20, width: 30, height: 30)),
                 "explicit recovery permits a fresh annotation")
+
+        // The old path-hash layout's page-edit session must be retargeted, not copied verbatim.
+        try await legacyRecoveryMigrationChecks(root: root)
         print("Document cache checks passed")
     }
 }

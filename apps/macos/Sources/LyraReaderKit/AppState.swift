@@ -11823,6 +11823,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func restoreCachedPageEdits(for original: URL) {
         guard pageEditSession == nil else { return }
         let recoveryURL = DocumentEditCache.recoveryURL(for: original)
+        // The directory lookup above may have tried to migrate an old path-hash cache. If its
+        // page-edit manifest could not be retargeted, the staged edits were kept in the old
+        // directory but cannot be restored here; say so rather than silently opening without
+        // them.
+        if let failure = DocumentEditCache.migrationFailure(for: original) {
+            lastError = lastError.map { "\($0)\n\(failure)" } ?? failure
+            return
+        }
         if let owner = Self.pageEditOwners[recoveryURL.path]?.value, owner !== self { return }
         guard FileManager.default.fileExists(atPath: recoveryURL.path) else { return }
         do {

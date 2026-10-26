@@ -47,7 +47,8 @@ pub mod transaction;
 pub use api::{DocumentSummary, LyraReaderDocument, LyraReaderEngine, LyraReaderFfiError};
 pub use transaction::{
     DocumentTransactionApplyRecord, DocumentTransactionInputRecord, DocumentTransactionStartRecord,
-    DocumentTransactionStateRecord, LyraReaderDocumentTransaction, start_document_transaction,
+    DocumentTransactionStateRecord, LyraReaderDocumentTransaction, retarget_recovery_manifest,
+    start_document_transaction,
 };
 
 /// Location of a document's disposable derived index, for cache management and diagnostics.
