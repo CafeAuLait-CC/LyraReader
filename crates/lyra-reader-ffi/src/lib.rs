@@ -43,8 +43,13 @@ pub mod api;
 mod document_id;
 pub mod format;
 mod index_cache;
+pub mod navigation;
 pub mod transaction;
 pub use api::{DocumentSummary, LyraReaderDocument, LyraReaderEngine, LyraReaderFfiError};
+pub use navigation::{
+    LyraReaderNavigationHistory, NavigationHistorySnapshotRecord, ReaderLocationRecord,
+    ReaderSelectionRecord,
+};
 pub use transaction::{
     DocumentTransactionApplyRecord, DocumentTransactionInputRecord, DocumentTransactionStartRecord,
     DocumentTransactionStateRecord, LyraReaderDocumentTransaction, retarget_recovery_manifest,

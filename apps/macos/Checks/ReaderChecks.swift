@@ -394,6 +394,13 @@ struct ReaderChecks {
             print("Preview history checks passed")
             return
         }
+        if CommandLine.arguments.contains("--check-navigation-history") {
+            let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
+            try await navigationHistoryChecks(
+                url: root.appendingPathComponent("tests/fixtures/multipage.pdf"))
+            print("Navigation history checks passed")
+            return
+        }
         if CommandLine.arguments.contains("--check-preview-transparency") {
             let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await previewTransparencyChecks(root: root)
@@ -1068,6 +1075,9 @@ struct ReaderChecks {
             }),
             ("preview-history", {
                 try await previewHistoryChecks(url: b)
+            }),
+            ("navigation-history", {
+                try await navigationHistoryChecks(url: b)
             }),
             ("preview-transparency", {
                 try await previewTransparencyChecks(root: root)

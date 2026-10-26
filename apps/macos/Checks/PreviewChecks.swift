@@ -156,8 +156,8 @@ extension ReaderChecks {
         guard let first = state.backHistory.last else { fatalError("FAIL: missing history entry") }
         require(first.scrollYPt == startOffset && first.page == startPage - 1,
                 "the entry holds the exact previous scroll position (\(first.scrollYPt) pt)")
-        require(first.preview?.title == "Page \(target + 1)",
-                "the entry keeps the preview the jump came from")
+        // The old value also carried the open preview, but no path ever restored it; the Rust
+        // record keeps only what Back applies. Page, offset and selection are the whole payload.
         require(first.selection == startSelection, "the entry keeps the selection")
         require(state.scrollYPt != startOffset, "the jump actually moved the reader")
 
