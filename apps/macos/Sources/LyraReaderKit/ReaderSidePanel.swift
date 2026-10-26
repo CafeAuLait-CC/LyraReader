@@ -78,12 +78,13 @@ public enum ReaderSidePanelPreferences {
     }
 }
 
-/// Keyboard shortcuts the right panel introduces. The keymap on the Rust side already reserves
-/// ⇧⌘A for `CommandId::AiPanel`; the native command uses the same chord so the two agree.
+/// Keyboard shortcuts the right panel introduces.
+///
+/// ⇧⌘A is also registered by `ReaderCommands` in the app target and by the toolbar's Lyra
+/// button, so the menu, the toolbar and this constant agree.
 ///
 /// The other two-panel chords were checked before choosing it: ⌥⌘I is Document Information,
-/// ⌥⌘S is Toggle Sidebar, and the app's ⌘-number / ⌘[⌘] / ⌘⇧R / ⌥⌘R bindings are taken. ⇧⌘A is
-/// unused by the native menu and is the documented AI-panel binding in `lyra-reader-session`.
+/// ⌥⌘S is Toggle Sidebar, and the app's ⌘-number / ⌘[ / ⌘] bindings are taken.
 public enum ReaderShortcuts {
     public static let toggleAIPanelLabel = "Toggle Lyra Tools"
     public static let toggleAIPanelKey: KeyEquivalent = "a"

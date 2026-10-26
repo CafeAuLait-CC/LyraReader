@@ -104,8 +104,8 @@ struct LyraReaderApp: App {
 /// the other. A focused value gives each menu item the session of the window the reader is looking
 /// at, and disables the item when no reader window is focused (the Settings window, say).
 ///
-/// The keymap lives on the Rust side (lyra-reader-session::keymap, docs/04-ui-ux.md §4);
-/// this is a minimal set consistent with it, to be generated from engine queries after M1 T1.9.
+/// Shortcuts are registered where the commands are: the `.keyboardShortcut` calls below. The
+/// toolbar's Lyra button repeats ⇧⌘A; keep the two in sync when changing that chord.
 struct ReaderCommands: Commands {
     @ObservedObject private var readingAppearance = ReadingAppearanceStore.shared
     @FocusedValue(\.readerSession) private var session
@@ -182,7 +182,7 @@ struct ReaderCommands: Commands {
                 .disabled(focusedState?.document == nil)
 
             // Developer-facing, off by default. ⌥⌘P is free: the native menu's P chord is ⌘P
-            // (Print) and the Rust keymap's P binding is ⇧⌘P (PreviewCitation); neither is ⌥⌘P.
+            // (Print), and no command registers ⇧⌘P (the design's citation-preview chord).
             // See PerformancePanelShortcut for the full collision list.
             Button((focusedState?.performancePanelVisible == true ? "Hide " : "Show ")
                    + PerformancePanelShortcut.label) {
@@ -247,19 +247,18 @@ struct ReaderCommands: Commands {
             Button("Toggle Sidebar") { session?.state.sidebarVisible.toggle() }
                 .keyboardShortcut("s", modifiers: [.command, .option])
                 .disabled(session == nil)
-            // The assistant left the sidebar for its own right-hand panel. ⇧⌘A is the AI-panel
-            // binding the Rust keymap already documents, and it was unused by the native menu
-            // (⌥⌘I is Document Information and ⌥⌘S toggles the sidebar).
+            // The assistant left the sidebar for its own right-hand panel. ⇧⌘A is also the
+            // toolbar's Lyra button chord; it was unused by the native menu (⌥⌘I is Document
+            // Information and ⌥⌘S toggles the sidebar).
             Button(ReaderShortcuts.toggleAIPanelLabel) { session?.state.toggleAITools() }
                 .keyboardShortcut(ReaderShortcuts.toggleAIPanelKey,
                                   modifiers: ReaderShortcuts.toggleAIPanelModifiers)
                 .disabled(session == nil)
 
-            // In-place translation. ⇧⌘L is the Rust keymap's TranslateSelection binding; the
-            // comment there reserves it because ⇧⌘T already belongs to "reopen closed tab".
-            // The title follows the selection: Show original after a translation, Translate
-            // otherwise. The command is disabled without a selection, so it cannot appear to do
-            // something to a page that has no text selected.
+            // In-place translation. ⇧⌘L leaves ⇧⌘T free: the design reserves it for "reopen
+            // closed tab". The title follows the selection: Show original after a translation,
+            // Translate otherwise. The command is disabled without a selection, so it cannot
+            // appear to do something to a page that has no text selected.
             Button(session?.state.translationSelectionTitle ?? "Translate Selection") {
                 session?.state.performTranslationAction()
             }
@@ -325,8 +324,8 @@ struct ReaderCommands: Commands {
         // Redaction (T3.12) lives only in the Edit workspace. This entry opens that workspace
         // with the Blackout tool armed; the area is then staged like any other content edit and
         // is published only by Edit's own Save Copy / Replace Original transactions. No chord is
-        // assigned: the retired ⇧⌘R belonged to the Rust keymap's ExplainSelection, and a
-        // destructive command should not take a reader's existing shortcut by surprise.
+        // assigned: ⇧⌘R/⌥⌘R were retired with the old redaction path, and a destructive command
+        // should not take a reader's existing shortcut by surprise.
         CommandGroup(after: .pasteboard) {
             Button("Redact…") { session?.state.openRedactionWorkspace() }
                 .disabled(session?.state.canOpenRedactionWorkspace != true)

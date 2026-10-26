@@ -3,17 +3,19 @@ import SwiftUI
 
 /// The keyboard binding the performance panel introduces.
 ///
-/// ⌥⌘P was chosen because it is free on both sides of the shortcut map: the native menu uses
-/// ⌘P for Print, and the Rust keymap in `crates/lyra-reader-session/src/keymap.rs` binds ⇧⌘P
-/// (PreviewCitation), ⌥⌘F (full screen) and ⌥⌘H (chrome) but nothing with Option-Command-P.
-/// The rest of the native menu uses o / s / ⇧s / e / ⌥i / 0 / 9 / ⇧9 / + / − / ← / → / [ / ] /
-/// g / ⇧g / ⌥s / ⇧a / ⇧l / d / ⇧b / 1 / 3 / ⇧r / ⌥r / , — none of them ⌥⌘P. The checks in
-/// `PerformancePanelChecks` pin the collision test so a future binding cannot quietly take it.
+/// ⌥⌘P was chosen because it is free: the native menu uses ⌘P for Print and no command uses
+/// Option-Command-P. The rest of the native menu uses o / s / ⇧s / e / ⌥i / 0 / 9 / ⇧9 / + / − /
+/// ← / → / [ / ] / g / ⇧g / ⌥s / ⇧a / ⇧l / d / ⇧b / 1 / 3 / , — none of them ⌥⌘P. ⇧⌘P is not
+/// registered either (it was the design's citation-preview chord), and the panel keeps clear of
+/// it. The checks in `PerformancePanelChecks` pin the collision test so a future binding cannot
+/// quietly take it.
 public enum PerformancePanelShortcut {
     public static let label = "Performance Panel"
     public static let key: KeyEquivalent = "p"
     public static let modifiers: EventModifiers = [.command, .option]
-    /// Every chord the native menu already uses, as the check's collision list.
+    /// Every chord the native menu uses or reserves, as the check's collision list: the
+    /// registered menu chords, the implicit Settings ⌘, and the retired ⇧⌘R / ⌥⌘R pair (kept
+    /// here so a future binding does not silently reuse them).
     public static let reservedNativeChords: [(KeyEquivalent, EventModifiers)] = [
         ("o", [.command]), ("s", [.command]), ("s", [.command, .shift]),
         ("e", [.command]), ("p", [.command]),
