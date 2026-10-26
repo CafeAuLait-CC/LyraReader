@@ -2914,10 +2914,12 @@ impl LyraReaderDocument {
 
     /// Writes `annotations` into a **new PDF** at `destination`.
     ///
-    /// The document that is open is not modified, and neither is its annotation cache. `annotations`
-    /// cross the boundary as view-space geometry at `zoom`; Rust converts it to page space with
-    /// the page's own `/CropBox`, `/Rotate` and `/UserUnit`, so the same highlight saved at 100%
-    /// and at 300% lands in the same PDF coordinates.
+    /// The document that is open is not modified, and neither is its annotation cache.
+    /// `annotations` cross the boundary as page-local view-space geometry at **100%**, the same
+    /// convention [`Self::annotations`] reports and the annotation cache stores; the engine
+    /// applies the one page transform (`/CropBox`, `/Rotate`, `/UserUnit`) itself. The shell
+    /// never multiplies by its canvas zoom to cross this boundary, so there is no zoom factor to
+    /// divide out here and a stored mark is the same value at every zoom.
     ///
     /// The write is append-only: the destination begins with every byte of the source. It is
     /// written to a temporary file beside `destination`, flushed, reopened, verified annotation
@@ -2927,7 +2929,6 @@ impl LyraReaderDocument {
         destination: String,
         annotations: Vec<WriteAnnotationRecord>,
         bookmarks: Vec<WriteBookmarkRecord>,
-        zoom: f64,
     ) -> Result<AnnotationSaveReport, LyraReaderFfiError> {
         self.save_annotations_to(
             std::path::PathBuf::from(destination),
@@ -2935,7 +2936,6 @@ impl LyraReaderDocument {
             bookmarks,
             Vec::new(),
             Vec::new(),
-            zoom,
             SaveMode::Copy,
         )
     }
@@ -2954,7 +2954,6 @@ impl LyraReaderDocument {
         bookmarks: Vec<WriteBookmarkRecord>,
         updates: Vec<AnnotationUpdateRecord>,
         deletions: Vec<AnnotationDeleteRecord>,
-        zoom: f64,
     ) -> Result<AnnotationSaveReport, LyraReaderFfiError> {
         self.save_annotations_to(
             std::path::PathBuf::from(destination),
@@ -2962,7 +2961,6 @@ impl LyraReaderDocument {
             bookmarks,
             updates,
             deletions,
-            zoom,
             SaveMode::Copy,
         )
     }
@@ -2976,7 +2974,6 @@ impl LyraReaderDocument {
         bookmarks: Vec<WriteBookmarkRecord>,
         updates: Vec<AnnotationUpdateRecord>,
         deletions: Vec<AnnotationDeleteRecord>,
-        zoom: f64,
     ) -> Result<AnnotationSaveReport, LyraReaderFfiError> {
         self.save_annotations_to(
             std::path::PathBuf::from(&self.path),
@@ -2984,7 +2981,6 @@ impl LyraReaderDocument {
             bookmarks,
             updates,
             deletions,
-            zoom,
             SaveMode::ReplaceOriginal,
         )
     }
@@ -2999,7 +2995,6 @@ impl LyraReaderDocument {
         &self,
         annotations: Vec<WriteAnnotationRecord>,
         bookmarks: Vec<WriteBookmarkRecord>,
-        zoom: f64,
     ) -> Result<AnnotationSaveReport, LyraReaderFfiError> {
         self.save_annotations_to(
             std::path::PathBuf::from(&self.path),
@@ -3007,7 +3002,6 @@ impl LyraReaderDocument {
             bookmarks,
             Vec::new(),
             Vec::new(),
-            zoom,
             SaveMode::ReplaceOriginal,
         )
     }
@@ -4641,9 +4635,8 @@ impl LyraReaderDocument {
     }
 
     // The result of merging three independent write-back features (annotations, edits/deletes,
-    // bookmarks) into one verified save: one argument per record list, plus the destination,
-    // zoom and mode. Splitting it would only move the same values into a struct.
-    #[allow(clippy::too_many_arguments)]
+    // bookmarks) into one verified save: one argument per record list, plus the destination and
+    // mode. Splitting it would only move the same values into a struct.
     fn save_annotations_to(
         &self,
         destination: std::path::PathBuf,
@@ -4651,7 +4644,6 @@ impl LyraReaderDocument {
         bookmarks: Vec<WriteBookmarkRecord>,
         updates: Vec<AnnotationUpdateRecord>,
         deletions: Vec<AnnotationDeleteRecord>,
-        zoom: f64,
         mode: SaveMode,
     ) -> Result<AnnotationSaveReport, LyraReaderFfiError> {
         // A copy writes a new file and is allowed for a signed document. Replacing the original
@@ -4677,12 +4669,6 @@ impl LyraReaderDocument {
                 message:
                     "this document is encrypted; saving annotations or bookmarks into it is not supported yet"
                         .to_string(),
-            });
-        }
-        if !(zoom.is_finite() && zoom > 0.0 && zoom <= 64.0) {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                severity: ErrorSeverity::Document,
-                message: format!("zoom must be positive, finite and at most 64, got {zoom}"),
             });
         }
         let page_count = self.backend.page_count();
@@ -4711,21 +4697,12 @@ impl LyraReaderDocument {
         }
         let mut additions = Vec::with_capacity(annotations.len());
         for record in &annotations {
-            additions.push(self.convert_write_annotation(
-                record,
-                page_count,
-                zoom,
-                &mut geometries,
-            )?);
+            additions.push(self.convert_write_annotation(record, page_count, &mut geometries)?);
         }
         let mut changed = Vec::with_capacity(updates.len());
         for update in &updates {
-            let values = self.convert_write_annotation(
-                &update.annotation,
-                page_count,
-                zoom,
-                &mut geometries,
-            )?;
+            let values =
+                self.convert_write_annotation(&update.annotation, page_count, &mut geometries)?;
             changed.push(lyra_reader_pdfium::AnnotationUpdate {
                 target: update.target.clone(),
                 values,
@@ -4787,15 +4764,14 @@ impl LyraReaderDocument {
 
     /// Converts one shell write record into the page-space annotation the writer expects.
     ///
-    /// Geometry crosses the FFI in view space at `zoom`, exactly what the canvas draws; the page
-    /// geometry inverts that once, so a mark saved at 100% and the same mark saved at 300% land
-    /// in the same PDF coordinates. Split out of the save loop so an edit and an addition go
-    /// through exactly the same conversion.
+    /// Geometry crosses the FFI in page-local view space at 100%, the same convention the cache
+    /// stores and [`Self::annotations`] reports. The page geometry is inverted exactly once, so
+    /// the shell neither multiplies nor divides by its canvas zoom to cross the boundary. Split
+    /// out of the save loop so an edit and an addition go through exactly the same conversion.
     fn convert_write_annotation(
         &self,
         record: &WriteAnnotationRecord,
         page_count: u32,
-        zoom: f64,
         geometries: &mut std::collections::HashMap<u32, PageGeometry>,
     ) -> Result<WriteAnnotation, LyraReaderFfiError> {
         annotation_rules::validate_page(&record.id, i64::from(record.page), page_count as usize)
@@ -4820,7 +4796,7 @@ impl LyraReaderDocument {
         };
         let inverse =
             geometry
-                .view_to_page(zoom)
+                .view_to_page(1.0)
                 .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
                     severity: ErrorSeverity::Document,
                     message: format!("page {} has no invertible geometry", record.page + 1),
@@ -6473,9 +6449,10 @@ pub struct WriteBookmarkRecord {
 
 /// One annotation the shell asks the writer to put into a PDF.
 ///
-/// Geometry is **view space at `zoom`** (points, top-left origin), exactly the space the canvas
-/// draws in. The Rust side owns the single conversion into page space, so a highlight saved at
-/// 100% and the same highlight saved at 300% produce identical PDF coordinates.
+/// Geometry is **page-local view space at 100%** (points, top-left origin), the same convention
+/// [`AnnotationRecord`] reports and the annotation cache stores. The Rust side owns the single
+/// conversion into PDF page space, including `/CropBox`, `/Rotate` and `/UserUnit`; the shell
+/// does not multiply by its canvas zoom to cross the boundary.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct WriteAnnotationRecord {
     /// Stable identity written as `/NM`; the shell uses the cached annotation's UUID string so a saved
@@ -6483,14 +6460,15 @@ pub struct WriteAnnotationRecord {
     pub id: String,
     pub page: u32,
     pub kind: AnnotationWriteKind,
-    /// View-space box at `zoom`. For a note this is its icon; for markup the union of `quads`
-    /// is used and this box is validated for consistency.
+    /// Page-local view-space box at 100%. For a note this is its icon; for markup the union of
+    /// `quads` is used and this box is validated for consistency.
     pub rect: AnnotationQuad,
-    /// View-space `/QuadPoints` at `zoom`; empty for notes and for the stroked kinds.
+    /// Page-local view-space `/QuadPoints` at 100%; empty for notes and for the stroked kinds.
     pub quads: Vec<AnnotationQuad>,
-    /// View-space `/InkList` at `zoom`, one stroke per entry; only for [`AnnotationWriteKind::Ink`].
+    /// Page-local view-space `/InkList` at 100%, one stroke per entry; only for
+    /// [`AnnotationWriteKind::Ink`].
     pub ink_paths: Vec<Vec<AnnotationPoint>>,
-    /// View-space `/L` endpoints at `zoom`; required for [`AnnotationWriteKind::Line`].
+    /// Page-local view-space `/L` endpoints at 100%; required for [`AnnotationWriteKind::Line`].
     pub line_start: Option<AnnotationPoint>,
     pub line_end: Option<AnnotationPoint>,
     /// Write `/LE [/None /ClosedArrow]`; only meaningful for a line.
@@ -7117,13 +7095,13 @@ fn page_region_to_view(
     geometry.page_to_view(1.0).apply_rect(region)
 }
 
-/// One view-space box at `zoom`, converted into page space.
+/// One page-local view-space box at 100%, converted into page space.
 ///
-/// The inverse of [`page_region_to_view`]'s transform, with the zoom the canvas is drawing at.
-/// The returned rectangle is axis-aligned in page space: `/Rotate` is a multiple of 90° in PDF,
-/// so a view rectangle maps to another axis-aligned rectangle (the canvas only ever produces
-/// horizontal text boxes anyway). Bounds are checked against `/CropBox` with one point of slack
-/// so a hairline round-off at the page edge is not turned into a refusal.
+/// The inverse of [`page_region_to_view`]'s transform. The returned rectangle is axis-aligned in
+/// page space: `/Rotate` is a multiple of 90° in PDF, so a view rectangle maps to another
+/// axis-aligned rectangle (the canvas only ever produces horizontal text boxes anyway). Bounds
+/// are checked against `/CropBox` with one point of slack so a hairline round-off at the page
+/// edge is not turned into a refusal.
 fn view_box_to_page_rect(
     view: &AnnotationQuad,
     inverse: Transform2D,
@@ -8866,6 +8844,254 @@ mod tests {
         assert!(view.max_x() <= page.width && view.max_y() <= page.height);
     }
 
+    /// The 100%-view-space write boundary maps to the same page geometry as the old
+    /// zoom-scaled boundary, for every page geometry and canvas position.
+    ///
+    /// This is the frozen C8 matrix. The left side is what the shell fed before the change: a
+    /// page-local 100% view-space value multiplied by the canvas zoom, inverted with
+    /// `view_to_page(zoom)`. The right side is the boundary after it: the same page-local value,
+    /// inverted with `view_to_page(1.0)`. The canvas arithmetic in between is
+    /// `CanvasGeometry.contentPoint` in Swift, including the page placement and scroll offset
+    /// that are deliberately the shell's. The matrix includes 0°/90°/180°/270°, an offset
+    /// `/CropBox`, `/UserUnit` ≠ 1 and a real corpus page. For the powers-of-two zooms the
+    /// equality is **exact in f64**: `page_to_view(zoom)` is then `page_to_view(1.0)` followed
+    /// by an exact binary scale. An arbitrary canvas zoom (1.37, 2.5) can round
+    /// `(page_local × zoom) / zoom` once more; the measured worst case over this matrix is
+    /// 2.3e-13 page points, so the test asserts the documented 1e-9 bound there. That bound is
+    /// also the bar the annotation checks use when they compare view-space geometry; the writer
+    /// stores PDF reals as `f32`, which is coarser still.
+    #[test]
+    fn annotation_write_geometry_is_the_same_from_100_percent_and_zoom_scaled_view_space() {
+        fn first_corpus_page_geometry() -> Option<PageGeometry> {
+            let directory = std::env::var_os("LYRA_READER_PDF_SAMPLES")?;
+            let mut paths: Vec<PathBuf> = std::fs::read_dir(directory)
+                .ok()?
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| {
+                    path.extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+                })
+                .collect();
+            paths.sort();
+            let path = paths.into_iter().next()?;
+            let backend = PdfiumBackend::open(&path, None).ok()?;
+            let info = backend.page_info(PageIndex(0)).ok()?;
+            Some(info.geometry)
+        }
+
+        fn assert_same_point(
+            context: &str,
+            old_inverse: Transform2D,
+            new_inverse: Transform2D,
+            zoom: f64,
+            local: Point,
+        ) {
+            let old = old_inverse.apply(Point::new(local.x * zoom, local.y * zoom));
+            let new = new_inverse.apply(local);
+            let delta = (old.x - new.x).abs().max((old.y - new.y).abs());
+            let tolerance = if matches!(zoom, 0.25 | 1.0 | 4.0) {
+                0.0
+            } else {
+                1e-9
+            };
+            assert!(
+                delta <= tolerance,
+                "{context} point {local:?}: old {old:?} new {new:?} delta {delta:e}"
+            );
+        }
+
+        fn assert_same_rect(
+            context: &str,
+            geometry: &PageGeometry,
+            old_inverse: Transform2D,
+            new_inverse: Transform2D,
+            zoom: f64,
+            local: lyra_reader_core::Rect,
+        ) {
+            let old = view_box_to_page_rect(
+                &AnnotationQuad {
+                    x_pt: local.min_x() * zoom,
+                    y_pt: local.min_y() * zoom,
+                    width_pt: local.size.width * zoom,
+                    height_pt: local.size.height * zoom,
+                },
+                old_inverse,
+                geometry,
+            )
+            .expect("old box is inside the page");
+            let new = view_box_to_page_rect(
+                &AnnotationQuad {
+                    x_pt: local.min_x(),
+                    y_pt: local.min_y(),
+                    width_pt: local.size.width,
+                    height_pt: local.size.height,
+                },
+                new_inverse,
+                geometry,
+            )
+            .expect("new box is inside the page");
+            let delta = (old.min_x() - new.min_x())
+                .abs()
+                .max((old.min_y() - new.min_y()).abs())
+                .max((old.max_x() - new.max_x()).abs())
+                .max((old.max_y() - new.max_y()).abs());
+            let tolerance = if matches!(zoom, 0.25 | 1.0 | 4.0) {
+                0.0
+            } else {
+                1e-9
+            };
+            assert!(
+                delta <= tolerance,
+                "{context} rect {local:?}: old {old:?} new {new:?} delta {delta:e}"
+            );
+        }
+
+        let mut geometries: Vec<(String, PageGeometry)> = vec![
+            (
+                "a4".to_string(),
+                PageGeometry::new(
+                    lyra_reader_core::Rect::new(0.0, 0.0, 595.0, 842.0),
+                    lyra_reader_core::Rect::new(0.0, 0.0, 595.0, 842.0),
+                    lyra_reader_core::Rotation::None,
+                    1.0,
+                ),
+            ),
+            (
+                "crop-90".to_string(),
+                PageGeometry::new(
+                    lyra_reader_core::Rect::new(0.0, 0.0, 612.0, 792.0),
+                    lyra_reader_core::Rect::new(36.5, 48.25, 500.0, 650.0),
+                    lyra_reader_core::Rotation::Clockwise90,
+                    1.0,
+                ),
+            ),
+            (
+                "offset-crop-180".to_string(),
+                PageGeometry::new(
+                    lyra_reader_core::Rect::new(0.0, 0.0, 612.0, 792.0),
+                    lyra_reader_core::Rect::new(-10.25, 20.5, 480.75, 610.25),
+                    lyra_reader_core::Rotation::Clockwise180,
+                    1.0,
+                ),
+            ),
+            (
+                "crop-270-user-unit".to_string(),
+                PageGeometry::new(
+                    lyra_reader_core::Rect::new(0.0, 0.0, 800.0, 600.0),
+                    lyra_reader_core::Rect::new(15.5, 22.25, 760.0, 550.5),
+                    lyra_reader_core::Rotation::Clockwise270,
+                    1.5,
+                ),
+            ),
+            (
+                "crop-user-unit".to_string(),
+                PageGeometry::new(
+                    lyra_reader_core::Rect::new(0.0, 0.0, 700.0, 900.0),
+                    lyra_reader_core::Rect::new(12.0, 24.0, 650.0, 820.0),
+                    lyra_reader_core::Rotation::None,
+                    0.75,
+                ),
+            ),
+        ];
+        match first_corpus_page_geometry() {
+            Some(geometry) => geometries.push(("corpus-page-0".to_string(), geometry)),
+            None => eprintln!(
+                "skipping the real-corpus row: LYRA_READER_PDF_SAMPLES is not set or the first PDF cannot be read"
+            ),
+        }
+
+        const PAGE_LEFT_PT: f64 = 37.25;
+        const PAGE_TOP_PT: f64 = 91.5;
+        const CONTENT_OFFSET_X_PT: f64 = 12.0;
+        let zooms = [0.25, 1.0, 4.0, 1.37, 2.5];
+        let scrolls = [0.0, 123.5, -80.25];
+
+        for (name, geometry) in geometries {
+            let page = geometry.view_size(1.0);
+            let points = [
+                Point::new(0.0, 0.0),
+                Point::new(page.width * 0.5, page.height * 0.5),
+                Point::new(page.width - 0.5, page.height - 0.5),
+                Point::new(page.width * 0.125 + 1.25, page.height * 0.875 - 2.5),
+            ];
+            let rects = [
+                lyra_reader_core::Rect::new(0.5, 0.75, page.width.min(100.0), 30.0),
+                lyra_reader_core::Rect::new(page.width * 0.5, page.height * 0.5, 1.0, 1.0),
+                lyra_reader_core::Rect::new(page.width - 50.0, page.height - 30.0, 40.0, 20.0),
+            ];
+            for zoom in zooms {
+                let old_inverse = geometry.view_to_page(zoom).expect("invertible geometry");
+                let new_inverse = geometry.view_to_page(1.0).expect("invertible geometry");
+                for scroll in scrolls {
+                    let context = format!("{name} zoom {zoom} scroll {scroll}");
+                    for local in points {
+                        // The cache value itself: no canvas arithmetic participates.
+                        assert_same_point(
+                            &format!("{context} cached"),
+                            old_inverse,
+                            new_inverse,
+                            zoom,
+                            local,
+                        );
+
+                        // The same value after the shell's canvas path at this zoom and scroll.
+                        let view_x = (local.x + PAGE_LEFT_PT) * zoom + CONTENT_OFFSET_X_PT;
+                        let view_y = (local.y + PAGE_TOP_PT - scroll) * zoom;
+                        let recovered = Point::new(
+                            (view_x - CONTENT_OFFSET_X_PT) / zoom - PAGE_LEFT_PT,
+                            view_y / zoom + scroll - PAGE_TOP_PT,
+                        );
+                        assert!((recovered.x - local.x).abs() <= 1e-9);
+                        assert!((recovered.y - local.y).abs() <= 1e-9);
+                        assert_same_point(
+                            &format!("{context} canvas"),
+                            old_inverse,
+                            new_inverse,
+                            zoom,
+                            recovered,
+                        );
+                    }
+                    for local in rects {
+                        assert_same_rect(
+                            &format!("{context} cached"),
+                            &geometry,
+                            old_inverse,
+                            new_inverse,
+                            zoom,
+                            local,
+                        );
+
+                        let view = lyra_reader_core::Rect::new(
+                            (local.min_x() + PAGE_LEFT_PT) * zoom + CONTENT_OFFSET_X_PT,
+                            (local.min_y() + PAGE_TOP_PT - scroll) * zoom,
+                            local.size.width * zoom,
+                            local.size.height * zoom,
+                        );
+                        let recovered = lyra_reader_core::Rect::new(
+                            (view.min_x() - CONTENT_OFFSET_X_PT) / zoom - PAGE_LEFT_PT,
+                            view.min_y() / zoom + scroll - PAGE_TOP_PT,
+                            view.size.width / zoom,
+                            view.size.height / zoom,
+                        );
+                        assert!((recovered.min_x() - local.min_x()).abs() <= 1e-9);
+                        assert!((recovered.min_y() - local.min_y()).abs() <= 1e-9);
+                        assert!((recovered.size.width - local.size.width).abs() <= 1e-9);
+                        assert!((recovered.size.height - local.size.height).abs() <= 1e-9);
+                        assert_same_rect(
+                            &format!("{context} canvas"),
+                            &geometry,
+                            old_inverse,
+                            new_inverse,
+                            zoom,
+                            recovered,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn engine_reports_version_and_backend() {
         let engine = LyraReaderEngine::new();
@@ -9144,12 +9370,7 @@ mod tests {
         let scratch = scratch("ffi-damaged-annotation");
         let destination = scratch.join("saved.pdf");
         let error = document
-            .save_annotations_copy(
-                destination.display().to_string(),
-                Vec::new(),
-                Vec::new(),
-                1.0,
-            )
+            .save_annotations_copy(destination.display().to_string(), Vec::new(), Vec::new())
             .expect_err("saving around an unreadable annotation must be refused");
         match error {
             LyraReaderFfiError::Document { message, .. } => {
@@ -9725,21 +9946,21 @@ mod tests {
         Some(directory)
     }
 
-    fn zoom_annotation(zoom: f64) -> WriteAnnotationRecord {
-        let box_at_zoom = |x: f64, y: f64, width: f64, height: f64| AnnotationQuad {
-            x_pt: x * zoom,
-            y_pt: y * zoom,
-            width_pt: width * zoom,
-            height_pt: height * zoom,
+    fn annotation_at_100() -> WriteAnnotationRecord {
+        let box_at_100 = |x: f64, y: f64, width: f64, height: f64| AnnotationQuad {
+            x_pt: x,
+            y_pt: y,
+            width_pt: width,
+            height_pt: height,
         };
         WriteAnnotationRecord {
             id: "33333333-3333-3333-3333-333333333333".to_string(),
             page: 0,
             kind: AnnotationWriteKind::Highlight,
-            rect: box_at_zoom(72.0, 141.0, 388.0, 15.0),
+            rect: box_at_100(72.0, 141.0, 388.0, 15.0),
             // View space at 100% is page space y-flipped: page [72 686 388 15] on an 842 pt
             // page is view (72, 842 - 686 - 15) = (72, 141).
-            quads: vec![box_at_zoom(72.0, 141.0, 388.0, 15.0)],
+            quads: vec![box_at_100(72.0, 141.0, 388.0, 15.0)],
             ink_paths: Vec::new(),
             line_start: None,
             line_end: None,
@@ -9751,7 +9972,7 @@ mod tests {
                 blue: 64,
             },
             opacity: 0.4,
-            contents: "Saved at an arbitrary zoom.".to_string(),
+            contents: "Saved in 100% view space.".to_string(),
             author: "LyraReader".to_string(),
             modified: "D:20261016213000-07'00'".to_string(),
             font_size_pt: 0.0,
@@ -9763,16 +9984,13 @@ mod tests {
         }
     }
 
-    fn zoom_stroke(zoom: f64) -> WriteAnnotationRecord {
-        let point = |x: f64, y: f64| AnnotationPoint {
-            x_pt: x * zoom,
-            y_pt: y * zoom,
-        };
-        let box_at_zoom = |x: f64, y: f64, width: f64, height: f64| AnnotationQuad {
-            x_pt: x * zoom,
-            y_pt: y * zoom,
-            width_pt: width * zoom,
-            height_pt: height * zoom,
+    fn stroke_at_100() -> WriteAnnotationRecord {
+        let point = |x: f64, y: f64| AnnotationPoint { x_pt: x, y_pt: y };
+        let box_at_100 = |x: f64, y: f64, width: f64, height: f64| AnnotationQuad {
+            x_pt: x,
+            y_pt: y,
+            width_pt: width,
+            height_pt: height,
         };
         WriteAnnotationRecord {
             id: "44444444-4444-4444-4444-444444444444".to_string(),
@@ -9780,7 +9998,7 @@ mod tests {
             kind: AnnotationWriteKind::Ink,
             // The outer box at view 100%: page [72 600 200 60] on an 842 pt page is
             // view (72, 842 - 600 - 60) = (72, 182), inflated by the stroke's half width.
-            rect: box_at_zoom(72.0, 181.0, 201.0, 61.0),
+            rect: box_at_100(72.0, 181.0, 201.0, 61.0),
             quads: Vec::new(),
             ink_paths: vec![vec![
                 point(73.0, 182.0),
@@ -9798,7 +10016,7 @@ mod tests {
                 blue: 30,
             },
             opacity: 0.8,
-            contents: "Stroked at an arbitrary zoom.".to_string(),
+            contents: "Stroked in 100% view space.".to_string(),
             author: "LyraReader".to_string(),
             modified: "D:20261017120000-07'00'".to_string(),
             font_size_pt: 0.0,
@@ -9811,8 +10029,8 @@ mod tests {
     }
 
     #[test]
-    fn write_back_converts_view_space_at_any_zoom_to_the_same_page_space() {
-        let Some(directory) = writeback_fixture("zoom") else {
+    fn write_back_takes_page_local_view_space_at_100_percent() {
+        let Some(directory) = writeback_fixture("write-back-100") else {
             return;
         };
         let engine = LyraReaderEngine::new();
@@ -9830,99 +10048,72 @@ mod tests {
             "the suggested name is <name> (annotated).pdf"
         );
 
-        let at_100 = directory.join("at-100.pdf");
-        let at_300 = directory.join("at-300.pdf");
-        let report_100 = document
+        let destination = directory.join("at-100.pdf");
+        let written = annotation_at_100();
+        let report = document
             .save_annotations_copy(
-                at_100.display().to_string(),
-                vec![zoom_annotation(1.0)],
+                destination.display().to_string(),
+                vec![written.clone()],
                 Vec::new(),
-                1.0,
             )
-            .expect("save at 100%");
-        let report_300 = document
-            .save_annotations_copy(
-                at_300.display().to_string(),
-                vec![zoom_annotation(3.0)],
-                Vec::new(),
-                3.0,
-            )
-            .expect("save at 300%");
+            .expect("save with 100% view-space geometry");
 
-        assert_eq!(report_100.written_ids, vec![zoom_annotation(1.0).id]);
-        assert_eq!(report_100.backup_path, None);
-        assert_eq!(report_100.preexisting_annotation_count, 7);
-        assert!(report_100.appended_bytes > 0);
-        assert!(report_100.source_bytes_preserved);
+        assert_eq!(report.written_ids, vec![written.id]);
+        assert_eq!(report.backup_path, None);
+        assert_eq!(report.preexisting_annotation_count, 7);
+        assert!(report.appended_bytes > 0);
+        assert!(report.source_bytes_preserved);
         assert_eq!(
             std::fs::read(&source).expect("source readable"),
             source_bytes,
             "a copy save leaves the open document untouched"
         );
-        assert_eq!(report_300.preexisting_annotation_count, 7);
 
-        // The two saves were made from different view-space geometry and zoom factors. Their
-        // page-space output must be identical, which is the promise that a highlight saved at
-        // one zoom reloads in the same place at another.
-        let page_space = |path: &std::path::Path| {
-            let backend = PdfiumBackend::open(path, None).expect("reopen saved copy");
-            let annotations = backend.annotations(PageIndex(0)).expect("page annotations");
-            annotations
-                .into_iter()
-                .find(|annotation| annotation.id == "nm:33333333-3333-3333-3333-333333333333")
-                .expect("written annotation")
-        };
-        let first = page_space(&at_100);
-        let second = page_space(&at_300);
-        assert_eq!(first, second, "zoom must not change page-space geometry");
+        // The boundary is page-local view space at 100%; the writer applies the page geometry
+        // exactly once. This is the frozen page-space output for the fixture's 842 pt page.
+        let backend = PdfiumBackend::open(&destination, None).expect("reopen saved copy");
+        let page_space = backend
+            .annotations(PageIndex(0))
+            .expect("page annotations")
+            .into_iter()
+            .find(|annotation| annotation.id == "nm:33333333-3333-3333-3333-333333333333")
+            .expect("written annotation");
         assert_eq!(
-            first.rect,
+            page_space.rect,
             lyra_reader_core::Rect::new(72.0, 686.0, 388.0, 15.0)
         );
         assert_eq!(
-            first.quads,
+            page_space.quads,
             vec![lyra_reader_core::Rect::new(72.0, 686.0, 388.0, 15.0)]
         );
 
-        // Reopening through the FFI at "another zoom" is the same file-space geometry: the
-        // reader reports view space at 100%, and the canvas scales it. Both saved files agree
-        // with the original view box, so the annotation reloads at the same place.
-        for path in [&at_100, &at_300] {
-            let reopened = engine
-                .open_document(path.display().to_string(), None)
-                .expect("reopen saved copy");
-            let records = reopened.annotations().expect("annotations");
-            let ours: Vec<_> = records
-                .iter()
-                .filter(|record| record.id == "nm:33333333-3333-3333-3333-333333333333")
-                .collect();
-            assert_eq!(ours.len(), 1, "exactly one copy of the written annotation");
-            assert!((ours[0].x_pt - 72.0).abs() < 1e-6);
-            assert!((ours[0].y_pt - 141.0).abs() < 1e-6);
-            assert!((ours[0].width_pt - 388.0).abs() < 1e-6);
-            assert!((ours[0].height_pt - 15.0).abs() < 1e-6);
-            assert_eq!(
-                ours[0].contents.as_deref(),
-                Some("Saved at an arbitrary zoom.")
-            );
-            assert_eq!(ours[0].author.as_deref(), Some("LyraReader"));
-            assert_eq!(ours[0].blend, "multiply");
-        }
-
-        let bad_zoom = document.save_annotations_copy(
-            directory.join("bad.pdf").display().to_string(),
-            vec![zoom_annotation(1.0)],
-            Vec::new(),
-            0.0,
+        // The reader reports that file geometry back in the same 100% view space it accepted.
+        let reopened = engine
+            .open_document(destination.display().to_string(), None)
+            .expect("reopen saved copy");
+        let records = reopened.annotations().expect("annotations");
+        let ours: Vec<_> = records
+            .iter()
+            .filter(|record| record.id == "nm:33333333-3333-3333-3333-333333333333")
+            .collect();
+        assert_eq!(ours.len(), 1, "exactly one copy of the written annotation");
+        assert_eq!(ours[0].x_pt, 72.0);
+        assert_eq!(ours[0].y_pt, 141.0);
+        assert_eq!(ours[0].width_pt, 388.0);
+        assert_eq!(ours[0].height_pt, 15.0);
+        assert_eq!(
+            ours[0].contents.as_deref(),
+            Some("Saved in 100% view space.")
         );
-        assert!(bad_zoom.is_err(), "a zero zoom is refused before any write");
+        assert_eq!(ours[0].author.as_deref(), Some("LyraReader"));
+        assert_eq!(ours[0].blend, "multiply");
 
         let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn stroke_write_back_converts_view_space_at_any_zoom_to_the_same_page_space() {
-        let Some(directory) = writeback_fixture("stroke-zoom") else {
+    fn stroke_write_back_takes_page_local_points_at_100_percent() {
+        let Some(directory) = writeback_fixture("stroke-100") else {
             return;
         };
         let engine = LyraReaderEngine::new();
@@ -9930,56 +10121,38 @@ mod tests {
         let document = engine
             .open_document(source.display().to_string(), None)
             .expect("open source");
-        let at_100 = directory.join("stroke-100.pdf");
-        let at_300 = directory.join("stroke-300.pdf");
+        let destination = directory.join("stroke-100.pdf");
         document
             .save_annotations_copy(
-                at_100.display().to_string(),
-                vec![zoom_stroke(1.0)],
+                destination.display().to_string(),
+                vec![stroke_at_100()],
                 Vec::new(),
-                1.0,
             )
-            .expect("save stroke at 100%");
-        document
-            .save_annotations_copy(
-                at_300.display().to_string(),
-                vec![zoom_stroke(3.0)],
-                Vec::new(),
-                3.0,
-            )
-            .expect("save stroke at 300%");
+            .expect("save stroke with 100% view-space geometry");
 
-        let page_space = |path: &std::path::Path| {
-            let backend = PdfiumBackend::open(path, None).expect("reopen saved copy");
-            backend
-                .annotations(PageIndex(0))
-                .expect("page annotations")
-                .into_iter()
-                .find(|annotation| annotation.id == "nm:44444444-4444-4444-4444-444444444444")
-                .expect("written stroke")
-        };
-        let first = page_space(&at_100);
-        let second = page_space(&at_300);
-        assert_eq!(
-            first, second,
-            "zoom must not change the stroke's page-space points"
-        );
-        assert_eq!(first.kind, lyra_reader_core::RawAnnotationKind::Ink);
-        assert_eq!(first.ink_paths.len(), 1);
+        let backend = PdfiumBackend::open(&destination, None).expect("reopen saved copy");
+        let stroke = backend
+            .annotations(PageIndex(0))
+            .expect("page annotations")
+            .into_iter()
+            .find(|annotation| annotation.id == "nm:44444444-4444-4444-4444-444444444444")
+            .expect("written stroke");
+        assert_eq!(stroke.kind, lyra_reader_core::RawAnnotationKind::Ink);
+        assert_eq!(stroke.ink_paths.len(), 1);
         let expected = [
             (73.0, 182.0),
             (120.0, 220.0),
             (180.0, 190.0),
             (272.0, 240.0),
         ];
-        for (point, (x, y)) in first.ink_paths[0].iter().zip(expected) {
+        for (point, (x, y)) in stroke.ink_paths[0].iter().zip(expected) {
             // The view points above are page-space top-left; the writer's inverse flips them
             // back into PDF page space, so compare the y flip explicitly.
             assert!((point.x - x).abs() < 0.01, "{point:?} vs {x}");
             assert!((point.y - (842.0 - y)).abs() < 0.01, "{point:?} vs {y}");
         }
-        assert_eq!(first.border_width, Some(2.5));
-        assert!((first.opacity.expect("opacity") - 0.8).abs() < 0.01);
+        assert_eq!(stroke.border_width, Some(2.5));
+        assert!((stroke.opacity.expect("opacity") - 0.8).abs() < 0.01);
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -10007,7 +10180,7 @@ mod tests {
         assert!(document.interrupted_save_note().is_none());
 
         let report = document
-            .replace_with_annotations(vec![zoom_annotation(1.0)], Vec::new(), 1.0)
+            .replace_with_annotations(vec![annotation_at_100()], Vec::new())
             .expect("replace original");
         let backup = report.backup_path.expect("backup path");
         let backup_bytes = std::fs::read(&backup).expect("backup readable");
@@ -10086,12 +10259,7 @@ mod tests {
         ];
         let saved = directory.join("saved.pdf");
         let report = document
-            .save_annotations_copy(
-                saved.display().to_string(),
-                Vec::new(),
-                bookmarks.clone(),
-                1.0,
-            )
+            .save_annotations_copy(saved.display().to_string(), Vec::new(), bookmarks.clone())
             .expect("a document with only bookmarks can still be saved");
         assert_eq!(
             report.written_bookmark_ids,
@@ -10168,12 +10336,7 @@ mod tests {
             })
             .collect();
         reopened
-            .save_annotations_copy(
-                again.display().to_string(),
-                Vec::new(),
-                reopened_bookmarks,
-                1.0,
-            )
+            .save_annotations_copy(again.display().to_string(), Vec::new(), reopened_bookmarks)
             .expect("second save");
         let second = engine
             .open_document(again.display().to_string(), None)

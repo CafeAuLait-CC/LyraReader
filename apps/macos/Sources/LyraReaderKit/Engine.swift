@@ -1009,10 +1009,10 @@ public struct AnnotationQuadBox: Sendable, Equatable {
 
 /// One annotation the shell asks the engine to write into a PDF.
 ///
-/// Geometry is **view space at `zoom`** — exactly what the canvas draws — because that is the
-/// shell's coordinate space. The engine converts it to page space once, using the page's own
-/// crop box and rotation, so a highlight saved at 100% and one saved at 300% land in the same
-/// place.
+/// Geometry is **page-local view space at 100%** — the same convention the annotation cache and
+/// `DocumentAnnotation` use. The engine converts it to PDF page space exactly once, using the
+/// page's own `/CropBox`, `/Rotate` and `/UserUnit`; the shell never scales geometry by the
+/// canvas zoom to cross this boundary.
 public struct AnnotationWriteRequest: Sendable, Equatable {
     /// What the annotation becomes in the PDF: the engine's write kind.
     ///
@@ -1025,13 +1025,14 @@ public struct AnnotationWriteRequest: Sendable, Equatable {
     public let id: String
     public let page: Int
     public let kind: Kind
-    /// View-space box at `zoom`; for markup the union of `quads` is what is written as `/Rect`.
+    /// Page-local view-space box at 100%; for markup the union of `quads` is what is written as
+    /// `/Rect`.
     public let rect: CGRect
-    /// View-space `/QuadPoints` at `zoom`; empty for notes and for the stroked kinds.
+    /// Page-local view-space `/QuadPoints` at 100%; empty for notes and for the stroked kinds.
     public let quads: [CGRect]
-    /// View-space `/InkList` at `zoom`, one stroke per entry; only for `.ink`.
+    /// Page-local view-space `/InkList` at 100%, one stroke per entry; only for `.ink`.
     public let inkPaths: [[CGPoint]]
-    /// View-space `/L` endpoints at `zoom`; required for `.line`.
+    /// Page-local view-space `/L` endpoints at 100%; required for `.line`.
     public let lineStart: CGPoint?
     public let lineEnd: CGPoint?
     /// Write `/LE [/None /ClosedArrow]`; only meaningful for `.line`.
@@ -1834,8 +1835,7 @@ public protocol PDFEngine: AnyObject {
     func saveAnnotatedCopy(
         to url: URL,
         annotations: [AnnotationWriteRequest],
-        bookmarks: [Bookmark],
-        zoom: CGFloat
+        bookmarks: [Bookmark]
     ) async throws -> AnnotationWriteReport
     /// Applies additions, edits and deletions to a new PDF at `url`.
     func saveAnnotationChanges(
@@ -1843,16 +1843,14 @@ public protocol PDFEngine: AnyObject {
         additions: [AnnotationWriteRequest],
         bookmarks: [Bookmark],
         updates: [AnnotationUpdateRequest],
-        deletions: [AnnotationDeleteRequest],
-        zoom: CGFloat
+        deletions: [AnnotationDeleteRequest]
     ) async throws -> AnnotationWriteReport
     /// Replaces the open document with one carrying `annotations` and `bookmarks`; the engine
     /// writes and verifies a backup first and refuses the replacement if the backup cannot be
     /// written.
     func replaceWithAnnotations(
         _ annotations: [AnnotationWriteRequest],
-        bookmarks: [Bookmark],
-        zoom: CGFloat
+        bookmarks: [Bookmark]
     ) async throws -> AnnotationWriteReport
     /// Replaces the open document with one carrying additions, edits and deletions, after a
     /// verified backup.
@@ -1860,8 +1858,7 @@ public protocol PDFEngine: AnyObject {
         _ additions: [AnnotationWriteRequest],
         bookmarks: [Bookmark],
         updates: [AnnotationUpdateRequest],
-        deletions: [AnnotationDeleteRequest],
-        zoom: CGFloat
+        deletions: [AnnotationDeleteRequest]
     ) async throws -> AnnotationWriteReport
     /// The document's AcroForm fields, read from the widget dictionaries and reported in view
     /// space. Reading never writes; an encrypted file is reported with `encrypted: true` and a
@@ -2053,8 +2050,7 @@ public extension PDFEngine {
     func saveAnnotatedCopy(
         to url: URL,
         annotations: [AnnotationWriteRequest],
-        bookmarks: [Bookmark],
-        zoom: CGFloat
+        bookmarks: [Bookmark]
     ) async throws -> AnnotationWriteReport {
         throw NSError(
             domain: "LyraReader",
@@ -2065,8 +2061,7 @@ public extension PDFEngine {
 
     func replaceWithAnnotations(
         _ annotations: [AnnotationWriteRequest],
-        bookmarks: [Bookmark],
-        zoom: CGFloat
+        bookmarks: [Bookmark]
     ) async throws -> AnnotationWriteReport {
         throw NSError(
             domain: "LyraReader",
@@ -2080,8 +2075,7 @@ public extension PDFEngine {
         additions: [AnnotationWriteRequest],
         bookmarks: [Bookmark],
         updates: [AnnotationUpdateRequest],
-        deletions: [AnnotationDeleteRequest],
-        zoom: CGFloat
+        deletions: [AnnotationDeleteRequest]
     ) async throws -> AnnotationWriteReport {
         throw NSError(
             domain: "LyraReader",
@@ -2094,8 +2088,7 @@ public extension PDFEngine {
         _ additions: [AnnotationWriteRequest],
         bookmarks: [Bookmark],
         updates: [AnnotationUpdateRequest],
-        deletions: [AnnotationDeleteRequest],
-        zoom: CGFloat
+        deletions: [AnnotationDeleteRequest]
     ) async throws -> AnnotationWriteReport {
         throw NSError(
             domain: "LyraReader",
@@ -2812,8 +2805,7 @@ public final class RustEngine: PDFEngine {
     public func saveAnnotatedCopy(
         to url: URL,
         annotations: [AnnotationWriteRequest],
-        bookmarks: [Bookmark],
-        zoom: CGFloat
+        bookmarks: [Bookmark]
     ) async throws -> AnnotationWriteReport {
         guard let document else {
             throw NSError(
@@ -2833,8 +2825,7 @@ public final class RustEngine: PDFEngine {
                     continuation.resume(returning: try document.saveAnnotationsCopy(
                         destination: url.path,
                         annotations: records,
-                        bookmarks: bookmarkRecords,
-                        zoom: Double(zoom)
+                        bookmarks: bookmarkRecords
                     ))
                 } catch {
                     continuation.resume(throwing: error)
@@ -2853,8 +2844,7 @@ public final class RustEngine: PDFEngine {
         additions: [AnnotationWriteRequest],
         bookmarks: [Bookmark],
         updates: [AnnotationUpdateRequest],
-        deletions: [AnnotationDeleteRequest],
-        zoom: CGFloat
+        deletions: [AnnotationDeleteRequest]
     ) async throws -> AnnotationWriteReport {
         guard let document else {
             throw NSError(
@@ -2883,8 +2873,7 @@ public final class RustEngine: PDFEngine {
                         annotations: additionRecords,
                         bookmarks: bookmarkRecords,
                         updates: updateRecords,
-                        deletions: deleteRecords,
-                        zoom: Double(zoom)
+                        deletions: deleteRecords
                     ))
                 } catch {
                     continuation.resume(throwing: error)
@@ -2899,8 +2888,7 @@ public final class RustEngine: PDFEngine {
         _ additions: [AnnotationWriteRequest],
         bookmarks: [Bookmark],
         updates: [AnnotationUpdateRequest],
-        deletions: [AnnotationDeleteRequest],
-        zoom: CGFloat
+        deletions: [AnnotationDeleteRequest]
     ) async throws -> AnnotationWriteReport {
         guard let document else {
             throw NSError(
@@ -2928,8 +2916,7 @@ public final class RustEngine: PDFEngine {
                         annotations: additionRecords,
                         bookmarks: bookmarkRecords,
                         updates: updateRecords,
-                        deletions: deleteRecords,
-                        zoom: Double(zoom)
+                        deletions: deleteRecords
                     ))
                 } catch {
                     continuation.resume(throwing: error)
@@ -2942,8 +2929,7 @@ public final class RustEngine: PDFEngine {
 
     public func replaceWithAnnotations(
         _ annotations: [AnnotationWriteRequest],
-        bookmarks: [Bookmark],
-        zoom: CGFloat
+        bookmarks: [Bookmark]
     ) async throws -> AnnotationWriteReport {
         guard let document else {
             throw NSError(
@@ -2959,8 +2945,7 @@ public final class RustEngine: PDFEngine {
                 do {
                     continuation.resume(returning: try document.replaceWithAnnotations(
                         annotations: records,
-                        bookmarks: bookmarkRecords,
-                        zoom: Double(zoom)
+                        bookmarks: bookmarkRecords
                     ))
                 } catch {
                     continuation.resume(throwing: error)

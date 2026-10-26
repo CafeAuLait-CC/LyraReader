@@ -723,7 +723,7 @@ extension ReaderChecks {
         do {
             _ = try await writerEngine.saveAnnotationChanges(
                 to: writerOutput, additions: [borderRequest], bookmarks: [], updates: [],
-                deletions: [], zoom: 1)
+                deletions: [])
             require(false, "the writer must refuse the border width the rule set refuses")
         } catch {
             require(AnnotationRecords.message(error) == annotationMessage(borderCase),
@@ -743,7 +743,7 @@ extension ReaderChecks {
         do {
             _ = try await writerEngine.saveAnnotationChanges(
                 to: writerOutput, additions: [longNoteRequest], bookmarks: [], updates: [],
-                deletions: [], zoom: 1)
+                deletions: [])
             require(false, "the writer must refuse the note length the rule set refuses")
         } catch {
             require(AnnotationRecords.message(error) == annotationMessage(noteCase),
@@ -753,7 +753,7 @@ extension ReaderChecks {
             title: String(repeating: "x", count: 4_097), yPt: 0)
         do {
             _ = try await writerEngine.saveAnnotatedCopy(
-                to: writerOutput, annotations: [], bookmarks: [writerBookmark], zoom: 1)
+                to: writerOutput, annotations: [], bookmarks: [writerBookmark])
             require(false, "the outline writer must refuse the title the rule set refuses")
         } catch {
             require(AnnotationRecords.message(error) == bookmarkMessage(longTitle),

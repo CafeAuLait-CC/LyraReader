@@ -5498,7 +5498,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     private func stampWriteRequest(
         _ annotation: Annotation,
-        zoom: CGFloat,
         modified: String
     ) throws -> AnnotationWriteRequest {
         guard annotation.hasValidGeometry, let box = annotation.shapeRect else {
@@ -5509,8 +5508,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     "Annotation \(annotation.id.uuidString) has no box and cannot be written"]
             )
         }
-        let rect = CGRect(x: box.minX * zoom, y: box.minY * zoom,
-                          width: box.width * zoom, height: box.height * zoom)
+        let rect = box
         guard rect.width > 0.5, rect.height > 0.5 else {
             throw NSError(
                 domain: "LyraReader",
@@ -9029,8 +9027,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 additions: changes.additions,
                 bookmarks: bookmarkRequests,
                 updates: changes.updates,
-                deletions: changes.deletions,
-                zoom: zoomFactor
+                deletions: changes.deletions
             )
             lastAnnotationWriteReport = report
             // The erasure now exists in a PDF (the copy), so the pending-erasure banner has
@@ -9108,8 +9105,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 changes.additions,
                 bookmarks: bookmarkRequests,
                 updates: changes.updates,
-                deletions: changes.deletions,
-                zoom: zoomFactor
+                deletions: changes.deletions
             )
             try? DocumentEditCache.recordSource(for: url)
 
@@ -9211,13 +9207,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Builds write requests from the cached annotations.
     ///
-    /// The quads are the same `TextPage.selectionRects` the canvas draws, scaled to the zoom the
-    /// reader is at now. They are **view-space** on purpose: the engine inverts that scale with
-    /// the page geometry, so the stored PDF coordinates do not depend on the zoom this happened
-    /// to be called at.
+    /// The quads are the same `TextPage.selectionRects` the canvas draws, in the 100% page-local
+    /// view space the annotation cache uses. The canvas multiplies them by its own zoom to draw;
+    /// that transform never crosses this boundary, so the engine applies the page geometry once
+    /// and the stored PDF coordinates do not depend on the zoom the save happened at.
     private func pendingAnnotationChanges() async throws -> PendingAnnotationChanges {
         guard let document else { return PendingAnnotationChanges() }
-        let zoom = zoomFactor
         let modified = Self.pdfDate(Date())
         var changes = PendingAnnotationChanges()
         func record(_ request: AnnotationWriteRequest, for annotation: Annotation) {
@@ -9239,17 +9234,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 )
             }
             if annotation.kind.isPlacedText {
-                record(try placedTextWriteRequest(annotation, zoom: zoom, modified: modified),
+                record(try placedTextWriteRequest(annotation, modified: modified),
                        for: annotation)
                 continue
             }
             if annotation.kind.isStampArtwork {
-                record(try stampWriteRequest(annotation, zoom: zoom, modified: modified),
+                record(try stampWriteRequest(annotation, modified: modified),
                        for: annotation)
                 continue
             }
             if annotation.kind.isGeometry {
-                record(try geometryWriteRequest(annotation, zoom: zoom, modified: modified),
+                record(try geometryWriteRequest(annotation, modified: modified),
                        for: annotation)
                 continue
             }
@@ -9258,9 +9253,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // the file's own boxes, because its characters are in somebody else's text layer.
             let quads: [CGRect]
             if let fixed = annotation.fileQuads, !fixed.isEmpty {
-                quads = fixed.map { box in
-                    CGRect(x: box.x * zoom, y: box.y * zoom,
-                           width: box.width * zoom, height: box.height * zoom)
+                quads = fixed.map {
+                    CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
                 }
             } else {
                 let text: TextPage
@@ -9291,14 +9285,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                             "Annotation \(annotation.id.uuidString) covers no visible text and cannot be written"]
                     )
                 }
-                quads = rects.map { rect in
-                    CGRect(
-                        x: rect.origin.x * zoom,
-                        y: rect.origin.y * zoom,
-                        width: rect.width * zoom,
-                        height: rect.height * zoom
-                    )
-                }
+                quads = rects
             }
             let union = quads.dropFirst().reduce(quads[0]) { $0.union($1) }
             // The kind table is the one statement of which mark becomes which write kind.
@@ -9336,12 +9323,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// One placed-text annotation as a write request: a `/Text` sticky note for an icon, a
     /// `/FreeText` annotation for a box.
     ///
-    /// The cached annotation's box is page space at 100%; the request wants view space at the current zoom,
-    /// exactly like the stroked kinds. A text box keeps its font size in page points (the zoom
-    /// is a display transform, not part of the stored text) and carries its alignment.
+    /// The cached annotation's box is page-local view space at 100%, which is exactly what the
+    /// write request takes. A text box keeps its font size in page points (the zoom is a display
+    /// transform, not part of the stored text) and carries its alignment.
     private func placedTextWriteRequest(
         _ annotation: Annotation,
-        zoom: CGFloat,
         modified: String
     ) throws -> AnnotationWriteRequest {
         guard annotation.hasValidGeometry, let box = annotation.shapeRect else {
@@ -9352,8 +9338,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     "Annotation \(annotation.id.uuidString) has no box and cannot be written"]
             )
         }
-        let rect = CGRect(x: box.minX * zoom, y: box.minY * zoom,
-                          width: box.width * zoom, height: box.height * zoom)
+        let rect = box
         guard rect.width > 0.5, rect.height > 0.5 else {
             throw NSError(
                 domain: "LyraReader",
@@ -9381,10 +9366,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// One stroked annotation as a write request.
     ///
-    /// The annotation cache stores page-local view space at 100%; `AnnotationWriteRequest` wants the same
-    /// space scaled to the zoom the canvas is at. That multiplication and the engine's inverse
-    /// are the pair the zoom-independence check exercises: the PDF's coordinates come back
-    /// identical whichever zoom this ran at.
+    /// The annotation cache stores page-local view space at 100%, and `AnnotationWriteRequest`
+    /// takes exactly that: the engine applies the page geometry once. The canvas zoom is a
+    /// display transform and never scales the value that crosses this boundary, so the PDF's
+    /// coordinates do not depend on the zoom the save happened at.
     ///
     /// `/Rect` is the **outer** box of the stroke: a centred stroke extends half a width past
     /// the path, and an arrowhead extends past its endpoint. Writing the outer box is what makes
@@ -9392,7 +9377,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// border width again so the stroke is the same width in the PDF as on the page.
     private func geometryWriteRequest(
         _ annotation: Annotation,
-        zoom: CGFloat,
         modified: String
     ) throws -> AnnotationWriteRequest {
         guard annotation.hasValidGeometry, let bounds = annotation.geometryBounds else {
@@ -9426,13 +9410,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     "Annotation \(annotation.id.uuidString) has a box too small to write"]
             )
         }
-        func scaled(_ rect: CGRect) -> CGRect {
-            CGRect(x: rect.minX * zoom, y: rect.minY * zoom,
-                   width: rect.width * zoom, height: rect.height * zoom)
-        }
-        func scaled(_ point: CGPoint) -> CGPoint {
-            CGPoint(x: point.x * zoom, y: point.y * zoom)
-        }
         guard annotation.kind.isGeometry,
               let kind = AnnotationRecordRules.writeKind(for: annotation.kind) else {
             throw NSError(
@@ -9445,11 +9422,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             id: annotation.id.uuidString,
             page: annotation.page,
             kind: kind,
-            rect: scaled(outer),
+            rect: outer,
             quads: [],
-            inkPaths: annotation.inkPaths.map { $0.map(scaled) },
-            lineStart: annotation.lineStart.map(scaled),
-            lineEnd: annotation.lineEnd.map(scaled),
+            inkPaths: annotation.inkPaths,
+            lineStart: annotation.lineStart,
+            lineEnd: annotation.lineEnd,
             lineArrow: annotation.kind == .arrow,
             borderWidthPt: width,
             color: annotation.color,
@@ -11157,7 +11134,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         do {
             let snapshot = directory.appendingPathComponent("source.pdf")
             _ = try await engine.saveAnnotationChanges(to: snapshot, additions: changes.additions,
-                bookmarks: marks, updates: changes.updates, deletions: changes.deletions, zoom: zoomFactor)
+                bookmarks: marks, updates: changes.updates, deletions: changes.deletions)
             let isolated = try RustEngine()
             _ = try isolated.openDocument(at: snapshot)
             return (isolated, directory)
@@ -11179,7 +11156,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         if marks.isEmpty { _ = try await export.saveEditedCopy(to: destination) }
         else { _ = try await export.saveAnnotationChanges(to: destination, additions: [], bookmarks: marks,
-            updates: [], deletions: [], zoom: zoomFactor) }
+            updates: [], deletions: []) }
     }
 
     /// The destination's annotation cache when it already holds records.
@@ -11822,7 +11799,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard !changes.isEmpty || !marks.isEmpty else { return false }
         let next = session.directory.appendingPathComponent("marks-\(UUID().uuidString).pdf")
         _ = try await engine.saveAnnotationChanges(to: next, additions: changes.additions,
-            bookmarks: marks, updates: changes.updates, deletions: changes.deletions, zoom: zoomFactor)
+            bookmarks: marks, updates: changes.updates, deletions: changes.deletions)
         let oldScroll = scrollYPt
         try loadPageEditRevision(at: next, title: session.title, annotationRecordsURL: session.annotationRecordsURL,
             annotations: [], bookmarks: [], slots: [], currentPage: currentPage, selection: pageSelection)
