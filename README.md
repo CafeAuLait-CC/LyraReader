@@ -21,9 +21,17 @@ them written back into the PDF, staged page editing with undo, merge and split, 
 content, printing, bookmarks, citation / figure / table previews, paper metadata with BibTeX, annotation
 export, an index cache, and the AI assistant.
 
-Deliberately not done: cross-platform shells (Linux, Windows), localisation, automatic updates, and a handful
+Deliberately not done on master: cross-platform shells (Linux, Windows), localisation, automatic updates, and a handful
 of editing niceties documented in the task list. In-place body-text editing and full content editing exist as
 separate features with their own documented limits.
+
+The `codex/linux-native` integration branch contains an experimental native Qt Quick shell for Linux,
+using Qt's rendering hardware interface and the shared Rust engine. It is being brought up to date
+with the macOS saving and interaction model. Annotation drafts use the platform application cache,
+keyed by the engine's document identity; old JSON companions beside PDFs are ignored. Set
+`LYRA_READER_DOCUMENT_CACHE_DIR` to an absolute directory to isolate recoverable reader state.
+Page-session recovery, unified Save/Save As, and several newer macOS features are still being ported.
+The Linux branch is not yet a release or a claim of full feature parity.
 
 ## Capabilities
 

@@ -1,8 +1,64 @@
-//! Presentation plans and sidecar handling for the shared merge/split writers.
+//! Native export plans and annotation materialization for the shared merge/split writers.
 use crate::document::DesktopDocument;
 use lyra_reader_ffi::api::*;
 use serde_json::{Value, json};
-use std::{collections::HashSet, fs, path::Path};
+use std::{collections::HashSet, fs, path::Path, sync::Arc};
+
+struct ExportSource {
+    // Fields drop in this order: close the PDF before removing its private directory.
+    document: Arc<LyraReaderDocument>,
+    _directory: Option<Arc<crate::pages::SessionDirectory>>,
+}
+
+fn materialize(
+    source: &Arc<LyraReaderDocument>,
+    marks: &crate::marks::Marks,
+) -> Result<ExportSource, String> {
+    let payload = marks.payload(source)?;
+    if payload.annotations.is_empty()
+        && payload.bookmarks.is_empty()
+        && payload.updates.is_empty()
+        && payload.deletions.is_empty()
+    {
+        return Ok(ExportSource {
+            document: Arc::clone(source),
+            _directory: None,
+        });
+    }
+    let path = marks
+        .cache_root()
+        .ok_or("The document cache is unavailable")?
+        .join(format!("export-{}", crate::marks::uuid()?));
+    let mut options = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        options.mode(0o700);
+    }
+    options.create(&path).map_err(|e| e.to_string())?;
+    let directory = Arc::new(crate::pages::SessionDirectory(path));
+    let destination = directory
+        .0
+        .join("materialized.pdf")
+        .to_string_lossy()
+        .into_owned();
+    source
+        .save_annotation_changes_copy(
+            destination.clone(),
+            payload.annotations,
+            payload.bookmarks,
+            payload.updates,
+            payload.deletions,
+        )
+        .map_err(|e| e.to_string())?;
+    let document = LyraReaderEngine::new()
+        .open_document(destination, None)
+        .map_err(|e| e.to_string())?;
+    Ok(ExportSource {
+        document,
+        _directory: Some(directory),
+    })
+}
 
 fn groups(request: &Value, count: u32) -> Result<Vec<Vec<u32>>, String> {
     if count == 0 {
@@ -57,15 +113,10 @@ fn groups(request: &Value, count: u32) -> Result<Vec<Vec<u32>>, String> {
     result.sort_by_key(|pages| pages[0]);
     Ok(result)
 }
-fn sidecar_exists(path: &Path) -> bool {
-    ["lyra-reader-annotations.json", "aris-annotations.json"]
-        .iter()
-        .any(|suffix| Path::new(&format!("{}.{suffix}", path.display())).exists())
-}
 fn new_destination(path: &Path) -> Result<(), String> {
-    if path.exists() || sidecar_exists(path) {
+    if path.exists() {
         return Err(format!(
-            "{} already exists or has an annotation sidecar; choose a new destination",
+            "{} already exists; choose a new destination",
             path.display()
         ));
     }
@@ -117,7 +168,7 @@ impl DesktopDocument {
                     };
                     let noun = if pages.len() == 1 { "page" } else { "pages" };
                     let path = directory.join(format!("{stem} ({noun} {label}).pdf"));
-                    if path.exists() || sidecar_exists(&path) {
+                    if path.exists() {
                         conflicts.push(path.to_string_lossy().into_owned());
                     }
                     SplitPartRecord {
@@ -133,6 +184,10 @@ impl DesktopDocument {
             .lock()
             .map_err(|_| "Annotation state is unavailable")?;
         marks.validate_export(op == "save_split")?;
+        // Exported marks must travel inside the PDF, including when the recipient has
+        // no access to this application's cache. The original remains untouched.
+        let materialized = materialize(&source, &marks)?;
+        let writer = &materialized.document;
         if op == "save_merge" {
             let destination = r["destination"]
                 .as_str()
@@ -141,7 +196,7 @@ impl DesktopDocument {
             new_destination(path)?;
             let others: Vec<String> =
                 serde_json::from_value(r["others"].clone()).map_err(|e| e.to_string())?;
-            let report = source
+            let report = writer
                 .merge_documents(others, destination.to_string())
                 .map_err(|e| e.to_string())?;
             let sidecar = (|| {
@@ -193,7 +248,7 @@ impl DesktopDocument {
             };
             let mut error = None;
             for part in &parts {
-                match source.split_pages(vec![part.clone()]) {
+                match writer.split_pages(vec![part.clone()]) {
                     Ok(next) => {
                         report.parts.extend(next.parts);
                         report.cleaned_temporary_files += next.cleaned_temporary_files;
@@ -206,7 +261,7 @@ impl DesktopDocument {
             }
             error.map_or(Ok(report), Err)
         } else {
-            source.split_pages(parts.clone())
+            writer.split_pages(parts.clone())
         };
         let mut written = 0;
         let mut sidecar_errors = Vec::new();

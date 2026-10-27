@@ -35,6 +35,13 @@ fn text(request: &Value, key: &str) -> Result<String, String> {
 
 impl DesktopDocument {
     pub fn open(path: &Path, password: Option<&str>) -> Result<Self, String> {
+        Self::open_with_cache_root(path, password, None)
+    }
+    fn open_with_cache_root(
+        path: &Path,
+        password: Option<&str>,
+        cache_root: Option<&Path>,
+    ) -> Result<Self, String> {
         let engine = LyraReaderEngine::new()
             .open_document(
                 path.to_string_lossy().into_owned(),
@@ -57,7 +64,7 @@ impl DesktopDocument {
                 Ok((size.width_pt, size.height_pt))
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let mut mark_state = crate::marks::Marks::load(path, engine.page_count());
+        let mut mark_state = crate::marks::Marks::load_opened(&engine, cache_root);
         if let Err(error) = mark_state.seed_bookmarks(&engine) {
             mark_state.error = Some(error);
         }
@@ -122,16 +129,6 @@ impl DesktopDocument {
             return self.export_command(op, &r);
         }
         if let Some(destination) = r.get("destination").and_then(Value::as_str) {
-            if op.starts_with("save_")
-                && [
-                    format!("{destination}.lyra-reader-annotations.json"),
-                    format!("{destination}.aris-annotations.json"),
-                ]
-                .iter()
-                .any(|p| Path::new(p).exists())
-            {
-                return Err("The destination has an annotation sidecar. Choose another name so the existing marks are preserved.".into());
-            }
             let destination = Path::new(destination);
             let resolved = if destination.exists() {
                 std::fs::canonicalize(destination)
@@ -222,11 +219,7 @@ impl DesktopDocument {
                     .lock()
                     .map_err(|_| "Annotation state is unavailable")?;
                 let destination = text(&r, "destination")?;
-                let original = crate::marks::Marks::load(Path::new(&destination), d.page_count());
-                let sidecar = PathBuf::from(format!("{destination}.lyra-reader-annotations.json"));
-                if sidecar.exists() {
-                    return Err("The destination already has an annotation sidecar. Choose another name so its marks are preserved.".into());
-                }
+                let original = crate::marks::Marks::load_with_root(Path::new(&destination), d.page_count(), marks.cache_root());
                 let (report, _, _) = marks.publish_page_revision(&original, || {
                     d.save_edited_copy(destination).map_err(|e| e.to_string())
                 })?;
@@ -256,7 +249,7 @@ impl DesktopDocument {
                 }
                 .map_err(|e| e.to_string())?;
                 let cleanup = if op == "replace_current_annotations" {
-                    marks.clear_saved(&payload.ids).err()
+                    marks.clear_saved(&payload.ids).and_then(|()| marks.after_save()).err()
                 } else {
                     None
                 };
@@ -415,6 +408,28 @@ mod tests {
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
     };
+    fn fixture_cache_root(path: &Path) -> PathBuf {
+        path.ancestors()
+            .find(|p| {
+                p.file_name().is_some_and(|n| {
+                    n.to_string_lossy()
+                        .starts_with("lyra-reader-desktop-check-")
+                })
+            })
+            .expect("fixture-owned directory")
+            .join("cache")
+    }
+    fn open_fixture_document(
+        path: &Path,
+        password: Option<&str>,
+    ) -> Result<DesktopDocument, String> {
+        DesktopDocument::open_with_cache_root(path, password, Some(&fixture_cache_root(path)))
+    }
+    fn cache_path(path: &Path) -> PathBuf {
+        crate::document_cache::DocumentCache::open(path, &fixture_cache_root(path))
+            .unwrap()
+            .annotations()
+    }
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     struct Fixture {
         directory: PathBuf,
@@ -439,7 +454,7 @@ mod tests {
             Self { directory, path }
         }
         fn open(&self) -> DesktopDocument {
-            DesktopDocument::open(&self.path, None).unwrap()
+            open_fixture_document(&self.path, None).unwrap()
         }
     }
     impl Drop for Fixture {
@@ -455,7 +470,7 @@ mod tests {
         let original = fs::read(&fixture.path).unwrap();
         let created=doc.command(json!({"op":"mark_create","entry":{"kind":"ink","page":0,"version":1,"paths":[[{"x":100,"y":200},{"x":150,"y":200},{"x":250,"y":200},{"x":300,"y":200}]],"strokeWidth":2,"color":"#1B7F3BFF","note":"keep my ink note"}})).unwrap();
         let id = created["selected_id"].as_str().unwrap();
-        let sidecar = format!("{}.lyra-reader-annotations.json", fixture.path.display());
+        let sidecar = cache_path(&fixture.path);
         let baseline = fs::read(&sidecar).unwrap();
         let segments = json!([{"from":{"x":200,"y":170},"to":{"x":200,"y":230}}]);
         let begin=doc.command(json!({"op":"ink_erase_begin","token":"first","page":0,"zoom":1,"segments":segments})).unwrap();
@@ -596,7 +611,7 @@ mod tests {
         let output = fixture.directory.join("cut.pdf");
         doc.command(json!({"op":"save_current_annotations","destination":output}))
             .unwrap();
-        let saved = DesktopDocument::open(&output, None)
+        let saved = open_fixture_document(&output, None)
             .unwrap()
             .command(json!({"op":"annotations"}))
             .unwrap();
@@ -648,9 +663,12 @@ mod tests {
         let doc = fixture.open();
         doc.command(json!({"op":"file_adopt","id":"nm:review-ink-bare"}))
             .unwrap();
-        let sidecar = format!("{}.lyra-reader-annotations.json", fixture.path.display());
+        let sidecar = cache_path(&fixture.path);
         let before = fs::read(&sidecar).unwrap();
-        let original = doc.command(json!({"op":"marks"})).unwrap()["annotations"].clone();
+        // Freeze the persisted snapshot before the cut. The shared Foundation codec
+        // writes integral geometry as JSON integers rather than floating-point literals.
+        let original =
+            fixture.open().command(json!({"op":"marks"})).unwrap()["annotations"].clone();
         doc.command(json!({"op":"ink_erase_begin","token":"cut","page":0,"zoom":1,"segments":[{"from":{"x":250,"y":200},"to":{"x":250,"y":350}}]})).unwrap();
         let cut = doc
             .command(json!({"op":"ink_erase_commit","token":"cut","segments":[]}))
@@ -727,7 +745,7 @@ mod tests {
         doc.command(json!({"op":"save_current_annotations","destination":copy}))
             .unwrap();
         assert_eq!(fs::read(&fixture.path).unwrap(), original);
-        let copy_doc = DesktopDocument::open(&copy, None).unwrap();
+        let copy_doc = open_fixture_document(&copy, None).unwrap();
         let file = copy_doc.command(json!({"op":"annotations"})).unwrap();
         assert_eq!(file.as_array().unwrap().len(), 2);
         assert!(
@@ -762,7 +780,7 @@ mod tests {
         copy_doc
             .command(json!({"op":"save_current_annotations","destination":second}))
             .unwrap();
-        let reopened = DesktopDocument::open(&second, None)
+        let reopened = open_fixture_document(&second, None)
             .unwrap()
             .command(json!({"op":"annotations"}))
             .unwrap();
@@ -775,10 +793,203 @@ mod tests {
             .unwrap();
         assert!((moved["x_pt"].as_f64().unwrap() - 260.0).abs() < 0.01);
         assert!((moved["y_pt"].as_f64().unwrap() - 130.0).abs() < 0.01);
-        let sidecar = format!("{}.lyra-reader-annotations.json", fixture.path.display());
+        let sidecar = cache_path(&fixture.path);
         let before = fs::read(&sidecar).unwrap();
         assert!(doc.command(json!({"op":"mark_create","entry":{"kind":"signature","page":0,"version":1,"color":"#000000FF","note":"","image":"invalid","rect":{"x":10,"y":10,"width":10,"height":10}}})).is_err());
         assert_eq!(before, fs::read(&sidecar).unwrap());
+    }
+
+    #[test]
+    fn annotation_cache_uses_document_id_and_ignores_both_adjacent_formats() {
+        let fixture = Fixture::new("text-page.pdf");
+        let modern = format!("{}.lyra-reader-annotations.json", fixture.path.display());
+        let legacy = format!("{}.aris-annotations.json", fixture.path.display());
+        fs::write(&modern, b"deliberately unreadable adjacent file").unwrap();
+        fs::write(&legacy, b"[]").unwrap();
+        let doc = fixture.open();
+        let state = doc.command(json!({"op":"marks"})).unwrap();
+        assert!(state["error"].is_null());
+        assert!(state["annotations"].as_array().unwrap().is_empty());
+        doc.command(json!({"op":"mark_create","entry":{"kind":"highlight","page":0,"start":0,"end":1,"color":"#E8BC5552","note":"cached only"}})).unwrap();
+        let path = cache_path(&fixture.path);
+        assert_eq!(
+            path.parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            doc.active().unwrap().document_id()
+        );
+        assert_eq!(
+            fs::read(&modern).unwrap(),
+            b"deliberately unreadable adjacent file"
+        );
+        assert_eq!(fs::read(&legacy).unwrap(), b"[]");
+        assert_eq!(
+            fixture.open().command(json!({"op":"marks"})).unwrap()["annotations"][0]["note"],
+            "cached only"
+        );
+        #[cfg(unix)]
+        {
+            let alias = fixture.directory.join("alias.pdf");
+            std::os::unix::fs::symlink(&fixture.path, &alias).unwrap();
+            assert_eq!(cache_path(&alias), path);
+            assert_eq!(
+                open_fixture_document(&alias, None)
+                    .unwrap()
+                    .command(json!({"op":"marks"}))
+                    .unwrap()["annotations"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn external_pdf_changes_keep_readable_drafts_and_refuse_replacement() {
+        let fixture = Fixture::new("text-page.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        doc.command(json!({"op":"mark_create","entry":{"kind":"highlight","page":0,"start":0,"end":1,"color":"#E8BC5552","note":"keep after external edit"}})).unwrap();
+        let old_cache = cache_path(&fixture.path);
+        let draft = fs::read(&old_cache).unwrap();
+        // A changed mtime with identical bytes still names the same document.
+        fs::write(&fixture.path, &original).unwrap();
+        assert_eq!(cache_path(&fixture.path), old_cache);
+        assert!(fixture.open().command(json!({"op":"marks"})).unwrap()["error"].is_null());
+        let changed = [original.as_slice(), b"\n% external change\n"].concat();
+        fs::write(&fixture.path, &changed).unwrap();
+        assert!(
+            doc.command(json!({"op":"replace_current_annotations"}))
+                .unwrap_err()
+                .contains("changed outside")
+        );
+        let reopened = fixture.open();
+        let state = reopened.command(json!({"op":"marks"})).unwrap();
+        assert_eq!(state["annotations"][0]["note"], "keep after external edit");
+        assert!(state["error"].as_str().unwrap().contains("changed outside"));
+        assert_ne!(cache_path(&fixture.path), old_cache);
+        assert_eq!(fs::read(old_cache).unwrap(), draft);
+        assert!(
+            reopened
+                .command(json!({"op":"replace_current_annotations"}))
+                .unwrap_err()
+                .contains("changed outside")
+        );
+        assert_eq!(fs::read(&fixture.path).unwrap(), changed);
+    }
+
+    #[test]
+    fn successful_save_rekeys_cleaned_records_and_keeps_foreign_bytes() {
+        let fixture = Fixture::new("text-page.pdf");
+        let old = cache_path(&fixture.path);
+        let foreign = r#"{ "kind":"future-cache-kind", "number":1.0000, "text":"a\/b" }"#;
+        fs::write(&old, format!("[{foreign}]")).unwrap();
+        let doc = fixture.open();
+        let old_identity = doc.active().unwrap().document_identity();
+        doc.command(json!({"op":"mark_create","entry":{"kind":"highlight","page":0,"start":0,"end":1,"color":"#E8BC5552","note":"saved mark"}})).unwrap();
+        let report = doc
+            .command(json!({"op":"replace_current_annotations"}))
+            .unwrap();
+        assert!(report["sidecar_cleanup_error"].is_null(), "{report}");
+        let new = cache_path(&fixture.path);
+        assert_ne!(new, old);
+        assert!(old.exists());
+        assert!(fs::read_to_string(&new).unwrap().contains(foreign));
+        let reopened = fixture.open();
+        assert_ne!(
+            reopened.active().unwrap().document_id(),
+            old_identity.document_id
+        );
+        let state = reopened.command(json!({"op":"marks"})).unwrap();
+        assert!(state["error"].is_null(), "{state}");
+        assert_eq!(state["preserved"], 1);
+        assert!(state["annotations"].as_array().unwrap().is_empty());
+        assert!(
+            reopened
+                .command(json!({"op":"annotations"}))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["contents"] == "saved mark")
+        );
+    }
+
+    #[test]
+    fn corrupt_source_metadata_never_drops_readable_annotation_records() {
+        let fixture = Fixture::new("text-page.pdf");
+        fixture
+            .open()
+            .command(json!({"op":"bookmark_create","page":0,"title":"kept","yPt":0}))
+            .unwrap();
+        let source = cache_path(&fixture.path)
+            .parent()
+            .unwrap()
+            .join("source.json");
+        fs::write(&source, b"broken metadata").unwrap();
+        let doc = fixture.open();
+        let state = doc.command(json!({"op":"marks"})).unwrap();
+        assert_eq!(state["bookmarks"][0]["title"], "kept");
+        assert!(state["error"].as_str().unwrap().contains("source stamp"));
+        assert!(
+            doc.command(json!({"op":"replace_current_annotations"}))
+                .is_err()
+        );
+        assert_eq!(fs::read(source).unwrap(), b"broken metadata");
+    }
+
+    #[test]
+    fn previous_page_recovery_keeps_records_and_pointer_until_it_can_be_restored() {
+        use sha2::{Digest, Sha256};
+        let fixture = Fixture::new("text-page.pdf");
+        let root = fixture_cache_root(&fixture.path);
+        let canonical = fixture.path.canonicalize().unwrap();
+        let key: String = Sha256::digest(canonical.to_string_lossy().as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let legacy = root.join(&key);
+        fs::create_dir_all(&legacy).unwrap();
+        let bytes = br#"[{"id":"AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA","kind":"bookmark","page":0,"title":"recover me","yPt":0,"createdAt":0}]"#;
+        fs::write(legacy.join("annotations.json"), bytes).unwrap();
+        let recovery = br#"{"keep":"complete legacy recovery manifest"}"#;
+        fs::write(legacy.join("session.json"), recovery).unwrap();
+        for _ in 0..2 {
+            let doc = fixture.open();
+            let state = doc.command(json!({"op":"marks"})).unwrap();
+            assert_eq!(state["bookmarks"][0]["title"], "recover me");
+            assert!(state["error"].as_str().unwrap().contains("recovery"));
+            assert!(
+                doc.command(json!({"op":"bookmark_create","page":0,"title":"must wait","yPt":0}))
+                    .is_err()
+            );
+            assert!(
+                doc.command(json!({"op":"replace_current_annotations"}))
+                    .is_err()
+            );
+        }
+        assert_eq!(fs::read(legacy.join("annotations.json")).unwrap(), bytes);
+        assert_eq!(fs::read(legacy.join("session.json")).unwrap(), recovery);
+        assert!(!root.join(format!("{key}.identity")).exists());
+    }
+
+    #[test]
+    fn unavailable_document_cache_keeps_pdf_readable_and_blocks_edits() {
+        let fixture = Fixture::new("text-page.pdf");
+        let blocked = fixture.directory.join("blocked-cache");
+        fs::write(&blocked, b"existing file").unwrap();
+        let doc =
+            DesktopDocument::open_with_cache_root(&fixture.path, None, Some(&blocked)).unwrap();
+        assert_eq!(doc.info().unwrap()["pages"].as_array().unwrap().len(), 1);
+        assert!(doc.command(json!({"op":"marks"})).unwrap()["error"].is_string());
+        assert!(
+            doc.command(json!({"op":"bookmark_create","page":0,"title":"refused","yPt":0}))
+                .is_err()
+        );
+        assert_eq!(fs::read(blocked).unwrap(), b"existing file");
     }
 
     #[test]
@@ -836,7 +1047,7 @@ mod tests {
             }]}))
             .unwrap();
         assert!(report["source_bytes_preserved"].as_bool().unwrap());
-        let filled = DesktopDocument::open(&copy, None)
+        let filled = open_fixture_document(&copy, None)
             .unwrap()
             .command(json!({"op":"forms"}))
             .unwrap();
@@ -850,7 +1061,7 @@ mod tests {
         assert_eq!(fs::read(&fixture.path).unwrap(), original);
         let properties = fixture.directory.join("properties.pdf");
         doc.command(json!({"op":"save_properties","destination":properties,"title":"Linux title","author":"Reader","subject":"Check","keywords":"native"})).unwrap();
-        let info = DesktopDocument::open(&properties, None)
+        let info = open_fixture_document(&properties, None)
             .unwrap()
             .command(json!({"op":"document_info"}))
             .unwrap();
@@ -861,10 +1072,7 @@ mod tests {
     fn annotations_bookmarks_and_future_entries_survive_verified_replace() {
         let fixture = Fixture::new("text-page.pdf");
         let original = fs::read(&fixture.path).unwrap();
-        let sidecar = PathBuf::from(format!(
-            "{}.lyra-reader-annotations.json",
-            fixture.path.display()
-        ));
+        let sidecar = cache_path(&fixture.path);
         let future = r#"{ "kind" : "future-tool", "id":"F12FA132-BB4B-4272-A8F5-64240550BE19", "future" : [1, 2, 3] }"#;
         fs::write(&sidecar, format!("[{future}]\n")).unwrap();
         let doc = fixture.open();
@@ -878,7 +1086,7 @@ mod tests {
         doc.command(json!({"op":"save_current_annotations","destination":copy}))
             .unwrap();
         assert_eq!(fs::read(&fixture.path).unwrap(), original);
-        let copy_doc = DesktopDocument::open(&copy, None).unwrap();
+        let copy_doc = open_fixture_document(&copy, None).unwrap();
         assert_eq!(
             copy_doc
                 .command(json!({"op":"annotations"}))
@@ -915,10 +1123,7 @@ mod tests {
     #[test]
     fn damaged_or_externally_modified_sidecars_are_never_overwritten() {
         let fixture = Fixture::new("text-page.pdf");
-        let sidecar = PathBuf::from(format!(
-            "{}.lyra-reader-annotations.json",
-            fixture.path.display()
-        ));
+        let sidecar = cache_path(&fixture.path);
         fs::write(&sidecar, b"damaged json").unwrap();
         let doc = fixture.open();
         assert!(doc.command(json!({"op":"marks"})).unwrap()["error"].is_string());
@@ -937,18 +1142,21 @@ mod tests {
         assert_eq!(fs::read(&sidecar).unwrap(), b"[ ]\n");
     }
     #[test]
-    fn oversized_sidecar_changes_roll_back_without_overwriting_the_saved_state() {
+    fn oversized_annotation_notes_roll_back_without_overwriting_the_saved_state() {
         let fixture = Fixture::new("text-page.pdf");
         let doc = fixture.open();
         doc.command(json!({"op":"bookmark_create","page":0,"title":"Preserve me","yPt":0}))
             .unwrap();
-        let path = PathBuf::from(format!(
-            "{}.lyra-reader-annotations.json",
-            fixture.path.display()
-        ));
+        let path = cache_path(&fixture.path);
         let before = fs::read(&path).unwrap();
         let error=doc.command(json!({"op":"mark_create","entry":{"kind":"highlight","page":0,"start":0,"end":1,"color":"#E8BC5552","note":"x".repeat(16*1024*1024)}})).unwrap_err();
-        assert!(error.contains("16 MiB"));
+        assert!(
+            error.contains(&format!(
+                "more than {} bytes of text",
+                lyra_reader_edit::rules::MAX_NOTE_BYTES
+            )),
+            "{error}"
+        );
         assert_eq!(fs::read(path).unwrap(), before);
         assert!(
             doc.command(json!({"op":"marks"})).unwrap()["annotations"]
@@ -1074,9 +1282,19 @@ mod tests {
                 .iter()
                 .any(|n| n.as_u64().unwrap() > 0)
         );
-        let merged_doc = DesktopDocument::open(&merged, None).unwrap();
+        let merged_doc = open_fixture_document(&merged, None).unwrap();
         let marks = merged_doc.command(json!({"op":"marks"})).unwrap();
         assert_eq!(marks["annotations"].as_array().unwrap().len(), 2);
+        let embedded = merged_doc.command(json!({"op":"annotations"})).unwrap();
+        for note in ["mark-0", "mark-2"] {
+            assert!(
+                embedded
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|a| a["contents"] == note)
+            );
+        }
         assert!(
             doc.command(json!({"op":"save_merge","others":[other.path],"destination":merged}))
                 .is_err()
@@ -1092,10 +1310,18 @@ mod tests {
             .unwrap();
         assert_eq!(report["parts"].as_array().unwrap().len(), 2);
         let last = PathBuf::from(report["parts"][1]["destination_path"].as_str().unwrap());
-        let part = DesktopDocument::open(&last, None).unwrap();
+        let part = open_fixture_document(&last, None).unwrap();
         let marks = part.command(json!({"op":"marks"})).unwrap();
         assert_eq!(marks["annotations"][0]["page"], 0);
         assert_eq!(marks["annotations"][0]["note"], "mark-2");
+        let embedded = part.command(json!({"op":"annotations"})).unwrap();
+        assert!(
+            embedded
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["contents"] == "mark-2" && a["page"] == 0)
+        );
         assert!(
             doc.command(json!({"op":"save_split","parts":plan["parts"]}))
                 .is_err()
@@ -1106,13 +1332,13 @@ mod tests {
             b"[]",
         )
         .unwrap();
-        assert!(
-            doc.command(
-                json!({"op":"save_split","parts":[{"destination_path":blocked,"pages":[0]}]})
-            )
-            .is_err()
+        doc.command(json!({"op":"save_split","parts":[{"destination_path":blocked,"pages":[0]}]}))
+            .unwrap();
+        assert!(blocked.exists());
+        assert_eq!(
+            fs::read(format!("{}.aris-annotations.json", blocked.display())).unwrap(),
+            b"[]"
         );
-        assert!(!blocked.exists());
         assert_eq!(fs::read(&fixture.path).unwrap(), source_bytes);
     }
 
@@ -1130,7 +1356,7 @@ mod tests {
         let outcome=doc.command(json!({"op":"save_split","parts":[{"destination_path":first,"pages":[0]},{"destination_path":blocked.join("second.pdf"),"pages":[2]}]}));
         fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(outcome.unwrap_err().contains("1 completed outputs"));
-        let first = DesktopDocument::open(&first, None).unwrap();
+        let first = open_fixture_document(&first, None).unwrap();
         let marks = first.command(json!({"op":"marks"})).unwrap();
         assert_eq!(marks["annotations"][0]["note"], "carried");
     }
@@ -1140,17 +1366,13 @@ mod tests {
         let fixture = Fixture::new("multipage.pdf");
         let other = Fixture::new("text-page.pdf");
         let raw = r#"{"kind" : "future-entry", "page": 2, "unknown" : [1, 2]}"#;
-        fs::write(
-            format!("{}.lyra-reader-annotations.json", fixture.path.display()),
-            format!("[{raw}]"),
-        )
-        .unwrap();
+        fs::write(cache_path(&fixture.path), format!("[{raw}]")).unwrap();
         let doc = fixture.open();
         let merged = fixture.directory.join("future-merged.pdf");
         doc.command(json!({"op":"save_merge","others":[other.path],"destination":merged}))
             .unwrap();
         assert!(
-            fs::read_to_string(format!("{}.lyra-reader-annotations.json", merged.display()))
+            fs::read_to_string(cache_path(&merged))
                 .unwrap()
                 .contains(raw)
         );
@@ -1173,7 +1395,7 @@ mod tests {
         doc.command(json!({"op":"save_split","parts":[{"destination_path":copy,"pages":[0]}]}))
             .unwrap();
         assert_eq!(
-            DesktopDocument::open(&copy, None).unwrap().info().unwrap()["signature_status"]["signed"],
+            open_fixture_document(&copy, None).unwrap().info().unwrap()["signature_status"]["signed"],
             false
         );
 
@@ -1193,10 +1415,7 @@ mod tests {
         doc.command(json!({"op":"bookmark_create","page":2,"title":"Last page","yPt":20}))
             .unwrap();
         doc.command(json!({"op":"mark_create","entry":{"kind":"highlight","page":0,"start":0,"end":3,"color":"#E8BC5552","note":"Move with this page"}})).unwrap();
-        let sidecar = PathBuf::from(format!(
-            "{}.lyra-reader-annotations.json",
-            fixture.path.display()
-        ));
+        let sidecar = cache_path(&fixture.path);
         let sidecar_before = fs::read(&sidecar).unwrap();
         assert!(
             doc.command(
@@ -1235,7 +1454,7 @@ mod tests {
         let copy = fixture.directory.join("edited-copy.pdf");
         doc.command(json!({"op":"save_current_edited_copy","destination":copy}))
             .unwrap();
-        let copied = DesktopDocument::open(&copy, None).unwrap();
+        let copied = open_fixture_document(&copy, None).unwrap();
         assert_eq!(copied.info().unwrap()["pages"].as_array().unwrap().len(), 2);
         assert_eq!(
             copied.command(json!({"op":"marks"})).unwrap()["bookmarks"][0]["page"],

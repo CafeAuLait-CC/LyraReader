@@ -594,7 +594,7 @@ private slots:
         reader.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QTRY_VERIFY_WITH_TIMEOUT(ready(),10000);
         window->setProperty("fitting",false);window->setProperty("paperAppearance","original");QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,1.0),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QTest::qWait(100);
         reader.submit("mark_create",{{"entry",QVariantMap{{"kind","ink"},{"page",0},{"version",1},{"paths",QVariantList{QVariantList{QVariantMap{{"x",100},{"y",350}},QVariantMap{{"x",150},{"y",350}},QVariantMap{{"x",250},{"y",350}},QVariantMap{{"x",300},{"y",350}}}}},{"strokeWidth",2},{"color","#1B7F3BFF"},{"note","preserve ink note"}}}});QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QCOMPARE(entries().size(),1);
-        const auto before=entries().first();QFile sidecar(path+".lyra-reader-annotations.json");QVERIFY(sidecar.open(QIODevice::ReadOnly));const auto baseline=sidecar.readAll();sidecar.close();
+        const auto before=entries().first();QFile sidecar(reader.data().value("marks").toMap().value("path").toString());QVERIFY(sidecar.open(QIODevice::ReadOnly));const auto baseline=sidecar.readAll();sidecar.close();
         window->setProperty("annotationTool","eraser");QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,point(200,320));QTest::mouseMove(window,point(200,380),30);
         QTRY_COMPARE_WITH_TIMEOUT(preview().size(),2,10000);QCOMPARE(hidden().size(),1);QCOMPARE(entries().first(),before);
         QVERIFY(sidecar.open(QIODevice::ReadOnly));QCOMPARE(sidecar.readAll(),baseline);sidecar.close();
@@ -1381,6 +1381,9 @@ private slots:
 };
 
 int main(int argc, char **argv) {
+    QTemporaryDir documentCacheDirectory;
+    if(!documentCacheDirectory.isValid())return 2;
+    qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",documentCacheDirectory.path().toUtf8());
     QApplication application(argc, argv);
     QFontDatabase::addApplicationFont(QStringLiteral(":/fonts/LyraReaderSansSC-Regular.ttf"));
     QCoreApplication::setOrganizationName("LyraReaderChecks");

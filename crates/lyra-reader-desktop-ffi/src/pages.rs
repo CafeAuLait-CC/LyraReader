@@ -207,7 +207,7 @@ impl DesktopDocument {
                         self.password.clone(),
                     )
                     .map_err(|e| e.to_string())?;
-                let mut next_marks = Marks::load(&self.original_path, next.page_count());
+                let mut next_marks = Marks::load_opened(&next, marks.cache_root());
                 next_marks.seed_bookmarks(&next)?;
                 edits.base = None;
                 edits.undo.clear();

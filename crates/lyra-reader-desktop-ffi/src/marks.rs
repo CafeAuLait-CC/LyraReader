@@ -1,6 +1,7 @@
-//! The native shells share the macOS sidecar format, including verbatim future entries.
+//! Native-shell persistence adapter for the shared annotation codec and rules.
+use lyra_reader_edit::{kind::AnnotationKind, records, rules};
 use lyra_reader_ffi::api::*;
-use serde_json::{Value, json, value::RawValue};
+use serde_json::{Value, json};
 use std::{
     collections::HashSet,
     fs::{self, OpenOptions},
@@ -14,59 +15,10 @@ const MAX_SIDECAR_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HISTORY_BYTES: usize = 32 * 1024 * 1024;
 static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-const ANNOTATION_KEYS: &[&str] = &[
-    "id",
-    "kind",
-    "page",
-    "start",
-    "end",
-    "color",
-    "colorIndex",
-    "note",
-    "createdAt",
-    "version",
-    "paths",
-    "rect",
-    "lineStart",
-    "lineEnd",
-    "strokeWidth",
-    "fontSize",
-    "fileIdentity",
-    "quads",
-    "textAlignment",
-    "stampStyle",
-    "image",
-];
-const BOOKMARK_KEYS: &[&str] = &["id", "kind", "page", "title", "yPt", "createdAt"];
-const LEGACY_COLORS: [&str; 8] = [
-    "#FFD84066",
-    "#70D06066",
-    "#60A0F066",
-    "#E070B066",
-    "#FFA04066",
-    "#A080F066",
-    "#40C0C066",
-    "#9098A066",
-];
-const KINDS: &[&str] = &[
-    "highlight",
-    "underline",
-    "strikeout",
-    "ink",
-    "square",
-    "circle",
-    "line",
-    "arrow",
-    "stickyNote",
-    "textBox",
-    "stamp",
-    "signature",
-];
-
 #[derive(Clone)]
 enum Entry {
     Known(Value),
-    Opaque(Box<RawValue>),
+    Opaque(String),
 }
 #[derive(Clone)]
 struct Snapshot {
@@ -86,6 +38,8 @@ pub struct Marks {
     erase: Option<ink_erase::Gesture>,
     embedded_bookmarks: HashSet<String>,
     path: PathBuf,
+    cache: Option<crate::document_cache::DocumentCache>,
+    source_error: Option<String>,
     baseline: Option<Vec<u8>>,
     entries: Vec<Entry>,
     deletions: Vec<AnnotationDeleteRecord>,
@@ -135,14 +89,7 @@ pub(super) fn uuid() -> Result<String, String> {
     ))
 }
 fn valid_uuid(s: &str) -> bool {
-    s.len() == 36
-        && s.bytes().enumerate().all(|(i, c)| {
-            if [8, 13, 18, 23].contains(&i) {
-                c == b'-'
-            } else {
-                c.is_ascii_hexdigit()
-            }
-        })
+    records::normalize_uuid(s).is_some()
 }
 fn number(v: &Value, k: &str) -> Result<f64, String> {
     v[k].as_f64()
@@ -154,163 +101,129 @@ fn string(v: &Value, k: &str) -> Result<String, String> {
         .map(str::to_string)
         .ok_or_else(|| format!("Missing {k}"))
 }
-fn rect(v: &Value) -> Result<(), String> {
-    number(v, "x")?;
-    number(v, "y")?;
-    if number(v, "width")? <= 0.0 || number(v, "height")? <= 0.0 {
-        return Err("Invalid annotation rectangle".into());
-    }
-    Ok(())
-}
-fn point(v: &Value) -> Result<(), String> {
-    number(v, "x")?;
-    number(v, "y")?;
-    Ok(())
-}
 fn color(v: &Value) -> Option<String> {
-    if let Some(s) = v["color"].as_str().filter(|s| {
-        s.len() == 9 && s.starts_with('#') && s[1..].bytes().all(|c| c.is_ascii_hexdigit())
-    }) {
-        return Some(s.to_uppercase());
+    if let Some(text) = v["color"].as_str() {
+        return records::PaletteColor::from_hex(text).map(|c| c.hex());
     }
-    v["colorIndex"]
-        .as_u64()
-        .and_then(|i| LEGACY_COLORS.get(i as usize))
-        .map(|s| s.to_string())
+    v["colorIndex"].as_u64().and_then(|index| {
+        usize::try_from(index).ok().and_then(|index| {
+            records::legacy_highlight_palette()
+                .get(index)
+                .map(|c| c.hex())
+        })
+    })
 }
 fn kind(v: &Value) -> &str {
     v["kind"].as_str().unwrap_or("highlight")
 }
+fn decode_records(bytes: &[u8], pages: u32) -> Result<records::Contents, String> {
+    records::decode(bytes, pages as usize, &records::legacy_highlight_palette())
+        .map_err(|e| format!("Invalid annotation records: {e}"))
+}
+
+fn decode_entries(bytes: &[u8], pages: u32) -> Result<Vec<Entry>, String> {
+    let contents = decode_records(bytes, pages)?;
+    // Normalize known entries through the production codec. Opaque slots retain their
+    // original source bytes, including numeric spellings and escaped characters.
+    let normalized = records::encode(
+        &contents.annotations,
+        &contents.bookmarks,
+        &contents.slots,
+        &records::legacy_highlight_palette(),
+    )
+    .map_err(|e| e.to_string())?;
+    let values: Vec<Value> = serde_json::from_slice(&normalized).map_err(|e| e.to_string())?;
+    if values.len() != contents.slots.len() {
+        return Err("The annotation codec returned an inconsistent entry order".into());
+    }
+    Ok(values
+        .into_iter()
+        .zip(contents.slots)
+        .map(|(value, slot)| match slot {
+            records::Slot::Opaque(raw) => Entry::Opaque(raw),
+            _ => Entry::Known(value),
+        })
+        .collect())
+}
+
+fn encode_entries(
+    entries: &[Entry],
+    pages: u32,
+    transient: &HashSet<String>,
+) -> Result<Vec<u8>, String> {
+    let elements = entries
+        .iter()
+        .filter(|e| {
+            !matches!(e, Entry::Known(v)
+        if v["id"].as_str().is_some_and(|id| transient.contains(id)))
+        })
+        .map(|e| match e {
+            Entry::Known(value) => serde_json::to_string(value).map_err(|e| e.to_string()),
+            Entry::Opaque(raw) => Ok(raw.clone()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let input = format!("[{}]", elements.join(","));
+    let contents = decode_records(input.as_bytes(), pages)?;
+    records::encode(
+        &contents.annotations,
+        &contents.bookmarks,
+        &contents.slots,
+        &records::legacy_highlight_palette(),
+    )
+    .map_err(|e| e.to_string())
+}
+
 fn validate(v: &Value, pages: u32) -> Result<bool, String> {
-    let object = v.as_object().ok_or("Sidecar entry is not an object")?;
-    let k = kind(v);
-    let keys = if k == "bookmark" {
-        BOOKMARK_KEYS
-    } else {
-        ANNOTATION_KEYS
-    };
-    if object.keys().any(|key| !keys.contains(&key.as_str())) {
+    let bytes = serde_json::to_vec(&vec![v]).map_err(|e| e.to_string())?;
+    let contents = decode_records(&bytes, pages)?;
+    if contents.preserved_count() != 0 {
         return Ok(false);
     }
-    if k != "bookmark" {
-        if !KINDS.contains(&k) || color(v).is_none() {
-            return Ok(false);
-        }
-        let geometry = [
-            "ink",
-            "square",
-            "circle",
-            "line",
-            "arrow",
-            "stickyNote",
-            "textBox",
-            "stamp",
-            "signature",
-        ]
-        .contains(&k);
-        if geometry && v["version"].as_u64() != Some(1) || !geometry && v.get("version").is_some() {
-            return Ok(false);
-        }
-    }
-    if !valid_uuid(&string(v, "id")?) {
-        return Err("Invalid sidecar identity".into());
-    }
-    if v["page"]
-        .as_u64()
-        .filter(|p| *p < u64::from(pages))
-        .is_none()
-    {
-        return Err("Sidecar page is outside the document".into());
-    }
-    number(v, "createdAt")?;
-    if k == "bookmark" {
-        string(v, "title")?;
-        if number(v, "yPt")? < 0.0 {
-            return Err("Invalid bookmark position".into());
-        }
-        return Ok(true);
-    }
-    string(v, "note")?;
-    match k {
-        "highlight" | "underline" | "strikeout" => {
-            if v["start"].as_u64().is_none()
-                || v["end"].as_u64().is_none()
-                || v["end"].as_u64() < v["start"].as_u64()
-            {
-                return Err("Invalid text annotation range".into());
-            }
-        }
-        "ink" => {
-            let paths = v["paths"].as_array().ok_or("Missing ink paths")?;
-            if paths.is_empty() {
-                return Err("Empty ink paths".into());
-            }
-            for path in paths {
-                let points = path.as_array().ok_or("Invalid ink path")?;
-                if points.len() < 2 {
-                    return Err("An ink path needs two points".into());
-                }
-                for p in points {
-                    point(p)?
-                }
-            }
-            if number(v, "strokeWidth")? <= 0.0 {
-                return Err("Invalid stroke width".into());
-            }
-        }
-        "square" | "circle" => {
-            rect(&v["rect"])?;
-            if number(v, "strokeWidth")? <= 0.0 {
-                return Err("Invalid stroke width".into());
-            }
-        }
-        "line" | "arrow" => {
-            point(&v["lineStart"])?;
-            point(&v["lineEnd"])?;
-            if number(v, "strokeWidth")? <= 0.0 {
-                return Err("Invalid stroke width".into());
-            }
-        }
-        "stickyNote" | "textBox" => {
-            rect(&v["rect"])?;
-            number(v, "fontSize")?;
-        }
-        "stamp" => {
-            rect(&v["rect"])?;
-            if string(v, "note")?.trim().is_empty() {
-                return Err("A stamp needs text".into());
-            }
-            if !matches!(
-                v["stampStyle"].as_str().unwrap_or("custom"),
-                "approved" | "reviewed" | "draft" | "confidential" | "date" | "custom"
-            ) {
-                return Ok(false);
-            }
-        }
-        "signature" => {
-            rect(&v["rect"])?;
-            if !string(v, "note")?.is_empty() {
-                return Err("A signature image cannot carry stamp text".into());
-            }
+    for annotation in &contents.annotations {
+        rules::validate_annotation(annotation, pages as usize, &[]).map_err(|e| e.to_string())?;
+        if annotation.kind == AnnotationKind::Signature {
             crate::artwork::dimensions(&string(v, "image")?)?;
         }
-        _ => {}
     }
-    if let Some(quads) = v.get("quads") {
-        for q in quads.as_array().ok_or("Invalid quads")? {
-            rect(q)?
-        }
+    for bookmark in &contents.bookmarks {
+        rules::validate_bookmark(bookmark, pages as usize, &[]).map_err(|e| e.to_string())?;
     }
     Ok(true)
 }
 
 impl Marks {
+    pub fn validate_source(&self) -> Result<(), String> {
+        self.cache
+            .as_ref()
+            .ok_or("The document cache is unavailable")?
+            .validate_source()
+    }
+    pub fn cache_root(&self) -> Option<&Path> {
+        self.cache.as_ref().map(|c| c.root.as_path())
+    }
+    pub fn after_save(&mut self) -> Result<(), String> {
+        let cache = self
+            .cache
+            .as_ref()
+            .ok_or("The document cache is unavailable")?
+            .after_save()?;
+        self.path = cache.annotations();
+        self.baseline = if self.path.exists() {
+            Some(fs::read(&self.path).map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
+        self.source_error = None;
+        self.cache = Some(cache);
+        Ok(())
+    }
     pub fn can_stage(&self, operation: &PageOperationRecord) -> Result<(), String> {
+        self.validate_source()?;
         if let Some(error) = &self.error {
             return Err(error.clone());
         }
         if self.entries.iter().any(|e| matches!(e, Entry::Opaque(_))) {
-            return Err("The sidecar contains entries from another version whose pages cannot be remapped safely. Page editing is disabled.".into());
+            return Err("The annotation cache contains entries from another version whose pages cannot be remapped safely. Page editing is disabled.".into());
         }
         let rotating = match operation {
             PageOperationRecord::Rotate { pages, .. }
@@ -324,17 +237,20 @@ impl Marks {
                 && !v["id"].as_str().is_some_and(|id| self.embedded_bookmarks.contains(id)))
             })
         {
-            return Err("These pages have sidecar annotations or bookmarks. Save the marks inside the PDF before rotating, so their text positions cannot move to different words.".into());
+            return Err("These pages have annotation cache annotations or bookmarks. Save the marks inside the PDF before rotating, so their text positions cannot move to different words.".into());
         }
         Ok(())
     }
     pub fn validate_export(&self, remapping: bool) -> Result<(), String> {
+        self.validate_source()?;
         if let Some(error) = &self.error {
-            return Err(format!("The annotation sidecar cannot be read: {error}"));
+            return Err(format!(
+                "The annotation annotation cache cannot be read: {error}"
+            ));
         }
         if remapping && self.entries.iter().any(|e| matches!(e, Entry::Opaque(_))) {
             return Err(
-                "The sidecar contains unknown entries whose pages cannot be remapped safely".into(),
+                "The annotation cache contains unknown entries whose pages cannot be remapped safely".into(),
             );
         }
         if !self.deletions.is_empty() {
@@ -396,7 +312,16 @@ impl Marks {
         };
         let mut result = self.clone();
         result.erase = None;
-        result.path = PathBuf::from(format!("{}.lyra-reader-annotations.json", path.display()));
+        let root = self
+            .cache
+            .as_ref()
+            .ok_or("The document cache is unavailable")?
+            .root
+            .clone();
+        let cache = crate::document_cache::DocumentCache::open(path, &root)?;
+        result.path = cache.annotations();
+        result.source_error = cache.validate_source().err();
+        result.cache = Some(cache);
         result.baseline = None;
         result.page_count = new.page_count();
         result.undo.clear();
@@ -408,7 +333,7 @@ impl Marks {
                     entries.push(entry.clone());
                     continue;
                 }
-                return Err("Unsupported sidecar entry".into());
+                return Err("Unsupported annotation cache entry".into());
             };
             if v["id"]
                 .as_str()
@@ -456,13 +381,16 @@ impl Marks {
         original: &Self,
         publish: impl FnOnce() -> Result<T, String>,
     ) -> Result<(T, Self, Option<PathBuf>), String> {
+        original.validate_source()?;
         let mut prepared = self.clone();
         prepared.path = original
             .path
             .with_extension(format!("json.prepared-{}", uuid()?));
         prepared.baseline = None;
         prepared.persist()?;
-        let _write_guard = WRITES.lock().map_err(|_| "Sidecar writer is unavailable")?;
+        let _write_guard = WRITES
+            .lock()
+            .map_err(|_| "Annotation cache writer is unavailable")?;
         let current = if original.path.exists() {
             Some(fs::read(&original.path).map_err(|e| e.to_string())?)
         } else {
@@ -470,7 +398,7 @@ impl Marks {
         };
         if current != original.baseline {
             let _ = fs::remove_file(&prepared.path);
-            return Err("The original sidecar changed during page editing. The original PDF was not replaced.".into());
+            return Err("The original annotation cache changed during page editing. The original PDF was not replaced.".into());
         }
         let backup = if let Some(bytes) = current {
             let path = original
@@ -494,7 +422,7 @@ impl Marks {
                 .and_then(|_| file.sync_all())
                 .map_err(|e| e.to_string())?;
             if fs::read(&path).map_err(|e| e.to_string())? != bytes {
-                return Err("Sidecar backup verification failed".into());
+                return Err("Annotation cache backup verification failed".into());
             }
             Some(path)
         } else {
@@ -508,21 +436,27 @@ impl Marks {
             }
         };
         let mut result = self.clone();
+        result.cache = original.cache.clone();
         result.path = original.path.clone();
         result.baseline = prepared.baseline.clone();
         result.undo.clear();
         result.redo.clear();
         if let Err(error) = fs::rename(&prepared.path, &original.path) {
             result.error = Some(format!(
-                "The PDF was saved, but the remapped sidecar could not be published: {error}. Recovery data: {}",
+                "The PDF was saved, but the remapped annotation cache could not be published: {error}. Recovery data: {}",
                 prepared.path.display()
+            ));
+        } else if let Err(error) = result.after_save() {
+            result.error = Some(format!(
+                "The PDF was saved, but its document cache needs recovery: {error}"
             ));
         }
         Ok((report, result, backup))
     }
     pub fn payload(&self, document: &LyraReaderDocument) -> Result<Payload, String> {
+        self.validate_source()?;
         if let Some(error) = &self.error {
-            return Err(format!("Sidecar writes are blocked: {error}"));
+            return Err(format!("Annotation cache writes are blocked: {error}"));
         }
         let file = document.annotations().map_err(|e| e.to_string())?;
         let mut result = Payload {
@@ -705,7 +639,7 @@ impl Marks {
         for entry in &self.entries {
             let value = match entry {
                 Entry::Known(v) => v.clone(),
-                Entry::Opaque(raw) => serde_json::from_str(raw.get()).map_err(|e| e.to_string())?,
+                Entry::Opaque(raw) => serde_json::from_str(raw).map_err(|e| e.to_string())?,
             };
             if let Some(id) = value["id"].as_str() {
                 identities.insert(id.to_uppercase());
@@ -730,16 +664,36 @@ impl Marks {
         }
         Ok(())
     }
-    pub fn load(document: &Path, page_count: u32) -> Self {
-        let current = PathBuf::from(format!(
-            "{}.lyra-reader-annotations.json",
-            document.display()
-        ));
-        let legacy = PathBuf::from(format!("{}.aris-annotations.json", document.display()));
-        let path = if !current.exists() && legacy.exists() {
-            legacy
-        } else {
-            current
+    pub fn load_opened(document: &LyraReaderDocument, root: Option<&Path>) -> Self {
+        Self::load_internal(
+            Path::new(&document.path()),
+            document.page_count(),
+            root,
+            Some(document.document_identity()),
+        )
+    }
+    pub fn load_with_root(document: &Path, page_count: u32, root: Option<&Path>) -> Self {
+        Self::load_internal(document, page_count, root, None)
+    }
+    fn load_internal(
+        document: &Path,
+        page_count: u32,
+        root: Option<&Path>,
+        identity: Option<DocumentIdentityRecord>,
+    ) -> Self {
+        let location = root
+            .map(|p| Ok(p.to_path_buf()))
+            .unwrap_or_else(crate::document_cache::default_root)
+            .and_then(|root| {
+                crate::document_cache::DocumentCache::open_with_identity(document, &root, identity)
+            });
+        let (cache, path, initial_error) = match location {
+            Ok(cache) => {
+                let path = cache.annotations();
+                (Some(cache), path, None)
+            }
+            // Keep the PDF readable; an unavailable location explicitly blocks annotation writes.
+            Err(error) => (None, PathBuf::new(), Some(error)),
         };
         let mut result = Self {
             transient_ink: HashSet::new(),
@@ -747,39 +701,30 @@ impl Marks {
             erase: None,
             embedded_bookmarks: HashSet::new(),
             path,
+            source_error: cache.as_ref().and_then(|c| c.opened_source_status().err()),
+            cache,
             baseline: None,
             entries: vec![],
             deletions: vec![],
             undo: vec![],
             redo: vec![],
-            error: None,
+            error: initial_error,
             page_count,
         };
         let parsed = (|| -> Result<(), String> {
+            if let Some(error) = &result.error {
+                return Err(error.clone());
+            }
             if !result.path.exists() {
                 return Ok(());
             }
             if fs::metadata(&result.path).map_err(|e| e.to_string())?.len()
                 > MAX_SIDECAR_BYTES as u64
             {
-                return Err("Sidecar exceeds the 16 MiB limit".into());
+                return Err("Annotation cache exceeds the 16 MiB limit".into());
             }
             let bytes = fs::read(&result.path).map_err(|e| e.to_string())?;
-            let raw: Vec<Box<RawValue>> = serde_json::from_slice(&bytes)
-                .map_err(|e| format!("Invalid annotation sidecar: {e}"))?;
-            let mut ids = HashSet::new();
-            for entry in raw {
-                let value: Value = serde_json::from_str(entry.get()).map_err(|e| e.to_string())?;
-                if validate(&value, page_count)? {
-                    let identity = string(&value, "id")?.to_uppercase();
-                    if !ids.insert(identity) {
-                        return Err("Duplicate sidecar identity".into());
-                    }
-                    result.entries.push(Entry::Known(value));
-                } else {
-                    result.entries.push(Entry::Opaque(entry))
-                }
-            }
+            result.entries = decode_entries(&bytes, page_count)?;
             result.baseline = Some(bytes);
             Ok(())
         })();
@@ -801,7 +746,7 @@ impl Marks {
             .iter()
             .map(|e| match e {
                 Entry::Known(v) => serde_json::to_vec(v).map_or(0, |b| b.len()),
-                Entry::Opaque(v) => v.get().len(),
+                Entry::Opaque(v) => v.len(),
             })
             .sum::<usize>()
             + self
@@ -835,9 +780,11 @@ impl Marks {
         self.deletions = s.deletions;
     }
     fn persist(&mut self) -> Result<(), String> {
-        let _write_guard = WRITES.lock().map_err(|_| "Sidecar writer is unavailable")?;
+        let _write_guard = WRITES
+            .lock()
+            .map_err(|_| "Annotation cache writer is unavailable")?;
         if let Some(error) = &self.error {
-            return Err(format!("Sidecar writes are blocked: {error}"));
+            return Err(format!("Annotation cache writes are blocked: {error}"));
         }
         let current = if self.path.exists() {
             Some(fs::read(&self.path).map_err(|e| e.to_string())?)
@@ -846,22 +793,15 @@ impl Marks {
         };
         if current != self.baseline {
             return Err(
-                "The sidecar changed outside this window. Reopen the document before saving."
+                "The annotation cache changed outside this window. Reopen the document before saving."
                     .into(),
             );
         }
-        let elements = self
-            .entries
-            .iter()
-            .filter(|e| !matches!(e,Entry::Known(v) if v["id"].as_str().is_some_and(|id|self.transient_ink.contains(id))))
-            .map(|e| match e {
-                Entry::Known(v) => serde_json::to_string(v).unwrap(),
-                Entry::Opaque(raw) => raw.get().to_string(),
-            })
-            .collect::<Vec<_>>();
-        let bytes = format!("[\n{}\n]\n", elements.join(",\n")).into_bytes();
+        let bytes = encode_entries(&self.entries, self.page_count, &self.transient_ink)?;
         if bytes.len() > MAX_SIDECAR_BYTES {
-            return Err("Sidecar exceeds the 16 MiB limit; this change was not saved".into());
+            return Err(
+                "Annotation cache exceeds the 16 MiB limit; this change was not saved".into(),
+            );
         }
         if self.baseline.as_ref() == Some(&bytes) {
             return Ok(());
@@ -899,6 +839,9 @@ impl Marks {
         Ok(())
     }
     fn change(&mut self, task: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), String> {
+        if let Some(cache) = &self.cache {
+            cache.validate_recovery()?;
+        }
         self.erase = None;
         if let Some(error) = &self.error {
             return Err(error.clone());
@@ -973,7 +916,7 @@ impl Marks {
             .collect();
         let file = crate::artwork::annotations(file)?;
         Ok(
-            json!({"annotations":own,"file_annotations":file,"bookmarks":bookmarks,"can_undo":!self.undo.is_empty(),"can_redo":!self.redo.is_empty(),"preserved":self.entries.iter().filter(|e|matches!(e,Entry::Opaque(_))).count(),"error":self.error,"path":self.path,"pdf_dirty":!own.is_empty()||!self.deletions.is_empty(),"pending_deletions":self.deletions.len()}),
+            json!({"annotations":own,"file_annotations":file,"bookmarks":bookmarks,"can_undo":!self.undo.is_empty(),"can_redo":!self.redo.is_empty(),"preserved":self.entries.iter().filter(|e|matches!(e,Entry::Opaque(_))).count(),"error":self.error.as_ref().or(self.source_error.as_ref()),"path":self.path,"pdf_dirty":!own.is_empty()||!self.deletions.is_empty(),"pending_deletions":self.deletions.len()}),
         )
     }
     fn display(&self, v: &Value, document: &LyraReaderDocument) -> Result<Value, String> {
@@ -1253,7 +1196,7 @@ impl Marks {
                     "line" if a.line_arrow => "arrow",
                     "text" => "stickyNote",
                     "freeText" => "textBox",
-                    kind if KINDS.contains(&kind) => kind,
+                    kind if AnnotationKind::from_record_kind(kind).is_some() => kind,
                     _ => {
                         return Err(
                             "This annotation kind can be deleted but cannot be edited".into()
@@ -1350,11 +1293,14 @@ impl Marks {
                 return Ok(state);
             }
             "marks_recover" => {
+                if let Some(cache) = &self.cache {
+                    cache.validate_recovery()?;
+                }
                 let bytes = fs::read(&self.path).map_err(|e| e.to_string())?;
                 let backup = self.path.with_extension(format!("json.backup-{}", uuid()?));
                 fs::copy(&self.path, &backup).map_err(|e| e.to_string())?;
                 if fs::read(&backup).map_err(|e| e.to_string())? != bytes {
-                    return Err("Sidecar backup verification failed".into());
+                    return Err("Annotation cache backup verification failed".into());
                 }
                 self.error = None;
                 self.baseline = Some(bytes);
@@ -1375,5 +1321,54 @@ impl Marks {
             state["selected_id"] = json!(id);
         }
         Ok(state)
+    }
+}
+
+#[cfg(test)]
+mod codec_checks {
+    use super::*;
+
+    #[test]
+    fn desktop_codec_round_trips_the_shared_foundation_goldens_byte_for_byte() {
+        for name in [
+            "empty.json",
+            "plain-highlights.json",
+            "every-kind.json",
+            "notes-newlines.json",
+            "bookmarks-unicode.json",
+            "old-version-record.json",
+            "unknown-extra-fields.json",
+            "interleaved-order.json",
+            "ui-add-highlight.json",
+        ] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/annotation-codec")
+                .join(name);
+            let bytes = fs::read(path).expect("required shared annotation golden");
+            let entries = decode_entries(&bytes, 1000).expect(name);
+            assert_eq!(
+                encode_entries(&entries, 1000, &HashSet::new()).expect(name),
+                bytes,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn imported_opaque_numbers_and_escaped_strings_keep_their_original_bytes() {
+        let foreign = r#"{ "kind":"future", "number":1.0000e+00, "text":"a\/b" }"#;
+        let entries = decode_entries(format!("[{foreign}]").as_bytes(), 1).expect("foreign entry");
+        let output = encode_entries(&entries, 1, &HashSet::new()).expect("encode");
+        assert!(String::from_utf8(output).expect("UTF-8").contains(foreign));
+    }
+
+    #[test]
+    fn new_annotations_use_the_shared_writer_limits_before_persistence() {
+        let value = json!({"id":"FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF", "kind":"highlight",
+            "page":0,"start":0,"end":1,"note":"x".repeat(16*1024*1024),
+            "createdAt":0,"color":"#E8BC5552"});
+        let decoded = decode_records(&serde_json::to_vec(&vec![&value]).unwrap(), 1).unwrap();
+        let expected = rules::validate_annotation(&decoded.annotations[0], 1, &[]).unwrap_err();
+        assert_eq!(validate(&value, 1).unwrap_err(), expected.to_string());
     }
 }

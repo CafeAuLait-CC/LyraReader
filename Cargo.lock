@@ -937,11 +937,13 @@ dependencies = [
  "getrandom 0.4.3",
  "image",
  "lyra-reader-core",
+ "lyra-reader-edit",
  "lyra-reader-ffi",
  "lyra-reader-runtime",
  "lyra-reader-session",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

@@ -456,6 +456,34 @@ impl From<lyra_reader_core::LyraReaderError> for LyraReaderFfiError {
     }
 }
 
+/// Frozen document and content identity for platform cache adapters.
+#[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
+pub struct DocumentIdentityRecord {
+    pub document_id: String,
+    pub canonical_path: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
+/// The same identity used by an open document, for cache migration and source checks.
+#[uniffi::export]
+pub fn document_identity_for_path(
+    path: String,
+) -> Result<DocumentIdentityRecord, LyraReaderFfiError> {
+    let identity = crate::document_id::DocumentId::of(Path::new(&path))?;
+    Ok(document_identity_record(&identity))
+}
+
+fn document_identity_record(identity: &crate::document_id::DocumentId) -> DocumentIdentityRecord {
+    DocumentIdentityRecord {
+        document_id: identity.key().to_string(),
+        canonical_path: identity.canonical_path.to_string_lossy().into_owned(),
+        size: identity.content.bytes,
+        sha256: identity.content.sha256.clone(),
+    }
+}
+
 /// Value-typed document summary, safe to copy across the boundary.
 #[derive(Debug, Clone, uniffi::Record)]
 #[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
@@ -1821,6 +1849,11 @@ impl LyraReaderDocument {
     /// open handle still describes the bytes it parsed, which is what its other records mean).
     pub fn document_id(&self) -> String {
         self.document_id.key().to_string()
+    }
+
+    /// Frozen identity of the bytes this handle opened; this never hashes again.
+    pub fn document_identity(&self) -> DocumentIdentityRecord {
+        document_identity_record(&self.document_id)
     }
 
     pub fn page_count(&self) -> u32 {
