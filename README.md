@@ -32,8 +32,10 @@ keyed by the engine's document identity; old JSON companions beside PDFs are ign
 `LYRA_READER_DOCUMENT_CACHE_DIR` to an absolute directory to isolate recoverable reader state.
 Page edits use the shared Rust transaction, with revision/annotation recovery and undo history in
 the application cache. Rotating a marked page embeds the cached marks into a working revision first;
-undo restores the preceding PDF and its cached marks together. Unified Save/Save As and several
-newer macOS features are still being ported.
+undo restores the preceding PDF and its cached marks together. Save combines the active revision,
+annotations, bookmarks and pending form values, verifies a backup, then reopens the saved original.
+Save As writes a combined copy and keeps the original session open. Several newer macOS features
+are still being ported.
 The Linux branch is not yet a release or a claim of full feature parity.
 
 ## Capabilities
@@ -175,8 +177,9 @@ Per-milestone detail, measurements and the remaining work live in the design not
 ## License
 
 This project is released under the MIT licence ([LICENSE](LICENSE)). The components it ships or links are
-listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md); all of them are permissive, and no AGPL component is
-included (MuPDF is excluded on purpose). The decision record is [ADR-0005](docs/adr/0005-licensing.md).
+listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md), including the Qt frontend's dynamically linked
+dependencies and distribution requirements. No AGPL component is included (MuPDF is excluded on purpose).
+The decision record is [ADR-0005](docs/adr/0005-licensing.md).
 
 Notable components: PDFium (BSD-3-Clause), wgpu (Apache-2.0), pdfium-render (MIT OR Apache-2.0), UniFFI
 (MPL-2.0, build-time only), ureq (MIT OR Apache-2.0), rustls (Apache-2.0 OR ISC OR MIT), unicode-segmentation

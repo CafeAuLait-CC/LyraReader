@@ -1294,6 +1294,36 @@ private slots:
             preview->close();
         }
     }
+    void unifiedSaveCombinesTheActiveRevisionAndDraftsAndReopensRenderedContent() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/save.pdf",copy=scratch.path()+"/copy.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/form-fields.pdf",path));QFile source(path);QVERIFY(source.open(QIODevice::ReadOnly));const auto original=source.readAll();source.close();
+        WorkspaceController workspace;auto *reader=workspace.activeReader();QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);
+        engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",reader);engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        reader->openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),2,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        reader->submit("page_stage",{{"operation",QVariantMap{{"InsertBlank",QVariantMap{{"index",0}}}}}});QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        reader->submit("mark_create",{{"entry",QVariantMap{{"kind","square"},{"version",1},{"page",1},{"rect",QVariantMap{{"x",20},{"y",50},{"width",80},{"height",40}}},{"strokeWidth",2},{"color","#E8BC5580"},{"note","Unified shape"}}}});
+        reader->submit("bookmark_create",{{"page",1},{"title","Unified bookmark"},{"yPt",20}});reader->submit("forms");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
+        QVariantMap field;for(const auto &entry:reader->data().value("forms").toMap().value("fields").toList())if(entry.toMap().value("kind")==QString("text")){field=entry.toMap();break;}QVERIFY(!field.isEmpty());
+        QVERIFY(QMetaObject::invokeMethod(window,"updateFormValue",Q_ARG(QVariant,field.value("id")),Q_ARG(QVariant,(QVariantMap{{"text","Unified Qt form"}}))));
+        const auto drafts=reader->editDrafts().value("forms").toMap();QVariantList forms;for(const auto &entry:drafts)forms.append(entry);
+        window->setProperty("exportContext",QVariantMap{{"reader",QVariant::fromValue(reader)},{"revision",reader->data().value("document_revision")},{"kind","document"},{"forms",forms}});
+        QVERIFY(QMetaObject::invokeMethod(window,"exportTo",Q_ARG(QVariant,QUrl::fromLocalFile(copy))));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QVERIFY(reader->hasEditDrafts());
+        ReaderController copied;copied.openFile(QUrl::fromLocalFile(copy));QTRY_COMPARE_WITH_TIMEOUT(copied.pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(copied.pendingCommands(),0,10000);QCOMPARE(copied.data().value("annotations").toList().size(),1);
+        QVERIFY(source.open(QIODevice::ReadOnly));QCOMPARE(source.readAll(),original);source.close();
+        QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,1),Q_ARG(QVariant,120)));QTRY_COMPARE(window->property("currentPage").toInt(),1);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTRY_VERIFY(!window->property("positionRestoring").toBool());
+        QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));const auto beforeSave=workspace.viewState(reader);
+        auto *action=window->findChild<QObject *>("saveDocumentAction");QVERIFY(action);QTRY_VERIFY(action->property("enabled").toBool());QVERIFY(QMetaObject::invokeMethod(action,"trigger"));
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QTRY_VERIFY(reader->editDrafts().isEmpty());QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
+        QVERIFY(!reader->data().value("marks").toMap().value("page_session_active").toBool());QCOMPARE(reader->pageCount(),3);QTRY_COMPARE(window->property("currentPage").toInt(),1);
+        QTRY_VERIFY(!window->property("positionRestoring").toBool());QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));
+        QVERIFY(qAbs(workspace.viewState(reader).value("offset").toDouble()-beforeSave.value("offset").toDouble())<2.0);
+        reader->submit("annotations");reader->submit("forms");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QCOMPARE(reader->data().value("annotations").toList().size(),1);
+        bool filled=false;for(const auto &entry:reader->data().value("forms").toMap().value("fields").toList())filled|=entry.toMap().value("value")==QString("Unified Qt form");QVERIFY(filled);
+        const auto result=reader->data().value("marks").toMap();QVERIFY(result.value("annotations").toList().isEmpty());QCOMPARE(result.value("bookmarks").toList().first().toMap().value("page").toInt(),1);
+        reader->openFile(QUrl::fromLocalFile(root+"/tests/fixtures/xfa-refusal.pdf"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTRY_VERIFY(reader->pageCount()>0);
+        QVERIFY(reader->data().value("xfa_status").toMap().value("is_xfa").toBool());QVERIFY(!action->property("enabled").toBool());
+        auto *saveAs=window->findChild<QObject *>("saveDocumentAsAction");QVERIFY(saveAs);QVERIFY(!saveAs->property("enabled").toBool());
+    }
     void recoveredPageSessionsRestoreLocationAndDiscardBeforeTabClosure() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/recovery.pdf";
         QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",path));

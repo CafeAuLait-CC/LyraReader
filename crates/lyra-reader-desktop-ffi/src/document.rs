@@ -14,7 +14,7 @@ use std::{
 pub struct DesktopDocument {
     pub(super) engine: RwLock<Arc<LyraReaderDocument>>,
     pub(super) layout: RwLock<DocumentLayout>,
-    original_signature: SignatureStatusRecord,
+    pub(super) original_signature: SignatureStatusRecord,
     ai: Mutex<Option<Arc<LyraReaderAiRequest>>>,
     pub(super) marks: Mutex<crate::marks::Marks>,
     pub(super) edits: Mutex<crate::pages::PageEdits>,
@@ -105,7 +105,7 @@ impl DesktopDocument {
             .map_err(|_| "Layout state is unavailable")?;
         Ok(json!({
             "pages":layout.placements().iter().map(|p|json!({"index":p.index,"width":p.width_pt,"height":p.height_pt,"top":p.top_pt,"left":p.left_pt})).collect::<Vec<_>>(),
-            "width":layout.content_width_pt(),"height":layout.content_height_pt(),"gap":layout.gap_pt(),"path":self.original_path,"signature_status":self.original_signature,"recovery":self.recovery_status.lock().map_err(|_|"Recovery state is unavailable")?.clone(),
+            "width":layout.content_width_pt(),"height":layout.content_height_pt(),"gap":layout.gap_pt(),"path":self.original_path,"revision":self.active()?.path(),"signature_status":self.original_signature,"xfa_status":self.active()?.xfa_status(),"recovery":self.recovery_status.lock().map_err(|_|"Recovery state is unavailable")?.clone(),
         }))
     }
 
@@ -158,7 +158,12 @@ impl DesktopDocument {
         }
         if matches!(
             op,
-            "page_stage" | "page_undo" | "page_redo" | "page_discard" | "page_apply"
+            "page_stage"
+                | "page_undo"
+                | "page_redo"
+                | "page_discard"
+                | "page_apply"
+                | "document_save"
         ) {
             return self.page_command(op, &r);
         }
@@ -224,7 +229,7 @@ impl DesktopDocument {
             return Ok(edits.annotate_state(state, &active, &self.original_path));
         }
         match op {
-            "save_current_edited_copy" => {
+            "save_current_edited_copy" | "save_document_copy" => {
                 let marks = self
                     .marks
                     .lock()
@@ -232,14 +237,19 @@ impl DesktopDocument {
                 let destination = text(&r, "destination")?;
                 let original = crate::marks::Marks::load_with_root(Path::new(&destination), d.page_count(), marks.cache_root());
                 let payload=marks.payload(&d)?;
+                let prepared=crate::saving::prepare(&d,&marks.cache_location()?.directory,&r,self.password.clone())?;
+                let d=&prepared.document;
                 let clean=marks.cleaned_for_save(&payload.ids);
-                let (report, _, _) = clean.publish_page_revision(&original, || {
+                let (report, published, _) = clean.publish_page_revision(&original, || {
                     if payload.is_empty() {
                         serde_json::to_value(d.save_edited_copy(destination).map_err(|e|e.to_string())?).map_err(|e|e.to_string())
                     } else {
                         serde_json::to_value(d.save_annotation_changes_copy(destination,payload.annotations,payload.bookmarks,payload.updates,payload.deletions).map_err(|e|e.to_string())?).map_err(|e|e.to_string())
                     }
                 })?;
+                let mut report=report;
+                report["forms"]=prepared.form_report;
+                report["cache_cleanup_error"]=json!(published.error);
                 value(Ok(report))
             }
             "save_current_annotations" | "replace_current_annotations" => {
@@ -1418,6 +1428,17 @@ mod tests {
         );
 
         let original = fs::read(&fixture.path).unwrap();
+        assert!(doc.command(json!({"op":"document_save"})).is_err());
+        let unsigned = fixture.directory.join("signed-document-copy.pdf");
+        doc.command(json!({"op":"save_document_copy","destination":unsigned}))
+            .unwrap();
+        assert_eq!(
+            open_fixture_document(&unsigned, None)
+                .unwrap()
+                .info()
+                .unwrap()["signature_status"]["signed"],
+            false
+        );
         let staged = doc
             .command(json!({"op":"page_stage","operation":{"InsertBlank":{"index":0}}}))
             .unwrap();
@@ -1697,6 +1718,197 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fs::read(&manifest).unwrap(), b"{unreadable");
+    }
+
+    #[test]
+    fn a_saved_pdf_is_reported_as_saved_when_its_projected_cache_cannot_be_published() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let engine = doc.active().unwrap();
+        let destination = fixture.directory.join("saved-with-cache-warning.pdf");
+        let original = crate::marks::Marks::load_with_root(
+            &destination,
+            1,
+            Some(&fixture_cache_root(&fixture.path)),
+        );
+        let target = PathBuf::from(original.state(&engine).unwrap()["path"].as_str().unwrap());
+        let marks = doc.marks.lock().unwrap();
+        let (report, published, _) = marks
+            .publish_page_revision(&original, || {
+                let report = engine
+                    .save_edited_copy(destination.to_string_lossy().into_owned())
+                    .map_err(|e| e.to_string())?;
+                // Simulate a post-PDF cache publication failure without a production failpoint.
+                fs::create_dir(&target).map_err(|e| e.to_string())?;
+                Ok(report)
+            })
+            .unwrap();
+        assert_eq!(Path::new(&report.destination_path), destination);
+        assert!(destination.exists());
+        assert!(
+            published
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("PDF was saved")
+        );
+        assert_eq!(
+            open_fixture_document(&destination, None)
+                .unwrap()
+                .info()
+                .unwrap()["pages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unified_save_keeps_xfa_read_only_and_creates_no_editing_session() {
+        let fixture = Fixture::new("xfa-refusal.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        assert_eq!(doc.info().unwrap()["xfa_status"]["is_xfa"], true);
+        assert!(doc.command(json!({"op":"document_save"})).is_err());
+        let copy = fixture.directory.join("xfa-copy.pdf");
+        assert!(
+            doc.command(json!({"op":"save_document_copy","destination":copy}))
+                .is_err()
+        );
+        assert!(!copy.exists());
+        assert!(
+            !cache_path(&fixture.path)
+                .parent()
+                .unwrap()
+                .join("session.json")
+                .exists()
+        );
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+    }
+
+    #[test]
+    fn unified_save_combines_page_revisions_marks_bookmarks_and_forms_and_reopens_the_source() {
+        let fixture = Fixture::new("form-fields.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        let initial_revision = doc.info().unwrap()["revision"].clone();
+        doc.command(json!({"op":"bookmark_create","page":0,"title":"Saved bookmark","yPt":40}))
+            .unwrap();
+        doc.command(json!({"op":"mark_create","entry":{"kind":"square","version":1,"page":0,"rect":{"x":20,"y":50,"width":80,"height":40},"strokeWidth":2,"color":"#E8BC5580","note":"Saved shape"}})).unwrap();
+        doc.command(json!({"op":"page_stage","operation":{"InsertBlank":{"index":0}}}))
+            .unwrap();
+        let stale = fixture.directory.join("stale-copy.pdf");
+        assert!(doc.command(json!({"op":"save_document_copy","destination":stale,"expected_revision":initial_revision})).is_err());
+        assert!(!stale.exists());
+        let fields = doc.command(json!({"op":"forms"})).unwrap();
+        let field = fields["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["kind"] == "text")
+            .unwrap();
+        let forms = json!([{"field_id":field["id"],"text":"Unified form value","checked":null,"selected":null}]);
+        let copy = fixture.directory.join("combined.pdf");
+        doc.command(json!({"op":"save_document_copy","destination":copy,"forms":forms}))
+            .unwrap();
+        let copy_doc = open_fixture_document(&copy, None).unwrap();
+        assert_eq!(
+            copy_doc.info().unwrap()["pages"].as_array().unwrap().len(),
+            3
+        );
+        assert_eq!(
+            copy_doc.command(json!({"op":"annotations"})).unwrap()[0]["contents"],
+            "Saved shape"
+        );
+        assert_eq!(
+            copy_doc.command(json!({"op":"marks"})).unwrap()["bookmarks"][0]["page"],
+            1
+        );
+        assert!(
+            copy_doc.command(json!({"op":"forms"})).unwrap()["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["value"] == "Unified form value")
+        );
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        assert_eq!(
+            doc.command(json!({"op":"marks"})).unwrap()["annotations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let result = doc
+            .command(json!({"op":"document_save","forms":forms}))
+            .unwrap();
+        assert_eq!(
+            fs::read(result["report"]["backup_path"].as_str().unwrap()).unwrap(),
+            original
+        );
+        assert_eq!(result["marks"]["page_session_active"], false);
+        assert!(
+            result["marks"]["annotations"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            doc.command(json!({"op":"annotations"})).unwrap()[0]["contents"],
+            "Saved shape"
+        );
+        assert!(
+            doc.command(json!({"op":"forms"})).unwrap()["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["value"] == "Unified form value")
+        );
+        assert_eq!(
+            fixture.open().info().unwrap()["pages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(doc.command(json!({"op":"page_undo"})).is_err());
+    }
+
+    #[test]
+    fn failed_unified_form_save_keeps_drafts_recovery_and_the_original_pdf() {
+        let fixture = Fixture::new("form-fields.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        doc.command(json!({"op":"bookmark_create","page":0,"title":"Keep draft","yPt":40}))
+            .unwrap();
+        let failed=doc.command(json!({"op":"document_save","forms":[{"field_id":"absent-field","text":"invalid","checked":null,"selected":null}]}));
+        assert!(failed.is_err());
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        assert_eq!(
+            doc.command(json!({"op":"marks"})).unwrap()["bookmarks"][0]["title"],
+            "Keep draft"
+        );
+        let manifest = cache_path(&fixture.path)
+            .parent()
+            .unwrap()
+            .join("session.json");
+        assert!(manifest.exists());
+        let directory = manifest.parent().unwrap();
+        assert!(!fs::read_dir(directory).unwrap().any(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("save-")
+        }));
+        drop(doc);
+        let reopened = fixture.open();
+        assert!(reopened.info().unwrap()["recovery"]["error"].is_null());
+        assert_eq!(
+            reopened.command(json!({"op":"marks"})).unwrap()["bookmarks"][0]["title"],
+            "Keep draft"
+        );
+        reopened.command(json!({"op":"page_discard"})).unwrap();
     }
 
     #[test]

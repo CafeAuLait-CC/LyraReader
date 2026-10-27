@@ -9,6 +9,7 @@ mod exports;
 mod marks;
 mod pages;
 mod render_source;
+mod saving;
 mod session;
 use document::DesktopDocument as Document;
 use std::{

@@ -1411,6 +1411,7 @@ pub fn appearance_font_coverage(
 /// disables those controls with the same sentence. Reading aids (zoom, scroll, search,
 /// selection, summaries) are unaffected because they run on the synthetic PDF.
 #[derive(Clone, Debug, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct XfaStatusRecord {
     /// True when the file carries `/AcroForm /XFA`; false for every ordinary PDF.
     pub is_xfa: bool,

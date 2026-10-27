@@ -25,6 +25,7 @@ ApplicationWindow {
     readonly property var currentReader: session ? session.activeReader : reader
     readonly property var signatureStatus: currentReader.data.signature_status || {}
     readonly property bool originalReadOnly: !!signatureStatus.signed
+    readonly property bool xfaReadOnly: !!(currentReader.data.xfa_status || {}).is_xfa
     readonly property string readOnlyReason: signatureStatus.read_only_reason || ""
     readonly property var colors: theme
     readonly property var pageList: canvas.view
@@ -308,6 +309,8 @@ ApplicationWindow {
                 // Unlike animation timers this also runs without frame callbacks.
                 if (root.closingTab !== -2)
                     Qt.callLater(root.retryPendingClose);
+                if (root.pendingDocumentSave)
+                    Qt.callLater(root.finishDocumentSave);
             }
         }
     }
@@ -1012,6 +1015,37 @@ ApplicationWindow {
             root.printDocument()
     }
     property var exportContext: null
+    property var pendingSavePosition: null
+    property var pendingDocumentSave: null
+    function saveDocument(copy) {
+        if (xfaReadOnly) {operationStatus=currentReader.data.xfa_status.read_only_reason;return;}
+        if (pendingRedactions.length) {
+            operationStatus = qsTr("Finish or clear the content redaction before saving.");
+            return;
+        }
+        saveReadingPosition();
+        pendingDocumentSave = {reader:currentReader,revision:currentReader.data.document_revision,copy:!!copy || originalReadOnly,forms:formPayload(),page:currentPage,selection:selectedPages.slice(),position:session ? session.viewState(currentReader) : {page:currentPage,zoom:zoom,fitting:fitting}};
+        dialogs.flushAnnotation();
+        finishDocumentSave();
+    }
+    function finishDocumentSave() {
+        const context=pendingDocumentSave;
+        if (!context || !context.reader || context.reader.pendingCommands > 0) return;
+        pendingDocumentSave=null;
+        if (Object.keys(context.reader.noteDrafts).length) {
+            operationStatus=qsTr("The annotation note could not be saved. Retry or discard the note before saving the document.");
+            return;
+        }
+        if (context.copy) {
+            exportKind="document";
+            exportContext={reader:context.reader,revision:context.revision,kind:"document",forms:context.forms};
+            dialogs.saveDialog.open();
+        } else {
+            pendingSavePosition={reader:context.reader,position:context.position};
+            if (context.reader===currentReader) {pendingPage=context.page;pendingPageSelection=context.selection;}
+            context.reader.submit("document_save",{forms:context.forms,current_page:context.page,selected_pages:context.selection,expected_revision:context.revision});
+        }
+    }
     function chooseExport(kind) {
         exportKind = kind;
         exportContext = {
@@ -1094,7 +1128,9 @@ ApplicationWindow {
         if (!owner)
             return;
         const destination = session.localPath(url);
-        if (context.kind === "redactions")
+        if (context.kind === "document")
+            owner.submit("save_document_copy", Object.assign({destination: destination, forms: context.forms},context.revision ? {expected_revision:context.revision} : {}));
+        else if (context.kind === "redactions")
             owner.submit("save_redactions", {
                 destination: destination,
                 areas: context.redactions
@@ -1218,6 +1254,22 @@ ApplicationWindow {
         text: qsTr("Open PDF…")
         shortcut: StandardKey.Open
         onTriggered: fileDialog.open()
+    }
+    Action {
+        id: saveDocumentAction
+        objectName: "saveDocumentAction"
+        text: qsTr("Save")
+        shortcut: StandardKey.Save
+        enabled: currentReader.pageCount > 0 && currentReader.pendingCommands === 0 && !root.positionRestoring && !root.xfaReadOnly
+        onTriggered: root.saveDocument()
+    }
+    Action {
+        id: saveDocumentAsAction
+        objectName: "saveDocumentAsAction"
+        text: qsTr("Save As…")
+        shortcut: StandardKey.SaveAs
+        enabled: saveDocumentAction.enabled
+        onTriggered: root.saveDocument(true)
     }
     Action {
         id: quitAction
@@ -1369,6 +1421,8 @@ ApplicationWindow {
             MenuItem {
                 action: openAction
             }
+            MenuItem { action: saveDocumentAction }
+            MenuItem { action: saveDocumentAsAction }
             MenuSeparator {}
             MenuItem {
                 action: quitAction
@@ -1814,7 +1868,7 @@ ApplicationWindow {
                     root.operationStatus = qsTr("Artwork placed. Saved in the annotation sidecar.");
                 }
             }
-            if (op.indexOf("page_") === 0 && op !== "page_operation") {
+            if ((op.indexOf("page_") === 0 && op !== "page_operation") || op === "document_save") {
                 root.pageEditBusy = false;
                 if (!error.length) {
                     const map = result.report ? result.report.page_map : null;
@@ -1828,13 +1882,14 @@ ApplicationWindow {
                     }).filter(function (p) {
                         return p !== null && p !== undefined;
                     }) : [page]);
-                    root.pendingPosition = {
+                    root.pendingPosition = op === "document_save" && root.pendingSavePosition && root.pendingSavePosition.reader === currentReader ? root.pendingSavePosition.position : {
                         page: result.report && result.report.inserted_page !== null && result.report.inserted_page !== undefined ? result.report.inserted_page : page,
                         zoom: root.zoom,
                         fitting: root.fitting
                     };
                     currentReader.setLayout(root.layoutMode, root.pageGap);
-                    root.operationStatus = op === "page_apply" ? qsTr("Page changes applied. Backup: %1").arg(result.report.backup_path || "") : qsTr("Page session updated; original unchanged.");
+                    root.pendingSavePosition = null;
+                    root.operationStatus = op === "document_save" ? qsTr("Document saved. Verified backup: %1").arg(result.report.backup_path || "") : (op === "page_apply" ? qsTr("Page changes applied. Backup: %1").arg(result.report.backup_path || "") : qsTr("Page session updated; original unchanged."));
                     const warning = result.report ? (result.report.recovery_warning || result.report.cache_cleanup_error || result.report.sidecar_error) : null;
                     if (warning) root.operationStatus += " " + warning;
                 }
@@ -1911,9 +1966,10 @@ ApplicationWindow {
             else if (op === "save_redactions") {
                 root.annotationTool = "select";
                 root.operationStatus = qsTr("Verified redacted copy saved: %1 · %2 characters removed.").arg(result.destination_path).arg(result.removed_characters);
-            } else if (op.indexOf("save_") === 0)
+            } else if (op.indexOf("save_") === 0) {
                 root.operationStatus = qsTr("Saved to %1").arg(result.destination_path || "");
-            else if (op.indexOf("replace_") === 0) {
+                if (result.cache_cleanup_error) root.operationStatus += " " + result.cache_cleanup_error;
+            } else if (op.indexOf("replace_") === 0) {
                 root.operationStatus = qsTr("Saved. Verified backup: %1").arg(result.backup_path || "");
                 currentReader.openFile(currentReader.fileUrl);
             }

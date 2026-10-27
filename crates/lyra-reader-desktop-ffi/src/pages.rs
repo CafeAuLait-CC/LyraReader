@@ -522,16 +522,37 @@ impl DesktopDocument {
                 restored.seed_bookmarks(&next)?;
                 (next, restored)
             }
-            "page_apply" => {
+            "page_apply" | "document_save" => {
+                crate::saving::check_revision(&current, r)?;
+                if let Some(reason) = current.xfa_status().read_only_reason {
+                    return Err(reason);
+                }
+                if op == "document_save"
+                    && let Some(reason) = &self.original_signature.read_only_reason
+                {
+                    return Err(reason.clone());
+                }
+                if op == "document_save" && !edits.has_session() {
+                    let input = edits.input(&marks, r, current.page_count())?;
+                    let state = edits.begin(&current, &marks, input)?;
+                    *marks = marks.restored_transaction(&state, edits.control()?, &current)?;
+                }
                 let original = edits
                     .original
                     .clone()
                     .ok_or("There are no staged page changes")?;
                 let payload = marks.payload(&current)?;
                 let directory = edits.directory.clone().ok_or("Missing editing directory")?;
+                let prepared = crate::saving::prepare(
+                    &current,
+                    &marks.cache_location()?.directory,
+                    r,
+                    self.password.clone(),
+                )?;
+                let current = &prepared.document;
                 let clean = marks.cleaned_for_save(&payload.ids);
                 let combined = if payload.is_empty() {
-                    Arc::clone(&current)
+                    Arc::clone(current)
                 } else {
                     let combined = directory
                         .path
@@ -567,6 +588,7 @@ impl DesktopDocument {
                 report["sidecar_backup_path"] = json!(backup);
                 report["cache_cleanup_error"] = json!(cleanup);
                 report["sidecar_error"] = json!(next_marks.error);
+                report["forms"] = prepared.form_report;
                 edits.control = None;
                 edits.directory = None;
                 edits.original = None;
