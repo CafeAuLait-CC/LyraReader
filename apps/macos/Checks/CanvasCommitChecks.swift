@@ -36,9 +36,11 @@ extension ReaderChecks {
         try await runCanvasCommitScenario(fixture: fixture, tracing: false)
     }
 
-    /// One scenario: a real `ReaderWindow` around a real engine and canvas, one scroll that
-    /// changes only the viewport offset (the single-page fixture needs no new raster), then one
-    /// commit that changes nothing.
+    /// One scenario: a real `ReaderWindow` around a real engine and canvas. The zoom is forced
+    /// to a fit-width/overflow state because a headless or virtual display's calibration can
+    /// otherwise make the whole page fit and leave no vertical range; then one scroll changes
+    /// only the viewport offset (the single-page fixture needs no new raster at that zoom), and
+    /// one commit changes nothing.
     @MainActor
     private static func runCanvasCommitScenario(fixture: URL, tracing: Bool) async throws {
         let collector = CanvasCommitTraceCollector()
@@ -103,6 +105,24 @@ extension ReaderChecks {
         guard let canvas = findCanvas(host) else {
             fatalError("FAIL: the reader window never built its Metal canvas")
         }
+        try await waitForQuiescentCanvas(state: state, canvas: canvas)
+
+        // The opening zoom is 100% of the display's calibration, and a headless/virtual runner
+        // can report a calibration low enough that the whole page fits the window. The check
+        // needs a vertical scroll range, not a particular percentage: fit the page to the canvas
+        // width first (a portrait page on a landscape canvas must overflow vertically at
+        // fit-width), and only step the zoom up if this window's aspect still fits the page.
+        state.zoomFitWidth()
+        for _ in 0..<30 where !state.hasScrollableContent {
+            state.zoomIn()
+        }
+        require(state.hasScrollableContent,
+                "\(mode): the scenario window has a vertical scroll range at "
+                    + "\(state.zoomPercent)% (content \(Int(state.contentHeightPt)) pt, "
+                    + "canvas \(Int(canvas.bounds.height)) pt high)")
+        // Start the measured scroll from the top, so "scroll by 96 pt" cannot already be clamped
+        // at the end of the document.
+        state.scroll(toFraction: 0)
         try await waitForQuiescentCanvas(state: state, canvas: canvas)
 
         // ── one commit, drawn before `reloadVisiblePages` returns ─────────────
@@ -192,9 +212,10 @@ extension ReaderChecks {
                 "\(mode): the SwiftUI update for a no-op commit submits no frame either")
     }
 
-    /// Waits until no tile work is queued or in flight and the frame counter has been stable for
-    /// several samples, so the action under test starts from a canvas that is not already drawing
-    /// an earlier commit.
+    /// Waits until no tile work is queued or in flight, no page raster has just replaced its
+    /// preview, and the frame counter has been stable for several samples, so the action under
+    /// test starts from a canvas that is not already drawing an earlier commit (the zoom in this
+    /// scenario starts a new screen-resolution raster).
     @MainActor
     private static func waitForQuiescentCanvas(state: AppState, canvas: MetalCanvasView) async throws {
         var lastSignature = ""
@@ -202,10 +223,10 @@ extension ReaderChecks {
         for _ in 0..<400 {
             let work = state.scheduledTileWork
             let signature = "\(work.queued)/\(work.inFlight)/\(canvas.frameAttemptCount)/"
-                + "\(state.canvasPages.count)"
+                + "\(state.canvasPages.count)/\(state.pageRasterCount)/\(state.tileRasterCount)"
             if work.queued == 0 && work.inFlight == 0 && signature == lastSignature {
                 stableSamples += 1
-                if stableSamples >= 6 { return }
+                if stableSamples >= 8 { return }
             } else {
                 stableSamples = 0
             }
