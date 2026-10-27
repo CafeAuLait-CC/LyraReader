@@ -274,6 +274,15 @@ public enum PlacementIndex {
         index > -4 * block && index <= -3 * block
     }
 
+    /// The page a whole-page raster index names, or nil for every other index block.
+    ///
+    /// The inverse of ``pageRaster(_:)``; the perf trace uses it to attribute a drawn backdrop to
+    /// its page without duplicating the block arithmetic.
+    public static func pageRasterPage(_ index: Int) -> Int? {
+        guard isPageRaster(index) else { return nil }
+        return -3 * block - index
+    }
+
     /// Whether `index` names one box of a markup annotation loaded from the PDF.
     public static func isDocumentAnnotationBox(_ index: Int) -> Bool {
         index >= -5 * block && index < -4 * block

@@ -2548,9 +2548,21 @@ public final class RustEngine: PDFEngine {
         generation += 1
         let generation = self.generation
         let requestedScale = Double(scale)
+        // Perf-trace staging (`LYRA_READER_PERF_TRACE=1`): entry time here is when the shell
+        // task resumed and called the engine. The dispatch, raster-core and resume-scheduled
+        // stages below split the rest of the do/await latencies without touching the work.
+        let perfSource = withAnnotations ? "thumbnail" : "page-raster"
+        let perfCall = PerfTrace.enabled ? PerfTrace.now : 0
 
         return try await withCheckedThrowingContinuation { continuation in
             rasterQueue.async {
+                if PerfTrace.enabled {
+                    PerfTrace.stage("raster_dispatch", source: perfSource, page: page,
+                                    generation: generation,
+                                    milliseconds: (PerfTrace.now - perfCall) * 1000,
+                                    scale: requestedScale)
+                }
+                let perfCore = PerfTrace.enabled ? PerfTrace.now : 0
                 let started = DispatchTime.now()
                 do {
                     let bitmap = try withAnnotations
@@ -2562,6 +2574,12 @@ public final class RustEngine: PDFEngine {
                             page: UInt32(page),
                             scale: requestedScale
                         )
+                    if PerfTrace.enabled {
+                        PerfTrace.stage("raster_core", source: perfSource, page: page,
+                                        generation: generation,
+                                        milliseconds: (PerfTrace.now - perfCore) * 1000,
+                                        scale: requestedScale)
+                    }
                     let milliseconds =
                         Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000
                     // Written to stderr (unbuffered) on purpose: it is how the
@@ -2577,6 +2595,13 @@ public final class RustEngine: PDFEngine {
                         Thread.isMainThread ? "yes" : "no"
                     )
                     FileHandle.standardError.write(Data(line.utf8))
+                    // Emitted immediately before the continuation is resumed, so the gap to the
+                    // shell's `raster_resumed` stage is the main-actor wait (the raster work is
+                    // already done at this point; the result only has to be folded into the UI).
+                    if PerfTrace.enabled {
+                        PerfTrace.stage("raster_resume_scheduled", source: perfSource, page: page,
+                                        generation: generation, scale: requestedScale)
+                    }
                     continuation.resume(
                         returning: PageImage(
                             pixelWidth: Int(bitmap.widthPx),
@@ -2587,6 +2612,12 @@ public final class RustEngine: PDFEngine {
                         )
                     )
                 } catch {
+                    if PerfTrace.enabled {
+                        PerfTrace.stage("raster_failed", source: perfSource, page: page,
+                                        generation: generation,
+                                        milliseconds: (PerfTrace.now - perfCore) * 1000,
+                                        scale: requestedScale)
+                    }
                     continuation.resume(throwing: error)
                 }
             }
@@ -2610,9 +2641,16 @@ public final class RustEngine: PDFEngine {
 
         generation += 1
         let generation = self.generation
+        let perfCall = PerfTrace.enabled ? PerfTrace.now : 0
 
         return try await withCheckedThrowingContinuation { continuation in
             rasterQueue.async {
+                if PerfTrace.enabled {
+                    PerfTrace.stage("raster_dispatch", source: "tile", page: page,
+                                    generation: generation,
+                                    milliseconds: (PerfTrace.now - perfCall) * 1000)
+                }
+                let perfCore = PerfTrace.enabled ? PerfTrace.now : 0
                 do {
                     let tile = try document.rasterizeTile(
                         page: UInt32(page),
@@ -2621,6 +2659,13 @@ public final class RustEngine: PDFEngine {
                         tileY: UInt32(tileY),
                         tileSize: UInt32(tileSize)
                     )
+                    if PerfTrace.enabled {
+                        PerfTrace.stage("raster_core", source: "tile", page: page,
+                                        generation: generation,
+                                        milliseconds: (PerfTrace.now - perfCore) * 1000)
+                        PerfTrace.stage("raster_resume_scheduled", source: "tile", page: page,
+                                        generation: generation)
+                    }
                     continuation.resume(
                         returning: TileImage(
                             page: page,
@@ -2633,6 +2678,11 @@ public final class RustEngine: PDFEngine {
                         )
                     )
                 } catch {
+                    if PerfTrace.enabled {
+                        PerfTrace.stage("raster_failed", source: "tile", page: page,
+                                        generation: generation,
+                                        milliseconds: (PerfTrace.now - perfCore) * 1000)
+                    }
                     continuation.resume(throwing: error)
                 }
             }

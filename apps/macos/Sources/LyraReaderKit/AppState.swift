@@ -823,6 +823,33 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     private static let renderStatsEnabled =
         ProcessInfo.processInfo.environment["LYRA_READER_RENDER_STATS"] == "1"
     private var pendingTiles: [(TileKey, PagePlacement)] = []
+
+    // MARK: Performance trace state (`LYRA_READER_PERF_TRACE=1`)
+    //
+    // Every field below is only written when `PerfTrace.enabled`; when the trace is off the
+    // scheduling path performs one predictable bool test per event site and keeps no state.
+    // The counters classify rasters for the close-of-document `summary` record.
+    private var perfViewportSeq: UInt64 = 0
+    private var perfInputSeq: UInt64 = 0
+    private var perfSharpToken: UInt64 = 0
+    /// Bumped whenever the tile cache is deliberately emptied (`invalidateTiles`): a raster
+    /// after that is a first raster for the new content version, not eviction thrash.
+    private var perfContentVersion: UInt64 = 0
+    private var perfRasteredKeys: Set<TileKey> = []
+    private var perfPrefetchRastered: Set<TileKey> = []
+    private var perfDrawnTiles: Set<TileKey> = []
+    private var perfFirstRasters = 0
+    private var perfRepeatRasters = 0
+    private var perfTileEnqueuedAt: [TileKey: Double] = [:]
+    private var perfTileStartedAt: [TileKey: Double] = [:]
+    private var perfTilePrefetch: [TileKey: Bool] = [:]
+    private var perfThumbnailEnqueuedAt: [Int: Double] = [:]
+    /// Raster generations whose `drawn` record was already emitted (a preview can be drawn by
+    /// many frames; only the first draw is a lifecycle event).
+    private var perfDrawnRasterGenerations: Set<UInt64> = []
+    private var perfMemoryTask: Task<Void, Never>?
+    /// What the canvas copies into its `frame` records, published with `canvasPages`.
+    public private(set) var perfViewportStamp = PerfViewportStamp()
     private var pagePreviews: [Int: PageImage] = [:]
     private var pagePreviewScales: [Int: CGFloat] = [:]
     private var desiredPreviewScale: CGFloat = 1
@@ -3059,6 +3086,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         desiredPreviewPages = []
         failedPreviewPages = []
         renderEpoch &+= 1
+        if PerfTrace.enabled {
+            // The cache was emptied deliberately (new document, page edit, launch zoom): a
+            // raster after this point is a first raster for a new content version, not thrash.
+            perfContentVersion &+= 1
+            perfRasteredKeys.removeAll(keepingCapacity: false)
+            perfPrefetchRastered.removeAll(keepingCapacity: false)
+            perfDrawnTiles.removeAll(keepingCapacity: false)
+            perfTileEnqueuedAt.removeAll(keepingCapacity: false)
+            perfTileStartedAt.removeAll(keepingCapacity: false)
+            perfTilePrefetch.removeAll(keepingCapacity: false)
+            perfThumbnailEnqueuedAt.removeAll(keepingCapacity: false)
+        }
     }
 
     /// Adopts the `cacheBudgetMB` setting into the live cache (ADR 0007 wired the setting to a
@@ -3118,6 +3157,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Whether one tile is cached. The budget checks use it to prove that a visible tile
     /// survived an eviction pass that a stale tile did not.
     public func isTileCached(_ key: TileKey) -> Bool { tileCache.contains(key) }
+    /// Tiles waiting for a raster slot and tiles rasterizing right now.
+    ///
+    /// Read-only and observation-only: the trace hooks and the perf-trace check wait for this to
+    /// reach `(0, 0)` before comparing counters. It changes no scheduling decision.
+    public var scheduledTileWork: (queued: Int, inFlight: Int) {
+        (pendingTiles.count, tilesInFlight.count)
+    }
     /// Backing scale reported by the canvas; the engine rasterizes at this resolution.
     private var deviceScale: CGFloat = 2.0
 
@@ -3191,6 +3237,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         statusMessage = self.engine.version
         if let tileCacheBudgetBytes { tileCache.setBudget(max(1, tileCacheBudgetBytes)) }
+        reportPerfLaunch()
+        if PerfTrace.enabled {
+            // A quit does not close the document (the shell flushes the reading position and
+            // lets the process end), so the close-of-document records are produced by the real
+            // close paths below. This final sample is the last live reading of the curve, which
+            // a harness would otherwise miss entirely on a normal ⌘Q.
+            NotificationCenter.default.addObserver(
+                forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, self.document != nil else { return }
+                    self.samplePerfMemory(phase: "terminate")
+                }
+            }
+        }
 
         if Self.usesStoredSidebarTab {
             sidebarTab = SidebarTab.restored()
@@ -3417,6 +3478,47 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 }
             }
 
+            // Measurement-only input: LYRA_READER_PERF_SCROLLS=<n> performs n discrete wheel
+            // gestures through the real `scroll(byScreenPoints:)` path, each followed by a full
+            // stop, so `scroll_stop_to_sharp_ms` can be measured on real gestures instead of the
+            // one continuous scroll `LYRA_READER_SCROLL_TRACE_SECONDS` produces. It runs without
+            // the trace too, so the trace's own RSS cost can be measured against exactly the
+            // same workload; it changes no scheduling or drawing decision.
+            if let raw = ProcessInfo.processInfo.environment["LYRA_READER_PERF_SCROLLS"],
+               let count = Int(raw), count > 0, count <= 50 {
+                let steps = Self.perfInt("LYRA_READER_PERF_SCROLL_STEPS", 8, 1...60)
+                let stepPt = Self.perfDouble("LYRA_READER_PERF_SCROLL_STEP_PT", 80, 1...2000)
+                let stepMs = Self.perfInt("LYRA_READER_PERF_SCROLL_STEP_MS", 16, 1...500)
+                let settleMs = Self.perfInt("LYRA_READER_PERF_SCROLL_SETTLE_MS", 900, 100...10000)
+                let startMs = Self.perfInt("LYRA_READER_PERF_SCROLL_START_MS", 3000, 0...30000)
+                let epoch = documentEpoch
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: .milliseconds(startMs))
+                    guard let self, epoch == self.documentEpoch, self.document != nil else { return }
+                    for gesture in 0..<count {
+                        for _ in 0..<steps {
+                            guard epoch == self.documentEpoch, self.document != nil else { return }
+                            self.scroll(byScreenPoints: CGFloat(stepPt))
+                            try? await Task.sleep(for: .milliseconds(stepMs))
+                        }
+                        if gesture < count - 1 {
+                            try? await Task.sleep(for: .milliseconds(settleMs))
+                        }
+                    }
+                    // `LYRA_READER_PERF_CLOSE=1` closes the tab through the real close path
+                    // after the last gesture, so the trace's close-of-document memory sample and
+                    // classification summary describe a document that actually closed instead
+                    // of a process that simply exited. The wait exceeds the scroll indicator's
+                    // 1.2 s idle window, so the after-scrolling-stops memory sample is taken
+                    // before the close rather than being cancelled by it.
+                    if ProcessInfo.processInfo.environment["LYRA_READER_PERF_CLOSE"] == "1" {
+                        try? await Task.sleep(for: .milliseconds(1600))
+                        guard epoch == self.documentEpoch else { return }
+                        if let index = self.activeTabIndex { self.closeTab(index) }
+                    }
+                }
+            }
+
             // Development aid: LYRA_READER_FIND="pattern" searches at launch and reports the
             // hits on stderr, so search is verifiable without typing.
             if let raw = ProcessInfo.processInfo.environment["LYRA_READER_FIND"], !raw.isEmpty {
@@ -3634,6 +3736,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // the flag. It is retained even when the panel is closed, so opening the panel later
             // still reports the open latency instead of "not measured".
             performanceProbe.beginOpenToFirstFrameMeasurement()
+            if PerfTrace.enabled {
+                PerfTrace.document(phase: "open_start", epoch: documentEpoch)
+            }
             let loaded = try engine.openDocument(at: url)
             resetDocumentState()
             // A tab switch already put the old document's page-edit session in its retained
@@ -3666,6 +3771,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             }
             invalidateTiles()
             scrollYPt = 0
+            if PerfTrace.enabled {
+                resetPerfDocumentState()
+                PerfTrace.document(phase: "opened", epoch: documentEpoch, pages: loaded.pageCount)
+                startPerfMemorySampling()
+            }
 
             loadAnnotations(for: url)
             noticeInterruptedSave(at: url)
@@ -3707,6 +3817,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     private func resetDocumentState() {
+        // The perf trace's close records describe the state the document still has, so they run
+        // before any of it is cleared; the first open (no document yet) emits nothing.
+        let hadDocument = document != nil
+        if hadDocument { reportPerfDocumentClose() }
+        stopPerfMemorySampling()
         documentKnowledge.invalidate()
         let wasChanging = isChangingDocumentState
         isChangingDocumentState = true
@@ -3862,6 +3977,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         isScrolling = false
         isScrollIndicatorHovered = false
         isDraggingScrollIndicator = false
+        // The rasters are now dropped (`invalidateTiles` above), so this sample is the
+        // "after the document closes" point of the memory curve, not another live sample.
+        if hadDocument { samplePerfMemory(phase: "document_close") }
+        resetPerfDocumentState()
     }
 
     public func zoomIn() {
@@ -4408,6 +4527,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         beginScrollActivity()
         guard abs(next - scrollYPt) > 0.01 else { return }
         scrollYPt = next
+        tracePerfInput(source: "wheel", phase: "changed", delta: delta, offset: next,
+                       destination: next)
         reloadVisiblePages()
         schedulePositionSave()
     }
@@ -4439,6 +4560,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             mostAhead: lead.map { $0 / max(zoomFactor, 0.01) },
             maximumSpeed: ScrollGlide.defaultMaximumSpeed / max(zoomFactor, 0.01)
         )
+        tracePerfInput(source: "keyboard", phase: "changed", delta: delta, offset: scrollYPt,
+                       destination: aimed)
         beginScrollActivity()
         startGlideDriver()
     }
@@ -4540,10 +4663,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
         searchSidebarVisible = true
         isSearching = true
+        let perfEnqueued: Double? = PerfTrace.enabled ? PerfTrace.now : nil
         Task { @MainActor [weak self] in
             guard let self else { return }
             guard epoch == self.documentEpoch, request == self.searchEpoch else { return }
+            let perfStarted: Double? = PerfTrace.enabled ? PerfTrace.now : nil
             let hits = (try? await self.engine.search(pattern, limit: 500)) ?? []
+            if PerfTrace.enabled, let perfEnqueued, let perfStarted {
+                // The whole-document search pass is the shell's only index-consuming task; the
+                // per-page text layer that feeds it is the `text` category.
+                PerfTrace.queue(category: "index", page: nil,
+                                waitMs: max(0, (perfStarted - perfEnqueued) * 1000),
+                                execMs: max(0, (PerfTrace.now - perfStarted) * 1000),
+                                epoch: epoch)
+            }
             guard epoch == self.documentEpoch, request == self.searchEpoch else { return }
             self.searchHits = hits
             self.isSearching = false
@@ -13792,6 +13925,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             guard thumbnails[page] == nil, !thumbnailsInFlight.contains(page), !pendingThumbnails.contains(page) else { continue }
             if requestedPage != nil { pendingThumbnails.insert(page, at: 0) }
             else { pendingThumbnails.append(page) }
+            if PerfTrace.enabled {
+                perfThumbnailEnqueuedAt[page] = PerfTrace.now
+                PerfTrace.tile(phase: "enqueue", source: "thumbnail", page: page, lod: 0, x: 0,
+                               y: 0, epoch: documentEpoch, contentVersion: perfContentVersion,
+                               offsetPt: scrollYPt)
+            }
         }
         pumpThumbnails()
     }
@@ -13806,17 +13945,51 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // become an opaque pixel in the final thumbnail (or two on a Retina display).
         let scale = CGFloat(targetWidth * 4) / max(document.firstPageSize.width, 1)
         let epoch = documentEpoch
+        let perfEnqueued = PerfTrace.enabled
+            ? (perfThumbnailEnqueuedAt.removeValue(forKey: page) ?? PerfTrace.now) : nil
         Task { @MainActor [weak self] in
             guard let self, epoch == self.documentEpoch else { return }
+            let perfStarted: Double? = PerfTrace.enabled ? PerfTrace.now : nil
+            if PerfTrace.enabled {
+                // Emitted when the task body actually runs (not when the pump queued it), so the
+                // gap from the enqueue is main-actor wait, not "the queue handed it out".
+                PerfTrace.tile(phase: "start", source: "thumbnail", page: page, lod: 0, x: 0, y: 0,
+                               epoch: self.documentEpoch, contentVersion: self.perfContentVersion,
+                               offsetPt: self.scrollYPt)
+            }
             let image = try? await self.engine.renderThumbnail(page, scale: scale)
+            if PerfTrace.enabled, let image {
+                PerfTrace.stage("raster_resumed", source: "thumbnail", page: page,
+                                generation: image.generation, scale: Double(scale),
+                                epoch: self.documentEpoch)
+            }
             guard epoch == self.documentEpoch else { return }
             if backingScale == self.deviceScale, let image {
+                let perfDownsample = PerfTrace.enabled ? PerfTrace.now : 0
                 let reduced = await Task.detached { image.downsampled(toWidth: targetWidth) }.value
+                if PerfTrace.enabled {
+                    // The only image decode/convert stage in the reading path: CGImage reduction
+                    // for a sidebar thumbnail (the canvas path receives BGRA straight from PDFium).
+                    PerfTrace.stage("thumbnail_downsample", source: "thumbnail", page: page,
+                                    generation: image.generation,
+                                    milliseconds: (PerfTrace.now - perfDownsample) * 1000,
+                                    epoch: self.documentEpoch)
+                }
                 guard epoch == self.documentEpoch else { return }
                 if backingScale == self.deviceScale { self.thumbnails[page] = reduced }
                 else { self.pendingThumbnails.insert(page, at: 0) }
             } else if backingScale != self.deviceScale {
                 self.pendingThumbnails.insert(page, at: 0)
+            }
+            if PerfTrace.enabled, let perfEnqueued, let perfStarted {
+                PerfTrace.queue(category: "thumbnail", page: page,
+                                waitMs: max(0, (perfStarted - perfEnqueued) * 1000),
+                                execMs: max(0, (PerfTrace.now - perfStarted) * 1000),
+                                epoch: self.documentEpoch)
+                PerfTrace.tile(phase: "done", source: "thumbnail", page: page, lod: 0, x: 0, y: 0,
+                               epoch: self.documentEpoch, contentVersion: self.perfContentVersion,
+                               offsetPt: self.scrollYPt,
+                               bytes: self.thumbnails[page]?.bgra.count, scale: scale)
             }
             self.thumbnailsInFlight.remove(page)
             self.pumpThumbnails()
@@ -13892,7 +14065,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let next = CGFloat(min(max(fraction, 0), 1)) * scrollable
         beginScrollActivity()
         guard abs(next - scrollYPt) > 0.01 else { return }
+        let previousOffset = scrollYPt
         scrollYPt = next
+        tracePerfInput(source: "fraction", phase: "changed", delta: next - previousOffset,
+                       offset: next, destination: next)
         reloadVisiblePages()
         // A scrollbar drag is a scroll like any other: it has to schedule the same debounced
         // position save, or a drag right before quitting would be lost.
@@ -13908,6 +14084,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             try? await Task.sleep(for: .milliseconds(1200))
             guard !Task.isCancelled else { return }
             self?.isScrolling = false
+            // The memory curve's "after scrolling stops" point, taken at the same idle edge the
+            // scroll indicator fades on; it does not feed back into any scheduling decision.
+            self?.samplePerfMemory(phase: "scroll_stop")
         }
     }
 
@@ -14345,11 +14524,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var missedTiles = Set<TileKey>()
         var tilePlacements: [TileKey: PagePlacement] = [:]
         var queuedTiles: [TilePlanSnapshot.Tile] = []
+        // Trace-only: which on-screen pages the committed page list covers at target sharpness.
+        // `nil` (no allocation) whenever the trace is off.
+        let perfOnScreen: Set<Int>? = PerfTrace.enabled
+            ? Set(onScreen.map(\.placement.index)) : nil
+        var perfSharpSources: [Int: String]? = perfOnScreen == nil ? nil : [:]
 
         for span in band {
             let placement = span.placement
             var sharpRows: [CanvasPage] = []
             var complete = true
+            var pageSharp = false
             let previous = canvasTiles.filter { $0.placement.index >= 0 && $0.placement.index >> 24 == placement.index }
             let changingLOD = previous.contains { ($0.placement.index >> 20) & 15 != Int(lod) }
             if usesScreenPageRasters, !failedPreviewPages.contains(placement.index) {
@@ -14360,10 +14545,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 if !attempted || isScreenPageCached(placement.index) {
                     if let preview, isScreenPageCached(placement.index) || previous.isEmpty {
                         pages.append(canvasPageRaster(preview, placement: placement))
+                        // "Sharp" on this path means a page raster at least
+                        // `zoom × deviceScale`; a 1x preview is a backdrop, not sharpness.
+                        pageSharp = isScreenPageCached(placement.index)
                     } else if !previous.isEmpty {
                         pages.append(contentsOf: previous)
                     } else if let thumbnail = thumbnails[placement.index] {
                         pages.append(canvasPageRaster(thumbnail, placement: placement))
+                    }
+                    if let perfOnScreen, perfOnScreen.contains(placement.index), pageSharp {
+                        perfSharpSources?[placement.index] = "page-raster"
                     }
                     continue
                 }
@@ -14447,6 +14638,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             } else {
                 pages.append(contentsOf: sharpRows)
             }
+            // Sharp on the tile path: every visible tile at the target LOD was cached and went
+            // into the drawn list. `complete` is exactly that condition (a missing visible tile
+            // clears it; a missing ring tile does not).
+            if let perfOnScreen, perfOnScreen.contains(placement.index), complete {
+                perfSharpSources?[placement.index] = "tile"
+            }
         }
         // Submit in the plan's order: visible tiles first, then the ring by distance. The
         // planner's sort is stable, so equal distances keep the band's page/row/column order —
@@ -14458,7 +14655,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                   !failedTiles.contains(key), let placement = tilePlacements[key] else {
                 continue
             }
-            scheduleTile(key, placement: placement)
+            scheduleTile(key, placement: placement, prefetch: tile.prefetch)
             queuedTiles.append(TilePlanSnapshot.Tile(key: key, prefetch: tile.prefetch))
         }
         recordTilePlan(plan, scheduled: queuedTiles)
@@ -14478,6 +14675,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // complementary source rectangles.
         pages = applyPageTears(to: pages)
         canvasPages = pages
+        if let perfOnScreen, let perfSharpSources {
+            finishPerfViewport(pages: pages, sharpSources: perfSharpSources, onScreen: perfOnScreen,
+                               path: usesScreenPageRasters ? "page-raster" : "tile", lod: lod,
+                               viewport: viewport, visibleMisses: bandReport.visibleMisses,
+                               queuedTiles: queuedTiles.count, wanted: wanted.count)
+        }
         if isRestoringDocument && !pages.isEmpty { isRestoringDocument = false }
         currentPage = regionCurrentPage(at: scrollYPt) + 1
         reportTileCacheStats(
@@ -15356,13 +15559,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
             let page = placement.index
             let epoch = documentEpoch
+            let perfEnqueued: Double? = PerfTrace.enabled ? PerfTrace.now : nil
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 guard epoch == self.documentEpoch else { return }
                 defer { if epoch == self.documentEpoch { self.textPagesInFlight.remove(page) } }
+                let perfStarted: Double? = PerfTrace.enabled ? PerfTrace.now : nil
                 if let extracted = try? await self.engine.textPage(page) {
                     guard epoch == self.documentEpoch else { return }
                     self.textPages[page] = extracted
+                    if PerfTrace.enabled, let perfEnqueued, let perfStarted {
+                        PerfTrace.queue(category: "text", page: page,
+                                        waitMs: max(0, (perfStarted - perfEnqueued) * 1000),
+                                        execMs: max(0, (PerfTrace.now - perfStarted) * 1000),
+                                        epoch: self.documentEpoch)
+                    }
                     self.reloadVisiblePages()
                 }
             }
@@ -15643,12 +15854,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// Rasterizes one tile in the background and folds it into the cache.
-    private func scheduleTile(_ key: TileKey, placement: PagePlacement) {
+    private func scheduleTile(_ key: TileKey, placement: PagePlacement, prefetch: Bool) {
         guard !tilesInFlight.contains(key), !failedTiles.contains(key) else { return }
         pendingTiles.append((key, placement))
         // One request per queued raster. Repeated viewport updates re-append the tile only after
         // `pendingTiles` is rebuilt, so this counts real scheduler requests, not cache lookups.
         tileRequestCount += 1
+        if PerfTrace.enabled {
+            perfTileEnqueuedAt[key] = PerfTrace.now
+            perfTilePrefetch[key] = prefetch
+            PerfTrace.tile(phase: "enqueue", source: "tile", page: key.page, lod: Int(key.lod),
+                           x: key.x, y: key.y, epoch: documentEpoch,
+                           contentVersion: perfContentVersion, offsetPt: scrollYPt,
+                           detail: prefetch ? "prefetch" : "visible")
+        }
     }
 
     private func pumpTiles() {
@@ -15664,6 +15883,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let epoch = renderEpoch
         let tileSize = tileSizePx
         let started = DispatchTime.now().uptimeNanoseconds
+        if PerfTrace.enabled {
+            perfTileStartedAt[key] = PerfTrace.now
+            PerfTrace.tile(phase: "start", source: "tile", page: key.page, lod: Int(key.lod),
+                           x: key.x, y: key.y, epoch: documentEpoch,
+                           contentVersion: perfContentVersion, offsetPt: scrollYPt)
+        }
         Task { @MainActor [weak self] in
             guard let self, epoch == self.renderEpoch else { return }
 
@@ -15675,6 +15900,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     tileY: key.y,
                     tileSize: tileSize
                 )
+                if PerfTrace.enabled {
+                    // Gap from the engine's `raster_resume_scheduled` to here is main-actor wait.
+                    PerfTrace.stage("raster_resumed", source: "tile", page: key.page,
+                                    generation: tile.generation, epoch: self.documentEpoch)
+                }
                 guard epoch == self.renderEpoch else { return }
                 self.tilesInFlight.remove(key)
                 // Self-reported wall time of the engine call: it includes PDFium rasterization
@@ -15683,7 +15913,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 self.tileRasterMilliseconds += Double(
                     DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
 
+                let perfCopy = PerfTrace.enabled ? PerfTrace.now : 0
                 let image = tile.pageImage(pointSize: CGSize(width: placement.widthPt, height: placement.heightPt))
+                if PerfTrace.enabled {
+                    // Edge tiles are cropped row by row into their placement bitmap; that copy
+                    // is the tile path's only image conversion, and it is measured, not guessed.
+                    PerfTrace.stage("image_copy", source: "tile", page: key.page,
+                                    generation: tile.generation,
+                                    milliseconds: (PerfTrace.now - perfCopy) * 1000,
+                                    epoch: self.documentEpoch)
+                    self.tracePerfTileRastered(key, started: self.perfTileStartedAt[key] ?? PerfTrace.now,
+                                               finished: PerfTrace.now, bytes: image.bgra.count,
+                                               generation: image.generation)
+                }
                 self.tileCache.insert(image, for: key)
                 self.reloadVisiblePages()
             } catch {
@@ -15691,6 +15933,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 self.tilesInFlight.remove(key)
                 self.failedTiles.insert(key)
                 self.lastError = String(describing: error)
+                if PerfTrace.enabled {
+                    _ = self.perfTileEnqueuedAt.removeValue(forKey: key)
+                    _ = self.perfTileStartedAt.removeValue(forKey: key)
+                    PerfTrace.tile(phase: "failed", source: "tile", page: key.page,
+                                   lod: Int(key.lod), x: key.x, y: key.y, epoch: documentEpoch,
+                                   contentVersion: self.perfContentVersion,
+                                   offsetPt: self.scrollYPt,
+                                   detail: String(describing: error))
+                }
                 self.reloadVisiblePages()
             }
         }
@@ -15862,10 +16113,32 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let scale = desiredPreviewScale
         let epoch = renderEpoch
         let started = DispatchTime.now().uptimeNanoseconds
+        // The same raster serves two roles: on the screen-page path it is the sharp source
+        // (`page-raster`); with that path off it is a lower-resolution backdrop (`preview`).
+        let source = usesScreenPageRasters ? "page-raster" : "preview"
+        let perfEnqueued: Double? = PerfTrace.enabled ? PerfTrace.now : nil
+        if PerfTrace.enabled {
+            PerfTrace.tile(phase: "enqueue", source: source, page: page, lod: 0, x: 0, y: 0,
+                           epoch: documentEpoch, contentVersion: perfContentVersion,
+                           offsetPt: scrollYPt, scale: scale)
+        }
         Task { @MainActor [weak self] in
             guard let self, epoch == self.renderEpoch else { return }
+            let perfStarted: Double? = PerfTrace.enabled ? PerfTrace.now : nil
+            if PerfTrace.enabled {
+                PerfTrace.tile(phase: "start", source: source, page: page, lod: 0, x: 0, y: 0,
+                               epoch: self.documentEpoch, contentVersion: self.perfContentVersion,
+                               offsetPt: self.scrollYPt, scale: scale)
+            }
             do {
                 let image = try await self.engine.renderPage(page, scale: scale)
+                if PerfTrace.enabled {
+                    // The shell task resumed here: the gap from the engine's
+                    // `raster_resume_scheduled` stage to this instant is main-actor wait.
+                    PerfTrace.stage("raster_resumed", source: source, page: page,
+                                    generation: image.generation, scale: Double(scale),
+                                    epoch: self.documentEpoch)
+                }
                 guard epoch == self.renderEpoch else { return }
                 if self.desiredPreviewPages.contains(page), scale >= (self.pagePreviewScales[page] ?? 0) {
                     self.pagePreviews[page] = image
@@ -15878,6 +16151,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             } catch {
                 guard epoch == self.renderEpoch else { return }
                 self.failedPreviewPages.insert(page)
+            }
+            if let perfEnqueued, let perfStarted {
+                PerfTrace.queue(category: "page-raster", page: page,
+                                waitMs: max(0, (perfStarted - perfEnqueued) * 1000),
+                                execMs: max(0, (PerfTrace.now - perfStarted) * 1000),
+                                epoch: self.documentEpoch)
+                PerfTrace.tile(phase: "done", source: source, page: page, lod: 0, x: 0, y: 0,
+                               epoch: self.documentEpoch, contentVersion: self.perfContentVersion,
+                               offsetPt: self.scrollYPt,
+                               execMs: max(0, (PerfTrace.now - perfStarted) * 1000),
+                               bytes: self.pagePreviews[page]?.bgra.count, scale: scale)
             }
             self.pagePreviewInFlight = nil
             self.reloadVisiblePages()
@@ -16698,5 +16982,219 @@ extension AppState {
             discardEmptyPageEditSession()
             return false
         }
+    }
+}
+
+// MARK: - Performance trace (`LYRA_READER_PERF_TRACE=1`)
+
+/// The shell half of the perf trace. These helpers only run when ``PerfTrace/enabled``; with the
+/// variable unset each event site costs one bool test and no allocation, and no counter below is
+/// maintained at all. Nothing here schedules, rasterizes, caches or draws differently: it reads
+/// the state those paths already produced and writes a line to stderr.
+extension AppState {
+    /// Clamped integer measurement override (the perf scroll hook's knobs).
+    private static func perfInt(_ key: String, _ fallback: Int,
+                                _ range: ClosedRange<Int>) -> Int {
+        guard let raw = ProcessInfo.processInfo.environment[key], let value = Int(raw) else {
+            return fallback
+        }
+        return min(max(value, range.lowerBound), range.upperBound)
+    }
+
+    /// Clamped finite double measurement override.
+    private static func perfDouble(_ key: String, _ fallback: Double,
+                                   _ range: ClosedRange<Double>) -> Double {
+        guard let raw = ProcessInfo.processInfo.environment[key], let value = Double(raw),
+              value.isFinite else { return fallback }
+        return min(max(value, range.lowerBound), range.upperBound)
+    }
+
+    /// One launch marker per process, emitted by the first state built (or already by the app
+    /// entry point). It anchors `first_present_ms` for the launch document;
+    /// `document(open_start)` anchors open itself.
+    private func reportPerfLaunch() {
+        PerfTrace.reportLaunchOnce()
+    }
+
+    /// Records a scroll input. `source` is the input path, `phase` says whether it began,
+    /// changed or ended a gesture (the wheel path currently reports `changed` per event).
+    /// `destination` is the offset the input aimed at: the applied offset for a wheel event,
+    /// the glide's target for a keyboard step.
+    private func tracePerfInput(source: String, phase: String, delta: CGFloat, offset: CGFloat,
+                                destination: CGFloat?) {
+        guard PerfTrace.enabled else { return }
+        perfInputSeq &+= 1
+        PerfTrace.input(seq: perfInputSeq, source: source, phase: phase, offsetPt: offset,
+                        deltaPt: delta, destinationPt: destination, epoch: documentEpoch)
+    }
+
+    /// One RSS + cache sample. `phase` is `sample` (1 Hz), `scroll_stop` (the indicator's idle
+    /// window), `document_close_before` (rasters still resident) or `document_close` (dropped).
+    private func samplePerfMemory(phase: String) {
+        guard PerfTrace.enabled else { return }
+        PerfTrace.memory(phase: phase, rssBytes: PerfTrace.residentBytes(),
+                         tileCacheBytes: tileCache.usedBytes,
+                         pageRasterBytes: pageRasterCacheUsedBytes,
+                         thumbnailBytes: thumbnailCacheBytes,
+                         tileCount: tileCache.count,
+                         pageRasterCount: pagePreviews.count,
+                         peakBytes: tileCache.peakBytes,
+                         evictions: tileCache.stats.evictions,
+                         epoch: documentEpoch)
+    }
+
+    private func startPerfMemorySampling() {
+        guard PerfTrace.enabled, perfMemoryTask == nil else { return }
+        perfMemoryTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled, let self, self.document != nil,
+                      PerfTrace.enabled else { return }
+                self.samplePerfMemory(phase: "sample")
+            }
+        }
+    }
+
+    private func stopPerfMemorySampling() {
+        perfMemoryTask?.cancel()
+        perfMemoryTask = nil
+    }
+
+    /// The counters for the document that is leaving, emitted before `resetDocumentState`
+    /// clears them. `prefetch_rastered_never_drawn` is the one classification that can only be
+    /// decided at the end: a prefetch raster may still be drawn later in the same document.
+    private func reportPerfDocumentClose() {
+        guard PerfTrace.enabled else { return }
+        samplePerfMemory(phase: "document_close_before")
+        PerfTrace.summary(
+            epoch: documentEpoch,
+            contentVersion: perfContentVersion,
+            rasteredTiles: perfRasteredKeys.count,
+            drawnTiles: perfDrawnTiles.count,
+            firstRasters: perfFirstRasters,
+            repeatsAfterEviction: perfRepeatRasters,
+            prefetchRasteredNeverDrawn: perfPrefetchRastered.subtracting(perfDrawnTiles).count,
+            uploadsAfterCacheHit: PerfTrace.uploadsAfterCacheHit,
+            evictions: tileCache.stats.evictions)
+        PerfTrace.document(phase: "closed", epoch: documentEpoch, pages: document?.pageCount)
+    }
+
+    /// Drops the per-document classification state and starts a fresh content version.
+    private func resetPerfDocumentState() {
+        guard PerfTrace.enabled else { return }
+        perfRasteredKeys.removeAll(keepingCapacity: false)
+        perfPrefetchRastered.removeAll(keepingCapacity: false)
+        perfDrawnTiles.removeAll(keepingCapacity: false)
+        perfDrawnRasterGenerations.removeAll(keepingCapacity: false)
+        perfTileEnqueuedAt.removeAll(keepingCapacity: false)
+        perfTileStartedAt.removeAll(keepingCapacity: false)
+        perfTilePrefetch.removeAll(keepingCapacity: false)
+        perfThumbnailEnqueuedAt.removeAll(keepingCapacity: false)
+        perfFirstRasters = 0
+        perfRepeatRasters = 0
+        perfContentVersion &+= 1
+        PerfTrace.resetUploadsAfterCacheHit()
+        // The stamp belongs to the page list that was just dropped: keep the monotonic sharp
+        // token (a frame can then only match a newer commit) but clear the viewport identity.
+        perfViewportStamp = PerfViewportStamp(token: perfSharpToken, epoch: documentEpoch,
+                                              contentVersion: perfContentVersion)
+    }
+
+    /// Marks one tile's raster as finished: classifies it, and reports the queue timings the
+    /// tile waited through. Called from `startTile`'s completion, before the cache insert.
+    private func tracePerfTileRastered(_ key: TileKey, started: Double, finished: Double,
+                                       bytes: Int, generation: UInt64) {
+        guard PerfTrace.enabled else { return }
+        let first = perfRasteredKeys.insert(key).inserted
+        let classification = first ? "first" : "repeat-after-eviction"
+        if first { perfFirstRasters += 1 } else { perfRepeatRasters += 1 }
+        if perfTilePrefetch[key] == true { perfPrefetchRastered.insert(key) }
+        PerfTrace.raster(classification: classification, source: "tile", page: key.page,
+                         lod: Int(key.lod), x: key.x, y: key.y,
+                         generation: generation, epoch: documentEpoch,
+                         contentVersion: perfContentVersion)
+        let enqueued = perfTileEnqueuedAt.removeValue(forKey: key) ?? started
+        perfTileStartedAt.removeValue(forKey: key)
+        PerfTrace.queue(category: "tile", page: key.page,
+                        waitMs: max(0, (started - enqueued) * 1000),
+                        execMs: max(0, (finished - started) * 1000),
+                        epoch: documentEpoch)
+        PerfTrace.tile(phase: "done", source: "tile", page: key.page, lod: Int(key.lod),
+                       x: key.x, y: key.y, epoch: documentEpoch,
+                       contentVersion: perfContentVersion, offsetPt: scrollYPt,
+                       waitMs: max(0, (started - enqueued) * 1000),
+                       execMs: max(0, (finished - started) * 1000), bytes: bytes)
+    }
+
+    /// Walks the page list that was just committed. A positive index is a tile (the only
+    /// positive block), so the first time a rastered tile appears here it has been drawn; a
+    /// page-raster/thumbnail index records that a whole-page fallback reached the canvas.
+    private func tracePerfDrawnPages(_ pages: [CanvasPage]) {
+        guard PerfTrace.enabled else { return }
+        for page in pages {
+            let id = page.placement.index
+            if id >= 0 {
+                let key = TileKey(page: id >> 24, lod: UInt8((id >> 20) & 15),
+                                  x: id & 1023, y: (id >> 10) & 1023)
+                guard perfDrawnTiles.insert(key).inserted else { continue }
+                PerfTrace.tile(phase: "drawn", source: "tile", page: key.page, lod: Int(key.lod),
+                               x: key.x, y: key.y, epoch: documentEpoch,
+                               contentVersion: perfContentVersion, offsetPt: scrollYPt)
+                continue
+            }
+            guard let pageIndex = PlacementIndex.pageRasterPage(id),
+                  perfDrawnRasterGenerations.insert(page.image.generation).inserted else {
+                continue
+            }
+            let source: String
+            if pagePreviews[pageIndex]?.generation == page.image.generation {
+                // A page raster drawn below `zoom × deviceScale` is a preview backdrop, not a
+                // sharp source; the same bitmap can become `page-raster` once it reaches the
+                // screen resolution (a later generation).
+                source = isScreenPageCached(pageIndex) ? "page-raster" : "preview"
+            } else {
+                source = "thumbnail"
+            }
+            PerfTrace.tile(phase: "drawn", source: source, page: pageIndex, lod: 0, x: 0, y: 0,
+                           epoch: documentEpoch, contentVersion: perfContentVersion,
+                           offsetPt: scrollYPt,
+                           scale: Double(page.image.pixelWidth) / max(1, Double(page.placement.widthPt)))
+        }
+    }
+
+    /// Closes one `reloadVisiblePages` pass: emits the viewport plan, the `sharp` transition when
+    /// every on-screen page is covered at target sharpness, publishes the stamp the canvas copies
+    /// into frame records, and records first draws.
+    private func finishPerfViewport(pages: [CanvasPage], sharpSources: [Int: String],
+                                    onScreen: Set<Int>, path: String, lod: UInt8,
+                                    viewport: CGRect, visibleMisses: Int, queuedTiles: Int,
+                                    wanted: Int) {
+        guard PerfTrace.enabled else { return }
+        perfViewportSeq &+= 1
+        let visiblePages = onScreen.sorted()
+        let sources = visiblePages.compactMap { sharpSources[$0] }
+        // No visible page means no "whole viewport": a plan with nothing on screen is never
+        // reported sharp, even though there is nothing blurry either.
+        let sharpNow = !visiblePages.isEmpty && sources.count == visiblePages.count
+        let sourcePath = Set(sources).count == 1 ? (sources.first ?? path) : "mixed"
+        PerfTrace.viewport(seq: perfViewportSeq, epoch: documentEpoch,
+                           contentVersion: perfContentVersion, offsetPt: scrollYPt,
+                           path: sharpNow ? sourcePath : path, lod: lod,
+                           visiblePages: visiblePages, viewport: viewport, sharp: sharpNow,
+                           visibleMisses: visibleMisses, queuedTiles: queuedTiles,
+                           wantedTiles: wanted, pageRasters: pagePreviews.count)
+        if sharpNow {
+            perfSharpToken &+= 1
+            PerfTrace.sharp(token: perfSharpToken, viewportSeq: perfViewportSeq,
+                            epoch: documentEpoch, contentVersion: perfContentVersion,
+                            offsetPt: scrollYPt, path: sourcePath, lod: lod,
+                            pages: visiblePages, sources: sources,
+                            afterInputSeq: perfInputSeq == 0 ? nil : perfInputSeq)
+        }
+        perfViewportStamp = PerfViewportStamp(token: perfSharpToken, epoch: documentEpoch,
+                                              contentVersion: perfContentVersion,
+                                              path: sharpNow ? sourcePath : path, lod: lod,
+                                              offsetPt: scrollYPt)
+        tracePerfDrawnPages(pages)
     }
 }

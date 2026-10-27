@@ -4,11 +4,40 @@ import Metal
 import QuartzCore
 import SwiftUI
 
+/// One frame's draw-call time, shared between the canvas (writer, main actor) and the presented
+/// handler (reader, Metal's callback thread). A reference box exists so the handler does not
+/// capture the layer itself, which would be a non-Sendable capture; the value is diagnostic and
+/// a torn read could only mislabel one frame's CPU time.
+final class TraceCPUSample: @unchecked Sendable {
+    var microseconds: UInt64 = 0
+}
+
 /// Diagnostic layer: observe the drawable wgpu acquires without acquiring another one.
 /// Metal reports its actual presentation host time asynchronously, including zero for drops.
+///
+/// Serves both traces: the older `LYRA_READER_SCROLL_TRACE_SECONDS` line and the perf trace's
+/// `frame` record. The perf record is written here because this callback is the only place the
+/// host presentation timestamp exists; when Metal reports zero (display asleep, window occluded)
+/// the record says `"unavailable"` with a reason instead of substituting 0 for a frame time.
 final class PresentationTraceLayer: CAMetalLayer {
     var traceSurface: UInt64 = 0
     var traceY: Double = 0
+    var traceStamp = PerfViewportStamp()
+    /// CPU submission uptime, captured by `renderFrame` before the draw call.
+    var traceSubmitTime: Double = 0
+    var traceQuads: Int = 0
+    var traceTileQuads: Int = 0
+    var traceFrameIndex: UInt64 = 0
+    /// Draw-call wall time, written after the draw returns; the handler reads it at presentation.
+    var traceCPU = TraceCPUSample()
+    /// Texture-upload wall time of the pass that produced this frame's textures.
+    var traceUploadMs: Double = 0
+    /// Fixed at surface creation, like the scroll-trace gate: whether this layer was installed
+    /// for the perf trace. The global ``PerfTrace/enabled`` is still checked when emitting.
+    var tracePerfEnabled = false
+    /// Whether the older `LYRA_READER_SCROLL_TRACE_SECONDS` line is also wanted. Keeping the two
+    /// gates separate means enabling the perf trace does not add scroll-trace records to a log.
+    var traceScrollEnabled = false
     private(set) var traceSequence: UInt64 = 0
 
     override func nextDrawable() -> (any CAMetalDrawable)? {
@@ -17,9 +46,33 @@ final class PresentationTraceLayer: CAMetalLayer {
         let sequence = traceSequence
         let surface = traceSurface
         let y = traceY
+        // Captured at acquisition: these describe the page list this drawable was drawn from,
+        // and later frames must not retroactively change them.
+        let stamp = traceStamp
+        let submitTime = traceSubmitTime
+        let quads = traceQuads
+        let tileQuads = traceTileQuads
+        let frameIndex = traceFrameIndex
+        let cpu = traceCPU
+        let uploadMs = traceUploadMs
+        let perfEnabled = tracePerfEnabled
+        let scrollEnabled = traceScrollEnabled
         drawable.addPresentedHandler { drawable in
-            let line = "lyra-reader-scroll-trace: {\"kind\":\"presentation\",\"time\":\(drawable.presentedTime),\"callback_time\":\(CACurrentMediaTime()),\"surface\":\(surface),\"sequence\":\(sequence),\"y\":\(y)}\n"
-            FileHandle.standardError.write(Data(line.utf8))
+            if scrollEnabled {
+                let line = "lyra-reader-scroll-trace: {\"kind\":\"presentation\",\"time\":\(drawable.presentedTime),\"callback_time\":\(CACurrentMediaTime()),\"surface\":\(surface),\"sequence\":\(sequence),\"y\":\(y)}\n"
+                FileHandle.standardError.write(Data(line.utf8))
+            }
+            guard perfEnabled, PerfTrace.enabled else { return }
+            let hostTime = drawable.presentedTime
+            let presented = hostTime.isFinite && hostTime > 0
+            PerfTrace.frame(
+                presented: true,
+                presentedTime: presented ? hostTime : nil,
+                reason: presented ? nil
+                    : "Metal reported a zero host presentation timestamp (display asleep or window occluded)",
+                submitTime: submitTime, surface: surface, sequence: sequence, stamp: stamp,
+                cpuUs: cpu.microseconds, quads: quads, tileQuads: tileQuads,
+                frameIndex: frameIndex, uploadMs: uploadMs > 0 ? uploadMs : nil)
         }
         return drawable
     }
@@ -387,6 +440,12 @@ public final class MetalCanvasView: NSView {
     private var surfaceId: UInt64 = 0
     /// One texture per page, with the generation it was uploaded from.
     private var textures: [Int: (generation: UInt64, id: UInt64)] = [:]
+    /// Trace-only: generations this view has uploaded before. A repeat is an upload after a CPU
+    /// cache hit (the texture was released while the pixels survived in the tile cache).
+    private var uploadedImageGenerations: Set<UInt64> = []
+    /// Trace-only: wall time of the most recent texture-sync pass that uploaded something, for
+    /// the next frame's `upload_ms` field. Consumed when that frame is submitted.
+    private var pendingTextureUploadMs: Double = 0
     package var residentTextureIDs: [Int: UInt64] { textures.mapValues(\.id) }
     /// Whether to print what this view submits (`LYRA_READER_CANVAS_DUMP=1`).
     ///
@@ -411,6 +470,14 @@ public final class MetalCanvasView: NSView {
     /// Reads the just-updated model during AppKit event tracking, before SwiftUI commits:
     /// pages, scroll offset in content points, and zoom factor.
     public var interactionSnapshot: (() -> ([CanvasPage], CGFloat, CGFloat))?
+    /// The viewport stamp belonging to the page list this view draws. Set with `pages` by the
+    /// SwiftUI update, and read during event tracking through ``perfStampProvider`` so the
+    /// stamp and the pixels always describe the same commit.
+    var perfStamp = PerfViewportStamp()
+    /// Reads the model's current stamp during AppKit event tracking. Optional: a canvas without
+    /// a perf trace (the floating preview) leaves the default stamp, and tracing off never calls
+    /// it.
+    public var perfStampProvider: (() -> PerfViewportStamp)?
 
     private func syncInteraction() {
         if let snapshot = interactionSnapshot?() {
@@ -418,6 +485,7 @@ public final class MetalCanvasView: NSView {
             scrollYPt = snapshot.1
             zoom = snapshot.2
         }
+        if PerfTrace.enabled, let stamp = perfStampProvider?() { perfStamp = stamp }
         if needsRender {
             needsRender = false
             renderFrame()
@@ -465,7 +533,13 @@ public final class MetalCanvasView: NSView {
     private let traceScheduling = ProcessInfo.processInfo.environment["LYRA_READER_SCROLL_TRACE_SCHEDULING"] == "1"
 
     public override func makeBackingLayer() -> CALayer {
-        let metalLayer = traceFrames ? PresentationTraceLayer() : CAMetalLayer()
+        // The perf trace needs the drawable's presentation callback too; the layer only changes
+        // what is *observed*, never what is drawn. With both variables unset the layer is a
+        // plain `CAMetalLayer` and the frame path is byte-for-byte the old one.
+        let metalLayer = (traceFrames || PerfTrace.enabled)
+            ? PresentationTraceLayer() : CAMetalLayer()
+        (metalLayer as? PresentationTraceLayer)?.tracePerfEnabled = PerfTrace.enabled
+        (metalLayer as? PresentationTraceLayer)?.traceScrollEnabled = traceFrames
         // Same device as wgpu's adapter (see the class comment).
         metalLayer.device = MTLCreateSystemDefaultDevice()
         metalLayer.isOpaque = true
@@ -1444,6 +1518,8 @@ public final class MetalCanvasView: NSView {
     private func syncTextures() {
         guard surfaceId != 0 else { return }
 
+        let perfSyncStarted = PerfTrace.enabled ? PerfTrace.now : 0
+        var perfUploads = 0
         var wanted = Set<Int>()
         var claimed: [Int: UInt64] = [:]
         for page in pages {
@@ -1461,8 +1537,45 @@ public final class MetalCanvasView: NSView {
             if let stale = textures.removeValue(forKey: index) {
                 _ = lyra_reader_gpu_release_texture(stale.id)
             }
+            let perfUploadStarted = PerfTrace.enabled ? PerfTrace.now : 0
             if let id = uploadTexture(page.image) {
                 textures[index] = (page.image.generation, id)
+                perfUploads += 1
+                if PerfTrace.enabled {
+                    PerfTrace.stage(
+                        "upload",
+                        source: index >= 0 ? "tile" : "page-raster",
+                        page: index >= 0 ? index >> 24 : PlacementIndex.pageRasterPage(index),
+                        generation: page.image.generation,
+                        milliseconds: (PerfTrace.now - perfUploadStarted) * 1000,
+                        epoch: perfStamp.epoch)
+                    // The CPU image was already in a cache; uploading it again means the GPU
+                    // texture had been released while the pixels survived on the CPU side.
+                    if uploadedImageGenerations.contains(page.image.generation) {
+                        PerfTrace.noteUploadAfterCacheHit()
+                        if index >= 0 {
+                            PerfTrace.raster(
+                                classification: "upload-after-cache-hit", source: "tile",
+                                page: index >> 24, lod: (index >> 20) & 15,
+                                x: index & 1023, y: (index >> 10) & 1023,
+                                generation: page.image.generation,
+                                epoch: perfStamp.epoch,
+                                contentVersion: perfStamp.contentVersion)
+                        } else if let pageIndex = PlacementIndex.pageRasterPage(index) {
+                            PerfTrace.raster(
+                                classification: "upload-after-cache-hit", source: "page-raster",
+                                page: pageIndex, lod: 0, x: 0, y: 0,
+                                generation: page.image.generation,
+                                epoch: perfStamp.epoch,
+                                contentVersion: perfStamp.contentVersion)
+                        }
+                    }
+                    // Bounded on purpose: past the cap the counter under-reports rather than
+                    // growing without limit in a very long run.
+                    if uploadedImageGenerations.count < 16_384 {
+                        uploadedImageGenerations.insert(page.image.generation)
+                    }
+                }
             }
         }
 
@@ -1472,6 +1585,11 @@ public final class MetalCanvasView: NSView {
             if let stale = textures.removeValue(forKey: index) {
                 _ = lyra_reader_gpu_release_texture(stale.id)
             }
+        }
+        if PerfTrace.enabled, perfUploads > 0 {
+            // Attributed to the next submitted frame: this is the sync pass that produced the
+            // textures that frame draws. A later pass with no uploads leaves the value alone.
+            pendingTextureUploadMs = (PerfTrace.now - perfSyncStarted) * 1000
         }
     }
 
@@ -1638,9 +1756,22 @@ public final class MetalCanvasView: NSView {
         // and presents it. Skipping the submission is what left the last drawn document on
         // screen behind the empty state when its last tab closed, because a `CAMetalLayer`
         // keeps showing the last drawable until another one is presented.
+        // The CPU submission instant is measurable even when Metal never reports a presentation
+        // time, so the perf frame record keeps it separate from `presented_time`.
+        let perfSubmitTime = PerfTrace.enabled ? PerfTrace.now : 0
+        // The texture-sync pass that uploaded this frame's bitmaps happened before this draw;
+        // its wall time is attributed to exactly one frame and then cleared.
+        let perfUploadMs = PerfTrace.enabled ? pendingTextureUploadMs : 0
+        if PerfTrace.enabled { pendingTextureUploadMs = 0 }
         if let traceLayer = layer as? PresentationTraceLayer {
             traceLayer.traceSurface = surfaceId
             traceLayer.traceY = Double(scrollYPt)
+            traceLayer.traceStamp = perfStamp
+            traceLayer.traceSubmitTime = perfSubmitTime
+            traceLayer.traceQuads = textureIds.count
+            traceLayer.traceTileQuads = tileQuadCount
+            traceLayer.traceFrameIndex = frameAttemptCount + 1
+            traceLayer.traceUploadMs = perfUploadMs
         }
         let clear = canvasClearColor.map {
             LyraReaderTheme.clearComponents(of: $0, appearance: effectiveAppearance)
@@ -1668,12 +1799,41 @@ public final class MetalCanvasView: NSView {
             report("lyra_reader_surface_draw_pages failed (\(LyraReaderStatus.describe(code)))")
             return
         }
+        if let traceLayer = layer as? PresentationTraceLayer {
+            traceLayer.traceCPU.microseconds = UInt64(stats.elapsed_us)
+        }
 
         if traceFrames {
             let now = ProcessInfo.processInfo.systemUptime
             let sequence = (layer as? PresentationTraceLayer)?.traceSequence ?? 0
             let line = "lyra-reader-scroll-trace: {\"kind\":\"frame\",\"time\":\(now),\"surface\":\(surfaceId),\"sequence\":\(sequence),\"presented\":\(stats.presented),\"cpu_us\":\(stats.elapsed_us),\"y\":\(scrollYPt)}\n"
             FileHandle.standardError.write(Data(line.utf8))
+        }
+
+        if PerfTrace.enabled {
+            if stats.presented == 0 {
+                // A skipped draw is not a presented frame; it is recorded anyway so an occluded
+                // run is diagnosable instead of looking like a trace with frames missing.
+                PerfTrace.frame(
+                    presented: false, presentedTime: nil,
+                    reason: "the compositor skipped the draw (window occluded or display asleep)",
+                    submitTime: perfSubmitTime, surface: UInt64(surfaceId),
+                    sequence: (layer as? PresentationTraceLayer)?.traceSequence ?? 0,
+                    stamp: perfStamp, cpuUs: UInt64(stats.elapsed_us), quads: textureIds.count,
+                    tileQuads: tileQuadCount, frameIndex: frameAttemptCount + 1,
+                    uploadMs: perfUploadMs > 0 ? perfUploadMs : nil)
+            } else if (layer as? PresentationTraceLayer)?.tracePerfEnabled != true {
+                // Presentation happened, but without the observing layer there is no host
+                // timestamp to report. Say so instead of reusing the submit time as if it were
+                // a presentation time.
+                PerfTrace.frame(
+                    presented: true, presentedTime: nil,
+                    reason: "no presentation trace layer was installed when the surface was created; Metal's host timestamp is unavailable",
+                    submitTime: perfSubmitTime, surface: UInt64(surfaceId), sequence: 0,
+                    stamp: perfStamp, cpuUs: UInt64(stats.elapsed_us), quads: textureIds.count,
+                    tileQuads: tileQuadCount, frameIndex: frameAttemptCount + 1,
+                    uploadMs: perfUploadMs > 0 ? perfUploadMs : nil)
+            }
         }
 
         // Count the submission before presentation is decided: an occluded window still runs
@@ -1874,6 +2034,13 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let onUndo: () -> Void
     private let onRedo: () -> Void
     private let interactionSnapshot: (() -> ([CanvasPage], CGFloat, CGFloat))?
+    /// The `sharp` token / document epoch the `pages` above belong to. Published with `pages` so
+    /// a frame record can name the exact commit that produced the pixels; the canvas reads it
+    /// only when the perf trace is emitting.
+    private let perfStamp: PerfViewportStamp
+    /// Reads the model's stamp during AppKit event tracking, where `pages` come from
+    /// `interactionSnapshot` instead of a SwiftUI update.
+    private let onPerfStamp: (() -> PerfViewportStamp)?
     /// Documents dropped on the canvas: the shell's open funnel (see `DocumentOpenCoordinator`).
     private let fileDrop: DocumentOpenCoordinator?
     /// Right-click command list, rendered in the shared LyraReader panel. `nil` offers no menu.
@@ -1930,6 +2097,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         onUndo: @escaping () -> Void = {},
         onRedo: @escaping () -> Void = {},
         interactionSnapshot: (() -> ([CanvasPage], CGFloat, CGFloat))? = nil,
+        perfStamp: PerfViewportStamp = PerfViewportStamp(),
+        onPerfStamp: (() -> PerfViewportStamp)? = nil,
         fileDrop: DocumentOpenCoordinator? = nil,
         onContextMenu: ((CGPoint) -> NSMenu?)? = nil,
         onTranslationToggle: ((String) -> Void)? = nil,
@@ -1989,6 +2158,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.onUndo = onUndo
         self.onRedo = onRedo
         self.interactionSnapshot = interactionSnapshot
+        self.perfStamp = perfStamp
+        self.onPerfStamp = onPerfStamp
         self.fileDrop = fileDrop
         self.onContextMenu = onContextMenu
         self.onTranslationToggle = onTranslationToggle
@@ -2010,6 +2181,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.configureRegionCards(state: regionState, onOpenInPanel: onOpenRegionInPanel,
                                   onShowHistory: onShowRegionHistory)
         view.interactionSnapshot = interactionSnapshot
+        view.perfStamp = perfStamp
+        view.perfStampProvider = onPerfStamp
         view.onFrame = onFrame
         view.onFailure = onFailure
         view.performanceProbe = performanceProbe
