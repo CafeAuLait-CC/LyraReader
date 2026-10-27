@@ -7,8 +7,8 @@ import Foundation
 ///
 /// A document that carries a digital signature is read-only **in place**: every command that
 /// would rewrite the file is refused, while commands whose destination is a new file (extract,
-/// merge, split, save edited copy, filled-form/properties copy, redaction to a copy, annotation
-/// copy export) are allowed. Those copies are stripped of signature fields, because their bytes
+/// merge, split, save edited copy, filled-form/properties copy, content-edit redaction to a copy,
+/// annotation copy export) are allowed. Those copies are stripped of signature fields, because their bytes
 /// are no longer covered by the signature. An unsigned document is written exactly as before,
 /// except that a save which removes annotations prunes the file so the removed content cannot be
 /// recovered from the bytes.
@@ -88,8 +88,8 @@ extension ReaderChecks {
                 let message: String
                 if let ffi = error as? LyraReaderFfiError {
                     switch ffi {
-                    case .Document(let value), .Backend(let value),
-                         .InvalidArgument(let value), .Ai(let value):
+                    case .Document(let value, _), .Backend(let value, _),
+                         .InvalidArgument(let value, _), .Ai(let value, _, _):
                         message = value
                     }
                 } else {
@@ -101,11 +101,11 @@ extension ReaderChecks {
         }
 
         await expectRefusal("replaceWithAnnotations") {
-            _ = try await gateEngine.replaceWithAnnotations([], bookmarks: [], zoom: 1)
+            _ = try await gateEngine.replaceWithAnnotations([], bookmarks: [])
         }
         await expectRefusal("replaceWithAnnotationChanges") {
             _ = try await gateEngine.replaceWithAnnotationChanges(
-                [], bookmarks: [], updates: [], deletions: [], zoom: 1)
+                [], bookmarks: [], updates: [], deletions: [])
         }
         await expectRefusal("replaceWithFilledForm") {
             _ = try await gateEngine.replaceWithFilledForm([])
@@ -113,10 +113,6 @@ extension ReaderChecks {
         await expectRefusal("replaceWithDocumentProperties") {
             _ = try await gateEngine.replaceWithDocumentProperties(
                 DocumentProperties(title: "x", author: "", subject: "", keywords: ""))
-        }
-        await expectRefusal("replaceWithRedactions") {
-            _ = try await gateEngine.replaceWithRedactions(
-                [RedactionArea(page: 0, rect: CGRect(x: 10, y: 10, width: 40, height: 20))])
         }
         await expectRefusal("replaceOriginalWithPageEdits") {
             _ = try await gateEngine.replaceOriginalWithPageEdits(original: signedURL)
@@ -171,13 +167,6 @@ extension ReaderChecks {
         require(editedReport.pageCount == 1, "saveEditedCopy writes the revision")
         try requireUnsignedCopy(editedCopy, "saveEditedCopy")
 
-        // Redaction to a copy.
-        let redactedCopy = scratch.appendingPathComponent("copy-redacted.pdf")
-        _ = try await gateEngine.redactToCopy(
-            to: redactedCopy,
-            areas: [RedactionArea(page: 0, rect: CGRect(x: 10, y: 10, width: 40, height: 20))])
-        try requireUnsignedCopy(redactedCopy, "redactToCopy")
-
         // Annotation copy: the new mark is written, the signature fields are not.
         let annotatedCopy = scratch.appendingPathComponent("copy-annotated.pdf")
         let highlight = AnnotationWriteRequest(
@@ -198,8 +187,7 @@ extension ReaderChecks {
             additions: [highlight],
             bookmarks: [],
             updates: [],
-            deletions: [],
-            zoom: 1)
+            deletions: [])
         require(annotationReport.writtenIDs == [highlight.id],
                 "the annotated copy reports the annotation it wrote")
         try requireUnsignedCopy(annotatedCopy, "annotation copy")
@@ -281,52 +269,60 @@ extension ReaderChecks {
                 "annotation tools stay usable: edits go to a copy")
         require(state.canPageEdit && state.canPageOperations,
                 "page editing is staged and page copies are available")
-        require(state.canMarkRedactions, "redaction can be staged")
+        require(state.canOpenRedactionWorkspace,
+                "redaction is offered through the Edit workspace")
         require(state.canSaveAnnotationsToPDF, "copy export is available")
         require(!state.canReplaceOriginalWithAnnotations,
                 "in-place annotation writing is disabled")
         require(!state.canReplaceOriginalWithPageEdits,
                 "applying a page revision to the signed original is disabled")
-        require(!state.canReplaceOriginalWithRedactions,
-                "replacing the signed original with a redaction is disabled")
         require(!state.canReplaceOriginalWithFilledForm,
                 "writing form values into the signed original is disabled")
         require(!state.canReplaceOriginalWithDocumentProperties,
                 "writing properties into the signed original is disabled")
 
-        // Annotation and bookmark edits are sidecar work; the copy export carries them.
+        // Annotation and bookmark edits are annotation cache work; the copy export carries them.
         let addedInk = state.addInkAnnotation(
             page: 0, points: [CGPoint(x: 40, y: 40), CGPoint(x: 140, y: 80)])
-        require(addedInk, "an annotation can be added to the signed document's sidecar")
+        require(addedInk, "an annotation can be added to the signed document's annotation cache")
         guard let inkID = state.annotations.last?.id else {
             require(false, "the added ink stroke has an identity")
             return
         }
         require(state.addBookmarkAtCurrentPage(name: "Copy bookmark"),
-                "a bookmark can be added to the signed document's sidecar")
+                "a bookmark can be added to the signed document's annotation cache")
         state.toggleEraserTool()
         require(state.annotationTool == .eraser, "the eraser can be armed")
         state.selectTool()
-
-        // A redaction can be marked and applied to a copy; replacing is disabled.
-        state.addPendingRedaction(page: 0, rect: CGRect(x: 20, y: 20, width: 60, height: 30))
-        require(!state.pendingRedactions.isEmpty && state.canApplyRedactions,
-                "a redaction can be marked for a copy")
-        require(!state.canReplaceOriginalWithRedactions,
-                "the marked redaction cannot be applied in place")
-        state.clearPendingRedactions()
 
         // Form drafts and property drafts are allowed; only their in-place save is disabled.
         try await eventually("the signed fixture's form loads", {
             !state.formLoading && (state.formError != nil || !state.formInfo.fields.isEmpty)
         })
-        require(state.canUseFormTool, "form filling can be staged")
+        require(state.canOpenFillAndSign,
+                "the Fill & Sign row is available on a signed document")
+        require(state.fillSignFormCommands.contains { $0.id == "save-filled-copy" },
+                "the Fill & Sign form commands offer the filled-copy command")
         if let editable = state.formInfo.fields.first(where: { $0.editable && $0.kind == .text }) {
+            require(state.formFieldsAcceptPointer,
+                    "a signed form's fields accept the pointer: values stay drafts for a copy")
+            state.clickFormField(editable.id)
+            require(state.formFocusedFieldID == editable.id,
+                    "a signed form's field focuses by click, with no tool armed")
             state.updateFormText(editable.id, text: "Draft on a signed PDF")
             require(state.canSaveFilledForm,
                     "a form draft can be saved to a copy")
             require(!state.canReplaceOriginalWithFilledForm,
                     "a form draft cannot be written into the signed original")
+            state.toggleAnnotationTool(.pen)
+            require(state.formFocusedFieldID == nil && !state.formFieldsAcceptPointer,
+                    "an armed annotation tool takes the pointer from the fields and drops focus")
+            state.focusFormField(editable.id)
+            require(state.formFocusedFieldID == nil,
+                    "with a tool armed a field click does not focus the field")
+            state.toggleAnnotationTool(.pen)
+            require(state.annotationTool == .select && state.formFieldsAcceptPointer,
+                    "turning the tool off restores the implicit pointer state for the fields")
         } else {
             require(false, "the signed fixture exposes an editable text field")
         }
@@ -341,7 +337,7 @@ extension ReaderChecks {
         require(!state.canReplaceOriginalWithDocumentProperties,
                 "a properties draft cannot be written into the signed original")
 
-        // The shell's annotated-copy export writes the sidecar marks into a new, unsigned file.
+        // The shell's annotated-copy export writes the cached marks into a new, unsigned file.
         let shellCopy = scratch.appendingPathComponent("shell-annotated-copy.pdf")
         let exported = await state.saveAnnotatedCopy(to: shellCopy)
         require(exported, "the shell exports an annotated copy of the signed document")
@@ -350,14 +346,14 @@ extension ReaderChecks {
         require(contains(shellCopyBytes, "a-signed-copy-highlight") == false,
                 "the shell copy is a new file, not the engine test's copy")
         require(contains(shellCopyBytes, inkID.uuidString),
-                "the shell copy carries the sidecar ink stroke")
+                "the shell copy carries the reader ink stroke")
         require(contains(shellCopyBytes, "Copy bookmark"),
-                "the shell copy carries the sidecar bookmark")
+                "the shell copy carries the cached bookmark")
         require(state.lastAnnotationWriteReport?.sourceBytesPreserved == false,
                 "the shell reports that the signed copy was rewritten")
 
         // A staged page edit is allowed; applying it to the original is not.
-        // An inserted blank page has no text-position conflict with the sidecar marks.
+        // An inserted blank page has no text-position conflict with the cached marks.
         let staged = await state.applyPageEditOperation(
             .insertBlank(index: 1), label: "insert blank page")
         require(staged, "a page edit can be staged on a signed document")
@@ -452,7 +448,7 @@ extension ReaderChecks {
         require(eraseState.pendingFileDeletions.isEmpty,
                 "a refused file-owned stroke stages no deletion")
         require(eraseState.annotations.isEmpty,
-                "a refused file-owned stroke writes no sidecar ink")
+                "a refused file-owned stroke writes no reader ink")
         require(eraseState.undoStack.isEmpty,
                 "a refused file-owned stroke adds no undo step")
         require(eraseState.eraserRefusalNotice?.contains("comment") == true,

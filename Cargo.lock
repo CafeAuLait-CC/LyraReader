@@ -902,6 +902,8 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "serde_json",
+ "sha2",
+ "unicode-segmentation",
  "ureq",
 ]
 
@@ -911,11 +913,13 @@ version = "0.0.0"
 dependencies = [
  "image",
  "libc",
+ "lyra-reader-ai",
  "lyra-reader-core",
  "lyra-reader-metadata",
  "lyra-reader-pdfium",
  "lyra-reader-render",
  "lyra-reader-text",
+ "lyra-reader-xfa",
  "serde",
  "serde_json",
 ]
@@ -945,6 +949,7 @@ name = "lyra-reader-edit"
 version = "0.0.0"
 dependencies = [
  "lyra-reader-core",
+ "serde_json",
 ]
 
 [[package]]
@@ -953,11 +958,14 @@ version = "0.0.0"
 dependencies = [
  "lyra-reader-ai",
  "lyra-reader-core",
+ "lyra-reader-edit",
  "lyra-reader-gpu",
  "lyra-reader-metadata",
  "lyra-reader-pdfium",
+ "lyra-reader-render",
  "lyra-reader-session",
  "lyra-reader-text",
+ "lyra-reader-xfa",
  "serde",
  "serde_json",
  "sha2",
@@ -988,6 +996,7 @@ dependencies = [
  "libloading 0.8.9",
  "lopdf",
  "lyra-reader-core",
+ "lyra-reader-edit",
  "pdfium-render",
  "png",
  "serde",
@@ -1027,6 +1036,14 @@ version = "0.0.0"
 dependencies = [
  "lyra-reader-core",
  "serde",
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "lyra-reader-xfa"
+version = "0.0.0"
+dependencies = [
+ "lopdf",
 ]
 
 [[package]]
@@ -1983,6 +2000,12 @@ name = "unicode-properties"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6ccf251212114b54433ec949fd6a7841275f9ada20dddd2f29e9ceea4501493"
 
 [[package]]
 name = "unicode-width"

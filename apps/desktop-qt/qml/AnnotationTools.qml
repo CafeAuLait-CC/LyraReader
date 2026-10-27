@@ -84,11 +84,6 @@ ToolBar {
                         name: qsTr("Text Box")
                     },
                     {
-                        kind: "redact",
-                        icon: "redact",
-                        name: qsTr("Mark for Redaction")
-                    },
-                    {
                         kind: "eraser",
                         icon: "eraser",
                         name: qsTr("Erase parts of ink strokes")
@@ -99,7 +94,6 @@ ToolBar {
                     symbol: modelData.icon
                     text: modelData.name
                     selected: app.annotationTool === modelData.kind
-                    enabled: modelData.kind !== "redact" || app.canRedact
                     onClicked: app.setAnnotationTool(modelData.kind)
                 }
             }

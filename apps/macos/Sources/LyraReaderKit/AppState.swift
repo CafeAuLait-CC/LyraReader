@@ -1,4 +1,5 @@
 import LyraReaderFFI
+import LyraReaderBindings
 import Combine
 import AppKit
 import Foundation
@@ -92,7 +93,7 @@ public enum SidebarTab: String, CaseIterable, Identifiable, Sendable {
 /// colour (`/C` and `/CA`), and because a highlight is *meant* to be translucent: 0x66 is the
 /// alpha every preset below uses, so the text under a highlight stays readable.
 ///
-/// Encoded as a single `#RRGGBBAA` string in the sidecar: one key, and impossible to misread the
+/// Encoded as a single `#RRGGBBAA` string in the annotation cache: one key, and impossible to misread the
 /// channel order of.
 public struct AnnotationColor: Codable, Equatable, Hashable, Sendable {
     public var red: UInt8
@@ -114,7 +115,7 @@ public struct AnnotationColor: Codable, Equatable, Hashable, Sendable {
     }
 
     /// Parses `#RRGGBBAA` (or `#RRGGBB`, taken as opaque). Anything else is rejected rather than
-    /// guessed at: a sidecar is a file the reader must be able to trust.
+    /// guessed at: an annotation cache is a file the reader must be able to trust.
     public init?(hex: String) {
         var digits = hex
         guard digits.hasPrefix("#") else { return nil }
@@ -202,14 +203,14 @@ public struct AnnotationColor: Codable, Equatable, Hashable, Sendable {
 /// the layout switches between continuous and facing pages — all of those move a page's top
 /// without moving anything inside the page.
 ///
-/// Persisted in the same sidecar as the reader's annotations, tagged `"kind": "bookmark"`.
+/// Persisted in the same annotation cache as the reader's annotations, tagged `"kind": "bookmark"`.
 /// The tag is what keeps an annotation-only build from misreading the entry: that build puts
 /// unknown kinds in its verbatim bucket before it looks at `page` or `title`, so it preserves
-/// this entry even though `yPt` is not an annotation key. See `AnnotationSidecar`.
+/// this entry even though `yPt` is not an annotation key. See `AnnotationRecords`.
 public struct Bookmark: Identifiable, Codable, Equatable, Sendable {
-    /// The discriminator written to the sidecar. Also the reason an older build preserves the
+    /// The discriminator written to the annotation cache. Also the reason an older build preserves the
     /// entry instead of trying to decode it as a highlight.
-    public static let sidecarKind = "bookmark"
+    public static let recordKind = "bookmark"
 
     public let id: UUID
     public var page: Int
@@ -239,7 +240,7 @@ public struct Bookmark: Identifiable, Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(UUID.self, forKey: .id)
-        // `kind` is checked by `AnnotationSidecar` before this decoder runs. Tolerating its
+        // `kind` is checked by `AnnotationRecords` before this decoder runs. Tolerating its
         // absence here keeps the model decodable on its own (tests, future formats).
         _ = try values.decodeIfPresent(String.self, forKey: .kind)
         page = try values.decode(Int.self, forKey: .page)
@@ -251,7 +252,7 @@ public struct Bookmark: Identifiable, Codable, Equatable, Sendable {
     public func encode(to encoder: Encoder) throws {
         var values = encoder.container(keyedBy: CodingKeys.self)
         try values.encode(id, forKey: .id)
-        try values.encode(Self.sidecarKind, forKey: .kind)
+        try values.encode(Self.recordKind, forKey: .kind)
         try values.encode(page, forKey: .page)
         try values.encode(title, forKey: .title)
         try values.encode(yPt, forKey: .yPt)
@@ -262,8 +263,8 @@ public struct Bookmark: Identifiable, Codable, Equatable, Sendable {
 /// The reader's global layout preferences (T2.10): facing pages and the gap between pages.
 ///
 /// These are view preferences, not document content, so they live in `UserDefaults` rather
-/// than in the sidecar: a reader who prefers facing spreads wants them in the next paper too,
-/// and the sidecar is the place for marks on *this* file. The checks disable stored lookups
+/// than in the document's annotation records: a reader who prefers facing spreads wants them in
+/// the next paper too, and the cache is the place for marks on *this* file. The checks disable stored lookups
 /// (`AppState.usesStoredReadingLayoutPreferences`) so their geometry never depends on what the
 /// person running them chose in the app.
 public enum ReadingLayoutPreferences {
@@ -304,9 +305,16 @@ public enum ReadingLayoutPreferences {
 }
 
 @MainActor
-public final class AppState: ObservableObject {
+public final class AppState: ObservableObject, InPlaceTranslationHost {
     /// Enabled by the application entry point; library/check hosts never alter user history.
     public static var recordsRecentDocuments = false
+    /// Test seam: makes the identity and timestamp of a UI-created text mark deterministic.
+    ///
+    /// Production leaves this nil, so creation keeps using `UUID()` and `Date()`. The
+    /// annotation-codec check pins both because they are the only nondeterministic inputs to
+    /// `annotations.json`; everything else about the entry comes from the model.
+    nonisolated(unsafe) package static var annotationCreationStamp:
+        (() -> (id: UUID, createdAt: Date))?
     @Published public var document: LoadedDocument?
     @Published public var sidebarTab: SidebarTab = .thumbnails {
         didSet {
@@ -321,6 +329,19 @@ public final class AppState: ObservableObject {
     /// it closed, so the content keeps its geometry and an answer is not thrown away by a toggle.
     @Published public var rightPanelVisible: Bool = false {
         didSet {
+            if oldValue != rightPanelVisible, document != nil {
+                // Protect covered columns before SwiftUI reports the new viewport. Tile
+                // completions can rebuild the band between this write and onChange/layout.
+                beginRightPanelMovement()
+                armRightPanelSettle(after: ReaderMotion.panelDuration + 0.15)
+            }
+            if rightPanelVisible, contentEditEnabled {
+                if deferContentTransition({ [weak self] in self?.rightPanelVisible = true }) {
+                    rightPanelVisible = false
+                    return
+                }
+                contentEditEnabled = false
+            }
             guard oldValue != rightPanelVisible, Self.usesStoredSidePanelPreferences else { return }
             ReaderSidePanelPreferences.store(visible: rightPanelVisible, defaults: panelDefaults)
         }
@@ -329,6 +350,23 @@ public final class AppState: ObservableObject {
     /// The 6 pt resize handle and 1 pt separator are added by ``ReaderSidePanelMetrics``.
     @Published public private(set) var rightPanelWidthPt =
         ReaderSidePanelMetrics.defaultContentWidthPt
+    /// Whether the developer-facing performance panel is open. Off by default, deliberately not
+    /// persisted (a diagnostic that survives a relaunch is chrome the reader did not ask for),
+    /// and only one right-hand drawer can be open at a time.
+    @Published public private(set) var performancePanelVisible = false {
+        didSet {
+            guard oldValue != performancePanelVisible else { return }
+            // Opening starts the 4 Hz sampling task; closing cancels it. The controller also
+            // clears the snapshot, so closed means no timer and no retained sample.
+            performancePanel.setRunning(performancePanelVisible, state: self)
+        }
+    }
+    /// The window's frame-sampling seam. Always allocated (one tiny object), but it does no
+    /// work until the panel's controller starts sampling or a document-open measurement is
+    /// pending; the canvas checks one bool per frame.
+    public let performanceProbe = CanvasPerformanceProbe()
+    /// The performance panel's sampler and last snapshot.
+    public let performancePanel = PerformancePanelController()
     /// Test-only transition progress. The app never sets it; `TransitionChecks` pins a value and
     /// steps it so a "partly open" frame is a deterministic layout, not a race with the display
     /// link on a loaded runner.
@@ -343,24 +381,92 @@ public final class AppState: ObservableObject {
     @Published public private(set) var formLoading = false
     @Published public private(set) var formError: String?
     @Published public private(set) var formLoadCompleted = false
-    /// The form tool is a mode like the ink and markup tools: while it is on, a click on a field
-    /// edits it and a click elsewhere still reads the page. Leaving it restores normal reading.
-    @Published public var formToolActive = false
-    /// The field that owns the keyboard while the form tool is active.
+    /// The field that owns the keyboard while no annotation or content tool owns the pointer.
+    ///
+    /// There is no form tool: a click on a widget focuses it whenever the pointer is in its
+    /// implicit selection state, and arming any annotation/content tool takes the pointer away
+    /// again (and drops this focus).
     @Published public private(set) var formFocusedFieldID: String?
-    /// The drop-down whose option list is open, when the form tool is active.
+    /// The drop-down whose option list is open.
     @Published public private(set) var formOpenChoiceFieldID: String?
     @Published public private(set) var formSaveInProgress = false
+    /// Set while a flattened copy is being written; the menu item and panel are unavailable.
+    @Published public private(set) var flattenInProgress = false
+    /// The last flattened copy's report, kept so the status line (and the checks) can name what
+    /// was baked, what was kept, and which comments were not carried over.
+    @Published public private(set) var lastFlattenReport: FlattenReport?
     /// Facts and `/Info` values for the information panel, loaded when it opens.
     @Published public private(set) var documentInfo: DocumentInfo?
     @Published public private(set) var documentPropertiesDraft: DocumentProperties = .init()
     @Published public private(set) var documentInfoLoading = false
     @Published public private(set) var documentInfoError: String?
     @Published public private(set) var propertiesSaveInProgress = false
-    @Published public var pageOverviewVisible: Bool = false
+    @Published public var pageOverviewVisible: Bool = false {
+        didSet {
+            if pageOverviewVisible {
+                blurFormField()
+                cancelRegionSelection(reason: "Region selection cancelled: page overview opened.")
+                // Page overview covers the page an armed tool would act on. A tool is armed for
+                // that page, not for a row that happens to stay open behind the grid, so opening
+                // the overview disarms every row's tool. The rows themselves stay open and come
+                // back in the implicit pointer state when the overview closes.
+                deactivateAllSecondaryRowTools()
+            }
+        }
+    }
     /// Whether the annotation tools row is expanded. The row is an overlay on the canvas, not a
     /// layout row above it, so this is the value its show/hide transition animates.
-    @Published public var annotationToolsVisible: Bool = false
+    @Published public var annotationToolsVisible: Bool = false {
+        didSet {
+            if annotationToolsVisible {
+                closeOtherSecondaryRows(except: .annotations)
+            } else {
+                // A tool lives in its row: closing Annotate returns the page to the implicit
+                // pointer state instead of leaving a pen or highlight armed with no visible
+                // control to turn it off.
+                deactivateSecondaryRowTool(.annotations)
+            }
+        }
+    }
+    /// Whether the Fill & Sign row is expanded. It shares the one secondary-row slot with the
+    /// annotation, Edit and Export rows, so only one of them can be open.
+    @Published public var fillAndSignVisible: Bool = false {
+        didSet {
+            if fillAndSignVisible {
+                closeOtherSecondaryRows(except: .fillAndSign)
+            } else {
+                // The inspector exists only while a Fill & Sign tool is armed. Closing the row
+                // clears the arm, the placement it was waiting for, and the inspector with it.
+                clearFillSignTool()
+            }
+        }
+    }
+    /// Whether the Export row is expanded. Like the other rows it owns the one shared slot and
+    /// its own toolbar button's selected state.
+    @Published public var exportVisible: Bool = false {
+        didSet {
+            if exportVisible { closeOtherSecondaryRows(except: .export) }
+        }
+    }
+    /// The Fill & Sign row item currently armed, if any.
+    ///
+    /// This is deliberately separate from ``annotationTool``: a date, check mark or cross claims
+    /// one click without changing what a drag means, and Signature waits for a method to be
+    /// chosen in the inspector. The inspector is visible exactly when this is non-nil while the
+    /// Fill & Sign row is open.
+    @Published public private(set) var armedFillSignTool: FillSignTool?
+    /// The date style the Date tool places, chosen in the Fill & Sign inspector.
+    @Published public var fillSignDateFormat: FillSignDateFormat = .medium
+    /// The rotation the Date tool places, chosen in the Fill & Sign inspector.
+    @Published public var fillSignDateRotation: FillSignDateRotation = .none
+    /// The initial height of a placed picture, chosen in the Fill & Sign inspector.
+    @Published public var fillSignImageSize: FillSignImageSize = .medium
+    @Published public var aiToolsVisible: Bool = false {
+        didSet {
+            if aiToolsVisible { closeOtherSecondaryRows(except: .lyra) }
+            else { cancelRegionSelection() }
+        }
+    }
     /// 100% means actual physical size, scaled by the current screen's calibration.
     @Published public var zoomPercent: Int = 100 {
         willSet {if newValue != zoomPercent,contentTextEditing {commitContentText?()}}
@@ -379,6 +485,12 @@ public final class AppState: ObservableObject {
     }
     @Published public var statusMessage: String = "Drag in a PDF, or press ⌘O to open a document"
     @Published public var lastError: String?
+    /// A recoverable engine error, shown inline instead of in the blocking alert.
+    ///
+    /// `Severity.recoverable` means one feature failed while the document stays readable; the
+    /// shell shows the sentence in a dismissible banner (and mirrors it to the status line) so a
+    /// page-level failure never interrupts reading with a modal dialog.
+    @Published public private(set) var recoverableErrorBanner: String?
     @Published public var showFileImporter: Bool = false
 
     // ── Page editing (T3.9) ────────────────────────────────────────────────────
@@ -393,9 +505,61 @@ public final class AppState: ObservableObject {
     /// True while PDFium is rewriting a revision; commands are disabled rather than queued.
     @Published public private(set) var pageEditBusy: Bool = false
     /// The staged session. Nil means the file on disk is the document on screen.
-    private var pageEditSession: PageEditSession?
+    private var pageEditSession: PageEditSession? {
+        didSet {
+            if let session = pageEditSession {
+                Self.pageEditOwners[DocumentEditCache.recoveryURL(for: session.originalURL).path] = WeakState(self)
+                persistPageEditRecovery()
+            }
+        }
+    }
+    private static var pageEditOwners: [String: WeakState] = [:]
+    private var isChangingDocumentState = false
+    /// The saved record state, independent of Undo stack depth and carried with recovery/tabs.
+    /// Older dirty caches without a baseline stay dirty until their contents are saved.
+    struct AnnotationCleanSnapshot: Codable, Equatable {
+        let annotations: [Annotation]
+        let bookmarks: [Bookmark]
+    }
+    private var annotationCleanSnapshot: AnnotationCleanSnapshot?
+    private var currentAnnotationSnapshot: AnnotationCleanSnapshot {
+        AnnotationCleanSnapshot(annotations: annotations, bookmarks: bookmarks)
+    }
+    @Published public private(set) var annotationCacheIsDirty = false {
+        didSet {
+            if !annotationCacheIsDirty { annotationCleanSnapshot = currentAnnotationSnapshot }
+        }
+    }
 
-    @Published public var contentEditEnabled = false
+    @Published public var contentEditEnabled = false {
+        didSet {
+            if contentEditEnabled, isXfaDocument {
+                contentEditEnabled = false
+                lastError = readOnlyReason
+                statusMessage = "XFA form · content editing is not available"
+                return
+            }
+            if contentEditEnabled {
+                closeOtherSecondaryRows(except: .contentEdit)
+                rightPanelVisible = false
+                performancePanelVisible = false
+                // Edit owns the pointer: a form field that was borrowing the keyboard hands it
+                // back before the content editor starts receiving clicks.
+                blurFormField()
+                cancelRegionSelection(reason: "Region selection cancelled: Edit PDF took the pointer.")
+            } else {
+                // Leaving Edit leaves its tool too. Reopening the row starts in the implicit
+                // pointer state, so the inspector (which follows an armed tool) stays closed.
+                if rasterRedactionPrompt != nil {
+                    rasterRedactionPrompt = nil
+                    pendingRasterRedaction = nil
+                    contentCommandInFlight = false
+                    contentEditTask = nil
+                }
+                deactivateSecondaryRowTool(.contentEdit)
+            }
+        }
+    }
     @Published public var contentEditTool = "select"
     @Published public var contentEditPage: PDFContentPage?
     @Published public var contentEditSelection: String?
@@ -403,19 +567,28 @@ public final class AppState: ObservableObject {
     @Published public var contentLinkDraft: CGRect?
     @Published public var contentTextEditing = false
     @Published public var contentTextRecovery: String?
+    @Published public private(set) var contentTextNotice: String?
     @Published public private(set) var contentCommandInFlight = false
     @Published public var contentCloseRequested = false
-    private var contentRecoveryCommand: (command: PDFContentCommand, page: Int, url: URL?)?
+    /// Set when a redaction needs the whole-page raster fallback and the reader has not chosen
+    /// yet. The Edit workspace presents Cancel/Continue from this value; clearing it without
+    /// staging is the Cancel path and writes nothing.
+    @Published public private(set) var rasterRedactionPrompt: RasterRedactionPrompt?
+    private var pendingRasterRedaction: (command: ContentCommandRecord, page: Int, label: String)?
+    private var contentRecoveryCommand: (command: ContentCommandRecord, page: Int, url: URL?)?
     private var pendingContentClose: Int?
     var commitContentText: (() -> Void)?
+    private var pendingWindowCloseAction: (() -> Void)?
     private var contentEditTask: Task<Bool,Never>?
     private var contentLoadToken = UUID()
 
     /// Pages the canvas should draw right now (usually one or two while scrolling).
-    @Published public private(set) var canvasPages: [CanvasPage] = []
+    @Published public private(set) var canvasPages: [CanvasPage] = [] {
+        didSet { refreshTranslationPaperColors() }
+    }
     private var canvasTiles: [CanvasPage] = []
     /// Scroll offset in content points; 0 is the top of the first page.
-    @Published public private(set) var scrollYPt: CGFloat = 0
+    @Published public internal(set) var scrollYPt: CGFloat = 0
     /// True while the user is scrolling, so the indicator stays on screen.
     @Published public private(set) var isScrolling = false
     /// True while the pointer is in the indicator's lane, so a faded-out scroller comes back as
@@ -435,7 +608,7 @@ public final class AppState: ObservableObject {
     }
     private var pendingPosition: PendingPosition?
     /// Total content height in points (for scrollbars and clamping).
-    @Published public private(set) var contentHeightPt: CGFloat = 0
+    @Published public internal(set) var contentHeightPt: CGFloat = 0
     /// Width of the widest page in points; the canvas centres the content with it.
     @Published public private(set) var contentWidthPt: CGFloat = 0
 
@@ -466,7 +639,7 @@ public final class AppState: ObservableObject {
     private var layoutPreferencesObserver: NSObjectProtocol?
 
     /// Viewport size in screen points, reported by the canvas.
-    private var viewportSizePt: CGSize = .zero
+    var viewportSizePt: CGSize = .zero
     /// One coalesced rebuild for width-only changes that can move the visible columns.
     private var pendingViewportReload: DispatchWorkItem?
     /// True while the right panel is sliding or being dragged. Its width changes arrive once per
@@ -564,6 +737,12 @@ public final class AppState: ObservableObject {
     /// whole wanted band keeps scrolling smooth and still bounds what the budget is for: the
     /// tiles the reader has scrolled *away* from, and the previous LOD's tiles after a zoom.
     private var wantedTiles: Set<TileKey> = []
+    /// The plan the last viewport update produced, in the order it will be rasterized.
+    ///
+    /// Observation only: nothing reads it to schedule, rasterize or draw. `TilePlanFixtureChecks`
+    /// freezes what the shell planned before the decision moved to `lyra-reader-render` and then
+    /// requires the Rust plan to reproduce the same rows, ring, pinned set and submission order.
+    public private(set) var lastTilePlan: TilePlanSnapshot?
     /// The scheduler's wanted set from the last viewport update (visible + prefetch band): the
     /// tiles the byte cache may not evict.
     ///
@@ -576,23 +755,10 @@ public final class AppState: ObservableObject {
 
     // MARK: - Prefetch band
 
-    /// Longest prefetch ring the band may use, in viewport heights (ADR 0007 shipped 3.5
-    /// viewports of *band*, i.e. a 2.5-viewport ring plus the viewport itself).
-    ///
-    /// This is the ceiling, not the value: `prefetchRingVh` shortens the ring whenever the
-    /// band it would produce does not fit `prefetchBandBudgetBytes`. The reason is measured — at
-    /// 400% zoom the fixed band pinned 110 tiles / 99.2 MiB, of which the viewport showed 16
-    /// tiles: the band, not the cache budget, was most of what the peak RSS was made of.
-    static let maxPrefetchRingVh: CGFloat = 2.5
-    /// Ring distance below which the band is not shortened further.
-    ///
-    /// The floor is measured, not chosen: the bench's step scroll (`phase_scroll`) records the
-    /// raster time the viewport spent *waiting* for tiles that were not ready — p95 0.00 ms and
-    /// 9 misses over 120 steps at a 1.0-viewport ring, but p95 8.1 ms and 141 misses (worst
-    /// 120 ms) at 0.5. A ring shorter than a viewport cannot cover one step of the bench's
-    /// scroll (half a viewport) plus raster time, so the reader starts seeing the preview
-    /// instead of the page. 0.75 is the shortest ring that measured no worse than 1.0.
-    static let minPrefetchRingVh: CGFloat = 0.75
+    /// The ring ladder, the band's byte target and the row/column rules live in
+    /// `lyra-reader-render`'s `plan` module (ADR 0007 / audit C5). The shell resolves the
+    /// measurement overrides here and sends them as inputs; it no longer derives the plan.
+
     /// Columns kept ready beyond the ones on screen.
     ///
     /// Zero, deliberately. The canvas left-aligns a page that is wider than the viewport and
@@ -606,24 +772,6 @@ public final class AppState: ObservableObject {
     static let defaultMaxPreviewPages = 7
     private static let maxPreviewPages = ProcessInfo.processInfo.environment["LYRA_READER_PREVIEW_PAGES"]
         .flatMap(Int.init).map { min(max($0, 0), 32) } ?? defaultMaxPreviewPages
-
-    /// Byte target for the whole wanted band (visible + ring + the ready columns).
-    ///
-    /// The band is the *pinned* set — `TileCache.evictToFit` never drops it — so a fixed band
-    /// in viewport heights is an unbounded commitment in bytes: the same 3.5 viewports cost
-    /// 27 MiB at 100% zoom and 99 MiB at 400%, and the peak followed (measured on a real
-    /// 115-page paper: 417.7 MiB and 515.1 MiB). A third of the cache budget is the rule, with
-    /// an 8 MiB floor so that a reader who shrinks the cache in Settings still gets a band:
-    /// the pinned third keeps scrolling fed, the rest stays for what the reader scrolled *away*
-    /// from and for the previous LOD — which is what makes scrolling and zooming back cache
-    /// hits — and raising the budget raises both together.
-    ///
-    /// 16 MiB at the default 48 MB budget is the measured operating point; the curve it was
-    /// chosen from is in the pull request (peak RSS against the bench's raster wait at 8, 16,
-    /// 24 and 48 MiB, and against the fixed 3.5-viewport band).
-    public static func prefetchBandBudgetBytes(cacheBudgetBytes: Int) -> Int {
-        max(8 * 1024 * 1024, cacheBudgetBytes / 3)
-    }
 
     /// `LYRA_READER_PREFETCH_RING_VH=<viewports>`: measurement override that pins the ring to
     /// exactly that distance instead of deriving it from the byte target (`2.5` reproduces the
@@ -660,12 +808,18 @@ public final class AppState: ObservableObject {
     }
 
     /// The `LYRA_READER_PREFETCH_*` overrides are read once: they are constants for the
-    /// process, and the band is rebuilt (with `bandSpans` several times inside it) on every
-    /// viewport update, i.e. on the scrolling path.
+    /// process, and the plan is recomputed on every viewport update, i.e. on the scrolling path.
     private static let prefetchRingOverride = configuredPrefetchRingOverride()
     private static let wantAllColumns = configuredWantAllColumns()
     private static let prefetchColumns = configuredPrefetchColumns()
     private static let prefetchBandMiB = ProcessInfo.processInfo.environment["LYRA_READER_PREFETCH_BAND_MIB"]
+    /// Byte target for the prefetch band, for the equivalence fixtures and the ADR 0007 bench.
+    ///
+    /// `nil` (every app path) uses the `LYRA_READER_PREFETCH_BAND_MIB` measurement override or
+    /// the measured third-of-the-budget rule. A check may set this before its viewport updates
+    /// to exercise several ring rungs without re-launching the process. It is not a setting: no
+    /// UI writes it and nothing persists it.
+    public var prefetchBandBudgetOverrideBytes: Int?
     private static let renderStatsEnabled =
         ProcessInfo.processInfo.environment["LYRA_READER_RENDER_STATS"] == "1"
     private var pendingTiles: [(TileKey, PagePlacement)] = []
@@ -710,8 +864,11 @@ public final class AppState: ObservableObject {
     @Published package private(set) var annotationPassages: [AnnotationPassage] = []
     @Published package private(set) var annotationSidebarPages: [AnnotationSidebarPage] = []
     private var textPagesInFlight: Set<Int> = []
+
+    /// A page's already-loaded text layer, for paths that plan page geometry synchronously.
+    func cachedTextPage(_ page: Int) -> TextPage? { textPages[page] }
     /// Page placements from the last layout pass (hit-testing needs them).
-    private var visiblePagePlacements: [PagePlacement] = []
+    var visiblePagePlacements: [PagePlacement] = []
 
     /// The small, honest set of stamps a reader actually uses.
 ///
@@ -789,9 +946,9 @@ public enum StampStyle: String, CaseIterable, Codable, Sendable, Identifiable {
 
 /// A highlight the reader added.
 ///
-/// Stored in a sidecar JSON next to the document rather than inside the PDF itself: writing
+/// Stored in the document cache's `annotations.json` rather than inside the PDF itself: writing
 /// PDF annotations means round-tripping the file through PDFium (`FPDF_Annot_*` +
-/// `FPDF_SaveAsCopy`), and a sidecar keeps the original untouched until that lands. The
+/// `FPDF_SaveAsCopy`), and the cache keeps the original untouched until the reader saves. The
 /// durable model and its undo/redo transactions belong in `lyra-reader-edit` (T3.1).
 public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// How the annotation is drawn.
@@ -801,7 +958,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// origin at the page's top-left corner at 100% zoom), so a mark lands on the same place at
     /// every zoom. The four shapes are stroked, never filled: they are outlines, and keeping the
     /// interior transparent is what lets the text behind them stay selectable.
-    public enum Kind: String, Codable, Sendable {
+    public enum Kind: String, Codable, Sendable, CaseIterable {
         case highlight
         case underline
         /// A line through the middle of the selected glyphs. A text-markup kind like the two
@@ -825,48 +982,41 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case signature
 
         /// Whether this kind is stored as geometry rather than as a character range.
-        public var isGeometry: Bool {
-            switch self {
-            case .highlight, .underline, .strikeout: return false
-            case .ink, .square, .circle, .line, .arrow: return true
-            case .stickyNote, .textBox, .stamp, .signature: return false
-            }
-        }
+        ///
+        /// The answer comes from the one kind table in `lyra-reader-edit`; this enum is the UI's
+        /// display vocabulary, not a second set of rules.
+        public var isGeometry: Bool { flags.isGeometry }
 
-        public var isTextMarkup: Bool { self == .highlight || self == .underline || self == .strikeout }
+        /// Whether this kind is one the selection can turn into a text mark.
+        public var isTextMarkup: Bool { flags.isTextMarkup }
 
         /// Whether this kind is a placed text annotation (a sticky note or a text box).
-        ///
-        /// These carry page-space geometry like an ink stroke, but they are drawn from a glyph
-        /// bitmap rather than a vector path and they carry their text in `note`. They are
-        /// versioned separately from the stroked kinds so a newer schema is preserved rather
-        /// than partially read.
-        public var isPlacedText: Bool {
-            switch self {
-            case .stickyNote, .textBox: return true
-            case .highlight, .underline, .strikeout, .ink, .square, .circle, .line, .arrow,
-                 .stamp, .signature:
-                return false
-            }
-        }
+        public var isPlacedText: Bool { flags.isPlacedText }
 
         /// Whether this kind is an image or a stamp badge whose box is placed, moved and
         /// resized like a note's but whose content is not text to be edited in a text view.
-        public var isStampArtwork: Bool {
-            self == .stamp || self == .signature
-        }
+        public var isStampArtwork: Bool { flags.isStampArtwork }
 
         /// Whether this kind occupies a page box that the select tool can move and resize.
         ///
         /// This is the union the canvas needs, not a statement about how the content is drawn:
         /// ink and shapes move by their geometry, placed text by its box, and a stamp by the box
         /// its appearance fills.
-        public var isPlacement: Bool { isGeometry || isPlacedText || isStampArtwork }
+        public var isPlacement: Bool { flags.isPlacement }
+
+        /// The write request this kind becomes, from the same table that decides the write
+        /// request mapping on the Rust side.
+        package var writeKind: AnnotationWriteKind? { flags.writeKind }
+
+        /// The FFI kind-table row for this kind.
+        private var flags: AnnotationKindFlagsRecord {
+            AnnotationRecordRules.flags(for: self)
+        }
     }
 
-    /// One point of a stored ink stroke or line, as the sidecar writes it.
+    /// One point of a stored ink stroke or line, as the cache writes it.
     ///
-    /// Deliberately not `CGPoint`: the JSON shape is part of the sidecar's compatibility story
+    /// Deliberately not `CGPoint`: the JSON shape is part of the annotation records' compatibility story
     /// (a newer build reads it, an older build preserves the whole entry), and spelling out
     /// `x`/`y` keeps that shape independent of a platform type's Codable representation.
     public struct StoredPoint: Codable, Equatable, Sendable {
@@ -894,49 +1044,64 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
-    /// The sidecar schema version of a geometry entry.
+    /// The annotation-record schema version of a geometry entry.
     ///
     /// Text-markup entries have no version: they are the shape every older build already knows.
     /// Geometry entries do, so a newer build can change them without an older one guessing at
-    /// the new meaning. `AnnotationSidecar` preserves any entry it cannot interpret verbatim.
-    public static let geometryVersion = 1
+    /// the new meaning. `AnnotationRecords` preserves any entry it cannot interpret verbatim.
+    ///
+    /// The value comes from `lyra-reader-edit` so the codec and the Swift model cannot drift.
+    public static let geometryVersion = Int(AnnotationRecordRules.limits.geometryVersion)
 
-    /// The sidecar schema version of a placed-text entry (sticky note or text box).
+    /// The annotation-record schema version of a placed-text entry (sticky note or text box).
     ///
     /// Separate from `geometryVersion` on purpose: the two kinds are drawn and written by
     /// different code, and a future change to one must never make the other's entries look
-    /// half-understood. `AnnotationSidecar` preserves any version it does not know.
-    public static let placedTextVersion = 1
+    /// half-understood. `AnnotationRecords` preserves any version it does not know.
+    public static let placedTextVersion = Int(AnnotationRecordRules.limits.placedTextVersion)
 
-    /// The sidecar schema version of a text stamp entry.
-    public static let stampVersion = 1
+    /// The annotation-record schema version of a text stamp entry.
+    public static let stampVersion = Int(AnnotationRecordRules.limits.stampVersion)
 
-    /// The sidecar schema version of an image-signature entry.
-    public static let signatureVersion = 1
+    /// The annotation-record schema version of an image-signature entry.
+    public static let signatureVersion = Int(AnnotationRecordRules.limits.signatureVersion)
 
     /// The size a newly placed sticky note icon occupies on the page, in points.
-    public static let stickyNoteSize = CGSize(width: 22, height: 22)
+    public static let stickyNoteSize = CGSize(
+        width: CGFloat(AnnotationRecordRules.limits.stickyNoteWidthPt),
+        height: CGFloat(AnnotationRecordRules.limits.stickyNoteHeightPt))
 
     /// The default font size of a new text box, in points.
-    public static let defaultTextBoxFontSize: CGFloat = 14
+    public static let defaultTextBoxFontSize =
+        CGFloat(AnnotationRecordRules.limits.defaultTextBoxFontSizePt)
 
     /// The size a newly placed stamp occupies, in page points. Wide enough for `CONFIDENTIAL`
     /// at a readable size; the reader can move and resize it afterwards.
-    public static let defaultStampSize = CGSize(width: 150, height: 50)
+    public static let defaultStampSize = CGSize(
+        width: CGFloat(AnnotationRecordRules.limits.defaultStampWidthPt),
+        height: CGFloat(AnnotationRecordRules.limits.defaultStampHeightPt))
 
     /// The height a newly placed image signature occupies, in page points. Its width follows the
     /// picture's aspect ratio, so a tall signature is not stretched on the way in.
-    public static let defaultSignatureHeight: CGFloat = 64
+    public static let defaultSignatureHeight =
+        CGFloat(AnnotationRecordRules.limits.defaultSignatureHeightPt)
+
+    /// The height a newly placed ordinary picture occupies, in page points. Larger than a
+    /// signature: a picture is content the reader is placing, not a mark that stays out of the way.
+    public static let defaultPictureHeight =
+        CGFloat(AnnotationRecordRules.limits.defaultPictureHeightPt)
 
     /// The smallest text box the reader may create or resize to, in points.
     ///
     /// The width is wide enough for a few narrow glyphs but small enough for the box a
     /// double-click creates (about three characters, see `TextBoxLayout.creationSize`); the
-    /// height is one line at the smallest font. Older sidecars' larger boxes stay valid.
-    public static let minimumTextBoxSize = CGSize(width: 24, height: 24)
+    /// height is one line at the smallest font. Older cached annotations' larger boxes stay valid.
+    public static let minimumTextBoxSize = CGSize(
+        width: CGFloat(AnnotationRecordRules.limits.minTextBoxWidthPt),
+        height: CGFloat(AnnotationRecordRules.limits.minTextBoxHeightPt))
 
     public let id: UUID
-    /// Defaults to `.highlight` for sidecars written before kinds existed.
+    /// Defaults to `.highlight` for cached annotations written before kinds existed.
     public var kind: Kind = .highlight
     public var page: Int
     /// Inclusive character range in the page's text layer; zero for geometry annotations.
@@ -969,7 +1134,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// The value is exactly `DocumentAnnotation.id` (`nm:<NM>`, or `fp:<fingerprint>` when the
     /// file carries no `/NM`). It is what the writer resolves at save time, so the annotation's
-    /// `/NM`, author, flags, popup, parent and reply links stay the file's own. Sidecar entries
+    /// `/NM`, author, flags, popup, parent and reply links stay the file's own. Cached entries
     /// with an identity are hidden from the PDF-annotation list while they are open, so a mark
     /// is never drawn twice.
     public var fileIdentity: String?
@@ -990,7 +1155,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// `date`. `nil` for every other kind.
     public var stampStyle: String?
     /// The picture of a `.signature` entry, exactly the bytes the reader chose (PNG or JPEG).
-    /// Stored base64 in the sidecar, and re-encoded into the PDF as an image XObject on save.
+    /// Stored base64 in the annotation cache, and re-encoded into the PDF as an image XObject on save.
     public var imageData: Data?
 
     private enum CodingKeys: String, CodingKey {
@@ -1047,52 +1212,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Whether the annotation's geometry is complete and finite.
     ///
-    /// The sidecar encoder and the write-back path both rely on this: a mark that cannot be
-    /// drawn or written must be refused before it reaches a file, not turned into an empty
-    /// annotation on the page.
+    /// The thresholds live in `lyra-reader-edit::records::RecordAnnotation::has_valid_geometry`
+    /// and cross the FFI; this property only supplies the shell's typed record. The
+    /// annotation-record encoder and the write-back path both rely on the answer: a mark that
+    /// cannot be drawn or written must be refused before it reaches a file, not turned into an
+    /// empty annotation on the page.
     public var hasValidGeometry: Bool {
-        guard strokeWidth.isFinite, strokeWidth >= 0, strokeWidth <= 200 else { return false }
-        switch kind {
-        case .ink:
-            return !inkPaths.isEmpty && inkPaths.allSatisfy { path in
-                path.count >= 2 && path.allSatisfy { $0.x.isFinite && $0.y.isFinite }
-            }
-        case .square, .circle:
-            guard let rect = shapeRect else { return false }
-            return rect.minX.isFinite && rect.minY.isFinite
-                && rect.width.isFinite && rect.height.isFinite
-                && rect.width > 0 && rect.height > 0
-        case .line, .arrow:
-            guard let start = lineStart, let end = lineEnd else { return false }
-            return start.x.isFinite && start.y.isFinite && end.x.isFinite && end.y.isFinite
-                && hypot(end.x - start.x, end.y - start.y) > 0.01
-        case .stickyNote:
-            guard let rect = shapeRect else { return false }
-            return rect.minX.isFinite && rect.minY.isFinite
-                && rect.width.isFinite && rect.height.isFinite
-                && rect.width >= 1 && rect.height >= 1
-        case .stamp:
-            guard let rect = shapeRect else { return false }
-            return rect.minX.isFinite && rect.minY.isFinite
-                && rect.width.isFinite && rect.height.isFinite
-                && rect.width >= 12 && rect.height >= 8
-                && !note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        case .signature:
-            guard let rect = shapeRect else { return false }
-            return rect.minX.isFinite && rect.minY.isFinite
-                && rect.width.isFinite && rect.height.isFinite
-                && rect.width >= 6 && rect.height >= 6
-                && !(imageData?.isEmpty ?? true)
-        case .textBox:
-            guard let rect = shapeRect else { return false }
-            return rect.minX.isFinite && rect.minY.isFinite
-                && rect.width.isFinite && rect.height.isFinite
-                && rect.width >= Self.minimumTextBoxSize.width
-                && rect.height >= Self.minimumTextBoxSize.height
-                && fontSize.isFinite && fontSize >= 1 && fontSize <= 400
-        case .highlight, .underline, .strikeout:
-            return false
-        }
+        cachedAnnotationHasValidGeometry(annotation: AnnotationRecords.entry(self))
     }
 
     /// The page-space box the geometry occupies, for hit testing and the canvas overlay.
@@ -1137,12 +1263,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return copy
     }
 
-    /// Older sidecars predate `kind`; decode them as highlights while preserving all
-    /// explicitly stored kinds in newer sidecars.
+    /// Older cached annotations predate `kind`; decode them as highlights while preserving all
+    /// explicitly stored kinds in newer cached annotations.
     ///
     /// Colour has two shapes in the wild, and the order matters: `color` is this version's
     /// (any RGB value), `colorIndex` is the older build's index into `AppState.highlightPalette`.
-    /// An index outside the palette is not decodable — `AnnotationSidecar` classifies such an
+    /// An index outside the palette is not decodable — `AnnotationRecords` classifies such an
     /// entry as one this version cannot interpret and keeps it verbatim instead of guessing.
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -1243,7 +1369,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Writes a palette colour as `colorIndex` and anything else as `color`.
     ///
     /// The asymmetry is deliberate and is the whole backward-compatibility story (see
-    /// `AnnotationSidecar`): a colour that *is* one of the presets is written exactly as the
+    /// `AnnotationRecords`): a colour that *is* one of the presets is written exactly as the
     /// older build wrote it, with no new key, so an older build both reads and draws it. Only a
     /// colour the old model cannot express needs the new key — and for that one the older build
     /// preserves the entry verbatim instead of misreading it.
@@ -1323,9 +1449,268 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @Published public private(set) var selection: Selection?
 
+    // MARK: - In-place translation
+    //
+    // Translation is a presentation overlay, never a document modification. `translationOverlays`
+    // is what the canvas draws; `inPlaceTranslation` owns the cache and the requests. Nothing in
+    // this section writes into the PDF, the annotation cache or the region-card export.
+    @Published public private(set) var translationOverlays: [TranslationOverlay] = []
+    /// One reader-facing sentence about the last translation action, including removals caused by
+    /// a page edit. The window shows it as a dismissible banner.
+    @Published public internal(set) var translationNotice: String?
+    /// The fixed transport category behind `translationNotice`, when the last failure was
+    /// recognized as offline or local-server. Nil for ordinary notices and validation errors.
+    @Published public internal(set) var translationFailure: AIRequestFailure?
+    /// Page paper colours sampled from the visible rasters, so a cover matches the paper it sits
+    /// on instead of assuming white.
+    @Published public private(set) var translationPaperColors: [Int: TranslationPaperColor] = [:]
+    /// The language the in-place action requests. The window keeps this in step with the AI
+    /// panel's target-language field; a check can set it directly.
+    public var inPlaceTranslationTargetLanguage = "English"
+    /// Injection points for the native checks. Production leaves both nil and uses the window's
+    /// assistant settings and the engine's AI service.
+    public var inPlaceTranslationServiceOverride: (() -> (any AIChatServicing)?)?
+    public var inPlaceTranslationSettingsOverride: AISettingsStore?
+    /// The audit trail the in-place requests append to. Production points it at the window
+    /// assistant's trail; the checks inject an isolated file.
+    public var inPlaceTranslationAuditOverride: AIAuditTrail?
+    /// The original PDF whose cache owns the translations. A page-edit revision on screen must
+    /// not create a second cache directory.
+    private var translationCacheDocumentURL: URL?
+
+    var translationDocumentURL: URL? { translationCacheDocumentURL }
+    var translationDocumentTitle: String { document?.title ?? "" }
+    var translationPageCount: Int { document?.pageCount ?? 0 }
+    var translationCurrentPage: Int { currentPage }
+    var translationLanguage: String { inPlaceTranslationTargetLanguage }
+    var translationService: (any AIChatServicing)? {
+        inPlaceTranslationServiceOverride?() ?? aiChatService
+    }
+    var translationSettings: AISettingsStore? {
+        inPlaceTranslationSettingsOverride ?? AISettingsStore.shared
+    }
+    var translationAudit: AIAuditTrail {
+        inPlaceTranslationAuditOverride ?? AIAuditTrail.shared
+    }
+    var translationPaperAppearance: PaperAppearance { ReadingAppearanceStore.shared.mode }
+
+    lazy var inPlaceTranslation: InPlaceTranslationController = {
+        let controller = InPlaceTranslationController()
+        controller.host = self
+        return controller
+    }()
+
+    /// The action the context menu and toolbar offer for the current selection. Nil when there
+    /// is no selection.
+    public var translationSelectionAction: TranslationSelectionAction? {
+        guard let selection else { return nil }
+        return inPlaceTranslation.action(for: selection.range, page: selection.page)
+    }
+
+    public var translationSelectionTitle: String {
+        switch translationSelectionAction {
+        case .showOriginal: return "Show original"
+        case .showTranslation, .translate: return "Translate"
+        case .cancel: return "Cancel Translation"
+        case .retry: return "Retry Translation"
+        case nil: return "Translate"
+        }
+    }
+
+    public var canTranslateSelection: Bool {
+        guard selection != nil, document != nil else { return false }
+        return true
+    }
+
+    /// Run the Translate / Show original action for the current selection.
+    ///
+    /// This is the only entry point: the context menu, the toolbar, ⇧⌘L and the Reading menu
+    /// all call it. The first press is the explicit action that may start requests; a flip after
+    /// that never does.
+    @discardableResult
+    public func performTranslationAction() -> Bool {
+        guard let selection else {
+            translationNotice = "Select text on the page first; there is nothing to translate."
+            return false
+        }
+        switch inPlaceTranslation.action(for: selection.range, page: selection.page) {
+        case .showOriginal:
+            for entry in inPlaceTranslation.entries(overlapping: selection.range,
+                                                     page: selection.page) {
+                inPlaceTranslation.showOriginal(entry.key)
+            }
+            return true
+        case .showTranslation:
+            for entry in inPlaceTranslation.entries(overlapping: selection.range,
+                                                     page: selection.page) {
+                inPlaceTranslation.showTranslation(entry.key)
+            }
+            return true
+        case .cancel:
+            for overlay in translationOverlays where overlay.page == selection.page
+                && overlay.isTranslating
+                && overlay.range?.overlaps(selection.range) == true {
+                inPlaceTranslation.cancel(overlay.id)
+            }
+            return true
+        case .retry:
+            for overlay in translationOverlays where overlay.page == selection.page {
+                guard case .failed = overlay.phase else { continue }
+                guard overlay.range?.overlaps(selection.range) == true else { continue }
+                inPlaceTranslation.retry(overlay.id)
+            }
+            return true
+        case .translate:
+            Task { @MainActor [weak self] in
+                await self?.beginInPlaceTranslation(selection)
+            }
+            return true
+        }
+    }
+
+    /// Translate the current selection. Called by the context menu and toolbar after the reader
+    /// has already made a selection.
+    @discardableResult
+    public func translateSelection() -> Bool {
+        performTranslationAction()
+    }
+
+    /// Chip actions. A toggle never sends: the cached entry is already in memory and on disk.
+    public func toggleTranslation(id: String) {
+        inPlaceTranslation.toggle(id)
+    }
+
+    public func cancelTranslation(id: String) {
+        inPlaceTranslation.cancel(id)
+    }
+
+    /// Test hook: establish a text selection without synthesising pointer events. The native
+    /// checks use it to address the same character range the canvas would produce.
+    func selectTranslationRange(page: Int, range: ClosedRange<Int>) {
+        selection = Selection(page: page, range: range)
+        selectionAnchor = nil
+    }
+
+    /// Flip the translation of the block the selection is in, if there is one.
+    @discardableResult
+    public func toggleTranslationForSelection() -> Bool {
+        performTranslationAction()
+    }
+
+    private func beginInPlaceTranslation(_ selection: Selection) async {
+        guard let textPage = await translationTextPage(selection.page) else {
+            translationNotice = "The text layer for this page could not be read, so nothing was sent."
+            return
+        }
+        let targets = TranslationTargetResolver.targets(
+            page: selection.page, range: selection.range, textPage: textPage)
+        guard !targets.isEmpty else {
+            translationNotice = "The selection has no text to translate."
+            return
+        }
+        inPlaceTranslation.translate(targets: targets)
+    }
+
+    // MARK: - Translation host
+
+    /// Sample the paper colour of every rasterized page. Called when the visible rasters change;
+    /// sampling a handful of pixels per page is cheaper than keeping a separate paper model.
+    private func refreshTranslationPaperColors() {
+        var colors: [Int: TranslationPaperColor] = [:]
+        for page in canvasPages {
+            guard let sampled = TranslationPaperSampler.paperColor(from: page.image) else { continue }
+            let display = ReadingAppearanceStore.shared.mode.displayColor(sampled.nsColor)
+            colors[page.placement.index] = TranslationPaperColor(nsColor: display)
+        }
+        if colors != translationPaperColors {
+            translationPaperColors = colors
+        }
+    }
+
+    func translationTextPage(_ page: Int) async -> TextPage? {
+        if let cached = textPages[page] { return cached }
+        guard page >= 0, page < (document?.pageCount ?? 0) else { return nil }
+        guard let text = try? await engine.textPage(page) else { return nil }
+        if document != nil { textPages[page] = text }
+        return text
+    }
+
+    func translationPaperColor(page: Int) -> TranslationPaperColor? {
+        translationPaperColors[page]
+    }
+
+    func translationDidChangeOverlays(_ overlays: [TranslationOverlay]) {
+        translationOverlays = overlays
+    }
+
+    func translationDidChangeNotice(_ notice: String?) {
+        translationNotice = notice
+    }
+
+    func translationDidChangeFailure(_ failure: AIRequestFailure?) {
+        translationFailure = failure
+    }
+
+    /// Dismiss the translation banner. It carries no state the reader can lose.
+    public func dismissTranslationNotice() {
+        translationNotice = nil
+        translationFailure = nil
+        inPlaceTranslation.setNotice(nil)
+    }
+
+    /// Dismiss the "some annotations could not be read" notice.
+    ///
+    /// Writes stay blocked: the notice is information, not the safety gate.
+    public func dismissAnnotationReadNotice() {
+        annotationReadNotice = nil
+    }
+
+    // MARK: - Error presentation (single severity → surface table)
+
+    /// Whether the blocking error alert is on screen. `ReaderWindow` binds its alert to this,
+    /// so a check can assert the alert surface without opening a window.
+    public var isErrorAlertPresented: Bool { lastError != nil }
+
+    /// Whether the inline recoverable-error banner is on screen.
+    public var isRecoverableErrorBannerPresented: Bool { recoverableErrorBanner != nil }
+
+    /// Present a thrown error on the surface its severity names.
+    ///
+    /// This is the shell's **only** severity decision. The message stays the caller's (some
+    /// call sites add an operation prefix), so wiring this in cannot change any existing error
+    /// text. Errors that did not cross the FFI (Cocoa, Swift) are document-level today: they
+    /// have always been shown in the alert, and they still are.
+    public func present(_ error: Error, message: String? = nil) {
+        let severity = (error as? LyraReaderFfiError)?.severity ?? .document
+        present(message: message ?? AIReadableError.message(error), severity: severity)
+    }
+
+    /// Present one already-composed message at an explicit severity.
+    ///
+    /// `Severity.recoverable` is non-blocking: it is shown inline (banner) and mirrored to the
+    /// status line, because one degraded feature must not interrupt reading. `Document` and
+    /// `Fatal` keep the blocking alert that every engine error used before this table existed.
+    public func present(message: String, severity: ErrorSeverity) {
+        switch severity.presentation {
+        case .alert:
+            lastError = message
+        case .banner:
+            recoverableErrorBanner = message
+            statusMessage = message
+        case .status:
+            statusMessage = message
+        }
+    }
+
+    /// Dismiss the recoverable-error banner. The message stays in the status line, so the state
+    /// is still visible after the reader acknowledges it.
+    public func dismissRecoverableError() {
+        recoverableErrorBanner = nil
+    }
+
     /// A passage the AI chat is pointing at. This is deliberately **not** an annotation: it is
     /// drawn for a moment, fades in three steps and disappears, and nothing is written to the
-    /// PDF or the sidecar. `id` makes two clicks on the same page restart the fade.
+    /// PDF or the annotation cache. `id` makes two clicks on the same page restart the fade.
     public struct AISourceHighlight: Identifiable, Equatable, Sendable {
         public let id: UUID
         public let page: Int
@@ -1348,26 +1733,30 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var aiSourceHighlight: AISourceHighlight?
     private var aiSourceHighlightTask: Task<Void, Never>?
 
-    /// A rectangle the reader marked for redaction, pending until the explicit apply command.
-    public struct PendingRedaction: Identifiable, Equatable, Sendable {
-        public let id: UUID
-        public let page: Int
-        /// Page-local view space (points, top-left origin, 100% zoom).
-        public let rect: CGRect
-
-        public init(id: UUID = UUID(), page: Int, rect: CGRect) {
-            self.id = id
-            self.page = page
-            self.rect = rect
-        }
-    }
-
-    /// Areas marked for redaction but not applied yet. They are drawn on the canvas, and
-    /// clearing them leaves the file completely untouched.
-    @Published public private(set) var pendingRedactions: [PendingRedaction] = []
-    @Published public private(set) var redactionBusy = false
-    /// The last applied redaction, for the status line and the checks.
-    @Published public private(set) var lastRedactionReport: RedactionReport?
+    // MARK: - Region questions (inline cards)
+    //
+    // A card is a reading aid, never an annotation: `regionCards` and `regionHistory` are
+    // in-memory only. The gap they open is a presentation shift of the page layout, computed by
+    // the helpers in AIRegionState.swift; the engine's layout is untouched, so removing a card
+    // restores every page offset exactly.
+    @Published public internal(set) var regionCards: [AIRegionCard] = []
+    /// Finished conversations by document key. Kept for this window's session; deliberately not
+    /// written to disk (see AIRegionState.swift's persistence note).
+    @Published public internal(set) var regionHistory: [String: [AIRegionHistoryEntry]] = [:]
+    @Published public internal(set) var regionSelectionArmed = false
+    @Published public internal(set) var regionCaptureInFlight = false
+    /// A refusal the reader can read: empty selection, blank region, oversized capture, no engine.
+    @Published public internal(set) var regionRefusalMessage: String?
+    /// A short status shown near the card / page HUD.
+    @Published public internal(set) var regionStatusMessage: String?
+    /// Injection points for the native checks: production keeps both nil.
+    public var regionAssistantFactory: (() -> AIAssistantModel)?
+    public var regionChatServiceOverride: (() -> (any AIChatServicing)?)?
+    public static var usesDocumentKnowledge = true
+    public lazy var documentKnowledge = AIDocumentKnowledge()
+    var regionContentObservers: [UUID: AnyCancellable] = [:]
+    var regionHistoryLoadFailures = Set<String>()
+    var regionEscapeMonitor: Any?
 
     /// What a floating preview is *for*. It decides what the panel's body shows, because the
     /// four cases genuinely want four different things.
@@ -1437,30 +1826,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Where the reader was before a jump the preview started.
     ///
     /// `scrollYPt` is the **exact** content offset, not a page number rounded to a page top: a
-    /// reader halfway down a long page must come back halfway down it. `selection` and `preview`
-    /// ride along because both are already values in memory — returning to a highlighted
-    /// paragraph should not lose the highlight — and they cost a copy of references, not a
-    /// re-render.
+    /// reader halfway down a long page must come back halfway down it. `selection` rides along
+    /// because it is already a value in memory — returning to a highlighted paragraph should not
+    /// lose the highlight — and it costs a copy, not a re-render.
+    ///
+    /// This is the shell's **mirror** of the record owned by the Rust navigation history
+    /// (`LyraReaderNavigationHistory`). The old `preview` field is gone: nothing ever restored
+    /// it (Back does not reopen a panel), so the payload was written and never read.
     public struct ReaderLocation: Equatable, Sendable {
         /// 0-based, the page under the viewport's top edge.
         public let page: Int
         /// Content offset in points, exactly as ``AppState/scrollYPt`` held it.
         public let scrollYPt: CGFloat
         public let selection: Selection?
-        /// The preview that was open when the jump was made. Kept for context; Back does not
-        /// reopen a panel the reader has since closed.
-        public let preview: ReferencePreview?
     }
 
     @Published public private(set) var referencePreview: ReferencePreview?
-    /// A pinned preview stays exactly as it is while the reader keeps working.
-    ///
-    /// Pinning is a property of the preview, not of a second panel: while it is set, a new
-    /// interaction in the document that would normally replace the preview is refused instead of
-    /// replacing it (`openReferencePreview`). Unpinning only clears the flag; the next preview
-    /// request updates the panel again. Closing the preview or leaving the document clears it, so
-    /// a pin can never outlive the content it protects.
-    @Published public private(set) var referencePreviewPinned = false
     /// Page content for the preview panel (its own render surface).
     @Published public private(set) var referencePreviewPages: [CanvasPage] = []
     @Published public private(set) var referencePreviewZoom: CGFloat = 1
@@ -1507,15 +1888,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                              sectionReference: preview.sectionReference)
     }
 
-    public func showFullPreviewPage() {
-        guard let preview = referencePreview else { return }
-        // The page image is exactly what "Full page" is for, so the kind changes with the view.
-        // A section preview's text body is traded for the page it points at, which is the one
-        // place its crop is still the point.
-        openReferencePreview(page: preview.page, title: preview.title, from: preview.source,
-                             kind: .page, anchor: preview.anchor, entries: preview.entries)
-    }
-
     /// Opens a floating preview of `page`.
     ///
     /// `entries` is the citation's whole group of resolved works; `page`, `title` and `region`
@@ -1527,11 +1899,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// *is* the body, so the panel opens immediately and no page, tile or prefetch work is
     /// started for it.
     ///
-    /// Returns `false` when the request was refused. The only refusal that is not an invalid
-    /// target is a **pinned** preview: a new interaction in the document must not replace what
-    /// the reader pinned, so the panel keeps its original content until it is unpinned. A request
-    /// for the preview already on screen (a viewport re-fit, for instance) is not a replacement
-    /// and still runs.
+    /// Returns `false` for an invalid target. A request for the preview already on screen (a
+    /// viewport re-fit, for instance) still runs.
     @discardableResult
     public func openReferencePreview(
         page: Int,
@@ -1560,10 +1929,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             sectionTitle: sectionTitle,
             sectionReference: sectionReference
         )
-        if referencePreviewPinned, let current = referencePreview, current != requested {
-            statusMessage = "Preview pinned — unpin it to preview a new reference"
-            return false
-        }
         if requested != referencePreview { previewLookupEpoch &+= 1 }
         previewEpoch &+= 1
         let request = previewEpoch
@@ -1624,7 +1989,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             guard epoch == self.documentEpoch, request == self.previewEpoch else { return }
             self.referencePreviewLoading = false
             guard let image = rasterized else {
-                self.referencePreviewError = "This preview could not be rendered. Try opening the full page."
+                self.referencePreviewError = "This preview could not be rendered."
                 return
             }
 
@@ -1651,7 +2016,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func closeReferencePreview() {
         previewLookupEpoch &+= 1
         previewEpoch &+= 1
-        referencePreviewPinned = false
         referencePreviewLoading = false
         referencePreviewError = nil
         referencePreviewScrollYPt = 0
@@ -1660,21 +2024,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     // MARK: - Preview actions (T4.8)
-
-    /// Whether the current preview can be pinned. Every preview kind can: pinning protects the
-    /// panel, not one body.
-    public var canPinReferencePreview: Bool { referencePreview != nil }
-
-    /// Pins or unpins the current preview. A pinned preview is frozen: new interactions in the
-    /// document are refused instead of replacing it. Unpinning re-arms the ordinary update path;
-    /// the next preview request lands in the same panel.
-    public func toggleReferencePreviewPin() {
-        guard referencePreview != nil else { return }
-        referencePreviewPinned.toggle()
-        statusMessage = referencePreviewPinned
-            ? "Preview pinned — new interactions will not replace it"
-            : "Preview unpinned — the next preview replaces it"
-    }
 
     /// Whether a citation preview can copy a BibTeX entry.
     ///
@@ -1739,9 +2088,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return
         }
         cancelScrollGlide()
-        let top = engine.pageTopPt(page, gapPt: pageGapPt, layout: layoutMode)
+        guard let target = contentY(forPageLocalY: region.minY, onPage: page) else { gotoPage(page); return }
         let margin: CGFloat = 24
-        scrollYPt = clampedScrollOffset(top + region.minY - margin)
+        scrollYPt = clampedScrollOffset(target - margin)
         reloadVisiblePages()
         schedulePositionSave()
         statusMessage = "Opened page \(page + 1) at the referenced position"
@@ -1751,16 +2100,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// How many past (and future) locations one window remembers.
     ///
-    /// Each direction's stack is trimmed to this many entries when a jump or a back would exceed
-    /// it, so a reader who follows the same preview twenty-five times keeps the twenty most
-    /// recent places. Twenty entries of value types is bounded memory, and far more than a
-    /// preview jump normally needs.
-    public static let navigationHistoryLimit = 20
+    /// The limit and the trimming live in Rust (`lyra-reader-session`); this read-only mirror
+    /// exists so the checks and log messages can name the documented cap without keeping a
+    /// second constant. Each direction keeps the most recent entries.
+    public static let navigationHistoryLimit =
+        Int(LyraReaderBindings.navigationHistoryLimit())
 
+    /// The canonical stacks live in `lyra-reader-session`, behind
+    /// `LyraReaderNavigationHistory`. These arrays are **published mirrors** refreshed from the
+    /// object after every mutation so SwiftUI observation and ``canGoBack`` keep working; the
+    /// shell must never push, pop, clear or trim them itself.
     @Published public private(set) var backHistory: [ReaderLocation] = []
     @Published public private(set) var forwardHistory: [ReaderLocation] = []
     public var canGoBack: Bool { !backHistory.isEmpty }
     public var canGoForward: Bool { !forwardHistory.isEmpty }
+    /// The canonical Back/Forward state machine: record, back, forward and clear all run here.
+    private let navigationHistory = LyraReaderNavigationHistory()
 
     /// A jump the **preview** started: record where the reader is, then move.
     ///
@@ -1776,28 +2131,32 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Returns to the reader's previous location. True when there was one.
     @discardableResult
     public func goBack() -> Bool {
-        guard let target = backHistory.popLast() else { return false }
-        forwardHistory.append(currentReaderLocation())
-        trimNavigationHistory()
-        applyReaderLocation(target, message: "Back to page")
+        guard let target = navigationHistory.goBack(current: currentReaderLocationRecord()) else {
+            return false
+        }
+        refreshNavigationHistoryMirrors()
+        applyReaderLocation(Self.readerLocation(from: target), message: "Back to page")
         return true
     }
 
     /// Moves forward again. True when the forward branch had an entry.
     @discardableResult
     public func goForward() -> Bool {
-        guard let target = forwardHistory.popLast() else { return false }
-        backHistory.append(currentReaderLocation())
-        trimNavigationHistory()
-        applyReaderLocation(target, message: "Forward to page")
+        guard let target = navigationHistory.goForward(current: currentReaderLocationRecord()) else {
+            return false
+        }
+        refreshNavigationHistoryMirrors()
+        applyReaderLocation(Self.readerLocation(from: target), message: "Forward to page")
         return true
     }
 
     /// Leaving a document throws its history away; the document reset path calls this.
     public func clearNavigationHistory() {
+        // Keep the pre-change no-op when there is no history, so closing a document that never
+        // recorded a jump does not publish an empty-array change.
         guard !backHistory.isEmpty || !forwardHistory.isEmpty else { return }
-        backHistory = []
-        forwardHistory = []
+        navigationHistory.clear()
+        refreshNavigationHistoryMirrors()
     }
 
     /// Whether a page's text layer is already in memory.
@@ -1812,23 +2171,45 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     private func currentReaderLocation() -> ReaderLocation {
         ReaderLocation(page: max(0, currentPage - 1), scrollYPt: scrollYPt,
-                       selection: selection, preview: referencePreview)
+                       selection: selection)
+    }
+
+    private func currentReaderLocationRecord() -> ReaderLocationRecord {
+        let location = currentReaderLocation()
+        return ReaderLocationRecord(
+            page: UInt32(location.page),
+            scrollYPt: Double(location.scrollYPt),
+            selection: location.selection.map { selection in
+                ReaderSelectionRecord(
+                    page: UInt32(selection.page),
+                    start: UInt32(selection.range.lowerBound),
+                    end: UInt32(selection.range.upperBound))
+            })
+    }
+
+    private static func readerLocation(from record: ReaderLocationRecord) -> ReaderLocation {
+        let selection = record.selection.flatMap { selection -> Selection? in
+            // The pre-change value held a `ClosedRange`, which cannot be inverted. The FFI record
+            // is the only place an inverted pair could enter; treating it as no selection keeps a
+            // malformed record from trapping while the mirror is rebuilt.
+            guard selection.start <= selection.end else { return nil }
+            return Selection(page: Int(selection.page),
+                             range: Int(selection.start)...Int(selection.end))
+        }
+        return ReaderLocation(page: Int(record.page),
+                              scrollYPt: CGFloat(record.scrollYPt),
+                              selection: selection)
+    }
+
+    private func refreshNavigationHistoryMirrors() {
+        let snapshot = navigationHistory.snapshot()
+        backHistory = snapshot.back.map(Self.readerLocation(from:))
+        forwardHistory = snapshot.forward.map(Self.readerLocation(from:))
     }
 
     private func recordReaderLocation() {
-        backHistory.append(currentReaderLocation())
-        // A new jump has a new future: the forward branch it replaced is stale.
-        forwardHistory.removeAll()
-        trimNavigationHistory()
-    }
-
-    private func trimNavigationHistory() {
-        if backHistory.count > Self.navigationHistoryLimit {
-            backHistory.removeFirst(backHistory.count - Self.navigationHistoryLimit)
-        }
-        if forwardHistory.count > Self.navigationHistoryLimit {
-            forwardHistory.removeFirst(forwardHistory.count - Self.navigationHistoryLimit)
-        }
+        navigationHistory.record(location: currentReaderLocationRecord())
+        refreshNavigationHistoryMirrors()
     }
 
     /// Restores a remembered **offset**, not just its page. `reloadVisiblePages` then re-derives
@@ -1848,9 +2229,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Annotations the **PDF itself carries**, in view space — highlights and notes somebody
     /// else made (or the reader made in another viewer).
     ///
-    /// A different thing from `annotations` below: that is what this reader wrote to its sidecar,
+    /// A different thing from `annotations` below: that is what this reader wrote to its annotation cache,
     /// this is what the file says. Both sources share sentence excerpts in the sidebar, while
-    /// only the sidecar annotations can be edited here.
+    /// only the cached annotations can be edited here.
     @Published public private(set) var documentAnnotations: [DocumentAnnotation] = [] {
         didSet { passageTextMaps = [:]; rebuildAnnotationPassages() }
     }
@@ -1858,15 +2239,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var documentAnnotationsLoading = false
     /// Why the document's annotations could not be read, if they could not.
     @Published public private(set) var documentAnnotationsError: String?
+    /// A one-line, dismissible notice when some annotations inside the PDF could not be decoded.
+    ///
+    /// The readable annotations are still shown. The engine also blocks annotation writes while
+    /// this is set, so the unreadable ones cannot be dropped by a rewrite.
+    @Published public private(set) var annotationReadNotice: String?
     private var documentAnnotationsLoadCompleted = false
 
     /// One annotation the reader removed from the PDF's annotation list but has not written to a
     /// file yet.
     ///
     /// The deletion is a pending change, like an unsaved highlight: the PDF on disk still has
-    /// the annotation until "Save Copy" or "Save and Replace Original". The identity is what the
-    /// writer resolves; the page is kept for the sidebar and for the report.
-    public struct FileAnnotationDeletion: Identifiable, Equatable, Sendable {
+    /// the annotations until the reader saves. The identity is what the writer resolves; the
+    /// page is kept for the sidebar and for the report.
+    public struct FileAnnotationDeletion: Identifiable, Codable, Equatable, Sendable {
         public let identity: String
         public let page: Int
         public var id: String { identity }
@@ -1878,7 +2264,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// Annotations deleted in this session, waiting for the next explicit save.
-    @Published public private(set) var pendingFileDeletions: [FileAnnotationDeletion] = []
+    @Published public private(set) var pendingFileDeletions: [FileAnnotationDeletion] = [] {
+        didSet { persistPendingAnnotationState() }
+    }
     /// `/Popup` presence for every annotation the file carries, keyed by identity. An adopted
     /// entry is no longer in `documentAnnotations`, but the file still owns its popup, so the
     /// eraser guard needs this to survive adoption.
@@ -1916,45 +2304,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// The one editability decision. Called by the canvas, the eraser, the sidebar and the
     /// writer; nothing re-derives it.
+    ///
+    /// The engine computes the whole policy (reply, hidden, kind, empty geometry, unreadable
+    /// stamp picture, not drawn) and carries the sentence across the FFI. The shell only maps it
+    /// to its display type.
     public static func documentAnnotationEditability(
         _ annotation: DocumentAnnotation
     ) -> DocumentAnnotationEditability {
-        if annotation.isReply {
-            return .unsupported(
-                reason: "This is a reply. Edit or delete the annotation at the top of the thread; "
-                    + "the replies stay attached to it.")
-        }
-        guard annotation.visible else {
-            return .unsupported(reason: "This annotation is hidden by the file (/F).")
-        }
-        switch annotation.kind {
-        case "highlight", "underline", "strikeout", "text", "freeText",
-             "ink", "square", "circle", "line", "stamp":
-            break
-        case "squiggly":
-            return .unsupported(
-                reason: "LyraReader has no editable model for /Squiggly; editing it would have to "
-                    + "change the mark's subtype.")
-        default:
-            return .unsupported(
-                reason: "LyraReader has no editable model for a /\(annotation.kind) annotation yet.")
-        }
-        if annotation.kind == "ink" && annotation.inkPaths.isEmpty {
-            return .unsupported(reason: "This ink annotation carries no /InkList to move or draw.")
-        }
-        if annotation.kind == "line" && (annotation.lineStart == nil || annotation.lineEnd == nil) {
-            return .unsupported(reason: "This line annotation carries no /L endpoints.")
-        }
-        if annotation.kind == "stamp",
-           annotation.stampImageData == nil,
-           (annotation.stampText ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-           let reason = annotation.stampImageError {
-            return .unsupported(
-                reason: "This stamp's picture could not be decoded (\(reason)), so it can be "
-                    + "deleted here but not moved, resized or edited.")
-        }
-        if annotation.drawing == .skipped {
-            return .unsupported(reason: "This annotation is not drawn by the reader.")
+        if let reason = annotation.unsupportedEditReason {
+            return .unsupported(reason: reason)
         }
         return .editable
     }
@@ -1992,7 +2350,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             }
         default: return nil
         }
-        let opacity = min(max(document.opacity ?? 1.0, 0.0), 1.0)
+        let opacity = AnnotationRecordRules.clampOpacity(document.opacity ?? 1.0)
         let alpha = UInt8(min(max((opacity * 255.0).rounded(), 0), 255))
         let box = CGRect(x: document.xPt, y: document.yPt,
                          width: document.widthPt, height: document.heightPt)
@@ -2049,7 +2407,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 inkPaths: document.inkPaths, strokeWidth: width, fileIdentity: document.id)
         case .square, .circle:
             guard box.width > 0, box.height > 0 else { return nil }
-            // The sidecar stores the stroke's centre line; a PDF `/Rect` is its outer edge.
+            // The annotation cache stores the stroke's centre line; a PDF `/Rect` is its outer edge.
             let inset = box.insetBy(dx: width / 2, dy: width / 2)
             guard inset.width > 0, inset.height > 0 else { return nil }
             return Annotation(
@@ -2122,8 +2480,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// This is the array this version can *render and edit*. Entries a newer version wrote in
     /// a shape this one does not understand are not in here: they live in
-    /// `annotationSidecarSlots` as raw JSON and are written back untouched (see
-    /// `AnnotationSidecar`).
+    /// `annotationRecordSlots` as raw JSON and are written back untouched (see
+    /// `AnnotationRecords`).
     @Published public private(set) var annotations: [Annotation] = [] {
         didSet { rebuildAnnotationPassages() }
     }
@@ -2131,19 +2489,37 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public var pendingStampStyle: StampStyle?
     /// The picture the armed signature tool will place, or `nil` when it is not armed.
     @Published public var pendingSignatureImageData: Data?
+    /// True when the armed picture is an ordinary image rather than a signature. The annotation
+    /// kind and writer are the same; this only decides the initial size and the words shown.
+    @Published public private(set) var pendingSignatureIsPicture = false
+    /// A Fill & Sign placement waiting for the next click on the page.
+    ///
+    /// This is orthogonal to ``annotationTool``: a check mark or a date does not change what a
+    /// drag means, it only claims the next click. Text is the one case that also arms the
+    /// existing text-box tool because its editing surface is the tool's.
+    @Published public private(set) var pendingFillSignPlacement: FillSignPlacement?
+    /// True when the open placed-text editor should start with its whole text selected.
+    ///
+    /// Only a Date placement creates a box with words already in it; selecting them means the
+    /// reader's first keystroke replaces the date rather than appending to it.
+    @Published public private(set) var editingTextSelectAll = false
     /// The one active canvas tool. A text-markup case makes finished text selections mark
     /// themselves; the pen and shape cases draw on a drag. The eraser removes ink on a drag. The
-    /// modes cannot both be active.
+    /// modes cannot both be active. ``AnnotationTool/select`` is the implicit pointer state: it
+    /// means no tool is armed, which is why the toolbar has no Select button.
     @Published public var annotationTool: AnnotationTool = .select {
         didSet {
-            // The form tool and the drawing tools are modes of the same canvas; choosing a
-            // drawing tool leaves the form tool (and never the other way around).
-            if annotationTool != .select && formToolActive {
-                formToolActive = false
+            // Arming any tool takes the pointer from a form field (and never the other way
+            // around): once a tool is active, a click on the page belongs to that tool for as
+            // long as it is armed.
+            if annotationTool != .select {
                 formFocusedFieldID = nil
                 formOpenChoiceFieldID = nil
             }
             if annotationTool != oldValue {
+                if annotationTool != .select {
+                    cancelRegionSelection(reason: "Region selection cancelled: another annotation tool took the pointer.")
+                }
                 // The hover halo and any draft gesture belong to the tool that was armed. A tool
                 // switch from the toolbar mid-drag cannot leave a half-erased gesture behind.
                 if annotationTool != .eraser {
@@ -2153,9 +2529,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 // A placed stamp or signature picture belongs to its own tool; leaving that tool
                 // disarms it so a later click cannot place the wrong picture.
                 if annotationTool != .stamp { pendingStampStyle = nil }
-                if annotationTool != .signature { pendingSignatureImageData = nil }
-                // Selection is the Select tool's business: arming a pen, shape, markup or the
-                // eraser drops the halo instead of leaving a mark that Delete would still act on.
+                if annotationTool != .signature {
+                    pendingSignatureImageData = nil
+                    pendingSignatureIsPicture = false
+                }
+                // A Fill & Sign placement belongs to the gesture that armed it. Any tool change
+                // (including turning a tool off) drops it, so a later click can never place a
+                // check mark or date the reader has forgotten about.
+                pendingFillSignPlacement = nil
+                // Selecting a mark belongs to the implicit pointer state: arming a pen, shape,
+                // markup or the eraser drops the halo instead of leaving a mark that Delete
+                // would still act on.
                 cancelPendingMarkSelection()
                 if selectedAnnotationID != nil { selectedAnnotationID = nil }
                 // A selection on screen is drawn as the mark the tool will commit, or as the
@@ -2173,7 +2557,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var eraserHoverMarkID: String?
     /// Ink strokes the eraser has shortened or removed since their absence was last written to
     /// a PDF. While this is non-empty the interface says that the PDF on disk is still unchanged.
-    @Published public private(set) var erasedInkStrokeIDs: Set<UUID> = []
+    @Published public private(set) var erasedInkStrokeIDs: Set<UUID> = [] {
+        didSet { persistPendingAnnotationState() }
+    }
     /// Why a plain click last refused to select a mark the PDF itself carries.
     ///
     /// A mark with no editable model (a reply, a hidden annotation, a subtype this reader does
@@ -2197,7 +2583,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             refreshSelectionOverlay()
         }
     }
-    /// The annotation the reader last clicked, if any. Only sidecar annotations can be selected:
+    /// The annotation the reader last clicked, if any. Only cached annotations can be selected:
     /// a PDF's own ink, shapes, notes and text are drawn but not editable, because moving them
     /// would mean rewriting somebody else's annotation.
     @Published public private(set) var selectedAnnotationID: UUID?
@@ -2222,7 +2608,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private var resizeOriginalAnnotation: Annotation?
     private var resizeStartPagePoint: CGPoint?
     private var resizeHandle: TextBoxResizeHandle?
-    /// The sidecar annotation whose text editor is open, and the state needed to commit or
+    /// The cached annotation whose text editor is open, and the state needed to commit or
     /// cancel that one editing session as one undoable change.
     @Published public private(set) var editingAnnotationID: UUID?
     private var editingWasCreated = false
@@ -2232,31 +2618,31 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The annotations as they were when the current eraser drag began, and the cuts it has made
     /// so far. Both are empty when no gesture is in flight.
     private var eraserGestureBase: [Annotation]?
-    /// One splitter per original path, keyed by the sidecar annotation they came from.
-    private var eraserGestureSidecarSplits: [UUID: SidecarInkSplit] = [:]
+    /// One splitter per original path, keyed by the cached annotation they came from.
+    private var eraserGestureRecordSplits: [UUID: RecordInkSplit] = [:]
     /// The same for ink the PDF carries; a split of one of those is a **cross-reader** change:
     /// the original annotation is deleted by identity and its surviving pieces become new
-    /// sidecar ink.
+    /// reader ink.
     private var eraserGestureDocumentSplits: [String: DocumentInkSplit] = [:]
     /// File-owned strokes this drag found but must not touch: splitting one would orphan its
     /// review thread. Cached so every pointer sample does not rebuild the same sentence.
     private var eraserGestureRefusedDocumentIDs: Set<String> = []
-    /// Adopted sidecar entries that are file-owned and carry review text, refused for this drag.
-    private var eraserGestureRefusedSidecarIDs: Set<UUID> = []
+    /// Adopted annotation-cache entries that are file-owned and carry review text, refused for this drag.
+    private var eraserGestureRefusedRecordIDs: Set<UUID> = []
     /// What the canvas should draw while a drag is cutting. `nil` while no gesture is in flight.
     /// Preview marks are not annotations: they carry stable, throwaway identities so a pointer
-    /// sample cannot churn the model or the sidecar.
+    /// sample cannot churn the model or the annotation cache.
     @Published public private(set) var eraserPreviewMarks: [CanvasAnnotationMark]?
     /// The reader's bookmarks for this document, in the order the sidebar shows them.
     ///
-    /// Stored in the same sidecar as `annotations` (see `Bookmark` and `AnnotationSidecar`);
+    /// Stored in the same annotation cache as `annotations` (see `Bookmark` and `AnnotationRecords`);
     /// entries a newer build wrote in a shape this one cannot interpret stay in the slot list
     /// and are written back verbatim, exactly as foreign annotation entries are.
     @Published public private(set) var bookmarks: [Bookmark] = []
-    /// Number of sidecar entries preserved verbatim because this version cannot interpret
+    /// Number of annotation-cache entries preserved verbatim because this version cannot interpret
     /// them (unknown `kind`, colour outside the palette, unknown fields).
     @Published public private(set) var preservedAnnotationEntryCount = 0
-    /// How many times this document's sidecar has been written since the document opened.
+    /// How many times this document's annotation cache has been written since the document opened.
     /// Instrumentation: it is what makes write coalescing measurable instead of asserted.
     @Published public private(set) var annotationWriteCount = 0
     /// True while a PDF write-back is running, so the save commands cannot run twice at once.
@@ -2268,29 +2654,35 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var interruptedAnnotationSaveNotice: String?
     /// What the last successful write-back did, for the status line, diagnostics and checks.
     @Published public private(set) var lastAnnotationWriteReport: AnnotationWriteReport?
-    /// True while the note editor holds text that has not reached the sidecar yet.
+    /// True while the note editor holds text that has not reached the annotation cache yet.
     @Published public private(set) var hasPendingAnnotationWrite = false
     /// The last recovery backup, so the UI can offer to reveal it in Finder.
-    @Published public private(set) var lastSidecarBackupURL: URL?
+    @Published public private(set) var lastAnnotationBackupURL: URL?
     private var annotationsURL: URL?
-    /// A failed read permanently blocks writes for this document, protecting its sidecar.
+    /// A failed read permanently blocks writes for this document, protecting its annotation cache.
     /// The only way out is the explicit recovery action, which backs the file up first.
     private var annotationWritesBlockedReason: String?
-    /// The order entries had in the sidecar, so foreign entries keep their place across saves.
-    private var annotationSidecarSlots: [AnnotationSidecar.Slot] = []
+    /// Set when the annotation cache decoded but the PDF's identity changed since it was saved.
+    ///
+    /// This is *not* a read failure: the records are loaded and may be edited. The stamp still
+    /// guards replacing the original PDF (``DocumentEditCache/validateSource(for:)``), so the
+    /// only explicit way out is the same backup-and-start-fresh action, which resets the stamp.
+    private var annotationSourceChangedReason: String?
+    /// The order entries had in the annotation cache, so foreign entries keep their place across saves.
+    private var annotationRecordSlots: [AnnotationRecords.Slot] = []
     /// Open coalescing window for note typing; see `updateNote`.
     private var noteFlushTask: Task<Void, Never>?
     /// True when a keystroke arrived after the current window's flush was scheduled, i.e. the
     /// reader is still typing and the window should stay open for another round.
     private var noteWindowSawKeystrokes = false
-    /// How long a note edit may stay in memory only. At most one sidecar write per window
+    /// How long a note edit may stay in memory only. At most one cache write per window
     /// while typing, plus immediate writes on commit, blur, undo, redo and flush points.
     private static let noteCoalescingWindow = Duration.milliseconds(500)
     /// Highlight colours offered when **creating** an annotation (translucent, so the text under
     /// a highlight stays readable).
     ///
     /// The first four entries are the palette this application has always had, in the same order
-    /// and with the same bytes: a sidecar written by an older build stores `colorIndex` 0…3, and
+    /// and with the same bytes: an annotation cache written by an older build stores `colorIndex` 0…3, and
     /// those indices must keep meaning exactly what they meant. The rest were added because four
     /// colours is not a palette a reader can work in; a loaded annotation is not limited to these
     /// at all (see `AnnotationColor`).
@@ -2298,7 +2690,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// decodes its legacy `colorIndex` against this table from any thread. It is a `let` of
     /// `Sendable` values, so sharing it is safe.
     /// LyraReader presets for new annotations. The legacy indexed palette below remains stable so
-    /// old sidecars retain their original colors when decoded or re-saved.
+    /// old cached annotations retain their original colors when decoded or re-saved.
     public nonisolated static let annotationPalette: [(name: String, color: AnnotationColor)] = [
         ("Gold", AnnotationColor(red: 0xE8, green: 0xBC, blue: 0x55, alpha: 82)),
         ("Apricot", AnnotationColor(red: 0xEF, green: 0xA7, blue: 0x7D, alpha: 77)),
@@ -2331,7 +2723,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// annotation, at the scale the canvas is currently drawing it at. Cleared with the rest of
     /// the annotation textures when the document changes.
     private var noteGlyphTextures: [NoteGlyphKey: PageImage] = [:]
-    /// Textures for the sidecar's sticky notes and text boxes: the icon and the laid-out text,
+    /// Textures for the cached sticky notes and text boxes: the icon and the laid-out text,
     /// keyed by every input that changes a pixel.
     private var placedGlyphTextures: [PlacedGlyphKey: PageImage] = [:]
     /// Stamp badges and signature images, keyed by every input that changes a pixel.
@@ -2408,6 +2800,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private var captionMentionsInFlight: Set<Int> = []
     @Published public private(set) var figures: [Figure] = []
     private var figuresLoadCompleted = false
+
+    /// The in-flight caption-index load, so a region tear can wait (briefly) for the boxes it
+    /// must not cut through.
+    private var figuresLoadTask: Task<Void, Never>?
     /// Recognised document metadata, with the source of every field.
     @Published public private(set) var metadata: DocumentMetadata?
     /// The editable values and the BibTeX generated from them. This is the panel's single
@@ -2428,10 +2824,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// One tab. The document itself lives in the tab-retention cache below; a tab whose document
     /// is beyond the keep-limit keeps only its URL and reading position and reloads on selection.
     public struct OpenTab: Identifiable, Sendable {
-        public let id = UUID()
+        public let id: UUID
         public let url: URL
         public var title: String
         public var scrollYPt: CGFloat
+
+        /// `id` is a parameter so a tab moved to another window keeps the identity it had in the
+        /// old one: retained documents, the transfer's completion check and the undo story are all
+        /// keyed by it. A normal open lets it default to a fresh UUID.
+        public init(id: UUID = UUID(), url: URL, title: String, scrollYPt: CGFloat) {
+            self.id = id
+            self.url = url
+            self.title = title
+            self.scrollYPt = scrollYPt
+        }
     }
 
     @Published public private(set) var tabs: [OpenTab] = []
@@ -2462,7 +2868,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var statusMessage: String
         var pageSelection: Set<Int>
         var pageSelectionAnchor: Int?
-        var pendingRedactions: [PendingRedaction]
         var pageEditSession: PageEditSession?
         var pageEditPendingOperations: [String]
         var pageEditIsApplied: Bool
@@ -2471,6 +2876,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var searchHits: [SearchHit]
         var currentHitIndex: Int?
         var tileCache: TileCache
+        /// Where the lifetime cache peak stood when this document opened; the panel's peak is
+        /// measured from here, and it travels with the tab like the counters below.
+        var tileCachePeakBaseline: Int
+        /// The performance panel's per-document counters, so switching back to a retained tab
+        /// reports that tab's requests and raster times instead of the previous tab's.
+        var tileRequestCount: Int
+        var tileRasterCount: Int
+        var tileRasterMilliseconds: Double
+        var pageRasterCount: Int
+        var pageRasterMilliseconds: Double
         var pagePreviews: [Int: PageImage]
         var pagePreviewScales: [Int: CGFloat]
         var desiredPreviewScale: CGFloat
@@ -2499,7 +2914,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var metadataLoadCompleted: Bool
         var formInfo: FormInfo
         var formDraft: [String: FormFieldValue]
-        var formToolActive: Bool
+        var formHasPendingChanges: Bool
         var formLoadCompleted: Bool
         var formError: String?
         var documentInfo: DocumentInfo?
@@ -2508,6 +2923,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var documentPopupFlags: [String: Bool]
         var pendingFileDeletions: [FileAnnotationDeletion]
         var documentAnnotationsError: String?
+        var annotationReadNotice: String?
         var documentAnnotationsLoadCompleted: Bool
         var outline: [OutlineEntry]
         var outlineLoadCompleted: Bool
@@ -2518,12 +2934,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var bookmarks: [Bookmark]
         var preservedAnnotationEntryCount: Int
         var annotationWriteCount: Int
+        var annotationCacheIsDirty: Bool
+        var annotationCleanSnapshot: AnnotationCleanSnapshot?
         var lastAnnotationWriteReport: AnnotationWriteReport?
         var interruptedAnnotationSaveNotice: String?
-        var lastSidecarBackupURL: URL?
+        var lastAnnotationBackupURL: URL?
         var annotationsURL: URL?
         var annotationWritesBlockedReason: String?
-        var annotationSidecarSlots: [AnnotationSidecar.Slot]
+        var annotationSourceChangedReason: String?
+        var annotationRecordSlots: [AnnotationRecords.Slot]
         var selectedDocumentAnnotationID: String?
         var openDocumentNoteID: String?
         var annotationTextures: [AnnotationTextureKey: PageImage]
@@ -2531,6 +2950,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var placedGlyphTextures: [PlacedGlyphKey: PageImage]
         var undoStack: [UndoableAction]
         var redoStack: [UndoableAction]
+        /// Completed translations and their show-original flags travel with the tab. In-flight
+        /// requests do not: switching tabs cancels them and leaves those blocks untranslated.
+        var translationSnapshot: TranslationSessionSnapshot
+        var translationDocumentURL: URL?
     }
 
     private struct RetainedTab {
@@ -2627,6 +3050,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         tileCache.removeAll()
         tilesInFlight.removeAll()
         wantedTiles.removeAll()
+        lastTilePlan = nil
         pendingTiles = []
         failedTiles = []
         pagePreviews = [:]
@@ -2660,6 +3084,36 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public var tileCachePeakBytes: Int { tileCache.peakBytes }
     public var tileCacheEvictions: Int { tileCache.stats.evictions }
     public var tileCacheTileCount: Int { tileCache.count }
+    /// The cache peak when the current document opened. `tileCachePeakBytes` is a lifetime
+    /// high-water mark for `LYRA_READER_RENDER_STATS`, so the panel subtracts this baseline to
+    /// report a per-document peak without changing that existing diagnostic's meaning.
+    private var tileCachePeakBaseline = 0
+    public var tileCacheDocumentPeakBytes: Int {
+        max(0, tileCache.peakBytes - tileCachePeakBaseline)
+    }
+    /// A copy of the cache's counters for the performance panel. `TileCacheStats` is a value
+    /// type, so the panel cannot mutate the cache through the snapshot.
+    public var tileCacheSnapshot: TileCacheStats { tileCache.stats }
+    /// The LOD of the visible band's tile pyramid. Read-only: the panel reports it, the canvas
+    /// and the scheduler are the only writers.
+    public var currentRasterLOD: UInt8 { rasterLod }
+    /// Tiles the scheduler actually queued for rasterization since the document opened. This is
+    /// a request, not a cache lookup: a tile already cached is a hit and never queued.
+    public private(set) var tileRequestCount = 0
+    /// Tiles the engine finished rasterizing since the document opened (successful insertions).
+    public private(set) var tileRasterCount = 0
+    /// Wall-clock milliseconds spent in those tile raster calls, as self-reported by the shell
+    /// around `PDFEngine.rasterizeTile`. This is CPU/wall time, not GPU upload or draw time.
+    public private(set) var tileRasterMilliseconds: Double = 0
+    /// Whole-page rasters the engine finished since the document opened.
+    public private(set) var pageRasterCount = 0
+    /// Wall-clock milliseconds spent waiting for those page raster calls. Same caveat as the
+    /// tile figure: an engine self-report, not a GPU or presentation measurement.
+    public private(set) var pageRasterMilliseconds: Double = 0
+    public var thumbnailCacheBytes: Int {
+        thumbnails.values.reduce(0) { $0 + $1.bgra.count }
+    }
+    public var thumbnailCacheCount: Int { thumbnails.count }
 
     /// Whether one tile is cached. The budget checks use it to prove that a visible tile
     /// survived an eviction pass that a stale tile did not.
@@ -2944,7 +3398,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     for (index, level) in levels.enumerated() {
                         if index > 0 { try? await Task.sleep(for: .milliseconds(stepMs)) }
                         guard let self, self.document != nil else { return }
-                        self.zoomPercent = min(400, max(25, level))
+                        self.zoomPercent = self.resolvedZoomPercent(
+                            mode: .percent, percent: level) ?? self.zoomPercent
                         self.reloadVisiblePages()
                         // Report the counters once this leg's band has settled: read at the
                         // instant of the zoom they would bill the *next* leg for this leg's
@@ -3008,20 +3463,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 }
             }
 
-            // Development aid: LYRA_READER_RECOVER_SIDECAR=1 runs the explicit recovery for a
-            // sidecar that failed to load, so the backup path is visible on stderr.
-            if ProcessInfo.processInfo.environment["LYRA_READER_RECOVER_SIDECAR"] == "1" {
+            // Development aid: LYRA_READER_RECOVER_ANNOTATIONS=1 runs the explicit recovery for
+            // an annotation cache that failed to load, so the backup path is visible on stderr.
+            if ProcessInfo.processInfo.environment["LYRA_READER_RECOVER_ANNOTATIONS"] == "1" {
                 if let reason = annotationWritesBlockedReason {
                     FileHandle.standardError.write(
                         Data("lyra-reader-annotate: writes blocked: \(reason)\n".utf8)
                     )
-                    let backup = recoverUnreadableAnnotationSidecar()
+                    let backup = recoverUnreadableAnnotationRecords()
                     FileHandle.standardError.write(
                         Data("lyra-reader-annotate: recovery \(backup == nil ? "failed" : "backup=\(backup!.path)")\n".utf8)
                     )
                 } else {
                     FileHandle.standardError.write(
-                        Data("lyra-reader-annotate: recovery hook found no blocked sidecar\n".utf8)
+                        Data("lyra-reader-annotate: recovery hook found no blocked annotation cache\n".utf8)
                     )
                 }
             }
@@ -3110,7 +3565,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func open(url: URL) -> Bool {
-        if deferContentTransition({[weak self] in _ = self?.open(url:url)}) {return true}
+        open(url: url, restoringTabScroll: nil)
+    }
+
+    /// The shared open path. `restoringTabScroll` is non-nil for a tab arriving from another
+    /// window: the saved offset is applied while the document loads, exactly as for a tab whose
+    /// document was evicted, so the arriving tab does not flash the top of the file first.
+    @discardableResult
+    private func open(url: URL, restoringTabScroll: CGFloat?) -> Bool {
+        if deferContentTransition({[weak self] in _ = self?.open(url: url, restoringTabScroll: restoringTabScroll)}) {return true}
+        finishRegionCardsForDocumentSwitch(reason: "The document changed. The region conversation was moved to Region questions.")
         // Keep the document the reader left behind if it belongs to a tab. The snapshot is only
         // committed after the new document actually opens, so a refused open leaves the cache and
         // the screen exactly as they were.
@@ -3119,7 +3583,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // document back; its handle must go, or an untabbed open path would leak one per file.
         let orphanURL = previous == nil && activeTabIndex == nil ? document?.url : nil
         let preserveSession = previous != nil && pageEditSession.map { !Self.resolvesToSameFile(url,$0.originalURL) } == true
-        guard loadDocument(url: url, restoringTabScroll: nil,preservingPageEditSessionInSnapshot:preserveSession) else { return false }
+        guard loadDocument(url: url, restoringTabScroll: restoringTabScroll,preservingPageEditSessionInSnapshot:preserveSession) else { return false }
         if var previous {
             // The new open may have discarded a page-edit session on the previous document
             // (after the explicit alert). Its revision is gone, so the retained tab must not
@@ -3145,21 +3609,31 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                               preservingPageEditSessionInSnapshot: Bool = false) -> Bool {
         openRequestCount += 1
         if let session = pageEditSession, !preservingPageEditSessionInSnapshot {
-            let same = Self.resolvesToSameFile(url, session.originalURL)
-            let alert = NSAlert()
-            alert.alertStyle = .warning
-            alert.messageText = same
-                ? "Discard the pending page changes and reopen the original?"
-                : "Discard the pending page changes to “\(session.originalURL.lastPathComponent)”?"
-            alert.informativeText =
-                "The original file is unchanged, but annotations and bookmarks added during the "
-                + "page-editing session are discarded with the working copy."
-            alert.addButton(withTitle: "Discard and Open")
-            alert.addButton(withTitle: "Cancel")
-            guard alert.runModal() == .alertFirstButtonReturn else { return false }
-            endPageEditSession(deleteFiles: true)
+            // A working copy with no staged change is not something to confirm discarding; it
+            // only has to be closed before the new document takes its place.
+            if session.operations.isEmpty {
+                endPageEditSession(deleteFiles: true)
+            } else {
+                let same = Self.resolvesToSameFile(url, session.originalURL)
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = same
+                    ? "Discard the pending page changes and reopen the original?"
+                    : "Discard the pending page changes to “\(session.originalURL.lastPathComponent)”?"
+                alert.informativeText =
+                    "The original file is unchanged, but annotations and bookmarks added during the "
+                    + "page-editing session are discarded with the working copy."
+                alert.addButton(withTitle: "Discard and Open")
+                alert.addButton(withTitle: "Cancel")
+                guard alert.runModal() == .alertFirstButtonReturn else { return false }
+                endPageEditSession(deleteFiles: true)
+            }
         }
         do {
+            // One-shot, not a timer: stamps the request now; the first *presented* frame clears
+            // the flag. It is retained even when the panel is closed, so opening the panel later
+            // still reports the open latency instead of "not measured".
+            performanceProbe.beginOpenToFirstFrameMeasurement()
             let loaded = try engine.openDocument(at: url)
             resetDocumentState()
             // A tab switch already put the old document's page-edit session in its retained
@@ -3171,9 +3645,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 pageEditIsApplied = false
             }
             document = loaded
+            DocumentEditCache.adopt(documentId: loaded.documentId, for: url)
             lastError = nil
+            recoverableErrorBanner = nil
             currentPage = 1
-            if loaded.pageCount > 0 {
+            if loaded.xfa.isXfa {
+                // A reading cue, not a diagnostics report: the structural facts (packets, field
+                // and skipped counts) stay in the FFI record and in `lyra-reader-cli xfa`.
+                statusMessage = "XFA form · read-only · \(loaded.pageCount) page(s)"
+            } else if loaded.pageCount > 0 {
                 statusMessage = String(
                     format: "Opened %d page(s) · first page %.0f×%.0f pt · %@",
                     loaded.pageCount,
@@ -3191,6 +3671,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             noticeInterruptedSave(at: url)
             if let restoringTabScroll {
                 contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode)
+                    + regionGapTotalPt
                 contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt, layout: layoutMode)
                 scrollYPt = min(max(0, restoringTabScroll),
                                 max(0, contentHeightPt - viewportHeightContentPt))
@@ -3206,16 +3687,30 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             loadMetadata()
             loadDocumentAnnotations()
             loadFormInfo()
+            restoreCachedPageEdits(for: url)
+            // In-place translations belong to the original file's document cache. Load after a
+            // cached page-edit session has opened its working revision, so the cache directory is
+            // still the original PDF's, never a revision path.
+            translationCacheDocumentURL = url
+            loadRegionHistory(for: url)
+            refreshTranslationPaperColors()
+            inPlaceTranslation.loadDocument(url: url, pageCount: loaded.pageCount)
             return true
 
         } catch {
-            lastError = String(describing: error)
+            // The message is the historical one; `present` only chooses the surface, and an
+            // open failure is Document/Fatal, so this still lands in the alert exactly as before.
+            present(error, message: String(describing: error))
             statusMessage = "Couldn't open the document"
             return false
         }
     }
 
     private func resetDocumentState() {
+        documentKnowledge.invalidate()
+        let wasChanging = isChangingDocumentState
+        isChangingDocumentState = true
+        defer { isChangingDocumentState = wasChanging }
         contentLoadToken = UUID()
         contentEditPage = nil
         contentEditSelection = nil
@@ -3223,7 +3718,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         contentEditLoading = false
         contentTextEditing = false
         // Pending writes describe the document being replaced or closed, so they have to land
-        // before the state that carries them (sidecar URL, scroll offset) is cleared.
+        // before the state that carries them (annotation cache URL, scroll offset) is cleared.
         flushPendingWrites()
         // A glide belongs to the document that was scrolling; the next one starts still.
         cancelScrollGlide()
@@ -3236,11 +3731,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // be able to scroll the next document to an offset it never had.
         clearNavigationHistory()
         invalidateTiles()
+        // The performance panel's counters are per document. The cache keeps its retained tiles
+        // while tabs are swapped, but the counters should not carry one paper's raster history
+        // into another's report.
+        tileCache.resetStats()
+        // The lifetime peak is intentionally not reset (`LYRA_READER_RENDER_STATS` documents it
+        // as "since the cache was created"); the panel measures from this document's baseline.
+        tileCachePeakBaseline = tileCachePeakBytes
+        tileRequestCount = 0
+        tileRasterCount = 0
+        tileRasterMilliseconds = 0
+        pageRasterCount = 0
+        pageRasterMilliseconds = 0
         canvasPages = []
         canvasTiles = []
         visiblePagePlacements = []
-        pendingRedactions = []
-        redactionBusy = false
         textPages = [:]
         textPagesInFlight = []
         linkCache = [:]
@@ -3261,7 +3766,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         formLoading = false
         formError = nil
         formLoadCompleted = false
-        formToolActive = false
         formFocusedFieldID = nil
         formOpenChoiceFieldID = nil
         formSaveInProgress = false
@@ -3275,6 +3779,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         documentPopupFlags = [:]
         documentAnnotationsLoading = false
         documentAnnotationsError = nil
+        annotationReadNotice = nil
+        recoverableErrorBanner = nil
         annotationSaveInProgress = false
         pageEditIsApplied = false
         interruptedAnnotationSaveNotice = nil
@@ -3284,6 +3790,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         outlineLoadCompleted = false
         referencesLoadCompleted = false
         figuresLoadCompleted = false
+        figuresLoadTask = nil
         metadataLoadCompleted = false
         documentAnnotationsLoadCompleted = false
         isRestoringDocument = false
@@ -3295,6 +3802,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         isSearching = false
         selection = nil
         selectionAnchor = nil
+        inPlaceTranslation.reset()
+        translationOverlays = []
+        translationNotice = nil
+        translationPaperColors = [:]
+        translationCacheDocumentURL = nil
         clearAISourceHighlight()
         selectedAnnotationID = nil
         pendingMarkSelection = nil
@@ -3307,6 +3819,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         editingWasCreated = false
         editingOriginalText = ""
         editingUndoDepth = 0
+        editingTextSelectAll = false
+        pendingFillSignPlacement = nil
+        pendingSignatureIsPicture = false
         annotationTool = .select
         transitionProgressOverride = nil
         annotations = []
@@ -3316,16 +3831,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         markSelectionRefusalNotice = nil
         eraserRefusalNotice = nil
         eraserGestureBase = nil
-        eraserGestureSidecarSplits = [:]
+        eraserGestureRecordSplits = [:]
         eraserGestureDocumentSplits = [:]
         eraserGestureRefusedDocumentIDs = []
-        eraserGestureRefusedSidecarIDs = []
+        eraserGestureRefusedRecordIDs = []
         eraserPreviewMarks = nil
         pageSelection = []
         pageSelectionAnchor = nil
         annotationsURL = nil
         annotationWritesBlockedReason = nil
-        annotationSidecarSlots = []
+        annotationSourceChangedReason = nil
+        annotationRecordSlots = []
         preservedAnnotationEntryCount = 0
         hasPendingAnnotationWrite = false
         noteFlushTask?.cancel()
@@ -3349,23 +3865,53 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func zoomIn() {
-        zoomPercent = min(Self.maximumZoomPercent, zoomPercent + 10)
+        zoomPercent = resolvedZoomPercent(mode: .percent, percent: zoomPercent, delta: 10)
+            ?? zoomPercent
         reloadVisiblePages()
     }
 
     public func zoomOut() {
-        zoomPercent = max(Self.minimumZoomPercent, zoomPercent - 10)
+        zoomPercent = resolvedZoomPercent(mode: .percent, percent: zoomPercent, delta: -10)
+            ?? zoomPercent
         reloadVisiblePages()
     }
 
     /// The zoom range the toolbar buttons and the pointer gestures share.
-    public static let minimumZoomPercent = 25
-    public static let maximumZoomPercent = 400
+    ///
+    /// Read from the session policy through the FFI. These are conveniences for UI checks and
+    /// labels; every production clamp goes through ``resolvedZoomPercent``/``clampScroll``.
+    public static let minimumZoomPercent = Int(LyraReaderBindings.zoomMinPercent())
+    public static let maximumZoomPercent = Int(LyraReaderBindings.zoomMaxPercent())
 
     /// The inset the Fit Width and Fit Page presets leave between a page edge and the viewport
-    /// edge, measured on each side. 8 logical points is small enough that a fitted page still
-    /// reads as "fit" and large enough that it does not touch the window chrome.
-    public static let zoomPresetInsetPt: CGFloat = 8
+    /// edge, measured on each side. The value lives in the session policy; this reads it.
+    public static let zoomPresetInsetPt = CGFloat(LyraReaderBindings.zoomPresetInsetPt())
+
+    /// Ask the Rust session policy for the one integer zoom percentage.
+    ///
+    /// A step is clamped to 25…400; a fit floors the calibrated content size into the viewport
+    /// minus 16 pt and clamps the same way. Returning `nil` means the fit has no usable geometry
+    /// and the caller must leave the zoom alone — the same contract the old Swift formula had.
+    private func resolvedZoomPercent(
+        mode: LyraReaderBindings.ZoomModeRecord,
+        percent: Int,
+        delta: Int = 0,
+        page: CGSize = .zero,
+        viewport: CGSize = .zero
+    ) -> Int? {
+        let policy = ZoomPolicyRecord(
+            mode: mode,
+            percent: UInt32(clamping: percent),
+            delta: Int32(clamping: delta),
+            pageWidthPt: Double(page.width),
+            pageHeightPt: Double(page.height),
+            viewportWidthPt: Double(viewport.width),
+            viewportHeightPt: Double(viewport.height),
+            calibration: Double(displayCalibration.factor)
+        )
+        guard let resolved = resolveZoom(policy: policy) else { return nil }
+        return Int(resolved)
+    }
 
     /// The current page's row geometry in content points.
     ///
@@ -3431,17 +3977,27 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Flooring is deliberate: a fit that rounds up would leave a sliver of the page outside the
     /// viewport (there is no horizontal scrolling to reach it, and the vertical one would show a
     /// scrollbar for a page that was supposed to fit).
-    private func fitZoomPercent(fittingContentPt contentPt: CGFloat,
+    private func fitZoomPercent(_ mode: LyraReaderBindings.ZoomModeRecord,
+                                fittingContentPt contentPt: CGFloat,
                                 intoViewportPt viewportPt: CGFloat) -> Int? {
-        let available = viewportPt - 2 * Self.zoomPresetInsetPt
-        guard contentPt.isFinite, contentPt > 0,
-              available.isFinite, available > 0,
-              displayCalibration.factor.isFinite, displayCalibration.factor > 0
-        else { return nil }
-        let percent = available / (contentPt * displayCalibration.factor) * 100
-        guard percent.isFinite else { return nil }
-        return min(Self.maximumZoomPercent,
-                   max(Self.minimumZoomPercent, Int(percent.rounded(.down))))
+        switch mode {
+        case .fitWidth:
+            return resolvedZoomPercent(
+                mode: .fitWidth,
+                percent: 100,
+                page: CGSize(width: contentPt, height: 1),
+                viewport: CGSize(width: viewportPt, height: 1)
+            )
+        case .fitPage:
+            return resolvedZoomPercent(
+                mode: .fitPage,
+                percent: 100,
+                page: CGSize(width: 1, height: contentPt),
+                viewport: CGSize(width: 1, height: viewportPt)
+            )
+        case .percent:
+            return nil
+        }
     }
 
     private enum ZoomPresetAnchor {
@@ -3473,8 +4029,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case .viewportTop:
             scrollYPt = clampedScrollOffset(scrollYPt)
         case .pageTop(let page):
-            scrollYPt = clampedScrollOffset(
-                engine.pageTopPt(page, gapPt: pageGapPt, layout: layoutMode))
+            scrollYPt = clampedScrollOffset(displayPageTop(page))
         }
         reloadVisiblePages()
         schedulePositionSave()
@@ -3487,7 +4042,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// the content point at the viewport top is kept.
     public func zoomFitWidth() {
         guard let geometry = pageFitGeometry(),
-              let target = fitZoomPercent(fittingContentPt: geometry.widthToFitPt,
+              let target = fitZoomPercent(.fitWidth,
+                                          fittingContentPt: geometry.widthToFitPt,
                                           intoViewportPt: viewportSizePt.width)
         else { return }
         applyZoomPreset(target, anchoring: .viewportTop)
@@ -3502,7 +4058,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// and the target is recomputed from the page geometry and the viewport.
     public func zoomFitPage() {
         guard let geometry = pageFitGeometry(),
-              let target = fitZoomPercent(fittingContentPt: geometry.pageHeightPt,
+              let target = fitZoomPercent(.fitPage,
+                                          fittingContentPt: geometry.pageHeightPt,
                                           intoViewportPt: viewportSizePt.height)
         else { return }
         applyZoomPreset(target, anchoring: .pageTop(page: geometry.page))
@@ -3561,8 +4118,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard whole != 0 else { return false }
         pointerZoomRemainder -= whole
 
-        let target = min(Self.maximumZoomPercent,
-                         max(Self.minimumZoomPercent, zoomPercent + Int(whole)))
+        let target = resolvedZoomPercent(mode: .percent, percent: zoomPercent, delta: Int(whole))
+            ?? zoomPercent
         guard target != zoomPercent else {
             // At a limit the remainder must not pile up, or the first step back would jump.
             pointerZoomRemainder = 0
@@ -3594,7 +4151,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// The scroll offset clamped to the document (shared by every path that sets it).
     private func clampedScrollOffset(_ value: CGFloat) -> CGFloat {
-        min(max(0, value), max(0, contentHeightPt - viewportHeightContentPt))
+        CGFloat(clampScroll(
+            offsetPt: Double(value),
+            contentHeightPt: Double(contentHeightPt),
+            viewportHeightPt: Double(viewportHeightContentPt)
+        ))
     }
 
     /// Actual physical size: 100% of the calibrated scale (⌘0).
@@ -3644,8 +4205,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// When the content is wider than one of the widths the visible columns can change. Those
     /// changes are coalesced into one rebuild shortly after the width stops moving, so a slide or
     /// a live window resize still settles correctly without doing that work per frame.
-    public func setViewportSize(_ size: CGSize) {
-        guard size != viewportSizePt else { return }
+    // The inspector may cover part of a wider drawing surface. Fit commands use the visible
+    // viewport; tiles, hit-test anchors and torn-page overlays use the drawing transform.
+    private var presentationWidthPt: CGFloat?
+    public var canvasPresentationWidthPt: CGFloat { presentationWidthPt ?? viewportSizePt.width }
+
+    public func setViewportSize(_ size: CGSize, canvasWidth: CGFloat? = nil) {
+        let drawingWidth = canvasWidth ?? size.width
+        let drawingWidthChanged = abs(drawingWidth - canvasPresentationWidthPt) > 0.5
+        presentationWidthPt = drawingWidth
+        guard size != viewportSizePt else {
+            if drawingWidthChanged { scheduleViewportReload() }
+            return
+        }
         let previous = viewportSizePt
         viewportSizePt = size
 
@@ -3679,6 +4251,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// on the expected width after the layout settles.
     public var canvasViewportWidthPt: CGFloat { viewportSizePt.width }
 
+    private var horizontalViewportOrigin: CGFloat = 0
+    public func setHorizontalViewportOrigin(_ origin: CGFloat) {
+        guard abs(origin - horizontalViewportOrigin) > 0.5 else { return }
+        horizontalViewportOrigin = max(0, origin)
+        scheduleViewportReload()
+    }
+
     /// Opens or closes the right-hand panel.
     ///
     /// Opening it leaves page overview: the assistant is a reading surface and the overview
@@ -3688,9 +4267,32 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         if rightPanelVisible {
             rightPanelVisible = false
         } else {
+            if contentEditEnabled {
+                if deferContentTransition({ [weak self] in self?.toggleRightPanel() }) { return }
+                contentEditEnabled = false
+            }
             pageOverviewVisible = false
+            // Both live in the same right-hand slot, so opening one closes the other rather
+            // than drawing two drawers on top of each other.
+            performancePanelVisible = false
             rightPanelVisible = true
         }
+    }
+
+    /// Opens or closes the developer-facing performance panel.
+    ///
+    /// Off by default and not persisted: it is a diagnostic surface, not reader chrome. It uses
+    /// the same right-hand drawer host and visual language as the assistant, so it needs no new
+    /// chrome of its own. The menu command and ⌥⌘P are the only ways in.
+    public func togglePerformancePanel() {
+        guard document != nil else { return }
+        if performancePanelVisible {
+            performancePanelVisible = false
+            return
+        }
+        pageOverviewVisible = false
+        rightPanelVisible = false
+        performancePanelVisible = true
     }
 
     /// Sets the panel width and remembers it at once (one discrete change, not a gesture). A live
@@ -3721,7 +4323,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard document != nil else { return }
         beginRightPanelMovement()
         guard animated else {
-            finishRightPanelMovement()
+            // The view jumps immediately, but its viewport report still arrives later.
+            // Keep the raster band intact until that layout has reached the canvas too.
+            armRightPanelSettle(after: 0.15)
             return
         }
         // Hold for at least the animation's nominal length. Every frame that arrives re-arms
@@ -4001,16 +4605,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard let selection, let url = document?.url else { return false }
         if annotationsURL == nil { loadAnnotations(for: url) }
 
+        let stamp = Self.annotationCreationStamp?()
+            ?? (id: UUID(), createdAt: Date())
         let annotation = Annotation(
-            id: UUID(),
+            id: stamp.id,
             kind: kind,
             page: selection.page,
             start: selection.range.lowerBound,
             end: selection.range.upperBound,
             color: color,
             note: note,
-            createdAt: Date()
+            createdAt: stamp.createdAt
         )
+        guard validateNewAnnotation(annotation) else { return false }
         var updated = annotations
         updated.append(annotation)
         guard saveAnnotations(updated, trigger: "add-\(kind.rawValue)") else { return false }
@@ -4064,9 +4671,33 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return added
     }
 
-    /// The Select button leaves whatever mode is active, including a sticky markup tool.
+    /// Returns the canvas to the implicit pointer state. Kept as the programmatic entry point
+    /// used by the checks; there is deliberately no toolbar Select button.
     public func selectTool() {
         annotationTool = .select
+    }
+
+    /// One toolbar click on a tool: arms it, or turns it off when it is already active.
+    ///
+    /// Turning a tool off always means ``AnnotationTool/select``, never "no state": the pointer
+    /// is the implicit state whenever no tool is armed, so the toolbar needs no Select button.
+    /// Stamp and signature are exceptions on purpose: they carry a chosen picture/style and are
+    /// armed by their menus (``armStampTool(_:)``/``armSignatureTool(imageData:)``), not toggled.
+    public func toggleAnnotationTool(_ tool: AnnotationTool) {
+        switch tool {
+        case .select:
+            selectTool()
+        case .highlight, .underline, .strikeout:
+            guard let kind = tool.textMarkupKind else { return }
+            toggleTextMarkupTool(kind)
+        case .eraser:
+            toggleEraserTool()
+        case .stamp, .signature:
+            return
+        case .pen, .line, .arrow, .rectangle, .ellipse, .note, .textBox:
+            guard canEditAnnotations else { return }
+            annotationTool = annotationTool == tool ? .select : tool
+        }
     }
 
     /// Whether the toolbar's eraser button has something to act on.
@@ -4081,23 +4712,35 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         annotationTool = annotationTool == .eraser ? .select : .eraser
     }
 
-    /// Escape and the Select button leave every mode that has no finished draft to keep.
+    /// Escape, or clicking the active tool again, leaves any armed annotation tool.
     ///
     /// Returns whether anything was left or cleared, so the canvas consumes Escape only when it
-    /// did something. A selected mark is dropped even in plain Select mode: Escape is the
-    /// platform-wide way to end a selection, and Delete must not still have a target afterwards.
-    /// Text markup and the eraser are left; the pen and shape tools keep their existing
-    /// behaviour (only the live draft is cancelled).
+    /// did something. A selected mark is dropped even in the implicit pointer state: Escape is
+    /// the platform-wide way to end a selection, and Delete must not still have a target
+    /// afterwards. Every case lands on ``AnnotationTool/select``.
     @discardableResult
     public func cancelActiveAnnotationTool() -> Bool {
         let hadMarkSelection = selectedAnnotationID != nil || pendingMarkSelection != nil
-        if cancelTextMarkupTool() {
+        // A Fill & Sign row item is armed even when it has no placement yet (Signature waits
+        // for a method, Image for a picture). Escape clears the row's armed item and its
+        // inspector before it falls through to the annotation tools.
+        if armedFillSignTool != nil {
+            clearFillSignTool()
             if hadMarkSelection { clearAnnotationSelection() }
             return true
         }
-        if annotationTool == .redact {
+        // Fill & Sign arms a click, not a drawing tool. Escape drops it first so the next click
+        // is the pointer again instead of an unexpected check mark.
+        if pendingFillSignPlacement != nil {
+            pendingFillSignPlacement = nil
             annotationTool = .select
-            statusMessage = "Redaction tool off · pending marks were kept"
+            // The armed row item goes with the placement, so the inspector closes too.
+            finishFillSignPlacement()
+            statusMessage = "Placement cancelled"
+            if hadMarkSelection { clearAnnotationSelection() }
+            return true
+        }
+        if cancelTextMarkupTool() {
             if hadMarkSelection { clearAnnotationSelection() }
             return true
         }
@@ -4110,8 +4753,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         if annotationTool == .stamp || annotationTool == .signature {
             pendingStampStyle = nil
             pendingSignatureImageData = nil
+            pendingSignatureIsPicture = false
             annotationTool = .select
+            finishFillSignPlacement()
             statusMessage = "Stamp tool off"
+            if hadMarkSelection { clearAnnotationSelection() }
+            return true
+        }
+        // Pen, shape, note and text-box modes: Escape cancels the live draft (the canvas does
+        // that before calling here) and drops the tool itself.
+        if annotationTool != .select {
+            annotationTool = .select
+            statusMessage = "Tool off · selection mode"
             if hadMarkSelection { clearAnnotationSelection() }
             return true
         }
@@ -4120,11 +4773,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return true
     }
 
-    /// Escape and the Select button leave the sticky markup mode.
+    /// Escape, or clicking the active markup tool again, leaves the sticky markup mode.
     ///
     /// Returns whether a mode was actually left, so the canvas can consume the Escape key only
-    /// when it did something. Pen and shape tools keep their existing Escape behaviour (the
-    /// live draft is cancelled; the tool stays selected).
+    /// when it did something.
     @discardableResult
     public func cancelTextMarkupTool() -> Bool {
         guard annotationTool.isTextMarkup else { return false }
@@ -4244,7 +4896,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// freehand line look like one stroke rather than a pressure-sensitive brush this reader
     /// does not model; `strokeWidth` is stored per annotation so a future width control can
     /// change it without changing the schema.
-    public static let defaultAnnotationStrokeWidth: CGFloat = 2
+    public static let defaultAnnotationStrokeWidth =
+        CGFloat(AnnotationRecordRules.limits.defaultStrokeWidthPt)
 
     /// Adds a geometry mark whose coordinates are already **page space** (page-local, top-left,
     /// 100% points). This is the one creation entry point the canvas uses; all validation and
@@ -4297,7 +4950,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lineEnd: lineEnd,
             strokeWidth: strokeWidth
         )
-        guard annotation.hasValidGeometry else { return false }
+        guard validateNewAnnotation(annotation), annotation.hasValidGeometry else { return false }
 
         var updated = annotations
         updated.append(annotation)
@@ -4354,6 +5007,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Arms the stamp tool with one style. The next click on a page places it.
     public func armStampTool(_ style: StampStyle) {
+        pendingFillSignPlacement = nil
+        pendingSignatureIsPicture = false
         pendingStampStyle = style
         pendingSignatureImageData = nil
         annotationTool = .stamp
@@ -4369,10 +5024,66 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lastError = "That image file is empty."
             return
         }
+        pendingFillSignPlacement = nil
         pendingSignatureImageData = imageData
+        pendingSignatureIsPicture = false
         pendingStampStyle = nil
         annotationTool = .signature
         statusMessage = "Click on the page to place the signature image"
+    }
+
+    /// Arms the signature tool with an ordinary picture instead of a signature.
+    ///
+    /// The annotation kind and writer are the same (`/Stamp` with an image appearance); the
+    /// difference is the larger default size and the words the reader sees. Nothing here calls
+    /// it a signature.
+    public func armPicturePlacement(imageData: Data) {
+        guard !imageData.isEmpty else {
+            lastError = "That image file is empty."
+            return
+        }
+        guard CGImageSourceCreateWithData(imageData as CFData, nil) != nil else {
+            lastError = "That file is not an image the reader can place."
+            return
+        }
+        pendingFillSignPlacement = nil
+        pendingSignatureImageData = imageData
+        pendingSignatureIsPicture = true
+        pendingStampStyle = nil
+        annotationTool = .signature
+        statusMessage = "Click on the page to place the picture"
+    }
+
+    /// Renders a typed name in a built-in handwriting font and arms it as a signature image.
+    /// Returns false (with `lastError`) when the name is empty or no handwriting font is usable.
+    @discardableResult
+    public func armTypedSignature(name: String, fontName: String? = nil) -> Bool {
+        guard canPlaceFillSignAnnotation else {
+            lastError = fillSignPlacementRefusal
+            return false
+        }
+        guard let data = TypedSignatureRenderer.pngData(name: name, fontName: fontName) else {
+            lastError = "That name could not be drawn in a handwriting font."
+            return false
+        }
+        armSignatureTool(imageData: data)
+        statusMessage = "Click on the page to place the typed signature"
+        return true
+    }
+
+    /// Arms a hand-drawn signature as an ink annotation placement.
+    public func armDrawnSignature(_ signature: DrawnSignature) {
+        guard canPlaceFillSignAnnotation else {
+            lastError = fillSignPlacementRefusal
+            return
+        }
+        guard !signature.isEmpty else {
+            lastError = "Draw a signature first."
+            return
+        }
+        annotationTool = .select
+        pendingFillSignPlacement = .drawnSignature(signature)
+        statusMessage = "Click on the page to place the drawn signature"
     }
 
     /// Places the armed stamp centred on a content point. Returns whether it was added.
@@ -4381,17 +5092,28 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard let style = pendingStampStyle,
               let hit = pagePoint(atContentPoint: point) else { return false }
         let placed = addStampAnnotation(page: hit.page, style: style, center: hit.point)
-        if placed { pendingStampStyle = nil; annotationTool = .select }
+        if placed {
+            pendingStampStyle = nil
+            annotationTool = .select
+            finishFillSignPlacement()
+        }
         return placed
     }
 
-    /// Places the armed signature image centred on a content point.
+    /// Places the armed signature image (or picture) centred on a content point.
     @discardableResult
     public func placeSignature(atContentPoint point: CGPoint) -> Bool {
         guard let data = pendingSignatureImageData,
               let hit = pagePoint(atContentPoint: point) else { return false }
-        let placed = addSignatureAnnotation(page: hit.page, imageData: data, center: hit.point)
-        if placed { pendingSignatureImageData = nil; annotationTool = .select }
+        let placed = pendingSignatureIsPicture
+            ? addPictureAnnotation(page: hit.page, imageData: data, center: hit.point)
+            : addSignatureAnnotation(page: hit.page, imageData: data, center: hit.point)
+        if placed {
+            pendingSignatureImageData = nil
+            pendingSignatureIsPicture = false
+            annotationTool = .select
+            finishFillSignPlacement()
+        }
         return placed
     }
 
@@ -4429,6 +5151,23 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// decides the initial width, so a tall signature is not stretched on the way in.
     @discardableResult
     public func addSignatureAnnotation(page: Int, imageData: Data, center: CGPoint) -> Bool {
+        addImageAnnotation(page: page, imageData: imageData, center: center,
+                           height: Annotation.defaultSignatureHeight,
+                           stampStyle: "signature")
+    }
+
+    /// Adds an arbitrary picture as the same `/Stamp`-with-an-image the signature uses, at the
+    /// size class chosen in the Fill & Sign inspector (medium is the historical default) and
+    /// with the "image" style in the cache.
+    @discardableResult
+    public func addPictureAnnotation(page: Int, imageData: Data, center: CGPoint) -> Bool {
+        addImageAnnotation(page: page, imageData: imageData, center: center,
+                           height: fillSignImageSize.height,
+                           stampStyle: "image")
+    }
+
+    private func addImageAnnotation(page: Int, imageData: Data, center: CGPoint,
+                                    height: CGFloat, stampStyle: String) -> Bool {
         guard let document, page >= 0, page < document.pageCount,
               let url = document.url else { return false }
         if annotationsURL == nil { loadAnnotations(for: url) }
@@ -4436,7 +5175,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lastError = annotationWritesBlockedReason
             return false
         }
-        guard let size = Self.signatureBoxSize(imageData) else {
+        guard let size = Self.imageBoxSize(imageData, height: height) else {
             lastError = "That file is not an image the reader can place."
             return false
         }
@@ -4452,15 +5191,194 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             createdAt: Date(),
             shapeRect: box,
             strokeWidth: 0,
-            stampStyle: "signature",
+            stampStyle: stampStyle,
             imageData: imageData
         )
         return appendPlacedArtwork(annotation)
     }
 
-    /// The one commit path for a placed stamp or signature: sidecar first, then one undo step.
+    // MARK: - Fill & Sign placement
+
+    /// Text is the one Fill & Sign command that arms a real tool. It also claims the next click
+    /// so the box is placed with one click, while the tool's double-click behaviour is kept for
+    /// the toolbar button. The tool is also the Fill & Sign row's armed item, so its inspector
+    /// opens with it and closes when the placement commits or is cancelled.
+    public func armFillSignText() {
+        guard canPlaceFillSignAnnotation else {
+            lastError = fillSignPlacementRefusal
+            return
+        }
+        prepareFillSignTool(.text)
+        annotationTool = .textBox
+        pendingFillSignPlacement = .text
+        statusMessage = "Click the page to place a text box"
+    }
+
+    /// Arms a one-click date text box.
+    public func armFillSignDate() {
+        guard canPlaceFillSignAnnotation else {
+            lastError = fillSignPlacementRefusal
+            return
+        }
+        prepareFillSignTool(.date)
+        annotationTool = .select
+        pendingFillSignPlacement = .date
+        statusMessage = "Click the page to place \(fillSignDateFormat.title.lowercased()) date"
+    }
+
+    /// Arms a one-click vector check mark or cross.
+    public func armFillSignMark(_ mark: FillSignMark) {
+        guard canPlaceFillSignAnnotation else {
+            lastError = fillSignPlacementRefusal
+            return
+        }
+        prepareFillSignTool(mark == .checkmark ? .checkmark : .cross)
+        annotationTool = .select
+        pendingFillSignPlacement = mark == .checkmark ? .checkmark : .cross
+        statusMessage = "Click the page to place a \(mark.title.lowercased())"
+    }
+
+    /// Commits the armed Fill & Sign placement at a content point. Returns whether anything was
+    /// placed; a click in the gap between pages leaves the placement armed.
+    @discardableResult
+    public func placePendingFillSign(atContentPoint point: CGPoint) -> Bool {
+        guard let pending = pendingFillSignPlacement,
+              let hit = pagePoint(atContentPoint: point) else { return false }
+        switch pending {
+        case .text:
+            // `placeOrOpenTextBox` opens the editor, which returns the canvas to the pointer.
+            // Clear the pending placement here too: opening a box that is already being edited
+            // can return without changing the tool, and a stale placement must not survive.
+            let placed = placeOrOpenTextBox(atContentPoint: point)
+            if placed {
+                pendingFillSignPlacement = nil
+                annotationTool = .select
+                finishFillSignPlacement()
+            }
+            return placed
+        case .date:
+            guard placeDateTextBox(atContentPoint: point) else { return false }
+            pendingFillSignPlacement = nil
+            finishFillSignPlacement()
+            return true
+        case .checkmark:
+            guard addFillSignMark(.checkmark, page: hit.page, center: hit.point) else {
+                return false
+            }
+            pendingFillSignPlacement = nil
+            finishFillSignPlacement()
+            return true
+        case .cross:
+            guard addFillSignMark(.cross, page: hit.page, center: hit.point) else {
+                return false
+            }
+            pendingFillSignPlacement = nil
+            finishFillSignPlacement()
+            return true
+        case .drawnSignature(let signature):
+            guard addDrawnSignature(signature, page: hit.page, center: hit.point) else {
+                return false
+            }
+            pendingFillSignPlacement = nil
+            finishFillSignPlacement()
+            return true
+        }
+    }
+
+    /// Places today's date centred on the click, in the style and rotation chosen in the
+    /// inspector. A 0° date is the editable text box #153 placed; a rotated one is rendered to
+    /// a transparent picture and placed through the image `/Stamp` writer, which is the reader's
+    /// only annotation appearance that carries an arbitrary orientation into the saved PDF.
+    @discardableResult
+    public func placeDateTextBox(atContentPoint point: CGPoint, date: Date = Date()) -> Bool {
+        guard canPlaceFillSignAnnotation,
+              let hit = pagePoint(atContentPoint: point),
+              let placement = visiblePagePlacements.first(where: { $0.index == hit.page })
+        else { return false }
+        let text = fillSignDateFormat.string(for: date)
+        guard !text.isEmpty else { return false }
+        if fillSignDateRotation.isRotated {
+            guard let data = FillSignDatePictureRenderer.pngData(
+                text: text, rotation: fillSignDateRotation) else { return false }
+            let height = FillSignDatePictureRenderer.placementHeight(
+                text: text, rotation: fillSignDateRotation)
+            guard addImageAnnotation(page: hit.page, imageData: data, center: hit.point,
+                                     height: height, stampStyle: "date") else { return false }
+            statusMessage = "Placed the date as a picture · "
+                + "its \(fillSignDateRotation.title) rotation is kept when saved"
+            return true
+        }
+        let fitted = TextBoxLayout.fittedRect(
+            text: text,
+            fontSize: Annotation.defaultTextBoxFontSize,
+            origin: .zero,
+            maximumWidth: max(1, placement.widthPt),
+            maximumHeight: max(1, placement.heightPt))
+        guard let box = placementBox(page: hit.page, size: fitted.size, center: hit.point),
+              addTextBox(page: hit.page, rect: box, text: text) else { return false }
+        editingTextSelectAll = true
+        statusMessage = "Placed the date · type to replace it"
+        return true
+    }
+
+    /// Adds one vector mark as a single ink annotation with two strokes. One undo step removes
+    /// the whole mark.
+    @discardableResult
+    public func addFillSignMark(_ mark: FillSignMark, page: Int, center: CGPoint) -> Bool {
+        guard canPlaceFillSignAnnotation else {
+            lastError = fillSignPlacementRefusal
+            return false
+        }
+        let strokes = mark.strokes(centeredAt: center)
+        let points = strokes.flatMap { $0 }
+        var minX = points[0].x, maxX = points[0].x
+        var minY = points[0].y, maxY = points[0].y
+        for point in points.dropFirst() {
+            minX = Swift.min(minX, point.x); maxX = Swift.max(maxX, point.x)
+            minY = Swift.min(minY, point.y); maxY = Swift.max(maxY, point.y)
+        }
+        // The box is what the selection's eight resize handles are drawn around. Normal pen ink
+        // has no box (a freehand stroke is moved, not squashed); a placed symbol is a shape a
+        // reader may want to enlarge, so it carries one.
+        let box = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+        let placed = addGeometryAnnotation(
+            kind: .ink,
+            page: page,
+            inkPaths: strokes,
+            shapeRect: box,
+            color: annotationStrokeColor,
+            strokeWidth: mark.strokeWidth)
+        if placed { statusMessage = "Placed a \(mark.title.lowercased())" }
+        return placed
+    }
+
+    /// Adds hand-drawn signature strokes as one ink annotation, scaled to the signature default.
+    @discardableResult
+    public func addDrawnSignature(_ signature: DrawnSignature, page: Int, center: CGPoint) -> Bool {
+        guard canPlaceFillSignAnnotation, !signature.isEmpty else { return false }
+        let height = Annotation.defaultSignatureHeight
+        let aspect = min(max(signature.aspect, 0.3), 6)
+        let size = CGSize(width: height * aspect, height: height)
+        guard let box = placementBox(page: page, size: size, center: center) else { return false }
+        let paths = signature.strokes.compactMap { stroke -> [CGPoint]? in
+            guard stroke.count >= 2 else { return nil }
+            return stroke.map { point in
+                CGPoint(x: box.minX + point.x * box.width,
+                        y: box.minY + point.y * box.height)
+            }
+        }
+        guard !paths.isEmpty else { return false }
+        let placed = addGeometryAnnotation(
+            kind: .ink, page: page, inkPaths: paths, shapeRect: box,
+            color: annotationStrokeColor,
+            strokeWidth: AppState.defaultAnnotationStrokeWidth)
+        if placed { statusMessage = "Placed a drawn signature" }
+        return placed
+    }
+
+    /// The one commit path for a placed stamp or signature: one cache write, then one undo step.
     private func appendPlacedArtwork(_ annotation: Annotation) -> Bool {
-        guard annotation.hasValidGeometry else { return false }
+        guard validateNewAnnotation(annotation), annotation.hasValidGeometry else { return false }
         var updated = annotations
         updated.append(annotation)
         guard saveAnnotations(updated, trigger: "add-\(annotation.kind.rawValue)") else {
@@ -4471,7 +5389,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         selectedAnnotationID = annotation.id
         refreshSelectionOverlay()
         reloadVisiblePages()
-        statusMessage = "Placed a \(annotation.kind == .stamp ? "stamp" : "signature image")"
+        if annotation.kind == .stamp {
+            statusMessage = "Placed a stamp"
+        } else if annotation.stampStyle == "image" {
+            statusMessage = "Placed a picture"
+        } else {
+            statusMessage = "Placed a signature image"
+        }
         return true
     }
 
@@ -4493,18 +5417,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return CGRect(x: x, y: y, width: width, height: height)
     }
 
-    /// The initial page-space size of an image signature, from the picture's pixel aspect ratio.
-    private static func signatureBoxSize(_ data: Data) -> CGSize? {
+    /// The initial page-space size of an image signature or picture, from the picture's pixel
+    /// aspect ratio. `height` is the signature's or the picture's default height in points.
+    private static func imageBoxSize(_ data: Data, height boxHeight: CGFloat) -> CGSize? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
                 as? [CFString: Any],
               let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue,
-              let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue,
-              width > 0, height > 0 else { return nil }
-        let aspect = width / height
+              let pixelHeight = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue,
+              width > 0, pixelHeight > 0 else { return nil }
+        let aspect = width / pixelHeight
         let clamped = min(max(aspect, 0.2), 8.0)
-        return CGSize(width: Annotation.defaultSignatureHeight * clamped,
-                      height: Annotation.defaultSignatureHeight)
+        return CGSize(width: boxHeight * clamped, height: boxHeight)
     }
 
     /// Decodes an image signature into the straight RGBA the PDF writer stores.
@@ -4549,9 +5473,24 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// One stamp or signature as a write request: a `/Stamp` with text or an image.
+    /// The wire kind a write request carries, from the one kind table.
+    ///
+    /// The builders below still choose their payload from the kind (words, a picture, a box);
+    /// the kind the request names is the table's answer, never a second mapping here.
+    private func writeRequestKind(for annotation: Annotation) throws -> AnnotationWriteKind {
+        guard let kind = AnnotationRecordRules.writeKind(for: annotation.kind) else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Annotation \(annotation.id.uuidString) has no write kind"]
+            )
+        }
+        return kind
+    }
+
     private func stampWriteRequest(
         _ annotation: Annotation,
-        zoom: CGFloat,
         modified: String
     ) throws -> AnnotationWriteRequest {
         guard annotation.hasValidGeometry, let box = annotation.shapeRect else {
@@ -4562,8 +5501,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     "Annotation \(annotation.id.uuidString) has no box and cannot be written"]
             )
         }
-        let rect = CGRect(x: box.minX * zoom, y: box.minY * zoom,
-                          width: box.width * zoom, height: box.height * zoom)
+        let rect = box
         guard rect.width > 0.5, rect.height > 0.5 else {
             throw NSError(
                 domain: "LyraReader",
@@ -4572,6 +5510,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     "Annotation \(annotation.id.uuidString) has a box too small to write"]
             )
         }
+        let writeKind = try writeRequestKind(for: annotation)
         if annotation.kind == .stamp {
             guard !annotation.note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw NSError(
@@ -4584,7 +5523,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return AnnotationWriteRequest(
                 id: annotation.id.uuidString,
                 page: annotation.page,
-                kind: .stamp,
+                kind: writeKind,
                 rect: rect,
                 quads: [],
                 color: annotation.color,
@@ -4607,7 +5546,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return AnnotationWriteRequest(
             id: annotation.id.uuidString,
             page: annotation.page,
-            kind: .signature,
+            kind: writeKind,
             rect: rect,
             quads: [],
             color: annotation.color,
@@ -4653,7 +5592,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 guard rect.insetBy(dx: -tolerance, dy: -tolerance).contains(local) else { continue }
                 return PlacedTextHit(id: annotation.id, page: annotation.page, point: local,
                                      handle: nil)
-            case .textBox, .stamp, .signature:
+            case .textBox, .stamp, .signature, .ink:
                 let selected = annotation.id == selectedAnnotationID
                 if selected,
                    let handle = textBoxHandle(at: local, in: rect, tolerance: tolerance) {
@@ -4668,7 +5607,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     return PlacedTextHit(id: annotation.id, page: annotation.page, point: local,
                                          handle: nil)
                 }
-            case .ink, .square, .circle, .line, .arrow, .highlight, .underline, .strikeout:
+            case .square, .circle, .line, .arrow, .highlight, .underline, .strikeout:
                 continue
             }
         }
@@ -4728,7 +5667,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return true
         }
         // A note that belongs to the PDF is read-only; opening its paper is better than placing
-        // a sidecar note on top of it.
+        // a cached note on top of it.
         if openDocumentNote(at: point) { return true }
         guard let pageHit = pagePoint(atContentPoint: point) else { return false }
         return placeStickyNote(page: pageHit.page, at: pageHit.point)
@@ -4765,7 +5704,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             strokeWidth: 0,
             fontSize: 0
         )
-        guard annotation.hasValidGeometry else { return false }
+        guard validateNewAnnotation(annotation), annotation.hasValidGeometry else { return false }
         var updated = annotations
         updated.append(annotation)
         guard saveAnnotations(updated, trigger: "add-stickyNote") else { return false }
@@ -4811,13 +5750,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return addTextBox(page: page, rect: CGRect(origin: origin, size: size))
     }
 
-    /// Creates an empty text box in `rect` (page space) and opens its editor.
+    /// Creates a text box in `rect` (page space) and opens its editor. `text` is usually empty;
+    /// the Date placement passes today's date so the box starts filled.
     ///
     /// The double-click path (`placeTextBox`) computes the one-line-high creation rect; this
     /// rectangle-based entry point remains for callers that already have a box, such as an
-    /// older sidecar or a restored session. Its contents then grow from that box.
+    /// older annotation cache or a restored session. Its contents then grow from that box.
     @discardableResult
-    public func addTextBox(page: Int, rect: CGRect) -> Bool {
+    public func addTextBox(page: Int, rect: CGRect, text: String = "") -> Bool {
         guard let document, page >= 0, page < document.pageCount,
               let placement = visiblePagePlacements.first(where: { $0.index == page }),
               let url = document.url else { return false }
@@ -4828,6 +5768,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         box.size.height = max(box.height, Annotation.minimumTextBoxSize.height)
         box.origin.x = min(max(0, box.origin.x), max(0, placement.widthPt - box.width))
         box.origin.y = min(max(0, box.origin.y), max(0, placement.heightPt - box.height))
+        if !text.isEmpty {
+            box = TextBoxLayout.fittedRect(
+                text: text,
+                fontSize: Annotation.defaultTextBoxFontSize,
+                origin: box.origin,
+                maximumWidth: max(1, placement.widthPt - box.minX),
+                maximumHeight: max(1, placement.heightPt - box.minY))
+        }
 
         let annotation = Annotation(
             id: UUID(),
@@ -4836,13 +5784,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             start: 0,
             end: 0,
             color: AppState.defaultTextBoxColor,
-            note: "",
+            note: text,
             createdAt: Date(),
             shapeRect: box,
             strokeWidth: 0,
             fontSize: Annotation.defaultTextBoxFontSize
         )
-        guard annotation.hasValidGeometry else { return false }
+        guard validateNewAnnotation(annotation), annotation.hasValidGeometry else { return false }
         var updated = annotations
         updated.append(annotation)
         guard saveAnnotations(updated, trigger: "add-textBox") else { return false }
@@ -4884,6 +5832,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         selection = nil
         selectionAnchor = nil
         closeDocumentNote()
+        editingTextSelectAll = false
         editingAnnotationID = id
         editingWasCreated = created
         editingOriginalText = annotation.note
@@ -4892,7 +5841,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         refreshSelectionOverlay()
     }
 
-    /// Applies text typed in the editor. Sidecar writes are coalesced by `updateNote`; undo
+    /// Applies text typed in the editor. Cache writes are coalesced by `updateNote`; undo
     /// merges consecutive keystrokes into one step for the session.
     public func updateEditingText(_ text: String) {
         guard let id = editingAnnotationID,
@@ -4931,7 +5880,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         refreshSelectionOverlay()
     }
 
-    /// Commits the open editor: flushes the coalesced sidecar write and closes the editor.
+    /// Commits the open editor: flushes the coalesced cache write and closes the editor.
     @discardableResult
     public func commitTextEditing() -> Bool {
         guard editingAnnotationID != nil else { return true }
@@ -4944,6 +5893,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         editingWasCreated = false
         editingOriginalText = ""
         editingUndoDepth = 0
+        editingTextSelectAll = false
         reloadVisiblePages()
         return written
     }
@@ -4952,7 +5902,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// Cancelling a brand-new note or box removes it again (and the creation step); cancelling
     /// an edit restores the previous text and drops the undo steps the session added. In both
-    /// cases the sidecar is written once so memory and disk agree.
+    /// cases the annotation cache is written once so memory and disk agree.
     public func cancelTextEditing() {
         guard let id = editingAnnotationID else { return }
         noteFlushTask?.cancel()
@@ -4967,6 +5917,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         editingWasCreated = false
         editingOriginalText = ""
         editingUndoDepth = 0
+        editingTextSelectAll = false
 
         var updated = annotations
         if wasCreated {
@@ -5058,7 +6009,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
-    /// Commits a resize on mouse-up: one sidecar write and one undo step for the whole drag.
+    /// Commits a resize on mouse-up: one cache write and one undo step for the whole drag.
     private func finishAnnotationResize(
         original: Annotation,
         handle: TextBoxResizeHandle,
@@ -5071,9 +6022,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             resizeStartPagePoint = nil
             resizeHandle = nil
         }
-        guard let placement = visiblePagePlacements.first(where: { $0.index == original.page })
+        guard let hit = pagePoint(atContentPoint: point), hit.page == original.page
         else { return }
-        let current = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+        let current = hit.point
         guard let finalRect = resizedTextBox(
             original, handle: handle,
             delta: CGPoint(x: current.x - start.x, y: current.y - start.y)
@@ -5081,8 +6032,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard !wasClick, finalRect != original.shapeRect,
               let index = annotations.firstIndex(where: { $0.id == original.id })
         else { return }
-        var resized = annotations[index]
-        resized.shapeRect = finalRect
+        let resized = Self.applyingBox(finalRect, to: annotations[index])
         guard resized.hasValidGeometry else {
             annotations[index] = original
             return
@@ -5107,18 +6057,25 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// The canvas converts a view point to content points once, at the event boundary, the same
     /// way text selection does; this subtraction is therefore zoom-independent by construction.
+    ///
+    /// A torn page is two display segments, so the subtraction is piecewise: a point above the
+    /// split maps to the page's own Y, a point in the bottom segment subtracts the card's gap as
+    /// well, and a point in the gap belongs to no page.
     public func pagePoint(atContentPoint point: CGPoint) -> (page: Int, point: CGPoint)? {
-        for placement in visiblePagePlacements {
-            let rect = CGRect(x: placement.leftPt, y: placement.topPt,
-                              width: placement.widthPt, height: placement.heightPt)
+        for segment in canvasPageSegments {
+            let rect = CGRect(x: segment.leftPt, y: segment.topPt,
+                              width: segment.widthPt, height: segment.heightPt)
             guard rect.contains(point) else { continue }
-            return (placement.index, CGPoint(x: point.x - placement.leftPt,
-                                             y: point.y - placement.topPt))
+            return (
+                segment.index,
+                CGPoint(x: point.x - segment.leftPt,
+                        y: point.y - segment.topPt + segment.sourceTopPt)
+            )
         }
         return nil
     }
 
-    /// Every geometry mark the overlay should draw, in sidecar order followed by the file's own.
+    /// Every geometry mark the overlay should draw, in record order followed by the file's own.
     ///
     /// Text marks travel here too, carrying the quads of the character range they cover. They
     /// are not stroked by the overlay (the canvas draws their tint), but the quads are what the
@@ -5175,7 +6132,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return nil
     }
 
-    /// One sidecar annotation as the canvas draws it, or `nil` for a kind the canvas does not
+    /// One cached annotation as the canvas draws it, or `nil` for a kind the canvas does not
     /// paint itself (its text layer or note bitmap does).
     private func canvasMark(for annotation: Annotation) -> CanvasAnnotationMark? {
         guard annotation.kind.isPlacement || annotation.kind.isTextMarkup else { return nil }
@@ -5258,7 +6215,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// The reader's own text mark under a content point, with the point in its page space.
     ///
-    /// Only sidecar marks are considered: a highlight the PDF itself carries is reported by
+    /// Only cached marks are considered: a highlight the PDF itself carries is reported by
     /// `fileOwnedMarkupHit` so the click can be refused with an explanation. The hit is the
     /// marked words themselves, including a few points of hand tolerance.
     public func textMarkupHit(
@@ -5346,7 +6303,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         )
     }
 
-    /// The sidecar annotation whose stroke is within `tolerance` points of `point` (page space).
+    /// The cached annotation whose stroke is within `tolerance` points of `point` (page space).
     public func hitTestGeometryAnnotation(page: Int, point: CGPoint,
                                           tolerance: CGFloat) -> UUID? {
         for annotation in annotations.reversed() where annotation.kind.isGeometry {
@@ -5364,7 +6321,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return nil
     }
 
-    /// The sidecar annotation under a content point, with the point in its page space.
+    /// The cached annotation under a content point, with the point in its page space.
     ///
     /// `toleranceViewPt` is converted to page points with the current zoom: a 4 pt allowance on
     /// screen is 4/zoom points on the page, so a hairline stays easy to hit at 300% without
@@ -5385,21 +6342,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     // The eraser removes the ink under its pointer path, not whole annotations. A stroke is cut
     // where the pointer reaches it; the pieces that survive become new ink annotations, and one
     // undo restores the original. The geometry rule lives in `InkStrokeSplitter`; this section is
-    // the model half: identity, ordering, the sidecar and the undo action.
+    // the model half: identity, ordering, the annotation cache and the undo action.
 
     /// What an armed eraser is over, and therefore what a press would begin to cut.
     ///
-    /// Sidecar strokes are cut into pieces. A stroke the PDF itself carries follows the
-    /// cross-reader path: its surviving pieces become new sidecar ink and the original annotation
+    /// Cached strokes are cut into pieces. A stroke the PDF itself carries follows the
+    /// cross-reader path: its surviving pieces become new reader ink and the original annotation
     /// is staged for deletion by identity, because the writer deletes a file annotation rather
     /// than rewriting its `/InkList` in place.
     public enum EraserTarget: Equatable, Sendable {
-        case sidecar(id: UUID, page: Int)
+        case records(id: UUID, page: Int)
         case document(id: String, page: Int)
 
         public var page: Int {
             switch self {
-            case .sidecar(_, let page), .document(_, let page): return page
+            case .records(_, let page), .document(_, let page): return page
             }
         }
 
@@ -5414,7 +6371,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// Only `.ink` is considered: highlights, underlines, strikeouts, notes, text boxes and the
     /// four shapes are annotations, not ink, and the eraser deliberately leaves them alone (they
-    /// are still removed with Select + Delete). Sidecar ink is tested before the PDF's own ink so
+    /// are still removed with Select + Delete). Reader ink is tested before the PDF's own ink so
     /// a stroke the reader drew on top of a file annotation stays erasable; the hover halo shows
     /// which one the eraser picked.
     public func eraserTarget(atContentPoint point: CGPoint) -> EraserTarget? {
@@ -5430,7 +6387,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 inkPaths: annotation.inkPaths, color: annotation.color,
                 strokeWidth: annotation.strokeWidth, isSelected: false, isEditable: true)
             if AnnotationGeometry.hitTest(mark, at: hit.point, tolerance: tolerance) {
-                return .sidecar(id: annotation.id, page: hit.page)
+                return .records(id: annotation.id, page: hit.page)
             }
         }
         for annotation in documentAnnotations.reversed()
@@ -5457,7 +6414,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return
         }
         let id: String? = switch target {
-        case .sidecar(let id, _): id.uuidString
+        case .records(let id, _): id.uuidString
         case .document(let id, _): "pdf:" + id
         }
         if eraserHoverMarkID != id { eraserHoverMarkID = id }
@@ -5468,7 +6425,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// The model is not touched while the pointer moves: the gesture only accumulates the
     /// parameter intervals each stroke has lost and publishes throwaway preview marks. The
-    /// sidecar write, the final annotations and the undo step are created together on release,
+    /// cache write, the final annotations and the undo step are created together on release,
     /// so a cancel or a failed write leaves the page exactly as it was.
     public func beginEraserGesture(atContentPoint point: CGPoint) {
         guard annotationTool == .eraser, document != nil else { return }
@@ -5487,37 +6444,37 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         eraseInk(alongContentSegment: previous, to: point)
     }
 
-    /// Ends the gesture and writes its result to the sidecar as one change.
+    /// Ends the gesture and writes its result to the annotation cache as one change.
     ///
     /// Every original stroke the drag reached is replaced by the pieces that survived, in the
     /// original's place in drawing order and in the original path's order. The originals are
-    /// removed from the sidecar; the pieces get new identities. A stroke the PDF itself carried
+    /// removed from the annotation cache; the pieces get new identities. A stroke the PDF itself carried
     /// is removed through the cross-reader path: its identity joins `pendingFileDeletions`, and
-    /// its surviving pieces become ordinary sidecar ink, so saving a copy both prunes the
+    /// its surviving pieces become ordinary reader ink, so saving a copy both prunes the
     /// original geometry and appends the pieces.
     ///
     /// The PDF on disk is untouched. Returns the number of original strokes the drag changed
-    /// (not the number of pieces), or `0` when it reached nothing or the sidecar write failed.
+    /// (not the number of pieces), or `0` when it reached nothing or the cache write failed.
     @discardableResult
     public func endEraserGesture() -> Int {
         guard let base = eraserGestureBase else { return 0 }
-        let sidecarSplits = eraserGestureSidecarSplits
+        let recordsSplits = eraserGestureRecordSplits
         let documentSplits = eraserGestureDocumentSplits
         resetEraserGesture()
-        guard !sidecarSplits.isEmpty || !documentSplits.isEmpty else {
+        guard !recordsSplits.isEmpty || !documentSplits.isEmpty else {
             // A refused file-owned stroke is not "nothing happened": the banner explains what
             // would have been destroyed, and the page is untouched.
             statusMessage = eraserRefusalNotice ?? "The eraser did not reach any ink"
             return 0
         }
 
-        // Rebuild the sidecar list: each touched stroke stands where it did, as its surviving
+        // Rebuild the record list: each touched stroke stands where it did, as its surviving
         // pieces (none at all when the drag covered it completely).
         var updated: [Annotation] = []
         var pieces = 0
         var slotInsertions: [(original: UUID, pieces: [UUID])] = []
         for annotation in base {
-            guard let split = sidecarSplits[annotation.id] else {
+            guard let split = recordsSplits[annotation.id] else {
                 updated.append(annotation)
                 continue
             }
@@ -5529,7 +6486,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             }
         }
 
-        // A file-owned stroke's pieces are new sidecar ink, after the reader's own marks, in the
+        // A file-owned stroke's pieces are new reader ink, after the reader's own marks, in the
         // order the page drew the file's annotations.
         var documents: [ErasedFileAnnotation] = []
         var deletions: [FileAnnotationDeletion] = []
@@ -5544,7 +6501,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             updated.append(contentsOf: segments)
         }
         for annotation in base {
-            guard let split = sidecarSplits[annotation.id] else { continue }
+            guard let split = recordsSplits[annotation.id] else { continue }
             if let identity = split.annotation.fileIdentity {
                 addDeletion(FileAnnotationDeletion(identity: identity,
                                                    page: split.annotation.page),
@@ -5557,13 +6514,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             !pendingFileDeletions.contains(where: { $0.identity == deletion.identity })
         }
 
-        // Keep the sidecar's own entry order: the original's slot stays as the anchor (it is
+        // Keep the annotation cache's own entry order: the original's slot stays as the anchor (it is
         // skipped while the annotation is absent) and the pieces' slots follow it. Undo restores
         // the original array, and the now-orphaned piece slots are skipped by the encoder, so
         // the untouched bytes come back exactly; redo finds the piece slots already in place.
-        let slotsBefore = annotationSidecarSlots
+        let slotsBefore = annotationRecordSlots
         if !slotInsertions.isEmpty {
-            var slots = annotationSidecarSlots
+            var slots = annotationRecordSlots
             for insertion in slotInsertions {
                 guard let index = slots.firstIndex(where: { slot in
                     if case .annotation(let id) = slot { return id == insertion.original }
@@ -5572,13 +6529,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 slots.insert(contentsOf: insertion.pieces.map { .annotation($0) },
                              at: index + 1)
             }
-            annotationSidecarSlots = slots
+            annotationRecordSlots = slots
         }
         if updated != base {
             guard saveAnnotations(updated, trigger: "erase-ink") else {
                 // The write never reached disk: no annotation is removed, no deletion is staged
-                // and no undo step claims a cut the sidecar does not have.
-                annotationSidecarSlots = slotsBefore
+                // and no undo step claims a cut the annotation cache does not have.
+                annotationRecordSlots = slotsBefore
                 statusMessage = "Could not save the cut ink; the page is unchanged"
                 refreshSelectionOverlay()
                 return 0
@@ -5587,7 +6544,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             annotations = updated
         }
 
-        // Only now, with the sidecar holding the pieces, remove the file-owned originals from
+        // Only now, with the annotation cache holding the pieces, remove the file-owned originals from
         // the page and stage their pruned deletion.
         let removedDocumentIDs = Set(documents.map(\.document.id))
         documentAnnotations.removeAll { removedDocumentIDs.contains($0.id) }
@@ -5606,8 +6563,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         reloadVisiblePages()
         refreshSelectionOverlay()
 
-        let changed = sidecarSplits.count + documentSplits.count
-        let fullyRemoved = (sidecarSplits.values.filter { $0.survivingPaths.isEmpty }.count)
+        let changed = recordsSplits.count + documentSplits.count
+        let fullyRemoved = (recordsSplits.values.filter { $0.survivingPaths.isEmpty }.count)
             + (documentSplits.values.filter { $0.survivingPaths.isEmpty }.count)
         if pieces == 0 {
             statusMessage = changed == 1
@@ -5624,7 +6581,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// Abandons a gesture in flight (Escape, or a tool switch). Nothing reached the model, the
-    /// sidecar or the PDF, so clearing the preview is the whole undo.
+    /// annotation cache or the PDF, so clearing the preview is the whole undo.
     public func cancelEraserGesture() {
         guard eraserGestureBase != nil else { return }
         resetEraserGesture()
@@ -5635,7 +6592,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// pointer was down, so this is also the cancel path.
     private func resetEraserGesture() {
         eraserGestureBase = nil
-        eraserGestureSidecarSplits = [:]
+        eraserGestureRecordSplits = [:]
         eraserGestureDocumentSplits = [:]
         eraserGestureRefusedDocumentIDs = []
         eraserPreviewMarks = nil
@@ -5686,8 +6643,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     // MARK: - Eraser gesture state and geometry
 
-    /// One sidecar ink annotation's cuts, with the splitters that produced them.
-    private struct SidecarInkSplit {
+    /// One reader ink annotation's cuts, with the splitters that produced them.
+    private struct RecordInkSplit {
         let annotation: Annotation
         var splitters: [InkStrokeSplitter]
         var survivingPaths: [[CGPoint]]
@@ -5706,20 +6663,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// would orphan.
     ///
     /// Splitting a PDF-owned stroke is implemented as "delete the original annotation by
-    /// identity, append its surviving pieces as new sidecar ink". That is the cross-reader path
+    /// identity, append its surviving pieces as new reader ink". That is the cross-reader path
     /// and it is safe for bare ink, but the original annotation can also own review data the
     /// reader does not model as separate marks: its `/Contents`, a `/Popup` window, and the
     /// `/IRT` replies that name it. Deleting it would destroy that conversation, so the eraser
-    /// leaves the stroke whole and says what is at stake. Sidecar ink has no such attachments.
+    /// leaves the stroke whole and says what is at stake. Reader ink has no such attachments.
     private func inkAttachmentRefusal(for annotation: DocumentAnnotation) -> String? {
         inkAttachmentRefusal(contents: annotation.contents,
                              hasPopup: annotation.hasPopup,
                              identity: annotation.id)
     }
 
-    /// The adopted-entry form. It is still a file-owned stroke: the sidecar entry edits the PDF's
+    /// The adopted-entry form. It is still a file-owned stroke: the annotation-cache entry edits the PDF's
     /// own annotation by identity, so the file's popup (remembered in `documentPopupFlags`), its
-    /// current comment (kept in the sidecar note), and the `/IRT` replies still in
+    /// current comment (kept in the cached note), and the `/IRT` replies still in
     /// `documentAnnotations` would all be deleted by a split.
     private func inkAttachmentRefusal(for annotation: Annotation) -> String? {
         guard let identity = annotation.fileIdentity else { return nil }
@@ -5766,28 +6723,31 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard let base = eraserGestureBase else { return }
         let zoom = max(zoomFactor, 0.01)
         var changed = false
-        for placement in visiblePagePlacements {
+        for placement in canvasPageSegments {
             let rect = CGRect(x: placement.leftPt, y: placement.topPt,
                               width: placement.widthPt, height: placement.heightPt)
             guard let clipped = AnnotationGeometry.clippedSegment(from: start, to: end, in: rect)
             else { continue }
+            // A torn page erases in page-local space, not content space: the pointer segment is
+            // clipped to each display segment (so it never crosses the card) and shifted back by
+            // the segment's own page-local offset.
             let localStart = CGPoint(x: clipped.start.x - placement.leftPt,
-                                     y: clipped.start.y - placement.topPt)
+                                     y: clipped.start.y - placement.topPt + placement.sourceTopPt)
             let localEnd = CGPoint(x: clipped.end.x - placement.leftPt,
-                                   y: clipped.end.y - placement.topPt)
+                                   y: clipped.end.y - placement.topPt + placement.sourceTopPt)
             for annotation in base
             where annotation.kind == .ink && annotation.page == placement.index {
-                if eraserGestureRefusedSidecarIDs.contains(annotation.id) { continue }
+                if eraserGestureRefusedRecordIDs.contains(annotation.id) { continue }
                 if let reason = inkAttachmentRefusal(for: annotation) {
-                    eraserGestureRefusedSidecarIDs.insert(annotation.id)
+                    eraserGestureRefusedRecordIDs.insert(annotation.id)
                     eraserRefusalNotice = reason
                     statusMessage = reason
                     continue
                 }
                 let reach = AnnotationGeometry.eraserReach(
                     strokeWidth: annotation.strokeWidth, zoom: zoom)
-                var split = eraserGestureSidecarSplits[annotation.id]
-                    ?? SidecarInkSplit(
+                var split = eraserGestureRecordSplits[annotation.id]
+                    ?? RecordInkSplit(
                         annotation: annotation,
                         splitters: annotation.inkPaths.map {
                             InkStrokeSplitter(points: $0, reach: reach)
@@ -5800,7 +6760,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 }
                 if pathChanged {
                     split.survivingPaths = Self.survivingPaths(of: split.splitters)
-                    eraserGestureSidecarSplits[annotation.id] = split
+                    eraserGestureRecordSplits[annotation.id] = split
                     changed = true
                 }
             }
@@ -5811,7 +6771,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 if eraserGestureRefusedDocumentIDs.contains(annotation.id) { continue }
                 if let reason = inkAttachmentRefusal(for: annotation) {
                     // Refuse this stroke for the whole gesture: no cuts, no pending deletion,
-                    // no sidecar entry. Other strokes under the same drag still split.
+                    // no annotation-cache entry. Other strokes under the same drag still split.
                     eraserGestureRefusedDocumentIDs.insert(annotation.id)
                     eraserRefusalNotice = reason
                     statusMessage = reason
@@ -5857,7 +6817,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// These are previews, not model entries: their identities are derived from the original and
     /// the piece index, so a pointer sample cannot create annotation churn. On release the same
-    /// geometry becomes real annotations with real UUIDs and one sidecar write.
+    /// geometry becomes real annotations with real UUIDs and one cache write.
     private func rebuildEraserPreviewMarks() {
         guard let base = eraserGestureBase else {
             eraserPreviewMarks = nil
@@ -5865,7 +6825,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         var marks: [CanvasAnnotationMark] = []
         for annotation in base {
-            if let split = eraserGestureSidecarSplits[annotation.id] {
+            if let split = eraserGestureRecordSplits[annotation.id] {
                 for (index, path) in split.survivingPaths.enumerated() {
                     marks.append(previewInkMark(
                         id: "erase-preview:\(annotation.id.uuidString):\(index)",
@@ -5925,7 +6885,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
-    /// The new sidecar ink a file-owned split produces. The original's identity and review
+    /// The new reader ink a file-owned split produces. The original's identity and review
     /// thread are not copied: the original annotation is deleted by identity through the
     /// cross-reader path, and these pieces are the reader's new ink.
     private func inkSegments(from annotation: DocumentAnnotation,
@@ -5971,7 +6931,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Deletes the selected annotation (ink, shape, text mark, note or text box). Returns
     /// whether anything was deleted.
     ///
-    /// Every kind goes through the same removal: one sidecar write, one undo step, one reload.
+    /// Every kind goes through the same removal: one cache write, one undo step, one reload.
     @discardableResult
     public func deleteSelectedAnnotation() -> Bool {
         guard let id = selectedAnnotationID else { return false }
@@ -6014,8 +6974,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let minimum = Self.minimumPlacementSize(for: before.kind)
         guard rect.width >= minimum.width, rect.height >= minimum.height,
               rect.minX.isFinite, rect.minY.isFinite else { return false }
-        var after = before
-        after.shapeRect = rect
+        let after = Self.applyingBox(rect, to: before)
         guard after.hasValidGeometry else { return false }
         var updated = annotations
         updated[index] = after
@@ -6027,6 +6986,26 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         reloadVisiblePages()
         statusMessage = "Resized the \(after.kind.rawValue)"
         return true
+    }
+
+    /// Moves a placed mark's box to `rect`, scaling ink strokes through the old box.
+    ///
+    /// A check, cross or drawn signature is ink that carries a box for its resize handles; a
+    /// plain pen stroke has no box and is moved, never squashed. Keeping this in one helper
+    /// means the drag path and the programmatic path measure the same geometry.
+    private static func applyingBox(_ rect: CGRect, to annotation: Annotation) -> Annotation {
+        var after = annotation
+        if after.kind == .ink, let old = after.shapeRect,
+           old.width > 0.01, old.height > 0.01 {
+            after.inkPaths = after.inkPaths.map { stroke in
+                stroke.map { point in
+                    CGPoint(x: rect.minX + (point.x - old.minX) / old.width * rect.width,
+                            y: rect.minY + (point.y - old.minY) / old.height * rect.height)
+                }
+            }
+        }
+        after.shapeRect = rect
+        return after
     }
 
     /// The canvas bitmap the reader draws for one stamp the PDF carries.
@@ -6055,7 +7034,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Moves one annotation the PDF carries into the editable model.
     ///
     /// The file's identity (`/NM`, or the stable fingerprint when there is none) travels with the
-    /// sidecar entry; the PDF's copy is removed from `documentAnnotations` so the page shows the
+    /// annotation-cache entry; the PDF's copy is removed from `documentAnnotations` so the page shows the
     /// adopted mark exactly once. Nothing about the file changes until an explicit save. Returns
     /// the new entry's id, or `nil` when the kind has no editable model.
     @discardableResult
@@ -6209,6 +7188,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             editingWasCreated = false
             editingOriginalText = ""
             editingUndoDepth = 0
+            editingTextSelectAll = false
         }
         if selectedAnnotationID == id { selectedAnnotationID = nil }
         let removed = annotations[index]
@@ -6236,31 +7216,45 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// window resize and a continuous↔facing switch without drifting inside the page.
     @discardableResult
     public func addBookmarkAtCurrentPage(name: String? = nil) -> Bool {
-        guard let document, document.pageCount > 0, let url = document.url else { return false }
+        guard let document, document.pageCount > 0 else { return false }
+        let page = min(max(currentPage - 1, 0), document.pageCount - 1)
+        // A bookmark stores page-local Y. In a tear's gap the viewport top names the tear, so
+        // the bookmark lands at the split rather than jumping a card-height away.
+        let yPt = pageLocalY(forContentY: scrollYPt, onPage: page)
+            ?? pageTear(forPage: page)?.splitPt
+            ?? max(0, scrollYPt - displayPageTop(page))
+        return addBookmark(onPage: page, yPt: yPt, name: name)
+    }
+
+    /// Adds a bookmark to an explicit page without moving the viewport or changing selection.
+    @discardableResult
+    package func addBookmark(onPage page: Int, yPt: CGFloat = 0, name: String? = nil) -> Bool {
+        guard let document, let url = document.url else { return false }
         if annotationsURL == nil { loadAnnotations(for: url) }
         if annotationWritesBlockedReason != nil {
-            statusMessage = "Could not add the bookmark because the sidecar could not be loaded"
+            statusMessage = "Could not add the bookmark because annotation writes are blocked"
             lastError = statusMessage
             return false
         }
-
-        let page = min(max(currentPage - 1, 0), document.pageCount - 1)
-        let top = engine.pageTopPt(page, gapPt: pageGapPt, layout: layoutMode)
-        let yPt = max(0, scrollYPt - top)
-        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let title = trimmed.isEmpty ? "Page \(page + 1)" : trimmed
-
+        let title = AnnotationRecords.titleForNewBookmark(name: name, page: page)
         let bookmark = Bookmark(page: page, title: title, yPt: yPt)
+        guard validateNewBookmark(bookmark) else { return false }
+        let index = AnnotationRecords.insertionIndexForNewBookmark(
+            page: page, yPt: yPt, among: bookmarks)
+        guard index >= 0, index <= bookmarks.count else {
+            // The rule set takes the current list as its input, so this cannot happen; refuse
+            // rather than trap or clamp a rule the shell does not understand.
+            statusMessage = "Could not add the bookmark: the bookmark rule set returned an invalid position"
+            lastError = statusMessage
+            return false
+        }
         var updated = bookmarks
-        updated.append(bookmark)
-        var slots = annotationSidecarSlots
+        updated.insert(bookmark, at: index)
+        // A new bookmark's cache slot is appended, not reordered into a removed bookmark's slot:
+        // that keeps the new mark from jumping ahead of an entry this version preserves verbatim.
+        var slots = annotationRecordSlots
         slots.append(.bookmark(bookmark.id))
-        guard writeSidecar(
-            annotations: annotations,
-            bookmarks: updated,
-            slots: slots,
-            trigger: "bookmark-add"
-        ) else { return false }
+        guard writeBookmarks(updated, slots: slots, trigger: "bookmark-add") else { return false }
 
         statusMessage = "Added bookmark “\(title)”"
         return true
@@ -6273,45 +7267,47 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let title = bookmarks[index].title
         var updated = bookmarks
         updated.remove(at: index)
-        guard writeSidecar(
-            annotations: annotations,
-            bookmarks: updated,
-            slots: annotationSidecarSlots,
-            trigger: "bookmark-remove"
-        ) else { return }
+        guard writeBookmarks(updated, trigger: "bookmark-remove") else { return }
         statusMessage = "Deleted bookmark “\(title)”"
     }
 
     /// Renames a bookmark. An empty title is allowed; the sidebar falls back to "Page N" when
     /// displaying it, and nothing is silently rewritten.
-    public func renameBookmark(_ id: UUID, to title: String) {
+    ///
+    /// A title the outline writer would refuse is refused here with the writer's own sentence,
+    /// rather than being written into the cache and failing only when the PDF is saved.
+    @discardableResult
+    public func renameBookmark(_ id: UUID, to title: String) -> Bool {
         guard let index = bookmarks.firstIndex(where: { $0.id == id }),
-              bookmarks[index].title != title else { return }
+              bookmarks[index].title != title else { return false }
+        if let message = AnnotationRecords.validationMessage(forBookmarkTitle: title, id: id) {
+            statusMessage = message
+            lastError = message
+            return false
+        }
         var updated = bookmarks
         updated[index].title = title
-        guard writeSidecar(
-            annotations: annotations,
-            bookmarks: updated,
-            slots: annotationSidecarSlots,
-            trigger: "bookmark-rename"
-        ) else { return }
+        guard writeBookmarks(updated, trigger: "bookmark-rename") else { return false }
+        return true
     }
 
     /// Moves a bookmark by `offset` places in the reader's order. The order is the array's,
-    /// and it is persisted by reordering the bookmark slots in the sidecar in place, so
-    /// foreign entries keep their positions.
+    /// and it is persisted by reordering the bookmark slots in the annotation cache in place, so
+    /// foreign entries keep their positions. A move past either end stays at that end.
     public func moveBookmark(_ id: UUID, by offset: Int) {
         guard let index = bookmarks.firstIndex(where: { $0.id == id }), offset != 0 else { return }
-        let target = min(max(index + offset, 0), bookmarks.count - 1)
+        let target = AnnotationRecords.movedBookmarkIndex(
+            index: index, offset: offset, count: bookmarks.count)
         guard target != index else { return }
 
         var updated = bookmarks
         let bookmark = updated.remove(at: index)
         updated.insert(bookmark, at: target)
-        guard writeSidecar(
-            annotations: annotations,
-            bookmarks: updated,
-            slots: bookmarkSlots(matching: updated),
+        let slots = AnnotationRecords.slotsAfterBookmarkReorder(
+            annotationRecordSlots, orderedIDs: updated.map(\.id))
+        guard writeBookmarks(
+            updated,
+            slots: slots,
             trigger: "bookmark-move"
         ) else { return }
         statusMessage = "Moved bookmark “\(bookmark.title)”"
@@ -6319,47 +7315,41 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Jumps so the bookmarked page position is at the top of the viewport.
     public func jump(to bookmark: Bookmark) {
-        guard let document, bookmark.page >= 0, bookmark.page < document.pageCount else { return }
-        cancelScrollGlide()
-        let top = engine.pageTopPt(bookmark.page, gapPt: pageGapPt, layout: layoutMode)
-        scrollYPt = clampedScrollOffset(top + bookmark.yPt)
-        reloadVisiblePages()
-        schedulePositionSave()
+        guard jumpToSavedPosition(page: bookmark.page, yPt: bookmark.yPt) else { return }
         statusMessage = "Jumped to “\(bookmark.title)”"
     }
 
-    /// The display name for a bookmark with an empty custom title.
-    public static func defaultBookmarkTitle(page: Int) -> String {
-        "Page \(page + 1)"
-    }
-
-    /// The current bookmark list split into one section per page, in the reader's order.
+    /// Moves the viewport to a page-local position saved on `page`.
     ///
-    /// Grouping by page is what makes a list of named places readable; the order *within* and
-    /// *between* sections is still the reader's (first appearance wins), which is what the
-    /// move commands manipulate.
-    public var bookmarkGroups: [BookmarkGroup] {
-        BookmarkGrouping.groups(for: bookmarks)
+    /// The bookmark list and the reader's outline rows both address the same saved marks, so
+    /// both entry points land through this one method. Returns whether the jump happened.
+    @discardableResult
+    private func jumpToSavedPosition(page: Int, yPt: CGFloat) -> Bool {
+        guard let document, page >= 0, page < document.pageCount else { return false }
+        cancelScrollGlide()
+        guard let target = contentY(forPageLocalY: yPt, onPage: page) else { return false }
+        scrollYPt = clampedScrollOffset(target)
+        reloadVisiblePages()
+        schedulePositionSave()
+        return true
     }
 
-    /// Rebuilds the `.bookmark` slots in the current order while leaving every other slot in
-    /// place. Appending covers bookmarks added after the file was loaded.
-    private func bookmarkSlots(matching ordered: [Bookmark]) -> [AnnotationSidecar.Slot] {
-        var remaining = ordered.makeIterator()
-        var slots: [AnnotationSidecar.Slot] = []
-        for slot in annotationSidecarSlots {
-            if case .bookmark = slot {
-                if let next = remaining.next() {
-                    slots.append(.bookmark(next.id))
-                }
-            } else {
-                slots.append(slot)
-            }
-        }
-        while let next = remaining.next() {
-            slots.append(.bookmark(next.id))
-        }
-        return slots
+    /// Writes the reader's bookmark list and its slots to the one annotation cache.
+    ///
+    /// Every bookmark command goes through here so add, rename, remove and move cannot drift
+    /// apart in which arrays they publish or which trigger they record.
+    @discardableResult
+    private func writeBookmarks(
+        _ updated: [Bookmark],
+        slots: [AnnotationRecords.Slot]? = nil,
+        trigger: String
+    ) -> Bool {
+        writeAnnotationRecords(
+            annotations: annotations,
+            bookmarks: updated,
+            slots: slots ?? annotationRecordSlots,
+            trigger: trigger
+        )
     }
 
     // MARK: - Undo / redo
@@ -6386,7 +7376,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case replaced(before: Annotation, after: Annotation)
         case noteChanged(id: UUID, oldNote: String, newNote: String)
         /// Everything one eraser drag changed. The two annotation arrays are the **complete**
-        /// before/after state of the sidecar list, so undo restores the exact original strokes —
+        /// before/after state of the record list, so undo restores the exact original strokes —
         /// geometry, order and identities — and redo re-applies the exact pieces. A drag is one
         /// gesture and therefore **one undo step**, even when it splits five strokes into
         /// twelve pieces: one ⌘Z puts the drawing back together, because the reader made one
@@ -6394,14 +7384,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         ///
         /// `documents` are file-owned originals removed through the cross-reader path, with
         /// their pre-gesture indices. `deletions` are every file identity the gesture stages for
-        /// deletion (including adopted sidecar entries, which are represented in the arrays).
+        /// deletion (including adopted annotation-cache entries, which are represented in the arrays).
         /// `erasedStrokeIDs` are the reader-created strokes whose absence is pending a PDF.
         case erasedInk(before: [Annotation], after: [Annotation],
                        documents: [ErasedFileAnnotation],
                        deletions: [FileAnnotationDeletion],
                        erasedStrokeIDs: Set<UUID>)
         /// A file annotation was adopted into the editable model. Undo puts it back in the PDF's
-        /// list and removes the sidecar entry, exactly as if it had never been touched.
+        /// list and removes the annotation-cache entry, exactly as if it had never been touched.
         case adoptedFile(annotation: Annotation, document: DocumentAnnotation, index: Int)
         /// A file annotation was deleted in this session. Undo restores it (and cancels the
         /// pending deletion) until a save makes the removal real.
@@ -6411,16 +7401,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var undoStack: [UndoableAction] = []
     @Published public private(set) var redoStack: [UndoableAction] = []
 
-    public var canUndo: Bool { contentTextEditing ? (NSApp.keyWindow?.firstResponder as? NSTextView)?.undoManager?.canUndo == true : (contentEditEnabled ? canUndoPageEdit : !undoStack.isEmpty) }
-    public var canRedo: Bool { contentTextEditing ? (NSApp.keyWindow?.firstResponder as? NSTextView)?.undoManager?.canRedo == true : (contentEditEnabled ? canRedoPageEdit : !redoStack.isEmpty) }
+    public var canUndo: Bool { contentTextEditing ? (NSApp.keyWindow?.firstResponder as? NSTextView)?.undoManager?.canUndo == true : (canUndoPageEdit || !undoStack.isEmpty) }
+    public var canRedo: Bool { contentTextEditing ? (NSApp.keyWindow?.firstResponder as? NSTextView)?.undoManager?.canRedo == true : (canRedoPageEdit || !redoStack.isEmpty) }
 
     public func undo() {
         if contentTextEditing {(NSApp.keyWindow?.firstResponder as? NSTextView)?.undoManager?.undo();return}
-        if contentEditEnabled { undoPageEdit(); return }
+        if canUndoPageEdit && (contentEditEnabled || undoStack.isEmpty) { undoPageEdit(); return }
         guard let action = undoStack.last else { return }
         if editingAnnotationID != nil { commitTextEditing() }
         flushPendingAnnotationWrite()
-        // A direct deletion never touched the sidecar, so undo is a pure in-memory restoration
+        // A direct deletion never touched the annotation cache, so undo is a pure in-memory restoration
         // (and the pending deletion goes away with it).
         if case .deletedFile(let document, let index) = action {
             pendingFileDeletions.removeAll { $0.identity == document.id }
@@ -6468,7 +7458,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     public func redo() {
         if contentTextEditing {(NSApp.keyWindow?.firstResponder as? NSTextView)?.undoManager?.redo();return}
-        if contentEditEnabled { redoPageEdit(); return }
+        if canRedoPageEdit && (contentEditEnabled || redoStack.isEmpty) { redoPageEdit(); return }
         guard let action = redoStack.last else { return }
         if editingAnnotationID != nil { commitTextEditing() }
         flushPendingAnnotationWrite()
@@ -6550,7 +7540,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 updated[index].note = undoing ? oldNote : newNote
             }
         case .erasedInk(let before, let after, _, _, _):
-            // The arrays are the exact sidecar state on either side of the gesture, so restoring
+            // The arrays are the exact annotation cache state on either side of the gesture, so restoring
             // them is what guarantees the original identities, geometry and order (and lets redo
             // re-apply the same pieces).
             updated = undoing ? before : after
@@ -6649,12 +7639,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         scheduleNoteFlush()
     }
 
-    /// True while an open coalescing window is still holding note text back from the sidecar.
+    /// True while an open coalescing window is still holding note text back from the annotation cache.
     /// (Instrumentation: it is what lets a check or a log line tell "queued" from "written".)
     public var noteWriteWindowIsOpen: Bool { noteFlushTask != nil }
 
     /// Called when the note field is committed (Return) or loses focus: the text reaches the
-    /// sidecar now instead of at the end of the coalescing window.
+    /// annotation cache now instead of at the end of the coalescing window.
     public func commitNoteEdits() {
         flushPendingAnnotationWrite()
     }
@@ -6674,9 +7664,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// tab close and by `resetDocumentState`, so a scroll or a typed note cannot be lost just
     /// because the debounce had not expired yet.
     public func flushPendingWrites() {
+        persistRegionHistory()
         if editingAnnotationID != nil { commitTextEditing() }
         let pendingNote = hasPendingAnnotationWrite
         let pendingPosition = self.pendingPosition != nil
+        defer { persistPageEditRecovery() }
         guard pendingNote || pendingPosition else { return }
         if pendingNote { flushPendingAnnotationWrite() }
         if pendingPosition { flushPendingPositionSave() }
@@ -6688,7 +7680,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Shows an annotation: selects its range (or its mark) and scrolls it into view.
     public func jump(to annotation: Annotation) {
-        let top = engine.pageTopPt(annotation.page, gapPt: pageGapPt, layout: layoutMode)
+        let top = displayPageTop(annotation.page)
         if annotation.kind.isGeometry || annotation.kind.isPlacedText {
             // A geometry mark and a placed note/box have no character range. Select the mark so
             // the overlay shows its halo, and scroll to it rather than to the page's first
@@ -6726,11 +7718,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // sidebar highlights the row it was asked to show, and a click on the annotation's own
         // glyph on the page comes here too.
         selectedDocumentAnnotationID = annotation.id
-        let top = engine.pageTopPt(annotation.page, gapPt: pageGapPt, layout: layoutMode)
         let box = annotation.boxes.first
         // Put the annotation a third of the way down the viewport rather than at its very top:
         // a highlight is easier to recognise with the text above it visible.
-        let target = top + (box?.yPt ?? 0) - viewportHeightContentPt / 3
+        let target = (contentY(forPageLocalY: box?.yPt ?? 0, onPage: annotation.page) ?? 0)
+            - viewportHeightContentPt / 3
         scrollYPt = max(0, min(target, max(0, contentHeightPt - viewportHeightContentPt)))
 
         selection = nil
@@ -6890,7 +7882,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public var canSaveFilledForm: Bool {
-        document != nil && formHasPendingChanges
+        document != nil && !isXfaDocument && formHasPendingChanges
             && !formSaveInProgress && !formInfo.encrypted
     }
 
@@ -6899,75 +7891,234 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         canSaveFilledForm && !isReadOnlyDocument
     }
 
-    /// Whether the Fill & Sign placeholder has something to offer.
-    public var canUseFormTool: Bool {
-        document != nil && !formInfo.encrypted
-            && formInfo.fields.contains(where: { $0.editable })
+    /// True while a click on a form field belongs to the field rather than to the canvas.
+    ///
+    /// The pointer is implicitly in selection mode whenever no annotation or content tool is
+    /// armed, and that is the whole gate. There is no form tool to arm: a plain document and a
+    /// signed document both accept field clicks (a signed file's values stay drafts and can be
+    /// saved to a copy), while the pen, a shape, a markup tool, the eraser, a stamp/signature
+    /// placement, Edit PDF, an armed region marquee or an open placed-text editor all own the
+    /// pointer and leave fields alone.
+    public var formFieldsAcceptPointer: Bool {
+        document != nil && !isXfaDocument && !formInfo.encrypted && annotationTool == .select
+            && pendingFillSignPlacement == nil
+            && !contentEditEnabled && !pageOverviewVisible && !contentTextEditing
+            && !regionSelectionArmed && editingAnnotationID == nil
     }
 
-    /// The toolbar button. Activating the form tool leaves the annotation tool in its normal
-    /// selection mode, so a click on a field is an edit and a click elsewhere still reads.
-    public func toggleFormTool() {
-        guard document != nil else { return }
+    /// The Fill & Sign row opens whenever a document is open, even when it has no form fields.
+    /// The row is the button's job; having nothing to fill is said inside it, not by greying
+    /// the button out.
+    public var canOpenFillAndSign: Bool { document != nil }
+
+    /// The Fill & Sign toolbar button's tooltip. It names the seven tools and where a signed
+    /// document keeps the result.
+    public var fillAndSignHelp: String {
+        if document == nil { return "Fill & Sign · open a PDF first" }
+        if isXfaDocument {
+            return "Fill & Sign · not available: this XFA form is rendered read-only from its XML"
+        }
         if formInfo.encrypted {
-            lastError = formInfo.refusal
-                ?? "This PDF is encrypted, so the reader will not fill it."
-            return
+            return "Fill & Sign · not available: this PDF is encrypted, so the reader will not add annotations"
         }
-        guard canUseFormTool else {
-            statusMessage = formInfo.fields.isEmpty
-                ? "This document has no form fields"
-                : "This document has no fillable form fields"
-            return
-        }
-        if formToolActive {
-            leaveFormTool()
-            return
-        }
-        formToolActive = true
-        annotationTool = .select
-        formFocusedFieldID = nil
-        formOpenChoiceFieldID = nil
-        statusMessage = formHasPendingChanges
-            ? (formPendingSummary ?? "Form tool: click a field to fill it")
-            : "Form tool: click a field to fill it · Tab next field · Esc leaves"
-        FileHandle.standardError.write(Data(
-            "lyra-reader-forms: tool on · \(formInfo.fields.count) field(s) · "
-            .appending("encrypted: \(formInfo.encrypted)\n").utf8
-        ))
+        let base = "Fill & Sign: place text, a signature, date, check mark, cross, stamp or image"
+            + " on the page · each is an annotation until you save"
+        return isReadOnlyDocument ? base + " · the signed original is unchanged; save a copy" : base
     }
 
-    /// Escape on the canvas: leave the form tool when it is active. Returns whether a mode was
-    /// consumed, so the canvas can fall through to its other Escape handling when it was not.
-    @discardableResult
-    public func cancelFormTool() -> Bool {
-        guard formToolActive || formFocusedFieldID != nil else { return false }
-        leaveFormTool()
-        return true
+    /// The Fill & Sign inspector is visible exactly while this row is open and one of its tools
+    /// is armed. Clearing the tool (Escape, a placed mark, the active row item again) closes it.
+    public var fillSignInspectorVisible: Bool {
+        document != nil && fillAndSignVisible && armedFillSignTool != nil
     }
 
-    /// Leaves the form tool and returns the canvas to normal reading. Pending values stay in the
-    /// reader and the banner keeps saying so; only an explicit save writes them.
-    public func leaveFormTool() {
-        let wasActive = formToolActive || formFocusedFieldID != nil
-        formToolActive = false
-        formFocusedFieldID = nil
-        formOpenChoiceFieldID = nil
-        if wasActive {
-            statusMessage = formHasPendingChanges
-                ? (formPendingSummary ?? "Reading mode")
-                : "Reading mode · form values are unchanged"
+    /// The Edit inspector is visible while Edit is open *and* a content tool is armed (or a page
+    /// object is selected with the implicit pointer). Opening Edit alone does not open it.
+    public var contentEditInspectorVisible: Bool {
+        document != nil && contentEditEnabled
+            && (contentEditTool != "select" || contentEditSelection != nil)
+    }
+
+    /// Width the right-hand inspector column takes from the canvas. There is one inspector slot
+    /// and at most one row open, so the two inspectors can never both be visible.
+    public var secondaryInspectorWidth: CGFloat {
+        if fillSignInspectorVisible || contentEditInspectorVisible {
+            return ReaderChrome.editingPanelWidthPt
+        }
+        return 0
+    }
+
+    /// The rows that are open. At most one element; the checks use this rather than the four
+    /// booleans so "one sub-toolbar at a time" is one assertion.
+    public var openSecondaryRows: [SecondaryRow] {
+        var rows: [SecondaryRow] = []
+        if annotationToolsVisible { rows.append(.annotations) }
+        if contentEditEnabled { rows.append(.contentEdit) }
+        if fillAndSignVisible { rows.append(.fillAndSign) }
+        if exportVisible { rows.append(.export) }
+        if aiToolsVisible { rows.append(.lyra) }
+        return rows
+    }
+
+    /// One command in the Fill & Sign inspector's form section.
+    ///
+    /// The placement tools are the row; these are the two form writes that lived at the bottom
+    /// of #153's menu. The inspector shows them again, and File carries them for whenever no
+    /// Fill & Sign tool is armed.
+    public struct FormMenuCommand: Identifiable, Equatable, Sendable {
+        public let id: String
+        public let title: String
+        public let enabled: Bool
+        public let help: String?
+    }
+
+    /// Why a Fill & Sign placement is unavailable, in the reader's words. Nil means "ready".
+    ///
+    /// A signed document is deliberately not a refusal: annotations live in the reader's cache
+    /// and are written to a copy, exactly like the annotation toolbar's marks.
+    public var fillSignPlacementRefusal: String? {
+        if document == nil { return "Open a PDF first." }
+        if isXfaDocument {
+            return readOnlyReason ?? "This XFA form is rendered read-only from its XML."
+        }
+        if formInfo.encrypted {
+            return formInfo.refusal
+                ?? "This PDF is encrypted, so the reader will not add annotations."
+        }
+        return nil
+    }
+
+    /// Whether the placement half of Fill & Sign can arm.
+    public var canPlaceFillSignAnnotation: Bool { fillSignPlacementRefusal == nil }
+
+    /// True when a Fill & Sign placement is waiting for a click, so the checks and the canvas
+    /// can ask without unwrapping the enum.
+    public var hasPendingFillSignPlacement: Bool { pendingFillSignPlacement != nil }
+
+    private func fillSignPlacementHelp(_ what: String) -> String {
+        let base = "\(what) · placed as an annotation until you save"
+        if let refusal = fillSignPlacementRefusal {
+            return base + " · not available: \(refusal)"
+        }
+        if isReadOnlyDocument {
+            return base + " · the signed original is unchanged; save a copy to keep it"
+        }
+        return base
+    }
+
+    /// The seven row items, left to right, with their enabled state and help.
+    public var fillSignRowCommands: [FillSignRowCommand] {
+        let enabled = canPlaceFillSignAnnotation
+        let helps: [FillSignTool: String] = [
+            .text: "Place a text box and start typing in it",
+            .signature: "Add a signature: type one, draw one, choose a picture or sign on a device",
+            .date: "Place today's date as a text box, selected so you can type over it",
+            .checkmark: "Place a vector check mark drawn as two ink strokes",
+            .cross: "Place a vector cross drawn as two ink strokes",
+            .stamp: "Place a stamp; the inspector shows the stamp styles",
+            .image: "Place a PNG or JPEG on the page as a picture annotation, not a signature",
+        ]
+        return FillSignTool.rowOrder.map { tool in
+            FillSignRowCommand(
+                tool: tool,
+                title: tool.title,
+                icon: tool.icon,
+                enabled: enabled,
+                help: fillSignPlacementHelp(helps[tool] ?? tool.title))
         }
     }
 
-    /// Puts the keyboard in a field. Only the form tool can focus an editable field.
+    /// The Signature inspector's four methods, in #153's submenu order.
+    public var fillSignSignatureMethods: [SignatureMethodCommand] {
+        let enabled = canPlaceFillSignAnnotation
+        return [
+            SignatureMethodCommand(
+                action: .type, title: "Type", icon: "keyboard", enabled: enabled,
+                help: fillSignPlacementHelp(
+                    "Type your name and place it as an image signature in a handwriting font")),
+            SignatureMethodCommand(
+                action: .draw, title: "Draw", icon: "scribble", enabled: enabled,
+                help: fillSignPlacementHelp(
+                    "Draw a signature on a small canvas and place it as an ink annotation")),
+            SignatureMethodCommand(
+                action: .image, title: "Image…", icon: "photo", enabled: enabled,
+                help: fillSignPlacementHelp(
+                    "Place a PNG or JPEG picture of your signature")),
+            SignatureMethodCommand(
+                action: .continuity, title: "From iPhone or iPad",
+                icon: "iphone.and.arrow.forward", enabled: enabled,
+                help: fillSignPlacementHelp(
+                    "Sign on your iPhone or iPad and place the sketch as a signature image")),
+        ]
+    }
+
+    /// Why a form write is unavailable, in the reader's words. Nil means "ready".
+    private var formWriteRefusal: String? {
+        if document == nil { return "Open a PDF first." }
+        if isXfaDocument { return readOnlyReason }
+        if formInfo.encrypted {
+            return formInfo.refusal ?? "This PDF is encrypted, so the reader will not fill it."
+        }
+        if formLoading || !formLoadCompleted { return "Form fields are still loading." }
+        if !formInfo.fields.contains(where: { $0.editable }) {
+            return "This document has no fillable form fields."
+        }
+        if !formHasPendingChanges { return "There are no form changes to save." }
+        return nil
+    }
+
+    /// The two form writes, shown in the Fill & Sign inspector's form section and in File.
+    public var fillSignFormCommands: [FormMenuCommand] {
+        let refusal = formWriteRefusal
+        return [
+            FormMenuCommand(
+                id: "save-filled-copy",
+                title: "Save Filled Form Copy…",
+                enabled: canSaveFilledForm,
+                help: canSaveFilledForm
+                    ? "Write the values in the reader into a copy; the original is unchanged."
+                    : (refusal ?? "There are no form changes to save.")
+            ),
+            FormMenuCommand(
+                id: "write-form-values",
+                title: "Write Form Values to Original…",
+                enabled: canReplaceOriginalWithFilledForm,
+                help: canReplaceOriginalWithFilledForm
+                    ? "Write the filled values into the original file, with a verified backup first."
+                    : (readOnlyReason ?? refusal ?? "There are no form changes to save.")
+            ),
+        ]
+    }
+
+    /// Runs a Fill & Sign command by its stable id. Unknown ids do nothing.
+    public func performFillAndSignCommand(_ id: String) {
+        switch id {
+        case "save-filled-copy":
+            presentSaveFilledFormPanel()
+        case "write-form-values":
+            presentReplaceOriginalWithFilledFormConfirmation()
+        default:
+            break
+        }
+    }
+
+    /// Puts the keyboard in a field when the implicit pointer state owns it.
     public func focusFormField(_ id: String) {
-        guard formToolActive, let field = formField(id: id), field.editable else { return }
+        guard formFieldsAcceptPointer, let field = formField(id: id), field.editable else {
+            return
+        }
         formFocusedFieldID = id
         formOpenChoiceFieldID = field.kind == .comboBox ? id : nil
     }
 
-    /// Ends field editing without leaving the tool. Escape in a field calls this.
+    /// The overlay's tap handler. It is ``focusFormField(_:)`` under the same gate; the name
+    /// states the path so a check can drive a field click without putting a window on screen.
+    public func clickFormField(_ id: String) {
+        focusFormField(id)
+    }
+
+    /// Ends field editing and hands the keyboard back to the canvas. Escape in a field, or
+    /// arming a tool, calls this; pending values stay in the reader.
     public func blurFormField() {
         formFocusedFieldID = nil
         formOpenChoiceFieldID = nil
@@ -6976,6 +8127,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Tab order: the engine's reading order — page ascending, then the widget's top edge
     /// top-to-bottom, then its left edge. Wraps around at both ends.
     public func focusNextFormField(backwards: Bool = false) {
+        guard formFieldsAcceptPointer else { return }
         let editable = formInfo.fields.filter { $0.editable }
         guard !editable.isEmpty else { return }
         let current = formFocusedFieldID.flatMap { id in
@@ -6993,9 +8145,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// One text edit. `maxLength` is enforced as characters, matching how PDF `/MaxLen` counts.
+    ///
+    /// A multiline field keeps the reader's line breaks (the save normalises CR/CRLF to LF). A
+    /// single-line field cannot hold one: a paste that carries a line break becomes a space, the
+    /// same rule the writer applies to `/V`, so the draft never promises a line the file cannot
+    /// keep.
     public func updateFormText(_ id: String, text: String) {
         guard let field = formField(id: id), field.kind == .text, field.editable else { return }
         var value = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        if !field.multiline {
+            value = value.replacingOccurrences(of: "\n", with: " ")
+        }
         if let maxLength = field.maxLength, value.count > maxLength {
             value = String(value.prefix(maxLength))
         }
@@ -7165,10 +8327,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         defer { formSaveInProgress = false }
         do {
             let report = try await engine.replaceWithFilledForm(values)
+            carryDocumentCacheAfterReplacement(at: url)
             let backup = report.backupPath?.lastPathComponent ?? "none"
             formDraft = [:]
             formInfo = .empty
-            formToolActive = false
             formFocusedFieldID = nil
             formOpenChoiceFieldID = nil
             formLoadCompleted = false
@@ -7187,6 +8349,131 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             FileHandle.standardError.write(Data(
                 "lyra-reader-forms: replace failed: \(error)\n".utf8
             ))
+            return false
+        }
+    }
+
+
+    // MARK: - Flattened copy
+
+    /// Whether "Export as Flattened Copy…" can run for the open document.
+    ///
+    /// The command reads the PDF as saved on disk; it is not a save of the reader's cache. It is
+    /// offered for an ordinary or signed PDF, never for an XFA form or an encrypted file (both
+    /// have a specific reason in ``flattenRefusal``).
+    public var canFlattenDocument: Bool {
+        document != nil && !isXfaDocument && !formInfo.encrypted
+            && !flattenInProgress && !annotationSaveInProgress && !formSaveInProgress
+            && !propertiesSaveInProgress && !pageEditBusy
+    }
+
+    /// The one sentence the menu item's help and a refused direct call share.
+    public var flattenRefusal: String? {
+        if document == nil { return "Open a PDF before exporting a flattened copy" }
+        if isXfaDocument { return readOnlyReason }
+        if formInfo.encrypted {
+            return "This PDF is encrypted, so a flattened copy is not supported: the new page "
+                + "content would need the security envelope rewritten."
+        }
+        if flattenInProgress { return "A flattened copy is already being written" }
+        return nil
+    }
+
+    /// The save-panel explanation. It is deliberately explicit about the limits: flattening is
+    /// an appearance export, not a signature and not protection from a content editor.
+    public static let flattenPanelMessage =
+        "Paints the annotations and filled form values into a new PDF; the original is not "
+        + "modified. Links and sticky notes stay as annotations, and a field that cannot be baked "
+        + "faithfully is kept and reported. The copy uses the file as saved on disk. This is not "
+        + "tamper-proof: the painted content is still editable with a PDF editor, and only a "
+        + "digital signature can detect changes made after signing."
+
+    public func presentFlattenCopyPanel() {
+        guard let url = document?.url else { return }
+        if let refusal = flattenRefusal {
+            lastError = refusal
+            statusMessage = isXfaDocument ? "XFA form · read-only" : "Flattened copy unavailable"
+            return
+        }
+        let suggestion = engine.suggestedFlattenedCopyURL(for: url)
+        let panel = NSSavePanel()
+        panel.title = "Export as Flattened Copy"
+        panel.message = Self.flattenPanelMessage
+        panel.nameFieldStringValue = suggestion.lastPathComponent
+        panel.directoryURL = suggestion.deletingLastPathComponent()
+        panel.allowedContentTypes = [.pdf]
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        Task { @MainActor [weak self] in
+            await self?.flattenToCopy(to: destination)
+        }
+    }
+
+    /// Writes the flattened copy through the engine's verified temporary-file save.
+    @discardableResult
+    public func flattenToCopy(to destination: URL) async -> Bool {
+        guard let url = document?.url else {
+            lastError = "Open a PDF before exporting a flattened copy"
+            return false
+        }
+        if let refusal = flattenRefusal {
+            lastError = refusal
+            statusMessage = isXfaDocument ? "XFA form · read-only" : "Could not flatten the PDF"
+            return false
+        }
+        if Self.resolvesToSameFile(destination, url) {
+            lastError = "The flattened copy would be the original. Choose another name; the "
+                + "source is never overwritten."
+            return false
+        }
+        flattenInProgress = true
+        defer { flattenInProgress = false }
+        do {
+            let report = try await engine.flattenToCopy(to: destination)
+            lastFlattenReport = report
+            var status = "Saved the flattened copy to \(destination.lastPathComponent)"
+                + " · \(report.flattenedAnnotations) annotation(s) and "
+                + "\(report.flattenedFields) field(s) baked"
+                + " · the original is unchanged"
+            if report.linksKept > 0 || report.stickyNotesKept > 0
+                || !report.keptAnnotations.isEmpty || !report.keptFields.isEmpty {
+                status += " · kept \(report.linksKept) link(s), "
+                    + "\(report.stickyNotesKept) sticky note(s)"
+                let otherKept = max(
+                    0,
+                    report.keptAnnotations.count - report.linksKept
+                        - report.stickyNotesKept
+                )
+                if otherKept > 0 {
+                    status += ", \(otherKept) hidden/thread annotation(s)"
+                }
+                if !report.keptFields.isEmpty {
+                    let names = report.keptFields.prefix(3).map(\.name).joined(separator: ", ")
+                    status += ", \(report.keptFields.count) field(s) kept"
+                    if !names.isEmpty { status += " (\(names))" }
+                }
+            }
+            if report.commentsNotCarried > 0 {
+                status += " · \(report.commentsNotCarried) comment(s) not carried over"
+            }
+            if report.signatureFieldsRemoved > 0 {
+                status += " · \(report.signatureFieldsRemoved) signature field(s) removed"
+            }
+            statusMessage = status
+            FileHandle.standardError.write(Data((
+                "lyra-reader-flatten: wrote \(destination.path) · "
+                + "\(report.flattenedAnnotations) annotation(s), "
+                + "\(report.flattenedFields) field(s), "
+                + "\(report.keptAnnotations.count) kept annotation(s), "
+                + "\(report.keptFields.count) kept field(s)\n"
+            ).utf8))
+            return true
+        } catch {
+            lastError = "Could not export the flattened copy: \(error.localizedDescription)"
+            statusMessage = "Could not export the flattened copy"
+            FileHandle.standardError.write(
+                Data("lyra-reader-flatten: failed (\(url.lastPathComponent)): \(error)\n".utf8)
+            )
             return false
         }
     }
@@ -7245,7 +8532,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public var canSaveDocumentProperties: Bool {
-        document != nil && documentInfo != nil
+        document != nil && !isXfaDocument && documentInfo != nil
             && documentPropertiesAreDirty && !propertiesSaveInProgress
             && !(documentInfo?.isEncrypted ?? true)
     }
@@ -7368,6 +8655,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         defer { propertiesSaveInProgress = false }
         do {
             let report = try await engine.replaceWithDocumentProperties(documentPropertiesDraft)
+            carryDocumentCacheAfterReplacement(at: url)
             let backup = report.backupPath?.lastPathComponent ?? "none"
             documentInfo = nil
             _ = open(url: url)
@@ -7386,35 +8674,70 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     // MARK: - Signed documents (read-only)
 
     /// The signature evidence for the open document, read by the engine once at open.
-    public var documentSignature: DocumentSignature { document?.signature ?? .unsigned }
+    public var documentSignature: DocumentSignature { pageEditSession?.originalSignature ?? document?.signature ?? .unsigned }
 
-    /// True when the file carries a digital signature and every **in-place** write is refused.
+    /// The XFA facts for the open document, read by the engine once at open.
+    public var documentXfa: DocumentXfa { document?.xfa ?? .none }
+
+    /// True when the document is an XFA form rendered read-only from its XML.
+    public var isXfaDocument: Bool { documentXfa.isXfa }
+
+    /// True when the file carries a digital signature or is an XFA form. Every write command is
+    /// refused with ``readOnlyReason``; reading aids stay available.
     ///
-    /// Edits are still allowed: they go to the sidecar and can be saved to a new file. The
-    /// decision lives in Rust; the shell mirrors it only to disable the in-place controls and
-    /// explain them. A direct engine call is still refused by the same gate, so a stale button
-    /// cannot rewrite a signed file.
-    public var isReadOnlyDocument: Bool { documentSignature.signed }
+    /// For a signed PDF the refusal is only for in-place writes (copies are still allowed). For
+    /// an XFA form even copies are refused: the synthetic PDF is a rendering of the form, not
+    /// the form itself, so a "copy of the edits" would not be the document the reader thinks it
+    /// is. The decision lives in Rust; the shell mirrors it to disable and explain the controls.
+    public var isReadOnlyDocument: Bool { documentSignature.signed || isXfaDocument }
 
-    /// The one sentence every in-place write refuses with.
-    public var readOnlyReason: String? { documentSignature.readOnlyReason }
+    /// The one sentence every write refusal uses. An XFA form's reason is more specific than
+    /// the signature reason, so it wins when both are present (the sample has both).
+    public var readOnlyReason: String? {
+        isXfaDocument ? (documentXfa.readOnlyReason ?? documentXfa.error) : documentSignature.readOnlyReason
+    }
 
-    /// The banner's headline. The reason below it names the evidence.
-    public var readOnlyBannerTitle: String { "Signed PDF · read-only in place" }
+    /// The banner's headline.
+    public var readOnlyBannerTitle: String {
+        isXfaDocument ? "XFA form · read-only" : "Signed PDF · read-only in place"
+    }
 
-    /// The evidence, one line, for the banner's second line.
+    /// The banner's body, directly under the headline.
+    ///
+    /// An XFA form gets reader-facing copy only: it says what the document is, that it opens
+    /// read-only and that the rendering may differ, then where to edit it. Packet names, counts
+    /// and the list of skipped items belong to diagnostics, not to the banner.
+    public var readOnlyBannerBody: String {
+        if isXfaDocument {
+            return "This document is an XFA form, opened read-only; the rendering may not match "
+                + "the original form. To edit it, open it in Adobe Acrobat."
+        }
+        return readOnlyReason ?? "This PDF is digitally signed, so it is read-only."
+    }
+
+    /// Detailed evidence for the information panel and for diagnostics. It is deliberately not
+    /// shown in the XFA banner; `lyra-reader-cli xfa` and the FFI status record keep it too.
     public var readOnlyBannerEvidence: String {
-        documentSignature.evidence.map(\.detail).joined(separator: " · ")
+        if isXfaDocument {
+            let packets = documentXfa.packetNames.count
+            let base = "\(packets) XFA packet(s) · \(documentXfa.pageCount) page(s) · \(documentXfa.fieldCount) field(s)"
+            if documentXfa.skipped.isEmpty { return base }
+            return base + " · skipped: " + documentXfa.skipped.joined(separator: " · ")
+        }
+        return documentSignature.evidence.map(\.detail).joined(separator: " · ")
     }
 
-    /// What a signed document can still do. Shown in the banner next to the reason.
+    /// What a read-only document can still do. Shown in the banner next to the reason for a
+    /// signed PDF. The XFA banner is short copy only, so it has no second note.
     public var readOnlyBannerNote: String {
-        "Saving a copy is allowed; the copy leaves the signature fields out."
+        if isXfaDocument { return "" }
+        return "Saving a copy is allowed; the copy leaves the signature fields out."
     }
 
-    /// True when annotation tools may create or remove marks. Sidecar edits are allowed for a
+    /// True when annotation tools may create or remove marks. Cache edits are allowed for a
     /// signed document too: they can be written to a copy, and the signed original is untouched.
-    public var canEditAnnotations: Bool { document != nil }
+    /// An XFA form offers none: its synthetic pages are a rendering, not an annotation carrier.
+    public var canEditAnnotations: Bool { document != nil && !isXfaDocument }
 
     /// Refuses an in-place write and states the shared reason. Returns true when the file is
     /// writable.
@@ -7425,28 +8748,100 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func guardWritable() -> Bool {
         guard let reason = readOnlyReason else { return true }
         lastError = reason
-        statusMessage = "Signed PDF · read-only"
+        statusMessage = isXfaDocument ? "XFA form · read-only" : "Signed PDF · read-only"
         FileHandle.standardError.write(Data(
-            "lyra-reader-signature: write refused · \(reason)\n".utf8
+            (isXfaDocument ? "lyra-reader-xfa: write refused · \(reason)\n"
+                           : "lyra-reader-signature: write refused · \(reason)\n").utf8
         ))
         return false
     }
 
     // MARK: - Saving annotations into the PDF
 
+    public var canSaveDocument: Bool {
+        document != nil && !isXfaDocument && !pageEditBusy && !annotationSaveInProgress &&
+            (canSaveAnnotationsToPDF || canSavePageEditsCopy || contentCommandInFlight)
+    }
+
+    public var hasUnsavedDocumentChanges: Bool {
+        pageEditHasPendingChanges || contentTextEditing || contentTextRecovery != nil
+            || annotationCacheIsDirty || hasPendingInkErasure || hasPendingFileDeletions
+            || formHasPendingChanges
+    }
+
+    public func tabHasUnsavedChanges(_ index: Int) -> Bool {
+        guard tabs.indices.contains(index) else { return false }
+        if index == activeTabIndex { return hasUnsavedDocumentChanges }
+        guard let saved = retainedTabs[tabs[index].id]?.state else { return false }
+        return !saved.pageEditPendingOperations.isEmpty || saved.annotationCacheIsDirty
+            || !saved.erasedInkStrokeIDs.isEmpty || !saved.pendingFileDeletions.isEmpty
+            || saved.formHasPendingChanges
+    }
+
+    public var closeRequiresReview: Bool {
+        formHasPendingChanges
+    }
+
+    public var closeChangesMessage: String {
+        if closeRequiresReview {
+            return "Form values need their dedicated save command. Review them before closing, or discard the changes."
+        }
+        return isReadOnlyDocument
+            ? "Save an unsigned copy to keep these changes."
+            : "Save these changes to the original PDF before closing."
+    }
+
+    public func reviewChangesBeforeClosing() {
+        cancelContentClose()
+        contentEditEnabled = false
+        statusMessage = "Save the filled form before closing"
+    }
+
+    public func saveDocument() {
+        if isXfaDocument {
+            lastError = readOnlyReason
+            statusMessage = "XFA form · rendered read-only from XML"
+            return
+        }
+        if isReadOnlyDocument { presentSaveDocumentCopyPanel(); return }
+        Task { @MainActor [weak self] in _ = await self?.saveDocumentToOriginal() }
+    }
+
+    public func presentSaveDocumentCopyPanel() {
+        if isXfaDocument {
+            lastError = readOnlyReason
+            statusMessage = "XFA form · saving a copy of edits is not available"
+            return
+        }
+        if pageEditSession != nil || contentTextEditing { presentSavePageEditsCopyPanel() }
+        else { presentSaveAnnotatedCopyPanel() }
+    }
+
+    @discardableResult
+    public func saveDocumentToOriginal() async -> Bool {
+        guard guardWritable(), document != nil, contentTextRecovery == nil else { return false }
+        commitContentText?()
+        if let task = contentEditTask {
+            let succeeded = await task.value
+            contentEditTask = nil
+            if !succeeded { return false }
+        }
+        if pageEditSession != nil { return await replaceOriginalWithPageEdits() }
+        return await replaceOriginalWithSavedAnnotations()
+    }
+
     /// Whether the two PDF-writing commands can run.
     ///
-    /// The sidecar is an unsaved-work store, not the feature: saving is always an explicit
+    /// The cache holds unsaved work, but it is not the feature: saving is always an explicit
     /// command from the reader, and it is disabled when there is nothing to write. A pending
     /// erasure counts even when it removed the last annotation: the copy must still be
     /// obtainable so the eraser's "Save Copy…" action cannot become a disabled promise.
     public var canSaveAnnotationsToPDF: Bool {
         guard document != nil, !annotationSaveInProgress else { return false }
-        // A signed document cannot be edited, but exporting a copy (with whatever sidecar
+        // A signed document cannot be edited, but exporting a copy (with whatever cached
         // annotations it already carries, or none) never touches the signed original.
         if isReadOnlyDocument { return true }
-        return !annotations.isEmpty || !bookmarks.isEmpty || hasEmbeddedBookmarkSubtree
-            || hasPendingInkErasure || hasPendingFileDeletions
+        return annotationCacheIsDirty || hasPendingInkErasure || hasPendingFileDeletions
     }
 
     /// Whether the open document's outline already contains the reader's marked bookmark
@@ -7474,9 +8869,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// The Save Annotated Copy panel. The writer's only job is to produce a new file; the
-    /// document on screen (and its sidecar) stays exactly where it is.
+    /// document on screen (and its annotation cache) stays exactly where it is.
     public func presentSaveAnnotatedCopyPanel() {
-        if contentEditEnabled {presentSavePageEditsCopyPanel();return}
+        if pageEditSession != nil || contentTextEditing { presentSavePageEditsCopyPanel(); return }
         guard let suggestion = suggestedAnnotatedCopyURL else { return }
         let panel = NSSavePanel()
         panel.title = "Save Annotated Copy"
@@ -7489,38 +8884,58 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let destination = panel.url else { return }
         Task { @MainActor [weak self] in
-            await self?.saveAnnotatedCopy(to: destination)
+            await self?.saveAnnotatedCopyInteractively(to: destination)
         }
     }
 
-    /// The clearly-labelled second choice: replace the original. The alert spells out the backup;
-    /// the engine refuses the replacement if that backup cannot be written and verified.
-    public func presentReplaceOriginalConfirmation() {
-        guard canReplaceOriginalWithAnnotations, let url = document?.url else { return }
+    /// Saves an annotated copy, and when the destination already holds annotation records offers
+    /// the two resolutions instead of only refusing: choose another destination, or replace the
+    /// stale records after this explicit confirmation. The direct
+    /// ``saveAnnotatedCopy(to:replaceExistingRecords:)`` call stays a refusal, so a programmatic
+    /// caller cannot delete somebody else's records by accident.
+    private func saveAnnotatedCopyInteractively(to destination: URL) async {
+        guard let records = Self.annotationRecordConflict(for: destination) else {
+            await saveAnnotatedCopy(to: destination)
+            return
+        }
         let alert = NSAlert()
-        alert.alertStyle = .critical
+        alert.alertStyle = .warning
         alert.messageText =
-            "Replace “\(url.lastPathComponent)” with the reader's annotations and bookmarks?"
+            "“\(destination.lastPathComponent)” already has annotations that would duplicate this copy"
         alert.informativeText =
-            "This changes the file on disk. A byte-identical backup is written first; "
-            + "if the backup cannot be written, nothing is replaced."
-        alert.addButton(withTitle: "Save and Replace")
+            Self.annotationRecordConflictMessage(records, destination: destination)
+        alert.addButton(withTitle: "Choose Another Destination…")
+        alert.addButton(withTitle: "Replace Records")
         alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        Task { @MainActor [weak self] in
-            await self?.replaceOriginalWithSavedAnnotations()
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            presentSaveAnnotatedCopyPanel()
+        case .alertSecondButtonReturn:
+            await saveAnnotatedCopy(to: destination, replaceExistingRecords: true)
+        default:
+            return
         }
     }
 
     /// Writes every annotation currently in the reader's list into a new PDF at `destination`.
     ///
-    /// The original document is not touched, and its sidecar is not changed: the copy carries
-    /// the annotations itself, so a fresh LyraReader opening that copy sees them from the PDF and no
-    /// sidecar duplicates them. When an eraser gesture removed the last annotation there is
-    /// nothing to append, and the copy is the source file byte for byte. Returns `false` when
-    /// nothing was written.
+    /// The original document is not touched, and its cached annotations are not changed: the copy
+    /// carries the annotations itself, so a fresh LyraReader opening that copy sees them from the
+    /// PDF and no cached copy duplicates them. When an eraser gesture removed the last annotation
+    /// there is nothing to append, and the copy is the source file byte for byte. Returns `false`
+    /// when nothing was written.
+    ///
+    /// A destination whose document cache already holds annotation records is refused by
+    /// default: opening that file would show the stale records next to the annotations the copy
+    /// carries, duplicating every mark. `replaceExistingRecords` is the caller's confirmation
+    /// that those records may be moved to a backup and the destination rewritten; the
+    /// interactive ``presentSaveAnnotatedCopyPanel()`` asks before passing it.
     @discardableResult
-    public func saveAnnotatedCopy(to destination: URL) async -> Bool {
+    public func saveAnnotatedCopy(
+        to destination: URL,
+        replaceExistingRecords: Bool = false
+    ) async -> Bool {
+        if pageEditSession != nil || contentTextEditing { return await savePageEditsCopy(to: destination) }
         guard !annotationSaveInProgress else { return false }
         guard let documentURL = document?.url else {
             lastError = "Open a document before saving annotations"
@@ -7533,18 +8948,30 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return false
         }
         if Self.resolvesToSameFile(destination, documentURL) {
-            lastError = "The annotated copy would be the original. Choose another name, or use “Save and Replace Original”."
+            lastError = "The annotated copy would be the original. Choose another name, or use Save to update the original."
             return false
         }
-        // A sidecar beside the chosen copy would make every saved annotation appear twice when
-        // that copy is opened: once from the PDF, once from the stale sidecar. Refuse rather
-        // than silently deleting somebody else's file.
-        let destinationSidecar = Self.sidecarURL(for: destination)
-        if FileManager.default.fileExists(atPath: destinationSidecar.path) {
-            lastError =
-                "“\(destination.lastPathComponent)” already has a LyraReader annotation sidecar. "
-                + "Choose another name so the copy cannot show every annotation twice."
-            return false
+        // Annotation records already associated with the chosen copy would make every saved
+        // annotation appear twice when that copy is opened: once from the PDF, once from the
+        // stale records. Refuse rather than silently deleting somebody else's file; the
+        // interactive panel offers "choose another destination" and "replace the records".
+        if let records = Self.annotationRecordConflict(for: destination) {
+            guard replaceExistingRecords else {
+                lastError = Self.annotationRecordConflictMessage(records, destination: destination)
+                return false
+            }
+            do {
+                let backups = try Self.retireAnnotationRecords(records)
+                FileHandle.standardError.write(Data((
+                    "lyra-reader-annotate: moved the destination's annotation records to "
+                    + backups.map(\.path).joined(separator: ", ") + "\n"
+                ).utf8))
+            } catch {
+                lastError =
+                    "Could not move the annotation records attached to “\(destination.lastPathComponent)” "
+                    + "out of the way; nothing was saved: \(error.localizedDescription)"
+                return false
+            }
         }
 
         annotationSaveInProgress = true
@@ -7557,7 +8984,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
         do {
             let changes = try await pendingAnnotationChanges()
-            let bookmarkRequests = bookmarkWriteRequests()
+            let bookmarkRequests = bookmarks
             if changes.isEmpty && bookmarkRequests.isEmpty {
                 // The eraser removed the last annotation and there is no bookmark to write, or
                 // the document is signed and has nothing the reader may add: the engine
@@ -7595,12 +9022,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 additions: changes.additions,
                 bookmarks: bookmarkRequests,
                 updates: changes.updates,
-                deletions: changes.deletions,
-                zoom: zoomFactor
+                deletions: changes.deletions
             )
             lastAnnotationWriteReport = report
             // The erasure now exists in a PDF (the copy), so the pending-erasure banner has
-            // nothing left to warn about. The open document and its sidecar are unchanged; a
+            // nothing left to warn about. The open document and its annotation cache are unchanged; a
             // pending *file deletion* stays pending because the open file still has the mark.
             erasedInkStrokeIDs.removeAll()
             let backup = report.backupPath.map { " · backup \(URL(fileURLWithPath: $0).lastPathComponent)" } ?? ""
@@ -7636,12 +9062,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Replaces the open document with one carrying the reader's annotations and bookmarks.
     ///
     /// The engine writes a verified backup first and replaces the original by an atomic rename
-    /// of a verified temporary file. Only after that succeeds are exactly the saved sidecar
+    /// of a verified temporary file. Only after that succeeds are exactly the saved annotation cache
     /// entries removed; the document is reopened so its annotations and bookmark subtree now
     /// come from the PDF.
     /// Returns `false` when nothing was replaced.
     @discardableResult
     public func replaceOriginalWithSavedAnnotations() async -> Bool {
+        if pageEditSession != nil { return await replaceOriginalWithPageEdits() }
         guard guardWritable() else { return false }
         guard !annotationSaveInProgress else { return false }
         guard let url = document?.url else {
@@ -7650,6 +9077,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         guard !annotations.isEmpty || !bookmarks.isEmpty || hasEmbeddedBookmarkSubtree
                 || hasPendingFileDeletions else {
+            annotationCacheIsDirty = false
+            persistPendingAnnotationState()
             statusMessage = "There are no annotations or bookmarks to save"
             return false
         }
@@ -7663,19 +9092,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
 
         do {
+            try DocumentEditCache.validateSource(for: url)
+            let previousCacheDirectory = annotationsURL?.deletingLastPathComponent()
             let changes = try await pendingAnnotationChanges()
-            let bookmarkRequests = bookmarkWriteRequests()
+            let bookmarkRequests = bookmarks
             let report = try await engine.replaceWithAnnotationChanges(
                 changes.additions,
                 bookmarks: bookmarkRequests,
                 updates: changes.updates,
-                deletions: changes.deletions,
-                zoom: zoomFactor
+                deletions: changes.deletions
             )
+            try? DocumentEditCache.recordSource(for: url)
 
             // The PDF is now the source of truth. Remove exactly the written entries and the
             // adopted entries whose annotation was deleted (including a thread's cascaded
-            // replies) from the sidecar, so reopening shows each annotation once.
+            // replies) from the annotation cache, so reopening shows each annotation once.
             let deletedFileIDs = Set(report.deletedFileIDs)
             let writtenEntries = Set(report.writtenIDs.compactMap { UUID(uuidString: $0) })
             let deletedAdopted = Set(annotations.compactMap { annotation -> UUID? in
@@ -7687,8 +9118,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             let cleanedBookmarks = forgetBookmarksSavedToPDF(
                 ids: Set(report.writtenBookmarkIDs.compactMap { UUID(uuidString: $0) })
             )
-            let cleanedSidecar = cleanedAnnotations && cleanedBookmarks
+            let cleanedRecords = cleanedAnnotations && cleanedBookmarks
             pendingFileDeletions.removeAll()
+            annotationCacheIsDirty = false
+            persistPendingAnnotationState()
+            carryDocumentCacheAfterReplacement(at: url, from: previousCacheDirectory)
 
             // The engine marks the old handle stale; reopen the file in place, keeping the
             // reading position and zoom.
@@ -7703,11 +9137,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             selectedDocumentAnnotationID = nil
             openDocumentNoteID = nil
             invalidateTiles()
-            if cleanedSidecar {
+            if cleanedRecords {
                 loadAnnotations(for: url)
             }
             // The file now carries the bookmark subtree; reload the outline so the sidebar can
-            // show it (and adopt the file's bookmarks instead of a duplicate sidecar list).
+            // show it (and adopt the file's bookmarks instead of a duplicate record list).
             outline = []
             outlineLoadCompleted = false
             loadOutline()
@@ -7717,9 +9151,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lastAnnotationWriteReport = report
             // The current annotations (and therefore the erasures) are in the PDF itself now.
             erasedInkStrokeIDs.removeAll()
-            if !cleanedSidecar {
+            if !cleanedRecords {
                 lastError =
-                    "The annotations are saved in the PDF, but the sidecar could not be updated. "
+                    "The annotations are saved in the PDF, but the annotation cache could not be updated. "
                     + "They will be reconciled the next time the document is opened, so they do not appear twice."
             }
             let backup = report.backupPath
@@ -7737,12 +9171,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             if report.deletedReplyCount > 0 {
                 statusMessage += " · \(report.deletedReplyCount) repl\(report.deletedReplyCount == 1 ? "y" : "ies") removed with their thread"
             }
-            if !cleanedSidecar {
-                statusMessage += " · the sidecar could not be updated and will be reconciled on open"
+            if !cleanedRecords {
+                statusMessage += " · the annotation cache could not be updated and will be reconciled on open"
             }
             FileHandle.standardError.write(Data((
                 "lyra-reader-annotate: replaced \(url.path) with \(written),"
-                + " \(deletedCount) annotation deletion(s), backup \(backup), sidecar cleaned: \(cleanedSidecar)\n"
+                + " \(deletedCount) annotation deletion(s), backup \(backup), cache cleaned: \(cleanedRecords)\n"
             ).utf8))
             return true
         } catch {
@@ -7752,18 +9186,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 Data("lyra-reader-annotate: replace failed: \(error)\n".utf8)
             )
             return false
-        }
-    }
-
-    /// The current bookmarks as writer requests, in the order the sidebar shows them.
-    private func bookmarkWriteRequests() -> [BookmarkWriteRequest] {
-        bookmarks.map { bookmark in
-            BookmarkWriteRequest(
-                id: bookmark.id,
-                page: bookmark.page,
-                title: bookmark.title,
-                yPt: bookmark.yPt
-            )
         }
     }
 
@@ -7778,15 +9200,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
-    /// Builds write requests from the sidecar annotations.
+    /// Builds write requests from the cached annotations.
     ///
-    /// The quads are the same `TextPage.selectionRects` the canvas draws, scaled to the zoom the
-    /// reader is at now. They are **view-space** on purpose: the engine inverts that scale with
-    /// the page geometry, so the stored PDF coordinates do not depend on the zoom this happened
-    /// to be called at.
+    /// The quads are the same `TextPage.selectionRects` the canvas draws, in the 100% page-local
+    /// view space the annotation cache uses. The canvas multiplies them by its own zoom to draw;
+    /// that transform never crosses this boundary, so the engine applies the page geometry once
+    /// and the stored PDF coordinates do not depend on the zoom the save happened at.
     private func pendingAnnotationChanges() async throws -> PendingAnnotationChanges {
         guard let document else { return PendingAnnotationChanges() }
-        let zoom = zoomFactor
         let modified = Self.pdfDate(Date())
         var changes = PendingAnnotationChanges()
         func record(_ request: AnnotationWriteRequest, for annotation: Annotation) {
@@ -7808,17 +9229,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 )
             }
             if annotation.kind.isPlacedText {
-                record(try placedTextWriteRequest(annotation, zoom: zoom, modified: modified),
+                record(try placedTextWriteRequest(annotation, modified: modified),
                        for: annotation)
                 continue
             }
             if annotation.kind.isStampArtwork {
-                record(try stampWriteRequest(annotation, zoom: zoom, modified: modified),
+                record(try stampWriteRequest(annotation, modified: modified),
                        for: annotation)
                 continue
             }
             if annotation.kind.isGeometry {
-                record(try geometryWriteRequest(annotation, zoom: zoom, modified: modified),
+                record(try geometryWriteRequest(annotation, modified: modified),
                        for: annotation)
                 continue
             }
@@ -7827,9 +9248,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // the file's own boxes, because its characters are in somebody else's text layer.
             let quads: [CGRect]
             if let fixed = annotation.fileQuads, !fixed.isEmpty {
-                quads = fixed.map { box in
-                    CGRect(x: box.x * zoom, y: box.y * zoom,
-                           width: box.width * zoom, height: box.height * zoom)
+                quads = fixed.map {
+                    CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
                 }
             } else {
                 let text: TextPage
@@ -7860,22 +9280,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                             "Annotation \(annotation.id.uuidString) covers no visible text and cannot be written"]
                     )
                 }
-                quads = rects.map { rect in
-                    CGRect(
-                        x: rect.origin.x * zoom,
-                        y: rect.origin.y * zoom,
-                        width: rect.width * zoom,
-                        height: rect.height * zoom
-                    )
-                }
+                quads = rects
             }
             let union = quads.dropFirst().reduce(quads[0]) { $0.union($1) }
-            let writeKind: AnnotationWriteRequest.Kind = switch annotation.kind {
-            case .highlight: .highlight
-            case .underline: .underline
-            case .strikeout: .strikeout
-            default: .highlight
-            }
+            // The kind table is the one statement of which mark becomes which write kind.
+            let writeKind: AnnotationWriteKind = AnnotationRecordRules.writeKind(
+                for: annotation.kind) ?? .highlight
             record(AnnotationWriteRequest(
                 id: annotation.id.uuidString,
                 page: annotation.page,
@@ -7908,12 +9318,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// One placed-text annotation as a write request: a `/Text` sticky note for an icon, a
     /// `/FreeText` annotation for a box.
     ///
-    /// The sidecar's box is page space at 100%; the request wants view space at the current zoom,
-    /// exactly like the stroked kinds. A text box keeps its font size in page points (the zoom
-    /// is a display transform, not part of the stored text) and carries its alignment.
+    /// The cached annotation's box is page-local view space at 100%, which is exactly what the
+    /// write request takes. A text box keeps its font size in page points (the zoom is a display
+    /// transform, not part of the stored text) and carries its alignment.
     private func placedTextWriteRequest(
         _ annotation: Annotation,
-        zoom: CGFloat,
         modified: String
     ) throws -> AnnotationWriteRequest {
         guard annotation.hasValidGeometry, let box = annotation.shapeRect else {
@@ -7924,8 +9333,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     "Annotation \(annotation.id.uuidString) has no box and cannot be written"]
             )
         }
-        let rect = CGRect(x: box.minX * zoom, y: box.minY * zoom,
-                          width: box.width * zoom, height: box.height * zoom)
+        let rect = box
         guard rect.width > 0.5, rect.height > 0.5 else {
             throw NSError(
                 domain: "LyraReader",
@@ -7934,10 +9342,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     "Annotation \(annotation.id.uuidString) has a box too small to write"]
             )
         }
+        let writeKind = try writeRequestKind(for: annotation)
         return AnnotationWriteRequest(
             id: annotation.id.uuidString,
             page: annotation.page,
-            kind: annotation.kind == .stickyNote ? .note : .freeText,
+            kind: writeKind,
             rect: rect,
             quads: [],
             color: annotation.color,
@@ -7952,10 +9361,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// One stroked annotation as a write request.
     ///
-    /// The sidecar stores page-local view space at 100%; `AnnotationWriteRequest` wants the same
-    /// space scaled to the zoom the canvas is at. That multiplication and the engine's inverse
-    /// are the pair the zoom-independence check exercises: the PDF's coordinates come back
-    /// identical whichever zoom this ran at.
+    /// The annotation cache stores page-local view space at 100%, and `AnnotationWriteRequest`
+    /// takes exactly that: the engine applies the page geometry once. The canvas zoom is a
+    /// display transform and never scales the value that crosses this boundary, so the PDF's
+    /// coordinates do not depend on the zoom the save happened at.
     ///
     /// `/Rect` is the **outer** box of the stroke: a centred stroke extends half a width past
     /// the path, and an arrowhead extends past its endpoint. Writing the outer box is what makes
@@ -7963,7 +9372,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// border width again so the stroke is the same width in the PDF as on the page.
     private func geometryWriteRequest(
         _ annotation: Annotation,
-        zoom: CGFloat,
         modified: String
     ) throws -> AnnotationWriteRequest {
         guard annotation.hasValidGeometry, let bounds = annotation.geometryBounds else {
@@ -7997,23 +9405,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     "Annotation \(annotation.id.uuidString) has a box too small to write"]
             )
         }
-        func scaled(_ rect: CGRect) -> CGRect {
-            CGRect(x: rect.minX * zoom, y: rect.minY * zoom,
-                   width: rect.width * zoom, height: rect.height * zoom)
-        }
-        func scaled(_ point: CGPoint) -> CGPoint {
-            CGPoint(x: point.x * zoom, y: point.y * zoom)
-        }
-        let kind: AnnotationWriteRequest.Kind
-        switch annotation.kind {
-        case .ink: kind = .ink
-        case .square: kind = .square
-        case .circle: kind = .circle
-        case .line, .arrow: kind = .line
-        case .highlight: kind = .highlight
-        case .underline: kind = .underline
-        case .strikeout: kind = .strikeout
-        case .stickyNote, .textBox, .stamp, .signature:
+        guard annotation.kind.isGeometry,
+              let kind = AnnotationRecordRules.writeKind(for: annotation.kind) else {
             throw NSError(
                 domain: "LyraReader",
                 code: 3,
@@ -8024,11 +9417,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             id: annotation.id.uuidString,
             page: annotation.page,
             kind: kind,
-            rect: scaled(outer),
+            rect: outer,
             quads: [],
-            inkPaths: annotation.inkPaths.map { $0.map(scaled) },
-            lineStart: annotation.lineStart.map(scaled),
-            lineEnd: annotation.lineEnd.map(scaled),
+            inkPaths: annotation.inkPaths,
+            lineStart: annotation.lineStart,
+            lineEnd: annotation.lineEnd,
             lineArrow: annotation.kind == .arrow,
             borderWidthPt: width,
             color: annotation.color,
@@ -8039,20 +9432,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         )
     }
 
-    /// Removes exactly `ids` from the sidecar, keeping every other entry, foreign entry, bookmark
-    /// and their order. Returns false when the sidecar could not be written; the in-memory model
+    /// Removes exactly `ids` from the annotation cache, keeping every other entry, foreign entry, bookmark
+    /// and their order. Returns false when the annotation cache could not be written; the in-memory model
     /// is still trimmed so the canvas cannot show a duplicate until the next open reconciles it.
     @discardableResult
     private func forgetAnnotationsSavedToPDF(ids: Set<UUID>) -> Bool {
         guard !ids.isEmpty else { return true }
         let remaining = annotations.filter { !ids.contains($0.id) }
-        let slots = annotationSidecarSlots.filter { slot in
+        let slots = annotationRecordSlots.filter { slot in
             if case .annotation(let id) = slot { return !ids.contains(id) }
             return true
         }
         undoStack.removeAll()
         redoStack.removeAll()
-        if writeSidecar(
+        if writeAnnotationRecords(
             annotations: remaining,
             bookmarks: bookmarks,
             slots: slots,
@@ -8061,29 +9454,29 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return true
         }
         annotations = remaining
-        annotationSidecarSlots = slots
+        annotationRecordSlots = slots
         FileHandle.standardError.write(Data(
-            "lyra-reader-annotate: the PDF was saved but the sidecar could not be updated; the saved entries are hidden in memory and will be reconciled on the next open\n".utf8
+            "lyra-reader-annotate: the PDF was saved but the annotation cache could not be updated; the saved entries are hidden in memory and will be reconciled on the next open\n".utf8
         ))
         return false
     }
 
     /// Removes exactly the bookmark entries a replacement wrote into the outline.
     ///
-    /// Mirrors [`forgetAnnotationsSavedToPDF`]: the PDF now owns them, so the sidecar must not
-    /// keep a second copy. Returns `false` when the sidecar write failed; the in-memory list is
+    /// Mirrors [`forgetAnnotationsSavedToPDF`]: the PDF now owns them, so the annotation cache must not
+    /// keep a second copy. Returns `false` when the cache write failed; the in-memory list is
     /// still trimmed, and the next open adopts the file's copy instead of showing both.
     @discardableResult
     private func forgetBookmarksSavedToPDF(ids: Set<UUID>) -> Bool {
         guard !ids.isEmpty else { return true }
         let remaining = bookmarks.filter { !ids.contains($0.id) }
-        let slots = annotationSidecarSlots.filter { slot in
+        let slots = annotationRecordSlots.filter { slot in
             if case .bookmark(let id) = slot { return !ids.contains(id) }
             return true
         }
         undoStack.removeAll()
         redoStack.removeAll()
-        if writeSidecar(
+        if writeAnnotationRecords(
             annotations: annotations,
             bookmarks: remaining,
             slots: slots,
@@ -8092,9 +9485,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return true
         }
         bookmarks = remaining
-        annotationSidecarSlots = slots
+        annotationRecordSlots = slots
         FileHandle.standardError.write(Data(
-            ("lyra-reader-annotate: the PDF carries the bookmarks but the sidecar could not be "
+            ("lyra-reader-annotate: the PDF carries the bookmarks but the annotation cache could not be "
                 + "updated; the saved entries are hidden in memory and the outline supplies them "
                 + "on the next open\n").utf8
         ))
@@ -8103,10 +9496,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// The open-time half of duplicate avoidance for bookmarks.
     ///
-    /// A saved file carries its bookmarks in the outline, with the sidecar's UUID in a private
+    /// A saved file carries its bookmarks in the outline, with the cached annotation's UUID in a private
     /// key. Adopting them gives the sidebar back the reader's own list — identities, titles and
-    /// page positions — without a sidecar and without showing a second copy. This runs once per
-    /// open, after [`loadOutline`]; it never writes a sidecar on its own.
+    /// page positions — without writing the cache and without showing a second copy. This runs
+    /// once per open, after [`loadOutline`]; it never writes the cache on its own.
     private func adoptEmbeddedBookmarks(from entries: [OutlineEntry]) {
         guard let document else { return }
         var known = Set(bookmarks.map(\.id))
@@ -8130,17 +9523,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         guard !adopted.isEmpty else { return }
         bookmarks.append(contentsOf: adopted)
+        if !annotationCacheIsDirty { annotationCleanSnapshot = currentAnnotationSnapshot }
         let line = "lyra-reader-annotate: adopted \(adopted.count) bookmark(s) from the document outline\n"
         FileHandle.standardError.write(Data(line.utf8))
     }
 
     /// The open-time half of duplicate avoidance.
     ///
-    /// A write-back can succeed and then fail to update the sidecar (or somebody can restore an
-    /// old sidecar). The PDF's `/NM` is the sidecar's UUID string, so an entry whose identity is
-    /// already in the file is stale by definition: show the PDF's copy and drop the sidecar's,
+    /// A write-back can succeed and then fail to update the annotation cache (or somebody can restore an
+    /// old annotation cache). The PDF's `/NM` is the cached annotation's UUID string, so an entry whose identity is
+    /// already in the file is stale by definition: show the PDF's copy and drop the cached copy,
     /// never both. The stale entries are removed from the slot list, so the next ordinary
-    /// sidecar write also drops them from the file.
+    /// cache write also drops them from the file.
     private func reconcileAnnotationsAlreadySaved(_ found: [DocumentAnnotation]) {
         guard !annotations.isEmpty else { return }
         let identities = Set(found.map(\.id))
@@ -8148,7 +9542,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard !saved.isEmpty else { return }
         let savedIDs = Set(saved.map(\.id))
         annotations.removeAll { savedIDs.contains($0.id) }
-        annotationSidecarSlots.removeAll { slot in
+        annotationRecordSlots.removeAll { slot in
             if case .annotation(let id) = slot { return savedIDs.contains(id) }
             return true
         }
@@ -8157,7 +9551,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         statusMessage =
             "\(savedIDs.count) annotation(s) in this PDF were already saved; they now come from the file"
         FileHandle.standardError.write(Data(
-            "lyra-reader-annotate: reconciled \(savedIDs.count) sidecar entr(ies) already present in the PDF\n".utf8
+            "lyra-reader-annotate: reconciled \(savedIDs.count) cached entr(ies) already present in the PDF\n".utf8
         ))
     }
 
@@ -8197,34 +9591,60 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return firstPath == secondPath
     }
 
-    /// `document.pdf` → `document.pdf.lyra-reader-annotations.json`.
-    private static func sidecarURL(for document: URL) -> URL {
-        ReaderDataCompatibility.annotationSidecarURL(for: document)
+    /// After a command rewrote the PDF in place, carry the reader state to the new content
+    /// identity before anything reads or writes the cache again.
+    ///
+    /// The document id includes the bytes, so a save changes the directory key. The annotation
+    /// cache, summaries, translations, knowledge and region conversations are reader state and
+    /// must survive exactly as they did before the id existed; a transient page-edit session is
+    /// retired by the save and is not carried.
+    private func carryDocumentCacheAfterReplacement(at url: URL, from oldDirectory: URL? = nil) {
+        guard let source = oldDirectory ?? annotationsURL?.deletingLastPathComponent() else {
+            return
+        }
+        let newDirectory = DocumentEditCache.directory(for: url)
+        DocumentEditCache.carryDocumentState(from: source, to: newDirectory)
+    }
+
+    /// The cached annotation records file for `document`.
+    private static func annotationRecordsURL(for document: URL) -> URL {
+        DocumentEditCache.annotationsURL(for: document)
     }
 
     private func loadAnnotations(for url: URL) {
-        let sidecarURL = Self.sidecarURL(for: url)
-        annotationsURL = sidecarURL
+        let wasChanging = isChangingDocumentState
+        isChangingDocumentState = true
+        defer { isChangingDocumentState = wasChanging }
+        annotationCacheIsDirty = false
+        annotationCleanSnapshot = nil
+        let recordsURL = Self.annotationRecordsURL(for: url)
+        annotationsURL = recordsURL
         annotationWritesBlockedReason = nil
+        annotationSourceChangedReason = nil
         preservedAnnotationEntryCount = 0
-        annotationSidecarSlots = []
+        annotationRecordSlots = []
         annotationWriteCount = 0
         hasPendingAnnotationWrite = false
         erasedInkStrokeIDs = []
         pendingFileDeletions = []
         eraserHoverMarkID = nil
 
+        // Reading the annotation records comes first. A readable cache is a successful load
+        // even when the PDF's identity moved; only a real decode failure below blocks writes.
         do {
-            _ = try FileManager.default.attributesOfItem(atPath: sidecarURL.path)
-            let data = try Data(contentsOf: sidecarURL)
-            let contents = try AnnotationSidecar.decode(
+            let prepared = try DocumentEditCache.prepareAnnotations(for: url)
+            annotationsURL = prepared
+            _ = try FileManager.default.attributesOfItem(atPath: recordsURL.path)
+            let data = try Data(contentsOf: recordsURL)
+            let contents = try AnnotationRecords.decode(
                 data,
                 pageCount: document?.pageCount ?? 0,
                 paletteCount: Self.highlightPalette.count
             )
             annotations = contents.annotations
             bookmarks = contents.bookmarks
-            annotationSidecarSlots = contents.slots
+            annotationCacheIsDirty = !annotations.isEmpty || !bookmarks.isEmpty
+            annotationRecordSlots = contents.slots
             preservedAnnotationEntryCount = contents.preservedCount
             undoStack.removeAll()
             redoStack.removeAll()
@@ -8243,49 +9663,164 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             undoStack.removeAll()
             redoStack.removeAll()
             annotationWritesBlockedReason = error.localizedDescription
-            statusMessage = "Could not read annotations; the sidecar is protected from overwrite"
-            lastError = statusMessage
+            statusMessage = "Could not restore annotations; recovery data was kept"
+            lastError = "Could not restore annotations; recovery data was kept. \(error.localizedDescription)"
             FileHandle.standardError.write(
                 Data("lyra-reader-annotate: read failed; writes blocked: \(error)\n".utf8)
             )
         }
+        if annotationWritesBlockedReason == nil,
+           FileManager.default.fileExists(atPath: DocumentEditCache.pendingStateURL(for: url).path) {
+            do {
+                let data = try Data(contentsOf: DocumentEditCache.pendingStateURL(for: url))
+                let saved = try JSONDecoder().decode(PendingAnnotationState.self, from: data)
+                pendingFileDeletions = saved.deletions
+                erasedInkStrokeIDs = saved.erasedInk
+                annotationCacheIsDirty = saved.dirty
+                annotationCleanSnapshot = saved.cleanSnapshot
+            } catch let error as DecodingError {
+                annotationWritesBlockedReason = AnnotationRecords.describe(error)
+                lastError = "Pending PDF changes could not be restored; the cache was kept. \(annotationWritesBlockedReason ?? "")"
+            } catch {
+                annotationWritesBlockedReason = error.localizedDescription
+                lastError = "Pending PDF changes could not be restored; the cache was kept. \(error.localizedDescription)"
+            }
+        }
+        // A readable cache whose PDF identity moved is not a corrupt cache. If there is nothing
+        // to lose, adopt the current bytes as the new identity and carry on silently. Otherwise
+        // keep every record, allow annotation editing, and let the explicit recovery action
+        // reset the identity: replacing the original PDF stays blocked by `validateSource`.
+        if annotationWritesBlockedReason == nil,
+           let source = document?.url {
+            let status = DocumentEditCache.sourceStatus(for: source)
+            let hasCachedWork = !annotations.isEmpty || !bookmarks.isEmpty
+                || preservedAnnotationEntryCount > 0
+                || !pendingFileDeletions.isEmpty || !erasedInkStrokeIDs.isEmpty
+                || annotationCacheIsDirty || annotationCleanSnapshot != nil
+                || FileManager.default.fileExists(atPath: DocumentEditCache.recoveryURL(for: source).path)
+            switch status {
+            case .missing, .matches:
+                break
+            case .changed(let saved, let current):
+                if hasCachedWork {
+                    let detail = DocumentEditCache.sourceChangeMessage(saved: saved, current: current)
+                    annotationSourceChangedReason = detail
+                    statusMessage = "The PDF changed outside LyraReader; its saved annotations were kept"
+                    lastError = "The PDF changed outside LyraReader. Its saved annotations were kept and loaded,"
+                        + " but saving into this PDF is blocked. Restore the recorded file, or back up the"
+                        + " recovery data and start fresh.\n\n\(detail)"
+                    FileHandle.standardError.write(
+                        Data("lyra-reader-annotate: source changed; records loaded, PDF replacement blocked: \(detail)\n".utf8)
+                    )
+                } else {
+                    do {
+                        try DocumentEditCache.recordSource(for: source)
+                        FileHandle.standardError.write(Data(
+                            "lyra-reader-annotate: adopted the current PDF identity for an empty annotation cache\n".utf8))
+                    } catch {
+                        annotationSourceChangedReason = error.localizedDescription
+                        lastError = "The PDF changed outside LyraReader and its new identity could not be recorded:"
+                            + " \(error.localizedDescription)"
+                    }
+                }
+            case .unreadable(let detail):
+                if hasCachedWork {
+                    annotationSourceChangedReason = detail
+                    lastError = "The PDF's saved source stamp could not be read (\(detail))."
+                        + " Its annotations were kept and loaded, but saving into this PDF is blocked."
+                        + " Back up the recovery data and start fresh if the file is the one you expect."
+                } else {
+                    try? DocumentEditCache.recordSource(for: source)
+                }
+            }
+        }
+        if !annotationCacheIsDirty { annotationCleanSnapshot = currentAnnotationSnapshot }
+    }
+
+    private struct PendingAnnotationState: Codable {
+        let dirty: Bool
+        let deletions: [FileAnnotationDeletion]
+        let erasedInk: Set<UUID>
+        let cleanSnapshot: AnnotationCleanSnapshot?
+    }
+
+    private func persistPendingAnnotationState() {
+        guard !isChangingDocumentState, annotationWritesBlockedReason == nil,
+              document != nil, let records = annotationsURL else { return }
+        do {
+            let saved = PendingAnnotationState(dirty: annotationCacheIsDirty,
+                deletions: pendingFileDeletions, erasedInk: erasedInkStrokeIDs,
+                cleanSnapshot: annotationCleanSnapshot)
+            try JSONEncoder().encode(saved).write(to:
+                records.deletingLastPathComponent().appendingPathComponent("changes.json"), options: .atomic)
+        } catch { lastError = "Could not cache pending PDF changes: \(error.localizedDescription)" }
     }
 
     /// Writes a candidate first and publishes it only after the atomic write succeeds.
-    /// Any unreadable/corrupt existing sidecar is protected from accidental replacement.
+    /// Any unreadable/corrupt existing annotation cache is protected from accidental replacement.
     ///
     /// `trigger` only labels the stderr instrumentation line, so a run can show *why* a write
     /// happened (a keystroke, a coalesced flush, a tab switch, …).
+    /// Refuses a creation the PDF writer would later refuse, with the writer's own sentence.
+    ///
+    /// The limits used to be discovered at save time (or after the entry was already on disk);
+    /// asking the Rust rule set here means the reader is told at creation. A message is also
+    /// published so the status line and the alert say the same thing as an engine refusal.
+    private func validateNewAnnotation(_ annotation: Annotation) -> Bool {
+        guard let document else { return false }
+        guard let message = AnnotationRecords.validationMessage(
+            for: annotation,
+            pageCount: document.pageCount,
+            existingIDs: annotations.map(\.id)
+        ) else { return true }
+        statusMessage = message
+        lastError = message
+        return false
+    }
+
+    private func validateNewBookmark(_ bookmark: Bookmark) -> Bool {
+        guard let document else { return false }
+        guard let message = AnnotationRecords.validationMessage(
+            for: bookmark,
+            pageCount: document.pageCount,
+            existingIDs: bookmarks.compactMap { $0.id == bookmark.id ? nil : $0.id }
+        ) else { return true }
+        statusMessage = message
+        lastError = message
+        return false
+    }
+
     @discardableResult
     private func saveAnnotations(_ candidate: [Annotation], trigger: String) -> Bool {
-        writeSidecar(
+        writeAnnotationRecords(
             annotations: candidate,
             bookmarks: bookmarks,
-            slots: annotationSidecarSlots,
+            slots: annotationRecordSlots,
             trigger: trigger
         )
     }
 
-    /// Writes both kinds of entry to the one sidecar and publishes the new arrays only after
-    /// the atomic write succeeds. Any unreadable/corrupt existing sidecar is protected from
+    /// Writes both kinds of entry to the one annotation cache and publishes the new arrays only after
+    /// the atomic write succeeds. Any unreadable/corrupt existing annotation cache is protected from
     /// accidental replacement.
     ///
     /// `trigger` only labels the stderr instrumentation line, so a run can show *why* a write
     /// happened (a keystroke, a coalesced flush, a bookmark move, …).
     @discardableResult
-    private func writeSidecar(
+    private func writeAnnotationRecords(
         annotations candidateAnnotations: [Annotation],
         bookmarks candidateBookmarks: [Bookmark],
-        slots: [AnnotationSidecar.Slot],
+        slots: [AnnotationRecords.Slot],
         trigger: String
     ) -> Bool {
         guard let annotationsURL else {
-            statusMessage = "Could not save annotations: no document sidecar is selected"
+            statusMessage = "Could not save annotations: no document is open"
             lastError = statusMessage
             return false
         }
         if let reason = annotationWritesBlockedReason {
-            statusMessage = "Could not save annotations because the sidecar could not be loaded; it was left untouched"
+            statusMessage = "Could not save annotations because annotation writes are blocked"
+                + " (\(reason)); it was left untouched"
             lastError = statusMessage
             FileHandle.standardError.write(
                 Data("lyra-reader-annotate: write blocked [\(trigger)]: \(reason)\n".utf8)
@@ -8294,7 +9829,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
 
         do {
-            let data = try AnnotationSidecar.encode(
+            let clean = annotationCacheIsDirty ? annotationCleanSnapshot : currentAnnotationSnapshot
+            let data = try AnnotationRecords.encode(
                 annotations: candidateAnnotations,
                 bookmarks: candidateBookmarks,
                 slots: slots
@@ -8302,7 +9838,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             try data.write(to: annotationsURL, options: .atomic)
             annotations = candidateAnnotations
             bookmarks = candidateBookmarks
-            annotationSidecarSlots = slots
+            annotationRecordSlots = slots
+            if !["page-edit-session", "page-edit-revision", "saved-to-pdf", "bookmarks-saved-to-pdf", "recovery"].contains(trigger) {
+                annotationCleanSnapshot = clean
+                annotationCacheIsDirty = clean.map { $0 != currentAnnotationSnapshot } ?? true
+            } else if !annotationCacheIsDirty {
+                annotationCleanSnapshot = currentAnnotationSnapshot
+            }
+            persistPendingAnnotationState()
+            persistPageEditRecovery()
             hasPendingAnnotationWrite = false
             annotationWriteCount += 1
             let line = "lyra-reader-annotate: saved \(candidateAnnotations.count) annotation(s),"
@@ -8334,7 +9878,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// Every annotation the file carries is included, including ones whose `/F` hides them from
     /// the page: the flag says what to paint, not what the review thread contains. The reader's
-    /// own sidecar entries are included of course. Bookmarks are not annotations and are not part
+    /// own cached entries are included of course. Bookmarks are not annotations and are not part
     /// of this export.
     public var hasAnnotationsToExport: Bool {
         !annotations.isEmpty || !documentAnnotations.isEmpty
@@ -8343,7 +9887,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Why an export found nothing, without pretending a failed read was an empty file.
     private var noAnnotationsToExportDetail: String {
         if let error = documentAnnotationsError {
-            return "The PDF's annotations could not be read (\(error)), and LyraReader's sidecar has "
+            return "The PDF's annotations could not be read (\(error)), and LyraReader has cached "
                 + "none, so no file was written."
         }
         return "This document has no annotations from LyraReader and none in the PDF, so no file was written."
@@ -8411,7 +9955,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The ordered, source-labelled export of the current document, or `nil` when it has no
     /// annotations.
     ///
-    /// Text layers are fetched only for pages the export needs: a sidecar highlight's character
+    /// Text layers are fetched only for pages the export needs: a cached highlight's character
     /// range gives both its quote and its vertical position, and a file markup annotation's
     /// quads give its quote the same way. A page whose text layer cannot be read still exports
     /// its annotations — the quote and the vertical position are simply absent, rather than the
@@ -8502,7 +10046,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Writes the export at `destination` and returns whether a file was written.
     ///
-    /// This is a local file write with the same atomic discipline as the sidecar: the complete
+    /// This is a local file write with the same atomic discipline as the annotation cache: the complete
     /// document is written to a sibling temporary file and renamed into place, so an interrupted
     /// or failed export cannot leave a truncated file where the reader expects a complete one.
     /// With no annotations the method writes nothing, reports why, and returns `false`.
@@ -8524,7 +10068,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return false
         }
         // A note that is still inside the typing debounce is already in `annotations`; flushing
-        // it first keeps the sidecar consistent with what this export says.
+        // it first keeps the annotation cache consistent with what this export says.
         flushPendingWrites()
 
         guard let export = await annotationExportDocument(exportedAt: exportedAt, timeZone: timeZone) else {
@@ -8548,14 +10092,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return false
         }
 
-        let sidecarCount = export.rows.filter { $0.entry.source == .sidecar }.count
-        let pdfCount = export.rows.count - sidecarCount
+        let cachedCount = export.rows.filter { $0.entry.source == .sidecar }.count
+        let pdfCount = export.rows.count - cachedCount
         statusMessage =
             "Exported \(export.rows.count) annotation(s) to \(destination.lastPathComponent)"
-            + " · \(format.displayName) · \(sidecarCount) from the sidecar, \(pdfCount) from the PDF"
+            + " · \(format.displayName) · \(cachedCount) from LyraReader, \(pdfCount) from the PDF"
         FileHandle.standardError.write(Data((
             "lyra-reader-annotate-export: wrote \(export.rows.count) annotation(s) to \(destination.path)"
-            + " (\(format.rawValue), \(sidecarCount) sidecar, \(pdfCount) pdf)\n"
+            + " (\(format.rawValue), \(cachedCount) cached, \(pdfCount) pdf)\n"
         ).utf8))
         return true
     }
@@ -8576,296 +10120,46 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     // MARK: - Redaction (T3.12)
 
-    /// The pending marks as canvas rectangles, for the warning overlay.
-    public var pendingRedactionMarks: [CanvasRedactionMark] {
-        pendingRedactions.map {
-            CanvasRedactionMark(id: $0.id.uuidString, page: $0.page, rect: $0.rect)
-        }
+    /// Whether the menu can offer the Edit workspace's redaction tool.
+    ///
+    /// Redaction is a content edit: it stages blackout/erase commands in the page-edit working
+    /// copy and is published by that workspace's Save Copy / Replace Original transactions. An
+    /// XFA form has no editable page content, so it stays the one refusal the Edit workspace
+    /// itself makes.
+    public var canOpenRedactionWorkspace: Bool {
+        document != nil && !isXfaDocument
     }
 
-    /// The pending marks as engine requests, in page-local view space at 100%.
-    public var pendingRedactionAreas: [RedactionArea] {
-        pendingRedactions.map { RedactionArea(page: $0.page, rect: $0.rect) }
-    }
-
-    public var pendingRedactionPageCount: Int {
-        Set(pendingRedactions.map(\.page)).count
-    }
-
-    public var canMarkRedactions: Bool {
-        document != nil && !redactionBusy && pageEditSession == nil
-    }
-
-    public var canApplyRedactions: Bool {
-        canMarkRedactions && !pendingRedactions.isEmpty && !annotationSaveInProgress
-    }
-
-    /// Replacing the signed file with the redacted version. "Apply to Copy" stays available.
-    public var canReplaceOriginalWithRedactions: Bool {
-        canApplyRedactions && !isReadOnlyDocument
-    }
-
-    /// Arms the redaction tool, or leaves it when it is already armed.
-    public func toggleRedactionTool() {
-        guard canMarkRedactions else {
-            lastError = pageEditSession != nil
-                ? "Finish or discard the pending page changes before redacting."
-                : "Open a document before marking redactions."
+    /// The menu's entry point into redaction: open Edit with the Blackout tool armed.
+    ///
+    /// There is deliberately no reading-view redaction mode. A reader who wants to remove
+    /// content goes to the same workspace as every other page edit, where the change is staged
+    /// in a working copy and nothing touches the file until Save Copy or Replace Original.
+    public func openRedactionWorkspace() {
+        guard document != nil else {
+            lastError = "Open a document before redacting."
             return
         }
-        if annotationTool == .redact {
-            annotationTool = .select
-            statusMessage = "Redaction tool off · pending marks were kept"
-        } else {
-            annotationTool = .redact
-            statusMessage =
-                "Redaction tool · drag over content to mark it; nothing is removed until you apply"
-        }
-    }
-
-    /// Adds every line rectangle of the current text selection as a pending redaction.
-    @discardableResult
-    public func markSelectionForRedaction() -> Bool {
-        guard let selection, let document else {
-            lastError = "Select text before marking it for redaction."
-            return false
-        }
-        guard selection.page >= 0, selection.page < document.pageCount else {
-            lastError = "The selection is outside the document."
-            return false
-        }
-        guard let text = textPages[selection.page] else {
-            lastError = "The selected page's text is still loading; try again in a moment."
-            return false
-        }
-        let rects = text.selectionRects(in: selection.range)
-        guard !rects.isEmpty else {
-            lastError = "The selection has no drawable rectangles."
-            return false
-        }
-        for rect in rects {
-            addPendingRedaction(page: selection.page, rect: rect)
-        }
-        statusMessage =
-            "Marked \(rects.count) text line(s) for redaction · still pending, the file is unchanged"
-        return true
-    }
-
-    /// Adds one pending rectangle, clipped to the page's visible box.
-    public func addPendingRedaction(page: Int, rect: CGRect) {
-        guard let document, page >= 0, page < document.pageCount else { return }
-        var clipped = rect
-        if let frame = visiblePagePlacements.first(where: { $0.index == page }) {
-            let pageBox = CGRect(x: 0, y: 0, width: frame.widthPt, height: frame.heightPt)
-            clipped = rect.intersection(pageBox)
-        }
-        guard clipped.width >= 1, clipped.height >= 1,
-              clipped.minX.isFinite, clipped.minY.isFinite else { return }
-        let normalized = CGRect(
-            x: clipped.minX,
-            y: clipped.minY,
-            width: clipped.width,
-            height: clipped.height
-        )
-        guard !pendingRedactions.contains(where: {
-            $0.page == page && $0.rect.equalTo(normalized)
-        }) else { return }
-        pendingRedactions.append(PendingRedaction(page: page, rect: normalized))
-        statusMessage = pendingRedactions.count == 1
-            ? "Marked 1 area for redaction · pending, the file is unchanged"
-            : "Marked \(pendingRedactions.count) areas for redaction · pending, the file is unchanged"
-    }
-
-    public func removeLastPendingRedaction() {
-        guard !pendingRedactions.isEmpty else { return }
-        pendingRedactions.removeLast()
-        statusMessage = pendingRedactions.isEmpty
-            ? "No pending redactions"
-            : "Removed the last redaction mark · \(pendingRedactions.count) pending"
-    }
-
-    public func clearPendingRedactions() {
-        guard !pendingRedactions.isEmpty else { return }
-        pendingRedactions = []
-        statusMessage = "Cleared the pending redaction marks · the file is unchanged"
-    }
-
-    /// The confirmation wording. It states what the file loses, not just that something happens.
-    private func redactionConfirmation(replacing: Bool) -> (title: String, message: String) {
-        let areas = pendingRedactions.count
-        let pages = pendingRedactionPageCount
-        let name = document?.title ?? "the document"
-        let title = replacing
-            ? "Replace “\(name)” with the redacted version?"
-            : "Apply \(areas) redaction\(areas == 1 ? "" : "s") to a copy of “\(name)”?"
-        var message =
-            "\(areas) marked area\(areas == 1 ? "" : "s") on \(pages) page\(pages == 1 ? "" : "s"). "
-            + "The covered text is deleted from the page content, not merely covered: it cannot be "
-            + "extracted or copied from the saved file. Vector graphics and images that intersect a "
-            + "mark are removed whole; a page whose content cannot be attributed is rasterised and "
-            + "loses its whole text layer. Every mark is painted black."
-        if replacing {
-            message +=
-                "\n\nThis is irreversible and changes the file on disk. A byte-identical backup is "
-                + "written and verified first; if it cannot be written, nothing is replaced. The "
-                + "replacement is an atomic rename of a verified temporary file."
-        } else {
-            message +=
-                "\n\nThe original file is not touched; you will choose where to save the copy. The "
-                + "copy is written atomically: a temporary file, reopened and verified, then renamed."
-        }
-        return (title, message)
-    }
-
-    private func redactionPreviewSummary(_ preview: RedactionPreview?) -> String {
-        guard let preview else { return "" }
-        var lines: [String] = []
-        for page in preview.pages.prefix(8) {
-            var line = "Page \(page.page + 1): \(page.characters) character\(page.characters == 1 ? "" : "s")"
-            if page.graphics > 0 {
-                line += " + \(page.graphics) graphic object\(page.graphics == 1 ? "" : "s")"
-            }
-            if !page.textPreview.isEmpty {
-                line += " — “\(page.textPreview.prefix(120))”"
-            }
-            lines.append(line)
-        }
-        if preview.pages.count > 8 {
-            lines.append("…and \(preview.pages.count - 8) more page(s)")
-        }
-        guard !lines.isEmpty else { return "" }
-        return "\n\nWhat is under the marks:\n" + lines.joined(separator: "\n")
-    }
-
-    /// Presents the "apply to a copy" confirmation and, on approval, a save panel.
-    public func presentApplyRedactionsPanel() {
-        guard canApplyRedactions else {
-            lastError = pendingRedactions.isEmpty
-                ? "Mark at least one area before applying redactions."
-                : "Redactions cannot be applied while another write is in progress."
+        guard !isXfaDocument else {
+            lastError = readOnlyReason
+            statusMessage = "XFA form · read-only"
             return
         }
-        let areas = pendingRedactionAreas
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            let preview = try? await self.engine.previewRedactions(areas)
-            if preview == nil {
-                self.lastError = "Could not read the text under the marks; nothing was changed."
-                return
-            }
-            let confirmation = self.redactionConfirmation(replacing: false)
-            let alert = NSAlert()
-            alert.alertStyle = .critical
-            alert.messageText = confirmation.title
-            alert.informativeText = confirmation.message
-                + self.redactionPreviewSummary(preview)
-            alert.addButton(withTitle: "Choose Copy Destination…")
-            alert.addButton(withTitle: "Cancel")
-            guard alert.runModal() == .alertFirstButtonReturn else { return }
-            guard let source = self.document?.url else { return }
-            let panel = NSSavePanel()
-            panel.title = "Save Redacted Copy"
-            panel.message =
-                "Writes the redacted document to a new PDF and leaves the original untouched."
-            panel.nameFieldStringValue =
-                self.engine.suggestedRedactionCopyURL(for: source).lastPathComponent
-            panel.directoryURL = source.deletingLastPathComponent()
-            panel.allowedContentTypes = [.pdf]
-            panel.canCreateDirectories = true
-            guard panel.runModal() == .OK, let destination = panel.url else { return }
-            await self.redactCopy(to: destination, areas: areas)
+        if !contentEditEnabled {
+            if deferContentTransition({ [weak self] in self?.openRedactionWorkspace() }) { return }
+            contentEditEnabled = true
+            pageOverviewVisible = false
+            rightPanelVisible = false
+            performancePanelVisible = false
         }
-    }
-
-    /// Presents the destructive confirmation for replacing the file on disk.
-    public func presentReplaceRedactionsConfirmation() {
-        guard guardWritable() else { return }
-        guard canReplaceOriginalWithRedactions else {
-            lastError = pendingRedactions.isEmpty
-                ? "Mark at least one area before replacing the document."
-                : "Redactions cannot be applied while another write is in progress."
-            return
-        }
-        let areas = pendingRedactionAreas
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            let preview = try? await self.engine.previewRedactions(areas)
-            if preview == nil {
-                self.lastError = "Could not read the text under the marks; nothing was changed."
-                return
-            }
-            let confirmation = self.redactionConfirmation(replacing: true)
-            let alert = NSAlert()
-            alert.alertStyle = .critical
-            alert.messageText = confirmation.title
-            alert.informativeText = confirmation.message
-                + self.redactionPreviewSummary(preview)
-            alert.addButton(withTitle: "Replace Original")
-            alert.addButton(withTitle: "Cancel")
-            guard alert.runModal() == .alertFirstButtonReturn else { return }
-            await self.redactReplacingOriginal(areas: areas)
-        }
-    }
-
-    @discardableResult
-    private func redactCopy(to destination: URL, areas: [RedactionArea]) async -> Bool {
-        guard let source = document?.url else { return false }
-        guard !Self.resolvesToSameFile(destination, source) else {
-            lastError = "The redacted copy cannot overwrite the document it came from."
-            return false
-        }
-        redactionBusy = true
-        defer { redactionBusy = false }
-        do {
-            let report = try await engine.redactToCopy(to: destination, areas: areas)
-            lastRedactionReport = report
-            pendingRedactions = []
-            annotationTool = .select
-            let pages = report.pages.count
+        annotationTool = .select
+        annotationToolsVisible = false
+        contentEditSelection = nil
+        contentLinkDraft = nil
+        selectContentTool("blackout")
+        if contentEditTool == "blackout" {
             statusMessage =
-                "Saved redacted copy \(destination.lastPathComponent) · \(report.removedCharacters) "
-                + "character(s) removed on \(pages) page(s) · verified · the original is unchanged"
-            FileHandle.standardError.write(Data((
-                "lyra-reader-redact: copy \(destination.path) · \(report.removedCharacters) character(s) "
-                + "on \(pages) page(s) · \(report.outputBytes) bytes · verified\n"
-            ).utf8))
-            return true
-        } catch {
-            lastError = "Could not write the redacted copy: \(error.localizedDescription)"
-            statusMessage = "Could not write the redacted copy"
-            FileHandle.standardError.write(Data("lyra-reader-redact: copy failed: \(error)\n".utf8))
-            return false
-        }
-    }
-
-    @discardableResult
-    private func redactReplacingOriginal(areas: [RedactionArea]) async -> Bool {
-        guard guardWritable() else { return false }
-        guard let url = document?.url else { return false }
-        redactionBusy = true
-        defer { redactionBusy = false }
-        do {
-            let report = try await engine.replaceWithRedactions(areas)
-            lastRedactionReport = report
-            let backup = report.backupPath.map { URL(fileURLWithPath: $0).lastPathComponent }
-                ?? "none"
-            pendingRedactions = []
-            annotationTool = .select
-            _ = open(url: url)
-            statusMessage =
-                "Replaced \(url.lastPathComponent) with redacted content · "
-                + "\(report.removedCharacters) character(s) removed on \(report.pages.count) page(s) "
-                + "· backup: \(backup)"
-            FileHandle.standardError.write(Data((
-                "lyra-reader-redact: replaced \(url.path) · \(report.removedCharacters) character(s) "
-                + "on \(report.pages.count) page(s) · backup \(backup)\n"
-            ).utf8))
-            return true
-        } catch {
-            lastError = "Could not replace the document; it was left untouched: \(error.localizedDescription)"
-            statusMessage = "Could not replace the document"
-            FileHandle.standardError.write(Data("lyra-reader-redact: replace failed: \(error)\n".utf8))
-            return false
+                "Edit · Blackout armed · drag over content; nothing is removed until you save"
         }
     }
 
@@ -8874,18 +10168,77 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// File > Print: a print operation over a view that renders one page at print resolution
     /// when the print system asks for it.
     ///
-    /// The page range and the copy count are the print panel's own, because the panel is the
-    /// system's; the view supplies the page count through `knowsPageRange`. Only the pages the
-    /// panel selected are rendered, one at a time, by [`ReaderPrintView`].
+    /// The view the print operation paginates, built from the document's own pages. Every page
+    /// carries its own paper (`PrintPageSpec.plan`); this full view is what the checks render and
+    /// what a uniform document prints.
+    ///
+    /// Printing is independent of the display layout on purpose: a torn page's gap, its two
+    /// segments and its card are display-only, so the printer is handed one page per document
+    /// page at the page's paper size. This accessor exists so the checks can render the exact
+    /// view `Print` would and compare it with a torn state's output.
+    package func makePrintView(texts: [Int: TextPage]? = nil) -> ReaderPrintView? {
+        guard let document, document.pageCount > 0 else { return nil }
+        let pages = printPageSpecs()
+        guard !pages.isEmpty else { return nil }
+        return makePrintView(
+            pages: pages,
+            annotations: annotations.map(PrintAnnotation.init),
+            texts: texts ?? textPages
+        )
+    }
+
+    /// The per-page paper plan for the open document.
+    ///
+    /// The engine reports each page's own size; a page whose size cannot be read falls back to
+    /// the document's first-page size so one unreadable page never aborts the print.
+    private func printPageSpecs() -> [PrintPageSpec] {
+        guard let document, document.pageCount > 0 else { return [] }
+        let fallback = document.firstPageSize.width > 1 && document.firstPageSize.height > 1
+            ? document.firstPageSize
+            : CGSize(width: 612, height: 792)
+        let sizes = (0..<document.pageCount).map { page in
+            engine.pageSizeForPrint(page) ?? fallback
+        }
+        return PrintPageSpec.plan(pageSizes: sizes)
+    }
+
+    /// A print view for an explicit page list, with the marks and text layers snapshotted when
+    /// Print was chosen. One view is built per paper-size group.
+    private func makePrintView(
+        pages: [PrintPageSpec],
+        annotations snapshot: [PrintAnnotation],
+        texts: [Int: TextPage]
+    ) -> ReaderPrintView {
+        let engine = self.engine
+        return ReaderPrintView(
+            pages: pages,
+            annotations: snapshot,
+            pageImage: { page, scale in
+                engine.renderPageForPrint(page, scale: scale)
+            },
+            textPage: { texts[$0] }
+        )
+    }
+
+    /// Prints the document, one page at a time, at each page's own paper size.
+    ///
+    /// A uniform document is a single `NSPrintOperation` with its single paper size, exactly as
+    /// before. A mixed-size document becomes one operation per distinct paper size: AppKit binds
+    /// one `NSPrintInfo.paperSize` to an operation, and honors it for every page in that
+    /// operation (verified against a real save-to-PDF job, not assumed). Each group is printed
+    /// in document order; the system print panel is shown for each group because copies and the
+    /// page range are per job. The status line says how many jobs were sent.
     public func printDocument() {
         guard let document, document.pageCount > 0 else {
             lastError = "Open a document before printing."
             return
         }
-        let pageCount = document.pageCount
-        let pageSize = document.firstPageSize.width > 1 && document.firstPageSize.height > 1
-            ? document.firstPageSize
-            : CGSize(width: 612, height: 792)
+        let pages = printPageSpecs()
+        guard !pages.isEmpty else {
+            lastError = "The document could not be prepared for printing."
+            return
+        }
+        let groups = PrintPageSpec.groupedByPaper(pages)
         let snapshot = annotations.map(PrintAnnotation.init)
         let markupPages = Set(snapshot.filter { $0.kind.isTextMarkup }.map(\.page))
         let engine = self.engine
@@ -8899,74 +10252,153 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 }
             }
             guard let self else { return }
-            let view = ReaderPrintView(
-                pageCount: pageCount,
-                pageSizePt: pageSize,
-                annotations: snapshot,
-                pageImage: { page, scale in
-                    engine.renderPageForPrint(page, scale: scale)
-                },
-                textPage: { texts[$0] }
-            )
-            let info = NSPrintInfo.shared.copy() as! NSPrintInfo
-            info.paperSize = pageSize
-            info.topMargin = 0
-            info.bottomMargin = 0
-            info.leftMargin = 0
-            info.rightMargin = 0
-            info.horizontalPagination = .fit
-            info.verticalPagination = .fit
-            info.orientation = pageSize.width > pageSize.height ? .landscape : .portrait
-            let operation = NSPrintOperation(view: view, printInfo: info)
-            operation.showsPrintPanel = true
-            operation.showsProgressPanel = true
-            let printed = operation.run()
-            guard printed else {
-                self.statusMessage = "Printing cancelled"
-                return
+            if groups.count > 1 {
+                // Say why one Cmd-P turns into several panels. AppKit gives an operation one
+                // paper size, so this is a real split, not a bug the reader should have to guess.
+                let summary = groups.map { group in
+                    let name = group.paper.standardName
+                        ?? "custom \(Int(group.paper.size.width))×\(Int(group.paper.size.height))"
+                    return "\(name): pages \(Self.pageRanges(group.documentPages))"
+                }.joined(separator: "\n")
+                let alert = NSAlert()
+                alert.alertStyle = .informational
+                alert.messageText = "This document uses \(groups.count) paper sizes"
+                alert.informativeText =
+                    "macOS prints one paper size per job, so this document prints as"
+                    + " \(groups.count) jobs, one after another:\n\n\(summary)\n\n"
+                    + "The print panel appears once per job; the copy count carries over."
+                alert.addButton(withTitle: "Print \(groups.count) Jobs")
+                alert.addButton(withTitle: "Cancel")
+                guard alert.runModal() == .alertFirstButtonReturn else {
+                    self.statusMessage = "Printing cancelled"
+                    return
+                }
+                self.statusMessage =
+                    "Printing \(document.pageCount) pages in \(groups.count) jobs"
+                    + " (one per paper size: \(groups.map { $0.paper.standardName ?? "custom" }.joined(separator: ", ")))"
             }
-            let count = view.printedPages.count
-            self.statusMessage =
-                "Sent \(count) page\(count == 1 ? "" : "s") to the printer"
-                + " · rendered at \(Int(ReaderPrintView.printDPI)) dpi as the printer asked"
+            var totalPrinted = 0
+            var jobsPrinted = 0
+            var panelSettings: NSPrintInfo?
+            for (index, group) in groups.enumerated() {
+                let view = self.makePrintView(
+                    pages: group.pages,
+                    annotations: snapshot,
+                    texts: texts
+                )
+                let info = self.printInfo(for: group.paper, panelSettings: panelSettings)
+                let operation = NSPrintOperation(view: view, printInfo: info)
+                operation.jobTitle = self.printJobTitle(document: document, group: group, index: index, count: groups.count)
+                operation.showsPrintPanel = true
+                operation.showsProgressPanel = true
+                guard operation.run() else {
+                    if jobsPrinted == 0 {
+                        self.statusMessage = "Printing cancelled"
+                    } else {
+                        self.statusMessage =
+                            "Printing cancelled after \(jobsPrinted) of \(groups.count) jobs"
+                    }
+                    return
+                }
+                // The panel's copies (and any paper-independent settings) carry over to the
+                // next paper group; the page range does not, because it is per job.
+                panelSettings = operation.printInfo
+                totalPrinted += view.printedPages.count
+                jobsPrinted += 1
+            }
+            let count = totalPrinted
+            if groups.count == 1 {
+                self.statusMessage =
+                    "Sent \(count) page\(count == 1 ? "" : "s") to the printer"
+                    + " · rendered at \(Int(ReaderPrintView.printDPI)) dpi as the printer asked"
+            } else {
+                self.statusMessage =
+                    "Sent \(count) page\(count == 1 ? "" : "s") to the printer in \(jobsPrinted) job"
+                    + "\(jobsPrinted == 1 ? "" : "s")"
+                    + " (one per paper size) · rendered at \(Int(ReaderPrintView.printDPI)) dpi"
+            }
             FileHandle.standardError.write(Data((
-                "lyra-reader-print: \(count) page(s) rendered at \(Int(ReaderPrintView.printDPI)) dpi"
+                "lyra-reader-print: \(count) page(s) in \(jobsPrinted) job(s) at "
+                + "\(Int(ReaderPrintView.printDPI)) dpi · papers "
+                + groups.map { $0.paper.standardName ?? "custom \(Int($0.paper.size.width))×\(Int($0.paper.size.height))" }
+                    .joined(separator: ", ")
                 + " · peak cached pages \(ReaderPrintView.maximumCachedPages)\n"
             ).utf8))
         }
+    }
+
+    /// The operation's print info for one paper group.
+    ///
+    /// The first group uses the shared settings (all pages); later groups inherit the first
+    /// panel's copies but reset the page range to all of their own pages, since the system panel
+    /// only ever edits one operation's range. Paper size and orientation always come from the
+    /// group, never from the first page.
+    private func printInfo(
+        for paper: PrintPaper,
+        panelSettings: NSPrintInfo?
+    ) -> NSPrintInfo {
+        let info = (panelSettings?.copy() as? NSPrintInfo)
+            ?? (NSPrintInfo.shared.copy() as! NSPrintInfo)
+        info.paperSize = paper.size
+        info.topMargin = 0
+        info.bottomMargin = 0
+        info.leftMargin = 0
+        info.rightMargin = 0
+        info.horizontalPagination = .fit
+        info.verticalPagination = .fit
+        info.orientation = paper.size.width > paper.size.height ? .landscape : .portrait
+        if panelSettings != nil {
+            // The copies from the previous panel stay; the page range starts fresh because it
+            // is a range over this job's pages, not the document's.
+            info.dictionary()[NSPrintInfo.AttributeKey.allPages] = true
+            info.dictionary().removeObject(forKey: NSPrintInfo.AttributeKey.firstPage)
+            info.dictionary().removeObject(forKey: NSPrintInfo.AttributeKey.lastPage)
+        }
+        info.dictionary()[NSPrintInfo.AttributeKey.jobSavingURL] = nil
+        info.jobDisposition = .spool
+        return info
+    }
+
+    /// A queue-visible title that says which paper this job is and which pages it carries.
+    private func printJobTitle(
+        document: LoadedDocument,
+        group: PrintPageGroup,
+        index: Int,
+        count: Int
+    ) -> String {
+        let paper = group.paper.standardName ?? "Custom paper"
+        let suffix = count > 1 ? " · paper \(index + 1)/\(count)" : ""
+        return "\(document.title) — \(paper), pages \(Self.pageRanges(group.documentPages))\(suffix)"
+    }
+
+    /// Compresses one-based document pages into "1-3, 5, 8-9" for the print job title and the
+    /// mixed-paper explanation. Sorted; duplicate pages are ignored.
+    private static func pageRanges(_ pages: [Int]) -> String {
+        LyraReaderBindings.compactPageRanges(pages: pages.map { UInt32(max(0, $0) + 1) })
     }
 
     // MARK: - Page editing (T3.9)
     //
     // The original file is never modified until the reader chooses "Replace Original". Every
     // operation is applied by the Rust engine to a temporary revision in a session directory;
-    // the app renders that revision and keeps the reader's sidecar in a session copy. That gives
-    // a coherent undo history (a stack of revisions, not an inverse operation that cannot restore
-    // deleted content) and means a crash or a discarded session leaves the PDF and its sidecar
-    // exactly as they were.
+    // the app renders that revision and keeps the reader's cached annotations in a session copy.
+    // That gives a coherent undo history (a stack of revisions, not an inverse operation that cannot restore
+    // deleted content) and means a crash or a discarded session leaves the PDF and its cached
+    // annotations exactly as they were.
 
-    /// One revision plus the reader's marks at that revision. Undo/redo restore both together:
-    /// an annotation added to a page that a later undo removes must disappear, and come back on
-    /// redo, rather than being pushed onto a neighbour.
-    private struct PageEditSnapshot {
-        let revisionURL: URL
-        let revisionNumber: Int
-        let currentToOriginal: [Int]
-        let operations: [String]
-        let annotations: [Annotation]
-        let bookmarks: [Bookmark]
-        let slots: [AnnotationSidecar.Slot]
-        let currentPage: Int
-        let selection: Set<Int>
-        let label: String
-    }
-
+    /// The shell's mirror of one `DocumentTransaction` plus the values the interface reads.
+    ///
+    /// The Rust transaction owns the revision chain, the page map, the undo/redo snapshots and
+    /// the recovery manifest. This value mirrors just the current state so the banners, menus and
+    /// tab snapshots do not need an FFI call per frame; every mutation goes through the
+    /// transaction and refreshes the mirror from its answer.
     private struct PageEditSession {
         let originalURL: URL
-        let originalSidecarURL: URL
+        let originalSignature: DocumentSignature
+        let originalRecordsURL: URL
         let title: String
         let directory: URL
-        let sidecarURL: URL
+        let annotationRecordsURL: URL
         /// `/Rotate` of every page of the file the session started from.
         let originalRotations: [Int]
         var revisionURL: URL
@@ -8974,23 +10406,35 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         /// current page index → index in `originalRotations`; -1 for an inserted blank page.
         var currentToOriginal: [Int]
         var operations: [String]
-        var undo: [PageEditSnapshot]
-        var redo: [PageEditSnapshot]
+        let transaction: DocumentTransactionSession
     }
 
     /// Whether the page commands can run at all.
     public var canPageEdit: Bool {
-        document != nil && !annotationSaveInProgress && !pageEditBusy && !contentCommandInFlight
+        document != nil && !isXfaDocument && !annotationSaveInProgress && !pageEditBusy && !contentCommandInFlight
     }
 
-    /// Page operations that write a new file (extract, merge, split).
-    public var canPageOperations: Bool { document != nil }
+    /// Page operations that write a new file (extract, merge, split). An XFA form has no
+    /// meaningful page operation to offer: its pages are synthesized from the XML.
+    public var canPageOperations: Bool { document != nil && !isXfaDocument }
 
+    /// Whether a page-editing session exists at all. A session is prepared before the first
+    /// write, so this can be true with nothing staged yet; the interface must ask
+    /// ``pageEditHasPendingChanges`` before saying anything is pending.
     public var pageEditSessionActive: Bool { pageEditSession != nil }
-    public var canUndoPageEdit: Bool { pageEditSession?.undo.isEmpty == false && !pageEditBusy }
-    public var canRedoPageEdit: Bool { pageEditSession?.redo.isEmpty == false && !pageEditBusy }
+
+    /// Whether the session has a page change the reader must still save. This — not the mere
+    /// existence of a working copy — is the one guard for the "Page changes pending" banner and
+    /// for every confirmation that offers to save or discard pending changes. A failed first
+    /// edit leaves a prepared session behind; it is not something pending.
+    public var pageEditHasPendingChanges: Bool {
+        pageEditSession?.operations.isEmpty == false
+    }
+
+    public var canUndoPageEdit: Bool { pageEditSession?.transaction.canUndo == true && !pageEditBusy }
+    public var canRedoPageEdit: Bool { pageEditSession?.transaction.canRedo == true && !pageEditBusy }
     public var canSavePageEditsCopy: Bool {
-        (pageEditSession != nil || contentTextEditing) && !pageEditBusy && !annotationSaveInProgress
+        (pageEditHasPendingChanges || contentTextEditing) && !pageEditBusy && !annotationSaveInProgress
     }
 
     /// Applying the staged revision to the signed file itself. "Save Copy" stays available.
@@ -9005,9 +10449,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return await applyPageEdit(operation, label: label)
     }
 
-    /// What the interface must say about the staged state. Nil when nothing is pending.
+    /// What the interface must say about the staged state. Nil when nothing is pending: a
+    /// prepared working copy with zero operations is not a page change, and a banner claiming
+    /// "0 page changes pending" would ask the reader to confirm something that does not exist.
     public var pageEditPendingSummary: String? {
-        guard let session = pageEditSession else { return nil }
+        guard let session = pageEditSession, !session.operations.isEmpty else { return nil }
         let count = session.operations.count
         let label = count == 1 ? "1 page change pending" : "\(count) page changes pending"
         return "\(label) · the file on disk is unchanged"
@@ -9016,6 +10462,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The most recent pending action, for the banner's second line.
     public var pageEditLastAction: String? {
         pageEditSession?.operations.last
+    }
+
+    /// Test visibility for the equivalence freeze: the original the session started from.
+    package var pageEditOriginalURLForChecks: URL? { pageEditSession?.originalURL }
+    /// Test visibility for the equivalence freeze: the revision the session currently shows.
+    package var pageEditRevisionNumberForChecks: Int { pageEditSession?.revisionNumber ?? 0 }
+    /// Test visibility for the equivalence freeze: current page → original page.
+    package var pageEditCurrentToOriginalForChecks: [Int] {
+        pageEditSession?.currentToOriginal ?? []
     }
 
     /// The pages a command acts on: the thumbnail selection, or the current page when there is
@@ -9076,11 +10531,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func rotateSelectedPages(clockwise: Bool) {
         let pages = selectedPageIndices
         guard !pages.isEmpty else { return }
-        if let conflict = rotationConflict(on: pages) {
-            lastError = conflict
-            statusMessage = "Rotation refused: the page has text-range annotations"
-            return
-        }
         Task { @MainActor [weak self] in
             guard let self else { return }
             _ = await self.applyPageEdit(
@@ -9091,12 +10541,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func resetSelectedPageRotations() {
-        let checkedPages = selectedPageIndices
-        if let conflict = rotationConflict(on: checkedPages) {
-            lastError = conflict
-            statusMessage = "Rotation refused: the page has text-range annotations"
-            return
-        }
         Task { @MainActor [weak self] in
             guard let self, await self.ensurePageEditSession() else { return }
             guard let session = self.pageEditSession else { return }
@@ -9280,21 +10724,91 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let destination = panel.url else { return }
         Task { @MainActor [weak self] in
-            await self?.extractPages(pages, to: destination)
+            await self?.extractPagesInteractively(pages, to: destination)
         }
     }
 
+    /// Extracts the selected pages, and when the destination already holds annotation records
+    /// offers the two resolutions instead of only refusing: choose another destination, or
+    /// replace the stale records after this explicit confirmation. The direct
+    /// ``extractPages(_:to:replaceExistingRecords:)`` call stays a refusal, so a programmatic
+    /// caller cannot delete somebody else's records by accident.
+    private func extractPagesInteractively(_ pages: [Int], to destination: URL) async {
+        guard let records = Self.annotationRecordConflict(for: destination) else {
+            await extractPages(pages, to: destination)
+            return
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText =
+            "“\(destination.lastPathComponent)” already has annotations that would duplicate these extracted pages"
+        alert.informativeText =
+            Self.annotationRecordConflictMessage(records, destination: destination)
+        alert.addButton(withTitle: "Choose Another Destination…")
+        alert.addButton(withTitle: "Replace Records")
+        alert.addButton(withTitle: "Cancel")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            presentExtractPagesPanel()
+        case .alertSecondButtonReturn:
+            await extractPages(pages, to: destination, replaceExistingRecords: true)
+        default:
+            return
+        }
+    }
+
+    /// Writes `pages` to a new PDF at `destination`.
+    ///
+    /// A destination whose document cache already holds annotation records is refused by
+    /// default: opening that file would show the stale records next to the annotations the
+    /// extracted pages carry, duplicating every mark. `replaceExistingRecords` is the caller's
+    /// confirmation that those records may be moved to a backup and the destination rewritten;
+    /// the interactive ``presentExtractPagesPanel()`` asks before passing it.
     @discardableResult
-    public func extractPages(_ pages: [Int], to destination: URL) async -> Bool {
+    public func extractPages(
+        _ pages: [Int],
+        to destination: URL,
+        replaceExistingRecords: Bool = false
+    ) async -> Bool {
         guard let url = document?.url else { return false }
         guard !Self.resolvesToSameFile(destination, url) else {
             lastError = "The extracted pages cannot overwrite the document they came from."
             return false
         }
+        guard pageEditSession.map({ !Self.resolvesToSameFile(destination, $0.originalURL) }) ?? true else {
+            lastError = "Extracted pages cannot replace the original editing document."
+            return false
+        }
+        // The same conflict the annotated copy, merge and split check. Opening the output later
+        // would import these records next to the annotations its pages carry, so the marks
+        // would appear twice; move them to a backup only after the caller's explicit approval.
+        if let records = Self.annotationRecordConflict(for: destination) {
+            guard replaceExistingRecords else {
+                lastError = Self.annotationRecordConflictMessage(records, destination: destination)
+                return false
+            }
+            do {
+                let backups = try Self.retireAnnotationRecords(records)
+                FileHandle.standardError.write(Data((
+                    "lyra-reader-pages: moved the destination's annotation records to "
+                    + backups.map(\.path).joined(separator: ", ") + "\n"
+                ).utf8))
+            } catch {
+                lastError =
+                    "Could not move the annotation records attached to “\(destination.lastPathComponent)” "
+                    + "out of the way; nothing was extracted: \(error.localizedDescription)"
+                return false
+            }
+        }
+        let bookmarkSnapshot = bookmarks
         pageEditBusy = true
         defer { pageEditBusy = false }
         do {
-            let report = try await engine.extractPages(pages, to: destination)
+            let export = try await preparedExportEngine(includeBookmarks: false)
+            defer { try? FileManager.default.removeItem(at: export.directory) }
+            let temporary = export.directory.appendingPathComponent("extracted.pdf")
+            let report = try await export.engine.extractPages(pages, to: temporary)
+            try await publishExport(temporary, to: destination, pages: pages.sorted(), bookmarks: bookmarkSnapshot)
             statusMessage =
                 "Extracted \(Self.pageList(pages)) to \(destination.lastPathComponent)"
                 + " · \(report.pageCount) page(s) written"
@@ -9317,11 +10831,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     // session and are not undoable. The source is only read. The outputs are files the reader
     // asked for by name, each written through the engine's verified temporary-file path.
     //
-    // Sidecar rules: a merge appends, so existing pages keep their indices and the reader's
-    // marks are copied unchanged to the merged file's sidecar. The appended pages start with no
-    // LyraReader marks because this app has no sidecar for the other documents (their file-owned
+    // Annotation-cache rules: a merge appends, so existing pages keep their indices and the
+    // reader's marks are copied unchanged to the merged file's records. The appended pages start
+    // with no reader marks because this app has no cached marks for the other documents (their file-owned
     // annotations travel inside the PDF). A split renumbers pages per output, so each output's
-    // sidecar holds exactly the marks whose pages that output contains, at their new indices.
+    // cache holds exactly the marks whose pages that output contains, at their new indices.
 
     public func presentMergeDocumentsPanel() {
         guard let source = pageEditDisplayURL else { return }
@@ -9344,8 +10858,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         panel.title = "Merge PDFs"
         panel.message =
             "Writes the current document followed by the chosen PDFs' pages to a new file. "
-            + "The first document's outline is kept; the appended documents' outlines are not "
-            + "imported. Annotations stored inside the PDFs travel with their pages. Your "
+            + "The first document's outline is kept; each appended document's outline becomes "
+            + "a group named after its file, with its entries pointing at the merged pages. "
+            + "Annotations stored inside the PDFs travel with their pages. Your "
             + "LyraReader marks keep their pages; appended pages carry none."
         panel.nameFieldStringValue =
             "\(source.deletingPathExtension().lastPathComponent) (merged).pdf"
@@ -9362,7 +10877,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// The open document (and any staged page-edit session) is left exactly as it is: this is
     /// the same immediate-to-a-new-file shape as ``extractPages(_:to:)``. The destination's
-    /// sidecar receives the current marks unchanged, because appending does not move a page.
+    /// records receive the current marks unchanged, because appending does not move a page.
     @discardableResult
     public func mergeDocuments(_ others: [URL], to destination: URL) async -> Bool {
         guard let source = document?.url else { return false }
@@ -9373,7 +10888,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard !pageEditBusy && !annotationSaveInProgress else { return false }
         if let reason = annotationWritesBlockedReason {
             lastError =
-                "This document's annotation sidecar could not be read (\(reason)), so the merge "
+                "This document's annotation writes are blocked (\(reason)), so the merge "
                 + "was not started: it could not tell which marks the merged file should carry."
             return false
         }
@@ -9389,40 +10904,34 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 + "Choose another name; the original is unchanged until Replace Original is used."
             return false
         }
-        let destinationSidecar = Self.sidecarURL(for: destination)
-        if Self.sidecarFileExists(for: destination) {
-            lastError =
-                "“\(destination.lastPathComponent)” already has a LyraReader annotation sidecar. "
-                + "Choose another name so the merged pages cannot show two sets of marks."
+        guard !Self.annotationRecordsExist(for: destination) else {
+            lastError = "The destination already has LyraReader annotation records. Open it before replacing it."
             return false
         }
-        let sidecarData: Data?
-        do {
-            sidecarData = try pageEditSidecarData()
-        } catch {
-            lastError = "Could not prepare the reader's annotations for the merge: \(error.localizedDescription)"
-            return false
-        }
-        if let sidecarData {
-            do {
-                try sidecarData.write(to: destinationSidecar, options: .atomic)
-            } catch {
-                lastError = "Could not write the merged file's annotation sidecar: \(error.localizedDescription)"
-                return false
-            }
-        }
-
         pageEditBusy = true
         defer { pageEditBusy = false }
         do {
-            let report = try await engine.mergeDocuments(others: others, to: destination)
+            let export = try await preparedExportEngine(includeBookmarks: true)
+            defer { try? FileManager.default.removeItem(at: export.directory) }
+            let report = try await export.engine.mergeDocuments(others: others, to: destination)
             let appendedNotes = report.appendedAnnotationCounts.reduce(0, +)
-            let outlineNote = report.droppedOutlineEntries == 0
-                ? "kept the first document's outline (\(report.firstOutlineEntries) entries); "
+            let outlineNote: String
+            if report.appendedOutlineEntries == 0 {
+                outlineNote =
+                    "kept the first document's outline (\(report.firstOutlineEntries) entries); "
                     + "the appended documents had no outline"
-                : "kept the first document's outline (\(report.firstOutlineEntries) entries) and "
-                    + "did not import \(report.droppedOutlineEntries) outline "
-                    + "entr\(report.droppedOutlineEntries == 1 ? "y" : "ies") from the appended documents"
+            } else {
+                let groupCount = report.appendedOutlineGroupTitles.count
+                let names = report.appendedOutlineGroupTitles
+                    .map { "“\($0)”" }
+                    .joined(separator: ", ")
+                outlineNote =
+                    "kept the first document's outline (\(report.firstOutlineEntries) entries) and "
+                    + "imported \(report.appendedOutlineEntries) appended outline "
+                    + "entr\(report.appendedOutlineEntries == 1 ? "y" : "ies") as "
+                    + "\(groupCount) group\(groupCount == 1 ? "" : "s")"
+                    + (names.isEmpty ? "" : " (\(names))")
+            }
             let marksNote: String
             if annotations.isEmpty && bookmarks.isEmpty {
                 marksNote = "there were no LyraReader marks to carry"
@@ -9439,14 +10948,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             FileHandle.standardError.write(Data((
                 "lyra-reader-pages: merged \(others.count) document(s) into \(destination.path) "
                 + "· \(report.pageCount) page(s), first \(report.firstPageCount) · "
-                + "dropped \(report.droppedOutlineEntries) outline entries · "
+                + "imported \(report.appendedOutlineEntries) outline entries as "
+                + "\(report.appendedOutlineGroupTitles.count) group(s) "
+                + "[\(report.appendedOutlineGroupTitles.joined(separator: ", "))] · "
                 + "\(report.outputBytes) bytes\n"
             ).utf8))
             return true
         } catch {
-            if sidecarData != nil {
-                try? FileManager.default.removeItem(at: destinationSidecar)
-            }
             lastError = "Could not merge the documents; nothing was written: \(error.localizedDescription)"
             statusMessage = "Could not merge the documents"
             FileHandle.standardError.write(Data("lyra-reader-pages: merge failed: \(error)\n".utf8))
@@ -9509,7 +11017,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         folderPanel.message =
             "\(ranges.count) file(s) will be written here, named like "
             + "“\(source.deletingPathExtension().lastPathComponent) (pages 1-5).pdf”. "
-            + "Nothing is overwritten: an existing file or sidecar stops the split before it starts."
+            + "Nothing is overwritten: an existing file or recovery data stops the split before it starts."
         folderPanel.prompt = "Choose Folder"
         folderPanel.canChooseFiles = false
         folderPanel.canChooseDirectories = true
@@ -9528,7 +11036,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     ///
     /// Like ``extractPages(_:to:)`` this is immediate: it does not start or end a page-edit
     /// session. Every output is verified by the engine. If a later output fails, earlier outputs
-    /// are complete and stay in place; each one that exists gets its remapped sidecar, so a
+    /// are complete and stay in place; each one that exists gets its remapped records, so a
     /// partial split still leaves usable files with the right marks.
     @discardableResult
     public func splitPages(_ ranges: [[Int]], to destinations: [URL]) async -> Bool {
@@ -9540,13 +11048,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard !pageEditBusy && !annotationSaveInProgress else { return false }
         if let reason = annotationWritesBlockedReason {
             lastError =
-                "This document's annotation sidecar could not be read (\(reason)), so the split "
+                "This document's annotation writes are blocked (\(reason)), so the split "
                 + "was not started: it could not tell which marks each output should carry."
             return false
         }
         guard preservedAnnotationEntryCount == 0 else {
             lastError =
-                "This document's annotation sidecar contains entries written by a newer LyraReader. "
+                "This document's annotation cache contains entries written by a newer LyraReader. "
                 + "Their pages cannot be remapped into the split outputs safely, so the split was "
                 + "not started."
             return false
@@ -9567,134 +11075,127 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     + "another folder or remove the file."
                 return false
             }
-            if Self.sidecarFileExists(for: destination) {
+            if Self.annotationRecordsExist(for: destination) {
                 lastError =
-                    "“\(destination.lastPathComponent)” already has LyraReader annotations beside it. "
+                    "“\(destination.lastPathComponent)” already has LyraReader annotation records. "
                     + "Nothing was written; choose another folder."
                 return false
             }
         }
 
         let ordered = ranges.map { $0.sorted() }
-        let partSidecarData: [Data?]
-        do {
-            partSidecarData = try ordered.map { try sidecarData(for: $0) }
-        } catch {
-            lastError = "Could not prepare the split outputs' annotations: \(error.localizedDescription)"
-            return false
-        }
-
+        let bookmarkSnapshot = bookmarks
         pageEditBusy = true
         defer { pageEditBusy = false }
         do {
-            let parts = zip(ordered, destinations).map { pair in
-                PageSplitPart(pages: pair.0, destination: pair.1)
+            let export = try await preparedExportEngine(includeBookmarks: false)
+            defer { try? FileManager.default.removeItem(at: export.directory) }
+            let temporary = ordered.indices.map { export.directory.appendingPathComponent("part-\($0).pdf") }
+            let parts = zip(ordered, temporary).map { PageSplitPart(pages: $0.0, destination: $0.1) }
+            _ = try await export.engine.splitPages(parts)
+            for index in ordered.indices {
+                try await publishExport(temporary[index], to: destinations[index], pages: ordered[index], bookmarks: bookmarkSnapshot)
             }
-            let report = try await engine.splitPages(parts)
-            var sidecarFailures = 0
-            for (index, part) in report.parts.enumerated() {
-                guard index < partSidecarData.count, let data = partSidecarData[index] else { continue }
-                do {
-                    try data.write(
-                        to: Self.sidecarURL(for: part.destination),
-                        options: .atomic
-                    )
-                } catch {
-                    sidecarFailures += 1
-                }
-            }
-            let counts = report.parts.map(\.pageCount).map(String.init).joined(separator: " + ")
-            let sidecarNote = sidecarFailures == 0
-                ? "the reader's marks were copied to the output that contains each page"
-                : "\(sidecarFailures) output sidecar(s) could not be written"
-            statusMessage =
-                "Split into \(report.parts.count) file(s) · \(counts) pages · each verified · "
-                + "the source is unchanged · \(sidecarNote)"
-            if sidecarFailures > 0 {
-                lastError = "The split PDFs are valid, but \(sidecarFailures) annotation sidecar(s) could not be written."
-            }
-            FileHandle.standardError.write(Data((
-                "lyra-reader-pages: split \(source.lastPathComponent) into \(report.parts.count) "
-                + "file(s) (\(counts) pages) · source unchanged\n"
-            ).utf8))
+            statusMessage = "Split into \(destinations.count) verified PDFs · annotations and bookmarks are embedded · source unchanged"
             return true
         } catch {
-            // An output is renamed only after its verification, so any destination that now
-            // exists is a complete earlier part. Give those parts their sidecars.
-            var completed = 0
-            for (index, destination) in destinations.enumerated() {
-                guard FileManager.default.fileExists(atPath: destination.path) else { continue }
-                completed += 1
-                if index < partSidecarData.count, let data = partSidecarData[index] {
-                    try? data.write(to: Self.sidecarURL(for: destination), options: .atomic)
-                }
-            }
-            lastError =
-                "Could not split the document; \(completed) complete output(s) are on disk and "
-                + "the source is unchanged: \(error.localizedDescription)"
-            statusMessage = completed == 0
-                ? "Split failed; nothing was written"
-                : "Split stopped after \(completed) complete output(s)"
-            FileHandle.standardError.write(Data("lyra-reader-pages: split failed: \(error)\n".utf8))
+            let completed = destinations.filter { FileManager.default.fileExists(atPath: $0.path) }.count
+            lastError = "Could not finish the split; \(completed) complete output(s) are on disk: \(error.localizedDescription)"
+            statusMessage = completed == 0 ? "Split failed; nothing was written" : "Split stopped after \(completed) complete output(s)"
             return false
         }
     }
 
-    /// True when either naming convention of the reader's sidecar exists beside `document`.
-    private static func sidecarFileExists(for document: URL) -> Bool {
-        let fileManager = FileManager.default
-        let current = document.appendingPathExtension("lyra-reader-annotations.json")
-        let legacy = document.appendingPathExtension("aris-annotations.json")
-        return fileManager.fileExists(atPath: current.path)
-            || fileManager.fileExists(atPath: legacy.path)
+    /// A separate engine exports a snapshot so the reader's active revision and undo stay intact.
+    private func preparedExportEngine(includeBookmarks: Bool) async throws -> (engine: any PDFEngine, directory: URL) {
+        guard let source = document?.url, annotationWritesBlockedReason == nil,
+              preservedAnnotationEntryCount == 0 else {
+            throw NSError(domain: "LyraReader", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "The annotation recovery data must be restored before exporting."])
+        }
+        flushPendingWrites()
+        guard !hasPendingAnnotationWrite else {
+            throw NSError(domain: "LyraReader", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "The active annotation could not be cached."])
+        }
+        let changes = try await pendingAnnotationChanges()
+        let marks = includeBookmarks ? bookmarks : []
+        guard document?.url == source else {
+            throw NSError(domain: "LyraReader", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "The active document changed before exporting."])
+        }
+        let directory = try DocumentEditCache.newSessionDirectory(for: pageEditDisplayURL ?? source)
+        guard !changes.isEmpty || !marks.isEmpty else { return (engine, directory) }
+        do {
+            let snapshot = directory.appendingPathComponent("source.pdf")
+            _ = try await engine.saveAnnotationChanges(to: snapshot, additions: changes.additions,
+                bookmarks: marks, updates: changes.updates, deletions: changes.deletions)
+            let isolated = try RustEngine()
+            _ = try isolated.openDocument(at: snapshot)
+            return (isolated, directory)
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
     }
 
-    /// The reader's marks on exactly `pages`, renumbered to their position in that output.
-    ///
-    /// Opaque entries (a newer LyraReader's schema) cannot be placed and are refused before a
-    /// split starts, so this filter never silently drops one.
-    private func sidecarData(for pages: [Int]) throws -> Data? {
+    private func publishExport(_ source: URL, to destination: URL, pages: [Int], bookmarks snapshot: [Bookmark]) async throws {
+        let export = try RustEngine()
+        _ = try export.openDocument(at: source)
         let positions = Dictionary(uniqueKeysWithValues: pages.enumerated().map { ($0.element, $0.offset) })
-        var mappedAnnotations: [Annotation] = []
-        for annotation in annotations {
-            guard let page = positions[annotation.page] else { continue }
-            var copy = annotation
-            copy.page = page
-            mappedAnnotations.append(copy)
+        let marks = snapshot.compactMap { bookmark -> Bookmark? in
+            guard let page = positions[bookmark.page] else { return nil }
+            var mapped = bookmark
+            mapped.page = page
+            return mapped
         }
-        var mappedBookmarks: [Bookmark] = []
-        for bookmark in bookmarks {
-            guard let page = positions[bookmark.page] else { continue }
-            var copy = bookmark
-            copy.page = page
-            mappedBookmarks.append(copy)
-        }
-        let annotationIDs = Set(mappedAnnotations.map(\.id))
-        let bookmarkIDs = Set(mappedBookmarks.map(\.id))
-        let mappedSlots = annotationSidecarSlots.filter { slot in
-            switch slot {
-            case .annotation(let id): return annotationIDs.contains(id)
-            case .bookmark(let id): return bookmarkIDs.contains(id)
-            case .opaque: return false
-            }
-        }
-        if mappedAnnotations.isEmpty && mappedBookmarks.isEmpty && mappedSlots.isEmpty {
-            return nil
-        }
-        return try AnnotationSidecar.encode(
-            annotations: mappedAnnotations,
-            bookmarks: mappedBookmarks,
-            slots: mappedSlots
-        )
+        if marks.isEmpty { _ = try await export.saveEditedCopy(to: destination) }
+        else { _ = try await export.saveAnnotationChanges(to: destination, additions: [], bookmarks: marks,
+            updates: [], deletions: []) }
+    }
+
+    /// The destination's annotation cache when it already holds records.
+    ///
+    /// Checked in one place so every immediate-to-a-new-file command (annotated copy, page-edit
+    /// copy, merge, split) uses exactly the same predicate.
+    static func annotationRecordConflict(for document: URL) -> URL? {
+        let cache = Self.annotationRecordsURL(for: document)
+        return FileManager.default.fileExists(atPath: cache.path) ? cache : nil
+    }
+
+    /// True when the destination already has annotation records in its document cache.
+    private static func annotationRecordsExist(for document: URL) -> Bool {
+        annotationRecordConflict(for: document) != nil
+    }
+
+    /// Names the store that blocks the write: the destination's document cache already has
+    /// annotations, and opening the copy would show every one of them twice.
+    static func annotationRecordConflictMessage(_ records: URL, destination: URL) -> String {
+        let name = destination.lastPathComponent
+        return "“\(name)” already has LyraReader annotation records in its document cache: "
+            + "the destination already has annotations. Choose another destination, "
+            + "or replace those records after confirmation, so the copy cannot show every "
+            + "annotation twice."
+    }
+
+    /// Moves the destination's conflicting cache directory to a backup instead of deleting it,
+    /// so an explicitly confirmed replacement cannot silently destroy the only copy of old marks.
+    @discardableResult
+    static func retireAnnotationRecords(_ records: URL) throws -> [URL] {
+        let directory = records.deletingLastPathComponent()
+        let backup = directory.deletingLastPathComponent()
+            .appendingPathComponent("replaced-\(UUID().uuidString)-\(directory.lastPathComponent)",
+                                     isDirectory: true)
+        try FileManager.default.moveItem(at: directory, to: backup)
+        return [backup]
     }
 
     public func presentSavePageEditsCopyPanel() {
-        guard let source = pageEditDisplayURL, pageEditSession != nil || contentTextEditing else { return }
+        guard let source = pageEditDisplayURL, pageEditHasPendingChanges || contentTextEditing else { return }
         let panel = NSSavePanel()
         panel.title = "Save Edited Copy"
         panel.message =
-            "Writes the staged page changes to a new PDF and leaves the original untouched. "
-            + "The reader's annotations are saved beside the copy."
+            "Writes the edited pages, annotations and bookmarks into a new PDF."
         panel.nameFieldStringValue =
             "\(source.deletingPathExtension().lastPathComponent) (page edits).pdf"
         panel.directoryURL = source.deletingLastPathComponent()
@@ -9708,150 +11209,96 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func savePageEditsCopy(to destination: URL) async -> Bool {
-        guard contentTextRecovery == nil else {lastError="Finish or discard the recovered draft before saving.";return false}
+        guard contentTextRecovery == nil else { lastError = "Finish or discard the recovered draft before saving."; return false }
         commitContentText?()
-        if let task=contentEditTask {
-            let succeeded=await task.value
-            contentEditTask=nil
-            if !succeeded {return false}
+        if let task = contentEditTask {
+            let succeeded = await task.value
+            contentEditTask = nil
+            if !succeeded { return false }
         }
-        guard let session = pageEditSession, !pageEditBusy else { return false }
-        if Self.resolvesToSameFile(destination, session.originalURL) {
-            lastError = "The edited copy would be the original. Use “Replace Original with Page Changes” for that."
+        guard let original = pageEditSession?.originalURL, !pageEditBusy else { return false }
+        guard pageEditHasPendingChanges else {
+            lastError = "There are no page changes to save"
             return false
         }
-        let destinationSidecar = Self.sidecarURL(for: destination)
-        if FileManager.default.fileExists(atPath: destinationSidecar.path) {
-            lastError =
-                "“\(destination.lastPathComponent)” already has a LyraReader annotation sidecar. "
-                + "Choose another name so the copy cannot show every annotation twice."
+        guard !Self.resolvesToSameFile(destination, original) else {
+            lastError = "Choose another name for Save As, or use Save to update the original."
             return false
         }
-        let sidecarData: Data?
+        guard !Self.annotationRecordsExist(for: destination) else {
+            lastError = "The destination already has LyraReader annotation records. Open it before replacing it."
+            return false
+        }
         do {
-            sidecarData = try pageEditSidecarData()
-        } catch {
-            lastError = "Could not prepare the annotations for the copy: \(error.localizedDescription)"
-            return false
-        }
-        let hasMarks = !annotations.isEmpty || !bookmarks.isEmpty
-        if hasMarks, let sidecarData {
-            do {
-                try sidecarData.write(to: destinationSidecar, options: .atomic)
-            } catch {
-                lastError = "Could not write the copy's annotation sidecar: \(error.localizedDescription)"
-                return false
-            }
-        }
-        pageEditBusy = true
-        defer { pageEditBusy = false }
-        do {
+            _ = try await materializeAnnotationsInWorkingCopy()
+            pageEditBusy = true
+            defer { pageEditBusy = false }
             let report = try await engine.saveEditedCopy(to: destination)
+            // The output already contains every annotation; it needs no cache entry.
             endPageEditSession(deleteFiles: true)
             _ = open(url: destination)
             pageEditIsApplied = true
-            let notes = hasMarks ? " · annotations saved beside it" : ""
-            statusMessage =
-                "Saved edited copy \(destination.lastPathComponent) · \(report.pageCount) page(s)"
-                + " · the original is unchanged\(notes)"
+            statusMessage = "Saved \(destination.lastPathComponent) · \(report.pageCount) page(s)"
             return true
         } catch {
-            if hasMarks {
-                try? FileManager.default.removeItem(at: destinationSidecar)
-            }
-            lastError = "Could not save the edited copy: \(error.localizedDescription)"
-            statusMessage = "Could not save the edited copy"
+            lastError = "Could not save the PDF copy: \(error.localizedDescription)"
             return false
-        }
-    }
-
-    public func presentReplaceOriginalWithPageEditsConfirmation() {
-        if contentTextEditing {
-            commitContentText?()
-            Task { @MainActor [weak self] in
-                guard let self, let task=contentEditTask, await task.value else{return}
-                contentEditTask=nil
-                presentReplaceOriginalWithPageEditsConfirmation()
-            }
-            return
-        }
-        guard guardWritable() else { return }
-        guard canReplaceOriginalWithPageEdits, let session = pageEditSession else { return }
-        let alert = NSAlert()
-        alert.alertStyle = .critical
-        alert.messageText = "Replace “\(session.originalURL.lastPathComponent)” with the page-edited version?"
-        alert.informativeText =
-            "This changes the file on disk. A byte-identical backup is written first; if the "
-            + "backup cannot be written and verified, nothing is replaced. The reader's "
-            + "annotations and bookmarks are remapped to the new page order."
-        alert.addButton(withTitle: "Save and Replace")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        Task { @MainActor [weak self] in
-            await self?.replaceOriginalWithPageEdits()
         }
     }
 
     @discardableResult
     public func replaceOriginalWithPageEdits() async -> Bool {
-        guard contentTextRecovery == nil else {lastError="Finish or discard the recovered draft before saving.";return false}
+        guard guardWritable(), contentTextRecovery == nil else { return false }
         commitContentText?()
-        if let task=contentEditTask {
-            let succeeded=await task.value
-            contentEditTask=nil
-            if !succeeded {return false}
+        if let task = contentEditTask {
+            let succeeded = await task.value
+            contentEditTask = nil
+            if !succeeded { return false }
         }
-        guard let session = pageEditSession, !pageEditBusy else { return false }
-        let sidecarData: Data?
-        do {
-            sidecarData = try pageEditSidecarData()
-        } catch {
-            lastError = "Could not prepare the annotations for the replacement: \(error.localizedDescription)"
+        guard let original = pageEditSession?.originalURL, !pageEditBusy else { return false }
+        guard pageEditHasPendingChanges else {
+            lastError = "There are no page changes to save"
             return false
         }
-        let hasMarks = !annotations.isEmpty || !bookmarks.isEmpty
-        let hadSidecar = FileManager.default.fileExists(atPath: session.originalSidecarURL.path)
-        let previousSidecar = hadSidecar ? try? Data(contentsOf: session.originalSidecarURL) : nil
-        if hasMarks || hadSidecar, let sidecarData {
-            do {
-                try sidecarData.write(to: session.originalSidecarURL, options: .atomic)
-            } catch {
-                lastError = "Could not write the annotation sidecar; the original was left untouched: \(error.localizedDescription)"
-                return false
-            }
-        }
-        pageEditBusy = true
-        defer { pageEditBusy = false }
         do {
-            let report = try await engine.replaceOriginalWithPageEdits(original: session.originalURL)
-            let backup = report.backupPath?.lastPathComponent ?? "none"
-            endPageEditSession(deleteFiles: true)
-            _ = open(url: session.originalURL)
+            try DocumentEditCache.validateSource(for: original)
+            _ = try await materializeAnnotationsInWorkingCopy()
+            pageEditBusy = true
+            defer { pageEditBusy = false }
+            let report = try await engine.replaceOriginalWithPageEdits(original: original)
+            // Retire cached marks only after the verified PDF transaction succeeds.
+            var cleanupError: String?
+            do {
+                try Data("[]".utf8).write(to: DocumentEditCache.annotationsURL(for: original), options: .atomic)
+                try JSONEncoder().encode(PendingAnnotationState(dirty: false, deletions: [], erasedInk: [], cleanSnapshot: nil)).write(
+                    to: DocumentEditCache.pendingStateURL(for: original), options: .atomic)
+                try DocumentEditCache.recordSource(for: original)
+            } catch { cleanupError = error.localizedDescription }
+            endPageEditSession(deleteFiles: cleanupError == nil)
+            _ = open(url: original)
             pageEditIsApplied = true
-            statusMessage =
-                "Applied page changes to \(session.originalURL.lastPathComponent)"
-                + " · backup: \(backup)"
-            FileHandle.standardError.write(Data((
-                "lyra-reader-pages: replaced \(session.originalURL.path) · backup \(backup)\n"
-            ).utf8))
+            statusMessage = "Saved \(original.lastPathComponent) · backup: \(report.backupPath?.lastPathComponent ?? "none")"
+            if let cleanupError { lastError = "The PDF was saved, but its old recovery data was kept: \(cleanupError)" }
             return true
         } catch {
-            // The PDF was not replaced; put the sidecar back exactly as it was.
-            if hadSidecar {
-                if let previousSidecar {
-                    try? previousSidecar.write(to: session.originalSidecarURL, options: .atomic)
-                }
-            } else {
-                try? FileManager.default.removeItem(at: session.originalSidecarURL)
-            }
-            lastError = "Could not replace the original; it was left untouched: \(error.localizedDescription)"
-            statusMessage = "Could not replace the original"
+            lastError = "Could not save the original; the editing cache was kept: \(error.localizedDescription)"
+            persistPageEditRecovery()
             return false
         }
     }
 
     public func presentDiscardPageEditsConfirmation() {
-        guard pageEditSession != nil else { return }
+        guard let session = pageEditSession else { return }
+        guard pageEditHasPendingChanges else {
+            // A prepared session with zero operations has nothing to discard, so there is
+            // nothing to confirm. Close it as the discard action would, and reopen the original
+            // only if a cached revision had already replaced the open document.
+            let original = session.originalURL
+            let moved = document?.url != original
+            endPageEditSession(deleteFiles: true)
+            if moved { _ = open(url: original) }
+            return
+        }
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Discard the pending page changes?"
@@ -9888,55 +11335,140 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     private func undoOrRedoPageEdit(redo: Bool) async {
         guard var session = pageEditSession, !pageEditBusy else { return }
-        let target = redo ? session.redo.last : session.undo.last
-        guard let target, let current = pageEditSnapshot(label: redo ? "redo" : "undo") else { return }
+        let hadTranslations = !inPlaceTranslation.snapshot().isEmpty
         pageEditBusy = true
         defer { pageEditBusy = false }
-        if redo {
-            session.redo.removeLast()
-            session.undo.append(current)
-        } else {
-            session.undo.removeLast()
-            session.redo.append(current)
+        let target: DocumentTransactionStateRecord?
+        do {
+            let input = try pageEditInputRecord()
+            target = redo
+                ? try session.transaction.redo(input: input)
+                : try session.transaction.undo(input: input)
+        } catch {
+            lastError = "Could not \(redo ? "redo" : "undo") the page change: \(AnnotationRecords.message(error))"
+            return
+        }
+        guard let target else { return }
+        guard let revision = URL(string: target.revisionUrl) else {
+            lastError = "Could not reopen the revision for \(redo ? "redo" : "undo")"
+            return
+        }
+        let payload: PageEditTransactionPayload
+        do {
+            payload = try decodedPageEditPayload(target)
+        } catch {
+            lastError = "Could not reopen the revision for \(redo ? "redo" : "undo"): \(AnnotationRecords.message(error))"
+            return
         }
         guard (try? loadPageEditRevision(
-            at: target.revisionURL,
+            at: revision,
             title: session.title,
-            sidecarURL: session.sidecarURL,
-            annotations: target.annotations,
-            bookmarks: target.bookmarks,
-            slots: target.slots,
-            currentPage: target.currentPage,
-            selection: target.selection
+            annotationRecordsURL: session.annotationRecordsURL,
+            annotations: payload.annotations,
+            bookmarks: payload.bookmarks,
+            slots: payload.slots,
+            currentPage: payload.currentPage,
+            selection: payload.selection
         )) != nil else {
             lastError = "Could not reopen the revision for \(redo ? "redo" : "undo")"
             return
         }
-        session.revisionURL = target.revisionURL
-        session.revisionNumber = target.revisionNumber
-        session.currentToOriginal = target.currentToOriginal
+        if hadTranslations {
+            inPlaceTranslation.setNotice(
+                "The page layout changed (\(redo ? "redo" : "undo")). In-place translations were "
+                + "removed because their blocks may have moved; the PDF was not modified."
+            )
+        }
+        session.revisionURL = revision
+        session.revisionNumber = Int(target.revisionNumber)
+        session.currentToOriginal = target.currentToOriginal.map(Int.init)
         session.operations = target.operations
         pageEditSession = session
+        pendingFileDeletions = payload.deletions
+        erasedInkStrokeIDs = payload.erasedInk
+        annotationCacheIsDirty = payload.annotationDirty
+        persistPendingAnnotationState()
+        persistPageEditRecovery()
         pageEditPendingOperations = session.operations
         pageEditIsApplied = false
-        statusMessage = "\(redo ? "Redid" : "Undid") \(target.label) · \(session.operations.count) page change(s) still pending"
+        statusMessage = "\(redo ? "Redid" : "Undid") \(target.lastLabel ?? (redo ? "redo" : "undo"))"
+            + " · \(session.operations.count) page change(s) still pending"
     }
 
     // MARK: Session plumbing
 
-    private func pageEditSnapshot(label: String) -> PageEditSnapshot? {
-        guard let session = pageEditSession, let url = document?.url else { return nil }
-        return PageEditSnapshot(
-            revisionURL: url,
-            revisionNumber: session.revisionNumber,
-            currentToOriginal: session.currentToOriginal,
-            operations: session.operations,
-            annotations: annotations,
-            bookmarks: bookmarks,
-            slots: annotationSidecarSlots,
-            currentPage: currentPage,
-            selection: pageSelection,
-            label: label
+    /// One value-typed view of what the transaction stores as JSON. Decoding is the shell's own
+    /// model decode; the transaction never reinterprets an annotation kind or a colour.
+    private struct PageEditTransactionPayload {
+        let annotations: [Annotation]
+        let bookmarks: [Bookmark]
+        let slots: [AnnotationRecords.Slot]
+        let deletions: [FileAnnotationDeletion]
+        let erasedInk: Set<UUID>
+        let annotationDirty: Bool
+        let currentPage: Int
+        let selection: Set<Int>
+    }
+
+    private func decodedPageEditPayload(
+        _ state: DocumentTransactionStateRecord
+    ) throws -> PageEditTransactionPayload {
+        PageEditTransactionPayload(
+            annotations: try DocumentTransactionJSON.value(
+                [Annotation].self, from: state.annotationsJson),
+            bookmarks: try DocumentTransactionJSON.value(
+                [Bookmark].self, from: state.bookmarksJson),
+            slots: try DocumentTransactionJSON.value(
+                [AnnotationRecords.Slot].self, from: state.slotsJson),
+            deletions: try DocumentTransactionJSON.value(
+                [FileAnnotationDeletion].self, from: state.deletionsJson),
+            erasedInk: Set(try DocumentTransactionJSON.value(
+                [UUID].self, from: state.erasedInkJson)),
+            annotationDirty: state.annotationDirty,
+            currentPage: Int(state.currentPage),
+            selection: Set(state.selection.map(Int.init))
+        )
+    }
+
+    private func pageEditInputRecord() throws -> DocumentTransactionInputRecord {
+        DocumentTransactionInputRecord(
+            annotationsJson: try DocumentTransactionJSON.string(annotations),
+            bookmarksJson: try DocumentTransactionJSON.string(bookmarks),
+            slotsJson: try DocumentTransactionJSON.string(annotationRecordSlots),
+            deletionsJson: try DocumentTransactionJSON.string(pendingFileDeletions),
+            erasedInkJson: try DocumentTransactionJSON.string(Array(erasedInkStrokeIDs)),
+            annotationDirty: annotationCacheIsDirty,
+            currentPage: UInt32(clamping: max(0, currentPage)),
+            selection: pageSelection.sorted().map { UInt32(clamping: max(0, $0)) }
+        )
+    }
+
+    private func pageEditSession(
+        from state: DocumentTransactionStateRecord,
+        originalURL: URL,
+        signature: DocumentSignature,
+        title: String,
+        directory: URL,
+        transaction: DocumentTransactionSession
+    ) throws -> PageEditSession {
+        guard let revision = URL(string: state.revisionUrl) else {
+            throw NSError(
+                domain: "LyraReader", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "the editing session has no valid revision URL"])
+        }
+        return PageEditSession(
+            originalURL: originalURL,
+            originalSignature: signature,
+            originalRecordsURL: URL(string: state.originalRecordsUrl) ?? originalURL,
+            title: title,
+            directory: directory,
+            annotationRecordsURL: URL(string: state.annotationRecordsUrl) ?? directory,
+            originalRotations: state.originalRotations.map(Int.init),
+            revisionURL: revision,
+            revisionNumber: Int(state.revisionNumber),
+            currentToOriginal: state.currentToOriginal.map(Int.init),
+            operations: state.operations,
+            transaction: transaction
         )
     }
 
@@ -9947,9 +11479,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             lastError = "Open a document before editing pages"
             return false
         }
+        if let owner = Self.pageEditOwners[DocumentEditCache.recoveryURL(for: url).path]?.value,
+           owner !== self {
+            lastError = "This PDF is being edited in another window. Save or close that editing session first."
+            return false
+        }
         guard preservedAnnotationEntryCount == 0 else {
             lastError =
-                "This document's annotation sidecar contains entries written by a newer LyraReader. "
+                "This document's annotation cache contains entries written by a newer LyraReader. "
                 + "Their page numbers cannot be remapped safely, so page editing is disabled "
                 + "rather than risking an annotation on the wrong page."
             return false
@@ -9961,37 +11498,57 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return false
         }
         do {
-            let directory = FileManager.default.temporaryDirectory
-                .appendingPathComponent("LyraReaderPageEdits-\(UUID().uuidString)", isDirectory: true)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let directory = try DocumentEditCache.newSessionDirectory(for: url)
             let originalRotations = try await engine.pageRotations()
             let pageCount = document?.pageCount ?? 0
-            let session = PageEditSession(
+            let signature = documentSignature
+            let sourceStamp = try DocumentEditCache.SourceStamp(url)
+            let title = document?.title ?? url.deletingPathExtension().lastPathComponent
+            let request = DocumentTransactionStartRecord(
+                originalUrl: url.absoluteString,
+                directoryUrl: directory.absoluteString,
+                recoveryPath: DocumentEditCache.recoveryURL(for: url).path,
+                originalRecordsUrl: Self.annotationRecordsURL(for: url).absoluteString,
+                title: title,
+                pageCount: UInt32(clamping: max(0, pageCount)),
+                originalRotations: originalRotations.map { UInt32(clamping: max(0, $0)) },
+                originalSignatureJson: try DocumentTransactionJSON.string(signature),
+                sourceSize: UInt64(max(0, sourceStamp.size)),
+                sourceModified: sourceStamp.modified?.timeIntervalSinceReferenceDate,
+                sourceSha256: sourceStamp.sha256,
+                annotationsJson: try DocumentTransactionJSON.string(annotations),
+                bookmarksJson: try DocumentTransactionJSON.string(bookmarks),
+                slotsJson: try DocumentTransactionJSON.string(annotationRecordSlots),
+                deletionsJson: try DocumentTransactionJSON.string(pendingFileDeletions),
+                erasedInkJson: try DocumentTransactionJSON.string(Array(erasedInkStrokeIDs)),
+                annotationDirty: annotationCacheIsDirty,
+                currentPage: UInt32(clamping: max(0, currentPage)),
+                selection: pageSelection.sorted().map { UInt32(clamping: max(0, $0)) },
+                cacheDirectoryPrefix: DocumentEditCache.directory(for: url).path + "/",
+                restore: false,
+                xfaReadOnlyReason: isXfaDocument ? readOnlyReason : nil
+            )
+            let (transaction, state) = try DocumentTransactionSession.start(request)
+            let session = try pageEditSession(
+                from: state,
                 originalURL: url,
-                originalSidecarURL: Self.sidecarURL(for: url),
-                title: document?.title ?? url.deletingPathExtension().lastPathComponent,
+                signature: signature,
+                title: title,
                 directory: directory,
-                sidecarURL: directory.appendingPathComponent("annotations.json"),
-                originalRotations: originalRotations,
-                revisionURL: url,
-                revisionNumber: 0,
-                currentToOriginal: Array(0..<pageCount),
-                operations: [],
-                undo: [],
-                redo: []
+                transaction: transaction
             )
             pageEditSession = session
-            annotationsURL = session.sidecarURL
-            let wrote = writeSidecar(
+            annotationsURL = session.annotationRecordsURL
+            let wrote = writeAnnotationRecords(
                 annotations: annotations,
                 bookmarks: bookmarks,
-                slots: annotationSidecarSlots,
+                slots: annotationRecordSlots,
                 trigger: "page-edit-session"
             )
             guard wrote else {
+                transaction.close(deleteFiles: true)
                 pageEditSession = nil
-                annotationsURL = session.originalSidecarURL
-                try? FileManager.default.removeItem(at: directory)
+                annotationsURL = session.originalRecordsURL
                 return false
             }
             pageEditPendingOperations = []
@@ -9999,7 +11556,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             statusMessage = "Page editing: changes are staged in a working copy; the file on disk is unchanged"
             return true
         } catch {
-            lastError = "Could not start the page-editing session: \(error.localizedDescription)"
+            lastError = "Could not start the page-editing session: \(AnnotationRecords.message(error))"
             return false
         }
     }
@@ -10007,7 +11564,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @discardableResult
     private func applyPageEdit(_ operation: PageEditOperation, label: String) async -> Bool {
         // A rotation changes the page's text-layer order (PDFium reports a 90° page's text in
-        // rotated order). The sidecar addresses annotations by character range, so rotating a
+        // rotated order). The annotation cache addresses annotations by character range, so rotating a
         // page that has LyraReader marks would silently move them onto different words. Embedded PDF
         // annotations are unaffected: they are page-space geometry and rotate with the page.
         let rotating: [Int]?
@@ -10015,90 +11572,95 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case .rotate(let pages, _), .setRotation(let pages, _): rotating = pages
         default: rotating = nil
         }
-        if let rotating, let conflict = rotationConflict(on: rotating) {
-            lastError = conflict
-            statusMessage = "Rotation refused: the page has text-range annotations"
-            return false
-        }
         guard await ensurePageEditSession() else { return false }
         guard var session = pageEditSession, !pageEditBusy else { return false }
-        guard let snapshot = pageEditSnapshot(label: label) else { return false }
-        let nextNumber = session.revisionNumber + 1
-        let nextURL = session.directory.appendingPathComponent("rev-\(nextNumber).pdf")
+        let input: DocumentTransactionInputRecord
+        do {
+            input = try pageEditInputRecord()
+        } catch {
+            lastError = "Page change failed; nothing was written: \(AnnotationRecords.message(error))"
+            return false
+        }
+        // A page edit can rotate, move, insert or delete the rectangles a translation covers.
+        // The complete entries travel through the revision and are filtered afterwards; the PDF
+        // itself is never touched by the translation layer.
+        let translationSnapshot = inPlaceTranslation.snapshot()
         pageEditBusy = true
         defer { pageEditBusy = false }
         do {
-            let report = try await engine.applyPageOperation(operation, to: nextURL)
-            let mappedAnnotations = Self.remap(annotations, with: report.pageMap)
-            let mappedBookmarks = Self.remap(bookmarks, with: report.pageMap)
-            let annotationIDs = Set(mappedAnnotations.map(\.id))
-            let bookmarkIDs = Set(mappedBookmarks.map(\.id))
-            let mappedSlots = annotationSidecarSlots.filter { slot in
-                switch slot {
-                case .annotation(let id): return annotationIDs.contains(id)
-                case .bookmark(let id): return bookmarkIDs.contains(id)
-                case .opaque: return true
+            // Snapshot before materialisation: undo across a rotation that had to write cached
+            // marks into the PDF must return to the revision the reader actually saw.
+            try session.transaction.prepare(label: label, input: input)
+            if let rotating, rotationConflict(on: rotating) != nil {
+                if try await materializeAnnotationsInWorkingCopy(), let updated = pageEditSession {
+                    session = updated
                 }
             }
-            var mapping = [Int](repeating: -1, count: Int(report.pageCount))
-            for (old, new) in report.pageMap.enumerated() {
-                guard let new, new >= 0, new < mapping.count else { continue }
-                mapping[new] = old < session.currentToOriginal.count ? session.currentToOriginal[old] : -1
+            let result = try await session.transaction.apply(operation)
+            let state = result.state
+            guard let revision = URL(string: state.revisionUrl) else {
+                throw NSError(
+                    domain: "LyraReader", code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "the revision has no valid URL"])
             }
-            let previousPage = min(max(currentPage - 1, 0), max(report.pageMap.count - 1, 0))
-            var newPage = report.insertedPage
-                ?? report.pageMap[previousPage]
-                ?? min(previousPage, max(Int(report.pageCount) - 1, 0))
-            if let inserted = report.insertedPage {
-                newPage = inserted
+            let payload = try decodedPageEditPayload(state)
+            if let inserted = result.insertedPage {
+                pageSelectionAnchor = Int(inserted)
             }
-            var newSelection = Set<Int>()
-            for selected in pageSelection {
-                if selected < report.pageMap.count, let mapped = report.pageMap[selected] {
-                    newSelection.insert(mapped)
-                }
-            }
-            if let inserted = report.insertedPage {
-                newSelection = [inserted]
-                pageSelectionAnchor = inserted
-            }
-
             guard (try? loadPageEditRevision(
-                at: nextURL,
+                at: revision,
                 title: session.title,
-                sidecarURL: session.sidecarURL,
-                annotations: mappedAnnotations,
-                bookmarks: mappedBookmarks,
-                slots: mappedSlots,
-                currentPage: newPage + 1,
-                selection: newSelection
+                annotationRecordsURL: session.annotationRecordsURL,
+                annotations: payload.annotations,
+                bookmarks: payload.bookmarks,
+                slots: payload.slots,
+                currentPage: payload.currentPage,
+                selection: payload.selection
             )) != nil else {
                 lastError = "The page change was written, but the revision could not be reopened; the original is unchanged"
                 return false
             }
-            session.revisionURL = nextURL
-            session.revisionNumber = nextNumber
-            session.currentToOriginal = mapping
-            session.operations.append(label)
-            session.undo.append(snapshot)
-            session.redo.removeAll()
+            await inPlaceTranslation.restoreAfterPageEdit(
+                translationSnapshot,
+                pageMap: result.pageMap.map { $0.map(Int.init) },
+                rotatedPages: Set(rotating ?? []),
+                editedPages: [],
+                reason: "The page layout changed (\(label))."
+            )
+            session.revisionURL = revision
+            session.revisionNumber = Int(state.revisionNumber)
+            session.currentToOriginal = state.currentToOriginal.map(Int.init)
+            session.operations = state.operations
             pageEditSession = session
+            persistPageEditRecovery()
+            if let recoveryError = state.recoveryError { lastError = recoveryError }
             pageEditPendingOperations = session.operations
             pageEditIsApplied = false
             statusMessage =
                 "\(label) · \(Self.annotationRule(for: operation)) · pending "
                 + "(the file on disk is unchanged)"
             FileHandle.standardError.write(Data((
-                "lyra-reader-pages: \(label) · revision \(nextNumber) · "
+                "lyra-reader-pages: \(label) · revision \(session.revisionNumber) · "
                 + "\(session.operations.count) pending change(s)\n"
             ).utf8))
+            // A page rotation, insertion or deletion changes what the captured rectangle means.
+            // Rather than leave a card pointing at a different page, close it into history and
+            // say why. The captured image and text stay exactly as they were asked about.
+            invalidateRegionLocationsAfterPageEdit()
             return true
         } catch {
+            pageEditSession?.transaction.cancelPrepared()
+            // The revision was not adopted. Put the translation overlays that were on screen
+            // back when they still describe the document that is still open.
+            await inPlaceTranslation.restoreAfterPageEdit(
+                translationSnapshot, pageMap: nil, rotatedPages: [], editedPages: [],
+                reason: nil)
             lastError = "Page change failed; nothing was written: \(error.localizedDescription)"
             statusMessage = "Page change failed"
-            // A failed operation may have created a partial revision file; it is never referenced
-            // by the session, so remove it best-effort.
-            try? FileManager.default.removeItem(at: nextURL)
+            // The transaction removes a partial revision it wrote and forgets the prepared
+            // snapshot. If this was the session's first operation, no page change exists; close
+            // the prepared working copy instead of leaving an "editing" state.
+            discardEmptyPageEditSession()
             return false
         }
     }
@@ -10106,10 +11668,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func loadPageEditRevision(
         at url: URL,
         title: String,
-        sidecarURL: URL,
+        annotationRecordsURL: URL,
         annotations newAnnotations: [Annotation],
         bookmarks newBookmarks: [Bookmark],
-        slots newSlots: [AnnotationSidecar.Slot],
+        slots newSlots: [AnnotationRecords.Slot],
         currentPage newCurrentPage: Int,
         selection newSelection: Set<Int>
     ) throws {
@@ -10122,23 +11684,29 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             )
         }
         let previousDocumentURL = document?.url
+        let translationURL = translationCacheDocumentURL
         resetDocumentState()
         var loaded = try engine.openDocument(at: url)
         loaded.title = title
         document = loaded
-        annotationsURL = sidecarURL
+        // The working revision is not a new document for translation-cache purposes. The caller
+        // restores the session's entries after this load; keeping the original URL here is what
+        // makes a second cache directory impossible.
+        translationCacheDocumentURL = translationURL
+        annotationsURL = annotationRecordsURL
         annotationWritesBlockedReason = nil
+        annotationSourceChangedReason = nil
         preservedAnnotationEntryCount = 0
         annotations = newAnnotations
         bookmarks = newBookmarks
-        annotationSidecarSlots = newSlots
+        annotationRecordSlots = newSlots
         pageSelection = newSelection
         pageSelectionAnchor = newSelection.first
         currentPage = min(max(1, newCurrentPage), max(loaded.pageCount, 1))
         invalidateTiles()
-        scrollYPt = engine.pageTopPt(currentPage - 1, gapPt: pageGapPt, layout: layoutMode)
+        scrollYPt = displayPageTop(currentPage - 1)
         reloadVisiblePages()
-        _ = writeSidecar(
+        _ = writeAnnotationRecords(
             annotations: newAnnotations,
             bookmarks: newBookmarks,
             slots: newSlots,
@@ -10159,34 +11727,166 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     private func endPageEditSession(deleteFiles: Bool) {
-        let directory = pageEditSession?.directory
-        let revisionURL = pageEditSession?.revisionURL
-        let originalURL = pageEditSession?.originalURL
+        let session = pageEditSession
+        if let originalURL = session?.originalURL {
+            let key = DocumentEditCache.recoveryURL(for: originalURL).path
+            if Self.pageEditOwners[key]?.value === self { Self.pageEditOwners.removeValue(forKey: key) }
+        }
         pageEditSession = nil
         pageEditPendingOperations = []
         pageEditIsApplied = false
-        if let revisionURL, revisionURL != originalURL {
+        if let revisionURL = session?.revisionURL, revisionURL != session?.originalURL {
             engine.closeDocument(at: revisionURL)
         }
-        if deleteFiles, let directory {
-            try? FileManager.default.removeItem(at: directory)
+        // The Rust transaction owns the session directory and the recovery manifest; closing it
+        // is the one place either is removed.
+        session?.transaction.close(deleteFiles: deleteFiles)
+    }
+
+    /// Closes a session a command prepared but left with nothing staged.
+    ///
+    /// The first write prepares the working copy before it knows whether the write will land. If
+    /// it fails, keeping that empty session would leave the reader in an "editing" state with no
+    /// page change to save (and, before ``pageEditHasPendingChanges``, would have presented a
+    /// "0 page changes pending" banner). Only a session that still points at the original and
+    /// has no operation is discarded here; a session with an earlier change is kept intact.
+    private func discardEmptyPageEditSession() {
+        guard let session = pageEditSession, session.operations.isEmpty,
+              session.revisionURL == session.originalURL else { return }
+        endPageEditSession(deleteFiles: true)
+    }
+
+    /// Rewrites `session.json` from the shell's current state.
+    ///
+    /// The transaction writes the bytes (shape, key order, number spelling); this only supplies
+    /// the current annotation/bookmark snapshot and the revision the reader is showing. A write
+    /// failure is reported but, as before, does not undo a page change that already landed.
+    private func persistPageEditRecovery() {
+        guard let session = pageEditSession else { return }
+        do {
+            let state = try session.transaction.persist(
+                input: try pageEditInputRecord(),
+                revisionURL: document?.url ?? session.revisionURL,
+                revisionNumber: session.revisionNumber,
+                recoveryPath: DocumentEditCache.recoveryURL(for: session.originalURL))
+            if let recoveryError = state.recoveryError { lastError = recoveryError }
+        } catch {
+            lastError = "Could not cache the editing session: \(AnnotationRecords.message(error))"
         }
     }
 
-    private func pageEditSidecarData() throws -> Data? {
-        if annotations.isEmpty && bookmarks.isEmpty && annotationSidecarSlots.isEmpty {
-            return nil
+    /// Freeze text-range marks into PDF geometry before changing the text layer. This is an
+    /// internal cached revision; the original PDF is only touched by the explicit Save command.
+    @discardableResult
+    private func materializeAnnotationsInWorkingCopy() async throws -> Bool {
+        guard !annotations.isEmpty || !bookmarks.isEmpty || hasPendingFileDeletions else { return false }
+        guard await ensurePageEditSession(), var session = pageEditSession else {
+            throw NSError(domain: "LyraReader", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: lastError ?? "Could not prepare the PDF cache"])
         }
-        return try AnnotationSidecar.encode(
-            annotations: annotations,
-            bookmarks: bookmarks,
-            slots: annotationSidecarSlots
-        )
+        flushPendingWrites()
+        guard !hasPendingAnnotationWrite else {
+            throw NSError(domain: "LyraReader", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Could not cache the active annotation"])
+        }
+        let changes = try await pendingAnnotationChanges()
+        let marks = bookmarks
+        guard !changes.isEmpty || !marks.isEmpty else { return false }
+        let next = session.directory.appendingPathComponent("marks-\(UUID().uuidString).pdf")
+        _ = try await engine.saveAnnotationChanges(to: next, additions: changes.additions,
+            bookmarks: marks, updates: changes.updates, deletions: changes.deletions)
+        let oldScroll = scrollYPt
+        try loadPageEditRevision(at: next, title: session.title, annotationRecordsURL: session.annotationRecordsURL,
+            annotations: [], bookmarks: [], slots: [], currentPage: currentPage, selection: pageSelection)
+        session.revisionURL = next
+        pendingFileDeletions = []
+        erasedInkStrokeIDs = []
+        pageEditSession = session
+        persistPageEditRecovery()
+        scrollYPt = clampedScrollOffset(oldScroll)
+        reloadVisiblePages()
+        return true
+    }
+
+    /// Restores the session recorded in `session.json` after a crash or a quit.
+    ///
+    /// The Rust transaction reads and validates the manifest (the PDF it names, its source
+    /// stamp, the session directory and every revision URL); this reloads the revision it names
+    /// and hands the saved annotations/bookmarks back to the model.
+    private func restoreCachedPageEdits(for original: URL) {
+        guard pageEditSession == nil else { return }
+        let recoveryURL = DocumentEditCache.recoveryURL(for: original)
+        // The directory lookup above may have tried to migrate an old path-hash cache. If its
+        // page-edit manifest could not be retargeted, the staged edits were kept in the old
+        // directory but cannot be restored here; say so rather than silently opening without
+        // them.
+        if let failure = DocumentEditCache.migrationFailure(for: original) {
+            lastError = lastError.map { "\($0)\n\(failure)" } ?? failure
+            return
+        }
+        if let owner = Self.pageEditOwners[recoveryURL.path]?.value, owner !== self { return }
+        guard FileManager.default.fileExists(atPath: recoveryURL.path) else { return }
+        do {
+            let sourceStamp = try DocumentEditCache.SourceStamp(original)
+            let title = document?.title ?? original.deletingPathExtension().lastPathComponent
+            let pageCount = document?.pageCount ?? 0
+            let request = DocumentTransactionStartRecord(
+                originalUrl: original.absoluteString,
+                directoryUrl: "",
+                recoveryPath: recoveryURL.path,
+                originalRecordsUrl: Self.annotationRecordsURL(for: original).absoluteString,
+                title: title,
+                pageCount: UInt32(clamping: max(0, pageCount)),
+                originalRotations: [],
+                originalSignatureJson: try DocumentTransactionJSON.string(documentSignature),
+                sourceSize: UInt64(max(0, sourceStamp.size)),
+                sourceModified: sourceStamp.modified?.timeIntervalSinceReferenceDate,
+                sourceSha256: sourceStamp.sha256,
+                annotationsJson: try DocumentTransactionJSON.string(annotations),
+                bookmarksJson: try DocumentTransactionJSON.string(bookmarks),
+                slotsJson: try DocumentTransactionJSON.string(annotationRecordSlots),
+                deletionsJson: try DocumentTransactionJSON.string(pendingFileDeletions),
+                erasedInkJson: try DocumentTransactionJSON.string(Array(erasedInkStrokeIDs)),
+                annotationDirty: annotationCacheIsDirty,
+                currentPage: UInt32(clamping: max(0, currentPage)),
+                selection: pageSelection.sorted().map { UInt32(clamping: max(0, $0)) },
+                cacheDirectoryPrefix: DocumentEditCache.directory(for: original).path + "/",
+                restore: true,
+                xfaReadOnlyReason: nil
+            )
+            let (transaction, state) = try DocumentTransactionSession.start(request)
+            let signature = try DocumentTransactionJSON.value(
+                DocumentSignature.self, from: state.originalSignatureJson)
+            let directory = URL(string: state.directoryUrl) ?? recoveryURL.deletingLastPathComponent()
+            let session = try pageEditSession(
+                from: state,
+                originalURL: original,
+                signature: signature,
+                title: state.title,
+                directory: directory,
+                transaction: transaction
+            )
+            let payload = try decodedPageEditPayload(state)
+            try loadPageEditRevision(at: session.revisionURL, title: session.title,
+                annotationRecordsURL: session.annotationRecordsURL,
+                annotations: payload.annotations,
+                bookmarks: payload.bookmarks, slots: payload.slots,
+                currentPage: payload.currentPage, selection: payload.selection)
+            pendingFileDeletions = payload.deletions
+            erasedInkStrokeIDs = payload.erasedInk
+            annotationCacheIsDirty = payload.annotationDirty
+            pageEditSession = session
+            pageEditPendingOperations = session.operations
+            persistPageEditRecovery()
+            statusMessage = "Recovered unsaved PDF changes · Save to update \(original.lastPathComponent)"
+        } catch {
+            lastError = "The cached editing session was kept but could not be restored: \(AnnotationRecords.message(error))"
+        }
     }
 
     /// Why rotating `pages` would invalidate LyraReader's own marks, or nil when it is safe.
     ///
-    /// Sidecar annotations address character ranges in the page's text layer, and a rotated
+    /// cached annotations address character ranges in the page's text layer, and a rotated
     /// page's text layer is reported in a different order. Rotating the page would not move the
     /// highlight with the words; it would leave the same offsets pointing at different text.
     /// Annotations already embedded in the PDF are page-space geometry and rotate correctly, so
@@ -10216,122 +11916,98 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
-    private static func remap(_ annotations: [Annotation], with pageMap: [Int?]) -> [Annotation] {
-        annotations.compactMap { annotation in
-            guard annotation.page >= 0, annotation.page < pageMap.count,
-                  let page = pageMap[annotation.page] else { return nil }
-            var copy = annotation
-            copy.page = page
-            return copy
-        }
-    }
-
-    private static func remap(_ bookmarks: [Bookmark], with pageMap: [Int?]) -> [Bookmark] {
-        bookmarks.compactMap { bookmark in
-            guard bookmark.page >= 0, bookmark.page < pageMap.count,
-                  let page = pageMap[bookmark.page] else { return nil }
-            var copy = bookmark
-            copy.page = page
-            return copy
-        }
-    }
-
     private static func pageList(_ pages: [Int]) -> String {
-        guard let first = pages.first, let last = pages.last else { return "no pages" }
-        if pages.count == 1 { return "page \(first + 1)" }
-        if last - first + 1 == pages.count {
-            return first == last ? "page \(first + 1)" : "pages \(first + 1)–\(last + 1)"
-        }
-        return "pages " + pages.map { String($0 + 1) }.joined(separator: ", ")
+        LyraReaderBindings.pageList(pages: pages.map { UInt32(max(0, $0)) })
     }
 
-    // MARK: - Recovery from a sidecar that cannot be read
+    // MARK: - Recovery from an annotation cache that cannot be read
 
-    /// True when this document's sidecar failed to load, so writes are refused until the
-    /// reader explicitly decides what to do with the file.
-    public var canRecoverUnreadableAnnotationSidecar: Bool {
-        annotationsURL != nil && annotationWritesBlockedReason != nil
+    /// True when this document needs the explicit backup-and-reset decision: its annotation
+    /// cache failed to decode (writes are refused), or it decoded but the PDF's identity moved
+    /// (writes are allowed, replacing that PDF is refused) so the reader must choose what to
+    /// do with the saved data.
+    public var canRecoverUnreadableAnnotationRecords: Bool {
+        annotationsURL != nil && (annotationWritesBlockedReason != nil || annotationSourceChangedReason != nil)
     }
 
     /// The explicit way out of the blocked state.
     ///
-    /// It never overwrites the unreadable file: the sidecar is *moved* to
-    /// `<name>.corrupt-<timestamp>.json` in the same directory, so the reader can inspect or
-    /// restore it, and only then is a fresh empty sidecar written. Returns the backup URL, or
-    /// `nil` when nothing was recovered (in which case the blocked state is kept and the
+    /// It never overwrites the unreadable file: every recovery record is copied to a verified
+    /// `unreadable-<uuid>-<name>` sibling in the same directory before the originals are
+    /// removed, and only then is a fresh empty annotation cache written. Returns the backup URL,
+    /// or `nil` when nothing was recovered (in which case the blocked state is kept and the
     /// reason is reported).
     @discardableResult
-    public func recoverUnreadableAnnotationSidecar() -> URL? {
-        guard let sidecarURL = annotationsURL, annotationWritesBlockedReason != nil else { return nil }
+    public func recoverUnreadableAnnotationRecords() -> URL? {
+        guard let annotationRecordsURL = annotationsURL,
+              annotationWritesBlockedReason != nil || annotationSourceChangedReason != nil else { return nil }
+        guard let original = pageEditSession?.originalURL ?? document?.url else { return nil }
+        // Readable records whose PDF identity moved use the same explicit backup-and-reset
+        // path, but they are not "unreadable": the status line should not claim they were.
+        let recordsWereReadable = annotationWritesBlockedReason == nil
 
         let fileManager = FileManager.default
         var backupURL: URL?
-        if fileManager.fileExists(atPath: sidecarURL.path) {
-            let destination = Self.uniqueBackupURL(for: sidecarURL)
-            do {
-                try fileManager.moveItem(at: sidecarURL, to: destination)
-                backupURL = destination
-                FileHandle.standardError.write(
-                    Data("lyra-reader-annotate: moved unreadable sidecar to \(destination.path)\n".utf8)
-                )
-            } catch {
-                let message = "Could not back up the unreadable annotation sidecar: \(error.localizedDescription)"
-                statusMessage = message
-                lastError = message
-                FileHandle.standardError.write(
-                    Data("lyra-reader-annotate: recovery failed, sidecar left in place: \(error)\n".utf8)
-                )
-                return nil
+        let records = [annotationRecordsURL, DocumentEditCache.pendingStateURL(for: original),
+                       DocumentEditCache.recoveryURL(for: original),
+                       DocumentEditCache.directory(for: original).appendingPathComponent("source.json")]
+        var copied: [(URL, URL)] = []
+        var seen: Set<String> = []
+        do {
+            for source in records where seen.insert(source.path).inserted
+                && fileManager.fileExists(atPath: source.path) {
+                let destination = DocumentEditCache.directory(for: original)
+                    .appendingPathComponent("unreadable-\(UUID().uuidString)-\(source.lastPathComponent)")
+                let bytes = try Data(contentsOf: source)
+                try bytes.write(to: destination, options: .atomic)
+                guard try Data(contentsOf: destination) == bytes else {
+                    throw DocumentEditCache.CacheError.backupVerification
+                }
+                copied.append((source, destination))
             }
+            // Verify every recovery record before retiring any. Cached PDF revisions remain
+            // available alongside the backed-up manifest for manual recovery.
+            for (source, _) in copied { try fileManager.removeItem(at: source) }
+            backupURL = copied.first?.1
+        } catch {
+            let message = "Could not back up the unreadable recovery data: \(error.localizedDescription)"
+            statusMessage = message
+            lastError = message
+            return nil
         }
 
-        // The path is free now, so a stale blocked flag must not stop the fresh write.
+        // The path is free now, so a stale blocked/source flag must not stop the fresh write.
         annotationWritesBlockedReason = nil
+        annotationSourceChangedReason = nil
+        annotationsURL = DocumentEditCache.annotationsURL(for: original)
+        do { try DocumentEditCache.recordSource(for: original) }
+        catch { annotationWritesBlockedReason = error.localizedDescription; lastError = error.localizedDescription; return nil }
         annotations = []
         bookmarks = []
-        annotationSidecarSlots = []
+        annotationRecordSlots = []
         preservedAnnotationEntryCount = 0
         undoStack.removeAll()
         redoStack.removeAll()
-        lastSidecarBackupURL = backupURL
+        lastAnnotationBackupURL = backupURL
 
         guard saveAnnotations([], trigger: "recovery") else {
             // The rename succeeded but the directory is not writable: keep refusing writes so
             // the state stays honest, and let the reader retry (the file is already backed up).
-            annotationWritesBlockedReason = lastError ?? "the sidecar could not be recreated"
+            annotationWritesBlockedReason = lastError ?? "the annotation cache could not be recreated"
             return nil
         }
 
         statusMessage = backupURL.map {
-            "Backed up the unreadable annotations to \($0.lastPathComponent) and started a fresh sidecar"
-        } ?? "Started a fresh annotation sidecar"
+            recordsWereReadable
+                ? "Backed up the annotation recovery data to \($0.lastPathComponent) and started fresh"
+                : "Backed up the unreadable annotations to \($0.lastPathComponent) and started a fresh annotation cache"
+        } ?? "Started a fresh annotation cache"
         return backupURL
     }
 
-    /// `<doc>.pdf.lyra-reader-annotations.json` → `<doc>.pdf.lyra-reader-annotations.corrupt-<stamp>.json`,
-    /// with a numeric suffix if that name is taken: an earlier backup is never overwritten.
-    static func uniqueBackupURL(for sidecarURL: URL, now: Date = Date()) -> URL {
-        let base = sidecarURL.deletingPathExtension()
-        let stamp = backupStampFormatter.string(from: now)
-        var candidate = base.appendingPathExtension("corrupt-\(stamp).json")
-        var counter = 2
-        while FileManager.default.fileExists(atPath: candidate.path) {
-            candidate = base.appendingPathExtension("corrupt-\(stamp)-\(counter).json")
-            counter += 1
-        }
-        return candidate
-    }
-
-    private static let backupStampFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
-        return formatter
-    }()
-
     /// Reveals a recovery backup in Finder (called by the UI, never by the checks).
-    public func revealSidecarBackupInFinder(_ url: URL? = nil) {
-        guard let target = url ?? lastSidecarBackupURL else { return }
+    public func revealAnnotationBackupInFinder(_ url: URL? = nil) {
+        guard let target = url ?? lastAnnotationBackupURL else { return }
         NSWorkspace.shared.activateFileViewerSelecting([target])
     }
 
@@ -10348,7 +12024,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         selection = Selection(page: hit.page, range: hit.start...(max(hit.start, hit.end - 1)))
         selectionAnchor = nil
 
-        let top = engine.pageTopPt(hit.page, gapPt: pageGapPt, layout: layoutMode)
+        let top = displayPageTop(hit.page)
         if top < scrollYPt || top > scrollYPt + viewportHeightContentPt {
             scrollYPt = top
         }
@@ -10474,7 +12150,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             || openDocumentNote(at: point)
         // Nothing above claimed the click, and it landed on markup the file itself carries.
         // Adopt it into the editable model and select it; a kind with no editable model states
-        // its one reason instead. Only the Select tool owns mark selection; the armed markup
+        // its one reason instead. Only the implicit pointer state owns mark selection; the armed markup
         // tools keep their old click behaviour.
         if annotationTool == .select, !resolved,
            let document = fileOwnedMarkupHit(atContentPoint: point) {
@@ -10500,7 +12176,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Commits or cancels the drag begun by `beginSelection`.
     ///
-    /// A drag that moved the mark writes the sidecar once and records a single `.replaced`
+    /// A drag that moved the mark writes the annotation cache once and records a single `.replaced`
     /// operation; a click (or a drag below one point) only selects it. A failed write puts the
     /// original geometry back, so the page never shows a position that is not on disk.
     private func finishAnnotationMove(original: Annotation, start: CGPoint,
@@ -10509,9 +12185,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             moveOriginalAnnotation = nil
             moveStartPagePoint = nil
         }
-        guard let placement = visiblePagePlacements.first(where: { $0.index == original.page })
+        guard let hit = pagePoint(atContentPoint: point), hit.page == original.page
         else { return }
-        let current = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+        let current = hit.point
         let dx = current.x - start.x
         let dy = current.y - start.y
         if wasClick || hypot(dx, dy) < 0.5 {
@@ -10553,17 +12229,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     @discardableResult
     public func openInlineNote(at point: CGPoint) -> Bool {
-        for marker in ownInlineNoteMarkers.reversed() {
-            guard let placement = visiblePagePlacements.first(where: { $0.index == marker.page }) else { continue }
-            let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
-            guard marker.rect.contains(local), annotations.indices.contains(marker.annotationIndex) else { continue }
+        guard let hit = pagePoint(atContentPoint: point) else { return false }
+        for marker in ownInlineNoteMarkers.reversed() where marker.page == hit.page {
+            guard marker.rect.contains(hit.point),
+                  annotations.indices.contains(marker.annotationIndex) else { continue }
             beginEditingAnnotation(annotations[marker.annotationIndex].id)
             return true
         }
-        for marker in inlineNoteMarkers.reversed() {
-            guard let placement = visiblePagePlacements.first(where: { $0.index == marker.page }) else { continue }
-            let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
-            guard marker.rect.contains(local) else { continue }
+        for marker in inlineNoteMarkers.reversed() where marker.page == hit.page {
+            guard marker.rect.contains(hit.point) else { continue }
             let annotation = documentAnnotations[marker.annotationIndex]
             showDocumentNote(annotation)
             return true
@@ -10574,19 +12248,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Expands a fixed-size paper beside the clicked glyph without moving the document.
     @discardableResult
     public func openDocumentNote(at point: CGPoint) -> Bool {
-        for placement in visiblePagePlacements {
-            let pageRect = CGRect(
-                x: placement.leftPt,
-                y: placement.topPt,
-                width: placement.widthPt,
-                height: placement.heightPt
-            )
-            guard pageRect.contains(point) else { continue }
-            let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
-
+        if let hit = pagePoint(atContentPoint: point) {
+            let local = hit.point
             // Backwards, so the note drawn last — the one the reader can see on top — wins.
             for annotation in documentAnnotations.reversed()
-            where annotation.page == placement.index && annotation.visible {
+            where annotation.page == hit.page && annotation.visible {
                 guard annotation.drawing == .noteIcon || annotation.drawing == .freeText,
                       let box = annotation.boxes.first
                 else { continue }
@@ -10645,16 +12311,29 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard !figuresLoadCompleted else { return }
         figuresLoadCompleted = true
         let epoch = documentEpoch
-        Task { @MainActor [weak self] in
+        let task = Task { @MainActor [weak self] in
             guard let self else { return }
             guard epoch == self.documentEpoch else { return }
             let found = (try? await self.engine.figures()) ?? []
             guard epoch == self.documentEpoch else { return }
             self.figures = found
+            self.figuresLoadTask = nil
             FileHandle.standardError.write(
                 Data("lyra-reader-figures: \(self.figures.count) caption(s)\n".utf8)
             )
         }
+        figuresLoadTask = task
+    }
+
+    /// Waits for the caption index a tear must consult.
+    ///
+    /// The index starts loading when the document opens and is cached by the engine, so this is
+    /// normally already done by the time a reader selects a region and returns immediately. If
+    /// the selection beats it, the card waits for the one scan instead of cutting through a
+    /// figure because the answer had not arrived. The scan always completes (a failure yields an
+    /// empty list), so this cannot hang on a broken document.
+    func awaitFiguresForPlacement() async {
+        await figuresLoadTask?.value
     }
 
     /// Loads the annotations the document itself carries (once per open document).
@@ -10674,8 +12353,28 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             guard epoch == self.documentEpoch else { return }
             defer { if epoch == self.documentEpoch { self.documentAnnotationsLoading = false } }
             do {
-                let found = try await self.engine.annotations()
+                let scan = try await self.engine.annotationScan()
                 guard epoch == self.documentEpoch else { return }
+                let found = scan.annotations
+                // One notice per document: the scan is document-wide and cached, so this
+                // block runs once rather than once per page. The readable marks still load.
+                if scan.unreadableAnnotations > 0 {
+                    let pages = scan.unreadablePages
+                        .map { String($0 + 1) }
+                        .joined(separator: ", ")
+                    let notice = "\(scan.unreadableAnnotations) annotation(s) could not be read"
+                        + " from this document (page(s) \(pages)); the rest are shown."
+                    self.annotationReadNotice = notice
+                    self.annotationWritesBlockedReason =
+                        "\(scan.unreadableAnnotations) annotation(s) on page(s) \(pages) could not"
+                        + " be read; saving new annotations would drop them."
+                    self.statusMessage = notice
+                    FileHandle.standardError.write(
+                        Data("lyra-reader-pdf-annotations: \(notice) \(scan.unreadableDetails.joined(separator: " | "))\n".utf8)
+                    )
+                } else {
+                    self.annotationReadNotice = nil
+                }
                 // An adopted entry is drawn from the editable model, and a pending deletion is
                 // drawn nowhere: hiding both here is what keeps a mark from appearing twice (or
                 // after the reader deleted it) until the save makes the change real.
@@ -10909,31 +12608,24 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// not on a citation, or when the citation names nothing we can resolve.
     @discardableResult
     public func openCitation(at point: CGPoint) -> Bool {
-        for placement in visiblePagePlacements {
-            let pageRect = CGRect(
-                x: placement.leftPt,
-                y: placement.topPt,
-                width: placement.widthPt,
-                height: placement.heightPt
-            )
-            guard pageRect.contains(point) else { continue }
-
-            let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
-            guard let citations = citationsByPage[placement.index] else {
-                // The page's citations are still being fetched — their first read runs the
-                // document-wide reference scan, queued behind this page's rasters and text layer,
-                // so a click can easily beat them. The pointer has already said which page it
-                // meant: resolve when the data lands instead of dropping the click. Nothing is
-                // known synchronously, so report "not handled" and let the panel appear a moment
-                // later, exactly as the figure-mention path does.
-                resolveCitation(on: placement, at: local)
-                return false
-            }
-            guard let citation = citation(at: local, in: citations) else { continue }
-            previewCitation(citation, on: placement)
-            return true
+        guard let hit = pagePoint(atContentPoint: point) else { return false }
+        let placement = visiblePagePlacements.first { $0.index == hit.page }
+            ?? PagePlacement(index: hit.page, topPt: displayPageTop(hit.page), leftPt: 0,
+                             widthPt: 0, heightPt: 0)
+        let local = hit.point
+        guard let citations = citationsByPage[placement.index] else {
+            // The page's citations are still being fetched — their first read runs the
+            // document-wide reference scan, queued behind this page's rasters and text layer,
+            // so a click can easily beat them. The pointer has already said which page it
+            // meant: resolve when the data lands instead of dropping the click. Nothing is
+            // known synchronously, so report "not handled" and let the panel appear a moment
+            // later, exactly as the figure-mention path does.
+            resolveCitation(on: placement, at: local)
+            return false
         }
-        return false
+        guard let citation = citation(at: local, in: citations) else { return false }
+        previewCitation(citation, on: placement)
+        return true
     }
 
     /// The citation whose box contains a page-local point, if any.
@@ -11051,34 +12743,27 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// moment later even though this call could not know it yet.
     @discardableResult
     public func openFigureMention(at point: CGPoint) -> Bool {
-        for placement in visiblePagePlacements {
-            let pageRect = CGRect(
-                x: placement.leftPt,
-                y: placement.topPt,
-                width: placement.widthPt,
-                height: placement.heightPt
-            )
-            guard pageRect.contains(point) else { continue }
-
-            let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
-            guard let mentions = captionMentionsByPage[placement.index] else {
-                // The page's mentions are still being fetched — their first read is queued
-                // behind the document-wide scans, so a click can beat them. The pointer has
-                // already said which page it meant: resolve when the data lands instead of
-                // dropping the click. Nothing is known synchronously, so report "not handled"
-                // and let the panel appear a moment later.
-                resolveFigureMention(on: placement.index, at: local)
-                return false
-            }
-            guard let mention = mention(at: local, in: mentions) else { continue }
-            if figures.isEmpty {
-                resolveFigureMention(on: placement.index, at: local)
-                return false
-            }
-            return openFigure(mention, from: placement.index,
-                              anchor: anchor(of: mention, on: placement))
+        guard let hit = pagePoint(atContentPoint: point) else { return false }
+        let placement = visiblePagePlacements.first { $0.index == hit.page }
+            ?? PagePlacement(index: hit.page, topPt: displayPageTop(hit.page), leftPt: 0,
+                             widthPt: 0, heightPt: 0)
+        let local = hit.point
+        guard let mentions = captionMentionsByPage[placement.index] else {
+            // The page's mentions are still being fetched — their first read is queued
+            // behind the document-wide scans, so a click can beat them. The pointer has
+            // already said which page it meant: resolve when the data lands instead of
+            // dropping the click. Nothing is known synchronously, so report "not handled"
+            // and let the panel appear a moment later.
+            resolveFigureMention(on: placement.index, at: local)
+            return false
         }
-        return false
+        guard let mention = mention(at: local, in: mentions) else { return false }
+        if figures.isEmpty {
+            resolveFigureMention(on: placement.index, at: local)
+            return false
+        }
+        return openFigure(mention, from: placement.index,
+                          anchor: anchor(of: mention, on: placement))
     }
 
     /// A caption mention's box in canvas view space, which is what the panel opens next to.
@@ -11184,7 +12869,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// have arrived, a right-click on that page has no link to offer. That is the same latency
     /// a click already has, rather than a second source of truth.
     private func linkHit(at point: CGPoint) -> (link: DocumentLink, placement: PagePlacement)? {
-        for placement in visiblePagePlacements {
+        for placement in canvasPageSegments {
             let pageRect = CGRect(
                 x: placement.leftPt,
                 y: placement.topPt,
@@ -11195,7 +12880,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 continue
             }
 
-            let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+            let local = CGPoint(
+                x: point.x - placement.leftPt,
+                y: point.y - placement.topPt + placement.sourceTopPt
+            )
             for link in links {
                 let box = CGRect(x: link.xPt, y: link.yPt, width: link.widthPt, height: link.heightPt)
                 guard box.contains(local) else { continue }
@@ -11220,14 +12908,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// reader's right-click has already said which one they mean. Gaps between pages answer `nil`,
     /// so a right-click in the gap offers no page operation at all.
     public func pageIndex(at point: CGPoint) -> Int? {
-        visiblePagePlacements.first { placement in
-            CGRect(
-                x: placement.leftPt,
-                y: placement.topPt,
-                width: placement.widthPt,
-                height: placement.heightPt
-            ).contains(point)
-        }?.index
+        pagePoint(atContentPoint: point)?.page
     }
 
     /// Follows the link under a content-space point, if there is one.
@@ -11253,7 +12934,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // preview must not cancel its own lookup; panel resizing has a separate raster epoch.
             previewLookupEpoch &+= 1
             previewEpoch &+= 1
-            let local = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+            let local = CGPoint(
+                x: point.x - placement.leftPt,
+                y: point.y - placement.topPt + placement.sourceTopPt
+            )
             if let citations = citationsByPage[placement.index],
                let citation = citation(at: local, in: citations) {
                 previewCitation(citation, on: placement)
@@ -11398,6 +13082,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @discardableResult
     public func openDocumentInTab(_ url: URL) -> Bool {
         if deferContentTransition({[weak self] in _ = self?.openDocumentInTab(url)}) {return true}
+        finishRegionCardsForDocumentSwitch(reason: "A document was opened. The region conversation was moved to Region questions.")
         saveActiveTabPosition()
         guard open(url: url) else { return false }
         let tab = OpenTab(url: url, title: url.deletingPathExtension().lastPathComponent,
@@ -11434,6 +13119,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func selectTab(_ index: Int) {
         guard tabs.indices.contains(index), index != activeTabIndex else { return }
         if deferContentTransition({[weak self] in self?.selectTab(index)}) {return}
+        finishRegionCardsForDocumentSwitch(reason: "Tab switched. The region conversation was moved to Region questions.")
         saveActiveTabPosition()
         flushPendingWrites()
         let previousID = activeTabIndex.flatMap { tabs.indices.contains($0) ? tabs[$0].id : nil }
@@ -11446,6 +13132,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 lastUsed: nextUseTick()
             )
         }
+
+        // Requests belong to the document leaving the screen. Their partial text is never kept;
+        // completed translations are already in the retained snapshot.
+        inPlaceTranslation.suspend()
 
         let target = tabs[index]
         if let cached = retainedTabs.removeValue(forKey: target.id),
@@ -11479,12 +13169,221 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         trimRetainedDocuments()
     }
 
+    /// Moves a tab to a new position in the strip and activates it.
+    ///
+    /// `insertionIndex` is a gap in the order *before* the move: 0 is before the first tab and
+    /// `tabs.count` is after the last one. The tab keeps its identity, so its retained document,
+    /// reading position and pending page-edit session move with it; only the array order and the
+    /// active index follow. The moved tab becomes active, which is what a reader sees after a
+    /// drop. Returns whether the order changed: dropping on either side of the tab itself, or
+    /// passing an out-of-range index, is a no-op.
+    ///
+    /// The reordered array *is* the persisted order. Every later read of the strip, a tab switch
+    /// or a close uses `tabs` in this order, so the new order survives the next layout pass and
+    /// the next document operation rather than existing only for the duration of the drag.
+    @discardableResult
+    public func moveTab(from sourceIndex: Int, toInsertionIndex insertionIndex: Int) -> Bool {
+        guard tabs.indices.contains(sourceIndex) else { return false }
+        guard insertionIndex >= 0, insertionIndex <= tabs.count else { return false }
+        guard let destination = TabReorder.destinationIndex(
+            sourceIndex: sourceIndex, insertionIndex: insertionIndex, tabCount: tabs.count
+        ) else { return false }
+
+        // The document on screen must stay on screen while the tabs shift under it. Recompute the
+        // active index from the tab id instead of shifting the number: a move in either direction
+        // changes the index by a different amount.
+        let activeID = activeTabIndex.flatMap { tabs.indices.contains($0) ? tabs[$0].id : nil }
+        let moved = tabs.remove(at: sourceIndex)
+        tabs.insert(moved, at: destination)
+        if let activeID {
+            activeTabIndex = tabs.firstIndex(where: { $0.id == activeID })
+        }
+        // The dragged tab is the one the reader let go of, so a drop selects it. This is a no-op
+        // when the moved tab was already active.
+        selectTab(destination)
+        return true
+    }
+
+    // MARK: - Moving a tab to another window
+
+    /// Why the tab at `index` cannot be moved to another window right now, or `nil` when it can.
+    ///
+    /// A tab is portable when its document is clean. Unsaved page/content/form edits live in this
+    /// window's `AppState` (a working revision, an in-flight command, a form draft) and have no
+    /// owner in the target window, so the move is refused with this sentence instead of silently
+    /// dropping the work. Annotation writes are part of `tabHasUnsavedChanges` too: their dirty
+    /// state lives in this state's cache snapshot, so the safe answer is the same sentence once
+    /// the automatic write has landed.
+    public func transferBlockReason(forTabAt index: Int) -> String? {
+        guard tabs.indices.contains(index) else {
+            return "That tab is no longer open."
+        }
+        if tabHasUnsavedChanges(index) {
+            return "“\(tabs[index].title)” has unsaved changes. Save or discard them before moving it to another window."
+        }
+        if index == activeTabIndex,
+           contentCommandInFlight || pageEditBusy || annotationSaveInProgress {
+            return "“\(tabs[index].title)” is still being written. Wait for the save to finish, then move the tab."
+        }
+        // Moving one of two copies out of this window would leave the same document open in two
+        // windows, which the transfer exists to prevent. Ask the reader to pick one copy first.
+        if tabs.contains(where: {
+            $0.id != tabs[index].id && Self.resolvesToSameFile($0.url, tabs[index].url)
+        }) {
+            return "“\(tabs[index].title)” is also open in another tab in this window. "
+                + "Close one of the copies before moving it to another window."
+        }
+        return nil
+    }
+
+    /// Everything the target window needs to continue this tab: the file, the title and the
+    /// reading position. The tab itself is not removed here — the target opens the document
+    /// first, and only then does the source give it up (``removeTransferredTab(id:)``), so a
+    /// failed open cannot lose the reader's place.
+    public func prepareTabTransfer(at index: Int) -> TabTransfer? {
+        guard tabs.indices.contains(index) else { return nil }
+        if let reason = transferBlockReason(forTabAt: index) {
+            reportTabTransferFailure(reason)
+            return nil
+        }
+        saveActiveTabPosition()
+        let tab = tabs[index]
+        let page: Int?
+        if index == activeTabIndex {
+            page = currentPage
+        } else {
+            // An inactive retained tab knows its page; an evicted one does not, and the target
+            // derives it from the restored scroll offset after the document opens.
+            page = retainedTabs[tab.id]?.state.currentPage
+        }
+        return TabTransfer(
+            tabID: tab.id,
+            url: tab.url,
+            title: tab.title,
+            scrollYPt: tab.scrollYPt,
+            currentPage: page
+        )
+    }
+
+    /// The reason the last incoming transfer was refused.
+    ///
+    /// Not `lastError`: the destination window is usually not the key window during a drag, so an
+    /// alert there would appear late and in the wrong window. The caller (``TabMove`` or the
+    /// window registry) reads this and reports it in the source window, where the reader let go.
+    public private(set) var lastTabTransferRefusal: String?
+
+    @discardableResult
+    private func refuseTabTransfer(_ message: String) -> Bool {
+        lastTabTransferRefusal = message
+        statusMessage = "Couldn’t receive the tab"
+        FileHandle.standardError.write(Data("lyra-reader-tabs: \(message)\n".utf8))
+        return false
+    }
+
+    /// Receives a tab from another window and inserts it at `insertionIndex` (the gap in this
+    /// window's order before the move, or the end when `nil`). The reader ends up looking at the
+    /// arriving tab, at its saved reading position.
+    ///
+    /// The document is opened through the same path as a normal open, so the tab that was on
+    /// screen becomes a retained tab exactly as it would after any other tab switch. The target
+    /// refuses while it is writing or editing its own document: opening over a live edit would
+    /// either discard it or show a confirmation sheet in the middle of a drag.
+    @discardableResult
+    public func acceptTabTransfer(_ transfer: TabTransfer, atInsertionIndex insertionIndex: Int? = nil) -> Bool {
+        if contentTextEditing || contentTextRecovery != nil || contentCommandInFlight
+            || pageEditBusy || annotationSaveInProgress {
+            return refuseTabTransfer(
+                "The other window is still editing or saving. Finish there, then move the tab again.")
+        }
+        if hasUnsavedDocumentChanges {
+            return refuseTabTransfer(
+                "The other window has unsaved changes. Save or discard them before moving a tab into it.")
+        }
+        // Opening a second copy of a document this window already has would leave it open twice
+        // for the same drop. Refuse, so the source tab stays where it is.
+        if tabs.contains(where: { Self.resolvesToSameFile($0.url, transfer.url) }) {
+            return refuseTabTransfer(
+                "“\(transfer.title)” is already open in the other window. "
+                + "Close that tab before moving this one there.")
+        }
+        guard open(url: transfer.url, restoringTabScroll: transfer.scrollYPt) else {
+            return refuseTabTransfer(
+                "Couldn’t open “\(transfer.title)” in this window. \(lastError ?? "")")
+        }
+        let index = min(max(insertionIndex ?? tabs.count, 0), tabs.count)
+        tabs.insert(OpenTab(
+            id: transfer.tabID,
+            url: transfer.url,
+            title: transfer.title,
+            scrollYPt: transfer.scrollYPt
+        ), at: index)
+        activeTabIndex = index
+        if let page = transfer.currentPage,
+           page >= 0, page < (document?.pageCount ?? 0) {
+            currentPage = page
+        } else if (document?.pageCount ?? 0) > 0 {
+            currentPage = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt)
+        }
+        trimRetainedDocuments()
+        statusMessage = "Moved “\(transfer.title)” from another window"
+        return true
+    }
+
+    /// Whether this window still has the tab with `id`. Used when a transfer completes: a tab
+    /// that disappeared with its source window is not a failure, while a tab that is still here
+    /// after the target accepted the document is a duplicate and must be rolled back.
+    public func containsTab(id: UUID) -> Bool {
+        tabs.contains { $0.id == id }
+    }
+
+    /// Removes the tab after its document has been opened in another window. The tab must still
+    /// be clean; the target rolls back if it is not. No document is left open in this window and
+    /// no cache or working file is deleted: the annotations and reading position belong to the
+    /// file, and the target now owns the screen.
+    @discardableResult
+    public func removeTransferredTab(id: UUID) -> Bool {
+        guard let index = tabs.firstIndex(where: { $0.id == id }) else { return false }
+        if let reason = transferBlockReason(forTabAt: index) {
+            reportTabTransferFailure(reason)
+            return false
+        }
+        saveActiveTabPosition()
+        if index != activeTabIndex {
+            // An inactive tab can be removed without touching the document the reader is actually
+            // editing in this window. `closeTab` would run the content-transition path first.
+            let closing = tabs.remove(at: index)
+            if let active = activeTabIndex, index < active {
+                activeTabIndex = active - 1
+            }
+            if let retained = retainedTabs.removeValue(forKey: closing.id) {
+                releaseEngineDocumentIfUnused(retained.state.document.url ?? retained.url)
+            }
+            return !tabs.contains(where: { $0.id == id })
+        }
+        closeTab(index)
+        return !tabs.contains(where: { $0.id == id })
+    }
+
+    /// Reports a refused or failed tab move in the same place every other shell error appears.
+    public func reportTabTransferFailure(_ message: String) {
+        lastError = message
+        statusMessage = "Couldn’t move the tab"
+        FileHandle.standardError.write(Data("lyra-reader-tabs: \(message)\n".utf8))
+    }
+
     public func closeTab(_ index: Int) {
         guard tabs.indices.contains(index) else { return }
         if deferContentTransition({[weak self] in self?.closeTab(index)}) {return}
-        if index != activeTabIndex, retainedTabs[tabs[index].id]?.state.pageEditSession?.operations.isEmpty == false {selectTab(index)}
-        if index == activeTabIndex, pageEditSession?.operations.isEmpty == false {
+        if index != activeTabIndex, tabHasUnsavedChanges(index) {
+            selectTab(index)
+            guard activeTabIndex == index else { return }
+        }
+        if index == activeTabIndex, hasUnsavedDocumentChanges {
+            flushPendingWrites()
             pendingContentClose=index;contentCloseRequested=true;return
+        }
+        if index == activeTabIndex {
+            finishRegionCardsForDocumentSwitch(reason: "Tab closed. The region conversation was moved to Region questions.")
         }
         saveActiveTabPosition()
         let closing = tabs[index]
@@ -11501,11 +13400,16 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         retainedTabs.removeValue(forKey: closing.id)
         let closingDocumentURL = document?.url
         activeTabIndex = nil
-        // Flush first: while the page-edit session is still current, its sidecar path is the
+        // The rows and their armed tools belong to the document that is leaving. Close them
+        // before the state is reset so no tool can act on the next document's first page.
+        closeAllSecondaryRows()
+        // Flush first: while the page-edit session is still current, its records path is the
         // working copy. Deleting the working directory before the flush would lose the note.
         resetDocumentState()
         endPageEditSession(deleteFiles: true)
         document = nil
+        // The panel is document chrome: no document means no numbers and no sampling task.
+        performancePanelVisible = false
         isRestoringDocument = false
         if let closingDocumentURL { releaseEngineDocumentIfUnused(closingDocumentURL) }
         guard !tabs.isEmpty else { return }
@@ -11532,7 +13436,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     private func saveActiveTabPosition() {
         guard let index = activeTabIndex, tabs.indices.contains(index) else { return }
-        tabs[index].scrollYPt = scrollYPt
+        tabs[index].scrollYPt = regionUnshiftedScrollYPt(scrollYPt)
     }
 
     private func restoreActiveTabPosition() {
@@ -11579,7 +13483,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             statusMessage: statusMessage,
             pageSelection: pageSelection,
             pageSelectionAnchor: pageSelectionAnchor,
-            pendingRedactions: pendingRedactions,
             pageEditSession: pageEditSession,
             pageEditPendingOperations: pageEditPendingOperations,
             pageEditIsApplied: pageEditIsApplied,
@@ -11588,6 +13491,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             searchHits: searchHits,
             currentHitIndex: currentHitIndex,
             tileCache: tileCache,
+            tileCachePeakBaseline: tileCachePeakBaseline,
+            tileRequestCount: tileRequestCount,
+            tileRasterCount: tileRasterCount,
+            tileRasterMilliseconds: tileRasterMilliseconds,
+            pageRasterCount: pageRasterCount,
+            pageRasterMilliseconds: pageRasterMilliseconds,
             pagePreviews: pagePreviews,
             pagePreviewScales: pagePreviewScales,
             desiredPreviewScale: desiredPreviewScale,
@@ -11616,7 +13525,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             metadataLoadCompleted: metadataLoadCompleted,
             formInfo: formInfo,
             formDraft: formDraft,
-            formToolActive: formToolActive,
+            formHasPendingChanges: formHasPendingChanges,
             formLoadCompleted: formLoadCompleted,
             formError: formError,
             documentInfo: documentInfo,
@@ -11625,6 +13534,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             documentPopupFlags: documentPopupFlags,
             pendingFileDeletions: pendingFileDeletions,
             documentAnnotationsError: documentAnnotationsError,
+            annotationReadNotice: annotationReadNotice,
             documentAnnotationsLoadCompleted: documentAnnotationsLoadCompleted,
             outline: outline,
             outlineLoadCompleted: outlineLoadCompleted,
@@ -11634,25 +13544,33 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             bookmarks: bookmarks,
             preservedAnnotationEntryCount: preservedAnnotationEntryCount,
             annotationWriteCount: annotationWriteCount,
+            annotationCacheIsDirty: annotationCacheIsDirty,
+            annotationCleanSnapshot: annotationCleanSnapshot,
             lastAnnotationWriteReport: lastAnnotationWriteReport,
             interruptedAnnotationSaveNotice: interruptedAnnotationSaveNotice,
-            lastSidecarBackupURL: lastSidecarBackupURL,
+            lastAnnotationBackupURL: lastAnnotationBackupURL,
             annotationsURL: annotationsURL,
             annotationWritesBlockedReason: annotationWritesBlockedReason,
-            annotationSidecarSlots: annotationSidecarSlots,
+            annotationSourceChangedReason: annotationSourceChangedReason,
+            annotationRecordSlots: annotationRecordSlots,
             selectedDocumentAnnotationID: selectedDocumentAnnotationID,
             openDocumentNoteID: openDocumentNoteID,
             annotationTextures: annotationTextures,
             noteGlyphTextures: noteGlyphTextures,
             placedGlyphTextures: placedGlyphTextures,
             undoStack: undoStack,
-            redoStack: redoStack
+            redoStack: redoStack,
+            translationSnapshot: inPlaceTranslation.snapshot(),
+            translationDocumentURL: translationCacheDocumentURL
         )
     }
 
     /// Puts a retained document's state back. The engine has already been told to make its
     /// document current (`RustEngine.activateDocument(at:)`), so no file is read here.
     private func restoreDocumentState(_ state: TabDocumentState) {
+        let wasChanging = isChangingDocumentState
+        isChangingDocumentState = true
+        defer { isChangingDocumentState = wasChanging }
         documentEpoch &+= 1
         searchEpoch &+= 1
         renderEpoch &+= 1
@@ -11684,7 +13602,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         statusMessage = state.statusMessage
         pageSelection = state.pageSelection
         pageSelectionAnchor = state.pageSelectionAnchor
-        pendingRedactions = state.pendingRedactions
         pageEditSession = state.pageEditSession
         pageEditPendingOperations = state.pageEditPendingOperations
         pageEditIsApplied = state.pageEditIsApplied
@@ -11693,6 +13610,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         searchHits = state.searchHits
         currentHitIndex = state.currentHitIndex
         tileCache = state.tileCache
+        tileCachePeakBaseline = state.tileCachePeakBaseline
+        tileRequestCount = state.tileRequestCount
+        tileRasterCount = state.tileRasterCount
+        tileRasterMilliseconds = state.tileRasterMilliseconds
+        pageRasterCount = state.pageRasterCount
+        pageRasterMilliseconds = state.pageRasterMilliseconds
         pagePreviews = state.pagePreviews
         pagePreviewScales = state.pagePreviewScales
         desiredPreviewScale = state.desiredPreviewScale
@@ -11721,7 +13644,6 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         metadataLoadCompleted = state.metadataLoadCompleted
         formInfo = state.formInfo
         formDraft = state.formDraft
-        formToolActive = state.formToolActive
         formLoadCompleted = state.formLoadCompleted
         formError = state.formError
         formLoading = false
@@ -11736,6 +13658,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         documentPopupFlags = state.documentPopupFlags
         pendingFileDeletions = state.pendingFileDeletions
         documentAnnotationsError = state.documentAnnotationsError
+        annotationReadNotice = state.annotationReadNotice
         documentAnnotationsLoadCompleted = state.documentAnnotationsLoadCompleted
         outline = state.outline
         outlineLoadCompleted = state.outlineLoadCompleted
@@ -11744,18 +13667,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         erasedInkStrokeIDs = state.erasedInkStrokeIDs
         eraserHoverMarkID = nil
         eraserGestureBase = nil
-        eraserGestureSidecarSplits = [:]
+        eraserGestureRecordSplits = [:]
         eraserGestureDocumentSplits = [:]
         eraserPreviewMarks = nil
         bookmarks = state.bookmarks
         preservedAnnotationEntryCount = state.preservedAnnotationEntryCount
         annotationWriteCount = state.annotationWriteCount
+        annotationCacheIsDirty = state.annotationCacheIsDirty
+        annotationCleanSnapshot = state.annotationCleanSnapshot
         lastAnnotationWriteReport = state.lastAnnotationWriteReport
         interruptedAnnotationSaveNotice = state.interruptedAnnotationSaveNotice
-        lastSidecarBackupURL = state.lastSidecarBackupURL
+        lastAnnotationBackupURL = state.lastAnnotationBackupURL
         annotationsURL = state.annotationsURL
         annotationWritesBlockedReason = state.annotationWritesBlockedReason
-        annotationSidecarSlots = state.annotationSidecarSlots
+        annotationSourceChangedReason = state.annotationSourceChangedReason
+        annotationRecordSlots = state.annotationRecordSlots
         selectedDocumentAnnotationID = state.selectedDocumentAnnotationID
         openDocumentNoteID = state.openDocumentNoteID
         annotationTextures = state.annotationTextures
@@ -11763,6 +13689,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         placedGlyphTextures = state.placedGlyphTextures
         undoStack = state.undoStack
         redoStack = state.redoStack
+        translationCacheDocumentURL = state.translationDocumentURL
+        if let url = state.translationDocumentURL ?? state.document.url { loadRegionHistory(for: url) }
+        inPlaceTranslation.restore(
+            state.translationSnapshot,
+            url: state.translationDocumentURL ?? state.document.url,
+            pageCount: state.document.pageCount
+        )
+        translationPaperColors = [:]
+        refreshTranslationPaperColors()
 
         // Nothing that was in flight for the previous document may land in this one.
         tilesInFlight.removeAll()
@@ -11800,7 +13735,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func trimRetainedDocuments() {
         while retainedDocumentCount > Self.maximumRetainedDocuments {
             let victim = retainedTabs.values
-                .filter { $0.state.pageEditSession == nil }
+                .filter { $0.state.pageEditSession == nil && !$0.state.annotationCacheIsDirty
+                    && $0.state.pendingFileDeletions.isEmpty && $0.state.erasedInkStrokeIDs.isEmpty
+                    && !$0.state.formHasPendingChanges }
                 .min { $0.lastUsed < $1.lastUsed }
             guard let victim else { return }
             retainedTabs.removeValue(forKey: victim.tabID)
@@ -11908,7 +13845,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     private func schedulePositionSave() {
         guard let url = document?.url else { return }
-        pendingPosition = PendingPosition(url: url, offset: scrollYPt)
+        pendingPosition = PendingPosition(url: url,
+                                         offset: regionUnshiftedScrollYPt(scrollYPt))
         positionSaveTask?.cancel()
         positionSaveTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(400))
@@ -11931,7 +13869,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         pendingPosition = nil
         // Prefer the live offset: while its document is still on screen it is the reader's
         // real position, which matters when a restore or a resize moved it after scheduling.
-        let offset = document?.url == pending.url ? scrollYPt : pending.offset
+        let offset = document?.url == pending.url
+            ? regionUnshiftedScrollYPt(scrollYPt) : pending.offset
         UserDefaults.standard.set(Double(offset), forKey: Self.positionKey(for: pending.url))
         // The system flushes defaults on a normal quit but not when the process is killed,
         // and losing the reading position is exactly what this flush exists to prevent.
@@ -11998,7 +13937,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Jump to a chat citation's page and flash the passage it came from.
     ///
-    /// This creates no annotation and writes no sidecar: the boxes live in `aiSourceHighlight`
+    /// This creates no annotation and writes nothing to the cache: the boxes live in `aiSourceHighlight`
     /// for the length of the fade and are then dropped. The page is scrolled so the first line
     /// of the passage is visible, not merely so the page top is.
     public func revealAISource(page: Int, rects: [CGRect]) {
@@ -12006,7 +13945,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let clipped = rects.filter {
             $0.width.isFinite && $0.height.isFinite && $0.width > 0 && $0.height > 0
         }
-        let pageTop = engine.pageTopPt(page, gapPt: pageGapPt, layout: layoutMode)
+        let pageTop = displayPageTop(page)
         let passageTop = clipped.map(\.minY).min() ?? 0
         cancelScrollGlide()
         scrollYPt = clampedScrollOffset(max(pageTop, pageTop + passageTop - 40))
@@ -12031,18 +13970,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     private func fadeAISourceHighlight(id: UUID) {
         aiSourceHighlightTask?.cancel()
+        let clock = ContinuousClock()
+        let started = clock.now
         aiSourceHighlightTask = Task { @MainActor [weak self] in
+            // Absolute deadlines avoid extending every later phase when raster work delays
+            // one main-actor resumption on a busy window or CI runner.
             for (phase, delay) in [
                 (AISourceHighlight.Phase.soft, Duration.milliseconds(450)),
-                (.faint, .milliseconds(450)),
+                (.faint, .milliseconds(900)),
             ] {
-                try? await Task.sleep(for: delay)
+                try? await clock.sleep(until: started.advanced(by: delay))
                 guard !Task.isCancelled, let self,
                       self.aiSourceHighlight?.id == id else { return }
                 self.aiSourceHighlight?.phase = phase
                 self.refreshSelectionOverlay()
             }
-            try? await Task.sleep(for: .milliseconds(500))
+            try? await clock.sleep(until: started.advanced(by: .milliseconds(1_400)))
             guard !Task.isCancelled, let self,
                   self.aiSourceHighlight?.id == id else { return }
             self.aiSourceHighlight = nil
@@ -12054,9 +13997,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func gotoPage(_ page: Int) {
         guard document != nil else { return }
         cancelScrollGlide()
-        scrollYPt = engine.pageTopPt(
-            max(0, page), gapPt: pageGapPt, layout: layoutMode
-        )
+        scrollYPt = displayPageTop(max(0, page))
         reloadVisiblePages()
         schedulePositionSave()
     }
@@ -12065,15 +14006,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// click lands on the bookmarked paragraph; a document node without one goes to the page top.
     public func gotoOutlineEntry(_ entry: OutlineEntry) {
         guard document != nil, let page = entry.page else { return }
-        guard let y = entry.yPt, y.isFinite, y > 0 else {
+        guard let y = entry.yPt, y.isFinite, y > 0,
+              jumpToSavedPosition(page: max(0, page), yPt: CGFloat(y)) else {
             gotoPage(page)
             return
         }
-        cancelScrollGlide()
-        let top = engine.pageTopPt(max(0, page), gapPt: pageGapPt, layout: layoutMode)
-        scrollYPt = clampedScrollOffset(top + CGFloat(y))
-        reloadVisiblePages()
-        schedulePositionSave()
         statusMessage = "Jumped to “\(entry.title)”"
     }
 
@@ -12138,11 +14075,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// 100% zoom is still one ⌘+ away.
     private func fitSpreadToViewportIfNeeded() {
         guard layoutMode == .facing, contentWidthPt > 0, viewportSizePt.width > 0 else { return }
-        guard let fitPercent = fitZoomPercent(fittingContentPt: contentWidthPt,
+        guard let fitPercent = fitZoomPercent(.fitWidth,
+                                              fittingContentPt: contentWidthPt,
                                               intoViewportPt: viewportSizePt.width)
         else { return }
         guard fitPercent < zoomPercent else { return }
-        let target = max(Self.minimumZoomPercent, fitPercent)
+        let target = resolvedZoomPercent(mode: .percent, percent: fitPercent) ?? fitPercent
         guard target < zoomPercent else { return }
 
         cancelScrollGlide()
@@ -12163,10 +14101,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     private func readingLayoutAnchor() -> ReadingLayoutAnchor {
         guard document != nil else { return ReadingLayoutAnchor(page: 0, offsetY: 0) }
-        let page = engine.pageIndex(
-            atScrollYPt: scrollYPt, gapPt: pageGapPt, layout: layoutMode
-        )
-        let top = engine.pageTopPt(page, gapPt: pageGapPt, layout: layoutMode)
+        let page = regionCurrentPage(at: scrollYPt)
+        let top = displayPageTop(page)
         return ReadingLayoutAnchor(page: page, offsetY: max(0, scrollYPt - top))
     }
 
@@ -12182,8 +14118,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return
         }
         contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode)
+            + regionGapTotalPt
         contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt, layout: layoutMode)
-        let top = engine.pageTopPt(anchor.page, gapPt: pageGapPt, layout: layoutMode)
+        let top = displayPageTop(anchor.page)
         scrollYPt = clampedScrollOffset(top + anchor.offsetY)
         reloadVisiblePages()
         schedulePositionSave()
@@ -12260,20 +14197,23 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             canvasPages = []
             canvasTiles = []
             contentHeightPt = 0
+            lastTilePlan = nil
             return
         }
 
         contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode)
+            + regionGapTotalPt
         contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt, layout: layoutMode)
 
         let viewportHeight = viewportHeightContentPt
         let margin = viewportHeight * 2
-        let visible = engine.visiblePages(
+        // Region cards shift pages down without changing the engine's layout. The shifted
+        // query is a superset of the viewport; `regionVisiblePages` filters it after applying
+        // the same shift the canvas draws with. With no cards this is exactly the engine call.
+        let visible = regionVisiblePages(
             scrollYPt: scrollYPt,
             viewportHeightPt: viewportHeight,
-            gapPt: pageGapPt,
-            marginPt: margin,
-            layout: layoutMode
+            marginPt: margin
         )
 
         let lod = rasterLod
@@ -12286,10 +14226,94 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // the visible window is the left one.
         let viewport = visibleContentRect(viewportHeight: viewportHeight)
 
-        // The band: viewport + ring, where the ring is picked so the band's bytes fit the
-        // band budget (see `prefetchRingVh`).
-        let ringVh = prefetchRingVh(viewportHeight: viewportHeight, tilePt: tilePt, pages: visible)
-        let band = bandSpans(ringVh: ringVh, viewportHeight: viewportHeight, tilePt: tilePt, pages: visible)
+        // The scheduler's decision for this update (ADR 0007 / audit C5): one batch plan from
+        // `lyra-reader-render`, not one query per tile. The plan owns the prefetch ring, the band
+        // rows and columns, the pinned set and the raster order; the cache, the eviction, the
+        // texture upload and rasterization all stay in the shell.
+        let drawerWidth = (rightPanelVisible || performancePanelVisible
+            ? ReaderSidePanelMetrics.totalWidth(contentWidth: rightPanelWidthPt) : 0)
+            + secondaryInspectorWidth
+        // The env override wins over the fixture/bench property; `nil` lets the planner derive
+        // the measured third-of-the-budget target.
+        let bandBudgetOverride: Int? = Self.prefetchBandMiB.flatMap(Int.init)
+            .map { min(max($0, 1), 512) * 1024 * 1024 }
+            ?? prefetchBandBudgetOverrideBytes
+        let planRequest = TilePlanRequestRecord(
+            viewportXPt: Double(viewport.minX),
+            viewportYPt: Double(viewport.minY),
+            viewportWidthPt: Double(viewport.width),
+            viewportHeightPt: Double(viewport.height),
+            scrollDirection: Double(scrollDirection),
+            zoom: Double(zoomFactor),
+            tileSizePx: UInt32(tileSizePx),
+            lod: lod,
+            cacheBudgetBytes: UInt64(max(0, tileCache.budgetBytes)),
+            bandBudgetOverrideBytes: bandBudgetOverride.map { UInt64(max(0, $0)) },
+            ringOverrideVh: Self.prefetchRingOverride.map(Double.init),
+            prefetchColumns: UInt32(Self.prefetchColumns),
+            wantAllColumns: Self.wantAllColumns,
+            drawerWidthPt: Double(drawerWidth),
+            rightPanelLayoutMoving: rightPanelLayoutIsMoving,
+            pages: visible.map { placement in
+                let tear = pageTear(forPage: placement.index)
+                return TilePlanPageRecord(
+                    page: UInt32(placement.index),
+                    topPt: Double(placement.topPt),
+                    leftPt: Double(placement.leftPt),
+                    widthPt: Double(placement.widthPt),
+                    heightPt: Double(placement.heightPt),
+                    displayTopPt: Double(displayPageTop(placement.index)),
+                    tearSplitPt: tear.map { Double($0.splitPt) },
+                    tearGapPt: Double(tear?.gapPt ?? 0)
+                )
+            },
+            cachedTiles: tileCache.keys().compactMap { key in
+                guard let bytes = tileCache.bytes(for: key) else { return nil }
+                return TilePlanCachedTileRecord(
+                    page: UInt32(key.page), lod: key.lod,
+                    x: UInt32(key.x), y: UInt32(key.y), bytes: UInt64(bytes))
+            },
+            priorTiles: canvasTiles.compactMap { tile in
+                let id = tile.placement.index
+                guard id >= 0 else { return nil }
+                return TilePlanPriorTileRecord(
+                    page: UInt32(id >> 24), lod: UInt8((id >> 20) & 15),
+                    x: UInt32(id & 1023), y: UInt32((id >> 10) & 1023),
+                    leftPt: Double(tile.placement.leftPt))
+            }
+        )
+        guard let plan = planTiles(request: planRequest) else {
+            // The shell cannot produce an invalid request; report it rather than draw a
+            // fabricated plan. The previous canvas stays as it was.
+            lastTilePlan = nil
+            lastError = "Tile plan rejected: invalid viewport geometry"
+            return
+        }
+
+        var placementsByPage: [Int: PagePlacement] = [:]
+        for placement in visible { placementsByPage[placement.index] = placement }
+        guard plan.pages.allSatisfy({ placementsByPage[Int($0.page)] != nil }) else {
+            lastTilePlan = nil
+            lastError = "Tile plan named a page outside the visible band"
+            return
+        }
+        // The plan's rows and columns are the band the page assembly and the band HUD use. The
+        // guard above makes the `compactMap` total.
+        let band: [BandSpan] = plan.pages.compactMap { page in
+            guard let placement = placementsByPage[Int(page.page)] else { return nil }
+            return BandSpan(
+                placement: placement,
+                columns: Int(page.firstColumn)...Int(page.lastColumn),
+                rows: Int(page.firstRow)...Int(page.lastRow)
+            )
+        }
+        let ringVh = CGFloat(plan.ringVh)
+        let wanted = Set(plan.pinned.map {
+            TileKey(page: Int($0.page), lod: $0.lod, x: Int($0.x), y: Int($0.y))
+        })
+        let retainedTiles = Set(plan.retained.map {
+            TileKey(page: Int($0.page), lod: $0.lod, x: Int($0.x), y: Int($0.y))
+        })
 
         visiblePagePlacements = Array(visible)
 
@@ -12314,9 +14338,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         configurePagePreviews(visible: visible, band: band, viewport: viewport,
                               viewportHeight: viewportHeight, screenScale: screenScale)
         schedulePagePreview()
-        var wanted = Set<TileKey>()
         var pages: [CanvasPage] = []
         var bandReport = BandReport()
+        // Tiles this update missed, with the placement the plan named. They are queued after the
+        // page assembly, in the plan's submission order.
+        var missedTiles = Set<TileKey>()
+        var tilePlacements: [TileKey: PagePlacement] = [:]
+        var queuedTiles: [TilePlanSnapshot.Tile] = []
 
         for span in band {
             let placement = span.placement
@@ -12343,12 +14371,25 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // The pinned set is the *shown* band plus the ring the byte budget allows: a tile
             // outside the band may be re-rasterized, a visible one may not be dropped.
 
+            // A drawer hides already sharp columns; it does not invalidate them. The plan
+            // already decided which of them are pinned (`retained`); append those quads in their
+            // old order, so Metal keeps their textures and closing the drawer can reveal them
+            // without raster or upload work.
+            for tile in previous {
+                let id = tile.placement.index
+                guard (id >> 20) & 15 == Int(lod) else { continue }
+                let key = TileKey(page: placement.index, lod: lod,
+                                  x: id & 1023, y: (id >> 10) & 1023)
+                guard retainedTiles.contains(key) else { continue }
+                sharpRows.append(tile)
+                bandReport.record(.offscreenColumn, bytes: tile.image.bgra.count)
+            }
+
             for ty in span.rows {
                 var rowReady: [CanvasPage] = []
                 var rowComplete = true
                 for tx in span.columns {
                     let key = TileKey(page: placement.index, lod: lod, x: tx, y: ty)
-                    wanted.insert(key)
 
                     let tilePlacement = PagePlacement(
                         index: tileIdentifier(key),
@@ -12377,7 +14418,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                             complete = false
                             bandReport.visibleMisses += 1
                         }
-                        scheduleTile(key, placement: tilePlacement)
+                        missedTiles.insert(key)
+                        tilePlacements[key] = tilePlacement
                     }
                 }
                 if rowComplete {
@@ -12406,20 +14448,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 pages.append(contentsOf: sharpRows)
             }
         }
-        let viewportTop = scrollYPt
-        pendingTiles.sort { a, b in
-            func priority(_ item: (TileKey, PagePlacement)) -> (Int, CGFloat) {
-                let rect = item.1
-                let visible = CGRect(x: rect.leftPt, y: rect.topPt,
-                                     width: rect.widthPt, height: rect.heightPt).intersects(viewport)
-                let distance = max(viewportTop - rect.topPt - rect.heightPt,
-                    rect.topPt - viewportTop - viewportHeight, 0)
-                // An offscreen neighbor touching the viewport also has distance zero.
-                // A page jump must fill its destination before that prefetch work.
-                return (visible ? 0 : 1, distance)
+        // Submit in the plan's order: visible tiles first, then the ring by distance. The
+        // planner's sort is stable, so equal distances keep the band's page/row/column order —
+        // the same order the shell's own sort produced before the plan moved to Rust.
+        for tile in plan.tiles {
+            let key = TileKey(page: Int(tile.page), lod: tile.lod,
+                              x: Int(tile.x), y: Int(tile.y))
+            guard missedTiles.contains(key), !tilesInFlight.contains(key),
+                  !failedTiles.contains(key), let placement = tilePlacements[key] else {
+                continue
             }
-            return priority(a) < priority(b)
+            scheduleTile(key, placement: placement)
+            queuedTiles.append(TilePlanSnapshot.Tile(key: key, prefetch: tile.prefetch))
         }
+        recordTilePlan(plan, scheduled: queuedTiles)
         pumpTiles()
 
         canvasTiles = pages
@@ -12430,9 +14472,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         loadCitations()
         wantedTiles = wanted
         evictTiles()
+        // One place, on the final list: every page raster, tile, selection tint, annotation quad
+        // and note glyph on a torn page is clipped into its two display segments here. No
+        // rasteriser call and no bitmap copy is added — the same textures are drawn twice with
+        // complementary source rectangles.
+        pages = applyPageTears(to: pages)
         canvasPages = pages
         if isRestoringDocument && !pages.isEmpty { isRestoringDocument = false }
-        currentPage = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt, layout: layoutMode) + 1
+        currentPage = regionCurrentPage(at: scrollYPt) + 1
         reportTileCacheStats(
             wanted: wanted.count, scheduled: pendingTiles.count, band: bandReport,
             ringVh: ringVh, lod: lod, tilePt: tilePt, pages: pages.count
@@ -12484,15 +14531,42 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         func bytes(_ kind: BandClass) -> Int { byteCounts[index(kind)] }
     }
 
+    /// Freezes the update's scheduling decision for `TilePlanFixtureChecks`.
+    ///
+    /// It reads exactly what the update is about to act on — the Rust plan's band, ring, pinned
+    /// set and prefetch flags, plus the tiles actually queued for rasterization — and stores a
+    /// value copy. Nothing downstream consumes it; the equivalence suite is the only reader.
+    private func recordTilePlan(_ plan: TilePlanRecord, scheduled: [TilePlanSnapshot.Tile]) {
+        let pages = plan.pages.map { page in
+            TilePlanSnapshot.Page(
+                page: Int(page.page),
+                firstColumn: Int(page.firstColumn),
+                lastColumn: Int(page.lastColumn),
+                firstRow: Int(page.firstRow),
+                lastRow: Int(page.lastRow)
+            )
+        }
+        let pinned = plan.pinned.map {
+            TileKey(page: Int($0.page), lod: $0.lod, x: Int($0.x), y: Int($0.y))
+        }.sorted { a, b in
+            if a.page != b.page { return a.page < b.page }
+            if a.lod != b.lod { return a.lod < b.lod }
+            if a.y != b.y { return a.y < b.y }
+            return a.x < b.x
+        }
+        lastTilePlan = TilePlanSnapshot(lod: plan.lod, ringVh: CGFloat(plan.ringVh),
+                                        pages: pages, pinned: pinned, scheduled: scheduled)
+    }
+
     /// The part of the content the viewport shows, in content points. The canvas centres the
     /// content when it is narrower than the viewport (`PDFCanvasView.renderFrame`), which is
     /// the same transform; when a page is wider there is no horizontal scrolling, so the
     /// visible window is its left edge.
     private func visibleContentRect(viewportHeight: CGFloat) -> CGRect {
         let zoom = max(zoomFactor, 0.01)
-        let centreOffsetPt = max(0, (viewportSizePt.width - contentWidthPt * zoomFactor) / 2)
+        let centreOffsetPt = max(0, (canvasPresentationWidthPt - contentWidthPt * zoomFactor) / 2)
         return CGRect(
-            x: -centreOffsetPt / zoom,
+            x: (horizontalViewportOrigin - centreOffsetPt) / zoom,
             y: scrollYPt,
             width: max(1, viewportSizePt.width) / zoom,
             height: viewportHeight
@@ -12520,7 +14594,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// rectangle; exposing the decision makes the facing-layout hit test checkable directly
     /// (a point in the right-hand page must name that page's index, not its partner's).
     public func pagePlacement(at point: CGPoint) -> PagePlacement? {
-        visiblePagePlacements.first { placement in
+        canvasPageSegments.first { placement in
             CGRect(
                 x: placement.leftPt,
                 y: placement.topPt,
@@ -12535,125 +14609,42 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The click paths use this to hand the floating panel the rectangle the reader actually
     /// clicked, transformed exactly the way the canvas transforms it while drawing.
     public func viewRect(local region: CGRect, on placement: PagePlacement) -> CGRect {
-        CanvasGeometry.viewRect(
+        // A torn page needs the piecewise map. The placement may be the page or one of its
+        // segments; the page index is the stable thing, so ask for the page's segments.
+        if pageTear(forPage: placement.index) != nil {
+            return viewRect(local: region, onPage: placement.index)
+                ?? CanvasGeometry.viewRect(
+                    pageTopPt: placement.topPt, pageLeftPt: placement.leftPt, region: region,
+                    scrollYPt: scrollYPt, zoom: zoomFactor,
+                    contentOffsetX: CanvasGeometry.contentOffsetX(
+                        viewportWidthPt: canvasPresentationWidthPt,
+                        contentWidthPt: contentWidthPt,
+                        zoom: zoomFactor
+                    )
+                )
+        }
+        return CanvasGeometry.viewRect(
             pageTopPt: placement.topPt,
             pageLeftPt: placement.leftPt,
             region: region,
             scrollYPt: scrollYPt,
             zoom: zoomFactor,
             contentOffsetX: CanvasGeometry.contentOffsetX(
-                viewportWidthPt: viewportSizePt.width,
+                viewportWidthPt: canvasPresentationWidthPt,
                 contentWidthPt: contentWidthPt,
                 zoom: zoomFactor
             )
         )
     }
 
-    /// The ring above and below the viewport, in viewport heights.
-    ///
-    /// Both numbers are distances from the viewport's *top* edge (`scrollYPt`), which is how
-    /// ADR 0007 wrote them: the viewport itself is the interval [0, 1], so a ring of `R`
-    /// viewports is `above + below = 1 + R` and never less than 1 — the band must contain the
-    /// viewport whatever the budget says, or the reader stares at tiles the scheduler decided
-    /// not to want.
-    ///
-    /// The ring is asymmetric on purpose — most of it points the way the reader is scrolling —
-    /// and the shape ADR 0007 shipped (0.5 above / 2.0 below the viewport going down, 2.0/0.5
-    /// going up) is kept as the *ratio* for every shorter ring, so shortening the band never
-    /// changes which side it favours, only how far it reaches.
-    private func ringSplit(_ ringVh: CGFloat) -> (above: CGFloat, below: CGFloat) {
-        if scrollDirection < 0 {
-            return (ringVh * 2.0 / Self.maxPrefetchRingVh, 1 + ringVh * 0.5 / Self.maxPrefetchRingVh)
-        }
-        return (ringVh * 0.5 / Self.maxPrefetchRingVh, 1 + ringVh * 2.0 / Self.maxPrefetchRingVh)
-    }
-
-    /// Rungs the ring is chosen from, longest first, ending at the floor. The ladder is coarse
-    /// on purpose: each rung is a whole row of tiles at ordinary geometries, so a finer ladder
-    /// would buy bytes the band HUD cannot even show.
-    static let prefetchRingLadder: [CGFloat] = [2.5, 2.0, 1.5, 1.25, 1.0, minPrefetchRingVh]
-
-    /// Picks the ring distance: the longest rung whose band fits `prefetchBandBudgetBytes`.
-    ///
-    /// The estimate is the band this update is about to build, tile for tile — cached tiles at
-    /// their real (often cropped) size, the rest at a full tile — so the choice and the
-    /// scheduling loop cannot drift apart.
-    private func prefetchRingVh(
-        viewportHeight: CGFloat,
-        tilePt: CGFloat,
-        pages: [PagePlacement]
-    ) -> CGFloat {
-        if let override = Self.prefetchRingOverride {
-            return min(override, Self.maxPrefetchRingVh)
-        }
-        let budget = Self.prefetchBandMiB.flatMap(Int.init)
-            .map { min(max($0, 1), 512) * 1024 * 1024 }
-            ?? Self.prefetchBandBudgetBytes(cacheBudgetBytes: tileCache.budgetBytes)
-        let lod = rasterLod
-        let fullTileBytes = tileSizePx * tileSizePx * 4
-        for rung in Self.prefetchRingLadder {
-            let bytes = bandSpans(ringVh: rung, viewportHeight: viewportHeight, tilePt: tilePt, pages: pages)
-                .reduce(0) { bandBytes, span in
-                    bandBytes + span.rows.reduce(0) { rowBytes, ty in
-                        rowBytes + span.columns.reduce(0) { columnBytes, tx in
-                            columnBytes + (tileCache.bytes(for: TileKey(page: span.placement.index, lod: lod, x: tx, y: ty))
-                                ?? fullTileBytes)
-                        }
-                    }
-                }
-            if bytes <= budget { return rung }
-        }
-        return Self.prefetchRingLadder.last ?? Self.minPrefetchRingVh
-    }
-
     /// The tile rows and columns the band covers, per visible page.
+    ///
+    /// The rows and columns now come from `lyra-reader-render`'s plan (ADR 0007 / audit C5);
+    /// this type only pairs them with the placement the page assembly needs.
     private struct BandSpan {
         let placement: PagePlacement
         let columns: ClosedRange<Int>
         let rows: ClosedRange<Int>
-    }
-
-    /// The rows and columns of every visible page that the band covers.
-    ///
-    /// Rows come from the ring; columns come from what the viewport can reveal. ADR 0007 wanted
-    /// *every* column, on the grounds that "a page is a handful of columns wide" — true at 100%
-    /// zoom (3 columns, all on screen), false at 400% (10 columns, 3 on screen), where the
-    /// unreachable ones were 24 of the 110 tiles (22.2 of 99.2 MiB). There is no horizontal
-    /// scrolling, so the columns off to the right can only be revealed by a widening window,
-    /// which rasterizes them on demand behind the whole-page preview that is already there for
-    /// an incomplete page — that trade is measured, not assumed: see `minPrefetchRingVh`.
-    private func bandSpans(
-        ringVh: CGFloat,
-        viewportHeight: CGFloat,
-        tilePt: CGFloat,
-        pages: [PagePlacement]
-    ) -> [BandSpan] {
-        let (above, below) = ringSplit(ringVh)
-        let top = scrollYPt - viewportHeight * above
-        let bottom = scrollYPt + viewportHeight * below
-        let viewport = visibleContentRect(viewportHeight: viewportHeight)
-        let allColumns = Self.wantAllColumns
-
-        return pages.compactMap { placement in
-            let rows = max(1, Int(ceil(placement.heightPt / tilePt)))
-            let firstRow = max(0, Int(floor((top - placement.topPt) / tilePt)))
-            let lastRow = min(rows - 1, Int(floor((bottom - placement.topPt) / tilePt)))
-            guard firstRow <= lastRow else { return nil }
-
-            let columns = max(1, Int(ceil(placement.widthPt / tilePt)))
-            var firstColumn = 0
-            var lastColumn = columns - 1
-            if !allColumns {
-                firstColumn = max(0, min(columns - 1, Int(floor((viewport.minX - placement.leftPt) / tilePt))))
-                lastColumn = min(columns - 1, max(firstColumn, Int(floor((viewport.maxX - placement.leftPt) / tilePt))
-                    + Self.prefetchColumns))
-            }
-            return BandSpan(
-                placement: placement,
-                columns: firstColumn...lastColumn,
-                rows: firstRow...lastRow
-            )
-        }
     }
 
     /// `LYRA_READER_RENDER_STATS=1`: the shell's half of the HUD documented in docs/09 §9 —
@@ -12730,7 +14721,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func refreshSelectionOverlay() {
         var pages = canvasTiles
         appendSelectionHighlights(to: &pages)
-        canvasPages = pages
+        canvasPages = applyPageTears(to: pages)
     }
 
     /// Adds continuous line rectangles for selection and annotations.
@@ -13007,13 +14998,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
                 for (boxIndex, box) in annotation.boxes.enumerated() {
                     // Underline, strikeout and squiggly are lines through or under the text, not
-                    // filled boxes: the same thin-bar trick our own annotations use, with the bar
-                    // placed at the bottom (underline, squiggly) or the middle (strikeout).
-                    let isLine = annotation.kind != "highlight"
-                    let scale: CGFloat = isLine ? 0.12 : 1.0
-                    let offset: CGFloat = annotation.kind == "strikeout" ? 0.45 : 0.85
+                    // filled boxes: the same thin-bar geometry the writer puts in `/AP`, so a
+                    // mark cannot move when it is saved and read back. A highlight fills its
+                    // quad; underline sits in the bottom tenth; strikeout crosses the middle;
+                    // squiggly sits just above the underline's band.
+                    let (scale, offset): (CGFloat, CGFloat) = switch annotation.kind {
+                    case "highlight": (1.0, 0.0)
+                    case "underline": (0.10, 0.90)
+                    case "strikeout": (0.12, 0.45)
+                    default: (0.12, 0.85)
+                    }
                     let index = PlacementIndex.documentAnnotation(annotationIndex, box: boxIndex)
-                    let topPt = placement.topPt + box.yPt + box.heightPt * (isLine ? offset : 0)
+                    let topPt = placement.topPt + box.yPt + box.heightPt * offset
 
                     pages.append(CanvasPage(
                         placement: PagePlacement(
@@ -13146,7 +15142,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return image
     }
 
-    /// The bitmap for one sidecar sticky note or text box, from the cache or freshly rendered.
+    /// The bitmap for one cached sticky note or text box, from the cache or freshly rendered.
     private func placedGlyphTexture(for annotation: Annotation, index: Int) -> PageImage? {
         guard let box = annotation.shapeRect, box.width > 0, box.height > 0 else { return nil }
         let scale = NoteGlyph.scale(zoom: zoomFactor, deviceScale: deviceScale)
@@ -13535,30 +15531,29 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         if let original = resizeOriginalAnnotation, let handle = resizeHandle,
            let start = resizeStartPagePoint,
-           let placement = visiblePagePlacements.first(where: { $0.index == original.page }) {
-            let current = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+           let hit = pagePoint(atContentPoint: point), hit.page == original.page {
+            let current = hit.point
             guard let rect = resizedTextBox(
                 original, handle: handle,
                 delta: CGPoint(x: current.x - start.x, y: current.y - start.y)
             ), let index = annotations.firstIndex(where: { $0.id == original.id })
             else { return }
-            annotations[index].shapeRect = rect
-            // The text box's text is a canvas quad, so it has to be re-laid out at the new size
-            // while the drag is in flight. This is a canvas refresh, not a sidecar write: the
-            // file is written once, on mouse-up.
+            // Set the box (and scale ink strokes through it) while the drag is in flight. This
+            // is a canvas refresh, not a cache write: the file is written once, on mouse-up.
+            annotations[index] = Self.applyingBox(rect, to: annotations[index])
             refreshSelectionOverlay()
             return
         }
         if let original = moveOriginalAnnotation,
            let start = moveStartPagePoint,
-           let placement = visiblePagePlacements.first(where: { $0.index == original.page }) {
-            let current = CGPoint(x: point.x - placement.leftPt, y: point.y - placement.topPt)
+           let hit = pagePoint(atContentPoint: point), hit.page == original.page {
+            let current = hit.point
             let moved = original.translated(by: current.x - start.x, dy: current.y - start.y)
             guard moved.hasValidGeometry,
                   let index = annotations.firstIndex(where: { $0.id == original.id }) else { return }
             var updated = annotations
             updated[index] = moved
-            // In memory only: one drag is one sidecar write, on mouse-up. Writing per pointer
+            // In memory only: one drag is one cache write, on mouse-up. Writing per pointer
             // event would turn a single gesture into hundreds of disk writes.
             annotations = updated
             if original.kind.isPlacedText {
@@ -13592,11 +15587,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Whether a content point is inside the page a text selection belongs to.
     private func isOnSelectionPage(_ point: CGPoint, page: Int) -> Bool {
-        visiblePagePlacements.contains { placement in
-            placement.index == page
-                && CGRect(x: placement.leftPt, y: placement.topPt,
-                          width: placement.widthPt, height: placement.heightPt).contains(point)
-        }
+        pagePoint(atContentPoint: point)?.page == page
     }
 
     /// Drops a text selection that a markup drag is still extending, without committing it.
@@ -13631,8 +15622,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let range = selection.range.clamped(to: 0...(textPage.chars.count - 1))
         guard !range.isEmpty else { return }
 
-        let scalars = textPage.chars[range].compactMap { Unicode.Scalar($0.unicode) }
-        let string = String(String.UnicodeScalarView(scalars))
+        // One range→string entry point (Rust for engine-loaded pages, the same Swift rule for
+        // synthetic ones); decoding scalars here would be the second copy this task removed.
+        let string = textPage.string(in: range)
         guard !string.isEmpty else { return }
 
         NSPasteboard.general.clearContents()
@@ -13642,33 +15634,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Hit-test the nearest visual line, including inferred whitespace, before its characters.
     private func characterIndex(at point: CGPoint, extendingSelection: Bool = false) -> (page: Int, index: Int)? {
-        for placement in visiblePagePlacements {
-            let pageRect = CGRect(
-                x: placement.leftPt,
-                y: placement.topPt,
-                width: placement.widthPt,
-                height: placement.heightPt
-            )
-            guard pageRect.contains(point), let textPage = textPages[placement.index] else {
-                continue
-            }
-
-            let local = CGPoint(
-                x: point.x - placement.leftPt,
-                y: point.y - placement.topPt
-            )
-            if let index = textPage.characterIndex(at: local, extendingSelection: extendingSelection) {
-                return (placement.index, index)
-            }
-            return nil
-        }
-        return nil
+        guard let hit = pagePoint(atContentPoint: point),
+              let textPage = textPages[hit.page] else { return nil }
+        guard let index = textPage.characterIndex(
+            at: hit.point, extendingSelection: extendingSelection
+        ) else { return nil }
+        return (hit.page, index)
     }
 
     /// Rasterizes one tile in the background and folds it into the cache.
     private func scheduleTile(_ key: TileKey, placement: PagePlacement) {
         guard !tilesInFlight.contains(key), !failedTiles.contains(key) else { return }
         pendingTiles.append((key, placement))
+        // One request per queued raster. Repeated viewport updates re-append the tile only after
+        // `pendingTiles` is rebuilt, so this counts real scheduler requests, not cache lookups.
+        tileRequestCount += 1
     }
 
     private func pumpTiles() {
@@ -13683,6 +15663,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
         let epoch = renderEpoch
         let tileSize = tileSizePx
+        let started = DispatchTime.now().uptimeNanoseconds
         Task { @MainActor [weak self] in
             guard let self, epoch == self.renderEpoch else { return }
 
@@ -13696,6 +15677,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 )
                 guard epoch == self.renderEpoch else { return }
                 self.tilesInFlight.remove(key)
+                // Self-reported wall time of the engine call: it includes PDFium rasterization
+                // and the FFI copy, not the GPU upload (which happens on the next canvas update).
+                self.tileRasterCount += 1
+                self.tileRasterMilliseconds += Double(
+                    DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
 
                 let image = tile.pageImage(pointSize: CGSize(width: placement.widthPt, height: placement.heightPt))
                 self.tileCache.insert(image, for: key)
@@ -13815,14 +15801,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func configurePagePreviews(visible: [PagePlacement], band: [BandSpan], viewport: CGRect,
                                        viewportHeight: CGFloat, screenScale: CGFloat) {
         desiredPreviewScale = usesScreenPageRasters ? screenScale : 1
-        let current = engine.pageIndex(atScrollYPt: scrollYPt, gapPt: pageGapPt, layout: layoutMode)
+        let current = regionCurrentPage(at: scrollYPt)
         let bandPages = Set(band.map(\.placement.index))
         let candidates: [PagePlacement]
         let budget: Int
         if usesScreenPageRasters {
-            candidates = engine.visiblePages(scrollYPt: scrollYPt, viewportHeightPt: viewportHeight,
-                gapPt: pageGapPt, marginPt: max(viewportHeight * 2, (document?.firstPageSize.height ?? 0) * 3),
-                layout: layoutMode)
+            candidates = regionVisiblePages(scrollYPt: scrollYPt, viewportHeightPt: viewportHeight,
+                marginPt: max(viewportHeight * 2, (document?.firstPageSize.height ?? 0) * 3))
                 .filter { abs($0.index - current) <= 3 && canRasterizeScreenPage($0, scale: screenScale) }
             budget = tileCache.budgetBytes
         } else {
@@ -13876,6 +15861,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         pagePreviewInFlight = page
         let scale = desiredPreviewScale
         let epoch = renderEpoch
+        let started = DispatchTime.now().uptimeNanoseconds
         Task { @MainActor [weak self] in
             guard let self, epoch == self.renderEpoch else { return }
             do {
@@ -13884,6 +15870,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 if self.desiredPreviewPages.contains(page), scale >= (self.pagePreviewScales[page] ?? 0) {
                     self.pagePreviews[page] = image
                     self.pagePreviewScales[page] = scale
+                    // Self-report around the engine call, same caveat as the tile figure.
+                    self.pageRasterCount += 1
+                    self.pageRasterMilliseconds += Double(
+                        DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
                 }
             } catch {
                 guard epoch == self.renderEpoch else { return }
@@ -13917,12 +15907,249 @@ extension AppState {
         contentEditPage?.items.first { $0.id == contentEditSelection }
     }
 
+    public func selectContentTool(_ tool: String) {
+        guard ["select", "text", "image", "link", "erase", "blackout"].contains(tool) else { return }
+        if deferContentTransition({ [weak self] in self?.selectContentTool(tool) }) { return }
+        // One click arms a content tool; a second click on the same one returns the pointer to
+        // its implicit selection state, which is why the Edit row needs no Select button.
+        contentEditTool = (tool != "select" && contentEditTool == tool) ? "select" : tool
+        contentEditSelection = nil
+        contentLinkDraft = nil
+    }
+
+    /// Escape in the Edit workspace leaves the active content tool before it leaves Edit.
+    /// Returns whether a tool was cleared, so the caller can keep the workspace open.
+    @discardableResult
+    public func cancelContentTool() -> Bool {
+        guard contentEditTool != "select" else { return false }
+        contentEditTool = "select"
+        contentEditSelection = nil
+        contentLinkDraft = nil
+        return true
+    }
+
+    public func toggleAITools() {
+        if contentEditEnabled, deferContentTransition({ [weak self] in self?.toggleAITools() }) { return }
+        contentEditEnabled = false
+        pageOverviewVisible = false
+        annotationToolsVisible = false
+        annotationTool = .select
+        aiToolsVisible.toggle()
+        if !aiToolsVisible { cancelRegionSelection() }
+    }
+
+    public func toggleAnnotationTools() {
+        if contentEditEnabled, deferContentTransition({ [weak self] in self?.toggleAnnotationTools() }) { return }
+        contentEditEnabled = false
+        pageOverviewVisible = false
+        aiToolsVisible = false
+        cancelRegionSelection()
+        annotationToolsVisible.toggle()
+    }
+
     public func toggleContentEditing() {
+        if isXfaDocument {
+            lastError = readOnlyReason
+            statusMessage = "XFA form · rendered read-only from XML"
+            return
+        }
         if contentEditEnabled, deferContentTransition({[weak self] in self?.toggleContentEditing()}) {return}
+        aiToolsVisible = false
+        cancelRegionSelection()
         contentEditEnabled.toggle()
+        if contentEditEnabled {
+            pageOverviewVisible = false
+            rightPanelVisible = false
+            performancePanelVisible = false
+        }
         annotationTool = .select
         annotationToolsVisible = false
         contentEditSelection = nil
+    }
+
+    /// Opens the Fill & Sign row, or closes it when it is already the open row.
+    ///
+    /// The four secondary rows share one slot, so this is the switch the toolbar button uses:
+    /// opening it closes Annotate, Edit and Export, and closing it clears the armed tool (and
+    /// with it the inspector).
+    public func toggleFillAndSign() {
+        guard canOpenFillAndSign else { return }
+        if fillAndSignVisible {
+            fillAndSignVisible = false
+            return
+        }
+        if contentEditEnabled, deferContentTransition({ [weak self] in self?.toggleFillAndSign() }) {
+            return
+        }
+        pageOverviewVisible = false
+        fillAndSignVisible = true
+        statusMessage = "Fill & Sign · choose a tool; its options appear on the right"
+    }
+
+    /// Opens the Export row, or closes it when it is already the open row.
+    public func toggleExport() {
+        guard document != nil else { return }
+        if exportVisible {
+            exportVisible = false
+            return
+        }
+        if contentEditEnabled, deferContentTransition({ [weak self] in self?.toggleExport() }) {
+            return
+        }
+        pageOverviewVisible = false
+        exportVisible = true
+    }
+
+    /// Choosing a Fill & Sign row item: arm it (opening the row and its inspector), or clear it
+    /// when the same item is clicked again.
+    public func selectFillSignTool(_ tool: FillSignTool) {
+        guard canOpenFillAndSign else { return }
+        if armedFillSignTool == tool {
+            clearFillSignTool()
+            return
+        }
+        guard canPlaceFillSignAnnotation else {
+            lastError = fillSignPlacementRefusal
+            return
+        }
+        if contentEditEnabled, deferContentTransition({ [weak self] in
+            self?.selectFillSignTool(tool)
+        }) { return }
+        prepareFillSignTool(tool)
+        switch tool {
+        case .text:
+            annotationTool = .textBox
+            pendingFillSignPlacement = .text
+            statusMessage = "Click the page to place a text box"
+        case .signature:
+            statusMessage = "Choose a signature method in the inspector"
+        case .date:
+            annotationTool = .select
+            pendingFillSignPlacement = .date
+            statusMessage = "Click the page to place the date"
+        case .checkmark:
+            annotationTool = .select
+            pendingFillSignPlacement = .checkmark
+            statusMessage = "Click the page to place a check mark"
+        case .cross:
+            annotationTool = .select
+            pendingFillSignPlacement = .cross
+            statusMessage = "Click the page to place a cross"
+        case .stamp:
+            armStampTool(pendingStampStyle ?? .approved)
+        case .image:
+            annotationTool = .select
+            statusMessage = "Choose an image in the inspector"
+        }
+    }
+
+    /// The Stamp inspector's style grid.
+    public func selectFillSignStamp(_ style: StampStyle) {
+        guard canPlaceFillSignAnnotation else {
+            lastError = fillSignPlacementRefusal
+            return
+        }
+        prepareFillSignTool(.stamp)
+        armStampTool(style)
+    }
+
+    /// Clears the armed Fill & Sign tool and closes its inspector. Safe to call when none is
+    /// armed; a tool that belongs to the annotation row is left alone unless this row armed it.
+    public func clearFillSignTool() {
+        let hadTool = armedFillSignTool != nil || pendingFillSignPlacement != nil
+        armedFillSignTool = nil
+        pendingFillSignPlacement = nil
+        if annotationTool == .textBox || annotationTool == .stamp || annotationTool == .signature {
+            annotationTool = .select
+        }
+        pendingStampStyle = nil
+        pendingSignatureImageData = nil
+        pendingSignatureIsPicture = false
+        if hadTool { statusMessage = "Fill & Sign tool cleared" }
+    }
+
+    /// The row-level setup every Fill & Sign entry point shares: the row owns the slot, the
+    /// inspector takes the right-hand drawer, and the armed item is the inspector's gate.
+    private func prepareFillSignTool(_ tool: FillSignTool) {
+        if contentEditEnabled {
+            if deferContentTransition({ [weak self] in self?.prepareFillSignTool(tool) }) { return }
+            contentEditEnabled = false
+        }
+        pageOverviewVisible = false
+        if !fillAndSignVisible { fillAndSignVisible = true }
+        // Switching row items starts from a clean pointer: a stamp style, a signature picture
+        // or a one-click placement belongs to the tool that armed it, not to the next one.
+        pendingFillSignPlacement = nil
+        pendingStampStyle = nil
+        pendingSignatureImageData = nil
+        pendingSignatureIsPicture = false
+        annotationTool = .select
+        armedFillSignTool = tool
+        // The inspector and the assistant share the right-hand slot: the tool's options must
+        // not be drawn behind the assistant panel.
+        rightPanelVisible = false
+        performancePanelVisible = false
+    }
+
+    /// Records that a Fill & Sign placement committed, so the inspector closes with the arm.
+    private func finishFillSignPlacement() {
+        guard armedFillSignTool != nil else { return }
+        armedFillSignTool = nil
+        pendingFillSignPlacement = nil
+        pendingStampStyle = nil
+        pendingSignatureImageData = nil
+        pendingSignatureIsPicture = false
+    }
+
+    /// Clears the tool a secondary row owns, when that row closes or stops being the one on
+    /// screen. A tool is only meaningful while its row is visible: closing the row, switching
+    /// to another row, opening page overview or closing the document must all leave the page in
+    /// the implicit pointer state rather than keep applying a tool whose control is gone.
+    ///
+    /// Export and Lyra own no persistent page tool, so they have nothing to clear.
+    private func deactivateSecondaryRowTool(_ row: SecondaryRow) {
+        switch row {
+        case .annotations:
+            annotationTool = .select
+        case .contentEdit:
+            contentEditTool = "select"
+            contentEditSelection = nil
+            contentLinkDraft = nil
+        case .fillAndSign:
+            clearFillSignTool()
+        case .export, .lyra:
+            break
+        }
+    }
+
+    /// Disarms every row's tool without changing which rows are open. Page overview uses this:
+    /// it covers the page while leaving the row state alone, so closing the overview restores
+    /// the row in the implicit pointer state.
+    private func deactivateAllSecondaryRowTools() {
+        deactivateSecondaryRowTool(.annotations)
+        deactivateSecondaryRowTool(.contentEdit)
+        deactivateSecondaryRowTool(.fillAndSign)
+    }
+
+    /// Closes every secondary row, deactivating the tool each one owns as it closes. Closing the
+    /// document uses this: there is no page left for a row or its tool to act on.
+    private func closeAllSecondaryRows() {
+        pageOverviewVisible = false
+        annotationToolsVisible = false
+        contentEditEnabled = false
+        fillAndSignVisible = false
+        exportVisible = false
+        aiToolsVisible = false
+    }
+
+    /// Closes every secondary row except one. Called by the visibility setters, so a row cannot
+    /// be opened beside another one even when a caller assigns the boolean directly.
+    private func closeOtherSecondaryRows(except row: SecondaryRow) {
+        if row != .annotations, annotationToolsVisible { annotationToolsVisible = false }
+        if row != .contentEdit, contentEditEnabled { contentEditEnabled = false }
+        if row != .fillAndSign, fillAndSignVisible { fillAndSignVisible = false }
+        if row != .export, exportVisible { exportVisible = false }
+        if row != .lyra, aiToolsVisible { aiToolsVisible = false }
     }
 
     public func reloadContentObjects() async {
@@ -13949,67 +16176,150 @@ extension AppState {
 
     public func transformContent(_ item: PDFContentItem, to rect: CGRect, rotation: Double = 0) {
         guard let page = contentEditPage else { return }
-        var command = PDFContentCommand(action: "transform", revision: page.revision)
-        command.target = item.id
-        command.bounds = PDFContentBox(rect)
-        command.rotation = rotation
+        let command: ContentCommandRecord
         if item.can_edit_text, abs(rotation) < 0.001,
             abs(rect.width - item.bounds.width) > 0.1 || abs(rect.height - item.bounds.height) > 0.1
         {
-            command.action = "replaceText"
-            command.rotation = nil
-            command.text = item.text
-            command.font = "Original"
-            command.size = item.size
-            command.colour = item.colour
-            command.alignment = 0
+            command = .replaceText(
+                revision: page.revision, target: item.id, text: item.text,
+                bounds: ContentBoxRecord(rect), font: "Original", size: item.size,
+                colour: Data(item.colour), alignment: 0)
+        } else {
+            command = .transform(
+                revision: page.revision, target: item.id, bounds: ContentBoxRecord(rect),
+                rotation: rotation)
         }
         stageContentEdit(command, page: page.page, label: "Move or resize \(item.kind)")
     }
 
     public func replaceContentText(
         _ item: PDFContentItem, text: String, font: String = "Original", size: Double? = nil,
-        colour: [UInt8]? = nil, alignment: Int = 0
+        colour: [UInt8]? = nil, alignment: UInt8 = 0
     ) {
         guard let page = contentEditPage else { return }
-        var command = PDFContentCommand(action: "replaceText", revision: page.revision)
-        command.target = item.id
-        command.bounds = item.bounds
-        command.text = text
-        command.font = font
-        command.size = size ?? item.size
-        command.colour = colour ?? item.colour
-        command.alignment = alignment
+        let command = ContentCommandRecord.replaceText(
+            revision: page.revision, target: item.id, text: text,
+            bounds: ContentBoxRecord(item.bounds), font: font, size: size ?? item.size,
+            colour: Data(colour ?? item.colour), alignment: alignment)
         stageContentEdit(command, page: page.page, label: "Edit page text")
     }
 
     public func insertContentText(at rect: CGRect) {
         guard let page = contentEditPage else { return }
-        var command = PDFContentCommand(action: "insertText", revision: page.revision)
-        command.bounds = PDFContentBox(rect)
-        command.text = "New text"
-        command.font = "Helvetica"
-        command.size = 12
-        command.colour = [0, 0, 0, 255]
-        command.alignment = 0
+        let command = ContentCommandRecord.insertText(
+            revision: page.revision, text: "New text", bounds: ContentBoxRecord(rect),
+            font: "Helvetica", size: 12, colour: Data([0, 0, 0, 255]), alignment: 0)
         stageContentEdit(command, page: page.page, label: "Insert page text")
     }
 
     public func deleteContent(_ item: PDFContentItem) {
         guard let page = contentEditPage else { return }
-        var command = PDFContentCommand(action: "delete", revision: page.revision)
-        command.target = item.id
+        let command = ContentCommandRecord.delete(revision: page.revision, target: item.id)
         stageContentEdit(command, page: page.page, label: "Delete \(item.kind)")
     }
 
     public func redactContent(in rect: CGRect, blackout: Bool) {
         guard let page = contentEditPage else { return }
-        var command = PDFContentCommand(action: "redact", revision: page.revision)
-        command.bounds = PDFContentBox(rect)
-        command.blackout = blackout
-        stageContentEdit(
+        let command = ContentCommandRecord.redact(
+            revision: page.revision, bounds: ContentBoxRecord(rect), blackout: blackout)
+        preflightContentRedaction(
             command, page: page.page,
             label: blackout ? "Blackout page content" : "Erase page content")
+    }
+
+    /// Looks for the whole-page raster fallback before creating a working revision.
+    ///
+    /// Ordinary text redactions continue straight into the existing staging path, so nothing
+    /// about them changes. If the engine would have to replace pages with images, the command is
+    /// held here and ``rasterRedactionPrompt`` asks: Cancel drops the command and writes
+    /// nothing; Continue stages it with the fallback allowed.
+    private func preflightContentRedaction(
+        _ command: ContentCommandRecord, page: Int, label: String
+    ) {
+        guard rasterRedactionPrompt == nil else { return }
+        guard contentTextRecovery == nil else {
+            contentTextNotice = "Finish or discard the recovered text draft before another edit."
+            return
+        }
+        guard !contentCommandInFlight, !pageEditBusy, !contentEditLoading else {
+            preserveContentFailure(
+                command, "Wait for the current page change to finish.", page: page)
+            return
+        }
+        guard contentEditPage?.revision == command.revision else {
+            preserveContentFailure(
+                command, "The page changed before this edit. Reload the page before retrying.",
+                page: page)
+            return
+        }
+        contentCommandInFlight = true
+        let source = document?.url
+        contentEditTask = Task { @MainActor [weak self] in
+            guard let self else { return false }
+            defer { self.contentCommandInFlight = false }
+            do {
+                let pages = try await self.engine.contentRedactionRasterPages(
+                    page: page, command: command)
+                guard self.document?.url == source, self.contentEditPage?.page == page else {
+                    throw NSError(
+                        domain: "LyraReader", code: 2,
+                        userInfo: [
+                            NSLocalizedDescriptionKey: "The active document changed during the edit"
+                        ])
+                }
+                if pages.isEmpty {
+                    return await self.performContentStage(
+                        command, page: page, label: label, allowRaster: false, source: source)
+                }
+                self.pendingRasterRedaction = (command, page, label)
+                self.rasterRedactionPrompt = Self.rasterRedactionPrompt(pages: pages)
+                return false
+            } catch {
+                self.preserveContentFailure(
+                    command,
+                    "Content edit failed; the previous revision is unchanged: \(error.localizedDescription)",
+                    page: page, url: self.document?.url)
+                self.discardEmptyPageEditSession()
+                return false
+            }
+        }
+    }
+
+    /// The confirmation's Continue action: stage the held redaction with the fallback.
+    public func confirmRasterRedaction() {
+        guard rasterRedactionPrompt != nil, let pending = pendingRasterRedaction else { return }
+        rasterRedactionPrompt = nil
+        pendingRasterRedaction = nil
+        stageContentEdit(
+            pending.command, page: pending.page, label: pending.label, allowRaster: true)
+    }
+
+    /// The confirmation's Cancel action: drop the held command before any revision exists.
+    public func cancelRasterRedaction() {
+        guard rasterRedactionPrompt != nil else { return }
+        rasterRedactionPrompt = nil
+        pendingRasterRedaction = nil
+        contentCommandInFlight = false
+        contentEditTask = nil
+        statusMessage = "Redaction cancelled · nothing was written; the document is unchanged"
+    }
+
+    /// Builds the words the reader sees. The page list is 1-based, as everywhere in the UI.
+    private static func rasterRedactionPrompt(pages: [Int]) -> RasterRedactionPrompt {
+        let zeroBased = pages.sorted()
+        let list = pageList(zeroBased)
+        let one = zeroBased.count == 1
+        let images = one ? "an image" : "images"
+        let possessive = one ? "its" : "their"
+        let title = "Replace \(list) with \(images)?"
+        let message =
+            "This redaction can only remove the content by rasterising \(list), which replaces "
+            + "\(one ? "the page" : "those pages") with \(images). The text layer on \(list) is "
+            + "gone afterwards, so \(possessive) text is no longer selectable or searchable. "
+            + "Other pages keep their text. Cancel leaves the document unchanged; Continue "
+            + "stages the redaction in the working copy."
+        return RasterRedactionPrompt(
+            pages: zeroBased.map { $0 + 1 }, title: title, message: message)
     }
 
     public func setContentLink(_ item: PDFContentItem?, page: Int?, uri: String?) {
@@ -14019,11 +16329,9 @@ extension AppState {
             lastError = "Choose a page inside this document."
             return
         }
-        var command = PDFContentCommand(action: "setLink", revision: snapshot.revision)
-        command.target = item?.id
-        command.bounds = PDFContentBox(bounds)
-        command.page = page
-        command.uri = uri
+        let command = ContentCommandRecord.setLink(
+            revision: snapshot.revision, target: item?.id, bounds: ContentBoxRecord(bounds),
+            page: page.map { UInt32($0) }, uri: uri)
         contentLinkDraft = nil
         stageContentEdit(
             command, page: snapshot.page, label: item == nil ? "Insert link" : "Edit link")
@@ -14044,15 +16352,22 @@ extension AppState {
             lastError = error.localizedDescription
             return
         }
-        var command = PDFContentCommand(
-            action: item == nil ? "insertImage" : "replaceImage", revision: page.revision)
-        command.target = item?.id
-        command.image_path = path.path
-        if let rect {
-            command.bounds = PDFContentBox(
-                CGRect(
-                    x: rect.minX, y: rect.minY, width: 180,
-                    height: 180 * Double(cg.height) / Double(cg.width)))
+        let command: ContentCommandRecord
+        if let item {
+            command = .replaceImage(
+                revision: page.revision, target: item.id, imagePath: path.path)
+        } else {
+            // The canvas passes the insertion point; the 180 pt width keeps the image's aspect
+            // ratio. An insert without a point cannot name a region, so the empty box is refused
+            // by the same region validation as any other invalid bounds.
+            let place = rect ?? .zero
+            command = .insertImage(
+                revision: page.revision,
+                bounds: ContentBoxRecord(
+                    CGRect(
+                        x: place.minX, y: place.minY, width: 180,
+                        height: 180 * Double(cg.height) / Double(cg.width))),
+                imagePath: path.path)
         }
         stageContentEdit(
             command, page: page.page, label: item == nil ? "Insert image" : "Replace image")
@@ -14060,9 +16375,8 @@ extension AppState {
 
     public func cropContentImage(_ item: PDFContentItem, to crop: CGRect) {
         guard let page = contentEditPage else { return }
-        var command = PDFContentCommand(action: "cropImage", revision: page.revision)
-        command.target = item.id
-        command.crop = PDFContentBox(crop)
+        let command = ContentCommandRecord.cropImage(
+            revision: page.revision, target: item.id, crop: ContentBoxRecord(crop))
         stageContentEdit(command, page: page.page, label: "Crop image")
     }
 
@@ -14098,43 +16412,41 @@ extension AppState {
     }
 
     private func preserveContentFailure(
-        _ command: PDFContentCommand, _ message: String, page: Int? = nil, url: URL? = nil
+        _ command: ContentCommandRecord, _ message: String, page: Int? = nil, url: URL? = nil
     ) {
-        if command.action == "replaceText", let text = command.text {
+        if let payload = command.replaceTextPayload {
             contentRecoveryCommand = (
                 command, page ?? contentEditPage?.page ?? currentPage - 1, url ?? document?.url
             )
-            contentTextRecovery = text
+            contentTextRecovery = payload.text
             contentEditEnabled = true
         }
-        lastError = message
+        if command.isReplaceText {
+            contentTextNotice = message
+            statusMessage = "Text draft preserved · see the Edit sidebar"
+        } else {
+            lastError = message
+        }
     }
 
     public func retryContentText(font: String) {
         guard let pending = contentRecoveryCommand, let text = contentTextRecovery,
             let snapshot = contentEditPage
         else { return }
-        var command = pending.command
+        let command = pending.command.replacingText(text, font: font)
         guard snapshot.revision == command.revision, document?.url == pending.url else {
             lastError = "This draft belongs to an older page. Copy it before discarding the draft."
             return
         }
-        command.text = text
-        command.font = font
         contentTextRecovery = nil
         stageContentEdit(command, page: pending.page, label: "Edit page text")
     }
     public func recoverDetachedContentText(
         _ item: PDFContentItem, text: String, revision: String, page: Int, url: URL?
     ) {
-        var command = PDFContentCommand(action: "replaceText", revision: revision)
-        command.target = item.id
-        command.bounds = item.bounds
-        command.text = text
-        command.font = "Original"
-        command.size = item.size
-        command.colour = item.colour
-        command.alignment = 0
+        let command = ContentCommandRecord.replaceText(
+            revision: revision, target: item.id, text: text, bounds: ContentBoxRecord(item.bounds),
+            font: "Original", size: item.size, colour: Data(item.colour), alignment: 0)
         preserveContentFailure(
             command,
             "The page changed before this text draft was committed. Your words are preserved in the Edit sidebar.",
@@ -14142,13 +16454,14 @@ extension AppState {
     }
     public func discardContentTextRecovery() {
         contentTextRecovery = nil
+        contentTextNotice = nil
         contentRecoveryCommand = nil
         contentEditTask = nil
     }
 
     private func deferContentTransition(_ action: @escaping @MainActor () -> Void) -> Bool {
         guard contentTextRecovery == nil else {
-            lastError = "Finish or discard the recovered text draft before leaving this document."
+            contentTextNotice = "Finish or discard the recovered text draft before leaving this document."
             return true
         }
         let hadDraft = contentTextEditing
@@ -14163,34 +16476,82 @@ extension AppState {
     public func cancelContentClose() {
         contentCloseRequested = false
         pendingContentClose = nil
+        pendingWindowCloseAction = nil
     }
+
+    /// Called by the native red close button. Continue through the same document close sheet
+    /// after saving/discarding each dirty tab; cancelling keeps the window and its work open.
+    public func prepareWindowClose(continueClosing: @escaping () -> Void) -> Bool {
+        if deferContentTransition({ [weak self] in
+            if self?.prepareWindowClose(continueClosing: continueClosing) == true { continueClosing() }
+        }) { return false }
+        guard let dirty = tabs.indices.first(where: { tabHasUnsavedChanges($0) }) else { return true }
+        pendingWindowCloseAction = continueClosing
+        closeTab(dirty)
+        return false
+    }
+
     public func discardContentAndClose() {
         guard let index = pendingContentClose else { return }
+        let continueClosing = pendingWindowCloseAction
         cancelContentClose()
         discardPageEdits()
+        flushPendingWrites()
+        guard writeAnnotationRecords(annotations: [], bookmarks: [],
+            slots: annotationRecordSlots.filter {
+                if case .annotation = $0 { return false }
+                if case .bookmark = $0 { return false }
+                return true
+            }, trigger: "saved-to-pdf") else {
+            lastError = "Could not clear the saved annotation draft. The document is still open."
+            return
+        }
+        annotationCacheIsDirty = false
+        pendingFileDeletions = []
+        erasedInkStrokeIDs = []
+        formDraft = [:]
+        undoStack = []
+        redoStack = []
+        persistPendingAnnotationState()
         closeTab(index)
+        continueClosing?()
     }
     public func saveContentAndClose() {
         guard let index = pendingContentClose else { return }
+        guard !closeRequiresReview else { reviewChangesBeforeClosing(); return }
         contentCloseRequested = false
-        let panel = NSSavePanel()
-        panel.allowedContentTypes = [.pdf]
-        panel.nameFieldStringValue = "Edited document.pdf"
-        guard panel.runModal() == .OK, let destination = panel.url else {
-            cancelContentClose()
-            return
+        var destination: URL?
+        if isReadOnlyDocument {
+            let panel = NSSavePanel()
+            panel.allowedContentTypes = [.pdf]
+            panel.nameFieldStringValue = "Edited document.pdf"
+            guard panel.runModal() == .OK, let url = panel.url else { cancelContentClose(); return }
+            destination = url
         }
         Task { @MainActor [weak self] in
-            guard let self, await savePageEditsCopy(to: destination) else { return }
+            guard let self else { return }
+            let saved: Bool
+            if let destination { saved = await savePageEditsCopy(to: destination) }
+            else { saved = await saveDocumentToOriginal() }
+            guard saved else { return }
+            guard !hasUnsavedDocumentChanges else {
+                statusMessage = "Changes remain unsaved · the document is still open"
+                return
+            }
+            let continueClosing = pendingWindowCloseAction
+            pendingWindowCloseAction = nil
             pendingContentClose = nil
-            discardPageEdits()
             closeTab(index)
+            continueClosing?()
         }
     }
 
-    private func stageContentEdit(_ command: PDFContentCommand, page: Int, label: String) {
+    private func stageContentEdit(
+        _ command: ContentCommandRecord, page: Int, label: String, allowRaster: Bool = false
+    ) {
+        guard rasterRedactionPrompt == nil else { return }
         guard contentTextRecovery == nil else {
-            lastError = "Finish or discard the recovered text draft before another edit."
+            contentTextNotice = "Finish or discard the recovered text draft before another edit."
             return
         }
         guard !contentCommandInFlight, !pageEditBusy, !contentEditLoading else {
@@ -14198,72 +16559,144 @@ extension AppState {
                 command, "Wait for the current page change to finish.", page: page)
             return
         }
+        guard contentEditPage?.revision == command.revision else {
+            preserveContentFailure(command, "The page changed before this edit. Reload the page before retrying.", page: page)
+            return
+        }
         contentCommandInFlight = true
         let source = document?.url
         contentEditTask = Task { @MainActor [weak self] in
             defer {
                 self?.contentCommandInFlight = false
-                if let path = command.image_path,
+                if let path = command.imagePath,
                     URL(fileURLWithPath: path).lastPathComponent.hasPrefix("LyraContentImage-")
                 {
                     try? FileManager.default.removeItem(atPath: path)
                 }
             }
             guard let self else { return false }
-            guard !annotations.contains(where: { $0.page == page }),
-                !bookmarks.contains(where: { $0.page == page })
-            else {
-                preserveContentFailure(
-                    command,
-                    "This page has LyraReader marks stored as text positions. Save those marks into a PDF copy before editing its page content.",
-                    page: page)
-                return false
+            return await self.performContentStage(
+                command, page: page, label: label, allowRaster: allowRaster, source: source)
+        }
+    }
+
+    /// The shared staging body: prepares the working copy, writes one revision, and adopts it.
+    ///
+    /// `allowRaster` is only true after the reader accepted ``rasterRedactionPrompt``. The
+    /// engine's report, not the confirmation's prediction, decides which pages the status names.
+    private func performContentStage(
+        _ command: ContentCommandRecord, page: Int, label: String, allowRaster: Bool,
+        source: URL?
+    ) async -> Bool {
+        guard await ensurePageEditSession(), document?.url == source else {
+            preserveContentFailure(command, "Could not prepare the working copy.", page: page)
+            return false
+        }
+        let snapshotInput: DocumentTransactionInputRecord
+        do {
+            snapshotInput = try pageEditInputRecord()
+        } catch {
+            preserveContentFailure(command, "Could not prepare the working copy.", page: page)
+            return false
+        }
+        var next: URL?
+        var effectiveCommand = command
+        let translationSnapshot = inPlaceTranslation.snapshot()
+        do {
+            guard let transaction = pageEditSession?.transaction else { return false }
+            try transaction.prepare(label: label, input: snapshotInput)
+            if try await materializeAnnotationsInWorkingCopy() {
+                effectiveCommand = effectiveCommand.replacingRevision(
+                    try await engine.contentObjects(page: page).revision)
             }
-            guard await ensurePageEditSession(), var session = pageEditSession,
-                let snapshot = pageEditSnapshot(label: label), document?.url == source
-            else {
-                preserveContentFailure(command, "Could not prepare the working copy.", page: page)
-                return false
-            }
+            guard var session = pageEditSession else { return false }
             pageEditBusy = true
             defer { pageEditBusy = false }
-            let next = session.directory.appendingPathComponent("rev-\(UUID().uuidString).pdf")
-            do {
-                try await engine.applyContentEdit(page: page, command: command, to: next)
-                guard document?.url == source else {
-                    throw NSError(
-                        domain: "LyraReader", code: 2,
-                        userInfo: [
-                            NSLocalizedDescriptionKey: "The active document changed during the edit"
-                        ])
-                }
-                try loadPageEditRevision(
-                    at: next, title: session.title, sidecarURL: session.sidecarURL,
-                    annotations: annotations, bookmarks: bookmarks, slots: annotationSidecarSlots,
-                    currentPage: currentPage, selection: pageSelection)
-                session.revisionURL = next
-                session.revisionNumber += 1
-                session.operations.append(label)
-                session.undo.append(snapshot)
-                session.redo.removeAll()
-                pageEditSession = session
-                pageEditPendingOperations = session.operations
-                pageEditIsApplied = false
-                if command.action == "replaceText" {
-                    contentRecoveryCommand = nil
-                    contentTextRecovery = nil
-                }
-                statusMessage = "\(label) · staged in working copy; Save Edited Copy to publish"
-                await reloadContentObjects()
-                return true
-            } catch {
-                preserveContentFailure(
-                    command,
-                    "Content edit failed; the previous revision is unchanged: \(error.localizedDescription)",
-                    page: page, url: source)
-                try? FileManager.default.removeItem(at: next)
-                return false
+            let destination = session.directory.appendingPathComponent("rev-\(UUID().uuidString).pdf")
+            next = destination
+            let editingSource = document?.url
+            let rasterizedPages: [Int]
+            if allowRaster {
+                rasterizedPages = try await engine.applyContentEditAllowingRaster(
+                    page: page, command: effectiveCommand, to: destination)
+            } else {
+                try await engine.applyContentEdit(
+                    page: page, command: effectiveCommand, to: destination)
+                rasterizedPages = []
             }
+            guard document?.url == editingSource else {
+                throw NSError(
+                    domain: "LyraReader", code: 2,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "The active document changed during the edit"
+                    ])
+            }
+            try loadPageEditRevision(
+                at: destination, title: session.title, annotationRecordsURL: session.annotationRecordsURL,
+                annotations: annotations, bookmarks: bookmarks, slots: annotationRecordSlots,
+                currentPage: currentPage, selection: pageSelection)
+            // The edit may have changed one block's words or reflowed it. Entries on this
+            // page are re-checked individually; translations on every other page survive.
+            await inPlaceTranslation.restoreAfterPageEdit(
+                translationSnapshot,
+                pageMap: nil,
+                rotatedPages: [],
+                editedPages: [page],
+                reason: "The edited page changed."
+            )
+            let state = try session.transaction.commitRevision(
+                url: destination,
+                revisionNumber: session.revisionNumber + 1,
+                label: label,
+                input: try pageEditInputRecord())
+            session.revisionURL = destination
+            session.revisionNumber = Int(state.revisionNumber)
+            session.operations = state.operations
+            session.currentToOriginal = state.currentToOriginal.map(Int.init)
+            pageEditSession = session
+            pageEditPendingOperations = session.operations
+            pageEditIsApplied = false
+            if let recoveryError = state.recoveryError { lastError = recoveryError }
+            if command.isReplaceText {
+                contentRecoveryCommand = nil
+                contentTextRecovery = nil
+                contentTextNotice = nil
+            }
+            if rasterizedPages.isEmpty {
+                statusMessage = "\(label) · unsaved PDF changes"
+            } else {
+                let pages = rasterizedPages.map { $0 + 1 }.sorted()
+                let one = pages.count == 1
+                let list = Self.pageList(rasterizedPages.sorted())
+                let consequence =
+                    one
+                    ? "its text layer is gone (no longer selectable or searchable)"
+                    : "their text layers are gone (no longer selectable or searchable)"
+                statusMessage =
+                    "\(label) · \(list) \(one ? "is" : "are") now \(one ? "an image" : "images"): "
+                    + "\(consequence) · unsaved PDF changes"
+            }
+            await reloadContentObjects()
+            return true
+        } catch {
+            pageEditSession?.transaction.cancelPrepared()
+            // The edit did not land, so the blocks and their cached translations are still
+            // the ones on screen. Restore them rather than making a failed command discard
+            // overlays.
+            await inPlaceTranslation.restoreAfterPageEdit(
+                translationSnapshot, pageMap: nil, rotatedPages: [], editedPages: [],
+                reason: nil)
+            await reloadContentObjects()
+            preserveContentFailure(
+                effectiveCommand,
+                "Content edit failed; the previous revision is unchanged: \(error.localizedDescription)",
+                page: page, url: document?.url)
+            if let next { try? FileManager.default.removeItem(at: next) }
+            // A failed first edit leaves a prepared working copy with zero operations. It is
+            // not a pending page change, so close it: there is nothing to confirm or save,
+            // and the edit error is the only thing the reader must see.
+            discardEmptyPageEditSession()
+            return false
         }
     }
 }

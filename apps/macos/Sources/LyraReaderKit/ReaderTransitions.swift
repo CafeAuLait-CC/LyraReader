@@ -1,6 +1,27 @@
 import AppKit
 import SwiftUI
 
+/// Native frame probes let regression checks measure the chrome SwiftUI actually lays out.
+package final class ReaderChromeMarkerView: NSView {
+    package enum Kind {
+        case secondaryToolbar
+        case secondaryRowSlot
+        case editingInspector
+        case editingInspectorSlot
+        case fillSignInspector
+        case fillSignInspectorSlot
+    }
+    package let kind: Kind
+    init(kind: Kind) { self.kind = kind; super.init(frame: .zero) }
+    @available(*, unavailable) required init?(coder: NSCoder) { fatalError() }
+}
+
+struct ReaderChromeMarkerHost: NSViewRepresentable {
+    let kind: ReaderChromeMarkerView.Kind
+    func makeNSView(context: Context) -> ReaderChromeMarkerView { ReaderChromeMarkerView(kind: kind) }
+    func updateNSView(_ view: ReaderChromeMarkerView, context: Context) {}
+}
+
 /// Fixed chrome sizes shared by the transition views and the hosted-window checks.
 public enum ReaderChrome {
     /// Content width of the sidebar, before its edge separator.
@@ -11,17 +32,18 @@ public enum ReaderChrome {
     public static var sidebarTotalWidthPt: CGFloat { sidebarWidthPt + sidebarSeparatorWidthPt }
     /// The annotation / page-overview row: 32 pt controls plus 7 pt padding above and below.
     public static let secondaryToolbarHeightPt: CGFloat = 46
+    public static let editingPanelWidthPt: CGFloat = 292
     /// Width of the scroll indicator's lane at the canvas's trailing edge.
     ///
     /// The indicator is a sibling of the canvas rather than an overlay, so this strip is real
     /// layout: the page, Fit Width and the pointer anchor all use the canvas width *without* it,
     /// and the right panel starts after it. The lane is only present while a document is open.
-    public static let scrollIndicatorLaneWidthPt: CGFloat = 18
+    public static let scrollIndicatorLaneWidthPt: CGFloat = 13
 
-    /// Everything the layout puts between the canvas and the window's trailing edge.
+    /// Trailing panels the secondary toolbar must avoid.
     ///
-    /// The secondary toolbar is drawn over the content row, so it has to stop at the same place:
-    /// the scroll lane, then search results, then the right panel. Page overview covers the whole
+    /// The secondary toolbar covers the scroll lane and stops flush against search results or
+    /// the right panel. Page overview covers the whole
     /// content area, so it has no trailing chrome to avoid. Kept as a pure function so the
     /// checks can assert the overlay's arithmetic without a screenshot.
     public static func trailingChromeWidth(
@@ -32,7 +54,7 @@ public enum ReaderChrome {
         rightPanelContentWidth: CGFloat
     ) -> CGFloat {
         guard documentOpen, !pageOverviewVisible else { return 0 }
-        var width = scrollIndicatorLaneWidthPt
+        var width: CGFloat = 0
         if searchVisible { width += sidebarTotalWidthPt }
         if rightPanelVisible {
             width += ReaderSidePanelMetrics.totalWidth(contentWidth: rightPanelContentWidth)
@@ -56,11 +78,13 @@ public struct ReaderTransitionProgress: Equatable, Sendable {
     public var row: Double?
     /// 0 is closed, 1 is the full right panel. `nil` means "use `isVisible` and animate normally".
     public var panel: Double?
+    public var editingPanel: Double?
 
-    public init(sidebar: Double? = nil, row: Double? = nil, panel: Double? = nil) {
+    public init(sidebar: Double? = nil, row: Double? = nil, panel: Double? = nil, editingPanel: Double? = nil) {
         self.sidebar = sidebar
         self.row = row
         self.panel = panel
+        self.editingPanel = editingPanel
     }
 }
 
@@ -172,11 +196,14 @@ struct ReaderSidebarTransition<Content: View>: View {
     }
 }
 
-/// The annotation / page-overview row as an overlay on the content.
+/// The one secondary sub-toolbar row (Annotate, Edit, Fill & Sign, Export, Lyra or page
+/// overview) as an overlay on the content.
 ///
 /// The row is laid out once at its full height and the container's height animates from 46 to 0
 /// with the content top-aligned and clipped. The controls therefore never see a shorter proposal:
-/// they do not squash, reflow or change their labels while the row expands.
+/// they do not squash, reflow or change their labels while the row expands. This slide is the
+/// row's *only* reveal: the row content is inserted with an identity transition, so no branch
+/// fades in while the height moves.
 ///
 /// The background and the row itself are inside the clipped container, so the overlay covers
 /// exactly the revealed height. `contentShape` makes that whole rectangle hit-testable, which is
@@ -203,6 +230,7 @@ struct ReaderSecondaryToolbarTransition<Content: View>: View {
 
     var body: some View {
         content
+            .offset(y: -ReaderChrome.secondaryToolbarHeightPt * (1 - progress))
             .frame(height: ReaderChrome.secondaryToolbarHeightPt)
             .frame(maxWidth: .infinity)
             .frame(height: ReaderChrome.secondaryToolbarHeightPt * progress, alignment: .top)

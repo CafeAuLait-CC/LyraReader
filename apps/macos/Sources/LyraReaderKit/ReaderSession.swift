@@ -67,6 +67,7 @@ public final class ReaderSession: ObservableObject, Identifiable {
 
     private var windowObservers: [NSObjectProtocol] = []
     private var titlebarLayout: ReaderTitlebarLayout?
+    private var closeDelegate: ReaderWindowCloseDelegate?
 
     /// `state` is injectable so the checks can drive a session against a known engine; the app
     /// leaves it out and gets a session with its own engine.
@@ -75,12 +76,6 @@ public final class ReaderSession: ObservableObject, Identifiable {
         self.opener = DocumentOpenCoordinator(state: self.state, registry: registry)
         self.previewPanels = ReferencePreviewPanelController()
         self.registry = registry
-        // The panel's "open in a new window" action is this window's own coordinator: it knows
-        // the document, the preview target and the registry that makes the second window. The
-        // closure is weak in the coordinator so the panel never keeps a closed window alive.
-        previewPanels.openInNewWindow = { [weak opener = self.opener] in
-            opener?.openPreviewTargetInNewWindow() ?? false
-        }
     }
 
     /// Installs the app's "make another reader window" command into the registry.
@@ -90,6 +85,28 @@ public final class ReaderSession: ObservableObject, Identifiable {
     /// is asserted against the real routing rule rather than against a screenshot.
     public func installNewWindowAction(_ action: @escaping () -> Void) {
         registry?.newWindow = action
+    }
+
+    /// Installs the window-moving halves of the tab drag.
+    ///
+    /// A drop outside every strip asks the app's registry for a new reader window and hands it the
+    /// prepared tab; the registry completes the move when that window's session registers. A drop
+    /// on another window's strip completes through ``TabMove`` and asks the registry to close the
+    /// source window when its last tab left it.
+    ///
+    /// Both closures hold the *registry* weakly, not this session: every window installs the same
+    /// actions, but the ones installed last are the ones the process-wide coordinator keeps. A
+    /// session-owned closure would stop moving tabs as soon as that particular window closed; the
+    /// registry lives for the app, so tab moves keep working from any remaining window.
+    public func installTabDragActions() {
+        guard let registry else { return }
+        TabDragCoordinator.shared.tearOff = { [weak registry] transfer, source in
+            guard let registry else { return false }
+            return registry.requestNewWindow(moving: transfer, from: source)
+        }
+        TabDragCoordinator.shared.closeEmptiedSource = { [weak registry] source in
+            registry?.closeWindowAfterTabMove(from: source)
+        }
     }
 
     // MARK: - Window lifecycle
@@ -112,6 +129,9 @@ public final class ReaderSession: ObservableObject, Identifiable {
         if window !== self.window {
             removeWindowObservers()
             self.window = window
+            let delegate = ReaderWindowCloseDelegate(state: state, previous: window.delegate)
+            closeDelegate = delegate
+            window.delegate = delegate
             window.backgroundColor = LyraReaderTheme.titlebarColor
             window.titlebarAppearsTransparent = true
             window.titleVisibility = .hidden
@@ -167,6 +187,35 @@ public final class ReaderSession: ObservableObject, Identifiable {
         for observer in windowObservers { NotificationCenter.default.removeObserver(observer) }
         windowObservers.removeAll()
         titlebarLayout = nil
+        if let window, window.delegate === closeDelegate { window.delegate = closeDelegate?.previous }
+        closeDelegate = nil
+    }
+}
+
+@MainActor
+private final class ReaderWindowCloseDelegate: NSObject, NSWindowDelegate {
+    weak var state: AppState?
+    // NSObject's selector forwarding hooks are nonisolated; AppKit installs and invokes this
+    // proxy on the window's main thread.
+    nonisolated(unsafe) weak var previous: (any NSWindowDelegate)?
+    init(state: AppState, previous: (any NSWindowDelegate)?) {
+        self.state = state
+        self.previous = previous
+    }
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard state?.prepareWindowClose(continueClosing: { [weak sender] in sender?.performClose(nil) }) != false else {
+            return false
+        }
+        return previous?.windowShouldClose?(sender) ?? true
+    }
+    override func responds(to selector: Selector!) -> Bool {
+        super.responds(to: selector) || previous?.responds(to: selector) == true
+    }
+    override func forwardingTarget(for selector: Selector!) -> Any? {
+        if let delegate = previous, delegate.responds(to: selector) {
+            return delegate
+        }
+        return super.forwardingTarget(for: selector)
     }
 }
 
@@ -201,6 +250,8 @@ public struct ReaderWindowRoot: View {
                 // second window in the registry). Every window installs the same action; it is
                 // idempotent and always refers to this scene's WindowGroup.
                 session.installNewWindowAction { openWindow(id: ReaderWindowRegistry.readerWindowID) }
+                // A tab dragged out of any tab strip is torn off or moved through the registry.
+                session.installTabDragActions()
             }
     }
 }

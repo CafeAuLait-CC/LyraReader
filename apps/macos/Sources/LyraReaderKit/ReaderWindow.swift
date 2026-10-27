@@ -2,6 +2,62 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// The window's explicit confirmations: pending PDF changes before closing, and the Edit
+/// workspace's raster-redaction warning.
+///
+/// They share one `confirmationDialog` on purpose: two dialog modifiers on the same view are not
+/// reliably presented by SwiftUI, and losing "save before closing" to a second dialog would be a
+/// serious regression. The state always decides which one is live, so the view only picks the
+/// matching title, message and buttons. Kept out of `ReaderWindow.body` because the dynamic title
+/// and message pushed that already-large expression past the type-checker's budget.
+private struct ReaderConfirmationModifier: ViewModifier {
+    @ObservedObject var state: AppState
+
+    private var title: String {
+        if let prompt = state.rasterRedactionPrompt { return prompt.title }
+        return "Save PDF changes before closing?"
+    }
+
+    private var isPresented: Binding<Bool> {
+        Binding(
+            get: { state.rasterRedactionPrompt != nil || state.contentCloseRequested },
+            set: { presented in
+                guard !presented else { return }
+                if state.rasterRedactionPrompt != nil { state.cancelRasterRedaction() }
+                if state.contentCloseRequested { state.cancelContentClose() }
+            }
+        )
+    }
+
+    func body(content: Content) -> some View {
+        content.confirmationDialog(
+            title, isPresented: isPresented, titleVisibility: .visible
+        ) {
+            if state.rasterRedactionPrompt != nil {
+                // Cancel is the safe default: nothing exists until Continue stages the revision.
+                Button("Continue", role: .destructive) { state.confirmRasterRedaction() }
+                Button("Cancel", role: .cancel) { state.cancelRasterRedaction() }
+            } else {
+                if state.closeRequiresReview {
+                    Button("Review Changes") { state.reviewChangesBeforeClosing() }
+                } else {
+                    Button(state.isReadOnlyDocument ? "Save a Copy…" : "Save") {
+                        state.saveContentAndClose()
+                    }
+                }
+                Button("Discard Changes", role: .destructive) { state.discardContentAndClose() }
+                Button("Cancel", role: .cancel) { state.cancelContentClose() }
+            }
+        } message: {
+            if let prompt = state.rasterRedactionPrompt {
+                Text(prompt.message)
+            } else {
+                Text(state.closeChangesMessage)
+            }
+        }
+    }
+}
+
 /// Main window: toolbar + collapsible sidebar + canvas + optional right-hand side panel
 /// (`docs/04-ui-ux.md` §2). The right panel is the AI assistant's home; the left sidebar keeps
 /// thumbnails, outline, annotations and bookmarks, so both can be open at once.
@@ -13,6 +69,7 @@ import UniformTypeIdentifiers
 /// (evaluated together with the scrolling approach in T1.4).
 public struct ReaderWindow: View {
     @ObservedObject private var state: AppState
+    @ObservedObject private var documentKnowledge: AIDocumentKnowledge
     @ObservedObject private var appearance = ReadingAppearanceStore.shared
     /// Documents arriving at *this* window: its own coordinator, so a drop on its canvas becomes a
     /// tab here and nowhere else. Files dropped on the canvas also drive its hover hint.
@@ -39,6 +96,7 @@ public struct ReaderWindow: View {
         aiAssistant: AIAssistantModel? = nil
     ) {
         self.state = state
+        _documentKnowledge = ObservedObject(wrappedValue: state.documentKnowledge)
         self.opener = opener
         self.previewPanels = previewPanels
         self.integratesTitlebar = integratesTitlebar
@@ -63,7 +121,13 @@ public struct ReaderWindow: View {
                         SidebarView(state: state, opener: opener)
                     }
                     .accessibilityHidden(state.document == nil || !state.sidebarVisible)
-                    canvas.frame(maxWidth: .infinity, maxHeight: .infinity)
+                    HorizontalDocumentViewport(
+                        contentWidth: state.contentWidthPt * state.zoomFactor,
+                        preservesHorizontalAnchor: state.contentEditInspectorVisible || state.fillSignInspectorVisible,
+                        onViewport: { size, canvasWidth in state.setViewportSize(size, canvasWidth: canvasWidth) },
+                        onHorizontalScroll: { state.setHorizontalViewportOrigin($0) }
+                    ) { canvas }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     // The scroll indicator is a real lane, not an overlay: the canvas viewport
                     // and the page column end before it, and the right panel starts after it.
                     if state.document != nil {
@@ -75,23 +139,28 @@ public struct ReaderWindow: View {
                         SearchResultSidebar(state: state).frame(width: ReaderChrome.sidebarTotalWidthPt)
                             .transition(.move(edge: .trailing).combined(with: .opacity))
                     }
-                    // The AI assistant is a right-hand panel now, not a sidebar tab. The host is
-                    // generic (a sliding drawer); the assistant is only its content, so its
-                    // model, settings and request state keep their public surface.
-                    ReaderSidePanel(
-                        isVisible: state.rightPanelVisible && state.document != nil,
-                        contentWidth: state.rightPanelWidthPt,
-                        progressOverride: state.transitionProgressOverride?.panel,
-                        accessibilityLabel: "AI assistant panel",
-                        onResizeBegan: { state.beginRightPanelResize() },
-                        onResize: { state.resizeRightPanel(to: $0) },
-                        onResizeEnded: {
-                            state.endRightPanelResize()
-                            state.commitRightPanelWidth()
-                        }
+                    assistantDrawer
+                    if state.performancePanelVisible { performanceDrawer }
+                    // The two inspectors share the right-hand slot, so they also share the
+                    // test seam that pins the panel's progress. The override applies only to
+                    // the inspector that is actually visible: an editing-panel pin must not
+                    // force the Fill & Sign inspector open (or the other way round).
+                    ReaderEditingPanelTransition(
+                        isVisible: state.contentEditInspectorVisible,
+                        progressOverride: state.contentEditInspectorVisible
+                            ? state.transitionProgressOverride?.editingPanel : nil
                     ) {
-                        AIAssistantRightPanelContent(state: state, model: aiAssistant)
+                        ContentEditInspector(state: state)
                     }
+                    .background(ReaderChromeMarkerHost(kind: .editingInspectorSlot))
+                    ReaderEditingPanelTransition(
+                        isVisible: state.fillSignInspectorVisible,
+                        progressOverride: state.fillSignInspectorVisible
+                            ? state.transitionProgressOverride?.editingPanel : nil
+                    ) {
+                        FillSignInspector(state: state)
+                    }
+                    .background(ReaderChromeMarkerHost(kind: .fillSignInspectorSlot))
                 }
                 // The animation belongs to the row, not to the sidebar view: it is this
                 // HStack's layout that must interpolate, so the canvas width moves with the
@@ -99,6 +168,9 @@ public struct ReaderWindow: View {
                 .animation(sidebarAnimation, value: state.sidebarVisible)
                 .animation(sidebarAnimation, value: state.searchSidebarVisible)
                 .animation(panelAnimation, value: state.rightPanelVisible)
+                .animation(panelAnimation, value: state.performancePanelVisible)
+                .animation(panelAnimation, value: state.contentEditInspectorVisible)
+                .animation(panelAnimation, value: state.fillSignInspectorVisible)
                 .opacity(state.pageOverviewVisible ? 0 : 1)
                 .allowsHitTesting(!state.pageOverviewVisible)
                 .accessibilityHidden(state.pageOverviewVisible)
@@ -114,45 +186,77 @@ public struct ReaderWindow: View {
         .frame(minWidth: 900, minHeight: 600)
         .background(LyraReaderTheme.windowBg)
         .background(WindowLiveResizeReporter { isLiveResizing = $0 })
+        .background(DocumentEditedReporter(isEdited: state.tabs.indices.contains { state.tabHasUnsavedChanges($0) }))
         .foregroundStyle(LyraReaderTheme.textPrimary)
         .tint(LyraReaderTheme.accent)
         .preferredColorScheme(appearance.mode.colorScheme)
+        .sheet(isPresented: $documentKnowledge.isPresented) {
+            AIDocumentKnowledgeSheet(knowledge: documentKnowledge)
+        }
         .sheet(isPresented: $state.showDocumentInformation) { DocumentInformationView(state: state) }
-        .confirmationDialog("Save PDF changes before closing?",isPresented:$state.contentCloseRequested,titleVisibility:.visible) {
-            Button("Save Edited Copy…") {state.saveContentAndClose()}
-            Button("Discard Changes",role:.destructive) {state.discardContentAndClose()}
-            Button("Cancel",role:.cancel) {state.cancelContentClose()}
-        } message: {Text("The original file has not been changed. Save a copy to keep this editing session.")}
-        .onAppear { state.installTerminationHandling() }
+        .modifier(ReaderConfirmationModifier(state: state))
+        .onAppear {
+            state.installTerminationHandling()
+            documentKnowledge.settings = aiAssistant.settings
+            // The in-place action uses the same provider settings and target language as the
+            // assistant panel; there is exactly one AI configuration in a window.
+            state.inPlaceTranslationSettingsOverride = aiAssistant.settings
+            state.inPlaceTranslationAuditOverride = aiAssistant.audit
+            state.inPlaceTranslationTargetLanguage = aiAssistant.targetLanguage
+        }
+        .onChange(of: state.document?.url) { _, _ in documentKnowledge.invalidate() }
+        .onChange(of: aiAssistant.targetLanguage) { _, language in
+            state.inPlaceTranslationTargetLanguage = language
+        }
         // Tell the state whether this toggle is a real animation. The state holds the width-only
         // viewport updates (and releases one rebuild) for the slide, because a loaded machine can
         // take longer per frame than the ordinary coalescing window.
         .onChange(of: state.rightPanelVisible) { _, _ in
             state.noteRightPanelVisibilityChange(animated: panelAnimation != nil)
         }
+        .onChange(of: state.contentEditInspectorVisible) { _, _ in
+            state.noteRightPanelVisibilityChange(animated: panelAnimation != nil)
+        }
+        .onChange(of: state.fillSignInspectorVisible) { _, _ in
+            state.noteRightPanelVisibilityChange(animated: panelAnimation != nil)
+        }
         .onChange(of: activeDocumentURL, initial: true) { _, url in
             guard AppState.recordsRecentDocuments, let url else { return }
-            RecentDocumentStore.shared.record(url)
-            if let cover = state.thumbnails[0] { RecentDocumentStore.shared.saveCover(cover, for: url) }
+            // The cover belongs to the tab's URL. During page editing `state.document` is a
+            // working revision, so ask the identity helper for the URL actually recorded.
+            let documentId = DocumentEditCache.documentIdentity(for: url)
+                ?? state.document?.documentId.nonEmpty
+            RecentDocumentStore.shared.record(url, documentId: documentId)
+            if let cover = state.thumbnails[0] {
+                RecentDocumentStore.shared.saveCover(cover, for: url, documentId: documentId)
+            }
         }
         .onChange(of: state.thumbnails[0]?.generation) { _, _ in
             guard AppState.recordsRecentDocuments, let url = activeDocumentURL,
                   let cover = state.thumbnails[0] else { return }
-            RecentDocumentStore.shared.saveCover(cover, for: url)
+            RecentDocumentStore.shared.saveCover(
+                cover, for: url, documentId: state.document?.documentId.nonEmpty)
         }
         .onChange(of: state.document?.url) { _, url in
             if url == nil { state.pageOverviewVisible = false }
+        }
+        .onChange(of: state.document?.id) { _, _ in
+            // Covers direct open/close paths that do not go through a tab switch. Switching
+            // tabs already closes the card in AppState; this call is then a no-op.
+            state.finishRegionCardsForDocumentSwitch(
+                reason: "Document switched. The region conversation was moved to Region questions."
+            )
         }
         .alert("LyraReader", isPresented: Binding(
             get: { state.lastError != nil },
             set: { if !$0 { state.lastError = nil } }
         )) {
-            // The way out of a sidecar that failed to load: an explicit action that moves the
+            // The way out of an annotation cache that failed to load: an explicit action that moves the
             // unreadable file aside (never overwrites it) and starts a fresh one.
-            if state.canRecoverUnreadableAnnotationSidecar {
-                Button("Back Up Sidecar and Start Fresh") {
-                    if let backup = state.recoverUnreadableAnnotationSidecar() {
-                        state.revealSidecarBackupInFinder(backup)
+            if state.canRecoverUnreadableAnnotationRecords {
+                Button("Back Up Recovery Data and Start Fresh") {
+                    if let backup = state.recoverUnreadableAnnotationRecords() {
+                        state.revealAnnotationBackupInFinder(backup)
                     }
                 }
             }
@@ -171,7 +275,7 @@ public struct ReaderWindow: View {
                     state.newTab(url: url)
                 }
             case .failure(let error):
-                state.lastError = String(describing: error)
+                state.present(error, message: String(describing: error))
             }
         }
     }
@@ -179,6 +283,44 @@ public struct ReaderWindow: View {
     private var activeDocumentURL: URL? {
         guard state.document != nil, let index = state.activeTabIndex, state.tabs.indices.contains(index) else { return nil }
         return state.tabs[index].url
+    }
+
+    /// The drawer reserves a column beside the document viewport. Width changes recenter the
+    /// page horizontally while preserving its vertical scroll position.
+    private var assistantDrawer: some View {
+        ReaderSidePanel(
+            isVisible: state.rightPanelVisible && state.document != nil,
+            contentWidth: state.rightPanelWidthPt,
+            progressOverride: state.transitionProgressOverride?.panel,
+            accessibilityLabel: "AI assistant panel",
+            onResizeBegan: { state.beginRightPanelResize() },
+            onResize: { state.resizeRightPanel(to: $0) },
+            onResizeEnded: { state.endRightPanelResize(); state.commitRightPanelWidth() }
+        ) {
+            AIAssistantRightPanelContent(state: state, model: aiAssistant)
+        }
+        .animation(panelAnimation, value: state.rightPanelVisible)
+    }
+
+    /// The developer-facing performance panel, in the same right-hand drawer host as the
+    /// assistant. It shares the persisted right-panel width, so the two tenants cannot end up
+    /// with different geometry and the resize handle keeps working. Only one is open at a time
+    /// (`AppState.togglePerformancePanel`).
+    private var performanceDrawer: some View {
+        ReaderSidePanel(
+            isVisible: state.performancePanelVisible && state.document != nil,
+            contentWidth: state.rightPanelWidthPt,
+            progressOverride: state.transitionProgressOverride?.panel,
+            accessibilityLabel: "Performance panel",
+            resizeAccessibilityLabel: "Resize performance panel",
+            onResizeBegan: { state.beginRightPanelResize() },
+            onResize: { state.resizeRightPanel(to: $0) },
+            onResizeEnded: { state.endRightPanelResize(); state.commitRightPanelWidth() }
+        ) {
+            PerformancePanelView(controller: state.performancePanel) {
+                state.togglePerformancePanel()
+            }
+        }
     }
 
     // MARK: - Canvas
@@ -192,9 +334,17 @@ public struct ReaderWindow: View {
                 contentWidthPt: state.contentWidthPt,
                 paperAppearance: appearance.mode,
                 annotationMarks: state.canvasAnnotationMarks,
-                annotationPageFrames: state.canvasPageFrames,
-                redactionMarks: state.pendingRedactionMarks,
+                annotationPageFrames: state.canvasPageSegments,
+                translationOverlays: state.translationOverlays,
+                translationPaperColors: state.translationPaperColors,
                 annotationTool: state.annotationTool,
+                regionSelectionArmed: state.regionSelectionArmed,
+                onRegionSelection: { page, rect in
+                    state.handleRegionSelection(page: page, rect: rect)
+                },
+                onRegionSelectionCancelled: { reason in
+                    state.cancelRegionSelection(reason: reason)
+                },
                 annotationColor: state.annotationStrokeColor,
                 annotationStrokeWidth: AppState.defaultAnnotationStrokeWidth,
                 onAnnotationDraft: { draft in
@@ -211,9 +361,6 @@ public struct ReaderWindow: View {
                             lineEnd: draft.lineEnd
                         )
                     }
-                },
-                onRedactionDraft: { page, rect in
-                    state.addPendingRedaction(page: page, rect: rect)
                 },
                 // The eraser's mode owns the pointer, but all of its geometry and undo live in
                 // AppState like every other edit. Hover drives the pre-erase halo only.
@@ -237,18 +384,21 @@ public struct ReaderWindow: View {
                 },
                 onPlaceStamp: { point in state.placeStamp(atContentPoint: point) },
                 onPlaceSignature: { point in state.placeSignature(atContentPoint: point) },
-                // Escape leaves the sticky markup mode or the eraser. It is consumed only when a
-                // mode was active; the canvas keeps its existing Escape handling for a live draft.
-                onCancelTool: { state.cancelActiveAnnotationTool() || state.cancelFormTool() },
+                fillSignPlacementPending: state.hasPendingFillSignPlacement,
+                onPlaceFillSign: { point in state.placePendingFillSign(atContentPoint: point) },
+                // Escape leaves whichever annotation tool is armed; the canvas cancels a live
+                // draft first. Escape inside a form field is the field editor's own key path.
+                onCancelTool: { state.cancelActiveAnnotationTool() },
                 onFrame: { stats in state.updateGpuStatus(stats, label: "GPU") },
                 onFailure: { message in state.reportGpuFailure(message) },
+                performanceProbe: state.performanceProbe,
                 onDeviceScale: { scale in state.setDeviceScale(scale) },
                 // The screen's physical density: 100% means actual size on it, so moving the
                 // window to another display keeps the percentage and changes the factor.
                 onDisplayCalibration: { calibration in
                     state.setDisplayCalibration(calibration)
                 },
-                onViewportSize: { size in state.setViewportSize(size) },
+                onViewportSize: { _ in },
                 // Precise input preserves system deltas; wheel input applies its accelerated
                 // distance immediately, with no queued motion after the wheel stops.
                 onScroll: { delta in state.scroll(byScreenPoints: delta) },
@@ -280,16 +430,31 @@ public struct ReaderWindow: View {
                 // the reader's state (`CanvasContextMenu`), so no item is shown dead.
                 onContextMenu: { point in
                     CanvasContextMenu.menu(state: state, at: point)
+                },
+                onTranslationToggle: { id in state.toggleTranslation(id: id) },
+                onTranslationCancel: { id in state.cancelTranslation(id: id) },
+                regionState: state,
+                onOpenRegionInPanel: { entry in
+                    guard let context = state.aiReaderContext else { return }
+                    aiAssistant.importConversation(question: entry.question, answer: entry.answer,
+                        attachment: entry.attachment, context: context)
+                    state.rightPanelVisible = true
+                },
+                onShowRegionHistory: {
+                    state.rightPanelVisible = true
+                    aiAssistant.selectedTab = .regions
                 }
             )
             .background(ReferencePreviewHost(state: state, panels: previewPanels))
 
+
             if state.contentEditEnabled {
                 PDFContentEditor(state:state)
                     .task(id:"\(state.document?.url?.path ?? "")-\(state.currentPage)-\(state.activeTabIndex)") {
-                        await state.reloadContentObjects()
+                        if !state.contentEditLoading, state.contentEditPage?.page != state.currentPage - 1 {
+                            await state.reloadContentObjects()
+                        }
                     }
-                HStack { Spacer(); ContentEditInspector(state:state) }
             }
 
             if state.document == nil {
@@ -316,22 +481,35 @@ public struct ReaderWindow: View {
                 .accessibilityLabel("Reopening \(document.title)")
             }
 
-            if state.isReadOnlyDocument || state.pageEditSessionActive
+            if state.isReadOnlyDocument
                 || state.formHasPendingChanges
                 || state.hasPendingInkErasure || state.hasPendingFileDeletions
-                || !state.pendingRedactions.isEmpty
                 || state.markSelectionRefusalNotice != nil
-                || state.eraserRefusalNotice != nil {
+                || state.eraserRefusalNotice != nil
+                || state.regionRefusalMessage != nil
+                || state.translationNotice != nil
+                || state.annotationReadNotice != nil
+                || state.recoverableErrorBanner != nil {
                 VStack(spacing: 8) {
                     if state.isReadOnlyDocument { readOnlyBanner }
-                    if !state.pendingRedactions.isEmpty { redactionBanner }
-                    if state.pageEditSessionActive { pageEditBanner }
                     if state.formHasPendingChanges { formBanner }
                     if state.markSelectionRefusalNotice != nil {
                         annotationRefusalBanner
                     }
                     if state.eraserRefusalNotice != nil {
                         eraserRefusalBanner
+                    }
+                    if state.regionRefusalMessage != nil {
+                        regionRefusalBanner
+                    }
+                    if state.translationNotice != nil {
+                        translationBanner
+                    }
+                    if state.annotationReadNotice != nil {
+                        annotationReadBanner
+                    }
+                    if state.recoverableErrorBanner != nil {
+                        recoverableErrorBanner
                     }
                     if state.hasPendingInkErasure || state.hasPendingFileDeletions {
                         eraserPendingBanner
@@ -360,17 +538,25 @@ public struct ReaderWindow: View {
 
     // MARK: - Secondary toolbar row
 
-    /// The contextual row (annotation tools or page overview) drawn over the content.
+    /// The contextual row (the six sub-toolbars) drawn over the content.
     ///
     /// It is a sibling of the content, not a row inside the `VStack` above it, so its height never
     /// participates in the canvas's layout: showing it cannot push the document down, and the
     /// canvas frame and page position are identical before, during and after the reveal.
     ///
+    /// All six rows are one `ReaderSecondaryToolbar` inside one
+    /// ``ReaderSecondaryToolbarTransition``. Its height animation is the row's only reveal: no
+    /// branch adds a visible transition, a frame, a padding or an animation of its own (the
+    /// branches use `.transition(.identity)`), so Annotate, Edit, Fill & Sign, Export and Lyra
+    /// cannot look like different effects. Switching from one open row to another swaps the
+    /// content at the same 46 pt height, exactly like the other rows, instead of sliding a second
+    /// view over the first.
+    ///
     /// While the sidebar is open the row starts at the sidebar's width and spans only the canvas,
     /// so it never covers the sidebar's tab picker. Page overview draws its grid over the sidebar,
-    /// so there the row spans the full content area like the grid does. The inset uses the
-    /// sidebar's target width rather than its animated width, which keeps the row's own contents
-    /// from reflowing on every frame if the sidebar is toggled while the row is open.
+    /// so there the row spans the full content area like the grid does. The leading and trailing
+    /// insets track the drawers' animated widths, so the row's background stays flush with them
+    /// on every frame instead of snapping to the settled edge.
     private var secondaryToolbarLayer: some View {
         let inset = secondaryToolbarInset
         // Top alignment matters while the row is only partly revealed: a centred HStack would
@@ -387,15 +573,29 @@ public struct ReaderWindow: View {
                 isVisible: secondaryToolbarVisible,
                 progressOverride: state.transitionProgressOverride?.row
             ) {
-                ReaderSecondaryToolbar(state: state)
+                ReaderSecondaryToolbar(state: state, model: aiAssistant)
             }
+            // The slot's animated height, not its 46 pt content: the checks read this instead
+            // of hit-testing, because the Edit workspace's content editor covers the canvas
+            // below the row and would look like row chrome.
+            .background(ReaderChromeMarkerHost(kind: .secondaryRowSlot))
         }
         // Same rule as the sidebar: the animation has to own the layout that changes. The row
-        // ends at the canvas's trailing edge, before the scroll lane and the right panel; the
-        // trailing inset uses their settled widths (like the leading sidebar inset) so the row's
-        // own controls do not reflow on every animation frame.
+        // covers the scroll lane and ends flush against the right panel, so its leading and
+        // trailing insets follow the drawers' *animated* widths with their own duration/curve.
+        // A settled inset would snap the row's edge away from a sliding panel for a frame or
+        // two and leave a strip of page visible ("white sliver").
         .padding(.trailing, secondaryToolbarTrailingInset)
+        // Include the slot marker and leading spacer in the hit gate: neither the row's
+        // native scroll host nor its closing animation may leave a transparent hit surface.
+        .allowsHitTesting(secondaryToolbarVisible || state.transitionProgressOverride?.row != nil)
         .animation(secondaryRowAnimation, value: secondaryToolbarVisible)
+        .animation(sidebarAnimation, value: state.sidebarVisible)
+        .animation(sidebarAnimation, value: state.searchSidebarVisible)
+        .animation(panelAnimation, value: state.rightPanelVisible)
+        .animation(panelAnimation, value: state.performancePanelVisible)
+        .animation(panelAnimation, value: state.contentEditInspectorVisible)
+        .animation(panelAnimation, value: state.fillSignInspectorVisible)
     }
 
     /// A toggle made while the window edge is being dragged changes layout without animating:
@@ -421,33 +621,175 @@ public struct ReaderWindow: View {
     /// One row slot, selected exactly like the old `if pageOverviewVisible … else if
     /// annotationToolsVisible` chain: page overview wins and the two can never be shown twice.
     private var secondaryToolbarVisible: Bool {
-        state.pageOverviewVisible || state.annotationToolsVisible
+        state.pageOverviewVisible || state.annotationToolsVisible || state.contentEditEnabled
+            || state.fillAndSignVisible || state.exportVisible || state.aiToolsVisible
     }
 
+    /// The row's leading inset: the sidebar's *animated* width, not its settled width.
+    ///
+    /// ``ReaderSidebarTransition`` lays the drawer out at `sidebarTotalWidthPt * progress`.
+    /// The row uses the same progress (including the checks' pinned override), so its background
+    /// begins exactly at the drawer's moving trailing edge instead of jumping out from under it.
     private var secondaryToolbarInset: CGFloat {
-        guard !state.pageOverviewVisible, state.sidebarVisible else { return 0 }
-        return ReaderChrome.sidebarTotalWidthPt
+        guard !state.pageOverviewVisible else { return 0 }
+        let sidebarVisible = state.sidebarVisible && state.document != nil
+        let progress = state.transitionProgressOverride?.sidebar
+            ?? (sidebarVisible ? 1 : 0)
+        return ReaderChrome.sidebarTotalWidthPt * CGFloat(min(max(progress, 0), 1))
     }
 
-    /// Everything between the canvas's trailing edge and the window's: the scroll lane, the
-    /// search results and the right panel. Page overview draws over the whole content area, so it
-    /// suppresses all three like it suppresses the leading inset.
+    /// The search results and right panels. The row covers the scroll lane, preventing a strip
+    /// of track between the tools and the inspector. Page overview draws over the whole area, so
+    /// it suppresses all three like it suppresses the leading inset.
+    ///
+    /// Every term is the *animated* width, mirroring the view that owns it: the right drawer is
+    /// `totalWidth * panelProgress`, the editing inspector is `292 * editingPanelProgress`, and
+    /// the search column appears at its settled width under the sidebar animation. Using the
+    /// settled widths here snapped the row while a panel slid, which is the white-sliver bug.
     private var secondaryToolbarTrailingInset: CGFloat {
-        ReaderChrome.trailingChromeWidth(
-            documentOpen: state.document != nil,
-            pageOverviewVisible: state.pageOverviewVisible,
-            searchVisible: state.searchSidebarVisible,
-            rightPanelVisible: state.rightPanelVisible,
-            rightPanelContentWidth: state.rightPanelWidthPt
-        )
+        guard !state.pageOverviewVisible, state.document != nil else { return 0 }
+        var inset: CGFloat = 0
+
+        let panelVisible = state.rightPanelVisible || state.performancePanelVisible
+        let panelProgress = state.transitionProgressOverride?.panel
+            ?? (panelVisible ? 1 : 0)
+        inset += ReaderSidePanelMetrics.totalWidth(contentWidth: state.rightPanelWidthPt)
+            * CGFloat(min(max(panelProgress, 0), 1))
+
+        if state.searchSidebarVisible {
+            inset += ReaderChrome.sidebarTotalWidthPt
+        }
+        if state.secondaryInspectorWidth > 0 {
+            let inspectorProgress = state.transitionProgressOverride?.editingPanel ?? 1
+            inset += ReaderChrome.editingPanelWidthPt
+                * CGFloat(min(max(inspectorProgress, 0), 1))
+        }
+        return inset
     }
 
-    /// The read-only explanation for a digitally signed document.
+    /// What the in-place translation layer just did, including why an overlay disappeared after
+    /// a page edit. It is a status sentence, not a warning about the file: the PDF is untouched.
+    private var translationBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "character.bubble")
+                .foregroundStyle(LyraReaderTheme.accent)
+            VStack(alignment: .leading, spacing: 5) {
+                Text(state.translationNotice ?? "")
+                    .font(.callout)
+                    .frame(maxWidth: 640, alignment: .leading)
+                if let failure = state.translationFailure,
+                   let hint = AIOfflineHint.forFailure(failure) {
+                    AIOfflineHintView(hint: hint)
+                        .frame(maxWidth: 640, alignment: .leading)
+                }
+            }
+            Spacer(minLength: 0)
+            Button {
+                state.dismissTranslationNotice()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .frame(width: 20, height: 20)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss")
+            .accessibilityLabel("Dismiss translation message")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(LyraReaderTheme.raisedBg, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(LyraReaderTheme.accent.opacity(0.45), lineWidth: 1)
+        )
+        .shadow(radius: 3, y: 1)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(state.translationNotice ?? "Translation status")
+    }
+
+    /// One line about annotations inside the PDF that the engine could not decode.
+    ///
+    /// The rest of the file's annotations are still shown. Dismissing this note is safe: the
+    /// engine keeps annotation writes blocked while the unreadable content exists, so a save
+    /// cannot silently drop it.
+    private var annotationReadBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle")
+                .foregroundStyle(LyraReaderTheme.warningFg)
+            Text(state.annotationReadNotice ?? "")
+                .font(.callout)
+                .frame(maxWidth: 640, alignment: .leading)
+            Spacer(minLength: 0)
+            Button {
+                state.dismissAnnotationReadNotice()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .frame(width: 20, height: 20)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss")
+            .accessibilityLabel("Dismiss annotation read notice")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(LyraReaderTheme.raisedBg, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(LyraReaderTheme.warningFg.opacity(0.45), lineWidth: 1)
+        )
+        .shadow(radius: 3, y: 1)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(state.annotationReadNotice ?? "Annotation read status")
+    }
+
+    /// A recoverable engine error: one feature failed, the document is still readable.
+    ///
+    /// It is a sibling of the annotation-read banner rather than the block alert so a page-level
+    /// failure cannot interrupt reading. The same sentence is mirrored to the status line, which
+    /// survives dismissing the banner.
+    private var recoverableErrorBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle")
+                .foregroundStyle(LyraReaderTheme.warningFg)
+            Text(state.recoverableErrorBanner ?? "")
+                .font(.callout)
+                .frame(maxWidth: 640, alignment: .leading)
+            Spacer(minLength: 0)
+            Button {
+                state.dismissRecoverableError()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .frame(width: 20, height: 20)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss")
+            .accessibilityLabel("Dismiss error message")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(LyraReaderTheme.raisedBg, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(LyraReaderTheme.warningFg.opacity(0.45), lineWidth: 1)
+        )
+        .shadow(radius: 3, y: 1)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(state.recoverableErrorBanner ?? "Error status")
+    }
+
+    /// The read-only explanation for a digitally signed document or an XFA form.
     ///
     /// This is a *permanent* banner, not a pending-state one: the restriction belongs to the
-    /// file, so it stays visible for as long as the document is open. It names the evidence the
-    /// engine found and says what still works (copying/exporting), because a banner that only
-    /// said "read-only" would leave the reader guessing whether reading is affected too.
+    /// file, so it stays visible for as long as the document is open. A signed PDF names the
+    /// evidence the engine found and says what still works (copying/exporting), because a banner
+    /// that only said "read-only" would leave the reader guessing whether reading is affected
+    /// too. An XFA form gets two sentences of reader-facing copy instead: packet names, field
+    /// counts and the skipped list are diagnostics, not banner text.
     private var readOnlyBanner: some View {
         HStack(spacing: 10) {
             Image(systemName: "lock.doc")
@@ -455,11 +797,11 @@ public struct ReaderWindow: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(state.readOnlyBannerTitle)
                     .font(.callout.weight(.semibold))
-                Text(state.readOnlyReason ?? "This PDF is digitally signed, so it is read-only.")
+                Text(state.readOnlyBannerBody)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: 640, alignment: .leading)
-                if !state.readOnlyBannerEvidence.isEmpty {
+                if !state.isXfaDocument && !state.readOnlyBannerEvidence.isEmpty {
                     Text(state.readOnlyBannerEvidence)
                         .font(.caption2)
                         .foregroundStyle(LyraReaderTheme.textTertiary)
@@ -467,10 +809,12 @@ public struct ReaderWindow: View {
                 }
             }
             Spacer(minLength: 0)
-            Text(state.readOnlyBannerNote)
-                .font(.caption2)
-                .foregroundStyle(LyraReaderTheme.textSecondary)
-                .frame(maxWidth: 220, alignment: .trailing)
+            if !state.readOnlyBannerNote.isEmpty {
+                Text(state.readOnlyBannerNote)
+                    .font(.caption2)
+                    .foregroundStyle(LyraReaderTheme.textSecondary)
+                    .frame(maxWidth: 220, alignment: .trailing)
+            }
         }
         .controlSize(.small)
         .padding(.horizontal, 14)
@@ -483,96 +827,15 @@ public struct ReaderWindow: View {
         .shadow(radius: 3, y: 1)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            "Signed PDF, read-only. \(state.readOnlyReason ?? "") Saving a copy still works."
+            state.isXfaDocument
+                ? "\(state.readOnlyBannerTitle). \(state.readOnlyBannerBody)"
+                : "Signed PDF, read-only. \(state.readOnlyBannerBody) Saving a copy still works."
         )
-    }
-
-    /// The one place the interface states, without qualification, that the file on disk is not
-    /// what is on screen. It stays visible for the whole staged session, not just after an action.
-    private var pageEditBanner: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "square.stack.3d.up")
-                .foregroundStyle(LyraReaderTheme.warningFg)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Page changes pending")
-                    .font(.callout.weight(.semibold))
-                Text(
-                    [state.pageEditPendingSummary, state.pageEditLastAction]
-                        .compactMap { $0 }
-                        .joined(separator: " · ")
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
-            Divider().frame(height: 24)
-            Button("Undo") { state.undoPageEdit() }
-                .disabled(!state.canUndoPageEdit)
-            Button("Redo") { state.redoPageEdit() }
-                .disabled(!state.canRedoPageEdit)
-            Button("Apply to Original…") {
-                state.presentReplaceOriginalWithPageEditsConfirmation()
-            }
-            .disabled(!state.canReplaceOriginalWithPageEdits)
-            .help(state.isReadOnlyDocument
-                  ? (state.readOnlyReason ?? "Signed PDF · read-only in place")
-                  : "Replace the original file with the staged page changes")
-            Button("Save Copy…") { state.presentSavePageEditsCopyPanel() }
-                .disabled(!state.canSavePageEditsCopy)
-            Button("Discard…") { state.presentDiscardPageEditsConfirmation() }
-        }
-        .controlSize(.small)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .background(LyraReaderTheme.raisedBg, in: RoundedRectangle(cornerRadius: 10))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(LyraReaderTheme.warningFg.opacity(0.5), lineWidth: 1)
-        )
-        .shadow(radius: 3, y: 1)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Page changes pending. The file on disk is unchanged.")
     }
 
     /// The form session's version of the page-edit banner: the same raised panel, the same
     /// warning icon and the same sentence about the file on disk. It says exactly which fields
     /// changed and never calls the file saved.
-    private var redactionBanner: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "rectangle.dashed")
-                .foregroundStyle(Color.red)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Redactions pending")
-                    .font(.callout.weight(.semibold))
-                Text(
-                    "\(state.pendingRedactions.count) area(s) on \(state.pendingRedactionPageCount) page(s)"
-                        + " · nothing has been removed yet; the file on disk is unchanged"
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
-            Divider().frame(height: 24)
-            Button("Apply to Copy…") { state.presentApplyRedactionsPanel() }
-                .disabled(!state.canApplyRedactions)
-            Button("Replace Original…") { state.presentReplaceRedactionsConfirmation() }
-                .disabled(!state.canReplaceOriginalWithRedactions)
-                .help(state.isReadOnlyDocument
-                      ? (state.readOnlyReason ?? "Signed PDF · read-only in place")
-                      : "Replace the original file with the redacted version")
-            Button("Clear") { state.clearPendingRedactions() }
-        }
-        .controlSize(.small)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .background(LyraReaderTheme.raisedBg, in: RoundedRectangle(cornerRadius: 10))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.red.opacity(0.5), lineWidth: 1)
-        )
-        .shadow(radius: 3, y: 1)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Redactions pending. Nothing has been removed from the file yet.")
-    }
-
     private var formBanner: some View {
         HStack(spacing: 10) {
             Image(systemName: "signature")
@@ -592,7 +855,7 @@ public struct ReaderWindow: View {
             }
             .disabled(!state.canReplaceOriginalWithFilledForm)
             .help(state.isReadOnlyDocument
-                  ? (state.readOnlyReason ?? "Signed PDF · read-only in place")
+                  ? (state.readOnlyReason ?? state.readOnlyBannerTitle)
                   : "Write the form values into the original file")
             Button("Discard") { state.discardFormChanges() }
                 .disabled(!state.formHasPendingChanges)
@@ -613,7 +876,7 @@ public struct ReaderWindow: View {
     }
 
     /// The eraser's pending state: the strokes are gone from the reader's view and from its
-    /// sidecar, but the PDF on disk is untouched until an explicit save. Same panel, icon and
+    /// annotation cache, but the PDF on disk is untouched until an explicit save. Same panel, icon and
     /// sentence as the other pending banners; the only difference is that this one has no
     /// "Apply to Original" pair because it is a deletion, not a value.
     private var eraserPendingBanner: some View {
@@ -623,7 +886,7 @@ public struct ReaderWindow: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text("Annotation changes pending")
                     .font(.callout.weight(.semibold))
-                Text(state.eraserPendingSummary ?? "The PDF on disk is unchanged until you save a copy.")
+                Text(state.eraserPendingSummary ?? "The PDF on disk is unchanged until you save.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -644,7 +907,7 @@ public struct ReaderWindow: View {
         .shadow(radius: 3, y: 1)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            "Annotation deletions pending. The PDF on disk is unchanged until you save a copy."
+            "Annotation deletions pending. The PDF on disk is unchanged until you save."
         )
     }
 
@@ -685,6 +948,34 @@ public struct ReaderWindow: View {
     /// The eraser's refusal when cutting a PDF-owned stroke would delete its review thread.
     /// The sentence comes from `AppState.inkAttachmentRefusal`, so the check and the banner
     /// cannot disagree about what would be lost.
+    private var regionRefusalBanner: some View {
+        HStack(spacing: 9) {
+            Image(systemName: "rectangle.dashed")
+                .foregroundStyle(LyraReaderTheme.warningFg)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Region question was not created")
+                    .font(.caption.weight(.semibold))
+                Text(state.regionRefusalMessage ?? "")
+                    .font(.caption2)
+                    .foregroundStyle(LyraReaderTheme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+            Button { state.regionRefusalMessage = nil } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss region refusal")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(LyraReaderTheme.panelBg, in: RoundedRectangle(cornerRadius: 7))
+        .overlay(RoundedRectangle(cornerRadius: 7)
+            .strokeBorder(LyraReaderTheme.warningFg.opacity(0.5), lineWidth: 0.75))
+        .frame(maxWidth: 620)
+    }
+
     private var eraserRefusalBanner: some View {
         let message = state.eraserRefusalNotice
             ?? "This stroke belongs to the PDF and carries review text; splitting it would delete it."

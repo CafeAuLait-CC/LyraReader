@@ -31,35 +31,29 @@
 //!    incremental save that disturbes an existing annotation fails instead of replacing the
 //!    original.
 //!
-//! # Appearance streams (honest limitation)
+//! # Appearance streams
 //!
-//! PDFium's C API has exactly one way to attach an appearance stream to an annotation:
-//! `FPDFAnnot_SetAP`. Its implementation creates the form XObject **and its `/ExtGState`**, and
-//! that graphics state is hard-coded to `/BM /Normal` (PDFium `fpdf_annot.cpp`,
-//! `SetExtGStateInResourceDict(doc, annot_dict, "Normal")`; measured against the vendored
-//! dylib, whose output contains `/BM/Normal`). There is no public call that puts `/BM /Multiply`
-//! in that state, and writing a `Normal` state for a translucent highlight would make Preview
-//! tint the glyphs instead of multiplying into the page — strictly worse than no appearance at
-//! all, because the two viewers would then disagree about the same file.
+//! Every annotation this writer adds carries a real `/AP /N` Form XObject, except `/Text` (whose
+//! icon is a viewer glyph selected by `/Name`). PDFium's C API cannot produce those streams
+//! faithfully: `FPDFAnnot_SetAP` encodes its argument as text, and the `/ExtGState` it creates is
+//! hard-coded to `/BM /Normal` (PDFium `fpdf_annot.cpp`,
+//! `SetExtGStateInResourceDict(doc, annot_dict, "Normal")`). A translucent highlight written with
+//! that state would tint the glyphs instead of multiplying into the page, so annotation
+//! dictionaries and appearances are written by [`crate::geometry_write`] (the direct lopdf
+//! writer, named for the first kinds it handled) into the same incremental temporary file.
 //!
-//! This writer therefore does **not** write `/AP` for the quad-based kinds, which now includes
-//! `/StrikeOut`: it has the same `/QuadPoints` and `/C` contract as an underline, just a
-//! different line position. Both PDFium and PDFKit synthesize the appearance from those keys;
-//! the macOS test suite renders a saved copy with PDFKit and asserts that the highlight covers
-//! the line while the glyph pixels stay black, which is the multiply-like result Preview is
-//! expected to show. A viewer that requires an explicit `/AP` (some older readers do) will show
-//! nothing; the alternative was to
-//! write a state that is knowingly wrong. See the task report and `README.md` for the measurement.
+//! A stroked mark gets its `/BS` geometry and a stream that strokes the same path; a text mark
+//! gets `/QuadPoints`, `/C`, `/CA`, `/BM` and a stream that fills the same bands the canvas
+//! draws. The stream's `/ExtGState` carries the blend and constant alpha, so a viewer that
+//! honours `/AP` and one that synthesises from the dictionary show the same mark. `/Text` gets
+//! `/Name /Comment`; `/FreeText` gets `/DA`, `/Q` and a stream in the embedded appearance font.
+//! The appearance objects are appended by the same save as the annotation dictionaries and are
+//! verified before the rename.
 //!
-//! Ink, shapes, sticky notes and free text are different: they have no blend mode to get wrong,
-//! and PDFium's C API cannot write the keys they need (`/BS`, `/L`, `/Name`, `/DA`, `/Q`, or a
-//! real `/AP` form XObject). They are written by [`crate::geometry_write`] (the direct lopdf
-//! writer, named for the first kinds it handled): a stroked mark gets a real `/AP /N` **and** its
-//! geometry, a sticky note gets `/Name /Comment`, and a text box gets `/DA`, `/Q` **and** an
-//! appearance stream. The appearance objects are appended by the same save as the annotation
-//! dictionaries and are verified before the rename. A viewer that ignores the appearance can
-//! still synthesize the stroke or the free text; a viewer that ignores both shows nothing, which
-//! no such viewer in this environment did.
+//! An edit of an annotation the file already carried keeps every key this writer does not own.
+//! A comment-only edit keeps the producer's own `/AP` untouched; a colour or opacity change
+//! replaces `/AP /N` (the old stream is stale) while `/R`, `/D`, `/Rect`, `/QuadPoints`,
+//! `/Popup`, `/Parent`, `/IRT` and unknown keys stay as they were.
 //!
 //! # Threading
 //!
@@ -73,6 +67,7 @@ use crate::annotation_edit::{
 use crate::annotations::{
     AnnotationAppender, AnnotationReader, WriteAnnotation, WriteAnnotationKind,
 };
+use crate::copy_path::{CopyPathExtension, suggest_copy_path};
 use crate::geometry_write::{append_direct_annotations, verify_direct_annotations};
 use crate::outline_write::{
     WriteBookmark, append_bookmarks, has_bookmark_subtree, validate_bookmarks, verify_outline,
@@ -111,7 +106,7 @@ pub struct SaveReport {
     /// Content annotations the source already had (they are all verified unchanged).
     pub preexisting_annotation_count: usize,
     /// The bookmark identities written into the outline, so the shell removes exactly those
-    /// sidecar entries after a replacement.
+    /// cached entries after a replacement.
     pub written_bookmark_ids: Vec<String>,
     /// Title of the rewritten bookmark subtree; `None` when the list was empty.
     pub bookmark_outline_title: Option<String>,
@@ -176,19 +171,18 @@ const TEMP_MARKER: &str = ".lyra-reader-save-";
 const TEMP_SUFFIX: &str = ".tmp";
 const BACKUP_MARKER: &str = ".lyra-reader-backup-";
 const COPY_BUFFER: usize = 64 * 1024;
+/// Attempts to find a free temporary/backup name beside the destination.
+///
+/// A collision means a concurrent save took the name in the last few microseconds. Three tries
+/// cover the realistic race; the previous 100 only delayed the same error by 97 stat calls.
+const FILE_NAME_ATTEMPTS: u32 = 3;
 
 /// Hard limits, so a malformed shell request cannot ask the writer to build an unreasonable PDF.
 const MAX_ANNOTATIONS: usize = 20_000;
-const MAX_QUADS: usize = 1_000;
 const MAX_INK_PATHS: usize = 256;
 const MAX_INK_POINTS: usize = 100_000;
-const MAX_TEXT_BYTES: usize = 100_000;
-const MAX_AUTHOR_BYTES: usize = 1_024;
+/// An `/NM` assigned to an annotation that had none.
 const MAX_ID_BYTES: usize = 128;
-/// A stamp is a short mark, not a text box; a longer string is a request mistake.
-const MAX_STAMP_TEXT_BYTES: usize = 512;
-/// The largest image signature the writer will store, per side.
-const MAX_STAMP_IMAGE_SIDE: u32 = 8_192;
 
 /// Appends `annotations` to `source` and writes the result to `destination`.
 ///
@@ -355,19 +349,22 @@ fn save_annotation_changes_with(
             "there are no annotations or bookmarks to save",
         ));
     }
-    // Two writers, one save contract. PDFium creates the quad-based markup kinds; the rest need
-    // `/BS`, `/L`, `/Name`, `/DA`, `/Q` or a real appearance XObject, none of which its C API can
-    // write (see `geometry_write`). Edits and deletions always go through the incremental lopdf
-    // writer: PDFium has no accessor that preserves a foreign annotation's unknown keys, and its
-    // removal API cannot take a reply chain with it. Both write into the same temporary file and
-    // are verified together before the rename.
+    // One save contract. Every addition goes through the incremental lopdf writer (see
+    // `geometry_write`); PDFium's C API can write neither the dictionary keys nor the appearance
+    // graphics state these kinds need. Edits and deletions go through the same writer because
+    // PDFium has no accessor that preserves a foreign annotation's unknown keys, and its removal
+    // API cannot take a reply chain with it. The update is verified before the rename.
     let (pdfium_annotations, direct_annotations): (Vec<WriteAnnotation>, Vec<WriteAnnotation>) =
         annotations
             .iter()
             .cloned()
             .partition(|annotation| annotation.kind.uses_pdfium());
 
-    let preexisting = read_annotations(&source, password, page_count)?;
+    let preexisting_scan = read_annotations_report(&source, password, page_count)?;
+    if !preexisting_scan.unreadable.is_empty() {
+        return Err(annotation_write_blocked(&preexisting_scan.unreadable));
+    }
+    let preexisting = preexisting_scan.pages;
     let preexisting_annotation_count: usize = preexisting.iter().map(Vec::len).sum();
     // Additions must not collide with an identity the file already has. Edits and deletions name
     // existing identities by definition.
@@ -484,7 +481,18 @@ fn save_annotation_changes_with(
             verify_prefix(&source, temp.path(), source_len)?;
         }
 
-        let saved = read_annotations(temp.path(), password, page_count)?;
+        let saved_scan = read_annotations_report(temp.path(), password, page_count)?;
+        if !saved_scan.unreadable.is_empty() {
+            return Err(LyraReaderError::new(
+                ErrorCode::Internal,
+                "the saved file contains annotations that could not be read back",
+            )
+            .with_detail(format!(
+                "{} unreadable annotation(s) after the rewrite",
+                saved_scan.unreadable.len()
+            )));
+        }
+        let saved = saved_scan.pages;
         verify_all(&preexisting, &saved, changes, &applied.deleted_ids)?;
         verify_direct_annotations(temp.path(), &direct_annotations, password)?;
         verify_changes(&source, temp.path(), changes, password)?;
@@ -974,17 +982,16 @@ pub fn cleanup_interrupted_save_temporaries(target: &Path) -> Result<usize> {
     Ok(removed)
 }
 
-/// The default name a copy is offered as: `<name> (annotated).pdf`.
+/// The default name a copy is offered as: `<name> (annotated).<extension>`.
+///
+/// The source's extension is kept (`pdf` when it has none), so an annotated copy of
+/// `paper.PDF` is still offered as `paper (annotated).PDF`.
 pub fn suggested_copy_path(source: &Path) -> PathBuf {
-    let stem = source
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "document".to_string());
-    let extension = source
-        .extension()
-        .map(|extension| extension.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "pdf".to_string());
-    source.with_file_name(format!("{stem} (annotated).{extension}"))
+    suggest_copy_path(source, "annotated", CopyPathExtension::Preserve)
+}
+
+fn rule_error(error: lyra_reader_edit::rules::RuleError) -> LyraReaderError {
+    LyraReaderError::new(ErrorCode::InvalidArgument, error.message)
 }
 
 fn validate(annotations: &[WriteAnnotation], page_count: u32) -> Result<()> {
@@ -995,40 +1002,21 @@ fn validate(annotations: &[WriteAnnotation], page_count: u32) -> Result<()> {
         ));
     }
 
-    let mut ids = HashSet::new();
+    let ids: Vec<String> = annotations
+        .iter()
+        .map(|annotation| annotation.id.clone())
+        .collect();
+    lyra_reader_edit::rules::validate_unique_annotation_ids(&ids).map_err(rule_error)?;
     for annotation in annotations {
         let id = &annotation.id;
-        if id.is_empty()
-            || id.len() > MAX_ID_BYTES
-            || !id.bytes().all(|byte| byte.is_ascii_graphic())
-        {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                "an annotation identity must be 1–128 printable ASCII characters",
-            )
-            .with_detail(format!("id: {id:?}")));
-        }
-        if !ids.insert(id.clone()) {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!("two annotations in one save share the identity {id:?}"),
-            ));
-        }
-        if annotation.page.0 >= page_count {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!(
-                    "annotation {id:?} names page {}, but the document has {page_count} page(s)",
-                    annotation.page.get()
-                ),
-            ));
-        }
-        if !annotation.opacity.is_finite() || !(0.0..=1.0).contains(&annotation.opacity) {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!("annotation {id:?} has an opacity outside 0…1"),
-            ));
-        }
+        lyra_reader_edit::rules::validate_annotation_identity(id).map_err(rule_error)?;
+        lyra_reader_edit::rules::validate_page(
+            id,
+            i64::from(annotation.page.0),
+            page_count as usize,
+        )
+        .map_err(rule_error)?;
+        lyra_reader_edit::rules::validate_opacity(id, annotation.opacity).map_err(rule_error)?;
         validate_rect(&annotation.rect, id, "rect")?;
         match annotation.kind {
             WriteAnnotationKind::Text => {
@@ -1046,31 +1034,21 @@ fn validate(annotations: &[WriteAnnotation], page_count: u32) -> Result<()> {
                         format!("free-text annotation {id:?} must not carry /QuadPoints"),
                     ));
                 }
-                if !annotation.font_size.is_finite()
-                    || annotation.font_size < 1.0
-                    || annotation.font_size > 400.0
-                {
-                    return Err(LyraReaderError::new(
-                        ErrorCode::InvalidArgument,
-                        format!("free-text annotation {id:?} has a font size outside 1…400 pt"),
-                    ));
-                }
+                lyra_reader_edit::rules::validate_font_size(id, annotation.font_size)
+                    .map_err(rule_error)?;
             }
             WriteAnnotationKind::Highlight
             | WriteAnnotationKind::Underline
-            | WriteAnnotationKind::StrikeOut => {
+            | WriteAnnotationKind::StrikeOut
+            | WriteAnnotationKind::Squiggly => {
                 if annotation.quads.is_empty() {
                     return Err(LyraReaderError::new(
                         ErrorCode::InvalidArgument,
                         format!("markup annotation {id:?} has no /QuadPoints"),
                     ));
                 }
-                if annotation.quads.len() > MAX_QUADS {
-                    return Err(LyraReaderError::new(
-                        ErrorCode::InvalidArgument,
-                        format!("annotation {id:?} has more than {MAX_QUADS} quads"),
-                    ));
-                }
+                lyra_reader_edit::rules::validate_quads(id, annotation.quads.len())
+                    .map_err(rule_error)?;
                 for quad in &annotation.quads {
                     validate_rect(quad, id, "quad")?;
                 }
@@ -1083,32 +1061,12 @@ fn validate(annotations: &[WriteAnnotation], page_count: u32) -> Result<()> {
                     ));
                 }
                 let text = annotation.contents.as_deref().unwrap_or("");
-                if text.trim().is_empty() {
-                    return Err(LyraReaderError::new(
-                        ErrorCode::InvalidArgument,
-                        format!("stamp annotation {id:?} has no text"),
-                    ));
-                }
-                if text.len() > MAX_STAMP_TEXT_BYTES {
-                    return Err(LyraReaderError::new(
-                        ErrorCode::InvalidArgument,
-                        format!(
-                            "stamp annotation {id:?} has more than {MAX_STAMP_TEXT_BYTES} bytes of text"
-                        ),
-                    ));
-                }
-                if !matches!(
-                    annotation.stamp_style.as_deref(),
-                    Some("approved" | "reviewed" | "draft" | "confidential" | "date" | "custom")
-                ) {
-                    return Err(LyraReaderError::new(
-                        ErrorCode::InvalidArgument,
-                        format!(
-                            "stamp annotation {id:?} has an unknown style {:?}",
-                            annotation.stamp_style
-                        ),
-                    ));
-                }
+                lyra_reader_edit::rules::validate_stamp_text(id, text).map_err(rule_error)?;
+                lyra_reader_edit::rules::validate_stamp_style(
+                    id,
+                    annotation.stamp_style.as_deref().unwrap_or(""),
+                )
+                .map_err(rule_error)?;
                 if annotation.stamp_image.is_some() {
                     return Err(LyraReaderError::new(
                         ErrorCode::InvalidArgument,
@@ -1129,25 +1087,13 @@ fn validate(annotations: &[WriteAnnotation], page_count: u32) -> Result<()> {
                         format!("signature annotation {id:?} has no image"),
                     ));
                 };
-                if image.width == 0
-                    || image.height == 0
-                    || image.width > MAX_STAMP_IMAGE_SIDE
-                    || image.height > MAX_STAMP_IMAGE_SIDE
-                {
-                    return Err(LyraReaderError::new(
-                        ErrorCode::InvalidArgument,
-                        format!(
-                            "signature annotation {id:?} has dimensions {}×{}; the limit is {MAX_STAMP_IMAGE_SIDE} on a side",
-                            image.width, image.height
-                        ),
-                    ));
-                }
-                if image.rgba.len() != image.width as usize * image.height as usize * 4 {
-                    return Err(LyraReaderError::new(
-                        ErrorCode::InvalidArgument,
-                        format!("signature annotation {id:?} has a pixel buffer of the wrong size"),
-                    ));
-                }
+                lyra_reader_edit::rules::validate_signature_dimensions(
+                    id,
+                    image.width,
+                    image.height,
+                    image.rgba.len(),
+                )
+                .map_err(rule_error)?;
                 if annotation
                     .contents
                     .as_deref()
@@ -1231,44 +1177,13 @@ fn validate(annotations: &[WriteAnnotation], page_count: u32) -> Result<()> {
             }
         }
         if let Some(contents) = &annotation.contents {
-            if contents.len() > MAX_TEXT_BYTES {
-                return Err(LyraReaderError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("annotation {id:?} has more than {MAX_TEXT_BYTES} bytes of text"),
-                ));
-            }
-            if contents.contains('\0') {
-                return Err(LyraReaderError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("annotation {id:?} has a NUL in its contents"),
-                ));
-            }
+            lyra_reader_edit::rules::validate_note(id, contents).map_err(rule_error)?;
         }
         if let Some(author) = &annotation.author {
-            if author.len() > MAX_AUTHOR_BYTES {
-                return Err(LyraReaderError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("annotation {id:?} has an author longer than {MAX_AUTHOR_BYTES} bytes"),
-                ));
-            }
-            if author.contains('\0') {
-                return Err(LyraReaderError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("annotation {id:?} has a NUL in its author"),
-                ));
-            }
+            lyra_reader_edit::rules::validate_author(id, author).map_err(rule_error)?;
         }
-        if let Some(modified) = &annotation.modified
-            && (!modified.starts_with("D:")
-                || !modified.is_ascii()
-                || modified.len() > 64
-                || modified.contains('\0'))
-        {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!("annotation {id:?} has a malformed PDF date"),
-            )
-            .with_detail(format!("{modified:?}")));
+        if let Some(modified) = &annotation.modified {
+            lyra_reader_edit::rules::validate_pdf_date(id, modified).map_err(rule_error)?;
         }
     }
     Ok(())
@@ -1394,16 +1309,7 @@ fn validate_rect(rect: &lyra_reader_core::Rect, id: &str, what: &str) -> Result<
 
 /// The checks every stroked kind shares: a positive border width and no quads.
 fn validate_geometry_common(annotation: &WriteAnnotation, id: &str) -> Result<()> {
-    if !annotation.border_width.is_finite()
-        || annotation.border_width <= 0.0
-        || annotation.border_width > 200.0
-    {
-        return Err(LyraReaderError::new(
-            ErrorCode::InvalidArgument,
-            format!("annotation {id:?} has a border width outside 0…200 pt"),
-        ));
-    }
-    Ok(())
+    lyra_reader_edit::rules::validate_border_width(id, annotation.border_width).map_err(rule_error)
 }
 
 /// A point must be finite and inside the annotation's own box (with half a point of slack for
@@ -1457,32 +1363,85 @@ fn reject_identities_already_in_the_pdf(
     Ok(())
 }
 
-/// Reads every content annotation, page by page. The `AnnotationReader` owns a second PDFium
-/// document handle, so this is safe to run before and after the write.
+/// One pass over the file's annotations: the readable pages and everything that did not decode.
+struct AnnotationScan {
+    pages: Vec<Vec<RawAnnotation>>,
+    unreadable: Vec<crate::annotations::UnreadableAnnotation>,
+}
+
+/// Reads every content annotation, page by page, keeping the unreadable ones as diagnostics.
+///
+/// The `AnnotationReader` owns a second PDFium document handle, so this is safe to run before and
+/// after the write. A damaged annotation is reported, not treated as absent.
+fn read_annotations_report(
+    path: &Path,
+    password: Option<&str>,
+    page_count: u32,
+) -> Result<AnnotationScan> {
+    let reader = {
+        let _guard = crate::backend::lock_pdfium()?;
+        AnnotationReader::open_locked(path, password)?
+    };
+    let mut pages = Vec::with_capacity(page_count as usize);
+    let mut unreadable = Vec::new();
+    for page in 0..page_count {
+        let report = {
+            let _guard = crate::backend::lock_pdfium()?;
+            reader.page_report_locked(PageIndex(page))?
+        };
+        pages.push(report.annotations);
+        unreadable.extend(report.unreadable);
+    }
+    // `AnnotationReader::drop` takes `PDFIUM_LOCK` itself; every guard above is out of scope.
+    drop(reader);
+    Ok(AnnotationScan { pages, unreadable })
+}
+
+/// Reads every content annotation, page by page, for tests that only need the readable records.
+#[cfg(test)]
 fn read_annotations(
     path: &Path,
     password: Option<&str>,
     page_count: u32,
 ) -> Result<Vec<Vec<RawAnnotation>>> {
-    let reader = {
-        let _guard = crate::backend::PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        AnnotationReader::open_locked(path, password)?
-    };
-    let mut pages = Vec::with_capacity(page_count as usize);
-    for page in 0..page_count {
-        let annotations = {
-            let _guard = crate::backend::PDFIUM_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            reader.page_locked(PageIndex(page))?
-        };
-        pages.push(annotations);
-    }
-    // `AnnotationReader::drop` takes `PDFIUM_LOCK` itself; every guard above is out of scope.
-    drop(reader);
-    Ok(pages)
+    read_annotations_report(path, password, page_count).map(|scan| scan.pages)
+}
+
+/// The explicit refusal used when a damaged annotation makes a rewrite unsafe.
+///
+/// Rewriting around an annotation we could not decode would drop the unknown content. The
+/// message names the count and pages so the shell can show the same sentence and block the write.
+fn annotation_write_blocked(
+    unreadable: &[crate::annotations::UnreadableAnnotation],
+) -> LyraReaderError {
+    let mut pages: Vec<u32> = unreadable.iter().map(|item| item.page.get() + 1).collect();
+    pages.sort_unstable();
+    pages.dedup();
+    let page_list = pages
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let details = unreadable
+        .iter()
+        .take(8)
+        .map(|item| {
+            let slot = item
+                .slot
+                .map(|slot| format!("annotation {slot}: "))
+                .unwrap_or_default();
+            format!("page {} {}{}", item.page.get() + 1, slot, item.reason)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    LyraReaderError::new(
+        ErrorCode::ReadOnly,
+        format!(
+            "saving annotations is blocked because {} annotation(s) on page(s) {page_list} could not be read; saving would drop them",
+            unreadable.len()
+        ),
+    )
+    .with_detail(details)
 }
 
 /// Reopens the temporary file and checks it really contains what was asked for.
@@ -1555,7 +1514,7 @@ fn verify_all(
                 // geometry is the text selection's, not the editor's; `values` carries it only so
                 // the request is self-contained.
                 expected.author = original.author.clone();
-                if expected.kind.uses_pdfium() {
+                if expected.kind.is_markup() {
                     expected.rect = original.rect;
                     expected.quads = original.quads.clone();
                 }
@@ -1668,6 +1627,7 @@ fn verify_one(
         WriteAnnotationKind::Highlight => RawAnnotationKind::Highlight,
         WriteAnnotationKind::Underline => RawAnnotationKind::Underline,
         WriteAnnotationKind::StrikeOut => RawAnnotationKind::Strikeout,
+        WriteAnnotationKind::Squiggly => RawAnnotationKind::Squiggly,
         WriteAnnotationKind::Text => RawAnnotationKind::Text,
         WriteAnnotationKind::FreeText => RawAnnotationKind::FreeText,
         WriteAnnotationKind::Ink => RawAnnotationKind::Ink,
@@ -1688,7 +1648,7 @@ fn verify_one(
             format!("expected {:?}, got {:?}", expected.rect, record.rect),
         ));
     }
-    if expected.kind.uses_pdfium() {
+    if expected.kind.is_markup() {
         if record.quads.len() != expected.quads.len()
             || record
                 .quads
@@ -1749,6 +1709,7 @@ fn verify_one(
             WriteAnnotationKind::Highlight
             | WriteAnnotationKind::Underline
             | WriteAnnotationKind::StrikeOut => lyra_reader_core::AnnotationBlend::Multiply,
+            WriteAnnotationKind::Squiggly => lyra_reader_core::AnnotationBlend::Normal,
             WriteAnnotationKind::Text
             | WriteAnnotationKind::FreeText
             | WriteAnnotationKind::Ink
@@ -1953,6 +1914,7 @@ fn verify_geometry(
         WriteAnnotationKind::Highlight
         | WriteAnnotationKind::Underline
         | WriteAnnotationKind::StrikeOut
+        | WriteAnnotationKind::Squiggly
         | WriteAnnotationKind::Text
         | WriteAnnotationKind::FreeText
         | WriteAnnotationKind::Stamp
@@ -2070,7 +2032,7 @@ fn write_backup(source: &Path) -> Result<PathBuf> {
         .unwrap_or(0);
 
     let mut last_error = None;
-    for attempt in 0..100 {
+    for attempt in 0..FILE_NAME_ATTEMPTS {
         let name = if attempt == 0 {
             format!("{stem}{BACKUP_MARKER}{seconds}.{extension}")
         } else {
@@ -2209,7 +2171,7 @@ impl TempFile {
                 "the destination has no file name",
             )
         })?;
-        for attempt in 0..100 {
+        for attempt in 0..FILE_NAME_ATTEMPTS {
             let path = parent.join(format!(
                 "{}{TEMP_MARKER}{}-{}-{attempt}{TEMP_SUFFIX}",
                 name.to_string_lossy(),
@@ -2457,7 +2419,7 @@ mod tests {
     }
 
     #[test]
-    fn a_mixed_save_keeps_the_pdfium_update_and_appends_the_stroked_objects() {
+    fn a_mixed_save_writes_every_kind_with_a_verified_appearance() {
         if !crate::is_available() {
             eprintln!("skipping: PDFium unavailable");
             return;
@@ -2575,8 +2537,8 @@ mod tests {
             }
         }
 
-        // The saved bytes name the PDF subtype explicitly. No appearance stream is written for
-        // any quad-based markup kind; the honesty note in `writeback` says what that costs.
+        // The saved bytes name the PDF subtype explicitly and carry a real appearance stream;
+        // the appearance's own blend and alpha are what the writeback contract verifies.
         let bytes = fs::read(&destination).expect("saved bytes");
         assert!(
             bytes
@@ -3076,6 +3038,35 @@ mod tests {
         let reopened =
             read_annotations(&source, None, 2).expect("original still opens after a failed save");
         assert_eq!(reopened.iter().map(Vec::len).sum::<usize>(), 7);
+    }
+
+    #[test]
+    fn a_damaged_annotation_blocks_the_save_and_writes_nothing() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("damaged-annotation-save");
+        let source =
+            crate::test_support::copy_fixture(&directory, "annotations-damaged.pdf", "source.pdf");
+        let destination = directory.join("saved.pdf");
+        let error = save_annotated_pdf(
+            &source,
+            &destination,
+            std::slice::from_ref(&highlight()),
+            &[],
+            None,
+            SaveMode::Copy,
+        )
+        .expect_err("a damaged annotation must block the rewrite");
+        assert_eq!(error.code, ErrorCode::ReadOnly, "{error:?}");
+        assert!(error.message.contains("could not be read"), "{error:?}");
+        assert!(error.message.contains("page(s) 1"), "{error:?}");
+        assert!(!destination.exists(), "a blocked save wrote a file");
+        assert!(
+            interrupted_save_temporaries(&destination).is_empty(),
+            "a blocked save left a temporary file"
+        );
     }
 
     #[test]
@@ -3747,7 +3738,7 @@ mod tests {
         .page_map;
         assert_eq!(page_map, vec![Some(1), Some(2), Some(0)]);
 
-        // The shell remaps the sidecar bookmark pages from the same report.
+        // The shell remaps the cached bookmark pages from the same report.
         let remapped = [
             bookmark("22222222-2222-2222-2222-222222222201", 1, "Alpha", 120.0),
             bookmark("22222222-2222-2222-2222-222222222202", 2, "Beta", 340.0),
@@ -3776,7 +3767,7 @@ mod tests {
             "destinations are written against the written page order"
         );
 
-        // Delete old page 1 from the first save: Beta was on it and the sidecar mapping drops
+        // Delete old page 1 from the first save: Beta was on it and the cached bookmark mapping drops
         // it. The save must then carry Alpha only, with no destination to a missing page.
         let deleted = directory.join("deleted.pdf");
         let delete_map = crate::page_ops::apply_page_operation(

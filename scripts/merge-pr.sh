@@ -5,8 +5,8 @@
 # rule this script enforces: a branch is deleted only for a pull request whose
 # merge response said merged=true AND whose merged tree passed verification.
 #
-# Usage: scripts/merge-pr.sh <pr-number> [<pr-number> ...]
-#        scripts/merge-pr.sh --skip-verify <pr-number> ...   (docs-only merges)
+# Usage: scripts/merge-pr.sh [--skip-verify] [--keep-branch] <pr-number> ...
+#        --keep-branch keeps the merged branch, for a pull request stacked on it.
 #
 # Exits non-zero on the first problem and deletes nothing in that case.
 set -euo pipefail
@@ -16,7 +16,14 @@ TOKEN_FILE="$(cd "$(dirname "$0")/../.." && pwd)/gh-pat"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SKIP_VERIFY=0
 
-if [ "${1:-}" = "--skip-verify" ]; then SKIP_VERIFY=1; shift; fi
+KEEP_BRANCH=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --skip-verify) SKIP_VERIFY=1; shift ;;
+    --keep-branch) KEEP_BRANCH=1; shift ;;
+    *) break ;;
+  esac
+done
 if [ $# -eq 0 ]; then echo "usage: $0 [--skip-verify] <pr> [<pr> ...]" >&2; exit 2; fi
 if [ ! -r "$TOKEN_FILE" ]; then echo "fatal: cannot read token file $TOKEN_FILE" >&2; exit 1; fi
 TOKEN="$(tr -d '\n\r ' < "$TOKEN_FILE")"
@@ -44,6 +51,18 @@ PY
 )
   echo "    $TITLE"
   echo "    mergeable=$MERGEABLE state=$STATE head=${HEAD:0:8}"
+
+  BASE="$(python3 - "$PR" <<'PY2'
+import json, sys
+n = sys.argv[1]
+print(json.load(open(f"/tmp/merge-pr-{n}.json"))["base"]["ref"])
+PY2
+)"
+  echo "    base=$BASE"
+  if [ "$BASE" != "master" ]; then
+    echo "fatal: PR #$PR targets '$BASE', not master - it is stacked on another pull request. Merging it here would land the work on a branch instead of master, and deleting the branch would break the pull request stacked below it. Merge the base pull request first." >&2
+    exit 1
+  fi
 
   if [ "$MERGEABLE" != "True" ] || [ "$STATE" != "clean" ]; then
     echo "fatal: PR #$PR is not cleanly mergeable; nothing merged, no branch deleted." >&2
@@ -111,14 +130,31 @@ if [ "$SKIP_VERIFY" -eq 0 ]; then
   echo "==> building"
   ./scripts/build-rust.sh >/dev/null
   echo "==> checking"
-  RESULT="$(./scripts/check.sh 2>&1 | grep -E 'passed ·' | tail -1)"
+  CHECK_LOG="$(mktemp -t lyra-merge-check)"
+  RESULT="$(./scripts/check.sh 2>&1 | tee "$CHECK_LOG" | grep -E 'passed ·' | tail -1 || true)"
+  if [ -z "$RESULT" ]; then
+    echo "fatal: the check suite produced no summary line; verification failed. Branches kept." >&2
+    echo "---- last lines of the check output ----" >&2
+    tail -n 25 "$CHECK_LOG" >&2
+    echo "----------------------------------------" >&2
+    exit 1
+  fi
   echo "    $RESULT"
+  if ! echo "$RESULT" | grep -q "0 failed"; then
+    echo "fatal: verification failed ($RESULT). Branches kept; see $CHECK_LOG" >&2
+    exit 1
+  fi
   case "$RESULT" in *"0 failed"*) ;; *)
     echo "fatal: verification failed; branches kept so the merge can be inspected." >&2
     exit 1
   esac
   echo "==> packaging"
   ./scripts/make-app-bundle.sh >/dev/null
+fi
+
+if [ "$KEEP_BRANCH" -eq 1 ]; then
+  echo "==> keeping branches (a pull request is stacked on one of them): ${MERGED_BRANCHES[*]}"
+  exit 0
 fi
 
 for BRANCH in "${MERGED_BRANCHES[@]}"; do

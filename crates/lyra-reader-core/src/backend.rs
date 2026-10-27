@@ -670,7 +670,7 @@ pub trait DocumentBackend: Send + Sync {
     /// Annotations **already stored in the document** (highlights, notes, free text, …).
     ///
     /// Read-only and page-scoped like [`DocumentBackend::links`]: this is what someone else's
-    /// PDF carries, not what this application wrote (that lives in the sidecar).
+    /// PDF carries, not what this application wrote (that lives in the application's annotation cache).
     fn annotations(&self, page: PageIndex) -> Result<Vec<RawAnnotation>>;
 
     /// Raw text layer (built lazily and cached by the upper layer).
@@ -689,8 +689,21 @@ pub trait DocumentBackend: Send + Sync {
     /// Rasterize (CPU, PDFium).
     fn rasterize(&self, request: &RasterRequest) -> Result<RasterTile>;
 
-    /// Whether the document is encrypted (and has been unlocked with a password).
+    /// Whether the document carries an encryption dictionary.
+    ///
+    /// A permission-encrypted file with an empty user password reports `true` even though it
+    /// opened without a prompt. Write gates that mean "a password was supplied" must use
+    /// [`Self::needs_password`], so that reporting the encryption does not by itself change how
+    /// an ordinary encrypted PDF is edited.
     fn is_encrypted(&self) -> bool;
+
+    /// Whether a password was supplied to unlock the document.
+    ///
+    /// This is the write-policy question for the non-XFA path; it preserves the behavior a
+    /// file had before encryption was reported more precisely.
+    fn needs_password(&self) -> bool {
+        false
+    }
 
     /// Whether the document has a tagged structure (determines the reading-order strategy).
     fn is_tagged(&self) -> bool;

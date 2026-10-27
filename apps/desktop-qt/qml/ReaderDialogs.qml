@@ -233,11 +233,6 @@ Item {
     }
     Menu {
         id: selection
-        MenuItem {
-            text: qsTr("Mark Selection for Redaction")
-            enabled: !!app.selection && app.canRedact
-            onTriggered: app.markSelectionForRedaction()
-        }
         parent: Overlay.overlay
         MenuItem {
             text: qsTr("Copy Text")

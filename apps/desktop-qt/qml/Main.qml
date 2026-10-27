@@ -114,7 +114,7 @@ ApplicationWindow {
     property var infoData: ({})
     readonly property var formValues: currentReader.editDrafts.forms || ({})
     readonly property var pendingRedactions: currentReader.editDrafts.redactions || []
-    readonly property bool canRedact: currentReader.pageCount > 0 && !pageEditsPending && currentReader.pendingCommands === 0
+    readonly property bool canRedact: false // Annotation redaction is retired; content editing has its own tools.
     property string exportKind: ""
     readonly property bool pageEditsPending: !!markState.page_pending
     property bool pageEditBusy: false

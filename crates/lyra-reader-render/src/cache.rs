@@ -1,21 +1,29 @@
-//! Tile cache policy: **byte budget + LRU + pinned set** (the specification and test bed).
+//! **Historical sketch — not the shipping tile-cache policy and not its specification.**
 //!
-//! ADR 0007 (`docs/adr/0007-tile-cache-and-scheduling.md`) decided where the production cache
-//! lives and what this module is for: the hot-path cache stays in the shell, because a cache
-//! lookup must sit next to the draw call rather than behind one FFI round trip per tile; and
-//! the *policy* is this one — a budget in **bytes**, LRU order, and a pinned set that is never
-//! evicted. The shell's `TileCache` (`apps/macos/Sources/LyraReaderKit/TileCache.swift`) is the
-//! port of that policy onto the path users actually run, and it is checked against these
-//! cases.
+//! This module is the M0/M1 skeleton cache: a plain byte-budget LRU with a pinned set and a
+//! newest-insert protected entry. It is deliberately not called by the app. ADR 0007
+//! (`docs/adr/0007-tile-cache-and-scheduling.md`) kept the hot-path cache in the shell, and the
+//! cache users actually run is `apps/macos/Sources/LyraReaderKit/TileCache.swift`.
 //!
-//! So this module is deliberately *not* called by the app: deleting it would delete the
-//! specification the shell is held to, and calling it from the shell would undo ADR 0007's
-//! reason for keeping the cache in Swift. The eviction tests below are the executable half of
-//! that specification.
+//! The two implementations are **not** equivalent, and this file must not be cited as the
+//! contract the shipping cache is held to:
 //!
-//! The current implementation is a **naive LRU** (each eviction scans for the oldest entry), good enough for the skeleton phase.
-//! TODO(T1.6): switch to LRU-K with batch eviction (release 10% of capacity at once) to avoid frame-time jitter;
-//! and split the budget into three tiers, "GPU texture / CPU bitmap / disk" (`docs/03-rendering.md` §6).
+//! * the shipping cache is **LOD-aware** — eviction prefers tiles from other LODs and protects
+//!   the current LOD's visible/prefetch working set;
+//! * it accounts a page-raster reservation inside the same byte budget, and its eviction
+//!   returns what it dropped in one pass (`evictToFit(pinned:currentLod:reservedBytes:)`);
+//! * it has the hit/miss/eviction statistics the performance panel shows.
+//!
+//! `apps/macos/Checks/TileCacheChecks.swift` is the executable specification for the shipping
+//! policy. The tests here cover this historical module's own behaviour only; changing them does
+//! not change what the app does.
+//!
+//! The implementation is a naive LRU (each eviction scans for the oldest entry). It is kept as
+//! a small, readable model of the policy the shell started from; do not wire it into the draw
+//! path or treat it as a source of truth.
+//! TODO(T1.6): if this module is ever revived, it needs LRU-K with batch eviction (release 10%
+//! of capacity at once) to avoid frame-time jitter, and the "GPU texture / CPU bitmap / disk"
+//! tiers (`docs/03-rendering.md` §6). Neither is implemented here.
 
 use crate::tile::TileKey;
 use std::collections::{BTreeMap, HashMap, HashSet};

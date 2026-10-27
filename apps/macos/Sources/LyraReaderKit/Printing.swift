@@ -74,7 +74,233 @@ public struct PrintAnnotation: Sendable {
     }
 }
 
+/// The paper one printed page is composed on.
+///
+/// A page is printed on its own paper size, not on the first page's. `standardName` names the
+/// standard stock the page was matched to (`A4`, `US Letter`, …) and is `nil` for a page that
+/// matches no standard within ``PrintPaperSelection/tolerancePt``; such a page keeps its exact
+/// dimensions as a custom paper.
+public struct PrintPaper: Equatable, Sendable {
+    /// Paper size in points, in the page's orientation (a landscape page gets landscape paper).
+    public let size: CGSize
+    /// The matched standard's name, or `nil` for custom paper.
+    public let standardName: String?
+
+    public init(size: CGSize, standardName: String? = nil) {
+        self.size = size
+        self.standardName = standardName
+    }
+
+    public var isCustom: Bool { standardName == nil }
+}
+
+/// A standard paper stock the reader can print on.
+public struct PrintPaperStandard: Equatable, Sendable {
+    public let name: String
+    /// Portrait dimensions in points.
+    public let size: CGSize
+
+    public init(name: String, size: CGSize) {
+        self.name = name
+        self.size = size
+    }
+}
+
+/// Chooses the paper for a page from that page's own size.
+///
+/// # Rule
+///
+/// 1. A page whose dimensions (orientation-normalised) are within
+///    ``tolerancePt`` of a standard stock on **both** dimensions is printed on that standard's
+///    paper, in the page's orientation. The nearest standard wins (smallest total difference).
+/// 2. Otherwise the page is printed on custom paper of exactly its own size.
+/// 3. The page is then fitted to that paper preserving aspect ratio, and the fit factor is
+///    capped at 1: a page smaller than its paper is **centred at 100%**, never enlarged.
+///
+/// A document whose pages all share one size is a special case: the shared size is used as the
+/// paper size as well. That keeps an ordinary uniform document printing exactly as it did before
+/// per-page paper selection existed (no sub-point snap margins), while still naming the stock.
+public enum PrintPaperSelection {
+    /// Both dimensions must be this close to a standard to count as that stock. 12 pt is smaller
+    /// than the difference between A4 and US Letter on the short edge (16.7 pt), so the two
+    /// never collapse into one another.
+    public static let tolerancePt: CGFloat = 12
+
+    /// The stocks the reader recognises. ISO sizes use their exact 72 dpi values; US sizes are
+    /// exact by definition. The names match what the system print panel calls them.
+    public static let standards: [PrintPaperStandard] = [
+        PrintPaperStandard(name: "A3", size: CGSize(width: 841.89, height: 1190.55)),
+        PrintPaperStandard(name: "A4", size: CGSize(width: 595.28, height: 841.89)),
+        PrintPaperStandard(name: "A5", size: CGSize(width: 420.94, height: 595.28)),
+        PrintPaperStandard(name: "A6", size: CGSize(width: 297.64, height: 420.94)),
+        PrintPaperStandard(name: "B4", size: CGSize(width: 708.66, height: 1000.63)),
+        PrintPaperStandard(name: "B5", size: CGSize(width: 498.90, height: 708.66)),
+        PrintPaperStandard(name: "US Letter", size: CGSize(width: 612, height: 792)),
+        PrintPaperStandard(name: "US Legal", size: CGSize(width: 612, height: 1008)),
+        PrintPaperStandard(name: "US Tabloid", size: CGSize(width: 792, height: 1224)),
+        PrintPaperStandard(name: "US Executive", size: CGSize(width: 522, height: 756)),
+    ]
+
+    /// The nearest standard within ``tolerancePt``, or `nil` when the page is custom-sized.
+    public static func standard(forPageSize size: CGSize) -> PrintPaperStandard? {
+        let size = normalized(size)
+        let pagePortrait = size.height >= size.width
+        let pageSmall = pagePortrait ? size.width : size.height
+        let pageLarge = pagePortrait ? size.height : size.width
+        var best: (standard: PrintPaperStandard, distance: CGFloat)?
+        for standard in standards {
+            let standardSmall = min(standard.size.width, standard.size.height)
+            let standardLarge = max(standard.size.width, standard.size.height)
+            let widthDifference = abs(pageSmall - standardSmall)
+            let heightDifference = abs(pageLarge - standardLarge)
+            guard widthDifference <= tolerancePt, heightDifference <= tolerancePt else { continue }
+            let distance = widthDifference + heightDifference
+            if best == nil || distance < best!.distance {
+                best = (standard, distance)
+            }
+        }
+        return best?.standard
+    }
+
+    /// The paper a page of `size` prints on.
+    public static func paper(forPageSize size: CGSize) -> PrintPaper {
+        let size = normalized(size)
+        guard let standard = standard(forPageSize: size) else {
+            return PrintPaper(size: size)
+        }
+        let landscape = size.width > size.height
+        let paperSize = landscape
+            ? CGSize(width: standard.size.height, height: standard.size.width)
+            : standard.size
+        return PrintPaper(size: paperSize, standardName: standard.name)
+    }
+
+    /// A usable page size: non-positive or non-finite geometry falls back to US Letter, the
+    /// same fallback the print view has always used for a document with no usable page size.
+    public static func normalized(_ size: CGSize) -> CGSize {
+        guard size.width.isFinite, size.height.isFinite,
+              size.width > 1, size.height > 1 else {
+            return CGSize(width: 612, height: 792)
+        }
+        return size
+    }
+}
+
+/// Everything the print view needs to know about one printed page.
+///
+/// `documentPage` is the zero-based page in the document (the key for the page raster,
+/// annotations and text layer); the view's own page numbers are the positions in the array the
+/// view was built from. A per-paper-size print operation therefore prints a subset of the
+/// document's pages while still asking the engine and the annotation store for the right ones.
+public struct PrintPageSpec: Equatable, Sendable {
+    public let documentPage: Int
+    /// The page's own size in points, already rotated.
+    public let pageSize: CGSize
+    /// The paper this page is composed on.
+    public let paper: PrintPaper
+
+    public init(documentPage: Int, pageSize: CGSize, paper: PrintPaper) {
+        self.documentPage = documentPage
+        self.pageSize = pageSize
+        self.paper = paper
+    }
+
+    /// Fit factor from page points to paper points. Never above 1 (never enlarges).
+    public var contentScale: CGFloat {
+        let page = PrintPaperSelection.normalized(pageSize)
+        let fit = min(paper.size.width / page.width, paper.size.height / page.height)
+        return min(1, max(0, fit))
+    }
+
+    /// Where the page's content sits on the paper, in paper coordinates with the paper's
+    /// bottom-left corner at the origin. Centred; aspect ratio preserved; never cropped.
+    public var contentRect: CGRect {
+        let page = PrintPaperSelection.normalized(pageSize)
+        let scale = contentScale
+        let width = page.width * scale
+        let height = page.height * scale
+        return CGRect(
+            x: (paper.size.width - width) / 2,
+            y: (paper.size.height - height) / 2,
+            width: width,
+            height: height
+        )
+    }
+
+    /// Plans a whole document from its page sizes, applying the per-page paper rule.
+    ///
+    /// A document whose pages all share one size keeps that exact size as the paper (see
+    /// ``PrintPaperSelection``), so a uniform document is unchanged.
+    public static func plan(pageSizes: [CGSize]) -> [PrintPageSpec] {
+        let sizes = pageSizes.map(PrintPaperSelection.normalized)
+        guard let first = sizes.first else { return [] }
+        let uniform = sizes.allSatisfy {
+            abs($0.width - first.width) <= 0.5 && abs($0.height - first.height) <= 0.5
+        }
+        if uniform {
+            let paper = PrintPaper(
+                size: first,
+                standardName: PrintPaperSelection.standard(forPageSize: first)?.name
+            )
+            return sizes.enumerated().map {
+                PrintPageSpec(documentPage: $0.offset, pageSize: $0.element, paper: paper)
+            }
+        }
+        return sizes.enumerated().map { index, size in
+            PrintPageSpec(
+                documentPage: index,
+                pageSize: size,
+                paper: PrintPaperSelection.paper(forPageSize: size)
+            )
+        }
+    }
+
+    /// Groups pages by paper, preserving document order inside a group and first-appearance
+    /// order between groups. Each group becomes one `NSPrintOperation`, because AppKit binds one
+    /// paper size to an operation (see ``ReaderPrintView``).
+    public static func groupedByPaper(_ pages: [PrintPageSpec]) -> [PrintPageGroup] {
+        var groups: [PrintPageGroup] = []
+        for page in pages {
+            if let index = groups.firstIndex(where: { $0.paper == page.paper }) {
+                groups[index].pages.append(page)
+            } else {
+                groups.append(PrintPageGroup(paper: page.paper, pages: [page]))
+            }
+        }
+        return groups
+    }
+}
+
+/// The pages printed together on one paper size, in document order.
+public struct PrintPageGroup: Equatable, Sendable {
+    public let paper: PrintPaper
+    public var pages: [PrintPageSpec]
+
+    public init(paper: PrintPaper, pages: [PrintPageSpec]) {
+        self.paper = paper
+        self.pages = pages
+    }
+
+    public var pageCount: Int { pages.count }
+    public var documentPages: [Int] { pages.map(\.documentPage) }
+}
+
 /// The view `NSPrintOperation` paginates: one page of the document per printed page.
+///
+/// # Per-page paper
+///
+/// Each page is laid out on its own paper rectangle (`PrintPageSpec.paper`), selected by
+/// ``PrintPaperSelection`` from that page's size. Pages are stacked bottom-to-top in the view,
+/// so `rectForPage` can hand AppKit a different rectangle for every page. AppKit still binds a
+/// single paper size to an `NSPrintOperation`, so `AppState` splits a mixed-size document into
+/// one operation per distinct paper (`PrintPageSpec.groupedByPaper`); a view is built for each
+/// group with only that group's pages.
+///
+/// # Scaling
+///
+/// The page raster is drawn into the page's paper rectangle with aspect ratio preserved,
+/// centred, and never enlarged past 100%. A page smaller than the stock it was matched to keeps
+/// its size and gets paper-coloured margins rather than being blown up.
 ///
 /// # Resolution
 ///
@@ -107,8 +333,14 @@ public final class ReaderPrintView: NSView {
     /// press and the one just drawn.
     public static let maximumCachedPages = 2
 
-    public let pageCount: Int
-    public let pageSizePt: CGSize
+    /// The pages this view prints, in print order. The array index is the view's page number
+    /// minus one; `documentPage` names the page in the document.
+    public let pages: [PrintPageSpec]
+    public var pageCount: Int { pages.count }
+    /// Paper size of the first page. Kept for the tear checks, which compare two views of the
+    /// same document; use ``pages`` for per-page paper.
+    public var pageSizePt: CGSize { pages[0].paper.size }
+    private let pageRects: [CGRect]
     private let annotations: [PrintAnnotation]
     private let pageImage: (Int, CGFloat) -> PageImage?
     private let textPage: (Int) -> TextPage?
@@ -120,26 +352,56 @@ public final class ReaderPrintView: NSView {
     /// The pages the last print panel asked for, in order.
     public private(set) var printedPages: [Int] = []
 
+    /// Builds a view for an explicit list of pages, each with its own paper.
     public init(
+        pages: [PrintPageSpec],
+        annotations: [PrintAnnotation] = [],
+        pageImage: @escaping (Int, CGFloat) -> PageImage?,
+        textPage: @escaping (Int) -> TextPage? = { _ in nil }
+    ) {
+        // A print operation needs at least one page. An empty plan is a programming error, but
+        // falling back to one blank Letter page is safer than a zero-sized view.
+        let pages = pages.isEmpty
+            ? [PrintPageSpec(
+                documentPage: 0,
+                pageSize: CGSize(width: 612, height: 792),
+                paper: PrintPaper(size: CGSize(width: 612, height: 792), standardName: "US Letter")
+            )]
+            : pages
+        self.pages = pages
+        self.annotations = annotations
+        self.pageImage = pageImage
+        self.textPage = textPage
+        var rects: [CGRect] = []
+        var y: CGFloat = 0
+        var width: CGFloat = 0
+        for page in pages {
+            let size = page.paper.size
+            rects.append(CGRect(x: 0, y: y, width: size.width, height: size.height))
+            y += size.height
+            width = max(width, size.width)
+        }
+        self.pageRects = rects
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: y))
+    }
+
+    /// Uniform-size convenience initializer. The whole document is planned with the per-page
+    /// paper rule, so a uniform document keeps its exact shared size (see ``PrintPageSpec.plan``).
+    public convenience init(
         pageCount: Int,
         pageSizePt: CGSize,
         annotations: [PrintAnnotation] = [],
         pageImage: @escaping (Int, CGFloat) -> PageImage?,
         textPage: @escaping (Int) -> TextPage? = { _ in nil }
     ) {
-        self.pageCount = max(pageCount, 1)
-        self.pageSizePt = pageSizePt.width > 1 && pageSizePt.height > 1
-            ? pageSizePt
-            : CGSize(width: 612, height: 792)
-        self.annotations = annotations
-        self.pageImage = pageImage
-        self.textPage = textPage
-        super.init(frame: NSRect(
-            x: 0,
-            y: 0,
-            width: self.pageSizePt.width,
-            height: self.pageSizePt.height * CGFloat(self.pageCount)
-        ))
+        self.init(
+            pages: PrintPageSpec.plan(
+                pageSizes: Array(repeating: pageSizePt, count: max(pageCount, 1))
+            ),
+            annotations: annotations,
+            pageImage: pageImage,
+            textPage: textPage
+        )
     }
 
     @available(*, unavailable)
@@ -154,29 +416,32 @@ public final class ReaderPrintView: NSView {
     }
 
     public override func rectForPage(_ page: Int) -> NSRect {
-        NSRect(
-            x: 0,
-            y: CGFloat(page - 1) * pageSizePt.height,
-            width: pageSizePt.width,
-            height: pageSizePt.height
-        )
+        guard page >= 1, page <= pageRects.count else { return .zero }
+        return pageRects[page - 1]
     }
 
-    /// The pages the print panel selected, as zero-based indices.
+    /// The pages the print panel selected, as zero-based view page indices.
     ///
     /// `NSPrintInfo` stores the panel's choice in its dictionary (`NSPrintFirstPage`,
     /// `NSPrintLastPage`, `NSPrintAllPages`); the operation's `pageRange` is derived from it and
     /// is what AppKit uses to call `rectForPage` for selected pages only.
     public func selectedPages(from info: NSPrintInfo) -> [Int] {
+        Self.selectedPages(from: info, pageCount: pageCount)
+    }
+
+    /// The page-range attributes of `info`, as zero-based pages of a `pageCount`-page document.
+    ///
+    /// Used for the full document view before it is split into per-paper print operations.
+    public static func selectedPages(from info: NSPrintInfo, pageCount: Int) -> [Int] {
+        let count = max(pageCount, 1)
         let dictionary = info.dictionary()
         let allPages = (dictionary[NSPrintInfo.AttributeKey.allPages] as? NSNumber)?.boolValue
             ?? true
-        guard !allPages else { return Array(0..<pageCount) }
+        guard !allPages else { return Array(0..<count) }
         let first = (dictionary[NSPrintInfo.AttributeKey.firstPage] as? NSNumber)?.intValue ?? 1
-        let last = (dictionary[NSPrintInfo.AttributeKey.lastPage] as? NSNumber)?.intValue
-            ?? pageCount
-        let low = min(max(first, 1), pageCount)
-        let high = min(max(last, low), pageCount)
+        let last = (dictionary[NSPrintInfo.AttributeKey.lastPage] as? NSNumber)?.intValue ?? count
+        let low = min(max(first, 1), count)
+        let high = min(max(last, low), count)
         return Array((low - 1)..<high)
     }
 
@@ -185,33 +450,25 @@ public final class ReaderPrintView: NSView {
     public var cachedPageCount: Int { cache.count }
 
     public override func draw(_ dirtyRect: NSRect) {
-        let height = pageSizePt.height
-        guard height > 0 else { return }
-        let first = max(0, Int(floor(dirtyRect.minY / height)))
-        let last = min(pageCount - 1, Int(floor((dirtyRect.maxY - 0.01) / height)))
-        guard first <= last else { return }
-        for page in first...last {
-            let rect = CGRect(
-                x: 0,
-                y: CGFloat(page) * height,
-                width: pageSizePt.width,
-                height: height
-            )
+        for (index, rect) in pageRects.enumerated() where rect.intersects(dirtyRect) {
+            let page = pages[index].documentPage
             if !printedPages.contains(page) { printedPages.append(page) }
-            drawPage(page, in: rect)
+            drawPage(index, in: rect)
         }
     }
 
-    /// Renders one page to an `NSBitmapImageRep` at print resolution, for the headless check.
+    /// Renders one printed page to an `NSBitmapImageRep` at print resolution. `page` is a
+    /// zero-based view page index; the bitmap is the page's paper, with the fitted content.
     ///
     /// This is the same `drawPage` the print operation calls, into an offscreen context, so the
     /// bitmap the check inspects is the bitmap the printer receives (before the print system's
     /// own scaling).
     public func renderPageBitmap(_ page: Int) -> NSBitmapImageRep? {
-        guard page >= 0, page < pageCount else { return nil }
+        guard page >= 0, page < pages.count else { return nil }
+        let paperSize = pages[page].paper.size
         let scale = Self.printDPI / 72.0
-        let width = max(1, Int((pageSizePt.width * scale).rounded()))
-        let height = max(1, Int((pageSizePt.height * scale).rounded()))
+        let width = max(1, Int((paperSize.width * scale).rounded()))
+        let height = max(1, Int((paperSize.height * scale).rounded()))
         guard let representation = NSBitmapImageRep(
             bitmapDataPlanes: nil,
             pixelsWide: width,
@@ -224,45 +481,61 @@ public final class ReaderPrintView: NSView {
             bytesPerRow: 0,
             bitsPerPixel: 0
         ) else { return nil }
-        representation.size = NSSize(width: pageSizePt.width, height: pageSizePt.height)
+        representation.size = NSSize(width: paperSize.width, height: paperSize.height)
         guard let context = NSGraphicsContext(bitmapImageRep: representation) else { return nil }
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = context
         // `NSGraphicsContext(bitmapImageRep:)` already maps the rep's point size to its pixel
-        // size (300/72 here), so drawing in page points is already at print resolution. Scaling
+        // size (300/72 here), so drawing in paper points is already at print resolution. Scaling
         // again would draw a quarter of the page off the bitmap.
-        drawPage(page, in: CGRect(origin: .zero, size: pageSizePt))
+        drawPage(page, in: CGRect(origin: .zero, size: paperSize))
         NSGraphicsContext.restoreGraphicsState()
         return representation
     }
 
     // MARK: - Drawing
 
-    private func drawPage(_ page: Int, in rect: CGRect) {
+    /// Draws one page on its paper rect. `paperRect` is in the view's bottom-left coordinates.
+    private func drawPage(_ index: Int, in paperRect: CGRect) {
         guard let context = NSGraphicsContext.current?.cgContext else { return }
+        let spec = pages[index]
+        let pageSize = PrintPaperSelection.normalized(spec.pageSize)
+        let content = spec.contentRect.offsetBy(dx: paperRect.minX, dy: paperRect.minY)
+        let scale = spec.contentScale
+
         context.saveGState()
-        // Page space is top-left in this app; printing is bottom-left. Flip once around the page
-        // rectangle, then all page-local geometry can be used as stored.
-        context.translateBy(x: rect.minX, y: rect.minY + rect.height)
+        // The paper is white; a page smaller than the stock shows these margins.
+        context.setFillColor(NSColor.white.cgColor)
+        context.fill(paperRect)
+
+        // Page space is top-left in this app; printing is bottom-left. Flip around the content
+        // rect, then scale page points to fitted paper points, so every page-local geometry
+        // (raster, annotations, highlight boxes) can be used as stored.
+        context.translateBy(x: content.minX, y: content.minY + content.height)
         context.scaleBy(x: 1, y: -1)
+        context.scaleBy(x: scale, y: scale)
 
         context.setFillColor(NSColor.white.cgColor)
-        context.fill(CGRect(origin: .zero, size: rect.size))
+        context.fill(CGRect(origin: .zero, size: pageSize))
 
-        if let image = pageImageForPrint(page) {
+        if let image = pageImageForPrint(spec.documentPage) {
             // CGImage draws in an unflipped coordinate space; flip locally so it comes out
             // upright inside the already-flipped page context.
             context.saveGState()
-            context.translateBy(x: 0, y: rect.height)
+            context.translateBy(x: 0, y: pageSize.height)
             context.scaleBy(x: 1, y: -1)
-            context.draw(image, in: CGRect(origin: .zero, size: rect.size))
+            context.draw(image, in: CGRect(origin: .zero, size: pageSize))
             context.restoreGState()
         } else {
-            drawMissingPage(page, in: CGRect(origin: .zero, size: rect.size), context: context)
+            drawMissingPage(
+                spec.documentPage,
+                in: CGRect(origin: .zero, size: pageSize),
+                context: context
+            )
         }
 
-        for annotation in annotations where annotation.page == page {
-            draw(annotation, in: rect, context: context)
+        for annotation in annotations where annotation.page == spec.documentPage {
+            draw(annotation, context: context)
         }
         context.restoreGState()
     }
@@ -302,7 +575,7 @@ public final class ReaderPrintView: NSView {
         context.restoreGState()
     }
 
-    private func draw(_ annotation: PrintAnnotation, in rect: CGRect, context: CGContext) {
+    private func draw(_ annotation: PrintAnnotation, context: CGContext) {
         let color = NSColor(
             srgbRed: CGFloat(annotation.color.red) / 255,
             green: CGFloat(annotation.color.green) / 255,

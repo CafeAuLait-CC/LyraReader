@@ -44,7 +44,7 @@ extension ReaderChecks {
     /// the same three `AppState` calls the canvas makes on press / drag / release, so the
     /// comparison is between the real mid-gesture canvas state and the real committed state.
     ///
-    /// The fixtures are scratch copies: the committed PDF and its sidecar are never touched.
+    /// The fixtures are scratch copies: the committed PDF and its annotation cache are never touched.
     @MainActor static func liveMarkupChecks(textPage: URL, twoColumn: URL) async throws {
         let fileManager = FileManager.default
         let scratch = fileManager.temporaryDirectory
@@ -201,7 +201,7 @@ extension ReaderChecks {
             require(false, "a drag with Select armed produces a text selection")
             return
         }
-        require(state.annotationTool == .select, "reading opens in Select mode")
+        require(state.annotationTool == .select, "reading opens in the implicit pointer state")
         require(state.annotations.isEmpty, "a plain selection creates no annotation")
         let plainExpected = expectedSelection(plainSelection.range)
         require(!plainExpected.isEmpty && overlayQuads() == plainExpected,
@@ -408,7 +408,7 @@ extension ReaderChecks {
         dragToPreview(leaveRange)
         require(!overlayQuads().isEmpty, "the tool-leaving gesture starts with a live preview")
         state.selectTool()
-        require(state.annotationTool == .select, "Select leaves the markup tool")
+        require(state.annotationTool == .select, "the implicit pointer state leaves the markup tool")
         guard let leaveSelection = state.selection else {
             require(false, "leaving the tool keeps the selection in progress")
             return

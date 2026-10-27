@@ -53,11 +53,17 @@ mod backend;
 #[cfg(feature = "pdfium")]
 pub mod content_edit;
 #[cfg(feature = "pdfium")]
+mod copy_path;
+#[cfg(feature = "pdfium")]
 mod document_properties;
+#[cfg(feature = "pdfium")]
+mod flatten;
 #[cfg(feature = "pdfium")]
 mod forms;
 #[cfg(feature = "pdfium")]
 mod geometry_write;
+#[cfg(feature = "pdfium")]
+mod limits;
 #[cfg(feature = "pdfium")]
 mod outline_write;
 #[cfg(feature = "pdfium")]
@@ -87,7 +93,8 @@ pub use annotation_edit::{
 };
 #[cfg(feature = "pdfium")]
 pub use annotations::{
-    AnnotationAppender, AnnotationReader, WriteAnnotation, WriteAnnotationKind, WriteStampImage,
+    AnnotationAppender, AnnotationPageReport, AnnotationReader, UnreadableAnnotation,
+    WriteAnnotation, WriteAnnotationKind, WriteStampImage,
 };
 #[cfg(feature = "pdfium")]
 pub use appearance_font::{AppearanceCoverage, coverage as appearance_coverage, missing_glyphs};
@@ -96,10 +103,17 @@ pub use backend::{
     PdfiumBackend, destination_region_view_space as destination_view_rect, library_candidates,
 };
 #[cfg(feature = "pdfium")]
+pub use copy_path::{CopyPathExtension, suggest_copy_path};
+#[cfg(feature = "pdfium")]
 pub use document_properties::{
     DocumentFacts, DocumentInfo, DocumentProperties, PropertiesSaveReport,
     read_document_facts_unencrypted_header, read_document_info, save_document_properties,
     suggested_properties_copy_path,
+};
+#[cfg(feature = "pdfium")]
+pub use flatten::{
+    FlattenKindCount, FlattenReport, KeptAnnotation, KeptField, flatten_to_copy,
+    suggested_flatten_copy_path,
 };
 #[cfg(feature = "pdfium")]
 pub use forms::{
@@ -120,13 +134,16 @@ pub use page_ops::{
 #[cfg(feature = "pdfium")]
 pub use redaction::{
     RASTER_DPI, RedactionArea, RedactionMode, RedactionPagePreview, RedactionPageReport,
-    RedactionPreview, RedactionReport, preview_redactions, redact_pdf,
+    RedactionPreview, RedactionReport, preview_redactions, raster_pages_for_redaction, redact_pdf,
     suggested_redaction_copy_path,
 };
 #[cfg(feature = "pdfium")]
 pub use rewrite::{SignatureStripReport, strip_signature_from_copy};
 #[cfg(feature = "pdfium")]
-pub use signature::{SignatureEvidence, SignatureEvidenceKind, SignatureStatus, detect_signature};
+pub use signature::{
+    SignatureEvidence, SignatureEvidenceKind, SignatureStatus, detect_signature,
+    detect_signature_in_document,
+};
 #[cfg(not(feature = "pdfium"))]
 pub use stub::PdfiumBackend;
 #[cfg(feature = "pdfium")]
@@ -157,6 +174,18 @@ pub fn is_available() -> bool {
     {
         false
     }
+}
+
+/// Test-only hook: poison the process-wide PDFium lock, then let the next call report the
+/// explicit corruption error instead of continuing with a possibly inconsistent PDFium state.
+///
+/// Only a separate test process may call this: the poison marker lasts for the life of the
+/// process. Public because integration tests are separate crates; hidden from the documented API.
+#[cfg(feature = "pdfium")]
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn poison_pdfium_lock_for_test() {
+    backend::poison_pdfium_lock_for_test();
 }
 
 /// Human-readable description of the build-time backend selection, used by

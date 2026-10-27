@@ -1,4 +1,5 @@
 import CoreGraphics
+import LyraReaderBindings
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
@@ -444,7 +445,7 @@ public struct SidebarView: View {
     /// The reader's own bookmarks: one section per page, in the order the reader set.
     ///
     /// Renaming is committed on Return or blur (`BookmarkNameField`), not on every keystroke,
-    /// so typing a title costs one sidecar write rather than one per character. Moving is
+    /// so typing a title costs one cache write rather than one per character. Moving is
     /// explicit (↑/↓) instead of drag-only: the list is also reachable from the keyboard, and
     /// a drag in a grouped `List` cannot say whether the reader meant to reorder or to regroup.
     private var bookmarkList: some View {
@@ -458,7 +459,7 @@ public struct SidebarView: View {
                         .font(.callout)
                         .foregroundStyle(LyraReaderTheme.textSecondary)
                     if state.document != nil {
-                        Text("⌘D or Add Bookmark puts the current page and position here.")
+                        Text("Hover over a page’s top-right corner to add a bookmark, or press ⌘D.")
                             .font(.caption)
                             .foregroundStyle(LyraReaderTheme.textTertiary)
                             .multilineTextAlignment(.center)
@@ -467,68 +468,11 @@ public struct SidebarView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(20)
             } else {
-                List {
-                    ForEach(state.bookmarkGroups) { group in
-                        Section(group.title) {
-                            ForEach(group.bookmarks) { bookmark in
-                                bookmarkRow(bookmark)
-                            }
-                        }
-                    }
+                List(state.bookmarks) { bookmark in
+                    BookmarkSidebarRow(state: state, bookmark: bookmark)
                 }
                 .listStyle(.sidebar)
             }
-        }
-    }
-
-    private func bookmarkRow(_ bookmark: Bookmark) -> some View {
-        HStack(alignment: .top, spacing: 6) {
-            Image(systemName: "bookmark.fill")
-                .font(.caption2)
-                .foregroundStyle(Color.accentColor)
-                .padding(.top, 3)
-
-            VStack(alignment: .leading, spacing: 2) {
-                BookmarkNameField(state: state, bookmark: bookmark)
-                Button {
-                    state.jump(to: bookmark)
-                } label: {
-                    Text("Page \(bookmark.page + 1) · \(Int(bookmark.yPt.rounded())) pt")
-                        .font(.caption2)
-                        .monospacedDigit()
-                        .foregroundStyle(LyraReaderTheme.textSecondary)
-                }
-                .buttonStyle(.plain)
-                .help("Jump to this bookmark")
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            Button {
-                state.moveBookmark(bookmark.id, by: -1)
-            } label: {
-                Image(systemName: "arrow.up")
-                    .font(.caption2)
-            }
-            .buttonStyle(.plain)
-            .help("Move bookmark up")
-
-            Button {
-                state.moveBookmark(bookmark.id, by: 1)
-            } label: {
-                Image(systemName: "arrow.down")
-                    .font(.caption2)
-            }
-            .buttonStyle(.plain)
-            .help("Move bookmark down")
-
-            Button {
-                state.removeBookmark(bookmark.id)
-            } label: {
-                Image(systemName: "trash")
-                    .font(.caption2)
-            }
-            .buttonStyle(.plain)
-            .help("Delete bookmark")
         }
     }
 
@@ -536,8 +480,8 @@ public struct SidebarView: View {
 
     /// Everything annotation-shaped about this document, in one list.
     ///
-    /// PDF and sidecar markup share sentence excerpts; non-text annotations and threaded
-    /// replies retain their individual rows. Only sidecar entries are editable here.
+    /// PDF and cached markup share sentence excerpts; non-text annotations and threaded
+    /// replies retain their individual rows. Only annotation-cache entries are editable here.
     private var annotationList: some View {
         Group {
             if state.annotations.isEmpty && state.documentAnnotations.isEmpty && !state.documentAnnotationsLoading {
@@ -603,7 +547,7 @@ public struct SidebarView: View {
             HStack(spacing: 6) {
                 Image(systemName: collapsedAnnotationPages.contains(page.id) ? "chevron.right" : "chevron.down")
                     .font(.system(size: 9, weight: .semibold)).frame(width: 10)
-                Text("Page \(page.id + 1)").fontWeight(.semibold)
+                Text(LyraReaderBindings.pageLabel(pages: [UInt32(page.id + 1)])).fontWeight(.semibold)
                 Spacer(minLength: 2)
                 Text("\(page.annotationCount)").foregroundStyle(LyraReaderTheme.textSecondary)
             }
@@ -699,7 +643,7 @@ public struct SidebarView: View {
                             .foregroundStyle(LyraReaderTheme.textSecondary)
                     }
                     if row.showsPage {
-                        Text("On page \(row.annotation.page + 1)")
+                        Text("On " + LyraReaderBindings.pageLabel(pages: [UInt32(row.annotation.page + 1)]).lowercased())
                             .font(.caption2)
                             .foregroundStyle(LyraReaderTheme.textSecondary)
                     }
@@ -759,7 +703,7 @@ public struct SidebarView: View {
             } label: {
                 VStack(alignment: .leading, spacing: 2) {
                     if annotation.kind == .signature {
-                        Text("Signature image")
+                        Text(annotation.stampStyle == "image" ? "Picture" : "Signature image")
                             .font(.caption)
                     } else if annotation.kind.isPlacedText {
                         Text(annotation.note.isEmpty ? (annotation.kind == .textBox ? "Text Box" : "Sticky Note") : annotation.note)
@@ -798,7 +742,7 @@ public struct SidebarView: View {
         }
     }
 
-    /// The one line under a sidecar annotation's note field.
+    /// The one line under a cached annotation's note field.
     private func ownAnnotationSubtitle(_ annotation: AppState.Annotation) -> String {
         let kind = annotation.kind.rawValue
         let source = annotation.isFileOwned ? "PDF annotation · " : ""
@@ -807,23 +751,23 @@ public struct SidebarView: View {
             let detail = annotation.kind == .textBox
                 ? "\(String(format: "%.0f", annotation.fontSize)) pt"
                 : "icon"
-            return "\(source)Page \(annotation.page + 1) · placed \(kind) · \(detail) · "
+            return "\(source)\(LyraReaderBindings.pageLabel(pages: [UInt32(annotation.page + 1)])) · placed \(kind) · \(detail) · "
                 + "\(characters) character\(characters == 1 ? "" : "s")"
         }
         if annotation.kind.isGeometry {
             let width = String(format: "%.1f pt", annotation.strokeWidth)
-            return "\(source)Page \(annotation.page + 1) · \(kind) · \(width) stroke"
+            return "\(source)\(LyraReaderBindings.pageLabel(pages: [UInt32(annotation.page + 1)])) · \(kind) · \(width) stroke"
         }
         if annotation.kind.isStampArtwork {
             let detail = annotation.kind == .signature
-                ? "picture"
+                ? (annotation.stampStyle == "image" ? "picture" : "signature picture")
                 : "\(annotation.stampStyle ?? "custom") · \(annotation.note.count) character\(annotation.note.count == 1 ? "" : "s")"
-            return "\(source)Page \(annotation.page + 1) · \(kind) · \(detail)"
+            return "\(source)\(LyraReaderBindings.pageLabel(pages: [UInt32(annotation.page + 1)])) · \(kind) · \(detail)"
         }
         if annotation.isFileOwned {
-            return "\(source)Page \(annotation.page + 1) · \(kind)"
+            return "\(source)\(LyraReaderBindings.pageLabel(pages: [UInt32(annotation.page + 1)])) · \(kind)"
         }
-        return "Page \(annotation.page + 1) · \(kind) · "
+        return "\(LyraReaderBindings.pageLabel(pages: [UInt32(annotation.page + 1)])) · \(kind) · "
             + "\(annotation.end - annotation.start + 1) characters"
     }
 
@@ -845,7 +789,7 @@ public struct SidebarView: View {
     }
 
     private func documentAnnotationSubtitle(_ annotation: DocumentAnnotation) -> String {
-        var parts = ["Page \(annotation.page + 1)"]
+        var parts = [annotation.pageLabel]
         if let author = annotation.author, !author.isEmpty { parts.append(author) }
         if let date = annotation.displayDate { parts.append(date) }
         return parts.joined(separator: " · ")
@@ -879,36 +823,40 @@ public struct SidebarView: View {
     }
 }
 
-/// A bookmark's name, edited locally and committed once.
-///
-/// The field is not bound straight to `AppState`: a `TextField` setter fires per keystroke, and
-/// unlike note typing there is no coalescing window for bookmarks. A small draft keeps the
-/// sidecar write count equal to the number of edits the reader actually finished.
-private struct BookmarkNameField: View {
-    let state: AppState
+private struct BookmarkSidebarRow: View {
+    @ObservedObject var state: AppState
     let bookmark: Bookmark
-
-    @State private var draft: String = ""
-    @FocusState private var isFocused: Bool
+    @State private var editing = false
 
     var body: some View {
-        TextField("Name", text: $draft)
-            .textFieldStyle(.plain)
-            .font(.caption)
-            .focused($isFocused)
-            .onAppear { draft = bookmark.title }
-            .onChange(of: bookmark.title) { _, title in
-                // Do not clobber what the reader is typing when another change lands.
-                if !isFocused { draft = title }
-            }
-            .onSubmit { commit() }
-            .onChange(of: isFocused) { _, focused in
-                if !focused { commit() }
-            }
-    }
-
-    private func commit() {
-        state.renameBookmark(bookmark.id, to: draft)
+        HStack(alignment: .top, spacing: 10) {
+            Button { state.jump(to: bookmark) } label: {
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: "bookmark.fill").foregroundStyle(LyraReaderTheme.accent)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(bookmark.displayTitle).font(.system(size: 13, weight: .medium))
+                            .lineLimit(2)
+                            .foregroundStyle(LyraReaderTheme.textPrimary)
+                        Text(LyraReaderBindings.pageLabel(pages: [UInt32(bookmark.page + 1)])).font(.caption)
+                            .foregroundStyle(LyraReaderTheme.textSecondary)
+                    }
+                    Spacer(minLength: 0)
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }.buttonStyle(.plain).help("Jump to this bookmark")
+            LyraReaderMenu(title: "Bookmark options", items: [
+                LyraReaderMenuItem("Rename…", icon: "pencil") { editing = true },
+                LyraReaderMenuItem("Remove Bookmark", icon: "trash") { state.removeBookmark(bookmark.id) },
+                .separator("bookmark-order"),
+                LyraReaderMenuItem("Move Up", icon: "arrow.up") { state.moveBookmark(bookmark.id, by: -1) },
+                LyraReaderMenuItem("Move Down", icon: "arrow.down") { state.moveBookmark(bookmark.id, by: 1) },
+            ]) { Image(systemName: "ellipsis") }
+        }
+        .padding(10)
+        .background(state.currentPage == bookmark.page + 1 ? LyraReaderTheme.selectedBg : .clear,
+                    in: RoundedRectangle(cornerRadius: 8))
+        .popover(isPresented: $editing) {
+            BookmarkEditor(state: state, bookmark: bookmark, close: { editing = false })
+        }
     }
 }
 

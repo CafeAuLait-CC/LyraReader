@@ -152,6 +152,7 @@ extension ReaderChecks {
         try await aiMergeChecks()
         try await aiDocumentChatChecks(root: root)
         try await aiDocumentChatLayoutChecks(root: root)
+        try await aiLayeredSummaryChecks(root: root)
     }
 
     @MainActor
@@ -374,7 +375,7 @@ extension ReaderChecks {
         }
 
         var profiles: [(AIAssistantAction, String)] = []
-        for action in AIAssistantAction.allCases where !action.isDocumentChat {
+        for action in AIAssistantAction.allCases where !action.isDocumentChat && action != .regionQuestion {
             let context = action.requiresSelection ? selectionContext : pageContext
             let service = ScriptedAIChatService(
                 engine: engine,
@@ -421,7 +422,7 @@ extension ReaderChecks {
                     "\(action.rawValue) feeds the same answer accumulator")
             model.discard()
         }
-        require(profiles.count == AIAssistantAction.allCases.filter { !$0.isDocumentChat }.count,
+        require(profiles.count == AIAssistantAction.allCases.filter { !$0.isDocumentChat && $0 != .regionQuestion }.count,
                 "all four single-shot action paths were profiled")
         for (action, body) in profiles {
             require(body.contains("\"thinking\":{\"type\":\"disabled\"}"),
@@ -577,6 +578,7 @@ extension ReaderChecks {
         func promptSelection(for range: ClosedRange<Int>) async throws -> String {
             let record = AiPlanRequestRecord(
                 action: .translateSelection,
+                documentKnowledge: false,
                 currentPage: 0,
                 selection: AiSelectionRecord(
                     page: 0,
@@ -586,6 +588,7 @@ extension ReaderChecks {
                 question: nil,
                 language: "English",
                 history: [],
+                region: nil,
                 baseUrl: "http://127.0.0.1:11434/v1",
                 model: "mock-model",
                 temperature: 0.2,
@@ -611,11 +614,13 @@ extension ReaderChecks {
         let summaryPlan = try await engine.prepareAIPlan(
             AiPlanRequestRecord(
                 action: .summarizePage,
+                documentKnowledge: false,
                 currentPage: 0,
                 selection: nil,
                 question: nil,
                 language: "English",
                 history: [],
+                region: nil,
                 baseUrl: "http://127.0.0.1:11434/v1",
                 model: "mock-model",
                 temperature: 0.2,
@@ -642,11 +647,13 @@ extension ReaderChecks {
             let documentPlan = try await engine.prepareAIPlan(
                 AiPlanRequestRecord(
                     action: .summarizeDocument,
+                documentKnowledge: false,
                     currentPage: 0,
                     selection: nil,
                     question: nil,
                     language: nil,
                     history: [],
+                    region: nil,
                     baseUrl: "http://127.0.0.1:11434/v1",
                     model: "mock-model",
                     temperature: 0.2,
@@ -660,8 +667,10 @@ extension ReaderChecks {
             }
             let largestPart = documentPlan.parts.map(\.pageCharacters).max() ?? 0
             print("AI-DOCUMENT-SUMMARY pages=\(documentPlan.pageCount) parts=\(documentPlan.parts.count) total_page_chars=\(totalPageCharacters) largest_part_page_chars=\(largestPart)")
-            require(largestPart <= 12_000,
-                    "each document-summary part respects the 12,000 page-character budget")
+            require(documentPlan.parts.count == 1 && largestPart == totalPageCharacters,
+                    "the complete paper uses one independent summary request")
+            require(documentPlan.parts[0].systemPrompt.contains("Evidence and results"),
+                    "the summary prompt supports critical academic reading")
         }
 
         print("AI-SELECTION \(label) range intended=\(intendedRange) canvas=\(selection.range) charCount=\(characters.count) textCount=\(text.text.count)")
@@ -711,7 +720,8 @@ extension ReaderChecks {
                 systemPrompt: "system",
                 userPrompt: "part \(index + 1)",
                 wireBody: "{\"stream\":true,\"max_tokens\":900}",
-                note: nil
+                note: nil,
+                image: nil
             )
         }
         let originalPlan = AiPlanRecord(
@@ -726,6 +736,10 @@ extension ReaderChecks {
             model: "mock-model",
             temperature: 0.2,
             maxTokens: 900,
+            stream: true,
+            includeStreamOptions: true,
+            reasoningField: nil,
+            reasoningValue: nil,
             parts: [
                 planPart(0, "Pages 1-2", 1, [1, 2]),
                 planPart(1, "Page 3", 3, [3]),
@@ -840,7 +854,7 @@ extension ReaderChecks {
         let engine = try RustEngine()
         let document = try engine.openDocument(at: fixtureURL)
         let context = AIReaderContext(
-            documentKey: fixtureURL.standardizedFileURL.path,
+            documentKey: DocumentEditCache.documentIdentity(for: fixtureURL) ?? fixtureURL.standardizedFileURL.path,
             documentTitle: document.title,
             pageCount: document.pageCount,
             currentPage: 1,
@@ -884,7 +898,12 @@ extension ReaderChecks {
         try await eventually("the AI preview is built locally", { model.phase == .preview })
         require(recording.startedPlans.isEmpty, "preparing a preview sends nothing")
         guard let preview = model.plan else { fatalError("expected a plan") }
-        require(recording.returnedPlans.last == preview, "the model holds the exact plan the service built")
+        guard let sourcePlan = recording.returnedPlans.last else { fatalError("expected a prepared plan") }
+        require(sourcePlan.parts.allSatisfy { $0.wireBody.isEmpty },
+                "the service returns the transport-neutral plan, not a pre-encoded body")
+        let renderedPlan = try AIPlanWire.render(sourcePlan, connection: .apiKey)
+        require(renderedPlan == preview,
+                "the model holds the service plan with the one rendered chat-completions body")
         require(preview.isLocal, "the local endpoint is shown as local")
         require(preview.pageCount == UInt32(document.pageCount), "the preview carries the document page count")
         require(preview.parts.count == 1, "a three-page summary needs one request")
@@ -1154,7 +1173,7 @@ extension ReaderChecks {
             fatalError("the document-chat fixture did not produce 8 pages (got \(document.pageCount))")
         }
         let context = AIReaderContext(
-            documentKey: url.standardizedFileURL.path,
+            documentKey: DocumentEditCache.documentIdentity(for: url) ?? url.standardizedFileURL.path,
             documentTitle: document.title,
             pageCount: document.pageCount,
             currentPage: 1,
@@ -1250,8 +1269,8 @@ extension ReaderChecks {
         state.open(url: url)
         require(state.currentPage == 1, "the reader starts on page 1")
         let annotationsBefore = state.annotations
-        let sidecar = url.appendingPathExtension("lyra-reader-annotations.json")
-        try? FileManager.default.removeItem(at: sidecar)
+        let records = DocumentEditCache.annotationsURL(for: url)
+        try? FileManager.default.removeItem(at: records)
         chip.follow(in: state)
         require(state.currentPage == chip.page,
                 "the chip jumped to page \(chip.page) (current \(state.currentPage))")
@@ -1264,15 +1283,15 @@ extension ReaderChecks {
                 "the source boxes are drawn as transient canvas quads")
         require(state.annotations == annotationsBefore,
                 "following a citation creates no annotation")
-        require(!FileManager.default.fileExists(atPath: sidecar.path),
-                "following a citation writes no sidecar annotation")
-        try await Task.sleep(for: .milliseconds(1_700))
-        require(state.aiSourceHighlight == nil,
-                "the source highlight disappears after the fade")
+        require(!FileManager.default.fileExists(atPath: records.path),
+                "following a citation writes no cached annotation")
+        try await eventually("the source highlight disappears after the fade") {
+            state.aiSourceHighlight == nil
+        }
         require(!state.canvasPages.contains { PlacementIndex.isAISource($0.placement.index) },
                 "the transient quads are removed with the highlight")
-        require(state.annotations == annotationsBefore && !FileManager.default.fileExists(atPath: sidecar.path),
-                "the fade leaves no annotation or sidecar behind")
+        require(state.annotations == annotationsBefore && !FileManager.default.fileExists(atPath: records.path),
+                "the fade leaves no annotation or cached record behind")
 
         // 3. A second question carries the first exchange and its own retrieval.
         model.chatQuestion = "Which evaluation query set was replayed against the retrieval baseline?"
@@ -1524,7 +1543,7 @@ extension ReaderChecks {
         let engine = try RustEngine()
         _ = try engine.openDocument(at: url)
         let context = AIReaderContext(
-            documentKey: url.standardizedFileURL.path,
+            documentKey: DocumentEditCache.documentIdentity(for: url) ?? url.standardizedFileURL.path,
             documentTitle: "Long paper",
             pageCount: 8,
             currentPage: 1,
@@ -1586,10 +1605,10 @@ extension ReaderChecks {
         ] {
             require(abs(measurement.chat.width - expectedWidth) < 1,
                     "\(label): the chat fills the panel width (\(measurement.chat.width) pt)")
-            require(measurement.chat.height > 250,
-                    "\(label): the chat gets the panel height below the actions (\(measurement.chat.height) pt)")
-            require(measurement.actions.height >= 170 && measurement.actions.height <= 280,
-                    "\(label): the single-shot actions keep a bounded scrollable area (\(measurement.actions.height) pt)")
+            require(measurement.chat.height > 650,
+                    "\(label): chat uses the full tab beneath the header (\(measurement.chat.height) pt)")
+            require(measurement.actions == .zero,
+                    "\(label): summary actions are absent from the Chat tab")
             require(measurement.chat.minX >= -0.5
                         && measurement.chat.maxX <= measurement.hostBounds.maxX + 0.5,
                     "\(label): the chat is not clipped horizontally")
@@ -1656,6 +1675,8 @@ extension ReaderChecks {
         model: AIAssistantModel,
         width: CGFloat
     ) async throws -> DocumentChatPanelMeasurements {
+        model.selectedTab = .chat
+        model.expandedChatSources = Set(model.chatTurns.map(\.id))
         let host = NSHostingView(rootView: AIAssistantRightPanelContent(state: state, model: model))
         let container = NSView(frame: CGRect(x: 0, y: 0, width: width, height: 800))
         host.frame = container.bounds
@@ -1678,13 +1699,13 @@ extension ReaderChecks {
                 "the layout host keeps the requested 800 pt height (got \(host.bounds.height))")
 
         guard let chatMarker = findView(AIDocumentChatMarkerView.self, in: host),
-              let composerMarker = findView(AIDocumentChatComposerMarkerView.self, in: host),
-              let actionsMarker = findView(AIAssistantPanelMarkerView.self, in: host) else {
-            fatalError("FAIL: the hosted right panel is missing a chat, composer or actions marker")
+              let composerMarker = findView(AIDocumentChatComposerMarkerView.self, in: host) else {
+            fatalError("FAIL: the hosted Chat tab is missing its chat or composer")
         }
         let chat = host.convert(chatMarker.bounds, from: chatMarker)
         let composer = host.convert(composerMarker.bounds, from: composerMarker)
-        let actions = host.convert(actionsMarker.bounds, from: actionsMarker)
+        let actions = findView(AIAssistantPanelMarkerView.self, in: host)
+            .map { host.convert($0.bounds, from: $0) } ?? .zero
         let composerFrame = host.convert(composerMarker.bounds, from: composerMarker)
         let fields = findViews(NSTextField.self, in: host)
             .filter {
@@ -1707,17 +1728,46 @@ extension ReaderChecks {
             .sorted { $0.1.minY < $1.1.minY }
         var seenPages: Set<Int> = []
         let firstChipPerPage = chipMarkers.filter { seenPages.insert($0.0).inserted }
-        return DocumentChatPanelMeasurements(
+        let measurement = DocumentChatPanelMeasurements(
             hostBounds: host.bounds,
             chat: chat,
             composer: composer,
             actions: actions,
             composerField: fields.first.map { host.convert($0.bounds, from: $0) },
-            askButton: buttons.first.map { host.convert($0.bounds, from: $0) },
+            askButton: findView(AIDocumentChatAskMarkerView.self, in: host)
+                .map { host.convert($0.bounds, from: $0) }
+                ?? buttons.first.map { host.convert($0.bounds, from: $0) },
             historyContentHeight: history?.documentView?.frame.height ?? 0,
             historyViewportHeight: history?.contentView.bounds.height ?? 0,
             chipFrames: firstChipPerPage.map { (page: $0.0, frame: $0.1) }
         )
+        model.expandedChatSources = []
+        let turnsBefore = model.chatTurns.count
+        let languageBefore = model.targetLanguage
+        for tab in AIAssistantTab.allCases {
+            model.selectedTab = tab
+            try await Task.sleep(for: .milliseconds(100))
+            host.layoutSubtreeIfNeeded()
+            if tab == .regions {
+                require(findView(AIDocumentChatMarkerView.self, in: host) == nil,
+                        "Regions has its own workspace without a stacked chat")
+            } else if tab != .chat {
+                require(findView(AIDocumentChatMarkerView.self, in: host) == nil,
+                        "\(tab.title) has its own workspace without a stacked chat")
+                require(findView(AIAssistantPanelMarkerView.self, in: host) != nil,
+                        "\(tab.title) hosts the task controls")
+            }
+            if let directory = ProcessInfo.processInfo.environment["LYRA_AI_EVIDENCE"],
+               let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+                try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+                host.cacheDisplay(in: host.bounds, to: bitmap)
+                try bitmap.representation(using: .png, properties: [:])?.write(to:
+                    URL(fileURLWithPath: directory).appendingPathComponent("ai-\(tab.rawValue)-\(Int(width)).png"))
+            }
+        }
+        require(model.chatTurns.count == turnsBefore && model.targetLanguage == languageBefore,
+                "switching AI tabs preserves conversation and translation inputs")
+        return measurement
     }
 
     @MainActor

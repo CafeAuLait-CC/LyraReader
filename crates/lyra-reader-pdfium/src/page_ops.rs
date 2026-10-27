@@ -23,7 +23,7 @@
 //!
 //! Every report carries `page_map`: `page_map[old] = Some(new)` for a page that survived and
 //! `None` for a page that was deleted (or not selected by an extraction). The shell uses it to
-//! remap the reader's sidecar annotations and bookmarks. Embedded PDF annotations are handled by
+//! remap the reader's cached annotations and bookmarks. Embedded PDF annotations are handled by
 //! PDFium: moving a page moves its annotation dictionary with it, deleting a page deletes its
 //! annotations, and importing pages copies them. The tests assert that, because it is the kind
 //! of behaviour a viewer must not assume from a page-tree edit.
@@ -37,20 +37,22 @@
 //! reopened and checked, and only then renamed. The inputs are never modified.
 //!
 //! **Outline rule.** A merge keeps the first document's outline exactly as it was (its page
-//! numbers do not move because pages are appended), and does **not** import the other documents'
-//! outlines: PDFium's page-import call copies page dictionaries, not a document-level bookmark
-//! tree, and inventing destinations for another author's outline would be worse than leaving it
-//! out. [`MergeReport::dropped_outline_entries`] counts what was left out so the shell can say
-//! so. A split keeps no outline in any output for the same reason: the source outline's
-//! destinations refer to pages that may be in a different output; the shell's sidecar bookmarks
-//! are remapped per output instead.
+//! numbers do not move because pages are appended) and imports each other document's outline as
+//! one clearly-labelled top-level group named after that file. The appended document's own
+//! entries become the group's children, so their relative nesting, titles and order survive.
+//! Every destination is moved by the pages already appended, which makes it point at the page
+//! that entry named in its own document. A destination that did not resolve to a page in its
+//! source is written without one rather than as a dangling reference. [`MergeReport`] counts the
+//! imported entries and names the groups. A split keeps no outline in any output for the same
+//! reason: the source outline's destinations refer to pages that may be in a different output;
+//! the shell's cached bookmarks are remapped per output instead.
 //!
-//! **Sidecar rule.** The reader's own annotations/bookmarks live outside this module, in a
-//! sidecar keyed by page index. Merge only appends, so the first document's pages keep their
+//! **Annotation-cache rule.** The reader's own annotations/bookmarks live outside this module,
+//! in the application's document cache, keyed by page index. Merge only appends, so the first document's pages keep their
 //! indices and every existing mark keeps pointing at its page; the appended pages are new
-//! indices with no sidecar marks, because this app has no sidecar for the other documents (their
+//! indices with no reader marks, because this app has no annotation cache for the other documents (their
 //! file-owned annotations do travel with them). Split outputs are renumbered, so the shell
-//! remaps the sidecar per output.
+//! remaps the cached records per output.
 //!
 //! **Split failure model.** The whole plan is validated before anything is written (indices,
 //! overlapping outputs, destinations). Outputs are then written one at a time, each with its own
@@ -92,8 +94,9 @@
 #![allow(unsafe_code)]
 
 use crate::annotations::AnnotationReader;
-use crate::backend::{PDFIUM_LOCK, PdfiumBackend};
-use crate::writeback::{OutputMode, RewrittenOutput, write_rewritten_pdf};
+use crate::backend::PdfiumBackend;
+use crate::outline_write::{MergeOutlineGroup, append_merge_outline_groups};
+use crate::writeback::{OutputMode, RewrittenOutput, TempFile, write_rewritten_pdf};
 use libloading::Library;
 use lyra_reader_core::{
     DocumentBackend, ErrorCode, LyraReaderError, OutlineNode, PageIndex, RawAnnotation, Result,
@@ -214,8 +217,11 @@ pub struct MergeReport {
     pub page_sizes: Vec<(f64, f64)>,
     /// Flattened outline entries the first document had and the output kept.
     pub first_outline_entries: usize,
-    /// Flattened outline entries in the other documents that were **not** imported.
-    pub dropped_outline_entries: usize,
+    /// Flattened outline entries imported from the appended documents (the synthetic group
+    /// labels are not counted).
+    pub appended_outline_entries: usize,
+    /// Titles of the top-level groups added for appended documents, in input order.
+    pub appended_outline_group_titles: Vec<String>,
     pub output_bytes: u64,
     pub cleaned_temporaries: usize,
 }
@@ -262,7 +268,7 @@ fn apply_page_operation_with_mode(
     reject_password(password)?;
     let api = api()?;
     let document = open_editable(api, source, "the document being edited")?;
-    let page_count = document.page_count();
+    let page_count = document.page_count()?;
     let rotations = document.rotations()?;
     let sizes = document.sizes()?;
     let expected = plan(operation, page_count, &rotations, &sizes)?;
@@ -324,7 +330,7 @@ pub fn extract_pages(
     reject_password(password)?;
     let api = api()?;
     let document = open_editable(api, source, "the document being extracted")?;
-    let page_count = document.page_count();
+    let page_count = document.page_count()?;
     let rotations = document.rotations()?;
     let sizes = document.sizes()?;
     let selected = validate_pages(pages, page_count, "extract")?;
@@ -377,12 +383,14 @@ pub fn extract_pages(
 /// The first document's pages keep their indices; every other document's pages follow in the
 /// order given. The source and every appended document are never modified, and the output may
 /// not be any of them. The result is verified before its atomic rename: page count, rotations,
-/// sizes, per-page text, per-page file-owned annotations, and the first document's outline.
+/// sizes, per-page text, per-page file-owned annotations, the first document's outline, and every
+/// appended outline group and destination.
 ///
-/// What happens to the second document's outline, and to the reader's sidecar, is documented at
-/// the top of this module. In short: its outline is not imported (and is counted in the report),
-/// its embedded annotations travel, and the first document's sidecar marks keep their page
-/// indices because nothing before the appended pages moves.
+/// Each appended outline is imported as one top-level group named after the appended file, with
+/// that document's own entries nested beneath it and destinations moved to the merged pages. The
+/// shape is documented at the top of this module. The reader's cached marks are the shell's
+/// concern: appending does not move existing pages, so their page indices are unchanged because
+/// nothing before the appended pages moves.
 pub fn merge_documents(
     source: &Path,
     others: &[PathBuf],
@@ -429,7 +437,7 @@ pub fn merge_documents(
 
     let api = api()?;
     let merged = open_editable(api, &source, "the document to append to")?;
-    let first_page_count = merged.page_count();
+    let first_page_count = merged.page_count()?;
     if first_page_count == 0 {
         return Err(empty_document_error(&source));
     }
@@ -437,19 +445,28 @@ pub fn merge_documents(
     let mut expected_sizes = merged.sizes()?;
     let mut expected_texts = page_texts(&source)?;
     let mut expected_annotations = page_annotations(&source)?;
-    let first_outline = outline_signature(&source)?;
+    let first_nodes = read_outline(&source)?;
+    let mut first_outline = Vec::new();
+    flatten_outline(&first_nodes, 0, &mut first_outline);
+    // A group label must still be distinguishable from the target's existing top-level entries
+    // (and from an earlier group with the same file name).
+    let mut used_outline_titles: HashSet<String> =
+        first_nodes.iter().map(|node| node.title.clone()).collect();
+    let mut outline_groups = Vec::new();
     let mut appended_page_counts = Vec::with_capacity(others.len());
     let mut appended_annotation_counts = Vec::with_capacity(others.len());
-    let mut dropped_outline_entries = 0usize;
+    let mut appended_outline_entries = 0usize;
 
     for other in inputs.iter().skip(1) {
         let appended = open_editable(api, other, "a document being appended")?;
-        let count = appended.page_count();
+        let count = appended.page_count()?;
         if count == 0 {
             return Err(empty_document_error(other));
         }
+        let offset = merged.page_count()?;
+        let outline_nodes = read_outline(other)?;
         let pages: Vec<u32> = (0..count).collect();
-        merged.import_pages(&appended, &pages, merged.page_count())?;
+        merged.import_pages(&appended, &pages, offset)?;
         expected_rotations.extend(appended.rotations()?);
         expected_sizes.extend(appended.sizes()?);
         expected_texts.extend(page_texts(other)?);
@@ -457,23 +474,60 @@ pub fn merge_documents(
         appended_annotation_counts.push(annotations.iter().map(Vec::len).sum::<usize>());
         expected_annotations.extend(annotations);
         appended_page_counts.push(count);
-        dropped_outline_entries += outline_signature(other)?.len();
+        if !outline_nodes.is_empty() {
+            let title = appended_group_title(other, &mut used_outline_titles);
+            let group = MergeOutlineGroup {
+                title,
+                first_page: offset,
+                page_count: count,
+                nodes: outline_nodes,
+            };
+            appended_outline_entries += group.entry_count();
+            outline_groups.push(group);
+        }
     }
 
     let page_count = expected_rotations.len() as u32;
     let first_outline_entries = first_outline.len();
+    let mut expected_outline = first_outline.clone();
+    for group in &outline_groups {
+        group.flatten(&mut expected_outline);
+    }
+    let appended_outline_group_titles = outline_groups
+        .iter()
+        .map(|group| group.title.clone())
+        .collect();
     let rotations_for_report = expected_rotations.clone();
     let sizes_for_report = expected_sizes.clone();
     let rewritten = write_rewritten_pdf(
         &source,
         destination,
         OutputMode::Copy,
-        |file| merged.save(file),
+        |file| {
+            if outline_groups.is_empty() {
+                return merged.save(file);
+            }
+            // PDFium has no bookmark-writing API, so its merged bytes are saved to a scratch
+            // file first and the outline writer adds the groups in one incremental update that
+            // lands in the verified temporary file.
+            let (scratch, mut scratch_file) = TempFile::create(destination)?;
+            merged.save(&mut scratch_file)?;
+            scratch_file.flush().map_err(|error| {
+                io_error(
+                    "could not flush the merged document before adding its outlines",
+                    scratch.path(),
+                    error,
+                )
+            })?;
+            drop(scratch_file);
+            append_merge_outline_groups(scratch.path(), file, &outline_groups, None)?;
+            Ok(())
+        },
         |path| {
             verify_output(path, page_count, &expected_rotations, &expected_sizes)?;
             verify_text_pages(path, &expected_texts)?;
             verify_annotation_pages(path, &expected_annotations)?;
-            verify_outline(path, &first_outline)?;
+            verify_outline(path, &expected_outline)?;
             Ok(())
         },
     )?;
@@ -490,7 +544,8 @@ pub fn merge_documents(
             .map(|size| (size.width, size.height))
             .collect(),
         first_outline_entries,
-        dropped_outline_entries,
+        appended_outline_entries,
+        appended_outline_group_titles,
         output_bytes: rewritten.output_bytes,
         cleaned_temporaries: rewritten.cleaned_temporaries,
     })
@@ -524,7 +579,7 @@ pub fn split_pages(
     let source = canonical_input(source, "the document being split")?;
     let api = api()?;
     let document = open_editable(api, &source, "the document being split")?;
-    let page_count = document.page_count();
+    let page_count = document.page_count()?;
     if page_count == 0 {
         return Err(empty_document_error(&source));
     }
@@ -950,11 +1005,7 @@ fn plan(
 fn page_out_of_range(page: u32, page_count: u32) -> LyraReaderError {
     LyraReaderError::new(
         ErrorCode::InvalidArgument,
-        format!(
-            "page {} is outside the document ({} page(s))",
-            page + 1,
-            page_count
-        ),
+        lyra_reader_core::page_out_of_range_message(page, page_count),
     )
 }
 
@@ -1062,7 +1113,7 @@ fn open_editable(api: &'static PageApi, path: &Path, role: &str) -> Result<RawDo
             };
         }
     };
-    if document.security_revision() >= 0 {
+    if document.security_revision()? >= 0 {
         return Err(encrypted_refusal(role, path));
     }
     Ok(document)
@@ -1117,16 +1168,9 @@ fn validate_split_pages(
         }
     }
     for page in &unique {
-        if *page >= page_count {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!(
-                    "page {} is outside the document ({} page(s))",
-                    page + 1,
-                    page_count
-                ),
-            ));
-        }
+        lyra_reader_core::checked_page_index(*page, page_count, |page| {
+            page_out_of_range(page, page_count)
+        })?;
     }
     Ok(unique)
 }
@@ -1159,7 +1203,8 @@ fn split_output_error(
 /// higher-level `text.all()` representation can come back empty.
 fn page_texts(path: &Path) -> Result<Vec<String>> {
     let backend = PdfiumBackend::open(path, None)?;
-    (0..backend.page_count())
+    let count = backend.page_count();
+    (0..count)
         .map(|page| {
             let raw = backend.raw_text_page(PageIndex(page))?;
             Ok(raw
@@ -1180,9 +1225,7 @@ fn page_annotations(path: &Path) -> Result<Vec<Vec<RawAnnotation>>> {
     let mut pages = Vec::with_capacity(count as usize);
     for page in 0..count {
         let records = {
-            let _guard = PDFIUM_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _guard = crate::backend::lock_pdfium()?;
             reader.page_locked(PageIndex(page))?
         };
         pages.push(records);
@@ -1258,14 +1301,39 @@ fn verify_annotation_pages(path: &Path, expected: &[Vec<RawAnnotation>]) -> Resu
     Ok(())
 }
 
+/// The document's outline tree, read through the normal backend.
+fn read_outline(path: &Path) -> Result<Vec<OutlineNode>> {
+    PdfiumBackend::open(path, None)?.outline()
+}
+
 /// A flattened outline: title, target page and depth. Enough to prove structure and destinations
 /// survived, while ignoring destination view coordinates PDFium may normalise.
 fn outline_signature(path: &Path) -> Result<Vec<(String, Option<u32>, usize)>> {
-    let backend = PdfiumBackend::open(path, None)?;
-    let nodes = backend.outline()?;
+    let nodes = read_outline(path)?;
     let mut flattened = Vec::new();
     flatten_outline(&nodes, 0, &mut flattened);
     Ok(flattened)
+}
+
+/// A unique, human-readable group label for an appended document: its file name, with a numbered
+/// suffix only when the target outline (or an earlier group) already uses that title.
+fn appended_group_title(path: &Path, used: &mut HashSet<String>) -> String {
+    let base = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| path.display().to_string());
+    if used.insert(base.clone()) {
+        return base;
+    }
+    let mut suffix = 2u32;
+    loop {
+        let candidate = format!("{base} ({suffix})");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        suffix = suffix.saturating_add(1);
+    }
 }
 
 fn flatten_outline(
@@ -1289,7 +1357,7 @@ fn verify_outline(path: &Path, expected: &[(String, Option<u32>, usize)]) -> Res
             .unwrap_or_else(|| actual.len().min(expected.len()));
         return Err(LyraReaderError::new(
             ErrorCode::Internal,
-            "the merged document's outline does not match the first document's outline",
+            "the merged document's outline does not match the planned outline",
         )
         .with_detail(format!(
             "expected {} entr(ies), reopened {}; first difference at entry {}: expected {:?}, reopened {:?}",
@@ -1567,16 +1635,15 @@ impl RawDocument {
                 "the password contains a NUL byte",
             )
         })?;
+        let length = crate::limits::document_len(bytes.len())?;
         let document = {
-            let _guard = PDFIUM_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _guard = crate::backend::lock_pdfium()?;
             // SAFETY: `bytes` lives in the returned struct and the library is initialised by
             // `pdfium_instance` (called by the backend open path).
             unsafe {
                 (api.load_mem_document)(
                     bytes.as_ptr().cast(),
-                    bytes.len() as c_int,
+                    length,
                     password
                         .as_ref()
                         .map_or(std::ptr::null(), |value| value.as_ptr()),
@@ -1600,9 +1667,7 @@ impl RawDocument {
         // Make sure the library is initialised the same way the rest of the backend does it.
         crate::backend::pdfium_instance()?;
         let document = {
-            let _guard = PDFIUM_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _guard = crate::backend::lock_pdfium()?;
             // SAFETY: no arguments, returns a new document or null.
             unsafe { (api.create_new_document)() }
         };
@@ -1619,12 +1684,10 @@ impl RawDocument {
         })
     }
 
-    fn page_count(&self) -> u32 {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fn page_count(&self) -> Result<u32> {
+        let _guard = crate::backend::lock_pdfium()?;
         // SAFETY: `document` is live.
-        unsafe { (self.api.get_page_count)(self.document) }.max(0) as u32
+        Ok(unsafe { (self.api.get_page_count)(self.document) }.max(0) as u32)
     }
 
     /// `FPDF_GetSecurityHandlerRevision`: -1 when the PDF carries no encryption dictionary.
@@ -1632,19 +1695,15 @@ impl RawDocument {
     /// Unlike `PdfiumBackend::is_encrypted` (which records whether a password was supplied),
     /// this detects a document encrypted with an empty user password, which PDFium opens
     /// without asking. That is the case the merge/split refusal must not miss.
-    fn security_revision(&self) -> c_int {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fn security_revision(&self) -> Result<c_int> {
+        let _guard = crate::backend::lock_pdfium()?;
         // SAFETY: `document` is live and the API is documented to accept it.
-        unsafe { (self.api.security_revision)(self.document) }
+        Ok(unsafe { (self.api.security_revision)(self.document) })
     }
 
     fn rotations(&self) -> Result<Vec<u32>> {
-        let count = self.page_count();
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = self.page_count()?;
+        let _guard = crate::backend::lock_pdfium()?;
         let mut rotations = Vec::with_capacity(count as usize);
         for index in 0..count {
             // SAFETY: `document` is live and `index` is below the page count.
@@ -1667,10 +1726,8 @@ impl RawDocument {
     }
 
     fn sizes(&self) -> Result<Vec<PageSize>> {
-        let count = self.page_count();
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = self.page_count()?;
+        let _guard = crate::backend::lock_pdfium()?;
         let mut sizes = Vec::with_capacity(count as usize);
         for index in 0..count {
             // SAFETY: `document` is live and `index` is below the page count.
@@ -1698,9 +1755,7 @@ impl RawDocument {
         if delta == 0 {
             return Ok(());
         }
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         for page_index in pages {
             let page = self.load_page_locked(*page_index)?;
             // SAFETY: `page` is live; the rotation is written before the handle is closed.
@@ -1734,9 +1789,7 @@ impl RawDocument {
     }
 
     fn set_rotation(&self, pages: &[u32], rotations: &[u32]) -> Result<()> {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         for (page_index, rotation) in pages.iter().zip(rotations) {
             let page = self.load_page_locked(*page_index)?;
             let value = (*rotation % 4) as c_int;
@@ -1759,9 +1812,7 @@ impl RawDocument {
     }
 
     fn delete(&self, pages: &[u32]) -> Result<()> {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         // Descending order: deleting a lower index first would shift the higher ones.
         let mut descending = pages.to_vec();
         descending.sort_unstable_by(|left, right| right.cmp(left));
@@ -1774,9 +1825,7 @@ impl RawDocument {
 
     fn move_pages(&self, pages: &[u32], destination: u32) -> Result<()> {
         let indices: Vec<c_int> = pages.iter().map(|page| *page as c_int).collect();
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         // SAFETY: `document` is live and `indices` outlives the call; the API copies the list.
         let moved = unsafe {
             (self.api.move_pages)(
@@ -1796,9 +1845,7 @@ impl RawDocument {
     }
 
     fn insert_blank(&self, index: u32, size: PageSize) -> Result<()> {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         // SAFETY: `document` is live; width/height are finite and positive (checked by `plan`).
         let page =
             unsafe { (self.api.page_new)(self.document, index as c_int, size.width, size.height) };
@@ -1820,9 +1867,7 @@ impl RawDocument {
     /// front and every page (and outline destination) shifts.
     fn import_pages(&self, source: &RawDocument, pages: &[u32], index: u32) -> Result<()> {
         let indices: Vec<c_int> = pages.iter().map(|page| *page as c_int).collect();
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         // SAFETY: both documents are live; `indices` outlives the call and PDFium copies it.
         let imported = unsafe {
             (self.api.import_pages_by_index)(
@@ -1862,9 +1907,7 @@ impl RawDocument {
             failed: false,
         };
         let ok = {
-            let _guard = PDFIUM_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _guard = crate::backend::lock_pdfium()?;
             // SAFETY: `document` is live and `sink.header` is the FPDF_FILEWRITE whose callback
             // writes into `sink`. PDFium calls it only during this call.
             unsafe {
@@ -1901,9 +1944,7 @@ impl RawDocument {
 
 impl Drop for RawDocument {
     fn drop(&mut self) {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium_for_cleanup();
         // SAFETY: the handle came from `load_mem_document`/`create_new_document` and is closed
         // exactly once, here.
         unsafe { (self.api.close_document)(self.document) };
@@ -1993,9 +2034,7 @@ mod tests {
         let mut pages = Vec::with_capacity(count as usize);
         for page in 0..count {
             let records = {
-                let _guard = PDFIUM_LOCK
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let _guard = crate::backend::lock_pdfium().expect("PDFium lock");
                 reader
                     .page_locked(PageIndex(page))
                     .expect("annotation page")
@@ -2651,7 +2690,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_appends_pages_annotations_and_keeps_the_first_outline() {
+    fn merge_appends_pages_annotations_and_imports_the_appended_outline() {
         if !crate::is_available() {
             eprintln!("skipping: PDFium unavailable");
             return;
@@ -2690,7 +2729,11 @@ mod tests {
             vec![second_annotations.iter().map(Vec::len).sum::<usize>(), 0]
         );
         assert_eq!(report.first_outline_entries, first_outline.len());
-        assert_eq!(report.dropped_outline_entries, third_outline.len());
+        assert_eq!(report.appended_outline_entries, third_outline.len());
+        assert_eq!(
+            report.appended_outline_group_titles,
+            vec!["outlined-again.pdf".to_string()]
+        );
         assert_eq!(
             report.rotations,
             rotations(&merged),
@@ -2725,16 +2768,91 @@ mod tests {
         );
         assert!(merged_annotations[5].is_empty() && merged_annotations[7].is_empty());
 
-        // The first document's outline survives unchanged; the appended outline was not imported.
+        // The first document's outline survives unchanged, and the appended document's outline is
+        // one labelled group whose entries move to its pages in the merged file (offset 5).
+        let mut expected_outline = first_outline;
+        expected_outline.push(("outlined-again.pdf".to_string(), Some(5), 0));
+        for (title, page, depth) in third_outline {
+            expected_outline.push((title, page.map(|page| page + 5), depth + 1));
+        }
         assert_eq!(
             outline_signature(&merged).expect("merged outline"),
-            first_outline
+            expected_outline
         );
+        for (title, page, _) in &expected_outline {
+            if let Some(page) = page {
+                assert!(
+                    *page < 8,
+                    "the outline entry {title:?} points at page {page}, outside the merged file"
+                );
+            }
+        }
 
         // Every input is byte-identical.
         assert_eq!(fs::read(&first).expect("first after"), first_bytes);
         assert_eq!(fs::read(&second).expect("second after"), second_bytes);
         assert_eq!(fs::read(&third).expect("third after"), third_bytes);
+    }
+
+    #[test]
+    fn merge_imports_each_appended_outline_as_its_own_labelled_group() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("merge-outlines");
+        let first = copy_fixture(&directory, "outlined.pdf");
+        let second = copy_named(&directory, "outlined.pdf", "chapter-b.pdf");
+        let third = copy_named(&directory, "outlined.pdf", "chapter-c.pdf");
+        let first_outline = outline_signature(&first).expect("first outline");
+        let second_outline = outline_signature(&second).expect("second outline");
+        let third_outline = outline_signature(&third).expect("third outline");
+        let merged = directory.join("merge-outlines.pdf");
+
+        let report = merge_documents(&first, &[second.clone(), third.clone()], &merged, None)
+            .expect("merge three outlined documents");
+
+        assert_eq!(report.page_count, 9);
+        assert_eq!(report.first_page_count, 3);
+        assert_eq!(report.appended_page_counts, vec![3, 3]);
+        assert_eq!(
+            report.appended_outline_entries,
+            second_outline.len() + third_outline.len()
+        );
+        assert_eq!(
+            report.appended_outline_group_titles,
+            vec!["chapter-b.pdf".to_string(), "chapter-c.pdf".to_string()],
+            "each appended document gets its own top-level group"
+        );
+
+        let mut expected = first_outline;
+        for (label, outline, offset) in [
+            ("chapter-b.pdf", second_outline, 3u32),
+            ("chapter-c.pdf", third_outline, 6u32),
+        ] {
+            expected.push((label.to_string(), Some(offset), 0));
+            for (title, page, depth) in outline {
+                expected.push((title, page.map(|page| page + offset), depth + 1));
+            }
+        }
+        assert_eq!(
+            outline_signature(&merged).expect("merged outline"),
+            expected,
+            "the first outline is unchanged, then one group per appended document"
+        );
+        let top_level_titles: Vec<&str> = expected
+            .iter()
+            .filter(|(_, _, depth)| *depth == 0)
+            .map(|(title, _, _)| title.as_str())
+            .collect();
+        let mut unique = top_level_titles.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            top_level_titles.len(),
+            "group labels do not collide with the existing outline or each other"
+        );
     }
 
     #[test]

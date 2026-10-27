@@ -6,14 +6,38 @@ import Security
 
 // MARK: - Actions and request inputs
 
+public enum AIAssistantTab: String, CaseIterable, Identifiable, Sendable {
+    case summary, translation, chat, regions
+    public var id: String { rawValue }
+    public var title: String {
+        switch self {
+        case .summary: "Summary"
+        case .translation: "Translate"
+        case .chat: "Chat"
+        case .regions: "Regions"
+        }
+    }
+    public var icon: String {
+        switch self {
+        case .summary: "doc.text"
+        case .translation: "character.bubble"
+        case .chat: "text.bubble"
+        case .regions: "rectangle.dashed"
+        }
+    }
+}
+
 /// The actions the AI panel can request. Document chat is the conversational action; the other
 /// four stay available alongside it.
 public enum AIAssistantAction: String, CaseIterable, Identifiable, Sendable {
     case documentChat
     case summarizePage
     case summarizeDocument
+    case summarizeSelection
     case askSelection
     case translateSelection
+    /// Not a panel action: a question about a marquee-selected region, built by the inline card.
+    case regionQuestion
 
     public var id: String { rawValue }
 
@@ -22,8 +46,10 @@ public enum AIAssistantAction: String, CaseIterable, Identifiable, Sendable {
         case .documentChat: return "Ask the document"
         case .summarizePage: return "Summarise page"
         case .summarizeDocument: return "Summarise document"
+        case .summarizeSelection: return "Summarise selection"
         case .askSelection: return "Ask selection"
         case .translateSelection: return "Translate selection"
+        case .regionQuestion: return "Ask about a region"
         }
     }
 
@@ -32,8 +58,10 @@ public enum AIAssistantAction: String, CaseIterable, Identifiable, Sendable {
         case .documentChat: return "text.bubble"
         case .summarizePage: return "doc.text"
         case .summarizeDocument: return "doc.on.doc"
+        case .summarizeSelection: return "text.quote"
         case .askSelection: return "questionmark.bubble"
         case .translateSelection: return "character.bubble"
+        case .regionQuestion: return "rectangle.dashed"
         }
     }
 
@@ -43,14 +71,16 @@ public enum AIAssistantAction: String, CaseIterable, Identifiable, Sendable {
         case .documentChat: return .documentChat
         case .summarizePage: return .summarizePage
         case .summarizeDocument: return .summarizeDocument
+        case .summarizeSelection: return .summarizeSelection
         case .askSelection: return .askSelection
         case .translateSelection: return .translateSelection
+        case .regionQuestion: return .regionQuestion
         }
     }
 
     /// Whether the panel must have a live selection before offering the action.
     public var requiresSelection: Bool {
-        self == .askSelection || self == .translateSelection
+        self == .askSelection || self == .translateSelection || self == .summarizeSelection
     }
 
     /// The conversational action keeps the panel's chat section, even while a different action
@@ -186,6 +216,8 @@ public struct AIChatTurn: Identifiable, Equatable, Sendable {
     public let pageCount: Int
     public var state: State
     public var error: String?
+    /// The fixed transport category for a failed turn. Nil unless `state == .failed`.
+    public var failure: AIRequestFailure?
     public var usage: AIUsage?
 
     public init(
@@ -197,6 +229,7 @@ public struct AIChatTurn: Identifiable, Equatable, Sendable {
         pageCount: Int = 0,
         state: State = .streaming,
         error: String? = nil,
+        failure: AIRequestFailure? = nil,
         usage: AIUsage? = nil
     ) {
         self.id = id
@@ -207,6 +240,7 @@ public struct AIChatTurn: Identifiable, Equatable, Sendable {
         self.pageCount = pageCount
         self.state = state
         self.error = error
+        self.failure = failure
         self.usage = usage
     }
 
@@ -314,6 +348,12 @@ public struct AIProviderSettings: Equatable, Sendable {
     public var maxTokens: Int?
     public var reasoningMode: AIReasoningMode
     public var reasoningEncoding: AIReasoningEncoding
+    /// Whether the request should carry the region picture. The API-key connection takes the
+    /// reader's explicit statement, because a wrong guess could silently send a picture to a
+    /// text-only endpoint. The ChatGPT plan connection sets it because the documented Responses
+    /// shape carries an inline image; if the model refuses it, the send fails with a real error
+    /// rather than degrading to a text-only request.
+    public var vision: Bool
 
     public init(
         baseURL: String,
@@ -321,7 +361,8 @@ public struct AIProviderSettings: Equatable, Sendable {
         temperature: Double?,
         maxTokens: Int?,
         reasoningMode: AIReasoningMode = .off,
-        reasoningEncoding: AIReasoningEncoding = .thinking
+        reasoningEncoding: AIReasoningEncoding = .thinking,
+        vision: Bool = false
     ) {
         self.baseURL = baseURL
         self.model = model
@@ -329,6 +370,7 @@ public struct AIProviderSettings: Equatable, Sendable {
         self.maxTokens = maxTokens
         self.reasoningMode = reasoningMode
         self.reasoningEncoding = reasoningEncoding
+        self.vision = vision
     }
 
     /// Plain words for the request preview. This is the part that changes cost and latency.
@@ -370,6 +412,20 @@ public struct AIMakePlanRequest: Sendable {
     public let language: String?
     /// Oldest first. Only document chat reads it; the Rust builder applies the bound again.
     public let history: [AIConversationTurn]
+    /// Present only for `regionQuestion`. The capture travels with the preview, so the request
+    /// body and the preview are built from the same bytes.
+    public let region: AIRegionAttachment?
+    /// Whether the region picture should be included. Mirrors `settings.vision` and is explicit
+    /// in the record so a text-only preview says why the image is absent.
+    public let documentKnowledge: Bool
+    /// Shared document understanding from a completed reading. The Rust planner appends the
+    /// rules and prepends the generated-context block exactly as the shell used to; `nil` keeps
+    /// the request unchanged.
+    public let documentKnowledgeText: String?
+    /// 1-based pages the shared reading covered, carried with the text as one input record.
+    public let documentKnowledgePages: [Int]
+    public let includeDocumentContext: Bool
+    public let sendRegionImage: Bool
     public let settings: AIProviderSettings
 
     public init(
@@ -379,6 +435,12 @@ public struct AIMakePlanRequest: Sendable {
         question: String?,
         language: String?,
         history: [AIConversationTurn] = [],
+        region: AIRegionAttachment? = nil,
+        sendRegionImage: Bool = false,
+        includeDocumentContext: Bool = false,
+        documentKnowledge: Bool = false,
+        documentKnowledgeText: String? = nil,
+        documentKnowledgePages: [Int] = [],
         settings: AIProviderSettings
     ) {
         self.action = action
@@ -387,7 +449,31 @@ public struct AIMakePlanRequest: Sendable {
         self.question = question
         self.language = language
         self.history = history
+        self.region = region
+        self.documentKnowledge = documentKnowledge
+        self.documentKnowledgeText = documentKnowledgeText
+        self.documentKnowledgePages = documentKnowledgePages
+        self.includeDocumentContext = includeDocumentContext
+        self.sendRegionImage = sendRegionImage
         self.settings = settings
+    }
+}
+
+extension AIMakePlanRequest {
+    func withDocumentContext() -> Self {
+        Self(action: action, currentPage: currentPage, selection: selection, question: question,
+             language: language, history: history, region: region, sendRegionImage: sendRegionImage,
+             includeDocumentContext: true, documentKnowledge: documentKnowledge,
+             documentKnowledgeText: documentKnowledgeText,
+             documentKnowledgePages: documentKnowledgePages, settings: settings)
+    }
+
+    /// Attach the shared document understanding the planner adds to every part.
+    package func withDocumentKnowledge(_ text: String, pages: [Int]) -> Self {
+        Self(action: action, currentPage: currentPage, selection: selection, question: question,
+             language: language, history: history, region: region, sendRegionImage: sendRegionImage,
+             includeDocumentContext: includeDocumentContext, documentKnowledge: documentKnowledge,
+             documentKnowledgeText: text, documentKnowledgePages: pages, settings: settings)
     }
 }
 
@@ -421,11 +507,28 @@ public struct AIMergePlanRequest: Sendable {
     public var documentTitle: String
     public var settings: AIProviderSettings
     public var parts: [AIMergePart]
+    public var documentKnowledgeText: String?
+    public var documentKnowledgePages: [Int]
 
-    public init(documentTitle: String, settings: AIProviderSettings, parts: [AIMergePart]) {
+    public init(
+        documentTitle: String,
+        settings: AIProviderSettings,
+        parts: [AIMergePart],
+        documentKnowledgeText: String? = nil,
+        documentKnowledgePages: [Int] = []
+    ) {
         self.documentTitle = documentTitle
         self.settings = settings
         self.parts = parts
+        self.documentKnowledgeText = documentKnowledgeText
+        self.documentKnowledgePages = documentKnowledgePages
+    }
+
+    package func withDocumentKnowledge(_ text: String, pages: [Int]) -> Self {
+        var copy = self
+        copy.documentKnowledgeText = text
+        copy.documentKnowledgePages = pages
+        return copy
     }
 }
 
@@ -538,7 +641,15 @@ public enum AIStreamEvent: Equatable, Sendable {
     case usage(AIUsage)
     case diagnostics(AIStreamDiagnostics)
     case done
-    case error(message: String, cancelled: Bool)
+    /// `failure` is the transport's fixed category; `.other` keeps the existing error display.
+    /// `code` is the stable AI error category assigned by Rust, so the audit trail never has to
+    /// match message text.
+    case error(
+        message: String,
+        cancelled: Bool,
+        failure: AIRequestFailure = .other,
+        code: AiErrorCode = .other
+    )
 }
 
 // MARK: - Service boundary
@@ -557,6 +668,11 @@ public protocol AIChatHandle: AnyObject {
 public protocol AIChatServicing: AnyObject {
     func prepare(_ request: AIMakePlanRequest) async throws -> AiPlanRecord
     func prepareMerge(_ request: AIMergePlanRequest) async throws -> AiPlanRecord
+    /// Coverage-only inspection for the layered summary. No prompts are built, so opening the
+    /// panel can match cached rows without a request.
+    func inspectSummary(_ request: AiSummaryRequestRecord) async throws -> [AiSummaryFingerprintRecord]
+    /// One preview per layered-summary unit; this is what the panel shows before Send.
+    func prepareSummary(_ request: AiSummaryRequestRecord) async throws -> AiSummaryPlanRecord
     func start(_ plan: AiPlanRecord, apiKey: String) throws -> any AIChatHandle
 }
 
@@ -564,6 +680,15 @@ public extension AIChatServicing {
     /// Older test doubles do not need to implement consolidation; the production service does.
     func prepareMerge(_ request: AIMergePlanRequest) async throws -> AiPlanRecord {
         throw AISettingsError.invalid("This service cannot prepare a consolidation request.")
+    }
+
+    /// Test doubles that do not model the layered summary keep building the old actions.
+    func inspectSummary(_ request: AiSummaryRequestRecord) async throws -> [AiSummaryFingerprintRecord] {
+        throw AISettingsError.invalid("This service cannot inspect a layered summary.")
+    }
+
+    func prepareSummary(_ request: AiSummaryRequestRecord) async throws -> AiSummaryPlanRecord {
+        throw AISettingsError.invalid("This service cannot prepare a layered summary.")
     }
 }
 
@@ -588,8 +713,24 @@ public final class RustAIChatService: AIChatServicing {
                 end: UInt32($0.end)
             )
         }
+        let region = request.region.map { attachment in
+            AiRegionRecord(
+                page: UInt32(max(0, attachment.page)),
+                xPt: Double(attachment.rect.minX),
+                yPt: Double(attachment.rect.minY),
+                widthPt: Double(attachment.rect.width),
+                heightPt: Double(attachment.rect.height),
+                text: attachment.text,
+                imagePng: attachment.png,
+                imageWidthPx: UInt32(max(0, attachment.pixelWidth)),
+                imageHeightPx: UInt32(max(0, attachment.pixelHeight)),
+                sendImage: request.sendRegionImage && request.settings.vision,
+                includeDocumentContext: request.includeDocumentContext
+            )
+        }
         let record = AiPlanRequestRecord(
             action: request.action.generated,
+            documentKnowledge: request.documentKnowledge,
             currentPage: UInt32(max(0, request.currentPage - 1)),
             selection: selection,
             question: request.question,
@@ -597,12 +738,15 @@ public final class RustAIChatService: AIChatServicing {
             history: request.history.map {
                 AiConversationTurnRecord(question: $0.question, answer: $0.answer)
             },
+            region: region,
             baseUrl: request.settings.baseURL,
             model: request.settings.model,
             temperature: request.settings.temperature,
             maxTokens: request.settings.maxTokens.map { UInt32(max(0, $0)) },
             reasoningMode: request.settings.reasoningMode.rawValue,
-            reasoningEncoding: request.settings.reasoningEncoding.rawValue
+            reasoningEncoding: request.settings.reasoningEncoding.rawValue,
+            documentKnowledgeText: request.documentKnowledgeText,
+            documentKnowledgePages: request.documentKnowledgePages.map { UInt32(max(0, $0)) }
         )
         return try await engine.prepareAIPlan(record)
     }
@@ -624,14 +768,34 @@ public final class RustAIChatService: AIChatServicing {
                 temperature: request.settings.temperature,
                 maxTokens: request.settings.maxTokens.map { UInt32(max(0, $0)) },
                 reasoningMode: request.settings.reasoningMode.rawValue,
-                reasoningEncoding: request.settings.reasoningEncoding.rawValue
+                reasoningEncoding: request.settings.reasoningEncoding.rawValue,
+                documentKnowledgeText: request.documentKnowledgeText,
+                documentKnowledgePages: request.documentKnowledgePages.map { UInt32(max(0, $0)) }
             )
         )
     }
 
+    public func inspectSummary(
+        _ request: AiSummaryRequestRecord
+    ) async throws -> [AiSummaryFingerprintRecord] {
+        try await engine.inspectAISummary(request)
+    }
+
+    public func prepareSummary(
+        _ request: AiSummaryRequestRecord
+    ) async throws -> AiSummaryPlanRecord {
+        try await engine.prepareAISummary(request)
+    }
+
     public func start(_ plan: AiPlanRecord, apiKey: String) throws -> any AIChatHandle {
+        // Paths without a preview (the connection test, a programmatic caller) still get exactly
+        // one chat-completions body, built at send time. A previewed plan already carries it, so
+        // those bytes are reused and the capture is not encoded a second time.
+        let rendered = plan.parts.allSatisfy { !$0.wireBody.isEmpty }
+            ? plan
+            : try renderAiPlan(plan: plan, transport: .chatCompletions)
         let handle = try startAiRequest(
-            plan: plan,
+            plan: rendered,
             apiKey: apiKey,
             useMockProvider: useMockProvider
         )
@@ -640,7 +804,7 @@ public final class RustAIChatService: AIChatServicing {
 }
 
 @MainActor
-private final class RustAIChatHandle: AIChatHandle {
+final class RustAIChatHandle: AIChatHandle {
     private let handle: LyraReaderAiRequest
 
     init(handle: LyraReaderAiRequest) {
@@ -685,8 +849,13 @@ private final class RustAIChatHandle: AIChatHandle {
                 ))
             case .done:
                 return .done
-            case .error(let message, let cancelled):
-                return .error(message: message, cancelled: cancelled)
+            case .error(let message, let cancelled, let failure, let code):
+                return .error(
+                    message: message,
+                    cancelled: cancelled,
+                    failure: AIRequestFailure(failure),
+                    code: code
+                )
             }
         }
     }
@@ -840,11 +1009,21 @@ public final class InMemoryAPIKeyStore: AIAPIKeyStore {
 
 public enum AISettingsError: LocalizedError, Equatable {
     case invalid(String)
+    /// A local refusal that already knows the audit category the old message classifier would
+    /// have derived. Carrying it on the error is what lets the audit trail stop matching text.
+    case refused(String, AIAuditCode)
 
     public var errorDescription: String? {
         switch self {
         case .invalid(let message): return message
+        case .refused(let message, _): return message
         }
+    }
+
+    /// The explicit category for a refusal, when the throw site knew it.
+    public var auditCode: AIAuditCode? {
+        if case .refused(_, let code) = self { return code }
+        return nil
     }
 }
 
@@ -858,6 +1037,7 @@ public final class AISettingsStore: ObservableObject {
     public static let maxTokensKey = "aiMaxTokens"
     public static let reasoningModeKey = "aiReasoningMode"
     public static let reasoningEncodingKey = "aiReasoningEncoding"
+    public static let modelAcceptsImagesKey = "aiModelAcceptsImages"
 
     public static let defaultBaseURL = "https://api.openai.com/v1"
     public static let defaultModel = "gpt-4o-mini"
@@ -865,6 +1045,7 @@ public final class AISettingsStore: ObservableObject {
     public static let defaultMaxTokens = 900
     public static let defaultReasoningMode = AIReasoningMode.off
     public static let defaultReasoningEncoding = AIReasoningEncoding.thinking
+    public static let defaultModelAcceptsImages = false
     public static let temperatureRange = 0.0...2.0
     public static let maxTokensRange = 1...32_768
 
@@ -876,6 +1057,10 @@ public final class AISettingsStore: ObservableObject {
     @Published public private(set) var maxTokens: Int
     @Published public private(set) var reasoningMode: AIReasoningMode
     @Published public private(set) var reasoningEncoding: AIReasoningEncoding
+    /// The reader's statement that this model accepts image input. It is not guessed from the
+    /// model name: a wrong guess would either leak a picture to a text-only model or silently
+    /// drop the picture the reader asked about.
+    @Published public private(set) var modelAcceptsImages: Bool
     @Published public private(set) var hasKey: Bool
     @Published public var connectionMode: AIConnectionMode {
         didSet { defaults.set(connectionMode.rawValue, forKey: "aiConnectionMode") }
@@ -910,6 +1095,9 @@ public final class AISettingsStore: ObservableObject {
             .flatMap(AIReasoningMode.init(rawValue:)) ?? Self.defaultReasoningMode
         self.reasoningEncoding = defaults.string(forKey: Self.reasoningEncodingKey)
             .flatMap(AIReasoningEncoding.init(rawValue:)) ?? Self.defaultReasoningEncoding
+        self.modelAcceptsImages = defaults.object(forKey: Self.modelAcceptsImagesKey) == nil
+            ? Self.defaultModelAcceptsImages
+            : defaults.bool(forKey: Self.modelAcceptsImagesKey)
         self.hasKey = (try? keyStore.hasKey()) ?? false
         self.endpointInfo = try? inspectAiBaseUrl(baseUrl: self.baseURL)
         self.invalidSettingsMessage = Self.validateBaseAndModel(
@@ -931,7 +1119,8 @@ public final class AISettingsStore: ObservableObject {
         maxTokens: Int,
         apiKey: String?,
         reasoningMode: AIReasoningMode = .off,
-        reasoningEncoding: AIReasoningEncoding = .thinking
+        reasoningEncoding: AIReasoningEncoding = .thinking,
+        modelAcceptsImages: Bool = false
     ) -> Bool {
         invalidSettingsMessage = nil
         let endpoint: AiEndpointRecord
@@ -980,12 +1169,14 @@ public final class AISettingsStore: ObservableObject {
         defaults.set(maxTokens, forKey: Self.maxTokensKey)
         defaults.set(reasoningMode.rawValue, forKey: Self.reasoningModeKey)
         defaults.set(reasoningEncoding.rawValue, forKey: Self.reasoningEncodingKey)
+        defaults.set(modelAcceptsImages, forKey: Self.modelAcceptsImagesKey)
         baseURL = endpoint.baseUrl
         self.model = model
         self.temperature = temperature
         self.maxTokens = maxTokens
         self.reasoningMode = reasoningMode
         self.reasoningEncoding = reasoningEncoding
+        self.modelAcceptsImages = modelAcceptsImages
         endpointInfo = endpoint
         hasKey = (try? keyStore.hasKey()) ?? false
         return true
@@ -1015,22 +1206,28 @@ public final class AISettingsStore: ObservableObject {
     public func providerSettings() throws -> AIProviderSettings {
         if connectionMode == .chatGPT {
             guard let account = chatGPT.selected, account.connected, !account.model.isEmpty else {
-                throw AISettingsError.invalid("Connect ChatGPT and select a model in Settings > AI first.")
+                throw AISettingsError.refused(
+                    "Connect ChatGPT and select a model in Settings > AI first.", .invalidSettings)
             }
+            // The Responses transport carries an inline picture, so a region question always
+            // asks for one. The catalog exposes no documented vision flag; sending the
+            // documented content part and reporting a real refusal is honest, whereas dropping
+            // the picture because we guessed would answer a different question.
             return AIProviderSettings(baseURL: "https://api.openai.com/v1", model: account.model,
                                       temperature: nil, maxTokens: nil,
-                                      reasoningMode: .providerDefault, reasoningEncoding: .none)
+                                      reasoningMode: .providerDefault, reasoningEncoding: .none,
+                                      vision: true)
         }
         let endpoint = try inspectAiBaseUrl(baseUrl: baseURL)
         let model = try validateAiModel(model: model)
         guard temperature.isFinite, Self.temperatureRange.contains(temperature) else {
-            throw AISettingsError.invalid("Temperature must be between 0 and 2.")
+            throw AISettingsError.refused("Temperature must be between 0 and 2.", .invalidSettings)
         }
         guard Self.maxTokensRange.contains(maxTokens) else {
-            throw AISettingsError.invalid("Max tokens must be between 1 and 32,768.")
+            throw AISettingsError.refused("Max tokens must be between 1 and 32,768.", .invalidSettings)
         }
         if let message = Self.reasoningValidationMessage(mode: reasoningMode, encoding: reasoningEncoding) {
-            throw AISettingsError.invalid(message)
+            throw AISettingsError.refused(message, .invalidSettings)
         }
         return AIProviderSettings(
             baseURL: endpoint.baseUrl,
@@ -1038,7 +1235,8 @@ public final class AISettingsStore: ObservableObject {
             temperature: temperature,
             maxTokens: maxTokens,
             reasoningMode: reasoningMode,
-            reasoningEncoding: reasoningEncoding
+            reasoningEncoding: reasoningEncoding,
+            vision: modelAcceptsImages
         )
     }
 
@@ -1109,26 +1307,18 @@ extension Result where Success == Void, Failure == AISettingsError {
     }
 }
 
-/// Pull a reader-facing string out of a UniFFI-generated error. The generated error enum's
-/// `localizedDescription` is `String(reflecting:)` (`Ai(message: "...")`), which is not something
-/// to show in a panel, so the associated message is read structurally instead.
+/// Pull a reader-facing string out of an error.
+///
+/// The generated FFI error carries the message as a typed associated value, so this reads it
+/// structurally instead of reflecting over the enum or matching message text. Errors that did
+/// not come from the engine still fall through to their own description.
 public enum AIReadableError {
     public static func message(_ error: Error) -> String {
-        // The generated UniFFI error enum carries its message as the single associated String.
-        // `Mirror` reads it without depending on the generated case name or its reflection
-        // formatting ("LyraReaderBindings.LyraReaderFfiError.Ai(message: ...)").
-        let mirror = Mirror(reflecting: error)
-        for child in mirror.children {
-            if let text = child.value as? String, !text.isEmpty {
-                return text
-            }
-            // A generated enum case with one associated value reflects as a tuple such as
-            // `(message: "...")`, so look one level deeper for the labelled message.
-            let nested = Mirror(reflecting: child.value)
-            for associated in nested.children where associated.label == "message" {
-                if let text = associated.value as? String, !text.isEmpty {
-                    return text
-                }
+        if let ffi = error as? LyraReaderFfiError {
+            switch ffi {
+            case .Document(let message, _), .Backend(let message, _),
+                 .InvalidArgument(let message, _), .Ai(let message, _, _):
+                return message
             }
         }
         if let localized = (error as? LocalizedError)?.errorDescription,
@@ -1153,7 +1343,9 @@ extension AppState {
             )
         }
         return AIReaderContext(
-            documentKey: document.url?.standardizedFileURL.path ?? document.id.uuidString,
+            documentKey: document.documentId.nonEmpty
+                ?? document.url?.standardizedFileURL.path
+                ?? document.id.uuidString,
             documentTitle: document.title,
             pageCount: document.pageCount,
             currentPage: currentPage,
@@ -1165,7 +1357,12 @@ extension AppState {
     /// AI feature is honest about needing the Rust core instead of faking an answer.
     public var aiChatService: (any AIChatServicing)? {
         guard let engine = engine as? RustEngine else { return nil }
-        return RustAIChatService(engine: engine)
+        let base = RustAIChatService(engine: engine)
+        guard Self.usesDocumentKnowledge, let context = aiReaderContext,
+              let sourceURL = document?.url else { return base }
+        return DocumentKnowledgeService(base: base, knowledge: documentKnowledge,
+            context: context, sourceURL: sourceURL,
+            cacheDocumentURL: translationDocumentURL ?? sourceURL)
     }
 }
 
@@ -1195,18 +1392,91 @@ extension AiPlanPartRecord {
     public var characterLabel: String {
         "\(pageCharacters) page characters · \(requestCharacters) request characters"
     }
+
+    /// Whether this exact request carries the region PNG. The plan stores the capture bytes on
+    /// its own, before any transport renders them, so the preview can ask this instead of
+    /// searching the JSON for a transport-specific key.
+    public var includesRegionImage: Bool { image != nil }
 }
 
 public enum AIPlanFormatting {
     /// "Page 3", "Pages 1-3", "Pages 1, 3, 5" for 1-based pages.
+    ///
+    /// The grammar (dedupe, sort, collapse a contiguous run, comma-separate a gap) lives once,
+    /// in `lyra-reader-ffi::format`, and the preview and the summary panel share it.
     public static func pageLabel(_ pages: [Int]) -> String {
-        let pages = Array(Set(pages)).sorted()
-        guard let first = pages.first else { return "No pages" }
-        if pages.count == 1 { return "Page \(first)" }
-        let contiguous = zip(pages, pages.dropFirst()).allSatisfy { $0 + 1 == $1 }
-        if contiguous {
-            return "Pages \(first)-\(pages.last!)"
-        }
-        return "Pages " + pages.map(String.init).joined(separator: ", ")
+        LyraReaderBindings.pageLabel(pages: pages.map { UInt32(max(0, $0)) })
+    }
+}
+
+// MARK: - Plan-record conveniences
+//
+// The generated records gained the shared-reading input at the end. These overloads keep every
+// existing caller (and test double) source-compatible: no prior text means exactly the old plan.
+
+public extension AiPlanRequestRecord {
+    init(
+        action: AiActionRecord,
+        documentKnowledge: Bool,
+        currentPage: UInt32,
+        selection: AiSelectionRecord?,
+        question: String?,
+        language: String?,
+        history: [AiConversationTurnRecord],
+        region: AiRegionRecord?,
+        baseUrl: String,
+        model: String,
+        temperature: Double?,
+        maxTokens: UInt32?,
+        reasoningMode: String,
+        reasoningEncoding: String
+    ) {
+        self.init(
+            action: action, documentKnowledge: documentKnowledge, currentPage: currentPage,
+            selection: selection, question: question, language: language, history: history,
+            region: region, baseUrl: baseUrl, model: model, temperature: temperature,
+            maxTokens: maxTokens, reasoningMode: reasoningMode,
+            reasoningEncoding: reasoningEncoding, documentKnowledgeText: nil,
+            documentKnowledgePages: [])
+    }
+}
+
+public extension AiMergePlanRequestRecord {
+    init(
+        documentTitle: String,
+        parts: [AiMergePartRecord],
+        baseUrl: String,
+        model: String,
+        temperature: Double?,
+        maxTokens: UInt32?,
+        reasoningMode: String,
+        reasoningEncoding: String
+    ) {
+        self.init(
+            documentTitle: documentTitle, parts: parts, baseUrl: baseUrl, model: model,
+            temperature: temperature, maxTokens: maxTokens, reasoningMode: reasoningMode,
+            reasoningEncoding: reasoningEncoding, documentKnowledgeText: nil,
+            documentKnowledgePages: [])
+    }
+}
+
+public extension AiSummaryRequestRecord {
+    init(
+        layer: AiSummaryLayerRecord,
+        units: [AiSummaryUnitRequestRecord],
+        language: String?,
+        documentTitle: String,
+        baseUrl: String,
+        model: String,
+        temperature: Double?,
+        maxTokens: UInt32?,
+        reasoningMode: String,
+        reasoningEncoding: String
+    ) {
+        self.init(
+            layer: layer, units: units, language: language, documentTitle: documentTitle,
+            baseUrl: baseUrl, model: model, temperature: temperature, maxTokens: maxTokens,
+            reasoningMode: reasoningMode, reasoningEncoding: reasoningEncoding,
+            documentKnowledgeText: nil, documentKnowledgePages: [])
     }
 }

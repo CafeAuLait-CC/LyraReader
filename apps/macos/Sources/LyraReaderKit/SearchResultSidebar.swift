@@ -1,4 +1,5 @@
 import SwiftUI
+import LyraReaderBindings
 
 package struct SearchResultSidebar: View {
     @ObservedObject var state: AppState
@@ -64,7 +65,8 @@ package struct SearchResultSidebar: View {
                                     switch row {
                                     case .page(let page, let count):
                                         HStack {
-                                            Text("Page \(page + 1)")
+                                            Text(LyraReaderBindings.pageLabel(
+                                                pages: [UInt32(max(0, page + 1))]))
                                             Spacer()
                                             Text("\(count) \(count == 1 ? "item" : "items")")
                                                 .foregroundStyle(LyraReaderTheme.textTertiary)

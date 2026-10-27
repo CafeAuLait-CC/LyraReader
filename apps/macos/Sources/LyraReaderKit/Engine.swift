@@ -8,8 +8,8 @@ import Foundation
 /// ``readOnlyReason``, and the shell disables those commands and shows the same sentence. Saving
 /// an annotated **copy** stays available because it writes a new file and never touches the
 /// signed original.
-public struct DocumentSignature: Equatable, Sendable {
-    public struct Evidence: Equatable, Sendable {
+public struct DocumentSignature: Codable, Equatable, Sendable {
+    public struct Evidence: Codable, Equatable, Sendable {
         /// Stable machine name: `sigFlags`, `docMdp`, `signatureField`, `dss` or `pdfium`.
         public let kind: String
         /// The concrete dictionary fact, for the banner and logs.
@@ -42,6 +42,65 @@ public struct DocumentSignature: Equatable, Sendable {
     }
 }
 
+/// The XFA facts for an open document.
+///
+/// An XFA form is rendered read-only from its XML into a synthetic in-memory PDF. `isXfa`
+/// therefore means: every write command is refused (annotations, form filling, content
+/// editing, page operations, save-a-copy of edits), while zoom, scroll, search, selection and
+/// summaries work on the synthetic pages. `skipped` is the honest list of what the renderer
+/// could not draw.
+public struct DocumentXfa: Codable, Equatable, Sendable {
+    public let isXfa: Bool
+    public let rendered: Bool
+    public let pageCount: Int
+    public let fieldCount: Int
+    public let packetNames: [String]
+    public let skipped: [String]
+    public let error: String?
+    public let readOnlyReason: String?
+    public let encrypted: Bool
+
+    public init(
+        isXfa: Bool,
+        rendered: Bool,
+        pageCount: Int,
+        fieldCount: Int,
+        packetNames: [String],
+        skipped: [String],
+        error: String?,
+        readOnlyReason: String?,
+        encrypted: Bool
+    ) {
+        self.isXfa = isXfa
+        self.rendered = rendered
+        self.pageCount = pageCount
+        self.fieldCount = fieldCount
+        self.packetNames = packetNames
+        self.skipped = skipped
+        self.error = error
+        self.readOnlyReason = readOnlyReason
+        self.encrypted = encrypted
+    }
+
+    public static let none = DocumentXfa(
+        isXfa: false, rendered: false, pageCount: 0, fieldCount: 0,
+        packetNames: [], skipped: [], error: nil, readOnlyReason: nil, encrypted: false)
+
+    init(_ record: XfaStatusRecord) {
+        isXfa = record.isXfa
+        rendered = record.rendered
+        pageCount = Int(record.pageCount)
+        fieldCount = Int(record.fieldCount)
+        packetNames = record.packetNames
+        skipped = record.skipped
+        error = record.error
+        readOnlyReason = record.readOnlyReason
+        encrypted = record.encrypted
+    }
+
+    public var skippedSummary: String { skipped.joined(separator: " · ") }
+}
+
 /// Snapshot of a document the shell has opened.
 ///
 /// Deliberately *not* called `DocumentSummary`: the UniFFI-generated control plane
@@ -49,6 +108,9 @@ public struct DocumentSignature: Equatable, Sendable {
 /// (stable identity, display title) on top of it.
 public struct LoadedDocument: Identifiable, Equatable, Sendable {
     public let id: UUID
+    /// The engine's one document identity: canonical path + content hash. Empty only for the
+    /// mock engine, which has no file to hash.
+    public var documentId: String
     public var title: String
     public var pageCount: Int
     public var url: URL?
@@ -58,23 +120,29 @@ public struct LoadedDocument: Identifiable, Equatable, Sendable {
     public var backend: String
     /// Signature evidence, read once at open. `.unsigned` when the document has none.
     public var signature: DocumentSignature
+    /// XFA state, read once at open. `.none` for an ordinary PDF.
+    public var xfa: DocumentXfa
 
     public init(
         id: UUID = UUID(),
+        documentId: String = "",
         title: String,
         pageCount: Int,
         url: URL? = nil,
         firstPageSize: CGSize = .zero,
         backend: String = "unknown",
-        signature: DocumentSignature = .unsigned
+        signature: DocumentSignature = .unsigned,
+        xfa: DocumentXfa = .none
     ) {
         self.id = id
+        self.documentId = documentId
         self.title = title
         self.pageCount = pageCount
         self.url = url
         self.firstPageSize = firstPageSize
         self.backend = backend
         self.signature = signature
+        self.xfa = xfa
     }
 }
 
@@ -140,13 +208,43 @@ public struct PagePlacement: Equatable, Sendable {
     public let leftPt: CGFloat
     public let widthPt: CGFloat
     public let heightPt: CGFloat
+    /// Page-local Y (PDF points from the paper's top) this placement's top shows.
+    ///
+    /// A whole page has `sourceTopPt == 0` and `sourceHeightPt == heightPt`. A display segment
+    /// of a torn page carries the part of the page it shows: the bottom segment of a tear has
+    /// `sourceTopPt == tear.splitPt`, and its `heightPt` is only the segment's height. Every
+    /// page-local conversion (hit testing, annotations, the marquee) uses this offset instead
+    /// of assuming the placement's top is the page's top.
+    public let sourceTopPt: CGFloat
+    /// Page-local height this placement shows. Equal to `heightPt` for an untorn page.
+    public let sourceHeightPt: CGFloat
 
-    public init(index: Int, topPt: CGFloat, leftPt: CGFloat, widthPt: CGFloat, heightPt: CGFloat) {
+    public init(
+        index: Int,
+        topPt: CGFloat,
+        leftPt: CGFloat,
+        widthPt: CGFloat,
+        heightPt: CGFloat,
+        sourceTopPt: CGFloat = 0,
+        sourceHeightPt: CGFloat? = nil
+    ) {
         self.index = index
         self.topPt = topPt
         self.leftPt = leftPt
         self.widthPt = widthPt
         self.heightPt = heightPt
+        self.sourceTopPt = sourceTopPt
+        self.sourceHeightPt = sourceHeightPt ?? heightPt
+    }
+
+    /// The page-local Y range this placement shows.
+    public var sourceRangePt: Range<CGFloat> {
+        sourceTopPt..<(sourceTopPt + sourceHeightPt)
+    }
+
+    /// The placement's content-space rect.
+    public var contentRect: CGRect {
+        CGRect(x: leftPt, y: topPt, width: widthPt, height: heightPt)
     }
 }
 
@@ -168,19 +266,36 @@ public struct TextChar: Sendable {
 }
 
 /// A page's text layer.
+///
+/// Pages the engine loaded carry ``rust``, a synchronous handle to the document's cached
+/// Swift-parity selection implementation. The public methods below stay the same for every
+/// call site and fall back to the original Swift implementation when there is no handle (tests,
+/// previews and benchmark pages constructed from a dataset). The Rust path is the interactive
+/// one; the Swift code remains the reference the parity fixture pins.
 public struct TextPage: Sendable {
     public let page: Int
     public let chars: [TextChar]
     public let text: String
     public let hasUnicodeMapError: Bool
     private let selectionLines: [SelectionLine]
+    private let rust: TextPageRust?
 
     public init(page: Int, chars: [TextChar], text: String, hasUnicodeMapError: Bool) {
+        self.init(
+            page: page, chars: chars, text: text, hasUnicodeMapError: hasUnicodeMapError,
+            rust: nil)
+    }
+
+    init(
+        page: Int, chars: [TextChar], text: String, hasUnicodeMapError: Bool,
+        rust: TextPageRust?
+    ) {
         self.page = page
         self.chars = chars
         self.text = text
         self.hasUnicodeMapError = hasUnicodeMapError
         self.selectionLines = SelectionLine.build(chars)
+        self.rust = rust
     }
 
     /// The text line touched by an annotation, excluding a separate line-number gutter.
@@ -194,7 +309,29 @@ public struct TextPage: Sendable {
 
     /// Resolve the visual line before resolving x. Ink-free spaces must never make
     /// a character on a neighbouring line win merely because its x is closer.
+    ///
+    /// This is a thin wrapper: an engine-loaded page asks the document's prepared Rust cache
+    /// with one synchronous, extraction-free call. On a miss (or on a legitimate Rust "no hit")
+    /// the Swift reference below answers immediately, and a miss also schedules a background
+    /// warm so later events can hit the Rust cache. A page built by a test or benchmark has no
+    /// `rust` handle and always uses the Swift reference.
     public func characterIndex(at point: CGPoint, extendingSelection: Bool = false) -> Int? {
+        if let rust {
+            switch rust.characterIndex(at: point, extendingSelection: extendingSelection) {
+            case .some(let index):
+                if let index { return index }
+                rust.warmIfNeeded()
+            case .none:
+                // The engine could not answer; the local model is the fallback.
+                break
+            }
+        }
+        return localCharacterIndex(at: point, extendingSelection: extendingSelection)
+    }
+
+    private func localCharacterIndex(
+        at point: CGPoint, extendingSelection: Bool = false
+    ) -> Int? {
         func distance(_ value: CGFloat, _ low: CGFloat, _ high: CGFloat) -> CGFloat {
             max(low - value, value - high, 0)
         }
@@ -285,6 +422,108 @@ private struct SelectionLine: Sendable {
         }
         if let current { lines.append(current) }
         return lines
+    }
+}
+
+/// Synchronous page-scoped access to the document's cached Rust selection implementation.
+///
+/// The outer optional on the methods means "the engine could not answer" (for example the
+/// document handle is gone). A successful Rust `nil` means either "no hit" or "not prepared";
+/// both fall back to Swift's parity-tested page model, and only the miss is worth warming.
+final class TextPageRust: Sendable {
+    private let document: LyraReaderDocument
+    private let page: UInt32
+    /// Requests one background `text_page` warm-up. `Engine.textPage` supplies a closure that
+    /// runs it on the engine's serial raster queue and deduplicates in-flight pages.
+    private let warm: @Sendable () -> Void
+
+    init(
+        document: LyraReaderDocument,
+        page: UInt32,
+        warm: @escaping @Sendable () -> Void
+    ) {
+        self.document = document
+        self.page = page
+        self.warm = warm
+    }
+
+    /// Whether the Rust cache currently holds this page. One mutex lookup; no PDFium.
+    var isPrepared: Bool {
+        document.textPagePrepared(page: page)
+    }
+
+    /// Ask for a background warm after a synchronous miss.
+    ///
+    /// A page that is already prepared (or whose warm is in flight) is left alone, so hit
+    /// testing a blank area of a prepared page cannot trigger an extraction. The pointer event
+    /// never waits for the warm; the caller answers from Swift's model immediately.
+    func warmIfNeeded() {
+        guard !isPrepared else { return }
+        warm()
+    }
+
+    func characterIndex(at point: CGPoint, extendingSelection: Bool) -> Int?? {
+        do {
+            return .some(
+                try document.textCharacterIndex(
+                    page: page, xPt: Double(point.x), yPt: Double(point.y),
+                    extendingSelection: extendingSelection).map(Int.init))
+        } catch {
+            return nil
+        }
+    }
+
+    func characterRange(in rect: CGRect) -> ClosedRange<Int>?? {
+        do {
+            guard let range = try document.textCharacterRange(
+                page: page, xPt: Double(rect.minX), yPt: Double(rect.minY),
+                widthPt: Double(rect.width), heightPt: Double(rect.height))
+            else {
+                return .some(nil)
+            }
+            return .some(Int(range.start)...Int(range.end))
+        } catch {
+            return nil
+        }
+    }
+
+    func string(in range: ClosedRange<Int>) -> String?? {
+        guard let start = UInt32(exactly: range.lowerBound),
+              let end = UInt32(exactly: range.upperBound)
+        else { return nil }
+        do {
+            return .some(
+                try document.textRangeString(page: page, start: start, end: end))
+        } catch {
+            return nil
+        }
+    }
+}
+
+/// Deduplicates background text-page warm-ups per document and page.
+///
+/// Without it, every pointer event during a page's ~1 ms extraction would queue another
+/// extraction on the serial raster queue. The lock only guards the in-flight key set; no FFI
+/// call happens while it is held.
+final class TextPageWarmTracker: @unchecked Sendable {
+    private struct Key: Hashable {
+        let document: ObjectIdentifier
+        let page: UInt32
+    }
+
+    private let lock = NSLock()
+    private var warming: Set<Key> = []
+
+    func begin(document: LyraReaderDocument, page: UInt32) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return warming.insert(Key(document: ObjectIdentifier(document), page: page)).inserted
+    }
+
+    func end(document: LyraReaderDocument, page: UInt32) {
+        lock.lock()
+        defer { lock.unlock() }
+        warming.remove(Key(document: ObjectIdentifier(document), page: page))
     }
 }
 
@@ -604,6 +843,26 @@ public struct Figure: Sendable {
     public let widthPt: CGFloat
     public let heightPt: CGFloat
 
+    public init(
+        kind: String,
+        label: String,
+        page: Int,
+        captionText: String,
+        xPt: CGFloat,
+        yPt: CGFloat,
+        widthPt: CGFloat,
+        heightPt: CGFloat
+    ) {
+        self.kind = kind
+        self.label = label
+        self.page = page
+        self.captionText = captionText
+        self.xPt = xPt
+        self.yPt = yPt
+        self.widthPt = widthPt
+        self.heightPt = heightPt
+    }
+
     /// `"Figure 3"` — how the caption is named in the text and in the panel's title bar.
     public var title: String { "\(kind) \(label)" }
 }
@@ -649,10 +908,36 @@ public enum AnnotationSkipReason: String, Sendable {
     case stampImageUnreadable = "stamp-image-unreadable"
 }
 
+/// The readable file-owned annotations plus what the engine could not decode.
+///
+/// A damaged annotation is not a failed read: the rest are shown, the count and pages are
+/// surfaced once, and annotation writes are blocked so the unknown content is not dropped.
+public struct DocumentAnnotationScan: Sendable {
+    public let annotations: [DocumentAnnotation]
+    public let unreadableAnnotations: Int
+    public let unreadablePages: [Int]
+    public let unreadableDetails: [String]
+
+    public init(
+        annotations: [DocumentAnnotation],
+        unreadableAnnotations: Int,
+        unreadablePages: [Int],
+        unreadableDetails: [String]
+    ) {
+        self.annotations = annotations
+        self.unreadableAnnotations = unreadableAnnotations
+        self.unreadablePages = unreadablePages
+        self.unreadableDetails = unreadableDetails
+    }
+
+    public static let empty = DocumentAnnotationScan(
+        annotations: [], unreadableAnnotations: 0, unreadablePages: [], unreadableDetails: [])
+}
+
 /// An annotation that was **already inside the PDF**, in view space (points, top-left origin).
 ///
 /// The counterpart of `AppState.Annotation`: that one is what this reader wrote and keeps in a
-/// sidecar, this one is what the file itself carries — a highlight made in Preview, a colleague's
+/// annotation cache, this one is what the file itself carries — a highlight made in Preview, a colleague's
 /// sticky note. `quads` is what markup annotations are really drawn from; `xPt`/`yPt`/`widthPt`/
 /// `heightPt` is the `/Rect` and the fallback when a file has no quad points.
 public struct DocumentAnnotation: Sendable, Identifiable, Equatable {
@@ -696,7 +981,12 @@ public struct DocumentAnnotation: Sendable, Identifiable, Equatable {
     public let blend: String
     public let contents: String?
     public let author: String?
+    /// The reader-facing page label from the one Rust formatter: `Page 4`.
+    public let pageLabel: String
     public let modified: String?
+    /// The historical sidebar/passages display for `/M` (`YYYY-MM-DD HH:mm`, clock as written),
+    /// or the file's own string when it is not the PDF date shape. Computed by Rust once.
+    public let pdfDisplayDate: String?
     /// The font size `/DA` states for this annotation's text, in points; `nil` when the file
     /// states none. Only free text has one in practice, and it is the size its text is drawn at.
     public let fontSizePt: CGFloat?
@@ -722,25 +1012,29 @@ public struct DocumentAnnotation: Sendable, Identifiable, Equatable {
     public let skipReason: AnnotationSkipReason?
     /// False when the file marks the annotation hidden/invisible/`/NoView`.
     public let visible: Bool
+    /// Whether this is one of the four text-markup kinds, from the one kind table in Rust.
+    public let isMarkupAnnotation: Bool
+    /// Whether this is drawn from page-space geometry, from the same table.
+    public let isGeometryAnnotation: Bool
+    /// Whether this is a note (`/Text` or `/FreeText`), from the same table.
+    public let isNoteAnnotation: Bool
+    /// Why the reader cannot move, resize, recolour or delete this annotation, or `nil` when it
+    /// can. The engine computes the whole policy once (kind, reply, visibility, geometry and
+    /// stamp decoding), so no Swift surface re-derives it.
+    public let unsupportedEditReason: String?
 
     /// True when this is one of the four text-markup kinds, i.e. what the reader draws a tinted
     /// box per quad for. A statement about *what the annotation is*; what is actually drawn is
     /// `drawing`, which is `markup` for exactly these four when the file does not hide them.
-    public var isMarkup: Bool {
-        ["highlight", "underline", "strikeout", "squiggly"].contains(kind)
-    }
+    public var isMarkup: Bool { isMarkupAnnotation }
 
     /// True when this is a stroked mark drawn from its geometry rather than a text quad.
-    public var isGeometry: Bool {
-        ["ink", "square", "circle", "line", "arrow"].contains(kind)
-    }
+    public var isGeometry: Bool { isGeometryAnnotation }
 
     /// True when the annotation is a note rather than markup: something to *read*, listed in the
     /// sidebar. `/Text` (a sticky note) and `/FreeText` are the two kinds whose `/Contents` is
     /// the whole point of the annotation.
-    public var isNote: Bool {
-        kind == "text" || kind == "freeText"
-    }
+    public var isNote: Bool { isNoteAnnotation }
 
     /// A text-markup comment needs a label as well as its highlight/underline geometry.
     public var hasInlineNote: Bool {
@@ -778,50 +1072,30 @@ public struct AnnotationQuadBox: Sendable, Equatable {
 
 /// One annotation the shell asks the engine to write into a PDF.
 ///
-/// Geometry is **view space at `zoom`** — exactly what the canvas draws — because that is the
-/// shell's coordinate space. The engine converts it to page space once, using the page's own
-/// crop box and rotation, so a highlight saved at 100% and one saved at 300% land in the same
-/// place.
+/// Geometry is **page-local view space at 100%** — the same convention the annotation cache and
+/// `DocumentAnnotation` use. The engine converts it to PDF page space exactly once, using the
+/// page's own `/CropBox`, `/Rotate` and `/UserUnit`; the shell never scales geometry by the
+/// canvas zoom to cross this boundary.
 public struct AnnotationWriteRequest: Sendable, Equatable {
-    /// What the annotation becomes in the PDF.
-    public enum Kind: Sendable, Equatable {
-        /// `/Subtype /Highlight`.
-        case highlight
-        /// `/Subtype /Underline`.
-        case underline
-        /// `/Subtype /StrikeOut`: a line through the middle of the selected glyphs.
-        case strikeout
-        /// `/Subtype /Text`: a sticky note icon carrying the contents.
-        case note
-        /// `/Subtype /FreeText`: text in `rect`, laid out at `fontSizePt` and aligned by
-        /// `textAlignment`, with `/DA` and an appearance stream.
-        case freeText
-        /// `/Subtype /Ink`: the request's `inkPaths` are its `/InkList`.
-        case ink
-        /// `/Subtype /Square`.
-        case square
-        /// `/Subtype /Circle`.
-        case circle
-        /// `/Subtype /Line`, with `/LE` when `lineArrow` is true.
-        case line
-        /// `/Subtype /Stamp`: a text stamp in `rect`, with `stampStyle` and `contents` as the
-        /// words and an appearance stream that draws the border and text.
-        case stamp
-        /// `/Subtype /Stamp`: an image signature. The pixels are `signatureRGBA`.
-        case signature
-    }
+    /// What the annotation becomes in the PDF: the engine's write kind.
+    ///
+    /// This is the FFI enum, not a second Swift vocabulary. Which annotation kind becomes which
+    /// write kind is decided by the one kind table in `lyra-reader-edit`, so a new kind is a
+    /// table row rather than another `switch` here.
+    public typealias Kind = AnnotationWriteKind
 
-    /// Written as `/NM`; the sidecar's UUID string, so a saved annotation can be recognised.
+    /// Written as `/NM`; the cached annotation's UUID string, so a saved annotation can be recognised.
     public let id: String
     public let page: Int
     public let kind: Kind
-    /// View-space box at `zoom`; for markup the union of `quads` is what is written as `/Rect`.
+    /// Page-local view-space box at 100%; for markup the union of `quads` is what is written as
+    /// `/Rect`.
     public let rect: CGRect
-    /// View-space `/QuadPoints` at `zoom`; empty for notes and for the stroked kinds.
+    /// Page-local view-space `/QuadPoints` at 100%; empty for notes and for the stroked kinds.
     public let quads: [CGRect]
-    /// View-space `/InkList` at `zoom`, one stroke per entry; only for `.ink`.
+    /// Page-local view-space `/InkList` at 100%, one stroke per entry; only for `.ink`.
     public let inkPaths: [[CGPoint]]
-    /// View-space `/L` endpoints at `zoom`; required for `.line`.
+    /// Page-local view-space `/L` endpoints at 100%; required for `.line`.
     public let lineStart: CGPoint?
     public let lineEnd: CGPoint?
     /// Write `/LE [/None /ClosedArrow]`; only meaningful for `.line`.
@@ -893,83 +1167,12 @@ public struct AnnotationWriteRequest: Sendable, Equatable {
     }
 }
 
-/// One bookmark the shell asks the engine to write into the document's outline.
-///
-/// `yPt` is page-local view space (0 at the page top), the same value the sidecar stores, so the
-/// written destination survives a zoom change, a resize and a layout switch.
-public struct BookmarkWriteRequest: Sendable, Equatable {
-    public let id: UUID
-    public let page: Int
-    public let title: String
-    public let yPt: CGFloat
-
-    public init(id: UUID, page: Int, title: String, yPt: CGFloat) {
-        self.id = id
-        self.page = page
-        self.title = title
-        self.yPt = yPt
-    }
-}
-
 /// What a successful PDF write did.
-
-/// One rectangle the reader marked for redaction, in page-local view space (points, top-left
-/// origin, 100% zoom). The engine converts it to PDF user space with the page's own crop box and
-/// rotation.
-public struct RedactionArea: Sendable, Equatable {
-    public let page: Int
-    public let rect: CGRect
-
-    public init(page: Int, rect: CGRect) {
-        self.page = page
-        self.rect = rect
-    }
-}
-
-/// What one page would lose if the redaction were applied.
-public struct RedactionPagePreview: Sendable, Equatable {
-    public let page: Int
-    public let characters: Int
-    /// A short excerpt of the covered text, for the confirmation dialog.
-    public let textPreview: String
-    /// Vector paths, images, shadings and form XObjects intersecting a mark.
-    public let graphics: Int
-}
-
-/// What applying the marked areas would lose, gathered before the confirmation.
-public struct RedactionPreview: Sendable, Equatable {
-    public let pages: [RedactionPagePreview]
-    public let removedCharacters: Int
-}
-
-/// What one page lost when the redaction was applied.
-public struct RedactionPageReport: Sendable, Equatable {
-    public let page: Int
-    public let removedCharacters: Int
-    public let removedGraphics: Int
-    /// True when the page was rasterised; its whole text layer is gone.
-    public let rasterized: Bool
-    public let fillMarks: Int
-}
-
-/// What a successful redaction write did. `verified` is the writer's own reopen-and-prove step.
-public struct RedactionReport: Sendable, Equatable {
-    public let destinationPath: String
-    /// Present only for a replacement; the backup is verified byte-identical.
-    public let backupPath: String?
-    public let pages: [RedactionPageReport]
-    public let removedCharacters: Int
-    public let outputBytes: UInt64
-    public let cleanedTemporaryFiles: Int
-    public let verified: Bool
-    public let originalUnchanged: Bool
-}
-
 public struct AnnotationWriteReport: Sendable, Equatable {
     public let destinationPath: String
-    /// The `/NM` values written, so the sidecar can remove exactly those entries.
+    /// The `/NM` values written, so the annotation cache can remove exactly those entries.
     public let writtenIDs: [String]
-    /// The bookmark identities written into the outline, so the sidecar can remove exactly
+    /// The bookmark identities written into the outline, so the annotation cache can remove exactly
     /// those entries after a replacement.
     public let writtenBookmarkIDs: [String]
     /// Title of the bookmark subtree written into the outline; `nil` when the list was empty.
@@ -1219,6 +1422,50 @@ public struct FormSaveReport: Sendable, Equatable {
     public let sourceBytesPreserved: Bool
 }
 
+
+/// One kind of annotation or field a flattened copy baked, and how many of it.
+public struct FlattenKindCount: Sendable, Equatable {
+    public let kind: String
+    public let count: Int
+}
+
+/// One annotation a flattened copy deliberately keeps, with the reason.
+public struct FlattenKeptAnnotation: Sendable, Equatable {
+    /// Zero-based page index.
+    public let page: Int
+    public let kind: String
+    public let reason: String
+    public let hasComment: Bool
+}
+
+/// One form field a flattened copy deliberately keeps.
+public struct FlattenKeptField: Sendable, Equatable {
+    public let name: String
+    public let kind: String
+    public let reason: String
+}
+
+/// What a successful "Export as Flattened Copy" did.
+///
+/// The report is the honest half of the command: it names what was baked, what was deliberately
+/// kept, and what an annotation's comment lost when its painted appearance moved into the page.
+public struct FlattenReport: Sendable, Equatable {
+    public let destination: URL
+    public let pages: Int
+    public let flattenedAnnotations: Int
+    public let flattenedAnnotationKinds: [FlattenKindCount]
+    public let flattenedFields: Int
+    public let flattenedFieldKinds: [FlattenKindCount]
+    public let keptAnnotations: [FlattenKeptAnnotation]
+    public let keptFields: [FlattenKeptField]
+    public let stickyNotesKept: Int
+    public let linksKept: Int
+    public let commentsNotCarried: Int
+    public let signatureFieldsRemoved: Int
+    public let outputBytes: UInt64
+    public let cleanedTemporaryFiles: Int
+}
+
 /// The document facts and editable `/Info` entries the information panel shows.
 public struct DocumentInfo: Sendable, Equatable {
     public let title: String
@@ -1369,7 +1616,7 @@ public struct PageSplitOutput: Sendable, Equatable {
 ///
 /// Each part is an independent verified atomic write. On a later failure the engine throws, and
 /// the earlier outputs are already complete and stay on disk; the shell checks which destinations
-/// exist to write their sidecars.
+/// exist to write their cached annotations.
 public struct PageSplitReport: Sendable, Equatable {
     public let parts: [PageSplitOutput]
     public let sourcePageCount: Int
@@ -1378,9 +1625,11 @@ public struct PageSplitReport: Sendable, Equatable {
 
 /// What a merge wrote.
 ///
-/// The first document's outline is kept; the appended documents' outlines are not imported, and
-/// `droppedOutlineEntries` counts what was left out. The appended pages' file-owned annotations
-/// travel with them. The first document's pages keep their indices.
+/// The first document's outline is kept. Each appended document's outline is imported as one
+/// labelled top-level group named after that file, with its entries nested beneath it and its
+/// destinations moved to the merged pages; `appendedOutlineEntries` and
+/// `appendedOutlineGroupTitles` describe what was added. The appended pages' file-owned
+/// annotations travel with them. The first document's pages keep their indices.
 public struct PageMergeReport: Sendable, Equatable {
     public let destination: URL
     public let pageCount: Int
@@ -1389,7 +1638,8 @@ public struct PageMergeReport: Sendable, Equatable {
     public let appendedAnnotationCounts: [Int]
     public let rotations: [Int]
     public let firstOutlineEntries: Int
-    public let droppedOutlineEntries: Int
+    public let appendedOutlineEntries: Int
+    public let appendedOutlineGroupTitles: [String]
     public let outputBytes: UInt64
     public let cleanedTemporaryFiles: Int
 }
@@ -1417,7 +1667,7 @@ public struct OutlineEntry: Sendable, Identifiable {
     public let title: String
     public let page: Int?
     public let depth: Int
-    /// The sidecar bookmark's UUID when this entry belongs to the reader's own saved subtree.
+    /// The cached bookmark's UUID when this entry belongs to the reader's own saved subtree.
     /// `nil` for every node the document's author wrote.
     public let bookmarkID: String?
     /// Page-local Y (points, 0 at the page top) when the destination names a position.
@@ -1542,11 +1792,23 @@ public struct CanvasPage: Sendable {
     public let image: PageImage
     /// How this quad composites with what is already in the frame.
     public let blend: QuadBlend
+    /// Which part of `image` this quad shows, normalized (`0…1`, origin top-left).
+    ///
+    /// The whole texture by default. A torn page hands the canvas two quads with complementary
+    /// source rectangles over the **same** `PageImage` generation, so the bitmap is uploaded
+    /// once and the GPU clips it; there is no second rasteriser call and no copied bitmap.
+    public let source: CGRect
 
-    public init(placement: PagePlacement, image: PageImage, blend: QuadBlend = .normal) {
+    public init(
+        placement: PagePlacement,
+        image: PageImage,
+        blend: QuadBlend = .normal,
+        source: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+    ) {
         self.placement = placement
         self.image = image
         self.blend = blend
+        self.source = source
     }
 }
 
@@ -1585,6 +1847,12 @@ public protocol PDFEngine: AnyObject {
     /// progress panel visible) instead of deadlocking. Test doubles return nil, which the print
     /// view draws as a missing-page notice.
     func renderPageForPrint(_ page: Int, scale: CGFloat) -> PageImage?
+    /// Page size in points with `/Rotate` applied, for choosing that page's print paper.
+    ///
+    /// Synchronous for the same reason as `renderPageForPrint`: the print plan is built before
+    /// the operation starts, and paper must be chosen per page. `nil` when the engine cannot
+    /// report sizes; the caller falls back to the document's first-page size.
+    func pageSizeForPrint(_ page: Int) -> CGSize?
     /// Rasterizes one tile of a page at a discrete LOD (`scale = 2^lod`).
     func rasterizeTile(
         page: Int,
@@ -1595,6 +1863,16 @@ public protocol PDFEngine: AnyObject {
     ) async throws -> TileImage
     /// Extracts the text layer of a page (character boxes in view space).
     func textPage(_ page: Int) async throws -> TextPage
+    /// Extracts the text inside one page-local rectangle.
+    ///
+    /// The real engine delegates to `lyra-reader-text`, where the rectangle-coverage selection
+    /// lives beside pointer hit-testing and range→string. A test double with no text layer
+    /// returns an empty extraction; the card still opens on a non-blank picture.
+    func regionText(
+        page: Int,
+        rect: CGRect,
+        limit: Int
+    ) async throws -> (text: String, truncated: Bool)
     /// Rasterizes one rectangle of a page, in view-space points.
     ///
     /// `transparentBackground` leaves the page's unpainted paper clear (alpha 0) instead of
@@ -1614,38 +1892,36 @@ public protocol PDFEngine: AnyObject {
     /// Annotations the document **already carries** (highlights, notes, free text), from every
     /// page, in view space. Document-wide, so implementations cache it.
     func annotations() async throws -> [DocumentAnnotation]
+    /// The same annotations plus the count of damaged ones the engine could not decode.
+    func annotationScan() async throws -> DocumentAnnotationScan
     /// Writes `annotations` into a new PDF at `url`. Never touches the open document.
     func saveAnnotatedCopy(
         to url: URL,
         annotations: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
-        zoom: CGFloat
+        bookmarks: [Bookmark]
     ) async throws -> AnnotationWriteReport
     /// Applies additions, edits and deletions to a new PDF at `url`.
     func saveAnnotationChanges(
         to url: URL,
         additions: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
+        bookmarks: [Bookmark],
         updates: [AnnotationUpdateRequest],
-        deletions: [AnnotationDeleteRequest],
-        zoom: CGFloat
+        deletions: [AnnotationDeleteRequest]
     ) async throws -> AnnotationWriteReport
     /// Replaces the open document with one carrying `annotations` and `bookmarks`; the engine
     /// writes and verifies a backup first and refuses the replacement if the backup cannot be
     /// written.
     func replaceWithAnnotations(
         _ annotations: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
-        zoom: CGFloat
+        bookmarks: [Bookmark]
     ) async throws -> AnnotationWriteReport
     /// Replaces the open document with one carrying additions, edits and deletions, after a
     /// verified backup.
     func replaceWithAnnotationChanges(
         _ additions: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
+        bookmarks: [Bookmark],
         updates: [AnnotationUpdateRequest],
-        deletions: [AnnotationDeleteRequest],
-        zoom: CGFloat
+        deletions: [AnnotationDeleteRequest]
     ) async throws -> AnnotationWriteReport
     /// The document's AcroForm fields, read from the widget dictionaries and reported in view
     /// space. Reading never writes; an encrypted file is reported with `encrypted: true` and a
@@ -1659,6 +1935,17 @@ public protocol PDFEngine: AnyObject {
     func replaceWithFilledForm(_ values: [FormFieldValue]) async throws -> FormSaveReport
     /// The name to offer for a filled copy: `<name> (filled).pdf`.
     func suggestedFilledCopyURL(for url: URL) -> URL
+    /// Writes a **new** flattened PDF at `url`: annotation appearances and filled form widgets
+    /// are painted into the page content, then the annotation tree and the `/AcroForm` entry are
+    /// removed. The open document and the source file are never modified (a signed document is
+    /// copied, with its signature material stripped). Sticky notes and links are kept and
+    /// reported; a field whose appearance cannot be baked faithfully is kept and reported.
+    ///
+    /// This makes a signature harder to delete by accident. It is **not** tamper-proof: the
+    /// painted content is still editable, and only a digital signature detects later changes.
+    func flattenToCopy(to url: URL) async throws -> FlattenReport
+    /// The name to offer for a flattened copy: `<name> (flattened).pdf`.
+    func suggestedFlattenedCopyURL(for url: URL) -> URL
     /// The read-only facts and the four editable `/Info` entries.
     func documentInfo() async throws -> DocumentInfo
     /// Writes the four `/Info` entries into a new PDF at `url`.
@@ -1676,14 +1963,23 @@ public protocol PDFEngine: AnyObject {
     func pageRotations() async throws -> [Int]
     func contentObjects(page: Int) async throws -> PDFContentPage
     func contentImagePNG(page: Int, target: String, revision: String) async throws -> Data
-    func applyContentEdit(page: Int, command: PDFContentCommand, to destination: URL) async throws
+    func applyContentEdit(page: Int, command: ContentCommandRecord, to destination: URL) async throws
+    /// The 0-based pages a redaction would have to replace with a raster image, computed without
+    /// writing anything. Non-empty means the Edit workspace must ask before staging.
+    func contentRedactionRasterPages(page: Int, command: ContentCommandRecord) async throws -> [Int]
+    /// Stages a redaction after the reader accepted the raster fallback. Returns the 0-based
+    /// pages that were actually replaced by an image (empty for an ordinary stage).
+    func applyContentEditAllowingRaster(
+        page: Int, command: ContentCommandRecord, to destination: URL
+    ) async throws -> [Int]
     /// Applies a page operation to a copy of the open document and writes it to `destination`.
     /// The open document is not modified.
     func applyPageOperation(_ operation: PageEditOperation, to destination: URL) async throws -> PageOperationReport
     /// Extracts `pages` (0-based) from the open document into a new PDF.
     func extractPages(_ pages: [Int], to destination: URL) async throws -> PageOperationReport
     /// Appends `others` to the open document and writes a **new** file; the open document is
-    /// untouched. The first document's outline is kept, the appended outlines are not imported.
+    /// untouched. The first document's outline is kept, and each appended outline is imported as
+    /// a labelled top-level group with its destinations remapped to the merged pages.
     func mergeDocuments(others: [URL], to destination: URL) async throws -> PageMergeReport
     /// Splits the open document into `parts`, each an independently verified atomic write.
     func splitPages(_ parts: [PageSplitPart]) async throws -> PageSplitReport
@@ -1695,14 +1991,6 @@ public protocol PDFEngine: AnyObject {
     func interruptedSaveNote(at url: URL) -> String?
     /// The name to offer for an annotated copy of `url`.
     func suggestedAnnotatedCopyURL(for url: URL) -> URL
-    /// Reports what applying `areas` would remove, without writing. Used by the confirmation.
-    func previewRedactions(_ areas: [RedactionArea]) async throws -> RedactionPreview
-    /// Removes the content under `areas` and writes a new PDF; the open document is untouched.
-    func redactToCopy(to url: URL, areas: [RedactionArea]) async throws -> RedactionReport
-    /// Replaces the open document with a redacted version, after a verified backup.
-    func replaceWithRedactions(_ areas: [RedactionArea]) async throws -> RedactionReport
-    /// The name to offer for a redacted copy: `<name> (redacted).pdf`.
-    func suggestedRedactionCopyURL(for url: URL) -> URL
     /// Citations in the body text of a page.
     func citations(_ page: Int) async throws -> [Citation]
     /// `Figure 3` / `Table 2` references in the body text of a page (the click targets).
@@ -1766,14 +2054,35 @@ public protocol PDFEngine: AnyObject {
 }
 
 public extension PDFEngine {
+    /// Test doubles without a text layer have no region text; the picture path still works.
+    func regionText(
+        page: Int,
+        rect: CGRect,
+        limit: Int = AIRegionLimits.maximumTextCharacters
+    ) async throws -> (text: String, truncated: Bool) {
+        ("", false)
+    }
     func contentImagePNG(page: Int, target: String, revision: String) async throws -> Data {
         throw NSError(domain:"LyraReader",code:2,userInfo:[NSLocalizedDescriptionKey:"This engine cannot export images"])
     }
     func contentObjects(page: Int) async throws -> PDFContentPage {
         throw NSError(domain:"LyraReader",code:2,userInfo:[NSLocalizedDescriptionKey:"This engine cannot inspect page content"])
     }
-    func applyContentEdit(page: Int, command: PDFContentCommand, to destination: URL) async throws {
+    func applyContentEdit(page: Int, command: ContentCommandRecord, to destination: URL) async throws {
         throw NSError(domain:"LyraReader",code:2,userInfo:[NSLocalizedDescriptionKey:"This engine cannot edit page content"])
+    }
+    /// Engines that cannot predict the raster fallback never prompt: their ordinary
+    /// `applyContentEdit` either handles the command or refuses it as before.
+    func contentRedactionRasterPages(page: Int, command: ContentCommandRecord) async throws -> [Int] {
+        []
+    }
+    /// Engines that cannot rasterise a page fall back to the ordinary staging path, which keeps
+    /// the old refusal behaviour for test doubles.
+    func applyContentEditAllowingRaster(
+        page: Int, command: ContentCommandRecord, to destination: URL
+    ) async throws -> [Int] {
+        try await applyContentEdit(page: page, command: command, to: destination)
+        return []
     }
     /// A plain page raster for engines that have no annotation-burn-in path.
     ///
@@ -1786,43 +2095,25 @@ public extension PDFEngine {
     /// Engines with no synchronous renderer let the print view show a missing-page notice.
     func renderPageForPrint(_ page: Int, scale: CGFloat) -> PageImage? { nil }
 
-    /// Engines without a redaction writer refuse instead of pretending to remove content.
-    func previewRedactions(_ areas: [RedactionArea]) async throws -> RedactionPreview {
-        throw NSError(
-            domain: "LyraReader",
-            code: 2,
-            userInfo: [NSLocalizedDescriptionKey: "This engine cannot remove PDF content"]
+    /// Test doubles have no damaged-annotation diagnostics; their readable annotations are the
+    /// whole answer.
+    func annotationScan() async throws -> DocumentAnnotationScan {
+        DocumentAnnotationScan(
+            annotations: try await annotations(),
+            unreadableAnnotations: 0,
+            unreadablePages: [],
+            unreadableDetails: []
         )
     }
 
-    func redactToCopy(to url: URL, areas: [RedactionArea]) async throws -> RedactionReport {
-        throw NSError(
-            domain: "LyraReader",
-            code: 2,
-            userInfo: [NSLocalizedDescriptionKey: "This engine cannot remove PDF content"]
-        )
-    }
-
-    func replaceWithRedactions(_ areas: [RedactionArea]) async throws -> RedactionReport {
-        throw NSError(
-            domain: "LyraReader",
-            code: 2,
-            userInfo: [NSLocalizedDescriptionKey: "This engine cannot remove PDF content"]
-        )
-    }
-
-    func suggestedRedactionCopyURL(for url: URL) -> URL {
-        url.deletingLastPathComponent()
-            .appendingPathComponent("\(url.deletingPathExtension().lastPathComponent) (redacted).pdf")
-    }
-
+    /// Test doubles do not report page sizes; the print planner falls back to page one.
+    func pageSizeForPrint(_ page: Int) -> CGSize? { nil }
 
     /// Engines without a PDF writer refuse the operation instead of pretending to save.
     func saveAnnotatedCopy(
         to url: URL,
         annotations: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
-        zoom: CGFloat
+        bookmarks: [Bookmark]
     ) async throws -> AnnotationWriteReport {
         throw NSError(
             domain: "LyraReader",
@@ -1833,8 +2124,7 @@ public extension PDFEngine {
 
     func replaceWithAnnotations(
         _ annotations: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
-        zoom: CGFloat
+        bookmarks: [Bookmark]
     ) async throws -> AnnotationWriteReport {
         throw NSError(
             domain: "LyraReader",
@@ -1846,10 +2136,9 @@ public extension PDFEngine {
     func saveAnnotationChanges(
         to url: URL,
         additions: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
+        bookmarks: [Bookmark],
         updates: [AnnotationUpdateRequest],
-        deletions: [AnnotationDeleteRequest],
-        zoom: CGFloat
+        deletions: [AnnotationDeleteRequest]
     ) async throws -> AnnotationWriteReport {
         throw NSError(
             domain: "LyraReader",
@@ -1860,10 +2149,9 @@ public extension PDFEngine {
 
     func replaceWithAnnotationChanges(
         _ additions: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
+        bookmarks: [Bookmark],
         updates: [AnnotationUpdateRequest],
-        deletions: [AnnotationDeleteRequest],
-        zoom: CGFloat
+        deletions: [AnnotationDeleteRequest]
     ) async throws -> AnnotationWriteReport {
         throw NSError(
             domain: "LyraReader",
@@ -1899,6 +2187,18 @@ public extension PDFEngine {
 
     func suggestedFilledCopyURL(for url: URL) -> URL {
         Self.suggestedCopyURL(for: url, suffix: "filled")
+    }
+
+    func flattenToCopy(to url: URL) async throws -> FlattenReport {
+        throw NSError(
+            domain: "LyraReader",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot flatten a PDF"]
+        )
+    }
+
+    func suggestedFlattenedCopyURL(for url: URL) -> URL {
+        Self.suggestedCopyURL(for: url, suffix: "flattened")
     }
 
     func documentInfo() async throws -> DocumentInfo {
@@ -2083,6 +2383,8 @@ public final class RustEngine: PDFEngine {
     /// Serialises PDFium: the library is not thread-safe, so rasterizations run one at a
     /// time on a dedicated queue and never on the main thread.
     private let rasterQueue = DispatchQueue(label: "com.lyrareader.raster", qos: .userInitiated)
+    /// In-flight background selection-cache warm-ups; see `TextPageRust.warmIfNeeded`.
+    private let textPageWarms = TextPageWarmTracker()
     /// The document's caption index. `figures()` walks up to 120 pages, so it is fetched
     /// once per open document (the caption set cannot change while the file is open) and
     /// dropped by `openDocument` — the same lifetime the Rust side gives its own cache.
@@ -2095,6 +2397,15 @@ public final class RustEngine: PDFEngine {
 
     public var version: String {
         "\(engine.version()) · \(engine.backend()) · \(engine.rasterThreads()) raster threads"
+    }
+
+    /// Diagnostic counters for the active document's selection cache.
+    ///
+    /// The checks use this to prove that a pointer query on an evicted page answered from the
+    /// Swift fallback and then warmed the Rust cache in the background. `nil` before a document
+    /// is open. Not used by the reader UI.
+    public func textPageCacheStats() -> LyraReaderBindings.TextPageCacheStats? {
+        document?.textPageCacheStats()
     }
 
     public func openDocument(at url: URL) throws -> LoadedDocument {
@@ -2115,6 +2426,7 @@ public final class RustEngine: PDFEngine {
         // `Figure 3` click to the previous paper's artwork.
         let firstPage = opened.pageCount() > 0 ? try opened.pageSizePt(page: 0) : nil
         let loaded = LoadedDocument(
+            documentId: opened.documentId(),
             title: url.deletingPathExtension().lastPathComponent,
             pageCount: Int(opened.pageCount()),
             url: url,
@@ -2123,7 +2435,8 @@ public final class RustEngine: PDFEngine {
                 height: firstPage?.heightPt ?? 0
             ),
             backend: engine.backend(),
-            signature: DocumentSignature(opened.signatureStatus())
+            signature: DocumentSignature(opened.signatureStatus()),
+            xfa: DocumentXfa(opened.xfaStatus())
         )
 
         openDocuments[key] = opened
@@ -2174,6 +2487,18 @@ public final class RustEngine: PDFEngine {
     /// multiply pipeline; a thumbnail is a preview of where the file's marks are.
     public func renderThumbnail(_ page: Int, scale: CGFloat) async throws -> PageImage {
         try await renderPage(page, scale: scale, withAnnotations: true)
+    }
+
+    /// The page's own size (with `/Rotate` applied), read synchronously while the print plan is
+    /// built. A failure to read one page must not abort printing: `nil` makes the caller use the
+    /// document's first-page size for that page.
+    public func pageSizeForPrint(_ page: Int) -> CGSize? {
+        guard let document else { return nil }
+        guard let size = try? document.pageSizePt(page: UInt32(clamping: page)) else { return nil }
+        let width = CGFloat(size.widthPt)
+        let height = CGFloat(size.heightPt)
+        guard width.isFinite, height.isFinite, width > 1, height > 1 else { return nil }
+        return CGSize(width: width, height: height)
     }
 
     public func renderPageForPrint(_ page: Int, scale: CGFloat) -> PageImage? {
@@ -2324,9 +2649,21 @@ public final class RustEngine: PDFEngine {
         }
 
         return try await withCheckedThrowingContinuation { continuation in
+            let pageID = UInt32(page)
+            let warmQueue = rasterQueue
+            let warms = textPageWarms
+            let rust = TextPageRust(document: document, page: pageID) {
+                guard warms.begin(document: document, page: pageID) else { return }
+                warmQueue.async {
+                    defer { warms.end(document: document, page: pageID) }
+                    // The pointer event already answered from Swift's model, so a failed warm
+                    // only means the next event takes the same fallback again.
+                    _ = try? document.textPage(page: pageID)
+                }
+            }
             rasterQueue.async {
                 do {
-                    let extracted = try document.textPage(page: UInt32(page))
+                    let extracted = try document.textPage(page: pageID)
                     continuation.resume(
                         returning: TextPage(
                             page: page,
@@ -2340,9 +2677,42 @@ public final class RustEngine: PDFEngine {
                                 )
                             },
                             text: extracted.text,
-                            hasUnicodeMapError: extracted.hasUnicodeMapError
+                            hasUnicodeMapError: extracted.hasUnicodeMapError,
+                            rust: rust
                         )
                     )
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    public func regionText(
+        page: Int,
+        rect: CGRect,
+        limit: Int = AIRegionLimits.maximumTextCharacters
+    ) async throws -> (text: String, truncated: Bool) {
+        guard let document else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        _ = limit
+        return try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    let extracted = try document.regionText(
+                        page: UInt32(page),
+                        xPt: Double(rect.minX),
+                        yPt: Double(rect.minY),
+                        widthPt: Double(rect.width),
+                        heightPt: Double(rect.height)
+                    )
+                    continuation.resume(
+                        returning: (text: extracted.text, truncated: extracted.truncated))
                 } catch {
                     continuation.resume(throwing: error)
                 }
@@ -2489,28 +2859,39 @@ public final class RustEngine: PDFEngine {
     }
 
     public func annotations() async throws -> [DocumentAnnotation] {
-        // Document-wide and cached in Rust for the lifetime of the open document, so the shell
-        // fetches it once per document and only converts it here.
-        guard let document else { return [] }
+        try await annotationScan().annotations
+    }
 
-        let records: [AnnotationRecord] = try await withCheckedThrowingContinuation { continuation in
-            rasterQueue.async {
-                do {
-                    continuation.resume(returning: try document.annotations())
-                } catch {
-                    continuation.resume(throwing: error)
+    public func annotationScan() async throws -> DocumentAnnotationScan {
+        // Document-wide and cached in Rust for the lifetime of the open document, so the shell
+        // fetches the readable records and their unreadable count in one scan.
+        guard let document else { return .empty }
+
+        let (records, status): ([AnnotationRecord], AnnotationReadStatus) =
+            try await withCheckedThrowingContinuation { continuation in
+                rasterQueue.async {
+                    do {
+                        let records = try document.annotations()
+                        let status = try document.annotationReadStatus()
+                        continuation.resume(returning: (records, status))
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
                 }
             }
-        }
 
-        return records.map(Self.documentAnnotation(from:))
+        return DocumentAnnotationScan(
+            annotations: records.map(Self.documentAnnotation(from:)),
+            unreadableAnnotations: Int(status.unreadableAnnotations),
+            unreadablePages: status.pages.map(Int.init),
+            unreadableDetails: status.details
+        )
     }
 
     public func saveAnnotatedCopy(
         to url: URL,
         annotations: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
-        zoom: CGFloat
+        bookmarks: [Bookmark]
     ) async throws -> AnnotationWriteReport {
         guard let document else {
             throw NSError(
@@ -2530,8 +2911,7 @@ public final class RustEngine: PDFEngine {
                     continuation.resume(returning: try document.saveAnnotationsCopy(
                         destination: url.path,
                         annotations: records,
-                        bookmarks: bookmarkRecords,
-                        zoom: Double(zoom)
+                        bookmarks: bookmarkRecords
                     ))
                 } catch {
                     continuation.resume(throwing: error)
@@ -2548,10 +2928,9 @@ public final class RustEngine: PDFEngine {
     public func saveAnnotationChanges(
         to url: URL,
         additions: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
+        bookmarks: [Bookmark],
         updates: [AnnotationUpdateRequest],
-        deletions: [AnnotationDeleteRequest],
-        zoom: CGFloat
+        deletions: [AnnotationDeleteRequest]
     ) async throws -> AnnotationWriteReport {
         guard let document else {
             throw NSError(
@@ -2580,8 +2959,7 @@ public final class RustEngine: PDFEngine {
                         annotations: additionRecords,
                         bookmarks: bookmarkRecords,
                         updates: updateRecords,
-                        deletions: deleteRecords,
-                        zoom: Double(zoom)
+                        deletions: deleteRecords
                     ))
                 } catch {
                     continuation.resume(throwing: error)
@@ -2594,10 +2972,9 @@ public final class RustEngine: PDFEngine {
 
     public func replaceWithAnnotationChanges(
         _ additions: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
+        bookmarks: [Bookmark],
         updates: [AnnotationUpdateRequest],
-        deletions: [AnnotationDeleteRequest],
-        zoom: CGFloat
+        deletions: [AnnotationDeleteRequest]
     ) async throws -> AnnotationWriteReport {
         guard let document else {
             throw NSError(
@@ -2625,8 +3002,7 @@ public final class RustEngine: PDFEngine {
                         annotations: additionRecords,
                         bookmarks: bookmarkRecords,
                         updates: updateRecords,
-                        deletions: deleteRecords,
-                        zoom: Double(zoom)
+                        deletions: deleteRecords
                     ))
                 } catch {
                     continuation.resume(throwing: error)
@@ -2639,8 +3015,7 @@ public final class RustEngine: PDFEngine {
 
     public func replaceWithAnnotations(
         _ annotations: [AnnotationWriteRequest],
-        bookmarks: [BookmarkWriteRequest],
-        zoom: CGFloat
+        bookmarks: [Bookmark]
     ) async throws -> AnnotationWriteReport {
         guard let document else {
             throw NSError(
@@ -2656,8 +3031,7 @@ public final class RustEngine: PDFEngine {
                 do {
                     continuation.resume(returning: try document.replaceWithAnnotations(
                         annotations: records,
-                        bookmarks: bookmarkRecords,
-                        zoom: Double(zoom)
+                        bookmarks: bookmarkRecords
                     ))
                 } catch {
                     continuation.resume(throwing: error)
@@ -2760,6 +3134,36 @@ public final class RustEngine: PDFEngine {
             return Self.suggestedCopyURL(for: url, suffix: "filled")
         }
         return URL(fileURLWithPath: document.suggestedFilledCopyPath())
+    }
+
+    public func flattenToCopy(to url: URL) async throws -> FlattenReport {
+        guard let document else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let record: LyraReaderBindings.FlattenReportRecord =
+            try await withCheckedThrowingContinuation { continuation in
+                rasterQueue.async {
+                    do {
+                        continuation.resume(returning: try document.flattenToCopy(
+                            destination: url.path))
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        invalidateCachedCopy(at: url)
+        return Self.flattenReport(from: record)
+    }
+
+    public func suggestedFlattenedCopyURL(for url: URL) -> URL {
+        guard let document else {
+            return Self.suggestedCopyURL(for: url, suffix: "flattened")
+        }
+        return URL(fileURLWithPath: document.suggestedFlattenCopyPath())
     }
 
     public func documentInfo() async throws -> DocumentInfo {
@@ -2884,19 +3288,53 @@ public final class RustEngine: PDFEngine {
         }
     }
 
-    public func applyContentEdit(page: Int, command: PDFContentCommand, to destination: URL) async throws {
+    public func applyContentEdit(
+        page: Int, command: ContentCommandRecord, to destination: URL
+    ) async throws {
         guard let document else { throw NSError(domain:"LyraReader",code:1) }
-        let data=try JSONEncoder().encode(command)
-        let json=String(decoding:data,as:UTF8.self)
         try await withCheckedThrowingContinuation { (continuation:CheckedContinuation<Void,Error>) in
             rasterQueue.async {
                 do {
-                    try document.applyContentEdit(page:UInt32(page),command:json,destination:destination.path)
+                    try document.applyContentEdit(
+                        page: UInt32(page), command: command, destination: destination.path)
                     continuation.resume()
                 } catch { continuation.resume(throwing:error) }
             }
         }
         invalidateCachedCopy(at:destination)
+    }
+
+    public func contentRedactionRasterPages(
+        page: Int, command: ContentCommandRecord
+    ) async throws -> [Int] {
+        guard let document else { throw NSError(domain:"LyraReader",code:1) }
+        let pages: [UInt32] = try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(
+                        returning: try document.contentRedactionRasterPages(
+                            page: UInt32(page), command: command))
+                } catch { continuation.resume(throwing: error) }
+            }
+        }
+        return pages.map(Int.init)
+    }
+
+    public func applyContentEditAllowingRaster(
+        page: Int, command: ContentCommandRecord, to destination: URL
+    ) async throws -> [Int] {
+        guard let document else { throw NSError(domain:"LyraReader",code:1) }
+        let pages: [UInt32] = try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(
+                        returning: try document.applyContentEditAllowingRaster(
+                            page: UInt32(page), command: command, destination: destination.path))
+                } catch { continuation.resume(throwing: error) }
+            }
+        }
+        invalidateCachedCopy(at: destination)
+        return pages.map(Int.init)
     }
 
     public func applyPageOperation(
@@ -2991,7 +3429,8 @@ public final class RustEngine: PDFEngine {
             appendedAnnotationCounts: report.appendedAnnotationCounts.map(Int.init),
             rotations: report.rotations.map(Int.init),
             firstOutlineEntries: Int(report.firstOutlineEntries),
-            droppedOutlineEntries: Int(report.droppedOutlineEntries),
+            appendedOutlineEntries: Int(report.appendedOutlineEntries),
+            appendedOutlineGroupTitles: report.appendedOutlineGroupTitles,
             outputBytes: report.outputBytes,
             cleanedTemporaryFiles: Int(report.cleanedTemporaryFiles)
         )
@@ -3152,138 +3591,7 @@ public final class RustEngine: PDFEngine {
         return URL(fileURLWithPath: document.suggestedCopyPath())
     }
 
-    // MARK: - Redaction
-
-    public func previewRedactions(_ areas: [RedactionArea]) async throws -> RedactionPreview {
-        guard let document else {
-            throw NSError(
-                domain: "LyraReader",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
-            )
-        }
-        let records = Self.redactionRecords(areas)
-        let record: RedactionPreviewRecord = try await withCheckedThrowingContinuation {
-            continuation in
-            rasterQueue.async {
-                do {
-                    continuation.resume(returning: try document.previewRedactions(areas: records))
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
-        return Self.redactionPreview(record)
-    }
-
-    public func redactToCopy(
-        to url: URL,
-        areas: [RedactionArea]
-    ) async throws -> RedactionReport {
-        guard let document else {
-            throw NSError(
-                domain: "LyraReader",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
-            )
-        }
-        let records = Self.redactionRecords(areas)
-        let record: RedactionReportRecord = try await withCheckedThrowingContinuation {
-            continuation in
-            rasterQueue.async {
-                do {
-                    continuation.resume(returning: try document.redactToCopy(
-                        destination: url.path, areas: records))
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
-        invalidateCachedCopy(at: url)
-        return Self.redactionReport(record)
-    }
-
-    public func replaceWithRedactions(_ areas: [RedactionArea]) async throws -> RedactionReport {
-        guard let document else {
-            throw NSError(
-                domain: "LyraReader",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
-            )
-        }
-        let records = Self.redactionRecords(areas)
-        let record: RedactionReportRecord = try await withCheckedThrowingContinuation {
-            continuation in
-            rasterQueue.async {
-                do {
-                    continuation.resume(returning: try document.replaceWithRedactions(areas: records))
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
-        // The active handle now describes the pre-replacement bytes and must not be handed out
-        // by a later open. The caller immediately reopens the file.
-        if let activeDocumentURL { closeDocument(at: activeDocumentURL) }
-        return Self.redactionReport(record)
-    }
-
-    public func suggestedRedactionCopyURL(for url: URL) -> URL {
-        guard let document else {
-            let stem = url.deletingPathExtension().lastPathComponent
-            return url.deletingLastPathComponent()
-                .appendingPathComponent("\(stem) (redacted).pdf")
-        }
-        return URL(fileURLWithPath: document.suggestedRedactionCopyPath())
-    }
-
-    private static func redactionRecords(_ areas: [RedactionArea]) -> [RedactionAreaRecord] {
-        areas.map { area in
-            RedactionAreaRecord(
-                page: UInt32(max(area.page, 0)),
-                xPt: Double(area.rect.minX),
-                yPt: Double(area.rect.minY),
-                widthPt: Double(area.rect.width),
-                heightPt: Double(area.rect.height)
-            )
-        }
-    }
-
-    private static func redactionPreview(_ record: RedactionPreviewRecord) -> RedactionPreview {
-        RedactionPreview(
-            pages: record.pages.map { page in
-                RedactionPagePreview(
-                    page: Int(page.page),
-                    characters: Int(page.characters),
-                    textPreview: page.textPreview,
-                    graphics: Int(page.graphics)
-                )
-            },
-            removedCharacters: Int(record.removedCharacters)
-        )
-    }
-
-    private static func redactionReport(_ record: RedactionReportRecord) -> RedactionReport {
-        RedactionReport(
-            destinationPath: record.destinationPath,
-            backupPath: record.backupPath,
-            pages: record.pages.map { page in
-                RedactionPageReport(
-                    page: Int(page.page),
-                    removedCharacters: Int(page.removedCharacters),
-                    removedGraphics: Int(page.removedGraphics),
-                    rasterized: page.rasterized,
-                    fillMarks: Int(page.fillMarks)
-                )
-            },
-            removedCharacters: Int(record.removedCharacters),
-            outputBytes: record.outputBytes,
-            cleanedTemporaryFiles: Int(record.cleanedTemporaryFiles),
-            verified: record.verified,
-            originalUnchanged: record.originalUnchanged
-        )
-    }
-
+    // MARK: - Shell requests
 
     /// One shell request, as the FFI record.
     private static func writeRecords(from requests: [AnnotationWriteRequest]) -> [WriteAnnotationRecord] {
@@ -3296,19 +3604,7 @@ public final class RustEngine: PDFEngine {
                     heightPt: Double(rect.height)
                 )
             }
-            let kind: AnnotationWriteKind = switch request.kind {
-            case .highlight: .highlight
-            case .underline: .underline
-            case .strikeout: .strikeOut
-            case .note: .note
-            case .freeText: .freeText
-            case .ink: .ink
-            case .square: .square
-            case .circle: .circle
-            case .line: .line
-            case .stamp: .stamp
-            case .signature: .signature
-            }
+            let kind = request.kind
             let point = { (point: CGPoint) in
                 AnnotationPoint(xPt: Double(point.x), yPt: Double(point.y))
             }
@@ -3342,15 +3638,13 @@ public final class RustEngine: PDFEngine {
         }
     }
 
-    private static func writeBookmarkRecords(
-        from requests: [BookmarkWriteRequest]
-    ) -> [WriteBookmarkRecord] {
-        requests.map { request in
+    private static func writeBookmarkRecords(from bookmarks: [Bookmark]) -> [WriteBookmarkRecord] {
+        bookmarks.map { bookmark in
             WriteBookmarkRecord(
-                id: request.id.uuidString,
-                page: UInt32(request.page),
-                title: request.title,
-                yPt: Double(request.yPt)
+                id: bookmark.id.uuidString,
+                page: UInt32(bookmark.page),
+                title: bookmark.title,
+                yPt: Double(bookmark.yPt)
             )
         }
     }
@@ -3431,7 +3725,9 @@ public final class RustEngine: PDFEngine {
             blend: record.blend,
             contents: record.contents,
             author: record.author,
+            pageLabel: record.pageLabel,
             modified: record.modified,
+            pdfDisplayDate: record.displayDate,
             fontSizePt: record.fontSizePt.map { CGFloat($0) },
             alignment: record.alignment,
             stampText: record.stamp?.text,
@@ -3446,7 +3742,11 @@ public final class RustEngine: PDFEngine {
             // sidebar still lists it.
             drawing: AnnotationDrawing(rawValue: record.drawing) ?? .skipped,
             skipReason: record.skipReason.flatMap(AnnotationSkipReason.init(rawValue:)),
-            visible: record.visible
+            visible: record.visible,
+            isMarkupAnnotation: record.isMarkup,
+            isGeometryAnnotation: record.isGeometry,
+            isNoteAnnotation: record.isNote,
+            unsupportedEditReason: record.unsupportedReason
         )
     }
 
@@ -3652,6 +3952,37 @@ public final class RustEngine: PDFEngine {
         )
     }
 
+    private static func flattenReport(
+        from record: LyraReaderBindings.FlattenReportRecord
+    ) -> FlattenReport {
+        FlattenReport(
+            destination: URL(fileURLWithPath: record.destinationPath),
+            pages: Int(record.pages),
+            flattenedAnnotations: Int(record.flattenedAnnotations),
+            flattenedAnnotationKinds: record.flattenedAnnotationKinds.map {
+                FlattenKindCount(kind: $0.kind, count: Int($0.count))
+            },
+            flattenedFields: Int(record.flattenedFields),
+            flattenedFieldKinds: record.flattenedFieldKinds.map {
+                FlattenKindCount(kind: $0.kind, count: Int($0.count))
+            },
+            keptAnnotations: record.keptAnnotations.map {
+                FlattenKeptAnnotation(
+                    page: Int($0.page), kind: $0.kind,
+                    reason: $0.reason, hasComment: $0.hasComment)
+            },
+            keptFields: record.keptFields.map {
+                FlattenKeptField(name: $0.name, kind: $0.kind, reason: $0.reason)
+            },
+            stickyNotesKept: Int(record.stickyNotesKept),
+            linksKept: Int(record.linksKept),
+            commentsNotCarried: Int(record.commentsNotCarried),
+            signatureFieldsRemoved: Int(record.signatureFieldsRemoved),
+            outputBytes: record.outputBytes,
+            cleanedTemporaryFiles: Int(record.cleanedTemporaryFiles)
+        )
+    }
+
     private static func documentInfo(from record: DocumentInfoRecord) -> DocumentInfo {
         DocumentInfo(
             title: record.title,
@@ -3774,12 +4105,15 @@ public final class RustEngine: PDFEngine {
                 marginPt: Double(marginPt)
             )
             .map { record in
+                // The engine reports `nil` when PDFium could not measure a page. This is the
+                // shell's existing fallback (US Letter), so the visible layout is unchanged;
+                // the engine itself no longer claims that size.
                 PagePlacement(
                     index: Int(record.index),
                     topPt: CGFloat(record.topPt),
                     leftPt: CGFloat(record.leftPt),
-                    widthPt: CGFloat(record.widthPt),
-                    heightPt: CGFloat(record.heightPt)
+                    widthPt: CGFloat(record.widthPt ?? 612),
+                    heightPt: CGFloat(record.heightPt ?? 792)
                 )
             }
     }
@@ -3851,6 +4185,75 @@ public final class RustEngine: PDFEngine {
         return plan
     }
 
+    /// Inspect one layered-summary level without building prompts: every unit comes back with
+    /// the hash of exactly the text it would send. The panel uses this to show cached rows and
+    /// mark a changed section stale with no request. Runs on the serialised raster queue for the
+    /// same reason as the preview: it reads the text layer page by page.
+    public func inspectAISummary(
+        _ request: AiSummaryRequestRecord
+    ) async throws -> [AiSummaryFingerprintRecord] {
+        guard let document else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let epoch = documentEpoch
+        let fingerprints: [AiSummaryFingerprintRecord] = try await withCheckedThrowingContinuation {
+            continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(returning: try document.inspectAiSummary(request: request))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        guard epoch == documentEpoch else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "The document changed while the summary coverage was being read; nothing was sent."]
+            )
+        }
+        return fingerprints
+    }
+
+    /// Build one previewable request per layered-summary unit. Local work: no key, no network.
+    public func prepareAISummary(
+        _ request: AiSummaryRequestRecord
+    ) async throws -> AiSummaryPlanRecord {
+        guard let document else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let epoch = documentEpoch
+        let plan: AiSummaryPlanRecord = try await withCheckedThrowingContinuation {
+            continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(returning: try document.prepareAiSummary(request: request))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        guard epoch == documentEpoch else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "The document changed while the summary preview was being prepared; nothing was sent."]
+            )
+        }
+        return plan
+    }
+
 }
 
 /// Fallback engine for builds where the Rust backend cannot start (for example a build
@@ -3899,6 +4302,18 @@ public final class MockEngine: PDFEngine {
         )
     }
 
+    public func regionText(
+        page: Int,
+        rect: CGRect,
+        limit: Int
+    ) async throws -> (text: String, truncated: Bool) {
+        throw NSError(
+            domain: "LyraReader",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "The mock engine has no text layer"]
+        )
+    }
+
     public func rasterizeRegion(
         page: Int,
         scale: CGFloat,
@@ -3922,6 +4337,8 @@ public final class MockEngine: PDFEngine {
     public func captionMentions(page: Int) async throws -> [CaptionMention] { [] }
 
     public func annotations() async throws -> [DocumentAnnotation] { [] }
+
+    public func annotationScan() async throws -> DocumentAnnotationScan { .empty }
 
     public func figures() async throws -> [Figure] { [] }
 
@@ -3963,9 +4380,27 @@ public final class MockEngine: PDFEngine {
 // PDF glyph boxes describe ink, not a text selection. Join adjacent glyphs on each
 // line so spaces and the gaps between letters are included, without bridging columns.
 extension TextPage {
-    /// The text those characters spell, with the same Unicode-scalar mapping `copySelection`
-    /// uses. Empty when the range is empty or contains no decodable scalar.
+    /// The text those characters spell, with the same Unicode-scalar mapping the engine uses.
+    /// Empty when the range is empty or contains no decodable scalar.
+    ///
+    /// Thin wrapper over the cached Rust implementation for engine-loaded pages. Rust answers
+    /// only from its prepared cache; a miss falls back to the Swift reference immediately and
+    /// schedules a background warm. This is the **one** range→string entry point;
+    /// `copySelection` and the annotation export call it instead of decoding `chars` themselves.
     public func string(in range: ClosedRange<Int>) -> String {
+        if let rust {
+            switch rust.string(in: range) {
+            case .some(let text):
+                if let text { return text }
+                rust.warmIfNeeded()
+            case .none:
+                break
+            }
+        }
+        return localString(in: range)
+    }
+
+    private func localString(in range: ClosedRange<Int>) -> String {
         guard !chars.isEmpty else { return "" }
         let clamped = range.clamped(to: 0...(chars.count - 1))
         guard !clamped.isEmpty else { return "" }
@@ -3978,7 +4413,23 @@ extension TextPage {
     ///
     /// Returns `nil` when no glyph overlaps, which is the honest answer for a box over a figure
     /// or over a page whose text layer could not be read.
+    ///
+    /// Thin wrapper over the cached Rust implementation for engine-loaded pages; see
+    /// ``characterIndex(at:extendingSelection:)`` for the miss fallback and background warm.
     public func characterRange(in rect: CGRect) -> ClosedRange<Int>? {
+        if let rust {
+            switch rust.characterRange(in: rect) {
+            case .some(let range):
+                if let range { return range }
+                rust.warmIfNeeded()
+            case .none:
+                break
+            }
+        }
+        return localCharacterRange(in: rect)
+    }
+
+    private func localCharacterRange(in rect: CGRect) -> ClosedRange<Int>? {
         var first: Int?
         var last: Int?
         for line in selectionLines {

@@ -3,12 +3,15 @@ import CoreGraphics
 
 /// The tool the canvas is in.
 ///
-/// One value selects exactly one tool. The text-markup cases (`highlight`, `underline`,
-/// `strikeout`) change both what a drag *looks like* and what it commits: the swept text is
-/// drawn as the target mark while the pointer is down, and that same selection becomes the
-/// annotation on release. Keeping them in this enum is what makes "pen, then highlight" leave
-/// one tool active rather than two modes that could both apply.
+/// One value selects exactly one tool. `select` is the implicit pointer state: no tool is armed,
+/// the toolbar has no Select button, and turning any tool off (clicking it again or pressing
+/// Escape) lands here. The text-markup cases (`highlight`, `underline`, `strikeout`) change both
+/// what a drag *looks like* and what it commits: the swept text is drawn as the target mark while
+/// the pointer is down, and that same selection becomes the annotation on release. Keeping them in
+/// this enum is what makes "pen, then highlight" leave one tool active rather than two modes that
+/// could both apply.
 public enum AnnotationTool: String, CaseIterable, Sendable {
+    /// The implicit pointer: no annotation tool is armed.
     case select
     case pen
     /// A mode rather than a drawing tool: dragging removes the ink under its pointer path
@@ -21,10 +24,6 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
     case ellipse
     case note
     case textBox
-    /// A mode rather than an ink tool: a drag marks a rectangle for redaction instead of
-    /// creating an annotation. Nothing is removed until the reader confirms the explicit apply
-    /// command; the marks are pending until then.
-    case redact
     /// A sticky text-markup mode: every finished text selection is marked with this kind.
     case highlight
     case underline
@@ -37,8 +36,8 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
     /// The annotation kind a drag creates, or `nil` for a tool that does not draw a stroke.
     public var kind: AppState.Annotation.Kind? {
         switch self {
-        case .select, .eraser, .note, .textBox, .redact, .highlight, .underline, .strikeout,
-             .stamp, .signature:
+        case .select, .eraser, .note, .textBox, .highlight, .underline, .strikeout, .stamp,
+             .signature:
             return nil
         case .pen: return .ink
         case .line: return .line
@@ -50,7 +49,7 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
 
     /// The markup kind a finished text selection becomes, or `nil` for every other tool.
     ///
-    /// The three kinds are text marks, not glyphs drawn by a pointer: they live in the sidecar,
+    /// The three kinds are text marks, not glyphs drawn by a pointer: they live in the annotation cache,
     /// are written as `/QuadPoints`, and are hit-tested/selected through their text range.
     public var textMarkupKind: AppState.Annotation.Kind? {
         switch self {
@@ -58,7 +57,7 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
         case .underline: return .underline
         case .strikeout: return .strikeout
         case .select, .pen, .eraser, .line, .arrow, .rectangle, .ellipse, .note, .textBox,
-             .redact, .stamp, .signature:
+             .stamp, .signature:
             return nil
         }
     }
@@ -106,7 +105,7 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
 
     public var title: String {
         switch self {
-        case .select: return "Select"
+        case .select: return "Pointer"
         case .pen: return "Pen"
         case .eraser: return "Eraser"
         case .line: return "Line"
@@ -115,7 +114,6 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
         case .ellipse: return "Ellipse"
         case .note: return "Sticky Note"
         case .textBox: return "Text Box"
-        case .redact: return "Redact"
         case .highlight: return "Highlight"
         case .underline: return "Underline"
         case .strikeout: return "Strikethrough"
@@ -135,7 +133,6 @@ public enum AnnotationTool: String, CaseIterable, Sendable {
         case .ellipse: return "circle"
         case .note: return "note.text"
         case .textBox: return "textbox"
-        case .redact: return "rectangle.dashed"
         case .highlight: return "highlighter"
         case .underline: return "underline"
         case .strikeout: return "strikethrough"
@@ -176,25 +173,8 @@ public enum TextBoxResizeHandle: CaseIterable, Sendable {
 /// One geometry mark as the canvas overlay draws it.
 ///
 /// Coordinates are **page-local view space** (points at 100%, origin at the page's top-left),
-/// which is exactly what the sidecar stores and what the write-back path converts once. The
+/// which is exactly what the annotation cache stores and what the write-back path converts once. The
 /// canvas maps them to the view with the page's placement and the current zoom.
-/// A rectangle the reader marked for redaction, drawn while it is still pending.
-///
-/// It is deliberately not a `CanvasAnnotationMark`: nothing about it is an annotation, it cannot
-/// be selected or moved, and it is painted in the warning language (dark fill, dashed red edge)
-/// so a page with pending redactions never looks like a finished one.
-public struct CanvasRedactionMark: Identifiable, Equatable, Sendable {
-    public let id: String
-    public let page: Int
-    public let rect: CGRect
-
-    public init(id: String, page: Int, rect: CGRect) {
-        self.id = id
-        self.page = page
-        self.rect = rect
-    }
-}
-
 public struct CanvasAnnotationMark: Identifiable, Equatable, Sendable {
     public let id: String
     public let page: Int
@@ -316,6 +296,15 @@ public enum AnnotationGeometry {
     /// `zoom`. See ``eraserToleranceViewPt`` for the number and why it was chosen.
     public static func eraserReach(strokeWidth: CGFloat, zoom: CGFloat) -> CGFloat {
         strokeWidth / 2 + eraserToleranceViewPt / max(zoom, 0.01)
+    }
+
+    /// The same reach as a radius in **view** points, which is what the eraser's cursor ring
+    /// draws: the ring's circle is swept by the pointer, so its radius must be the distance on
+    /// screen within which a `strokeWidth`-wide stroke is removed. That is the page-space
+    /// ``eraserReach(strokeWidth:zoom:)`` scaled back by `zoom`, i.e. the fixed 8 view points
+    /// plus half the stroke's on-screen width: 9 pt for the default 2 pt pen at 100%.
+    public static func eraserCursorRadiusViewPt(strokeWidth: CGFloat, zoom: CGFloat) -> CGFloat {
+        eraserReach(strokeWidth: strokeWidth, zoom: zoom) * max(zoom, 0.01)
     }
 
     /// A path through `points`, smoothed with the midpoint-quadratic rule.

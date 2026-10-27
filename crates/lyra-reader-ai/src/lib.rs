@@ -11,12 +11,23 @@ pub mod citation;
 pub mod mock;
 pub mod openai;
 pub mod provider;
+pub mod sections;
 
 pub use chat::{
-    Action, CHAT_RETRIEVED_BLOCKS, ChatPart, ChatPlan, ChatSettings, ChatSource, ConversationTurn,
-    DocumentChatRequest, EndpointInfo, MAX_CHAT_CONTEXT_CHARS, MAX_CHAT_HISTORY_CHARS,
-    MAX_CHAT_HISTORY_TURNS, NOTHING_RELEVANT_MESSAGE, PageText, PlanRequest, SelectionRange,
-    SourceRect, build_document_chat_plan, inspect_base_url, validate_model,
+    Action, CHAT_RETRIEVED_BLOCKS, CONNECTION_TEST_MAX_TOKENS, CONNECTION_TEST_PROMPT, ChatImage,
+    ChatPart, ChatPlan, ChatSettings, ChatSource, ConversationTurn, DOCUMENT_KNOWLEDGE_MAX_CHARS,
+    DOCUMENT_KNOWLEDGE_RULES, DocumentChatRequest, DocumentKnowledgeInput, EndpointInfo,
+    MAX_CHAT_CONTEXT_CHARS, MAX_CHAT_HISTORY_CHARS, MAX_CHAT_HISTORY_TURNS, MAX_REGION_IMAGE_BYTES,
+    MAX_REGION_QUESTION_CHARS, MAX_REGION_TEXT_CHARS, NOTHING_RELEVANT_MESSAGE,
+    PROMPT_SYSTEM_PROMPT, PageText, PlanRequest, PromptPlanRequest, RegionQuestionRequest,
+    RegionRect, SUMMARY_ABSTRACT_MAX_CHARS, SUMMARY_ABSTRACT_MAX_PAGES,
+    SUMMARY_MAX_CONCURRENT_REQUESTS, SUMMARY_MAX_REQUESTS_PER_BATCH, SUMMARY_PAGE_MAX_CHARS,
+    SUMMARY_SECTION_MAX_CHARS, SelectionRange, SourceRect, SummaryCoverage, SummaryLayer,
+    SummaryLayerPlan, SummaryLayerRequest, SummaryUnitPlan, SummaryUnitRequest,
+    abstract_sample_page_indices, build_connection_test_plan, build_document_chat_plan,
+    build_document_knowledge_plan, build_prompt_plan, build_region_question_plan,
+    build_summary_layer, inspect_base_url, inspect_summary_layer, summary_coverage_note,
+    validate_model,
 };
 pub use citation::{CitationIndex, CitationKind, FigureEntry, RefEntry, ResolvedCitation};
 pub use mock::MockProvider;
@@ -26,7 +37,10 @@ pub use openai::{
     preview_headers, redact, redact_error, run_plan, run_plan_with_transport,
 };
 pub use provider::{
-    AiError, Capabilities, ChatMessage, ChatRequest, LlmProvider, Role, StreamSink,
+    AiError, AiFailure, Capabilities, ChatMessage, ChatRequest, LlmProvider, Role, StreamSink,
+};
+pub use sections::{
+    FALLBACK_PAGES_PER_SECTION, SummaryOutlineEntry, SummarySection, plan_summary_sections,
 };
 
 /// Image reference (a screenshot of the marquee-selected region; supplied by the render layer, M5).

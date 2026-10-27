@@ -8,7 +8,7 @@ use lyra_reader_core::{
     Result, Size,
 };
 use lyra_reader_pdfium::PdfiumBackend;
-use lyra_reader_session::{DocumentLayout, Zoom, resolve_zoom};
+use lyra_reader_session::DocumentLayout;
 use std::path::Path;
 
 /// A whole-page preview never exceeds this allocation. Deep-zoom tiles will refine it later.
@@ -120,17 +120,6 @@ pub fn bounded_raster_scale(size: Size, requested: f64) -> Result<f64> {
         ));
     }
     Ok(scale)
-}
-
-/// Shared fit-width calculation; Qt supplies viewport dimensions, not its own zoom formula.
-pub fn fit_width(page_width: f64, viewport_width: f64) -> f64 {
-    resolve_zoom(
-        Zoom::FitWidth,
-        Size::new(page_width, 1.0),
-        Size::new(viewport_width, 1.0),
-        32.0,
-    )
-    .clamp(0.1, 4.0)
 }
 
 /// Preserve a content point under the input anchor. Scroll clamping remains the host's job.

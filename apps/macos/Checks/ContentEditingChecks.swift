@@ -50,16 +50,20 @@ extension ReaderChecks {
         windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
     }
     let p = point(first)
+    state.selectContentTool("text")
     view.mouseMoved(with: event(.mouseMoved, p))
     require(view.hoveredContentID == first.id, "Edit hover identifies the complete text block")
     view.mouseDown(with: event(.leftMouseDown, p))
     view.mouseUp(with: event(.leftMouseUp, p))
     require(
       state.contentEditSelection == first.id,
-      "first click selects a block without opening the text editor")
+      "Text tool selects existing text instead of inserting a new block")
     require(
       contentTextViews(view).isEmpty,
       "selection and caret editing are distinct states")
+    state.selectContentTool("select")
+    require(state.contentEditSelection == nil, "switching tools clears the previous object selection")
+    state.contentEditSelection = first.id
     let moved = CGPoint(x: p.x + 20 * state.zoomFactor, y: p.y + 12 * state.zoomFactor)
     view.mouseDown(with: event(.leftMouseDown, p))
     view.mouseDragged(with: event(.leftMouseDragged, moved))
@@ -233,15 +237,22 @@ extension ReaderChecks {
       !state.tabs.contains(where: { $0.url == saved }), "explicit Discard closes the edited tab")
     let discardedSource = try Data(contentsOf: source)
     require(discardedSource == original, "discard never modifies the source PDF")
-    try await hostedContentEditingChecks(root: root, source: source)
+    for factor in [38.0 / 72.0, 1.0, 108.5 / 72.0] {
+      try await hostedContentEditingChecks(root: root, source: source, calibrationFactor: factor)
+    }
     print("Content editing native checks passed")
   }
 }
 
 extension ReaderChecks {
-  @MainActor static func hostedContentEditingChecks(root: URL, source: URL) async throws {
+  @MainActor static func hostedContentEditingChecks(
+    root: URL, source: URL, calibrationFactor: CGFloat
+  ) async throws {
     let state = AppState(engine: try RustEngine())
     state.sidebarVisible = false
+    // This check tests pointer/caret behavior. Drawer animation has its own regression;
+    // pin the open endpoint so the pointer target cannot move during this assertion.
+    state.transitionProgressOverride = ReaderTransitionProgress(editingPanel: 1)
     let host = NSHostingView(
       rootView: ReaderWindow(state: state, opener: DocumentOpenCoordinator(state: state)))
     let window = NSWindow(
@@ -267,6 +278,22 @@ extension ReaderChecks {
       return overlay(host) != nil && state.contentEditPage != nil && !state.canvasPageFrames.isEmpty
     }
     let view = overlay(host)!
+    state.setDisplayCalibration(DisplayCalibration(factor: calibrationFactor))
+    try await eventuallyExplaining("the hosted editor applies its viewport at scale \(calibrationFactor)", {
+      "model width \(state.canvasViewportWidthPt), view \(view.bounds), zoom \(state.zoomFactor)"
+    }, {
+      host.layoutSubtreeIfNeeded()
+      guard let clip = view.enclosingScrollView?.contentView else { return false }
+      let inspectorWidth = state.contentEditInspectorVisible
+        ? ReaderEditingPanelTransition<ContentEditInspector>.width : 0
+      let expected = host.bounds.width - ReaderChrome.scrollIndicatorLaneWidthPt - inspectorWidth
+      // The viewport is reported asynchronously. At low DPI the paragraph is centered, so
+      // calculating a click before that report produces a stale X coordinate on CI.
+      return abs(clip.bounds.width - expected) < 0.5
+        && abs(state.canvasViewportWidthPt - expected) < 0.5
+        && abs(view.bounds.width - max(expected, state.contentWidthPt * state.zoomFactor)) < 0.5
+        && !state.contentEditLoading
+    })
     guard let item = state.contentEditPage?.items.first(where: { $0.can_edit_text }),
       let placement = state.canvasPageFrames.first(where: { $0.index == 0 })
     else { fatalError("Hosted paragraph missing") }
@@ -289,6 +316,9 @@ extension ReaderChecks {
     require(state.contentEditSelection == item.id, "hosted first click selects the paragraph")
     host.layoutSubtreeIfNeeded()
     if let directory = ProcessInfo.processInfo.environment["LYRA_CONTENT_EVIDENCE"] {
+      // Wait for the secondary-row reveal and selection properties before capturing chrome.
+      try await Task.sleep(for: .milliseconds(450))
+      host.layoutSubtreeIfNeeded()
       try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
       if let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
         host.cacheDisplay(in: host.bounds, to: bitmap)

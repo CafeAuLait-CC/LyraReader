@@ -29,9 +29,12 @@ lyra-reader-text = { path = "../lyra-reader-text" }
 lyra-reader-ai = { workspace = true }
 lyra-reader-metadata = { workspace = true }
 lyra-reader-core = { workspace = true }
+lyra-reader-edit = { workspace = true }
+lyra-reader-render = { workspace = true }
 lyra-reader-session = { workspace = true }
 lyra-reader-gpu = { workspace = true }
 lyra-reader-pdfium = { workspace = true }
+lyra-reader-xfa = { workspace = true }
 # The control plane (object handles, records, errors, events) is generated, not
 # hand-written — see docs/adr/0004. `cli` pulls in the bindings generator used by the
 # `uniffi-bindgen` binary above.

@@ -1,0 +1,22 @@
+[
+  {
+    "colorIndex" : 0,
+    "createdAt" : 804000000.123456,
+    "end" : 1,
+    "fileIdentity" : "nm:escaped",
+    "id" : "0000001F-1111-4222-8333-00000000001F",
+    "kind" : "highlight",
+    "note" : "first line\nsecond line\r\nthird\ttabbed \"quoted\" backslash \\ slash \/ café 中文 😀 \u0000\u0001\u001f",
+    "page" : 0,
+    "quads" : [
+      {
+        "height" : 4.5,
+        "width" : 3,
+        "x" : 1.5,
+        "y" : 2.25
+      }
+    ],
+    "start" : 0,
+    "textAlignment" : "center"
+  }
+]

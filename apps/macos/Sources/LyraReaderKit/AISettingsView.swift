@@ -3,17 +3,22 @@ import SwiftUI
 /// Settings > AI. The read/write rules are in `AISettingsStore`; this view is only the form.
 public struct AISettingsView: View {
     @ObservedObject private var store: AISettingsStore
+    @ObservedObject private var route = AISettingsRoute.shared
+    @StateObject private var connectionTest: AIConnectionTestModel
+    @FocusState private var baseURLFocused: Bool
     @State private var baseURL = ""
     @State private var model = ""
     @State private var temperature = AISettingsStore.defaultTemperature
     @State private var maxTokens = AISettingsStore.defaultMaxTokens
     @State private var reasoningMode = AISettingsStore.defaultReasoningMode
     @State private var reasoningEncoding = AISettingsStore.defaultReasoningEncoding
+    @State private var modelAcceptsImages = AISettingsStore.defaultModelAcceptsImages
     @State private var keyDraft = ""
     @State private var savedMessage: String?
 
-    public init(store: AISettingsStore) {
+    public init(store: AISettingsStore, connectionTest: AIConnectionTestModel? = nil) {
         _store = ObservedObject(wrappedValue: store)
+        _connectionTest = StateObject(wrappedValue: connectionTest ?? AIConnectionTestModel())
     }
 
     public var body: some View {
@@ -29,8 +34,29 @@ public struct AISettingsView: View {
             Section {
                 TextField("Base URL", text: $baseURL)
                     .textFieldStyle(.roundedBorder)
+                    .focused($baseURLFocused)
                 TextField("Model", text: $model)
                     .textFieldStyle(.roundedBorder)
+                HStack(spacing: 8) {
+                    AIConnectionTestButton(isRunning: connectionTest.isRunning) {
+                        testConnection()
+                    }
+                    .fixedSize()
+                    if connectionTest.isRunning {
+                        ProgressView()
+                            .controlSize(.small)
+                        Button("Cancel") { connectionTest.cancel() }
+                            .help("Stops the connection test and closes the request")
+                    }
+                    Spacer()
+                }
+                if let text = connectionTest.statusText {
+                    Text(text)
+                        .font(.caption)
+                        .foregroundStyle(connectionTestStatusColor)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
                 Text("Examples: https://api.openai.com/v1, https://api.deepseek.com/v1, or http://localhost:11434/v1 for Ollama. LyraReader appends /chat/completions; do not include it here.")
                     .font(.caption)
                     .foregroundStyle(LyraReaderTheme.textSecondary)
@@ -78,6 +104,23 @@ public struct AISettingsView: View {
                 Text("API key")
             } footer: {
                 Text("The key is stored only in the macOS Keychain. It is never written to UserDefaults, a file, the request preview, or a log. LyraReader reads it only when you press Send in the AI panel.")
+                    .font(.caption)
+                    .foregroundStyle(LyraReaderTheme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Section {
+                Toggle("Model accepts image input (vision)", isOn: $modelAcceptsImages)
+                Text(modelAcceptsImages
+                     ? "Region questions send the selected rectangle as a PNG, plus its extracted text. The preview names the pixel size before you send."
+                     : "Text-only configuration: region questions send the extracted text only. The picture is captured for the preview and the knowledge export, but it is not sent to the model.")
+                    .font(.caption)
+                    .foregroundStyle(LyraReaderTheme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } header: {
+                Text("Region pictures")
+            } footer: {
+                Text("LyraReader never guesses from the model name. Leave this off for a text-only model; turn it on only when the provider documents image input for the model above.")
                     .font(.caption)
                     .foregroundStyle(LyraReaderTheme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -149,9 +192,43 @@ public struct AISettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .onAppear(perform: load)
+        .onAppear {
+            load()
+            focusBaseURLIfRequested()
+        }
+        .onChange(of: route.pendingBaseURLFocus) { _, pending in
+            if pending { focusBaseURLIfRequested() }
+        }
+        .onChange(of: store.connectionMode) { _, mode in
+            // A test for the previous connection mode must not keep running under another form.
+            if mode != .apiKey { connectionTest.cancel() }
+        }
+        .onDisappear {
+            // Closing Settings (or leaving the AI tab) cancels the worker and drops its handle.
+            connectionTest.cancel()
+        }
         .task(id: store.connectionMode) {
             if store.connectionMode == .chatGPT { await store.chatGPT.loadModels() }
+        }
+    }
+
+    private var connectionTestStatusColor: Color {
+        if connectionTest.isSuccess {
+            return LyraReaderTheme.successFg
+        }
+        if case .failure = connectionTest.status {
+            return LyraReaderTheme.errorFg
+        }
+        return LyraReaderTheme.textSecondary
+    }
+
+    /// Consume a request from the offline hint. The field takes focus after the tab has been
+    /// installed, so the reader can type a local URL immediately.
+    private func focusBaseURLIfRequested() {
+        guard route.pendingBaseURLFocus else { return }
+        route.consumeBaseURLFocus()
+        Task { @MainActor in
+            baseURLFocused = true
         }
     }
 
@@ -162,6 +239,7 @@ public struct AISettingsView: View {
         maxTokens = store.maxTokens
         reasoningMode = store.reasoningMode
         reasoningEncoding = store.reasoningEncoding
+        modelAcceptsImages = store.modelAcceptsImages
         keyDraft = ""
         savedMessage = nil
     }
@@ -173,8 +251,27 @@ public struct AISettingsView: View {
             temperature: temperature,
             maxTokens: maxTokens,
             reasoningMode: reasoningMode,
-            reasoningEncoding: reasoningEncoding
+            reasoningEncoding: reasoningEncoding,
+            vision: modelAcceptsImages
         )
+    }
+
+    /// Test the endpoint/model currently in the form, with a key typed here or the stored key.
+    /// The key is read only for this call; neither the model nor this view retains it.
+    private func testConnection() {
+        let typedKey = keyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key: String
+        if typedKey.isEmpty {
+            do {
+                key = try store.readKey() ?? ""
+            } catch {
+                connectionTest.reportFailure(AIReadableError.message(error))
+                return
+            }
+        } else {
+            key = typedKey
+        }
+        connectionTest.start(settings: previewSettings, apiKey: key)
     }
 
     private func save() {
@@ -185,7 +282,8 @@ public struct AISettingsView: View {
             maxTokens: maxTokens,
             apiKey: keyDraft,
             reasoningMode: reasoningMode,
-            reasoningEncoding: reasoningEncoding
+            reasoningEncoding: reasoningEncoding,
+            modelAcceptsImages: modelAcceptsImages
         )
         if succeeded {
             keyDraft = ""

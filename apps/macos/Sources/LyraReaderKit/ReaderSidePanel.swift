@@ -78,19 +78,20 @@ public enum ReaderSidePanelPreferences {
     }
 }
 
-/// Keyboard shortcuts the right panel introduces. The keymap on the Rust side already reserves
-/// ⇧⌘A for `CommandId::AiPanel`; the native command uses the same chord so the two agree.
+/// Keyboard shortcuts the right panel introduces.
+///
+/// ⇧⌘A is also registered by `ReaderCommands` in the app target and by the toolbar's Lyra
+/// button, so the menu, the toolbar and this constant agree.
 ///
 /// The other two-panel chords were checked before choosing it: ⌥⌘I is Document Information,
-/// ⌥⌘S is Toggle Sidebar, and the app's ⌘-number / ⌘[⌘] / ⌘⇧R / ⌥⌘R bindings are taken. ⇧⌘A is
-/// unused by the native menu and is the documented AI-panel binding in `lyra-reader-session`.
+/// ⌥⌘S is Toggle Sidebar, and the app's ⌘-number / ⌘[ / ⌘] bindings are taken.
 public enum ReaderShortcuts {
-    public static let toggleAIPanelLabel = "Toggle AI Assistant"
+    public static let toggleAIPanelLabel = "Toggle Lyra Tools"
     public static let toggleAIPanelKey: KeyEquivalent = "a"
     public static let toggleAIPanelModifiers: EventModifiers = [.command, .shift]
 }
 
-/// The right-hand panel as a sliding drawer whose width also changes the canvas.
+/// A sliding right-hand column beside the reader canvas.
 ///
 /// It is deliberately generic: the AI assistant is its first tenant, but the host knows nothing
 /// about the assistant's model, its settings or its request state. The content is laid out once
@@ -100,8 +101,7 @@ public enum ReaderShortcuts {
 /// * the panel's own content keeps its geometry for the whole transition (no per-frame reflow of
 ///   the action grid, preview or answer);
 /// * the separator travels with the content's leading edge while the panel is partly open;
-/// * the canvas gets the freed width frame by frame, so the page's vertical position never
-///   changes;
+/// * the canvas keeps its width and drawable for the entire transition;
 /// * at zero width the panel is still in the hierarchy (an answer is not lost by closing it), but
 ///   it is clipped out and takes no pointer or accessibility input.
 ///
@@ -113,6 +113,9 @@ public struct ReaderSidePanel<Content: View>: View {
     private let contentWidth: CGFloat
     private let progressOverride: Double?
     private let accessibilityLabel: String
+    /// The resize handle is part of the same host, so its spoken label names the tenant that is
+    /// actually open (the assistant by default; the performance panel overrides it).
+    private let resizeAccessibilityLabel: String
     private let onResizeBegan: () -> Void
     private let onResize: (CGFloat) -> Void
     private let onResizeEnded: () -> Void
@@ -126,6 +129,7 @@ public struct ReaderSidePanel<Content: View>: View {
         contentWidth: CGFloat,
         progressOverride: Double? = nil,
         accessibilityLabel: String = "Side panel",
+        resizeAccessibilityLabel: String = "Resize assistant panel",
         onResizeBegan: @escaping () -> Void = {},
         onResize: @escaping (CGFloat) -> Void,
         onResizeEnded: @escaping () -> Void = {},
@@ -135,6 +139,7 @@ public struct ReaderSidePanel<Content: View>: View {
         self.contentWidth = ReaderSidePanelMetrics.clampedContentWidth(contentWidth)
         self.progressOverride = progressOverride
         self.accessibilityLabel = accessibilityLabel
+        self.resizeAccessibilityLabel = resizeAccessibilityLabel
         self.onResizeBegan = onResizeBegan
         self.onResize = onResize
         self.onResizeEnded = onResizeEnded
@@ -165,6 +170,8 @@ public struct ReaderSidePanel<Content: View>: View {
         // Leading alignment is the mirror of the left drawer: as the frame closes, the content
         // stays anchored to the inner edge and slides out past the window's trailing edge.
         .frame(width: totalWidth * progress, alignment: .leading)
+        .background(LyraReaderTheme.panelBg)
+        .background(ReaderSidePanelMarkerHost())
         .clipped()
         .allowsHitTesting(isVisible || progressOverride != nil)
         .accessibilityElement(children: .contain)
@@ -208,7 +215,7 @@ public struct ReaderSidePanel<Content: View>: View {
                     }
             )
             .accessibilityElement()
-            .accessibilityLabel("Resize assistant panel")
+            .accessibilityLabel(resizeAccessibilityLabel)
             .accessibilityValue("\(Int(contentWidth.rounded())) points")
             .accessibilityAdjustableAction { direction in
                 onResizeBegan()
@@ -224,4 +231,11 @@ public struct ReaderSidePanel<Content: View>: View {
                 onResizeEnded()
             }
     }
+}
+
+/// Measures the actual drawer, independently of the underlying canvas geometry.
+public final class ReaderSidePanelMarkerView: NSView {}
+private struct ReaderSidePanelMarkerHost: NSViewRepresentable {
+    func makeNSView(context: Context) -> ReaderSidePanelMarkerView { ReaderSidePanelMarkerView() }
+    func updateNSView(_ nsView: ReaderSidePanelMarkerView, context: Context) {}
 }

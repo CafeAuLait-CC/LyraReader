@@ -231,14 +231,6 @@ pub unsafe extern "C" fn lyra_reader_desktop_buffer_free(buffer: Buffer) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn lyra_reader_desktop_fit_width(page_width: f64, viewport_width: f64) -> f64 {
-    if !page_width.is_finite() || !viewport_width.is_finite() {
-        return 1.0;
-    }
-    lyra_reader_runtime::fit_width(page_width, viewport_width)
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_desktop_zoom_offset(
     offset: f64,
     anchor: f64,

@@ -245,7 +245,6 @@ impl DesktopDocument {
                         payload.bookmarks,
                         payload.updates,
                         payload.deletions,
-                        1.0,
                     )
                 } else {
                     d.replace_with_annotation_changes(
@@ -253,7 +252,6 @@ impl DesktopDocument {
                         payload.bookmarks,
                         payload.updates,
                         payload.deletions,
-                        1.0,
                     )
                 }
                 .map_err(|e| e.to_string())?;
@@ -334,14 +332,12 @@ impl DesktopDocument {
                 arg(&r, "bookmarks")?,
                 arg(&r, "updates")?,
                 arg(&r, "deletions")?,
-                1.0,
             )),
             "replace_annotations" => value(d.replace_with_annotation_changes(
                 arg(&r, "annotations")?,
                 arg(&r, "bookmarks")?,
                 arg(&r, "updates")?,
                 arg(&r, "deletions")?,
-                1.0,
             )),
             "save_forms" => {
                 value(d.save_filled_form_copy(text(&r, "destination")?, arg(&r, "values")?))
@@ -366,13 +362,17 @@ impl DesktopDocument {
             }
             "save_edited_copy" => value(d.save_edited_copy(text(&r, "destination")?)),
             "replace_edited_pages" => value(d.replace_with_edited_pages(text(&r, "original")?)),
-            "preview_redactions" => value(d.preview_redactions(arg(&r, "areas")?)),
-            "save_redactions" => {
-                value(d.redact_to_copy(text(&r, "destination")?, arg(&r, "areas")?))
-            }
-            "replace_redactions" => value(d.replace_with_redactions(arg(&r, "areas")?)),
-            "ai_preview" => value(d.prepare_ai_plan(arg(&r, "request")?)),
-            "ai_merge_preview" => value(build_ai_merge_plan(arg(&r, "request")?)),
+            "preview_redactions" | "save_redactions" | "replace_redactions" => Err(
+                "Annotation redaction has been retired. The content editor's Blackout and Erase tools are not connected in this Linux build yet.".into(),
+            ),
+            "ai_preview" => value(
+                d.prepare_ai_plan(arg(&r, "request")?)
+                    .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),
+            ),
+            "ai_merge_preview" => value(
+                build_ai_merge_plan(arg(&r, "request")?)
+                    .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),
+            ),
             "ai_endpoint" => value(inspect_ai_base_url(text(&r, "base_url")?)),
             "ai_start" => {
                 let request = start_ai_request(arg(&r, "plan")?, text(&r, "api_key")?, false)

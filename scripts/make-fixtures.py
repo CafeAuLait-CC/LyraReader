@@ -24,6 +24,7 @@ PDF objects and a correct cross-reference table are emitted by hand.
 from __future__ import annotations
 
 import hashlib
+import math
 import struct
 import sys
 import zlib
@@ -52,6 +53,7 @@ def build_pdf(
     catalog_extra: bytes = b"",
     font_object: bytes | None = None,
     page_resources_extra: bytes = b"",
+    page_sizes: list[tuple[float, float]] | None = None,
 ) -> bytes:
     """Assemble a PDF from (content_stream, rotation_degrees) pairs.
 
@@ -80,6 +82,9 @@ def build_pdf(
     `font_object` replaces the default Helvetica dictionary (object 3), and
     `page_resources_extra` is appended verbatim to every page's `/Resources` dictionary.
     Both default to the old output, so only the text-edit fixture uses them.
+
+    `page_sizes` gives each page its own `/MediaBox`; the default is A4 for every page, so a
+    file that does not pass it stays byte-for-byte what this generator always wrote.
     """
     annotations = annotations or {}
     extra_objects = extra_objects or []
@@ -117,6 +122,8 @@ def build_pdf(
         )
     )
 
+    if page_sizes is not None and len(page_sizes) != len(pages):
+        raise ValueError("page_sizes must name exactly one size per page")
     for index, (content, rotation) in enumerate(pages):
         content_id = page_object_ids[index] + 1
         rotate = f" /Rotate {rotation}" if rotation else ""
@@ -124,10 +131,15 @@ def build_pdf(
         if annot_ids[index]:
             refs = " ".join(f"{aid} 0 R" for aid in annot_ids[index])
             annots = f" /Annots [{refs}]"
+        if page_sizes is None:
+            media_box = f"{A4_WIDTH} {A4_HEIGHT}"
+        else:
+            width, height = page_sizes[index]
+            media_box = f"{width:g} {height:g}"
         objects.append(
             (
                 f"<< /Type /Page /Parent 2 0 R "
-                f"/MediaBox [0 0 {A4_WIDTH} {A4_HEIGHT}] "
+                f"/MediaBox [0 0 {media_box}] "
                 f"/Resources << /Font << /F1 3 0 R >>{page_resources_extra.decode('latin-1')} >> "
                 f"/Contents {content_id} 0 R{rotate}{annots} >>"
             ).encode("ascii")
@@ -1610,6 +1622,34 @@ def text_page(title: str, subtitle: str, body_lines: list[str]) -> str:
     return "\n".join(parts)
 
 
+def print_paper_probe_page(label: str, width: float, height: float) -> str:
+    """A page whose geometry makes mixed-paper printing observable.
+
+    A red square sits at the top-left, a blue square at the bottom-right and a green diagonal
+    runs between them. If a page is rotated, cropped, or printed on another page's paper, those
+    marks land in the wrong place (or disappear); `PrintingChecks` samples them on the rendered
+    300 dpi bitmap. The label is at the top so a page printed upside-down is obvious too.
+    """
+    margin = 24
+    square = 48
+    return "\n".join(
+        [
+            "1 0 0 rg",
+            f"{margin} {height - margin - square} {square} {square} re f",
+            "0 0 1 rg",
+            f"{width - margin - square} {margin} {square} {square} re f",
+            "0 0.55 0 RG 5 w",
+            f"{margin + square} {height - margin - square} m "
+            f"{width - margin - square} {margin + square} l S",
+            "0 0 0 rg",
+            f"BT /F1 22 Tf {margin + 8} {height - 120} Td "
+            f"({escape_pdf_string(label)}) Tj ET",
+            f"BT /F1 12 Tf {margin + 8} {height - 144} Td "
+            f"({width:g} x {height:g} pt) Tj ET",
+        ]
+    )
+
+
 def numbered_margin_page() -> str:
     """A page with a real line-number gutter and body text that wraps.
 
@@ -2075,6 +2115,63 @@ def text_edit_pdf() -> bytes:
     )
 
 
+def form_text_pages_pdf() -> bytes:
+    """Two pages: page one has text inside a shared Form XObject, page two is ordinary.
+
+    Removing text that lives inside a form XObject forces the redaction writer to replace the
+    whole page with a raster image, because its glyphs cannot be attributed to a page-level
+    content operator. Page two exists so the check can prove the fallback stops at the page the
+    redaction names: it keeps its ordinary, selectable text layer.
+    """
+    page_count = 2
+    form_id = first_extra_object_id(page_count, 0)
+    tounicode_id = form_id + 1
+    widths = " ".join("500" for _ in range(32, 127))
+    font = (
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+        b"/FirstChar 32 /LastChar 126 /Widths [" + widths.encode("ascii") + b"] "
+        b"/Encoding /WinAnsiEncoding /ToUnicode "
+        + str(tounicode_id).encode("ascii") + b" 0 R >>"
+    )
+    form_content = b"BT /F1 12 Tf 0 0 Td (In shared form) Tj ET"
+    form = (
+        b"<< /Type /XObject /Subtype /Form /BBox [0 0 240 40] "
+        b"/Resources << /Font << /F1 3 0 R >> >> /Length "
+        + str(len(form_content)).encode("ascii")
+        + b" >>\nstream\n" + form_content + b"\nendstream"
+    )
+    cmap = (
+        b"/CIDInit /ProcSet findresource begin\n"
+        b"12 dict begin\nbegincmap\n"
+        b"/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n"
+        b"/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n"
+        b"1 begincodespacerange\n<00> <FF>\nendcodespacerange\n"
+        b"1 beginbfrange\n<20> <7E> <0020>\nendbfrange\n"
+        b"endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n"
+    )
+    tounicode = (
+        b"<< /Length " + str(len(cmap)).encode("ascii") + b" >>\nstream\n"
+        + cmap + b"\nendstream"
+    )
+    first_page = text_page(
+        "Shared form",
+        "page one draws one Form XObject twice",
+        ["Ordinary page-one text stays selectable until the fallback."],
+    )
+    first_page += "\nq 1 0 0 1 72 520 cm /Fm1 Do Q\nq 1 0 0 1 72 470 cm /Fm1 Do Q"
+    second_page = text_page(
+        "Untouched page",
+        "ordinary page-level text on page two",
+        ["Page two keeps its selectable text."],
+    )
+    return build_pdf(
+        [(first_page, 0), (second_page, 0)],
+        extra_objects=[form, tounicode],
+        font_object=font,
+        page_resources_extra=f" /XObject << /Fm1 {form_id} 0 R >>".encode("ascii"),
+    )
+
+
 def narrative_citation_pdf() -> bytes:
     """A year-only internal link must open the complete author-year entry as text."""
     body = text_page("Narrative citations", "author names outside the year parentheses", [
@@ -2134,6 +2231,253 @@ def booktabs_bounds_pdf() -> bytes:
         annotation("Link", body_line_box(1, 200), extra="/Border [0 0 0] /Dest [8 0 R /Fit]"),
         annotation("Link", body_line_box(2, 200), extra="/Border [0 0 0] /Dest [6 0 R /Fit]"),
     ]})
+
+
+# ── Flatten fixture ──────────────────────────────────────────────────────────
+#
+# One page carrying every annot/field kind "Export as Flattened Copy" must bake: a highlight
+# with an appearance stream, an ink stroke, a text box, a text stamp, an image signature with a
+# soft mask, a line with an arrowhead, and a filled text widget. Every annotation carries an
+# /AP, so the before/after render can be compared pixel for pixel; the AP-less synthesis path
+# is exercised against `annotated-inline-notes.pdf`, whose markup is what PDFium writes. It is
+# deliberately small and hand-written so the check can name every object it expects to
+# disappear.
+
+
+def flatten_image_data(width: int, height: int) -> tuple[bytes, bytes]:
+    """RGB samples and a grayscale /SMask for a blue signature squiggle on transparency."""
+    rgb = bytearray(width * height * 3)
+    alpha = bytearray(width * height)
+    for x in range(width):
+        y = height // 2 + int(7 * math.sin(x / 5.5))
+        for offset in (-1, 0, 1):
+            row = y + offset
+            if 0 <= row < height:
+                index = row * width + x
+                rgb[index * 3 : index * 3 + 3] = b"\x1f\x4b\xc8"
+                alpha[index] = 255
+    return zlib.compress(bytes(rgb)), zlib.compress(bytes(alpha))
+
+
+def flatten_ap_text(
+    width: float,
+    height: float,
+    text: str,
+    *,
+    size: int = 12,
+    border: bool = True,
+    fill: str = "1 1 1",
+    border_colour: str = "0.4 0.4 0.4",
+) -> bytes:
+    parts = ["q", f"{fill} rg"]
+    if border:
+        parts += [f"{border_colour} RG", "0.8 w", f"0.4 0.4 {width - 0.8:g} {height - 0.8:g} re B"]
+    parts += ["0 0 0 rg", f"BT /Helv {size:g} Tf 6 {max(4.0, height / 2 - size / 2):g} Td "
+              f"({escape_pdf_string(text)}) Tj ET", "Q"]
+    stream = ("\n".join(parts) + "\n").encode("cp1252")
+    return (
+        b"<< /Type /XObject /Subtype /Form /FormType 1 "
+        + f"/BBox [0 0 {width:g} {height:g}] ".encode("ascii")
+        + b"/Resources << /Font << /Helv 3 0 R >> >> /Length "
+        + str(len(stream)).encode("ascii")
+        + b" >>\nstream\n"
+        + stream
+        + b"\nendstream"
+    )
+
+
+def flatten_fixture() -> bytes:
+    body = [
+        "The quick brown fox jumps over the lazy dog.",
+        "A second line carries selectable text for marking up.",
+        "A third line leaves room for the form field below.",
+    ]
+    content = text_page(
+        "LyraReader flatten fixture",
+        "annotations and a filled form field, baked into the page",
+        body,
+    )
+    content += "\n" + "\n".join(
+        [
+            "BT /F1 9 Tf 72 570 Td (Full name) Tj ET",
+            "BT /F1 9 Tf 72 366 Td (Text box and stamps are annotations) Tj ET",
+        ]
+    )
+
+    # Ids: page 4, content 5, annotations 6..13, extras 14..24.
+    rgb, alpha = flatten_image_data(64, 24)
+    image_xobject = (
+        b"<< /Type /XObject /Subtype /Image /Width 64 /Height 24 "
+        b"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode "
+        b"/SMask 20 0 R /Length "
+        + str(len(rgb)).encode("ascii")
+        + b" >>\nstream\n"
+        + rgb
+        + b"\nendstream"
+    )
+    smask = (
+        b"<< /Type /XObject /Subtype /Image /Width 64 /Height 24 "
+        b"/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /Length "
+        + str(len(alpha)).encode("ascii")
+        + b" >>\nstream\n"
+        + alpha
+        + b"\nendstream"
+    )
+    image_ap_content = ("q 200 0 0 70 0 0 cm /Im0 Do Q\n").encode("ascii")
+    image_ap = (
+        b"<< /Type /XObject /Subtype /Form /FormType 1 /BBox [0 0 200 70] "
+        b"/Resources << /XObject << /Im0 19 0 R >> >> /Length "
+        + str(len(image_ap_content)).encode("ascii")
+        + b" >>\nstream\n"
+        + image_ap_content
+        + b"endstream"
+    )
+
+    highlight_box = body_line_box(0, 460)
+    ink_box = (80.0, 420.0, 250.0, 500.0)
+    free_text_box = (72.0, 300.0, 320.0, 350.0)
+    text_stamp_box = (350.0, 300.0, 530.0, 350.0)
+    image_signature_box = (330.0, 380.0, 530.0, 450.0)
+    line_box = (70.0, 230.0, 260.0, 290.0)
+    field_box = (72.0, 560.0, 300.0, 586.0)
+
+    annotations = [
+        annotation(
+            "Highlight",
+            highlight_box,
+            extra=(
+                f"/QuadPoints {quad_points([highlight_box])} /C [1 0.95 0] /CA 0.6 "
+                "/AP << /N 13 0 R >>"
+            ),
+            contents="A highlight drawn by its appearance stream.",
+            author="Reviewer A",
+        ),
+        annotation(
+            "Ink",
+            ink_box,
+            extra=(
+                "/C [0.1 0.5 0.3] /CA 0.9 /BS << /W 3 /S /S >> "
+                "/InkList [[90 430 120 480 170 440 235 495]] /AP << /N 15 0 R >>"
+            ),
+            contents="An ink stroke drawn by its appearance stream.",
+            author="Reviewer A",
+        ),
+        annotation(
+            "FreeText",
+            free_text_box,
+            extra=(
+                "/DA (/Helv 11 Tf 0 g) /Q 0 /Contents "
+                "(Text box: baked into the page) /AP << /N 16 0 R >>"
+            ),
+            contents="Text box: baked into the page",
+            author="Reviewer C",
+        ),
+        annotation(
+            "Stamp",
+            text_stamp_box,
+            extra="/Name /Approved /AP << /N 17 0 R >>",
+            contents="APPROVED",
+            author="Reviewer C",
+        ),
+        annotation(
+            "Stamp",
+            image_signature_box,
+            extra="/Name /Signature /AP << /N 18 0 R >>",
+            contents="Image signature",
+            author="Reviewer A",
+        ),
+        annotation(
+            "Line",
+            line_box,
+            extra=(
+                "/C [0.6 0.2 0.7] /CA 1 /L [80 240 250 280] /LE [/None /ClosedArrow] "
+                "/BS << /W 2 /S /S >> /AP << /N 21 0 R >>"
+            ),
+            contents="A line with an arrowhead.",
+            author="Reviewer B",
+        ),
+        # The widget is a page annotation too. Its /AP is the value the reader draws.
+        (
+            f"<< /Type /Annot /Subtype /Widget /T (fullName) /P 4 0 R /F 4 "
+            f"/FT /Tx /Rect [{field_box[0]:g} {field_box[1]:g} {field_box[2]:g} {field_box[3]:g}] "
+            f"/V (Ada Lovelace) /DA (/Helv 11 Tf 0 g) /AP << /N 22 0 R >> >>"
+        ).encode("ascii"),
+    ]
+
+    extras = [
+        # 13: highlight appearance, 14: its multiply ExtGState.
+        appearance_stream(highlight_box, [highlight_box], colour=(1, 0.95, 0), extgstate_id=14),
+        extgstate("Multiply", 0.6),
+        # 15: ink appearance.
+        stroke_appearance(
+            ink_box,
+            "0.1 0.5 0.3 RG 3 w 1 J 1 j 90 430 m 120 480 l 170 440 l 235 495 l S",
+        ),
+        # 16: text box appearance.
+        flatten_ap_text(248, 50, "Text box: baked into the page", size=11),
+        # 17: text stamp appearance.
+        flatten_ap_text(
+            180,
+            50,
+            "APPROVED",
+            size=18,
+            fill="0.92 0.97 0.92",
+            border_colour="0.1 0.5 0.2",
+        ),
+        # 18: image-signature appearance, 19: its image, 20: its /SMask.
+        image_ap,
+        image_xobject,
+        smask,
+        # 21: line appearance (the arrowhead is drawn explicitly).
+        stroke_appearance(
+            line_box,
+            "0.6 0.2 0.7 RG 2 w 1 J 1 j 80 240 m 250 280 l S "
+            "0.6 0.2 0.7 rg 250 280 m 237.4 281.1 l 239.2 273.4 l h f",
+        ),
+        # 22: widget appearance.
+        form_ap_text(228, 26, "Ada Lovelace"),
+        # 23: AcroForm.
+        (
+            "<< /Fields [12 0 R] /DA (/Helv 11 Tf 0 g) "
+            "/DR << /Font << /Helv 3 0 R >> >> /NeedAppearances false >>"
+        ).encode("ascii"),
+    ]
+
+    return build_pdf(
+        [(content, 0)],
+        {0: annotations},
+        extras,
+        info={"Title": "Flatten fixture", "Author": "LyraReader"},
+        catalog_extra=b" /AcroForm 23 0 R",
+    )
+
+
+def xfa_refusal_fixture() -> bytes:
+    """A minimal structurally-detected XFA form.
+
+    Detection is `/AcroForm /XFA`, not a blank page, so this file is enough to exercise the
+    reader's XFA refusal without shipping a real (and copyright-bearing) XFA form. The packet
+    is deliberately tiny; the XFA reader may not render it, and the refusal must still name XFA.
+    """
+    template = (
+        b'<?xml version="1.0" encoding="UTF-8"?>'
+        b'<xfa:template xmlns:xfa="http://www.xfa.org/schema/xfa-template/3.3/">'
+        b'<xfa:subform name="form"/></xfa:template>'
+    )
+    acro_form = (
+        b"<< /Fields [] /XFA [(template) 7 0 R] /NeedAppearances false >>"
+    )
+    template_stream = (
+        b"<< /Length " + str(len(template)).encode("ascii") + b" >>\nstream\n"
+        + template + b"\nendstream"
+    )
+    return build_pdf(
+        [(text_page("XFA refusal fixture", "a structurally detected XFA form",
+                    ["This file exists only to prove the flatten refusal."]), 0)],
+        extra_objects=[acro_form, template_stream],
+        catalog_extra=b" /AcroForm 6 0 R",
+    )
+
 
 
 def main() -> int:
@@ -2297,9 +2641,40 @@ def main() -> int:
         path.write_bytes(build_pdf(pages))
         print(f"  {path}  ({path.stat().st_size} bytes, {len(pages)} page(s))")
 
+    # 13) Mixed paper sizes: A4, US Letter and a page just inside A4's tolerance but smaller
+    #     than the stock, plus a landscape Letter page. Printing must choose paper per page,
+    #     never the first page's size; the red/blue/green probes make rotation and cropping
+    #     visible to the headless print check.
+    mixed_pages = [
+        (print_paper_probe_page("A4 portrait", 595, 842), 0),
+        (print_paper_probe_page("US Letter", 612, 792), 0),
+        (print_paper_probe_page("A4 again", 595, 842), 0),
+        (print_paper_probe_page("Small A4-ish", 590, 835), 0),
+        (print_paper_probe_page("Letter landscape", 792, 612), 0),
+        (print_paper_probe_page("Custom 300 x 400", 300, 400), 0),
+    ]
+    mixed_sizes = [
+        (595, 842),
+        (612, 792),
+        (595, 842),
+        (590, 835),
+        (792, 612),
+        (300, 400),
+    ]
+    path = out_dir / "mixed-paper.pdf"
+    path.write_bytes(build_pdf(mixed_pages, page_sizes=mixed_sizes))
+    print(
+        f"  {path}  ({path.stat().st_size} bytes, 6 pages,"
+        " A4 + US Letter + landscape + custom)"
+    )
+
     path = out_dir / "text-edit.pdf"
     path.write_bytes(text_edit_pdf())
     print(f"  {path}  ({path.stat().st_size} bytes, text-edit analysis shapes)")
+
+    path = out_dir / "form-text-pages.pdf"
+    path.write_bytes(form_text_pages_pdf())
+    print(f"  {path}  ({path.stat().st_size} bytes, 2 pages, shared-form text)")
 
     path = out_dir / "narrative-citation.pdf"
     path.write_bytes(narrative_citation_pdf())
@@ -2850,6 +3225,17 @@ def main() -> int:
     print(
         f"  {path}  ({path.stat().st_size} bytes, 1 page, 1 annotation, 1 embedded file)"
     )
+
+    # 10e) Flatten: every annotation kind and a filled widget on one page. The output of
+    # "Export as Flattened Copy" is checked against this file: no annotations, no AcroForm,
+    # the same page, the same text layer and a visually identical render.
+    path = out_dir / "flatten.pdf"
+    path.write_bytes(flatten_fixture())
+    print(f"  {path}  ({path.stat().st_size} bytes, 1 page, 6 annotations, 1 field)")
+
+    path = out_dir / "xfa-refusal.pdf"
+    path.write_bytes(xfa_refusal_fixture())
+    print(f"  {path}  ({path.stat().st_size} bytes, 1 page, /AcroForm /XFA)")
 
     if long_pages > 0:
         pages = long_document(long_pages)

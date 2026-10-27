@@ -22,8 +22,19 @@ lyra-reader-session = { path = "crates/lyra-reader-session" }
 lyra-reader-ai      = { path = "crates/lyra-reader-ai" }
 lyra-reader-ffi     = { path = "crates/lyra-reader-ffi" }
 lyra-reader-metadata = { path = "crates/lyra-reader-metadata" }
+lyra-reader-xfa     = { path = "crates/lyra-reader-xfa" }
 
 # ── External dependencies (from M1; versions in docs/09-dev-setup.md) ─────────
+# Extended grapheme clusters (UAX #29). The pre-refactor Swift enrichment used
+# `String.prefix(16_000)`/`String.count`, whose unit is a `Character`; `str::chars()` is a
+# Unicode scalar and cuts NFD accents, ZWJ emoji and flags early. MIT OR Apache-2.0, so it
+# satisfies the ADR-0005 permissive-dependency whitelist.
+#
+# Pinned to the Unicode 16.0 tables: grapheme-break data is behavior, not API. Swift 6.2.4 on
+# macOS 15.7 uses Unicode 16 (it groups U+0897 but not U+1ACF, both new combining marks), and
+# 1.13's Unicode 17 tables grouped text Swift still splits. Re-run the native
+# `--check-ai-plan-unicode` cases before changing this pin.
+unicode-segmentation = "=1.12.0"
 # wgpu          = "30"          # GPU abstraction (Metal / Vulkan / DX12)
 # pdfium-render = "0.9"         # Safe PDFium wrapper (feature = "thread_safe")
 # tokio         = "1"           # AI/async (M5)

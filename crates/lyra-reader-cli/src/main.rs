@@ -19,6 +19,7 @@
 //! lyra-reader-cli tables <file.pdf>... [--pages N] [--all]
 //! lyra-reader-cli metadata <file.pdf> [--bibtex]
 //! lyra-reader-cli eval [--body-pages N] [--save-baseline FILE] [--compare FILE]
+//! lyra-reader-cli ai probe --base-url URL --model MODEL --prompt TEXT [options]
 //! ```
 
 use lyra_reader_core::Rect;
@@ -32,8 +33,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+mod ai;
 mod bench;
 mod eval;
+mod xfa;
 
 const USAGE: &str = "\
 lyra-reader-cli — LyraReader headless tool
@@ -61,8 +64,17 @@ Usage:
                  [--save-baseline FILE]          and/or LYRA_READER_EVAL_PAPERS): citations detected
                  [--compare FILE]                vs resolved, captions that do not close, and table
                                                  grid regions; writes versioned JSON baselines
+  lyra-reader-cli ai probe --base-url URL        manual real-endpoint check: stream one plain
+                 --model MODEL --prompt TEXT     prompt (and optionally one PNG) through the same
+                 [--api-key KEY] [--image P.png] request builder, transport and SSE parser the
+                 [--max-tokens N] [--stream]     app uses. It sends your prompt and picture to the
+                 [--no-stream] [--yes-remote]    endpoint you name; never run it from tests or CI.
+                                                 It refuses a non-loopback host unless --yes-remote
+                                                 is passed. Run `ai probe --help` for details.
   lyra-reader-cli corpus <dir|files...>          what the engine sees in real PDFs
                  [--search TERM] [--pages N]
+  lyra-reader-cli xfa <file.pdf> --out <dir>  decrypt the XFA packets, write them to <dir>,
+                                                 and print the template/page/dataset structure
   lyra-reader-cli render <file.pdf>              render one page to PNG
                  [--page N] [--dpi D] [-o out.png]
   lyra-reader-cli compare <a.png> <b.png>        compare two renders (mean abs diff, PSNR)
@@ -144,6 +156,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("info") => cmd_info(rest(&args)),
+        Some("xfa") => xfa::run(rest(&args)),
         Some("render") => cmd_render(rest(&args)),
         Some("compare") => cmd_compare(rest(&args)),
         Some("text") => cmd_text(rest(&args)),
@@ -160,6 +173,7 @@ fn main() -> ExitCode {
         Some("tables") => cmd_tables(rest(&args)),
         Some("metadata") => cmd_metadata(rest(&args)),
         Some("eval") => eval::run(rest(&args)),
+        Some("ai") => ai::run(rest(&args)),
         Some(other) => {
             eprintln!("unknown subcommand: {other}\n");
             println!("{USAGE}");
@@ -195,6 +209,9 @@ pub(crate) fn parse(args: &[String]) -> (Vec<String>, Vec<(String, String)>) {
                 | "--json"
                 | "--all"
                 | "--include-tj-adjustments"
+                | "--stream"
+                | "--no-stream"
+                | "--yes-remote"
         ) {
             options.push((arg.clone(), String::new()));
             index += 1;
@@ -236,6 +253,28 @@ fn page_scan_end(total: u32, cap: u32) -> u32 {
 
 /// Opens a document, reporting the engine error (with its detail) on failure.
 fn open_document(path: &str) -> Result<PdfiumBackend, ExitCode> {
+    match lyra_reader_xfa::prepare(Path::new(path), None) {
+        Ok(Some(prepared)) => {
+            if let Some(bytes) = prepared.pdf {
+                return PdfiumBackend::open_bytes(bytes, Path::new(path)).map_err(|error| {
+                    eprintln!("error: {error}");
+                    ExitCode::from(1)
+                });
+            }
+            eprintln!(
+                "warning: this is an XFA form but it could not be rendered: {}",
+                prepared.status.error.as_deref().unwrap_or("unknown reason")
+            );
+        }
+        Ok(None) => {}
+        Err(lyra_reader_xfa::XfaError::PasswordRequired) => {
+            eprintln!("error: the document is password protected");
+            return Err(ExitCode::from(2));
+        }
+        Err(error) => {
+            eprintln!("warning: the XFA check failed ({error}); opening as an ordinary PDF");
+        }
+    }
     match PdfiumBackend::open(Path::new(path), None) {
         Ok(backend) => Ok(backend),
         Err(error) => {
@@ -329,17 +368,58 @@ fn cmd_info(args: &[String]) -> ExitCode {
     };
     let limit = opt_usize(&options, &["--pages"], 8);
 
-    let backend = match open_document(path) {
-        Ok(backend) => backend,
-        Err(code) => return code,
+    let prepared = match lyra_reader_xfa::prepare(Path::new(path), None) {
+        Ok(prepared) => prepared,
+        Err(lyra_reader_xfa::XfaError::PasswordRequired) => {
+            eprintln!("error: the document is password protected");
+            return ExitCode::from(2);
+        }
+        Err(error) => {
+            eprintln!("warning: the XFA check failed ({error}); opening as an ordinary PDF");
+            None
+        }
+    };
+    let backend = match prepared.as_ref().and_then(|prepared| prepared.pdf.as_ref()) {
+        Some(bytes) => match PdfiumBackend::open_bytes(bytes.clone(), Path::new(path)) {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        },
+        None => match PdfiumBackend::open(Path::new(path), None) {
+            Ok(backend) => backend,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        },
     };
 
     let page_count = backend.page_count();
     println!("file      : {path}");
     println!("pages     : {page_count}");
-    println!("encrypted : {}", backend.is_encrypted());
+    println!(
+        "encrypted : {}",
+        prepared
+            .as_ref()
+            .map(|prepared| prepared.file.encrypted)
+            .unwrap_or_else(|| backend.is_encrypted())
+    );
     println!("tagged    : {}", backend.is_tagged());
     println!("backend   : {}", backend_description());
+    if let Some(prepared) = &prepared {
+        println!(
+            "xfa       : rendered read-only from XML · {} page(s) · {} field(s) · {} skipped item(s)",
+            prepared.status.page_count,
+            prepared.status.field_count,
+            prepared.status.skipped.len()
+        );
+        println!("xfa reason: {}", prepared.status.read_only_reason);
+        for skipped in &prepared.status.skipped {
+            println!("  - {skipped}");
+        }
+    }
 
     for index in 0..page_count.min(limit as u32) {
         let page_index = PageIndex(index);
@@ -1516,12 +1596,9 @@ fn cmd_text(args: &[String]) -> ExitCode {
     };
     let page = opt_usize(&options, &["--page"], 0);
 
-    let backend = match PdfiumBackend::open(Path::new(path), None) {
+    let backend = match open_document(path) {
         Ok(backend) => backend,
-        Err(error) => {
-            eprintln!("cannot open {path}: {error}");
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
 
     match backend.raw_text_page(PageIndex(page as u32)) {

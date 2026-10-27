@@ -3,7 +3,7 @@
 //! Opening a PDF is cheap; deriving the reader's index from it is not. The reference list, the
 //! figure/table captions, the outline, the recognised metadata and the per-page citation spans
 //! are all read out of the text and object layers, and that work was repeated on every open. This
-//! module stores that derived index beside the PDF and reuses it when the **bytes** the index was
+//! module stores that derived index in the application cache and reuses it when the **bytes** the index was
 //! built from are the same bytes the reader has just opened.
 //!
 //! # Identity: the file's content, never its metadata
@@ -22,9 +22,9 @@
 //!
 //! # File and compatibility
 //!
-//! The sidecar is `<document>.pdf.lyra-reader-index.json`, next to the PDF, following the annotation
-//! sidecar's naming precedent (`<document>.pdf.lyra-reader-annotations.json`). It is a JSON object with
-//! a `kind` tag and a `format_version`. The contract is:
+//! The cache path is keyed by the canonical PDF path inside the platform application cache;
+//! nothing is read from or written beside the PDF. Each record is a JSON object with a `kind`
+//! tag and a `format_version`. The contract is:
 //!
 //! * **Older or same format, same bytes** — read. Unknown top-level keys make the file
 //!   *incompatible*: it is ignored and preserved untouched, because another LyraReader may own it.
@@ -36,7 +36,7 @@
 //!   is looking at.
 //!
 //! A cache is disposable; derived values are never edited by the user, so unlike the annotation
-//! sidecar there is nothing to merge. The compatibility rule is still conservative: a file this
+//! cache there is nothing to merge. The compatibility rule is still conservative: a file this
 //! build cannot fully understand is left alone rather than rewritten from a partial reading.
 //!
 //! # Atomicity
@@ -51,6 +51,7 @@
 use crate::api::{
     CitationRecord, DocumentMetadataRecord, FigureRecord, OutlineEntry, ReferenceRecord,
 };
+use crate::document_id::DocumentId;
 use lyra_reader_text::CitationStyle;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -71,7 +72,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Version 1 caches were written by the caption detector that read a wrapped prose line as a
 /// caption, and by the index that stopped at page 120. Both defects are fixed by *deleting*
 /// entries from the persisted `figures` list and by *adding* pages to `citations`; a version-1
-/// sidecar for unchanged PDF bytes would therefore be a hit and the fix would stay invisible —
+/// cache for unchanged PDF bytes would therefore be a hit and the fix would stay invisible —
 /// the old false positives would keep entering the index and page 121+ would stay empty. The
 /// version is bumped so every version-1 cache is re-derived from the document. The layout is
 /// otherwise unchanged; the bump is about the values, which is exactly what this constant
@@ -81,7 +82,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// The reference half gained the document's other reference lists (`lists` and
 /// `document_wide`): a page-aware citation resolution needs them to attribute a citation to its
-/// section's list. A version-2 sidecar has only the document-wide list, so using it would make
+/// section's list. A version-2 cache has only the document-wide list, so using it would make
 /// an appendix citation resolve into the main list again. Every version-2 cache is therefore
 /// re-derived once; the replacement carries the lists.
 ///
@@ -98,11 +99,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// and short equation bars also change the derived crops, so old indexes are rebuilt on open.
 pub(crate) const FORMAT_VERSION: u32 = 5;
 
-/// Tag that identifies our sidecar (a JSON file at the right name is not enough).
+/// Tag that identifies our index cache (a JSON file at the right name is not enough).
 pub(crate) const KIND: &str = "lyra-reader-document-index";
-
-/// Suffix appended to the PDF's own path, matching the annotation sidecar's convention.
-pub(crate) const CACHE_SUFFIX: &str = ".lyra-reader-index.json";
 
 /// Largest cache this reader will read. A derived index for a 2000-page manual is far below
 /// this; anything larger is not a file this build produced, and is preserved rather than
@@ -203,7 +201,7 @@ pub(crate) struct IndexCacheFile {
     pub citations: BTreeMap<u32, Vec<CitationRecord>>,
 }
 
-/// What reading the sidecar found.
+/// What reading the index cache found.
 pub(crate) enum CacheRead {
     Hit(Box<IndexCacheFile>),
     Stale,
@@ -229,15 +227,67 @@ const KNOWN_KEYS: [&str; 10] = [
     "citations",
 ];
 
-/// `<pdf>.lyra-reader-index.json`, built as an `OsString` so a non-UTF-8 document path keeps working.
+/// Derived indexes belong to the user's platform cache, including PDFs in read-only folders.
+///
+/// The path is keyed by the [`DocumentId`] — canonical path **and** content hash — so a symlink
+/// and its target share one index, while a replaced file at the same path does not inherit the
+/// old bytes' index. If the identity cannot be computed (an unreadable file), the historical
+/// path-only key is used; the caller will fail to parse the document anyway.
 pub(crate) fn cache_path(document_path: &Path) -> PathBuf {
-    let mut path = document_path.as_os_str().to_os_string();
-    path.push(CACHE_SUFFIX);
-    PathBuf::from(path)
+    match DocumentId::of(document_path) {
+        Ok(id) => cache_path_for_key(id.key()),
+        Err(_) => legacy_cache_path(document_path),
+    }
 }
 
-/// Whether this environment asks for the cache to be off. The native regression suite sets it so
-/// checks never write sidecars into the committed fixtures; the app does not set it.
+/// The index cache path for an already-computed [`DocumentId`] key.
+pub(crate) fn cache_path_for_key(key: &str) -> PathBuf {
+    cache_root().join(format!("{key}.json"))
+}
+
+/// The historical cache path: SHA-256 of the canonical path, with no content component.
+///
+/// Kept for lazy migration: a cache written by an older build is still read when the new key
+/// has no file, and a hit is copied forward. Nothing deletes the old file.
+pub(crate) fn legacy_cache_path(document_path: &Path) -> PathBuf {
+    let canonical = document_path
+        .canonicalize()
+        .unwrap_or_else(|_| document_path.to_path_buf());
+    let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+    let key: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    cache_root().join(format!("{key}.json"))
+}
+
+fn cache_root() -> PathBuf {
+    std::env::var_os("LYRA_READER_INDEX_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(platform_cache_root)
+}
+
+fn platform_cache_root() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    let root = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Library/Caches");
+    #[cfg(target_os = "windows")]
+    let root = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let root = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join(".cache")
+        });
+    root.join("LyraReader/Indexes")
+}
+
+/// Whether this environment asks for the derived application cache to be off.
+/// The app normally keeps caching enabled; test processes can disable it explicitly.
 pub(crate) fn disabled_by_environment() -> bool {
     match std::env::var("LYRA_READER_INDEX_CACHE") {
         Ok(value) => matches!(
@@ -340,6 +390,31 @@ pub(crate) fn read_cache(path: &Path, identity: &ContentIdentity, page_count: u3
     CacheRead::Hit(Box::new(file))
 }
 
+/// Reads the new-key cache, falling back to the legacy path-only cache.
+///
+/// A legacy hit is copied to `primary` and returned. Every other legacy outcome is reported
+/// unchanged: a stale legacy cache must still say "the bytes changed" (so the shell derives a
+/// fresh index and replaces the cache) rather than pretending no cache ever existed. The legacy
+/// file is never deleted; a downgrade and a curious user both still find it.
+pub(crate) fn read_cache_with_migration(
+    primary: &Path,
+    legacy: &Path,
+    identity: &ContentIdentity,
+    page_count: u32,
+) -> CacheRead {
+    let read = read_cache(primary, identity, page_count);
+    if !matches!(read, CacheRead::Missing) || legacy == primary {
+        return read;
+    }
+    match read_cache(legacy, identity, page_count) {
+        CacheRead::Hit(file) => {
+            let _ = write_cache(primary, &file);
+            CacheRead::Hit(file)
+        }
+        other => other,
+    }
+}
+
 /// Writes `file` atomically at `path`, returning the number of bytes written.
 ///
 /// The temporary name is unique per process and call. `create_new` refuses to reuse a file left
@@ -351,6 +426,7 @@ pub(crate) fn write_cache(path: &Path, file: &IndexCacheFile) -> io::Result<u64>
     bytes.push(b'\n');
 
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -451,7 +527,7 @@ mod tests {
     #[test]
     fn a_version_one_cache_is_not_read_after_the_caption_and_page_fixes() {
         // T4.12/T4.13 changed what a parse derives for the same bytes (fewer captions, and
-        // citations for every page), so a version-1 sidecar would be a plausible-looking hit
+        // citations for every page), so a version-1 cache would be a plausible-looking hit
         // with the old, wrong values. It is re-derived instead; see `FORMAT_VERSION`.
         let directory =
             std::env::temp_dir().join(format!("lyra-reader-index-cache-v1-{}", std::process::id()));
@@ -546,6 +622,38 @@ mod tests {
         fs::write(&path, br#"{"kind":"lyra-reader-document-index","#).expect("write truncated");
         let cache = read_cache(&path, &identity(b"x"), 1);
         assert!(matches!(cache, CacheRead::Corrupt { .. }));
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_legacy_path_only_cache_is_copied_forward_and_stays_readable() {
+        let directory = std::env::temp_dir().join(format!(
+            "lyra-reader-index-cache-migrate-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("scratch");
+        let primary = directory.join("new-key.json");
+        let legacy = directory.join("old-path-key.json");
+        let same = identity(b"same bytes");
+        write_cache(&legacy, &minimal_file(identity(b"same bytes"))).expect("legacy cache");
+        assert!(matches!(read_cache(&primary, &same, 1), CacheRead::Missing));
+        let migrated = read_cache_with_migration(&primary, &legacy, &same, 1);
+        assert!(matches!(migrated, CacheRead::Hit(_)));
+        assert!(
+            primary.is_file(),
+            "the legacy hit was copied to the new-key path"
+        );
+        assert!(legacy.is_file(), "the legacy cache is kept readable");
+        assert!(matches!(read_cache(&primary, &same, 1), CacheRead::Hit(_)));
+
+        // A legacy cache for different bytes keeps its honest Stale outcome; it must not be
+        // silently treated as a missing cache (the shell needs to rebuild and replace it).
+        let other = directory.join("other-key.json");
+        let changed = identity(b"changed bytes");
+        let stale = read_cache_with_migration(&primary, &legacy, &changed, 1);
+        assert!(matches!(stale, CacheRead::Stale));
+        assert!(!other.is_file());
         let _ = fs::remove_dir_all(&directory);
     }
 

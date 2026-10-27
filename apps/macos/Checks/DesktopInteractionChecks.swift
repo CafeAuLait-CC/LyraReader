@@ -88,6 +88,9 @@ extension ReaderChecks {
             fatalError("FAIL: the canvas-menu check could not select the fixture's text")
         }
         let withSelection = CanvasContextMenu.items(state: state, at: point)
+        require(!withSelection.contains(where: {
+                    $0.title.localizedCaseInsensitiveContains("redact")
+                }), "the canvas menu offers no redaction command; redaction lives in Edit")
         for action in textActions {
             guard let item = withSelection.first(where: { $0.action == action }) else {
                 fatalError("FAIL: a canvas menu with a selection is missing \(action)")
@@ -241,11 +244,21 @@ extension ReaderChecks {
         require(PageContextMenu.perform(
             .rotate(0, clockwise: true), state: state, newWindow: { _, _ in false }
         ), "the thumbnail's rotate command runs")
-        try await eventually("the thumbnail rotation is staged", {
-            state.pageEditSessionActive
+        // `pageEditSessionActive` becomes true when the working copy is prepared, before the
+        // rotation has been written into a revision. Waiting for that flag alone can therefore
+        // observe the interval where nothing is pending yet (it did on the CI runner). Wait for
+        // the change itself, then assert what the interface must say: one page change pending,
+        // and the file on disk unchanged.
+        try await eventually("the thumbnail rotation is pending", {
+            state.pageEditHasPendingChanges
         })
-        require(state.pageEditPendingSummary?.contains("file on disk is unchanged") == true,
-                "the rotation is pending, and the interface says the file is unchanged")
+        require(state.pageEditPendingOperations.count == 1,
+                "the rotation stages exactly one pending page change")
+        let summary = state.pageEditPendingSummary
+        require(summary?.hasPrefix("1 page change pending") == true,
+                "the pending summary names exactly one page change: \(summary ?? "nil")")
+        require(summary?.contains("file on disk is unchanged") == true,
+                "the interface says the file on disk is unchanged: \(summary ?? "nil")")
         let bytesAfter = try Data(contentsOf: b)
         require(bytesAfter == bytesBefore,
                 "a context-menu rotation leaves the original file byte-identical")

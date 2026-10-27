@@ -21,6 +21,7 @@ mod bibliography_tests;
 mod figures;
 mod fragments;
 mod paren;
+mod selection;
 mod superscript;
 pub mod tables;
 
@@ -32,6 +33,10 @@ pub use figures::{
     caption_region_without_margin, find_caption_mentions,
 };
 pub use paren::{ParenthesisedCandidate, inspect_parenthesised_citations};
+pub use selection::{
+    MAX_REGION_TEXT_CHARS, SelectionLayout, SelectionLine, SelectionStop, SelectionTextPage,
+    is_swift_whitespace, is_swift_whitespace_or_newline, region_text,
+};
 pub use superscript::CitationStyle;
 pub use tables::table_region;
 
@@ -139,10 +144,14 @@ impl TextPage {
         }
     }
 
-    /// Hit test: returns the index of the character that contains the point.
+    /// Legacy hit test: returns the index of the **first character whose box contains the
+    /// point**.
     ///
-    /// Currently a linear scan (good enough for the ~2000–5000 characters of a single page);
-    /// TODO(T2.2): if this becomes a hot spot, switch to a per-line bucketed R-tree / interval index.
+    /// This is *not* the interactive path and not Swift-parity: PDF glyph boxes describe ink,
+    /// so containment returns `nil` for gaps between letters, spaces and lines (48.7% of the
+    /// benchmark's points) and disagrees with the shell's selection on 44.4%. The line-aware,
+    /// Swift-parity path is [`SelectionTextPage::char_index_at`], which the engine's cache
+    /// serves. Kept because older text callers still use the containment rule.
     pub fn char_index_at(&self, p: Point) -> Option<CharIndex> {
         self.chars
             .iter()
@@ -150,7 +159,11 @@ impl TextPage {
             .map(|i| CharIndex(i as u32))
     }
 
-    /// Selection rectangles (used to draw highlights); an empty selection returns an empty vec.
+    /// Legacy selection rectangles: one rectangle per character, in character order.
+    ///
+    /// This is *not* the shell's highlight geometry (Swift merges stops per line in
+    /// `TextPage.selectionRects(in:)`). Kept for the callers that use the per-character rule;
+    /// changing it is a separate parity project.
     pub fn selection_rects(&self, start: CharIndex, end: CharIndex) -> Vec<Rect> {
         let (lo, hi) = if start <= end {
             (start, end)

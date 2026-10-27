@@ -11,12 +11,20 @@ public struct AIAssistantPanel: View {
     @ObservedObject private var model: AIAssistantModel
     @ObservedObject private var settings: AISettingsStore
     @ObservedObject private var chatGPT: ChatGPTAccountStore
+    @ObservedObject private var audit: AIAuditTrail
+    @State private var confirmingAuditClear = false
+
+    private var displaysCurrentRequest: Bool {
+        guard let action = model.plan?.action else { return true }
+        return (action == .translateSelection) == (model.selectedTab == .translation)
+    }
 
     public init(state: AppState, model: AIAssistantModel) {
         self.state = state
         self.model = model
         _settings = ObservedObject(wrappedValue: model.settings)
         _chatGPT = ObservedObject(wrappedValue: model.settings.chatGPT)
+        _audit = ObservedObject(wrappedValue: model.audit)
     }
 
     public var body: some View {
@@ -26,12 +34,14 @@ public struct AIAssistantPanel: View {
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 12) {
-                        providerHeader
                         if !settings.canUseAI {
                             keyMissing
                         }
+                        if model.selectedTab == .summary {
+                            AISummaryPanelView(state: state, model: model.layeredSummary)
+                        }
                         actions
-                        if let note = model.statusNote, !note.isEmpty,
+                        if displaysCurrentRequest, let note = model.statusNote, !note.isEmpty,
                            !model.isDocumentChatPlan, !model.isChatStreaming,
                            model.pendingChatQuestion == nil {
                             Text(note)
@@ -40,11 +50,14 @@ public struct AIAssistantPanel: View {
                                     model.phase == .failed
                                         ? LyraReaderTheme.errorFg
                                         : (model.phase == .finished && model.answer.isEmpty
-                                            ? LyraReaderTheme.warningFg : Color.secondary)
+                                            ? LyraReaderTheme.warningFg : LyraReaderTheme.textSecondary)
                                 )
                                 .fixedSize(horizontal: false, vertical: true)
                         }
-                        if model.isPreparing, model.pendingChatQuestion == nil {
+                        if displaysCurrentRequest, let hint = model.offlineHint {
+                            AIOfflineHintView(hint: hint)
+                        }
+                        if displaysCurrentRequest, model.isPreparing, model.pendingChatQuestion == nil {
                             HStack(spacing: 6) {
                                 ProgressView().controlSize(.small)
                                 Text("Reading text and building the preview…")
@@ -52,12 +65,12 @@ public struct AIAssistantPanel: View {
                                     .foregroundStyle(LyraReaderTheme.textSecondary)
                             }
                         }
-                        if let plan = model.plan, model.phase != .preparing, !plan.isDocumentChat {
+                        if displaysCurrentRequest, let plan = model.plan, model.phase != .preparing, !plan.isDocumentChat {
                             requestPreview(plan)
                         }
-                        if let mergePlan = model.mergePlan {
+                        if displaysCurrentRequest, let mergePlan = model.mergePlan {
                             requestPreview(mergePlan, isMerge: true)
-                        } else if model.phase == .mergePreview {
+                        } else if displaysCurrentRequest, model.phase == .mergePreview {
                             HStack(spacing: 6) {
                                 ProgressView().controlSize(.small)
                                 Text("Building the consolidation preview…")
@@ -65,13 +78,16 @@ public struct AIAssistantPanel: View {
                                     .foregroundStyle(LyraReaderTheme.textSecondary)
                             }
                         }
-                        if !model.isDocumentChatPlan, !model.isChatStreaming,
+                        if displaysCurrentRequest, !model.isDocumentChatPlan, !model.isChatStreaming,
                            model.phase == .streaming || model.phase.isTerminal || model.phase == .mergePreview {
                             answerSection
                         }
-                        controls
+                        if displaysCurrentRequest { controls }
+                        auditSection
+                        DisclosureGroup("Connection") { providerHeader.padding(.top, 8) }
+                            .font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
                     }
-                    .padding(10)
+                    .padding(16)
                 }
             }
         }
@@ -80,19 +96,22 @@ public struct AIAssistantPanel: View {
         // and empty for a window no assistive client has queried, so asking it would be a check
         // that depends on the machine, not on the layout.
         .background(AIAssistantPanelMarkerHost())
+        .background(LyraReaderTheme.panelBg)
+        .buttonStyle(ReaderPanelButtonStyle())
+        .textFieldStyle(ReaderPanelFieldStyle())
         .onAppear(perform: sync)
         .onChange(of: state.document?.id) { _, _ in sync() }
+        .onChange(of: state.outline.count) { _, _ in syncLayered() }
     }
 
     private var noDocument: some View {
         VStack(spacing: 10) {
-            Image(systemName: "sparkles")
-                .font(.system(size: 30, weight: .light))
+            LyraAIIcon().frame(width: 36, height: 36)
                 .foregroundStyle(LyraReaderTheme.textTertiary)
             Text("No document")
                 .font(.callout)
                 .foregroundStyle(LyraReaderTheme.textSecondary)
-            Text("Open a PDF to summarise a page, ask about a selection, or translate one.")
+            Text("Open a PDF to summarise, translate a passage or start a conversation.")
                 .font(.caption)
                 .foregroundStyle(LyraReaderTheme.textTertiary)
                 .multilineTextAlignment(.center)
@@ -157,39 +176,54 @@ public struct AIAssistantPanel: View {
     }
 
     private var actions: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Actions")
-                .font(.caption.weight(.semibold))
-            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 6) {
-                ForEach(AIAssistantAction.allCases.filter { !$0.isDocumentChat }) { action in
-                    Button {
-                        prepare(action)
-                    } label: {
-                        Label(action.title, systemImage: action.systemImage)
-                            .font(.caption2)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(disabled(action))
+        VStack(alignment: .leading, spacing: 18) {
+            ReaderPanelSection(title: model.selectedTab == .translation ? "Translate Selection" : "Summarise") {
+                if model.selectedTab == .translation {
+                    TextField("Translate to", text: $model.targetLanguage)
+                        .accessibilityLabel("Target language")
                 }
+                if model.selectedTab != .translation {
+                    Picker("Target", selection: $model.summaryUsesSelection) {
+                        Text("Document").tag(false)
+                        Text("Selected text").tag(true)
+                    }
+                    .pickerStyle(.segmented).labelsHidden()
+                    Text("Research question, approach, evidence and limitations in one complete summary.")
+                        .font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                let action: AIAssistantAction = model.selectedTab == .translation ? .translateSelection :
+                    (model.summaryUsesSelection ? .summarizeSelection : .summarizeDocument)
+                Button { prepare(action) } label: {
+                    Label {
+                        Text(model.selectedTab == .translation ? "Preview Translation" : "Preview Summary")
+                    } icon: {
+                        if model.selectedTab == .translation {
+                            Image(systemName: "character.bubble")
+                        } else { LyraAIIcon().frame(width: 16, height: 16) }
+                    }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(ReaderPanelButtonStyle(prominent: true))
+                .disabled(disabled(action))
             }
-
             if let selection = state.selection {
-                Text("Selection: \(selection.range.count) characters on page \(selection.page + 1)")
-                    .font(.caption2)
-                    .foregroundStyle(LyraReaderTheme.textSecondary)
+                Label("\(selection.range.count) characters · page \(selection.page + 1)", systemImage: "text.quote")
+                    .font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
             } else {
-                Text("Select text in the page to ask about it or translate it.")
-                    .font(.caption2)
+                Text(model.selectedTab == .translation ? "Select text on the page to translate it." :
+                    "Choose the complete document, or select a passage on the page.")
+                    .font(.caption)
                     .foregroundStyle(LyraReaderTheme.textTertiary)
             }
-
-            TextField("Question about the selection", text: $model.question)
-                .textFieldStyle(.roundedBorder)
-                .font(.caption)
-            TextField("Translate to", text: $model.targetLanguage)
-                .textFieldStyle(.roundedBorder)
-                .font(.caption)
+            if model.selectedTab != .translation {
+                DisclosureGroup("Question about a selection") {
+                    TextField("Question about the selected text…", text: $model.question, axis: .vertical)
+                        .lineLimit(2...5)
+                    Button("Preview Question") { prepare(.askSelection) }
+                        .disabled(disabled(.askSelection))
+                }
+            }
         }
     }
 
@@ -222,7 +256,7 @@ public struct AIAssistantPanel: View {
                  ? "This endpoint runs on this Mac; the page text does not leave it."
                  : "This is a remote endpoint: the page text below leaves this Mac when you press Send.")
                 .font(.caption2)
-                .foregroundStyle(plan.isLocal ? Color.secondary : LyraReaderTheme.warningFg)
+                .foregroundStyle(plan.isLocal ? LyraReaderTheme.textSecondary : LyraReaderTheme.warningFg)
                 .fixedSize(horizontal: false, vertical: true)
             if isMerge {
                 Text("This consolidation is a separate request and has its own cost. The part summaries are not re-sent as page text.")
@@ -348,6 +382,15 @@ public struct AIAssistantPanel: View {
                 Text(answerHeader)
                     .font(.caption.weight(.semibold))
                 Spacer()
+                if !model.answer.isEmpty {
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(model.answer, forType: .string)
+                    } label: { Image(systemName: "doc.on.doc") }
+                        .buttonStyle(.plain)
+                        .help("Copy Markdown source")
+                        .accessibilityLabel("Copy answer as Markdown")
+                }
                 if model.phase == .streaming {
                     ProgressView().controlSize(.small)
                 }
@@ -380,8 +423,8 @@ public struct AIAssistantPanel: View {
                     onJump: { page in state.gotoPage(page - 1) }
                 )
                 Text(model.plan?.action == .translateSelection
-                     ? "Rendered as paragraphs, headings, bullet and numbered lists. This action did not ask for page citations, so no numbers are linkified; other Markdown is shown literally."
-                     : "Rendered as paragraphs, headings, bullet and numbered lists. Only [p.N] citations are clickable; other Markdown is shown literally.")
+                     ? "Rendered as Markdown, with a local subset for mathematics. This action did not ask for page citations, so no numbers are linkified. Unsupported math falls back to its monospace source."
+                     : "Rendered as Markdown, with a local subset for mathematics. Only [p.N] citations are clickable. Unsupported math falls back to its monospace source.")
                     .font(.caption2)
                     .foregroundStyle(LyraReaderTheme.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -400,10 +443,9 @@ public struct AIAssistantPanel: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Part \(index + 1) · \(model.partLabels[index] ?? "")")
                                     .font(.caption2.weight(.semibold))
-                                Text(model.partAnswers[index] ?? "")
-                                    .font(.caption)
-                                    .textSelection(.enabled)
-                                    .fixedSize(horizontal: false, vertical: true)
+                                AIAnswerView(text: model.partAnswers[index] ?? "",
+                                    pageCount: Int(model.plan?.pageCount ?? 0),
+                                    onJump: { state.gotoPage($0 - 1) })
                             }
                         }
                     }
@@ -416,7 +458,7 @@ public struct AIAssistantPanel: View {
             if let usage = model.usage {
                 Text(usage.summary)
                     .font(.caption2)
-                    .foregroundStyle(model.answer.isEmpty ? Color.secondary.opacity(0.7) : Color.secondary)
+                    .foregroundStyle(model.answer.isEmpty ? LyraReaderTheme.textTertiary : LyraReaderTheme.textSecondary)
             } else if model.phase == .finished && !model.answer.isEmpty {
                 Text("No token usage was reported by the provider.")
                     .font(.caption2)
@@ -453,7 +495,7 @@ public struct AIAssistantPanel: View {
         VStack(alignment: .leading, spacing: 4) {
             Label(title, systemImage: "lightbulb")
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(prominent ? LyraReaderTheme.warningFg : Color.secondary)
+                .foregroundStyle(prominent ? LyraReaderTheme.warningFg : LyraReaderTheme.textSecondary)
             reasoningText
             Text("This is the model's reasoning, not the answer. It was not concatenated into the answer.")
                 .font(.caption2)
@@ -462,17 +504,14 @@ public struct AIAssistantPanel: View {
         }
         .padding(6)
         .background(
-            (prominent ? LyraReaderTheme.warningFg : Color.secondary).opacity(prominent ? 0.08 : 0.05),
+            (prominent ? LyraReaderTheme.warningFg : LyraReaderTheme.textSecondary).opacity(prominent ? 0.08 : 0.05),
             in: RoundedRectangle(cornerRadius: 5)
         )
     }
 
     private var reasoningText: some View {
-        Text(model.reasoning)
-            .font(.callout)
+        AIAnswerView(text: model.reasoning, pageCount: 0, onJump: { _ in })
             .foregroundStyle(LyraReaderTheme.textSecondary)
-            .textSelection(.enabled)
-            .fixedSize(horizontal: false, vertical: true)
     }
 
     @ViewBuilder
@@ -492,7 +531,7 @@ public struct AIAssistantPanel: View {
                 Button(model.requestCount > 1 ? "Send \(model.requestCount) requests" : "Send") {
                     model.send()
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(ReaderPanelButtonStyle(prominent: true))
                 .controlSize(.small)
                 Button("Discard") { model.discard() }
                     .controlSize(.small)
@@ -501,7 +540,7 @@ public struct AIAssistantPanel: View {
             HStack(spacing: 8) {
                 if model.canSendMerge {
                     Button("Send consolidation") { model.sendMerge() }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(ReaderPanelButtonStyle(prominent: true))
                         .controlSize(.small)
                 }
                 Button("Keep part summaries") { model.keepPartSummaries() }
@@ -521,7 +560,7 @@ public struct AIAssistantPanel: View {
             HStack(spacing: 8) {
                 if model.canRetry {
                     Button("Retry") { model.retry() }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(ReaderPanelButtonStyle(prominent: true))
                         .controlSize(.small)
                 }
                 Button("New request") { model.discard() }
@@ -532,15 +571,156 @@ public struct AIAssistantPanel: View {
         }
     }
 
+    // MARK: - Local audit trail
+
+    /// The audit section is laid out for the panel's 240 pt minimum width: every line wraps or
+    /// truncates vertically, and no row relies on a horizontal stack wide enough to clip.
+    private var auditSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(AIAuditPanelCopy.sectionTitle)
+                    .font(.caption.weight(.semibold))
+                Spacer(minLength: 4)
+                Button(AIAuditPanelCopy.clearButton) { confirmingAuditClear = true }
+                    .font(.caption2)
+                    .controlSize(.small)
+                    .disabled(audit.records.isEmpty)
+                    .accessibilityLabel("Clear the local AI audit trail")
+            }
+            Text(AIAuditPanelCopy.note)
+                .font(.caption2)
+                .foregroundStyle(LyraReaderTheme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let error = audit.lastError {
+                Text(error)
+                    .font(.caption2)
+                    .foregroundStyle(LyraReaderTheme.errorFg)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if audit.records.isEmpty {
+                Text(AIAuditPanelCopy.empty)
+                    .font(.caption2)
+                    .foregroundStyle(LyraReaderTheme.textTertiary)
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(audit.records.prefix(5).enumerated()), id: \.offset) { _, record in
+                        auditRow(record)
+                    }
+                }
+                if audit.records.count > 5 {
+                    Text("\(audit.records.count - 5) older entries are in the file.")
+                        .font(.caption2)
+                        .foregroundStyle(LyraReaderTheme.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Text(AIAuditPanelCopy.bounds)
+                .font(.caption2)
+                .foregroundStyle(LyraReaderTheme.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            DisclosureGroup(AIAuditPanelCopy.whatIsSentTitle) {
+                whatIsSentInventory
+            }
+            .font(.caption2)
+            .foregroundStyle(LyraReaderTheme.textSecondary)
+        }
+        .background(AIAuditSectionMarkerHost())
+        .confirmationDialog(
+            AIAuditPanelCopy.clearConfirmationTitle,
+            isPresented: $confirmingAuditClear,
+            titleVisibility: .visible
+        ) {
+            Button("Clear Audit Trail", role: .destructive) { audit.clear() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(AIAuditPanelCopy.clearConfirmationMessage)
+        }
+    }
+
+    private func auditRow(_ record: AIAuditRecord) -> some View {
+        let imageSuffix = record.image.map { " · image \($0.label)" } ?? ""
+        return VStack(alignment: .leading, spacing: 1) {
+            Text("\(record.at.formatted(date: .omitted, time: .shortened)) · \(record.action.label) · \(pagesLabel(record.pages))")
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("\(record.outcome.label) · \(durationLabel(record.durationMilliseconds)) · \(record.characters.formatted()) chars\(imageSuffix)")
+                .foregroundStyle(outcomeColor(record.outcome))
+                .fixedSize(horizontal: false, vertical: true)
+            if !record.host.isEmpty || !record.model.isEmpty {
+                Text("\(record.host.isEmpty ? "no endpoint" : record.host) · \(record.model.isEmpty ? "no model" : record.model)")
+                    .foregroundStyle(LyraReaderTheme.textTertiary)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+            }
+            if let code = record.code {
+                Text(code.label)
+                    .foregroundStyle(LyraReaderTheme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .font(.caption2)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var whatIsSentInventory: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            ForEach(AIAuditPanelCopy.whatIsSent, id: \.self) { item in
+                Text("• \(item)")
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text(AIAuditPanelCopy.wholeDocumentNote)
+                .foregroundStyle(LyraReaderTheme.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(AIAuditPanelCopy.neverSentTitle)
+                .font(.caption2.weight(.semibold))
+                .padding(.top, 2)
+            ForEach(AIAuditPanelCopy.neverSent, id: \.self) { item in
+                Text("• \(item)")
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.top, 4)
+    }
+
+    private func pagesLabel(_ pages: [Int]) -> String {
+        pages.isEmpty ? "No pages" : AIPlanFormatting.pageLabel(pages)
+    }
+
+    private func durationLabel(_ milliseconds: Int) -> String {
+        milliseconds < 1000
+            ? "\(milliseconds) ms"
+            : String(format: "%.1f s", Double(milliseconds) / 1000)
+    }
+
+    private func outcomeColor(_ outcome: AIAuditOutcome) -> Color {
+        switch outcome {
+        case .sent: return LyraReaderTheme.successFg
+        case .refused: return LyraReaderTheme.warningFg
+        case .failed: return LyraReaderTheme.errorFg
+        case .cancelled: return LyraReaderTheme.textSecondary
+        }
+    }
+
     private func sync() {
         model.attach(service: state.aiChatService, context: state.aiReaderContext)
+        syncLayered()
+    }
+
+    /// The outline loads asynchronously after the document opens, so the layered summary is
+    /// attached again when its entry count changes. The model ignores a repeated attach for the
+    /// same document and outline.
+    private func syncLayered() {
+        model.layeredSummary.attach(
+            service: state.aiChatService,
+            context: state.aiReaderContext,
+            outline: state.outline,
+            documentURL: state.document?.url
+        )
     }
 }
 
-/// The right panel's content: document chat fills the panel, and the existing single-shot
-/// actions keep their own scroll below it. Hosting the chat directly (rather than inside
-/// `AIAssistantPanel`) keeps one chat surface and one actions surface, so neither duplicates the
-/// other and the chat can use the whole remaining height instead of a fixed strip.
+/// The Lyra tools choose this panel's workspace. The window owns the model, so switching
+/// tools preserves drafts and conversation without duplicating navigation in the panel.
 public struct AIAssistantRightPanelContent: View {
     @ObservedObject private var state: AppState
     @ObservedObject private var model: AIAssistantModel
@@ -551,103 +731,30 @@ public struct AIAssistantRightPanelContent: View {
     }
 
     public var body: some View {
-        if state.document == nil {
-            AIAssistantPanel(state: state, model: model)
-        } else {
-            VStack(spacing: 0) {
+        VStack(spacing: 0) {
+            HStack {
+                Label { Text(model.selectedTab.title) } icon: {
+                    LyraAIActivityIcon(model: model).frame(width: 20, height: 20)
+                }.font(.system(size: 13, weight: .semibold))
+                Spacer()
+                SettingsLink { Image(systemName: "gearshape") }
+                    .buttonStyle(LyraReaderToolStyle()).help("AI connection settings")
+                Button { state.toggleRightPanel() } label: { Image(systemName: "xmark") }
+                    .buttonStyle(LyraReaderToolStyle()).accessibilityLabel("Close AI assistant")
+            }.padding(.horizontal, 14).padding(.vertical, 8)
+            Divider().overlay(LyraReaderTheme.separator)
+            if model.selectedTab == .chat {
                 AIDocumentChatView(state: state, model: model)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .layoutPriority(1)
-                Divider()
+            } else if model.selectedTab == .regions {
+                AIRegionHistoryView(state: state, aiAssistant: model)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
                 AIAssistantPanel(state: state, model: model)
-                    .frame(minHeight: 170, idealHeight: 220, maxHeight: 280)
             }
         }
-    }
-}
-
-/// Renders the streamed answer. Paragraphs, headings and lists are interpreted; citations are
-/// clickable only when they are the exact `[p.N]` form and name a page in this document.
-struct AIAnswerView: View {
-    let text: String
-    let pageCount: Int
-    /// `nil` keeps the single-shot actions' existing rule (any in-document page is clickable).
-    /// Document chat passes the pages that were actually sent, so an unverified citation stays
-    /// plain text and is explained below the answer instead of linking somewhere plausible.
-    var verifiedPages: Set<Int>? = nil
-    let onJump: (Int) -> Void
-
-    var body: some View {
-        let document = AIAnswerMarkdown.parse(
-            text, pageCount: pageCount, verifiedPages: verifiedPages
-        )
-        VStack(alignment: .leading, spacing: 7) {
-            ForEach(Array(document.blocks.enumerated()), id: \.offset) { _, block in
-                blockView(block)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .environment(\.openURL, OpenURLAction { url in
-            guard url.scheme == "lyra-reader-page",
-                  let host = url.host,
-                  let page = Int(host),
-                  page >= 1, page <= pageCount else {
-                return .systemAction
-            }
-            onJump(page)
-            return .handled
-        })
-    }
-
-    @ViewBuilder
-    private func blockView(_ block: AIAnswerBlock) -> some View {
-        switch block {
-        case .paragraph(let runs):
-            Text(attributed(runs))
-                .font(.callout)
-                .fixedSize(horizontal: false, vertical: true)
-                .textSelection(.enabled)
-        case .heading(let level, let runs):
-            Text(attributed(runs))
-                .font(level <= 2 ? .headline : .subheadline.weight(.semibold))
-                .fixedSize(horizontal: false, vertical: true)
-                .textSelection(.enabled)
-                .padding(.top, 2)
-        case .bullet(let runs):
-            HStack(alignment: .firstTextBaseline, spacing: 5) {
-                Text("•")
-                Text(attributed(runs))
-                    .fixedSize(horizontal: false, vertical: true)
-                    .textSelection(.enabled)
-            }
-            .font(.callout)
-        case .numbered(let number, let runs):
-            HStack(alignment: .firstTextBaseline, spacing: 5) {
-                Text("\(number).")
-                    .monospacedDigit()
-                Text(attributed(runs))
-                    .fixedSize(horizontal: false, vertical: true)
-                    .textSelection(.enabled)
-            }
-            .font(.callout)
-        }
-    }
-
-    private func attributed(_ runs: [AIInlineRun]) -> AttributedString {
-        var result = AttributedString()
-        for run in runs {
-            switch run {
-            case .text(let text):
-                result.append(AttributedString(text))
-            case .citation(let page, let raw):
-                var piece = AttributedString(raw)
-                piece.link = URL(string: "lyra-reader-page://\(page)")
-                piece.foregroundColor = .accentColor
-                piece.underlineStyle = .single
-                result.append(piece)
-            }
-        }
-        return result
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(LyraReaderTheme.panelBg)
     }
 }
 
@@ -675,4 +782,26 @@ private struct AIAssistantPanelMarkerHost: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: AIAssistantPanelMarkerView, context: Context) {}
+}
+
+/// The same seam for the audit section: a hosted check can prove the section exists at the
+/// panel's minimum width without asking SwiftUI's lazy accessibility tree.
+public final class AIAuditSectionMarkerView: NSView {
+    public override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setAccessibilityLabel("AI audit trail section")
+    }
+
+    public required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setAccessibilityLabel("AI audit trail section")
+    }
+}
+
+private struct AIAuditSectionMarkerHost: NSViewRepresentable {
+    func makeNSView(context: Context) -> AIAuditSectionMarkerView {
+        AIAuditSectionMarkerView(frame: .zero)
+    }
+
+    func updateNSView(_ nsView: AIAuditSectionMarkerView, context: Context) {}
 }

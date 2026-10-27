@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-/// Native semantic colors from docs/LyraReader-Palette (sRGB). PDF pixels keep their source colors.
+/// Native semantic colors from docs/Lyra-Palette (sRGB). PDF pixels keep their source colors.
 @MainActor
 public enum LyraReaderTheme {
     private static func adaptive(_ light: UInt32, _ dark: UInt32) -> NSColor {
@@ -18,6 +18,8 @@ public enum LyraReaderTheme {
     public static let toolbarBg = Color(nsColor: adaptive(0xF7F4EF, 0x28251F))
     public static let tabbarBg = Color(nsColor: adaptive(0xF0EBE3, 0x211F1C))
     public static let sidebarBg = Color(nsColor: sidebarColor)
+    /// Conversation-only window surface; the global Lyra palette stays unchanged.
+    public static let regionWindowBg = Color(nsColor: adaptive(0xF7F0DF, 0x302B23))
     public static let panelBg = Color(nsColor: adaptive(0xF8F6F2, 0x2B2823))
     /// The floating preview's card colour, also cleared behind its transparent figure crops.
     public static let raisedBgColor = adaptive(0xFFFDFA, 0x343029)
@@ -27,8 +29,12 @@ public enum LyraReaderTheme {
     public static let canvasBg = Color(nsColor: adaptive(0xE7E2D9, 0x171716))
     public static let emptyBg = Color(nsColor: adaptive(0xEEEAE3, 0x1B1A18))
     public static let statusbarBg = Color(nsColor: adaptive(0xF4F1EC, 0x24221F))
-    public static let textPrimary = Color(nsColor: adaptive(0x302B25, 0xF1ECE3))
-    public static let textSecondary = Color(nsColor: adaptive(0x655C50, 0xC8BFAF))
+    /// Dynamic NSColor forms of the text tokens, for callers that must resolve them under a
+    /// concrete appearance (the preview typography checks do exactly that).
+    public static let textPrimaryColor = adaptive(0x302B25, 0xF1ECE3)
+    public static let textPrimary = Color(nsColor: textPrimaryColor)
+    public static let textSecondaryColor = adaptive(0x655C50, 0xC8BFAF)
+    public static let textSecondary = Color(nsColor: textSecondaryColor)
     public static let textTertiary = Color(nsColor: adaptive(0x675C50, 0xB4A995))
     public static let textPlaceholder = Color(nsColor: adaptive(0x786E62, 0xB0A38F))
     public static let textDisabled = Color(nsColor: adaptive(0xA79E90, 0x736D62))
@@ -40,7 +46,8 @@ public enum LyraReaderTheme {
     public static let pageEdge = Color(nsColor: pageEdgeColor)
     public static let scrollThumb = Color(nsColor: scrollThumbColor)
     public static let scrollThumbHover = Color(nsColor: scrollThumbHoverColor)
-    public static let accent = Color(nsColor: adaptive(0x88611B, 0xE7C07B))
+    public static let accentColor = adaptive(0x88611B, 0xE7C07B)
+    public static let accent = Color(nsColor: accentColor)
     public static let accentHover = Color(nsColor: adaptive(0x6E4C10, 0xF2D49F))
     public static let accentPressed = Color(nsColor: adaptive(0x573B09, 0xD6A654))
     public static let onAccent = Color(nsColor: adaptive(0xFFFFFF, 0x2D2417))
@@ -116,7 +123,10 @@ struct LyraReaderToolStyle: ButtonStyle {
 
         var body: some View {
             configuration.label
-                .font(.system(size: 14, weight: .medium))
+                // Icon size only: a label that carries text applies ReaderToolbarFont to the Text
+                // itself, closer to the text than this style, so the label keeps its own
+                // toolbar/row typography.
+                .font(ReaderToolbarTypography.iconFont)
                 .frame(minWidth: 30, minHeight: 32)
                 .padding(.horizontal, 3)
                 .foregroundStyle(!enabled ? LyraReaderTheme.textDisabled :
@@ -142,5 +152,53 @@ struct LyraReaderSidebarTabStyle: ButtonStyle {
             .background(configuration.isPressed ? LyraReaderTheme.pressedBg :
                 (selected ? LyraReaderTheme.selectedBg : LyraReaderTheme.hoverBg))
             .contentShape(Rectangle())
+    }
+}
+
+/// Inspector actions share the reader's semantic surfaces in both appearances.
+struct ReaderPanelButtonStyle: ButtonStyle {
+    var prominent = false
+    var selected = false
+    @Environment(\.isEnabled) private var enabled
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 12, weight: .medium))
+            .frame(maxWidth: .infinity, minHeight: 32)
+            .foregroundStyle(!enabled ? LyraReaderTheme.textDisabled : prominent ? LyraReaderTheme.onAccent :
+                (selected ? LyraReaderTheme.selectedFg : LyraReaderTheme.textPrimary))
+            .background(!enabled ? LyraReaderTheme.panelBg : prominent ?
+                (configuration.isPressed ? LyraReaderTheme.accentPressed : LyraReaderTheme.accent) :
+                (configuration.isPressed ? LyraReaderTheme.pressedBg :
+                    (selected ? LyraReaderTheme.selectedBg : LyraReaderTheme.fieldBg)),
+                in: RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(
+                selected ? LyraReaderTheme.accentBorder : LyraReaderTheme.controlBorder))
+            .opacity(enabled ? (configuration.isPressed ? 0.85 : 1) : 0.45)
+    }
+}
+
+struct ReaderPanelSection<Content: View>: View {
+    let title: String
+    @ViewBuilder var content: Content
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title.uppercased())
+                .font(.system(size: 10, weight: .semibold))
+                .tracking(0.7)
+                .foregroundStyle(LyraReaderTheme.textTertiary)
+            content
+        }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+struct ReaderPanelFieldStyle: @preconcurrency TextFieldStyle {
+    @MainActor
+    func _body(configuration: TextField<Self._Label>) -> some View {
+        configuration
+            .textFieldStyle(.plain)
+            .font(.system(size: 12))
+            .padding(.horizontal, 9).padding(.vertical, 7)
+            .background(LyraReaderTheme.fieldBg, in: RoundedRectangle(cornerRadius: 5))
+            .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(LyraReaderTheme.controlBorder))
     }
 }

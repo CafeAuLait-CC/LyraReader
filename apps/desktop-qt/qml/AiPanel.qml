@@ -21,6 +21,11 @@ Pane {
         const modes = ["SummarizePage", "SummarizeDocument", "AskSelection", "TranslateSelection", "DocumentChat"];
         owner.prepareAi({
             action: modes[actionBox.currentIndex],
+            document_knowledge: false,
+            document_knowledge_text: null,
+            document_knowledge_pages: [],
+            history: [],
+            region: null,
             current_page: app.currentPage,
             selection: app.selection ? {
                 page: app.selection.page,
@@ -232,7 +237,8 @@ Pane {
             anchors.fill: parent
             contentWidth: availableWidth
             TextArea {
-                text: aiPanel.plan ? JSON.stringify(aiPanel.plan, null, 2) : ""
+                objectName: "aiWirePayload"
+                text: aiPanel.plan ? aiPanel.plan.parts.map(part => part.wire_body).join("\n\n") : ""
                 readOnly: true
                 selectByMouse: true
                 wrapMode: TextEdit.WrapAnywhere

@@ -68,6 +68,9 @@ enum LyraReaderStatus: Int32 {
 public final class MetalCanvasView: NSView {
     /// Reports frame statistics (the view throttles them itself).
     public var onFrame: ((LyraReaderFrameStats) -> Void)?
+    /// The performance panel's seam. Weak: the reader owns the probe, and an unopened panel's
+    /// only cost is the nil/bool check in `renderFrame` before any sample is built.
+    public weak var performanceProbe: CanvasPerformanceProbe?
     /// Reports a fatal GPU/surface problem; rendering stops afterwards.
     public var onFailure: ((String) -> Void)?
     /// Reports the backing scale so the engine can rasterize at device resolution.
@@ -82,6 +85,7 @@ public final class MetalCanvasView: NSView {
         didSet {
             let unchanged = pages.count == oldValue.count && zip(pages, oldValue).allSatisfy {
                 $0.placement == $1.placement && $0.image.generation == $1.image.generation
+                    && $0.source == $1.source && $0.blend == $1.blend
             }
             guard !unchanged else { return }
             syncTextures()
@@ -114,6 +118,53 @@ public final class MetalCanvasView: NSView {
         }
     }
 
+    /// In-place translations to draw over their source blocks. The model is page-local; the
+    /// overlay applies the same placement and zoom as the annotation layer.
+    public var translationOverlays: [TranslationOverlay] = [] {
+        didSet {
+            guard translationOverlays != oldValue else { return }
+            syncTranslationOverlay()
+        }
+    }
+
+    /// Paper colours sampled from each visible page. A missing page falls back to the display
+    /// appearance's paper colour.
+    public var translationPaperColors: [Int: TranslationPaperColor] = [:] {
+        didSet {
+            guard translationPaperColors != oldValue else { return }
+            syncTranslationOverlay()
+        }
+    }
+
+    /// The chip was pressed. AppState decides whether this is a flip, a retry or a fresh request.
+    public var onTranslationToggle: ((String) -> Void)?
+    /// The cancel affordance on a translating block.
+    public var onTranslationCancel: ((String) -> Void)?
+
+    /// One-shot region selection: the pointer becomes a crosshair, a drag draws a marquee with
+    /// visible bounds, and the release hands the page rectangle to the shell.
+    ///
+    /// The gesture is checked before every annotation, text-selection and page-edit path, so it
+    /// cannot fight a text-selection handle or a drawing tool. `AppState` refuses to arm it while
+    /// any of those modes owns the pointer; this view is the second guard.
+    public var regionSelectionArmed = false {
+        didSet {
+            guard regionSelectionArmed != oldValue else { return }
+            if !regionSelectionArmed { cancelRegionGesture() }
+            window?.invalidateCursorRects(for: self)
+        }
+    }
+    /// A completed marquee: 0-based page and page-local rectangle, in points.
+    public var onRegionSelection: ((Int, CGRect) -> Void)?
+    /// The drag was too small or left the page; the shell shows the reason and disarms.
+    public var onRegionSelectionCancelled: ((String) -> Void)?
+
+    private var regionMarquee: AIRegionMarqueeOverlayView?
+    private var regionGestureActive = false
+    private var regionGesturePage: Int?
+    private var regionGestureStart: CGPoint?
+    private var regionGestureCurrent: CGPoint?
+
     /// The tool a pointer drag uses. `.select` leaves text selection and mark selection intact.
     ///
     /// The eraser owns the gesture in the same way the pen does: a press starts a gesture, every
@@ -130,28 +181,21 @@ public final class MetalCanvasView: NSView {
             }
             eraserGestureActive = false
             eraserLastContentPoint = nil
-        }
-    }
-
-    /// Redaction rectangles that are pending on the page, drawn above the page but below the
-    /// selection chrome. Empty after the reader applies or clears them.
-    public var redactionMarks: [CanvasRedactionMark] = [] {
-        didSet {
-            guard redactionMarks != oldValue else { return }
-            syncAnnotationOverlay()
+            eraserRing.hideRing()
         }
     }
 
     /// Colour and width of the mark a drag creates. `AppState` owns both; the canvas only draws.
     public var annotationColor = AnnotationColor(red: 0xE8, green: 0xBC, blue: 0x55, alpha: 255)
     public var annotationStrokeWidth: CGFloat = 2 {
-        didSet { syncAnnotationOverlay() }
+        didSet {
+            syncAnnotationOverlay()
+            refreshEraserRing()
+        }
     }
 
     /// A finished stroke or shape, handed to the shell once, on mouse-up.
     public var onAnnotationDraft: ((AnnotationDraft) -> Void)?
-    /// A finished redaction rectangle: page index and page-local (top-left) rectangle.
-    public var onRedactionDraft: ((Int, CGRect) -> Void)?
     /// The eraser gesture, in content points. `dragged` receives the segment's previous and
     /// current points, so the model tests the path the pointer travelled, not isolated samples.
     public var onEraseGestureBegan: ((CGPoint) -> Void)?
@@ -173,20 +217,46 @@ public final class MetalCanvasView: NSView {
     public var onPlaceStamp: ((CGPoint) -> Bool)?
     /// A click with the image-signature tool armed, in content points.
     public var onPlaceSignature: ((CGPoint) -> Bool)?
+    /// A Fill & Sign placement is armed: the next click commits it (text, date, check, cross or
+    /// a drawn signature). Set from `AppState.pendingFillSignPlacement` on every update.
+    public var fillSignPlacementPending = false
+    /// A Fill & Sign click placement, in content points.
+    public var onPlaceFillSign: ((CGPoint) -> Bool)?
     /// Escape while the canvas is the first responder: leave a mode (sticky markup or the
     /// eraser). Returns whether a mode was left, so Escape is only consumed when it did something.
     public var onCancelTool: (() -> Bool)?
 
+    private let bookmarkHost = PageBookmarkCanvasHost()
+    package func configurePageBookmarks(state: AppState?) {
+        if bookmarkHost.superview == nil { addSubview(bookmarkHost) }
+        if state != nil { window?.acceptsMouseMovedEvents = true }
+        if bookmarkHost.configure(state: state) { markNeedsRender() }
+    }
+
+    private let regionHost = AIRegionCanvasHost()
+    package var regionCardFrames: [CGRect] { regionHost.cardFrames }
+    public func configureRegionCards(state: AppState?,
+        onOpenInPanel: @escaping (AIRegionHistoryEntry) -> Void = { _ in },
+        onShowHistory: @escaping () -> Void = {}) {
+        if regionHost.superview == nil { addSubview(regionHost) }
+        if regionHost.configure(state: state, onOpenInPanel: onOpenInPanel, onShowHistory: onShowHistory) {
+            markNeedsRender()
+        }
+    }
+
     private var pageChrome: PageChromeOverlayView?
+    package var pageChromeRectangles: [CGRect] { pageChrome?.pageRectangles ?? [] }
     private var annotationOverlay: AnnotationOverlayView?
+    private var translationOverlay: TranslationOverlayView?
     private var drawingPage: Int?
     private var drawingKind: AppState.Annotation.Kind?
-    private var drawingPlacesRedaction = false
     private var annotationSelectGesture = false
     /// The press was the sticky-note tool's; placement happens on mouse-up if it stayed a click.
     private var notePlacementPending = false
     private var stampPlacementPending = false
     private var signaturePlacementPending = false
+    /// The press belonged to an armed Fill & Sign placement; the click commits on mouse-up.
+    private var fillSignPlacementPressPending = false
     /// The text-box tool owns a press from down to up, but only a double-click creates a box.
     /// The flag keeps a drag with the tool armed from falling through to text selection.
     private var textBoxPlacementPending = false
@@ -195,6 +265,8 @@ public final class MetalCanvasView: NSView {
     /// An eraser drag is in flight, and where its last sample landed (content points).
     private var eraserGestureActive = false
     private var eraserLastContentPoint: CGPoint?
+    /// The click-through reach circle drawn while the eraser is armed.
+    private let eraserRing = EraserCursorRingView(frame: .zero)
     /// Delivers pointer movement for the eraser's pre-erase halo. Installed once; AppKit
     /// re-creates tracking areas when the view moves or resizes.
     private var hoverTrackingArea: NSTrackingArea?
@@ -307,6 +379,7 @@ public final class MetalCanvasView: NSView {
         didSet {
             guard zoom != oldValue else { return }
             syncAnnotationOverlay()
+            refreshEraserRing()
             markNeedsRender()
         }
     }
@@ -314,6 +387,7 @@ public final class MetalCanvasView: NSView {
     private var surfaceId: UInt64 = 0
     /// One texture per page, with the generation it was uploaded from.
     private var textures: [Int: (generation: UInt64, id: UInt64)] = [:]
+    package var residentTextureIDs: [Int: UInt64] { textures.mapValues(\.id) }
     /// Whether to print what this view submits (`LYRA_READER_CANVAS_DUMP=1`).
     ///
     /// A quad's `placement.index` is the key its texture is cached under, so **two quads sharing
@@ -368,6 +442,11 @@ public final class MetalCanvasView: NSView {
     /// to be zero, which catches the regression where the model empties but the old page stays
     /// on screen because no new frame was submitted.
     package private(set) var lastSubmittedQuadCount: Int?
+    /// Pyramid-tile quads in the most recent frame the GPU accepted (`nil` before the first one).
+    ///
+    /// Tile placements are the only positive indices the canvas draws (`PlacementIndex` gives
+    /// every overlay a negative block), so this is the exact "tiles per frame" the panel reports.
+    package private(set) var lastSubmittedTileCount: Int?
     /// Frames this view has handed to the engine, whether or not the WindowServer allowed the
     /// surface to present them.
     ///
@@ -390,6 +469,10 @@ public final class MetalCanvasView: NSView {
         // Same device as wgpu's adapter (see the class comment).
         metalLayer.device = MTLCreateSystemDefaultDevice()
         metalLayer.isOpaque = true
+        // wgpu's Metal backend waits until the command buffer is scheduled before presenting
+        // transaction-backed drawables. This keeps the paper and its AppKit edge/shadow layers
+        // in one Core Animation presentation during scrollbar tracking.
+        metalLayer.presentsWithTransaction = true
         return metalLayer
     }
 
@@ -410,6 +493,21 @@ public final class MetalCanvasView: NSView {
         overlay.autoresizingMask = [.width, .height]
         addSubview(overlay)
         annotationOverlay = overlay
+        let translations = TranslationOverlayView(frame: bounds)
+        translations.autoresizingMask = [.width, .height]
+        translations.onToggle = { [weak self] id in self?.onTranslationToggle?(id) }
+        translations.onCancel = { [weak self] id in self?.onTranslationCancel?(id) }
+        addSubview(translations)
+        translationOverlay = translations
+        let marquee = AIRegionMarqueeOverlayView(frame: bounds)
+        marquee.autoresizingMask = [.width, .height]
+        addSubview(marquee)
+        regionMarquee = marquee
+        // The eraser's reach circle is the topmost canvas overlay. It is click-through
+        // (`hitTest` is nil), so adding it here cannot take a press from the eraser underneath.
+        eraserRing.frame = bounds
+        eraserRing.autoresizingMask = [.width, .height]
+        addSubview(eraserRing)
     }
 
     @available(*, unavailable)
@@ -428,7 +526,7 @@ public final class MetalCanvasView: NSView {
         if window == nil {
             detachSurface()
         } else {
-            if annotationTool == .eraser { window?.acceptsMouseMovedEvents = true }
+            window?.acceptsMouseMovedEvents = true
             installScreenObservers()
             attachSurfaceIfNeeded()
             // `attachSurfaceIfNeeded` reports it too, but a view added to an already-attached
@@ -453,6 +551,17 @@ public final class MetalCanvasView: NSView {
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.reportDisplayCalibration() }
         })
+        screenObservers.append(center.addObserver(
+            forName: NSView.boundsDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let clip = note.object as? NSClipView else { return }
+            let identifier = ObjectIdentifier(clip)
+            MainActor.assumeIsolated {
+                guard let self, let parentClip = self.enclosingScrollView?.contentView,
+                      identifier == ObjectIdentifier(parentClip) else { return }
+                self.markNeedsRender()
+            }
+        })
     }
 
     private func removeScreenObservers() {
@@ -460,10 +569,10 @@ public final class MetalCanvasView: NSView {
         screenObservers.removeAll()
     }
 
-    // MARK: - Pointer hover (eraser indication)
+    // MARK: - Pointer hover (page bookmarks and eraser indication)
 
-    /// The eraser shows which stroke a press would remove, so pointer movement matters only
-    /// while it is armed. `.inVisibleRect` keeps the area correct across scrolling and resizing.
+    /// Pointer movement reveals page bookmarks and previews the armed eraser.
+    /// `.inVisibleRect` keeps the area correct across scrolling and resizing.
     public override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let hoverTrackingArea { removeTrackingArea(hoverTrackingArea) }
@@ -477,17 +586,42 @@ public final class MetalCanvasView: NSView {
         hoverTrackingArea = area
     }
 
+    public override func mouseEntered(with event: NSEvent) {
+        bookmarkHost.updateHover(at: bookmarkHost.convert(event.locationInWindow, from: nil))
+        if annotationTool == .eraser, !eraserGestureActive {
+            showEraserRing(for: event)
+            onEraserHover?(contentPoint(for: event))
+        } else {
+            eraserRing.hideRing()
+        }
+        super.mouseEntered(with: event)
+    }
+
     public override func mouseMoved(with event: NSEvent) {
+        bookmarkHost.updateHover(at: bookmarkHost.convert(event.locationInWindow, from: nil))
         guard annotationTool == .eraser, !eraserGestureActive else {
+            eraserRing.hideRing()
             super.mouseMoved(with: event)
             return
         }
+        showEraserRing(for: event)
         onEraserHover?(contentPoint(for: event))
     }
 
     public override func mouseExited(with event: NSEvent) {
+        bookmarkHost.updateHover(at: nil)
+        eraserRing.hideRing()
         if annotationTool == .eraser, !eraserGestureActive { onEraserHover?(nil) }
         super.mouseExited(with: event)
+    }
+
+    /// The crosshair is a real cursor rect: it appears over the whole canvas while the region
+    /// tool is armed and disappears with it, without a global cursor push that could leak.
+    public override func resetCursorRects() {
+        super.resetCursorRects()
+        if regionSelectionArmed {
+            addCursorRect(bounds, cursor: .crosshair)
+        }
     }
 
     public override func viewDidChangeEffectiveAppearance() {
@@ -500,9 +634,43 @@ public final class MetalCanvasView: NSView {
         super.layout()
         pageChrome?.frame = bounds
         annotationOverlay?.frame = bounds
+        translationOverlay?.frame = bounds
+        regionMarquee?.frame = bounds
+        eraserRing.frame = bounds
         syncAnnotationOverlay()
         resizeSurfaceIfNeeded()
         onViewportSize?(bounds.size)
+    }
+
+    // MARK: - Eraser cursor ring
+
+    /// The eraser's reach at the reader's current ink width and the live zoom, in view points.
+    private var eraserRingRadiusViewPt: CGFloat {
+        AnnotationGeometry.eraserCursorRadiusViewPt(strokeWidth: annotationStrokeWidth, zoom: zoom)
+    }
+
+    /// The ring in view coordinates (bottom-left origin), for the checks and the cursor path.
+    package var eraserCursorRing: EraserCursorRingView { eraserRing }
+
+    /// Shows the ring under a point in this view's coordinates, or hides it when the eraser is
+    /// disarmed, a drag owns the pointer, or the point is outside the canvas.
+    private func showEraserRing(atViewPoint point: CGPoint) {
+        guard annotationTool == .eraser, !eraserGestureActive, bounds.contains(point) else {
+            eraserRing.hideRing()
+            return
+        }
+        eraserRing.show(at: eraserRing.convert(point, from: self),
+                        radius: eraserRingRadiusViewPt)
+    }
+
+    private func showEraserRing(for event: NSEvent) {
+        showEraserRing(atViewPoint: convert(event.locationInWindow, from: nil))
+    }
+
+    /// Keeps an already-visible ring's radius in step with a zoom or ink-width change. The
+    /// pointer has not moved, so the centre stays put.
+    private func refreshEraserRing() {
+        eraserRing.updateRadius(eraserRingRadiusViewPt)
     }
 
     // MARK: - File drag and drop (T2.12)
@@ -689,16 +857,44 @@ public final class MetalCanvasView: NSView {
     }
 
     /// The page under a content point and the point in that page's top-left space.
+    ///
+    /// `annotationPageFrames` are display **segments**: an untorn page contributes one, a torn
+    /// page two. The conversion subtracts the segment's top and adds its page-local offset, so a
+    /// click below the tear still names the same page point it would without the card.
     private func pageLocalPoint(atContent point: CGPoint) -> (page: Int, point: CGPoint,
                                                               frame: PagePlacement)? {
         for frame in annotationPageFrames {
             let rect = CGRect(x: frame.leftPt, y: frame.topPt,
                               width: frame.widthPt, height: frame.heightPt)
             guard rect.contains(point) else { continue }
-            return (frame.index, CGPoint(x: point.x - frame.leftPt, y: point.y - frame.topPt),
-                    frame)
+            return (
+                frame.index,
+                CGPoint(
+                    x: point.x - frame.leftPt,
+                    y: point.y - frame.topPt + frame.sourceTopPt
+                ),
+                frame
+            )
         }
         return nil
+    }
+
+    /// The page-local point under `content` on one page, or nil in the card's gap.
+    private func pageLocalPoint(atContent point: CGPoint,
+                                page: Int) -> (point: CGPoint, frame: PagePlacement)? {
+        for frame in annotationPageFrames where frame.index == page {
+            let rect = CGRect(x: frame.leftPt, y: frame.topPt,
+                              width: frame.widthPt, height: frame.heightPt)
+            guard rect.contains(point) else { continue }
+            return (CGPoint(x: point.x - frame.leftPt,
+                            y: point.y - frame.topPt + frame.sourceTopPt), frame)
+        }
+        return nil
+    }
+
+    /// The display segments of one page, in reading order.
+    private func pageSegments(_ page: Int) -> [PagePlacement] {
+        annotationPageFrames.filter { $0.index == page }
     }
 
     public override func mouseDown(with event: NSEvent) {
@@ -708,6 +904,24 @@ public final class MetalCanvasView: NSView {
         pointerMoved = false
         let content = contentPoint(for: event)
         annotationDoubleClickConsumed = false
+        // The cursor ring is an indicator, not part of the gesture: a press always takes the
+        // same path with or without it, and the ring disappears while a drag is in flight.
+        eraserRing.hideRing()
+
+        // The region marquee owns the gesture while it is armed. It is checked before every
+        // other path so a text handle, a mark or a drawing tool can never start underneath it.
+        if regionSelectionArmed {
+            beginRegionGesture(atContent: content)
+            return
+        }
+
+        // A Fill & Sign placement claims the click before every other pointer path. It is not a
+        // tool: a drag with it armed is still inert, and only a press that stays inside the
+        // click slop commits the mark.
+        if fillSignPlacementPending {
+            fillSignPlacementPressPending = true
+            return
+        }
 
         // A double-click on a placed text annotation opens its editor. It is decided before the
         // ordinary press paths so the second press of the pair cannot start a move.
@@ -747,17 +961,6 @@ public final class MetalCanvasView: NSView {
             return
         }
 
-        // The redaction tool owns the gesture from press to release. Like the shapes, its live
-        // preview stays in the overlay; only a finished rectangle reaches AppState, and even then
-        // it is pending until the explicit apply command.
-        if annotationTool == .redact, let hit = pageLocalPoint(atContent: content) {
-            drawingPage = hit.page
-            drawingKind = .square
-            drawingPlacesRedaction = true
-            annotationOverlay?.beginLiveStroke(kind: .square, page: hit.page, at: hit.point)
-            return
-        }
-
         // The text-box tool places on a double-click, not by dragging a rectangle. The first
         // press of the pair does nothing; the second creates the one-line box at the click (or
         // reopens the box already there) and opens its editor with the caret at that point.
@@ -776,14 +979,13 @@ public final class MetalCanvasView: NSView {
            let hit = pageLocalPoint(atContent: content) {
             drawingPage = hit.page
             drawingKind = kind
-            drawingPlacesRedaction = false
             annotationOverlay?.beginLiveStroke(kind: kind, page: hit.page, at: hit.point)
             return
         }
 
         // Selecting a mark is decided on the press, not after the drag slop: the mark is what
         // the reader aimed at, and waiting would let the text under it start a text selection.
-        // Only an editable mark (one in the sidecar) qualifies.
+        // Only an editable mark (one in the annotation cache) qualifies.
         if annotationTool == .select,
            annotationOverlay?.hitTestMark(atContentPoint: content,
                                          toleranceViewPt: AnnotationGeometry.hitTolerancePt) != nil {
@@ -798,6 +1000,10 @@ public final class MetalCanvasView: NSView {
     }
 
     public override func mouseDragged(with event: NSEvent) {
+        if regionGestureActive {
+            extendRegionGesture(toContent: contentPoint(for: event))
+            return
+        }
         if eraserGestureActive {
             let content = contentPoint(for: event)
             let previous = eraserLastContentPoint ?? content
@@ -807,6 +1013,14 @@ public final class MetalCanvasView: NSView {
             return
         }
         if notePlacementPending {
+            let location = convert(event.locationInWindow, from: nil)
+            if hypot(location.x - (pressLocation?.x ?? location.x),
+                     location.y - (pressLocation?.y ?? location.y)) > Self.clickSlopPt {
+                pointerMoved = true
+            }
+            return
+        }
+        if fillSignPlacementPressPending {
             let location = convert(event.locationInWindow, from: nil)
             if hypot(location.x - (pressLocation?.x ?? location.x),
                      location.y - (pressLocation?.y ?? location.y)) > Self.clickSlopPt {
@@ -846,10 +1060,26 @@ public final class MetalCanvasView: NSView {
     }
 
     public override func mouseUp(with event: NSEvent) {
+        if regionGestureActive {
+            finishRegionGesture(atContent: contentPoint(for: event))
+            pressLocation = nil
+            pointerMoved = false
+            return
+        }
+        if regionSelectionArmed {
+            // The press missed every page, so no marquee started. Do not fall through to a
+            // text selection in the same gesture.
+            pressLocation = nil
+            pointerMoved = false
+            return
+        }
         if eraserGestureActive {
             eraserGestureActive = false
             eraserLastContentPoint = nil
             onEraseGestureEnded?()
+            // The pointer is still over the canvas and the eraser is still armed: restore the
+            // reach circle where the drag ended (a release outside the canvas keeps it hidden).
+            showEraserRing(for: event)
             pressLocation = nil
             pointerMoved = false
             syncInteraction()
@@ -857,6 +1087,15 @@ public final class MetalCanvasView: NSView {
         }
         if annotationDoubleClickConsumed {
             annotationDoubleClickConsumed = false
+            pressLocation = nil
+            pointerMoved = false
+            return
+        }
+        if fillSignPlacementPressPending {
+            fillSignPlacementPressPending = false
+            if !pointerMoved {
+                _ = onPlaceFillSign?(contentPoint(for: event))
+            }
             pressLocation = nil
             pointerMoved = false
             return
@@ -896,19 +1135,9 @@ public final class MetalCanvasView: NSView {
         }
         if drawingKind != nil {
             let draft = annotationOverlay?.finishLiveStroke(in: annotationPageFrames)
-            let placesRedaction = drawingPlacesRedaction
             drawingKind = nil
             drawingPage = nil
-            drawingPlacesRedaction = false
-            if let draft {
-                if placesRedaction {
-                    if let rect = draft.shapeRect, rect.width >= 1, rect.height >= 1 {
-                        onRedactionDraft?(draft.page, rect)
-                    }
-                } else {
-                    onAnnotationDraft?(draft)
-                }
-            }
+            if let draft { onAnnotationDraft?(draft) }
             pressLocation = nil
             pointerMoved = false
             return
@@ -919,6 +1148,136 @@ public final class MetalCanvasView: NSView {
         pointerMoved = false
         annotationSelectGesture = false
         syncInteraction()
+    }
+
+    // MARK: - Region marquee
+
+    /// A press with the region tool armed. Only a press that lands on a page starts a marquee.
+    private func beginRegionGesture(atContent point: CGPoint) {
+        guard let hit = pageLocalPoint(atContent: point) else { return }
+        regionGestureActive = true
+        regionGesturePage = hit.page
+        regionGestureStart = hit.point
+        regionGestureCurrent = hit.point
+        updateRegionMarquee()
+    }
+
+    private func extendRegionGesture(toContent point: CGPoint) {
+        guard regionGestureActive, let page = regionGesturePage,
+              let local = regionLocalPoint(atContent: point, page: page)
+        else { return }
+        regionGestureCurrent = local
+        updateRegionMarquee()
+    }
+
+    private func finishRegionGesture(atContent point: CGPoint) {
+        guard regionGestureActive, let page = regionGesturePage,
+              let start = regionGestureStart,
+              let local = regionLocalPoint(atContent: point, page: page)
+        else {
+            cancelRegionGesture()
+            return
+        }
+        let rect = CGRect(
+            x: min(start.x, local.x),
+            y: min(start.y, local.y),
+            width: abs(local.x - start.x),
+            height: abs(local.y - start.y)
+        )
+        let viewRects = CanvasGeometry.viewRects(
+            pageSegments: pageSegments(page), region: rect,
+            scrollYPt: scrollYPt, zoom: zoom, contentOffsetX: contentOffsetX
+        )
+        guard var union = viewRects.first else {
+            cancelRegionGesture()
+            return
+        }
+        for viewRect in viewRects.dropFirst() { union = union.union(viewRect) }
+        cancelRegionGesture()
+        guard union.width >= Self.regionMinimumViewPt,
+              union.height >= Self.regionMinimumViewPt
+        else {
+            onRegionSelectionCancelled?(
+                "The selected area is too small to ask about. Drag a larger rectangle."
+            )
+            return
+        }
+        onRegionSelection?(page, rect)
+    }
+
+    /// A page-local point for the marquee, clamped to the page and to the tear when the pointer
+    /// is in the card's gap. The marquee is a page rectangle, so its two display pieces are
+    /// derived from the same rectangle by `CanvasGeometry.viewRects`.
+    private func regionLocalPoint(atContent point: CGPoint, page: Int) -> CGPoint? {
+        if let hit = pageLocalPoint(atContent: point, page: page) { return hit.point }
+        let segments = pageSegments(page)
+        guard !segments.isEmpty else { return nil }
+        let first = segments[0]
+        let last = segments[segments.count - 1]
+        let x = min(max(point.x - first.leftPt, 0), first.widthPt)
+        if point.y < first.topPt { return CGPoint(x: x, y: first.sourceTopPt) }
+        if point.y > last.topPt + last.heightPt {
+            return CGPoint(x: x, y: last.sourceTopPt + last.sourceHeightPt)
+        }
+        // Inside the gap between the pieces: the page-local answer is the tear itself.
+        return CGPoint(x: x, y: first.sourceTopPt + first.sourceHeightPt)
+    }
+
+    /// The marquee's minimum on-screen size. Below this a press is a click, not a rectangle.
+    static let regionMinimumViewPt: CGFloat = 6
+
+    private func updateRegionMarquee() {
+        guard let page = regionGesturePage,
+              let start = regionGestureStart,
+              let current = regionGestureCurrent
+        else {
+            regionMarquee?.update(nil)
+            return
+        }
+        let rect = CGRect(
+            x: min(start.x, current.x),
+            y: min(start.y, current.y),
+            width: abs(current.x - start.x),
+            height: abs(current.y - start.y)
+        )
+        let viewRects = CanvasGeometry.viewRects(
+            pageSegments: pageSegments(page), region: rect,
+            scrollYPt: scrollYPt, zoom: zoom, contentOffsetX: contentOffsetX
+        )
+        var union = viewRects.first ?? .null
+        for viewRect in viewRects.dropFirst() { union = union.union(viewRect) }
+        regionMarqueeRectForTesting = viewRects.isEmpty ? nil : union
+        regionMarquee?.update(rects: viewRects)
+    }
+
+    private func cancelRegionGesture() {
+        regionGestureActive = false
+        regionGesturePage = nil
+        regionGestureStart = nil
+        regionGestureCurrent = nil
+        regionMarqueeRectForTesting = nil
+        regionMarquee?.update(nil)
+    }
+
+    /// The marquee rectangle in view space while a drag is in flight; nil otherwise.
+    package private(set) var regionMarqueeRectForTesting: CGRect?
+
+    /// Drives the same gesture the mouse events drive, in content points. The native checks use
+    /// this instead of synthesising AppKit events, so the geometry under test is the shipped one.
+    package func simulateRegionGesture(fromContent start: CGPoint, toContent end: CGPoint) {
+        beginRegionGesture(atContent: start)
+        extendRegionGesture(toContent: end)
+        finishRegionGesture(atContent: end)
+    }
+
+    /// The same drag without the release, for the marquee evidence screenshot.
+    package func simulateRegionDrag(fromContent start: CGPoint, toContent end: CGPoint) {
+        beginRegionGesture(atContent: start)
+        extendRegionGesture(toContent: end)
+    }
+
+    package func simulateRegionRelease(atContent point: CGPoint) {
+        finishRegionGesture(atContent: point)
     }
 
     public override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -961,14 +1320,19 @@ public final class MetalCanvasView: NSView {
             if onDeleteAnnotation?() == true { return }
             super.keyDown(with: event)
         case "\u{1B}":
+            if regionSelectionArmed || regionGestureActive {
+                cancelRegionGesture()
+                onRegionSelectionCancelled?("Region selection cancelled. Nothing was created.")
+                return
+            }
             annotationOverlay?.cancelLiveStroke()
             drawingKind = nil
             drawingPage = nil
-            drawingPlacesRedaction = false
             notePlacementPending = false
             textBoxPlacementPending = false
             stampPlacementPending = false
             signaturePlacementPending = false
+            fillSignPlacementPressPending = false
             if eraserGestureActive {
                 eraserGestureActive = false
                 eraserLastContentPoint = nil
@@ -1175,6 +1539,12 @@ public final class MetalCanvasView: NSView {
 
     private func renderFrame() {
         guard surfaceId != 0 else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        // Borders and paper quads must use the same submitted scroll position. Publishing
+        // borders from a setter moved the gap a frame ahead of Metal during scrollbar tracking.
+        syncPageChrome()
 
         // Every visible page goes into one frame; the shell only hands us pages it has
         // already rasterized, so an empty list simply means "nothing to draw yet".
@@ -1185,13 +1555,21 @@ public final class MetalCanvasView: NSView {
         let contentWidthPx = contentWidthPt * zoom * scale
         let offsetX = max(0, (CGFloat(surfaceWidth) - contentWidthPx) / 2)
         contentOffsetX = offsetX / scale
+        regionHost.sync(size: bounds.size, viewport: visibleRect, scroll: scrollYPt, zoom: zoom, pageFrames: annotationPageFrames)
+        bookmarkHost.sync(size: bounds.size, viewport: visibleRect, scroll: scrollYPt, zoom: zoom,
+                          contentWidth: contentWidthPt, pages: annotationPageFrames)
 
         var textureIds: [UInt64] = []
         var rects: [Float] = []
+        var sources: [Float] = []
         var blends: [UInt8] = []
         var submitted: [String] = []
+        var tileQuadCount = 0
         for page in pages {
             guard let texture = textures[page.placement.index] else { continue }
+            // Tiles are the only positive placement block (`PlacementIndex`); this is what the
+            // performance panel calls "tiles per frame".
+            if page.placement.index >= 0 { tileQuadCount += 1 }
             // `zoom` already includes the display calibration; `scale` is the backing scale.
             // This shared helper is the only place the two are multiplied for a page quad, so
             // calibration cannot be applied a second time here.
@@ -1214,6 +1592,12 @@ public final class MetalCanvasView: NSView {
             rects.append(Float(y))
             rects.append(Float(width))
             rects.append(Float(height))
+            // A torn page gives two quads the same texture with complementary source
+            // rectangles. The whole-page case is (0, 0, 1, 1).
+            sources.append(Float(page.source.minX))
+            sources.append(Float(page.source.minY))
+            sources.append(Float(page.source.maxX))
+            sources.append(Float(page.source.maxY))
             // A page is painted over the background; a highlight loaded from a PDF is usually
             // stored `/BM /Multiply` and has to multiply into the page under it.
             blends.append(page.blend.rawValue)
@@ -1223,12 +1607,16 @@ public final class MetalCanvasView: NSView {
                 let pixels = page.image.pixelWidth == 1 && page.image.pixelHeight == 1
                     ? " tint=\(Self.hex(page.image.bgra))"
                     : ""
+                let source = page.source == CGRect(x: 0, y: 0, width: 1, height: 1)
+                    ? ""
+                    : " source=(\(page.source.minX),\(page.source.minY))"
+                        + "(\(page.source.width)x\(page.source.height))"
                 submitted.append(
                     "idx=\(page.placement.index) tex=\(texture.id) gen=\(texture.generation) "
                         + "rect=(\(Int(x.rounded())),\(Int(y.rounded())) "
                         + "\(Int(width.rounded()))x\(Int(height.rounded())))px "
                         + "bitmap=\(page.image.pixelWidth)x\(page.image.pixelHeight)"
-                        + "\(pixels) blend=\(page.blend)")
+                        + "\(source)\(pixels) blend=\(page.blend)")
             }
         }
 
@@ -1260,16 +1648,19 @@ public final class MetalCanvasView: NSView {
         var stats = LyraReaderFrameStats()
         let code: Int32 = textureIds.withUnsafeBufferPointer { ids in
             rects.withUnsafeBufferPointer { rectangles in
-                blends.withUnsafeBufferPointer { modes in
-                    lyra_reader_surface_draw_pages_with_appearance(
-                        surfaceId,
-                        ids.baseAddress,
-                        rectangles.baseAddress,
-                        modes.baseAddress,
-                        textureIds.count,
-                        clear[0], clear[1], clear[2], paperAppearance.code,
-                        &stats
-                    )
+                sources.withUnsafeBufferPointer { sourceRects in
+                    blends.withUnsafeBufferPointer { modes in
+                        lyra_reader_surface_draw_pages_with_appearance_uv(
+                            surfaceId,
+                            ids.baseAddress,
+                            rectangles.baseAddress,
+                            sourceRects.baseAddress,
+                            modes.baseAddress,
+                            textureIds.count,
+                            clear[0], clear[1], clear[2], paperAppearance.code,
+                            &stats
+                        )
+                    }
                 }
             }
         }
@@ -1294,6 +1685,8 @@ public final class MetalCanvasView: NSView {
         if stats.presented == 0 {
             // The window is occluded (minimised, hidden, or covered by another app): wgpu
             // deliberately skips the draw. The frame loop retries at a low rate.
+            recordPerformanceSample(
+                stats: stats, presented: false, tileQuadCount: tileQuadCount, quadCount: textureIds.count)
             needsRender = true
             scheduleFrame(after: 0.133)
             return
@@ -1304,9 +1697,30 @@ public final class MetalCanvasView: NSView {
         // `submittedFrameCount`: together they say "a new frame reached the screen, and it had
         // this many page quads".
         lastSubmittedQuadCount = textureIds.count
+        lastSubmittedTileCount = tileQuadCount
+        recordPerformanceSample(
+            stats: stats, presented: true, tileQuadCount: tileQuadCount, quadCount: textureIds.count)
         if framesRendered == 1 || framesRendered % 15 == 0 {
             onFrame?(stats)
         }
+    }
+
+    /// Hands one frame to the performance probe, but only when it asked for samples.
+    ///
+    /// The nil/bool check is the entire closed-panel cost on the frame path; the sample value
+    /// (a POD struct) is not constructed unless a probe is sampling or the one-shot
+    /// open-to-first-frame measurement is pending.
+    private func recordPerformanceSample(
+        stats: LyraReaderFrameStats, presented: Bool, tileQuadCount: Int, quadCount: Int
+    ) {
+        guard let probe = performanceProbe, probe.wantsFrameSamples else { return }
+        probe.record(CanvasFrameSample(
+            presented: presented,
+            elapsedMicroseconds: stats.elapsed_us,
+            tileQuadCount: tileQuadCount,
+            quadCount: quadCount,
+            surfaceFrameIndex: stats.surface_frame_index
+        ))
     }
 
     /// Hands the current marks, page frames and view transform to the overlay.
@@ -1319,7 +1733,6 @@ public final class MetalCanvasView: NSView {
     }
 
     private func syncAnnotationOverlay() {
-        syncPageChrome()
         guard let overlay = annotationOverlay else { return }
         let color = annotationColor.nsColor
         overlay.update(
@@ -1333,7 +1746,22 @@ public final class MetalCanvasView: NSView {
             themeColor: NSColor.controlAccentColor,
             paperAppearance: paperAppearance
         )
-        overlay.updateRedactions(redactionMarks, frames: annotationPageFrames)
+        syncTranslationOverlay()
+    }
+
+    /// Hands the translation model to its own layer. It is separate from the annotation overlay
+    /// so hiding a translation cannot disturb a mark, and so the chip can take a click without
+    /// giving the annotation layer pointer ownership.
+    private func syncTranslationOverlay() {
+        translationOverlay?.update(
+            overlays: translationOverlays,
+            frames: annotationPageFrames,
+            zoom: zoom,
+            scrollYPt: scrollYPt,
+            contentWidthPt: contentWidthPt,
+            paperAppearance: paperAppearance,
+            paperColors: translationPaperColors
+        )
     }
 
     // MARK: - Geometry
@@ -1392,6 +1820,9 @@ public final class MetalCanvasView: NSView {
 
 /// SwiftUI wrapper around [`MetalCanvasView`].
 public struct PDFCanvasView: NSViewRepresentable {
+    private let regionState: AppState?
+    private let onOpenRegionInPanel: (AIRegionHistoryEntry) -> Void
+    private let onShowRegionHistory: () -> Void
     private let pages: [CanvasPage]
     private let scrollYPt: CGFloat
     private let zoom: CGFloat
@@ -1400,12 +1831,15 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let canvasClearColor: NSColor?
     private let annotationMarks: [CanvasAnnotationMark]
     private let annotationPageFrames: [PagePlacement]
-    private let redactionMarks: [CanvasRedactionMark]
+    private let translationOverlays: [TranslationOverlay]
+    private let translationPaperColors: [Int: TranslationPaperColor]
     private let annotationTool: AnnotationTool
+    private let regionSelectionArmed: Bool
+    private let onRegionSelection: ((Int, CGRect) -> Void)?
+    private let onRegionSelectionCancelled: ((String) -> Void)?
     private let annotationColor: AnnotationColor
     private let annotationStrokeWidth: CGFloat
     private let onAnnotationDraft: ((AnnotationDraft) -> Void)?
-    private let onRedactionDraft: ((Int, CGRect) -> Void)?
     private let onEraseGestureBegan: ((CGPoint) -> Void)?
     private let onEraseGestureDragged: ((CGPoint, CGPoint) -> Void)?
     private let onEraseGestureEnded: (() -> Void)?
@@ -1416,9 +1850,14 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let onPlaceTextBox: ((CGPoint) -> Bool)?
     private let onPlaceStamp: ((CGPoint) -> Bool)?
     private let onPlaceSignature: ((CGPoint) -> Bool)?
+    private let fillSignPlacementPending: Bool
+    private let onPlaceFillSign: ((CGPoint) -> Bool)?
     private let onCancelTool: (() -> Bool)?
     private let onFrame: (LyraReaderFrameStats) -> Void
     private let onFailure: (String) -> Void
+    /// The window's performance probe. Only the reader's canvas gets one; the floating preview
+    /// draws its own surface and must not report into the main window's panel.
+    private let performanceProbe: CanvasPerformanceProbe?
     private let onDeviceScale: (CGFloat) -> Void
     private let onDisplayCalibration: (DisplayCalibration) -> Void
     private let onViewportSize: (CGSize) -> Void
@@ -1439,6 +1878,8 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let fileDrop: DocumentOpenCoordinator?
     /// Right-click command list, rendered in the shared LyraReader panel. `nil` offers no menu.
     private let onContextMenu: ((CGPoint) -> NSMenu?)?
+    private let onTranslationToggle: ((String) -> Void)?
+    private let onTranslationCancel: ((String) -> Void)?
 
     public init(
         pages: [CanvasPage] = [],
@@ -1449,12 +1890,15 @@ public struct PDFCanvasView: NSViewRepresentable {
         canvasClearColor: NSColor? = nil,
         annotationMarks: [CanvasAnnotationMark] = [],
         annotationPageFrames: [PagePlacement] = [],
-        redactionMarks: [CanvasRedactionMark] = [],
+        translationOverlays: [TranslationOverlay] = [],
+        translationPaperColors: [Int: TranslationPaperColor] = [:],
         annotationTool: AnnotationTool = .select,
+        regionSelectionArmed: Bool = false,
+        onRegionSelection: ((Int, CGRect) -> Void)? = nil,
+        onRegionSelectionCancelled: ((String) -> Void)? = nil,
         annotationColor: AnnotationColor = AnnotationColor(red: 0xE8, green: 0xBC, blue: 0x55, alpha: 255),
         annotationStrokeWidth: CGFloat = 2,
         onAnnotationDraft: ((AnnotationDraft) -> Void)? = nil,
-        onRedactionDraft: ((Int, CGRect) -> Void)? = nil,
         onEraseGestureBegan: ((CGPoint) -> Void)? = nil,
         onEraseGestureDragged: ((CGPoint, CGPoint) -> Void)? = nil,
         onEraseGestureEnded: (() -> Void)? = nil,
@@ -1465,9 +1909,12 @@ public struct PDFCanvasView: NSViewRepresentable {
         onPlaceTextBox: ((CGPoint) -> Bool)? = nil,
         onPlaceStamp: ((CGPoint) -> Bool)? = nil,
         onPlaceSignature: ((CGPoint) -> Bool)? = nil,
+        fillSignPlacementPending: Bool = false,
+        onPlaceFillSign: ((CGPoint) -> Bool)? = nil,
         onCancelTool: (() -> Bool)? = nil,
         onFrame: @escaping (LyraReaderFrameStats) -> Void = { _ in },
         onFailure: @escaping (String) -> Void = { _ in },
+        performanceProbe: CanvasPerformanceProbe? = nil,
         onDeviceScale: @escaping (CGFloat) -> Void = { _ in },
         onDisplayCalibration: @escaping (DisplayCalibration) -> Void = { _ in },
         onViewportSize: @escaping (CGSize) -> Void = { _ in },
@@ -1484,8 +1931,16 @@ public struct PDFCanvasView: NSViewRepresentable {
         onRedo: @escaping () -> Void = {},
         interactionSnapshot: (() -> ([CanvasPage], CGFloat, CGFloat))? = nil,
         fileDrop: DocumentOpenCoordinator? = nil,
-        onContextMenu: ((CGPoint) -> NSMenu?)? = nil
+        onContextMenu: ((CGPoint) -> NSMenu?)? = nil,
+        onTranslationToggle: ((String) -> Void)? = nil,
+        onTranslationCancel: ((String) -> Void)? = nil,
+        regionState: AppState? = nil,
+        onOpenRegionInPanel: @escaping (AIRegionHistoryEntry) -> Void = { _ in },
+        onShowRegionHistory: @escaping () -> Void = {}
     ) {
+        self.regionState = regionState
+        self.onOpenRegionInPanel = onOpenRegionInPanel
+        self.onShowRegionHistory = onShowRegionHistory
         self.pages = pages
         self.scrollYPt = scrollYPt
         self.zoom = zoom
@@ -1494,12 +1949,15 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.canvasClearColor = canvasClearColor
         self.annotationMarks = annotationMarks
         self.annotationPageFrames = annotationPageFrames
-        self.redactionMarks = redactionMarks
+        self.translationOverlays = translationOverlays
+        self.translationPaperColors = translationPaperColors
         self.annotationTool = annotationTool
+        self.regionSelectionArmed = regionSelectionArmed
+        self.onRegionSelection = onRegionSelection
+        self.onRegionSelectionCancelled = onRegionSelectionCancelled
         self.annotationColor = annotationColor
         self.annotationStrokeWidth = annotationStrokeWidth
         self.onAnnotationDraft = onAnnotationDraft
-        self.onRedactionDraft = onRedactionDraft
         self.onEraseGestureBegan = onEraseGestureBegan
         self.onEraseGestureDragged = onEraseGestureDragged
         self.onEraseGestureEnded = onEraseGestureEnded
@@ -1510,9 +1968,12 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.onPlaceTextBox = onPlaceTextBox
         self.onPlaceStamp = onPlaceStamp
         self.onPlaceSignature = onPlaceSignature
+        self.fillSignPlacementPending = fillSignPlacementPending
+        self.onPlaceFillSign = onPlaceFillSign
         self.onCancelTool = onCancelTool
         self.onFrame = onFrame
         self.onFailure = onFailure
+        self.performanceProbe = performanceProbe
         self.onDeviceScale = onDeviceScale
         self.onDisplayCalibration = onDisplayCalibration
         self.onViewportSize = onViewportSize
@@ -1530,6 +1991,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.interactionSnapshot = interactionSnapshot
         self.fileDrop = fileDrop
         self.onContextMenu = onContextMenu
+        self.onTranslationToggle = onTranslationToggle
+        self.onTranslationCancel = onTranslationCancel
     }
 
     public func makeNSView(context: Context) -> MetalCanvasView {
@@ -1543,9 +2006,13 @@ public struct PDFCanvasView: NSViewRepresentable {
     }
 
     private func configure(_ view: MetalCanvasView) {
+        view.configurePageBookmarks(state: regionState)
+        view.configureRegionCards(state: regionState, onOpenInPanel: onOpenRegionInPanel,
+                                  onShowHistory: onShowRegionHistory)
         view.interactionSnapshot = interactionSnapshot
         view.onFrame = onFrame
         view.onFailure = onFailure
+        view.performanceProbe = performanceProbe
         view.onDeviceScale = onDeviceScale
         view.onDisplayCalibration = onDisplayCalibration
         view.onViewportSize = onViewportSize
@@ -1561,6 +2028,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.onUndo = onUndo
         view.onRedo = onRedo
         view.onContextMenu = onContextMenu
+        view.onTranslationToggle = onTranslationToggle
+        view.onTranslationCancel = onTranslationCancel
         view.zoom = zoom
         view.scrollYPt = scrollYPt
         view.contentWidthPt = contentWidthPt
@@ -1568,12 +2037,15 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.canvasClearColor = canvasClearColor
         view.annotationMarks = annotationMarks
         view.annotationPageFrames = annotationPageFrames
-        view.redactionMarks = redactionMarks
+        view.translationOverlays = translationOverlays
+        view.translationPaperColors = translationPaperColors
         view.annotationTool = annotationTool
+        view.regionSelectionArmed = regionSelectionArmed
+        view.onRegionSelection = onRegionSelection
+        view.onRegionSelectionCancelled = onRegionSelectionCancelled
         view.annotationColor = annotationColor
         view.annotationStrokeWidth = annotationStrokeWidth
         view.onAnnotationDraft = onAnnotationDraft
-        view.onRedactionDraft = onRedactionDraft
         view.onEraseGestureBegan = onEraseGestureBegan
         view.onEraseGestureDragged = onEraseGestureDragged
         view.onEraseGestureEnded = onEraseGestureEnded
@@ -1584,6 +2056,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.onPlaceTextBox = onPlaceTextBox
         view.onPlaceStamp = onPlaceStamp
         view.onPlaceSignature = onPlaceSignature
+        view.fillSignPlacementPending = fillSignPlacementPending
+        view.onPlaceFillSign = onPlaceFillSign
         view.onCancelTool = onCancelTool
         view.pages = pages
         // Drag & drop is rewired on every update: `connect` only assigns closures, and the

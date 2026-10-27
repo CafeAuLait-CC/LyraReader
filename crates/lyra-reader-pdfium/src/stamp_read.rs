@@ -37,6 +37,10 @@ const MAX_IMAGE_PIXELS: u64 = 16_000_000;
 const MAX_IMAGE_SIDE: u32 = 8_192;
 /// A decompressed stream larger than this is refused by the image and text readers.
 const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
+/// The widest `/DecodeParms /Columns` this reader will reconstruct. The file controls the
+/// value, and it used to size a row buffer directly; 1 MiB columns is already far beyond a
+/// real image (at 16 bits × 4 colours that is an 8 MiB row).
+const MAX_PREDICTOR_COLUMNS: usize = 1 << 20;
 
 /// One page and a rounded `/Rect`, the fallback identity for a stamp with no `/NM`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -365,7 +369,7 @@ fn decode_image(
     let mut data = stream
         .decompressed_content()
         .map_err(|error| format!("the image stream could not be decompressed: {error}"))?;
-    let predictor = decode_parms(document, &stream.dict).unwrap_or_default();
+    let predictor = decode_parms(document, &stream.dict)?;
     if predictor.predictor >= 10 {
         data = png_unpredict(&data, predictor.columns, predictor.colors, predictor.bits)
             .ok_or_else(|| "the image's PNG predictor is malformed".to_string())?;
@@ -419,7 +423,7 @@ fn decode_image(
         let mut alpha = mask
             .decompressed_content()
             .map_err(|error| format!("the image's /SMask could not be decompressed: {error}"))?;
-        let mask_predictor = decode_parms(document, &mask.dict).unwrap_or_default();
+        let mask_predictor = decode_parms(document, &mask.dict)?;
         if mask_predictor.predictor >= 10 {
             alpha = png_unpredict(
                 &alpha,
@@ -468,19 +472,47 @@ impl Default for Predictor {
     }
 }
 
-fn decode_parms(document: &Document, dictionary: &Dictionary) -> Option<Predictor> {
+fn decode_parms(
+    document: &Document,
+    dictionary: &Dictionary,
+) -> std::result::Result<Predictor, String> {
     let parms = dictionary
         .get(b"DecodeParms")
         .ok()
         .and_then(|object| deref(document, object))
-        .and_then(|object| object.as_dict().ok())?;
-    Some(Predictor {
-        predictor: integer(document, parms, b"Predictor").unwrap_or(1),
-        colors: integer(document, parms, b"Colors").unwrap_or(1).max(1) as usize,
-        bits: integer(document, parms, b"BitsPerComponent")
-            .unwrap_or(8)
-            .max(1) as usize,
-        columns: integer(document, parms, b"Columns").unwrap_or(1).max(1) as usize,
+        .and_then(|object| object.as_dict().ok());
+    let Some(parms) = parms else {
+        return Ok(Predictor::default());
+    };
+    let predictor = integer(document, parms, b"Predictor").unwrap_or(1);
+    let colors = integer(document, parms, b"Colors").unwrap_or(1);
+    let bits = integer(document, parms, b"BitsPerComponent").unwrap_or(8);
+    let columns = integer(document, parms, b"Columns").unwrap_or(1);
+
+    // These values size the reconstructed row buffer. Validate them before any allocation:
+    // an unchecked `columns * colors * bits` wrapped in release and aborted the process on a
+    // `vec![0; row_len]` in debug.
+    if !matches!(colors, 1 | 3 | 4) {
+        return Err(format!(
+            "the image's /DecodeParms /Colors is {colors}; this reader accepts 1, 3 or 4"
+        ));
+    }
+    if !matches!(bits, 1 | 2 | 4 | 8 | 16) {
+        return Err(format!(
+            "the image's /DecodeParms /BitsPerComponent is {bits}; this reader accepts 1, 2, 4, 8 or 16"
+        ));
+    }
+    if !(1..=MAX_PREDICTOR_COLUMNS as i64).contains(&columns) {
+        return Err(format!(
+            "the image's /DecodeParms /Columns is {columns}; this reader accepts 1 to {MAX_PREDICTOR_COLUMNS}"
+        ));
+    }
+
+    Ok(Predictor {
+        predictor,
+        colors: colors as usize,
+        bits: bits as usize,
+        columns: columns as usize,
     })
 }
 
@@ -753,9 +785,11 @@ fn hex_value(byte: u8) -> Option<u8> {
 }
 
 fn png_unpredict(data: &[u8], columns: usize, colors: usize, bits: usize) -> Option<Vec<u8>> {
-    let bytes_per_pixel = (colors * bits).div_ceil(8).max(1);
-    let row_len = (columns * colors * bits).div_ceil(8);
-    if row_len == 0 {
+    let bytes_per_pixel = colors.checked_mul(bits)?.div_ceil(8).max(1);
+    let row_len = columns.checked_mul(colors)?.checked_mul(bits)?.div_ceil(8);
+    // A row cannot be larger than the stream that contains it, so this also keeps a direct
+    // caller that skipped `decode_parms` from sizing a buffer the file never had to supply.
+    if row_len == 0 || row_len > data.len() {
         return None;
     }
     let mut output = Vec::new();
@@ -764,8 +798,9 @@ fn png_unpredict(data: &[u8], columns: usize, colors: usize, bits: usize) -> Opt
     while index < data.len() {
         let filter = *data.get(index)?;
         index += 1;
-        let row = data.get(index..index + row_len)?;
-        index += row_len;
+        let end = index.checked_add(row_len)?;
+        let row = data.get(index..end)?;
+        index = end;
         let mut current = vec![0u8; row_len];
         for slot in 0..row_len {
             let left = if slot >= bytes_per_pixel {
@@ -812,8 +847,8 @@ fn tiff_unpredict(data: &[u8], columns: usize, colors: usize, bits: usize) -> Op
     if bits != 8 {
         return None;
     }
-    let row_len = columns * colors;
-    if row_len == 0 {
+    let row_len = columns.checked_mul(colors)?;
+    if row_len == 0 || row_len > data.len() {
         return None;
     }
     let mut output = data.to_vec();
@@ -876,5 +911,52 @@ mod tests {
         // Two-byte CIDs in the range this writer emits for .notdef/subset glyphs.
         let content = b"BT <00010002> Tj ET";
         assert_eq!(appearance_text(content), None);
+    }
+
+    /// An image XObject whose only interesting part is its `/DecodeParms`.
+    fn predictor_image(columns: i64, colors: i64, bits: i64) -> Stream {
+        let mut parms = Dictionary::new();
+        parms.set("Predictor", 12i64);
+        parms.set("Columns", columns);
+        parms.set("Colors", colors);
+        parms.set("BitsPerComponent", bits);
+
+        let mut dict = Dictionary::new();
+        dict.set("Type", "XObject");
+        dict.set("Subtype", "Image");
+        dict.set("Width", 1i64);
+        dict.set("Height", 1i64);
+        dict.set("ColorSpace", "DeviceGray");
+        dict.set("BitsPerComponent", 8i64);
+        dict.set("DecodeParms", Object::Dictionary(parms));
+        Stream::new(dict, vec![0u8; 8])
+    }
+
+    #[test]
+    fn a_file_controlled_columns_value_is_refused_before_a_row_buffer_exists() {
+        let document = Document::with_version("1.7");
+        // i64::MAX used to reach `columns * colors * bits`, which overflows before any
+        // allocation and panicked the whole reader.
+        let error = decode_image(&document, &predictor_image(i64::MAX, 1, 8))
+            .expect_err("a huge /Columns must be refused");
+        assert!(error.contains("/Columns"), "{error}");
+        assert!(error.contains(&i64::MAX.to_string()), "{error}");
+    }
+
+    #[test]
+    fn unsupported_predictor_colours_and_bits_are_refused() {
+        let document = Document::with_version("1.7");
+        let colors = decode_image(&document, &predictor_image(16, 2, 8))
+            .expect_err("two colours are not a PNG predictor layout");
+        assert!(colors.contains("/Colors"), "{colors}");
+        let bits = decode_image(&document, &predictor_image(16, 1, 3))
+            .expect_err("three bits per component is not a PNG predictor layout");
+        assert!(bits.contains("/BitsPerComponent"), "{bits}");
+    }
+
+    #[test]
+    fn png_unpredict_never_sizes_a_row_beyond_its_input() {
+        assert!(png_unpredict(&[0u8; 8], usize::MAX / 8, 1, 8).is_none());
+        assert!(png_unpredict(&[0u8; 8], 1 << 24, 1, 8).is_none());
     }
 }

@@ -1,5 +1,6 @@
 import AppKit
 import LyraReaderKit
+import LyraReaderBindings
 import Foundation
 import SwiftUI
 
@@ -7,7 +8,7 @@ import SwiftUI
 ///
 /// Every assertion is a number or a state a reader can also see: the row's height, the traffic
 /// lights' leading inset and centre line, the document-open counter, the raster generation, the
-/// scroll offset, the index-sidecar inode. The only two things left to a human eye are stated in
+/// scroll offset, the index cache inode. The only two things left to a human eye are stated in
 /// the pull request: whether the optical alignment looks right against a real window, and whether
 /// the inset matches Safari/PDF Expert.
 extension ReaderChecks {
@@ -175,7 +176,7 @@ extension ReaderChecks {
 
     /// Defects 4a/4b: switching to an already-open tab must not call `open`, must present the same
     /// raster generation, and must restore the exact scroll offset. Beyond the keep-limit the LRU
-    /// document is closed exactly once; selecting its tab reloads it without a second index-sidecar
+    /// document is closed exactly once; selecting its tab reloads it without a second index cache
     /// write, with annotations and a pending page-edit session intact.
     @MainActor static func tabRetentionChecks(root: URL) async throws {
         let fileManager = FileManager.default
@@ -193,10 +194,11 @@ extension ReaderChecks {
             return destination
         }
 
-        // The full suite runs with the index cache disabled so it cannot write beside the committed
-        // fixtures. These copies are in a temporary directory, so enable the cache for this check
-        // and restore the previous environment value afterwards: it must be a hit, not a rewrite,
-        // when an evicted tab is selected again.
+        // The full suite runs with the index cache disabled and redirects both caches to a
+        // temporary directory, so it cannot read or write the user's cache. These copies are in a
+        // temporary directory, so enable the cache for this check and restore the previous
+        // environment value afterwards: it must be a hit, not a rewrite, when an evicted tab is
+        // selected again.
         let cacheEnvironmentKey = "LYRA_READER_INDEX_CACHE"
         let previousCacheSetting = ProcessInfo.processInfo.environment[cacheEnvironmentKey]
         setenv(cacheEnvironmentKey, "enabled", 1)
@@ -238,10 +240,12 @@ extension ReaderChecks {
         state.gotoPage(1)
         let scrollB = state.scrollYPt
         require(scrollB > 0, "the second tab is scrolled away from the top")
-        try await eventually("the second tab's index sidecar is written", {
-            fileManager.fileExists(atPath: b.appendingPathExtension("lyra-reader-index.json").path)
+        let indexURLB = URL(fileURLWithPath: LyraReaderBindings.documentIndexCachePath(path: b.path))
+        require(indexURLB.deletingLastPathComponent() != b.deletingLastPathComponent(),
+                "the derived index uses the application cache instead of the PDF's folder")
+        try await eventually("the second tab's application index cache is written", {
+            fileManager.fileExists(atPath: indexURLB.path)
         })
-        let indexURLB = b.appendingPathExtension("lyra-reader-index.json")
         let indexAfterFirstWrite = try fileManager.attributesOfItem(atPath: indexURLB.path)
 
         // 2. Switching to the first tab is a document activation, never an open, and presents the
@@ -262,7 +266,7 @@ extension ReaderChecks {
         let indexAfterSwitch = try fileManager.attributesOfItem(atPath: indexURLB.path)
         require(indexAfterSwitch[.systemFileNumber] as? NSNumber
                     == indexAfterFirstWrite[.systemFileNumber] as? NSNumber,
-                "switching tabs does not write a second index sidecar for the retained document")
+                "switching tabs does not write a second index cache for the retained document")
 
         // 3. Visit a third tab and come back: still no open, still the same raster and position.
         state.newTab(url: c)
@@ -302,18 +306,18 @@ extension ReaderChecks {
         require(engine.retainedDocumentURLs.count <= AppState.maximumRetainedDocuments,
                 "the engine retains no more documents than the shell's limit")
 
-        // The index sidecar was written once when b first opened; switching tabs and evicting it
+        // The index cache was written once when b first opened; switching tabs and evicting it
         // must not rewrite it.
         let indexAfterEviction = try fileManager.attributesOfItem(atPath: indexURLB.path)
         require(indexAfterEviction[.systemFileNumber] as? NSNumber
                     == indexBefore[.systemFileNumber] as? NSNumber,
-                "evicting b does not rewrite its index sidecar (same inode)")
+                "evicting b does not rewrite its index cache (same inode)")
         require(indexAfterEviction[.modificationDate] as? Date
                     == indexBefore[.modificationDate] as? Date,
-                "evicting b leaves its index sidecar's timestamp alone")
+                "evicting b leaves its index cache's timestamp alone")
 
         // 5. Selecting the evicted tab reloads it once, keeps its exact scroll position, and the
-        //    reload is an index-cache hit: the sidecar is not written a second time.
+        //    reload is an index-cache hit: the annotation cache is not written a second time.
         let bTab = state.tabs.firstIndex(where: { $0.url == b })
         require(bTab != nil, "the evicted tab is still in the strip")
         let opensBeforeBReload = engine.documentOpenCount
@@ -331,12 +335,12 @@ extension ReaderChecks {
         let indexAfterReload = try fileManager.attributesOfItem(atPath: indexURLB.path)
         require(indexAfterReload[.systemFileNumber] as? NSNumber
                     == indexBefore[.systemFileNumber] as? NSNumber,
-                "re-entering the evicted tab does not write a second index sidecar (same inode)")
+                "re-entering the evicted tab does not write a second index cache (same inode)")
         require(indexAfterReload[.modificationDate] as? Date
                     == indexBefore[.modificationDate] as? Date,
-                "re-entering the evicted tab leaves the index sidecar's timestamp alone")
+                "re-entering the evicted tab leaves the index cache's timestamp alone")
 
-        // 6. Annotations follow the document, not the tab's activation. A seeded sidecar is loaded
+        // 6. Annotations follow the document, not the tab's activation. A seeded annotation cache is loaded
         //    once; switching away and back presents it without writing it again.
         let annotated = try copyFixture("multipage.pdf", to: "annotated.pdf")
         let note = AppState.Annotation(
@@ -344,8 +348,8 @@ extension ReaderChecks {
             color: AppState.highlightPalette[0].color,
             note: "survives a tab switch", createdAt: Date()
         )
-        let annotationSidecar = annotated.appendingPathExtension("lyra-reader-annotations.json")
-        try JSONEncoder().encode([note]).write(to: annotationSidecar)
+        let annotationRecords = DocumentEditCache.annotationsURL(for: annotated)
+        try JSONEncoder().encode([note]).write(to: annotationRecords)
         let annotationState = AppState(engine: try RustEngine())
         annotationState.setViewportSize(CGSize(width: 700, height: 500))
         annotationState.newTab(url: annotated)
@@ -358,7 +362,7 @@ extension ReaderChecks {
         require(annotationState.annotations.first?.note == "survives a tab switch",
                 "the annotation's note survived the switch")
         require(annotationState.annotationWriteCount == writesBeforeSwitch,
-                "switching tabs does not rewrite the annotation sidecar")
+                "switching tabs does not rewrite the annotation cache")
 
         // 7. A pending page-edit session survives a tab switch, and the tab comes back on its
         //    working revision rather than the original file.

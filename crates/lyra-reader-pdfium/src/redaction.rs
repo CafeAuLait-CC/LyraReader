@@ -55,7 +55,7 @@
 
 #![allow(unsafe_code)]
 
-use crate::backend::PDFIUM_LOCK;
+use crate::copy_path::{CopyPathExtension, suggest_copy_path};
 use crate::page_ops::replace_original_with_edit;
 use crate::rewrite::{TextComparison, verify_document_equivalence};
 use crate::writeback::{OutputMode, write_rewritten_pdf};
@@ -97,12 +97,18 @@ impl RedactionFill {
 }
 
 /// Stage either redaction style for the content editor's reversible working-copy session.
+///
+/// `allow_raster` is the content editor's explicit user decision: when false, a page that can
+/// only be erased by replacing it with an image is refused (the caller must first ask). When
+/// true, exactly those pages are rasterised and the removed text layer is the caller's stated
+/// consequence. The CLI's [`redact_pdf`] has no working copy and always allows the fallback.
 pub fn stage_content_redaction(
     source: &Path,
     destination: &Path,
     areas: &[RedactionArea],
     fill: RedactionFill,
     expected_source: &[u8],
+    allow_raster: bool,
 ) -> Result<RedactionReport> {
     redact_with_fill(
         source,
@@ -112,6 +118,7 @@ pub fn stage_content_redaction(
         RedactionMode::Copy,
         fill,
         Some(expected_source),
+        allow_raster,
     )
 }
 
@@ -181,12 +188,12 @@ pub struct RedactionReport {
 }
 
 /// The name to offer when saving a redacted copy: `<name> (redacted).pdf`.
+///
+/// This is the one copy suggestion that does not preserve the source's extension: the
+/// redaction writer always produces a PDF, so `paper.txt` is offered as
+/// `paper (redacted).pdf`, not `paper (redacted).txt`.
 pub fn suggested_redaction_copy_path(source: &Path) -> PathBuf {
-    let stem = source
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "document".to_string());
-    source.with_file_name(format!("{stem} (redacted).pdf"))
+    suggest_copy_path(source, "redacted", CopyPathExtension::Pdf)
 }
 
 /// Reports what applying `areas` would remove, without writing.
@@ -199,7 +206,7 @@ pub fn preview_redactions(source: &Path, areas: &[RedactionArea]) -> Result<Reda
     reject_encrypted(&bytes)?;
     let api = redact_api()?;
     let document = RedactDocument::load(api, bytes, None)?;
-    let page_count = document.page_count();
+    let page_count = document.page_count()?;
     let grouped = group_areas(areas, page_count)?;
 
     let mut pages = Vec::with_capacity(grouped.len());
@@ -239,6 +246,35 @@ pub fn preview_redactions(source: &Path, areas: &[RedactionArea]) -> Result<Reda
     })
 }
 
+/// The pages applying `areas` would have to replace with a raster image, without writing.
+///
+/// This is the pre-flight for the content editor's confirmation. It runs the same page analysis
+/// as [`redact_pdf`] but stops before rendering the fallback image: a page listed here loses its
+/// entire text layer when the redaction is applied. The answer is a prediction, not a promise —
+/// the verified write is still the source of truth for what was actually rasterised — but the
+/// analysis that decides it is shared with the writer, so the list cannot drift from the result.
+pub fn raster_pages_for_redaction(source: &Path, areas: &[RedactionArea]) -> Result<Vec<u32>> {
+    validate_areas(areas)?;
+    let bytes = read_source(source)?;
+    reject_encrypted(&bytes)?;
+    let api = redact_api()?;
+    let original = RedactDocument::load(api, bytes.clone(), None)?;
+    let grouped = group_areas(areas, original.page_count()?)?;
+    let analysis = analyse(
+        &bytes,
+        &grouped,
+        &original,
+        api,
+        RedactionFill::Blackout,
+        false,
+    )?;
+    Ok(analysis
+        .pages
+        .iter()
+        .filter_map(|(&page, page_analysis)| page_analysis.rasterize.then_some(page))
+        .collect())
+}
+
 /// Applies `areas` and writes the result according to `mode`.
 ///
 /// See the module documentation for exactly what is removed, what the fallback rasterisation
@@ -258,9 +294,11 @@ pub fn redact_pdf(
         mode,
         RedactionFill::Blackout,
         None,
+        true,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn redact_with_fill(
     source: &Path,
     destination: &Path,
@@ -269,6 +307,7 @@ fn redact_with_fill(
     mode: RedactionMode,
     fill: RedactionFill,
     expected_source: Option<&[u8]>,
+    allow_raster: bool,
 ) -> Result<RedactionReport> {
     let working = expected_source.is_some();
     validate_areas(areas)?;
@@ -311,7 +350,7 @@ fn redact_with_fill(
     reject_encrypted(&source_bytes)?;
     let api = redact_api()?;
     let original = RedactDocument::load(api, source_bytes.clone(), None)?;
-    let page_count = original.page_count();
+    let page_count = original.page_count()?;
     let grouped = group_areas(areas, page_count)?;
 
     // Everything the verifier will look for, computed from the source before it is touched.
@@ -321,14 +360,14 @@ fn redact_with_fill(
         expected.insert(page, outside_text(&chars, rects));
     }
 
-    let analysis = analyse(&source_bytes, &grouped, &original, api, fill)?;
+    let analysis = analyse(&source_bytes, &grouped, &original, api, fill, true)?;
     let stats = collect_stats(&analysis);
     let rasterized: HashSet<u32> = stats
         .iter()
         .filter(|(_, report)| report.rasterized)
         .map(|(&page, _)| page)
         .collect();
-    if working && !rasterized.is_empty() {
+    if working && !allow_raster && !rasterized.is_empty() {
         return Err(refusal(
             "this region needs a raster redaction",
             "the content editor keeps surviving text editable; this page's nested or unsupported content cannot yet be erased without rasterising the page",
@@ -487,6 +526,7 @@ fn analyse(
     original: &RedactDocument,
     api: &'static RedactApi,
     fill: RedactionFill,
+    render_rasters: bool,
 ) -> Result<Analysis> {
     // The lopdf document is the rewrite target; PDFium is only the microscope (char boxes,
     // object bounds, the fallback raster). The two are loaded from the same bytes.
@@ -554,8 +594,13 @@ fn analyse(
                     }
                 } else {
                     // Text did not map one-to-one: fall back to a raster. The page's whole text
-                    // layer is lost, which the confirmation has warned about.
-                    let raster = render_raster(original, api, page, rects, fill)?;
+                    // layer is lost, which the confirmation has warned about. A pre-flight asks
+                    // for the decision without rendering the image it would discard.
+                    let raster = if render_rasters {
+                        Some(render_raster(original, api, page, rects, fill)?)
+                    } else {
+                        None
+                    };
                     PageAnalysis {
                         stats: PageBuildStats {
                             fill_marks: rects.len(),
@@ -566,14 +611,18 @@ fn analyse(
                         rasterize: true,
                         page_width: width,
                         page_height: height,
-                        raster: Some(raster),
+                        raster,
                         content: None,
                         crop: parsed.crop,
                     }
                 }
             }
             _ => {
-                let raster = render_raster(original, api, page, rects, fill)?;
+                let raster = if render_rasters {
+                    Some(render_raster(original, api, page, rects, fill)?)
+                } else {
+                    None
+                };
                 PageAnalysis {
                     stats: PageBuildStats {
                         fill_marks: rects.len(),
@@ -584,7 +633,7 @@ fn analyse(
                     rasterize: true,
                     page_width: width,
                     page_height: height,
-                    raster: Some(raster),
+                    raster,
                     content: None,
                     crop: None,
                 }
@@ -1922,15 +1971,13 @@ fn verify_redacted(
     let bytes = fs::read(path)
         .map_err(|error| io_error("could not reopen the redacted document", path, error))?;
     let document = RedactDocument::load(api, bytes, None)?;
-    if document.page_count() != page_count {
+    let found_page_count = document.page_count()?;
+    if found_page_count != page_count {
         return Err(LyraReaderError::new(
             ErrorCode::Internal,
             "the redacted document changed the page count",
         )
-        .with_detail(format!(
-            "expected {page_count}, found {}",
-            document.page_count()
-        )));
+        .with_detail(format!("expected {page_count}, found {found_page_count}")));
     }
 
     for (&page, rects) in grouped {
@@ -2257,16 +2304,15 @@ impl RedactDocument {
                     "the password contains a NUL byte",
                 )
             })?;
+        let length = crate::limits::document_len(bytes.len())?;
         let document = {
-            let _guard = PDFIUM_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _guard = crate::backend::lock_pdfium()?;
             // SAFETY: `bytes` lives in the returned struct; PDFium documents that the buffer must
             // stay valid while the document is open.
             unsafe {
                 (api.load_mem_document)(
                     bytes.as_ptr().cast(),
-                    bytes.len() as std::ffi::c_int,
+                    length,
                     password
                         .as_ref()
                         .map_or(std::ptr::null(), |value| value.as_ptr()),
@@ -2286,12 +2332,10 @@ impl RedactDocument {
         })
     }
 
-    fn page_count(&self) -> u32 {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fn page_count(&self) -> Result<u32> {
+        let _guard = crate::backend::lock_pdfium()?;
         // SAFETY: the document handle is live.
-        unsafe { (self.api.get_page_count)(self.document) }.max(0) as u32
+        crate::limits::page_count(unsafe { (self.api.get_page_count)(self.document) })
     }
 
     /// The real characters of a page, with degenerate boxes repaired and PDFium's synthetic line
@@ -2306,9 +2350,7 @@ impl RedactDocument {
     }
 
     fn page_chars(&self, page: u32) -> Result<Vec<PageChar>> {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         // SAFETY: the document is live and the page index comes from the caller's validated set.
         let page_handle = unsafe { (self.api.load_page)(self.document, page as std::ffi::c_int) };
         if page_handle.is_null() {
@@ -2403,7 +2445,7 @@ impl RedactDocument {
     }
 
     fn page_object_types(&self, page: u32) -> Result<Vec<i32>> {
-        let _guard = PDFIUM_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         let handle = unsafe { (self.api.load_page)(self.document, page as i32) };
         if handle.is_null() {
             return Err(page_error(page));
@@ -2417,9 +2459,7 @@ impl RedactDocument {
     }
 
     fn intersecting_graphics(&self, page: u32, rects: &[Rect]) -> Result<usize> {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         let page_handle = unsafe { (self.api.load_page)(self.document, page as std::ffi::c_int) };
         if page_handle.is_null() {
             return Err(page_error(page));
@@ -2468,18 +2508,14 @@ impl RedactDocument {
     }
 
     fn render_page(&self, page: u32, scale: f64) -> Result<RasterImage> {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         render_page_locked(self.api, self.document, page, scale)
     }
 }
 
 impl Drop for RedactDocument {
     fn drop(&mut self) {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium_for_cleanup();
         // SAFETY: the handle came from `load_mem_document` and is closed exactly once.
         unsafe { (self.api.close_document)(self.document) };
     }
@@ -2560,9 +2596,7 @@ fn render_raster(
 ) -> Result<RasterImage> {
     let scale = RASTER_DPI / 72.0;
     let mut raster = {
-        let _guard = PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         render_page_locked(api, document.document, page, scale)?
     };
     for rect in rects {
@@ -2632,6 +2666,20 @@ fn render_page_locked(
         (api.render_page_bitmap)(bitmap, page_handle, 0, 0, width, height, 0, 0);
     }
     let stride = unsafe { (api.bitmap_get_stride)(bitmap) } as usize;
+    let row_bytes = match raster_row_bytes(stride, width) {
+        Ok(row_bytes) => row_bytes,
+        Err(error) => {
+            unsafe {
+                (api.destroy_bitmap)(bitmap);
+                (api.close_page)(page_handle);
+            }
+            return Err(error);
+        }
+    };
+    debug_assert!(
+        stride >= row_bytes,
+        "a bitmap row must hold every pixel: stride {stride}, row {row_bytes}"
+    );
     let buffer = unsafe { (api.bitmap_get_buffer)(bitmap) }.cast::<u8>();
     if buffer.is_null() {
         unsafe {
@@ -2645,12 +2693,13 @@ fn render_page_locked(
     }
     let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
     for row in 0..height as usize {
-        let row_start = buffer as usize + row * stride;
+        // SAFETY: PDFium documents that the bitmap buffer covers `stride * height` bytes;
+        // `row` is inside that height, and `raster_row_bytes` proved `stride >= width * 4`, so
+        // this row slice and every `offset .. offset + 3` below stay inside the allocation.
+        let row_pixels = unsafe { std::slice::from_raw_parts(buffer.add(row * stride), stride) };
         for column in 0..width as usize {
             let offset = column * 4;
-            // SAFETY: the bitmap buffer has `stride * height` bytes; `column` and `row` are
-            // inside the bitmap.
-            let pixel = unsafe { std::slice::from_raw_parts((row_start + offset) as *const u8, 3) };
+            let pixel = &row_pixels[offset..offset + 3];
             // BGRA on little-endian; `FPDFBitmap_BGRA` is what `FPDFBitmap_Create` produces.
             rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
         }
@@ -2668,6 +2717,32 @@ fn render_page_locked(
 }
 
 // ─── Small helpers ──────────────────────────────────────────────────────────────────────────
+
+/// Bytes one BGRA bitmap row must hold for `width` pixels.
+///
+/// PDFium returns the bitmap with its own stride. The pixel loop indexes every row as
+/// `column * 4 .. column * 4 + 3`, so a stride shorter than `width * 4` would read into the next
+/// row (and past the allocation for the last one). Refuse that instead of trusting it.
+fn raster_row_bytes(stride: usize, width: std::ffi::c_int) -> Result<usize> {
+    let row_bytes = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .ok_or_else(|| {
+            LyraReaderError::new(
+                ErrorCode::RenderFailed,
+                format!("PDFium returned a bitmap {width} pixels wide, which has no byte count"),
+            )
+        })?;
+    if stride < row_bytes {
+        return Err(LyraReaderError::new(
+            ErrorCode::RenderFailed,
+            format!(
+                "PDFium returned a bitmap stride of {stride} bytes for a {width}-pixel row, which needs {row_bytes}"
+            ),
+        ));
+    }
+    Ok(row_bytes)
+}
 
 fn matrix_operands(operands: &[Object]) -> Option<[f64; 6]> {
     let values: Vec<f64> = operands.iter().filter_map(number).collect();
@@ -2732,6 +2807,15 @@ mod tests {
     use super::*;
     use crate::redaction::RedactDocument;
     use crate::test_support::{copy_fixture, scratch};
+
+    #[test]
+    fn a_short_bitmap_stride_is_refused_before_the_pixel_loop() {
+        assert_eq!(raster_row_bytes(16, 4).expect("a full row"), 16);
+        let error = raster_row_bytes(15, 4).expect_err("a short stride must be refused");
+        assert_eq!(error.code, ErrorCode::RenderFailed);
+        assert!(error.message.contains("15"), "{error}");
+        assert!(error.message.contains("16"), "{error}");
+    }
 
     #[test]
     fn raster_redaction_respects_nonzero_crop_box_coordinates() {
@@ -3010,6 +3094,76 @@ mod tests {
             rect.origin.y + rect.size.height / 2.0,
         );
         assert!(red < 40 && green < 40 && blue < 40);
+    }
+
+    #[test]
+    fn a_form_text_page_is_predicted_before_the_fallback_is_rendered() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("redact-raster-plan");
+        let source = directory.join("form-text.pdf");
+        write_form_text_fixture(&source);
+        let bytes = fs::read(&source).expect("source bytes");
+        let rect = word_rect(&source, 0, "Secret");
+        let area = [RedactionArea::new(0, rect)];
+
+        let predicted = raster_pages_for_redaction(&source, &area).expect("plan");
+        assert_eq!(predicted, vec![0], "the form text needs the whole page");
+
+        let refused = directory.join("refused.pdf");
+        let error = stage_content_redaction(
+            &source,
+            &refused,
+            &area,
+            RedactionFill::Blackout,
+            &bytes,
+            false,
+        )
+        .expect_err("staging without the reader's confirmation must refuse");
+        assert!(error.to_string().contains("raster redaction"), "{error}");
+        assert!(
+            !refused.exists(),
+            "a refused stage must not leave an output file"
+        );
+
+        let confirmed = directory.join("confirmed.pdf");
+        let report = stage_content_redaction(
+            &source,
+            &confirmed,
+            &area,
+            RedactionFill::Blackout,
+            &bytes,
+            true,
+        )
+        .expect("the confirmed stage uses the fallback");
+        assert_eq!(report.pages.len(), 1);
+        assert!(
+            report.pages[0].rasterized,
+            "the written report marks page 1"
+        );
+        assert!(
+            text_of(&confirmed, 0).trim().is_empty(),
+            "the page is an image after the confirmed stage"
+        );
+    }
+
+    #[test]
+    fn a_text_page_needs_no_raster_fallback() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("redact-no-raster-plan");
+        let source = copy_fixture(&directory, "text-page.pdf", "page.pdf");
+        let rect = word_rect(&source, 0, "brown");
+        let predicted =
+            raster_pages_for_redaction(&source, &[RedactionArea::new(0, rect)]).expect("plan");
+        assert!(
+            predicted.is_empty(),
+            "an ordinary text redaction must not ask to rasterise: {predicted:?}"
+        );
     }
 
     #[test]

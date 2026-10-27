@@ -23,10 +23,47 @@ pub mod context;
 pub mod page;
 
 pub use context::{FrameReport, GpuContext, SPIKE_TRIANGLE_RGBA};
-pub use page::{PaperAppearance, QuadBlend, TextureId};
+pub use page::{PaperAppearance, QuadBlend, TextureId, TexturedQuad};
 
-use lyra_reader_core::{DocId, PageIndex, Rect, Size};
+use lyra_reader_core::{DocId, ErrorCode, LyraReaderError, PageIndex, Rect, Result, Size};
 use std::ffi::c_void;
+
+/// The largest texture side this engine accepts.
+///
+/// The C ABI takes `u32` dimensions from the shell. Without a cap, `width * height * 4` could be
+/// computed in 32 bits (where it wraps) or wrap `usize`, and a short pixel buffer would then pass
+/// the length check it was supposed to fail.
+pub const MAX_TEXTURE_SIDE: u32 = 16_384;
+
+/// Byte length of a tightly packed RGBA/BGRA bitmap.
+///
+/// Returns an error instead of a wrapped product. Every texture entry point goes through this so
+/// the length check and the buffer slice cannot disagree about the dimensions.
+pub fn rgba_byte_len(width: u32, height: u32) -> Result<usize> {
+    if width == 0 || height == 0 {
+        return Err(LyraReaderError::new(
+            ErrorCode::InvalidArgument,
+            "a page texture must have a non-zero width and height",
+        ));
+    }
+    if width > MAX_TEXTURE_SIDE || height > MAX_TEXTURE_SIDE {
+        return Err(LyraReaderError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "a {width}×{height} texture exceeds this engine's {MAX_TEXTURE_SIDE}-pixel side limit"
+            ),
+        ));
+    }
+    (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| {
+            LyraReaderError::new(
+                ErrorCode::InvalidArgument,
+                format!("the byte size of a {width}×{height} texture overflows usize"),
+            )
+        })
+}
 
 /// GPU surface identifier (allocated by this crate; Swift only ever holds this opaque integer).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -137,5 +174,32 @@ impl TextureArrayPlan {
         let pixels = u64::from(self.tile_size) * u64::from(self.tile_size);
         // Including the mip chain: about 4/3 of the base level.
         pixels * 4 * 4 / 3
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wrapped_pixel_count_is_an_error_not_a_short_length() {
+        // `u32::MAX² * 4` is where the old 32-bit/unchecked product wrapped, so a small buffer
+        // could pass the `len >= expected` check.
+        let error = rgba_byte_len(u32::MAX, u32::MAX).expect_err("the product must not wrap");
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert!(error.message.contains("side limit"), "{error}");
+
+        let error = rgba_byte_len(MAX_TEXTURE_SIDE + 1, 1).expect_err("a side cap must apply");
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+
+        assert_eq!(rgba_byte_len(4, 3).expect("a small texture"), 48);
+        assert_eq!(
+            rgba_byte_len(MAX_TEXTURE_SIDE, MAX_TEXTURE_SIDE).expect("the cap itself is allowed"),
+            (MAX_TEXTURE_SIDE as usize) * (MAX_TEXTURE_SIDE as usize) * 4
+        );
+        assert!(
+            rgba_byte_len(0, 1).is_err(),
+            "zero-sized textures are refused"
+        );
     }
 }

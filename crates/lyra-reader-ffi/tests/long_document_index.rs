@@ -7,12 +7,15 @@
 //! every click and never persisted. This test pins both halves:
 //!
 //! * the API returns the late captions and the late citation;
-//! * the sidecar on disk carries them, which is what makes the second open a hit rather than a
+//! * the application cache on disk carries them, which is what makes the second open a hit rather than a
 //!   re-derivation (a version-1 cache would have neither field for this file).
 //!
-//! The fixture is copied into a scratch directory first: the cache writes beside the PDF by
-//! design, and the committed fixtures must stay clean. Every assertion is skipped with an
+//! Both the fixture and the application cache use private temporary directories, so the
+//! committed fixtures and the user's cache remain untouched. Every assertion is skipped with an
 //! announcement when PDFium is unavailable, like the other FFI integration tests.
+
+#[path = "support/index_cache.rs"]
+mod cache_test;
 
 use lyra_reader_ffi::api::LyraReaderEngine;
 use std::fs;
@@ -64,13 +67,16 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn cache_path(document: &Path) -> PathBuf {
-    let mut path = document.as_os_str().to_os_string();
-    path.push(".lyra-reader-index.json");
-    PathBuf::from(path)
+    let path = lyra_reader_ffi::document_index_cache_path(document);
+    fs::create_dir_all(path.parent().unwrap()).expect("create index cache directory");
+    path
 }
 
 #[test]
 fn captions_and_citations_past_page_120_are_returned_and_persisted() {
+    if !cache_test::isolated("captions_and_citations_past_page_120_are_returned_and_persisted") {
+        return;
+    }
     if !lyra_reader_pdfium::is_available() {
         eprintln!("skipping: PDFium unavailable");
         return;
@@ -145,11 +151,11 @@ fn captions_and_citations_past_page_120_are_returned_and_persisted() {
     // The persisted index carries the late records. This is the part that fails on the capped
     // implementation: its figure list stopped at page 120 and its citation map at page 120, so a
     // second open of unchanged bytes could not have answered from the cache.
-    let sidecar = cache_path(&path);
-    let bytes = fs::read(&sidecar).unwrap_or_else(|error| {
+    let cache_file = cache_path(&path);
+    let bytes = fs::read(&cache_file).unwrap_or_else(|error| {
         panic!(
             "the index cache was not written at {}: {error}",
-            sidecar.display()
+            cache_file.display()
         )
     });
     let value: serde_json::Value = serde_json::from_slice(&bytes).expect("cache is JSON");

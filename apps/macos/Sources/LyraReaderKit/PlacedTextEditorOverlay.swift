@@ -4,12 +4,12 @@ import SwiftUI
 /// The editor for an editable note or text box.
 ///
 /// A PDF's own notes keep the read-only `DocumentNoteOverlay`; this is the editable counterpart
-/// for entries in the sidecar. A sticky note opens a paper beside its icon, the way a reader
+/// for entries in the annotation cache. A sticky note opens a paper beside its icon, the way a reader
 /// expects after clicking a note icon. A text box opens **over its own box**, at the size the
 /// text is drawn at, so typing shows the line breaks and size the page will show.
 ///
 /// The text reaches `AppState` on every keystroke so the canvas can lay it out live and the box
-/// can grow with the text, but the sidecar write is coalesced and the whole session becomes one
+/// can grow with the text, but the cache write is coalesced and the whole session becomes one
 /// undoable change. Notes have a Done button; text boxes finish on a page click or
 /// Command-Return. Escape restores the session.
 package struct PlacedTextEditorOverlay: View {
@@ -48,7 +48,8 @@ package struct PlacedTextEditorOverlay: View {
                         InlineTextBoxEditor(text: $text,
                             fontSize: annotation.fontSize * state.zoomFactor,
                             color: ReadingAppearanceStore.shared.mode.displayColor(annotation.color.nsColor),
-                            onCommit: { state.commitTextEditing() }, onCancel: { state.cancelTextEditing() })
+                            onCommit: { state.commitTextEditing() }, onCancel: { state.cancelTextEditing() },
+                            selectAllOnAppear: state.editingTextSelectAll)
                             .padding(AnnotationTextFont.padding(size: annotation.fontSize) * state.zoomFactor)
                             .help("Click the page or press ⌘Return to finish; Esc cancels")
                             .overlay(alignment: .topLeading) {

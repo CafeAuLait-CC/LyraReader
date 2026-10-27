@@ -70,11 +70,11 @@
 //! [`crate::backend::PdfiumBackend`]; PDFium's own annotation API is not thread-safe, and the
 //! `Send`/`Sync` markers on [`AnnotationReader`] are only sound because of that lock.
 
-// The workspace warns on `unsafe_code` by default (`Cargo.toml`, `[workspace.lints.rust]`). This
-// module is the one place outside the FFI crate that needs it: PDFium is a C library, and the two
-// keys that decide how a highlight must be drawn (`/BM`, `/CA`) are not reachable through the safe
-// wrapper. Every block below carries a SAFETY comment naming what it relies on, and no other module
-// gains the exemption.
+// The workspace warns on `unsafe_code` by default (`Cargo.toml`, `[workspace.lints.rust]`).
+// This module needs it because PDFium is a C library and the keys that decide how a highlight
+// must be drawn (`/BM`, `/CA`) are not reachable through the safe wrapper. `page_ops` and
+// `redaction` also resolve the C ABI directly for operations the wrapper does not expose. Every
+// block below carries a SAFETY comment naming what it relies on.
 #![allow(unsafe_code)]
 
 use crate::stamp_read::{StampCatalog, read_stamp_catalog};
@@ -366,11 +366,15 @@ pub enum WriteAnnotationKind {
     /// `/Highlight`: the filled, quad-based text markup.
     Highlight,
     /// `/Underline`: the same shape as a highlight, drawn along the baseline. Not required by
-    /// the write-back task, but the sidecar already models underlines and the code is the same.
+    /// the write-back task, but the reader's annotation model already has underlines and the code is the same.
     Underline,
     /// `/StrikeOut`: the same quads and colour as an underline, drawn through the middle of the
     /// glyphs by the viewer that synthesises its appearance.
     StrikeOut,
+    /// `/Squiggly`: the same quads and colour as an underline, drawn as a ruled band beside the
+    /// text. The shell does not create this kind, but this reader's annotation model reports it
+    /// and a file may carry one; the writer can re-emit or refresh it.
+    Squiggly,
     /// `/Text`: a sticky note whose `/Contents` is the note and whose `/Rect` is its icon.
     Text,
     /// `/FreeText`: text laid out in `/Rect`, with `/DA`, `/Q` and an appearance stream.
@@ -398,6 +402,7 @@ impl WriteAnnotationKind {
             Self::Highlight => ANNOT_HIGHLIGHT,
             Self::Underline => ANNOT_UNDERLINE,
             Self::StrikeOut => ANNOT_STRIKEOUT,
+            Self::Squiggly => ANNOT_SQUIGGLY,
             Self::Text => ANNOT_TEXT,
             Self::FreeText => ANNOT_FREETEXT,
             Self::Ink => ANNOT_INK,
@@ -414,6 +419,7 @@ impl WriteAnnotationKind {
             Self::Highlight => "Highlight",
             Self::Underline => "Underline",
             Self::StrikeOut => "StrikeOut",
+            Self::Squiggly => "Squiggly",
             Self::Text => "Text",
             Self::FreeText => "FreeText",
             Self::Ink => "Ink",
@@ -430,6 +436,7 @@ impl WriteAnnotationKind {
             Self::Highlight => "Highlight",
             Self::Underline => "Underline",
             Self::StrikeOut => "StrikeOut",
+            Self::Squiggly => "Squiggly",
             Self::Text => "Note",
             Self::FreeText => "Free Text",
             Self::Ink => "Ink",
@@ -443,17 +450,21 @@ impl WriteAnnotationKind {
 
     /// Whether this kind is written through PDFium's `FPDFPage_CreateAnnot`.
     ///
-    /// PDFium will not create `/Line` at all (`FPDFPage_CreateAnnot` returns null), and none of
-    /// the stroked kinds can carry `/BS` or an appearance stream through its C API: the only
-    /// border setter writes `/Border`, and the only appearance setter stores a text string
-    /// rather than a form XObject. A sticky note has the same problem with `/Name` (the icon
-    /// name), and a free-text annotation needs `/DA`, `/Q` and a real `/AP` form XObject.
-    ///
-    /// Those facts are why highlights, underlines and strikeouts keep the PDFium path and every kind whose
-    /// appearance matters is written by the dictionary writer in `geometry_write` (which now
-    /// writes `/Text` and `/FreeText` too, despite the file's historical name).
+    /// No kind is, any more: PDFium's only appearance setter (`FPDFAnnot_SetAP`) hard-codes
+    /// `/BM /Normal`, and a translucent markup mark needs `/BM /Multiply` in its appearance's
+    /// graphics state. The direct writer in [`crate::geometry_write`] writes every annotation
+    /// dictionary and appearance stream. The method is kept because the save path still asks
+    /// the question when it plans and verifies a write.
     pub(crate) fn uses_pdfium(self) -> bool {
-        matches!(self, Self::Highlight | Self::Underline | Self::StrikeOut)
+        false
+    }
+
+    /// Whether this kind is one of the four quad-based text marks.
+    pub(crate) fn is_markup(self) -> bool {
+        matches!(
+            self,
+            Self::Highlight | Self::Underline | Self::StrikeOut | Self::Squiggly
+        )
     }
 
     /// Whether this kind is written by the direct (lopdf) writer.
@@ -714,9 +725,7 @@ impl AnnotationAppender {
 
         // SAFETY: the C strings outlive the call and the library is initialised above.
         let document = {
-            let _guard = crate::backend::PDFIUM_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _guard = crate::backend::lock_pdfium()?;
             unsafe {
                 (api.load_document)(
                     path.as_ptr(),
@@ -736,10 +745,15 @@ impl AnnotationAppender {
 
         // SAFETY: `document` is a live document handle.
         let page_count = {
-            let _guard = crate::backend::PDFIUM_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            unsafe { (api.get_page_count)(document) }.max(0) as u32
+            let _guard = crate::backend::lock_pdfium()?;
+            match crate::limits::page_count(unsafe { (api.get_page_count)(document) }) {
+                Ok(count) => count,
+                Err(error) => {
+                    // SAFETY: `document` was loaded above and no writer owns it yet.
+                    unsafe { (api.close_document)(document) };
+                    return Err(error);
+                }
+            }
         };
 
         Ok(Self {
@@ -755,27 +769,20 @@ impl AnnotationAppender {
 
     /// Appends one annotation. The caller has already validated the geometry and identity.
     pub fn add(&mut self, annotation: &WriteAnnotation) -> Result<()> {
-        if annotation.page.get() >= self.page_count {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!(
-                    "annotation {} names page {}, but the document has {} page(s)",
-                    annotation.id,
-                    annotation.page.get(),
-                    self.page_count
-                ),
-            ));
-        }
-        let page_index = c_int::try_from(annotation.page.get()).map_err(|_| {
+        // The page-range sentence is shared with every other entry point; the annotation's
+        // identity goes in `detail`, where diagnostics can use it without changing what the
+        // reader sees.
+        let page_count = self.page_count;
+        lyra_reader_core::checked_page_index(annotation.page.get(), page_count, |page| {
             LyraReaderError::new(
                 ErrorCode::InvalidArgument,
-                format!("page {} is out of range for PDFium", annotation.page.get()),
+                lyra_reader_core::page_out_of_range_message(page, page_count),
             )
+            .with_detail(format!("annotation {}", annotation.id))
         })?;
+        let page_index = pdfium_page_index(annotation.page.get())?;
 
-        let _guard = crate::backend::PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
 
         // SAFETY: `document` is live and `page_index` was checked against the page count.
         let page = unsafe { (self.api.load_page)(self.document, page_index) };
@@ -879,8 +886,10 @@ impl AnnotationAppender {
             set_string(self.api, handle, c"M", annotation.modified.as_deref())?;
             set_string(self.api, handle, c"Subj", Some(annotation.kind.subject()))?;
 
-            // Preview and the review corpus write `/F 4` (print). No appearance stream is set:
-            // see the module-level note in `writeback` for why, and what other viewers show.
+            // Preview and the review corpus write `/F 4` (print). The save path writes every
+            // annotation dictionary and appearance stream itself (see `geometry_write`), so this
+            // PDFium writer is not the one used for a new mark; the call is kept for the
+            // dictionary accessors this type owns.
             if (self.api.set_flags)(handle, FLAG_PRINT) == 0 {
                 return Err(write_error("FPDFAnnot_SetFlags", &annotation.id));
             }
@@ -894,9 +903,7 @@ impl AnnotationAppender {
     pub fn save_incremental(&mut self, file: std::fs::File) -> Result<u64> {
         let mut sink = FileSink::new(file);
         let ok = {
-            let _guard = crate::backend::PDFIUM_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _guard = crate::backend::lock_pdfium()?;
             // SAFETY: `self.document` is live, and `sink.header` is an `FPDF_FILEWRITE` whose
             // callback writes into `sink`. PDFium only calls it during this call.
             unsafe {
@@ -930,11 +937,23 @@ impl AnnotationAppender {
 impl Drop for AnnotationAppender {
     fn drop(&mut self) {
         // SAFETY: the handle came from `load_document` and is closed exactly once, here.
-        let _guard = crate::backend::PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium_for_cleanup();
         unsafe { (self.api.close_document)(self.document) };
     }
+}
+
+/// Converts a validated 0-based page index to PDFium's `c_int` page type.
+///
+/// This is not a page-count check (the callers have already compared against the document); it
+/// is the separate limit of the C API's page index. The sentence is therefore its own class and
+/// is shared by both annotation call sites.
+fn pdfium_page_index(page: u32) -> Result<c_int> {
+    c_int::try_from(page).map_err(|_| {
+        LyraReaderError::new(
+            ErrorCode::InvalidArgument,
+            format!("page {} is out of range for PDFium", page),
+        )
+    })
 }
 
 fn write_error(call: &str, id: &str) -> LyraReaderError {
@@ -969,6 +988,29 @@ fn set_string(
     Ok(())
 }
 
+/// One annotation the reader could not decode, kept for the caller instead of being dropped
+/// silently.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnreadableAnnotation {
+    /// Page the annotation sits on.
+    pub page: PageIndex,
+    /// 0-based slot in PDFium's annotation list for that page. `None` when the page itself
+    /// could not be read, so no slot exists.
+    pub slot: Option<i32>,
+    /// What failed, naming the field or dictionary pass when it can be diagnosed.
+    pub reason: String,
+}
+
+/// What one page's annotation read produced.
+///
+/// `annotations` is everything that did decode. `unreadable` is everything that did not; the
+/// caller decides how to surface it, but it must never be mistaken for "there is nothing there".
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AnnotationPageReport {
+    pub annotations: Vec<RawAnnotation>,
+    pub unreadable: Vec<UnreadableAnnotation>,
+}
+
 /// Reads annotations from one open document.
 ///
 /// Owns its own `FPDF_DOCUMENT`: PDFium has no way to hand out the handle behind the
@@ -982,8 +1024,9 @@ pub struct AnnotationReader {
     /// expose: a line's `/LE` endings are read with lopdf, keyed by `/NM`.
     path: PathBuf,
     password: Option<String>,
-    /// Annotation name → "has an arrowhead", built once on the first `/Line` read.
-    line_endings: OnceLock<HashMap<String, bool>>,
+    /// Annotation name → "has an arrowhead", built once on the first `/Line` read. The result
+    /// is cached too, so a failed second read is reported once and consistently.
+    line_endings: OnceLock<Result<HashMap<String, bool>>>,
     /// Annotation name → `/BS /W` (or the legacy `/Border` width), built on the first stroked
     /// read. PDFium's `FPDFAnnot_GetBorder` reads `/Border` but not the `/BS` dictionary this
     /// writer uses, so the dictionary itself is the authority here.
@@ -991,7 +1034,7 @@ pub struct AnnotationReader {
     /// Every `/Stamp` annotation's text and picture, built on the first stamp read. PDFium's C
     /// ABI exposes neither `/Contents`-as-drawn nor `/AP`, so the dictionary pass in
     /// [`crate::stamp_read`] is where a stamp becomes drawable.
-    stamp_details: OnceLock<StampCatalog>,
+    stamp_details: OnceLock<Result<StampCatalog>>,
 }
 
 // SAFETY: raw PDFium handles are not thread-safe, and these markers are only sound because every
@@ -1007,9 +1050,7 @@ impl AnnotationReader {
     /// turning into "this document has no annotations".
     pub fn open(path: &Path, password: Option<&str>) -> Result<Self> {
         crate::backend::pdfium_instance()?;
-        let _guard = crate::backend::PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium()?;
         Self::open_locked(path, password)
     }
 
@@ -1076,20 +1117,24 @@ impl AnnotationReader {
     /// skipped rather than failing the whole page: a reader must not refuse to show the other
     /// twenty highlights because the twenty-first is broken.
     pub fn page(&self, page: PageIndex) -> Result<Vec<RawAnnotation>> {
-        let _guard = crate::backend::PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.page_locked(page)
+        let _guard = crate::backend::lock_pdfium()?;
+        self.page_report_locked(page)
+            .map(|report| report.annotations)
+    }
+
+    /// Every annotation on `page`, plus the ones that could not be decoded.
+    ///
+    /// This is the interface the shell uses: the successfully read records are shown, and the
+    /// unreadable ones are counted so the caller can warn and block writes instead of silently
+    /// dropping them.
+    pub fn page_report(&self, page: PageIndex) -> Result<AnnotationPageReport> {
+        let _guard = crate::backend::lock_pdfium()?;
+        self.page_report_locked(page)
     }
 
     /// The caller already holds `PDFIUM_LOCK` for a larger PDFium transaction.
-    pub(crate) fn page_locked(&self, page: PageIndex) -> Result<Vec<RawAnnotation>> {
-        let index = c_int::try_from(page.get()).map_err(|_| {
-            LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!("page {} is out of range for PDFium", page.get()),
-            )
-        })?;
+    pub(crate) fn page_report_locked(&self, page: PageIndex) -> Result<AnnotationPageReport> {
+        let index = pdfium_page_index(page.get())?;
 
         // SAFETY: the document handle is live for as long as `self`, and every call here is
         // serialised by the caller's `PDFIUM_LOCK`.
@@ -1102,6 +1147,7 @@ impl AnnotationReader {
         }
 
         let mut annotations = Vec::new();
+        let mut unreadable = Vec::new();
         // SAFETY: `page_handle` is a loaded page and stays valid until `close_page` below.
         let count = unsafe { (self.api.get_annot_count)(page_handle) }.max(0);
         for slot in 0..count {
@@ -1110,30 +1156,54 @@ impl AnnotationReader {
             if handle.is_null() {
                 continue;
             }
-            if let Some(annotation) = self.read(handle, page) {
-                annotations.push(annotation);
-            }
+            let result = self.read(handle, page);
             // SAFETY: the handle came from `get_annot` and is not used afterwards.
             unsafe { (self.api.close_annot)(handle) };
+            match result {
+                Ok(Some(annotation)) => annotations.push(annotation),
+                Ok(None) => {}
+                Err(error) => unreadable.push(UnreadableAnnotation {
+                    page,
+                    slot: Some(slot),
+                    reason: error.to_string(),
+                }),
+            }
         }
         // SAFETY: the handle came from `load_page` and holds no borrowed data after this point.
         unsafe { (self.api.close_page)(page_handle) };
 
-        Ok(annotations)
+        Ok(AnnotationPageReport {
+            annotations,
+            unreadable,
+        })
+    }
+
+    /// The caller already holds `PDFIUM_LOCK`; successful annotations only.
+    pub(crate) fn page_locked(&self, page: PageIndex) -> Result<Vec<RawAnnotation>> {
+        self.page_report_locked(page)
+            .map(|report| report.annotations)
     }
 
     /// Reads one annotation, or `None` when it is not content or its `/Rect` is unreadable.
-    fn read(&self, handle: FpdfAnnotation, page: PageIndex) -> Option<RawAnnotation> {
+    ///
+    /// A failure of the second (lopdf) pass is an error: the file already opened in PDFium, so a
+    /// line ending or stamp dictionary that cannot be read is not the same as "no arrowhead" or
+    /// "no stamp content". The page loop records it as unreadable instead of failing the page.
+    fn read(&self, handle: FpdfAnnotation, page: PageIndex) -> Result<Option<RawAnnotation>> {
         // SAFETY: `handle` is a live annotation for the duration of `read`.
         let subtype = unsafe { (self.api.get_subtype)(handle) };
         if !is_content_annotation(subtype) {
-            return None;
+            return Ok(None);
         }
 
         let mut raw_rect = FsRectF::default();
         // SAFETY: `handle` is a live annotation; `raw_rect` is a valid out-pointer.
         if unsafe { (self.api.get_rect)(handle, &mut raw_rect) } == 0 {
-            return None;
+            return Err(LyraReaderError::new(
+                ErrorCode::CorruptDocument,
+                "the annotation has no readable /Rect",
+            )
+            .with_detail(format!("page {}", page.get())));
         }
         let rect = Rect::new(
             f64::from(raw_rect.left),
@@ -1153,11 +1223,21 @@ impl AnnotationReader {
             Vec::new()
         };
         let line = if kind == RawAnnotationKind::Line {
-            self.line(handle)
+            Some(self.line(handle).ok_or_else(|| {
+                LyraReaderError::new(
+                    ErrorCode::CorruptDocument,
+                    "the /Line annotation has no readable /L segment",
+                )
+                .with_detail(format!("page {}", page.get()))
+            })?)
         } else {
             None
         };
-        let line_arrow = kind == RawAnnotationKind::Line && self.line_is_arrow(&id, handle);
+        let line_arrow = if kind == RawAnnotationKind::Line {
+            self.line_is_arrow(&id, handle)?
+        } else {
+            false
+        };
         let border_width = if matches!(
             kind,
             RawAnnotationKind::Ink
@@ -1210,7 +1290,7 @@ impl AnnotationReader {
         let stamp = if kind == RawAnnotationKind::Stamp {
             let name = id.strip_prefix("nm:");
             let values = [rect.min_x(), rect.min_y(), rect.max_x(), rect.max_y()];
-            self.stamps()
+            self.stamps()?
                 .find(name, page.get(), values)
                 .map(|details| lyra_reader_core::RawStamp {
                     text: details.text.clone(),
@@ -1222,7 +1302,7 @@ impl AnnotationReader {
             None
         };
 
-        Some(RawAnnotation {
+        Ok(Some(RawAnnotation {
             page,
             id,
             parent_id,
@@ -1245,7 +1325,7 @@ impl AnnotationReader {
             alignment,
             stamp,
             visible: !hidden,
-        })
+        }))
     }
 
     /// The identity a `/IRT` entry uses for this annotation.
@@ -1407,17 +1487,17 @@ impl AnnotationReader {
     /// Two sources, because producers disagree: this writer puts `/Subj (Arrow)` beside a
     /// standard `/LE`, while other writers only put `/LE`. PDFium exposes neither array nor
     /// name list, so `/LE` comes from a lopdf read of the same file, keyed by `/NM`.
-    fn line_is_arrow(&self, id: &str, handle: FpdfAnnotation) -> bool {
+    fn line_is_arrow(&self, id: &str, handle: FpdfAnnotation) -> Result<bool> {
         if self
             .string(handle, c"Subj")
             .is_some_and(|subject| subject.to_ascii_lowercase().contains("arrow"))
         {
-            return true;
+            return Ok(true);
         }
         let Some(name) = id.strip_prefix("nm:") else {
-            return false;
+            return Ok(false);
         };
-        self.line_endings().get(name).copied().unwrap_or(false)
+        Ok(self.line_endings()?.get(name).copied().unwrap_or(false))
     }
 
     /// The `/BS` map for this document, read once.
@@ -1429,23 +1509,40 @@ impl AnnotationReader {
 
     /// The `/LE` map for this document, read once.
     ///
-    /// A failure to parse the file a second time is not an error here: the annotation is still
-    /// a line, and drawing it without an arrowhead is better than turning "PDFium could read the
-    /// geometry but lopdf could not re-open the file" into a failed page.
-    fn line_endings(&self) -> &HashMap<String, bool> {
-        self.line_endings.get_or_init(|| {
-            read_line_endings(&self.path, self.password.as_deref()).unwrap_or_default()
-        })
+    /// There is no PDFium fallback for `/LE`, so a failed second read is an error: reporting
+    /// "no arrowhead" would turn a damaged dictionary into a silently different line.
+    fn line_endings(&self) -> Result<&HashMap<String, bool>> {
+        self.line_endings
+            .get_or_init(|| {
+                read_line_endings(&self.path, self.password.as_deref()).ok_or_else(|| {
+                    LyraReaderError::new(
+                        ErrorCode::CorruptDocument,
+                        "the annotation reader could not re-read the document for /LE line endings",
+                    )
+                    .with_detail(format!("path: {}", self.path.to_string_lossy()))
+                })
+            })
+            .as_ref()
+            .map_err(Clone::clone)
     }
 
     /// Every `/Stamp`'s content for this document, read once.
     ///
-    /// A failure to parse the file a second time is not an error: the stamp is still a stamp,
-    /// and reporting its `/Rect` with no words is better than dropping the annotation.
-    fn stamps(&self) -> &StampCatalog {
-        self.stamp_details.get_or_init(|| {
-            read_stamp_catalog(&self.path, self.password.as_deref()).unwrap_or_default()
-        })
+    /// There is no PDFium fallback for the text and picture of a stamp, so a failed second read
+    /// is an error rather than a stamp silently reported without its content.
+    fn stamps(&self) -> Result<&StampCatalog> {
+        self.stamp_details
+            .get_or_init(|| {
+                read_stamp_catalog(&self.path, self.password.as_deref()).ok_or_else(|| {
+                    LyraReaderError::new(
+                        ErrorCode::CorruptDocument,
+                        "the annotation reader could not re-read the document for stamp content",
+                    )
+                    .with_detail(format!("path: {}", self.path.to_string_lossy()))
+                })
+            })
+            .as_ref()
+            .map_err(Clone::clone)
     }
 
     /// `/C`, but only when the file actually carries it.
@@ -1609,9 +1706,7 @@ impl Drop for AnnotationReader {
         // lock: the neighbouring raster backend serialises its own teardown the same way, and a
         // close racing a load is exactly the kind of cross-document interaction this build has
         // crashed on before (see the `PDFIUM_LOCK` note in `backend.rs`).
-        let _guard = crate::backend::PDFIUM_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::backend::lock_pdfium_for_cleanup();
         // SAFETY: the handle came from `FPDF_LoadDocument` and is closed exactly once, here.
         unsafe { (self.api.close_document)(self.document) };
     }
@@ -1892,6 +1987,58 @@ fn subtype_kind(subtype: c_ulong) -> RawAnnotationKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_second_read_is_an_error_not_an_empty_dictionary() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let scratch = crate::test_support::scratch("annotation-second-read");
+        let path = crate::test_support::copy_fixture(&scratch, "annotated.pdf", "source.pdf");
+        let reader = AnnotationReader::open(&path, None).expect("open the annotation reader");
+        // PDFium already holds the open document; the second, dictionary-based pass has to
+        // reopen the path, so removing it makes exactly that pass fail.
+        std::fs::remove_file(&path).expect("remove the source behind the open reader");
+        let error = reader
+            .line_endings()
+            .expect_err("a missing file must not read as 'no arrowheads'");
+        assert_eq!(error.code, ErrorCode::CorruptDocument);
+        let error = reader
+            .stamps()
+            .err()
+            .expect("a missing file must not read as 'no stamp content'");
+        assert_eq!(error.code, ErrorCode::CorruptDocument);
+    }
+
+    #[test]
+    fn one_damaged_annotation_does_not_discard_the_valid_ones() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let path = crate::test_support::fixture("annotations-damaged.pdf");
+        let reader = AnnotationReader::open(&path, None).expect("open the annotation reader");
+        let report = reader
+            .page_report(PageIndex(0))
+            .expect("the page itself must stay readable");
+        let ids: Vec<&str> = report
+            .annotations
+            .iter()
+            .map(|annotation| annotation.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["nm:good1", "nm:good2"]);
+        assert_eq!(report.unreadable.len(), 1);
+        assert_eq!(report.unreadable[0].page, PageIndex(0));
+        assert_eq!(report.unreadable[0].slot, Some(2));
+        assert!(
+            report.unreadable[0].reason.contains("/L"),
+            "the reason names the unreadable field: {}",
+            report.unreadable[0].reason
+        );
+        // The old `page()` API still returns the readable half; the count is the other half.
+        assert_eq!(reader.page(PageIndex(0)).expect("readable page").len(), 2);
+    }
 
     #[test]
     fn blend_names_map_to_the_two_modes_this_build_draws() {

@@ -65,7 +65,6 @@ impl RenderSource {
                     payload.bookmarks,
                     payload.updates,
                     payload.deletions,
-                    1.0,
                 )
                 .map_err(|e| e.to_string())?;
             LyraReaderEngine::new()

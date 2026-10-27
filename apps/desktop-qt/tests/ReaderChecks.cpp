@@ -804,61 +804,15 @@ private slots:
         QCOMPARE(model().value("nestedReplyCount").toInt(),4);
         const auto snapshots=qEnvironmentVariable("LYRA_READER_CHECK_SNAPSHOTS");if(!snapshots.isEmpty())QVERIFY(window->grabWindow().save(snapshots+"/lyrareader-reply-threads.png"));
     }
-    void redactionReviewDeletesRealContentAndKeepsNewerDrafts() {
-        QTemporaryDir scratch;QVERIFY(scratch.isValid());
-        const auto path=scratch.path()+"/source.pdf", output=scratch.path()+"/redacted.pdf";
-        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
-        QFile original(path);QVERIFY(original.open(QIODevice::ReadOnly));const auto bytes=original.readAll();original.close();
-        WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);
-        engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());
-        engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
-        workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();
-        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTest::qWait(150);
-        window->setProperty("fitting",false);QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,1.0),Q_ARG(QVariant,0),Q_ARG(QVariant,0));QTest::qWait(100);
-        QTRY_VERIFY(reader->textPages().contains("0"));const auto before=reader->textPages().value("0").toMap();const auto chars=before.value("chars").toList();QVERIFY(chars.size()>8);
-        QRectF area;
-        for(int i=0;i<6;++i){const auto c=chars[i].toMap();const QRectF box(c.value("x_pt").toDouble(),c.value("y_pt").toDouble(),c.value("width_pt").toDouble(),c.value("height_pt").toDouble());if(!box.isEmpty())area=area.isEmpty()?box:area.united(box);}
-        area=area.adjusted(-2,-2,2,2);
-        auto *page=visualItem(window->contentItem(),"pdfPage0");QVERIFY(page);
-        window->setProperty("annotationTool","redact");
-        QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,page->mapToScene(area.topLeft()).toPoint());
-        QTest::mouseMove(window,page->mapToScene(area.bottomRight()).toPoint(),30);
-        QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,page->mapToScene(area.bottomRight()).toPoint());
-        QTRY_COMPARE(reader->editDrafts().value("redactions").toList().size(),1);
-        const auto areas=reader->editDrafts().value("redactions").toList();
-        QVERIFY(QMetaObject::invokeMethod(window,"reviewRedactions",Q_ARG(QVariant,false)));
-        auto *review=window->findChild<QObject *>("redactionReview");QVERIFY(review);
-        QTRY_VERIFY(!review->property("loading").toBool());QVERIFY(review->property("error").toString().isEmpty());
-        const auto preview=review->property("preview").toMap();QVERIFY(preview.value("removed_characters").toInt()>0);
-        QMetaObject::invokeMethod(review,"close");
-        // A failed save retains all marks. A save dialog's old snapshot must not clear newer marks.
-        const QVariant context=QVariantMap{{"reader",QVariant::fromValue(reader)},{"kind","redactions"},{"redactions",areas}};
-        window->setProperty("exportContext",context);
-        QVERIFY(QMetaObject::invokeMethod(window,"exportTo",Q_ARG(QVariant,QUrl::fromLocalFile(scratch.path()+"/missing/out.pdf"))));
-        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(!reader->error().isEmpty());QCOMPARE(reader->editDrafts().value("redactions").toList(),areas);reader->dismissError();
-        auto newer=areas;newer.append(QVariantMap{{"page",0},{"x_pt",10},{"y_pt",10},{"width_pt",5},{"height_pt",5}});reader->setEditDraft("redactions",newer);
-        QVERIFY(QMetaObject::invokeMethod(window,"exportTo",Q_ARG(QVariant,QUrl::fromLocalFile(output))));
-        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
-        QCOMPARE(reader->editDrafts().value("redactions").toList(),newer);QVERIFY(reader->data().value("save_redactions").toMap().value("verified").toBool());
-        QVERIFY(original.open(QIODevice::ReadOnly));QCOMPARE(original.readAll(),bytes);original.close();
-        ReaderController redacted;redacted.openFile(QUrl::fromLocalFile(output));QTRY_COMPARE_WITH_TIMEOUT(redacted.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(redacted.pendingCommands(),0,10000);
-        redacted.requestText(0);QTRY_VERIFY(redacted.textPages().contains("0"));
-        QVERIFY(redacted.textPages().value("0").toMap().value("text").toString().size()<before.value("text").toString().size());
-        redacted.requestPage(0,1);QTRY_VERIFY_WITH_TIMEOUT(!redacted.cachedPage(0,1).isNull(),10000);const auto image=redacted.cachedPage(0,1);
-        const auto saved=areas.first().toMap();const QRect sample=QRectF(saved.value("x_pt").toDouble()+1,saved.value("y_pt").toDouble()+1,saved.value("width_pt").toDouble()-2,saved.value("height_pt").toDouble()-2).toAlignedRect();
-        for(int y=sample.top();y<sample.bottom();y+=3)for(int x=sample.left();x<sample.right();x+=3){const auto c=image.pixelColor(x,y);QVERIFY(c.red()<4 && c.green()<4 && c.blue()<4);}
-        // Every removed character is absent from the saved page's text geometry.
-        for(const auto &value:redacted.textPages().value("0").toMap().value("chars").toList()) {const auto c=value.toMap();if(c.value("unicode").toUInt()<=32)continue;const QRectF box(c.value("x_pt").toDouble(),c.value("y_pt").toDouble(),c.value("width_pt").toDouble(),c.value("height_pt").toDouble());QVERIFY(!box.intersects(area.adjusted(1,1,-1,-1)));}
-        workspace.newTab();auto *other=workspace.activeReader();other->openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));QTRY_VERIFY(other->pageCount()>0);QTRY_COMPARE_WITH_TIMEOUT(other->pendingCommands(),0,10000);QVERIFY(other->editDrafts().isEmpty());
-        workspace.selectTab(0);QCOMPARE(reader->editDrafts().value("redactions").toList(),newer);
-        reader->submit("page_stage",{{"operation",QVariantMap{{"Rotate",QVariantMap{{"pages",QVariantList{0}},{"quarter_turns",1}}}}}});QTest::qWait(50);QVERIFY(reader->error().contains("pending form"));reader->dismissError();
-        workspace.closeTab(0);QCOMPARE(workspace.tabs().size(),2);auto *close=window->findChild<QObject *>("closeChangesConfirmation");QVERIFY(close);QTRY_VERIFY(close->property("visible").toBool());QMetaObject::invokeMethod(close,"close");
-        workspace.requestQuit();QTRY_VERIFY(close->property("visible").toBool());QVERIFY(window->isVisible());QMetaObject::invokeMethod(close,"close");
-        // Matching successful snapshots clear their marks, while the source remains unchanged.
-        const QVariant currentContext=QVariantMap{{"reader",QVariant::fromValue(reader)},{"kind","redactions"},{"redactions",newer}};window->setProperty("exportContext",currentContext);
-        QVERIFY(QMetaObject::invokeMethod(window,"exportTo",Q_ARG(QVariant,QUrl::fromLocalFile(scratch.path()+"/second.pdf"))));
-        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QVERIFY(!reader->hasEditDrafts());
+    void annotationRedactionIsRetiredAndCannotWriteTheSource() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/source.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));QFile original(path);QVERIFY(original.open(QIODevice::ReadOnly));const auto bytes=original.readAll();original.close();
+        ReaderController reader;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("reader",&reader);engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        reader.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QVERIFY(!window->property("canRedact").toBool());
+        for(const auto &op:{"preview_redactions","save_redactions","replace_redactions"}){reader.submit(op,{{"destination",scratch.path()+"/refused.pdf"},{"areas",QVariantList{}}});QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QVERIFY(reader.error().contains("retired"));reader.dismissError();QVERIFY(!QFile::exists(scratch.path()+"/refused.pdf"));}
+        QVERIFY(original.open(QIODevice::ReadOnly));QCOMPARE(original.readAll(),bytes);
     }
+
     void formWidgetsEditOnThePageAndSaveAnIsolatedSnapshot() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/forms.pdf",output=scratch.path()+"/filled.pdf";
         QVERIFY(QFile::copy(root+"/tests/fixtures/form-fields.pdf",path));QFile original(path);QVERIFY(original.open(QIODevice::ReadOnly));const auto bytes=original.readAll();original.close();
@@ -967,8 +921,11 @@ private slots:
         WorkspaceController workspace;auto *reader=workspace.activeReader();QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",reader);engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
         reader->openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
         window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","fixture"}});reader->setAiInput("action",4);reader->setAiInput("question",QStringLiteral("Which page contains body text and caching?"));
-        auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("plan").toMap().isEmpty(),10000);const auto plan=reader->aiState().value("plan").toMap();QCOMPARE(plan.value("action").toString(),QStringLiteral("DocumentChat"));const auto sources=plan.value("sources").toList();QVERIFY(!sources.isEmpty());QCOMPARE(server.requests.size(),0);
+        auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY2_WITH_TIMEOUT(!reader->aiState().value("plan").toMap().isEmpty(),qPrintable(reader->aiState().value("status").toString()),10000);const auto plan=reader->aiState().value("plan").toMap();QCOMPARE(plan.value("action").toString(),QStringLiteral("DocumentChat"));const auto sources=plan.value("sources").toList();QVERIFY(!sources.isEmpty());QCOMPARE(server.requests.size(),0);
+        const auto wireBody=plan.value("parts").toList().first().toMap().value("wire_body").toString().toUtf8();QVERIFY(!wireBody.isEmpty());
+        auto *payload=window->findChild<QObject *>("aiWirePayload");QVERIFY(payload);QCOMPARE(payload->property("text").toString().toUtf8(),wireBody);
         QVERIFY(reader->startAi("local",plan));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QVERIFY(reader->aiState().value("output").toString().contains("Document answer"));
+        QCOMPARE(server.requests.size(),1);const auto sent=server.requests.first();const auto headerEnd=sent.indexOf("\r\n\r\n");QVERIFY(headerEnd>=0);QCOMPARE(sent.mid(headerEnd+4),wireBody);
         reader->setAiInput("question",QStringLiteral("A changed question"));QVERIFY(!reader->aiState().contains("plan"));
         const int page=sources.first().toMap().value("page").toInt();QVERIFY(QMetaObject::invokeMethod(panel,"followLink",Q_ARG(QVariant,QString("p.%1").arg(page))));QTRY_COMPARE(window->property("currentPage").toInt(),page-1);
         QVERIFY(QMetaObject::invokeMethod(panel,"followLink",Q_ARG(QVariant,QStringLiteral("p.99"))));QVERIFY(window->property("operationStatus").toString().contains("cannot be verified"));QCOMPARE(window->property("currentPage").toInt(),page-1);
@@ -985,7 +942,7 @@ private slots:
         engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
         workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));auto *reader=workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTest::qWait(150);
         window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","fixture"}});QVERIFY(QMetaObject::invokeMethod(window,"showSidebar",Q_ARG(QVariant,"ai")));
-        auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("plan").toMap().isEmpty(),10000);QCOMPARE(server.requests.size(),0);
+        auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY2_WITH_TIMEOUT(!reader->aiState().value("plan").toMap().isEmpty(),qPrintable(reader->aiState().value("status").toString()),10000);QCOMPARE(server.requests.size(),0);
         const auto plan=reader->aiState().value("plan").toMap();QVERIFY(plan.value("is_local").toBool());
         auto *send=window->findChild<QQuickItem *>("sendAiRequest");QVERIFY(send);QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,send->mapToScene(QPointF(send->width()/2,send->height()/2)).toPoint());
         QTRY_COMPARE(server.requests.size(),1);QVERIFY(reader->aiState().value("running").toBool());

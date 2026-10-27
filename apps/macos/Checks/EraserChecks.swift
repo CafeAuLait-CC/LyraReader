@@ -12,7 +12,7 @@ import PDFKit
 /// `ReaderWindow` wires it, so a press/drag here takes the same route a hand does: `mouseDown` →
 /// `beginEraserGesture`, `mouseDragged` → `extendEraserGesture`, `mouseUp` → `endEraserGesture`.
 extension ReaderChecks {
-    @MainActor static func eraserChecks(drawing: URL, strokes: URL) async throws {
+    @MainActor static func eraserChecks(root: URL, drawing: URL, strokes: URL) async throws {
         let fileManager = FileManager.default
         let scratch = fileManager.temporaryDirectory
             .appendingPathComponent("lyra-reader-eraser-\(UUID())")
@@ -22,11 +22,11 @@ extension ReaderChecks {
         func copy(_ source: URL, _ name: String) throws -> URL {
             let destination = scratch.appendingPathComponent(name)
             try fileManager.copyItem(at: source, to: destination)
-            try? fileManager.removeItem(at: sidecar(for: destination))
+            try? fileManager.removeItem(at: records(for: destination))
             return destination
         }
-        func sidecar(for document: URL) -> URL {
-            document.appendingPathExtension("lyra-reader-annotations.json")
+        func records(for document: URL) -> URL {
+            DocumentEditCache.annotationsURL(for: document)
         }
         func placement(_ state: AppState, page: Int) -> PagePlacement {
             guard let frame = state.canvasPageFrames.first(where: { $0.index == page }) else {
@@ -93,6 +93,16 @@ extension ReaderChecks {
                 windowNumber: 0, context: nil, characters: "\u{1b}",
                 charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: 53)!
         }
+        /// A mouse event at a **top-left** view point, the space the cursor ring reports in.
+        /// AppKit carries bottom-left window coordinates, so the conversion matches `drag`'s.
+        func mouseEvent(_ type: NSEvent.EventType, in view: MetalCanvasView,
+                        atTopLeft point: CGPoint) -> NSEvent {
+            NSEvent.mouseEvent(
+                with: type,
+                location: CGPoint(x: point.x, y: view.bounds.height - point.y),
+                modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil,
+                eventNumber: 0, clickCount: 1, pressure: 1)!
+        }
 
         // ── 1. The mode arms and disarms like the other tools ──────────────────────────────
         let document = try copy(drawing, "eraser.pdf")
@@ -115,7 +125,7 @@ extension ReaderChecks {
         require(state.annotationTool == .eraser,
                 "arming the eraser replaces another tool: the canvas has one mode")
         state.selectTool()
-        require(state.annotationTool == .select, "choosing Select leaves the eraser")
+        require(state.annotationTool == .select, "returning to the implicit pointer state leaves the eraser")
 
         state.toggleEraserTool()
         require(state.cancelActiveAnnotationTool(), "Escape leaves the eraser")
@@ -133,6 +143,143 @@ extension ReaderChecks {
         let noDocument = AppState(engine: try RustEngine())
         require(!noDocument.canUseEraserTool,
                 "the eraser button has nothing to act on without a document")
+
+        // ── 1b. The cursor ring: reach-sized, pointer-following and click-through ─────────
+        // The ring is an AppKit overlay, not `NSCursor.eraser`: the system cursor cannot show
+        // the tool's reach. It must be exactly `eraserReach × zoom` in view points, follow the
+        // pointer at every zoom, hide on exit/disarm and never take a press from the canvas.
+        let ringCanvas = makeCanvas(state)
+        let ring = ringCanvas.eraserCursorRing
+        ringCanvas.zoom = 1
+        require(ring.superview === ringCanvas,
+                "the eraser ring is an overlay inside the page canvas, not a system cursor")
+        require(!ring.isRingVisible,
+                "the ring starts hidden until the pointer is over the canvas")
+
+        let firstPointer = CGPoint(x: 220, y: 140)
+        ringCanvas.mouseMoved(
+            with: mouseEvent(.mouseMoved, in: ringCanvas, atTopLeft: firstPointer))
+        require(ring.isRingVisible,
+                "the ring appears while the eraser is armed and the pointer is over the canvas")
+        require(abs(ring.ringCenterViewPt.x - firstPointer.x) < 0.01
+                    && abs(ring.ringCenterViewPt.y - firstPointer.y) < 0.01,
+                "the ring is centred under the pointer (\(ring.ringCenterViewPt))")
+        let reachAt100 = AnnotationGeometry.eraserReach(strokeWidth: 2, zoom: 1)
+        let radiusAt100 = AnnotationGeometry.eraserCursorRadiusViewPt(strokeWidth: 2, zoom: 1)
+        require(abs(reachAt100 - 9) < 0.001 && abs(radiusAt100 - 9) < 0.001,
+                "at 100% the ring radius is the eraser's 9 pt reach (8 view pt + half the stroke)")
+        require(abs(ring.ringRadiusViewPt - radiusAt100) < 0.01,
+                "the ring's measured radius is the eraser's reach (\(ring.ringRadiusViewPt) pt)")
+
+        // Follows the pointer, not a cached first position.
+        let secondPointer = CGPoint(x: 380, y: 260)
+        ringCanvas.mouseMoved(
+            with: mouseEvent(.mouseMoved, in: ringCanvas, atTopLeft: secondPointer))
+        require(abs(ring.ringCenterViewPt.x - secondPointer.x) < 0.01
+                    && abs(ring.ringCenterViewPt.y - secondPointer.y) < 0.01,
+                "the ring follows the pointer to a new position at 100%")
+
+        // The radius is the erase reach at the live zoom: the page-space reach shrinks with
+        // zoom while its on-screen representation grows with the stroke's visible width.
+        ringCanvas.zoom = 2
+        let radiusAt200 = AnnotationGeometry.eraserCursorRadiusViewPt(strokeWidth: 2, zoom: 2)
+        require(abs(radiusAt200 - 10) < 0.001,
+                "at 200% a 2 pt stroke's on-screen reach is 10 view pt (8 + its 4 pt width / 2)")
+        require(abs(ring.ringRadiusViewPt - radiusAt200) < 0.01,
+                "the ring updates its radius when the zoom changes under a still pointer "
+                    + "(\(ring.ringRadiusViewPt) pt)")
+        require(abs(ring.ringRadiusViewPt / 2
+                    - AnnotationGeometry.eraserReach(strokeWidth: 2, zoom: 2)) < 0.001,
+                "the on-screen radius converts back to the page-space erase reach at 200%")
+        ringCanvas.mouseMoved(
+            with: mouseEvent(.mouseMoved, in: ringCanvas, atTopLeft: firstPointer))
+        require(abs(ring.ringCenterViewPt.x - firstPointer.x) < 0.01
+                    && abs(ring.ringCenterViewPt.y - firstPointer.y) < 0.01,
+                "the ring still follows the pointer at 200%")
+        ringCanvas.annotationStrokeWidth = 4
+        require(abs(ring.ringRadiusViewPt
+                    - AnnotationGeometry.eraserCursorRadiusViewPt(strokeWidth: 4, zoom: 2)) < 0.01,
+                "a wider ink setting widens the ring by half the extra stroke width")
+        ringCanvas.annotationStrokeWidth = 2
+        ringCanvas.zoom = 1
+
+        // Leaving the canvas hides it; moving outside its bounds does too.
+        ringCanvas.mouseExited(
+            with: mouseEvent(.mouseMoved, in: ringCanvas, atTopLeft: firstPointer))
+        require(!ring.isRingVisible, "leaving the canvas hides the ring")
+        ringCanvas.mouseMoved(
+            with: mouseEvent(.mouseMoved, in: ringCanvas, atTopLeft: CGPoint(x: -4, y: 30)))
+        require(!ring.isRingVisible, "a pointer outside the canvas does not draw the ring")
+        ringCanvas.mouseMoved(
+            with: mouseEvent(.mouseMoved, in: ringCanvas, atTopLeft: firstPointer))
+        require(ring.isRingVisible, "moving back over the canvas restores the ring")
+
+        // A drag hides it: the ring marks the reach before/after the cut, not a ghost under the
+        // hand while the gesture is running. It returns at the release point, still armed.
+        ringCanvas.mouseDown(
+            with: mouseEvent(.leftMouseDown, in: ringCanvas, atTopLeft: secondPointer))
+        require(!ring.isRingVisible, "the ring hides while an eraser drag owns the pointer")
+        ringCanvas.mouseDragged(
+            with: mouseEvent(.leftMouseDragged, in: ringCanvas, atTopLeft: secondPointer))
+        require(!ring.isRingVisible, "the ring stays hidden through the drag")
+        ringCanvas.mouseUp(
+            with: mouseEvent(.leftMouseUp, in: ringCanvas, atTopLeft: secondPointer))
+        require(ring.isRingVisible, "the ring returns at the release point after the drag")
+        require(abs(ring.ringCenterViewPt.x - secondPointer.x) < 0.01
+                    && abs(ring.ringCenterViewPt.y - secondPointer.y) < 0.01,
+                "the returned ring is centred on the release point")
+
+        // Click-through: the ring is never a hit target, and the event still belongs to the page.
+        require(ring.hitTest(CGPoint(x: firstPointer.x, y: firstPointer.y)) == nil,
+                "the ring's hitTest returns nil: it cannot intercept a click")
+        let hitPoint = CGPoint(x: firstPointer.x,
+                               y: ringCanvas.bounds.height - firstPointer.y)
+        require(ringCanvas.hitTest(hitPoint) === ringCanvas,
+                "a click at the ring's centre still reaches the canvas")
+
+        // Disarming hides it and further pointer movement cannot bring it back.
+        ringCanvas.annotationTool = .select
+        require(!ring.isRingVisible, "disarming the eraser hides the ring")
+        ringCanvas.mouseMoved(
+            with: mouseEvent(.mouseMoved, in: ringCanvas, atTopLeft: firstPointer))
+        require(!ring.isRingVisible,
+                "a pointer move with the eraser disarmed does not show the ring")
+
+        // Theme: a subtle theme-coloured outline with a transparent fill, resolving differently
+        // in light and dark. The ring is drawn over arbitrary page content, so it uses the
+        // secondary text token rather than a fixed colour.
+        require(EraserCursorRingView.fillColor.alphaComponent == 0,
+                "the ring's fill is transparent")
+        require(EraserCursorRingView.lineWidth == 1,
+                "the ring's stroke is the subtle 1 pt line")
+        let lightAppearance = NSAppearance(named: .aqua)!
+        let darkAppearance = NSAppearance(named: .darkAqua)!
+        func components(_ color: NSColor, _ appearance: NSAppearance)
+            -> (r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat) {
+            var resolved = color
+            appearance.performAsCurrentDrawingAppearance {
+                resolved = color.usingColorSpace(.sRGB) ?? .clear
+            }
+            return (resolved.redComponent, resolved.greenComponent,
+                    resolved.blueComponent, resolved.alphaComponent)
+        }
+        let lightStroke = components(ring.strokeColor(for: lightAppearance), lightAppearance)
+        let darkStroke = components(ring.strokeColor(for: darkAppearance), darkAppearance)
+        require(abs(lightStroke.a - 0.85) < 0.01 && abs(darkStroke.a - 0.85) < 0.01,
+                "the ring keeps the theme's subtle 0.85 alpha in both appearances")
+        require(lightStroke.r < darkStroke.r && lightStroke.g < darkStroke.g
+                    && lightStroke.b < darkStroke.b,
+                "the light appearance draws a dark-on-paper stroke and the dark one a light "
+                    + "stroke (\(lightStroke) vs \(darkStroke))")
+
+        let ringSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "apps/macos/Sources/LyraReaderKit/EraserCursorRing.swift"),
+            encoding: .utf8)
+        require(!ringSource.contains("NSCursor"),
+                "the ring is an AppKit overlay, not a system cursor push")
+        require(ringSource.contains("override func hitTest"),
+                "the ring's click-through rule is part of the overlay itself")
 
         // ── 2. Eraser geometry: a stated reach; tracing a stroke removes the whole stroke ──
         // Reach = half the stroke's width + 8 view points at the current zoom. At 100% a 2 pt
@@ -202,23 +349,29 @@ extension ReaderChecks {
         require(beforeCopyBytes.range(of: Data(strokeB.id.uuidString.utf8)) != nil,
                 "the pre-erase copy contains stroke B's /NM")
 
-        let sidecarBeforeFirstErase = try Data(contentsOf: sidecar(for: document))
+        let recordsBeforeFirstErase = try Data(contentsOf: records(for: document))
         state.toggleEraserTool()
         let undoBeforeFirstErase = state.undoStack.count
         let writesBeforeFirstErase = state.annotationWriteCount
         let canvas = makeCanvas(state)
+        canvas.mouseMoved(
+            with: mouseEvent(.mouseMoved, in: canvas, atTopLeft: CGPoint(x: 200, y: 150)))
+        require(canvas.eraserCursorRing.isRingVisible,
+                "the reach ring is on screen before the erasing drag")
         drag(canvas, from: content(state, page: 0, CGPoint(x: 90, y: 205)),
              through: [content(state, page: 0, CGPoint(x: 160, y: 205)),
                        content(state, page: 0, CGPoint(x: 240, y: 205))],
              to: content(state, page: 0, CGPoint(x: 310, y: 205)))
         require(!state.annotations.contains(where: { $0.id == strokeA.id }),
                 "the drag removed stroke A")
+        require(canvas.eraserCursorRing.isRingVisible,
+                "the ring returns after the drag: the gesture is unchanged by the overlay")
         require(state.annotations.contains(where: { $0.id == strokeB.id }),
                 "the parallel stroke B, 40 pt away, is untouched")
         require(state.undoStack.count == undoBeforeFirstErase + 1,
                 "the whole gesture is one undo step")
         require(state.annotationWriteCount == writesBeforeFirstErase + 1,
-                "the gesture wrote the sidecar once, on release")
+                "the gesture wrote the annotation cache once, on release")
 
         // ── 5. The pending banner says the PDF on disk is unchanged ──────────────────────
         require(state.hasPendingInkErasure, "the erased stroke is pending a PDF write")
@@ -227,15 +380,15 @@ extension ReaderChecks {
         let pdfAfterFirstErase = try Data(contentsOf: document)
         require(pdfAfterFirstErase == originalPDFBytes,
                 "erasing changed the reader's state, not the PDF on disk")
-        let sidecarAfterFirstErase = try Data(contentsOf: sidecar(for: document))
-        require(sidecarAfterFirstErase != sidecarBeforeFirstErase,
-                "the sidecar is the pending store and did change")
-        let pendingSidecar = String(decoding: try Data(contentsOf: sidecar(for: document)),
+        let recordsAfterFirstErase = try Data(contentsOf: records(for: document))
+        require(recordsAfterFirstErase != recordsBeforeFirstErase,
+                "the cache is the pending store and did change")
+        let pendingRecords = String(decoding: try Data(contentsOf: records(for: document)),
                                     as: UTF8.self)
-        require(!pendingSidecar.contains(strokeA.id.uuidString),
-                "the erased stroke is gone from the sidecar")
-        require(pendingSidecar.contains(strokeB.id.uuidString),
-                "the untouched stroke is still in the sidecar")
+        require(!pendingRecords.contains(strokeA.id.uuidString),
+                "the erased stroke is gone from the annotation cache")
+        require(pendingRecords.contains(strokeB.id.uuidString),
+                "the untouched stroke is still in the annotation cache")
 
         // ── 6. A drag across two strokes removes both as one undo step ───────────────────
         require(state.addInkAnnotation(page: 0,
@@ -268,7 +421,7 @@ extension ReaderChecks {
         require(ids(state) == orderBeforeSweep,
                 "undo restores the strokes at their original positions in drawing order")
         require(state.annotationWriteCount == writesBeforeFirstErase + 4,
-                "undo wrote the restored sidecar once (erase A, add C, erase sweep, undo sweep)")
+                "undo wrote the restored annotation cache once (erase A, add C, erase sweep, undo sweep)")
         state.redo()
         require(!state.annotations.contains(where: { $0.id == strokeB.id })
                     && !state.annotations.contains(where: { $0.id == strokeC.id }),
@@ -282,18 +435,18 @@ extension ReaderChecks {
         let idsBeforeNoOp = ids(state)
         let writesBeforeNoOp = state.annotationWriteCount
         let undoBeforeNoOp = state.undoStack.count
-        let sidecarBeforeNoOp = try Data(contentsOf: sidecar(for: document))
+        let recordsBeforeNoOp = try Data(contentsOf: records(for: document))
         drag(canvas, from: content(state, page: 0, CGPoint(x: 500, y: 600)),
              through: [content(state, page: 0, CGPoint(x: 540, y: 620))],
              to: content(state, page: 0, CGPoint(x: 580, y: 640)))
         require(ids(state) == idsBeforeNoOp, "a drag over empty page erases nothing")
         require(state.annotationWriteCount == writesBeforeNoOp,
-                "a gesture that erased nothing does not write the sidecar")
+                "a gesture that erased nothing does not write the annotation cache")
         require(state.undoStack.count == undoBeforeNoOp,
                 "a gesture that erased nothing adds no undo step")
-        let sidecarAfterNoOp = try Data(contentsOf: sidecar(for: document))
-        require(sidecarAfterNoOp == sidecarBeforeNoOp,
-                "a gesture that erased nothing leaves the sidecar byte-identical")
+        let recordsAfterNoOp = try Data(contentsOf: records(for: document))
+        require(recordsAfterNoOp == recordsBeforeNoOp,
+                "a gesture that erased nothing leaves the cache byte-identical")
 
         // ── 8. A stroke outside the tolerance survives; one inside is erased ───────────
         require(state.addInkAnnotation(page: 0,
@@ -441,11 +594,11 @@ extension ReaderChecks {
         require(external.pendingFileDeletions.isEmpty,
                 "a refused file-owned stroke stages no deletion")
         require(external.annotations.isEmpty,
-                "a refused file-owned stroke writes no sidecar ink")
+                "a refused file-owned stroke writes no reader ink")
         require(external.undoStack.count == externalUndo,
                 "a refused file-owned stroke adds no undo step")
         require(external.annotationWriteCount == externalWrites,
-                "a refused file-owned stroke writes no sidecar")
+                "a refused file-owned stroke writes nothing to the annotation cache")
         let externalRefusal = external.eraserRefusalNotice ?? ""
         require(externalRefusal.contains("belongs to the PDF")
                     && externalRefusal.contains("comment"),

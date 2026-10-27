@@ -319,7 +319,7 @@ fn a_later_split_failure_leaves_earlier_signed_outputs_signature_free() {
     assert_eq!(output.page_count(), 1);
     assert_eq!(
         output.signature_count(),
-        0,
+        Ok(0),
         "each completed part must be sanitized before publish"
     );
     assert!(

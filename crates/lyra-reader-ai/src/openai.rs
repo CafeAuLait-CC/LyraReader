@@ -17,10 +17,11 @@
 //! The client never logs. The key lives only in the request's `Authorization` header and in the
 //! in-process request spec; there is no shell-out and no temporary request file.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -33,7 +34,7 @@ use ureq::unversioned::transport::{
 };
 
 use crate::chat::{ChatPart, ChatPlan};
-use crate::provider::AiError;
+use crate::provider::{AiError, AiFailure};
 
 /// Default time allowed to establish a connection.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -103,6 +104,9 @@ pub struct RequestSpec {
     pub method: &'static str,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// Whether this endpoint is loopback. Connection failures mean different things for a local
+    /// server and a remote provider, and the transport is the only layer that sees the OS error.
+    pub is_local: bool,
 }
 
 impl fmt::Debug for RequestSpec {
@@ -117,15 +121,36 @@ impl fmt::Debug for RequestSpec {
     }
 }
 
-/// Build the request for one part.
-///
-/// The key is checked for line breaks (header injection) and placed only in the `Authorization`
-/// header. The body is the plan's `wire_body`, so the preview and the request cannot diverge.
-pub fn build_request_spec(
-    plan: &ChatPlan,
-    part: &ChatPart,
-    api_key: &str,
-) -> Result<RequestSpec, AiError> {
+/// Endpoint/model pairs that rejected `stream_options` with a 400 and then accepted the same
+/// request without it. In memory only: a fresh process tries the field first, which is what keeps
+/// token usage available on providers that support it.
+fn stream_options_rejections() -> &'static Mutex<HashSet<(String, String)>> {
+    static REJECTED: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+    REJECTED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Whether this endpoint/model has already rejected `stream_options` and then accepted the same
+/// request without it. Plan builders consult this so the previewed body and the sent body stay
+/// byte-identical after a fallback.
+pub fn stream_options_unsupported(endpoint: &str, model: &str) -> bool {
+    let cache = stream_options_rejections()
+        // Pure cache of "this endpoint rejected stream_options": a poisoned guard can only
+        // cause the next request to try the field again, which is the safe direction.
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.contains(&(endpoint.to_string(), model.to_string()))
+}
+
+fn remember_stream_options_unsupported(endpoint: &str, model: &str) {
+    let mut cache = stream_options_rejections()
+        // Pure cache of "this endpoint rejected stream_options": a poisoned guard can only
+        // cause the next request to try the field again, which is the safe direction.
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.insert((endpoint.to_string(), model.to_string()));
+}
+
+fn validate_api_key(api_key: &str) -> Result<(), AiError> {
     if api_key.is_empty() {
         return Err(AiError::InvalidSettings(
             "No API key is configured. Add one in Settings > AI; nothing was sent.".to_string(),
@@ -137,9 +162,23 @@ pub fn build_request_spec(
                 .to_string(),
         ));
     }
-    // A record passed back across FFI is data, not a promise: refuse a body that is not the
-    // JSON shape this client produces rather than send it.
-    let parsed: Value = serde_json::from_str(&part.wire_body).map_err(|_| {
+    Ok(())
+}
+
+/// The body for one part. A shell that already rendered the preview stores it on the part and
+/// that exact string is sent; a plan built programmatically (the CLI, a direct runner call)
+/// renders it here, once, for the chat-completions transport.
+fn chat_completions_body(plan: &ChatPlan, part: &ChatPart) -> String {
+    match &part.wire_body {
+        Some(body) => body.clone(),
+        None => plan.chat_completions_body(part),
+    }
+}
+
+/// Validate the exact JSON shape this client produces. A record passed back across FFI is data,
+/// not a promise, so a malformed preview is refused rather than sent.
+fn validate_wire_body(body: &str) -> Result<Value, AiError> {
+    let parsed: Value = serde_json::from_str(body).map_err(|_| {
         AiError::InvalidSettings(
             "The request preview is not valid JSON, so nothing was sent.".to_string(),
         )
@@ -152,8 +191,18 @@ pub fn build_request_spec(
                 .to_string(),
         ));
     }
+    Ok(parsed)
+}
 
-    Ok(RequestSpec {
+fn encode_without_stream_options(mut parsed: Value) -> Vec<u8> {
+    if let Some(object) = parsed.as_object_mut() {
+        object.remove("stream_options");
+    }
+    parsed.to_string().into_bytes()
+}
+
+fn assemble_request_spec(plan: &ChatPlan, api_key: &str, body: Vec<u8>) -> RequestSpec {
+    RequestSpec {
         url: plan.endpoint.clone(),
         method: "POST",
         headers: vec![
@@ -162,8 +211,86 @@ pub fn build_request_spec(
             ("Authorization".to_string(), format!("Bearer {api_key}")),
             ("User-Agent".to_string(), "LyraReader/0.0".to_string()),
         ],
-        body: part.wire_body.as_bytes().to_vec(),
-    })
+        body,
+        is_local: plan.is_local,
+    }
+}
+
+/// Build the request for one part.
+///
+/// The key is checked for line breaks (header injection) and placed only in the `Authorization`
+/// header. The body is the one rendered for the selected transport (or rendered here for a
+/// plan that has not been previewed). If this endpoint/model previously rejected
+/// `stream_options`, the optional field is removed so every later request goes straight through.
+pub fn build_request_spec(
+    plan: &ChatPlan,
+    part: &ChatPart,
+    api_key: &str,
+) -> Result<RequestSpec, AiError> {
+    validate_api_key(api_key)?;
+    let body = chat_completions_body(plan, part);
+    let parsed = validate_wire_body(&body)?;
+    let body = if stream_options_unsupported(&plan.endpoint, &plan.model)
+        && parsed.get("stream_options").is_some()
+    {
+        encode_without_stream_options(parsed)
+    } else {
+        body.into_bytes()
+    };
+    Ok(assemble_request_spec(plan, api_key, body))
+}
+
+/// The one retry body: everything the first attempt carried, minus the optional usage field.
+fn build_request_spec_without_stream_options(
+    plan: &ChatPlan,
+    part: &ChatPart,
+    api_key: &str,
+) -> Result<RequestSpec, AiError> {
+    validate_api_key(api_key)?;
+    let body = chat_completions_body(plan, part);
+    let parsed = validate_wire_body(&body)?;
+    Ok(assemble_request_spec(
+        plan,
+        api_key,
+        encode_without_stream_options(parsed),
+    ))
+}
+
+fn body_has_stream_options(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .map(|value| value.get("stream_options").is_some())
+        .unwrap_or(false)
+}
+
+/// A 400 whose body names the optional usage field we can drop. Other 400s (temperature, model,
+/// message shape) are not retried: dropping `stream_options` would not fix them.
+fn rejected_stream_options(status: u16, body: &str) -> bool {
+    if status != 400 {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("stream_options")
+        || lower.contains("streamoptions")
+        || lower.contains("include_usage")
+        || lower.contains("includeusage")
+}
+
+fn retry_failure(error: AiError) -> AiError {
+    const PREFIX: &str = "The retry without stream_options (second attempt) failed";
+    match error {
+        AiError::Unreachable(message) => AiError::Unreachable(format!("{PREFIX}: {message}")),
+        AiError::Offline(message) => AiError::Offline(format!("{PREFIX}: {message}")),
+        AiError::LocalServer(message) => AiError::LocalServer(format!("{PREFIX}: {message}")),
+        AiError::InvalidSettings(message) => {
+            AiError::InvalidSettings(format!("{PREFIX}: {message}"))
+        }
+        AiError::EmptyContext(message) => AiError::EmptyContext(format!("{PREFIX}: {message}")),
+        AiError::HttpStatus(message) => AiError::HttpStatus(format!("{PREFIX}: {message}")),
+        AiError::Protocol(message) => AiError::Protocol(format!("{PREFIX}: {message}")),
+        AiError::Timeout(message) => AiError::Timeout(format!("{PREFIX}: {message}")),
+        AiError::Other(message) => AiError::Other(format!("{PREFIX}: {message}")),
+        other => other,
+    }
 }
 
 /// The headers the preview shows. The key is not available when a plan is built, so the value is
@@ -207,6 +334,8 @@ pub fn redact(text: &str, key: &str) -> String {
 pub fn redact_error(error: AiError, key: &str) -> AiError {
     match error {
         AiError::Unreachable(message) => AiError::Unreachable(redact(&message, key)),
+        AiError::Offline(message) => AiError::Offline(redact(&message, key)),
+        AiError::LocalServer(message) => AiError::LocalServer(redact(&message, key)),
         AiError::InvalidSettings(message) => AiError::InvalidSettings(redact(&message, key)),
         AiError::EmptyContext(message) => AiError::EmptyContext(redact(&message, key)),
         AiError::HttpStatus(message) => AiError::HttpStatus(redact(&message, key)),
@@ -395,7 +524,7 @@ impl Transport for UreqTransport {
         // opaque status error.
         let response = request
             .send(&spec.body)
-            .map_err(|error| map_ureq_error(error, cancel))?;
+            .map_err(|error| map_ureq_error(error, cancel, spec.is_local))?;
         let status = response.status().as_u16();
         let reason = response
             .status()
@@ -519,7 +648,40 @@ impl ResponseStream for UreqResponseStream {
     }
 }
 
-fn map_ureq_error(error: ureq::Error, cancel: &CancellationToken) -> AiError {
+/// The platform errors that mean "this Mac could not put the request on the network".
+///
+/// `ErrorKind` is used rather than any message text, so the mapping survives a locale change and
+/// a wording change in the HTTP stack. Rust maps the Unix/macOS codes (`ENETUNREACH`,
+/// `EHOSTUNREACH`, `ENETDOWN`) and the Windows equivalents to these kinds.
+fn is_network_unreachable(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkDown
+    )
+}
+
+/// Classify a connection-stage OS error. A loopback endpoint that refuses the connection means
+/// the local server is not running; the same error for a remote endpoint is not evidence that the
+/// Mac is offline, so it stays generic.
+fn classify_io_failure(error: &std::io::Error, is_local: bool) -> AiFailure {
+    let kind = error.kind();
+    if is_local {
+        return if is_network_unreachable(kind) || kind == std::io::ErrorKind::ConnectionRefused {
+            AiFailure::LocalServer
+        } else {
+            AiFailure::Other
+        };
+    }
+    if is_network_unreachable(kind) {
+        AiFailure::Offline
+    } else {
+        AiFailure::Other
+    }
+}
+
+fn map_ureq_error(error: ureq::Error, cancel: &CancellationToken, is_local: bool) -> AiError {
     if cancel.is_cancelled() {
         return AiError::Cancelled;
     }
@@ -530,9 +692,21 @@ fn map_ureq_error(error: ureq::Error, cancel: &CancellationToken) -> AiError {
         ureq::Error::Tls(message) => {
             AiError::Unreachable(format!("TLS handshake failed: {message}"))
         }
-        ureq::Error::Io(error) => AiError::Unreachable(format!("the connection failed: {error}")),
+        ureq::Error::Io(error) => match classify_io_failure(&error, is_local) {
+            AiFailure::Offline => AiError::Offline(format!("no network route: {error}")),
+            AiFailure::LocalServer => AiError::LocalServer(format!(
+                "the local server did not accept the connection: {error}"
+            )),
+            AiFailure::Other => AiError::Unreachable(format!("the connection failed: {error}")),
+        },
         ureq::Error::HostNotFound => {
-            AiError::Unreachable("could not resolve the provider host".to_string())
+            if is_local {
+                // A loopback host should not need the resolver; keep the generic transport error
+                // rather than claiming anything about the network or the local server.
+                AiError::Unreachable("could not resolve the endpoint host".to_string())
+            } else {
+                AiError::Offline("could not resolve the provider host".to_string())
+            }
         }
         ureq::Error::BadUri(message) => {
             AiError::InvalidSettings(format!("The endpoint URL is not valid: {message}"))
@@ -1158,16 +1332,37 @@ fn run_plan_inner(
         });
         let spec = build_request_spec(plan, part, api_key)?;
         let mut response = transport.execute(&spec, cancel)?;
-        let status = response.status();
+        let mut status = response.status();
+        if !(200..300).contains(&status) {
+            let reason = response.reason().to_string();
+            let body = read_error_body(&mut *response, cancel)?;
+            if rejected_stream_options(status, &body) && body_has_stream_options(&spec.body) {
+                cancel.check()?;
+                trace("retrying without stream_options after an HTTP 400");
+                let retry_spec = build_request_spec_without_stream_options(plan, part, api_key)?;
+                response = transport
+                    .execute(&retry_spec, cancel)
+                    .map_err(retry_failure)?;
+                status = response.status();
+                if !(200..300).contains(&status) {
+                    let retry_reason = response.reason().to_string();
+                    let retry_body = read_error_body(&mut *response, cancel)?;
+                    return Err(retry_failure(http_error(
+                        status,
+                        &retry_reason,
+                        &retry_body,
+                    )));
+                }
+                remember_stream_options_unsupported(&plan.endpoint, &plan.model);
+            } else {
+                return Err(http_error(status, &reason, &body));
+            }
+        }
         let mut diagnostics = StreamDiagnostics {
             http_status: status,
             content_shape: "none".to_string(),
             ..Default::default()
         };
-        if !(200..300).contains(&status) {
-            let body = read_error_body(&mut *response, cancel)?;
-            return Err(http_error(status, response.reason(), &body));
-        }
 
         let content_type = header_value(response.headers(), "content-type")
             .unwrap_or("")
@@ -1433,9 +1628,12 @@ fn truncate(text: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
     use crate::chat::{
-        Action, ChatSettings, PageText, PlanRequest, ReasoningEncoding, ReasoningMode, build_plan,
+        Action, ChatImage, ChatSettings, PageText, PlanRequest, PromptPlanRequest,
+        ReasoningEncoding, ReasoningMode, build_plan, build_prompt_plan,
     };
 
     fn test_plan() -> ChatPlan {
@@ -1460,7 +1658,8 @@ mod tests {
 
                 reasoning_mode: ReasoningMode::Off,
                 reasoning_encoding: ReasoningEncoding::Thinking,},
-        })
+                    document_knowledge: None,
+})
         .unwrap()
     }
 
@@ -1488,6 +1687,19 @@ mod tests {
         let redacted = redact_error(error, "sk-secret-12345");
         assert!(!redacted.to_string().contains("sk-secret-12345"));
         assert!(redacted.to_string().contains("<redacted>"));
+    }
+
+    #[test]
+    fn redaction_also_applies_to_the_new_transport_categories() {
+        for error in [
+            AiError::Offline("no route for sk-secret-12345".to_string()),
+            AiError::LocalServer("refused for sk-secret-12345".to_string()),
+        ] {
+            let failure = error.failure();
+            let redacted = redact_error(error, "sk-secret-12345");
+            assert_eq!(redacted.failure(), failure);
+            assert!(!redacted.to_string().contains("sk-secret-12345"));
+        }
     }
 
     #[test]
@@ -1654,7 +1866,7 @@ mod tests {
     }
 
     #[test]
-    fn the_wire_body_streams_without_vendor_extensions() {
+    fn the_wire_body_asks_for_standard_streaming_usage() {
         let plan = build_plan(PlanRequest {
             action: Action::SummarizePage,
             document_title: "DeepSeek".to_string(),
@@ -1679,16 +1891,17 @@ mod tests {
                 reasoning_mode: ReasoningMode::Off,
                 reasoning_encoding: ReasoningEncoding::Thinking,
             },
+            document_knowledge: None,
         })
         .unwrap();
         assert_eq!(plan.endpoint, "https://api.deepseek.com/chat/completions");
+        let body = plan.chat_completions_body(&plan.parts[0]);
+        assert!(body.contains("\"model\":\"deepseek-flash\""));
+        assert!(body.contains("\"stream\":true"));
         assert!(
-            plan.parts[0]
-                .wire_body
-                .contains("\"model\":\"deepseek-flash\"")
+            body.contains("\"stream_options\":{\"include_usage\":true}"),
+            "body: {body}"
         );
-        assert!(plan.parts[0].wire_body.contains("\"stream\":true"));
-        assert!(!plan.parts[0].wire_body.contains("stream_options"));
     }
 
     #[test]
@@ -1711,6 +1924,93 @@ mod tests {
         assert!(error.to_string().contains("model overloaded"));
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn platform_network_errors_are_offline_only_for_a_remote_endpoint() {
+        // The raw platform codes, not message text. std maps these to the portable ErrorKinds
+        // the classifier matches; this test pins the mapping the app relies on.
+        #[cfg(target_os = "macos")]
+        let (unreachable_network, unreachable_host, network_down, refused) = (51, 65, 50, 61);
+        #[cfg(target_os = "linux")]
+        let (unreachable_network, unreachable_host, network_down, refused) = (101, 113, 100, 111);
+
+        for code in [unreachable_network, unreachable_host, network_down] {
+            let error = std::io::Error::from_raw_os_error(code);
+            assert_eq!(classify_io_failure(&error, false), AiFailure::Offline);
+            assert_eq!(classify_io_failure(&error, true), AiFailure::LocalServer);
+        }
+
+        let refused_error = std::io::Error::from_raw_os_error(refused);
+        assert_eq!(
+            classify_io_failure(&refused_error, true),
+            AiFailure::LocalServer,
+            "a refused loopback connection means the local server is not running"
+        );
+        assert_eq!(
+            classify_io_failure(&refused_error, false),
+            AiFailure::Other,
+            "a refused remote connection is not evidence that this Mac is offline"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn ureq_io_errors_keep_the_category_through_mapping() {
+        #[cfg(target_os = "macos")]
+        let (unreachable_network, refused) = (51, 61);
+        #[cfg(target_os = "linux")]
+        let (unreachable_network, refused) = (101, 111);
+
+        let cancel = CancellationToken::new();
+        let remote = map_ureq_error(
+            ureq::Error::Io(std::io::Error::from_raw_os_error(unreachable_network)),
+            &cancel,
+            false,
+        );
+        assert_eq!(remote.failure(), AiFailure::Offline);
+
+        let local = map_ureq_error(
+            ureq::Error::Io(std::io::Error::from_raw_os_error(refused)),
+            &cancel,
+            true,
+        );
+        assert_eq!(local.failure(), AiFailure::LocalServer);
+
+        let refused_remote = map_ureq_error(
+            ureq::Error::Io(std::io::Error::from_raw_os_error(refused)),
+            &cancel,
+            false,
+        );
+        assert_eq!(refused_remote.failure(), AiFailure::Other);
+    }
+
+    #[test]
+    fn other_transport_errors_stay_generic() {
+        let reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert_eq!(classify_io_failure(&reset, false), AiFailure::Other);
+        assert_eq!(classify_io_failure(&reset, true), AiFailure::Other);
+    }
+
+    #[test]
+    fn error_failure_categories_are_stable() {
+        assert_eq!(
+            AiError::Offline("no route".to_string()).failure(),
+            AiFailure::Offline
+        );
+        assert_eq!(
+            AiError::LocalServer("refused".to_string()).failure(),
+            AiFailure::LocalServer
+        );
+        assert_eq!(
+            AiError::Unreachable("TLS".to_string()).failure(),
+            AiFailure::Other
+        );
+        assert_eq!(
+            AiError::HttpStatus("HTTP 500".to_string()).failure(),
+            AiFailure::Other
+        );
+    }
+
     #[test]
     fn cancellation_flag_is_observable() {
         let cancel = CancellationToken::new();
@@ -1718,5 +2018,267 @@ mod tests {
         assert!(matches!(cancel.check(), Ok(())));
         cancel.cancel();
         assert!(matches!(cancel.check(), Err(AiError::Cancelled)));
+    }
+
+    // ── stream_options fallback ─────────────────────────────────────────────────────────────
+
+    fn unique_model(label: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        format!("{label}-{}-{nanos}", std::process::id())
+    }
+
+    fn retry_plan(endpoint: &str, model: &str) -> ChatPlan {
+        build_prompt_plan(PromptPlanRequest {
+            prompt: "Describe the picture.".to_string(),
+            image: Some(ChatImage {
+                width_px: 2,
+                height_px: 2,
+                png: b"\x89PNG\r\n\x1a\nprobe".to_vec(),
+            }),
+            stream: true,
+            settings: ChatSettings {
+                base_url: endpoint.to_string(),
+                model: model.to_string(),
+                temperature: Some(0.2),
+                max_tokens: Some(16),
+                reasoning_mode: ReasoningMode::Default,
+                reasoning_encoding: ReasoningEncoding::None,
+            },
+        })
+        .expect("probe plan")
+    }
+
+    struct ScriptedReply {
+        status: u16,
+        reason: &'static str,
+        content_type: &'static str,
+        chunks: Vec<Vec<u8>>,
+    }
+
+    impl ScriptedReply {
+        fn error(status: u16, body: &str) -> Self {
+            Self {
+                status,
+                reason: if status == 400 {
+                    "Bad Request"
+                } else {
+                    "Internal Server Error"
+                },
+                content_type: "application/json",
+                chunks: vec![body.as_bytes().to_vec()],
+            }
+        }
+
+        fn success(text: &str) -> Self {
+            Self {
+                status: 200,
+                reason: "OK",
+                content_type: "text/event-stream",
+                chunks: vec![
+                    format!(
+                        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\n"
+                    )
+                    .into_bytes(),
+                    b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":1,\"total_tokens\":8}}\n\n"
+                        .to_vec(),
+                    b"data: [DONE]\n\n".to_vec(),
+                ],
+            }
+        }
+    }
+
+    struct ScriptedTransport {
+        replies: Mutex<VecDeque<ScriptedReply>>,
+        recorded: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl ScriptedTransport {
+        fn new(replies: Vec<ScriptedReply>) -> Self {
+            Self {
+                replies: Mutex::new(replies.into()),
+                recorded: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn request_count(&self) -> usize {
+            self.recorded.lock().unwrap().len()
+        }
+    }
+
+    impl Transport for ScriptedTransport {
+        fn execute(
+            &self,
+            spec: &RequestSpec,
+            _cancel: &CancellationToken,
+        ) -> Result<Box<dyn ResponseStream>, AiError> {
+            self.recorded.lock().unwrap().push(spec.body.clone());
+            let reply = self
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| AiError::Other("no scripted reply left".to_string()))?;
+            Ok(Box::new(ScriptedResponseStream {
+                status: reply.status,
+                reason: reply.reason.to_string(),
+                headers: vec![("content-type".to_string(), reply.content_type.to_string())],
+                chunks: reply.chunks.into_iter(),
+            }))
+        }
+    }
+
+    struct ScriptedResponseStream {
+        status: u16,
+        reason: String,
+        headers: Vec<(String, String)>,
+        chunks: std::vec::IntoIter<Vec<u8>>,
+    }
+
+    impl ResponseStream for ScriptedResponseStream {
+        fn status(&self) -> u16 {
+            self.status
+        }
+
+        fn reason(&self) -> &str {
+            &self.reason
+        }
+
+        fn headers(&self) -> &[(String, String)] {
+            &self.headers
+        }
+
+        fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, AiError> {
+            Ok(self.chunks.next())
+        }
+    }
+
+    #[test]
+    fn a_stream_options_rejection_is_retried_once_and_remembered() {
+        let endpoint = "http://127.0.0.1:9/v1";
+        let model = unique_model("retry");
+        let plan = retry_plan(endpoint, &model);
+        let transport = ScriptedTransport::new(vec![
+            ScriptedReply::error(
+                400,
+                "{\"error\":{\"message\":\"Unsupported parameter: stream_options\"}}",
+            ),
+            ScriptedReply::success("pong"),
+        ]);
+        let cancel = CancellationToken::new();
+        let mut text = String::new();
+        let mut usage = None;
+        let mut done = false;
+        run_plan_with_transport(
+            &plan,
+            "sk-test",
+            &transport,
+            &cancel,
+            &mut |event| match event {
+                RunEvent::Delta(delta) => text.push_str(&delta),
+                RunEvent::Usage(value) => usage = Some(value),
+                RunEvent::Done => done = true,
+                _ => {}
+            },
+        )
+        .expect("the retry must succeed");
+        assert_eq!(text, "pong");
+        assert_eq!(usage.and_then(|value| value.prompt_tokens), Some(7));
+        assert!(done);
+        assert_eq!(transport.request_count(), 2, "exactly one retry");
+
+        let recorded = transport.recorded.lock().unwrap().clone();
+        let first: Value = serde_json::from_slice(&recorded[0]).unwrap();
+        let second: Value = serde_json::from_slice(&recorded[1]).unwrap();
+        assert_eq!(first["stream_options"]["include_usage"], true);
+        assert!(second.get("stream_options").is_none());
+        let mut expected = first.clone();
+        expected.as_object_mut().unwrap().remove("stream_options");
+        assert_eq!(second, expected, "only stream_options may change");
+        assert_eq!(second["stream"], true);
+        assert_eq!(second["model"], model);
+        assert!(second["messages"][1]["content"].is_array());
+        assert!(
+            second["messages"][1]["content"][1]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+
+        // The endpoint/model is remembered for this process: a plan built afterwards omits the
+        // field in its preview, and the request carries that same body.
+        let cached_plan = retry_plan(endpoint, &model);
+        assert!(cached_plan.parts[0].wire_body.is_none());
+        assert!(
+            !cached_plan
+                .chat_completions_body(&cached_plan.parts[0])
+                .contains("stream_options"),
+            "the preview must already omit a field this endpoint/model rejected"
+        );
+        let transport = ScriptedTransport::new(vec![ScriptedReply::success("again")]);
+        run_plan_with_transport(&cached_plan, "sk-test", &transport, &cancel, &mut |_| {})
+            .expect("cached request");
+        assert_eq!(transport.request_count(), 1);
+        let recorded = transport.recorded.lock().unwrap();
+        let cached: Value = serde_json::from_slice(&recorded[0]).unwrap();
+        assert!(cached.get("stream_options").is_none());
+        assert_eq!(cached["messages"], second["messages"]);
+    }
+
+    #[test]
+    fn a_400_for_another_parameter_is_not_retried() {
+        let endpoint = "http://127.0.0.1:9/v1";
+        let model = unique_model("no-retry");
+        let plan = retry_plan(endpoint, &model);
+        let transport = ScriptedTransport::new(vec![
+            ScriptedReply::error(
+                400,
+                "{\"error\":{\"message\":\"temperature must be between 0 and 2\"}}",
+            ),
+            ScriptedReply::success("must not be requested"),
+        ]);
+        let cancel = CancellationToken::new();
+        let error = run_plan_with_transport(&plan, "sk-test", &transport, &cancel, &mut |_| {})
+            .expect_err("an unrelated 400 must fail");
+        assert!(error.to_string().contains("temperature"), "error: {error}");
+        assert_eq!(transport.request_count(), 1);
+
+        // An unrelated rejection does not mark the endpoint/model: the field is still sent.
+        let spec = build_request_spec(&plan, &plan.parts[0], "sk-test").unwrap();
+        let body: Value = serde_json::from_slice(&spec.body).unwrap();
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn a_failed_retry_reports_the_second_attempt() {
+        let endpoint = "http://127.0.0.1:9/v1";
+        let model = unique_model("retry-failure");
+        let plan = retry_plan(endpoint, &model);
+        let transport = ScriptedTransport::new(vec![
+            ScriptedReply::error(
+                400,
+                "{\"error\":{\"message\":\"Unsupported parameter: stream_options\"}}",
+            ),
+            ScriptedReply::error(500, "{\"error\":{\"message\":\"retry exploded\"}}"),
+        ]);
+        let cancel = CancellationToken::new();
+        let error = run_plan_with_transport(&plan, "sk-test", &transport, &cancel, &mut |_| {})
+            .expect_err("the failed retry must be the error");
+        let message = error.to_string();
+        assert!(message.contains("second attempt"), "message: {message}");
+        assert!(message.contains("HTTP 500"), "message: {message}");
+        assert!(message.contains("retry exploded"), "message: {message}");
+        assert!(
+            !message.contains("Unsupported parameter"),
+            "the first error must not be reported: {message}"
+        );
+        assert_eq!(transport.request_count(), 2);
+
+        // A failed retry does not mark the pair: the field is tried again next time.
+        let spec = build_request_spec(&plan, &plan.parts[0], "sk-test").unwrap();
+        let body: Value = serde_json::from_slice(&spec.body).unwrap();
+        assert_eq!(body["stream_options"]["include_usage"], true);
     }
 }

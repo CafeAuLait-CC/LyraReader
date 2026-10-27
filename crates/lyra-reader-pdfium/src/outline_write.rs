@@ -55,7 +55,7 @@
 //! # Page order
 //!
 //! The page index is resolved against the file being written, so a staged page reorder is
-//! honoured: the shell remaps the sidecar's bookmark pages when it edits pages, and this writer
+//! honoured: the shell remaps the cached bookmark pages when it edits pages, and this writer
 //! resolves those indices in the current revision. A bookmark whose page no longer exists is
 //! refused by [`validate_bookmarks`] before anything is written, so a deleted page cannot leave
 //! a dangling destination.
@@ -63,7 +63,7 @@
 use crate::forms::{decode_text_string, text_string_object};
 use lopdf::{Dictionary, Document, IncrementalDocument, LoadOptions, Object, ObjectId};
 use lyra_reader_core::{
-    ErrorCode, LyraReaderError, PageGeometry, PageIndex, Point, Rect, Result, Rotation,
+    ErrorCode, LyraReaderError, OutlineNode, PageGeometry, PageIndex, Point, Rect, Result, Rotation,
 };
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -77,26 +77,299 @@ pub const DEFAULT_BOOKMARK_TITLE: &str = "My bookmarks";
 const MARKER_KEY: &[u8] = b"LyraReaderBookmarks";
 const MARKER_VALUE: &str = "lyra-reader-bookmarks:v1";
 
-/// Private key on every child: the sidecar bookmark's UUID, so a reopened document can adopt
+/// Private key on every child: the cached bookmark's UUID, so a reopened document can adopt
 /// the file's bookmarks with their identities intact.
 pub(crate) const ID_KEY: &[u8] = b"LyraReaderID";
 
-/// Hard limits, so a malformed shell request cannot ask the writer to build an unreasonable tree.
-pub(crate) const MAX_BOOKMARKS: usize = 5_000;
-const MAX_ID_BYTES: usize = 128;
-const MAX_TITLE_BYTES: usize = 4_096;
+/// The bookmark limits themselves live in `lyra_reader_edit::rules`; this file only traverses.
 const MAX_OUTLINE_DEPTH: usize = 64;
 
 /// One bookmark the shell asks the writer to put into the outline.
 ///
 /// `y_pt` is a **page-local view-space** Y: 0 at the top of the page, increasing downwards,
-/// independent of zoom and window size (the same value the sidecar stores).
+/// independent of zoom and window size (the same value the annotation cache stores).
 #[derive(Clone, Debug, PartialEq)]
 pub struct WriteBookmark {
     pub id: String,
     pub page: PageIndex,
     pub title: String,
     pub y_pt: f64,
+}
+
+/// One appended document's outline, ready to become a labelled top-level group.
+///
+/// The group node is a synthetic entry whose title is the appended file's name (made unique
+/// against the target outline's top-level titles). The appended document's own top-level entries
+/// become its children, so their relative nesting is preserved one level deeper. Destinations
+/// are moved by [`Self::first_page`], because a merge only appends pages.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MergeOutlineGroup {
+    pub title: String,
+    /// 0-based index in the merged document where this document's first page landed.
+    pub first_page: u32,
+    /// How many pages this document contributed.
+    pub page_count: u32,
+    /// The document's outline as read before the merge; page indices are local to it.
+    pub nodes: Vec<OutlineNode>,
+}
+
+impl MergeOutlineGroup {
+    /// A source page index mapped to the merged document, or `None` when the source destination
+    /// is outside the document (which would be a dangling destination if written as-is).
+    pub(crate) fn merged_page(&self, page: PageIndex) -> Option<u32> {
+        if page.get() >= self.page_count {
+            return None;
+        }
+        self.first_page.checked_add(page.get())
+    }
+
+    pub(crate) fn entry_count(&self) -> usize {
+        count_outline_nodes(&self.nodes)
+    }
+
+    /// Flattens the group into the `(title, page, depth)` signature a reopened file should have.
+    pub(crate) fn flatten(&self, flattened: &mut Vec<(String, Option<u32>, usize)>) {
+        if self.nodes.is_empty() {
+            return;
+        }
+        flattened.push((self.title.clone(), Some(self.first_page), 0));
+        flatten_merged_nodes(&self.nodes, self, 1, flattened);
+    }
+}
+
+fn flatten_merged_nodes(
+    nodes: &[OutlineNode],
+    group: &MergeOutlineGroup,
+    depth: usize,
+    flattened: &mut Vec<(String, Option<u32>, usize)>,
+) {
+    for node in nodes {
+        flattened.push((
+            node.title.clone(),
+            node.page.and_then(|page| group.merged_page(page)),
+            depth,
+        ));
+        flatten_merged_nodes(&node.children, group, depth + 1, flattened);
+    }
+}
+
+fn count_outline_nodes(nodes: &[OutlineNode]) -> usize {
+    nodes
+        .iter()
+        .map(|node| 1 + count_outline_nodes(&node.children))
+        .sum()
+}
+
+/// Adds every group as a top-level node after the target outline's existing entries, writes the
+/// complete (incremental) document to `output`, and returns how many source outline entries were
+/// imported (group nodes are synthetic and not counted).
+///
+/// `base` is the merged file PDFium just produced. It is read into memory before anything is
+/// written, so `output` may be a fresh file. The caller verifies the written file before it is
+/// renamed into place, exactly like the bookmark writer.
+pub(crate) fn append_merge_outline_groups<W: Write>(
+    base: &Path,
+    output: &mut W,
+    groups: &[MergeOutlineGroup],
+    password: Option<&str>,
+) -> Result<usize> {
+    let groups: Vec<&MergeOutlineGroup> = groups
+        .iter()
+        .filter(|group| !group.nodes.is_empty())
+        .collect();
+    if groups.is_empty() {
+        return Err(internal("there is no appended outline to write"));
+    }
+    let previous_bytes = fs::read(base).map_err(|error| {
+        io_error(
+            "could not read the merged document before adding its outlines",
+            base,
+            error,
+        )
+    })?;
+    let document = load_document(base, password)?;
+    let pages = page_ids(&document);
+    let catalog = catalog_id(&document)?;
+    // Refuse an outline whose top-level chain is not made of indirect nodes, exactly like the
+    // bookmark writer: an inline node cannot be given a /Next reference, so appending past it
+    // would silently orphan it.
+    {
+        let view = OutlineView {
+            old: &document,
+            new: &document,
+        };
+        if let Some(dictionary) = outline_root(&document, catalog)?.dictionary(&view) {
+            ensure_reference_links(dictionary)?;
+        }
+    }
+    let mut incremental = IncrementalDocument::create_from(previous_bytes, document);
+    let root_id = ensure_outline_root(&mut incremental, catalog)?;
+    let existing_last = {
+        let view = OutlineView {
+            old: incremental.get_prev_documents(),
+            new: &incremental.new_document,
+        };
+        view.children(root_id).last().copied()
+    };
+    let mut last_group = existing_last;
+
+    for group in &groups {
+        let group_id = add_object(
+            &mut incremental.new_document,
+            Object::Dictionary(Dictionary::new()),
+        );
+        let child_ids = add_merged_outline_nodes(
+            &mut incremental.new_document,
+            &group.nodes,
+            group_id,
+            group,
+            &pages,
+            0,
+        )?;
+        if child_ids.is_empty() {
+            // Every selected group has at least one node, so this is a programming error.
+            return Err(internal(
+                "an appended outline group was created with no entries",
+            ));
+        }
+        {
+            let dictionary = incremental
+                .new_document
+                .get_dictionary_mut(group_id)
+                .map_err(|error| lopdf_error("the outline group is not a dictionary", error))?;
+            dictionary.set("Title", text_string_object(&group.title));
+            dictionary.set("Parent", Object::Reference(root_id));
+            if let Some(page_id) = group
+                .merged_page(PageIndex(0))
+                .and_then(|page| pages.get(&(page + 1)))
+            {
+                dictionary.set(
+                    "Dest",
+                    Object::Array(vec![
+                        Object::Reference(*page_id),
+                        Object::Name(b"Fit".to_vec()),
+                    ]),
+                );
+            }
+            dictionary.set("First", Object::Reference(child_ids[0]));
+            dictionary.set(
+                "Last",
+                Object::Reference(*child_ids.last().expect("non-empty child list")),
+            );
+            dictionary.set("Count", Object::Integer(group.entry_count() as i64));
+        }
+        link_top_level_group(&mut incremental, root_id, group_id, &mut last_group)?;
+    }
+
+    refresh_root_count(&mut incremental, root_id)?;
+    incremental.save_to(output).map_err(|error| {
+        LyraReaderError::new(
+            ErrorCode::Io,
+            "could not write the merged document's outlines",
+        )
+        .with_detail(error.to_string())
+    })?;
+    Ok(groups.iter().map(|group| group.entry_count()).sum())
+}
+
+fn add_merged_outline_nodes(
+    document: &mut Document,
+    nodes: &[OutlineNode],
+    parent: ObjectId,
+    group: &MergeOutlineGroup,
+    pages: &std::collections::HashMap<u32, ObjectId>,
+    depth: usize,
+) -> Result<Vec<ObjectId>> {
+    if depth > MAX_OUTLINE_DEPTH {
+        return Err(internal(
+            "an appended document's outline is too deep to import",
+        ));
+    }
+    let mut ids = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let mut dictionary = Dictionary::new();
+        dictionary.set("Title", text_string_object(&node.title));
+        dictionary.set("Parent", Object::Reference(parent));
+        if let Some(page) = node.page
+            && let Some(merged_page) = group.merged_page(page)
+            && let Some(page_id) = pages.get(&(merged_page + 1))
+        {
+            dictionary.set(
+                "Dest",
+                Object::Array(vec![
+                    Object::Reference(*page_id),
+                    Object::Name(b"Fit".to_vec()),
+                ]),
+            );
+        }
+        let id = add_object(document, Object::Dictionary(dictionary));
+        let children =
+            add_merged_outline_nodes(document, &node.children, id, group, pages, depth + 1)?;
+        if let (Some(first), Some(last)) = (children.first(), children.last()) {
+            let node_dictionary = document
+                .get_dictionary_mut(id)
+                .map_err(|error| lopdf_error("a merged outline node is not a dictionary", error))?;
+            node_dictionary.set("First", Object::Reference(*first));
+            node_dictionary.set("Last", Object::Reference(*last));
+            node_dictionary.set(
+                "Count",
+                Object::Integer(count_outline_nodes(&node.children) as i64),
+            );
+        }
+        ids.push(id);
+    }
+    for (index, id) in ids.iter().enumerate() {
+        let dictionary = document
+            .get_dictionary_mut(*id)
+            .map_err(|error| lopdf_error("a merged outline node is not a dictionary", error))?;
+        if index > 0 {
+            dictionary.set("Prev", Object::Reference(ids[index - 1]));
+        }
+        if index + 1 < ids.len() {
+            dictionary.set("Next", Object::Reference(ids[index + 1]));
+        }
+    }
+    Ok(ids)
+}
+
+fn link_top_level_group(
+    incremental: &mut IncrementalDocument,
+    root_id: ObjectId,
+    group_id: ObjectId,
+    last_group: &mut Option<ObjectId>,
+) -> Result<()> {
+    match last_group {
+        Some(previous) => {
+            incremental
+                .opt_clone_object_to_new_document(*previous)
+                .map_err(|error| lopdf_error("could not copy the last outline node", error))?;
+            incremental
+                .new_document
+                .get_dictionary_mut(*previous)
+                .map_err(|error| lopdf_error("the last outline node is not a dictionary", error))?
+                .set("Next", Object::Reference(group_id));
+            incremental
+                .new_document
+                .get_dictionary_mut(group_id)
+                .map_err(|error| lopdf_error("the outline group is not a dictionary", error))?
+                .set("Prev", Object::Reference(*previous));
+            incremental
+                .new_document
+                .get_dictionary_mut(root_id)
+                .map_err(|error| lopdf_error("the outline root is not a dictionary", error))?
+                .set("Last", Object::Reference(group_id));
+        }
+        None => {
+            let root = incremental
+                .new_document
+                .get_dictionary_mut(root_id)
+                .map_err(|error| lopdf_error("the outline root is not a dictionary", error))?;
+            root.set("First", Object::Reference(group_id));
+            root.set("Last", Object::Reference(group_id));
+        }
+    }
+    *last_group = Some(group_id);
+    Ok(())
 }
 
 /// What a bookmark write did.
@@ -127,67 +400,22 @@ pub struct EmbeddedBookmarks {
 }
 
 /// Refuses a bookmark list the writer cannot represent faithfully.
+///
+/// The rules and the sentences live in `lyra-reader-edit::rules`, together with the shell's
+/// creation-time check, so the outline writer, the FFI save path and the UI cannot disagree
+/// about what a bookmark may be (audit C2).
 pub(crate) fn validate_bookmarks(bookmarks: &[WriteBookmark], page_count: u32) -> Result<()> {
-    if bookmarks.len() > MAX_BOOKMARKS {
-        return Err(LyraReaderError::new(
-            ErrorCode::InvalidArgument,
-            format!("{MAX_BOOKMARKS} bookmarks is the most one save can write"),
-        ));
-    }
-    let mut ids = HashSet::new();
-    for bookmark in bookmarks {
-        if bookmark.id.is_empty()
-            || bookmark.id.len() > MAX_ID_BYTES
-            || !bookmark.id.bytes().all(|byte| byte.is_ascii_graphic())
-        {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                "a bookmark identity must be 1–128 printable ASCII characters",
-            )
-            .with_detail(format!("id: {:?}", bookmark.id)));
-        }
-        if !ids.insert(bookmark.id.clone()) {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!(
-                    "two bookmarks in one save share the identity {:?}",
-                    bookmark.id
-                ),
-            ));
-        }
-        if bookmark.page.0 >= page_count {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!(
-                    "bookmark {:?} names page {}, but the document has {page_count} page(s)",
-                    bookmark.id,
-                    bookmark.page.get()
-                ),
-            ));
-        }
-        if !bookmark.y_pt.is_finite() {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!("bookmark {:?} has a non-finite Y", bookmark.id),
-            ));
-        }
-        if bookmark.title.len() > MAX_TITLE_BYTES {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!(
-                    "bookmark {:?} has a title longer than {MAX_TITLE_BYTES} bytes",
-                    bookmark.id
-                ),
-            ));
-        }
-        if bookmark.title.contains('\0') {
-            return Err(LyraReaderError::new(
-                ErrorCode::InvalidArgument,
-                format!("bookmark {:?} has a NUL in its title", bookmark.id),
-            ));
-        }
-    }
-    Ok(())
+    let specs: Vec<lyra_reader_edit::rules::BookmarkSpec<'_>> = bookmarks
+        .iter()
+        .map(|bookmark| lyra_reader_edit::rules::BookmarkSpec {
+            id: &bookmark.id,
+            page: i64::from(bookmark.page.0),
+            title: &bookmark.title,
+            y_pt: bookmark.y_pt,
+        })
+        .collect();
+    lyra_reader_edit::rules::validate_bookmarks(&specs, page_count as usize)
+        .map_err(|error| LyraReaderError::new(ErrorCode::InvalidArgument, error.message))
 }
 
 /// Adds the reader's bookmark subtree to `base`, writing the complete document to `output`.
@@ -211,7 +439,7 @@ pub(crate) fn append_bookmarks(
     })?;
     let document = load_document(base, password)?;
     let pages = document.get_pages();
-    let page_count = u32::try_from(pages.len()).unwrap_or(u32::MAX);
+    let page_count = lyra_reader_core::saturating_u32(pages.len());
     validate_bookmarks(bookmarks, page_count)?;
     let pages_by_id: std::collections::HashMap<ObjectId, u32> =
         pages.iter().map(|(index, id)| (*id, index - 1)).collect();
@@ -245,7 +473,7 @@ pub(crate) fn append_bookmarks(
 
     // Everything that needs the old document must happen before it moves into the incremental
     // writer. Geometry and destinations are computed here; the requested Y is clamped into the
-    // page's visible height so an out-of-range sidecar value cannot create a destination far off
+    // page's visible height so an out-of-range cached value cannot create a destination far off
     // the page.
     struct Prepared<'a> {
         bookmark: &'a WriteBookmark,

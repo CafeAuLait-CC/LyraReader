@@ -292,10 +292,6 @@ void ReaderController::setLayout(const QString &mode, double gap) {
     submit(QStringLiteral("layout"), {{QStringLiteral("mode"),mode},{QStringLiteral("gap"),gap}});
 }
 
-double ReaderController::fitWidth(double viewportWidth) const {
-    return lyra_reader_desktop_fit_width(m_documentWidth, viewportWidth);
-}
-
 double ReaderController::zoomOffset(double offset, double anchor, double oldZoom, double newZoom) const {
     return lyra_reader_desktop_zoom_offset(offset, anchor, oldZoom, newZoom);
 }

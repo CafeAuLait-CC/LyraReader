@@ -11,6 +11,8 @@ LyraReader itself is MIT-licensed (see [LICENSE](LICENSE)). It ships or links th
 - image / base64 / zune-jpeg / zune-core — permissive MIT OR Apache-2.0
   (native desktop signature image decoding and transport).
 - png (Rust) — MIT OR Apache-2.0 (re-encodes an image stamp's samples for the reader)
+- unicode-segmentation (Rust) — MIT OR Apache-2.0 (extended grapheme clusters for the
+  document-knowledge cap and region text)
 - UniFFI / cbindgen — MPL-2.0 (build-time tooling only; their sources are not modified)
 
 The native Qt desktop frontend dynamically links Qt 6 Core, Gui, Qml, Quick,

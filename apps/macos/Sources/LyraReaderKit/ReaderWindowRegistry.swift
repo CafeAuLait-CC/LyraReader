@@ -56,6 +56,11 @@ public final class ReaderWindowRegistry: ObservableObject {
     /// page.
     private var pendingNewWindowRegion: CGRect?
 
+    /// A tab torn out of one window, waiting for the new window's session to register. Like
+    /// `pendingNewWindow`, it must not be drained into whichever window happens to exist: the
+    /// tab belongs in the window SwiftUI is making for this request.
+    private var pendingTransfer: (transfer: TabTransfer, source: AppState)?
+
     /// How the app asks SwiftUI for another reader window.
     ///
     /// Injected by ``ReaderWindowRoot`` (`@Environment(\.openWindow)`), so the registry itself
@@ -70,6 +75,9 @@ public final class ReaderWindowRegistry: ObservableObject {
 
     /// How many documents are waiting for the window they asked for (the checks read this).
     public var pendingNewWindowCount: Int { pendingNewWindow.count }
+
+    /// How many torn-off tabs are waiting for their new window (the checks read this).
+    public var pendingTransferCount: Int { pendingTransfer == nil ? 0 : 1 }
 
     /// Whether this registry can make another reader window.
     public var canOpenNewWindow: Bool { newWindow != nil }
@@ -89,6 +97,20 @@ public final class ReaderWindowRegistry: ObservableObject {
         pendingNewWindowRegion = region
         newWindowRequestCount += 1
         // Last, so a closure that registers its session synchronously finds the URLs waiting.
+        newWindow()
+        return true
+    }
+
+    /// Tears a tab off into a new window. The tab's document is opened in the window whose
+    /// session registers next, and only then is the tab removed from `source`; the source keeps
+    /// the tab (and the reader keeps their place) if the new window cannot open it.
+    ///
+    /// Returns `false` when there is no way to make a window; the caller reports that.
+    @discardableResult
+    public func requestNewWindow(moving transfer: TabTransfer, from source: AppState) -> Bool {
+        guard let newWindow else { return false }
+        pendingTransfer = (transfer, source)
+        newWindowRequestCount += 1
         newWindow()
         return true
     }
@@ -185,6 +207,32 @@ public final class ReaderWindowRegistry: ObservableObject {
         session.registrationOrdinal = registrations
         sessions.append(session)
         if isReady { session.opener.markReady() }
+        // A window asked for by tearing a tab out is this one. The target opens the document and
+        // inserts the tab first; only then does the source give the tab up. If the source somehow
+        // still holds it after that, the target's copy is removed again so one document is never
+        // shown in two windows.
+        if let pending = pendingTransfer {
+            pendingTransfer = nil
+            if session.state.acceptTabTransfer(pending.transfer) {
+                if pending.source.containsTab(id: pending.transfer.tabID),
+                   !pending.source.removeTransferredTab(id: pending.transfer.tabID) {
+                    session.state.removeTransferredTab(id: pending.transfer.tabID)
+                    pending.source.reportTabTransferFailure(
+                        "“\(pending.transfer.title)” was opened in a new window, but the old window "
+                        + "kept it (it has unsaved changes). The move was rolled back.")
+                } else {
+                    // The tear-off is complete: the new window owns the document and the source
+                    // has no tabs left, so the empty source window goes away with its last tab.
+                    closeWindowAfterTabMove(from: pending.source)
+                }
+            } else {
+                let reason = session.state.lastTabTransferRefusal
+                    ?? "The new window could not open the document."
+                pending.source.reportTabTransferFailure(
+                    "Couldn’t open “\(pending.transfer.title)” in a new window. \(reason)")
+            }
+            return
+        }
         // A window that was asked for by a drop on the sidebar (or a thumbnail's "Open in New
         // Window") is this one: its session is the next to register, and the documents that
         // asked for it go here — never into the window the reader dropped them on.
@@ -221,6 +269,28 @@ public final class ReaderWindowRegistry: ObservableObject {
     public func noteFocused(_ session: ReaderSession) {
         guard sessions.contains(where: { $0 === session }) else { return }
         focusedSession = session
+    }
+
+    /// Closes a source window after a successful tab move left it with no tabs.
+    ///
+    /// Both tab-window move paths call this once the destination has accepted the document and
+    /// the source has given the tab up: a tear-off (``register(_:)`` finishing its
+    /// `pendingTransfer`) and a drop on another window's strip (``TabDragCoordinator``). It
+    /// deliberately does nothing unless the source is empty, so a refused or failed transfer can
+    /// never close the window that still owns its tab.
+    ///
+    /// The close goes through `performClose`, the same `windowShouldClose` → `willClose` path as
+    /// the red close button. The reader is not asked to save: the move already refused a dirty
+    /// tab, and the source has no tabs left to ask about. ``ReaderSession/close()`` unregisters
+    /// the session from its normal `willClose` observer. If this was the last reader window,
+    /// AppKit's ordinary no-window state applies — the app does not terminate itself here, and
+    /// has no “terminate after last window closes” policy to trigger.
+    public func closeWindowAfterTabMove(from source: AppState) {
+        guard source.tabs.isEmpty,
+              let session = sessions.first(where: { $0.state === source }),
+              let window = session.window
+        else { return }
+        window.performClose(nil)
     }
 
     /// The app is up: queued documents may be opened, and sessions created from now on are ready

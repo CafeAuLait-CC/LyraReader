@@ -52,7 +52,7 @@ struct LyraReaderApp: App {
            let milliseconds = Int(raw), milliseconds >= 0 {
             DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(milliseconds)) {
                 NSApplication.shared.terminate(nil)
-                // An attached sheet (the "sidecar could not be read" alert) holds AppKit's
+                // An attached sheet (the "annotation cache could not be read" alert) holds AppKit's
                 // termination back until the reader answers it. Fall back to the signal path,
                 // which flushes and exits, so a dev run cannot become an unkillable process.
                 // A timer on a background queue, because the run loop may be in a modal mode.
@@ -104,8 +104,8 @@ struct LyraReaderApp: App {
 /// the other. A focused value gives each menu item the session of the window the reader is looking
 /// at, and disables the item when no reader window is focused (the Settings window, say).
 ///
-/// The keymap lives on the Rust side (lyra-reader-session::keymap, docs/04-ui-ux.md §4);
-/// this is a minimal set consistent with it, to be generated from engine queries after M1 T1.9.
+/// Shortcuts are registered where the commands are: the `.keyboardShortcut` calls below. The
+/// toolbar's Lyra button repeats ⇧⌘A; keep the two in sync when changing that chord.
 struct ReaderCommands: Commands {
     @ObservedObject private var readingAppearance = ReadingAppearanceStore.shared
     @FocusedValue(\.readerSession) private var session
@@ -118,21 +118,34 @@ struct ReaderCommands: Commands {
                 .disabled(session == nil)
         }
 
-        // The only two ways this application writes into a PDF. Both are explicit commands,
-        // and the second one is deliberately labelled with what it replaces: it is not a save
-        // key that silently overwrites the document the reader opened.
+        // Ordinary Save writes unsigned documents to their original path. Save As chooses
+        // an explicit destination; signed originals retain the protected-copy workflow.
         CommandGroup(replacing: .saveItem) {
-            Button("Save Annotated Copy…") {
-                session?.state.presentSaveAnnotatedCopyPanel()
+            Button("Save") {
+                session?.state.saveDocument()
             }
             .keyboardShortcut("s", modifiers: .command)
-            .disabled(session?.state.canSaveAnnotationsToPDF != true)
+            .disabled(session?.state.canSaveDocument != true)
 
-            Button("Save and Replace Original…") {
-                session?.state.presentReplaceOriginalConfirmation()
+            Button("Save As…") {
+                session?.state.presentSaveDocumentCopyPanel()
             }
             .keyboardShortcut("s", modifiers: [.command, .shift])
-            .disabled(session?.state.canReplaceOriginalWithAnnotations != true)
+            .disabled(session?.state.canSaveDocument != true)
+
+            Divider()
+
+            // The two form writes used to live at the bottom of the Fill & Sign menu. Fill &
+            // Sign is a row now (its inspector repeats them while a tool is armed), so File
+            // carries them for whenever no Fill & Sign tool is open.
+            Button("Save Filled Form Copy…") {
+                session?.state.presentSaveFilledFormPanel()
+            }
+            .disabled(session?.state.canSaveFilledForm != true)
+            Button("Write Form Values to Original…") {
+                session?.state.presentReplaceOriginalWithFilledFormConfirmation()
+            }
+            .disabled(session?.state.canReplaceOriginalWithFilledForm != true)
 
             Divider()
 
@@ -167,6 +180,17 @@ struct ReaderCommands: Commands {
             Button("Document Information…") { focusedState?.showDocumentInformation = true }
                 .keyboardShortcut("i", modifiers: [.command, .option])
                 .disabled(focusedState?.document == nil)
+
+            // Developer-facing, off by default. ⌥⌘P is free: the native menu's P chord is ⌘P
+            // (Print), and no command registers ⇧⌘P (the design's citation-preview chord).
+            // See PerformancePanelShortcut for the full collision list.
+            Button((focusedState?.performancePanelVisible == true ? "Hide " : "Show ")
+                   + PerformancePanelShortcut.label) {
+                focusedState?.togglePerformancePanel()
+            }
+            .keyboardShortcut(PerformancePanelShortcut.key,
+                              modifiers: PerformancePanelShortcut.modifiers)
+            .disabled(focusedState?.document == nil)
 
             Divider()
 
@@ -223,19 +247,34 @@ struct ReaderCommands: Commands {
             Button("Toggle Sidebar") { session?.state.sidebarVisible.toggle() }
                 .keyboardShortcut("s", modifiers: [.command, .option])
                 .disabled(session == nil)
-            // The assistant left the sidebar for its own right-hand panel. ⇧⌘A is the AI-panel
-            // binding the Rust keymap already documents, and it was unused by the native menu
-            // (⌥⌘I is Document Information and ⌥⌘S toggles the sidebar).
-            Button(ReaderShortcuts.toggleAIPanelLabel) { session?.state.toggleRightPanel() }
+            // The assistant left the sidebar for its own right-hand panel. ⇧⌘A is also the
+            // toolbar's Lyra button chord; it was unused by the native menu (⌥⌘I is Document
+            // Information and ⌥⌘S toggles the sidebar).
+            Button(ReaderShortcuts.toggleAIPanelLabel) { session?.state.toggleAITools() }
                 .keyboardShortcut(ReaderShortcuts.toggleAIPanelKey,
                                   modifiers: ReaderShortcuts.toggleAIPanelModifiers)
                 .disabled(session == nil)
+
+            // In-place translation. ⇧⌘L leaves ⇧⌘T free: the design reserves it for "reopen
+            // closed tab". The title follows the selection: Show original after a translation,
+            // Translate otherwise. The command is disabled without a selection, so it cannot
+            // appear to do something to a page that has no text selected.
+            Button(session?.state.translationSelectionTitle ?? "Translate Selection") {
+                session?.state.performTranslationAction()
+            }
+            .keyboardShortcut("l", modifiers: [.command, .shift])
+            .disabled(session?.state.canTranslateSelection != true)
 
             Divider()
 
             Button("Add Bookmark") { session?.state.addBookmarkAtCurrentPage() }
                 .keyboardShortcut("d", modifiers: .command)
                 .disabled(focusedState?.document == nil)
+
+            Button("Close Reference Preview") { session?.state.closeReferencePreview() }
+                .disabled(session?.state.referencePreview == nil)
+            Button("Export Region Questions…") { session?.state.presentRegionHistoryExportPanel() }
+                .disabled(session?.state.hasExportableRegionHistory != true)
 
             Divider()
 
@@ -267,45 +306,44 @@ struct ReaderCommands: Commands {
 
             Divider()
 
-            // Recovery for a sidecar that could not be read. The file is moved aside, never
-            // overwritten, and a fresh empty sidecar takes its place.
+            // Recovery for an annotation cache that could not be read. The file is moved aside, never
+            // overwritten, and a fresh empty annotation cache takes its place.
             Button("Back Up Unreadable Annotations and Start Fresh…") {
-                if let backup = session?.state.recoverUnreadableAnnotationSidecar() {
-                    session?.state.revealSidecarBackupInFinder(backup)
+                if let backup = session?.state.recoverUnreadableAnnotationRecords() {
+                    session?.state.revealAnnotationBackupInFinder(backup)
                 }
             }
-            .disabled(session?.state.canRecoverUnreadableAnnotationSidecar != true)
+            .disabled(session?.state.canRecoverUnreadableAnnotationRecords != true)
 
             Button("Reveal Annotation Backup in Finder") {
-                session?.state.revealSidecarBackupInFinder()
+                session?.state.revealAnnotationBackupInFinder()
             }
-            .disabled(session?.state.lastSidecarBackupURL == nil)
+            .disabled(session?.state.lastAnnotationBackupURL == nil)
         }
 
-        // Redaction (T3.12). Marks are pending until one of the two explicit apply commands;
-        // the confirmation says what will be lost, and neither command runs in the background.
-        CommandMenu("Redaction") {
-            Button("Redact Tool") { session?.state.toggleRedactionTool() }
-                .keyboardShortcut("r", modifiers: [.command, .shift])
-                .disabled(session?.state.canMarkRedactions != true)
-            Button("Mark Selection for Redaction") {
-                _ = session?.state.markSelectionForRedaction()
-            }
-            .keyboardShortcut("r", modifiers: [.command, .option])
-            .disabled(session == nil)
-            Button("Remove Last Mark") { session?.state.removeLastPendingRedaction() }
-                .disabled(session?.state.pendingRedactions.isEmpty != false)
+        // Redaction (T3.12) lives only in the Edit workspace. This entry opens that workspace
+        // with the Blackout tool armed; the area is then staged like any other content edit and
+        // is published only by Edit's own Save Copy / Replace Original transactions. No chord is
+        // assigned: ⇧⌘R/⌥⌘R were retired with the old redaction path, and a destructive command
+        // should not take a reader's existing shortcut by surprise.
+        CommandGroup(after: .pasteboard) {
+            Button("Redact…") { session?.state.openRedactionWorkspace() }
+                .disabled(session?.state.canOpenRedactionWorkspace != true)
 
-            Divider()
-
-            Button("Apply to Copy…") { session?.state.presentApplyRedactionsPanel() }
-                .disabled(session?.state.canApplyRedactions != true)
-            Button("Replace Original…") {
-                session?.state.presentReplaceRedactionsConfirmation()
+            // The toolbar's Organise pages menu is gone. Its six commands already had a home in
+            // the Pages menu below; this submenu gives them the Edit-menu home next to the
+            // other editing commands, and the checks assert every command is still here.
+            Menu(PageOperationsMenu.title) {
+                ForEach(PageOperationsMenu.commands) { command in
+                    Button(command.title) {
+                        guard let state = focusedState else { return }
+                        command.perform(on: state)
+                    }
+                    .disabled(focusedState.map { !command.isEnabled($0) } ?? true)
+                    .help(focusedState.map { command.helpText($0) } ?? command.help)
+                }
             }
-            .disabled(session?.state.canApplyRedactions != true)
-            Button("Clear Pending Redactions") { session?.state.clearPendingRedactions() }
-                .disabled(session?.state.pendingRedactions.isEmpty != false)
+            .disabled(focusedState == nil)
         }
 
         // Page operations (T3.9). Everything here is staged in a working copy until one of the
@@ -377,18 +415,10 @@ struct ReaderCommands: Commands {
 
             Divider()
 
-            Button("Save Edited Copy…") {
-                session?.state.presentSavePageEditsCopyPanel()
-            }
-            .disabled(session?.state.canSavePageEditsCopy != true)
-            Button("Replace Original with Page Changes…") {
-                session?.state.presentReplaceOriginalWithPageEditsConfirmation()
-            }
-            .disabled(session?.state.canReplaceOriginalWithPageEdits != true)
             Button("Discard Page Changes…") {
                 session?.state.presentDiscardPageEditsConfirmation()
             }
-            .disabled(session?.state.pageEditSessionActive != true)
+            .disabled(session?.state.pageEditHasPendingChanges != true)
 
             Divider()
 

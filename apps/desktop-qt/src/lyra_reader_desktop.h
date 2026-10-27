@@ -34,6 +34,5 @@ bool lyra_reader_desktop_render_region(const LyraReaderRenderSource *, std::uint
 void lyra_reader_desktop_buffer_free(LyraReaderBuffer buffer);
 bool lyra_reader_desktop_command(const LyraReaderDesktopDocument *document,
     const std::uint8_t *request, std::size_t request_len, LyraReaderBuffer *output, LyraReaderBuffer *error);
-double lyra_reader_desktop_fit_width(double page_width, double viewport_width);
 double lyra_reader_desktop_zoom_offset(double offset, double anchor, double old_zoom, double new_zoom);
 }

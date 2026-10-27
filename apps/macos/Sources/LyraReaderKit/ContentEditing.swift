@@ -1,4 +1,5 @@
 import AppKit
+import LyraReaderBindings
 import SwiftUI
 
 public struct PDFContentBox: Codable, Equatable, Sendable {
@@ -24,21 +25,115 @@ public struct PDFContentPage: Codable, Equatable, Sendable {
   public var revision: String, page: Int, items: [PDFContentItem]
 }
 
-public struct PDFContentCommand: Encodable, Sendable {
-  public var action: String, revision: String
-  public var target: String? = nil
-  public var bounds: PDFContentBox? = nil
-  public var rotation: Double? = nil
-  public var text: String? = nil
-  public var font: String? = nil
-  public var size: Double? = nil
-  public var colour: [UInt8]? = nil
-  public var alignment: Int? = nil
-  public var blackout: Bool? = nil
-  public var image_path: String? = nil
-  public var crop: PDFContentBox? = nil
-  public var page: Int? = nil
-  public var uri: String? = nil
+public extension ContentBoxRecord {
+  init(_ rect: CGRect) {
+    self.init(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height)
+  }
+  init(_ box: PDFContentBox) {
+    self.init(x: box.x, y: box.y, width: box.width, height: box.height)
+  }
+}
+
+extension ContentCommandRecord {
+  /// The source revision this command was built against.
+  var revision: String {
+    switch self {
+    case let .transform(revision, _, _, _),
+      let .replaceText(revision, _, _, _, _, _, _, _),
+      let .insertText(revision, _, _, _, _, _, _),
+      let .delete(revision, _),
+      let .redact(revision, _, _),
+      let .insertImage(revision, _, _),
+      let .replaceImage(revision, _, _),
+      let .cropImage(revision, _, _),
+      let .setLink(revision, _, _, _, _):
+      return revision
+    }
+  }
+
+  var isReplaceText: Bool {
+    if case .replaceText = self { return true }
+    return false
+  }
+
+  /// The text draft a failed replace-text command preserves for retry.
+  var replaceTextPayload: (text: String, font: String)? {
+    guard case let .replaceText(_, _, text, _, font, _, _, _) = self else { return nil }
+    return (text, font)
+  }
+
+  /// The temporary image a staged command owns, so it can be removed after the attempt.
+  var imagePath: String? {
+    switch self {
+    case let .insertImage(_, _, path), let .replaceImage(_, _, path):
+      return path
+    default:
+      return nil
+    }
+  }
+
+  /// Rebase a command after annotations were materialised into the working copy.
+  func replacingRevision(_ revision: String) -> Self {
+    switch self {
+    case let .transform(_, target, bounds, rotation):
+      return .transform(revision: revision, target: target, bounds: bounds, rotation: rotation)
+    case let .replaceText(_, target, text, bounds, font, size, colour, alignment):
+      return .replaceText(
+        revision: revision, target: target, text: text, bounds: bounds, font: font, size: size,
+        colour: colour, alignment: alignment)
+    case let .insertText(_, text, bounds, font, size, colour, alignment):
+      return .insertText(
+        revision: revision, text: text, bounds: bounds, font: font, size: size, colour: colour,
+        alignment: alignment)
+    case let .delete(_, target):
+      return .delete(revision: revision, target: target)
+    case let .redact(_, bounds, blackout):
+      return .redact(revision: revision, bounds: bounds, blackout: blackout)
+    case let .insertImage(_, bounds, imagePath):
+      return .insertImage(revision: revision, bounds: bounds, imagePath: imagePath)
+    case let .replaceImage(_, target, imagePath):
+      return .replaceImage(revision: revision, target: target, imagePath: imagePath)
+    case let .cropImage(_, target, crop):
+      return .cropImage(revision: revision, target: target, crop: crop)
+    case let .setLink(_, target, bounds, page, uri):
+      return .setLink(
+        revision: revision, target: target, bounds: bounds, page: page, uri: uri)
+    }
+  }
+
+  /// Replace the words and font of a preserved replace-text draft.
+  func replacingText(_ text: String, font: String) -> Self {
+    guard case let .replaceText(revision, target, _, bounds, _, size, colour, alignment) = self
+    else { return self }
+    return .replaceText(
+      revision: revision, target: target, text: text, bounds: bounds, font: font, size: size,
+      colour: colour, alignment: alignment)
+  }
+}
+
+/// A redaction the Edit workspace must ask about before it stages anything.
+///
+/// Some content cannot be removed from a page's operators at all: text inside a form XObject,
+/// or a page whose content uses an inline image or shading. The writer's only safe answer is to
+/// paint the page to an image and burn the marks in, which loses that page's entire text layer.
+/// The shell shows this prompt first. `pages` is 1-based and names exactly the pages that would
+/// become images; the user's decision is then either no write at all or the explicitly accepted
+/// fallback for those pages.
+public struct RasterRedactionPrompt: Identifiable, Sendable {
+  public let id = UUID()
+  /// The 1-based page numbers that would become images.
+  public let pages: [Int]
+  /// The alert title; it names the pages. Kept here so the check can assert the same words the
+  /// reader sees.
+  public let title: String
+  /// The consequence in plain language: the pages lose their text layer, so their text is no
+  /// longer selectable or searchable.
+  public let message: String
+  public init(pages: [Int], title: String, message: String) {
+    self.pages = pages
+    self.title = title
+    self.message = message
+  }
 }
 
 /// A native overlay owns pointer interaction only while Edit is active. The PDF itself stays
@@ -73,6 +168,8 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
   private var editingRevision: String?
   private var editingPage: Int?
   private var editingURL: URL?
+  private var originalEditingText: String?
+  private var wheelMotion = WheelMotion()
   private var wasSelected = false
   private var guides: [CGFloat] = []
   private var horizontalGuides: [CGFloat] = []
@@ -96,6 +193,9 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
     let z = state.zoomFactor
     let r = item.bounds.rect
     let offset = max(0, (bounds.width - state.contentWidthPt * z) / 2)
+    // `viewRect(local:onPage:)` is the piecewise mapping: one rectangle for an ordinary page,
+    // the union of the two pieces for an item that crosses a tear.
+    if let rect = state.viewRect(local: r, onPage: page.page) { return rect }
     return CGRect(
       x: offset + (placement.leftPt + r.minX) * z,
       y: (placement.topPt + r.minY - state.scrollYPt) * z, width: r.width * z, height: r.height * z)
@@ -106,14 +206,19 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
     else { return nil }
     let z = state.zoomFactor
     let offset = max(0, (bounds.width - state.contentWidthPt * z) / 2)
+    let contentY = rect.minY / z + state.scrollYPt
+    let localY = state.pageLocalY(forContentY: contentY, onPage: page.page)
+      ?? (rect.minY / z + state.scrollYPt - placement.topPt)
     return CGRect(
       x: (rect.minX - offset) / z - placement.leftPt,
-      y: rect.minY / z + state.scrollYPt - placement.topPt, width: rect.width / z,
+      y: localY, width: rect.width / z,
       height: rect.height / z)
   }
   private func hit(_ point: CGPoint) -> PDFContentItem? {
     state?.contentEditPage?.items.filter {
-      (state?.contentEditTool == "link" ? $0.kind == "link" : $0.kind != "link")
+      (state?.contentEditTool == "link" ? $0.kind == "link" :
+        state?.contentEditTool == "text" ? $0.kind == "text" :
+        state?.contentEditTool == "image" ? ["image", "graphic"].contains($0.kind) : $0.kind != "link")
         && frame($0)?.insetBy(dx: -3, dy: -3).contains(point) == true
     }
     .min { $0.bounds.width * $0.bounds.height < $1.bounds.width * $1.bounds.height }
@@ -139,6 +244,27 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
     guard let state, !state.pageEditBusy, !state.contentEditLoading, !state.contentCommandInFlight,
       state.contentTextRecovery == nil
     else { return }
+    let contentPoint = CanvasGeometry.contentPoint(viewX: point.x, viewYTop: point.y,
+      scrollYPt: state.scrollYPt, zoom: state.zoomFactor,
+      contentOffsetX: max(0, (bounds.width - state.contentWidthPt * state.zoomFactor) / 2))
+    if let page = state.pagePlacement(at: contentPoint)?.index,
+       page != state.contentEditPage?.page {
+      // A visible page is editable even when the viewport's top still belongs to the
+      // previous page. Inspect the clicked page, then complete this first selection.
+      state.contentEditSelection = nil
+      wasSelected = false
+      let url = state.document?.url
+      Task { @MainActor [weak self, weak state] in
+        guard let self, let state else { return }
+        state.currentPage = page + 1
+        await state.reloadContentObjects()
+        guard self.state === state, state.document?.url == url,
+              state.contentEditPage?.page == page else { return }
+        self.mouseDown(with: event)
+        self.mouseUp(with: event)
+      }
+      return
+    }
     if state.contentEditTool == "erase" || state.contentEditTool == "blackout" {
       origin = point
       original = nil
@@ -153,13 +279,13 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
       state.contentEditSelection = nil
       return
     }
-    if state.contentEditTool == "text",
+    if state.contentEditTool == "text", hit(point) == nil,
       let rect = local(CGRect(x: point.x, y: point.y, width: 250, height: 70))
     {
       state.insertContentText(at: rect)
       return
     }
-    if state.contentEditTool == "image",
+    if state.contentEditTool == "image", hit(point) == nil,
       let rect = local(CGRect(origin: point, size: CGSize(width: 1, height: 1)))
     {
       state.chooseContentImage(at: rect)
@@ -283,14 +409,14 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
     if state.contentEditTool == "link",
       let rect = preview
         ?? state.contentLinkDraft.flatMap({ local in
-          guard
-            let placement = state.canvasPageFrames.first(where: {
-              $0.index == state.contentEditPage?.page
-            })
+          guard let page = state.contentEditPage,
+                let placement = state.canvasPageFrames.first(where: {
+                  $0.index == page.page
+                })
           else { return nil as CGRect? }
           let z = state.zoomFactor
           let offset = max(0, (bounds.width - state.contentWidthPt * z) / 2)
-          return CGRect(
+          return state.viewRect(local: local, onPage: page.page) ?? CGRect(
             x: offset + (placement.leftPt + local.minX) * z,
             y: (placement.topPt + local.minY - state.scrollYPt) * z, width: local.width * z,
             height: local.height * z)
@@ -355,13 +481,20 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
     scroll.hasVerticalScroller = true
     scroll.autohidesScrollers = true
     scroll.borderType = .noBorder
-    let textView = NSTextView(frame: CGRect(origin: .zero, size: scroll.contentSize))
+    let textView = ContentDraftTextView(frame: CGRect(origin: .zero, size: scroll.contentSize))
+    textView.onCommit = { [weak self] in
+      self?.commitText()
+      self?.window?.makeFirstResponder(self)
+    }
     textView.isRichText = false
     textView.allowsUndo = true
     textView.drawsBackground = true
     textView.backgroundColor = .textBackgroundColor
     textView.font = contentEditorFont(item.font, size: item.size * state.zoomFactor)
-    textView.string = item.text
+    // Inspection's newlines are visual PDF lines, not paragraph breaks. Let the native
+    // container rewrap a paragraph naturally when a word is inserted in an existing line.
+    textView.string = item.text.replacingOccurrences(of: "\n", with: " ")
+    originalEditingText = textView.string
     textView.textContainerInset = NSSize(width: 2, height: 2)
     textView.textContainer?.widthTracksTextView = true
     textView.textContainer?.containerSize = NSSize(
@@ -385,6 +518,19 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
     textView.setSelectedRange(
       NSRange(location: min(position, textView.string.utf16.count), length: 0))
   }
+
+  func textDidChange(_ notification: Notification) {
+    guard let editor, let scroll = editor.enclosingScrollView,
+          let manager = editor.layoutManager, let container = editor.textContainer else { return }
+    manager.ensureLayout(for: container)
+    let needed = manager.usedRect(for: container).height + editor.textContainerInset.height * 2 + 6
+    let available = max(24, bounds.height - scroll.frame.minY)
+    let height = min(available, max(scroll.frame.height, needed))
+    scroll.setFrameSize(CGSize(width: scroll.frame.width, height: height))
+    scroll.wantsLayer = true
+    scroll.layer?.borderWidth = 1
+    scroll.layer?.borderColor = (needed > available ? NSColor.systemRed : NSColor.controlAccentColor).cgColor
+  }
   func commitText() {
     guard let editor, let item = editingItem else { return }
     state?.contentTextEditing = false
@@ -392,13 +538,14 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
     (editor.enclosingScrollView ?? editor).removeFromSuperview()
     self.editor = nil
     editingItem = nil
-    if value != item.text, editingRevision == state?.contentEditPage?.revision {
+    if value != originalEditingText, editingRevision == state?.contentEditPage?.revision {
       state?.replaceContentText(item, text: value)
-    } else if value != item.text, let revision = editingRevision, let page = editingPage {
+    } else if value != originalEditingText, let revision = editingRevision, let page = editingPage {
       state?.recoverDetachedContentText(
         item, text: value, revision: revision, page: page, url: editingURL)
     }
     editingRevision = nil
+    originalEditingText = nil
   }
   func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
     if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
@@ -425,6 +572,9 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
     }
     if event.keyCode == 53 {
       commitText()
+      // Escape first returns an armed content tool to the implicit pointer state; only a
+      // second Escape (with no tool armed) leaves the Edit workspace.
+      if state?.cancelContentTool() == true { return }
       state?.contentEditEnabled = false
       return
     }
@@ -435,255 +585,37 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
       super.scrollWheel(with: event)
       return
     }
+    if abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY) {
+      super.scrollWheel(with: event)
+      return
+    }
+    let delta = wheelMotion.delta(scrollingDeltaY: event.scrollingDeltaY,
+      precise: event.hasPreciseScrollingDeltas, timestamp: event.timestamp)
     if event.hasPreciseScrollingDeltas {
-      state.scroll(byScreenPoints: event.scrollingDeltaY)
+      state.scroll(byScreenPoints: delta)
     } else {
-      state.scrollByWheelStep(event.scrollingDeltaY)
+      state.scrollByWheelStep(delta)
     }
   }
 }
 
-struct ContentEditInspector: View {
-  @ObservedObject var state: AppState
-  @State private var font = "Original"
-  @State private var size = 12.0
-  @State private var alignment = 0
-  @State private var colour = Color.black
-  @State private var x = 0.0
-  @State private var y = 0.0
-  @State private var width = 100.0
-  @State private var height = 40.0
-  @State private var imagePreview: NSImage?
-  @State private var showCrop = false
-  @State private var cropLeft = 0.0
-  @State private var cropTop = 0.0
-  @State private var cropRight = 100.0
-  @State private var cropBottom = 100.0
-  @State private var linkDestination = "page"
-  @State private var linkPage = 1
-  @State private var linkURL = "https://"
-  private let fonts = [
-    "Original", "Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique",
-    "Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic", "Courier", "Courier-Bold",
-    "LyraReader Sans SC",
-  ]
-  var body: some View {
-    ScrollView {
-      VStack(alignment: .leading, spacing: 12) {
-        HStack {
-          Text("Edit PDF").font(.headline)
-          Spacer()
-          Button {
-            state.toggleContentEditing()
-          } label: {
-            Image(systemName: "xmark")
-          }
-        }
-        HStack {
-          ForEach(["select", "text", "image", "link"], id: \.self) { tool in
-            Button(tool.capitalized) { state.contentEditTool = tool }
-              .buttonStyle(LyraReaderToolStyle(selected: state.contentEditTool == tool))
-          }
-        }
-        HStack {
-          Button("Erase") { state.contentEditTool = "erase" }
-          Button("Blackout") { state.contentEditTool = "blackout" }
-        }
-        if state.contentEditTool == "erase" || state.contentEditTool == "blackout" {
-          Text(
-            "Drag a rectangle to remove its content. Undo restores the previous working revision."
-          )
-          .font(.caption)
-        }
-        if state.contentEditTool == "link" {
-          Text("Drag a region to create a link, or select an existing link.").font(.caption)
-          if state.selectedContentItem?.kind == "link" || state.contentLinkDraft != nil {
-            Picker("Destination", selection: $linkDestination) {
-              Text("Page").tag("page")
-              Text("URL").tag("url")
-            }
-            if linkDestination == "page" {
-              TextField("Page", value: $linkPage, format: .number)
-            } else {
-              TextField("URL", text: $linkURL)
-            }
-            Button("Apply link") {
-              state.setContentLink(
-                state.selectedContentItem, page: linkDestination == "page" ? linkPage - 1 : nil,
-                uri: linkDestination == "url" ? linkURL : nil)
-            }
-          }
-        }
-        if state.contentEditLoading || state.pageEditBusy { ProgressView() }
-        if state.contentTextRecovery != nil {
-          Text("Recovered text draft").font(.headline)
-          TextEditor(
-            text: Binding(
-              get: { state.contentTextRecovery ?? "" }, set: { state.contentTextRecovery = $0 })
-          ).frame(minHeight: 100)
-          Picker("Font", selection: $font) { ForEach(fonts, id: \.self) { Text($0) } }
-          HStack {
-            Button("Retry") { state.retryContentText(font: font) }
-            Button("Copy") {
-              NSPasteboard.general.clearContents()
-              NSPasteboard.general.setString(state.contentTextRecovery ?? "", forType: .string)
-            }
-            Button("Discard") { state.discardContentTextRecovery() }
-          }
-        }
-        if let item = state.selectedContentItem {
-          Text(item.kind.capitalized).font(.headline)
-          if item.kind == "image" || item.kind == "graphic" {
-            if let imagePreview {
-              Image(nsImage: imagePreview).resizable().scaledToFit().frame(maxHeight: 130)
-            }
-            HStack {
-              Button("Replace…") { state.chooseContentImage(replacing: item) }.disabled(
-                item.paths.contains { $0.count != 1 })
-              Button("Export…") { state.exportContentImage(item) }
-            }
-            if item.paths.allSatisfy({ $0.count == 1 }) {
-              Button("Crop…") { showCrop.toggle() }
-              if showCrop {
-                Text("Retained edges (%)").font(.caption)
-                HStack {
-                  Text("Left")
-                  TextField("Left", value: $cropLeft, format: .number)
-                  Text("Right")
-                  TextField("Right", value: $cropRight, format: .number)
-                }
-                HStack {
-                  Text("Top")
-                  TextField("Top", value: $cropTop, format: .number)
-                  Text("Bottom")
-                  TextField("Bottom", value: $cropBottom, format: .number)
-                }
-                Button("Apply crop") {
-                  state.cropContentImage(
-                    item,
-                    to: CGRect(
-                      x: cropLeft / 100, y: cropTop / 100, width: (cropRight - cropLeft) / 100,
-                      height: (cropBottom - cropTop) / 100))
-                }.disabled(
-                  cropLeft < 0 || cropTop < 0 || cropRight > 100 || cropBottom > 100
-                    || cropRight <= cropLeft || cropBottom <= cropTop)
-              }
-            }
-          }
-          if item.kind == "text" {
-            Text(item.text).lineLimit(3).font(.caption).foregroundStyle(.secondary)
-            if let reason = item.reason { Text(reason).font(.caption).foregroundStyle(.secondary) }
-            if item.can_edit_text {
-              Picker("Font", selection: $font) { ForEach(fonts, id: \.self) { Text($0) } }
-              HStack {
-                Text("Size")
-                TextField("Size", value: $size, format: .number).frame(width: 65)
-                Text("pt")
-              }
-              Picker("Alignment", selection: $alignment) {
-                Text("Left").tag(0)
-                Text("Center").tag(1)
-                Text("Right").tag(2)
-              }
-              ColorPicker("Color", selection: $colour, supportsOpacity: false)
-              Button("Apply text style") {
-                let c = NSColor(colour).usingColorSpace(.deviceRGB) ?? .black
-                let rgba: [UInt8] = [
-                  UInt8((c.redComponent * 255).rounded()),
-                  UInt8((c.greenComponent * 255).rounded()),
-                  UInt8((c.blueComponent * 255).rounded()), 255,
-                ]
-                state.replaceContentText(
-                  item, text: item.text, font: font, size: size, colour: rgba, alignment: alignment)
-              }
-            }
-          }
-          Divider()
-          HStack {
-            Text("X")
-            TextField("X", value: $x, format: .number)
-            Text("Y")
-            TextField("Y", value: $y, format: .number)
-          }
-          HStack {
-            Text("W")
-            TextField("Width", value: $width, format: .number)
-            Text("H")
-            TextField("Height", value: $height, format: .number)
-          }
-          Button("Apply position and size") {
-            state.transformContent(item, to: CGRect(x: x, y: y, width: width, height: height))
-          }
-          HStack {
-            Button {
-              state.transformContent(item, to: item.bounds.rect, rotation: -90)
-            } label: {
-              Image(systemName: "rotate.left")
-            }
-            Button {
-              state.transformContent(item, to: item.bounds.rect, rotation: 90)
-            } label: {
-              Image(systemName: "rotate.right")
-            }
-            Spacer()
-            Button("Delete", role: .destructive) { state.deleteContent(item) }.disabled(
-              item.paths.contains { $0.count != 1 })
-          }
-        } else {
-          Text(
-            "Hover to see a block. Click to select and drag; click selected text again to edit it."
-          ).font(.callout).foregroundStyle(.secondary)
-          Text("Click outside the text or press ⌘Return to apply. Escape cancels typing.").font(
-            .caption
-          ).foregroundStyle(.secondary)
-        }
-        Spacer()
-        if state.isReadOnlyDocument {
-          Text("Signed original is read-only. Changes can be saved to an unsigned copy.").font(
-            .caption)
-        }
-        HStack {
-          Button("Undo") { state.undoPageEdit() }.disabled(!state.canUndoPageEdit)
-          Button("Redo") { state.redoPageEdit() }.disabled(!state.canRedoPageEdit)
-        }
-        Button("Save Edited Copy…") { state.presentSavePageEditsCopyPanel() }.disabled(
-          !state.canSavePageEditsCopy)
-        Button("Replace Original…") { state.presentReplaceOriginalWithPageEditsConfirmation() }
-          .disabled(!state.canReplaceOriginalWithPageEdits)
-      }
-      .padding(16)
-    }.frame(width: 292).frame(maxHeight: .infinity)
-      .background(.regularMaterial)
-      .task(id: "\(state.contentEditPage?.revision ?? "")-\(state.contentEditSelection ?? "")") {
-        imagePreview = nil
-        showCrop = false
-        cropLeft = 0
-        cropTop = 0
-        cropRight = 100
-        cropBottom = 100
-        guard let item = state.selectedContentItem, item.kind == "image" || item.kind == "graphic",
-          let data = try? await state.contentImageData(item), !Task.isCancelled
-        else { return }
-        imagePreview = NSImage(data: data)
-      }
-      .onChange(of: state.selectedContentItem) { _, item in
-        guard let item else { return }
-        font = "Original"
-        size = item.size
-        x = item.bounds.x
-        y = item.bounds.y
-        width = item.bounds.width
-        height = item.bounds.height
-        linkDestination = item.link_uri == nil ? "page" : "url"
-        linkPage = (item.link_page ?? 0) + 1
-        linkURL = item.link_uri ?? "https://"
-        if item.colour.count == 4 {
-          colour = Color(
-            red: Double(item.colour[0]) / 255, green: Double(item.colour[1]) / 255,
-            blue: Double(item.colour[2]) / 255)
-        }
-      }
-      .disabled(state.pageEditBusy || state.contentCommandInFlight)
+/// Cmd-Return is a commit command, independent of the user's text key-binding selector.
+/// NSTextView can translate it to insertNewlineIgnoringFieldEditor rather than insertNewline.
+private final class ContentDraftTextView: NSTextView {
+  var onCommit: (() -> Void)?
+  override func keyDown(with event: NSEvent) {
+    if [36, 76].contains(event.keyCode), event.modifierFlags.contains(.command) {
+      onCommit?()
+    } else {
+      super.keyDown(with: event)
+    }
+  }
+  override func performKeyEquivalent(with event: NSEvent) -> Bool {
+    if [36, 76].contains(event.keyCode), event.modifierFlags.contains(.command) {
+      onCommit?()
+      return true
+    }
+    return super.performKeyEquivalent(with: event)
   }
 }
 

@@ -31,16 +31,34 @@ separate features with their own documented limits.
   page gap, calibrated zoom (Actual Size / Fit Width / Fit Page), independent windows.
 - **Navigate**: outline with section numbers and levels, thumbnails that show the file's own annotations,
   document-wide search, per-window Back/Forward across preview jumps.
-- **Annotate**: text markup, ink, shapes, sticky notes, text boxes, stamps and image signatures — with undo,
-  a sidecar that survives crashes, and a verified write-back into the PDF.
-- **Edit pages**: rotate, delete, reorder, insert, extract, merge and split, all staged with undo and verified
-  on write; forms; document properties (Info and XMP); redaction that removes the covered content; printing.
+- **Annotate**: four sliding tool rows — Annotate (markup / pen / placement), Edit (content tools), Fill & Sign
+  (text, signature, date, checkmark, cross, stamp, image) and Export — with a right-hand inspector that appears only
+  while a tool or a selected object needs it; text markup, ink, shapes, sticky notes, text boxes, stamps and image
+  signatures, all with undo,
+  recovery in the application cache and verified saving into the original PDF. Signed originals use Save As.
+- **Edit pages**: rotate, delete, reorder, insert, extract, merge and split, redaction consolidated in the Edit
+  workspace (Blackout / Erase), flattened copies that bake annotations and form values into the page, all staged with
+  undo and verified
+  on write; forms; document properties (Info and XMP); redaction that removes the covered content; printing
+  (a page torn open by a region card still prints as the original page).
 - **Papers**: clickable citations (author–year, bracketed, superscript and bare parenthetical numerals),
   figure/table/algorithm previews with transparent crops, metadata recognition with BibTeX export.
-- **Assist**: an optional assistant in its own right-hand panel — document chat with retrieval across the
-  whole file, citation chips that jump to the verified source and flash it briefly, plus summarise / selection
-  Q&A / translation — over an OpenAI-compatible endpoint or a ChatGPT plan, with the request previewed before
-  anything leaves the machine and the key held in the Keychain.
+- **Assist**: an optional assistant in its own right-hand panel — document chat with retrieval across the whole
+  file and citation chips that jump to the verified source and flash it; region questions, where a drag opens the
+  answer in a card set into a real tear in the page (the page's pixels are clipped into two pieces, never
+  re-rendered) and the exchange later exports as a Markdown knowledge document; layered summaries over the whole
+  document, its sections and its pages, each linking to its source; and in-place translation with a Show original
+  toggle that sends nothing on a cache hit. It works over an OpenAI-compatible endpoint or a ChatGPT plan, previews
+  every request before anything leaves the machine, keeps the key in the Keychain, and keeps a local record of what
+  each send contained (pages, characters, whether a picture went) that never stores document text.
+  Summary, Translate and Chat have separate tabs. The assistant and Edit inspectors share the right
+  edge; switching between them preserves drafts, reserves the panel's width in the document
+  viewport and keeps the document's vertical position stable. Wide pages can scroll horizontally.
+- **Translate in place**: select a paragraph and choose Translate from the context menu, the toolbar or
+  ⇧⌘L; the translation is drawn over that block with a Show original / Translate chip and a fitted font size,
+  never a side-by-side panel. Per-block results are cached in the document cache, so flipping, switching tabs,
+  scrolling away and relaunching send nothing again. On a region-card tear the cover follows the page's two paper
+  pieces, and opening or closing the tear sends nothing. The overlay writes nothing into the PDF.
 
 ## Tech stack (decided)
 
@@ -48,7 +66,7 @@ separate features with their own documented limits.
 | --- | --- | --- |
 | Rendering & compositing | **wgpu 30** (macOS → Metal; future Windows → DX12, Linux → Vulkan) | One GPU layer reused across all three platforms · [ADR-0003](docs/adr/0003-gpu-wgpu-shared-device.md) |
 | PDF engine | **Backend trait abstraction + PDFium as the first implementation** (BSD-3), with a slot reserved for a pure-Rust backend | The only engine that supports rendering, per-glyph text boxes, links, forms and incremental save at once · [ADR-0002](docs/adr/0002-pdf-engine-backend.md) |
-| UI | **SwiftUI + AppKit** (native macOS), with UI logic pushed down into the platform-independent `lyra-reader-session` | Native look and feel, input methods and accessibility; a future shell swap won't require rewriting the engine · [ADR-0001](docs/adr/0001-native-ui-stack.md) |
+| UI | **SwiftUI + AppKit** (native macOS), with the portable layout, zoom, viewport and navigation-history rules in the platform-independent `lyra-reader-session` | Native look and feel, input methods and accessibility; a future shell swap reuses those rules instead of rewriting them · [ADR-0001](docs/adr/0001-native-ui-stack.md) |
 | Bridging | **UniFFI** (control plane) + hand-written C ABI (GPU surface/device handoff) | Generates Swift bindings automatically, supports async and callback streams · [ADR-0004](docs/adr/0004-rust-swift-ffi.md) |
 | License | This project is **MIT**; all dependencies use permissive licenses | [ADR-0005](docs/adr/0005-licensing.md) |
 | Build | Cargo workspace + SwiftPM (**Command Line Tools only**, CLT 26.3 on this machine) | Develop without a full Xcode install · [ADR-0006](docs/adr/0006-build-without-xcode.md) |
@@ -57,21 +75,22 @@ separate features with their own documented limits.
 
 ```
 LyraReader/
-├── Cargo.toml                  # Rust workspace (11 crates)
+├── Cargo.toml                  # Rust workspace (12 crates)
 ├── rust-toolchain.toml         # Pinned toolchain
 ├── crates/
 │   ├── lyra-reader-core/              # Document model, geometry/coordinates, errors, backend traits (zero platform deps)
 │   ├── lyra-reader-pdfium/            # PDFium implementation of DocumentBackend (feature-gated)
 │   ├── lyra-reader-text/              # Text pages, per-glyph boxes, selection, search, reading order
-│   ├── lyra-reader-edit/              # Annotation model, page operations, forms, incremental save
-│   ├── lyra-reader-render/            # Tile pyramid, LOD, scheduling, cache, prefetch
+│   ├── lyra-reader-edit/              # Annotation model, page operations, forms, incremental save, page-edit transaction
+│   ├── lyra-reader-render/            # Tile pyramid, LOD, batch tile planning (cache stays in Swift, ADR-0007)
 │   ├── lyra-reader-gpu/               # wgpu device/surface/compositor, shares MTLDevice with the native layer
-│   ├── lyra-reader-session/           # Session and viewport state machine, command/event bus (platform-independent)
+│   ├── lyra-reader-session/           # Layout, zoom, viewport and navigation-history rules (platform-independent)
 │   ├── lyra-reader-ai/                # LLM provider abstraction, context building, citation index
 │   ├── lyra-reader-metadata/          # Info/XMP/first-page metadata recognition and BibTeX generation
+│   ├── lyra-reader-xfa/               # Read-only XFA rendering and form-data display
 │   ├── lyra-reader-ffi/               # UniFFI interface definitions + C ABI exports
 │   └── lyra-reader-cli/               # Headless CLI: render/text/metadata/benchmarks (also the golden test entry point)
-├── apps/macos/                 # SwiftPM package: LyraReaderKit (UI library) + LyraReader (executable app)
+├── apps/macos/                 # SwiftPM package: LyraReaderKit (UI library) + LyraReader (app) + LyraReaderChecks (native regression runner)
 ├── scripts/                    # Build, packaging, PDFium fetch and check scripts
 ├── docs/                       # Design and planning documents (see below)
 └── vendor/                     # Third-party binaries (pdfium, git-ignored)
@@ -100,9 +119,9 @@ design notes rather than here.
 ## Documentation index
 
 The design documents live in `docs/` in the working copy and are **not committed** (see the note under
-*Directory layout*), so the links below resolve locally. Two design documents do ship with the code:
-[PDF-CONTENT-EDITING.md](PDF-CONTENT-EDITING.md) (the content editor's model, limits and verification) and
-[RENAMING.md](RENAMING.md) (the rename's scope and upgrade compatibility).
+*Directory layout*), so the links below resolve locally. Everything explanatory lives there: the README
+carries the overview, and the only documents that ship with the code are this file, the licence and
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 | Document | Contents |
 | --- | --- |
@@ -118,6 +137,13 @@ The design documents live in `docs/` in the working copy and are **not committed
 | [10 Text and citations](docs/10-text-and-citations.md) | Text layer, citation detection, bibliography attribution, caption indexing |
 | [11 Content editing](docs/11-content-editing.md) | The content editor in Chinese: interaction, the three hard decisions, limits, verification |
 | [12](docs/12-readme-feature-notes.md) / [13](docs/13-readme-measurements.md) / [14](docs/14-readme-intro-archive.md) | Material moved out of this README: feature implementation notes, measurement recipes, the former overview |
+| [15](docs/15-document-saving.md) | The save model: working copies, the annotation cache, backups and what a failed save leaves behind |
+| [16](docs/16-renaming.md) | The ArisReader to LyraReader rename: scope, compatibility kept, and what migrates on first open |
+| [17](docs/17-review-notes.md) / [18](docs/18-eval-latest.md) / [19](docs/19-eval-audit.md) / [20](docs/20-m4-previews-notes.md) / [21](docs/21-review-pr9-notes.md) | Historical reviews and evaluation audits, kept for context — not the current state |
+| [22](docs/22-architecture-and-rust-audit.md) | Architecture and Rust-robustness audit: the counterexample catalogue behind the refactor |
+| [23](docs/23-audit-todo.md) | The audit's remediation list: what was moved, with PR numbers and the evidence each entry requires |
+| [24](docs/24-drift-checklist.md) | Periodic drift checklist and the measured baselines (line counts, unsafe/unwrap, goldens, corpora) |
+| [25](docs/25-post-refactor-independent-audit.md) | Independent post-refactor audit: the three regressions it found, their fixes, and what remains |
 | [ADR](docs/adr/) | Architecture decision records |
 
 ## Milestones at a glance
@@ -125,13 +151,13 @@ The design documents live in `docs/` in the working copy and are **not committed
 | Milestone | Theme | Status |
 | --- | --- | --- |
 | M0 | Skeleton, FFI path, GPU interop | Complete |
-| M1 | Minimum readable loop | Core implemented; performance and memory budgets still measured by hand |
-| M2 | Reading experience | Complete: tabs, independent windows, outline, search, bookmarks, facing pages |
-| M3 | Annotation and editing | Complete for annotations, page operations, forms, redaction and printing; in-place body editing is its own feature with documented limits |
-| M4 | Advanced reading | Core implemented: previews, citations (including bare parenthetical numerals and multi-list attribution), captions, metadata and BibTeX |
-| M5 | AI assistant | Partial: summaries, selection Q&A, translation; document chat and vision are not done |
-| M6 | Cross-platform | Not started |
-| M7 | Polish: performance, accessibility, i18n, updates | Not started |
+| M1 | Minimum readable loop | Complete for reading; performance budgets are now visible in the in-app performance panel |
+| M2 | Reading experience | Complete: tabs, independent windows, outline, search, bookmarks, page-corner flags, facing pages |
+| M3 | Annotation and editing | Complete: annotations (incl. stamps, image signatures, typed/drawn/Continuity signatures), page operations, forms filling without a tool, redaction (Edit workspace), flattened copies, printing |
+| M4 | Advanced reading | Complete: citation/figure/table previews, citation attribution, captions, metadata and BibTeX |
+| M5 | AI assistant | Broadly complete: document chat, region questions with an inline card, layered summaries, in-place translation, vision on both connections, local request log; cross-document Q&A not done |
+| M6 | Cross-platform | Not started (Linux and Windows shells) |
+| M7 | Polish: accessibility, i18n, updates | Not started |
 
 Per-milestone detail, measurements and the remaining work live in the design notes, not here.
 
@@ -142,7 +168,8 @@ listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md); all of them are perm
 included (MuPDF is excluded on purpose). The decision record is [ADR-0005](docs/adr/0005-licensing.md).
 
 Notable components: PDFium (BSD-3-Clause), wgpu (Apache-2.0), pdfium-render (MIT OR Apache-2.0), UniFFI
-(MPL-2.0, build-time only), ureq (MIT OR Apache-2.0), rustls (Apache-2.0 OR ISC OR MIT), Noto Sans SC (SIL Open
+(MPL-2.0, build-time only), ureq (MIT OR Apache-2.0), rustls (Apache-2.0 OR ISC OR MIT), unicode-segmentation
+(MIT OR Apache-2.0, pinned to the Unicode 16 tables that match the Swift runtime), Noto Sans SC (SIL Open
 Font License 1.1, shipped subsetted as `LyraReader Sans SC`), rcgen (tests only). Interface icons are SF Symbols,
 used under Apple's licence for in-app use on Apple platforms only: they may not become an application icon or
 mark, may not be redistributed as an icon set, and a Linux or Windows shell must bring its own icons. The

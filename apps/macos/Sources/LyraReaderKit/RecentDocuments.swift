@@ -29,13 +29,20 @@ public struct RecentDocument: Codable, Identifiable, Equatable {
             .appendingPathComponent("LyraReader/RecentCovers", isDirectory: true)
         if let data = defaults.data(forKey: Self.key),
            let saved = try? JSONDecoder().decode([RecentDocument].self, from: data) {
-            entries = Array(saved.filter { $0.url.isFileURL && $0.id == Self.identity($0.url) }
-                .sorted { ($0.openedAt ?? .distantPast) > ($1.openedAt ?? .distantPast) }.prefix(100))
+            // Loading the home screen must not read or hash a single source PDF (some are
+            // protected, and 100 of them would stall the first frame). Entries keep the id they
+            // were recorded with; the next open of that document supplies the engine's
+            // DocumentId and moves the cover then (see `record`).
+            var seen: Set<String> = []
+            entries = saved.filter { $0.url.isFileURL }
+                .filter { seen.insert($0.url.standardizedFileURL.path).inserted }
+                .sorted { ($0.openedAt ?? .distantPast) > ($1.openedAt ?? .distantPast) }
+            entries = Array(entries.prefix(100))
         } else {
             entries = (systemDocuments?.recentDocumentURLs ?? []).prefix(100).map { url in
                 // The system supplies order, not last-open dates; do not read protected files
                 // or invent dates just to fill the card's secondary line.
-                RecentDocument(id: Self.identity(url), url: url, openedAt: nil)
+                RecentDocument(id: Self.legacyIdentity(url), url: url, openedAt: nil)
             }
         }
         for entry in entries {
@@ -45,11 +52,33 @@ public struct RecentDocument: Codable, Identifiable, Equatable {
         }
     }
 
-    public func record(_ url: URL, at date: Date = Date()) {
+    /// The engine's document id for a live file, or the historical absolute-string key for a
+    /// recently deleted one (so its recents row and cover still resolve).
+    static func documentKey(for url: URL) -> String {
+        DocumentEditCache.documentIdentity(for: url) ?? legacyIdentity(url.standardizedFileURL)
+    }
+
+    private static func migrateCover(from oldID: String, to newID: String, cacheDirectory: URL) {
+        guard oldID != newID else { return }
+        let manager = FileManager.default
+        let old = cacheDirectory.appendingPathComponent(oldID + ".png")
+        let new = cacheDirectory.appendingPathComponent(newID + ".png")
+        guard manager.fileExists(atPath: old.path),
+              !manager.fileExists(atPath: new.path) else { return }
+        try? manager.copyItem(at: old, to: new)
+    }
+
+    public func record(_ url: URL, documentId: String? = nil, at date: Date = Date()) {
         guard url.isFileURL else { return }
         let url = url.standardizedFileURL
-        let id = Self.identity(url)
-        entries.removeAll { $0.id == id }
+        let id = documentId?.nonEmpty
+            ?? DocumentEditCache.documentIdentity(for: url)
+            ?? Self.legacyIdentity(url)
+        if let existing = entries.first(where: { $0.url.standardizedFileURL == url }),
+           existing.id != id {
+            Self.migrateCover(from: existing.id, to: id, cacheDirectory: cacheDirectory)
+        }
+        entries.removeAll { $0.id == id || $0.url.standardizedFileURL == url }
         entries.insert(RecentDocument(id: id, url: url, openedAt: date), at: 0)
         entries = Array(entries.prefix(100))
         persist()
@@ -65,7 +94,7 @@ public struct RecentDocument: Codable, Identifiable, Equatable {
     func cover(for entry: RecentDocument) -> NSImage? { covers[entry.id] }
 
     /// The bitmap already belongs to the open document: this does not read its source path.
-    func saveCover(_ page: PageImage, for url: URL) {
+    func saveCover(_ page: PageImage, for url: URL, documentId: String? = nil) {
         guard page.pixelWidth > 0, page.pixelHeight > 0,
               let provider = CGDataProvider(data: page.bgra as CFData),
               let image = CGImage(width: page.pixelWidth, height: page.pixelHeight,
@@ -75,14 +104,20 @@ public struct RecentDocument: Codable, Identifiable, Equatable {
                                     .union(.byteOrder32Little),
                                   provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent),
               let data = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else { return }
-        let id = Self.identity(url.standardizedFileURL)
+        let url = url.standardizedFileURL
+        let id = documentId?.nonEmpty
+            ?? DocumentEditCache.documentIdentity(for: url)
+            ?? Self.legacyIdentity(url)
+        Self.migrateCover(from: Self.legacyIdentity(url), to: id, cacheDirectory: cacheDirectory)
         covers[id] = NSImage(cgImage: image, size: page.pointSize)
         try? FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
         try? data.write(to: cacheDirectory.appendingPathComponent(id + ".png"), options: .atomic)
     }
 
     private func persist() { if let data = try? JSONEncoder().encode(entries) { defaults.set(data, forKey: Self.key) } }
-    private static func identity(_ url: URL) -> String {
+    /// The historical cover key: SHA-256 of the standardized absolute string. Kept only to read
+    /// and migrate covers written by older builds, and for entries whose file no longer exists.
+    private static func legacyIdentity(_ url: URL) -> String {
         SHA256.hash(data: Data(url.standardizedFileURL.absoluteString.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 }

@@ -12,29 +12,47 @@
 
 use crate::index_cache::{
     CacheRead, CachedReferenceList, CachedReferences, ContentIdentity, IndexCacheFile, cache_path,
-    disabled_by_environment, read_cache, write_cache,
+    disabled_by_environment, write_cache,
 };
+
+/// Cache-management location for the native shell; does not open or index the document.
+#[uniffi::export]
+pub fn document_index_cache_path(path: String) -> String {
+    cache_path(Path::new(&path)).display().to_string()
+}
 use lyra_reader_ai::MockProvider;
 use lyra_reader_ai::chat::{
-    Action as AiAction, ChatPlan, ChatSettings, ConversationTurn, DocumentChatRequest, MergePart,
-    MergePlanRequest, PageChar, PageText, PlanRequest, ReasoningEncoding, ReasoningMode,
-    SelectionRange as AiSelectionRange, SourceRect as AiSourceRect, build_document_chat_plan,
-    build_merge_plan, build_plan, inspect_base_url, validate_model,
+    Action as AiAction, CONNECTION_TEST_MAX_TOKENS, ChatImage, ChatPlan, ChatSettings,
+    ChatTransport, ChatWire, ConversationTurn, DocumentChatRequest, DocumentKnowledgeInput,
+    MergePart, MergePlanRequest, NOTHING_RELEVANT_MESSAGE, PageChar, PageText, PlanRequest,
+    ReasoningEncoding, ReasoningField, ReasoningMode, RegionQuestionRequest, RegionRect,
+    SUMMARY_ABSTRACT_MAX_CHARS, SUMMARY_ABSTRACT_MAX_PAGES, SUMMARY_MAX_CONCURRENT_REQUESTS,
+    SUMMARY_MAX_REQUESTS_PER_BATCH, SUMMARY_PAGE_MAX_CHARS, SUMMARY_SECTION_MAX_CHARS,
+    SelectionRange as AiSelectionRange, SourceRect as AiSourceRect, SummaryLayer,
+    SummaryLayerRequest, SummaryUnitRequest, abstract_sample_page_indices,
+    build_connection_test_plan, build_document_chat_plan, build_document_knowledge_plan,
+    build_merge_plan, build_plan, build_region_question_plan, build_summary_layer,
+    inspect_base_url, inspect_summary_layer, summary_coverage_note, validate_model,
 };
 use lyra_reader_ai::openai::{
     CancellationToken, RunEvent, StreamDiagnostics, TokenUsage, preview_headers, run_plan,
 };
+use lyra_reader_ai::{SummaryOutlineEntry, plan_summary_sections};
 use lyra_reader_core::{
     AnnotationAlignment, AnnotationDrawing, DocumentBackend, ENGINE_VERSION, EngineConfig,
     ErrorCode, PageGeometry, PageIndex, Point, RasterRequest, RawAnnotationLine, Transform2D,
 };
+use lyra_reader_edit::{
+    kind::{AnnotationKind as TaxonomyKind, WriteKind as TaxonomyWriteKind},
+    records as annotation_records, rules as annotation_rules,
+};
 use lyra_reader_metadata::{BibEntry, MetadataSource, RecognizedMetadata, recognize};
 use lyra_reader_pdfium::{
-    DEFAULT_BOOKMARK_TITLE, EmbeddedBookmarks, PageOperation, PdfiumBackend, RedactionArea,
-    RedactionMode, SaveMode, SplitPart, WriteAnnotation, WriteAnnotationKind, WriteBookmark,
-    backend_description, merge_documents, preview_redactions, read_embedded_bookmarks, redact_pdf,
-    split_pages, suggested_redaction_copy_path,
+    DEFAULT_BOOKMARK_TITLE, EmbeddedBookmarks, PageOperation, PdfiumBackend, SaveMode, SplitPart,
+    WriteAnnotation, WriteAnnotationKind, WriteBookmark, backend_description, merge_documents,
+    read_embedded_bookmarks, split_pages,
 };
+use lyra_reader_render::plan as render_plan;
 use lyra_reader_session::{DocumentLayout, LayoutMode};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -53,33 +71,364 @@ use std::time::{Duration, Instant};
 /// the page shapes alone. Captions have no such window; see [`LyraReaderDocument::figures`].
 const REFERENCE_SCAN_PAGES: u32 = 120;
 
+/// Size used only to keep the scrolling layout stable for a page PDFium could not measure.
+///
+/// This is the historical US Letter fallback. It is not reported as the page's size:
+/// [`PagePlacementRecord`] carries `None` for such a page and the shell applies its own
+/// fallback, which is the same 612 × 792 box users see today.
+const UNKNOWN_LAYOUT_PAGE_SIZE: (f64, f64) = (612.0, 792.0);
+
+/// Lazy page-size cache. Each entry is `None` when PDFium could not measure that page.
+type CachedPageSizes = Vec<Option<(f64, f64)>>;
+
+/// How many pages of line-aware selection geometry one document keeps.
+///
+/// The cache exists so a pointer event is one synchronous FFI call: the alternative is a
+/// `text_page` round trip per event (measured at ~1.4 ms in Rust and ~4.8 ms through the
+/// Swift boundary, versus ~0.7 µs for the cached line-aware hit). Five pages covers the pages
+/// a reader is actually pointing at, including the previous/next page during a scroll. The
+/// five corpus pages measured by `hit_bench` total ~858 KiB of selection geometry, so all five
+/// fit under the byte ceiling; larger pages evict oldest-first instead of exceeding it.
+const TEXT_PAGE_CACHE_MAX_ENTRIES: usize = 5;
+/// Byte ceiling for the same cache (~1.5 MiB).
+///
+/// The ceiling is soft for exactly one case: a page whose own geometry exceeds it is retained
+/// as the cache's **only** entry. Dropping it instead would make every pointer event fall back
+/// to the Swift model and every background warm re-extract the same page, so the reader would
+/// thrash on the one page it is actually pointing at. Keeping it alone bounds the overshoot to
+/// that page, and the next page that fits drops the exception (see [`TextPageCache::insert`]).
+const TEXT_PAGE_CACHE_MAX_BYTES: usize = 3 * 512 * 1024;
+
+/// One cached page: the Swift-parity line decomposition plus the per-character Unicode
+/// scalars range→string needs, and its estimated heap cost.
+struct CachedTextPage {
+    page: u32,
+    value: Arc<lyra_reader_text::SelectionTextPage>,
+    bytes: usize,
+    last_used: u64,
+}
+
+/// Per-document LRU of page text geometry.
+///
+/// `loads` counts pages the loading path (`text_page`) extracted through PDFium; `hits` counts
+/// synchronous cache reads; `misses` counts synchronous lookups that found the page not
+/// prepared. The counters exist so the regression check can prove that hit-test, box→range and
+/// range→string never extract a page, and that a cache miss is a typed answer rather than an
+/// implicit PDFium read.
+#[derive(Default)]
+struct TextPageCache {
+    entries: Vec<CachedTextPage>,
+    tick: u64,
+    loads: u64,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+impl TextPageCache {
+    fn get(&mut self, page: u32) -> Option<Arc<lyra_reader_text::SelectionTextPage>> {
+        self.tick += 1;
+        let tick = self.tick;
+        let entry = self.entries.iter_mut().find(|entry| entry.page == page)?;
+        entry.last_used = tick;
+        self.hits += 1;
+        Some(Arc::clone(&entry.value))
+    }
+
+    /// Whether `page` is prepared, without counting a hit or a miss.
+    fn contains(&self, page: u32) -> bool {
+        self.entries.iter().any(|entry| entry.page == page)
+    }
+
+    fn insert(&mut self, page: u32, value: Arc<lyra_reader_text::SelectionTextPage>, bytes: usize) {
+        self.tick += 1;
+        let tick = self.tick;
+        self.entries.retain(|entry| entry.page != page);
+        if bytes > TEXT_PAGE_CACHE_MAX_BYTES {
+            // Single-entry exception to the byte ceiling: retain this one page by itself and
+            // drop the pages it cannot share a budget with. Re-extracting it on every event is
+            // worse than keeping one page over a *soft* budget.
+            self.evictions += self.entries.len() as u64;
+            self.entries.clear();
+            self.entries.push(CachedTextPage {
+                page,
+                value,
+                bytes,
+                last_used: tick,
+            });
+            return;
+        }
+        // A page that fits drops an oversized exception instead of being evicted by it, so a
+        // single huge page cannot become a permanent resident and starve ordinary pages.
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.bytes > TEXT_PAGE_CACHE_MAX_BYTES)
+        {
+            self.evictions += self.entries.len() as u64;
+            self.entries.clear();
+        }
+        self.entries.push(CachedTextPage {
+            page,
+            value,
+            bytes,
+            last_used: tick,
+        });
+        while self.entries.len() > TEXT_PAGE_CACHE_MAX_ENTRIES
+            || self.entries.iter().map(|entry| entry.bytes).sum::<usize>()
+                > TEXT_PAGE_CACHE_MAX_BYTES
+        {
+            let Some((oldest, _)) = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_used)
+            else {
+                break;
+            };
+            self.entries.remove(oldest);
+            self.evictions += 1;
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        self.entries.iter().map(|entry| entry.bytes).sum()
+    }
+
+    fn pages_oldest_first(&self) -> Vec<u32> {
+        let mut entries: Vec<&CachedTextPage> = self.entries.iter().collect();
+        entries.sort_by_key(|entry| entry.last_used);
+        entries.iter().map(|entry| entry.page).collect()
+    }
+}
+
+/// Facts about one document's text-page cache, for the regression checks and diagnostics.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TextPageCacheStats {
+    /// Pages currently retained.
+    pub entries: u32,
+    /// Entry limit (5).
+    pub max_entries: u32,
+    /// Estimated retained bytes, including per-character scalars and the line decomposition.
+    /// Exceeds `max_bytes` only for the single-entry oversized-page exception.
+    pub bytes: u64,
+    /// Byte ceiling (~1.5 MiB); soft for one above-budget page.
+    pub max_bytes: u64,
+    /// Pages the loading path (`text_page`) extracted through PDFium.
+    pub loads: u64,
+    /// Synchronous cache reads served without PDFium.
+    pub hits: u64,
+    /// Synchronous lookups that returned the typed "not prepared" answer.
+    pub misses: u64,
+    /// Entries removed to stay under the entry or byte limit, or to make room for an oversized
+    /// page's single-entry exception.
+    pub evictions: u64,
+    /// Retained pages, least recently used first.
+    pub pages: Vec<u32>,
+}
+
+/// The stable category of an AI failure, for the error record and for stream events.
+///
+/// This is the machine contract the shell maps to its audit vocabulary and to the offline hint.
+/// It is assigned **once**, from the Rust error variant that failed — never from a provider's
+/// message text. `NothingRelevant` and `VisionUnsupported` are split out of `EmptyContext` because
+/// the shell has always shown them as distinct refusal categories; they are still decided by the
+/// Rust builder that produced the error, not by the shell matching substrings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
+pub enum AiErrorCode {
+    /// No provider configured.
+    NotConfigured,
+    /// A transport failure that is not one of the recognized categories below.
+    Unreachable,
+    /// The request never left this Mac: no route / network down / name resolution failed.
+    Offline,
+    /// The endpoint is loopback and nothing is listening there.
+    LocalServer,
+    /// Authentication failed (invalid or expired key).
+    Unauthorized,
+    /// Rate or quota limit exceeded.
+    RateLimited,
+    /// Cancelled by the user or the system.
+    Cancelled,
+    /// The model does not support the requested capability.
+    UnsupportedCapability,
+    /// The reader's settings are not usable.
+    InvalidSettings,
+    /// The requested context has nothing to send.
+    EmptyContext,
+    /// Retrieval found no passage relevant to the question.
+    NothingRelevant,
+    /// The question needs image input, which is off for this model.
+    VisionUnsupported,
+    /// The provider answered with a non-2xx HTTP status.
+    HttpStatus,
+    /// The response was not the streaming protocol this client speaks.
+    Protocol,
+    /// The connection or the stream took too long.
+    Timeout,
+    /// Any other error.
+    Other,
+}
+
+impl AiErrorCode {
+    /// The stable category of an [`lyra_reader_ai::AiError`]. This is the **only** place message
+    /// structure is interpreted, and only for the two refusals the Rust builder has no dedicated
+    /// variant for yet (`NothingRelevant`, `VisionUnsupported`).
+    fn of(error: &lyra_reader_ai::AiError) -> Self {
+        use lyra_reader_ai::AiError;
+        match error {
+            AiError::NotConfigured => Self::NotConfigured,
+            AiError::Unreachable(_) => Self::Unreachable,
+            AiError::Offline(_) => Self::Offline,
+            AiError::LocalServer(_) => Self::LocalServer,
+            AiError::Unauthorized => Self::Unauthorized,
+            AiError::RateLimited => Self::RateLimited,
+            AiError::Cancelled => Self::Cancelled,
+            AiError::UnsupportedCapability(_) => Self::UnsupportedCapability,
+            AiError::InvalidSettings(_) => Self::InvalidSettings,
+            AiError::EmptyContext(message) => {
+                if message == NOTHING_RELEVANT_MESSAGE {
+                    Self::NothingRelevant
+                } else if message.contains("Turn on image input") {
+                    Self::VisionUnsupported
+                } else {
+                    Self::EmptyContext
+                }
+            }
+            AiError::HttpStatus(_) => Self::HttpStatus,
+            AiError::Protocol(_) => Self::Protocol,
+            AiError::Timeout(_) => Self::Timeout,
+            AiError::Other(_) => Self::Other,
+        }
+    }
+}
+
+/// How the shell should present an error.
+///
+/// This mirrors [`lyra_reader_core::Severity`] as a UniFFI enum so every thrown error carries the
+/// decision with it. The shell maps one severity to one presentation (`alert` for `Fatal` and
+/// `Document`, `banner`/`status` for `Recoverable`); it never re-derives severity from the
+/// message or from the error variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ErrorSeverity {
+    /// One feature failed; the document and reading are still usable.
+    Recoverable,
+    /// The requested document operation failed; the reader must be told.
+    Document,
+    /// The engine cannot be trusted until it is restarted.
+    Fatal,
+}
+
+impl From<lyra_reader_core::Severity> for ErrorSeverity {
+    fn from(severity: lyra_reader_core::Severity) -> Self {
+        match severity {
+            lyra_reader_core::Severity::Recoverable => Self::Recoverable,
+            lyra_reader_core::Severity::Document => Self::Document,
+            lyra_reader_core::Severity::Fatal => Self::Fatal,
+        }
+    }
+}
+
+impl From<ErrorSeverity> for lyra_reader_core::Severity {
+    fn from(severity: ErrorSeverity) -> Self {
+        match severity {
+            ErrorSeverity::Recoverable => Self::Recoverable,
+            ErrorSeverity::Document => Self::Document,
+            ErrorSeverity::Fatal => Self::Fatal,
+        }
+    }
+}
+
+impl AiErrorCode {
+    /// The presentation severity of an AI failure.
+    ///
+    /// AI failures are shown beside the request that failed (the assistant panel keeps its
+    /// conversation and its inline message), so most are `Recoverable`. A configuration or
+    /// authentication problem is `Document`: the reader has to fix the connection before the
+    /// feature works at all.
+    pub fn severity(self) -> ErrorSeverity {
+        match self {
+            Self::NotConfigured
+            | Self::Unauthorized
+            | Self::UnsupportedCapability
+            | Self::InvalidSettings => ErrorSeverity::Document,
+            Self::Unreachable
+            | Self::Offline
+            | Self::LocalServer
+            | Self::RateLimited
+            | Self::Cancelled
+            | Self::EmptyContext
+            | Self::NothingRelevant
+            | Self::VisionUnsupported
+            | Self::HttpStatus
+            | Self::Protocol
+            | Self::Timeout
+            | Self::Other => ErrorSeverity::Recoverable,
+        }
+    }
+}
+
 /// Errors crossing the FFI boundary (they surface as Swift `throws`).
 #[derive(Debug, uniffi::Error)]
 pub enum LyraReaderFfiError {
     /// The file could not be read or parsed.
-    Document { message: String },
+    Document {
+        message: String,
+        /// How the shell presents this failure.
+        severity: ErrorSeverity,
+    },
     /// No usable PDF backend (for example, PDFium could not be loaded).
-    Backend { message: String },
+    Backend {
+        message: String,
+        /// How the shell presents this failure.
+        severity: ErrorSeverity,
+    },
     /// The caller passed something invalid.
-    InvalidArgument { message: String },
+    InvalidArgument {
+        message: String,
+        /// How the shell presents this failure.
+        severity: ErrorSeverity,
+    },
     /// The AI layer could not build a plan or run a request.
-    Ai { message: String },
+    Ai {
+        message: String,
+        /// Stable category; the shell maps this to its audit vocabulary.
+        code: AiErrorCode,
+        /// How the shell presents this failure; derived from `code`.
+        severity: ErrorSeverity,
+    },
+}
+
+impl LyraReaderFfiError {
+    /// The presentation severity carried by this error.
+    pub fn severity(&self) -> ErrorSeverity {
+        match self {
+            Self::Document { severity, .. }
+            | Self::Backend { severity, .. }
+            | Self::InvalidArgument { severity, .. }
+            | Self::Ai { severity, .. } => *severity,
+        }
+    }
 }
 
 impl std::fmt::Display for LyraReaderFfiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Document { message } => write!(f, "document error: {message}"),
-            Self::Backend { message } => write!(f, "backend error: {message}"),
-            Self::InvalidArgument { message } => write!(f, "invalid argument: {message}"),
-            Self::Ai { message } => write!(f, "AI error: {message}"),
+            Self::Document { message, .. } => write!(f, "document error: {message}"),
+            Self::Backend { message, .. } => write!(f, "backend error: {message}"),
+            Self::InvalidArgument { message, .. } => write!(f, "invalid argument: {message}"),
+            Self::Ai { message, .. } => write!(f, "AI error: {message}"),
         }
     }
 }
 
 impl From<lyra_reader_ai::AiError> for LyraReaderFfiError {
     fn from(error: lyra_reader_ai::AiError) -> Self {
+        let code = AiErrorCode::of(&error);
         Self::Ai {
+            severity: code.severity(),
+            code,
             message: error.to_string(),
         }
     }
@@ -89,16 +438,20 @@ impl std::error::Error for LyraReaderFfiError {}
 
 impl From<lyra_reader_core::LyraReaderError> for LyraReaderFfiError {
     fn from(error: lyra_reader_core::LyraReaderError) -> Self {
+        let severity = ErrorSeverity::from(error.severity);
         let message = error.to_string();
         match error.code {
-            ErrorCode::BackendUnavailable | ErrorCode::GpuUnavailable => Self::Backend { message },
-            ErrorCode::InvalidArgument => Self::InvalidArgument { message },
+            ErrorCode::BackendUnavailable | ErrorCode::GpuUnavailable => {
+                Self::Backend { message, severity }
+            }
+            ErrorCode::InvalidArgument => Self::InvalidArgument { message, severity },
             // A read-only document is a policy refusal, not a parse failure; keep the sentence
             // exactly as the signature status reports it (no `ReadOnly:` prefix).
             ErrorCode::ReadOnly => Self::Document {
                 message: error.message,
+                severity,
             },
-            _ => Self::Document { message },
+            _ => Self::Document { message, severity },
         }
     }
 }
@@ -109,6 +462,12 @@ impl From<lyra_reader_core::LyraReaderError> for LyraReaderFfiError {
 pub struct DocumentSummary {
     /// Absolute or user-supplied path the document was opened from.
     pub path: String,
+    /// The one identity every cache uses: canonical path + SHA-256 of the bytes.
+    ///
+    /// The shell gets the same value from [`LyraReaderDocument::document_id`] when it keeps the
+    /// document open; a probe returns it so one-shot callers (the CLI, checks) can compute the
+    /// same keys without opening twice.
+    pub document_id: String,
     pub page_count: u32,
     /// First page size in points, already accounting for `/Rotate` and `/UserUnit`.
     pub first_page_width_pt: f64,
@@ -116,6 +475,9 @@ pub struct DocumentSummary {
     /// `/Rotate` of the first page, in degrees (0/90/180/270).
     pub rotation_degrees: i32,
     pub is_encrypted: bool,
+    /// True when the file is an XFA form; the page count and size then describe the synthetic
+    /// read-only rendering, not the (usually blank) PDF page tree.
+    pub is_xfa: bool,
     /// Which backend produced this summary (for diagnostics in the UI).
     pub backend: String,
 }
@@ -135,8 +497,8 @@ pub struct SignatureEvidenceRecord {
 /// A signed document is read-only **in place**: every command that would rewrite the file itself
 /// is refused by the engine with [`Self::read_only_reason`], and the shell disables those
 /// commands and shows the same sentence. Commands that write a new file (extract, merge, split,
-/// save edited/filled/properties/redacted copy, annotation copy export) remain available; a
-/// modified copy has its signature material stripped so it cannot look signed but be invalid.
+/// save edited/filled/properties copy, annotation copy export) remain available; a modified copy
+/// has its signature material stripped so it cannot look signed but be invalid.
 #[derive(Debug, Clone, uniffi::Record)]
 #[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct SignatureStatusRecord {
@@ -245,6 +607,49 @@ pub struct FormSaveReport {
     pub source_bytes_preserved: bool,
 }
 
+/// One kind of annotation or field a flattened copy baked, and how many of it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FlattenKindCountRecord {
+    pub kind: String,
+    pub count: u32,
+}
+
+/// One annotation a flattened copy deliberately keeps, with the reason a person can read.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct KeptAnnotationRecord {
+    pub page: u32,
+    pub kind: String,
+    pub reason: String,
+    pub has_comment: bool,
+}
+
+/// One form field a flattened copy deliberately keeps.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct KeptFieldRecord {
+    pub name: String,
+    pub kind: String,
+    pub reason: String,
+}
+
+/// What a successful flattened copy did.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FlattenReportRecord {
+    pub destination_path: String,
+    pub pages: u32,
+    pub flattened_annotations: u32,
+    pub flattened_annotation_kinds: Vec<FlattenKindCountRecord>,
+    pub flattened_fields: u32,
+    pub flattened_field_kinds: Vec<FlattenKindCountRecord>,
+    pub kept_annotations: Vec<KeptAnnotationRecord>,
+    pub kept_fields: Vec<KeptFieldRecord>,
+    pub sticky_notes_kept: u32,
+    pub links_kept: u32,
+    pub comments_not_carried: u32,
+    pub signature_fields_removed: u32,
+    pub output_bytes: u64,
+    pub cleaned_temporary_files: u32,
+}
+
 /// The facts and editable `/Info` entries of a document.
 #[derive(Debug, Clone, uniffi::Record)]
 #[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
@@ -335,7 +740,25 @@ impl LyraReaderEngine {
         path: String,
         password: Option<String>,
     ) -> Result<DocumentSummary, LyraReaderFfiError> {
-        let backend = PdfiumBackend::open(std::path::Path::new(&path), password.as_deref())?;
+        let source = std::path::Path::new(&path);
+        let prepared = match lyra_reader_xfa::prepare(source, password.as_deref()) {
+            Ok(prepared) => prepared,
+            Err(lyra_reader_xfa::XfaError::PasswordRequired) => {
+                return Err(lyra_reader_core::LyraReaderError::new(
+                    ErrorCode::Encrypted,
+                    "the document is password protected",
+                )
+                .into());
+            }
+            Err(_) => None,
+        };
+        let backend = match prepared.as_ref() {
+            Some(prepared) => match &prepared.pdf {
+                Some(bytes) => PdfiumBackend::open_bytes(bytes.clone(), source)?,
+                None => PdfiumBackend::open(source, password.as_deref())?,
+            },
+            None => PdfiumBackend::open(source, password.as_deref())?,
+        };
 
         let page_count = backend.page_count();
         let (width, height, rotation) = if page_count > 0 {
@@ -346,16 +769,435 @@ impl LyraReaderEngine {
             (0.0, 0.0, 0)
         };
 
+        let document_id = crate::document_id::DocumentId::of(source)?
+            .key()
+            .to_string();
         Ok(DocumentSummary {
             path,
+            document_id,
             page_count,
             first_page_width_pt: width,
             first_page_height_pt: height,
             rotation_degrees: rotation,
-            is_encrypted: backend.is_encrypted(),
+            is_encrypted: prepared
+                .as_ref()
+                .map(|prepared| prepared.file.encrypted)
+                .unwrap_or_else(|| backend.is_encrypted()),
+            is_xfa: prepared.is_some(),
             backend: backend_description().to_string(),
         })
     }
+}
+
+/// Which fit preset a zoom request asks for.
+///
+/// `FitPage` is the shipping macOS "Fit Page": it fits the page's **height** only. Width is
+/// `FitWidth`'s job, and a page shorter than the window stays vertically scrollable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ZoomModeRecord {
+    /// A toolbar/pointer step from `percent` by `delta`, clamped to the reader's range.
+    Percent,
+    /// Fit the page width into the viewport width, leaving the preset inset per side.
+    FitWidth,
+    /// Fit the page height into the viewport height, leaving the preset inset per side.
+    FitPage,
+}
+
+/// One zoom resolution request.
+///
+/// All lengths are points. `calibration` is the display's physical-density factor (`1.0` for
+/// the uncalibrated convention); a fit divides the calibrated content size into the available
+/// viewport. Only the fields the selected mode needs are read.
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct ZoomPolicyRecord {
+    pub mode: ZoomModeRecord,
+    /// Current whole percentage, for `Percent`.
+    pub percent: u32,
+    /// Step in whole percent, for `Percent` (may be negative).
+    pub delta: i32,
+    /// Page (or facing-row) width at 100%, for `FitWidth`.
+    pub page_width_pt: f64,
+    /// Page (or facing-row) height at 100%, for `FitPage`.
+    pub page_height_pt: f64,
+    /// Viewport width, for `FitWidth`.
+    pub viewport_width_pt: f64,
+    /// Viewport height, for `FitPage`.
+    pub viewport_height_pt: f64,
+    /// Display calibration factor; `100%` is actual size when this is the physical factor.
+    pub calibration: f64,
+}
+
+/// The one zoom policy: integer percent, 25–400, fit inset 8 pt per side, floor rounding.
+///
+/// Returns `None` when a fit has no usable geometry (zero/non-finite sizes, viewport not larger
+/// than the inset, non-positive calibration), which is exactly when the shell's preset must
+/// leave the zoom alone.
+#[uniffi::export]
+pub fn resolve_zoom(policy: ZoomPolicyRecord) -> Option<u32> {
+    use lyra_reader_core::Size;
+    use lyra_reader_session::ZoomRequest;
+    let request = match policy.mode {
+        ZoomModeRecord::Percent => ZoomRequest::Step {
+            percent: policy.percent,
+            delta: policy.delta,
+        },
+        ZoomModeRecord::FitWidth => ZoomRequest::FitWidth,
+        ZoomModeRecord::FitPage => ZoomRequest::FitPage,
+    };
+    lyra_reader_session::resolve_zoom_percent(
+        request,
+        Size::new(policy.page_width_pt, policy.page_height_pt),
+        Size::new(policy.viewport_width_pt, policy.viewport_height_pt),
+        policy.calibration,
+    )
+}
+
+/// Clamp a scroll offset to `0 … max(0, content height − viewport height)`.
+#[uniffi::export]
+pub fn clamp_scroll(offset_pt: f64, content_height_pt: f64, viewport_height_pt: f64) -> f64 {
+    lyra_reader_session::clamp_scroll(offset_pt, content_height_pt, viewport_height_pt)
+}
+
+/// Lowest offered zoom percentage; the shell reads it instead of hard-coding 25.
+#[uniffi::export]
+pub fn zoom_min_percent() -> u32 {
+    lyra_reader_session::MIN_ZOOM_PERCENT
+}
+
+/// Highest offered zoom percentage; the shell reads it instead of hard-coding 400.
+#[uniffi::export]
+pub fn zoom_max_percent() -> u32 {
+    lyra_reader_session::MAX_ZOOM_PERCENT
+}
+
+/// Inset the fit presets leave on each side; the shell reads it instead of hard-coding 8.
+#[uniffi::export]
+pub fn zoom_preset_inset_pt() -> f64 {
+    lyra_reader_session::ZOOM_PRESET_INSET_PT
+}
+
+/// One page placement for [`plan_tiles`], in content points (top-left origin).
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct TilePlanPageRecord {
+    pub page: u32,
+    pub top_pt: f64,
+    pub left_pt: f64,
+    /// Display width; a facing spread's second page carries its horizontal offset in `left_pt`.
+    pub width_pt: f64,
+    /// Display height (a torn page's paper height, without the gap).
+    pub height_pt: f64,
+    /// The page's display top with region-card gaps applied. Only the torn branch reads it.
+    pub display_top_pt: f64,
+    /// Page-local Y of an inside-page tear, when one is open on this page.
+    pub tear_split_pt: Option<f64>,
+    /// Height of the tear's gap, in content points (0 when the page is not torn).
+    pub tear_gap_pt: f64,
+}
+
+/// One tile the shell's cache holds right now, with its real bitmap size.
+///
+/// The prefetch ring's byte estimate uses these instead of a full-tile estimate: an edge tile
+/// is a fraction of a full one, and the ring decision is about bytes (ADR 0007).
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct TilePlanCachedTileRecord {
+    pub page: u32,
+    pub lod: u8,
+    pub x: u32,
+    pub y: u32,
+    /// Exact `PageImage.bgra.count`, not a size inferred from the tile edge.
+    pub bytes: u64,
+}
+
+/// One tile quad the shell drew last update, for the drawer-retention rule.
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct TilePlanPriorTileRecord {
+    pub page: u32,
+    pub lod: u8,
+    pub x: u32,
+    pub y: u32,
+    /// Content-space left edge of the quad (not the page's).
+    pub left_pt: f64,
+}
+
+/// Everything one viewport update needs for its tile plan.
+///
+/// Lengths are points, `zoom` is the viewer scale, `lod` the tile-pyramid level (`2^lod` is the
+/// raster scale), and `tile_size_px` the LOD-0 tile edge in device pixels. The prefetch settings
+/// are the shell's resolved values for its measurement environment overrides; `None` means the
+/// measured default (`max(8 MiB, cache_budget / 3)` for the band, the ladder for the ring).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TilePlanRequestRecord {
+    /// The visible content rect: what the reader can actually see.
+    pub viewport_x_pt: f64,
+    pub viewport_y_pt: f64,
+    pub viewport_width_pt: f64,
+    pub viewport_height_pt: f64,
+    /// `+1` while moving down, `-1` while moving up; only the sign is read.
+    pub scroll_direction: f64,
+    /// Viewer scale (`zoomPercent / 100 × calibration`).
+    pub zoom: f64,
+    pub tile_size_px: u32,
+    pub lod: u8,
+    pub cache_budget_bytes: u64,
+    /// `LYRA_READER_PREFETCH_BAND_MIB` in bytes, when the measurement override is set.
+    pub band_budget_override_bytes: Option<u64>,
+    /// `LYRA_READER_PREFETCH_RING_VH`, when the measurement override is set.
+    pub ring_override_vh: Option<f64>,
+    /// `LYRA_READER_PREFETCH_COLUMNS` (columns kept ready beyond the on-screen ones).
+    pub prefetch_columns: u32,
+    /// `LYRA_READER_PREFETCH_ALL_COLUMNS=1`: the pre-change "every column" measurement mode.
+    pub want_all_columns: bool,
+    /// Width of the open right drawer in screen points (0 when no drawer is open).
+    pub drawer_width_pt: f64,
+    /// True while the drawer is still animating.
+    pub right_panel_layout_moving: bool,
+    pub pages: Vec<TilePlanPageRecord>,
+    pub cached_tiles: Vec<TilePlanCachedTileRecord>,
+    pub prior_tiles: Vec<TilePlanPriorTileRecord>,
+}
+
+/// What class of work a planned tile belongs to.
+///
+/// The planner emits `Visible` and `TargetLodPrefetch`; the other two are the scheduler's
+/// vocabulary for tasks the shell does not queue today (a lower-LOD preview is drawn from the
+/// cache, thumbnails never go through this path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum TilePriorityRecord {
+    Visible,
+    TargetLodPrefetch,
+    OneLodLower,
+    Thumbnail,
+}
+
+/// A tile identity without its payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct TilePlanKeyRecord {
+    pub page: u32,
+    pub lod: u8,
+    pub x: u32,
+    pub y: u32,
+}
+
+/// One page's band, in tile rows and columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct TilePlanPageSpansRecord {
+    pub page: u32,
+    pub first_column: u32,
+    pub last_column: u32,
+    pub first_row: u32,
+    pub last_row: u32,
+}
+
+/// One tile to rasterize, in submission order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct TilePlanTileRecord {
+    pub page: u32,
+    pub lod: u8,
+    pub x: u32,
+    pub y: u32,
+    pub priority: TilePriorityRecord,
+    /// True when the tile is outside the viewport (ring work).
+    pub prefetch: bool,
+}
+
+/// The batch plan for one viewport update.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TilePlanRecord {
+    pub lod: u8,
+    /// The chosen prefetch-ring distance, in viewport heights.
+    pub ring_vh: f64,
+    /// Every page the band covers, in placement order.
+    pub pages: Vec<TilePlanPageSpansRecord>,
+    /// Every tile of the band, visible first, then the ring by distance.
+    pub tiles: Vec<TilePlanTileRecord>,
+    /// The pinned set: every band tile plus the drawer-retained columns.
+    pub pinned: Vec<TilePlanKeyRecord>,
+    /// Prior tile quads kept because an open drawer covers them (pinned, not scheduled).
+    pub retained: Vec<TilePlanKeyRecord>,
+}
+
+/// Compute the tile plan for **one** viewport update (ADR 0007 / audit C5).
+///
+/// The shell keeps the cache, the eviction order, the texture upload and rasterization; this
+/// call owns the decision — the prefetch ring, each page's band rows and columns, the pinned
+/// set and the raster submission order. One call per viewport update, never one per tile.
+///
+/// `None` means the request violated an invariant the shell cannot produce (non-finite
+/// geometry, a zero tile edge, an out-of-range LOD, oversized lists). The caller reports it
+/// instead of fabricating a plan.
+#[uniffi::export]
+pub fn plan_tiles(request: TilePlanRequestRecord) -> Option<TilePlanRecord> {
+    let plan_request = render_plan::PlanRequest {
+        viewport: render_plan::PlanRect::new(
+            request.viewport_x_pt,
+            request.viewport_y_pt,
+            request.viewport_width_pt,
+            request.viewport_height_pt,
+        ),
+        scroll_direction: request.scroll_direction,
+        zoom: request.zoom,
+        tile_size_px: request.tile_size_px,
+        lod: request.lod,
+        cache_budget_bytes: request.cache_budget_bytes,
+        band_budget_override_bytes: request.band_budget_override_bytes,
+        ring_override_vh: request.ring_override_vh,
+        prefetch_columns: request.prefetch_columns,
+        want_all_columns: request.want_all_columns,
+        drawer_width_pt: request.drawer_width_pt,
+        right_panel_layout_moving: request.right_panel_layout_moving,
+        pages: request
+            .pages
+            .iter()
+            .map(|page| render_plan::PlanPage {
+                page: page.page,
+                top_pt: page.top_pt,
+                left_pt: page.left_pt,
+                width_pt: page.width_pt,
+                height_pt: page.height_pt,
+                display_top_pt: page.display_top_pt,
+                tear_split_pt: page.tear_split_pt,
+                tear_gap_pt: page.tear_gap_pt,
+            })
+            .collect(),
+        cached_tiles: request
+            .cached_tiles
+            .iter()
+            .map(|tile| render_plan::CachedTile {
+                page: tile.page,
+                lod: tile.lod,
+                x: tile.x,
+                y: tile.y,
+                bytes: tile.bytes,
+            })
+            .collect(),
+        prior_tiles: request
+            .prior_tiles
+            .iter()
+            .map(|tile| render_plan::PriorTile {
+                page: tile.page,
+                lod: tile.lod,
+                x: tile.x,
+                y: tile.y,
+                left_pt: tile.left_pt,
+            })
+            .collect(),
+    };
+    let plan = render_plan::plan_tiles(&plan_request)?;
+    let key = |key: render_plan::PlannedKey| TilePlanKeyRecord {
+        page: key.page,
+        lod: key.lod,
+        x: key.x,
+        y: key.y,
+    };
+    Some(TilePlanRecord {
+        lod: plan.lod,
+        ring_vh: plan.ring_vh,
+        pages: plan
+            .pages
+            .iter()
+            .map(|page| TilePlanPageSpansRecord {
+                page: page.page,
+                first_column: page.first_column,
+                last_column: page.last_column,
+                first_row: page.first_row,
+                last_row: page.last_row,
+            })
+            .collect(),
+        tiles: plan
+            .tiles
+            .iter()
+            .map(|tile| TilePlanTileRecord {
+                page: tile.page,
+                lod: tile.lod,
+                x: tile.x,
+                y: tile.y,
+                priority: match tile.priority {
+                    render_plan::TilePriority::Visible => TilePriorityRecord::Visible,
+                    render_plan::TilePriority::TargetLodPrefetch => {
+                        TilePriorityRecord::TargetLodPrefetch
+                    }
+                    render_plan::TilePriority::OneLodLower => TilePriorityRecord::OneLodLower,
+                    render_plan::TilePriority::Thumbnail => TilePriorityRecord::Thumbnail,
+                },
+                prefetch: tile.prefetch,
+            })
+            .collect(),
+        pinned: plan
+            .pinned
+            .iter()
+            .map(|key_value| key(*key_value))
+            .collect(),
+        retained: plan
+            .retained
+            .iter()
+            .map(|key_value| key(*key_value))
+            .collect(),
+    })
+}
+
+/// `Page 3`, `Pages 1-3`, `Pages 1, 3, 5` (1-based, sorted and de-duplicated).
+#[uniffi::export]
+pub fn page_label(pages: Vec<u32>) -> String {
+    crate::format::page_label(&pages)
+}
+
+/// `1-12 and 109-120` (1-based, sorted into inclusive runs).
+#[uniffi::export]
+pub fn page_ranges_label(pages: Vec<u32>) -> String {
+    crate::format::page_ranges_label(&pages)
+}
+
+/// `1-3, 5, 8-9` (1-based, sorted and de-duplicated).
+#[uniffi::export]
+pub fn compact_page_ranges(pages: Vec<u32>) -> String {
+    crate::format::compact_page_ranges(&pages)
+}
+
+/// `page 1`, `pages 1–3`, `pages 1, 3, 5` (**0-based** input, as the page menus hold it).
+#[uniffi::export]
+pub fn page_list(pages: Vec<u32>) -> String {
+    crate::format::page_list(&pages)
+}
+
+/// The layered-summary row's span label; `kind` is `abstract`, `sections` or `pages`.
+#[uniffi::export]
+#[allow(clippy::too_many_arguments)]
+pub fn page_span_label(
+    kind: String,
+    pages: Vec<u32>,
+    page_start: u32,
+    page_end: u32,
+    covered_page_end: u32,
+    truncated: bool,
+    page_count: u32,
+) -> String {
+    crate::format::page_span_label(
+        &kind,
+        &pages,
+        page_start,
+        page_end,
+        covered_page_end,
+        truncated,
+        page_count,
+    )
+}
+
+/// The historical sidebar/passages display of a PDF `/M` value: clock digits as written.
+///
+/// A zoned value is deliberately **not** converted; see the crate's format module. `None`
+/// means the annotation has no `/M`; an unrecognized string is returned unchanged.
+#[uniffi::export]
+pub fn pdf_date_display(value: String) -> Option<String> {
+    crate::format::pdf_date_display(&value)
+}
+
+/// The instant a PDF date names, in milliseconds since the Unix epoch, applying its offset.
+///
+/// `None` for a string that is not the PDF date shape (the export then sorts it last rather
+/// than inventing a time).
+#[uniffi::export]
+pub fn pdf_date_millis(value: String) -> Option<i64> {
+    crate::format::pdf_date_millis(&value)
 }
 
 /// Size of a page in points, already accounting for `/Rotate`.
@@ -533,6 +1375,35 @@ pub fn appearance_font_coverage(
     })
 }
 
+/// The XFA facts the shell needs to explain the document and to disable write commands.
+///
+/// An XFA form is rendered **read-only from its XML** into a synthetic in-memory PDF. There is
+/// no annotation write-back, no form filling, no content editing and no "save a copy" of edits:
+/// every command that would write is refused with [`Self::read_only_reason`], and the shell
+/// disables those controls with the same sentence. Reading aids (zoom, scroll, search,
+/// selection, summaries) are unaffected because they run on the synthetic PDF.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct XfaStatusRecord {
+    /// True when the file carries `/AcroForm /XFA`; false for every ordinary PDF.
+    pub is_xfa: bool,
+    /// True when the synthetic PDF was produced and is what the document handle renders.
+    pub rendered: bool,
+    /// Pages in the rendering (not the source PDF's page tree).
+    pub page_count: u32,
+    /// Fields found in the template.
+    pub field_count: u32,
+    /// Packet names in `/XFA` order.
+    pub packet_names: Vec<String>,
+    /// What the renderer could not draw, in a person's words. Empty only for a complete form.
+    pub skipped: Vec<String>,
+    /// Set when the template was detected but could not be rendered; the original PDF is open.
+    pub error: Option<String>,
+    /// The one explanation every XFA write refusal uses; `None` for an ordinary PDF.
+    pub read_only_reason: Option<String>,
+    /// The source file carries an encryption dictionary (even if it opened without a prompt).
+    pub encrypted: bool,
+}
+
 /// An open document.
 ///
 /// Long-lived by design: the shell opens once and then asks for pages as the reader
@@ -543,17 +1414,28 @@ pub fn appearance_font_coverage(
 pub struct LyraReaderDocument {
     backend: PdfiumBackend,
     path: String,
+    /// Canonical path + content hash, computed once at open. Every cache key and every tab
+    /// identity derives from this, so a symlink and its target are one document.
+    document_id: crate::document_id::DocumentId,
     /// Kept so [`LyraReaderDocument::reopen`] can hand a worker its own copy.
     password: Option<String>,
+    /// XFA state, when this document is a form rendered from its XML. The synthetic bytes are
+    /// kept so a worker copy can open its own PDFium handle without touching the source file.
+    xfa: Option<XfaState>,
     /// Signature evidence, read once when the document was opened.
     ///
     /// The decision is a property of the file's bytes, and the file is not written while this
     /// handle lives (a replacement marks the handle stale), so the status cannot change. Worker
     /// copies inherit it instead of paying for a second structural read.
     signature: lyra_reader_pdfium::SignatureStatus,
-    /// Page sizes in points, filled on first layout request (a 2000-page manual would
-    /// otherwise pay for every box at open time).
-    page_sizes: Mutex<Option<Vec<(f64, f64)>>>,
+    /// Page sizes in points, measured lazily on the first layout request.
+    ///
+    /// `None` means PDFium could not measure that page. The engine must not invent a size for
+    /// it: layout still uses [`UNKNOWN_LAYOUT_PAGE_SIZE`] to keep the scrolling geometry users
+    /// already see, but placement records report the size as absent and the shell applies the
+    /// fallback explicitly. Measuring is deliberately not part of open: a 900-page document
+    /// would pay 900 PDFium page loads before its first frame.
+    page_sizes: Mutex<Option<CachedPageSizes>>,
     /// Last computed layout, keyed by the mode and page gap it was built for.
     layout: Mutex<Option<(ReaderLayout, f64, Arc<DocumentLayout>)>>,
     /// Parsed reference list, with the citation style it implies (scanning the tail pages is
@@ -565,7 +1447,9 @@ pub struct LyraReaderDocument {
     /// Figure/table captions with their preview regions; same caching rule as `references`.
     figures: Mutex<Option<Vec<FigureRecord>>>,
     /// Annotations already stored in the PDF, in view space; same caching rule as `figures`.
-    annotations: Mutex<Option<Vec<AnnotationRecord>>>,
+    /// The cached scan also carries what could not be decoded, so callers cannot see the
+    /// readable half without being able to ask for the unreadable count.
+    annotations: Mutex<Option<AnnotationScanCache>>,
     /// Recognised metadata; page one does not change while the document is open.
     metadata: Mutex<Option<DocumentMetadataRecord>>,
     /// Outline, flattened once. Cheap to store and part of the cached index, so a warm open does
@@ -587,6 +1471,17 @@ pub struct LyraReaderDocument {
     /// the document is open (the annotation writer replaces the file, and then the shell
     /// reopens it), so this cache has the document's lifetime.
     ai_text: Mutex<std::collections::HashMap<u32, (String, Vec<PageChar>)>>,
+    /// Line-aware selection geometry, one small LRU per document. Kept separate from the AI
+    /// text cache (which has the document's lifetime) because the selection structure is
+    /// rebuilt per page and is much larger.
+    text_pages: Mutex<TextPageCache>,
+}
+
+/// The XFA handle state: the shell-facing facts plus the in-memory synthetic PDF.
+#[derive(Clone)]
+struct XfaState {
+    status: XfaStatusRecord,
+    synthetic_pdf: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 /// The parsed reference list together with the citation style it implies.
@@ -735,12 +1630,17 @@ impl LyraReaderDocument {
         let (x_pt, y_pt, width_pt, height_pt) = region;
         if !(scale.is_finite() && scale > 0.0) {
             return Err(LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
                 message: format!("scale must be positive and finite, got {scale}"),
             });
         }
         if page >= self.backend.page_count() {
             return Err(LyraReaderFfiError::InvalidArgument {
-                message: format!("page {page} is out of range"),
+                severity: ErrorSeverity::Document,
+                message: lyra_reader_core::page_out_of_range_message(
+                    page,
+                    self.backend.page_count(),
+                ),
             });
         }
         if !(x_pt.is_finite()
@@ -753,6 +1653,7 @@ impl LyraReaderDocument {
             && (y_pt + height_pt).is_finite())
         {
             return Err(LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
                 message: format!(
                     "region ({x_pt}, {y_pt}, {width_pt}×{height_pt}) must be finite with positive dimensions"
                 ),
@@ -767,6 +1668,7 @@ impl LyraReaderDocument {
             || y_pt + height_pt > page_size.height + tolerance
         {
             return Err(LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
                 message: format!(
                     "region ({x_pt}, {y_pt}, {width_pt}×{height_pt}) is outside the page bounds ({}, {})",
                     page_size.width, page_size.height
@@ -779,6 +1681,7 @@ impl LyraReaderDocument {
         let scale = clamp_scale((width_pt, height_pt), scale);
         if !(scale.is_finite() && scale > 0.0 && (scale as f32) > 0.0) {
             return Err(LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
                 message: "region dimensions exceed the renderer's supported range".to_string(),
             });
         }
@@ -805,11 +1708,119 @@ impl LyraReaderDocument {
     }
 }
 
+/// Converts a typed content command and its view-space rectangle to PDF user space.
+///
+/// Shared by the staging methods so the pre-flight and the write it confirms address exactly the
+/// same region, including rotated and cropped pages. A free function (not a method) so UniFFI's
+/// export of [`LyraReaderDocument`] does not ask its internal command type to cross the FFI.
+fn prepare_content_command(
+    document: &LyraReaderDocument,
+    page: u32,
+    command: ContentCommandRecord,
+) -> Result<lyra_reader_pdfium::content_edit::ContentCommand, LyraReaderFfiError> {
+    use lyra_reader_pdfium::content_edit::ContentCommand;
+    document.ensure_not_xfa()?;
+    if document.replaced.load(std::sync::atomic::Ordering::Acquire)
+        || document.backend.needs_password()
+    {
+        return Err(LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
+            message: "Reopen an unencrypted document before editing its contents.".into(),
+        });
+    }
+    // Convert after the read-only pre-flight: a refused document keeps its exact refusal even if
+    // the (unused) command payload is malformed.
+    let mut command = content_command(command)?;
+    let transform = document
+        .backend
+        .page_info(PageIndex(page))?
+        .geometry
+        .view_to_page(1.0)
+        .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
+            message: "Singular page geometry".into(),
+        })?;
+    match &mut command {
+        ContentCommand::Transform { bounds, .. }
+        | ContentCommand::ReplaceText { bounds, .. }
+        | ContentCommand::InsertText { bounds, .. }
+        | ContentCommand::Redact { bounds, .. }
+        | ContentCommand::InsertImage { bounds, .. }
+        | ContentCommand::SetLink { bounds, .. } => {
+            *bounds = transform
+                .apply_rect(lyra_reader_core::Rect::new(
+                    bounds.x,
+                    bounds.y,
+                    bounds.width,
+                    bounds.height,
+                ))
+                .into();
+        }
+        ContentCommand::Delete { .. }
+        | ContentCommand::ReplaceImage { .. }
+        | ContentCommand::CropImage { .. } => {}
+    }
+    // The shell's positive angle turns clockwise in its Y-down view space. PDF content matrices
+    // use Y-up coordinates, including on pages with an intrinsic /Rotate.
+    if let ContentCommand::Transform { rotation, .. } = &mut command {
+        *rotation = -*rotation;
+    }
+    Ok(command)
+}
+
+/// The page a selection-only AI action sends.
+///
+/// The request validation already rejects a missing selection for these actions. Keeping the
+/// conversion fallible here means widening `requires_selection` (or adding an action to the
+/// selection-only set) can never turn a missing field into a process abort.
+fn selection_only_page(selection: Option<AiSelectionRange>) -> Result<u32, LyraReaderFfiError> {
+    selection
+        .map(|selection| selection.page)
+        .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
+            message: "a selection-only request has no selection".to_string(),
+        })
+}
+
+/// Page sizes in document order. `None` is an explicit "PDFium could not measure this page".
+///
+/// A failed lookup must not become a fabricated US Letter size. Layout keeps the historical
+/// fallback so existing documents scroll exactly as before, but the per-page record says the
+/// size is unknown and the shell chooses the fallback on its side.
+fn collect_page_sizes<F>(count: u32, mut page_size: F) -> Vec<Option<(f64, f64)>>
+where
+    F: FnMut(u32) -> Result<(f64, f64), LyraReaderFfiError>,
+{
+    let mut sizes = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        sizes.push(page_size(index).ok());
+    }
+    sizes
+}
+
+fn document_knowledge_input(
+    text: Option<String>,
+    pages: Vec<u32>,
+) -> Option<DocumentKnowledgeInput> {
+    text.map(|text| DocumentKnowledgeInput { text, pages })
+}
+
 #[uniffi::export]
 impl LyraReaderDocument {
     /// The path this document was opened from.
     pub fn path(&self) -> String {
         self.path.clone()
+    }
+
+    /// The document's stable identity: canonical path + SHA-256 of its bytes.
+    ///
+    /// Computed once when the document was opened and valid for this handle's lifetime. The
+    /// shell uses it as the key for the annotation/edit cache, AI conversations, translations,
+    /// summaries, document knowledge, recent covers and the index cache. Two paths that resolve
+    /// to the same file return the same value; a file whose bytes change gets a new one (the
+    /// open handle still describes the bytes it parsed, which is what its other records mean).
+    pub fn document_id(&self) -> String {
+        self.document_id.key().to_string()
     }
 
     pub fn page_count(&self) -> u32 {
@@ -836,6 +1847,28 @@ impl LyraReaderDocument {
                 .collect(),
             read_only_reason: self.signature.read_only_reason(),
         }
+    }
+
+    /// The XFA facts for this document. `is_xfa: false` for an ordinary PDF.
+    ///
+    /// The shell uses this record for its short "XFA form · read-only" banner, for the detailed
+    /// XFA diagnostics outside the banner, and to disable annotation/form/editing commands. The
+    /// engine refuses those commands itself, so a stale button cannot write.
+    pub fn xfa_status(&self) -> XfaStatusRecord {
+        self.xfa
+            .as_ref()
+            .map(|state| state.status.clone())
+            .unwrap_or(XfaStatusRecord {
+                is_xfa: false,
+                rendered: false,
+                page_count: 0,
+                field_count: 0,
+                packet_names: Vec::new(),
+                skipped: Vec::new(),
+                error: None,
+                read_only_reason: None,
+                encrypted: false,
+            })
     }
 
     /// Page size in points (`/Rotate` applied).
@@ -872,9 +1905,9 @@ impl LyraReaderDocument {
     ///
     /// The same page, clamp and threading rules as [`LyraReaderDocument::rasterize_page`]; the only
     /// difference is PDFium's `FPDF_ANNOT` flag. The canvas must keep using the plain method:
-    /// it draws annotations itself, with live editing and the app's own sidecar marks. This one
+    /// it draws annotations itself, with live editing and the app's own cached marks. This one
     /// is for a small preview whose job is to show *where the marks are* — including marks the
-    /// canvas does not model. It does not include the sidecar, which is not part of the PDF.
+    /// canvas does not model. It does not include the reader's cached annotations, which are not part of the PDF.
     pub fn rasterize_page_with_annotations(
         &self,
         page: u32,
@@ -891,15 +1924,36 @@ impl LyraReaderDocument {
     ) -> Result<PageBitmap, LyraReaderFfiError> {
         if !(scale.is_finite() && scale > 0.0) {
             return Err(LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
                 message: format!("scale must be positive and finite, got {scale}"),
             });
         }
 
-        let size = self
-            .page_sizes()
-            .get(page as usize)
-            .copied()
-            .unwrap_or((612.0, 792.0));
+        let page_count = self.backend.page_count();
+        lyra_reader_core::checked_page_index(page, page_count, |page| {
+            LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
+                message: lyra_reader_core::page_out_of_range_message(page, page_count),
+            }
+        })?;
+        let sizes = self.page_sizes();
+        let size = match sizes.get(page as usize).copied() {
+            Some(Some(size)) => size,
+            Some(None) => {
+                return Err(LyraReaderFfiError::Document {
+                    severity: ErrorSeverity::Document,
+                    message: format!(
+                        "page {page} has no measurable size; PDFium could not report its geometry"
+                    ),
+                });
+            }
+            None => {
+                return Err(LyraReaderFfiError::InvalidArgument {
+                    severity: ErrorSeverity::Document,
+                    message: lyra_reader_core::page_out_of_range_message(page, page_count),
+                });
+            }
+        };
         let scale = clamp_scale(size, scale);
 
         let mut request = RasterRequest::full_page(PageIndex(page), scale);
@@ -925,12 +1979,24 @@ impl LyraReaderDocument {
     /// copy per worker; [`LyraReaderDocument::rasterize_tile`] on each copy then runs in
     /// parallel with the others.
     pub fn reopen(&self) -> Result<Arc<LyraReaderDocument>, LyraReaderFfiError> {
-        let backend =
-            PdfiumBackend::open(std::path::Path::new(&self.path), self.password.as_deref())?;
+        let backend = match self
+            .xfa
+            .as_ref()
+            .and_then(|state| state.synthetic_pdf.as_ref())
+        {
+            Some(bytes) => {
+                PdfiumBackend::open_bytes((**bytes).clone(), std::path::Path::new(&self.path))?
+            }
+            None => {
+                PdfiumBackend::open(std::path::Path::new(&self.path), self.password.as_deref())?
+            }
+        };
         Ok(Arc::new(LyraReaderDocument {
             backend,
             path: self.path.clone(),
+            document_id: self.document_id.clone(),
             password: self.password.clone(),
+            xfa: self.xfa.clone(),
             signature: self.signature.clone(),
             page_sizes: Mutex::new(None),
             layout: Mutex::new(None),
@@ -943,6 +2009,7 @@ impl LyraReaderDocument {
             index: Mutex::new(IndexRuntime::default()),
             replaced: std::sync::atomic::AtomicBool::new(false),
             ai_text: Mutex::new(std::collections::HashMap::new()),
+            text_pages: Mutex::new(TextPageCache::default()),
         }))
     }
 
@@ -963,19 +2030,23 @@ impl LyraReaderDocument {
         let max_lod = EngineConfig::default().max_lod;
         if lod > max_lod {
             return Err(LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
                 message: format!("lod {lod} exceeds the maximum of {max_lod}"),
             });
         }
         if tile_size == 0 || tile_size > 4096 {
             return Err(LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
                 message: format!("tile size {tile_size} is outside 1..=4096"),
             });
         }
-        if page >= self.backend.page_count() {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                message: format!("page {page} is out of range"),
-            });
-        }
+        let page_count = self.backend.page_count();
+        lyra_reader_core::checked_page_index(page, page_count, |page| {
+            LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
+                message: lyra_reader_core::page_out_of_range_message(page, page_count),
+            }
+        })?;
 
         let scale = 2f64.powi(i32::from(lod));
         let tile_size_pt = f64::from(tile_size) / scale;
@@ -1053,39 +2124,139 @@ impl LyraReaderDocument {
     /// Character boxes come back in **view space** (points, top-left origin), which is what
     /// hit-testing needs, so the shell never touches page space. The order is the engine's
     /// character order, not necessarily visual reading order (see `docs/03-rendering.md`).
+    ///
+    /// This method deliberately stays *uncached*: a caller asking for the text layer gets a
+    /// fresh read, and the build also prepares the selection cache as a side effect, so the
+    /// page the shell just loaded answers its first pointer event without another PDFium read.
+    ///
+    /// This is the **only** method that extracts a page for the selection cache. The
+    /// synchronous hit-test/range/string entry points below never call PDFium; on a cache miss
+    /// they return `Ok(None)` ("not prepared") and the shell answers from its own page model.
     pub fn text_page(&self, page: u32) -> Result<TextPage, LyraReaderFfiError> {
-        let raw = self.backend.raw_text_page(PageIndex(page))?;
-        let geometry = self.backend.page_info(PageIndex(page))?.geometry;
+        let model = self.extract_text_page(page)?;
+        let selection = Arc::new(lyra_reader_text::SelectionTextPage::new(model.clone()));
+        self.retain_selection_text_page(page, selection);
+        Ok(text_page_record(page, &model))
+    }
 
-        let chars: Vec<TextChar> = raw
-            .chars
-            .iter()
-            .map(|character| {
-                // Page boxes use a bottom-left origin, so the glyph's *top* edge is what
-                // maps to the view-space y after the single Y-flip.
-                let top_left = Point::new(
-                    character.rect.origin.x,
-                    character.rect.origin.y + character.rect.size.height,
-                );
-                // `page_to_view(1.0)` is the page→view transform at 100%: character boxes are
-                // reported in content points, and the canvas applies the zoom itself.
-                let view = geometry.page_to_view(1.0).apply(top_left);
-                TextChar {
-                    unicode: character.unicode,
-                    x_pt: view.x,
-                    y_pt: view.y,
-                    width_pt: character.rect.size.width,
-                    height_pt: character.rect.size.height,
-                }
-            })
-            .collect();
+    /// Line-aware hit test (Swift `TextPage.characterIndex`), served from the page cache.
+    ///
+    /// Synchronous and extraction-free: a pointer event is one lock-protected lookup. `Ok(Some)`
+    /// is the answer; `Ok(None)` means the page is not prepared yet (the shell falls back to the
+    /// parity-tested Swift model and may warm the cache in the background). Real failures stay
+    /// `Err`; a miss is never dressed up as one. The returned index addresses the same `chars`
+    /// array as [`LyraReaderDocument::text_page`].
+    pub fn text_character_index(
+        &self,
+        page: u32,
+        x_pt: f64,
+        y_pt: f64,
+        extending_selection: bool,
+    ) -> Result<Option<u32>, LyraReaderFfiError> {
+        let Some(page) = self.prepared_selection_text_page(page)? else {
+            return Ok(None);
+        };
+        Ok(page
+            .char_index_at(Point::new(x_pt, y_pt), extending_selection)
+            .map(|index| index.0))
+    }
 
-        Ok(TextPage {
-            page,
-            chars,
-            text: raw.text,
-            has_unicode_map_error: raw.has_unicode_map_error,
-        })
+    /// Box→range with Swift's acceptance rule (`TextPage.characterRange`), from the cache.
+    ///
+    /// `Ok(None)` is the typed "not prepared" answer; this call never extracts a page.
+    /// The result is the span from the first to the last intersecting stop; see
+    /// [`lyra_reader_text::SelectionLayout::character_range`] for the cross-column caveat.
+    pub fn text_character_range(
+        &self,
+        page: u32,
+        x_pt: f64,
+        y_pt: f64,
+        width_pt: f64,
+        height_pt: f64,
+    ) -> Result<Option<TextRange>, LyraReaderFfiError> {
+        let Some(page) = self.prepared_selection_text_page(page)? else {
+            return Ok(None);
+        };
+        Ok(page
+            .character_range(lyra_reader_core::Rect::new(x_pt, y_pt, width_pt, height_pt))
+            .map(|(first, last)| TextRange {
+                start: first.0,
+                end: last.0,
+            }))
+    }
+
+    /// Range→string with Swift's `TextPage.string(in:)` semantics, from the cache.
+    ///
+    /// `Ok(None)` is the typed "not prepared" answer; this call never extracts a page.
+    /// This is the single Rust implementation the shell's copy command, annotation export and
+    /// reference extraction call. Invalid Unicode scalars are dropped and the range is clamped
+    /// exactly like Swift.
+    pub fn text_range_string(
+        &self,
+        page: u32,
+        start: u32,
+        end: u32,
+    ) -> Result<Option<String>, LyraReaderFfiError> {
+        let Some(page) = self.prepared_selection_text_page(page)? else {
+            return Ok(None);
+        };
+        Ok(Some(page.string_in_range(start, end)))
+    }
+
+    /// Whether `page` is currently prepared in this document's selection cache.
+    ///
+    /// Cheap on purpose: one mutex lookup and no PDFium. The shell asks this after a synchronous
+    /// miss before scheduling a background `text_page` warm-up, so a legitimate no-hit on an
+    /// already prepared page does not trigger a pointless extraction.
+    pub fn text_page_prepared(&self, page: u32) -> bool {
+        self.text_pages
+            // Pure cache (immutable entries keyed by page): poisoning can only cost a miss.
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(page)
+    }
+
+    /// Extract the text layer inside a page-local rectangle.
+    ///
+    /// This is the rectangle-coverage selection mode in `lyra-reader-text::selection`, the same
+    /// module that answers pointer hit-testing and box→range selection. Region cards use it so
+    /// their quotes and the copied text come from one page/whitespace model. The text is capped
+    /// at the region limit and the result says whether the cap cut it.
+    pub fn region_text(
+        &self,
+        page: u32,
+        x_pt: f64,
+        y_pt: f64,
+        width_pt: f64,
+        height_pt: f64,
+    ) -> Result<AiRegionTextRecord, LyraReaderFfiError> {
+        let model = self.extract_text_page(page)?;
+        let (text, truncated) = lyra_reader_text::region_text(
+            &model.chars,
+            lyra_reader_core::Rect::new(x_pt, y_pt, width_pt, height_pt),
+            lyra_reader_text::MAX_REGION_TEXT_CHARS,
+        );
+        Ok(AiRegionTextRecord { text, truncated })
+    }
+
+    /// Current text-page cache state; used by the cache regression checks.
+    pub fn text_page_cache_stats(&self) -> TextPageCacheStats {
+        let cache = self
+            .text_pages
+            // Pure cache (immutable entries keyed by page): poisoning can only cost a miss.
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        TextPageCacheStats {
+            entries: cache.entries.len() as u32,
+            max_entries: TEXT_PAGE_CACHE_MAX_ENTRIES as u32,
+            bytes: cache.bytes() as u64,
+            max_bytes: TEXT_PAGE_CACHE_MAX_BYTES as u64,
+            loads: cache.loads,
+            hits: cache.hits,
+            misses: cache.misses,
+            evictions: cache.evictions,
+            pages: cache.pages_oldest_first(),
+        }
     }
 
     /// Searches every page for `pattern` (ASCII-case-insensitive).
@@ -1132,7 +2303,7 @@ impl LyraReaderDocument {
     /// A page's citations are not a page-local question any more: a superscript numeral is only
     /// a citation when the document's bibliography carries its label, so this call depends on
     /// the document's reference list and its citation style. The first access builds that index
-    /// (or loads it from the sidecar); the reference scan already holds the scanned pages' text,
+    /// (or loads it from the index cache); the reference scan already holds the scanned pages' text,
     /// so it records each page's spans at the same time and reads the pages past its window for
     /// this purpose. A cached index therefore makes this call independent of the PDF text layer
     /// for every page of the document.
@@ -1163,7 +2334,7 @@ impl LyraReaderDocument {
         let records = citation_records(&raw, &style, page, transform);
 
         // Remember the page for repeated clicks even when it is outside the scan window. It is
-        // not written back to the sidecar: the cache is complete for every page the scan saw,
+        // not written back to the cache: the cache is complete for every page the scan saw,
         // and a late page is a one-page read, not a reason to rewrite the document index.
         if let Ok(mut cache) = self.citations.lock() {
             cache
@@ -1467,7 +2638,7 @@ impl LyraReaderDocument {
         flatten_outline(&self.backend.outline()?, 0, &mut entries);
         // Our own bookmark subtree is written into the outline. Adopt its identities and
         // page-local positions so a click lands where the bookmark was set and the bookmarks tab
-        // can show the file's copy rather than a duplicate sidecar entry. The lopdf parse is only
+        // can show the file's copy rather than a duplicate cached entry. The lopdf parse is only
         // attempted when the title we would have written is present, which keeps ordinary
         // documents from paying for a whole-file parse on open.
         if entries
@@ -1508,9 +2679,11 @@ impl LyraReaderDocument {
         // The text boxes are in unrotated PDF user space; the footer band is measured there.
         let page_height = self
             .backend
-            .page_info(PageIndex(0))
-            .map(|info| info.geometry.crop_box.size.height)
-            .unwrap_or(842.0);
+            .page_info(PageIndex(0))?
+            .geometry
+            .crop_box
+            .size
+            .height;
         let recognized = recognize(&embedded, first_page.as_ref(), page_height);
         let report = metadata_report(&recognized);
         if let Ok(mut cache) = self.metadata.lock() {
@@ -1523,7 +2696,7 @@ impl LyraReaderDocument {
 
     /// Annotations the document **already carries**, from every page, in **view space**.
     ///
-    /// This is the other half of this application's annotation story: the sidecar holds what the
+    /// This is the other half of this application's annotation story: the annotation cache holds what the
     /// reader wrote, and this reads what is in the file — a PDF marked up in Preview, or one
     /// somebody else annotated. Every page is scanned: a cap like the reference index's 120 pages
     /// would silently hide notes in the back matter, and an annotation-free page costs one page
@@ -1534,155 +2707,20 @@ impl LyraReaderDocument {
     /// Cached for the lifetime of the open document, like [`LyraReaderDocument::figures`]: a PDF cannot
     /// change under us while it is open, and the canvas would otherwise re-scan on every rebuild.
     ///
-    /// A page whose annotations cannot be read fails the whole call rather than quietly
-    /// disappearing from the answer — "the file has no annotations" and "we could not read them"
-    /// are different things, and the shell says so.
+    /// This returns every annotation that reads. An annotation that cannot be decoded is not a
+    /// reason to fail the document: it is counted by [`Self::annotation_read_status`] and the
+    /// shell warns and blocks rewrites around content the engine could not see.
     pub fn annotations(&self) -> Result<Vec<AnnotationRecord>, LyraReaderFfiError> {
-        if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(LyraReaderFfiError::Document {
-                message: "the document was replaced on disk; reopen it before reading annotations"
-                    .to_string(),
-            });
-        }
-        if let Ok(cache) = self.annotations.lock()
-            && let Some(cached) = cache.as_ref()
-        {
-            return Ok(cached.clone());
-        }
+        Ok(self.annotation_scan()?.0)
+    }
 
-        let mut records = Vec::new();
-        let mut geometries: std::collections::HashMap<u32, lyra_reader_core::PageGeometry> =
-            std::collections::HashMap::new();
-
-        for page in 0..self.backend.page_count() {
-            let geometry = match geometries.get(&page) {
-                Some(geometry) => *geometry,
-                None => {
-                    let geometry = self.backend.page_info(PageIndex(page))?.geometry;
-                    geometries.insert(page, geometry);
-                    geometry
-                }
-            };
-
-            for annotation in self.backend.annotations(PageIndex(page))? {
-                let view = page_region_to_view(annotation.rect, geometry);
-                // Classified before the record is built: the answer travels with the annotation
-                // rather than being re-derived by every consumer from `kind` and `visible`.
-                let drawing = annotation.drawing();
-                let quads = annotation
-                    .quads
-                    .into_iter()
-                    .map(|quad| {
-                        let view = page_region_to_view(quad, geometry);
-                        AnnotationQuad {
-                            x_pt: view.origin.x,
-                            y_pt: view.origin.y,
-                            width_pt: view.size.width,
-                            height_pt: view.size.height,
-                        }
-                    })
-                    .collect();
-                let to_view = geometry.page_to_view(1.0);
-                let ink_paths = annotation
-                    .ink_paths
-                    .iter()
-                    .map(|path| {
-                        path.iter()
-                            .map(|point| {
-                                let view = to_view.apply(*point);
-                                AnnotationPoint {
-                                    x_pt: view.x,
-                                    y_pt: view.y,
-                                }
-                            })
-                            .collect()
-                    })
-                    .collect();
-                let (line_start, line_end) = match annotation.line {
-                    Some(line) => {
-                        let start = to_view.apply(line.start);
-                        let end = to_view.apply(line.end);
-                        (
-                            Some(AnnotationPoint {
-                                x_pt: start.x,
-                                y_pt: start.y,
-                            }),
-                            Some(AnnotationPoint {
-                                x_pt: end.x,
-                                y_pt: end.y,
-                            }),
-                        )
-                    }
-                    None => (None, None),
-                };
-                let kind = if annotation.kind == lyra_reader_core::RawAnnotationKind::Line
-                    && annotation.line_arrow
-                {
-                    "arrow".to_string()
-                } else {
-                    annotation.kind.as_str().to_string()
-                };
-
-                records.push(AnnotationRecord {
-                    page,
-                    id: annotation.id,
-                    parent_id: annotation.parent_id,
-                    is_reply: annotation.is_reply,
-                    has_popup: annotation.has_popup,
-                    kind,
-                    x_pt: view.origin.x,
-                    y_pt: view.origin.y,
-                    width_pt: view.size.width,
-                    height_pt: view.size.height,
-                    quads,
-                    ink_paths,
-                    line_start,
-                    line_end,
-                    line_arrow: annotation.line_arrow,
-                    border_width_pt: annotation.border_width,
-                    color: annotation.color.map(|color| AnnotationColorRecord {
-                        red: color.red,
-                        green: color.green,
-                        blue: color.blue,
-                    }),
-                    opacity: annotation.opacity,
-                    blend: annotation.blend.as_str().to_string(),
-                    contents: annotation.contents,
-                    author: annotation.author,
-                    modified: annotation.modified,
-                    font_size_pt: annotation.font_size_pt,
-                    alignment: annotation.alignment.as_str().to_string(),
-                    stamp: annotation.stamp.as_ref().map(|stamp| StampRecord {
-                        text: stamp.text.clone(),
-                        style: stamp.style.clone(),
-                        image: stamp
-                            .image
-                            .as_ref()
-                            .map(|image| image.data.clone())
-                            .unwrap_or_default(),
-                        image_encoding: stamp
-                            .image
-                            .as_ref()
-                            .map(|image| image.encoding.as_str().to_string())
-                            .unwrap_or_default(),
-                        image_width: stamp.image.as_ref().map_or(0, |image| image.width),
-                        image_height: stamp.image.as_ref().map_or(0, |image| image.height),
-                        image_error: stamp.image_error.clone(),
-                    }),
-                    drawing: drawing.as_str().to_string(),
-                    skip_reason: match drawing {
-                        AnnotationDrawing::Skipped(reason) => Some(reason.as_str().to_string()),
-                        _ => None,
-                    },
-                    visible: annotation.visible,
-                });
-            }
-        }
-
-        if let Ok(mut cache) = self.annotations.lock() {
-            *cache = Some(records.clone());
-        }
-        Ok(records)
+    /// What the document-wide annotation read could not decode.
+    ///
+    /// Shares the cache with [`Self::annotations`], so the count and the readable records come
+    /// from exactly one scan. The shell calls this after `annotations()` and shows the count as
+    /// a one-line notice instead of failing the page.
+    pub fn annotation_read_status(&self) -> Result<AnnotationReadStatus, LyraReaderFfiError> {
+        Ok(self.annotation_scan()?.1)
     }
 
     /// The `/Rotate` of every page, in quarter turns (0–3).
@@ -1720,6 +2758,7 @@ impl LyraReaderDocument {
                 .into();
         }
         serde_json::to_string(&snapshot).map_err(|e| LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
             message: e.to_string(),
         })
     }
@@ -1740,55 +2779,16 @@ impl LyraReaderDocument {
 
     /// Stages a content edit in a separate working revision; publication uses the existing
     /// signature-aware page-edit save transaction.
+    ///
+    /// A redaction that would need the whole-page raster fallback is refused: the shell must
+    /// ask first and then call [`Self::apply_content_edit_allowing_raster`].
     pub fn apply_content_edit(
         &self,
         page: u32,
-        command: String,
+        command: ContentCommandRecord,
         destination: String,
     ) -> Result<(), LyraReaderFfiError> {
-        use lyra_reader_pdfium::content_edit::ContentCommand;
-        if self.replaced.load(std::sync::atomic::Ordering::Acquire) || self.backend.is_encrypted() {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                message: "Reopen an unencrypted document before editing its contents.".into(),
-            });
-        }
-        let mut command: ContentCommand =
-            serde_json::from_str(&command).map_err(|e| LyraReaderFfiError::InvalidArgument {
-                message: e.to_string(),
-            })?;
-        let transform = self
-            .backend
-            .page_info(PageIndex(page))?
-            .geometry
-            .view_to_page(1.0)
-            .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
-                message: "Singular page geometry".into(),
-            })?;
-        match &mut command {
-            ContentCommand::Transform { bounds, .. }
-            | ContentCommand::ReplaceText { bounds, .. }
-            | ContentCommand::InsertText { bounds, .. }
-            | ContentCommand::Redact { bounds, .. }
-            | ContentCommand::InsertImage { bounds, .. }
-            | ContentCommand::SetLink { bounds, .. } => {
-                *bounds = transform
-                    .apply_rect(lyra_reader_core::Rect::new(
-                        bounds.x,
-                        bounds.y,
-                        bounds.width,
-                        bounds.height,
-                    ))
-                    .into();
-            }
-            ContentCommand::Delete { .. }
-            | ContentCommand::ReplaceImage { .. }
-            | ContentCommand::CropImage { .. } => {}
-        }
-        // The shell's positive angle turns clockwise in its Y-down view space. PDF content
-        // matrices use Y-up coordinates, including on pages with an intrinsic /Rotate.
-        if let ContentCommand::Transform { rotation, .. } = &mut command {
-            *rotation = -*rotation;
-        }
+        let command = prepare_content_command(self, page, command)?;
         lyra_reader_pdfium::content_edit::edit_content(
             Path::new(&self.path),
             Path::new(&destination),
@@ -1798,24 +2798,76 @@ impl LyraReaderDocument {
         Ok(())
     }
 
+    /// The pages staging this redaction would replace with a raster image, computed without
+    /// writing anything.
+    ///
+    /// This is what the Edit workspace asks before showing its confirmation. The engine still
+    /// decides the actual outcome when the edit is staged; this method only names the pages that
+    /// would lose their text layer.
+    pub fn content_redaction_raster_pages(
+        &self,
+        page: u32,
+        command: ContentCommandRecord,
+    ) -> Result<Vec<u32>, LyraReaderFfiError> {
+        let command = prepare_content_command(self, page, command)?;
+        Ok(
+            lyra_reader_pdfium::content_edit::content_redaction_raster_pages(
+                Path::new(&self.path),
+                page,
+                &command,
+            )?,
+        )
+    }
+
+    /// Stages a content edit after the reader has accepted the raster fallback.
+    ///
+    /// Returns the 0-based pages that were actually replaced by an image, in ascending order.
+    /// Empty for an ordinary edit and for a redaction that needed no fallback.
+    pub fn apply_content_edit_allowing_raster(
+        &self,
+        page: u32,
+        command: ContentCommandRecord,
+        destination: String,
+    ) -> Result<Vec<u32>, LyraReaderFfiError> {
+        let command = prepare_content_command(self, page, command)?;
+        let report = lyra_reader_pdfium::content_edit::edit_content_allowing_raster(
+            Path::new(&self.path),
+            Path::new(&destination),
+            page,
+            &command,
+        )?;
+        let mut pages: Vec<u32> = report
+            .into_iter()
+            .flat_map(|report| report.pages)
+            .filter(|page| page.rasterized)
+            .map(|page| page.page)
+            .collect();
+        pages.sort_unstable();
+        pages.dedup();
+        Ok(pages)
+    }
+
     /// Applies a page operation to a **copy** of this document and writes it to `destination`.
     ///
     /// This object's file is never modified. The written file is verified to have the requested
     /// page count, rotations and page sizes before the final rename. `page_map[old] = Some(new)`
-    /// lets the shell remap its sidecar annotations; `None` means the page was removed.
+    /// lets the shell remap its cached annotations; `None` means the page was removed.
     pub fn apply_page_operation(
         &self,
         destination: String,
         operation: PageOperationRecord,
     ) -> Result<PageEditReport, LyraReaderFfiError> {
+        self.ensure_not_xfa()?;
         if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
             return Err(LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
                 message: "the document was replaced on disk; reopen it before editing pages"
                     .to_string(),
             });
         }
-        if self.backend.is_encrypted() {
+        if self.backend.needs_password() {
             return Err(LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
                 message:
                     "this document is encrypted; page editing is not supported for encrypted files"
                         .to_string(),
@@ -1840,8 +2892,10 @@ impl LyraReaderDocument {
         destination: String,
         pages: Vec<u32>,
     ) -> Result<PageEditReport, LyraReaderFfiError> {
-        if self.backend.is_encrypted() {
+        self.ensure_not_xfa()?;
+        if self.backend.needs_password() {
             return Err(LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
                 message:
                     "this document is encrypted; page editing is not supported for encrypted files"
                         .to_string(),
@@ -1860,18 +2914,20 @@ impl LyraReaderDocument {
     ///
     /// This document is not modified. Encrypted inputs, a document merged into itself, the same
     /// document selected twice, and an output that would overwrite an input are refused with a
-    /// readable error and no file. The first document's outline is kept; the appended documents'
-    /// outlines are not imported (`dropped_outline_entries` counts them). File-owned annotations
-    /// on appended pages travel with their pages. The reader's sidecar marks are the shell's
-    /// concern: appending does not move existing pages, so their page indices are unchanged and
-    /// the appended pages start with no sidecar marks.
+    /// readable error and no file. The first document's outline is kept; each appended document's
+    /// outline is imported as one labelled top-level group, its entries nested beneath it and its
+    /// destinations remapped to the merged pages. File-owned annotations on appended pages travel
+    /// with their pages. The reader's cached marks are the shell's concern: appending does not
+    /// move existing pages, so their page indices are unchanged and the appended pages start with
+    /// no cached marks.
     pub fn merge_documents(
         &self,
         others: Vec<String>,
         destination: String,
     ) -> Result<MergeReportRecord, LyraReaderFfiError> {
-        if self.backend.is_encrypted() {
-            return Err(LyraReaderFfiError::Document {
+        self.ensure_not_xfa()?;
+        if self.backend.needs_password() {
+            return Err(LyraReaderFfiError::Document { severity: ErrorSeverity::Document,
                 message:
                     "this document is encrypted; merging an encrypted document is refused and no output was written"
                         .to_string(),
@@ -1896,8 +2952,9 @@ impl LyraReaderDocument {
         &self,
         parts: Vec<SplitPartRecord>,
     ) -> Result<SplitReportRecord, LyraReaderFfiError> {
-        if self.backend.is_encrypted() {
-            return Err(LyraReaderFfiError::Document {
+        self.ensure_not_xfa()?;
+        if self.backend.needs_password() {
+            return Err(LyraReaderFfiError::Document { severity: ErrorSeverity::Document,
                 message:
                     "this document is encrypted; splitting an encrypted document is refused and no output was written"
                         .to_string(),
@@ -1919,6 +2976,7 @@ impl LyraReaderDocument {
         &self,
         destination: String,
     ) -> Result<PageEditReport, LyraReaderFfiError> {
+        self.ensure_not_xfa()?;
         let report = lyra_reader_pdfium::publish_edited_copy(
             Path::new(&self.path),
             Path::new(&destination),
@@ -1937,17 +2995,22 @@ impl LyraReaderDocument {
         &self,
         original_path: String,
     ) -> Result<PageEditReport, LyraReaderFfiError> {
+        self.ensure_not_xfa()?;
         // The revision is a working copy, so its own signature status (normally signed) is not
         // the authority for an in-place write: check the file that would actually change.
         let original = Path::new(&original_path);
         if let Some(reason) =
             lyra_reader_pdfium::detect_signature(original, None, 0).read_only_reason()
         {
-            return Err(LyraReaderFfiError::Document { message: reason });
+            return Err(LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
+                message: reason,
+            });
         }
         self.ensure_writable()?;
-        if self.backend.is_encrypted() {
+        if self.backend.needs_password() {
             return Err(LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
                 message:
                     "this document is encrypted; page editing is not supported for encrypted files"
                         .to_string(),
@@ -1970,93 +3033,14 @@ impl LyraReaderDocument {
             .into_owned()
     }
 
-    /// Reports what applying `areas` would remove, without writing anything.
-    ///
-    /// The confirmation uses this to say what will be lost: the number of characters under the
-    /// marks, an excerpt of them, and how many vector/image objects the marks touch.
-    pub fn preview_redactions(
-        &self,
-        areas: Vec<RedactionAreaRecord>,
-    ) -> Result<RedactionPreviewRecord, LyraReaderFfiError> {
-        let areas = redaction_areas_for(&self.backend, &areas)?;
-        let preview = preview_redactions(Path::new(&self.path), &areas)?;
-        Ok(RedactionPreviewRecord {
-            removed_characters: preview.removed_characters as u32,
-            pages: preview
-                .pages
-                .into_iter()
-                .map(|page| RedactionPagePreviewRecord {
-                    page: page.page,
-                    characters: page.characters as u32,
-                    text_preview: page.text_preview,
-                    graphics: page.graphics as u32,
-                })
-                .collect(),
-        })
-    }
-
-    /// Removes the content under `areas` and writes the result to a **new PDF**.
-    ///
-    /// The open document is not modified. Glyphs, vector paths, images and form XObjects that
-    /// intersect a mark are removed from the page content; a page whose graphics or text cannot
-    /// be attributed is rasterised (losing its text layer), which the writer verifies. The output
-    /// is written to a temporary file beside `destination`, reopened, verified (no extractable
-    /// text in any mark, outside text preserved, every mark black) and only then atomically
-    /// renamed.
-    pub fn redact_to_copy(
-        &self,
-        destination: String,
-        areas: Vec<RedactionAreaRecord>,
-    ) -> Result<RedactionReportRecord, LyraReaderFfiError> {
-        let areas = redaction_areas_for(&self.backend, &areas)?;
-        let report = redact_pdf(
-            Path::new(&self.path),
-            Path::new(&destination),
-            &areas,
-            self.password.as_deref(),
-            RedactionMode::Copy,
-        )?;
-        Ok(redaction_report(report))
-    }
-
-    /// Replaces the open document with a redacted version, after a verified backup.
-    ///
-    /// This is the explicitly destructive command. A byte-identical backup of the file is written
-    /// and verified first; if it cannot be written, nothing is replaced. The in-memory handle is
-    /// marked stale so the shell must reopen the file rather than quietly reading the old bytes.
-    pub fn replace_with_redactions(
-        &self,
-        areas: Vec<RedactionAreaRecord>,
-    ) -> Result<RedactionReportRecord, LyraReaderFfiError> {
-        // Signed documents are read-only: this command would write into the file (or an
-        // edited derivative of it), so it stops here with the one shared explanation.
-        self.ensure_writable()?;
-        let areas = redaction_areas_for(&self.backend, &areas)?;
-        let report = redact_pdf(
-            Path::new(&self.path),
-            Path::new(&self.path),
-            &areas,
-            self.password.as_deref(),
-            RedactionMode::ReplaceOriginal,
-        )?;
-        self.replaced
-            .store(true, std::sync::atomic::Ordering::Release);
-        Ok(redaction_report(report))
-    }
-
-    /// The name to offer when saving a redacted copy: `<name> (redacted).pdf`.
-    pub fn suggested_redaction_copy_path(&self) -> String {
-        suggested_redaction_copy_path(Path::new(&self.path))
-            .to_string_lossy()
-            .into_owned()
-    }
-
     /// Writes `annotations` into a **new PDF** at `destination`.
     ///
-    /// The document that is open is not modified, and neither is its sidecar. `annotations`
-    /// cross the boundary as view-space geometry at `zoom`; Rust converts it to page space with
-    /// the page's own `/CropBox`, `/Rotate` and `/UserUnit`, so the same highlight saved at 100%
-    /// and at 300% lands in the same PDF coordinates.
+    /// The document that is open is not modified, and neither is its annotation cache.
+    /// `annotations` cross the boundary as page-local view-space geometry at **100%**, the same
+    /// convention [`Self::annotations`] reports and the annotation cache stores; the engine
+    /// applies the one page transform (`/CropBox`, `/Rotate`, `/UserUnit`) itself. The shell
+    /// never multiplies by its canvas zoom to cross this boundary, so there is no zoom factor to
+    /// divide out here and a stored mark is the same value at every zoom.
     ///
     /// The write is append-only: the destination begins with every byte of the source. It is
     /// written to a temporary file beside `destination`, flushed, reopened, verified annotation
@@ -2066,7 +3050,6 @@ impl LyraReaderDocument {
         destination: String,
         annotations: Vec<WriteAnnotationRecord>,
         bookmarks: Vec<WriteBookmarkRecord>,
-        zoom: f64,
     ) -> Result<AnnotationSaveReport, LyraReaderFfiError> {
         self.save_annotations_to(
             std::path::PathBuf::from(destination),
@@ -2074,7 +3057,6 @@ impl LyraReaderDocument {
             bookmarks,
             Vec::new(),
             Vec::new(),
-            zoom,
             SaveMode::Copy,
         )
     }
@@ -2093,7 +3075,6 @@ impl LyraReaderDocument {
         bookmarks: Vec<WriteBookmarkRecord>,
         updates: Vec<AnnotationUpdateRecord>,
         deletions: Vec<AnnotationDeleteRecord>,
-        zoom: f64,
     ) -> Result<AnnotationSaveReport, LyraReaderFfiError> {
         self.save_annotations_to(
             std::path::PathBuf::from(destination),
@@ -2101,7 +3082,6 @@ impl LyraReaderDocument {
             bookmarks,
             updates,
             deletions,
-            zoom,
             SaveMode::Copy,
         )
     }
@@ -2115,7 +3095,6 @@ impl LyraReaderDocument {
         bookmarks: Vec<WriteBookmarkRecord>,
         updates: Vec<AnnotationUpdateRecord>,
         deletions: Vec<AnnotationDeleteRecord>,
-        zoom: f64,
     ) -> Result<AnnotationSaveReport, LyraReaderFfiError> {
         self.save_annotations_to(
             std::path::PathBuf::from(&self.path),
@@ -2123,7 +3102,6 @@ impl LyraReaderDocument {
             bookmarks,
             updates,
             deletions,
-            zoom,
             SaveMode::ReplaceOriginal,
         )
     }
@@ -2138,7 +3116,6 @@ impl LyraReaderDocument {
         &self,
         annotations: Vec<WriteAnnotationRecord>,
         bookmarks: Vec<WriteBookmarkRecord>,
-        zoom: f64,
     ) -> Result<AnnotationSaveReport, LyraReaderFfiError> {
         self.save_annotations_to(
             std::path::PathBuf::from(&self.path),
@@ -2146,7 +3123,6 @@ impl LyraReaderDocument {
             bookmarks,
             Vec::new(),
             Vec::new(),
-            zoom,
             SaveMode::ReplaceOriginal,
         )
     }
@@ -2165,12 +3141,34 @@ impl LyraReaderDocument {
     pub fn form_info(&self) -> Result<FormInfoRecord, LyraReaderFfiError> {
         if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
             return Err(LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
                 message: "the document was replaced on disk; reopen it before reading its form"
                     .to_string(),
             });
         }
         let path = Path::new(&self.path);
-        if !self.backend.has_acro_form() {
+        if let Some(state) = &self.xfa {
+            // The synthetic PDF has no fillable fields: drawing a control in a picture does not
+            // create a widget. Report the refusal and the source's encryption state so the shell
+            // explains why the form tool is not offered, instead of showing an empty form.
+            let reason = state
+                .status
+                .read_only_reason
+                .clone()
+                .unwrap_or_else(|| lyra_reader_xfa::READ_ONLY_REASON.to_string());
+            return Ok(FormInfoRecord {
+                fields: Vec::new(),
+                encrypted: state.status.encrypted,
+                pdf_version: lyra_reader_pdfium::read_document_facts_unencrypted_header(
+                    path,
+                    self.backend.page_count(),
+                )
+                .pdf_version,
+                page_count: self.backend.page_count(),
+                refusal: Some(reason),
+            });
+        }
+        if !self.backend.has_acro_form()? {
             // No AcroForm: skip the whole-file dictionary parse. The PDF version is still a
             // fact the information panel would ask for, and reading the header is cheap.
             return Ok(FormInfoRecord {
@@ -2303,6 +3301,90 @@ impl LyraReaderDocument {
             .into_owned()
     }
 
+    /// Writes a flattened copy of the open document to `destination`.
+    ///
+    /// The annotations' appearances and the filled form widgets are painted into the page
+    /// content, then those annotations and the `/AcroForm` entry are removed. The text layer and
+    /// the vectors stay text and vectors; nothing is rasterised. Sticky notes and links are kept
+    /// as annotations, and a field whose appearance cannot be baked faithfully is kept and
+    /// reported. A signed document may be copied: the copy is a derived copy and has its
+    /// signature material stripped. An XFA form is refused with its existing read-only reason.
+    ///
+    /// This is not tamper-proof: the painted bytes are still editable by a content editor, and
+    /// only a digital signature can detect later changes.
+    pub fn flatten_to_copy(
+        &self,
+        destination: String,
+    ) -> Result<FlattenReportRecord, LyraReaderFfiError> {
+        self.ensure_not_xfa()?;
+        if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
+                message: "the document was replaced on disk; reopen it before flattening"
+                    .to_string(),
+            });
+        }
+        let report = lyra_reader_pdfium::flatten_to_copy(
+            Path::new(&self.path),
+            Path::new(&destination),
+            self.password.as_deref(),
+        )?;
+        Ok(FlattenReportRecord {
+            destination_path: report.destination.to_string_lossy().into_owned(),
+            pages: report.pages,
+            flattened_annotations: report.flattened_annotations,
+            flattened_annotation_kinds: report
+                .flattened_annotation_kinds
+                .into_iter()
+                .map(|count| FlattenKindCountRecord {
+                    kind: count.kind,
+                    count: count.count,
+                })
+                .collect(),
+            flattened_fields: report.flattened_fields,
+            flattened_field_kinds: report
+                .flattened_field_kinds
+                .into_iter()
+                .map(|count| FlattenKindCountRecord {
+                    kind: count.kind,
+                    count: count.count,
+                })
+                .collect(),
+            kept_annotations: report
+                .kept_annotations
+                .into_iter()
+                .map(|kept| KeptAnnotationRecord {
+                    page: kept.page,
+                    kind: kept.kind,
+                    reason: kept.reason,
+                    has_comment: kept.has_comment,
+                })
+                .collect(),
+            kept_fields: report
+                .kept_fields
+                .into_iter()
+                .map(|kept| KeptFieldRecord {
+                    name: kept.name,
+                    kind: kept.kind,
+                    reason: kept.reason,
+                })
+                .collect(),
+            sticky_notes_kept: report.sticky_notes_kept,
+            links_kept: report.links_kept,
+            comments_not_carried: report.comments_not_carried,
+            signature_fields_removed: report.signature_fields_removed,
+            output_bytes: report.output_bytes,
+            cleaned_temporary_files: lyra_reader_core::saturating_u32(report.cleaned_temporaries),
+        })
+    }
+
+    /// The name to offer when exporting a flattened copy: `<name> (flattened).pdf`.
+    pub fn suggested_flatten_copy_path(&self) -> String {
+        lyra_reader_pdfium::suggested_flatten_copy_path(Path::new(&self.path))
+            .to_string_lossy()
+            .into_owned()
+    }
+
     /// The document facts and the four editable `/Info` entries.
     ///
     /// Page count, PDF version and encryption state are read-only facts. An encrypted document
@@ -2311,11 +3393,48 @@ impl LyraReaderDocument {
     pub fn document_info(&self) -> Result<DocumentInfoRecord, LyraReaderFfiError> {
         if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
             return Err(LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
                 message: "the document was replaced on disk; reopen it to read its information"
                     .to_string(),
             });
         }
         let path = Path::new(&self.path);
+        if let Some(state) = &self.xfa {
+            // The page count must describe what the handle renders (the synthetic form), while
+            // the `/Info` entries still come from the source the reader opened.
+            let mut record =
+                match lyra_reader_pdfium::read_document_info(path, self.password.as_deref()) {
+                    Ok(info) => DocumentInfoRecord {
+                        title: info.properties.title,
+                        author: info.properties.author,
+                        subject: info.properties.subject,
+                        keywords: info.properties.keywords,
+                        page_count: info.facts.page_count,
+                        pdf_version: info.facts.pdf_version,
+                        is_encrypted: info.facts.is_encrypted,
+                        has_info_dictionary: info.has_info_dictionary,
+                    },
+                    Err(_) => {
+                        let facts = lyra_reader_pdfium::read_document_facts_unencrypted_header(
+                            path,
+                            self.backend.page_count(),
+                        );
+                        DocumentInfoRecord {
+                            title: String::new(),
+                            author: String::new(),
+                            subject: String::new(),
+                            keywords: String::new(),
+                            page_count: facts.page_count,
+                            pdf_version: facts.pdf_version,
+                            is_encrypted: true,
+                            has_info_dictionary: false,
+                        }
+                    }
+                };
+            record.page_count = self.backend.page_count();
+            record.is_encrypted = state.status.encrypted;
+            return Ok(record);
+        }
         match lyra_reader_pdfium::read_document_info(path, self.password.as_deref()) {
             Ok(info) => Ok(DocumentInfoRecord {
                 title: info.properties.title,
@@ -2456,15 +3575,21 @@ impl LyraReaderDocument {
         gap_pt: f64,
         margin_pt: f64,
     ) -> Vec<PagePlacementRecord> {
+        // Ensure the lazy size pass has run; the placement then reports whether this page's
+        // width/height are real or unknown. Geometry still uses the historical fallback.
+        let sizes = self.page_sizes();
         self.layout(layout, gap_pt)
             .visible_pages(scroll_y_pt, viewport_height_pt, margin_pt)
             .iter()
-            .map(|page| PagePlacementRecord {
-                index: page.index,
-                top_pt: page.top_pt,
-                left_pt: page.left_pt,
-                width_pt: page.width_pt,
-                height_pt: page.height_pt,
+            .map(|page| {
+                let size = sizes.get(page.index as usize).copied().flatten();
+                PagePlacementRecord {
+                    index: page.index,
+                    top_pt: page.top_pt,
+                    left_pt: page.left_pt,
+                    width_pt: size.map(|(width, _)| width),
+                    height_pt: size.map(|(_, height)| height),
+                }
             })
             .collect()
     }
@@ -2497,19 +3622,34 @@ impl LyraReaderDocument {
     ) -> Result<AiPlanRecord, LyraReaderFfiError> {
         let action = match request.action {
             AiActionRecord::SummarizePage => AiAction::SummarizePage,
+            AiActionRecord::SummarizeSelection => AiAction::SummarizeSelection,
             AiActionRecord::SummarizeDocument => AiAction::SummarizeDocument,
             AiActionRecord::AskSelection => AiAction::AskSelection,
             AiActionRecord::TranslateSelection => AiAction::TranslateSelection,
             AiActionRecord::DocumentChat => AiAction::DocumentChat,
+            AiActionRecord::RegionQuestion => AiAction::RegionQuestion,
+            AiActionRecord::SummarizeAbstract
+            | AiActionRecord::SummarizeSection
+            | AiActionRecord::SummarizePageLine => {
+                return Err(LyraReaderFfiError::Ai {
+                    severity: AiErrorCode::Other.severity(),
+                    code: AiErrorCode::Other,
+                    message: "A layered summary uses its own per-unit request builder.".to_string(),
+                });
+            }
         };
         let page_count = self.page_count();
         if page_count == 0 {
             return Err(LyraReaderFfiError::Ai {
+                severity: AiErrorCode::EmptyContext.severity(),
+                code: AiErrorCode::EmptyContext,
                 message: "This document has no pages.".to_string(),
             });
         }
         if request.current_page >= page_count {
             return Err(LyraReaderFfiError::Ai {
+                severity: AiErrorCode::EmptyContext.severity(),
+                code: AiErrorCode::EmptyContext,
                 message: format!(
                     "The current page {} is outside this document ({} pages).",
                     request.current_page + 1,
@@ -2524,6 +3664,8 @@ impl LyraReaderDocument {
         });
         if action.requires_selection() && selection.is_none() {
             return Err(LyraReaderFfiError::Ai {
+                severity: AiErrorCode::Other.severity(),
+                code: AiErrorCode::Other,
                 message: "Select text first; there is no selection to send.".to_string(),
             });
         }
@@ -2531,6 +3673,8 @@ impl LyraReaderDocument {
             && selection.page >= page_count
         {
             return Err(LyraReaderFfiError::Ai {
+                severity: AiErrorCode::EmptyContext.severity(),
+                code: AiErrorCode::EmptyContext,
                 message: format!(
                     "The selected page {} is outside this document.",
                     selection.page + 1
@@ -2538,10 +3682,133 @@ impl LyraReaderDocument {
             });
         }
 
-        // Translation only needs the selected page. Every other action can retrieve context
-        // from the whole document, and a document summary needs all of it.
-        let page_list: Vec<u32> = if action == AiAction::TranslateSelection {
-            vec![selection.expect("checked above").page]
+        let knowledge = document_knowledge_input(
+            request.document_knowledge_text.clone(),
+            request.document_knowledge_pages.clone(),
+        );
+
+        // A region image is exactly the selected rectangle. Once document knowledge has been
+        // established, bounded related source passages can connect it to the full document.
+        if action == AiAction::RegionQuestion {
+            let region = request.region.ok_or_else(|| LyraReaderFfiError::Ai {
+                severity: AiErrorCode::Other.severity(),
+                code: AiErrorCode::Other,
+                message: "The region question has no region; nothing was sent.".to_string(),
+            })?;
+            if region.page >= page_count {
+                return Err(LyraReaderFfiError::Ai {
+                    severity: AiErrorCode::EmptyContext.severity(),
+                    code: AiErrorCode::EmptyContext,
+                    message: format!(
+                        "The selected region is on page {}, outside this document ({} pages).",
+                        region.page + 1,
+                        page_count
+                    ),
+                });
+            }
+            let temperature = request.temperature.and_then(|value| {
+                if value.is_finite() {
+                    Some(value as f32)
+                } else {
+                    None
+                }
+            });
+            let temperature = if request.temperature.is_some_and(|value| !value.is_finite()) {
+                Some(f32::NAN)
+            } else {
+                temperature
+            };
+            let reasoning_mode =
+                ReasoningMode::from_wire(&request.reasoning_mode).ok_or_else(|| {
+                    LyraReaderFfiError::InvalidArgument {
+                        severity: ErrorSeverity::Document,
+                        message: format!(
+                            "Unknown reasoning mode {}. Use default, off, low, high or max.",
+                            request.reasoning_mode
+                        ),
+                    }
+                })?;
+            let reasoning_encoding = ReasoningEncoding::from_wire(&request.reasoning_encoding)
+                .ok_or_else(|| LyraReaderFfiError::InvalidArgument { severity: ErrorSeverity::Document,
+                    message: format!(
+                        "Unknown reasoning encoding {}. Use none, thinking, reasoning_effort, output_config or reasoning.effort.",
+                        request.reasoning_encoding
+                    ),
+                })?;
+            let settings = ChatSettings {
+                base_url: request.base_url,
+                model: request.model,
+                temperature,
+                max_tokens: request.max_tokens,
+                reasoning_mode,
+                reasoning_encoding,
+            };
+            let document_title = Path::new(&self.path)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("Document")
+                .to_string();
+            let image = match (
+                region.image_png,
+                region.image_width_px,
+                region.image_height_px,
+            ) {
+                (Some(png), Some(width), Some(height)) => Some(ChatImage {
+                    width_px: width,
+                    height_px: height,
+                    png,
+                }),
+                (None, _, _) => None,
+                _ => {
+                    return Err(LyraReaderFfiError::InvalidArgument {
+                        severity: ErrorSeverity::Document,
+                        message: "The region picture is missing its pixel size.".to_string(),
+                    });
+                }
+            };
+            let mut document_pages = Vec::new();
+            if region.include_document_context {
+                for page in 0..page_count {
+                    let (text, chars) = self.ai_page(page)?;
+                    document_pages.push(PageText { page, text, chars });
+                }
+            }
+            let plan = build_region_question_plan(RegionQuestionRequest {
+                document_title,
+                page_count,
+                page: region.page,
+                document_pages,
+                rect: RegionRect {
+                    x_pt: region.x_pt,
+                    y_pt: region.y_pt,
+                    width_pt: region.width_pt,
+                    height_pt: region.height_pt,
+                },
+                text: region.text,
+                image,
+                send_image: region.send_image,
+                question: request.question.unwrap_or_default(),
+                history: request
+                    .history
+                    .into_iter()
+                    .map(|turn| ConversationTurn {
+                        question: turn.question,
+                        answer: turn.answer,
+                    })
+                    .collect(),
+                settings,
+                document_knowledge: knowledge,
+            })?;
+            return Ok(ai_plan_record(plan));
+        }
+
+        // Selection-only summary and translation send only the exact selected target.
+        // Questions can retrieve context; a document summary needs every page.
+        let page_list: Vec<u32> = if matches!(
+            action,
+            AiAction::TranslateSelection | AiAction::SummarizeSelection
+        ) {
+            vec![selection_only_page(selection)?]
         } else {
             (0..page_count).collect()
         };
@@ -2568,6 +3835,7 @@ impl LyraReaderDocument {
         let reasoning_mode =
             ReasoningMode::from_wire(&request.reasoning_mode).ok_or_else(|| {
                 LyraReaderFfiError::InvalidArgument {
+                    severity: ErrorSeverity::Document,
                     message: format!(
                         "Unknown reasoning mode {}. Use default, off, low, high or max.",
                         request.reasoning_mode
@@ -2575,7 +3843,7 @@ impl LyraReaderDocument {
                 }
             })?;
         let reasoning_encoding = ReasoningEncoding::from_wire(&request.reasoning_encoding)
-            .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
+            .ok_or_else(|| LyraReaderFfiError::InvalidArgument { severity: ErrorSeverity::Document,
                 message: format!(
                     "Unknown reasoning encoding {}. Use none, thinking, reasoning_effort, output_config or reasoning.effort.",
                     request.reasoning_encoding
@@ -2610,9 +3878,10 @@ impl LyraReaderDocument {
                     .collect(),
                 pages,
                 settings,
+                document_knowledge: knowledge,
             })?
         } else {
-            build_plan(PlanRequest {
+            let input = PlanRequest {
                 action,
                 document_title,
                 page_count,
@@ -2622,13 +3891,261 @@ impl LyraReaderDocument {
                 language: request.language,
                 pages,
                 settings,
-            })?
+                document_knowledge: knowledge,
+            };
+            if request.document_knowledge {
+                build_document_knowledge_plan(input)?
+            } else {
+                build_plan(input)?
+            }
         };
         Ok(ai_plan_record(plan))
     }
+
+    /// Inspect one layered-summary level without building prompts or wire bodies. The panel
+    /// calls this when it opens: every unit returns the hash of exactly the text it would send,
+    /// so a cached summary can be matched (or marked stale) with no request.
+    pub fn inspect_ai_summary(
+        &self,
+        request: AiSummaryRequestRecord,
+    ) -> Result<Vec<AiSummaryFingerprintRecord>, LyraReaderFfiError> {
+        let page_count = self.page_count();
+        if page_count == 0 {
+            return Err(LyraReaderFfiError::Ai {
+                severity: AiErrorCode::EmptyContext.severity(),
+                code: AiErrorCode::EmptyContext,
+                message: "This document has no pages.".to_string(),
+            });
+        }
+        let layer = summary_layer_from_record(request.layer);
+        let pages = summary_page_texts(self, layer, &request.units, page_count)?;
+        let units = summary_units(&request.units);
+        let settings = ChatSettings {
+            base_url: "http://127.0.0.1".to_string(),
+            model: "inspect".to_string(),
+            temperature: None,
+            max_tokens: None,
+            reasoning_mode: ReasoningMode::Off,
+            reasoning_encoding: ReasoningEncoding::Thinking,
+        };
+        let core = SummaryLayerRequest {
+            layer,
+            document_title: request.document_title,
+            page_count,
+            language: request.language,
+            units,
+            pages,
+            settings,
+            document_knowledge: None,
+        };
+        let coverages = inspect_summary_layer(&core)?;
+        Ok(core
+            .units
+            .iter()
+            .zip(coverages)
+            .map(|(unit, coverage)| {
+                let note = summary_coverage_note(layer, unit, &coverage, page_count);
+                AiSummaryFingerprintRecord {
+                    index: unit.index,
+                    kind: summary_layer_record(unit.kind),
+                    requested_page_start: unit.page_start,
+                    requested_page_end: unit.page_end,
+                    covered_page_start: coverage.covered_page_start,
+                    covered_page_end: coverage.covered_page_end,
+                    pages: coverage.pages,
+                    truncated: coverage.truncated,
+                    text_hash: coverage.text_hash,
+                    characters: coverage.characters,
+                    note,
+                }
+            })
+            .collect())
+    }
+
+    /// Build one preview per unit of a layered-summary level. This never opens a connection;
+    /// the shell previews the requests and starts them only after the reader presses Send.
+    pub fn prepare_ai_summary(
+        &self,
+        request: AiSummaryRequestRecord,
+    ) -> Result<AiSummaryPlanRecord, LyraReaderFfiError> {
+        let page_count = self.page_count();
+        if page_count == 0 {
+            return Err(LyraReaderFfiError::Ai {
+                severity: AiErrorCode::EmptyContext.severity(),
+                code: AiErrorCode::EmptyContext,
+                message: "This document has no pages.".to_string(),
+            });
+        }
+        let layer = summary_layer_from_record(request.layer);
+        let settings = summary_settings(&request)?;
+        let pages = summary_page_texts(self, layer, &request.units, page_count)?;
+        let units = summary_units(&request.units);
+        let document_title = if request.document_title.trim().is_empty() {
+            Path::new(&self.path)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("Document")
+                .to_string()
+        } else {
+            request.document_title
+        };
+        let core = SummaryLayerRequest {
+            layer,
+            document_title,
+            page_count,
+            language: request.language,
+            units,
+            pages,
+            settings,
+            document_knowledge: document_knowledge_input(
+                request.document_knowledge_text,
+                request.document_knowledge_pages,
+            ),
+        };
+        let plan = build_summary_layer(core)?;
+        Ok(ai_summary_plan_record(plan))
+    }
 }
 
-fn page_operation(record: PageOperationRecord) -> PageOperation {
+/// Page text for exactly the pages a layer can send. The abstract reads only its two bounded
+/// end windows; section and page units read their own ranges. Deduplicated, so a 20-section
+/// document extracts each page once.
+fn summary_page_texts(
+    document: &LyraReaderDocument,
+    layer: SummaryLayer,
+    units: &[AiSummaryUnitRequestRecord],
+    page_count: u32,
+) -> Result<Vec<PageText>, LyraReaderFfiError> {
+    let mut needed = std::collections::BTreeSet::new();
+    match layer {
+        SummaryLayer::Abstract => {
+            needed.extend(abstract_sample_page_indices(page_count));
+        }
+        SummaryLayer::Section | SummaryLayer::Page => {
+            for unit in units {
+                if unit.page_start == 0 {
+                    continue;
+                }
+                let start = unit.page_start.min(page_count);
+                let end = unit.page_end.max(unit.page_start).min(page_count);
+                for page in start..=end {
+                    needed.insert(page - 1);
+                }
+            }
+        }
+    }
+    let mut pages = Vec::with_capacity(needed.len());
+    for page in needed {
+        let (text, chars) = document.ai_page(page)?;
+        pages.push(PageText { page, text, chars });
+    }
+    Ok(pages)
+}
+
+fn summary_layer_record(layer: SummaryLayer) -> AiSummaryLayerRecord {
+    match layer {
+        SummaryLayer::Abstract => AiSummaryLayerRecord::Abstract,
+        SummaryLayer::Section => AiSummaryLayerRecord::Section,
+        SummaryLayer::Page => AiSummaryLayerRecord::Page,
+    }
+}
+
+fn summary_layer_from_record(layer: AiSummaryLayerRecord) -> SummaryLayer {
+    match layer {
+        AiSummaryLayerRecord::Abstract => SummaryLayer::Abstract,
+        AiSummaryLayerRecord::Section => SummaryLayer::Section,
+        AiSummaryLayerRecord::Page => SummaryLayer::Page,
+    }
+}
+
+fn summary_units(units: &[AiSummaryUnitRequestRecord]) -> Vec<SummaryUnitRequest> {
+    units
+        .iter()
+        .map(|unit| SummaryUnitRequest {
+            kind: summary_layer_from_record(unit.kind),
+            index: unit.index,
+            title: unit.title.clone(),
+            number: unit.number.clone(),
+            depth: unit.depth,
+            page_start: unit.page_start,
+            page_end: unit.page_end,
+        })
+        .collect()
+}
+
+fn summary_settings(request: &AiSummaryRequestRecord) -> Result<ChatSettings, LyraReaderFfiError> {
+    let temperature = request.temperature.and_then(|value| {
+        if value.is_finite() {
+            Some(value as f32)
+        } else {
+            None
+        }
+    });
+    let temperature = if request.temperature.is_some_and(|value| !value.is_finite()) {
+        Some(f32::NAN)
+    } else {
+        temperature
+    };
+    let reasoning_mode = ReasoningMode::from_wire(&request.reasoning_mode).ok_or_else(|| {
+        LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
+            message: format!(
+                "Unknown reasoning mode {}. Use default, off, low, high or max.",
+                request.reasoning_mode
+            ),
+        }
+    })?;
+    let reasoning_encoding =
+        ReasoningEncoding::from_wire(&request.reasoning_encoding).ok_or_else(|| {
+            LyraReaderFfiError::InvalidArgument { severity: ErrorSeverity::Document,
+                message: format!(
+                    "Unknown reasoning encoding {}. Use none, thinking, reasoning_effort, output_config or reasoning.effort.",
+                    request.reasoning_encoding
+                ),
+            }
+        })?;
+    Ok(ChatSettings {
+        base_url: request.base_url.clone(),
+        model: request.model.clone(),
+        temperature,
+        max_tokens: request.max_tokens,
+        reasoning_mode,
+        reasoning_encoding,
+    })
+}
+
+fn ai_summary_plan_record(plan: lyra_reader_ai::SummaryLayerPlan) -> AiSummaryPlanRecord {
+    AiSummaryPlanRecord {
+        layer: summary_layer_record(plan.layer),
+        page_count: plan.page_count,
+        units: plan
+            .units
+            .into_iter()
+            .map(|unit| AiSummaryUnitRecord {
+                index: unit.unit.index,
+                kind: summary_layer_record(unit.unit.kind),
+                title: unit.unit.title,
+                number: unit.unit.number,
+                depth: unit.unit.depth,
+                page_start: unit.unit.page_start,
+                page_end: unit.unit.page_end,
+                covered_page_end: unit.coverage.covered_page_end,
+                pages: unit.coverage.pages,
+                truncated: unit.coverage.truncated,
+                text_hash: unit.coverage.text_hash,
+                characters: unit.coverage.characters,
+                note: unit.note,
+                plan: unit.plan.map(ai_plan_record),
+                error: unit.error,
+            })
+            .collect(),
+        note: plan.note,
+        max_requests_per_batch: SUMMARY_MAX_REQUESTS_PER_BATCH as u32,
+        max_concurrent_requests: SUMMARY_MAX_CONCURRENT_REQUESTS as u32,
+    }
+}
+
+pub(crate) fn page_operation(record: PageOperationRecord) -> PageOperation {
     match record {
         PageOperationRecord::Rotate {
             pages,
@@ -2652,94 +4169,6 @@ fn page_operation(record: PageOperationRecord) -> PageOperation {
     }
 }
 
-/// Converts the shell's view-space rectangles to PDF user space.
-///
-/// Every page is validated before any rectangle is converted, so a bad page index in the
-/// middle of a list cannot leave a partially accepted request.
-fn redaction_areas_for(
-    backend: &PdfiumBackend,
-    records: &[RedactionAreaRecord],
-) -> Result<Vec<RedactionArea>, LyraReaderFfiError> {
-    if records.is_empty() {
-        return Err(LyraReaderFfiError::InvalidArgument {
-            message: "there are no redaction areas to apply".to_string(),
-        });
-    }
-    let page_count = backend.page_count();
-    let mut areas = Vec::with_capacity(records.len());
-    for record in records {
-        if record.page >= page_count {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                message: format!(
-                    "redaction names page {} but the document has {} page(s)",
-                    record.page + 1,
-                    page_count
-                ),
-            });
-        }
-        let values = [record.x_pt, record.y_pt, record.width_pt, record.height_pt];
-        if values.iter().any(|value| !value.is_finite()) {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                message: "a redaction rectangle has a non-finite coordinate".to_string(),
-            });
-        }
-        if record.width_pt < 0.5 || record.height_pt < 0.5 {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                message: "a redaction rectangle is smaller than half a point".to_string(),
-            });
-        }
-        let geometry = backend
-            .page_info(PageIndex(record.page))
-            .map_err(LyraReaderFfiError::from)?
-            .geometry;
-        let transform =
-            geometry
-                .view_to_page(1.0)
-                .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
-                    message: "the page geometry cannot be inverted for redaction".to_string(),
-                })?;
-        let top_left = transform.apply(Point::new(record.x_pt, record.y_pt));
-        let bottom_right = transform.apply(Point::new(
-            record.x_pt + record.width_pt,
-            record.y_pt + record.height_pt,
-        ));
-        let left = top_left.x.min(bottom_right.x);
-        let right = top_left.x.max(bottom_right.x);
-        let bottom = top_left.y.min(bottom_right.y);
-        let top = top_left.y.max(bottom_right.y);
-        areas.push(RedactionArea::new(
-            record.page,
-            lyra_reader_core::Rect::new(left, bottom, right - left, top - bottom),
-        ));
-    }
-    Ok(areas)
-}
-
-fn redaction_report(report: lyra_reader_pdfium::RedactionReport) -> RedactionReportRecord {
-    RedactionReportRecord {
-        destination_path: report.destination.to_string_lossy().into_owned(),
-        backup_path: report
-            .backup_path
-            .map(|path| path.to_string_lossy().into_owned()),
-        pages: report
-            .pages
-            .into_iter()
-            .map(|page| RedactionPageReportRecord {
-                page: page.page,
-                removed_characters: page.removed_characters as u32,
-                removed_graphics: page.removed_graphics as u32,
-                rasterized: page.rasterized,
-                fill_marks: page.fill_marks as u32,
-            })
-            .collect(),
-        removed_characters: report.removed_characters as u32,
-        output_bytes: report.output_bytes,
-        cleaned_temporary_files: report.cleaned_temporaries as u32,
-        verified: report.verified,
-        original_unchanged: report.original_unchanged,
-    }
-}
-
 fn page_edit_report(report: lyra_reader_pdfium::PageOperationReport) -> PageEditReport {
     PageEditReport {
         destination_path: report.destination.to_string_lossy().into_owned(),
@@ -2751,7 +4180,7 @@ fn page_edit_report(report: lyra_reader_pdfium::PageOperationReport) -> PageEdit
             .backup_path
             .map(|path| path.to_string_lossy().into_owned()),
         output_bytes: report.output_bytes,
-        cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
+        cleaned_temporary_files: lyra_reader_core::saturating_u32(report.cleaned_temporaries),
     }
 }
 
@@ -2764,13 +4193,14 @@ fn merge_report(report: lyra_reader_pdfium::MergeReport) -> MergeReportRecord {
         appended_annotation_counts: report
             .appended_annotation_counts
             .into_iter()
-            .map(|count| u32::try_from(count).unwrap_or(u32::MAX))
+            .map(lyra_reader_core::saturating_u32)
             .collect(),
         rotations: report.rotations,
-        first_outline_entries: u32::try_from(report.first_outline_entries).unwrap_or(u32::MAX),
-        dropped_outline_entries: u32::try_from(report.dropped_outline_entries).unwrap_or(u32::MAX),
+        first_outline_entries: lyra_reader_core::saturating_u32(report.first_outline_entries),
+        appended_outline_entries: lyra_reader_core::saturating_u32(report.appended_outline_entries),
+        appended_outline_group_titles: report.appended_outline_group_titles,
         output_bytes: report.output_bytes,
-        cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
+        cleaned_temporary_files: lyra_reader_core::saturating_u32(report.cleaned_temporaries),
     }
 }
 
@@ -2788,17 +4218,343 @@ fn split_report(report: lyra_reader_pdfium::SplitReport) -> SplitReportRecord {
             })
             .collect(),
         source_page_count: report.source_page_count,
-        cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
+        cleaned_temporary_files: lyra_reader_core::saturating_u32(report.cleaned_temporaries),
     }
 }
 
 impl LyraReaderDocument {
+    /// Extracts a page and builds its Swift-parity line decomposition.
+    ///
+    /// This is the one place that performs the page-space→view-space Y flip for selection; the
+    /// cache, the hit test and the box→range methods all read the same geometry.
+    fn extract_text_page(
+        &self,
+        page: u32,
+    ) -> Result<lyra_reader_text::TextPage, LyraReaderFfiError> {
+        let raw = self.backend.raw_text_page(PageIndex(page))?;
+        let geometry = self.backend.page_info(PageIndex(page))?.geometry;
+
+        let chars = raw
+            .chars
+            .iter()
+            .map(|character| {
+                // Page boxes use a bottom-left origin, so the glyph's *top* edge is what
+                // maps to the view-space y after the single Y-flip.
+                let top_left = Point::new(
+                    character.rect.origin.x,
+                    character.rect.origin.y + character.rect.size.height,
+                );
+                // `page_to_view(1.0)` is the page→view transform at 100%: character boxes are
+                // reported in content points, and the canvas applies the zoom itself.
+                let view = geometry.page_to_view(1.0).apply(top_left);
+                lyra_reader_text::CharBox {
+                    rect: lyra_reader_core::Rect::new(
+                        view.x,
+                        view.y,
+                        character.rect.size.width,
+                        character.rect.size.height,
+                    ),
+                    origin: view,
+                    unicode: character.unicode,
+                    font_size: character.rect.size.height,
+                    logical_order: 0,
+                }
+            })
+            .collect();
+
+        Ok(lyra_reader_text::TextPage {
+            page: PageIndex(page),
+            chars,
+            blocks: Vec::new(),
+            text: raw.text,
+            is_generated: raw.is_generated,
+            has_unicode_map_error: raw.has_unicode_map_error,
+        })
+    }
+
+    /// Prepares `page` and counts the PDFium extraction that produced it.
+    ///
+    /// Only [`LyraReaderDocument::text_page`] calls this; the synchronous selection entry points
+    /// deliberately cannot, so `loads` also proves that a pointer event never extracts.
+    fn retain_selection_text_page(
+        &self,
+        page: u32,
+        value: Arc<lyra_reader_text::SelectionTextPage>,
+    ) {
+        let bytes = value.estimated_bytes();
+        let mut cache = self
+            .text_pages
+            // Pure cache (immutable entries keyed by page): poisoning can only cost a miss.
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.loads += 1;
+        cache.insert(page, value, bytes);
+    }
+
+    /// The synchronous lookup: a hit avoids PDFium entirely and a miss is a typed `Ok(None)`.
+    ///
+    /// This method never extracts. The only failure it can report is an out-of-range page,
+    /// which is an InvalidArgument rather than "not prepared"; keeping real failures as `Err`
+    /// is what lets the shell tell a missing page from a page it merely has not loaded yet.
+    fn prepared_selection_text_page(
+        &self,
+        page: u32,
+    ) -> Result<Option<Arc<lyra_reader_text::SelectionTextPage>>, LyraReaderFfiError> {
+        let page_count = self.backend.page_count();
+        lyra_reader_core::checked_page_index(page, page_count, |page| {
+            LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
+                message: lyra_reader_core::page_out_of_range_message(page, page_count),
+            }
+        })?;
+        let mut cache = self
+            .text_pages
+            // Pure cache (immutable entries keyed by page): poisoning can only cost a miss.
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(value) = cache.get(page) {
+            return Ok(Some(value));
+        }
+        cache.misses += 1;
+        Ok(None)
+    }
+}
+
+impl LyraReaderDocument {
+    fn annotation_scan(
+        &self,
+    ) -> Result<(Vec<AnnotationRecord>, AnnotationReadStatus), LyraReaderFfiError> {
+        if self.xfa.is_some() {
+            // The synthetic PDF is a picture of the form, not an annotation carrier. Reading the
+            // source's annotations through a handle whose page count is the rendering's would
+            // ask the original one-page file for page 2. There is nothing to offer: annotation
+            // tools are disabled for an XFA document.
+            return Ok((Vec::new(), AnnotationReadStatus::default()));
+        }
+        if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
+                message: "the document was replaced on disk; reopen it before reading annotations"
+                    .to_string(),
+            });
+        }
+        if let Ok(cache) = self.annotations.lock()
+            && let Some(cached) = cache.as_ref()
+        {
+            return Ok((cached.records.clone(), cached.status.clone()));
+        }
+
+        let mut records = Vec::new();
+        let mut status = AnnotationReadStatus::default();
+        let mut geometries: std::collections::HashMap<u32, lyra_reader_core::PageGeometry> =
+            std::collections::HashMap::new();
+
+        for page in 0..self.backend.page_count() {
+            let geometry = match geometries.get(&page) {
+                Some(geometry) => *geometry,
+                None => match self.backend.page_info(PageIndex(page)) {
+                    Ok(info) => {
+                        let geometry = info.geometry;
+                        geometries.insert(page, geometry);
+                        geometry
+                    }
+                    Err(error) => {
+                        // No geometry means even the annotations that read could not be placed.
+                        // Count the page and keep the other pages readable.
+                        status.unreadable_annotations =
+                            status.unreadable_annotations.saturating_add(1);
+                        status.pages.push(page);
+                        status.details.push(format!("page {}: {error}", page + 1));
+                        continue;
+                    }
+                },
+            };
+
+            let report = match self.backend.annotation_page_report(PageIndex(page)) {
+                Ok(report) => report,
+                Err(error) => {
+                    status.unreadable_annotations = status.unreadable_annotations.saturating_add(1);
+                    status.pages.push(page);
+                    status.details.push(format!("page {}: {error}", page + 1));
+                    continue;
+                }
+            };
+            for unreadable in report.unreadable {
+                status.unreadable_annotations = status.unreadable_annotations.saturating_add(1);
+                if status.pages.last().copied() != Some(page) {
+                    status.pages.push(page);
+                }
+                let slot = unreadable
+                    .slot
+                    .map(|slot| format!(" annotation {slot}"))
+                    .unwrap_or_default();
+                status
+                    .details
+                    .push(format!("page {}{slot}: {}", page + 1, unreadable.reason));
+            }
+
+            for annotation in report.annotations {
+                let view = page_region_to_view(annotation.rect, geometry);
+                // Classified before the record is built: the answer travels with the annotation
+                // rather than being re-derived by every consumer from `kind` and `visible`.
+                let drawing = annotation.drawing();
+                let quads = annotation
+                    .quads
+                    .into_iter()
+                    .map(|quad| {
+                        let view = page_region_to_view(quad, geometry);
+                        AnnotationQuad {
+                            x_pt: view.origin.x,
+                            y_pt: view.origin.y,
+                            width_pt: view.size.width,
+                            height_pt: view.size.height,
+                        }
+                    })
+                    .collect();
+                let to_view = geometry.page_to_view(1.0);
+                let ink_paths = annotation
+                    .ink_paths
+                    .iter()
+                    .map(|path| {
+                        path.iter()
+                            .map(|point| {
+                                let view = to_view.apply(*point);
+                                AnnotationPoint {
+                                    x_pt: view.x,
+                                    y_pt: view.y,
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let (line_start, line_end) = match annotation.line {
+                    Some(line) => {
+                        let start = to_view.apply(line.start);
+                        let end = to_view.apply(line.end);
+                        (
+                            Some(AnnotationPoint {
+                                x_pt: start.x,
+                                y_pt: start.y,
+                            }),
+                            Some(AnnotationPoint {
+                                x_pt: end.x,
+                                y_pt: end.y,
+                            }),
+                        )
+                    }
+                    None => (None, None),
+                };
+                let kind = if annotation.kind == lyra_reader_core::RawAnnotationKind::Line
+                    && annotation.line_arrow
+                {
+                    "arrow".to_string()
+                } else {
+                    annotation.kind.as_str().to_string()
+                };
+                let kind_flags = TaxonomyKind::from_document_kind(&kind).flags();
+                let (editable, unsupported_reason) =
+                    document_editability(AnnotationEditabilityInput {
+                        kind: &kind,
+                        is_reply: annotation.is_reply,
+                        visible: annotation.visible,
+                        ink_paths_empty: annotation.ink_paths.is_empty(),
+                        line_missing: annotation.line.is_none(),
+                        stamp_text_empty: annotation.stamp.as_ref().is_none_or(|stamp| {
+                            stamp.text.as_deref().unwrap_or("").trim().is_empty()
+                        }),
+                        stamp_has_image: annotation
+                            .stamp
+                            .as_ref()
+                            .is_some_and(|stamp| stamp.image.is_some()),
+                        stamp_image_error: annotation
+                            .stamp
+                            .as_ref()
+                            .and_then(|stamp| stamp.image_error.as_deref()),
+                        drawing,
+                    });
+
+                records.push(AnnotationRecord {
+                    page,
+                    page_label: crate::format::page_label(&[page.saturating_add(1)]),
+                    id: annotation.id,
+                    parent_id: annotation.parent_id,
+                    is_reply: annotation.is_reply,
+                    has_popup: annotation.has_popup,
+                    kind,
+                    x_pt: view.origin.x,
+                    y_pt: view.origin.y,
+                    width_pt: view.size.width,
+                    height_pt: view.size.height,
+                    quads,
+                    ink_paths,
+                    line_start,
+                    line_end,
+                    line_arrow: annotation.line_arrow,
+                    border_width_pt: annotation.border_width,
+                    color: annotation.color.map(|color| AnnotationColorRecord {
+                        red: color.red,
+                        green: color.green,
+                        blue: color.blue,
+                    }),
+                    opacity: annotation.opacity,
+                    blend: annotation.blend.as_str().to_string(),
+                    contents: annotation.contents,
+                    author: annotation.author,
+                    display_date: annotation
+                        .modified
+                        .as_deref()
+                        .and_then(crate::format::pdf_date_display),
+                    modified: annotation.modified,
+                    font_size_pt: annotation.font_size_pt,
+                    alignment: annotation.alignment.as_str().to_string(),
+                    stamp: annotation.stamp.as_ref().map(|stamp| StampRecord {
+                        text: stamp.text.clone(),
+                        style: stamp.style.clone(),
+                        image: stamp
+                            .image
+                            .as_ref()
+                            .map(|image| image.data.clone())
+                            .unwrap_or_default(),
+                        image_encoding: stamp
+                            .image
+                            .as_ref()
+                            .map(|image| image.encoding.as_str().to_string())
+                            .unwrap_or_default(),
+                        image_width: stamp.image.as_ref().map_or(0, |image| image.width),
+                        image_height: stamp.image.as_ref().map_or(0, |image| image.height),
+                        image_error: stamp.image_error.clone(),
+                    }),
+                    drawing: drawing.as_str().to_string(),
+                    skip_reason: match drawing {
+                        AnnotationDrawing::Skipped(reason) => Some(reason.as_str().to_string()),
+                        _ => None,
+                    },
+                    visible: annotation.visible,
+                    is_markup: kind_flags.is_markup,
+                    is_geometry: kind_flags.is_geometry,
+                    is_note: kind_flags.is_note,
+                    editable,
+                    unsupported_reason,
+                });
+            }
+        }
+
+        let scan = AnnotationScanCache {
+            records: records.clone(),
+            status: status.clone(),
+        };
+        if let Ok(mut cache) = self.annotations.lock() {
+            *cache = Some(scan);
+        }
+        Ok((records, status))
+    }
+
     /// The one gate for every command that would **rewrite the signed file itself**.
     ///
     /// The policy is "a signed document must not be modified", not "nothing may be derived from
-    /// it": `extract_pages`, `merge_documents`, `split_pages`, `save_edited_copy`,
-    /// `redact_to_copy`, and the annotation/form/properties copy saves write a new file and are
-    /// allowed. Every `replace_*` command (and applying a staged page edit to the original) must
+    /// it": `extract_pages`, `merge_documents`, `split_pages`, `save_edited_copy`, and the
+    /// annotation/form/properties copy saves write a new file and are allowed. Every `replace_*`
+    /// command (and applying a staged page edit to the original) must
     /// call this before it touches the path. Keeping the decision in one place is what makes
     /// "the same explanation" true: the shell gets the sentence from
     /// [`Self::signature_status`] and an error carries the same string, so a disabled button and
@@ -2812,6 +4568,25 @@ impl LyraReaderDocument {
         }
     }
 
+    /// The gate for every command that writes an XFA derivative, including copies.
+    ///
+    /// A signed document may still be exported to a new file; an XFA form may not, because the
+    /// synthetic PDF is not the source and a copy of it would be a picture of the form rather
+    /// than a form. The refusal sentence is the one the banner shows.
+    fn ensure_not_xfa(&self) -> Result<(), LyraReaderFfiError> {
+        if let Some(state) = &self.xfa {
+            let message = state
+                .status
+                .read_only_reason
+                .clone()
+                .unwrap_or_else(|| lyra_reader_xfa::READ_ONLY_REASON.to_string());
+            return Err(
+                lyra_reader_core::LyraReaderError::new(ErrorCode::ReadOnly, message).into(),
+            );
+        }
+        Ok(())
+    }
+
     /// Plain text and character boxes for one page, extracted once and kept for the
     /// document's lifetime. The boxes and the text come from the same `raw.chars` sequence, so
     /// the context builder's gutter rule and the canvas's selection indices agree.
@@ -2822,7 +4597,9 @@ impl LyraReaderDocument {
         mode: SaveMode,
     ) -> Result<FormSaveReport, LyraReaderFfiError> {
         // Writing values into the signed file is refused; a filled **copy** is a new file and
-        // is allowed (and stripped of the signature material it would otherwise carry).
+        // is allowed (and stripped of the signature material it would otherwise carry). An XFA
+        // form has no fillable fields in its synthetic PDF, so both modes are refused.
+        self.ensure_not_xfa()?;
         if mode == SaveMode::ReplaceOriginal {
             self.ensure_writable()?;
         }
@@ -2853,7 +4630,7 @@ impl LyraReaderDocument {
             backup_path: report
                 .backup_path
                 .map(|path| path.to_string_lossy().into_owned()),
-            cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
+            cleaned_temporary_files: lyra_reader_core::saturating_u32(report.cleaned_temporaries),
             source_bytes_preserved: report.source_bytes_preserved,
         })
     }
@@ -2869,7 +4646,8 @@ impl LyraReaderDocument {
         mode: SaveMode,
     ) -> Result<PropertiesSaveReport, LyraReaderFfiError> {
         // In-place property writing is refused; a properties **copy** is a new file and is
-        // allowed (and stripped of signature material).
+        // allowed (and stripped of signature material). An XFA form allows neither.
+        self.ensure_not_xfa()?;
         if mode == SaveMode::ReplaceOriginal {
             self.ensure_writable()?;
         }
@@ -2897,19 +4675,22 @@ impl LyraReaderDocument {
             backup_path: report
                 .backup_path
                 .map(|path| path.to_string_lossy().into_owned()),
-            cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
+            cleaned_temporary_files: lyra_reader_core::saturating_u32(report.cleaned_temporaries),
             source_bytes_preserved: report.source_bytes_preserved,
         })
     }
 
     fn ai_page(&self, page: u32) -> Result<(String, Vec<PageChar>), LyraReaderFfiError> {
-        if page >= self.backend.page_count() {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                message: format!("page {page} is outside the document"),
-            });
-        }
+        let page_count = self.backend.page_count();
+        lyra_reader_core::checked_page_index(page, page_count, |page| {
+            LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
+                message: lyra_reader_core::page_out_of_range_message(page, page_count),
+            }
+        })?;
         if let Some(cached) = self
             .ai_text
+            // Pure cache (immutable entries keyed by page): poisoning can only cost a miss.
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&page)
@@ -2938,16 +4719,43 @@ impl LyraReaderDocument {
             .collect();
         let text = text_of(&raw);
         self.ai_text
+            // Pure cache (immutable entries keyed by page): poisoning can only cost a miss.
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(page, (text.clone(), chars.clone()));
         Ok((text, chars))
     }
 
+    /// Refuses a rewrite when the annotation scan found content it could not decode.
+    ///
+    /// The shell has the same sentence on its copy button: rewriting around an annotation this
+    /// engine could not read would drop somebody else's content. The engine enforces it too, so
+    /// a caller that skipped the status check cannot lose the annotation.
+    fn annotation_write_gate(&self) -> Result<(), LyraReaderFfiError> {
+        let (_, status) = self.annotation_scan()?;
+        if status.unreadable_annotations == 0 {
+            return Ok(());
+        }
+        let pages = status
+            .pages
+            .iter()
+            .map(|page| (page + 1).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = format!(
+            "saving annotations is blocked because {} annotation(s) on page(s) {pages} could not be read; saving would drop them",
+            status.unreadable_annotations
+        );
+        Err(
+            lyra_reader_core::LyraReaderError::new(ErrorCode::ReadOnly, message)
+                .with_detail(status.details.join("; "))
+                .into(),
+        )
+    }
+
     // The result of merging three independent write-back features (annotations, edits/deletes,
-    // bookmarks) into one verified save: one argument per record list, plus the destination,
-    // zoom and mode. Splitting it would only move the same values into a struct.
-    #[allow(clippy::too_many_arguments)]
+    // bookmarks) into one verified save: one argument per record list, plus the destination and
+    // mode. Splitting it would only move the same values into a struct.
     fn save_annotations_to(
         &self,
         destination: std::path::PathBuf,
@@ -2955,47 +4763,50 @@ impl LyraReaderDocument {
         bookmarks: Vec<WriteBookmarkRecord>,
         updates: Vec<AnnotationUpdateRecord>,
         deletions: Vec<AnnotationDeleteRecord>,
-        zoom: f64,
         mode: SaveMode,
     ) -> Result<AnnotationSaveReport, LyraReaderFfiError> {
         // A copy writes a new file and is allowed for a signed document. Replacing the original
         // would invalidate the signature, so it is refused here; the copy is then stripped of
-        // the signature material it would otherwise carry.
+        // the signature material it would otherwise carry. An XFA form allows neither.
+        self.ensure_not_xfa()?;
+        // A document with an annotation the reader could not decode must not be rewritten:
+        // the unknown content would be dropped. This is the engine half of the shell's
+        // "annotation writes blocked" state; it also covers callers that never read the status.
+        self.annotation_write_gate()?;
         if mode == SaveMode::ReplaceOriginal {
             self.ensure_writable()?;
         }
         if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
             return Err(LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
                 message: "the document was replaced on disk; reopen it before saving again"
                     .to_string(),
             });
         }
-        if self.backend.is_encrypted() {
-            return Err(LyraReaderFfiError::Document {
+        if self.backend.needs_password() {
+            return Err(LyraReaderFfiError::Document { severity: ErrorSeverity::Document,
                 message:
                     "this document is encrypted; saving annotations or bookmarks into it is not supported yet"
                         .to_string(),
             });
         }
-        if !(zoom.is_finite() && zoom > 0.0 && zoom <= 64.0) {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                message: format!("zoom must be positive, finite and at most 64, got {zoom}"),
-            });
-        }
         let page_count = self.backend.page_count();
+        // One rule set with the outline writer and the shell's creation-time check.
+        let bookmark_limits: Vec<annotation_rules::BookmarkSpec<'_>> = bookmarks
+            .iter()
+            .map(|record| annotation_rules::BookmarkSpec {
+                id: &record.id,
+                page: i64::from(record.page),
+                title: &record.title,
+                y_pt: record.y_pt,
+            })
+            .collect();
+        annotation_rules::validate_bookmarks(&bookmark_limits, page_count as usize)
+            .map_err(annotation_rule_error)?;
         let mut geometries: std::collections::HashMap<u32, PageGeometry> =
             std::collections::HashMap::new();
         let mut bookmark_specs = Vec::with_capacity(bookmarks.len());
         for record in bookmarks {
-            if record.page >= page_count {
-                return Err(LyraReaderFfiError::InvalidArgument {
-                    message: format!(
-                        "bookmark {:?} names page {}, but the document has {page_count} page(s)",
-                        record.id,
-                        record.page + 1
-                    ),
-                });
-            }
             bookmark_specs.push(WriteBookmark {
                 id: record.id,
                 page: PageIndex(record.page),
@@ -3005,21 +4816,12 @@ impl LyraReaderDocument {
         }
         let mut additions = Vec::with_capacity(annotations.len());
         for record in &annotations {
-            additions.push(self.convert_write_annotation(
-                record,
-                page_count,
-                zoom,
-                &mut geometries,
-            )?);
+            additions.push(self.convert_write_annotation(record, page_count, &mut geometries)?);
         }
         let mut changed = Vec::with_capacity(updates.len());
         for update in &updates {
-            let values = self.convert_write_annotation(
-                &update.annotation,
-                page_count,
-                zoom,
-                &mut geometries,
-            )?;
+            let values =
+                self.convert_write_annotation(&update.annotation, page_count, &mut geometries)?;
             changed.push(lyra_reader_pdfium::AnnotationUpdate {
                 target: update.target.clone(),
                 values,
@@ -3061,16 +4863,18 @@ impl LyraReaderDocument {
             backup_path: report
                 .backup_path
                 .map(|path| path.to_string_lossy().into_owned()),
-            preexisting_annotation_count: u32::try_from(report.preexisting_annotation_count)
-                .unwrap_or(u32::MAX),
+            preexisting_annotation_count: lyra_reader_core::saturating_u32(
+                report.preexisting_annotation_count,
+            ),
             written_bookmark_ids: report.written_bookmark_ids,
             bookmark_outline_title: report.bookmark_outline_title,
-            preexisting_outline_entry_count: u32::try_from(report.preexisting_outline_entry_count)
-                .unwrap_or(u32::MAX),
-            cleaned_temporary_files: u32::try_from(report.cleaned_temporaries).unwrap_or(u32::MAX),
+            preexisting_outline_entry_count: lyra_reader_core::saturating_u32(
+                report.preexisting_outline_entry_count,
+            ),
+            cleaned_temporary_files: lyra_reader_core::saturating_u32(report.cleaned_temporaries),
             deleted_file_ids: report.deleted_ids,
-            deleted_reply_count: u32::try_from(report.deleted_reply_count).unwrap_or(u32::MAX),
-            deleted_popup_count: u32::try_from(report.deleted_popup_count).unwrap_or(u32::MAX),
+            deleted_reply_count: lyra_reader_core::saturating_u32(report.deleted_reply_count),
+            deleted_popup_count: lyra_reader_core::saturating_u32(report.deleted_popup_count),
             assigned_names: report.assigned_names,
             source_bytes_preserved: report.source_bytes_preserved,
             full_rewrite: report.full_rewrite,
@@ -3079,26 +4883,28 @@ impl LyraReaderDocument {
 
     /// Converts one shell write record into the page-space annotation the writer expects.
     ///
-    /// Geometry crosses the FFI in view space at `zoom`, exactly what the canvas draws; the page
-    /// geometry inverts that once, so a mark saved at 100% and the same mark saved at 300% land
-    /// in the same PDF coordinates. Split out of the save loop so an edit and an addition go
-    /// through exactly the same conversion.
+    /// Geometry crosses the FFI in page-local view space at 100%, the same convention the cache
+    /// stores and [`Self::annotations`] reports. The page geometry is inverted exactly once, so
+    /// the shell neither multiplies nor divides by its canvas zoom to cross the boundary. Split
+    /// out of the save loop so an edit and an addition go through exactly the same conversion.
     fn convert_write_annotation(
         &self,
         record: &WriteAnnotationRecord,
         page_count: u32,
-        zoom: f64,
         geometries: &mut std::collections::HashMap<u32, PageGeometry>,
     ) -> Result<WriteAnnotation, LyraReaderFfiError> {
-        if record.page >= page_count {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                message: format!(
-                    "annotation {:?} names page {}, but the document has {page_count} page(s)",
-                    record.id,
-                    record.page + 1
-                ),
-            });
-        }
+        annotation_rules::validate_page(&record.id, i64::from(record.page), page_count as usize)
+            .map_err(annotation_rule_error)?;
+        // The text/opacity/date limits the write-back used to discover later; refused here with
+        // the same sentence the shell now uses at creation.
+        annotation_rules::validate_opacity(&record.id, record.opacity)
+            .map_err(annotation_rule_error)?;
+        annotation_rules::validate_note(&record.id, &record.contents)
+            .map_err(annotation_rule_error)?;
+        annotation_rules::validate_author(&record.id, &record.author)
+            .map_err(annotation_rule_error)?;
+        annotation_rules::validate_pdf_date(&record.id, &record.modified)
+            .map_err(annotation_rule_error)?;
         let geometry = match geometries.get(&record.page) {
             Some(geometry) => *geometry,
             None => {
@@ -3109,8 +4915,9 @@ impl LyraReaderDocument {
         };
         let inverse =
             geometry
-                .view_to_page(zoom)
+                .view_to_page(1.0)
                 .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
+                    severity: ErrorSeverity::Document,
                     message: format!("page {} has no invertible geometry", record.page + 1),
                 })?;
         let quads = record
@@ -3120,11 +4927,7 @@ impl LyraReaderDocument {
             .collect::<Result<Vec<_>, _>>()?;
         let supplied_rect = view_box_to_page_rect(&record.rect, inverse, &geometry)?;
         let geometry_border = |id: &str, width: f64| -> Result<f64, LyraReaderFfiError> {
-            if !width.is_finite() || width <= 0.0 || width > 200.0 {
-                return Err(LyraReaderFfiError::InvalidArgument {
-                    message: format!("annotation {id:?} has a border width outside 0…200 pt"),
-                });
-            }
+            annotation_rules::validate_border_width(id, width).map_err(annotation_rule_error)?;
             Ok(width)
         };
         let view_point = |point: &AnnotationPoint| -> Point {
@@ -3144,29 +4947,15 @@ impl LyraReaderDocument {
                     AnnotationAlignment::Left,
                 ),
                 AnnotationWriteKind::FreeText => {
-                    if !record.font_size_pt.is_finite()
-                        || record.font_size_pt < 1.0
-                        || record.font_size_pt > 400.0
-                    {
-                        return Err(LyraReaderFfiError::InvalidArgument {
-                            message: format!(
-                                "annotation {:?} has a font size outside 1…400 pt",
-                                record.id
-                            ),
-                        });
-                    }
+                    annotation_rules::validate_font_size(&record.id, record.font_size_pt)
+                        .map_err(annotation_rule_error)?;
+                    annotation_rules::validate_alignment(&record.id, &record.text_alignment)
+                        .map_err(annotation_rule_error)?;
                     let alignment = match record.text_alignment.as_str() {
                         "left" => AnnotationAlignment::Left,
                         "center" => AnnotationAlignment::Center,
                         "right" => AnnotationAlignment::Right,
-                        other => {
-                            return Err(LyraReaderFfiError::InvalidArgument {
-                                message: format!(
-                                    "annotation {:?} has an alignment {other:?}; expected left, center or right",
-                                    record.id
-                                ),
-                            });
-                        }
+                        _ => unreachable!("validated above"),
                     };
                     (
                         WriteAnnotationKind::FreeText,
@@ -3182,9 +4971,11 @@ impl LyraReaderDocument {
                 }
                 AnnotationWriteKind::Highlight
                 | AnnotationWriteKind::Underline
-                | AnnotationWriteKind::StrikeOut => {
+                | AnnotationWriteKind::StrikeOut
+                | AnnotationWriteKind::Squiggly => {
                     if quads.is_empty() {
                         return Err(LyraReaderFfiError::InvalidArgument {
+                            severity: ErrorSeverity::Document,
                             message: format!("annotation {:?} has no quads to write", record.id),
                         });
                     }
@@ -3194,6 +4985,7 @@ impl LyraReaderDocument {
                     }
                     if !rects_close(union, supplied_rect) {
                         return Err(LyraReaderFfiError::InvalidArgument {
+                            severity: ErrorSeverity::Document,
                             message: format!(
                                 "annotation {:?} has a rect that does not cover its quads",
                                 record.id
@@ -3204,6 +4996,7 @@ impl LyraReaderDocument {
                         AnnotationWriteKind::Highlight => WriteAnnotationKind::Highlight,
                         AnnotationWriteKind::Underline => WriteAnnotationKind::Underline,
                         AnnotationWriteKind::StrikeOut => WriteAnnotationKind::StrikeOut,
+                        AnnotationWriteKind::Squiggly => WriteAnnotationKind::Squiggly,
                         _ => unreachable!("handled by the outer match"),
                     };
                     (
@@ -3221,6 +5014,7 @@ impl LyraReaderDocument {
                 AnnotationWriteKind::Ink => {
                     if record.ink_paths.is_empty() {
                         return Err(LyraReaderFfiError::InvalidArgument {
+                            severity: ErrorSeverity::Document,
                             message: format!(
                                 "ink annotation {:?} has no strokes to write",
                                 record.id
@@ -3268,6 +5062,7 @@ impl LyraReaderDocument {
                     let border = geometry_border(&record.id, record.border_width_pt)?;
                     let (Some(start), Some(end)) = (record.line_start, record.line_end) else {
                         return Err(LyraReaderFfiError::InvalidArgument {
+                            severity: ErrorSeverity::Document,
                             message: format!(
                                 "line annotation {:?} has no endpoints to write",
                                 record.id
@@ -3290,22 +5085,10 @@ impl LyraReaderDocument {
                     )
                 }
                 AnnotationWriteKind::Stamp => {
-                    if record.contents.trim().is_empty() {
-                        return Err(LyraReaderFfiError::InvalidArgument {
-                            message: format!("stamp annotation {:?} has no text", record.id),
-                        });
-                    }
-                    if !matches!(
-                        record.stamp_style.as_str(),
-                        "approved" | "reviewed" | "draft" | "confidential" | "date" | "custom"
-                    ) {
-                        return Err(LyraReaderFfiError::InvalidArgument {
-                            message: format!(
-                                "stamp annotation {:?} has an unknown style {:?}",
-                                record.id, record.stamp_style
-                            ),
-                        });
-                    }
+                    annotation_rules::validate_stamp_text(&record.id, &record.contents)
+                        .map_err(annotation_rule_error)?;
+                    annotation_rules::validate_stamp_style(&record.id, &record.stamp_style)
+                        .map_err(annotation_rule_error)?;
                     (
                         WriteAnnotationKind::Stamp,
                         supplied_rect,
@@ -3321,37 +5104,20 @@ impl LyraReaderDocument {
                 AnnotationWriteKind::Signature => {
                     if !record.contents.is_empty() {
                         return Err(LyraReaderFfiError::InvalidArgument {
+                            severity: ErrorSeverity::Document,
                             message: format!(
                                 "signature annotation {:?} must not carry text",
                                 record.id
                             ),
                         });
                     }
-                    if record.signature_width == 0
-                        || record.signature_height == 0
-                        || record.signature_width > 8192
-                        || record.signature_height > 8192
-                    {
-                        return Err(LyraReaderFfiError::InvalidArgument {
-                            message: format!(
-                                "signature annotation {:?} has dimensions {}×{}; the limit is 8192 on a side",
-                                record.id, record.signature_width, record.signature_height
-                            ),
-                        });
-                    }
-                    let expected =
-                        record.signature_width as usize * record.signature_height as usize * 4;
-                    if record.signature_rgba.len() != expected {
-                        return Err(LyraReaderFfiError::InvalidArgument {
-                            message: format!(
-                                "signature annotation {:?} has {} RGBA byte(s); {}×{} needs {expected}",
-                                record.id,
-                                record.signature_rgba.len(),
-                                record.signature_width,
-                                record.signature_height
-                            ),
-                        });
-                    }
+                    annotation_rules::validate_signature_dimensions(
+                        &record.id,
+                        record.signature_width,
+                        record.signature_height,
+                        record.signature_rgba.len(),
+                    )
+                    .map_err(annotation_rule_error)?;
                     (
                         WriteAnnotationKind::Signature,
                         supplied_rect,
@@ -3415,7 +5181,11 @@ impl LyraReaderDocument {
 
         let sizes = self.page_sizes();
         let placements = Arc::new(DocumentLayout::new_with_mode(
-            sizes.iter().copied(),
+            // Unknown pages keep the historical fallback here so existing documents scroll
+            // exactly as before. The placement record below still reports them as unknown.
+            sizes
+                .iter()
+                .map(|size| size.unwrap_or(UNKNOWN_LAYOUT_PAGE_SIZE)),
             gap_pt,
             layout.session(),
         ));
@@ -3426,8 +5196,8 @@ impl LyraReaderDocument {
         placements
     }
 
-    /// Page sizes in points, computed once and cached.
-    fn page_sizes(&self) -> Vec<(f64, f64)> {
+    /// Page sizes in points, measured lazily on the first layout/raster request.
+    fn page_sizes(&self) -> CachedPageSizes {
         if let Ok(cache) = self.page_sizes.lock()
             && let Some(sizes) = cache.as_ref()
         {
@@ -3435,17 +5205,20 @@ impl LyraReaderDocument {
         }
 
         let count = self.backend.page_count();
-        let mut sizes = Vec::with_capacity(count as usize);
-        for index in 0..count {
-            let size = self
-                .backend
-                .page_info(PageIndex(index))
-                .map(|info| {
-                    let view = info.geometry.view_size(1.0);
-                    (view.width, view.height)
-                })
-                .unwrap_or((612.0, 792.0)); // US Letter as a safe fallback
-            sizes.push(size);
+        let sizes = collect_page_sizes(count, |index| {
+            let info = self.backend.page_info(PageIndex(index))?;
+            let view = info.geometry.view_size(1.0);
+            Ok((view.width, view.height))
+        });
+        let unknown = sizes.iter().filter(|size| size.is_none()).count();
+        if unknown > 0 {
+            // Once per document: the size list is cached, and the fallback is applied by the
+            // shell. Logging every layout would repeat the same fact on every scroll frame.
+            eprintln!(
+                "lyra-reader-ffi: {unknown} of {count} page(s) in {} have no measurable size; \
+                 their placement records report an unknown size (layout keeps the historical fallback)",
+                self.path,
+            );
         }
 
         if let Ok(mut cache) = self.page_sizes.lock() {
@@ -3593,7 +5366,7 @@ impl LyraReaderDocument {
     /// The cache state for this document, for checks and measurements.
     ///
     /// Calling this first performs the one cache lookup (hashing the PDF and reading the
-    /// sidecar); it does not build any index component. `derived_parts` then says how much work
+    /// index cache); it does not build any index component. `derived_parts` then says how much work
     /// the following accessors actually did.
     pub fn index_cache_report(&self) -> IndexCacheReport {
         self.ensure_index_loaded();
@@ -3630,11 +5403,12 @@ impl LyraReaderDocument {
         }
     }
 
-    /// Looks the sidecar up once and, on a hit, fills every in-memory index component with it.
+    /// Looks the index cache up once and, on a hit, fills every in-memory index component with it.
     ///
-    /// Lazy by design: opening a document never hashes the file or reads the cache, so the page
-    /// raster and the first paint do not wait for the index. The shell's background loaders are
-    /// what call the accessors that reach this point.
+    /// Lazy with respect to the **cache file**: opening reads the bytes to compute the document
+    /// identity (the shell needs it for every cache), but does not read or validate the index
+    /// cache, so the first paint does not wait for the cache lookup. The shell's background
+    /// loaders are what call the accessors that reach this point.
     fn ensure_index_loaded(&self) {
         let mut runtime = match self.index.lock() {
             Ok(runtime) => runtime,
@@ -3645,7 +5419,7 @@ impl LyraReaderDocument {
         }
         runtime.attempted = true;
 
-        let path = cache_path(Path::new(&self.path));
+        let path = crate::index_cache::cache_path_for_key(self.document_id.key());
         runtime.cache_path = Some(path.clone());
         if self.replaced.load(std::sync::atomic::Ordering::Acquire) {
             // The file on disk is no longer the file the backend parsed. A cache bound to
@@ -3664,22 +5438,27 @@ impl LyraReaderDocument {
         }
 
         let started = Instant::now();
-        let identity = match ContentIdentity::of(Path::new(&self.path)) {
-            Ok(identity) => identity,
-            Err(error) => {
-                runtime.outcome = IndexCacheOutcome::Unreadable;
-                runtime.write_disabled = true;
-                runtime.write_error = Some(format!("could not hash the PDF: {error}"));
-                runtime.validation = started.elapsed();
-                return;
-            }
-        };
+        let identity = self.document_id.content.clone();
+        runtime.identity = Some(identity.clone());
+
+        // The new key is authoritative. When it has no file, an older build's path-only cache
+        // is read and a hit is copied forward; the old file is left in place so a downgrade (or
+        // a user inspecting it) still has the cache it wrote. Reading the legacy file also
+        // preserves the "stale cache" outcome after an in-place byte change: the new key is
+        // missing, the old path still holds the previous bytes' values, and `read_cache` says
+        // `Stale` rather than silently claiming there was never a cache.
+        let legacy = crate::index_cache::legacy_cache_path(Path::new(&self.path));
+        let read = crate::index_cache::read_cache_with_migration(
+            &path,
+            &legacy,
+            &identity,
+            self.backend.page_count(),
+        );
         runtime.cache_bytes = std::fs::metadata(&path)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
-        runtime.identity = Some(identity.clone());
 
-        match read_cache(&path, &identity, self.backend.page_count()) {
+        match read {
             CacheRead::Hit(file) => {
                 let IndexCacheFile {
                     outline,
@@ -3852,6 +5631,13 @@ impl LyraReaderDocument {
         match write_cache(&path, &file) {
             Ok(bytes) => {
                 runtime.cache_bytes = bytes;
+                // Keep the historical path-only file in step. It is not read when the new key
+                // exists; it is the anchor that makes a later byte change report `Stale` and
+                // that a downgrade can still use. A failure to mirror is not a document failure.
+                let legacy = crate::index_cache::legacy_cache_path(Path::new(&self.path));
+                if legacy != path {
+                    let _ = write_cache(&legacy, &file);
+                }
                 eprintln!(
                     "lyra-reader-index: wrote {} ({} bytes, {:.1} ms)",
                     path.display(),
@@ -3863,7 +5649,8 @@ impl LyraReaderDocument {
                 runtime.write_disabled = true;
                 runtime.write_error = Some(error.to_string());
                 eprintln!(
-                    "lyra-reader-index: cache not writable beside the PDF ({error}); continuing with the in-memory index"
+                    "lyra-reader-index: cache not writable at {} ({error}); continuing with the in-memory index",
+                    path.display()
                 );
             }
         }
@@ -3974,6 +5761,8 @@ pub struct StampRecord {
 pub struct AnnotationRecord {
     /// Page the annotation is on (0-based).
     pub page: u32,
+    /// The reader-facing label for that page, from the one page formatter: `Page 4`.
+    pub page_label: String,
     /// The annotation's identity: `nm:<NM>` when the file names it, otherwise a stable
     /// fingerprint (`fp:<hex>`) of its dictionary. This is what `/IRT` entries name, and it is
     /// unique among the annotations this reader reports for one document.
@@ -4027,6 +5816,9 @@ pub struct AnnotationRecord {
     pub contents: Option<String>,
     /// `/T`.
     pub author: Option<String>,
+    /// The historical display string for `/M` (`YYYY-MM-DD HH:mm`, clock as written), or the
+    /// file's own string when it is not the PDF date shape. Computed by the one date parser.
+    pub display_date: Option<String>,
     /// `/M`, as the file writes it (`D:YYYYMMDDHHmmSS±HH'mm'`).
     pub modified: Option<String>,
     /// The font size `/DA` states for this annotation's text, in points; `None` when the file
@@ -4058,6 +5850,44 @@ pub struct AnnotationRecord {
     pub skip_reason: Option<String>,
     /// False when the file marks the annotation hidden/invisible/`/NoView`.
     pub visible: bool,
+    /// Whether this is one of the four text-markup kinds, as the one kind table states it.
+    pub is_markup: bool,
+    /// Whether this is drawn from page-space geometry rather than a text quad.
+    pub is_geometry: bool,
+    /// Whether this is a note (`/Text` or `/FreeText`), something to read rather than markup.
+    pub is_note: bool,
+    /// Whether the reader can move, resize, recolour or delete this annotation.
+    ///
+    /// This is the whole policy the shell used to re-derive: the kind half comes from the one
+    /// kind table, and the instance half (a reply, a hidden annotation, empty ink, a line with no
+    /// endpoints, an unreadable stamp picture, an annotation the reader does not draw) is applied
+    /// here so every surface asks one question.
+    pub editable: bool,
+    /// Why [`Self::editable`] is false; the reader-facing sentence.
+    pub unsupported_reason: Option<String>,
+}
+
+/// What a document-wide annotation read could not decode.
+///
+/// The readable annotations are still returned by [`LyraReaderDocument::annotations`]. This
+/// record is the explicit remainder: the shell shows a one-line notice and blocks writes that
+/// would rewrite around content the engine could not see.
+#[derive(Debug, Clone, Default, PartialEq, uniffi::Record)]
+pub struct AnnotationReadStatus {
+    /// Total annotations that could not be read, across all pages.
+    pub unreadable_annotations: u32,
+    /// Pages carrying at least one unreadable annotation (0-based, document order).
+    pub pages: Vec<u32>,
+    /// Human-readable reason per unreadable annotation, naming the page, slot and field when
+    /// the reader could diagnose it.
+    pub details: Vec<String>,
+}
+
+/// The cached result of one document-wide annotation scan.
+#[derive(Clone)]
+struct AnnotationScanCache {
+    records: Vec<AnnotationRecord>,
+    status: AnnotationReadStatus,
 }
 
 /// One point of an ink stroke or a line, in view space (points, top-left origin).
@@ -4090,9 +5920,9 @@ pub struct AnnotationColorRecord {
 /// The PDF annotation a pending write becomes.
 ///
 /// `Note` is a sticky note (`/Subtype /Text`): its `rect` is the icon box and its contents are
-/// the note. `Highlight`/`Underline`/`StrikeOut` are the quad-based text marks: their `quads`
-/// are the text boxes and `contents` is the comment attached to the mark (what the shell's
-/// `note` field is).
+/// the note. `Highlight`/`Underline`/`StrikeOut`/`Squiggly` are the quad-based text marks: their
+/// `quads` are the text boxes and `contents` is the comment attached to the mark (what the
+/// shell's `note` field is).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 #[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub enum AnnotationWriteKind {
@@ -4100,6 +5930,9 @@ pub enum AnnotationWriteKind {
     Underline,
     /// `/StrikeOut`: a line through the middle of the selected glyphs.
     StrikeOut,
+    /// `/Squiggly`: a mark beside the text. The shell does not create it, but a foreign file may
+    /// carry one and this writer can re-emit it with an appearance stream.
+    Squiggly,
     Note,
     /// `/FreeText`: text in `rect`, at `font_size_pt`, aligned by `text_alignment`, with
     /// `/DA` and an appearance stream.
@@ -4120,14 +5953,713 @@ pub enum AnnotationWriteKind {
     Signature,
 }
 
+/// One RGBA colour of the durable annotation cache (`#RRGGBBAA` in the file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct AnnotationRecordColor {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub alpha: u8,
+}
+
+/// One page-space point of a stored ink stroke or line.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct AnnotationRecordPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// One page-space rectangle of a stored shape, box or fixed quad.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct AnnotationRecordRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// One annotation as `annotations.json` stores it.
+///
+/// This mirrors the shell's `AppState.Annotation` field for field; `created_at` is seconds since
+/// 2001-01-01 because that is the number Foundation's `JSONEncoder` writes. The codec in
+/// `lyra-reader-edit` owns the file format; this record is only the boundary.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct CachedAnnotationRecord {
+    /// UUID text. The codec normalises it to the upper-case hyphenated shape Foundation writes.
+    pub id: String,
+    /// The `"kind"` value: `highlight`, `underline`, `strikeout`, `ink`, `square`, `circle`,
+    /// `line`, `arrow`, `stickyNote`, `textBox`, `stamp` or `signature`.
+    pub kind: String,
+    pub page: i64,
+    pub start: i64,
+    pub end: i64,
+    pub color: AnnotationRecordColor,
+    pub note: String,
+    /// Seconds since 2001-01-01 (Foundation's `Date` interval).
+    pub created_at: f64,
+    pub ink_paths: Vec<Vec<AnnotationRecordPoint>>,
+    pub shape_rect: Option<AnnotationRecordRect>,
+    pub line_start: Option<AnnotationRecordPoint>,
+    pub line_end: Option<AnnotationRecordPoint>,
+    pub stroke_width: f64,
+    pub font_size: f64,
+    pub file_identity: Option<String>,
+    pub file_quads: Option<Vec<AnnotationRecordRect>>,
+    pub text_alignment: Option<String>,
+    pub stamp_style: Option<String>,
+    /// The picture of an image signature, exactly the bytes the reader chose (PNG or JPEG).
+    pub image_data: Option<Vec<u8>>,
+}
+
+/// One user bookmark as `annotations.json` stores it.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct CachedBookmarkRecord {
+    pub id: String,
+    pub page: i64,
+    pub title: String,
+    /// Page-local Y in points, 0 at the top of the page.
+    pub y_pt: f64,
+    /// Seconds since 2001-01-01.
+    pub created_at: f64,
+}
+
+/// Where an entry came from, so a save can reproduce the file's original order.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum CachedAnnotationSlot {
+    Annotation {
+        id: String,
+    },
+    Bookmark {
+        id: String,
+    },
+    /// The verbatim JSON text of an entry this version does not understand.
+    Opaque {
+        raw: String,
+    },
+}
+
+/// A decoded `annotations.json`.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct CachedAnnotationContents {
+    pub annotations: Vec<CachedAnnotationRecord>,
+    pub bookmarks: Vec<CachedBookmarkRecord>,
+    pub slots: Vec<CachedAnnotationSlot>,
+    /// How many entries were preserved verbatim because this version cannot interpret them.
+    pub preserved_count: u32,
+}
+
+/// The flags every surface derives from one annotation kind.
+///
+/// This is the FFI projection of `lyra_reader_edit::kind`: the shell's display enum no longer
+/// computes `isGeometry`/`isTextMarkup`/… itself, and the write-request mapping is a field rather
+/// than a second `switch`.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct AnnotationKindFlagsRecord {
+    /// The stable table key: the cache kind name (`highlight` … `signature`).
+    pub kind: String,
+    /// The `"kind"` value written to the cache, when this kind can be stored there.
+    pub record_kind: Option<String>,
+    /// The name the PDF reader reports (`text`, `freeText`, `arrow`, …).
+    pub document_kind: String,
+    /// The write request this kind becomes, when this build can write it.
+    pub write_kind: Option<AnnotationWriteKind>,
+    pub is_markup: bool,
+    /// The shell's text-markup creation predicate (it excludes `squiggly`).
+    pub is_text_markup: bool,
+    pub is_geometry: bool,
+    pub is_note: bool,
+    pub is_placed_text: bool,
+    pub is_stamp_artwork: bool,
+    pub is_placement: bool,
+    /// `markup`, `noteIcon`, `freeText`, `geometry`, `stamp` or `skipped`.
+    pub drawing: String,
+    /// The annotation-cache schema version written for this kind; `None` for text markup.
+    pub schema_version: Option<u32>,
+    pub in_records: bool,
+    /// The kind half of the file-annotation editability policy.
+    pub editable: bool,
+    /// Why a `squiggly` or an unmodelled subtype cannot be edited; instance reasons are applied
+    /// by [`AnnotationRecord::unsupported_reason`].
+    pub unsupported_reason: Option<String>,
+}
+
+/// The limits and defaults of the durable annotation model.
+///
+/// The shell reads these instead of restating them, so a change to a limit or a default is one
+/// Rust edit and both sides move together.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct AnnotationRulesRecord {
+    pub max_annotations: u32,
+    pub max_bookmarks: u32,
+    pub max_id_bytes: u32,
+    pub max_bookmark_title_bytes: u32,
+    pub max_note_bytes: u32,
+    pub max_author_bytes: u32,
+    pub max_stamp_text_bytes: u32,
+    pub max_quads: u32,
+    pub max_ink_paths: u32,
+    pub max_ink_points: u32,
+    pub max_stamp_image_side: u32,
+    pub max_border_width_pt: f64,
+    pub min_font_size_pt: f64,
+    pub max_font_size_pt: f64,
+    pub min_opacity: f64,
+    pub max_opacity: f64,
+    /// The record schema versions the cache writes.
+    pub geometry_version: u32,
+    pub placed_text_version: u32,
+    pub stamp_version: u32,
+    pub signature_version: u32,
+    /// The shell's creation defaults, in points.
+    pub default_stroke_width_pt: f64,
+    pub default_text_box_font_size_pt: f64,
+    pub sticky_note_width_pt: f64,
+    pub sticky_note_height_pt: f64,
+    pub default_stamp_width_pt: f64,
+    pub default_stamp_height_pt: f64,
+    pub default_signature_height_pt: f64,
+    pub default_picture_height_pt: f64,
+    pub min_text_box_width_pt: f64,
+    pub min_text_box_height_pt: f64,
+}
+
+fn annotation_rule_error(error: annotation_rules::RuleError) -> LyraReaderFfiError {
+    LyraReaderFfiError::InvalidArgument {
+        severity: ErrorSeverity::Document,
+        message: error.message,
+    }
+}
+
+fn taxonomy_write_kind(kind: TaxonomyWriteKind) -> AnnotationWriteKind {
+    match kind {
+        TaxonomyWriteKind::Highlight => AnnotationWriteKind::Highlight,
+        TaxonomyWriteKind::Underline => AnnotationWriteKind::Underline,
+        TaxonomyWriteKind::StrikeOut => AnnotationWriteKind::StrikeOut,
+        TaxonomyWriteKind::Squiggly => AnnotationWriteKind::Squiggly,
+        TaxonomyWriteKind::Note => AnnotationWriteKind::Note,
+        TaxonomyWriteKind::FreeText => AnnotationWriteKind::FreeText,
+        TaxonomyWriteKind::Ink => AnnotationWriteKind::Ink,
+        TaxonomyWriteKind::Square => AnnotationWriteKind::Square,
+        TaxonomyWriteKind::Circle => AnnotationWriteKind::Circle,
+        TaxonomyWriteKind::Line => AnnotationWriteKind::Line,
+        TaxonomyWriteKind::Stamp => AnnotationWriteKind::Stamp,
+        TaxonomyWriteKind::Signature => AnnotationWriteKind::Signature,
+    }
+}
+
+/// One read annotation's facts that the editability policy needs beyond its kind.
+struct AnnotationEditabilityInput<'a> {
+    kind: &'a str,
+    is_reply: bool,
+    visible: bool,
+    ink_paths_empty: bool,
+    line_missing: bool,
+    stamp_text_empty: bool,
+    stamp_has_image: bool,
+    stamp_image_error: Option<&'a str>,
+    drawing: AnnotationDrawing,
+}
+
+/// The whole file-annotation editability policy, in the shell's historical order and wording.
+fn document_editability(input: AnnotationEditabilityInput<'_>) -> (bool, Option<String>) {
+    let AnnotationEditabilityInput {
+        kind,
+        is_reply,
+        visible,
+        ink_paths_empty,
+        line_missing,
+        stamp_text_empty,
+        stamp_has_image,
+        stamp_image_error,
+        drawing,
+    } = input;
+    if is_reply {
+        return (
+            false,
+            Some(
+                "This is a reply. Edit or delete the annotation at the top of the thread; the \
+                 replies stay attached to it."
+                    .to_string(),
+            ),
+        );
+    }
+    if !visible {
+        return (
+            false,
+            Some("This annotation is hidden by the file (/F).".to_string()),
+        );
+    }
+    let kind = TaxonomyKind::from_document_kind(kind);
+    let (editable, reason) = kind.kind_editability();
+    if !editable {
+        return (editable, reason);
+    }
+    if kind == TaxonomyKind::Ink && ink_paths_empty {
+        return (
+            false,
+            Some("This ink annotation carries no /InkList to move or draw.".to_string()),
+        );
+    }
+    if kind == TaxonomyKind::Line && line_missing {
+        return (
+            false,
+            Some("This line annotation carries no /L endpoints.".to_string()),
+        );
+    }
+    if kind == TaxonomyKind::Stamp
+        && !stamp_has_image
+        && stamp_text_empty
+        && let Some(reason) = stamp_image_error
+    {
+        return (
+            false,
+            Some(format!(
+                "This stamp's picture could not be decoded ({reason}), so it can be deleted here \
+                 but not moved, resized or edited."
+            )),
+        );
+    }
+    if matches!(drawing, AnnotationDrawing::Skipped(_)) {
+        return (
+            false,
+            Some("This annotation is not drawn by the reader.".to_string()),
+        );
+    }
+    (true, None)
+}
+
+fn kind_flags_record(kind: &TaxonomyKind) -> AnnotationKindFlagsRecord {
+    let flags = kind.flags();
+    let (editable, unsupported_reason) = kind.kind_editability();
+    AnnotationKindFlagsRecord {
+        kind: kind
+            .record_name()
+            .unwrap_or(kind.document_name())
+            .to_string(),
+        record_kind: kind.record_name().map(str::to_string),
+        document_kind: kind.document_name().to_string(),
+        write_kind: flags.write_kind.map(taxonomy_write_kind),
+        is_markup: flags.is_markup,
+        is_text_markup: flags.is_text_markup,
+        is_geometry: flags.is_geometry,
+        is_note: flags.is_note,
+        is_placed_text: flags.is_placed_text,
+        is_stamp_artwork: flags.is_stamp_artwork,
+        is_placement: flags.is_placement,
+        drawing: flags.drawing.as_str().to_string(),
+        schema_version: flags.schema_version,
+        in_records: flags.in_records,
+        editable,
+        unsupported_reason,
+    }
+}
+
+/// The one kind table: every kind the durable model can store.
+///
+/// The shell builds its `Annotation.Kind` flag lookups from this once; nothing re-derives
+/// `isGeometry`, `isTextMarkup` or the write-request mapping. The row order and key set are
+/// `AnnotationKind::RECORD_KINDS`, so this projection cannot grow a second list of kind names.
+#[uniffi::export]
+pub fn annotation_kind_flags() -> Vec<AnnotationKindFlagsRecord> {
+    TaxonomyKind::RECORD_KINDS
+        .iter()
+        .map(kind_flags_record)
+        .collect()
+}
+
+/// The kind table for a PDF annotation's reported kind (`text`, `freeText`, `squiggly`, …).
+#[uniffi::export]
+pub fn document_annotation_kind_flags(kind: String) -> AnnotationKindFlagsRecord {
+    kind_flags_record(&TaxonomyKind::from_document_kind(&kind))
+}
+
+/// The limits and defaults of the durable annotation model.
+#[uniffi::export]
+pub fn annotation_rules() -> AnnotationRulesRecord {
+    AnnotationRulesRecord {
+        max_annotations: annotation_rules::MAX_ANNOTATIONS as u32,
+        max_bookmarks: annotation_rules::MAX_BOOKMARKS as u32,
+        max_id_bytes: annotation_rules::MAX_ID_BYTES as u32,
+        max_bookmark_title_bytes: annotation_rules::MAX_BOOKMARK_TITLE_BYTES as u32,
+        max_note_bytes: annotation_rules::MAX_NOTE_BYTES as u32,
+        max_author_bytes: annotation_rules::MAX_AUTHOR_BYTES as u32,
+        max_stamp_text_bytes: annotation_rules::MAX_STAMP_TEXT_BYTES as u32,
+        max_quads: annotation_rules::MAX_QUADS as u32,
+        max_ink_paths: annotation_rules::MAX_INK_PATHS as u32,
+        max_ink_points: annotation_rules::MAX_INK_POINTS as u32,
+        max_stamp_image_side: annotation_rules::MAX_STAMP_IMAGE_SIDE,
+        max_border_width_pt: annotation_rules::MAX_BORDER_WIDTH_PT,
+        min_font_size_pt: annotation_rules::MIN_FONT_SIZE_PT,
+        max_font_size_pt: annotation_rules::MAX_FONT_SIZE_PT,
+        min_opacity: annotation_rules::MIN_OPACITY,
+        max_opacity: annotation_rules::MAX_OPACITY,
+        geometry_version: 1,
+        placed_text_version: 1,
+        stamp_version: 1,
+        signature_version: 1,
+        default_stroke_width_pt: 2.0,
+        default_text_box_font_size_pt: 14.0,
+        sticky_note_width_pt: 22.0,
+        sticky_note_height_pt: 22.0,
+        default_stamp_width_pt: 150.0,
+        default_stamp_height_pt: 50.0,
+        default_signature_height_pt: 64.0,
+        default_picture_height_pt: 140.0,
+        min_text_box_width_pt: 24.0,
+        min_text_box_height_pt: 24.0,
+    }
+}
+
+/// `/CA` as the reader draws it: a malformed opacity becomes the nearest legal one.
+#[uniffi::export]
+pub fn clamp_annotation_opacity(opacity: f64) -> f64 {
+    annotation_rules::clamp_opacity(opacity)
+}
+
+#[uniffi::export]
+pub fn clamp_annotation_border_width(width: f64) -> f64 {
+    annotation_rules::clamp_border_width(width)
+}
+
+#[uniffi::export]
+pub fn clamp_annotation_font_size(size: f64) -> f64 {
+    annotation_rules::clamp_font_size(size)
+}
+
+fn edit_color(color: AnnotationRecordColor) -> annotation_records::PaletteColor {
+    annotation_records::PaletteColor::new(color.red, color.green, color.blue, color.alpha)
+}
+
+fn cached_color(color: annotation_records::PaletteColor) -> AnnotationRecordColor {
+    AnnotationRecordColor {
+        red: color.red,
+        green: color.green,
+        blue: color.blue,
+        alpha: color.alpha,
+    }
+}
+
+fn edit_point(point: AnnotationRecordPoint) -> annotation_records::StoredPoint {
+    annotation_records::StoredPoint::new(point.x, point.y)
+}
+
+fn cached_point(point: annotation_records::StoredPoint) -> AnnotationRecordPoint {
+    AnnotationRecordPoint {
+        x: point.x,
+        y: point.y,
+    }
+}
+
+fn edit_rect(rect: AnnotationRecordRect) -> annotation_records::StoredRect {
+    annotation_records::StoredRect::new(rect.x, rect.y, rect.width, rect.height)
+}
+
+fn cached_rect(rect: annotation_records::StoredRect) -> AnnotationRecordRect {
+    AnnotationRecordRect {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+    }
+}
+
+fn edit_annotation_with_kind(
+    record: CachedAnnotationRecord,
+    kind: TaxonomyKind,
+) -> annotation_records::RecordAnnotation {
+    annotation_records::RecordAnnotation {
+        id: record.id,
+        kind,
+        page: record.page,
+        start: record.start,
+        end: record.end,
+        color: edit_color(record.color),
+        note: record.note,
+        created_at: record.created_at,
+        ink_paths: record
+            .ink_paths
+            .into_iter()
+            .map(|path| path.into_iter().map(edit_point).collect())
+            .collect(),
+        shape_rect: record.shape_rect.map(edit_rect),
+        line_start: record.line_start.map(edit_point),
+        line_end: record.line_end.map(edit_point),
+        stroke_width: record.stroke_width,
+        font_size: record.font_size,
+        file_identity: record.file_identity,
+        file_quads: record
+            .file_quads
+            .map(|quads| quads.into_iter().map(edit_rect).collect()),
+        text_alignment: record.text_alignment,
+        stamp_style: record.stamp_style,
+        image_data: record.image_data,
+    }
+}
+
+fn edit_annotation(
+    record: CachedAnnotationRecord,
+) -> Result<annotation_records::RecordAnnotation, LyraReaderFfiError> {
+    let kind = TaxonomyKind::from_record_kind(&record.kind).ok_or_else(|| {
+        LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
+            message: format!("unknown annotation-cache kind {:?}", record.kind),
+        }
+    })?;
+    Ok(edit_annotation_with_kind(record, kind))
+}
+
+fn cached_annotation(record: &annotation_records::RecordAnnotation) -> CachedAnnotationRecord {
+    CachedAnnotationRecord {
+        id: record.id.clone(),
+        kind: record.kind.record_name().unwrap_or("highlight").to_string(),
+        page: record.page,
+        start: record.start,
+        end: record.end,
+        color: cached_color(record.color),
+        note: record.note.clone(),
+        created_at: record.created_at,
+        ink_paths: record
+            .ink_paths
+            .iter()
+            .map(|path| path.iter().copied().map(cached_point).collect())
+            .collect(),
+        shape_rect: record.shape_rect.map(cached_rect),
+        line_start: record.line_start.map(cached_point),
+        line_end: record.line_end.map(cached_point),
+        stroke_width: record.stroke_width,
+        font_size: record.font_size,
+        file_identity: record.file_identity.clone(),
+        file_quads: record
+            .file_quads
+            .as_ref()
+            .map(|quads| quads.iter().copied().map(cached_rect).collect()),
+        text_alignment: record.text_alignment.clone(),
+        stamp_style: record.stamp_style.clone(),
+        image_data: record.image_data.clone(),
+    }
+}
+
+fn edit_bookmark(record: CachedBookmarkRecord) -> annotation_records::RecordBookmark {
+    annotation_records::RecordBookmark {
+        id: record.id,
+        page: record.page,
+        title: record.title,
+        y_pt: record.y_pt,
+        created_at: record.created_at,
+    }
+}
+
+fn cached_bookmark(record: &annotation_records::RecordBookmark) -> CachedBookmarkRecord {
+    CachedBookmarkRecord {
+        id: record.id.clone(),
+        page: record.page,
+        title: record.title.clone(),
+        y_pt: record.y_pt,
+        created_at: record.created_at,
+    }
+}
+
+fn edit_slot(slot: CachedAnnotationSlot) -> annotation_records::Slot {
+    match slot {
+        CachedAnnotationSlot::Annotation { id } => annotation_records::Slot::Annotation(id),
+        CachedAnnotationSlot::Bookmark { id } => annotation_records::Slot::Bookmark(id),
+        CachedAnnotationSlot::Opaque { raw } => annotation_records::Slot::Opaque(raw),
+    }
+}
+
+fn cached_slot(slot: &annotation_records::Slot) -> CachedAnnotationSlot {
+    match slot {
+        annotation_records::Slot::Annotation(id) => {
+            CachedAnnotationSlot::Annotation { id: id.clone() }
+        }
+        annotation_records::Slot::Bookmark(id) => CachedAnnotationSlot::Bookmark { id: id.clone() },
+        annotation_records::Slot::Opaque(raw) => CachedAnnotationSlot::Opaque { raw: raw.clone() },
+    }
+}
+
+/// Decodes `annotations.json` through the one Rust codec.
+///
+/// `page_count` is the open document's page count; `palette` is the shell's legacy highlight
+/// palette in order, which is how an older entry's `colorIndex` becomes a colour. The returned
+/// slots are the file's entry order, with foreign entries carrying their exact source text.
+#[uniffi::export]
+pub fn decode_annotation_cache(
+    data: Vec<u8>,
+    page_count: u32,
+    palette: Vec<AnnotationRecordColor>,
+) -> Result<CachedAnnotationContents, LyraReaderFfiError> {
+    let palette: Vec<_> = palette.into_iter().map(edit_color).collect();
+    let contents =
+        annotation_records::decode(&data, page_count as usize, &palette).map_err(|error| {
+            LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
+                message: error.detail,
+            }
+        })?;
+    Ok(CachedAnnotationContents {
+        annotations: contents.annotations.iter().map(cached_annotation).collect(),
+        bookmarks: contents.bookmarks.iter().map(cached_bookmark).collect(),
+        slots: contents.slots.iter().map(cached_slot).collect(),
+        preserved_count: contents.preserved_count() as u32,
+    })
+}
+
+/// Encodes `annotations.json` through the one Rust codec.
+///
+/// The output is byte-for-byte what the Swift encoder wrote before this moved: same key order,
+/// same two-space pretty printing, same `Date`/`UUID`/base64 shapes, and foreign entries spliced
+/// back exactly as they were read.
+#[uniffi::export]
+pub fn encode_annotation_cache(
+    annotations: Vec<CachedAnnotationRecord>,
+    bookmarks: Vec<CachedBookmarkRecord>,
+    slots: Vec<CachedAnnotationSlot>,
+    palette: Vec<AnnotationRecordColor>,
+) -> Result<Vec<u8>, LyraReaderFfiError> {
+    let annotations: Vec<_> = annotations
+        .into_iter()
+        .map(edit_annotation)
+        .collect::<Result<_, _>>()?;
+    let bookmarks: Vec<_> = bookmarks.into_iter().map(edit_bookmark).collect();
+    let slots: Vec<_> = slots.into_iter().map(edit_slot).collect();
+    let palette: Vec<_> = palette.into_iter().map(edit_color).collect();
+    annotation_records::encode(&annotations, &bookmarks, &slots, &palette).map_err(|error| {
+        LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
+            message: error.detail,
+        }
+    })
+}
+
+/// Whether one cached annotation's geometry is complete and finite.
+///
+/// `RecordAnnotation::has_valid_geometry` is the one implementation; the shell's
+/// `AppState.Annotation.hasValidGeometry` calls this instead of restating the thresholds. A cache
+/// kind this build does not know has no valid geometry: the shell's display enum cannot produce
+/// one, and a future kind must be added to the table before it can be considered valid.
+#[uniffi::export]
+pub fn cached_annotation_has_valid_geometry(annotation: CachedAnnotationRecord) -> bool {
+    match TaxonomyKind::from_record_kind(&annotation.kind) {
+        Some(kind) => edit_annotation_with_kind(annotation, kind).has_valid_geometry(),
+        None => false,
+    }
+}
+
+/// The creation-time validation of one cached annotation.
+///
+/// The shell calls this before it appends a new entry, so the limits that used to be discovered
+/// only when saving into the PDF are refused at creation with the same sentence. `existing_ids`
+/// are the annotations already in the cache (uniqueness is checked across them).
+#[uniffi::export]
+pub fn validate_cached_annotation(
+    annotation: CachedAnnotationRecord,
+    page_count: u32,
+    existing_ids: Vec<String>,
+) -> Result<(), LyraReaderFfiError> {
+    let annotation = edit_annotation(annotation)?;
+    annotation_rules::validate_annotation(&annotation, page_count as usize, &existing_ids).map_err(
+        |error| LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
+            message: error.message,
+        },
+    )
+}
+
+/// The creation-time validation of one cached bookmark, with the outline writer's rules.
+#[uniffi::export]
+pub fn validate_cached_bookmark(
+    bookmark: CachedBookmarkRecord,
+    page_count: u32,
+    existing_ids: Vec<String>,
+) -> Result<(), LyraReaderFfiError> {
+    let bookmark = edit_bookmark(bookmark);
+    annotation_rules::validate_bookmark(&bookmark, page_count as usize, &existing_ids).map_err(
+        |error| LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
+            message: error.message,
+        },
+    )
+}
+
+/// The creation/rename check for one bookmark title, with the writer's own sentence.
+///
+/// Renaming replaces exactly one stored field, so it asks the field's rule rather than the whole
+/// record: a bookmark already in the cache must not become unrenamable because some unrelated
+/// field would nowadays be refused.
+#[uniffi::export]
+pub fn validate_cached_bookmark_title(id: String, title: String) -> Result<(), LyraReaderFfiError> {
+    annotation_rules::validate_bookmark_title(&id, &title).map_err(annotation_rule_error)
+}
+
+/// The title a new bookmark stores: the reader's trimmed name, or the page's default label.
+///
+/// `page` is zero-based, like every stored bookmark page. The default is the same page label the
+/// sidebar shows, so an unnamed bookmark cannot be called two different things.
+#[uniffi::export]
+pub fn bookmark_title(name: Option<String>, page: i64) -> String {
+    match name.as_deref().map(|name| name.trim()) {
+        Some(title) if !title.is_empty() => title.to_string(),
+        _ => {
+            let page_number = page.saturating_add(1).clamp(0, i64::from(u32::MAX)) as u32;
+            crate::format::page_label(&[page_number])
+        }
+    }
+}
+
+/// Where a new bookmark lands in the reader's persisted order.
+///
+/// The list is the reader's manual order; a new mark is appended even when another mark is on
+/// the same page. The shell asks this instead of deciding an index, so the rule has one home.
+#[uniffi::export]
+pub fn bookmark_insertion_index(bookmarks: Vec<CachedBookmarkRecord>, page: i64, y_pt: f64) -> u32 {
+    let specs: Vec<annotation_rules::BookmarkSpec<'_>> = bookmarks
+        .iter()
+        .map(|bookmark| annotation_rules::BookmarkSpec {
+            id: &bookmark.id,
+            page: bookmark.page,
+            title: &bookmark.title,
+            y_pt: bookmark.y_pt,
+        })
+        .collect();
+    lyra_reader_core::saturating_u32(annotation_rules::bookmark_insertion_index(
+        &specs, page, y_pt,
+    ))
+}
+
+/// The index a Move Up/Down request lands on, clamped to the list rather than wrapped.
+#[uniffi::export]
+pub fn bookmark_move_index(index: u32, offset: i32, count: u32) -> u32 {
+    lyra_reader_core::saturating_u32(annotation_rules::moved_bookmark_index(
+        index as usize,
+        i64::from(offset),
+        count as usize,
+    ))
+}
+
+/// The `annotations.json` entry order after the bookmark list is reordered.
+///
+/// Bookmark slots keep their places around annotations and preserved foreign entries; a deleted
+/// bookmark's slot disappears and a bookmark adopted after load is appended.
+#[uniffi::export]
+pub fn reorder_bookmark_slots(
+    slots: Vec<CachedAnnotationSlot>,
+    ordered_ids: Vec<String>,
+) -> Vec<CachedAnnotationSlot> {
+    let slots: Vec<annotation_records::Slot> = slots.into_iter().map(edit_slot).collect();
+    annotation_rules::reorder_bookmark_slots(&slots, &ordered_ids)
+        .iter()
+        .map(cached_slot)
+        .collect()
+}
+
 /// One bookmark the shell asks the writer to put into the document's `/Outlines`.
 ///
-/// `y_pt` is page-local view space (0 at the page top), the same value the sidecar stores, so a
+/// `y_pt` is page-local view space (0 at the page top), the same value the annotation cache stores, so a
 /// bookmark survives a zoom change, a resize and a layout switch.
 #[derive(Debug, Clone, uniffi::Record)]
 #[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct WriteBookmarkRecord {
-    /// The sidecar bookmark's UUID string, written as the private `/LyraReaderID` key so a
+    /// The cached bookmark's UUID string, written as the private `/LyraReaderID` key so a
     /// reopened document can adopt the file's bookmarks with their identities intact.
     pub id: String,
     pub page: u32,
@@ -4137,25 +6669,27 @@ pub struct WriteBookmarkRecord {
 
 /// One annotation the shell asks the writer to put into a PDF.
 ///
-/// Geometry is **view space at `zoom`** (points, top-left origin), exactly the space the canvas
-/// draws in. The Rust side owns the single conversion into page space, so a highlight saved at
-/// 100% and the same highlight saved at 300% produce identical PDF coordinates.
+/// Geometry is **page-local view space at 100%** (points, top-left origin), the same convention
+/// [`AnnotationRecord`] reports and the annotation cache stores. The Rust side owns the single
+/// conversion into PDF page space, including `/CropBox`, `/Rotate` and `/UserUnit`; the shell
+/// does not multiply by its canvas zoom to cross the boundary.
 #[derive(Debug, Clone, uniffi::Record)]
 #[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct WriteAnnotationRecord {
-    /// Stable identity written as `/NM`; the shell uses the sidecar's UUID string so a saved
+    /// Stable identity written as `/NM`; the shell uses the cached annotation's UUID string so a saved
     /// annotation can be recognised after reopening.
     pub id: String,
     pub page: u32,
     pub kind: AnnotationWriteKind,
-    /// View-space box at `zoom`. For a note this is its icon; for markup the union of `quads`
-    /// is used and this box is validated for consistency.
+    /// Page-local view-space box at 100%. For a note this is its icon; for markup the union of
+    /// `quads` is used and this box is validated for consistency.
     pub rect: AnnotationQuad,
-    /// View-space `/QuadPoints` at `zoom`; empty for notes and for the stroked kinds.
+    /// Page-local view-space `/QuadPoints` at 100%; empty for notes and for the stroked kinds.
     pub quads: Vec<AnnotationQuad>,
-    /// View-space `/InkList` at `zoom`, one stroke per entry; only for [`AnnotationWriteKind::Ink`].
+    /// Page-local view-space `/InkList` at 100%, one stroke per entry; only for
+    /// [`AnnotationWriteKind::Ink`].
     pub ink_paths: Vec<Vec<AnnotationPoint>>,
-    /// View-space `/L` endpoints at `zoom`; required for [`AnnotationWriteKind::Line`].
+    /// Page-local view-space `/L` endpoints at 100%; required for [`AnnotationWriteKind::Line`].
     pub line_start: Option<AnnotationPoint>,
     pub line_end: Option<AnnotationPoint>,
     /// Write `/LE [/None /ClosedArrow]`; only meaningful for a line.
@@ -4215,7 +6749,7 @@ pub struct AnnotationDeleteRecord {
 }
 
 /// What a successful write did. Every value is about the *file that was written*, not about the
-/// request: `written_ids` comes back so the shell removes exactly those sidecar entries.
+/// request: `written_ids` comes back so the shell removes exactly those cached entries.
 #[derive(Debug, Clone, uniffi::Record)]
 #[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AnnotationSaveReport {
@@ -4229,7 +6763,7 @@ pub struct AnnotationSaveReport {
     /// Content annotations the source already had; every one the save did not edit or delete
     /// was verified unchanged.
     pub preexisting_annotation_count: u32,
-    /// Bookmark identities written into the outline, so the shell removes exactly those sidecar
+    /// Bookmark identities written into the outline, so the shell removes exactly those cached
     /// entries after a replacement.
     pub written_bookmark_ids: Vec<String>,
     /// Title of the rewritten bookmark subtree; `None` when the bookmark list was empty.
@@ -4256,67 +6790,218 @@ pub struct AnnotationSaveReport {
     pub full_rewrite: bool,
 }
 
-/// One rectangle the reader marked for redaction, in **view space** at 100% zoom (points,
-/// top-left origin). The engine converts it to PDF user space with the page's own crop box and
-/// rotation, so the same mark saved at any zoom lands on the same content.
-#[derive(Debug, Clone, Copy, uniffi::Record)]
-#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
-pub struct RedactionAreaRecord {
-    pub page: u32,
-    pub x_pt: f64,
-    pub y_pt: f64,
-    pub width_pt: f64,
-    pub height_pt: f64,
+/// A rectangle used by a content command.
+///
+/// `bounds` arrives in the shell's top-left view space; [`prepare_content_command`] converts it
+/// with the open page's own geometry before the engine sees it. `crop` is the exception: it is a
+/// normalized fraction of the image and is already independent of page space.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct ContentBoxRecord {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
-/// What one page would lose if the marks were applied.
-#[derive(Debug, Clone, uniffi::Record)]
-#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
-pub struct RedactionPagePreviewRecord {
-    pub page: u32,
-    pub characters: u32,
-    /// A short excerpt of the text under the marks (whitespace collapsed, at most ~220 chars).
-    pub text_preview: String,
-    /// Vector paths, images, shadings and form XObjects whose bounds intersect a mark.
-    pub graphics: u32,
+impl From<ContentBoxRecord> for lyra_reader_pdfium::content_edit::ContentBox {
+    fn from(value: ContentBoxRecord) -> Self {
+        Self {
+            x: value.x,
+            y: value.y,
+            width: value.width,
+            height: value.height,
+        }
+    }
 }
 
-/// What applying the marks would lose, for the confirmation dialog.
-#[derive(Debug, Clone, uniffi::Record)]
-#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
-pub struct RedactionPreviewRecord {
-    pub pages: Vec<RedactionPagePreviewRecord>,
-    pub removed_characters: u32,
+/// The shell's request to edit page content.
+///
+/// This is a typed, field-for-field mirror of [`lyra_reader_pdfium::content_edit::ContentCommand`].
+/// Every variant carries the source revision it was built against; the engine refuses a command
+/// whose revision does not match the page it inspected. `colour` is RGBA with four components,
+/// validated by [`content_command`] because UniFFI has no fixed-length array type. `alignment`
+/// stays the engine's integer form (0 left, 1 centre, 2 right), validated by the layout writer.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum ContentCommandRecord {
+    Transform {
+        revision: String,
+        target: String,
+        bounds: ContentBoxRecord,
+        /// Clockwise degrees in the shell's Y-down view space; the FFI negates it for PDF Y-up.
+        rotation: f64,
+    },
+    ReplaceText {
+        revision: String,
+        target: String,
+        text: String,
+        bounds: ContentBoxRecord,
+        font: String,
+        size: f64,
+        colour: Vec<u8>,
+        alignment: u8,
+    },
+    InsertText {
+        revision: String,
+        text: String,
+        bounds: ContentBoxRecord,
+        font: String,
+        size: f64,
+        colour: Vec<u8>,
+        alignment: u8,
+    },
+    Delete {
+        revision: String,
+        target: String,
+    },
+    Redact {
+        revision: String,
+        bounds: ContentBoxRecord,
+        blackout: bool,
+    },
+    InsertImage {
+        revision: String,
+        bounds: ContentBoxRecord,
+        image_path: String,
+    },
+    ReplaceImage {
+        revision: String,
+        target: String,
+        image_path: String,
+    },
+    CropImage {
+        revision: String,
+        target: String,
+        crop: ContentBoxRecord,
+    },
+    SetLink {
+        revision: String,
+        target: Option<String>,
+        bounds: ContentBoxRecord,
+        page: Option<u32>,
+        uri: Option<String>,
+    },
 }
 
-/// What one page lost when the redaction was applied.
-#[derive(Debug, Clone, uniffi::Record)]
-#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
-pub struct RedactionPageReportRecord {
-    pub page: u32,
-    pub removed_characters: u32,
-    pub removed_graphics: u32,
-    /// True when the page was rasterised and its whole text layer is gone.
-    pub rasterized: bool,
-    pub fill_marks: u32,
-}
-
-/// What a successful redaction write did.
-#[derive(Debug, Clone, uniffi::Record)]
-#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
-pub struct RedactionReportRecord {
-    pub destination_path: String,
-    /// Present only when the original was replaced; the file is verified byte-identical.
-    pub backup_path: Option<String>,
-    pub pages: Vec<RedactionPageReportRecord>,
-    pub removed_characters: u32,
-    pub output_bytes: u64,
-    pub cleaned_temporary_files: u32,
-    /// The writer reopened its output and proved text is gone, outside text survived, marks are
-    /// black. Always true on success.
-    pub verified: bool,
-    /// True for a copy: the source file was not modified.
-    pub original_unchanged: bool,
+/// Converts the typed shell request into the engine command.
+///
+/// The only structural check left is the colour length; everything else (revision, geometry,
+/// text style, target identity) is validated by the engine with the same sentences as before.
+fn content_command(
+    record: ContentCommandRecord,
+) -> Result<lyra_reader_pdfium::content_edit::ContentCommand, LyraReaderFfiError> {
+    use lyra_reader_pdfium::content_edit::ContentCommand;
+    fn colour(value: Vec<u8>) -> Result<[u8; 4], LyraReaderFfiError> {
+        value
+            .try_into()
+            .map_err(|value: Vec<u8>| LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
+                message: format!(
+                    "The text colour must have exactly four components (red, green, blue, alpha); got {}.",
+                    value.len()
+                ),
+            })
+    }
+    Ok(match record {
+        ContentCommandRecord::Transform {
+            revision,
+            target,
+            bounds,
+            rotation,
+        } => ContentCommand::Transform {
+            revision,
+            target,
+            bounds: bounds.into(),
+            rotation,
+        },
+        ContentCommandRecord::ReplaceText {
+            revision,
+            target,
+            text,
+            bounds,
+            font,
+            size,
+            colour: value,
+            alignment,
+        } => ContentCommand::ReplaceText {
+            revision,
+            target,
+            text,
+            bounds: bounds.into(),
+            font,
+            size,
+            colour: colour(value)?,
+            alignment,
+        },
+        ContentCommandRecord::InsertText {
+            revision,
+            text,
+            bounds,
+            font,
+            size,
+            colour: value,
+            alignment,
+        } => ContentCommand::InsertText {
+            revision,
+            text,
+            bounds: bounds.into(),
+            font,
+            size,
+            colour: colour(value)?,
+            alignment,
+        },
+        ContentCommandRecord::Delete { revision, target } => {
+            ContentCommand::Delete { revision, target }
+        }
+        ContentCommandRecord::Redact {
+            revision,
+            bounds,
+            blackout,
+        } => ContentCommand::Redact {
+            revision,
+            bounds: bounds.into(),
+            blackout,
+        },
+        ContentCommandRecord::InsertImage {
+            revision,
+            bounds,
+            image_path,
+        } => ContentCommand::InsertImage {
+            revision,
+            bounds: bounds.into(),
+            image_path,
+        },
+        ContentCommandRecord::ReplaceImage {
+            revision,
+            target,
+            image_path,
+        } => ContentCommand::ReplaceImage {
+            revision,
+            target,
+            image_path,
+        },
+        ContentCommandRecord::CropImage {
+            revision,
+            target,
+            crop,
+        } => ContentCommand::CropImage {
+            revision,
+            target,
+            crop: crop.into(),
+        },
+        ContentCommandRecord::SetLink {
+            revision,
+            target,
+            bounds,
+            page,
+            uri,
+        } => ContentCommand::SetLink {
+            revision,
+            target,
+            bounds: bounds.into(),
+            page,
+            uri,
+        },
+    })
 }
 
 /// A destructive-ish page operation requested by the shell.
@@ -4415,8 +7100,10 @@ pub struct MergeReportRecord {
     pub rotations: Vec<u32>,
     /// Flattened outline entries kept from the first document.
     pub first_outline_entries: u32,
-    /// Flattened outline entries of the appended documents that were not imported.
-    pub dropped_outline_entries: u32,
+    /// Flattened entries imported from the appended documents (group labels are not counted).
+    pub appended_outline_entries: u32,
+    /// Titles of the top-level groups added for appended documents, in request order.
+    pub appended_outline_group_titles: Vec<String>,
     pub output_bytes: u64,
     pub cleaned_temporary_files: u32,
 }
@@ -4430,7 +7117,7 @@ pub struct OutlineEntry {
     pub page: Option<u32>,
     /// Nesting level; 0 is a top-level entry.
     pub depth: u32,
-    /// The sidecar bookmark's UUID when this entry belongs to the reader's own saved subtree.
+    /// The cached bookmark's UUID when this entry belongs to the reader's own saved subtree.
     /// `None` for every node the document's author wrote.
     pub bookmark_id: Option<String>,
     /// Page-local Y (points, 0 at the page top) when the destination names a position. This is
@@ -4640,13 +7327,13 @@ fn page_region_to_view(
     geometry.page_to_view(1.0).apply_rect(region)
 }
 
-/// One view-space box at `zoom`, converted into page space.
+/// One page-local view-space box at 100%, converted into page space.
 ///
-/// The inverse of [`page_region_to_view`]'s transform, with the zoom the canvas is drawing at.
-/// The returned rectangle is axis-aligned in page space: `/Rotate` is a multiple of 90° in PDF,
-/// so a view rectangle maps to another axis-aligned rectangle (the canvas only ever produces
-/// horizontal text boxes anyway). Bounds are checked against `/CropBox` with one point of slack
-/// so a hairline round-off at the page edge is not turned into a refusal.
+/// The inverse of [`page_region_to_view`]'s transform. The returned rectangle is axis-aligned in
+/// page space: `/Rotate` is a multiple of 90° in PDF, so a view rectangle maps to another
+/// axis-aligned rectangle (the canvas only ever produces horizontal text boxes anyway). Bounds
+/// are checked against `/CropBox` with one point of slack so a hairline round-off at the page
+/// edge is not turned into a refusal.
 fn view_box_to_page_rect(
     view: &AnnotationQuad,
     inverse: Transform2D,
@@ -4658,6 +7345,7 @@ fn view_box_to_page_rect(
         || view.height_pt <= 0.0
     {
         return Err(LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
             message: format!(
                 "a view-space box has no area or is not finite: {:?}",
                 values
@@ -4683,6 +7371,7 @@ fn view_box_to_page_rect(
         || rect.size.height <= 0.0
     {
         return Err(LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
             message: "a view-space box converted to an empty page-space box".to_string(),
         });
     }
@@ -4694,6 +7383,7 @@ fn view_box_to_page_rect(
         || rect.max_y() > crop.max_y() + SLACK
     {
         return Err(LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
             message: format!("annotation box {rect:?} falls outside the page's crop box {crop:?}"),
         });
     }
@@ -4935,6 +7625,33 @@ pub struct TextPage {
     pub has_unicode_map_error: bool,
 }
 
+/// One closed character range into a page's text layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct TextRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// Convert the Rust text model into the FFI record.
+fn text_page_record(page: u32, model: &lyra_reader_text::TextPage) -> TextPage {
+    TextPage {
+        page,
+        chars: model
+            .chars
+            .iter()
+            .map(|character| TextChar {
+                unicode: character.unicode,
+                x_pt: character.rect.origin.x,
+                y_pt: character.rect.origin.y,
+                width_pt: character.rect.size.width,
+                height_pt: character.rect.size.height,
+            })
+            .collect(),
+        text: model.text.clone(),
+        has_unicode_map_error: model.has_unicode_map_error,
+    }
+}
+
 /// One rasterized tile of a page.
 #[derive(Debug, Clone, uniffi::Record)]
 #[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
@@ -4950,14 +7667,18 @@ pub struct TileBitmap {
 }
 
 /// Where one page sits in the scrolling content (mirrors `PagePlacement`).
+///
+/// `width_pt`/`height_pt` are `None` when PDFium could not measure the page. The shell applies
+/// its own fallback for those pages, so the visible geometry matches the historical US Letter
+/// box while the engine no longer reports a size it does not have.
 #[derive(Debug, Clone, Copy, uniffi::Record)]
 #[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct PagePlacementRecord {
     pub index: u32,
     pub top_pt: f64,
     pub left_pt: f64,
-    pub width_pt: f64,
-    pub height_pt: f64,
+    pub width_pt: Option<f64>,
+    pub height_pt: Option<f64>,
 }
 
 #[uniffi::export]
@@ -4969,18 +7690,100 @@ impl LyraReaderEngine {
         path: String,
         password: Option<String>,
     ) -> Result<Arc<LyraReaderDocument>, LyraReaderFfiError> {
-        let backend = PdfiumBackend::open(std::path::Path::new(&path), password.as_deref())?;
-        // One structural read, at open. The decision cannot change while this handle lives and
-        // worker copies inherit it, so no other read path pays for it.
-        let signature = lyra_reader_pdfium::detect_signature(
-            std::path::Path::new(&path),
-            password.as_deref(),
-            backend.signature_count(),
-        );
+        let source = std::path::Path::new(&path);
+        // One full structural read at open. The same document is used for the XFA probe and the
+        // signature policy; previously each probe loaded and parsed the whole file, which was
+        // pure waste on every ordinary PDF. A blank page is not evidence of XFA: the decision
+        // comes from `/AcroForm /XFA`. The empty user password is handled by the standard
+        // security handler, so a permission-encrypted form opens without a prompt.
+        let structural = lyra_reader_xfa::load_document(source, password.as_deref());
+        let xfa = match &structural {
+            Ok(document) => {
+                match lyra_reader_xfa::prepare_in_document(document, password.as_deref()) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        // A damaged XFA packet is not an ordinary PDF. Keep the normal open path
+                        // (the fallback page is still the honest fallback) and let PDFium report
+                        // what it can; the status names the error when the packet read got far
+                        // enough to build one.
+                        eprintln!("lyra-reader-xfa: detection failed: {error}");
+                        None
+                    }
+                }
+            }
+            Err(lyra_reader_xfa::XfaError::PasswordRequired) => {
+                return Err(lyra_reader_core::LyraReaderError::new(
+                    ErrorCode::Encrypted,
+                    "the document is password protected",
+                )
+                .with_detail(format!("path: {}", source.display()))
+                .into());
+            }
+            Err(error) => {
+                // A structural parse failure on an otherwise openable PDF: signature detection
+                // below keeps its old fallback (PDFium's signature count), and PDFium decides
+                // whether the document itself can open.
+                eprintln!("lyra-reader-xfa: structural read failed: {error}");
+                None
+            }
+        };
+        let (backend, xfa_state) = match xfa {
+            Some(prepared) => {
+                let backend = match &prepared.pdf {
+                    Some(bytes) => PdfiumBackend::open_bytes(bytes.clone(), source)?,
+                    None => PdfiumBackend::open(source, password.as_deref())?,
+                };
+                let status = XfaStatusRecord {
+                    is_xfa: true,
+                    rendered: prepared.status.rendered,
+                    page_count: if prepared.status.rendered {
+                        prepared.status.page_count
+                    } else {
+                        backend.page_count()
+                    },
+                    field_count: prepared.status.field_count,
+                    packet_names: prepared.status.packet_names.clone(),
+                    skipped: prepared.status.skipped.clone(),
+                    error: prepared.status.error.clone(),
+                    read_only_reason: Some(prepared.status.read_only_reason.clone()),
+                    encrypted: prepared.file.encrypted,
+                };
+                let state = XfaState {
+                    status,
+                    synthetic_pdf: prepared.pdf.map(std::sync::Arc::new),
+                };
+                (backend, Some(state))
+            }
+            None => (PdfiumBackend::open(source, password.as_deref())?, None),
+        };
+        // The decision cannot change while this handle lives and worker copies inherit it.
+        // Reuse the document loaded above when it parsed; only a failed structural read falls
+        // back to the path-based signature probe, whose PDFium signature count is the last
+        // resort for a structure lopdf could not read.
+        let signature = match &structural {
+            Ok(document) => lyra_reader_pdfium::detect_signature_in_document(
+                document,
+                backend.signature_count()?,
+            ),
+            Err(_) => lyra_reader_pdfium::detect_signature(
+                source,
+                password.as_deref(),
+                backend.signature_count()?,
+            ),
+        };
+        // Page sizes stay lazy: opening a 900-page document must not pay 900 page loads
+        // before the first frame. The first layout request measures them (see `page_sizes`).
+
+        // One identity for every cache and every tab: canonical path + content hash. Hashing is
+        // the same sequential read the index cache needs later, and is done once here so the
+        // shell never has to derive a second key.
+        let document_id = crate::document_id::DocumentId::of(source)?;
         Ok(Arc::new(LyraReaderDocument {
             backend,
             path,
+            document_id,
             password,
+            xfa: xfa_state,
             signature,
             page_sizes: Mutex::new(None),
             layout: Mutex::new(None),
@@ -4993,6 +7796,7 @@ impl LyraReaderEngine {
             index: Mutex::new(IndexRuntime::default()),
             replaced: std::sync::atomic::AtomicBool::new(false),
             ai_text: Mutex::new(std::collections::HashMap::new()),
+            text_pages: Mutex::new(TextPageCache::default()),
         }))
     }
 }
@@ -5004,10 +7808,18 @@ impl LyraReaderEngine {
 #[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub enum AiActionRecord {
     SummarizePage,
+    SummarizeSelection,
     SummarizeDocument,
     AskSelection,
     TranslateSelection,
     DocumentChat,
+    RegionQuestion,
+    /// One request for the abstract-level summary of the whole document.
+    SummarizeAbstract,
+    /// One request for one outline section's summary.
+    SummarizeSection,
+    /// One request for one page's one-line decision aid.
+    SummarizePageLine,
 }
 
 /// A selected character range on one page (0-based, inclusive).
@@ -5017,6 +7829,34 @@ pub struct AiSelectionRecord {
     pub page: u32,
     pub start: u32,
     pub end: u32,
+}
+
+/// A marquee-selected page region. `page` is 0-based; the rectangle is page-local view space in
+/// points, top-left origin, exactly what `rasterize_region` and the text layer use.
+#[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
+pub struct AiRegionRecord {
+    pub page: u32,
+    pub x_pt: f64,
+    pub y_pt: f64,
+    pub width_pt: f64,
+    pub height_pt: f64,
+    /// Text extracted from the text layer inside the rectangle. May be empty for a picture.
+    pub text: String,
+    /// The PNG capture, when the shell produced one.
+    pub image_png: Option<Vec<u8>>,
+    pub image_width_px: Option<u32>,
+    pub image_height_px: Option<u32>,
+    /// Whether the configured model accepts image input. False degrades to text only.
+    pub send_image: bool,
+    pub include_document_context: bool,
+}
+
+/// Text extracted from a marquee-selected region, and whether the cap cut it.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AiRegionTextRecord {
+    pub text: String,
+    pub truncated: bool,
 }
 
 /// One previous document-chat exchange. `answer` is what the reader saw; the shell trims the
@@ -5033,6 +7873,8 @@ pub struct AiConversationTurnRecord {
 #[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AiPlanRequestRecord {
     pub action: AiActionRecord,
+    #[cfg_attr(feature = "desktop-json", serde(default))]
+    pub document_knowledge: bool,
     pub current_page: u32,
     pub selection: Option<AiSelectionRecord>,
     pub question: Option<String>,
@@ -5040,6 +7882,8 @@ pub struct AiPlanRequestRecord {
     /// Oldest first. Only used by document chat.
     #[cfg_attr(feature = "desktop-json", serde(default))]
     pub history: Vec<AiConversationTurnRecord>,
+    /// Present only for `region_question`.
+    pub region: Option<AiRegionRecord>,
     pub base_url: String,
     pub model: String,
     pub temperature: Option<f64>,
@@ -5048,6 +7892,11 @@ pub struct AiPlanRequestRecord {
     pub reasoning_mode: String,
     /// One of `none`, `thinking`, `reasoning_effort`, `output_config`, `reasoning.effort`.
     pub reasoning_encoding: String,
+    /// Shared document understanding from a completed reading, added by the planner. `None`
+    /// means this request carries no prior and the prompts are unchanged.
+    pub document_knowledge_text: Option<String>,
+    /// 1-based pages the reading covered; carried with the text as one input record.
+    pub document_knowledge_pages: Vec<u32>,
 }
 
 /// One part summary used by the consolidation request.
@@ -5072,6 +7921,9 @@ pub struct AiMergePlanRequestRecord {
     pub max_tokens: Option<u32>,
     pub reasoning_mode: String,
     pub reasoning_encoding: String,
+    /// Shared document understanding added to the consolidation request.
+    pub document_knowledge_text: Option<String>,
+    pub document_knowledge_pages: Vec<u32>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -5081,8 +7933,20 @@ pub struct AiHeaderRecord {
     pub value: String,
 }
 
-/// One request in the preview. `wire_body` is the exact JSON body; the key is added only when
-/// the reader presses Send, so it can never appear here.
+/// The exact PNG one request carries. The plan carries these captured bytes, not an encoded
+/// copy; the selected transport encodes them once into its own data URL.
+#[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
+pub struct AiPlanImageRecord {
+    pub png: Vec<u8>,
+    pub width_px: u32,
+    pub height_px: u32,
+}
+
+/// One request in the preview. The freshly built plan describes the text, the page labels and
+/// the capture; `wire_body` is empty until the shell materialises the body for the selected
+/// transport with [`render_ai_plan`]. The API key is added only when the reader presses Send, so
+/// it can never appear here.
 #[derive(Debug, Clone, uniffi::Record)]
 #[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AiPlanPartRecord {
@@ -5095,12 +7959,25 @@ pub struct AiPlanPartRecord {
     pub request_characters: u64,
     pub system_prompt: String,
     pub user_prompt: String,
+    /// Empty in a freshly planned request. [`render_ai_plan`] fills it with the one body for the
+    /// selected transport; the preview and the send use that same string.
     pub wire_body: String,
     pub note: Option<String>,
+    /// Present only when this exact request carries a region picture.
+    pub image: Option<AiPlanImageRecord>,
+}
+
+/// The wire shape to materialise for a preview. Exactly one is selected per request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum AiWireTransport {
+    /// The OpenAI-compatible `chat/completions` body used by the API-key connection.
+    ChatCompletions,
+    /// The documented Responses body used by the ChatGPT plan connection.
+    Responses,
 }
 
 /// A page-local rectangle of a retrieved passage, in 100% view space. The shell highlights these
-/// briefly when a citation chip is clicked; they are never written to the PDF or the sidecar.
+/// briefly when a citation chip is clicked; they are never written to the PDF or the annotation cache.
 #[derive(Debug, Clone, Copy, uniffi::Record)]
 #[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AiSourceRectRecord {
@@ -5134,6 +8011,15 @@ pub struct AiPlanRecord {
     pub model: String,
     pub temperature: Option<f64>,
     pub max_tokens: Option<u32>,
+    /// Whether the rendered body asks the provider to stream.
+    pub stream: bool,
+    /// Whether the rendered body includes the optional `stream_options` usage field. It is
+    /// false after this endpoint/model has rejected the field once.
+    pub include_stream_options: bool,
+    /// The one provider-specific reasoning field, or `None`. `reasoning_value` is the field's
+    /// JSON literal (for example `{"type":"disabled"}`), never a request body.
+    pub reasoning_field: Option<String>,
+    pub reasoning_value: Option<String>,
     pub parts: Vec<AiPlanPartRecord>,
     pub source_pages: Vec<u32>,
     pub note: Option<String>,
@@ -5155,6 +8041,30 @@ pub struct AiEndpointRecord {
     pub is_local: bool,
 }
 
+/// Build the Settings > AI connection test without touching the network.
+///
+/// The plan carries one fixed `ping` user message and no document, history, image or retrieval.
+/// It goes through the same prompt/body builder as every other request, so `start_ai_request`
+/// sends it with the same transport, SSE parser and error mapping. The key is never part of this
+/// record; it crosses the FFI only when the test starts.
+#[uniffi::export]
+pub fn build_ai_connection_test_plan(
+    base_url: String,
+    model: String,
+) -> Result<AiPlanRecord, LyraReaderFfiError> {
+    let plan = build_connection_test_plan(ChatSettings {
+        base_url,
+        model,
+        // A connection test measures reachability, not generation quality: no temperature and a
+        // small completion budget keep the request as close to a ping as the protocol allows.
+        temperature: None,
+        max_tokens: Some(CONNECTION_TEST_MAX_TOKENS),
+        reasoning_mode: ReasoningMode::Default,
+        reasoning_encoding: ReasoningEncoding::None,
+    })?;
+    Ok(ai_plan_record(plan))
+}
+
 /// Validate and normalise a base URL without touching the network.
 #[uniffi::export]
 pub fn inspect_ai_base_url(base_url: String) -> Result<AiEndpointRecord, LyraReaderFfiError> {
@@ -5171,6 +8081,195 @@ pub fn inspect_ai_base_url(base_url: String) -> Result<AiEndpointRecord, LyraRea
 #[uniffi::export]
 pub fn validate_ai_model(model: String) -> Result<String, LyraReaderFfiError> {
     Ok(validate_model(&model)?)
+}
+
+// ── Layered summaries ───────────────────────────────────────────────────────────────────────
+
+/// One level of the layered summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum AiSummaryLayerRecord {
+    /// One paragraph for the whole document, from a bounded prefix of its pages.
+    Abstract,
+    /// One entry per outline section, or per page range when there is no outline.
+    Section,
+    /// One line per page.
+    Page,
+}
+
+/// One planned outline-section row of the layered summary.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AiSummarySectionRecord {
+    /// Row title, including the outline number when there is one ("2.1 Method").
+    pub title: String,
+    /// Outline number when the row came from an outline; empty for fallback rows.
+    pub number: String,
+    pub depth: u32,
+    /// 1-based, inclusive.
+    pub page_start: u32,
+    /// 1-based, inclusive.
+    pub page_end: u32,
+    /// 0-based page a click on this row opens.
+    pub link_page: u32,
+}
+
+/// What the shell asks one layer to build. The outline lives in the shell's sidebar model, so
+/// the section ranges arrive here rather than being derived a second time.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiSummaryUnitRequestRecord {
+    pub kind: AiSummaryLayerRecord,
+    /// 0-based position within the layer; the row identity for matching results.
+    pub index: u32,
+    /// Row title: "Abstract", "1.1 Background" or "Page 3".
+    pub title: String,
+    /// Outline number when the section came from an outline.
+    pub number: Option<String>,
+    pub depth: u32,
+    /// 1-based, inclusive. The abstract ignores these and starts at page 1.
+    pub page_start: u32,
+    pub page_end: u32,
+}
+
+/// One layer's build request: no key, no network.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiSummaryRequestRecord {
+    pub layer: AiSummaryLayerRecord,
+    pub units: Vec<AiSummaryUnitRequestRecord>,
+    /// `None` means the document's own language.
+    pub language: Option<String>,
+    pub document_title: String,
+    pub base_url: String,
+    pub model: String,
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<u32>,
+    /// One of `default`, `off`, `low`, `high`, `max`.
+    pub reasoning_mode: String,
+    /// One of `none`, `thinking`, `reasoning_effort`, `output_config`, `reasoning.effort`.
+    pub reasoning_encoding: String,
+    /// Shared document understanding added to every unit's request.
+    pub document_knowledge_text: Option<String>,
+    pub document_knowledge_pages: Vec<u32>,
+}
+
+/// The text one unit sends and the hash the cache keys on, without prompts.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiSummaryFingerprintRecord {
+    pub index: u32,
+    pub kind: AiSummaryLayerRecord,
+    /// The pages the row asked for (1-based, inclusive).
+    pub requested_page_start: u32,
+    pub requested_page_end: u32,
+    /// The pages actually sent (1-based, inclusive). For a long document's abstract this is the
+    /// beginning window followed by the end window, with the middle absent.
+    pub covered_page_start: u32,
+    pub covered_page_end: u32,
+    pub pages: Vec<u32>,
+    pub truncated: bool,
+    /// SHA-256 of exactly the covered text. The cache key includes this.
+    pub text_hash: String,
+    pub characters: u64,
+    /// The honest coverage line, identical to the preview's ("Summarised from pages 1-12 and
+    /// 109-120 of 120."). `None` when the unit has no text.
+    pub note: Option<String>,
+}
+
+/// One previewable request of one layer.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiSummaryUnitRecord {
+    pub index: u32,
+    pub kind: AiSummaryLayerRecord,
+    pub title: String,
+    pub number: Option<String>,
+    pub depth: u32,
+    /// The pages the row asked for (1-based, inclusive).
+    pub page_start: u32,
+    pub page_end: u32,
+    /// The last page actually sent; smaller than `page_end` when the budget cut the unit.
+    /// For an abstract that samples both ends this is the end window's last page; `pages`
+    /// lists the beginning window followed by the end window.
+    pub covered_page_end: u32,
+    pub pages: Vec<u32>,
+    pub truncated: bool,
+    pub text_hash: String,
+    pub characters: u64,
+    /// The honest coverage line ("Summarised from pages 1-12 and 109-120 of 120.").
+    pub note: Option<String>,
+    /// Exactly what one request will send. `None` when the unit has no extractable text.
+    pub plan: Option<AiPlanRecord>,
+    /// Why this unit cannot be requested, when `plan` is `None`.
+    pub error: Option<String>,
+}
+
+/// One layer's preview: every request one Generate press may start.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiSummaryPlanRecord {
+    pub layer: AiSummaryLayerRecord,
+    pub page_count: u32,
+    pub units: Vec<AiSummaryUnitRecord>,
+    /// The batch/concurrency bounds and what each request sends.
+    pub note: String,
+    pub max_requests_per_batch: u32,
+    pub max_concurrent_requests: u32,
+}
+
+/// The bounds the panel states before anything is sent.
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct AiSummaryLimitsRecord {
+    /// Per end of the document: the abstract reads up to this many pages from the beginning
+    /// and the same number from the end.
+    pub abstract_max_pages: u32,
+    /// Per end, like `abstract_max_pages`.
+    pub abstract_max_chars: u64,
+    pub section_max_chars: u64,
+    pub page_max_chars: u64,
+    pub max_requests_per_batch: u32,
+    pub max_concurrent_requests: u32,
+}
+
+/// Turn the shell's flattened outline into the layered summary's section rows.
+///
+/// This is the one implementation of the outline range/title rules: the shell's section layer
+/// calls it, and the Rust summary builder enriches the rows it returns. Reader bookmarks are
+/// excluded; a missing destination is filled from the next (then previous) entry; a section ends
+/// before the next entry that starts later; no usable outline falls back to ten-page ranges.
+#[uniffi::export]
+pub fn ai_summary_sections(
+    outline: Vec<OutlineEntry>,
+    page_count: u32,
+) -> Vec<AiSummarySectionRecord> {
+    let entries: Vec<SummaryOutlineEntry> = outline
+        .into_iter()
+        .map(|entry| SummaryOutlineEntry {
+            title: entry.title,
+            page: entry.page,
+            depth: entry.depth,
+            bookmark_id: entry.bookmark_id,
+            is_bookmark_subtree: entry.is_bookmark_subtree,
+        })
+        .collect();
+    plan_summary_sections(&entries, page_count)
+        .into_iter()
+        .map(|section| AiSummarySectionRecord {
+            title: section.title,
+            number: section.number,
+            depth: section.depth,
+            page_start: section.page_start,
+            page_end: section.page_end,
+            link_page: section.link_page,
+        })
+        .collect()
+}
+
+/// The layered-summary bounds, available before a plan is built so the panel can state them.
+#[uniffi::export]
+pub fn ai_summary_limits() -> AiSummaryLimitsRecord {
+    AiSummaryLimitsRecord {
+        abstract_max_pages: SUMMARY_ABSTRACT_MAX_PAGES as u32,
+        abstract_max_chars: SUMMARY_ABSTRACT_MAX_CHARS as u64,
+        section_max_chars: SUMMARY_SECTION_MAX_CHARS as u64,
+        page_max_chars: SUMMARY_PAGE_MAX_CHARS as u64,
+        max_requests_per_batch: SUMMARY_MAX_REQUESTS_PER_BATCH as u32,
+        max_concurrent_requests: SUMMARY_MAX_CONCURRENT_REQUESTS as u32,
+    }
 }
 
 /// Per-request instrumentation. Counts and byte totals only; no content.
@@ -5192,6 +8291,28 @@ pub struct AiStreamDiagnostics {
     pub completion_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
+}
+
+/// The stable category of a transport failure. The panel and the audit trail read this instead
+/// of matching error text; `Other` keeps the existing error display unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
+pub enum AiFailureRecord {
+    Other,
+    /// The request never left this Mac: no route / network down / name resolution failed.
+    Offline,
+    /// The endpoint is loopback and nothing is listening there.
+    LocalServer,
+}
+
+impl From<lyra_reader_ai::AiFailure> for AiFailureRecord {
+    fn from(failure: lyra_reader_ai::AiFailure) -> Self {
+        match failure {
+            lyra_reader_ai::AiFailure::Other => Self::Other,
+            lyra_reader_ai::AiFailure::Offline => Self::Offline,
+            lyra_reader_ai::AiFailure::LocalServer => Self::LocalServer,
+        }
+    }
 }
 
 /// One event from a running request. The shell polls a handle and renders these in order.
@@ -5224,6 +8345,12 @@ pub enum AiEventRecord {
     Error {
         message: String,
         cancelled: bool,
+        /// Why the transport failed, as a fixed category. `Other` for every error that is not a
+        /// recognized offline/local-server transport failure.
+        failure: AiFailureRecord,
+        /// Stable AI error category. Assigned once from the Rust error variant; the shell maps
+        /// it to its audit vocabulary instead of matching message text.
+        code: AiErrorCode,
     },
 }
 
@@ -5307,6 +8434,7 @@ impl AiJob {
 
     fn push(&self, event: AiEventRecord) {
         self.events
+            // Append-only queue of independent records; no cross-event invariant is guarded.
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push_back(event);
@@ -5335,6 +8463,7 @@ impl LyraReaderAiRequest {
         let mut events = self
             .job
             .events
+            // Append-only queue of independent records; no cross-event invariant is guarded.
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::mem::take(&mut *events).into_iter().collect()
@@ -5351,6 +8480,30 @@ impl LyraReaderAiRequest {
     }
 }
 
+/// Materialise the exact body for the transport the reader selected.
+///
+/// This is the only place a body is built for a shell preview: one image is base64-encoded once
+/// for the selected transport, never for both. The returned plan's `wire_body` is the exact
+/// previewed string, and sending it reuses those bytes instead of encoding again. A freshly
+/// built plan has empty bodies, so it can never carry a stale chat-completions body into a
+/// ChatGPT request.
+#[uniffi::export]
+pub fn render_ai_plan(
+    plan: AiPlanRecord,
+    transport: AiWireTransport,
+) -> Result<AiPlanRecord, LyraReaderFfiError> {
+    let chat_plan = chat_plan_from_record(plan.clone())?;
+    let chat_transport = match transport {
+        AiWireTransport::ChatCompletions => ChatTransport::ChatCompletions,
+        AiWireTransport::Responses => ChatTransport::Responses,
+    };
+    let mut rendered = plan;
+    for (part, target) in chat_plan.parts.iter().zip(rendered.parts.iter_mut()) {
+        target.wire_body = chat_plan.render_body(part, chat_transport);
+    }
+    Ok(rendered)
+}
+
 /// Start a request for a previously previewed plan.
 ///
 /// `api_key` crosses the FFI boundary here and is moved into the worker thread; it is not stored
@@ -5364,12 +8517,16 @@ pub fn start_ai_request(
 ) -> Result<Arc<LyraReaderAiRequest>, LyraReaderFfiError> {
     if api_key.is_empty() {
         return Err(LyraReaderFfiError::Ai {
+            severity: AiErrorCode::Unauthorized.severity(),
+            code: AiErrorCode::Unauthorized,
             message: "No API key is configured. Add one in Settings > AI; nothing was sent."
                 .to_string(),
         });
     }
     if api_key.chars().any(|character| character.is_control()) {
         return Err(LyraReaderFfiError::Ai {
+            severity: AiErrorCode::InvalidSettings.severity(),
+            code: AiErrorCode::InvalidSettings,
             message: "The API key contains a control character or line break, so it was not sent."
                 .to_string(),
         });
@@ -5394,18 +8551,24 @@ pub fn start_ai_request(
                     worker_job.push(AiEventRecord::Error {
                         message: "Cancelled".to_string(),
                         cancelled: true,
+                        failure: AiFailureRecord::Other,
+                        code: AiErrorCode::Cancelled,
                     });
                 }
                 Ok(Err(error)) => {
                     worker_job.push(AiEventRecord::Error {
                         message: error.to_string(),
                         cancelled: false,
+                        failure: AiFailureRecord::from(error.failure()),
+                        code: AiErrorCode::of(&error),
                     });
                 }
                 Err(_) => {
                     worker_job.push(AiEventRecord::Error {
                         message: "The AI request worker stopped unexpectedly.".to_string(),
                         cancelled: false,
+                        failure: AiFailureRecord::Other,
+                        code: AiErrorCode::Other,
                     });
                 }
             }
@@ -5414,6 +8577,8 @@ pub fn start_ai_request(
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         })
         .map_err(|error| LyraReaderFfiError::Ai {
+            severity: AiErrorCode::Other.severity(),
+            code: AiErrorCode::Other,
             message: format!("could not start the AI request worker: {error}"),
         })?;
     Ok(Arc::new(LyraReaderAiRequest { job }))
@@ -5434,6 +8599,7 @@ pub fn build_ai_merge_plan(
     });
     let reasoning_mode = ReasoningMode::from_wire(&request.reasoning_mode).ok_or_else(|| {
         LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
             message: format!(
                 "Unknown reasoning mode {}. Use default, off, low, high or max.",
                 request.reasoning_mode
@@ -5442,7 +8608,7 @@ pub fn build_ai_merge_plan(
     })?;
     let reasoning_encoding =
         ReasoningEncoding::from_wire(&request.reasoning_encoding).ok_or_else(|| {
-            LyraReaderFfiError::InvalidArgument {
+            LyraReaderFfiError::InvalidArgument { severity: ErrorSeverity::Document,
                 message: format!(
                     "Unknown reasoning encoding {}. Use none, thinking, reasoning_effort, output_config or reasoning.effort.",
                     request.reasoning_encoding
@@ -5469,6 +8635,10 @@ pub fn build_ai_merge_plan(
                 summary: part.summary,
             })
             .collect(),
+        document_knowledge: document_knowledge_input(
+            request.document_knowledge_text,
+            request.document_knowledge_pages,
+        ),
     })?;
     Ok(ai_plan_record(plan))
 }
@@ -5476,6 +8646,18 @@ pub fn build_ai_merge_plan(
 fn ai_plan_record(plan: ChatPlan) -> AiPlanRecord {
     let estimated_tokens = plan.estimated_tokens();
     let history_turns = plan.history_turns;
+    let stream = plan.wire.stream;
+    let include_stream_options = plan.wire.include_stream_options;
+    let reasoning_field = plan
+        .wire
+        .reasoning
+        .as_ref()
+        .map(|field| field.field.clone());
+    let reasoning_value = plan
+        .wire
+        .reasoning
+        .as_ref()
+        .map(|field| field.value.to_string());
     let sources = plan
         .sources
         .into_iter()
@@ -5506,6 +8688,10 @@ fn ai_plan_record(plan: ChatPlan) -> AiPlanRecord {
         model: plan.model,
         temperature: plan.temperature.map(f64::from),
         max_tokens: plan.max_tokens,
+        stream,
+        include_stream_options,
+        reasoning_field,
+        reasoning_value,
         parts: plan
             .parts
             .into_iter()
@@ -5519,8 +8705,13 @@ fn ai_plan_record(plan: ChatPlan) -> AiPlanRecord {
                 request_characters: part.request_characters,
                 system_prompt: part.system_prompt,
                 user_prompt: part.user_prompt,
-                wire_body: part.wire_body,
+                wire_body: part.wire_body.unwrap_or_default(),
                 note: part.note,
+                image: part.image.map(|image| AiPlanImageRecord {
+                    png: image.png,
+                    width_px: image.width_px,
+                    height_px: image.height_px,
+                }),
             })
             .collect(),
         source_pages: plan.source_pages,
@@ -5538,31 +8729,68 @@ fn ai_plan_record(plan: ChatPlan) -> AiPlanRecord {
 fn ai_action_record(action: AiAction) -> AiActionRecord {
     match action {
         AiAction::SummarizePage => AiActionRecord::SummarizePage,
+        AiAction::SummarizeSelection => AiActionRecord::SummarizeSelection,
         AiAction::SummarizeDocument => AiActionRecord::SummarizeDocument,
         AiAction::AskSelection => AiActionRecord::AskSelection,
         AiAction::TranslateSelection => AiActionRecord::TranslateSelection,
         AiAction::DocumentChat => AiActionRecord::DocumentChat,
+        AiAction::RegionQuestion => AiActionRecord::RegionQuestion,
+        AiAction::SummarizeAbstract => AiActionRecord::SummarizeAbstract,
+        AiAction::SummarizeSection => AiActionRecord::SummarizeSection,
+        AiAction::SummarizePageLine => AiActionRecord::SummarizePageLine,
     }
 }
 
 fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, LyraReaderFfiError> {
     let action = match plan.action {
         AiActionRecord::SummarizePage => AiAction::SummarizePage,
+        AiActionRecord::SummarizeSelection => AiAction::SummarizeSelection,
         AiActionRecord::SummarizeDocument => AiAction::SummarizeDocument,
         AiActionRecord::AskSelection => AiAction::AskSelection,
         AiActionRecord::TranslateSelection => AiAction::TranslateSelection,
         AiActionRecord::DocumentChat => AiAction::DocumentChat,
+        AiActionRecord::RegionQuestion => AiAction::RegionQuestion,
+        AiActionRecord::SummarizeAbstract => AiAction::SummarizeAbstract,
+        AiActionRecord::SummarizeSection => AiAction::SummarizeSection,
+        AiActionRecord::SummarizePageLine => AiAction::SummarizePageLine,
     };
     if !(plan.endpoint.starts_with("http://") || plan.endpoint.starts_with("https://")) {
         return Err(LyraReaderFfiError::Ai {
+            severity: AiErrorCode::InvalidSettings.severity(),
+            code: AiErrorCode::InvalidSettings,
             message: "The request preview has an invalid endpoint.".to_string(),
         });
     }
     if plan.parts.is_empty() {
         return Err(LyraReaderFfiError::Ai {
+            severity: AiErrorCode::Other.severity(),
+            code: AiErrorCode::Other,
             message: "The request preview has no requests.".to_string(),
         });
     }
+    let reasoning = match (plan.reasoning_field.as_ref(), plan.reasoning_value.as_ref()) {
+        (Some(field), Some(value)) => Some(ReasoningField {
+            field: field.clone(),
+            value: serde_json::from_str(value).map_err(|_| LyraReaderFfiError::Ai {
+                severity: AiErrorCode::InvalidSettings.severity(),
+                code: AiErrorCode::InvalidSettings,
+                message: "The request preview has an invalid reasoning field.".to_string(),
+            })?,
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(LyraReaderFfiError::Ai {
+                severity: AiErrorCode::InvalidSettings.severity(),
+                code: AiErrorCode::InvalidSettings,
+                message: "The request preview names only half of its reasoning field.".to_string(),
+            });
+        }
+    };
+    let wire = ChatWire {
+        reasoning,
+        stream: plan.stream,
+        include_stream_options: plan.include_stream_options,
+    };
     let parts = plan
         .parts
         .into_iter()
@@ -5576,7 +8804,12 @@ fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, LyraReaderFfiEr
             request_characters: part.request_characters,
             system_prompt: part.system_prompt,
             user_prompt: part.user_prompt,
-            wire_body: part.wire_body,
+            image: part.image.map(|image| ChatImage {
+                width_px: image.width_px,
+                height_px: image.height_px,
+                png: image.png,
+            }),
+            wire_body: (!part.wire_body.is_empty()).then_some(part.wire_body),
             note: part.note,
         })
         .collect();
@@ -5591,6 +8824,7 @@ fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, LyraReaderFfiEr
         model: plan.model,
         temperature: plan.temperature.map(|value| value as f32),
         max_tokens: plan.max_tokens,
+        wire,
         parts,
         source_pages: plan.source_pages,
         note: plan.note,
@@ -5613,6 +8847,7 @@ fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, LyraReaderFfiEr
             })
             .collect(),
         history_turns: plan.history_turns,
+        estimated_tokens_override: None,
     })
 }
 
@@ -5621,6 +8856,118 @@ mod tests {
     use super::*;
     use std::io::ErrorKind;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// One representative error per severity class crosses the FFI boundary with its severity.
+    #[test]
+    fn every_severity_class_crosses_the_ffi_payload() {
+        let rows = [
+            (
+                lyra_reader_core::LyraReaderError::new(ErrorCode::RenderFailed, "a tile failed"),
+                ErrorSeverity::Recoverable,
+            ),
+            (
+                lyra_reader_core::LyraReaderError::new(
+                    ErrorCode::CorruptDocument,
+                    "the page tree is damaged",
+                ),
+                ErrorSeverity::Document,
+            ),
+            (
+                lyra_reader_core::LyraReaderError::new(
+                    ErrorCode::GpuDeviceLost,
+                    "the device was lost",
+                ),
+                ErrorSeverity::Fatal,
+            ),
+        ];
+        for (error, expected) in rows {
+            let converted: LyraReaderFfiError = error.into();
+            assert_eq!(converted.severity(), expected);
+        }
+
+        // Explicit per-path overrides survive the conversion too: a call site can classify a
+        // RenderFailed write failure as Document without changing its code or message.
+        let overridden =
+            lyra_reader_core::LyraReaderError::new(ErrorCode::RenderFailed, "the save failed")
+                .with_severity(lyra_reader_core::Severity::Document);
+        let converted: LyraReaderFfiError = overridden.into();
+        assert_eq!(converted.severity(), ErrorSeverity::Document);
+
+        // The AI payload derives its severity from the stable code, not from its message.
+        for (code, expected) in [
+            (AiErrorCode::RateLimited, ErrorSeverity::Recoverable),
+            (AiErrorCode::InvalidSettings, ErrorSeverity::Document),
+        ] {
+            assert_eq!(code.severity(), expected);
+        }
+        let ai: LyraReaderFfiError = lyra_reader_ai::AiError::RateLimited.into();
+        assert!(matches!(ai, LyraReaderFfiError::Ai { .. }));
+        assert_eq!(ai.severity(), ErrorSeverity::Recoverable);
+    }
+
+    #[test]
+    fn a_missing_ai_selection_is_an_error_not_a_panic() {
+        let error = selection_only_page(None).expect_err("no selection must not panic");
+        match error {
+            LyraReaderFfiError::InvalidArgument { message, .. } => {
+                assert!(message.contains("selection"), "{message}");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        assert_eq!(
+            selection_only_page(Some(AiSelectionRange {
+                page: 4,
+                start: 0,
+                end: 1,
+            }))
+            .expect("a present selection"),
+            4
+        );
+    }
+
+    #[test]
+    fn a_failed_page_info_is_unknown_not_us_letter() {
+        let sizes = collect_page_sizes(2, |index| match index {
+            0 => Ok((612.0, 792.0)),
+            _ => Err(LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
+                message: "page 2 could not be measured".to_string(),
+            }),
+        });
+        assert_eq!(
+            sizes,
+            vec![Some((612.0, 792.0)), None],
+            "a failed page_info must be reported as unknown, not as a default size"
+        );
+        assert_ne!(
+            sizes[1],
+            Some((612.0, 792.0)),
+            "US Letter must not be fabricated for an unmeasured page"
+        );
+    }
+
+    #[test]
+    fn transport_failures_cross_the_ffi_as_fixed_categories() {
+        // The shell and the audit trail read this enum, never the message string.
+        assert_eq!(
+            AiFailureRecord::from(lyra_reader_ai::AiFailure::Offline),
+            AiFailureRecord::Offline
+        );
+        assert_eq!(
+            AiFailureRecord::from(lyra_reader_ai::AiFailure::LocalServer),
+            AiFailureRecord::LocalServer
+        );
+        assert_eq!(
+            AiFailureRecord::from(lyra_reader_ai::AiFailure::Other),
+            AiFailureRecord::Other
+        );
+        assert_eq!(
+            AiFailureRecord::from(
+                lyra_reader_ai::AiError::Offline("no route".to_string()).failure()
+            ),
+            AiFailureRecord::Offline
+        );
+    }
 
     /// Resolves a committed fixture at run time.
     ///
@@ -5752,12 +9099,323 @@ mod tests {
         assert!(view.max_x() <= page.width && view.max_y() <= page.height);
     }
 
+    /// The 100%-view-space write boundary maps to the same page geometry as the old
+    /// zoom-scaled boundary, for every page geometry and canvas position.
+    ///
+    /// This is the frozen C8 matrix. The left side is what the shell fed before the change: a
+    /// page-local 100% view-space value multiplied by the canvas zoom, inverted with
+    /// `view_to_page(zoom)`. The right side is the boundary after it: the same page-local value,
+    /// inverted with `view_to_page(1.0)`. The canvas arithmetic in between is
+    /// `CanvasGeometry.contentPoint` in Swift, including the page placement and scroll offset
+    /// that are deliberately the shell's. The matrix includes 0°/90°/180°/270°, an offset
+    /// `/CropBox`, `/UserUnit` ≠ 1 and a real corpus page. For the powers-of-two zooms the
+    /// equality is **exact in f64**: `page_to_view(zoom)` is then `page_to_view(1.0)` followed
+    /// by an exact binary scale. An arbitrary canvas zoom (1.37, 2.5) can round
+    /// `(page_local × zoom) / zoom` once more; the measured worst case over this matrix is
+    /// 2.3e-13 page points, so the test asserts the documented 1e-9 bound there. That bound is
+    /// also the bar the annotation checks use when they compare view-space geometry; the writer
+    /// stores PDF reals as `f32`, which is coarser still.
+    #[test]
+    fn annotation_write_geometry_is_the_same_from_100_percent_and_zoom_scaled_view_space() {
+        fn first_corpus_page_geometry() -> Option<PageGeometry> {
+            let directory = std::env::var_os("LYRA_READER_PDF_SAMPLES")?;
+            let mut paths: Vec<PathBuf> = std::fs::read_dir(directory)
+                .ok()?
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| {
+                    path.extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+                })
+                .collect();
+            paths.sort();
+            let path = paths.into_iter().next()?;
+            let backend = PdfiumBackend::open(&path, None).ok()?;
+            let info = backend.page_info(PageIndex(0)).ok()?;
+            Some(info.geometry)
+        }
+
+        fn assert_same_point(
+            context: &str,
+            old_inverse: Transform2D,
+            new_inverse: Transform2D,
+            zoom: f64,
+            local: Point,
+        ) {
+            let old = old_inverse.apply(Point::new(local.x * zoom, local.y * zoom));
+            let new = new_inverse.apply(local);
+            let delta = (old.x - new.x).abs().max((old.y - new.y).abs());
+            let tolerance = if matches!(zoom, 0.25 | 1.0 | 4.0) {
+                0.0
+            } else {
+                1e-9
+            };
+            assert!(
+                delta <= tolerance,
+                "{context} point {local:?}: old {old:?} new {new:?} delta {delta:e}"
+            );
+        }
+
+        fn assert_same_rect(
+            context: &str,
+            geometry: &PageGeometry,
+            old_inverse: Transform2D,
+            new_inverse: Transform2D,
+            zoom: f64,
+            local: lyra_reader_core::Rect,
+        ) {
+            let old = view_box_to_page_rect(
+                &AnnotationQuad {
+                    x_pt: local.min_x() * zoom,
+                    y_pt: local.min_y() * zoom,
+                    width_pt: local.size.width * zoom,
+                    height_pt: local.size.height * zoom,
+                },
+                old_inverse,
+                geometry,
+            )
+            .expect("old box is inside the page");
+            let new = view_box_to_page_rect(
+                &AnnotationQuad {
+                    x_pt: local.min_x(),
+                    y_pt: local.min_y(),
+                    width_pt: local.size.width,
+                    height_pt: local.size.height,
+                },
+                new_inverse,
+                geometry,
+            )
+            .expect("new box is inside the page");
+            let delta = (old.min_x() - new.min_x())
+                .abs()
+                .max((old.min_y() - new.min_y()).abs())
+                .max((old.max_x() - new.max_x()).abs())
+                .max((old.max_y() - new.max_y()).abs());
+            let tolerance = if matches!(zoom, 0.25 | 1.0 | 4.0) {
+                0.0
+            } else {
+                1e-9
+            };
+            assert!(
+                delta <= tolerance,
+                "{context} rect {local:?}: old {old:?} new {new:?} delta {delta:e}"
+            );
+        }
+
+        let mut geometries: Vec<(String, PageGeometry)> = vec![
+            (
+                "a4".to_string(),
+                PageGeometry::new(
+                    lyra_reader_core::Rect::new(0.0, 0.0, 595.0, 842.0),
+                    lyra_reader_core::Rect::new(0.0, 0.0, 595.0, 842.0),
+                    lyra_reader_core::Rotation::None,
+                    1.0,
+                ),
+            ),
+            (
+                "crop-90".to_string(),
+                PageGeometry::new(
+                    lyra_reader_core::Rect::new(0.0, 0.0, 612.0, 792.0),
+                    lyra_reader_core::Rect::new(36.5, 48.25, 500.0, 650.0),
+                    lyra_reader_core::Rotation::Clockwise90,
+                    1.0,
+                ),
+            ),
+            (
+                "offset-crop-180".to_string(),
+                PageGeometry::new(
+                    lyra_reader_core::Rect::new(0.0, 0.0, 612.0, 792.0),
+                    lyra_reader_core::Rect::new(-10.25, 20.5, 480.75, 610.25),
+                    lyra_reader_core::Rotation::Clockwise180,
+                    1.0,
+                ),
+            ),
+            (
+                "crop-270-user-unit".to_string(),
+                PageGeometry::new(
+                    lyra_reader_core::Rect::new(0.0, 0.0, 800.0, 600.0),
+                    lyra_reader_core::Rect::new(15.5, 22.25, 760.0, 550.5),
+                    lyra_reader_core::Rotation::Clockwise270,
+                    1.5,
+                ),
+            ),
+            (
+                "crop-user-unit".to_string(),
+                PageGeometry::new(
+                    lyra_reader_core::Rect::new(0.0, 0.0, 700.0, 900.0),
+                    lyra_reader_core::Rect::new(12.0, 24.0, 650.0, 820.0),
+                    lyra_reader_core::Rotation::None,
+                    0.75,
+                ),
+            ),
+        ];
+        match first_corpus_page_geometry() {
+            Some(geometry) => geometries.push(("corpus-page-0".to_string(), geometry)),
+            None => eprintln!(
+                "skipping the real-corpus row: LYRA_READER_PDF_SAMPLES is not set or the first PDF cannot be read"
+            ),
+        }
+
+        const PAGE_LEFT_PT: f64 = 37.25;
+        const PAGE_TOP_PT: f64 = 91.5;
+        const CONTENT_OFFSET_X_PT: f64 = 12.0;
+        let zooms = [0.25, 1.0, 4.0, 1.37, 2.5];
+        let scrolls = [0.0, 123.5, -80.25];
+
+        for (name, geometry) in geometries {
+            let page = geometry.view_size(1.0);
+            let points = [
+                Point::new(0.0, 0.0),
+                Point::new(page.width * 0.5, page.height * 0.5),
+                Point::new(page.width - 0.5, page.height - 0.5),
+                Point::new(page.width * 0.125 + 1.25, page.height * 0.875 - 2.5),
+            ];
+            let rects = [
+                lyra_reader_core::Rect::new(0.5, 0.75, page.width.min(100.0), 30.0),
+                lyra_reader_core::Rect::new(page.width * 0.5, page.height * 0.5, 1.0, 1.0),
+                lyra_reader_core::Rect::new(page.width - 50.0, page.height - 30.0, 40.0, 20.0),
+            ];
+            for zoom in zooms {
+                let old_inverse = geometry.view_to_page(zoom).expect("invertible geometry");
+                let new_inverse = geometry.view_to_page(1.0).expect("invertible geometry");
+                for scroll in scrolls {
+                    let context = format!("{name} zoom {zoom} scroll {scroll}");
+                    for local in points {
+                        // The cache value itself: no canvas arithmetic participates.
+                        assert_same_point(
+                            &format!("{context} cached"),
+                            old_inverse,
+                            new_inverse,
+                            zoom,
+                            local,
+                        );
+
+                        // The same value after the shell's canvas path at this zoom and scroll.
+                        let view_x = (local.x + PAGE_LEFT_PT) * zoom + CONTENT_OFFSET_X_PT;
+                        let view_y = (local.y + PAGE_TOP_PT - scroll) * zoom;
+                        let recovered = Point::new(
+                            (view_x - CONTENT_OFFSET_X_PT) / zoom - PAGE_LEFT_PT,
+                            view_y / zoom + scroll - PAGE_TOP_PT,
+                        );
+                        assert!((recovered.x - local.x).abs() <= 1e-9);
+                        assert!((recovered.y - local.y).abs() <= 1e-9);
+                        assert_same_point(
+                            &format!("{context} canvas"),
+                            old_inverse,
+                            new_inverse,
+                            zoom,
+                            recovered,
+                        );
+                    }
+                    for local in rects {
+                        assert_same_rect(
+                            &format!("{context} cached"),
+                            &geometry,
+                            old_inverse,
+                            new_inverse,
+                            zoom,
+                            local,
+                        );
+
+                        let view = lyra_reader_core::Rect::new(
+                            (local.min_x() + PAGE_LEFT_PT) * zoom + CONTENT_OFFSET_X_PT,
+                            (local.min_y() + PAGE_TOP_PT - scroll) * zoom,
+                            local.size.width * zoom,
+                            local.size.height * zoom,
+                        );
+                        let recovered = lyra_reader_core::Rect::new(
+                            (view.min_x() - CONTENT_OFFSET_X_PT) / zoom - PAGE_LEFT_PT,
+                            view.min_y() / zoom + scroll - PAGE_TOP_PT,
+                            view.size.width / zoom,
+                            view.size.height / zoom,
+                        );
+                        assert!((recovered.min_x() - local.min_x()).abs() <= 1e-9);
+                        assert!((recovered.min_y() - local.min_y()).abs() <= 1e-9);
+                        assert!((recovered.size.width - local.size.width).abs() <= 1e-9);
+                        assert!((recovered.size.height - local.size.height).abs() <= 1e-9);
+                        assert_same_rect(
+                            &format!("{context} canvas"),
+                            &geometry,
+                            old_inverse,
+                            new_inverse,
+                            zoom,
+                            recovered,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn engine_reports_version_and_backend() {
         let engine = LyraReaderEngine::new();
         assert_eq!(engine.version(), ENGINE_VERSION);
         assert!(engine.backend().contains("pdfium") || engine.backend().contains("stub"));
         assert!(engine.raster_threads() >= 1);
+    }
+
+    /// Every page-taking entry point must read the same sentence for the same condition.
+    ///
+    /// The table is the contract: one canonical 1-based message for "page N is outside the
+    /// document", one severity (`Document`), and both numbers preserved. It covers the four
+    /// FFI-side call sites; the PDFium-side ones are covered by the backend's own table test.
+    #[test]
+    fn out_of_range_page_messages_are_one_canonical_sentence() {
+        if !lyra_reader_pdfium::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let path = fixture("multipage.pdf");
+        let engine = LyraReaderEngine::new();
+        let document = engine
+            .open_document(path.display().to_string(), None)
+            .expect("open fixture");
+        let page_count = document.page_count();
+        let page = page_count + 1;
+        let expected = lyra_reader_core::page_out_of_range_message(page, page_count);
+        assert!(expected.starts_with(&format!("page {} ", page + 1)));
+
+        let errors: Vec<(&str, LyraReaderFfiError)> = vec![
+            (
+                "rasterize_page",
+                document
+                    .rasterize_page(page, 1.0)
+                    .expect_err("out of range"),
+            ),
+            (
+                "rasterize_tile",
+                document
+                    .rasterize_tile(page, 0, 0, 0, 256)
+                    .expect_err("out of range"),
+            ),
+            (
+                "rasterize_region",
+                document
+                    .rasterize_region(page, 1.0, 0.0, 0.0, 10.0, 10.0, false)
+                    .expect_err("out of range"),
+            ),
+        ];
+        // `ai_page` is private to the document type; the test module is a child, so it can call
+        // it exactly as the AI plan builder does.
+        let ai_error = document.ai_page(page).expect_err("out of range");
+        let mut errors = errors;
+        errors.push(("ai_page", ai_error));
+
+        for (name, error) in errors {
+            let LyraReaderFfiError::InvalidArgument { message, severity } = &error else {
+                panic!("{name} must report InvalidArgument, got {error:?}");
+            };
+            assert_eq!(message, &expected, "{name} keeps the canonical sentence");
+            assert_eq!(*severity, ErrorSeverity::Document, "{name} severity");
+        }
+
+        // In-range pages still succeed: the helper must not reject page 0 or the last page.
+        for page in [0, page_count - 1] {
+            document
+                .rasterize_page(page, 1.0)
+                .unwrap_or_else(|error| panic!("page {page} is in range: {error:?}"));
+        }
     }
 
     #[test]
@@ -5774,7 +9432,7 @@ mod tests {
         let engine = LyraReaderEngine::new();
         let result = engine.probe_document("/nonexistent/lyra-reader.pdf".to_string(), None);
         match result {
-            Err(LyraReaderFfiError::Document { message }) => assert!(!message.is_empty()),
+            Err(LyraReaderFfiError::Document { message, .. }) => assert!(!message.is_empty()),
             other => panic!("expected a document error, got {other:?}"),
         }
     }
@@ -5933,6 +9591,53 @@ mod tests {
     }
 
     #[test]
+    fn a_damaged_annotation_is_reported_and_blocks_saves() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/annotations-damaged.pdf");
+        if !fixture.exists() || !lyra_reader_pdfium::is_available() {
+            eprintln!("skipping: damaged-annotation fixture or PDFium unavailable");
+            return;
+        }
+
+        let engine = LyraReaderEngine::new();
+        let document = engine
+            .open_document(fixture.display().to_string(), None)
+            .expect("open fixture");
+        let annotations = document.annotations().expect("the valid annotations load");
+        assert_eq!(annotations.len(), 2, "the two valid annotations are kept");
+
+        let status = document
+            .annotation_read_status()
+            .expect("the unreadable count is available");
+        assert_eq!(status.unreadable_annotations, 1);
+        assert_eq!(status.pages, vec![0]);
+        assert!(
+            status.details.iter().any(|detail| detail.contains("/L")),
+            "the detail names the field: {:?}",
+            status.details
+        );
+        // The status is cached with the scan: asking again does not grow the count per page.
+        assert_eq!(
+            document.annotation_read_status().expect("cached status"),
+            status
+        );
+
+        let scratch = scratch("ffi-damaged-annotation");
+        let destination = scratch.join("saved.pdf");
+        let error = document
+            .save_annotations_copy(destination.display().to_string(), Vec::new(), Vec::new())
+            .expect_err("saving around an unreadable annotation must be refused");
+        match error {
+            LyraReaderFfiError::Document { message, .. } => {
+                assert!(message.contains("blocked"), "{message}");
+                assert!(message.contains("page(s) 1"), "{message}");
+            }
+            other => panic!("expected a document refusal, got {other:?}"),
+        }
+        assert!(!destination.exists(), "the refused save wrote a file");
+    }
+
+    #[test]
     fn annotations_already_in_the_pdf_cross_the_ffi_intact() {
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/annotated.pdf");
@@ -5946,6 +9651,14 @@ mod tests {
             .open_document(fixture.display().to_string(), None)
             .expect("open fixture");
         let records = document.annotations().expect("annotations");
+        assert_eq!(
+            document
+                .annotation_read_status()
+                .expect("healthy status")
+                .unreadable_annotations,
+            0,
+            "a fully readable fixture reports no unreadable annotations"
+        );
 
         assert_eq!(records.len(), 7, "five on page 1, two on page 2");
         assert_eq!(
@@ -6488,21 +10201,21 @@ mod tests {
         Some(directory)
     }
 
-    fn zoom_annotation(zoom: f64) -> WriteAnnotationRecord {
-        let box_at_zoom = |x: f64, y: f64, width: f64, height: f64| AnnotationQuad {
-            x_pt: x * zoom,
-            y_pt: y * zoom,
-            width_pt: width * zoom,
-            height_pt: height * zoom,
+    fn annotation_at_100() -> WriteAnnotationRecord {
+        let box_at_100 = |x: f64, y: f64, width: f64, height: f64| AnnotationQuad {
+            x_pt: x,
+            y_pt: y,
+            width_pt: width,
+            height_pt: height,
         };
         WriteAnnotationRecord {
             id: "33333333-3333-3333-3333-333333333333".to_string(),
             page: 0,
             kind: AnnotationWriteKind::Highlight,
-            rect: box_at_zoom(72.0, 141.0, 388.0, 15.0),
+            rect: box_at_100(72.0, 141.0, 388.0, 15.0),
             // View space at 100% is page space y-flipped: page [72 686 388 15] on an 842 pt
             // page is view (72, 842 - 686 - 15) = (72, 141).
-            quads: vec![box_at_zoom(72.0, 141.0, 388.0, 15.0)],
+            quads: vec![box_at_100(72.0, 141.0, 388.0, 15.0)],
             ink_paths: Vec::new(),
             line_start: None,
             line_end: None,
@@ -6514,7 +10227,7 @@ mod tests {
                 blue: 64,
             },
             opacity: 0.4,
-            contents: "Saved at an arbitrary zoom.".to_string(),
+            contents: "Saved in 100% view space.".to_string(),
             author: "LyraReader".to_string(),
             modified: "D:20261016213000-07'00'".to_string(),
             font_size_pt: 0.0,
@@ -6526,16 +10239,13 @@ mod tests {
         }
     }
 
-    fn zoom_stroke(zoom: f64) -> WriteAnnotationRecord {
-        let point = |x: f64, y: f64| AnnotationPoint {
-            x_pt: x * zoom,
-            y_pt: y * zoom,
-        };
-        let box_at_zoom = |x: f64, y: f64, width: f64, height: f64| AnnotationQuad {
-            x_pt: x * zoom,
-            y_pt: y * zoom,
-            width_pt: width * zoom,
-            height_pt: height * zoom,
+    fn stroke_at_100() -> WriteAnnotationRecord {
+        let point = |x: f64, y: f64| AnnotationPoint { x_pt: x, y_pt: y };
+        let box_at_100 = |x: f64, y: f64, width: f64, height: f64| AnnotationQuad {
+            x_pt: x,
+            y_pt: y,
+            width_pt: width,
+            height_pt: height,
         };
         WriteAnnotationRecord {
             id: "44444444-4444-4444-4444-444444444444".to_string(),
@@ -6543,7 +10253,7 @@ mod tests {
             kind: AnnotationWriteKind::Ink,
             // The outer box at view 100%: page [72 600 200 60] on an 842 pt page is
             // view (72, 842 - 600 - 60) = (72, 182), inflated by the stroke's half width.
-            rect: box_at_zoom(72.0, 181.0, 201.0, 61.0),
+            rect: box_at_100(72.0, 181.0, 201.0, 61.0),
             quads: Vec::new(),
             ink_paths: vec![vec![
                 point(73.0, 182.0),
@@ -6561,7 +10271,7 @@ mod tests {
                 blue: 30,
             },
             opacity: 0.8,
-            contents: "Stroked at an arbitrary zoom.".to_string(),
+            contents: "Stroked in 100% view space.".to_string(),
             author: "LyraReader".to_string(),
             modified: "D:20261017120000-07'00'".to_string(),
             font_size_pt: 0.0,
@@ -6574,8 +10284,8 @@ mod tests {
     }
 
     #[test]
-    fn write_back_converts_view_space_at_any_zoom_to_the_same_page_space() {
-        let Some(directory) = writeback_fixture("zoom") else {
+    fn write_back_takes_page_local_view_space_at_100_percent() {
+        let Some(directory) = writeback_fixture("write-back-100") else {
             return;
         };
         let engine = LyraReaderEngine::new();
@@ -6593,99 +10303,72 @@ mod tests {
             "the suggested name is <name> (annotated).pdf"
         );
 
-        let at_100 = directory.join("at-100.pdf");
-        let at_300 = directory.join("at-300.pdf");
-        let report_100 = document
+        let destination = directory.join("at-100.pdf");
+        let written = annotation_at_100();
+        let report = document
             .save_annotations_copy(
-                at_100.display().to_string(),
-                vec![zoom_annotation(1.0)],
+                destination.display().to_string(),
+                vec![written.clone()],
                 Vec::new(),
-                1.0,
             )
-            .expect("save at 100%");
-        let report_300 = document
-            .save_annotations_copy(
-                at_300.display().to_string(),
-                vec![zoom_annotation(3.0)],
-                Vec::new(),
-                3.0,
-            )
-            .expect("save at 300%");
+            .expect("save with 100% view-space geometry");
 
-        assert_eq!(report_100.written_ids, vec![zoom_annotation(1.0).id]);
-        assert_eq!(report_100.backup_path, None);
-        assert_eq!(report_100.preexisting_annotation_count, 7);
-        assert!(report_100.appended_bytes > 0);
-        assert!(report_100.source_bytes_preserved);
+        assert_eq!(report.written_ids, vec![written.id]);
+        assert_eq!(report.backup_path, None);
+        assert_eq!(report.preexisting_annotation_count, 7);
+        assert!(report.appended_bytes > 0);
+        assert!(report.source_bytes_preserved);
         assert_eq!(
             std::fs::read(&source).expect("source readable"),
             source_bytes,
             "a copy save leaves the open document untouched"
         );
-        assert_eq!(report_300.preexisting_annotation_count, 7);
 
-        // The two saves were made from different view-space geometry and zoom factors. Their
-        // page-space output must be identical, which is the promise that a highlight saved at
-        // one zoom reloads in the same place at another.
-        let page_space = |path: &std::path::Path| {
-            let backend = PdfiumBackend::open(path, None).expect("reopen saved copy");
-            let annotations = backend.annotations(PageIndex(0)).expect("page annotations");
-            annotations
-                .into_iter()
-                .find(|annotation| annotation.id == "nm:33333333-3333-3333-3333-333333333333")
-                .expect("written annotation")
-        };
-        let first = page_space(&at_100);
-        let second = page_space(&at_300);
-        assert_eq!(first, second, "zoom must not change page-space geometry");
+        // The boundary is page-local view space at 100%; the writer applies the page geometry
+        // exactly once. This is the frozen page-space output for the fixture's 842 pt page.
+        let backend = PdfiumBackend::open(&destination, None).expect("reopen saved copy");
+        let page_space = backend
+            .annotations(PageIndex(0))
+            .expect("page annotations")
+            .into_iter()
+            .find(|annotation| annotation.id == "nm:33333333-3333-3333-3333-333333333333")
+            .expect("written annotation");
         assert_eq!(
-            first.rect,
+            page_space.rect,
             lyra_reader_core::Rect::new(72.0, 686.0, 388.0, 15.0)
         );
         assert_eq!(
-            first.quads,
+            page_space.quads,
             vec![lyra_reader_core::Rect::new(72.0, 686.0, 388.0, 15.0)]
         );
 
-        // Reopening through the FFI at "another zoom" is the same file-space geometry: the
-        // reader reports view space at 100%, and the canvas scales it. Both saved files agree
-        // with the original view box, so the annotation reloads at the same place.
-        for path in [&at_100, &at_300] {
-            let reopened = engine
-                .open_document(path.display().to_string(), None)
-                .expect("reopen saved copy");
-            let records = reopened.annotations().expect("annotations");
-            let ours: Vec<_> = records
-                .iter()
-                .filter(|record| record.id == "nm:33333333-3333-3333-3333-333333333333")
-                .collect();
-            assert_eq!(ours.len(), 1, "exactly one copy of the written annotation");
-            assert!((ours[0].x_pt - 72.0).abs() < 1e-6);
-            assert!((ours[0].y_pt - 141.0).abs() < 1e-6);
-            assert!((ours[0].width_pt - 388.0).abs() < 1e-6);
-            assert!((ours[0].height_pt - 15.0).abs() < 1e-6);
-            assert_eq!(
-                ours[0].contents.as_deref(),
-                Some("Saved at an arbitrary zoom.")
-            );
-            assert_eq!(ours[0].author.as_deref(), Some("LyraReader"));
-            assert_eq!(ours[0].blend, "multiply");
-        }
-
-        let bad_zoom = document.save_annotations_copy(
-            directory.join("bad.pdf").display().to_string(),
-            vec![zoom_annotation(1.0)],
-            Vec::new(),
-            0.0,
+        // The reader reports that file geometry back in the same 100% view space it accepted.
+        let reopened = engine
+            .open_document(destination.display().to_string(), None)
+            .expect("reopen saved copy");
+        let records = reopened.annotations().expect("annotations");
+        let ours: Vec<_> = records
+            .iter()
+            .filter(|record| record.id == "nm:33333333-3333-3333-3333-333333333333")
+            .collect();
+        assert_eq!(ours.len(), 1, "exactly one copy of the written annotation");
+        assert_eq!(ours[0].x_pt, 72.0);
+        assert_eq!(ours[0].y_pt, 141.0);
+        assert_eq!(ours[0].width_pt, 388.0);
+        assert_eq!(ours[0].height_pt, 15.0);
+        assert_eq!(
+            ours[0].contents.as_deref(),
+            Some("Saved in 100% view space.")
         );
-        assert!(bad_zoom.is_err(), "a zero zoom is refused before any write");
+        assert_eq!(ours[0].author.as_deref(), Some("LyraReader"));
+        assert_eq!(ours[0].blend, "multiply");
 
         let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn stroke_write_back_converts_view_space_at_any_zoom_to_the_same_page_space() {
-        let Some(directory) = writeback_fixture("stroke-zoom") else {
+    fn stroke_write_back_takes_page_local_points_at_100_percent() {
+        let Some(directory) = writeback_fixture("stroke-100") else {
             return;
         };
         let engine = LyraReaderEngine::new();
@@ -6693,56 +10376,38 @@ mod tests {
         let document = engine
             .open_document(source.display().to_string(), None)
             .expect("open source");
-        let at_100 = directory.join("stroke-100.pdf");
-        let at_300 = directory.join("stroke-300.pdf");
+        let destination = directory.join("stroke-100.pdf");
         document
             .save_annotations_copy(
-                at_100.display().to_string(),
-                vec![zoom_stroke(1.0)],
+                destination.display().to_string(),
+                vec![stroke_at_100()],
                 Vec::new(),
-                1.0,
             )
-            .expect("save stroke at 100%");
-        document
-            .save_annotations_copy(
-                at_300.display().to_string(),
-                vec![zoom_stroke(3.0)],
-                Vec::new(),
-                3.0,
-            )
-            .expect("save stroke at 300%");
+            .expect("save stroke with 100% view-space geometry");
 
-        let page_space = |path: &std::path::Path| {
-            let backend = PdfiumBackend::open(path, None).expect("reopen saved copy");
-            backend
-                .annotations(PageIndex(0))
-                .expect("page annotations")
-                .into_iter()
-                .find(|annotation| annotation.id == "nm:44444444-4444-4444-4444-444444444444")
-                .expect("written stroke")
-        };
-        let first = page_space(&at_100);
-        let second = page_space(&at_300);
-        assert_eq!(
-            first, second,
-            "zoom must not change the stroke's page-space points"
-        );
-        assert_eq!(first.kind, lyra_reader_core::RawAnnotationKind::Ink);
-        assert_eq!(first.ink_paths.len(), 1);
+        let backend = PdfiumBackend::open(&destination, None).expect("reopen saved copy");
+        let stroke = backend
+            .annotations(PageIndex(0))
+            .expect("page annotations")
+            .into_iter()
+            .find(|annotation| annotation.id == "nm:44444444-4444-4444-4444-444444444444")
+            .expect("written stroke");
+        assert_eq!(stroke.kind, lyra_reader_core::RawAnnotationKind::Ink);
+        assert_eq!(stroke.ink_paths.len(), 1);
         let expected = [
             (73.0, 182.0),
             (120.0, 220.0),
             (180.0, 190.0),
             (272.0, 240.0),
         ];
-        for (point, (x, y)) in first.ink_paths[0].iter().zip(expected) {
+        for (point, (x, y)) in stroke.ink_paths[0].iter().zip(expected) {
             // The view points above are page-space top-left; the writer's inverse flips them
             // back into PDF page space, so compare the y flip explicitly.
             assert!((point.x - x).abs() < 0.01, "{point:?} vs {x}");
             assert!((point.y - (842.0 - y)).abs() < 0.01, "{point:?} vs {y}");
         }
-        assert_eq!(first.border_width, Some(2.5));
-        assert!((first.opacity.expect("opacity") - 0.8).abs() < 0.01);
+        assert_eq!(stroke.border_width, Some(2.5));
+        assert!((stroke.opacity.expect("opacity") - 0.8).abs() < 0.01);
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -6770,7 +10435,7 @@ mod tests {
         assert!(document.interrupted_save_note().is_none());
 
         let report = document
-            .replace_with_annotations(vec![zoom_annotation(1.0)], Vec::new(), 1.0)
+            .replace_with_annotations(vec![annotation_at_100()], Vec::new())
             .expect("replace original");
         let backup = report.backup_path.expect("backup path");
         let backup_bytes = std::fs::read(&backup).expect("backup readable");
@@ -6849,12 +10514,7 @@ mod tests {
         ];
         let saved = directory.join("saved.pdf");
         let report = document
-            .save_annotations_copy(
-                saved.display().to_string(),
-                Vec::new(),
-                bookmarks.clone(),
-                1.0,
-            )
+            .save_annotations_copy(saved.display().to_string(), Vec::new(), bookmarks.clone())
             .expect("a document with only bookmarks can still be saved");
         assert_eq!(
             report.written_bookmark_ids,
@@ -6931,12 +10591,7 @@ mod tests {
             })
             .collect();
         reopened
-            .save_annotations_copy(
-                again.display().to_string(),
-                Vec::new(),
-                reopened_bookmarks,
-                1.0,
-            )
+            .save_annotations_copy(again.display().to_string(), Vec::new(), reopened_bookmarks)
             .expect("second save");
         let second = engine
             .open_document(again.display().to_string(), None)
@@ -6951,5 +10606,371 @@ mod tests {
             1,
             "one subtree, not two"
         );
+    }
+
+    /// The FFI table is a projection of the taxonomy, not a second list of kind names.
+    ///
+    /// The shell compares the same rows with `AppState.Annotation.Kind`, so between the two
+    /// checks a cache kind cannot exist on one side only, and a renamed wire value fails here
+    /// rather than reaching `AnnotationRecordRules.flags`, which traps.
+    #[test]
+    fn the_kind_table_projects_every_cache_kind_once() {
+        let rows = annotation_kind_flags();
+        assert_eq!(rows.len(), TaxonomyKind::RECORD_KINDS.len());
+        let kinds: Vec<&str> = rows.iter().map(|row| row.kind.as_str()).collect();
+        assert_eq!(
+            kinds.iter().collect::<std::collections::HashSet<_>>().len(),
+            kinds.len(),
+            "each cache kind appears once: {kinds:?}"
+        );
+        for kind in TaxonomyKind::RECORD_KINDS {
+            let record_name = kind.record_name().expect("a cache kind is named");
+            let row = rows
+                .iter()
+                .find(|row| row.record_kind.as_deref() == Some(record_name))
+                .unwrap_or_else(|| panic!("no row for {kind:?}"));
+            assert_eq!(row.kind, record_name);
+            assert_eq!(row.document_kind, kind.document_name());
+            if *kind != TaxonomyKind::Signature {
+                // A `/Stamp` is the one subtype whose cache kind depends on the instance (words
+                // or a picture), so its document name cannot round-trip to `signature`.
+                assert_eq!(
+                    document_annotation_kind_flags(kind.document_name().to_string()).record_kind,
+                    Some(record_name.to_string()),
+                    "{kind:?}"
+                );
+            }
+        }
+        assert_eq!(
+            document_annotation_kind_flags("stamp".to_string()).record_kind,
+            Some("stamp".to_string())
+        );
+    }
+}
+
+#[cfg(test)]
+mod ai_code_tests {
+    use super::*;
+    use lyra_reader_ai::AiError;
+
+    #[test]
+    fn the_stable_code_comes_from_the_error_variant_not_its_message() {
+        let cases = [
+            (AiError::NotConfigured, AiErrorCode::NotConfigured),
+            (
+                AiError::Unreachable("refused".into()),
+                AiErrorCode::Unreachable,
+            ),
+            (AiError::Offline("no route".into()), AiErrorCode::Offline),
+            (
+                AiError::LocalServer("nothing listening".into()),
+                AiErrorCode::LocalServer,
+            ),
+            (AiError::Unauthorized, AiErrorCode::Unauthorized),
+            (AiError::RateLimited, AiErrorCode::RateLimited),
+            (AiError::Cancelled, AiErrorCode::Cancelled),
+            (
+                AiError::UnsupportedCapability("image input"),
+                AiErrorCode::UnsupportedCapability,
+            ),
+            (
+                AiError::InvalidSettings("The model is not usable.".into()),
+                AiErrorCode::InvalidSettings,
+            ),
+            (
+                AiError::EmptyContext("This document has no pages.".into()),
+                AiErrorCode::EmptyContext,
+            ),
+            (
+                AiError::HttpStatus("HTTP 500".into()),
+                AiErrorCode::HttpStatus,
+            ),
+            (
+                AiError::Protocol("bad stream".into()),
+                AiErrorCode::Protocol,
+            ),
+            (AiError::Timeout("too long".into()), AiErrorCode::Timeout),
+            (AiError::Other("anything".into()), AiErrorCode::Other),
+        ];
+        for (error, code) in cases {
+            assert_eq!(AiErrorCode::of(&error), code, "{error:?}");
+        }
+        assert_eq!(
+            AiErrorCode::of(&AiError::EmptyContext(NOTHING_RELEVANT_MESSAGE.into())),
+            AiErrorCode::NothingRelevant
+        );
+        assert_eq!(
+            AiErrorCode::of(&AiError::EmptyContext(
+                "Turn on image input in Settings > AI.".into()
+            )),
+            AiErrorCode::VisionUnsupported
+        );
+    }
+
+    #[test]
+    fn the_ffi_error_carries_the_message_unchanged_and_the_code_beside_it() {
+        let converted: LyraReaderFfiError =
+            AiError::Timeout("The stream took too long.".into()).into();
+        match converted {
+            LyraReaderFfiError::Ai { message, code, .. } => {
+                assert_eq!(code, AiErrorCode::Timeout);
+                assert_eq!(message, "The stream took too long.");
+            }
+            other => panic!("expected an AI error, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod content_command_tests {
+    use super::*;
+    use lyra_reader_pdfium::content_edit::{ContentBox, ContentCommand};
+
+    fn revision() -> String {
+        "sha256:the-page-revision".into()
+    }
+
+    /// Every typed variant must produce exactly the engine variant and payload it replaced.
+    ///
+    /// The expected values are written literally rather than round-tripped through the record, so
+    /// a renamed, dropped or added field fails here even when the conversion itself was updated
+    /// consistently.
+    #[test]
+    fn every_content_command_record_maps_to_its_engine_command() {
+        let bounds = ContentBoxRecord {
+            x: 12.5,
+            y: -3.25,
+            width: 40.0,
+            height: 18.0,
+        };
+        let crop = ContentBoxRecord {
+            x: 0.1,
+            y: 0.2,
+            width: 0.3,
+            height: 0.4,
+        };
+        let cases: Vec<(ContentCommandRecord, ContentCommand)> = vec![
+            (
+                ContentCommandRecord::Transform {
+                    revision: revision(),
+                    target: "1.2".into(),
+                    bounds,
+                    rotation: 12.5,
+                },
+                ContentCommand::Transform {
+                    revision: revision(),
+                    target: "1.2".into(),
+                    bounds: ContentBox {
+                        x: 12.5,
+                        y: -3.25,
+                        width: 40.0,
+                        height: 18.0,
+                    },
+                    rotation: 12.5,
+                },
+            ),
+            (
+                ContentCommandRecord::ReplaceText {
+                    revision: revision(),
+                    target: "2".into(),
+                    text: "new words".into(),
+                    bounds,
+                    font: "Helvetica".into(),
+                    size: 11.5,
+                    colour: vec![10, 20, 30, 40],
+                    alignment: 2,
+                },
+                ContentCommand::ReplaceText {
+                    revision: revision(),
+                    target: "2".into(),
+                    text: "new words".into(),
+                    bounds: ContentBox {
+                        x: 12.5,
+                        y: -3.25,
+                        width: 40.0,
+                        height: 18.0,
+                    },
+                    font: "Helvetica".into(),
+                    size: 11.5,
+                    colour: [10, 20, 30, 40],
+                    alignment: 2,
+                },
+            ),
+            (
+                ContentCommandRecord::InsertText {
+                    revision: revision(),
+                    text: "inserted".into(),
+                    bounds,
+                    font: "Original".into(),
+                    size: 9.0,
+                    colour: vec![0, 0, 0, 255],
+                    alignment: 0,
+                },
+                ContentCommand::InsertText {
+                    revision: revision(),
+                    text: "inserted".into(),
+                    bounds: ContentBox {
+                        x: 12.5,
+                        y: -3.25,
+                        width: 40.0,
+                        height: 18.0,
+                    },
+                    font: "Original".into(),
+                    size: 9.0,
+                    colour: [0, 0, 0, 255],
+                    alignment: 0,
+                },
+            ),
+            (
+                ContentCommandRecord::Delete {
+                    revision: revision(),
+                    target: "3.1".into(),
+                },
+                ContentCommand::Delete {
+                    revision: revision(),
+                    target: "3.1".into(),
+                },
+            ),
+            (
+                ContentCommandRecord::Redact {
+                    revision: revision(),
+                    bounds,
+                    blackout: true,
+                },
+                ContentCommand::Redact {
+                    revision: revision(),
+                    bounds: ContentBox {
+                        x: 12.5,
+                        y: -3.25,
+                        width: 40.0,
+                        height: 18.0,
+                    },
+                    blackout: true,
+                },
+            ),
+            (
+                ContentCommandRecord::InsertImage {
+                    revision: revision(),
+                    bounds,
+                    image_path: "/tmp/insert.png".into(),
+                },
+                ContentCommand::InsertImage {
+                    revision: revision(),
+                    bounds: ContentBox {
+                        x: 12.5,
+                        y: -3.25,
+                        width: 40.0,
+                        height: 18.0,
+                    },
+                    image_path: "/tmp/insert.png".into(),
+                },
+            ),
+            (
+                ContentCommandRecord::ReplaceImage {
+                    revision: revision(),
+                    target: "4".into(),
+                    image_path: "/tmp/replace.png".into(),
+                },
+                ContentCommand::ReplaceImage {
+                    revision: revision(),
+                    target: "4".into(),
+                    image_path: "/tmp/replace.png".into(),
+                },
+            ),
+            (
+                ContentCommandRecord::CropImage {
+                    revision: revision(),
+                    target: "5".into(),
+                    crop,
+                },
+                ContentCommand::CropImage {
+                    revision: revision(),
+                    target: "5".into(),
+                    crop: ContentBox {
+                        x: 0.1,
+                        y: 0.2,
+                        width: 0.3,
+                        height: 0.4,
+                    },
+                },
+            ),
+            (
+                ContentCommandRecord::SetLink {
+                    revision: revision(),
+                    target: Some("6".into()),
+                    bounds,
+                    page: Some(7),
+                    uri: Some("https://example.test/".into()),
+                },
+                ContentCommand::SetLink {
+                    revision: revision(),
+                    target: Some("6".into()),
+                    bounds: ContentBox {
+                        x: 12.5,
+                        y: -3.25,
+                        width: 40.0,
+                        height: 18.0,
+                    },
+                    page: Some(7),
+                    uri: Some("https://example.test/".into()),
+                },
+            ),
+            (
+                ContentCommandRecord::SetLink {
+                    revision: revision(),
+                    target: None,
+                    bounds,
+                    page: None,
+                    uri: None,
+                },
+                ContentCommand::SetLink {
+                    revision: revision(),
+                    target: None,
+                    bounds: ContentBox {
+                        x: 12.5,
+                        y: -3.25,
+                        width: 40.0,
+                        height: 18.0,
+                    },
+                    page: None,
+                    uri: None,
+                },
+            ),
+        ];
+        for (record, expected) in cases {
+            assert_eq!(
+                content_command(record.clone()).expect("a well-formed record converts"),
+                expected,
+                "{record:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_content_colour_must_have_exactly_four_components() {
+        let bounds = ContentBoxRecord {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        for colour in [vec![], vec![0, 0, 0], vec![0, 0, 0, 0, 0]] {
+            let command = ContentCommandRecord::InsertText {
+                revision: revision(),
+                text: "x".into(),
+                bounds,
+                font: "Helvetica".into(),
+                size: 12.0,
+                colour,
+                alignment: 0,
+            };
+            match content_command(command) {
+                Err(LyraReaderFfiError::InvalidArgument { severity, message }) => {
+                    assert_eq!(severity, ErrorSeverity::Document);
+                    assert!(message.contains("exactly four components"), "{message}");
+                }
+                other => panic!("expected an invalid-argument error, got {other:?}"),
+            }
+        }
     }
 }

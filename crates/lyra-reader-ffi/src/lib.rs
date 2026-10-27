@@ -25,9 +25,10 @@
 //! alternative strategy described in `docs/adr/0003`.
 
 #![allow(clippy::missing_safety_doc)]
-// This is the **only** place in the project where `unsafe` is expected (raw pointers / foreign ABI),
-// so the workspace `unsafe_code` lint is explicitly waived here; every function must still document
-// its Safety contract.
+// The hand-written C ABI needs `unsafe` for raw pointers and foreign calls, so the workspace
+// `unsafe_code` lint is waived for this module. It is not the only such module: the PDFium crate
+// resolves C symbols in `annotations`, `page_ops` and `redaction` for the same reason. Every
+// function here must still document its Safety contract.
 #![allow(unsafe_code)]
 
 use lyra_reader_gpu::{GpuContext, QuadBlend, SurfaceConfig, SurfaceId, SurfaceTarget};
@@ -39,8 +40,26 @@ use std::sync::Mutex;
 uniffi::setup_scaffolding!();
 
 pub mod api;
+mod document_id;
+pub mod format;
 mod index_cache;
-pub use api::{DocumentSummary, LyraReaderEngine, LyraReaderFfiError};
+pub mod navigation;
+pub mod transaction;
+pub use api::{DocumentSummary, LyraReaderDocument, LyraReaderEngine, LyraReaderFfiError};
+pub use navigation::{
+    LyraReaderNavigationHistory, NavigationHistorySnapshotRecord, ReaderLocationRecord,
+    ReaderSelectionRecord,
+};
+pub use transaction::{
+    DocumentTransactionApplyRecord, DocumentTransactionInputRecord, DocumentTransactionStartRecord,
+    DocumentTransactionStateRecord, LyraReaderDocumentTransaction, retarget_recovery_manifest,
+    start_document_transaction,
+};
+
+/// Location of a document's disposable derived index, for cache management and diagnostics.
+pub fn document_index_cache_path(document: &std::path::Path) -> std::path::PathBuf {
+    index_cache::cache_path(document)
+}
 
 /// ABI version. **Must be bumped whenever the signature or semantics of any exported function changes**.
 ///
@@ -99,6 +118,19 @@ pub struct LyraReaderFrameStats {
 /// batch per frame. T1.7 moves this to a dedicated GPU thread with a command queue.
 static GPU: Mutex<Option<GpuContext>> = Mutex::new(None);
 
+/// Acquires [`GPU`], failing fast when an earlier panic poisoned it.
+///
+/// The C ABI cannot throw, so the failure is reported as [`code::ERR_INTERNAL`] after logging
+/// the same document-level sentence the throwing API uses. Continuing through `into_inner()`
+/// would hand out a GPU context whose surface table (and wgpu state) a panic may have left
+/// half-updated.
+fn lock_gpu() -> std::result::Result<std::sync::MutexGuard<'static, Option<GpuContext>>, i32> {
+    lyra_reader_core::sync::lock(&GPU).map_err(|error| {
+        eprintln!("lyra-reader-gpu: {error}");
+        code::ERR_INTERNAL
+    })
+}
+
 /// Returns the ABI version (checked by Swift at startup to avoid random crashes caused by bindings that do not match the library).
 ///
 /// # Safety
@@ -116,9 +148,8 @@ pub extern "C" fn lyra_reader_abi_version() -> u32 {
 pub extern "C" fn lyra_reader_gpu_init(flags: u32) -> i32 {
     let validation = flags & 1 != 0;
 
-    let mut guard = match GPU.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+    let Ok(mut guard) = lock_gpu() else {
+        return code::ERR_INTERNAL;
     };
     if guard.is_some() {
         return code::OK; // Idempotent: Swift may call this from every canvas view.
@@ -169,9 +200,8 @@ pub unsafe extern "C" fn lyra_reader_surface_attach(
         return code::ERR_INVALID_ARGUMENT;
     }
 
-    let mut guard = match GPU.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+    let Ok(mut guard) = lock_gpu() else {
+        return code::ERR_INTERNAL;
     };
     let Some(context) = guard.as_mut() else {
         return code::ERR_NOT_INITIALIZED;
@@ -311,7 +341,10 @@ pub unsafe extern "C" fn lyra_reader_gpu_upload_texture(
     if pixels.is_null() || out_texture_id.is_null() {
         return code::ERR_INVALID_ARGUMENT;
     }
-    let expected = (width as usize) * (height as usize) * 4;
+    let expected = match lyra_reader_gpu::rgba_byte_len(width, height) {
+        Ok(expected) => expected,
+        Err(_) => return code::ERR_INVALID_ARGUMENT,
+    };
     if len < expected {
         return code::ERR_INVALID_ARGUMENT;
     }
@@ -480,6 +513,85 @@ pub unsafe extern "C" fn lyra_reader_surface_draw_pages_with_appearance(
     appearance: u8,
     stats: *mut LyraReaderFrameStats,
 ) -> i32 {
+    // SAFETY: the caller owns the arrays and stats under this function's documented contract.
+    unsafe {
+        draw_pages(
+            surface_id,
+            texture_ids,
+            rects,
+            std::ptr::null(),
+            blend_modes,
+            count,
+            red,
+            green,
+            blue,
+            appearance,
+            stats,
+        )
+    }
+}
+
+/// Draws with a display-only paper profile and a normalized source rectangle per quad.
+///
+/// `uvs` is `count * 4` `f32`s of `[u0, v0, u1, v1]` (origin top-left). It is how a torn page
+/// draws its two display segments from one uploaded page texture: the page is rasterized once,
+/// and the GPU samples the part each segment shows. Values outside `0…1` or an empty/inverted
+/// rectangle are a caller bug and are rejected rather than clamped.
+///
+/// # Safety
+/// When `count > 0`, `texture_ids`, `rects`, `uvs` and `blend_modes` must each cover `count`
+/// elements (`rects` and `uvs` four `f32`s each per quad). `stats` must be null or writable.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn lyra_reader_surface_draw_pages_with_appearance_uv(
+    surface_id: u64,
+    texture_ids: *const u64,
+    rects: *const f32,
+    uvs: *const f32,
+    blend_modes: *const u8,
+    count: usize,
+    red: f64,
+    green: f64,
+    blue: f64,
+    appearance: u8,
+    stats: *mut LyraReaderFrameStats,
+) -> i32 {
+    // SAFETY: the caller owns the arrays and stats under this function's documented contract.
+    unsafe {
+        draw_pages(
+            surface_id,
+            texture_ids,
+            rects,
+            uvs,
+            blend_modes,
+            count,
+            red,
+            green,
+            blue,
+            appearance,
+            stats,
+        )
+    }
+}
+
+/// Shared body of the two appearance draw entry points. `uvs` null means "whole texture".
+///
+/// # Safety
+/// Arrays and `stats` follow the contract documented on the exported functions above.
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_pages(
+    surface_id: u64,
+    texture_ids: *const u64,
+    rects: *const f32,
+    uvs: *const f32,
+    blend_modes: *const u8,
+    count: usize,
+    red: f64,
+    green: f64,
+    blue: f64,
+    appearance: u8,
+    stats: *mut LyraReaderFrameStats,
+) -> i32 {
     let appearance = match appearance {
         0 => lyra_reader_gpu::PaperAppearance::Original,
         1 => lyra_reader_gpu::PaperAppearance::Warm,
@@ -496,15 +608,35 @@ pub unsafe extern "C" fn lyra_reader_surface_draw_pages_with_appearance(
         return code::ERR_INVALID_ARGUMENT;
     }
 
-    let mut draws = Vec::with_capacity(count);
+    let mut draws: Vec<lyra_reader_gpu::TexturedQuad> = Vec::with_capacity(count);
     if count > 0 {
-        // SAFETY: the caller guarantees all three arrays cover `count` elements (documented above).
+        // SAFETY: the caller guarantees all arrays cover `count` elements (documented above).
         let ids = unsafe { std::slice::from_raw_parts(texture_ids, count) };
         let coordinates = unsafe { std::slice::from_raw_parts(rects, count * 4) };
+        let sources = if uvs.is_null() {
+            None
+        } else {
+            Some(unsafe { std::slice::from_raw_parts(uvs, count * 4) })
+        };
         let modes = unsafe { std::slice::from_raw_parts(blend_modes, count) };
 
         for (index, id) in ids.iter().enumerate() {
             let rect = &coordinates[index * 4..index * 4 + 4];
+            let source = match sources {
+                Some(values) => {
+                    let uv = &values[index * 4..index * 4 + 4];
+                    if uv
+                        .iter()
+                        .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+                        || uv[0] >= uv[2]
+                        || uv[1] >= uv[3]
+                    {
+                        return code::ERR_INVALID_ARGUMENT;
+                    }
+                    [uv[0], uv[1], uv[2], uv[3]]
+                }
+                None => [0.0, 0.0, 1.0, 1.0],
+            };
             let blend = match modes[index] {
                 blend::MULTIPLY => QuadBlend::Multiply,
                 // An unknown value would be a caller bug; drawing it as an ordinary overlay is the
@@ -514,6 +646,7 @@ pub unsafe extern "C" fn lyra_reader_surface_draw_pages_with_appearance(
             draws.push((
                 lyra_reader_gpu::TextureId(*id),
                 [rect[0], rect[1], rect[2], rect[3]],
+                source,
                 blend,
             ));
         }
@@ -521,7 +654,7 @@ pub unsafe extern "C" fn lyra_reader_surface_draw_pages_with_appearance(
 
     let mut report = None;
     let result = with_context(|context| {
-        let frame = context.render_pages_with_appearance(
+        let frame = context.render_pages_with_appearance_uv(
             SurfaceId(surface_id),
             &draws,
             // The shell supplies a linear-light semantic surface color.
@@ -539,7 +672,7 @@ pub unsafe extern "C" fn lyra_reader_surface_draw_pages_with_appearance(
         {
             let summary: Vec<String> = draws
                 .iter()
-                .map(|(_, rect, _)| {
+                .map(|(_, rect, _, _)| {
                     format!(
                         "({:.0},{:.0} {:.0}×{:.0})",
                         rect[0], rect[1], rect[2], rect[3]
@@ -599,9 +732,8 @@ pub unsafe extern "C" fn lyra_reader_gpu_offscreen_probe(
 /// Shuts down the GPU (releases the device and all surfaces; call before the process exits).
 #[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_gpu_shutdown() -> i32 {
-    let mut guard = match GPU.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+    let Ok(mut guard) = lock_gpu() else {
+        return code::ERR_INTERNAL;
     };
     *guard = None;
     code::OK
@@ -622,9 +754,8 @@ fn with_context<F>(body: F) -> i32
 where
     F: FnOnce(&mut GpuContext) -> lyra_reader_core::Result<()>,
 {
-    let mut guard = match GPU.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+    let Ok(mut guard) = lock_gpu() else {
+        return code::ERR_INTERNAL;
     };
     let Some(context) = guard.as_mut() else {
         return code::ERR_NOT_INITIALIZED;
@@ -635,7 +766,7 @@ where
             use lyra_reader_core::ErrorCode;
             eprintln!("lyra-reader-gpu: {error}");
             match error.code {
-                ErrorCode::InvalidArgument | ErrorCode::NotReady => code::ERR_INVALID_ARGUMENT,
+                ErrorCode::InvalidArgument => code::ERR_INVALID_ARGUMENT,
                 ErrorCode::GpuUnavailable | ErrorCode::BackendUnavailable => {
                     code::ERR_GPU_UNAVAILABLE
                 }
@@ -697,6 +828,25 @@ mod tests {
             rc == code::ERR_NOT_INITIALIZED || rc == code::ERR_INVALID_ARGUMENT,
             "unexpected code {rc}"
         );
+    }
+
+    #[test]
+    fn wrapped_texture_dimensions_are_rejected_before_the_slice() {
+        let pixels = [0u8; 4];
+        let mut texture_id = 0u64;
+        // SAFETY: `pixels` and `texture_id` are valid locals. The dimensions overflow a pixel
+        // byte count, so the function must reject them before reading `pixels` as a texture.
+        let rc = unsafe {
+            lyra_reader_gpu_upload_texture(
+                u32::MAX,
+                u32::MAX,
+                pixels.as_ptr(),
+                pixels.len(),
+                &mut texture_id,
+            )
+        };
+        assert_eq!(rc, code::ERR_INVALID_ARGUMENT);
+        assert_eq!(texture_id, 0);
     }
 
     /// End-to-end GPU self-test through the C ABI, mirroring what the host does.

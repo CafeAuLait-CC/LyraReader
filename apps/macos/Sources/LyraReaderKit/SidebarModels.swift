@@ -1,4 +1,5 @@
 import Foundation
+import LyraReaderBindings
 
 /// A numbered sidebar row for one outline entry.
 ///
@@ -100,8 +101,8 @@ public struct AnnotationPanelSection: Identifiable {
     public var id: Int { page }
     public var annotationCount: Int { rows.count }
     public var title: String {
-        annotationCount == 1 ? "Page \(page + 1) · 1 annotation"
-            : "Page \(page + 1) · \(annotationCount) annotations"
+        "\(LyraReaderBindings.pageLabel(pages: [UInt32(page + 1)])) · "
+            + (annotationCount == 1 ? "1 annotation" : "\(annotationCount) annotations")
     }
 }
 
@@ -235,52 +236,10 @@ public struct AnnotationPanelModel {
 public extension DocumentAnnotation {
     /// `/M` as a readable date, or the file's own string when it is not the PDF `D:…` shape.
     var displayDate: String? {
+        if let pdfDisplayDate { return pdfDisplayDate }
+        // A locally constructed annotation (a check, a new mark) has no engine record yet; the
+        // same Rust parser fills the gap rather than a second Swift copy.
         guard let modified, !modified.isEmpty else { return nil }
-        var digits = modified
-        if digits.hasPrefix("D:") {
-            digits.removeFirst(2)
-        }
-        guard digits.count >= 14 else { return modified }
-        let stamp = String(digits.prefix(14))
-        let parser = DateFormatter()
-        parser.locale = Locale(identifier: "en_US_POSIX")
-        parser.timeZone = TimeZone(secondsFromGMT: 0)
-        parser.dateFormat = "yyyyMMddHHmmss"
-        guard let date = parser.date(from: stamp) else { return modified }
-        let display = DateFormatter()
-        display.locale = Locale(identifier: "en_US_POSIX")
-        display.timeZone = TimeZone(secondsFromGMT: 0)
-        display.dateFormat = "yyyy-MM-dd HH:mm"
-        return display.string(from: date)
-    }
-}
-
-/// One page's bookmarks, in the reader's own order.
-public struct BookmarkGroup: Identifiable {
-    public let page: Int
-    public let bookmarks: [Bookmark]
-
-    public var id: Int { page }
-
-    public var title: String {
-        bookmarks.count == 1 ? "Page \(page + 1) · 1 bookmark"
-            : "Page \(page + 1) · \(bookmarks.count) bookmarks"
-    }
-}
-
-/// The sidebar's bookmark grouping, kept apart from the view so it can be checked directly.
-///
-/// A bookmark list is the reader's outline, not a sorted index: the order is whatever they set
-/// with the move commands. Grouping therefore preserves first appearance — a page's section
-/// sits where its first bookmark is — and within a section the array order is kept.
-public enum BookmarkGrouping {
-    public static func groups(for bookmarks: [Bookmark]) -> [BookmarkGroup] {
-        var pageOrder: [Int] = []
-        var byPage: [Int: [Bookmark]] = [:]
-        for bookmark in bookmarks {
-            if byPage[bookmark.page] == nil { pageOrder.append(bookmark.page) }
-            byPage[bookmark.page, default: []].append(bookmark)
-        }
-        return pageOrder.map { BookmarkGroup(page: $0, bookmarks: byPage[$0] ?? []) }
+        return pdfDateDisplay(value: modified)
     }
 }
