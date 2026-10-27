@@ -2817,6 +2817,25 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var references: [Reference] = []
     private var referencesLoadCompleted = false
 
+    /// Document-wide indexes that no reader can see while the first page is still being
+    /// rasterised, held back until a visible raster has been produced.
+    ///
+    /// The engine runs every PDFium operation on one serial queue, and citations, the caption
+    /// index and the reference list are document-wide scans: on a 115-page paper they occupied
+    /// that queue for hundreds of milliseconds *ahead* of the first page and sidebar thumbnail,
+    /// which are the only content on screen. Deferring them changes when that offscreen work
+    /// runs, not what is drawn. The optional is the gate: `nil` means the normal path where
+    /// every loader starts immediately (checks, tab switches after the first raster, older
+    /// callers). `beginStartupPrefetchDeferral()` arms it for one open and
+    /// `releaseStartupPrefetch()` runs the loaders that were skipped, once.
+    private struct DeferredStartupPrefetch {
+        var references = false
+        var figures = false
+        var citations = false
+        var captionMentions = false
+    }
+    private var deferredStartupPrefetch: DeferredStartupPrefetch?
+
     /// `Figure 3` / `Table 2` mentions per page, and the document's caption index.
     ///
     /// Mentions are keyed by `(kind, label)`, which is exactly how `figures` is looked up:
@@ -3750,6 +3769,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 pageEditIsApplied = false
             }
             document = loaded
+            // The visible page raster and the sidebar thumbnail are created by the reload below;
+            // document-wide click/AI indexes are not on screen yet and must not occupy the
+            // engine's serial queue ahead of them.
+            beginStartupPrefetchDeferral()
             DocumentEditCache.adopt(documentId: loaded.documentId, for: url)
             lastError = nil
             recoverableErrorBanner = nil
@@ -3805,6 +3828,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             loadRegionHistory(for: url)
             refreshTranslationPaperColors()
             inPlaceTranslation.loadDocument(url: url, pageCount: loaded.pageCount)
+            // A document with no pages, or one whose viewport asked for neither a page raster
+            // nor a tile, has no visible raster completion to wait for.
+            releaseStartupPrefetchIfNoVisibleWork()
             return true
 
         } catch {
@@ -3906,6 +3932,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         referencesLoadCompleted = false
         figuresLoadCompleted = false
         figuresLoadTask = nil
+        // A previous document's deferred scans must not run against the new one.
+        deferredStartupPrefetch = nil
         metadataLoadCompleted = false
         documentAnnotationsLoadCompleted = false
         isRestoringDocument = false
@@ -12421,6 +12449,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Called from `reloadVisiblePages`, so a page that has just been scrolled into view gets
     /// its mentions before the pointer can reach them; the cache makes the repeated calls free.
     private func loadCaptionMentions() {
+        if deferStartupPrefetch(\.captionMentions) { return }
         for placement in visiblePagePlacements where captionMentionsByPage[placement.index] == nil {
             guard !captionMentionsInFlight.contains(placement.index) else { continue }
             captionMentionsInFlight.insert(placement.index)
@@ -12440,8 +12469,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// Loads the figure/table caption index once per open document (see `open(url:)`).
-    private func loadFigures() {
+    ///
+    /// `force` lets a reader action that is waiting on the index (a region selection or a figure
+    /// click made before the first page raster completes) bypass the startup gate: the scan is
+    /// then visible work, because its result decides what that action draws.
+    private func loadFigures(force: Bool = false) {
         guard !figuresLoadCompleted else { return }
+        if !force, deferStartupPrefetch(\.figures) { return }
         figuresLoadCompleted = true
         let epoch = documentEpoch
         let task = Task { @MainActor [weak self] in
@@ -12466,6 +12500,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// figure because the answer had not arrived. The scan always completes (a failure yields an
     /// empty list), so this cannot hang on a broken document.
     func awaitFiguresForPlacement() async {
+        // A reader can start a region selection before the startup gate released the index.
+        // The placement depends on this scan, so it is visible work here: start it now rather
+        // than awaiting a task that was never created.
+        if figuresLoadTask == nil, !figuresLoadCompleted {
+            loadFigures(force: true)
+        }
         await figuresLoadTask?.value
     }
 
@@ -12537,6 +12577,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Fetches the citations of every visible page, so a click resolves immediately.
     private func loadCitations() {
+        if deferStartupPrefetch(\.citations) { return }
         for placement in visiblePagePlacements where citationsByPage[placement.index] == nil {
             startCitationLoad(page: placement.index)
         }
@@ -12570,6 +12611,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Loads the reference list once (it never changes for an open document).
     private func loadReferences() {
         guard !referencesLoadCompleted else { return }
+        if deferStartupPrefetch(\.references) { return }
         referencesLoadCompleted = true
         let epoch = documentEpoch
         Task { @MainActor [weak self] in
@@ -12582,6 +12624,66 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 Data("lyra-reader-references: \(self.references.count) entries\n".utf8)
             )
         }
+    }
+
+    /// Records one offscreen document-wide scan for the startup gate.
+    ///
+    /// Returns `true` while the gate is armed, so the caller can return without starting the
+    /// scan. The flag is a `WritableKeyPath` into the small pending record rather than five
+    /// near-identical accessors; the engine call itself is unchanged when the gate is `nil`.
+    private func deferStartupPrefetch(
+        _ pending: WritableKeyPath<DeferredStartupPrefetch, Bool>
+    ) -> Bool {
+        guard var deferred = deferredStartupPrefetch else { return false }
+        deferred[keyPath: pending] = true
+        deferredStartupPrefetch = deferred
+        return true
+    }
+
+    /// Arms the startup gate for one document open.
+    private func beginStartupPrefetchDeferral() {
+        deferredStartupPrefetch = DeferredStartupPrefetch()
+    }
+
+    /// Runs the scans the gate held back. Called once the first visible raster has been folded in,
+    /// or immediately when there is no visible raster to wait for.
+    private func releaseStartupPrefetch() {
+        guard let deferred = deferredStartupPrefetch else { return }
+        deferredStartupPrefetch = nil
+        if deferred.references { loadReferences() }
+        if deferred.figures { loadFigures() }
+        if deferred.citations { loadCitations() }
+        if deferred.captionMentions { loadCaptionMentions() }
+    }
+
+    /// Ends the startup deferral early for a surface the reader just opened.
+    ///
+    /// The AI panel reads the reference list and the summary coverage, so showing it makes that
+    /// work visible; it no longer has to wait for the first page raster. A no-op when the gate is
+    /// already released or was never armed.
+    public func resumeDeferredStartupPrefetch() {
+        releaseStartupPrefetch()
+    }
+
+    /// Releases the gate if the open produced no visible raster at all (a document with no pages,
+    /// or a viewport that asks for neither a page raster nor a tile). Without this the deferred
+    /// scans would wait for a completion that cannot happen.
+    private func releaseStartupPrefetchIfNoVisibleWork() {
+        guard deferredStartupPrefetch != nil else { return }
+        guard pagePreviewInFlight == nil,
+              pendingTiles.isEmpty,
+              tilesInFlight.isEmpty
+        else { return }
+        releaseStartupPrefetch()
+    }
+
+    /// An on-screen page became fully sharp in the committed page list. The first one ends the
+    /// startup deferral; later calls are a cheap optional test. The whole-page path reaches this
+    /// after one raster; the 400% tile path waits for its first complete page so the remaining
+    /// visible tiles are not pushed behind the deferred scans.
+    private func noteFirstSharpVisiblePage() {
+        guard deferredStartupPrefetch != nil else { return }
+        releaseStartupPrefetch()
     }
 
     /// Loads the recognised metadata once per open document.
@@ -14524,11 +14626,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var missedTiles = Set<TileKey>()
         var tilePlacements: [TileKey: PagePlacement] = [:]
         var queuedTiles: [TilePlanSnapshot.Tile] = []
-        // Trace-only: which on-screen pages the committed page list covers at target sharpness.
-        // `nil` (no allocation) whenever the trace is off.
-        let perfOnScreen: Set<Int>? = PerfTrace.enabled
-            ? Set(onScreen.map(\.placement.index)) : nil
+        // Which pages the reader can actually see. The trace uses the same set, but the startup
+        // gate needs it whether or not the trace is enabled.
+        let onScreenPageIndices = Set(onScreen.map(\.placement.index))
+        let perfOnScreen: Set<Int>? = PerfTrace.enabled ? onScreenPageIndices : nil
         var perfSharpSources: [Int: String]? = perfOnScreen == nil ? nil : [:]
+        // At least one on-screen page is fully covered by a sharp source in the page list that
+        // is about to be committed. This is the point where the startup gate releases the
+        // document-wide index scans that were held behind the visible page.
+        var anyOnScreenPageSharp = false
 
         for span in band {
             let placement = span.placement
@@ -14555,6 +14661,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     }
                     if let perfOnScreen, perfOnScreen.contains(placement.index), pageSharp {
                         perfSharpSources?[placement.index] = "page-raster"
+                    }
+                    if pageSharp, onScreenPageIndices.contains(placement.index) {
+                        anyOnScreenPageSharp = true
                     }
                     continue
                 }
@@ -14644,6 +14753,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             if let perfOnScreen, perfOnScreen.contains(placement.index), complete {
                 perfSharpSources?[placement.index] = "tile"
             }
+            if complete, onScreenPageIndices.contains(placement.index) {
+                anyOnScreenPageSharp = true
+            }
         }
         // Submit in the plan's order: visible tiles first, then the ring by distance. The
         // planner's sort is stable, so equal distances keep the band's page/row/column order —
@@ -14675,6 +14787,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // complementary source rectangles.
         pages = applyPageTears(to: pages)
         canvasPages = pages
+        if anyOnScreenPageSharp {
+            // The first page the reader can see is fully covered by its sharp source in the
+            // committed list. Work that is not on screen (references, citations, caption
+            // mentions) may now use the serial queue.
+            noteFirstSharpVisiblePage()
+        }
         if let perfOnScreen, let perfSharpSources {
             finishPerfViewport(pages: pages, sharpSources: perfSharpSources, onScreen: perfOnScreen,
                                path: usesScreenPageRasters ? "page-raster" : "tile", lod: lod,
@@ -15943,6 +16061,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                                    detail: String(describing: error))
                 }
                 self.reloadVisiblePages()
+                self.releaseStartupPrefetchIfNoVisibleWork()
             }
         }
     }
@@ -16165,6 +16284,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             }
             self.pagePreviewInFlight = nil
             self.reloadVisiblePages()
+            // On success the reload above released the gate when the page became sharp. A
+            // failure (or a page whose raster was rejected) must not strand the deferred scans
+            // when no other visible raster is pending.
+            self.releaseStartupPrefetchIfNoVisibleWork()
         }
     }
 

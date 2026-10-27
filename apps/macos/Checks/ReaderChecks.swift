@@ -876,6 +876,11 @@ struct ReaderChecks {
                     citationsURL: root.appendingPathComponent("tests/fixtures/two-column-references.pdf"),
                     mentionsURL: root.appendingPathComponent("tests/fixtures/cross-references.pdf"))
             }),
+            ("startup-prefetch", {
+                // Pure shell ordering: a controlled engine holds the first visible page raster
+                // open and records whether any offscreen index scan was requested behind it.
+                try await startupPrefetchChecks(url: b)
+            }),
             ("screen-page", {
                 try await screenPageChecks(url: b)
             }),
