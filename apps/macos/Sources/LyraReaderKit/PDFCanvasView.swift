@@ -97,6 +97,66 @@ enum LyraReaderStatus: Int32 {
     }
 }
 
+/// The canvas-visible half of one model commit.
+///
+/// `AppState.reloadVisiblePages()` commits a page list together with the viewport transform,
+/// the page geometry the overlays draw with and the perf stamp that names the commit. SwiftUI
+/// normally publishes that state and `updateNSView` hands it to the canvas 6-16 ms later.
+/// ``MetalCanvasView/applyModelCommit()`` reads the same values from the model at the commit
+/// instead, so the frame leaves while the commit is still on the stack.
+///
+/// The fields are exactly the model-derived values ``PDFCanvasView/configure(_:)`` applies. The
+/// direct commit and the following SwiftUI pass therefore describe the same commit, which is
+/// what makes that pass a no-op for the canvas (no second frame, no stale page geometry).
+public struct CanvasModelCommit {
+    public var pages: [CanvasPage]
+    public var scrollYPt: CGFloat
+    public var zoom: CGFloat
+    public var contentWidthPt: CGFloat
+    public var pageFrames: [PagePlacement]
+    public var annotationMarks: [CanvasAnnotationMark]
+    public var translationOverlays: [TranslationOverlay]
+    public var translationPaperColors: [Int: TranslationPaperColor]
+
+    public init(
+        pages: [CanvasPage],
+        scrollYPt: CGFloat,
+        zoom: CGFloat,
+        contentWidthPt: CGFloat,
+        pageFrames: [PagePlacement],
+        annotationMarks: [CanvasAnnotationMark],
+        translationOverlays: [TranslationOverlay],
+        translationPaperColors: [Int: TranslationPaperColor]
+    ) {
+        self.pages = pages
+        self.scrollYPt = scrollYPt
+        self.zoom = zoom
+        self.contentWidthPt = contentWidthPt
+        self.pageFrames = pageFrames
+        self.annotationMarks = annotationMarks
+        self.translationOverlays = translationOverlays
+        self.translationPaperColors = translationPaperColors
+    }
+}
+
+extension CanvasModelCommit {
+    /// The reader state a commit makes visible, in the same form `ReaderWindow` passes to the
+    /// SwiftUI canvas. Reading it live at the commit is what lets the committed frame leave
+    /// before SwiftUI publishes; the next body evaluation builds the same value.
+    @MainActor
+    public init(state: AppState) {
+        self.init(
+            pages: state.canvasPages,
+            scrollYPt: state.scrollYPt,
+            zoom: state.zoomFactor,
+            contentWidthPt: state.contentWidthPt,
+            pageFrames: state.canvasPageSegments,
+            annotationMarks: state.canvasAnnotationMarks,
+            translationOverlays: state.translationOverlays,
+            translationPaperColors: state.translationPaperColors)
+    }
+}
+
 /// The `NSView` that hosts GPU rendering: **its backing layer is a `CAMetalLayer`**
 /// which the Rust engine attaches to as a render surface.
 ///
@@ -478,6 +538,11 @@ public final class MetalCanvasView: NSView {
     /// a perf trace (the floating preview) leaves the default stamp, and tracing off never calls
     /// it.
     public var perfStampProvider: (() -> PerfViewportStamp)?
+    /// Reads the full visual state of one model commit. The wheel path's ``interactionSnapshot``
+    /// is deliberately smaller (pages, offset, zoom); this one also carries the page geometry the
+    /// chrome overlay draws with and the overlay content, so the frame drawn at a commit cannot
+    /// mix it with the previous one. Set by ``PDFCanvasView`` for the reader's canvas only.
+    public var modelCommitSnapshot: (() -> CanvasModelCommit)?
 
     private func syncInteraction() {
         if let snapshot = interactionSnapshot?() {
@@ -490,6 +555,30 @@ public final class MetalCanvasView: NSView {
             needsRender = false
             renderFrame()
         }
+    }
+
+    /// Draws a model commit immediately instead of waiting for the next SwiftUI publish and
+    /// `updateNSView` pass.
+    ///
+    /// `AppState` calls this from the end of `reloadVisiblePages()`, after the page list, the
+    /// viewport transform and the sharp stamp are committed. It applies the same snapshot
+    /// `PDFCanvasView.configure` will apply on the next SwiftUI update, then goes through
+    /// ``syncInteraction()`` — the wheel handler's path — so texturing, `renderFrame()` and its
+    /// CATransaction are shared with ordinary input rather than duplicated. `renderFrame` syncs
+    /// the page chrome inside that same transaction; because the page geometry was applied
+    /// above, the chrome and the paper describe the same commit. A commit that changed nothing
+    /// visible leaves `needsRender` false, and this submits no frame.
+    func applyModelCommit() {
+        guard let commit = modelCommitSnapshot?() else { return }
+        pages = commit.pages
+        scrollYPt = commit.scrollYPt
+        zoom = commit.zoom
+        contentWidthPt = commit.contentWidthPt
+        annotationPageFrames = commit.pageFrames
+        annotationMarks = commit.annotationMarks
+        translationOverlays = commit.translationOverlays
+        translationPaperColors = commit.translationPaperColors
+        syncInteraction()
     }
     private var configuredSize: CGSize = .zero
     private var reportedDeviceScale: CGFloat = 0
@@ -526,6 +615,12 @@ public final class MetalCanvasView: NSView {
     /// Page quads in the most recent frame handed to the engine, presented or not. `0` means the
     /// submission was a clearing frame: the background with nothing drawn over it.
     package private(set) var lastAttemptedQuadCount: Int?
+    /// The viewport stamp the most recent frame handed to the engine carried.
+    ///
+    /// The `frame` trace record is written from Metal's presentation callback, which is
+    /// asynchronous; a native check that has just driven a commit needs the synchronous copy to
+    /// assert that the frame it caused describes that commit (same sharp token).
+    package private(set) var lastAttemptStamp = PerfViewportStamp()
     /// Whether this view's layer is attached to an engine surface. Checks use it where they
     /// cannot ask for a presented frame (an occluded window never presents).
     package var hasAttachedSurface: Bool { surfaceId != 0 }
@@ -1841,6 +1936,7 @@ public final class MetalCanvasView: NSView {
         // drawable once the window can present again.
         frameAttemptCount += 1
         lastAttemptedQuadCount = textureIds.count
+        lastAttemptStamp = perfStamp
 
         if stats.presented == 0 {
             // The window is occluded (minimised, hidden, or covered by another app): wgpu
@@ -2034,6 +2130,13 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let onUndo: () -> Void
     private let onRedo: () -> Void
     private let interactionSnapshot: (() -> ([CanvasPage], CGFloat, CGFloat))?
+    /// The reader state whose commits this canvas draws directly (see `applyModelCommit`).
+    /// `nil` for the floating preview, which has no reader commit to wait for.
+    private let modelCommitSource: AppState?
+    /// Reads the full visual state of a commit live from the model. The SwiftUI values below and
+    /// this closure are built from the same `CanvasModelCommit` definition, so the pass that
+    /// follows a direct commit applies the same values and does not draw again.
+    private let modelCommitSnapshot: (() -> CanvasModelCommit)?
     /// The `sharp` token / document epoch the `pages` above belong to. Published with `pages` so
     /// a frame record can name the exact commit that produced the pixels; the canvas reads it
     /// only when the perf trace is emitting.
@@ -2099,6 +2202,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         interactionSnapshot: (() -> ([CanvasPage], CGFloat, CGFloat))? = nil,
         perfStamp: PerfViewportStamp = PerfViewportStamp(),
         onPerfStamp: (() -> PerfViewportStamp)? = nil,
+        modelCommitSource: AppState? = nil,
+        modelCommitSnapshot: (() -> CanvasModelCommit)? = nil,
         fileDrop: DocumentOpenCoordinator? = nil,
         onContextMenu: ((CGPoint) -> NSMenu?)? = nil,
         onTranslationToggle: ((String) -> Void)? = nil,
@@ -2160,6 +2265,8 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.interactionSnapshot = interactionSnapshot
         self.perfStamp = perfStamp
         self.onPerfStamp = onPerfStamp
+        self.modelCommitSource = modelCommitSource
+        self.modelCommitSnapshot = modelCommitSnapshot
         self.fileDrop = fileDrop
         self.onContextMenu = onContextMenu
         self.onTranslationToggle = onTranslationToggle
@@ -2177,6 +2284,10 @@ public struct PDFCanvasView: NSViewRepresentable {
     }
 
     private func configure(_ view: MetalCanvasView) {
+        // Register before assigning the model values: a commit that lands while this update runs
+        // would otherwise draw through the old model snapshot.
+        view.modelCommitSnapshot = modelCommitSnapshot
+        if let modelCommitSource { modelCommitSource.attachedCanvas = view }
         view.configurePageBookmarks(state: regionState)
         view.configureRegionCards(state: regionState, onOpenInPanel: onOpenRegionInPanel,
                                   onShowHistory: onShowRegionHistory)

@@ -587,6 +587,12 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
         didSet { refreshTranslationPaperColors() }
     }
     private var canvasTiles: [CanvasPage] = []
+    /// The canvas drawing this window's page list, registered by ``PDFCanvasView``.
+    ///
+    /// Weak, because the window owns the view. ``reloadVisiblePages()`` tells it that the commit
+    /// has landed so it can submit the frame before the SwiftUI publish reaches `updateNSView`;
+    /// a window whose canvas has not attached yet simply keeps the old path.
+    package weak var attachedCanvas: MetalCanvasView?
     /// Scroll offset in content points; 0 is the top of the first page.
     @Published public internal(set) var scrollYPt: CGFloat = 0
     /// True while the user is scrolling, so the indicator stays on screen.
@@ -14508,6 +14514,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             contentHeightPt = 0
             lastTilePlan = nil
             visibleTileKeysByPage = [:]
+            invalidateCanvasForModelCommit()
             return
         }
 
@@ -14840,6 +14847,24 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             wanted: wanted.count, scheduled: pendingTiles.count, band: bandReport,
             ringVh: ringVh, lod: lod, tilePt: tilePt, pages: pages.count
         )
+        // The commit is complete: page list, viewport transform, chrome geometry and (with the
+        // trace on) the sharp stamp all belong to the same moment. Draw it now through the
+        // canvas's existing interaction path instead of waiting for the SwiftUI publish and
+        // `updateNSView` hop that used to add 6-16 ms plus the coalesced main-queue job.
+        invalidateCanvasForModelCommit()
+    }
+
+    /// Tells the attached canvas that a model commit has landed, so it can submit that commit's
+    /// frame inside the same CATransaction as the chrome instead of after the next SwiftUI pass.
+    ///
+    /// The canvas applies ``CanvasModelCommit`` — exactly the values `PDFCanvasView.configure`
+    /// will apply on that pass — and then reuses `syncInteraction`, the wheel handler's path.
+    /// Nothing about `renderFrame`, `presentsWithTransaction`, the transaction itself or the
+    /// drawable count changes. A commit that changed nothing visible leaves the canvas'
+    /// `needsRender` false and submits no frame; the canvas' coalescing job also makes the
+    /// following SwiftUI pass a no-op rather than a second draw.
+    private func invalidateCanvasForModelCommit() {
+        attachedCanvas?.applyModelCommit()
     }
 
     /// Where one wanted tile sits relative to what the viewport shows. The band HUD reports

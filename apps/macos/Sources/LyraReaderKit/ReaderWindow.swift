@@ -329,18 +329,29 @@ public struct ReaderWindow: View {
 
     // MARK: - Canvas
 
+    /// The model-derived values the canvas draws, read once per body evaluation.
+    ///
+    /// `canvas` uses this value for the SwiftUI arguments and the canvas' direct-commit closure
+    /// rebuilds the same ``CanvasModelCommit`` from the live model. Both go through the one
+    /// initializer, so a commit drawn immediately and the update pass that follows it describe
+    /// the same state instead of drifting apart.
+    private var canvasModel: CanvasModelCommit {
+        CanvasModelCommit(state: state)
+    }
+
     private var canvas: some View {
-        ZStack {
+        let model = canvasModel
+        return ZStack {
             PDFCanvasView(
-                pages: state.canvasPages,
-                scrollYPt: state.scrollYPt,
-                zoom: state.zoomFactor,
-                contentWidthPt: state.contentWidthPt,
+                pages: model.pages,
+                scrollYPt: model.scrollYPt,
+                zoom: model.zoom,
+                contentWidthPt: model.contentWidthPt,
                 paperAppearance: appearance.mode,
-                annotationMarks: state.canvasAnnotationMarks,
-                annotationPageFrames: state.canvasPageSegments,
-                translationOverlays: state.translationOverlays,
-                translationPaperColors: state.translationPaperColors,
+                annotationMarks: model.annotationMarks,
+                annotationPageFrames: model.pageFrames,
+                translationOverlays: model.translationOverlays,
+                translationPaperColors: model.translationPaperColors,
                 annotationTool: state.annotationTool,
                 regionSelectionArmed: state.regionSelectionArmed,
                 onRegionSelection: { page, rect in
@@ -430,6 +441,10 @@ public struct ReaderWindow: View {
                 interactionSnapshot: { (state.canvasPages, state.scrollYPt, state.zoomFactor) },
                 perfStamp: state.perfViewportStamp,
                 onPerfStamp: { state.perfViewportStamp },
+                // A model commit draws through the canvas' interaction path immediately; the
+                // snapshot is read live, at the commit, rather than carried by this update.
+                modelCommitSource: state,
+                modelCommitSnapshot: { CanvasModelCommit(state: state) },
                 fileDrop: opener,
                 // A right-click is a command surface on the page: copy, highlight, note, follow
                 // the link under the pointer, or stage a page command. The items are built from
