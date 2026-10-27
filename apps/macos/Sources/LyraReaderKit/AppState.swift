@@ -823,6 +823,26 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     private static let renderStatsEnabled =
         ProcessInfo.processInfo.environment["LYRA_READER_RENDER_STATS"] == "1"
     private var pendingTiles: [(TileKey, PagePlacement)] = []
+    /// A tile finished and its bytes are already in the cache, but the canvas page list has not
+    /// been rebuilt for it yet.
+    ///
+    /// Several tiles can finish inside one run-loop turn at deep zoom. Rebuilding the plan,
+    /// reassembling every page quad and republishing the page list once per tile makes the main
+    /// actor the throughput limit instead of PDFium; these three flags let one drain commit the
+    /// whole burst while the cache insert itself still happens immediately (so a viewport update
+    /// between the completion and the drain cannot queue the same tile twice).
+    private var tileCommitDirty = false
+    /// One main-queue drain is already scheduled for the pending commit.
+    private var tileCommitScheduled = false
+    /// A failed tile needs the startup gate checked once the burst has been drained.
+    private var tileCommitNeedsStartupCheck = false
+    /// The tiles the current band shows on screen, by page.
+    ///
+    /// Only the adaptive-flush test reads this: when a finished tile has just made every
+    /// on-screen tile of its page present, waiting for the rest of the burst would hold the page
+    /// back for up to one coalescing window. The set is rebuilt by every viewport update, like
+    /// `wantedTiles`.
+    private var visibleTileKeysByPage: [Int: Set<TileKey>] = [:]
 
     // MARK: Performance trace state (`LYRA_READER_PERF_TRACE=1`)
     //
@@ -3098,6 +3118,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         wantedTiles.removeAll()
         lastTilePlan = nil
         pendingTiles = []
+        // Stale completions are dropped by the render epoch; a commit that was already queued
+        // belongs to the page list this call is replacing.
+        tileCommitDirty = false
+        tileCommitNeedsStartupCheck = false
+        visibleTileKeysByPage = [:]
         failedTiles = []
         pagePreviews = [:]
         pagePreviewScales = [:]
@@ -14470,6 +14495,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// to promise this retention removed a "visible diagonal sweep" of preview plus tiles,
     /// which overstates what the base did.
     public func reloadVisiblePages() {
+        // A full rebuild reads the cache as it is now, so it already includes every tile whose
+        // completion queued this drain; the queued block will find nothing left to commit.
+        tileCommitDirty = false
         // Any explicit rebuild supersedes a width-only rebuild that was waiting to settle.
         pendingViewportReload?.cancel()
         pendingViewportReload = nil
@@ -14479,6 +14507,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             canvasTiles = []
             contentHeightPt = 0
             lastTilePlan = nil
+            visibleTileKeysByPage = [:]
             return
         }
 
@@ -14567,6 +14596,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // The shell cannot produce an invalid request; report it rather than draw a
             // fabricated plan. The previous canvas stays as it was.
             lastTilePlan = nil
+            visibleTileKeysByPage = [:]
             lastError = "Tile plan rejected: invalid viewport geometry"
             return
         }
@@ -14621,6 +14651,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         schedulePagePreview()
         var pages: [CanvasPage] = []
         var bandReport = BandReport()
+        var visibleKeysByPage: [Int: Set<TileKey>] = [:]
         // Tiles this update missed, with the placement the plan named. They are queued after the
         // page assembly, in the plan's submission order.
         var missedTiles = Set<TileKey>()
@@ -14703,6 +14734,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                                      width: tilePlacement.widthPt, height: tilePlacement.heightPt),
                         viewport: viewport
                     )
+                    if classOf == .visible {
+                        visibleKeysByPage[placement.index, default: []].insert(key)
+                    }
 
                     if let cached = tileCache.image(for: key) {
                         rowReady.append(CanvasPage(placement: tilePlacement, image: cached))
@@ -14757,6 +14791,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 anyOnScreenPageSharp = true
             }
         }
+        visibleTileKeysByPage = visibleKeysByPage
         // Submit in the plan's order: visible tiles first, then the ring by distance. The
         // planner's sort is stable, so equal distances keep the band's page/row/column order —
         // the same order the shell's own sort produced before the plan moved to Rust.
@@ -15995,6 +16030,64 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
+    /// Coalesces the page-list commit for one burst of finished tiles.
+    ///
+    /// The bitmap is already in `tileCache` when this is called, so the cache is never behind
+    /// the scheduler; only the plan rebuild, page assembly, texture sync and SwiftUI publish
+    /// wait for the next main-queue turn. That is what lets several completions share one
+    /// `reloadVisiblePages` pass instead of paying for a whole viewport update each.
+    private func scheduleTileCommit(startupCheck: Bool = false) {
+        tileCommitDirty = true
+        if startupCheck { tileCommitNeedsStartupCheck = true }
+        guard !tileCommitScheduled else { return }
+        tileCommitScheduled = true
+        // Wait a fraction of a frame instead of merely the next main-queue turn: the two raster
+        // slots finish a tile every few milliseconds at deep zoom, so an immediate block would
+        // still run once per tile and coalesce nothing. Half a 120 Hz refresh bounds the delay
+        // below one 60 Hz frame, which is the progressive-appearance budget this path accepts.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.tileCommitCoalescingDelay) {
+            [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.tileCommitScheduled = false
+                self.drainTileCommits()
+            }
+        }
+    }
+
+    /// Upper bound on how long a finished tile waits for the rest of its burst.
+    private static let tileCommitCoalescingDelay: TimeInterval = 1.0 / 120.0
+
+    /// Whether this completion has just made every on-screen tile of its page present.
+    ///
+    /// The coalescing window is bounded to one frame, but the *last* missing tile of a page is
+    /// the one that turns that page sharp. Holding exactly that tile for the rest of the window
+    /// adds the window to the tail latency for no batching benefit, so the caller commits it
+    /// immediately. Off-screen ring tiles and partial page bursts still share one drain.
+    private func tileCompletionSharpensPage(_ key: TileKey) -> Bool {
+        guard let visible = visibleTileKeysByPage[key.page], visible.contains(key) else {
+            return false
+        }
+        return visible.allSatisfy { tileCache.contains($0) }
+    }
+
+    /// Commits every tile that finished since the last viewport update in one pass.
+    ///
+    /// A synchronous `reloadVisiblePages` (a scroll, a resize, a zoom) already read the cache
+    /// after those inserts and clears `tileCommitDirty`, so the drain has nothing to redraw in
+    /// that case; it still runs the startup-gate check a failed tile asked for.
+    private func drainTileCommits() {
+        let needsStartupCheck = tileCommitNeedsStartupCheck
+        tileCommitNeedsStartupCheck = false
+        guard tileCommitDirty else {
+            if needsStartupCheck { releaseStartupPrefetchIfNoVisibleWork() }
+            return
+        }
+        tileCommitDirty = false
+        reloadVisiblePages()
+        if needsStartupCheck { releaseStartupPrefetchIfNoVisibleWork() }
+    }
+
     private func startTile(_ key: TileKey, placement: PagePlacement) {
         tilesInFlight.insert(key)
 
@@ -16045,7 +16138,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                                                generation: image.generation)
                 }
                 self.tileCache.insert(image, for: key)
-                self.reloadVisiblePages()
+                // Keep the byte budget and the eviction order exactly as the old
+                // insert→reload→evict sequence did. Only the page-list rebuild is coalesced:
+                // evicting here also keeps the cache inside the budget while the drain waits.
+                self.evictTiles()
+                self.pumpTiles()
+                if self.tileCompletionSharpensPage(key) {
+                    // This was the last on-screen tile of its page; do not hold the page-sharp
+                    // commit for the rest of the coalescing window.
+                    self.tileCommitDirty = false
+                    self.reloadVisiblePages()
+                } else {
+                    self.scheduleTileCommit()
+                }
             } catch {
                 guard epoch == self.renderEpoch else { return }
                 self.tilesInFlight.remove(key)
@@ -16060,8 +16165,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                                    offsetPt: self.scrollYPt,
                                    detail: String(describing: error))
                 }
-                self.reloadVisiblePages()
-                self.releaseStartupPrefetchIfNoVisibleWork()
+                // The failed slot is free now, so the next queued tile can start without
+                // waiting for the coalesced commit. The startup gate is checked after that
+                // commit, because that is where a successfully sharp page would release it.
+                self.pumpTiles()
+                self.scheduleTileCommit(startupCheck: true)
             }
         }
     }
