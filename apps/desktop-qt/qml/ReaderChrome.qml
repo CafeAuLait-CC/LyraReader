@@ -254,7 +254,9 @@ ColumnLayout {
             LyraToolButton {
                 objectName: "fillSignButton"
                 symbol: "form"
-                text: qsTr("Fill & Sign")
+                text: qsTr("Fill && Sign")
+                Accessible.name:qsTr("Fill & Sign")
+                ToolTip.text:qsTr("Fill & Sign")
                 selected: app.secondaryRow === "fill"
                 display: app.width < 1250 ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
                 enabled: app.canModifyPdf
