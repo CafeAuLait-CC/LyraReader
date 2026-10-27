@@ -6,6 +6,7 @@ ColumnLayout {
     id: chrome
     required property var app
     spacing: 0
+    property int tabDragCancelEpoch:0
     implicitHeight: 90
     Rectangle {
         Layout.fillWidth: true
@@ -18,6 +19,40 @@ ColumnLayout {
             spacing: 4
             ListView {
                 id: tabStrip
+                objectName:"tabStrip"
+                property var tabDrag:null
+                function sameOrder() {
+                    return tabDrag && app.session && tabDrag.readers.length===app.session.tabs.length &&
+                        tabDrag.readers.every(function(reader,index){return reader===app.session.tabs[index].reader;});
+                }
+                function updateDrag(x,y) {
+                    if(!tabDrag)return;
+                    const d=tabDrag,dx=x+contentX-d.pressX,pitch=d.width+spacing;
+                    d.x=x;d.y=y;d.dx=dx;d.inside=y>=0 && y<=height && x>=0 && x<=width;
+                    d.gap=d.sourceIndex;
+                    if(d.inside && Math.abs(dx)>=d.width/2) {
+                        const steps=1+Math.floor((Math.abs(dx)-d.width/2)/pitch);
+                        const target=Math.max(0,Math.min(d.readers.length-1,d.sourceIndex+(dx<0 ? -steps : steps)));
+                        d.gap=target>d.sourceIndex ? target+1 : target;
+                    }
+                    tabDrag=Object.assign({},d);
+                }
+                onWidthChanged:tabDrag=null
+                Timer {
+                    interval:16;repeat:true;running:!!tabStrip.tabDrag && tabStrip.tabDrag.inside
+                    onTriggered:{const d=tabStrip.tabDrag,step=d.x<24 ? -8 : d.x>tabStrip.width-24 ? 8 : 0;
+                        if(step){tabStrip.contentX=Math.max(0,Math.min(Math.max(0,tabStrip.contentWidth-tabStrip.width),tabStrip.contentX+step));tabStrip.updateDrag(d.x,d.y);}}
+                }
+                Connections {
+                    target:app.session
+                    function onTabsChanged(){tabStrip.tabDrag=null;chrome.tabDragCancelEpoch++;}
+                }
+                Connections {
+                    target:app
+                    function onCancelTabReorder(){tabStrip.tabDrag=null;chrome.tabDragCancelEpoch++;}
+                    function onTabReorderFinished(owner){const index=app.readerIndex(owner);tabStrip.positionViewAtIndex(index,ListView.Contain);
+                        Qt.callLater(function(){const item=tabStrip.itemAtIndex(index);if(item)item.focusTab();});}
+                }
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 orientation: ListView.Horizontal
@@ -32,6 +67,9 @@ ColumnLayout {
                 onCurrentIndexChanged: positionViewAtIndex(currentIndex, ListView.Contain)
                 delegate: Rectangle {
                     id: tab
+                    objectName:"readerTab"+index
+                    function focusTab(){tabMouse.forceActiveFocus();}
+                    opacity:tabStrip.tabDrag && tabStrip.tabDrag.reader===modelData.reader ? .35 : 1
                     required property var modelData
                     required property int index
                     // A QVariantList reset may temporarily reset ListView's
@@ -75,19 +113,42 @@ ColumnLayout {
                     }
                     MouseArea {
                         id: tabMouse
+                        objectName:"tabSurface"+tab.index
+                        enabled:!!app.session
+                        preventStealing:true
+                        property point pressPoint
+                        property var pressReaders:[]
+                        property bool hadDrag:false
+                        property bool canceled:false
+                        property int pressCancelEpoch:0
+                        cursorShape:hadDrag ? (tabStrip.tabDrag && tabStrip.tabDrag.inside ? Qt.ClosedHandCursor : Qt.ForbiddenCursor) : Qt.ArrowCursor
                         anchors.fill: parent
                         anchors.rightMargin: app.session ? 30 : 0
                         hoverEnabled: true
                         activeFocusOnTab: true
-                        onClicked: {
-                            forceActiveFocus();
-                            if (app.session)
-                                app.selectReaderTab(tab.index);
-                        }
+                        onPressed:function(mouse){forceActiveFocus();pressPoint=mapToItem(tabStrip,mouse.x,mouse.y);pressPoint.x+=tabStrip.contentX;
+                            pressCancelEpoch=chrome.tabDragCancelEpoch;pressReaders=app.session.tabs.map(function(t){return t.reader;});hadDrag=false;canceled=false;}
+                        onPositionChanged:function(mouse){if(!pressed || canceled || pressCancelEpoch!==chrome.tabDragCancelEpoch)return;
+                            const p=mapToItem(tabStrip,mouse.x,mouse.y);
+                            if(!hadDrag && Math.hypot(p.x+tabStrip.contentX-pressPoint.x,p.y-pressPoint.y)<3)return;
+                            if(!hadDrag){hadDrag=true;tabStrip.tabDrag={reader:modelData.reader,readers:pressReaders,sourceIndex:tab.index,width:tab.width,dx:0,gap:tab.index,inside:true,pressX:pressPoint.x,pressY:pressPoint.y,title:modelData.title};}
+                            if(!tabStrip.sameOrder()){tabStrip.tabDrag=null;canceled=true;return;}
+                            tabStrip.updateDrag(p.x,p.y);}
+                        onReleased:function(mouse){if(canceled || pressCancelEpoch!==chrome.tabDragCancelEpoch){hadDrag=false;tabStrip.tabDrag=null;return;}
+                            if(!hadDrag){app.selectReaderTab(tab.index);return;}
+                            const p=mapToItem(tabStrip,mouse.x,mouse.y);tabStrip.updateDrag(p.x,p.y);
+                            const d=tabStrip.tabDrag,valid=tabStrip.sameOrder();tabStrip.tabDrag=null;hadDrag=false;
+                            if(valid && d.inside)app.reorderReaderTab(d.reader,d.readers[d.gap] || null);}
+                        onCanceled:{canceled=true;hadDrag=false;tabStrip.tabDrag=null;}
+                        Keys.onEscapePressed:{canceled=true;hadDrag=false;tabStrip.tabDrag=null;}
+                        Keys.onPressed:function(event){if((event.modifiers & (Qt.AltModifier|Qt.ShiftModifier))!==(Qt.AltModifier|Qt.ShiftModifier))return;
+                            const gap=event.key===Qt.Key_Left ? tab.index-1 : event.key===Qt.Key_Right ? tab.index+2 : -1;
+                            if(gap>=0 && gap<=app.session.tabs.length){event.accepted=true;app.reorderReaderTab(modelData.reader,app.session.tabs[gap] ? app.session.tabs[gap].reader : null);}}
                         Keys.onReturnPressed: if (app.session)
                             app.selectReaderTab(tab.index)
                         Keys.onSpacePressed: if (app.session)
                             app.selectReaderTab(tab.index)
+                        Accessible.description:qsTr("Drag half a tab width to reorder; Alt+Shift+Left or Right moves this tab. Escape cancels.")
                         Accessible.role: Accessible.PageTab
                         Accessible.name: modelData.title
                         Accessible.selectable: true
@@ -103,6 +164,24 @@ ColumnLayout {
                         color: tabMouse.activeFocus ? app.colors.focusRing : app.colors.accent
                     }
                 }
+            }
+            Rectangle {
+                parent:tabStrip
+                visible:!!tabStrip.tabDrag
+                z:10
+                x:visible ? tabStrip.tabDrag.sourceIndex*(tabStrip.tabDrag.width+tabStrip.spacing)+tabStrip.tabDrag.dx-tabStrip.contentX : 0
+                y:4
+                width:visible ? tabStrip.tabDrag.width : 0;height:40;radius:7
+                color:app.colors.selectedBg;border.color:app.colors.accent
+                Accessible.ignored:true
+                Label {anchors.fill:parent;anchors.margins:12;textFormat:Text.PlainText;text:tabStrip.tabDrag ? tabStrip.tabDrag.title : "";elide:Text.ElideRight;color:app.colors.selectedFg}
+            }
+            Rectangle {
+                parent:tabStrip;z:11;visible:!!tabStrip.tabDrag && tabStrip.tabDrag.inside
+                x:{const d=tabStrip.tabDrag;if(!d)return 0;const gap=d.gap;
+                    return (gap===0 ? 0 : gap===d.readers.length ? gap*(d.width+tabStrip.spacing)-tabStrip.spacing : gap*(d.width+tabStrip.spacing)-tabStrip.spacing/2)-tabStrip.contentX-1;}
+                width:2;height:36;y:6;color:app.colors.accent
+                Accessible.ignored:true
             }
             LyraToolButton {
                 symbol: "plus"

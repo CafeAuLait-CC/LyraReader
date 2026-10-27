@@ -91,6 +91,13 @@ ApplicationWindow {
         if (!force && secondaryRow==="edit" && contentController.deferAction({kind:"tab",reader:session.tabs[index].reader})) return;
         session.selectTab(index);
     }
+    signal tabReorderFinished(var owner)
+    signal cancelTabReorder()
+    function reorderReaderTab(owner,before,force) {
+        if(!session || readerIndex(owner)<0 || (before && readerIndex(before)<0))return;
+        if(!force && owner!==currentReader && secondaryRow==="edit" && contentController.deferAction({kind:"reorder",reader:owner,before:before}))return;
+        if(session.moveTab(owner,before))tabReorderFinished(owner);
+    }
     function showOverview(force) {
         if (!force && secondaryRow==="edit" && contentController.deferAction({kind:"overview"})) return;
         overviewVisible=!overviewVisible;
@@ -1570,6 +1577,7 @@ ApplicationWindow {
     Shortcut {
         sequence: "Escape"
         onActivated: {
+            root.cancelTabReorder();
             if (root.previewController && root.previewController.visible)
                 root.previewController.close();
             root.cancelErase();

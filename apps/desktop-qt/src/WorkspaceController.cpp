@@ -79,6 +79,26 @@ void WorkspaceController::selectTab(int index) {
     m_activeIndex = index;
     emit activeReaderChanged();
 }
+bool WorkspaceController::moveTab(ReaderController *reader,ReaderController *before) {
+    auto destination=[&]() {
+        const auto source=m_tabs.indexOf(reader),gap=before ? m_tabs.indexOf(before) : m_tabs.size();
+        if(source<0 || gap<0)return qsizetype(-1);
+        const auto result=gap>source ? gap-1 : gap;
+        return result==source ? qsizetype(-1) : result;
+    };
+    if(destination()<0)return false;
+    const bool changing=reader!=activeReader();
+    QPointer<WorkspaceController> guard(this);
+    if(changing){emit activeReaderAboutToChange();if(!guard)return false;}
+    const auto target=destination();
+    if(target<0)return false;
+    if(changing)m_preview->close();
+    m_tabs.move(m_tabs.indexOf(reader),target);
+    m_activeIndex=int(target);
+    emit tabsChanged();
+    if(guard)emit activeReaderChanged();
+    return true;
+}
 void WorkspaceController::openFiles(const QList<QUrl> &urls) { for (const auto &url : urls) openFile(url); }
 void WorkspaceController::openFile(const QUrl &url) {
     if (!url.isLocalFile()) return;

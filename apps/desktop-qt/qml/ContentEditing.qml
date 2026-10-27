@@ -128,6 +128,7 @@ Item {
         if (next.kind==="row") app.setSecondaryRow(next.value,true);
         else if (next.kind==="tool") arm(next.value);
         else if (next.kind==="tab") app.selectReaderTab(app.readerIndex(next.reader),true);
+        else if (next.kind==="reorder") app.reorderReaderTab(next.reader,next.before,true);
         else if (next.kind==="tabClose") app.requestCloseTab(app.readerIndex(next.reader));
         else if (next.kind==="windowClose") app.close();
         else if (next.kind==="overview") app.showOverview(true);

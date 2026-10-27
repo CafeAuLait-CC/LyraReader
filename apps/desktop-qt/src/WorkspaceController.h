@@ -26,6 +26,7 @@ public:
     Q_INVOKABLE void openFiles(const QList<QUrl> &urls);
     Q_INVOKABLE void openFile(const QUrl &url);
     Q_INVOKABLE void selectTab(int index);
+    Q_INVOKABLE bool moveTab(ReaderController *reader, ReaderController *before);
     Q_INVOKABLE void closeTab(int index, bool discardPending = false);
     Q_INVOKABLE void newTab();
     Q_INVOKABLE void requestQuit();
