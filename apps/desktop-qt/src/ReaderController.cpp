@@ -53,6 +53,7 @@ struct OpenResult {
     double width = 0;
     double height = 0;
     QVariantMap signature;
+    QVariantMap recovery;
     QString error;
 };
 struct RasterResult { ResidentImage image; QString error; double actualScale = 0; qint64 elapsedMs = 0;bool cancelled=false,pressure=false; };
@@ -126,6 +127,8 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
         m_document = std::move(result.document);m_source=std::move(result.source);
         m_pages = std::move(result.pages);
         m_data.insert(QStringLiteral("signature_status"),result.signature);emit dataChanged();
+        m_data.insert(QStringLiteral("recovery"),result.recovery);
+        if(!result.recovery.value(QStringLiteral("error")).toString().isEmpty())setError(result.recovery.value(QStringLiteral("error")).toString());
         m_documentWidth = result.width;
         m_documentHeight = result.height;
         emit documentChanged();
@@ -158,6 +161,7 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
         result.width = object.value(QStringLiteral("width")).toDouble();
         result.height = object.value(QStringLiteral("height")).toDouble();
         result.signature = object.value(QStringLiteral("signature_status")).toObject().toVariantMap();
+        result.recovery = object.value(QStringLiteral("recovery")).toObject().toVariantMap();
         result.source=NativeRasterSource::prepare(result.document,false,&result.error);
         return result;
     }));

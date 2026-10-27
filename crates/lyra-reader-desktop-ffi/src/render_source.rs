@@ -9,7 +9,7 @@ use std::{fs, path::PathBuf, sync::Arc};
 pub struct RenderSource {
     engine: Arc<LyraReaderDocument>,
     _temporary: Option<OwnedDirectory>,
-    _session_directory: Option<Arc<crate::pages::SessionDirectory>>,
+    _session_directory: Option<crate::session::RevisionLease>,
 }
 struct OwnedDirectory(PathBuf);
 impl Drop for OwnedDirectory {
@@ -24,7 +24,11 @@ impl RenderSource {
             .lock()
             .map_err(|_| "Page-edit state is unavailable")?;
         let engine = document.active()?;
-        let session_directory = edits.directory.clone();
+        let session_directory = edits
+            .directory
+            .as_ref()
+            .map(|d| d.lease(std::path::Path::new(&engine.path())))
+            .transpose()?;
         if !include_edits {
             return Ok(Self {
                 engine,

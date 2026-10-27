@@ -9,6 +9,7 @@ mod exports;
 mod marks;
 mod pages;
 mod render_source;
+mod session;
 use document::DesktopDocument as Document;
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},

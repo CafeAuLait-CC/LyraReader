@@ -219,6 +219,40 @@ ApplicationWindow {
     function discardAndClose(index) {
         dialogs.cancelAnnotationDraft();
         saveReadingPosition();
+        if (discardCloseIndex !== -2 || hasPendingCloseWork(index))
+            return;
+        discardCloseIndex = index;
+        const tabs = session ? session.tabs : [{reader: currentReader}];
+        const requests = [];
+        tabs.forEach(function (tab, i) {
+            if (index < 0 || index === i) {
+                Object.keys(tab.reader.editDrafts).forEach(function (key) { tab.reader.setEditDraft(key, null); });
+                Object.keys(tab.reader.noteDrafts).forEach(function (key) { tab.reader.clearNoteDraft(key); });
+                if ((tab.reader.data.marks || {}).page_session_active)
+                    requests.push({reader: tab.reader, id: tab.reader.submit("page_discard")});
+            }
+        });
+        discardCloseRequests = requests;
+        if (!requests.length) finishDiscardClose();
+    }
+    property int discardCloseIndex: -2
+    property var discardCloseRequests: []
+    function discardedSession(reader, id, error) {
+        if (discardCloseIndex === -2) return;
+        const found = discardCloseRequests.some(function (request) { return request.reader === reader && request.id === id; });
+        if (!found) return;
+        discardCloseRequests = discardCloseRequests.filter(function (request) { return request.reader !== reader || request.id !== id; });
+        if (error.length) {
+            operationStatus = error;
+            discardCloseIndex = -2;
+            discardCloseRequests = [];
+            return;
+        }
+        if (!discardCloseRequests.length) finishDiscardClose();
+    }
+    function finishDiscardClose() {
+        const index = discardCloseIndex;
+        discardCloseIndex = -2;
         if (index < 0) {
             closeApproved = true;
             root.close();
@@ -266,6 +300,9 @@ ApplicationWindow {
         delegate: Connections {
             required property var modelData
             target: modelData.reader
+            function onCommandFinished(id, operation, result, error) {
+                root.discardedSession(modelData.reader, id, error);
+            }
             function onCommandsChanged() {
                 // Defer until the command's data/error notifications finish.
                 // Unlike animation timers this also runs without frame callbacks.
@@ -429,6 +466,14 @@ ApplicationWindow {
         ++positionRestoreEpoch;
         const state = session ? session.viewState(currentReader) : ({});
         pendingPosition = Object.assign({}, state);
+        const recovered = currentReader.data.recovery ? currentReader.data.recovery.location : null;
+        if (recovered && recovered.page !== undefined) {
+            pendingPosition.page = recovered.page;
+            selectedPages = recovered.selection || [];
+            delete pendingPosition.offset;
+            delete pendingPosition.viewportAnchor;
+            delete pendingPosition.documentX;
+        }
         if (requestedPage >= 0) {
             pendingPosition.page = requestedPage;
             pendingPosition.y = requestedY;
@@ -907,7 +952,9 @@ ApplicationWindow {
         pendingPage = currentPage;
         pendingPageSelection = selectedPages.slice();
         currentReader.submit("page_stage", {
-            operation: operation
+            operation: operation,
+            current_page: currentPage,
+            selected_pages: selectedPages
         });
     }
     function movePages(destination) {
@@ -930,7 +977,7 @@ ApplicationWindow {
             currentReader.submit("marks_undo");
         else if (markState.can_page_undo) {
             pendingPage = currentPage;
-            currentReader.submit("page_undo");
+            currentReader.submit("page_undo", {current_page: currentPage, selected_pages: selectedPages});
         }
     }
     function redo() {
@@ -938,7 +985,7 @@ ApplicationWindow {
             currentReader.submit("marks_redo");
         else if (markState.can_page_redo) {
             pendingPage = currentPage;
-            currentReader.submit("page_redo");
+            currentReader.submit("page_redo", {current_page: currentPage, selected_pages: selectedPages});
         }
     }
     property bool printRequested: false
@@ -1771,15 +1818,16 @@ ApplicationWindow {
                 root.pageEditBusy = false;
                 if (!error.length) {
                     const map = result.report ? result.report.page_map : null;
-                    const page = map && map[root.pendingPage] !== null && map[root.pendingPage] !== undefined ? map[root.pendingPage] : Math.min(root.pendingPage, currentReader.pageCount - 1);
+                    const location = result.marks ? result.marks.page_location : null;
+                    const page = location ? location.page : (map && map[root.pendingPage] !== null && map[root.pendingPage] !== undefined ? map[root.pendingPage] : Math.min(root.pendingPage, currentReader.pageCount - 1));
                     root.selection = null;
                     root.selectedAnnotation = null;
                     root.searchResults = [];
-                    root.selectedPages = map ? root.pendingPageSelection.map(function (p) {
+                    root.selectedPages = location ? location.selection : (map ? root.pendingPageSelection.map(function (p) {
                         return map[p];
                     }).filter(function (p) {
                         return p !== null && p !== undefined;
-                    }) : [page];
+                    }) : [page]);
                     root.pendingPosition = {
                         page: result.report && result.report.inserted_page !== null && result.report.inserted_page !== undefined ? result.report.inserted_page : page,
                         zoom: root.zoom,
@@ -1787,6 +1835,8 @@ ApplicationWindow {
                     };
                     currentReader.setLayout(root.layoutMode, root.pageGap);
                     root.operationStatus = op === "page_apply" ? qsTr("Page changes applied. Backup: %1").arg(result.report.backup_path || "") : qsTr("Page session updated; original unchanged.");
+                    const warning = result.report ? (result.report.recovery_warning || result.report.cache_cleanup_error || result.report.sidecar_error) : null;
+                    if (warning) root.operationStatus += " " + warning;
                 }
             }
             if (id === root.pendingDraftRequestId)

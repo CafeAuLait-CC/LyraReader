@@ -231,7 +231,7 @@ impl LyraReaderDocumentTransaction {
             return Err(LyraReaderError::new(ErrorCode::ReadOnly, reason.clone()).into());
         }
         let mut transaction = lock(&self.inner)?;
-        let target = transaction.next_revision();
+        let target = transaction.next_revision().map_err(document_error)?;
         let source = transaction.current_revision_path().ok_or_else(|| {
             document_error(lyra_reader_edit::transaction::TransactionError(
                 "the editing session's current revision is not a file URL".to_string(),
@@ -355,12 +355,40 @@ impl LyraReaderDocumentTransaction {
             .map_err(document_error)
     }
 
+    /// Applies the native shell's explicit undo history budget.
+    pub fn limit_history(
+        &self,
+        steps: u32,
+        bytes: u64,
+    ) -> Result<DocumentTransactionStateRecord, LyraReaderFfiError> {
+        let mut transaction = lock(&self.inner)?;
+        transaction
+            .limit_history(steps, bytes)
+            .map(|state| state_record(&state))
+            .map_err(document_error)
+    }
+    /// Batch cleanup after supplying all immutable render revision leases.
+    pub fn collect_revision_garbage(
+        &self,
+        protected_urls: Vec<String>,
+    ) -> Result<u32, LyraReaderFfiError> {
+        let transaction = lock(&self.inner)?;
+        transaction
+            .collect_revision_garbage(&protected_urls)
+            .map_err(document_error)
+    }
+
+    /// Retires its public recovery entry while immutable render snapshots retain the files.
+    pub fn retire_recovery(&self) -> Result<(), LyraReaderFfiError> {
+        let mut transaction = lock(&self.inner)?;
+        transaction.retire_recovery().map_err(document_error)
+    }
+
     /// Ends the session. `delete_files` retires the session directory and recovery manifest;
     /// false keeps them for the shell's cleanup-retry message after a failed save.
     pub fn close(&self, delete_files: bool) -> Result<(), LyraReaderFfiError> {
         let mut transaction = lock(&self.inner)?;
-        transaction.close(delete_files);
-        Ok(())
+        transaction.close(delete_files).map_err(document_error)
     }
 }
 

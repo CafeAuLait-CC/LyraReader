@@ -28,14 +28,19 @@
 //! UUIDs upper-case. Everything else is the shell's own JSON (annotations, bookmarks, slots,
 //! deletions, erased ink) spliced through as values, so the model cannot drift here.
 
+use std::collections::HashSet;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Map, Number, Value};
 
 /// The recovery shape this module writes and reads. The shell refuses newer versions rather than
 /// guessing at fields it does not know.
 pub const RECOVERY_VERSION: u32 = 1;
+/// Bound recovery parsing before allocating buffers controlled by a cached file.
+pub const MAX_RECOVERY_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The one sentence the shell shows when a recovery file no longer matches the file on disk.
 ///
@@ -405,18 +410,30 @@ impl DocumentTransaction {
             pending_state_changed: false,
             active: true,
         };
-        let _ = transaction.write_recovery();
+        transaction.write_recovery()?;
         Ok(transaction)
     }
 
     fn restore(request: StartRequest) -> Result<Self, TransactionError> {
-        let bytes = fs::read(&request.recovery_path).map_err(|read| {
-            error(format!(
-                "The cached editing session could not be read: {read}"
-            ))
-        })?;
+        let file = fs::File::open(&request.recovery_path)
+            .map_err(|e| error(format!("The cached editing session could not be read: {e}")))?;
+        if file.metadata().map_err(|e| error(e.to_string()))?.len() > MAX_RECOVERY_BYTES {
+            return Err(error(
+                "The cached editing session exceeds the 64 MiB read limit; its data was kept.",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_RECOVERY_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| error(e.to_string()))?;
+        if bytes.len() as u64 > MAX_RECOVERY_BYTES {
+            return Err(error(
+                "The cached editing session exceeds the 64 MiB read limit; its data was kept.",
+            ));
+        }
         let document: Value = serde_json::from_slice(&bytes)
             .map_err(|parse| error(format!("The cached editing session is not JSON: {parse}")))?;
+        validate_recovery_schema(&document)?;
         let session_value = document
             .get("session")
             .ok_or_else(|| error(RECOVERY_SOURCE_CHANGED))?;
@@ -454,10 +471,7 @@ impl DocumentTransaction {
                 .ok_or_else(|| error(RECOVERY_SOURCE_CHANGED))?,
         )?;
         let revision_url = string_field(session_value, "revisionURL")?;
-        let revision_number = session_value
-            .get("revisionNumber")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32;
+        let revision_number = u32_field(session_value, "revisionNumber")?;
         let current_to_original = i32_array(
             session_value
                 .get("currentToOriginal")
@@ -479,6 +493,25 @@ impl DocumentTransaction {
                 .ok_or_else(|| error(RECOVERY_SOURCE_CHANGED))?,
         )?;
         let state = snapshot_state(snapshot_value)?;
+        for (mapping, state) in std::iter::once((&current_to_original, &state)).chain(
+            undo.iter()
+                .chain(&redo)
+                .map(|s| (&s.current_to_original, &s.state)),
+        ) {
+            let count = mapping.len();
+            if count == 0
+                || state.current_page == 0
+                || state.current_page as usize > count
+                || state.selection.iter().any(|p| *p as usize >= count)
+                || mapping
+                    .iter()
+                    .any(|p| *p < -1 || i64::from(*p) >= i64::from(request.page_count))
+            {
+                return Err(error(
+                    "The cached editing session has invalid page positions; its files were kept.",
+                ));
+            }
+        }
 
         // The same checks the shell used to make after decoding: the file must still be the one
         // the session was started for, the session directory must still be inside that
@@ -547,17 +580,36 @@ impl DocumentTransaction {
         file_url_path(&self.revision_url)
     }
 
-    /// The next revision of the chain: `rev-<revision + 1>.pdf` in the session directory.
-    pub fn next_revision(&self) -> RevisionTarget {
-        let number = self.revision_number + 1;
+    /// Selects an unused revision path, including after undo branches. Existing files may
+    /// still belong to immutable render/print snapshots even after leaving the undo chain.
+    pub fn next_revision(&self) -> Result<RevisionTarget, TransactionError> {
+        let mut number = self
+            .revision_number
+            .checked_add(1)
+            .ok_or_else(|| error("The editing revision number overflowed."))?;
         let directory = file_url_path(&self.session.directory_url)
-            .unwrap_or_else(|| PathBuf::from(&self.session.directory_url));
-        let path = directory.join(format!("rev-{number}.pdf"));
-        RevisionTarget {
+            .ok_or_else(|| error("The editing session has an invalid directory URL."))?;
+        let path = loop {
+            let path = directory.join(format!("rev-{number}.pdf"));
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    number = number
+                        .checked_add(1)
+                        .ok_or_else(|| error("The editing revision number overflowed."))?
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break path,
+                Err(e) => {
+                    return Err(error(format!(
+                        "The next editing revision could not be checked: {e}"
+                    )));
+                }
+            }
+        };
+        Ok(RevisionTarget {
             number,
             url: format!("{}rev-{number}.pdf", self.session.directory_url),
             path,
-        }
+        })
     }
 
     /// Captures the pre-operation snapshot before the shell materialises annotations for this
@@ -777,18 +829,155 @@ impl DocumentTransaction {
         !self.redo.is_empty()
     }
 
-    /// Deletes the session directory and its recovery manifest (on Save, Replace or Discard).
-    /// `delete_files == false` keeps them for a failed cleanup the shell will retry.
-    pub fn close(&mut self, delete_files: bool) {
-        if delete_files {
-            if let Some(directory) = file_url_path(&self.session.directory_url) {
-                let _ = fs::remove_dir_all(directory);
+    /// Applies a shell's explicit history policy without changing other platforms' defaults.
+    /// The byte budget measures serialized snapshots, not process memory. Keep one undo
+    /// snapshot even if that one record exceeds the nominal budget.
+    pub fn limit_history(&mut self, steps: u32, bytes: u64) -> Result<State, TransactionError> {
+        if steps == 0 || bytes == 0 {
+            return Err(error("History limits must be positive."));
+        }
+        fn trim(
+            history: &mut Vec<Snapshot>,
+            steps: usize,
+            limit: u64,
+        ) -> Result<bool, TransactionError> {
+            let sizes = history
+                .iter()
+                .map(|s| {
+                    serde_json::to_vec(&DocumentTransaction::snapshot_value(s))
+                        .map(|v| v.len() as u64)
+                        .map_err(|e| error(e.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut total = sizes.iter().try_fold(0u64, |a, b| {
+                a.checked_add(*b)
+                    .ok_or_else(|| error("The history byte count overflowed."))
+            })?;
+            let mut remove = 0;
+            while history.len() - remove > 1 && (history.len() - remove > steps || total > limit) {
+                total -= sizes[remove];
+                remove += 1;
             }
-            let _ = fs::remove_file(&self.recovery_path);
+            if remove > 0 {
+                history.drain(..remove);
+            }
+            Ok(remove > 0)
+        }
+        let changed = trim(&mut self.undo, steps as usize, bytes)?
+            | trim(&mut self.redo, steps as usize, bytes)?;
+        let mut state = self.view();
+        if changed {
+            state.recovery_error = self.write_recovery().err().map(|e| e.0);
+        }
+        Ok(state)
+    }
+
+    /// Removes only generated revisions unreachable from history or an immutable render lease.
+    pub fn collect_revision_garbage(&self, protected: &[String]) -> Result<u32, TransactionError> {
+        let directory = file_url_path(&self.session.directory_url)
+            .ok_or_else(|| error("Invalid editing directory URL."))?;
+        let mut retained: HashSet<PathBuf> = std::iter::once(self.revision_url.as_str())
+            .chain(self.undo.iter().map(|s| s.revision_url.as_str()))
+            .chain(self.redo.iter().map(|s| s.revision_url.as_str()))
+            .chain(self.pending.iter().map(|s| s.revision_url.as_str()))
+            .chain(protected.iter().map(String::as_str))
+            .filter_map(file_url_path)
+            .collect();
+        retained.insert(
+            file_url_path(&self.session.original_url)
+                .ok_or_else(|| error("Invalid original URL."))?,
+        );
+        let mut count = 0u32;
+        for entry in fs::read_dir(&directory).map_err(|e| error(e.to_string()))? {
+            let entry = entry.map_err(|e| error(e.to_string()))?;
+            if !entry
+                .file_type()
+                .map_err(|e| error(e.to_string()))?
+                .is_file()
+            {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let generated = name.strip_suffix(".pdf").is_some_and(|stem| {
+                stem.strip_prefix("rev-")
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                    || ["marks-", "save-"].iter().any(|prefix| {
+                        stem.strip_prefix(prefix)
+                            .is_some_and(|id| crate::records::normalize_uuid(id).is_some())
+                    })
+            });
+            if generated && !retained.contains(&entry.path()) {
+                fs::remove_file(entry.path())
+                    .map_err(|e| error(format!("A retired revision could not be removed: {e}")))?;
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| error("The revision count overflowed."))?;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Retires the public recovery entry before render snapshots release this session's files.
+    /// A later `close(true)` targets only the private retired entry, so it cannot delete a new
+    /// session another window started for the same original document.
+    pub fn retire_recovery(&mut self) -> Result<(), TransactionError> {
+        let directory = file_url_path(&self.session.directory_url)
+            .ok_or_else(|| error("The editing session has no local directory URL."))?;
+        let retired = directory.join("retired-session.json");
+        if self.recovery_path != retired {
+            fs::rename(&self.recovery_path, &retired)
+                .map_err(|e| error(format!("Could not retire the cached editing session: {e}")))?;
+            let previous_parent = self.recovery_path.parent().map(Path::to_path_buf);
+            self.recovery_path = retired;
+            #[cfg(unix)]
+            {
+                if let Some(parent) = previous_parent {
+                    fs::File::open(parent).and_then(|f| f.sync_all()).map_err(|e|error(format!("The recovery entry was retired, but its directory could not be flushed: {e}")))?;
+                }
+                fs::File::open(&directory)
+                    .and_then(|f| f.sync_all())
+                    .map_err(|e| {
+                        error(format!(
+                            "The retired session directory could not be flushed: {e}"
+                        ))
+                    })?;
+            }
+            #[cfg(not(unix))]
+            let _ = previous_parent;
         }
         self.pending = None;
         self.pending_state_changed = false;
         self.active = false;
+        Ok(())
+    }
+
+    /// Deletes the session directory and its recovery manifest (on Save, Replace or Discard).
+    /// `delete_files == false` keeps them for a failed cleanup the shell will retry.
+    pub fn close(&mut self, delete_files: bool) -> Result<(), TransactionError> {
+        self.pending = None;
+        self.pending_state_changed = false;
+        self.active = false;
+        if delete_files {
+            let directory = file_url_path(&self.session.directory_url).ok_or_else(|| {
+                error("The editing session has an invalid cleanup directory URL.")
+            })?;
+            if let Err(e) = fs::remove_dir_all(directory)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(error(format!(
+                    "The document was kept, but its retired editing files could not be removed: {e}"
+                )));
+            }
+            if let Err(e) = fs::remove_file(&self.recovery_path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(error(format!(
+                    "The retired editing manifest could not be removed: {e}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn view(&self) -> State {
@@ -810,6 +999,11 @@ impl DocumentTransaction {
     fn write_recovery(&self) -> Result<(), TransactionError> {
         let value = self.recovery_value();
         let text = canonical_json(&value);
+        if text.len() as u64 > MAX_RECOVERY_BYTES {
+            return Err(error(
+                "The editing session exceeds the 64 MiB recovery limit; the previous recovery file was kept.",
+            ));
+        }
         write_atomic(&self.recovery_path, text.as_bytes())
             .map_err(|write| error(format!("Could not cache the editing session: {write}")))
     }
@@ -1042,21 +1236,12 @@ fn snapshot_state(value: &Value) -> Result<AnnotationState, TransactionError> {
             .get("annotationDirty")
             .and_then(Value::as_bool)
             .ok_or_else(|| error(RECOVERY_SOURCE_CHANGED))?,
-        current_page: value
-            .get("currentPage")
-            .and_then(Value::as_u64)
-            .unwrap_or(1) as u32,
-        selection: value
-            .get("selection")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_u64)
-                    .map(|page| page as u32)
-                    .collect()
-            })
-            .unwrap_or_default(),
+        current_page: u32_field(value, "currentPage")?,
+        selection: u32_array(
+            value
+                .get("selection")
+                .ok_or_else(|| error(RECOVERY_SOURCE_CHANGED))?,
+        )?,
     })
 }
 
@@ -1068,10 +1253,7 @@ fn snapshot_array(value: &Value) -> Result<Vec<Snapshot>, TransactionError> {
     for value in values {
         snapshots.push(Snapshot {
             revision_url: string_field(value, "revisionURL")?,
-            revision_number: value
-                .get("revisionNumber")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as u32,
+            revision_number: u32_field(value, "revisionNumber")?,
             current_to_original: i32_array(
                 value
                     .get("currentToOriginal")
@@ -1097,6 +1279,77 @@ fn string_field(value: &Value, name: &str) -> Result<String, TransactionError> {
         .ok_or_else(|| error(RECOVERY_SOURCE_CHANGED))
 }
 
+fn u32_field(value: &Value, name: &str) -> Result<u32, TransactionError> {
+    value
+        .get(name)
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| error(RECOVERY_SOURCE_CHANGED))
+}
+
+/// Unknown transaction structure cannot safely be rewritten by this version. Annotation
+/// objects and opaque slots remain values and keep their own forward-compatible fields.
+fn validate_recovery_schema(value: &Value) -> Result<(), TransactionError> {
+    fn keys(value: &Value, allowed: &[&str]) -> Result<(), TransactionError> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| error(RECOVERY_SOURCE_CHANGED))?;
+        if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+            return Err(error(
+                "The cached editing session contains fields this build cannot safely rewrite; its data was kept.",
+            ));
+        }
+        Ok(())
+    }
+    const SNAPSHOT: &[&str] = &[
+        "revisionURL",
+        "revisionNumber",
+        "currentToOriginal",
+        "operations",
+        "annotations",
+        "bookmarks",
+        "slots",
+        "deletions",
+        "erasedInk",
+        "annotationDirty",
+        "currentPage",
+        "selection",
+        "label",
+    ];
+    keys(value, &["version", "session", "snapshot"])?;
+    let session = &value["session"];
+    keys(
+        session,
+        &[
+            "originalURL",
+            "originalSignature",
+            "sourceStamp",
+            "originalRecordsURL",
+            "title",
+            "directory",
+            "annotationRecordsURL",
+            "originalRotations",
+            "revisionURL",
+            "revisionNumber",
+            "currentToOriginal",
+            "operations",
+            "undo",
+            "redo",
+        ],
+    )?;
+    keys(&session["sourceStamp"], &["size", "modified", "sha256"])?;
+    keys(&value["snapshot"], SNAPSHOT)?;
+    for name in ["undo", "redo"] {
+        for snapshot in session[name]
+            .as_array()
+            .ok_or_else(|| error(RECOVERY_SOURCE_CHANGED))?
+        {
+            keys(snapshot, SNAPSHOT)?;
+        }
+    }
+    Ok(())
+}
+
 fn string_array(value: &Value) -> Result<Vec<String>, TransactionError> {
     value
         .as_array()
@@ -1117,7 +1370,7 @@ fn u32_array(value: &Value) -> Result<Vec<u32>, TransactionError> {
         .iter()
         .map(|item| {
             item.as_u64()
-                .map(|number| number as u32)
+                .and_then(|number| u32::try_from(number).ok())
                 .ok_or_else(|| error(RECOVERY_SOURCE_CHANGED))
         })
         .collect()
@@ -1130,7 +1383,7 @@ fn i32_array(value: &Value) -> Result<Vec<i32>, TransactionError> {
         .iter()
         .map(|item| {
             item.as_i64()
-                .map(|number| number as i32)
+                .and_then(|number| i32::try_from(number).ok())
                 .ok_or_else(|| error(RECOVERY_SOURCE_CHANGED))
         })
         .collect()
@@ -1385,19 +1638,35 @@ fn directory_form(url: &str) -> String {
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let temporary = parent.join(format!(
-        ".{}.tmp-{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("session.json"),
-        std::process::id()
+        ".session-{}-{}.tmp",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::write(&temporary, bytes)?;
-    fs::rename(&temporary, path).inspect_err(|_| {
-        let _ = fs::remove_file(&temporary);
-    })
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        // Only the private temporary file from this write is disposable.
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
 
 fn path_has_prefix(path: &Path, prefix: &Path) -> bool {
@@ -1410,37 +1679,82 @@ fn same_file(left: &Path, right: &Path) -> bool {
     left == right
 }
 
-/// Decodes a Foundation `file://` URL to a path. Only the local form is needed here; anything
-/// else returns `None`, which the restore path reports as a changed cache.
-fn file_url_path(url: &str) -> Option<PathBuf> {
-    let rest = url.strip_prefix("file://")?;
-    let path = if rest.starts_with('/') {
-        rest
+/// Encodes a local absolute path in the same file-URL vocabulary the native shells persist.
+/// The platform adapter uses this boundary instead of maintaining another URL codec.
+pub fn path_file_url(path: &Path, directory: bool) -> Result<String, TransactionError> {
+    if !path.is_absolute() {
+        return Err(error("A recovery file URL must name an absolute path."));
+    }
+    let text = path
+        .to_str()
+        .ok_or_else(|| error("The recovery path is not valid UTF-8."))?;
+    #[cfg(windows)]
+    let text = text.replace('\\', "/");
+    #[cfg(windows)]
+    let text = text.as_str();
+    const ESCAPED: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+        .add(b'\\')
+        .add(b' ')
+        .add(b'%')
+        .add(b'#')
+        .add(b'?')
+        .add(b'"')
+        .add(b'<')
+        .add(b'>')
+        .add(b'`')
+        .add(b'{')
+        .add(b'}');
+    let encoded = percent_encoding::utf8_percent_encode(text, ESCAPED);
+    #[cfg(windows)]
+    let mut url = if text.starts_with("//") {
+        format!("file:{encoded}")
     } else {
-        // A host component (`file://localhost/...`) is not part of the cache layout.
-        rest.split_once('/').map(|(_, path)| path).unwrap_or(rest)
+        format!("file:///{encoded}")
     };
-    Some(PathBuf::from(percent_decode(path)))
+    #[cfg(not(windows))]
+    let mut url = format!("file://{encoded}");
+    if directory && !url.ends_with('/') {
+        url.push('/');
+    }
+    Ok(url)
 }
 
-fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            let high = (bytes[index + 1] as char).to_digit(16);
-            let low = (bytes[index + 2] as char).to_digit(16);
-            if let (Some(high), Some(low)) = (high, low) {
-                decoded.push((high * 16 + low) as u8);
-                index += 3;
-                continue;
-            }
+/// Decodes local file URLs, including drive and UNC paths on Windows.
+pub fn file_url_path(url: &str) -> Option<PathBuf> {
+    let rest = url.strip_prefix("file://")?;
+    #[cfg(not(windows))]
+    let text = if rest.starts_with('/') {
+        rest
+    } else {
+        let local = rest.strip_prefix("localhost")?;
+        if !local.starts_with('/') {
+            return None;
         }
-        decoded.push(bytes[index]);
-        index += 1;
-    }
-    String::from_utf8_lossy(&decoded).into_owned()
+        local
+    };
+    #[cfg(windows)]
+    let text = if rest.starts_with('/') {
+        if rest.as_bytes().get(2) == Some(&b':') {
+            &rest[1..]
+        } else {
+            rest
+        }
+    } else if let Some(local) = rest.strip_prefix("localhost/") {
+        local
+    } else {
+        return Some(PathBuf::from(format!(
+            "//{}",
+            percent_encoding::percent_decode_str(rest)
+                .decode_utf8()
+                .ok()?
+        )));
+    };
+    Some(PathBuf::from(
+        percent_encoding::percent_decode_str(text)
+            .decode_utf8()
+            .ok()?
+            .as_ref(),
+    ))
 }
 
 #[cfg(test)]
@@ -1524,7 +1838,7 @@ mod tests {
             restore: false,
         };
         let mut transaction = DocumentTransaction::start(request).unwrap();
-        let target = transaction.next_revision();
+        let target = transaction.next_revision().unwrap();
         transaction.begin_apply("Insert", state()).unwrap();
         let applied = transaction
             .apply_report(
@@ -1575,7 +1889,7 @@ mod tests {
             restore: false,
         };
         let mut transaction = DocumentTransaction::start(request).unwrap();
-        let first = transaction.next_revision();
+        let first = transaction.next_revision().unwrap();
         assert_eq!(
             first.url,
             format!("file://{}/rev-1.pdf", directory.display())
@@ -1593,12 +1907,12 @@ mod tests {
                 },
             )
             .unwrap();
-        let second = transaction.next_revision();
+        let second = transaction.next_revision().unwrap();
         assert_eq!(
             second.url,
             format!("file://{}/rev-2.pdf", directory.display())
         );
-        transaction.close(true);
+        transaction.close(true).unwrap();
         std::fs::remove_dir_all(directory).ok();
     }
 
@@ -1643,7 +1957,7 @@ mod tests {
                 directory.join("session.json"),
             )
             .unwrap();
-        let target = transaction.next_revision();
+        let target = transaction.next_revision().unwrap();
         transaction
             .apply_report(
                 target,
@@ -1660,7 +1974,7 @@ mod tests {
             .unwrap();
         assert_eq!(undone.revision_url, "file:///tmp/original.pdf");
         assert_eq!(undone.state.annotations.len(), 2);
-        transaction.close(true);
+        transaction.close(true).unwrap();
         fs::remove_dir_all(directory).ok();
     }
 
@@ -1892,6 +2206,183 @@ mod tests {
             value["session"]["revisionURL"],
             "file:///tmp/lyra-migration/new%20identity/session-AAAA/rev-1.pdf"
         );
+    }
+
+    #[test]
+    fn local_file_urls_round_trip_unicode_and_reserved_filename_characters() {
+        let root = tempdir();
+        let path = root.join("论文 100% #?.pdf");
+        let url = path_file_url(&path, false).unwrap();
+        assert!(
+            url.contains("%20")
+                && url.contains("%25")
+                && url.contains("%23")
+                && url.contains("%3F")
+        );
+        assert_eq!(file_url_path(&url), Some(path));
+        let directory = path_file_url(&root, true).unwrap();
+        assert!(directory.ends_with('/'));
+        assert_eq!(file_url_path(&directory), Some(root.clone()));
+        assert!(path_file_url(Path::new("relative.pdf"), false).is_err());
+        assert!(file_url_path("https://example.invalid/paper.pdf").is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_history_limits_collect_only_unreachable_generated_files_and_honor_leases() {
+        let root = tempdir();
+        let directory = root.join("session-history");
+        fs::create_dir(&directory).unwrap();
+        let mut transaction = DocumentTransaction::start(test_request(&root, &directory)).unwrap();
+        for number in 1..=4 {
+            let path = directory.join(format!("rev-{number}.pdf"));
+            fs::write(&path, b"revision").unwrap();
+            transaction
+                .begin_apply("Change", AnnotationState::default())
+                .unwrap();
+            transaction
+                .commit_external(
+                    path_file_url(&path, false).unwrap(),
+                    number,
+                    "Change",
+                    AnnotationState::default(),
+                )
+                .unwrap();
+        }
+        transaction.limit_history(2, u64::MAX).unwrap();
+        assert_eq!(transaction.undo.len(), 2);
+        let leased = path_file_url(&directory.join("rev-1.pdf"), false).unwrap();
+        fs::write(directory.join("unrelated.pdf"), b"external").unwrap();
+        assert_eq!(transaction.collect_revision_garbage(&[leased]).unwrap(), 0);
+        assert_eq!(transaction.collect_revision_garbage(&[]).unwrap(), 1);
+        assert!(!directory.join("rev-1.pdf").exists());
+        assert!(directory.join("unrelated.pdf").exists());
+        transaction.limit_history(2, 1).unwrap();
+        assert_eq!(
+            transaction.undo.len(),
+            1,
+            "one undo remains even above the nominal byte budget"
+        );
+        assert_eq!(transaction.collect_revision_garbage(&[]).unwrap(), 1);
+        let target = transaction.next_revision().unwrap();
+        fs::write(&target.path, b"leased after branch").unwrap();
+        assert_eq!(
+            transaction.next_revision().unwrap().number,
+            target.number + 1
+        );
+        transaction.revision_number = u32::MAX;
+        assert!(transaction.next_revision().is_err());
+        transaction.close(true).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_refuses_unknown_structure_truncated_numbers_and_unwritable_start() {
+        let root = tempdir();
+        let directory = root.join("session-validation");
+        fs::create_dir(&directory).unwrap();
+        let request = test_request(&root, &directory);
+        let transaction = DocumentTransaction::start(request.clone()).unwrap();
+        let original = transaction.recovery_value();
+        for case in [
+            "unknown",
+            "page-overflow",
+            "selection-type",
+            "revision-overflow",
+        ] {
+            let mut value = original.clone();
+            match case {
+                "unknown" => value["session"]["futureState"] = serde_json::json!({"preserve":true}),
+                "page-overflow" => value["snapshot"]["currentPage"] = serde_json::json!(u64::MAX),
+                "selection-type" => value["snapshot"]["selection"] = serde_json::json!(["0"]),
+                _ => {
+                    value["session"]["revisionNumber"] = serde_json::json!(u64::MAX);
+                    value["snapshot"]["revisionNumber"] = serde_json::json!(u64::MAX);
+                }
+            }
+            let bytes = serde_json::to_vec(&value).unwrap();
+            fs::write(&request.recovery_path, &bytes).unwrap();
+            let mut restore = request.clone();
+            restore.restore = true;
+            assert!(DocumentTransaction::start(restore).is_err(), "{case}");
+            assert_eq!(fs::read(&request.recovery_path).unwrap(), bytes);
+        }
+        let mut unwritable = request;
+        fs::write(root.join("blocked"), b"not a directory").unwrap();
+        unwritable.recovery_path = root.join("blocked/session.json");
+        assert!(DocumentTransaction::start(unwritable).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn test_request(root: &Path, directory: &Path) -> StartRequest {
+        StartRequest {
+            original_url: path_file_url(&root.join("original.pdf"), false).unwrap(),
+            directory_url: path_file_url(directory, true).unwrap(),
+            recovery_path: root.join("session.json"),
+            original_records_url: path_file_url(&root.join("annotations.json"), false).unwrap(),
+            title: "T".into(),
+            page_count: 1,
+            original_rotations: vec![0],
+            original_signature_json: "{}".into(),
+            source_size: 1,
+            source_modified: None,
+            source_sha256: "source".into(),
+            annotations_json: "[]".into(),
+            bookmarks_json: "[]".into(),
+            slots_json: "[]".into(),
+            deletions_json: "[]".into(),
+            erased_ink_json: "[]".into(),
+            annotation_dirty: false,
+            current_page: 1,
+            selection: vec![],
+            cache_directory_prefix: root.to_string_lossy().into_owned(),
+            restore: false,
+        }
+    }
+
+    #[test]
+    fn retired_session_cleanup_cannot_delete_a_new_window_recovery_manifest() {
+        let root = tempdir();
+        let directory = root.join("session-first");
+        fs::create_dir(&directory).unwrap();
+        let request = StartRequest {
+            original_url: path_file_url(&root.join("original.pdf"), false).unwrap(),
+            directory_url: path_file_url(&directory, true).unwrap(),
+            recovery_path: root.join("session.json"),
+            original_records_url: path_file_url(&root.join("annotations.json"), false).unwrap(),
+            title: "T".into(),
+            page_count: 1,
+            original_rotations: vec![0],
+            original_signature_json: "{}".into(),
+            source_size: 1,
+            source_modified: None,
+            source_sha256: "source".into(),
+            annotations_json: "[]".into(),
+            bookmarks_json: "[]".into(),
+            slots_json: "[]".into(),
+            deletions_json: "[]".into(),
+            erased_ink_json: "[]".into(),
+            annotation_dirty: false,
+            current_page: 1,
+            selection: vec![],
+            cache_directory_prefix: root.to_string_lossy().into_owned(),
+            restore: false,
+        };
+        let mut first = DocumentTransaction::start(request.clone()).unwrap();
+        first.retire_recovery().unwrap();
+        assert!(!request.recovery_path.exists());
+        assert!(directory.join("retired-session.json").exists());
+        let next_directory = root.join("session-next");
+        fs::create_dir(&next_directory).unwrap();
+        let mut next_request = request.clone();
+        next_request.directory_url = path_file_url(&next_directory, true).unwrap();
+        let mut next = DocumentTransaction::start(next_request).unwrap();
+        let bytes = fs::read(&request.recovery_path).unwrap();
+        first.close(true).unwrap();
+        assert!(!directory.exists());
+        assert_eq!(fs::read(&request.recovery_path).unwrap(), bytes);
+        next.close(true).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn tempdir() -> PathBuf {

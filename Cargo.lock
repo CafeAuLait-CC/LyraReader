@@ -951,6 +951,7 @@ name = "lyra-reader-edit"
 version = "0.0.0"
 dependencies = [
  "lyra-reader-core",
+ "percent-encoding",
  "serde_json",
 ]
 

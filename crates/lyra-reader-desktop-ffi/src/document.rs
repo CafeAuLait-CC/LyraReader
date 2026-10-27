@@ -19,6 +19,7 @@ pub struct DesktopDocument {
     pub(super) marks: Mutex<crate::marks::Marks>,
     pub(super) edits: Mutex<crate::pages::PageEdits>,
     pub(super) original_path: PathBuf,
+    pub(super) recovery_status: Mutex<Value>,
     pub(super) password: Option<String>,
 }
 
@@ -69,16 +70,26 @@ impl DesktopDocument {
             mark_state.error = Some(error);
         }
         let marks = Mutex::new(mark_state);
-        Ok(Self {
+        let document = Self {
             original_signature: engine.signature_status(),
             engine: RwLock::new(engine),
             layout: RwLock::new(DocumentLayout::new(sizes, PAGE_GAP_PT)),
             edits: Mutex::new(crate::pages::PageEdits::default()),
             original_path: path.to_path_buf(),
+            recovery_status: Mutex::new(Value::Null),
             password: password.map(str::to_owned),
             ai: Mutex::new(None),
             marks,
-        })
+        };
+        if let Err(error) = document.restore_cached_pages() {
+            if let Ok(mut marks) = document.marks.lock() {
+                marks.recovery_notice(error.clone());
+            }
+            if let Ok(mut status) = document.recovery_status.lock() {
+                *status = json!({"error":error});
+            }
+        }
+        Ok(document)
     }
 
     pub(super) fn active(&self) -> Result<Arc<LyraReaderDocument>, String> {
@@ -94,7 +105,7 @@ impl DesktopDocument {
             .map_err(|_| "Layout state is unavailable")?;
         Ok(json!({
             "pages":layout.placements().iter().map(|p|json!({"index":p.index,"width":p.width_pt,"height":p.height_pt,"top":p.top_pt,"left":p.left_pt})).collect::<Vec<_>>(),
-            "width":layout.content_width_pt(),"height":layout.content_height_pt(),"gap":layout.gap_pt(),"path":self.original_path,"signature_status":self.original_signature,
+            "width":layout.content_width_pt(),"height":layout.content_height_pt(),"gap":layout.gap_pt(),"path":self.original_path,"signature_status":self.original_signature,"recovery":self.recovery_status.lock().map_err(|_|"Recovery state is unavailable")?.clone(),
         }))
     }
 
@@ -171,7 +182,12 @@ impl DesktopDocument {
                 .map_err(|_| "Annotation state is unavailable")?
                 .command(op, &r, &d);
         }
-        if op.starts_with("replace_") && d.path() != self.original_path.to_string_lossy() {
+        if op.starts_with("replace_")
+            && (_write_guard
+                .as_ref()
+                .is_some_and(|edits| edits.has_session())
+                || d.path() != self.original_path.to_string_lossy())
+        {
             return Err(
                 "Apply or discard the staged page changes before replacing the original PDF".into(),
             );
@@ -194,7 +210,7 @@ impl DesktopDocument {
                 | "marks_erase"
                 | "ink_erase_commit"
         ) {
-            let mut edits = self
+            let edits = self
                 .edits
                 .lock()
                 .map_err(|_| "Page-edit state is unavailable")?;
@@ -204,12 +220,7 @@ impl DesktopDocument {
                 .map_err(|_| "Annotation state is unavailable")?;
             let active = self.active()?;
             let state = marks.command(op, &r, &active)?;
-            if !matches!(op, "marks" | "marks_undo" | "marks_redo")
-                && (op != "ink_erase_commit" || state["erase_changed"].as_u64().unwrap_or(0) > 0)
-            {
-                edits.clear_redo();
-                edits.collect_garbage(Path::new(&active.path()));
-            }
+            // Page redo follows the shared transaction, including its annotation snapshots.
             return Ok(edits.annotate_state(state, &active, &self.original_path));
         }
         match op {
@@ -220,8 +231,14 @@ impl DesktopDocument {
                     .map_err(|_| "Annotation state is unavailable")?;
                 let destination = text(&r, "destination")?;
                 let original = crate::marks::Marks::load_with_root(Path::new(&destination), d.page_count(), marks.cache_root());
-                let (report, _, _) = marks.publish_page_revision(&original, || {
-                    d.save_edited_copy(destination).map_err(|e| e.to_string())
+                let payload=marks.payload(&d)?;
+                let clean=marks.cleaned_for_save(&payload.ids);
+                let (report, _, _) = clean.publish_page_revision(&original, || {
+                    if payload.is_empty() {
+                        serde_json::to_value(d.save_edited_copy(destination).map_err(|e|e.to_string())?).map_err(|e|e.to_string())
+                    } else {
+                        serde_json::to_value(d.save_annotation_changes_copy(destination,payload.annotations,payload.bookmarks,payload.updates,payload.deletions).map_err(|e|e.to_string())?).map_err(|e|e.to_string())
+                    }
                 })?;
                 value(Ok(report))
             }
@@ -1179,7 +1196,7 @@ mod tests {
             .directory
             .as_ref()
             .unwrap()
-            .0
+            .path
             .clone();
         for _ in 0..36 {
             doc.command(json!({"op":"page_stage","operation":{"InsertBlank":{"index":0}}}))
@@ -1190,7 +1207,8 @@ mod tests {
             .flatten()
             .filter(|e| e.path().extension().is_some_and(|x| x == "pdf"))
             .count();
-        assert!(pdfs <= 33, "{pdfs} revisions retained");
+        // Thirty-two undo revisions, the current revision, and one externally leased snapshot.
+        assert!(pdfs <= 34, "{pdfs} revisions retained");
         doc.command(json!({"op":"page_discard"})).unwrap();
         drop(doc);
         assert!(directory.exists());
@@ -1408,6 +1426,280 @@ mod tests {
         assert_eq!(fs::read(&fixture.path).unwrap(), original);
     }
     #[test]
+    #[ignore = "subprocess fixture used by the crash-recovery check"]
+    fn write_editing_session_then_exit_without_running_destructors() {
+        let path = PathBuf::from(std::env::var_os("LYRA_READER_TEST_RECOVERY_PATH").unwrap());
+        let doc = open_fixture_document(&path, None).unwrap();
+        doc.command(json!({"op":"bookmark_create","page":2,"title":"Recovered bookmark","yPt":20}))
+            .unwrap();
+        let created=doc.command(json!({"op":"mark_create","entry":{"kind":"highlight","page":0,"start":0,"end":3,"color":"#E8BC5552","note":"Before exit"}})).unwrap();
+        let id = created["selected_id"].as_str().unwrap();
+        doc.command(json!({"op":"page_stage","operation":{"Move":{"pages":[2],"destination":0}},"current_page":2,"selected_pages":[0,2]})).unwrap();
+        doc.command(json!({"op":"page_stage","operation":{"Delete":{"pages":[1]}},"current_page":1,"selected_pages":[1,2]})).unwrap();
+        doc.command(json!({"op":"page_undo","current_page":0,"selected_pages":[0]}))
+            .unwrap();
+        doc.command(json!({"op":"mark_update","id":id,"patch":{"note":"Recovered after undo"}}))
+            .unwrap();
+        // A process exit deliberately skips Drop, like an interrupted desktop process.
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn process_exit_restores_revision_marks_location_and_both_history_directions() {
+        let fixture = Fixture::new("multipage.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "document::tests::write_editing_session_then_exit_without_running_destructors",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("LYRA_READER_TEST_RECOVERY_PATH", &fixture.path)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let manifest = cache_path(&fixture.path)
+            .parent()
+            .unwrap()
+            .join("session.json");
+        let cached = fs::read(&manifest).unwrap();
+        let doc = fixture.open();
+        assert!(doc.info().unwrap()["recovery"]["error"].is_null());
+        assert_eq!(
+            doc.info().unwrap()["recovery"]["location"],
+            json!({"page":1,"selection":[1,2]})
+        );
+        let marks = doc.command(json!({"op":"marks"})).unwrap();
+        assert_eq!(marks["annotations"][0]["page"], 1);
+        assert_eq!(marks["annotations"][0]["note"], "Recovered after undo");
+        assert_eq!(marks["bookmarks"][0]["page"], 0);
+        assert_eq!(marks["can_page_redo"], true);
+        assert_eq!(
+            fs::read(&manifest).unwrap(),
+            cached,
+            "opening must not rewrite recovery data"
+        );
+        assert_eq!(
+            doc.command(json!({"op":"page_redo"})).unwrap()["info"]["pages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let undone = doc.command(json!({"op":"page_undo"})).unwrap();
+        assert_eq!(
+            undone["marks"]["annotations"][0]["note"],
+            "Recovered after undo"
+        );
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        doc.command(json!({"op":"page_discard"})).unwrap();
+        assert!(!manifest.exists());
+    }
+
+    #[test]
+    fn rotation_materializes_marks_atomically_and_undo_restores_the_cached_selection() {
+        let fixture = Fixture::new("multipage.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        let created=doc.command(json!({"op":"mark_create","entry":{"kind":"highlight","page":0,"start":0,"end":3,"color":"#E8BC5552","note":"Rotate me"}})).unwrap();
+        let id = created["selected_id"].clone();
+        let before = fs::read(cache_path(&fixture.path)).unwrap();
+        let rotated=doc.command(json!({"op":"page_stage","operation":{"Rotate":{"pages":[0],"quarter_turns":1}},"current_page":0,"selected_pages":[0,2]})).unwrap();
+        assert!(
+            rotated["marks"]["annotations"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let file_marks = doc.command(json!({"op":"annotations"})).unwrap();
+        assert_eq!(file_marks.as_array().unwrap().len(), 1);
+        assert_eq!(file_marks[0]["contents"], "Rotate me");
+        assert_eq!(doc.active().unwrap().page_rotations().unwrap()[0], 1);
+        let copy = fixture.directory.join("rotated-marked.pdf");
+        doc.command(json!({"op":"save_current_edited_copy","destination":copy}))
+            .unwrap();
+        let copied = open_fixture_document(&copy, None).unwrap();
+        assert_eq!(
+            copied
+                .command(json!({"op":"annotations"}))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let undo = doc.command(json!({"op":"page_undo"})).unwrap();
+        assert_eq!(undo["marks"]["annotations"][0]["id"], id);
+        assert_eq!(
+            undo["marks"]["page_location"],
+            json!({"page":0,"selection":[0,2]})
+        );
+        assert!(!undo["marks"]["can_page_undo"].as_bool().unwrap());
+        assert_eq!(doc.active().unwrap().page_rotations().unwrap()[0], 0);
+        assert!(
+            doc.command(json!({"op":"annotations"}))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read(cache_path(&fixture.path)).unwrap(), before);
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+    }
+
+    #[test]
+    fn leased_revisions_survive_undo_branches_and_retired_sessions_cannot_remove_new_recovery() {
+        let fixture = Fixture::new("multipage.pdf");
+        let doc = fixture.open();
+        doc.command(json!({"op":"page_stage","operation":{"Delete":{"pages":[0]}}}))
+            .unwrap();
+        let revision = PathBuf::from(doc.active().unwrap().path());
+        let bytes = fs::read(&revision).unwrap();
+        let render = crate::render_source::RenderSource::new(&doc, false).unwrap();
+        doc.command(json!({"op":"page_undo"})).unwrap();
+        doc.command(json!({"op":"page_stage","operation":{"InsertBlank":{"index":0}}}))
+            .unwrap();
+        assert_ne!(PathBuf::from(doc.active().unwrap().path()), revision);
+        assert_eq!(fs::read(&revision).unwrap(), bytes);
+        assert_eq!(
+            render
+                .query(json!({"op":"info"}))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let other = fixture.open();
+        assert!(
+            other.info().unwrap()["recovery"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("another window")
+        );
+        assert!(
+            other
+                .command(json!({"op":"page_stage","operation":{"InsertBlank":{"index":0}}}))
+                .is_err()
+        );
+        drop(other);
+        doc.command(json!({"op":"page_discard"})).unwrap();
+        assert!(revision.exists());
+        let next = fixture.open();
+        next.command(json!({"op":"page_stage","operation":{"InsertBlank":{"index":1}}}))
+            .unwrap();
+        let manifest = cache_path(&fixture.path)
+            .parent()
+            .unwrap()
+            .join("session.json");
+        let next_bytes = fs::read(&manifest).unwrap();
+        drop(render);
+        assert!(!revision.exists());
+        assert_eq!(fs::read(&manifest).unwrap(), next_bytes);
+        next.command(json!({"op":"page_discard"})).unwrap();
+    }
+
+    #[test]
+    fn recovery_rejects_missing_and_escaped_revisions_without_rewriting_the_manifest() {
+        for mode in ["missing", "outside", "symlink"] {
+            let fixture = Fixture::new("multipage.pdf");
+            let original = fs::read(&fixture.path).unwrap();
+            let doc = fixture.open();
+            doc.command(json!({"op":"page_stage","operation":{"Delete":{"pages":[0]}}}))
+                .unwrap();
+            let revision = PathBuf::from(doc.active().unwrap().path());
+            drop(doc);
+            let manifest = cache_path(&fixture.path)
+                .parent()
+                .unwrap()
+                .join("session.json");
+            let mut value: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+            match mode {
+                "missing" => fs::remove_file(&revision).unwrap(),
+                "outside" => {
+                    let outside = fixture.directory.join("external-revision.pdf");
+                    fs::copy(&revision, &outside).unwrap();
+                    let url =
+                        lyra_reader_edit::transaction::path_file_url(&outside, false).unwrap();
+                    value["session"]["revisionURL"] = json!(url);
+                    value["snapshot"]["revisionURL"] = json!(url);
+                    fs::write(&manifest, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                _ => {
+                    #[cfg(unix)]
+                    {
+                        let outside = fixture.directory.join("external-revision.pdf");
+                        fs::copy(&revision, &outside).unwrap();
+                        fs::remove_file(&revision).unwrap();
+                        std::os::unix::fs::symlink(&outside, &revision).unwrap();
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        continue;
+                    }
+                }
+            }
+            let bytes = fs::read(&manifest).unwrap();
+            let reopened = fixture.open();
+            assert!(
+                reopened.info().unwrap()["recovery"]["error"].is_string(),
+                "{mode}"
+            );
+            assert_eq!(
+                reopened.info().unwrap()["pages"].as_array().unwrap().len(),
+                3
+            );
+            assert!(reopened.command(json!({"op":"page_apply"})).is_err());
+            assert_eq!(fs::read(&manifest).unwrap(), bytes);
+            assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn changed_recovery_manifest_blocks_writes_without_losing_source_or_external_bytes() {
+        let fixture = Fixture::new("multipage.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        doc.command(json!({"op":"page_stage","operation":{"Delete":{"pages":[0]}}}))
+            .unwrap();
+        let manifest = cache_path(&fixture.path)
+            .parent()
+            .unwrap()
+            .join("session.json");
+        let mut external = fs::read(&manifest).unwrap();
+        external.extend_from_slice(b" \n");
+        fs::write(&manifest, &external).unwrap();
+        assert!(doc.command(json!({"op":"page_apply"})).is_err());
+        assert!(doc.command(json!({"op":"page_discard"})).is_err());
+        assert!(
+            doc.command(json!({"op":"bookmark_create","page":0,"title":"Must fail","yPt":20}))
+                .is_err()
+        );
+        assert_eq!(fs::read(&manifest).unwrap(), external);
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        drop(doc);
+        fs::write(&manifest, b"{unreadable").unwrap();
+        let reopened = fixture.open();
+        assert_eq!(
+            reopened.info().unwrap()["pages"].as_array().unwrap().len(),
+            3
+        );
+        assert!(reopened.info().unwrap()["recovery"]["error"].is_string());
+        assert!(
+            reopened
+                .command(json!({"op":"page_stage","operation":{"InsertBlank":{"index":0}}}))
+                .is_err()
+        );
+        assert_eq!(fs::read(&manifest).unwrap(), b"{unreadable");
+    }
+
+    #[test]
     fn page_sessions_remap_marks_undo_without_touching_original_and_apply_with_backups() {
         let fixture = Fixture::new("multipage.pdf");
         let original = fs::read(&fixture.path).unwrap();
@@ -1417,12 +1709,6 @@ mod tests {
         doc.command(json!({"op":"mark_create","entry":{"kind":"highlight","page":0,"start":0,"end":3,"color":"#E8BC5552","note":"Move with this page"}})).unwrap();
         let sidecar = cache_path(&fixture.path);
         let sidecar_before = fs::read(&sidecar).unwrap();
-        assert!(
-            doc.command(
-                json!({"op":"page_stage","operation":{"Rotate":{"pages":[0],"quarter_turns":1}}})
-            )
-            .is_err()
-        );
         let moved = doc
             .command(json!({"op":"page_stage","operation":{"Move":{"pages":[2],"destination":0}}}))
             .unwrap();

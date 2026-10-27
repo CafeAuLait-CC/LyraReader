@@ -14,3 +14,4 @@ lyra-reader-core = { workspace = true }
 # The durable annotation cache is JSON: `serde_json` reads an entry far enough to classify it,
 # while the original text is sliced and preserved separately (see `records`).
 serde_json = { version = "1", features = ["float_roundtrip"] }
+percent-encoding = "2.3"

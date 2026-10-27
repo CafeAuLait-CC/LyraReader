@@ -1294,6 +1294,37 @@ private slots:
             preview->close();
         }
     }
+    void recoveredPageSessionsRestoreLocationAndDiscardBeforeTabClosure() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/recovery.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",path));
+        QFile original(path);QVERIFY(original.open(QIODevice::ReadOnly));const auto bytes=original.readAll();original.close();
+        {
+            ReaderController interrupted;interrupted.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(interrupted.pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(interrupted.pendingCommands(),0,10000);
+            interrupted.submit("page_stage",{{"operation",QVariantMap{{"Move",QVariantMap{{"pages",QVariantList{2}},{"destination",0}}}}},{"current_page",2},{"selected_pages",QVariantList{0,2}}});
+            QTRY_COMPARE_WITH_TIMEOUT(interrupted.pendingCommands(),0,10000);QVERIFY2(interrupted.error().isEmpty(),qPrintable(interrupted.error()));
+            interrupted.submit("page_stage",{{"operation",QVariantMap{{"Delete",QVariantMap{{"pages",QVariantList{1}}}}}},{"current_page",1},{"selected_pages",QVariantList{1,2}}});
+            QTRY_COMPARE_WITH_TIMEOUT(interrupted.pendingCommands(),0,10000);QCOMPARE(interrupted.pageCount(),2);
+        }
+        WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);
+        engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
+        auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),2,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
+        QTRY_VERIFY(!window->property("positionRestoring").toBool());QCOMPARE(window->property("currentPage").toInt(),1);
+        QVERIFY(reader->data().value("marks").toMap().value("can_page_undo").toBool());
+        reader->submit("page_undo");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QCOMPARE(reader->pageCount(),3);
+        QTRY_COMPARE(window->property("selectedPages").toList(),QVariantList({1,2}));
+        // Even a session whose undo reaches the original must be retired on explicit discard.
+        reader->submit("page_undo");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(!reader->data().value("marks").toMap().value("page_pending").toBool());
+        QVERIFY(reader->data().value("marks").toMap().value("page_session_active").toBool());
+        reader->setEditDraft("forms",QVariantMap{{"dummy",true}});
+        QPointer<ReaderController> closing=reader;
+        QVERIFY(QMetaObject::invokeMethod(window,"discardAndClose",Q_ARG(QVariant,0)));
+        QTRY_VERIFY_WITH_TIMEOUT(closing.isNull(),10000);
+        workspace.openFile(QUrl::fromLocalFile(path));reader=workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(!reader->data().value("marks").toMap().value("page_session_active").toBool());
+        QVERIFY(reader->data().value("recovery").toMap().isEmpty());
+        QVERIFY(original.open(QIODevice::ReadOnly));QCOMPARE(original.readAll(),bytes);
+    }
     void tabsRetainDocumentsAndSharedSearchAndMarksWork(){
         QTemporaryDir scratch;
         QVERIFY(scratch.isValid());

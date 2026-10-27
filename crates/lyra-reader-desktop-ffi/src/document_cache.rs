@@ -240,6 +240,9 @@ impl DocumentCache {
 
     pub fn validate_source(&self) -> Result<(), String> {
         self.validate_recovery()?;
+        self.validate_pdf_source()
+    }
+    pub fn validate_pdf_source(&self) -> Result<(), String> {
         if read_optional(&self.directory.join("source.json"))?.is_none() {
             return Ok(());
         }

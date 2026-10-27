@@ -30,7 +30,10 @@ using Qt's rendering hardware interface and the shared Rust engine. It is being 
 with the macOS saving and interaction model. Annotation drafts use the platform application cache,
 keyed by the engine's document identity; old JSON companions beside PDFs are ignored. Set
 `LYRA_READER_DOCUMENT_CACHE_DIR` to an absolute directory to isolate recoverable reader state.
-Page-session recovery, unified Save/Save As, and several newer macOS features are still being ported.
+Page edits use the shared Rust transaction, with revision/annotation recovery and undo history in
+the application cache. Rotating a marked page embeds the cached marks into a working revision first;
+undo restores the preceding PDF and its cached marks together. Unified Save/Save As and several
+newer macOS features are still being ported.
 The Linux branch is not yet a release or a claim of full feature parity.
 
 ## Capabilities

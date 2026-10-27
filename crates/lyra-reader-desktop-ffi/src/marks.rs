@@ -1,6 +1,7 @@
 //! Native-shell persistence adapter for the shared annotation codec and rules.
 use lyra_reader_edit::{kind::AnnotationKind, records, rules};
 use lyra_reader_ffi::api::*;
+use lyra_reader_ffi::{DocumentTransactionInputRecord, DocumentTransactionStateRecord};
 use serde_json::{Value, json};
 use std::{
     collections::HashSet,
@@ -40,6 +41,8 @@ pub struct Marks {
     path: PathBuf,
     cache: Option<crate::document_cache::DocumentCache>,
     source_error: Option<String>,
+    session: Option<crate::session::SessionContext>,
+    owns_recovery: bool,
     baseline: Option<Vec<u8>>,
     entries: Vec<Entry>,
     deletions: Vec<AnnotationDeleteRecord>,
@@ -54,6 +57,14 @@ pub struct Payload {
     pub updates: Vec<AnnotationUpdateRecord>,
     pub deletions: Vec<AnnotationDeleteRecord>,
     pub ids: HashSet<String>,
+}
+impl Payload {
+    pub fn is_empty(&self) -> bool {
+        self.annotations.is_empty()
+            && self.bookmarks.is_empty()
+            && self.updates.is_empty()
+            && self.deletions.is_empty()
+    }
 }
 
 fn now() -> f64 {
@@ -193,10 +204,15 @@ fn validate(v: &Value, pages: u32) -> Result<bool, String> {
 
 impl Marks {
     pub fn validate_source(&self) -> Result<(), String> {
-        self.cache
+        let cache = self
+            .cache
             .as_ref()
-            .ok_or("The document cache is unavailable")?
-            .validate_source()
+            .ok_or("The document cache is unavailable")?;
+        if self.owns_recovery {
+            cache.validate_pdf_source()
+        } else {
+            cache.validate_source()
+        }
     }
     pub fn cache_root(&self) -> Option<&Path> {
         self.cache.as_ref().map(|c| c.root.as_path())
@@ -217,7 +233,7 @@ impl Marks {
         self.cache = Some(cache);
         Ok(())
     }
-    pub fn can_stage(&self, operation: &PageOperationRecord) -> Result<(), String> {
+    pub fn can_stage(&self, _operation: &PageOperationRecord) -> Result<(), String> {
         self.validate_source()?;
         if let Some(error) = &self.error {
             return Err(error.clone());
@@ -225,21 +241,167 @@ impl Marks {
         if self.entries.iter().any(|e| matches!(e, Entry::Opaque(_))) {
             return Err("The annotation cache contains entries from another version whose pages cannot be remapped safely. Page editing is disabled.".into());
         }
-        let rotating = match operation {
-            PageOperationRecord::Rotate { pages, .. }
-            | PageOperationRecord::SetRotation { pages, .. } => Some(pages),
-            _ => None,
-        };
-        if let Some(pages) = rotating
-            && self.entries.iter().any(|e| {
-                matches!(e,Entry::Known(v)
-                if pages.contains(&(v["page"].as_u64().unwrap_or(u64::MAX) as u32))
-                && !v["id"].as_str().is_some_and(|id| self.embedded_bookmarks.contains(id)))
-            })
-        {
-            return Err("These pages have annotation cache annotations or bookmarks. Save the marks inside the PDF before rotating, so their text positions cannot move to different words.".into());
-        }
         Ok(())
+    }
+    pub fn cache_location(&self) -> Result<&crate::document_cache::DocumentCache, String> {
+        self.cache
+            .as_ref()
+            .ok_or_else(|| "The document cache is unavailable".into())
+    }
+    pub fn owns_session(&mut self) {
+        self.owns_recovery = true;
+        self.source_error = None;
+    }
+    pub fn recovery_notice(&mut self, error: String) {
+        self.source_error = Some(error);
+    }
+    pub fn needs_materialization(&self, operation: &PageOperationRecord) -> bool {
+        let pages = match operation {
+            PageOperationRecord::Rotate { pages, .. }
+            | PageOperationRecord::SetRotation { pages, .. } => pages,
+            _ => return false,
+        };
+        self.entries.iter().any(|e| matches!(e, Entry::Known(v)
+            if v["page"].as_u64().and_then(|p|u32::try_from(p).ok()).is_some_and(|p|pages.contains(&p))
+            && !v["id"].as_str().is_some_and(|id|self.embedded_bookmarks.contains(id))))
+    }
+    pub fn transaction_input(
+        &self,
+        page: u32,
+        selection: &[u32],
+    ) -> Result<DocumentTransactionInputRecord, String> {
+        let mut annotations = Vec::new();
+        let mut bookmarks = Vec::new();
+        let mut slots = Vec::new();
+        for entry in &self.entries {
+            match entry {
+                Entry::Known(value) => {
+                    let id = string(value, "id")?;
+                    if kind(value) == "bookmark" {
+                        bookmarks.push(value.clone());
+                        slots.push(json!({"bookmark":{"_0":id}}));
+                    } else {
+                        annotations.push(value.clone());
+                        slots.push(json!({"annotation":{"_0":id}}));
+                    }
+                }
+                Entry::Opaque(raw) => slots.push(json!({"opaque":{"_0":raw}})),
+            }
+        }
+        let deletions: Vec<_> = self
+            .deletions
+            .iter()
+            .map(|d| json!({"identity":d.target,"page":d.page}))
+            .collect();
+        let mut hidden: Vec<_> = self.hidden_ink.iter().cloned().collect();
+        hidden.sort();
+        Ok(DocumentTransactionInputRecord {
+            annotations_json: serde_json::to_string(&annotations).map_err(|e| e.to_string())?,
+            bookmarks_json: serde_json::to_string(&bookmarks).map_err(|e| e.to_string())?,
+            slots_json: serde_json::to_string(&slots).map_err(|e| e.to_string())?,
+            deletions_json: serde_json::to_string(&deletions).map_err(|e| e.to_string())?,
+            erased_ink_json: serde_json::to_string(&hidden).map_err(|e| e.to_string())?,
+            annotation_dirty: !annotations.is_empty()
+                || !bookmarks.is_empty()
+                || !deletions.is_empty(),
+            current_page: page,
+            selection: selection.to_vec(),
+        })
+    }
+    pub fn restored_transaction(
+        &self,
+        state: &DocumentTransactionStateRecord,
+        control: std::sync::Arc<crate::session::SessionControl>,
+        document: &LyraReaderDocument,
+    ) -> Result<Self, String> {
+        let annotations: Vec<Value> =
+            serde_json::from_str(&state.annotations_json).map_err(|e| e.to_string())?;
+        let bookmarks: Vec<Value> =
+            serde_json::from_str(&state.bookmarks_json).map_err(|e| e.to_string())?;
+        let slots: Vec<Value> =
+            serde_json::from_str(&state.slots_json).map_err(|e| e.to_string())?;
+        let mut pieces = Vec::new();
+        let mut emitted = HashSet::new();
+        for slot in slots {
+            if let Some(raw) = slot["opaque"]["_0"].as_str() {
+                pieces.push(raw.to_string());
+                continue;
+            }
+            for (tag, values) in [("annotation", &annotations), ("bookmark", &bookmarks)] {
+                if let Some(id) = slot[tag]["_0"].as_str() {
+                    let value = values.iter().find(|v| v["id"].as_str().is_some_and(|s|s.eq_ignore_ascii_case(id)))
+                        .ok_or("The cached editing snapshot refers to a missing annotation or bookmark")?;
+                    if emitted.insert(format!("{tag}:{id}")) {
+                        pieces.push(serde_json::to_string(value).map_err(|e| e.to_string())?);
+                    }
+                }
+            }
+        }
+        for (tag, values) in [("annotation", annotations), ("bookmark", bookmarks)] {
+            for value in values {
+                let id = string(&value, "id")?;
+                if emitted.insert(format!("{tag}:{id}")) {
+                    pieces.push(serde_json::to_string(&value).map_err(|e| e.to_string())?);
+                }
+            }
+        }
+        let mut result = self.clone();
+        result.entries = decode_entries(
+            format!("[{}]", pieces.join(",")).as_bytes(),
+            document.page_count(),
+        )?;
+        let deletions: Vec<Value> =
+            serde_json::from_str(&state.deletions_json).map_err(|e| e.to_string())?;
+        result.deletions = deletions
+            .into_iter()
+            .map(|v| {
+                Ok(AnnotationDeleteRecord {
+                    target: string(&v, "identity")?,
+                    page: v["page"]
+                        .as_u64()
+                        .and_then(|p| u32::try_from(p).ok())
+                        .ok_or("Invalid cached deletion page")?,
+                })
+            })
+            .collect::<Result<_, String>>()?;
+        result.hidden_ink = serde_json::from_str::<Vec<String>>(&state.erased_ink_json)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .collect();
+        // The shared manifest now persists pieces and their deletions together. Private
+        // session records can keep both; the original document cache is never rewritten.
+        result.transient_ink.clear();
+        result.embedded_bookmarks.clear();
+        result.undo.clear();
+        result.redo.clear();
+        result.erase = None;
+        result.path = lyra_reader_edit::transaction::file_url_path(&state.annotation_records_url)
+            .ok_or("Invalid session annotation URL")?;
+        result.baseline = None;
+        result.error = None;
+        result.source_error = state.recovery_error.clone();
+        result.owns_recovery = true;
+        result.session = Some(crate::session::SessionContext {
+            control,
+            revision_url: state.revision_url.clone(),
+            revision_number: state.revision_number,
+            current_page: state.current_page,
+            selection: state.selection.clone(),
+        });
+        result.seed_bookmarks(document)?;
+        Ok(result)
+    }
+    pub fn cleaned_for_save(&self, ids: &HashSet<String>) -> Self {
+        let mut result = self.clone();
+        result.entries.retain(
+            |e| !matches!(e,Entry::Known(v)if v["id"].as_str().is_some_and(|id|ids.contains(id))),
+        );
+        result.deletions.clear();
+        result.hidden_ink.clear();
+        result.transient_ink.clear();
+        result.undo.clear();
+        result.redo.clear();
+        result
     }
     pub fn validate_export(&self, remapping: bool) -> Result<(), String> {
         self.validate_source()?;
@@ -373,9 +535,6 @@ impl Marks {
         result.persist()?;
         Ok(result)
     }
-    pub fn clear_redo(&mut self) {
-        self.redo.clear();
-    }
     pub fn publish_page_revision<T>(
         &self,
         original: &Self,
@@ -383,6 +542,7 @@ impl Marks {
     ) -> Result<(T, Self, Option<PathBuf>), String> {
         original.validate_source()?;
         let mut prepared = self.clone();
+        prepared.session = None;
         prepared.path = original
             .path
             .with_extension(format!("json.prepared-{}", uuid()?));
@@ -437,6 +597,8 @@ impl Marks {
         };
         let mut result = self.clone();
         result.cache = original.cache.clone();
+        result.session = None;
+        result.owns_recovery = false;
         result.path = original.path.clone();
         result.baseline = prepared.baseline.clone();
         result.undo.clear();
@@ -455,6 +617,9 @@ impl Marks {
     }
     pub fn payload(&self, document: &LyraReaderDocument) -> Result<Payload, String> {
         self.validate_source()?;
+        if let Some(session) = &self.session {
+            session.control.check()?;
+        }
         if let Some(error) = &self.error {
             return Err(format!("Annotation cache writes are blocked: {error}"));
         }
@@ -703,6 +868,8 @@ impl Marks {
             path,
             source_error: cache.as_ref().and_then(|c| c.opened_source_status().err()),
             cache,
+            session: None,
+            owns_recovery: false,
             baseline: None,
             entries: vec![],
             deletions: vec![],
@@ -780,6 +947,22 @@ impl Marks {
         self.deletions = s.deletions;
     }
     fn persist(&mut self) -> Result<(), String> {
+        if let Some(context) = self.session.clone() {
+            let input = self.transaction_input(context.current_page, &context.selection)?;
+            let state = context.control.mutate(|handle| {
+                handle.persist(
+                    input,
+                    context.revision_url,
+                    context.revision_number,
+                    context.control.recovery_path.to_string_lossy().into_owned(),
+                )
+            })?;
+            return match state.recovery_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            };
+        }
+
         let _write_guard = WRITES
             .lock()
             .map_err(|_| "Annotation cache writer is unavailable")?;
@@ -839,7 +1022,9 @@ impl Marks {
         Ok(())
     }
     fn change(&mut self, task: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), String> {
-        if let Some(cache) = &self.cache {
+        if !self.owns_recovery
+            && let Some(cache) = &self.cache
+        {
             cache.validate_recovery()?;
         }
         self.erase = None;
@@ -849,6 +1034,11 @@ impl Marks {
         let old = self.snapshot();
         if let Err(error) = task(self).and_then(|_| self.persist()) {
             self.restore(old);
+            if self.session.is_some()
+                && let Err(rollback) = self.persist()
+            {
+                self.error = Some(format!("The editing session needs recovery: {rollback}"));
+            }
             return Err(error);
         }
         self.undo.push(old);

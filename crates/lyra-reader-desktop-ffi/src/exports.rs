@@ -36,9 +36,9 @@ fn materialize(
         options.mode(0o700);
     }
     options.create(&path).map_err(|e| e.to_string())?;
-    let directory = Arc::new(crate::pages::SessionDirectory(path));
+    let directory = Arc::new(crate::pages::SessionDirectory::temporary(path));
     let destination = directory
-        .0
+        .path
         .join("materialized.pdf")
         .to_string_lossy()
         .into_owned();

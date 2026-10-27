@@ -107,7 +107,7 @@ void WorkspaceController::closeTab(int index, bool discardPending) {
     if (index < 0 || index >= m_tabs.size()) return;
     auto *candidate=m_tabs.at(index);
     const auto marks=candidate->data().value(QStringLiteral("marks")).toMap();
-    if(candidate->pendingCommands()>0 || (!discardPending &&
+    if(candidate->pendingCommands()>0 || (discardPending && marks.value(QStringLiteral("page_session_active")).toBool()) || (!discardPending &&
         (marks.value(QStringLiteral("page_pending")).toBool() || marks.value(QStringLiteral("pending_deletions")).toInt()>0 || !candidate->noteDrafts().isEmpty() || candidate->hasEditDrafts()))) {
         emit closeTabRequested(index);
         return;
