@@ -112,6 +112,19 @@ extension ReaderChecks {
         require(source.tabs.map(\.id) == ids, "dragging blank tab padding reorders by the same rules")
         require(windows[0].frame == sourceFrame, "dragging tab padding never drags the window")
 
+        let middle = try await surface(ids[1], host: hosts[0])
+        let shortStart = point(middle, x: 35)
+        drag(middle, from: shortStart,
+             to: CGPoint(x: shortStart.x - ceil(middle.bounds.width / 2), y: shortStart.y))
+        require(source.tabs.map(\.id) == [ids[1], ids[0], ids[2]],
+                "half a tab width from the title swaps with the left neighbour")
+        let swapped = try await surface(ids[1], host: hosts[0])
+        let paddingStart = point(swapped, x: swapped.bounds.width - 2)
+        drag(swapped, from: paddingStart,
+             to: CGPoint(x: paddingStart.x + ceil(swapped.bounds.width / 2), y: paddingStart.y))
+        require(source.tabs.map(\.id) == ids && windows[0].frame == sourceFrame,
+                "half a tab width from trailing padding swaps right without moving the window")
+
         let target = makeWindow(x: sourceFrame.minX + 80, y: sourceFrame.minY - 60, urls: [urls[3]])
         let targetTab = try await surface(target.tabs[0].id, host: hosts[1])
         let moving = try await surface(ids[0], host: hosts[0])

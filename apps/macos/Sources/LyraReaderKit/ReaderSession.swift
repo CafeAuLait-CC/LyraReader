@@ -137,6 +137,11 @@ public final class ReaderSession: ObservableObject, Identifiable {
             window.titleVisibility = .hidden
             window.titlebarSeparatorStyle = .none
             if window.styleMask.contains(.fullSizeContentView) {
+                // Window Server can drag the native titlebar independently of the tab's
+                // AppKit input, even when mouseDownCanMoveWindow is false. Disable that
+                // automatic path before interaction; the explicit titlebar drag view still
+                // starts a system drag with performDrag(with:).
+                window.isMovable = false
                 titlebarLayout = ReaderTitlebarLayout(window: window)
             }
             let center = NotificationCenter.default
