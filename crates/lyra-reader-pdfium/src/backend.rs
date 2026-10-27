@@ -11,7 +11,7 @@ use lyra_reader_core::{
     Size,
 };
 use pdfium_render::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -271,7 +271,22 @@ pub struct PdfiumBackend {
     /// Rendering keeps navigation borders native while the shell draws content annotations.
     /// Only the raster document is changed in memory; annotation reads and saves use other handles.
     annotation_rendering: std::sync::Mutex<HashMap<PageIndex, AnnotationRenderState>>,
-    link_borders: OnceLock<HashMap<PageIndex, Vec<crate::link_borders::LinkBorder>>>,
+    /// The legacy link-border cache. `parsed` is filled by one lopdf read per document; until
+    /// then `scanned` records the pages a cheap PDFium annotation scan has already cleared.
+    /// See [`PdfiumBackend::paint_link_borders`] for why the scan exists.
+    link_borders: std::sync::Mutex<LinkBorderCache>,
+}
+
+/// Lazy state behind [`PdfiumBackend::link_borders`].
+#[derive(Default)]
+struct LinkBorderCache {
+    /// The result of [`crate::link_borders::read`], run at most once per document.
+    ///
+    /// `Some(empty)` is a valid result and must not trigger a second read: the dictionary pass
+    /// covers every page at once.
+    parsed: Option<HashMap<PageIndex, Vec<crate::link_borders::LinkBorder>>>,
+    /// Pages the PDFium gate proved borderless. Ignored once `parsed` is set.
+    scanned: HashSet<PageIndex>,
 }
 
 struct AnnotationRenderState {
@@ -309,7 +324,7 @@ impl PdfiumBackend {
                     raster_lock: std::sync::Mutex::new(()),
                     annotation_reader: std::sync::OnceLock::new(),
                     annotation_rendering: std::sync::Mutex::new(HashMap::new()),
-                    link_borders: OnceLock::new(),
+                    link_borders: std::sync::Mutex::new(LinkBorderCache::default()),
                 })
             }
             Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError)) => {
@@ -358,7 +373,7 @@ impl PdfiumBackend {
                 raster_lock: std::sync::Mutex::new(()),
                 annotation_reader: std::sync::OnceLock::new(),
                 annotation_rendering: std::sync::Mutex::new(HashMap::new()),
-                link_borders: OnceLock::new(),
+                link_borders: std::sync::Mutex::new(LinkBorderCache::default()),
             }),
             Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError)) => {
                 Err(LyraReaderError::new(
@@ -625,18 +640,13 @@ impl PdfiumBackend {
             },
         )?);
 
-        let reader = self.annotation_reader.get_or_init(|| {
-            AnnotationReader::open_locked(&self.path, self.password.as_deref())
-                .map_err(|error| format!("{error:?}"))
-        });
-
-        match reader {
+        match self.annotation_reader() {
             Ok(reader) => reader.page_report_locked(page),
             Err(detail) => Err(LyraReaderError::new(
                 ErrorCode::BackendUnavailable,
                 "could not read the document's annotations",
             )
-            .with_detail(detail.clone())),
+            .with_detail(detail.to_owned())),
         }
     }
 
@@ -647,6 +657,25 @@ impl PdfiumBackend {
 
     pub fn reopen(&self) -> Result<Self> {
         Self::open(&self.path, self.password.as_deref())
+    }
+
+    /// Test seam: whether the one-shot lopdf dictionary pass has run for this document.
+    ///
+    /// Used to prove that a border-less document never pays for
+    /// [`crate::link_borders::read`] and that a bordered one still does.
+    #[cfg(test)]
+    pub(crate) fn link_border_cache_is_parsed(&self) -> bool {
+        lyra_reader_core::sync::lock(&self.link_borders)
+            .map(|cache| cache.parsed.is_some())
+            .unwrap_or(true)
+    }
+
+    /// Test seam: how many pages the PDFium gate has cleared so far.
+    #[cfg(test)]
+    pub(crate) fn link_border_scanned_pages(&self) -> usize {
+        lyra_reader_core::sync::lock(&self.link_borders)
+            .map(|cache| cache.scanned.len())
+            .unwrap_or(0)
     }
 
     /// The path this document was opened from.
@@ -680,27 +709,82 @@ impl PdfiumBackend {
                     .with_detail(error.to_string())
             })
     }
-    /// Renders a sub-rectangle ("tile") of a page through PDFium's matrix path.
+    /// Paints the legacy `/Link` borders the raster path has to draw itself.
     ///
-    /// PDFium composes the matrix on top of its own display transform, which already
-    /// applies the page's intrinsic `/Rotate`, so a tile lands in exactly the same
-    /// orientation as a whole-page render — the `a_tile_matches_the_full_page_render`
-    /// test pins that down by comparing against a crop of the full render.
+    /// The lopdf read behind [`crate::link_borders::read`] is the expensive part of the first
+    /// tile on a large document: it loads the whole object graph to find dictionaries that, on
+    /// a real 115-page paper, produce **zero** borders. So before paying it, the page that is
+    /// about to be painted is checked through PDFium's annotation API
+    /// ([`AnnotationReader::page_may_have_link_borders_locked`]):
     ///
-    /// Region rendering is what makes a tile pipeline affordable at all: rendering the
-    /// whole page and cropping would re-interpret the content stream once per tile.
+    /// * `Some(false)` records the page as cleared and paints nothing. The answer is a superset
+    ///   of what `parse` would paint, so this can never hide a border.
+    /// * `Some(true)` or `None` (the page could not be inspected) runs the one dictionary pass,
+    ///   exactly as before; the result is kept for every later page.
+    ///
+    /// The scan is per painted page, not a document-wide sweep: loading every page through
+    /// PDFium was measured at ~100 ms on the same paper, which would defeat the purpose. A
+    /// document made only of pages the scan clears never loads lopdf for borders at all.
     fn paint_link_borders(
         &self,
         page: &PdfPage<'_>,
         request: &RasterRequest,
         tile: &mut RasterTile,
-    ) {
-        let borders = self
-            .link_borders
-            .get_or_init(|| crate::link_borders::read(&self.path, self.password.as_deref()));
-        if let Some(borders) = borders.get(&request.page) {
+    ) -> Result<()> {
+        let mut cache = lyra_reader_core::sync::lock(&self.link_borders)?;
+        if cache.parsed.is_none() {
+            if cache.scanned.contains(&request.page) {
+                return Ok(());
+            }
+            match self.page_may_have_link_borders(request.page) {
+                Some(false) => {
+                    cache.scanned.insert(request.page);
+                    return Ok(());
+                }
+                // A possible border and an unreadable gate both fail open to the
+                // authoritative dictionary pass.
+                Some(true) | None => {
+                    cache.parsed = Some(crate::link_borders::read(
+                        &self.path,
+                        self.password.as_deref(),
+                    ));
+                }
+            }
+        }
+        if let Some(borders) = cache
+            .parsed
+            .as_ref()
+            .and_then(|pages| pages.get(&request.page))
+        {
             crate::link_borders::paint(borders, page_geometry(page), request, tile);
         }
+        Ok(())
+    }
+
+    /// The PDFium-side half of [`Self::paint_link_borders`].
+    ///
+    /// The annotation reader is the document's lazily opened second `FPDF_DOCUMENT`; opening it
+    /// here does not add work to [`PdfiumBackend::open`], and a reader that cannot be opened
+    /// makes the gate inconclusive, which runs the lopdf pass as before.
+    fn page_may_have_link_borders(&self, page: PageIndex) -> Option<bool> {
+        match self.annotation_reader() {
+            Ok(reader) => reader.page_may_have_link_borders_locked(page),
+            Err(_) => None,
+        }
+    }
+
+    /// The lazily opened annotation reader for this document. Caller holds `PDFIUM_LOCK`.
+    ///
+    /// The failure is cached with the reader: the file cannot become readable while this
+    /// backend is open, and the shell reports the same error every time.
+    fn annotation_reader(&self) -> std::result::Result<&AnnotationReader, &str> {
+        self.annotation_reader
+            .get_or_init(|| {
+                AnnotationReader::open_locked(&self.path, self.password.as_deref())
+                    .map_err(|error| format!("{error:?}"))
+            })
+            .as_ref()
+            .map_err(String::as_str)
     }
 
     /// Let PDFium paint link borders with their original /Border, /BS, colour and appearance.
@@ -755,6 +839,15 @@ impl PdfiumBackend {
         Ok(())
     }
 
+    /// Renders a sub-rectangle ("tile") of a page through PDFium's matrix path.
+    ///
+    /// PDFium composes the matrix on top of its own display transform, which already
+    /// applies the page's intrinsic `/Rotate`, so a tile lands in exactly the same
+    /// orientation as a whole-page render — the `a_tile_matches_the_full_page_render`
+    /// test pins that down by comparing against a crop of the full render.
+    ///
+    /// Region rendering is what makes a tile pipeline affordable at all: rendering the
+    /// whole page and cropping would re-interpret the content stream once per tile.
     fn rasterize_region(
         &self,
         page: &PdfPage<'_>,
@@ -1110,7 +1203,7 @@ impl DocumentBackend for PdfiumBackend {
 
         if let Some(region) = request.region {
             let mut tile = self.rasterize_region(&page, request, region)?;
-            self.paint_link_borders(&page, request, &mut tile);
+            self.paint_link_borders(&page, request, &mut tile)?;
             return Ok(tile);
         }
 
@@ -1134,7 +1227,7 @@ impl DocumentBackend for PdfiumBackend {
         })?;
 
         let mut tile = tile_from_bitmap(&bitmap);
-        self.paint_link_borders(&page, request, &mut tile);
+        self.paint_link_borders(&page, request, &mut tile)?;
         Ok(tile)
     }
 

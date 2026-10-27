@@ -1,5 +1,9 @@
 //! Legacy /Link borders have no appearance stream, and PDFium's bitmap renderer omits them.
 //! Read only their dictionary geometry once; paint directly into the existing BGRA raster.
+//!
+//! [`read`] is not on the first-tile path for a document without borders: the raster backend
+//! asks PDFium's annotation API whether the page being painted could carry one, and only runs
+//! this document-wide lopdf pass when the answer is yes (or cannot be determined).
 
 use lopdf::{Dictionary, Document, LoadOptions, Object};
 use lyra_reader_core::{PageGeometry, PageIndex, RasterRequest, RasterTile};
@@ -117,7 +121,16 @@ fn parse(document: &Document, annotation: &Dictionary) -> Option<LinkBorder> {
     let width = bs
         .and_then(|d| value(document, d, b"W"))
         .and_then(number)
-        .unwrap_or_else(|| border_number(2).unwrap_or(1.0));
+        .unwrap_or_else(|| match border {
+            // A three-entry /Border array that does not state a numeric width has no width.
+            // PDFium's FPDFAnnot_GetBorder reads exactly this shape as 0, and the cheap gate in
+            // `backend::PdfiumBackend::paint_link_borders` relies on that agreement to skip a
+            // page without loading the dictionary. A shorter array or a non-array /Border is
+            // still malformed in a way PDFium refuses, so the gate runs this pass and the
+            // specification default of 1 pt applies.
+            Some(array) if array.len() >= 3 => border_number(2).unwrap_or(0.0),
+            _ => border_number(2).unwrap_or(1.0),
+        });
     if width <= 0.0 {
         return None;
     }
@@ -307,6 +320,50 @@ mod tests {
         let border = parse(&document, &annotation).expect("/BS has a visible default width of 1");
         assert_eq!(border.stroke.width, 1.0);
         assert!(border.stroke.dash.is_some());
+    }
+
+    #[test]
+    fn malformed_border_width_is_read_as_zero_like_pdfium() {
+        // PDFium's FPDFAnnot_GetBorder reports width 0 for a three-entry /Border array whose
+        // third entry is not a number (measured against the vendored dylib). The raster gate
+        // trusts that answer, so the dictionary parser must not invent a 1 pt border here; the
+        // 1 pt default belongs to a *missing* /Border key, not a malformed one.
+        let document = Document::new();
+        let annotation = dictionary! {
+            "Subtype" => "Link", "Rect" => vec![0.into(), 0.into(), 100.into(), 20.into()],
+            "Border" => vec![0.into(), 0.into(), Object::Name(b"Foo".to_vec())],
+        };
+        assert!(parse(&document, &annotation).is_none());
+    }
+
+    #[test]
+    fn missing_and_short_border_arrays_keep_the_specification_default() {
+        // These shapes do not reach the gate's "PDFium says zero" branch: PDFium's accessor
+        // fails on them, so the raster path always runs this parser. They must keep painting
+        // the default 1 pt border, which is why the gate treats a missing or unreadable /Border
+        // as "possible border".
+        let document = Document::new();
+        let missing = dictionary! {
+            "Subtype" => "Link", "Rect" => vec![0.into(), 0.into(), 100.into(), 20.into()],
+        };
+        assert_eq!(
+            parse(&document, &missing)
+                .expect("a missing /Border uses the PDF default")
+                .stroke
+                .width,
+            1.0
+        );
+        let short = dictionary! {
+            "Subtype" => "Link", "Rect" => vec![0.into(), 0.into(), 100.into(), 20.into()],
+            "Border" => vec![0.into(), 0.into()],
+        };
+        assert_eq!(
+            parse(&document, &short)
+                .expect("a short /Border cannot state a width and keeps the default")
+                .stroke
+                .width,
+            1.0
+        );
     }
 
     #[test]
