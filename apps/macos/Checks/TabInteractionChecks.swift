@@ -164,6 +164,31 @@ extension ReaderChecks {
                 "the newest tab is the active one before the drag")
         let tabIDs = state.tabs.map(\.id)
 
+        // Local reordering follows the dragged tab's travel, not the pointer's grab offset.
+        // A title, leading padding and trailing inset all swap at exactly half a tab width.
+        for tabWidth: CGFloat in [96, 180, 250] {
+            let pitch = tabWidth + TabRowLayout.tabSpacing
+            for grabX in [CGFloat(2), CGFloat(35), tabWidth - 2] {
+                for direction: CGFloat in [-1, 1] {
+                    let start = pitch + grabX
+                    var short = TabDragSession(sourceIndex: 1, tabCount: 3, tabWidth: tabWidth)
+                    for travel in [CGFloat(1), tabWidth / 2 - 1, tabWidth / 2] {
+                        let delta = direction * travel
+                        let location = CGPoint(x: start + delta, y: 22)
+                        short.update(location: location, translation: CGSize(width: delta, height: 0))
+                        let expected: Int? = travel < tabWidth / 2 ? nil : (direction < 0 ? 0 : 2)
+                        require(short.dropDestination == expected,
+                                "local reorder uses half-width travel from every grab position (width \(tabWidth), grab \(grabX), delta \(delta))")
+                        short.update(location: location)
+                        require(short.dropDestination == expected,
+                                "mouse-up preserves the half-width reorder target")
+                    }
+                    short.update(location: CGPoint(x: start, y: 22))
+                    require(short.dropDestination == nil, "returning to the starting point cancels the reorder")
+                }
+            }
+        }
+
         // Drag tab 3 to the leading edge. The session's numbers are what the indicator shows and
         // what the drop commits, so the check drives the release location through it.
         var drag = TabDragSession(sourceIndex: 2, tabCount: count, tabWidth: width, spacing: spacing)
