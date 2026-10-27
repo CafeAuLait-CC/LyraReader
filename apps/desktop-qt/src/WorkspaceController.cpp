@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <QFileInfo>
 #include <QSettings>
+#include <QJSValue>
 #include <QClipboard>
 #include <QGuiApplication>
 #include <QWindow>
@@ -162,11 +163,21 @@ void WorkspaceController::openExternal(const QUrl &url) {
 }
 QVariant WorkspaceController::preference(const QString &key,const QVariant &fallback) const {
     QSettings settings;
-    return settings.value(QStringLiteral("reader/preferences/")+key,fallback);
+    const auto plainFallback=fallback.metaType()==QMetaType::fromType<QJSValue>() ? fallback.value<QJSValue>().toVariant() : fallback;
+    const auto storedKey=QStringLiteral("reader/preferences/")+key;
+    const auto value=settings.value(storedKey,plainFallback);
+    if(!value.isValid() && settings.contains(storedKey)) {
+        // Legacy QJSValue preferences cannot be deserialized. Keep the stored bytes for
+        // diagnosis and use the caller's explicit default until the user saves settings.
+        qWarning("lyra-reader-preferences: an unreadable preference was retained; using its requested default");
+        return plainFallback;
+    }
+    return value;
 }
 void WorkspaceController::setPreference(const QString &key,const QVariant &value) {
     QSettings settings;
-    settings.setValue(QStringLiteral("reader/preferences/")+key,value);
+    const auto plain=value.metaType()==QMetaType::fromType<QJSValue>() ? value.value<QJSValue>().toVariant() : value;
+    settings.setValue(QStringLiteral("reader/preferences/")+key,plain);
 }
 QString WorkspaceController::writeTextFile(const QUrl &url,const QString &text) {
     if (!url.isLocalFile()) return tr("Choose a local destination.");

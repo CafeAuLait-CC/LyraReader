@@ -1,4 +1,5 @@
 #include "DisplayCalibration.h"
+#include "AuxiliaryWindowPolicy.h"
 #include "ReaderController.h"
 #include "PageItem.h"
 #include "CropItem.h"
@@ -25,6 +26,7 @@
 #include <QQmlContext>
 #include <QJSValue>
 #include <QInputMethodEvent>
+#include <QProcess>
 #include <QQuickStyle>
 #include <QQuickWindow>
 #include <QSGRendererInterface>
@@ -64,9 +66,41 @@ private slots:
         }
         qmlRegisterUncreatableType<ReaderController>("LyraReader", 1, 0, "ReaderController", "Created by host");
         qmlRegisterType<DisplayCalibration>("LyraReader",1,0,"DisplayCalibration");
+        qmlRegisterType<AuxiliaryWindowPolicy>("LyraReader",1,0,"AuxiliaryWindowPolicy");
         qmlRegisterType<PageItem>("LyraReader", 1, 0, "PdfPage");
         qmlRegisterType<CropItem>("LyraReader",1,0,"PdfCrop");
         qmlRegisterType<AnnotationOverlay>("LyraReader",1,0,"PdfAnnotations");
+    }
+    void qmlPreferencesPersistAsValuesAcrossAProcessRestart() {
+        WorkspaceController workspace;
+        if(qEnvironmentVariableIsSet("LYRA_READER_CHECK_PREF_CHILD")) {
+            const auto value=workspace.preference("syntheticPreference").toMap();QCOMPARE(value.value("width").toInt(),580);QCOMPARE(value.value("height").toInt(),620);QCOMPARE(value.value("nested").toMap().value("values").toList(),QVariantList({1,2}));return;
+        }
+        QJSEngine js;const auto value=js.evaluate("({width:580,height:620,nested:{values:[1,2]}})");QVERIFY(!value.isError());workspace.setPreference("syntheticPreference",QVariant::fromValue(value));QSettings settings;settings.sync();QCOMPARE(settings.status(),QSettings::NoError);
+        auto directory=QFileInfo(settings.fileName()).absoluteDir();QVERIFY(directory.cdUp());auto env=QProcessEnvironment::systemEnvironment();env.insert("LYRA_READER_CHECK_PREF_CHILD","1");env.insert("LYRA_READER_CHECK_SETTINGS_ROOT",directory.absolutePath());QProcess child;child.setProcessEnvironment(env);child.start(QCoreApplication::applicationFilePath(),{root,"qmlPreferencesPersistAsValuesAcrossAProcessRestart"});QVERIFY(child.waitForFinished(10000));QCOMPARE(child.exitStatus(),QProcess::NormalExit);QVERIFY2(child.exitCode()==0,child.readAllStandardOutput().constData());
+    }
+    void auxiliaryGeometryClampsBeforeConvertingSavedValues() {
+        QCOMPARE(AuxiliaryWindowPolicy::boundedSize({560,650},{0,0,1920,1080}),QSize(560,650));
+        QCOMPARE(AuxiliaryWindowPolicy::boundedSize({3000,2000},{-1200,0,1200,800}),QSize(1168,768));
+        QCOMPARE(AuxiliaryWindowPolicy::boundedSize({1e300,1e300},{0,0,1200,800}),QSize(560,650));
+        QCOMPARE(AuxiliaryWindowPolicy::boundedSize({qQNaN(),-1},{0,0,800,600}),QSize(560,568));
+        QCOMPARE(AuxiliaryWindowPolicy::boundedSize({1,1},{0,0,100,90}),QSize(68,58));
+        QVERIFY(AuxiliaryWindowPolicy::boundedSize({560,650},{}).isEmpty());
+    }
+    void settingsAreIndependentTransientWindowsWithSafeReopenAndOwnerLifetime() {
+        WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        auto *settings=window->findChild<QQuickWindow *>("settingsWindow");QVERIFY(settings);QVERIFY(!settings->isVisible());bool preparedAtFirstShow=false;
+        connect(settings,&QWindow::visibleChanged,this,[&](bool shown){if(shown)preparedAtFirstShow=settings->transientParent()==window && settings->type()==Qt::Dialog && settings->modality()==Qt::NonModal;});
+        workspace.setPreference("auxiliarySettingsGeometry",QVariantMap{{"width",1e300},{"height",-10},{"x",-1e300},{"y",1e300}});
+        QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));QTRY_VERIFY(settings->isVisible());QVERIFY(preparedAtFirstShow);QVERIFY(settings->minimumWidth()<settings->maximumWidth());QVERIFY(settings->minimumHeight()<settings->maximumHeight());
+        const auto available=settings->screen()->availableGeometry();QVERIFY(settings->width()<=available.width());QVERIFY(settings->height()<=available.height());QVERIFY(!(settings->flags() & Qt::WindowStaysOnTopHint));
+        if(qEnvironmentVariableIsSet("LYRA_READER_CHECK_AUX_OBSERVE"))QTest::qWait(1800);
+        if(qEnvironmentVariableIsSet("LYRA_READER_CHECK_AUX_SNAPSHOT")){QTest::qWait(80);QVERIFY(settings->grabWindow().save(qEnvironmentVariable("LYRA_READER_CHECK_AUX_SNAPSHOT")));}
+        auto *url=settings->findChild<QObject *>("settingsBaseUrl");auto *key=settings->findChild<QObject *>("settingsApiKey");QVERIFY(url && key);url->setProperty("text","http://127.0.0.1:1/cancelled");key->setProperty("text","synthetic-local-draft");QVERIFY(settings->close());QTRY_VERIFY(!settings->isVisible());QVERIFY(key->property("text").toString().isEmpty());
+        QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));QTRY_VERIFY(settings->isVisible());QVERIFY(url->property("text").toString()!="http://127.0.0.1:1/cancelled");
+        const auto newSize=QSize(qMax(settings->minimumWidth(),settings->width()-40),qMax(settings->minimumHeight(),settings->height()-30));settings->resize(newSize);QTRY_COMPARE(settings->size(),newSize);QVERIFY(settings->close());
+        QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));QTRY_VERIFY(settings->isVisible());QCOMPARE(settings->size(),newSize);url->setProperty("text","http://127.0.0.1:1/saved");QVERIFY(QMetaObject::invokeMethod(settings,"save"));QTRY_VERIFY(!settings->isVisible());QCOMPARE(workspace.preference("ai").toMap().value("baseUrl").toString(),QString("http://127.0.0.1:1/saved"));
+        QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));QTRY_VERIFY(settings->isVisible());window->hide();QTRY_VERIFY(!settings->isVisible());
     }
     void displayCalibrationValidatesPhysicalMetrics() {
         const auto normal=DisplayCalibration::resolve(1920,508);
@@ -1590,7 +1624,7 @@ int main(int argc, char **argv) {
     QTemporaryDir settingsDirectory;
     if(!settingsDirectory.isValid())return 2;
     QSettings::setDefaultFormat(QSettings::IniFormat);
-    QSettings::setPath(QSettings::IniFormat,QSettings::UserScope,settingsDirectory.path());
+    QSettings::setPath(QSettings::IniFormat,QSettings::UserScope,qEnvironmentVariable("LYRA_READER_CHECK_SETTINGS_ROOT",settingsDirectory.path()));
     QQuickStyle::setStyle("Fusion");
     if (argc < 2) return 2;
     ReaderChecks checks;

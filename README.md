@@ -46,6 +46,9 @@ failed or superseded text drafts remain available to copy or retry. Redact → B
 PDF content and asks explicitly before a fallback replaces an entire page with an image. Fill & Sign
 places text, dates, vector checkmarks/crosses, stamps and image signatures; other signature methods,
 image crop/export and the newer AI overlays remain work in progress.
+Settings opens as a separate resizable native dialog, with a transient owner and a bounded initial
+size. Its first map was observed floating on niri; other compositors and dedicated PDF preview
+windows still need their own acceptance.
 The Linux branch is not yet a release or a claim of full feature parity.
 
 ## Capabilities
