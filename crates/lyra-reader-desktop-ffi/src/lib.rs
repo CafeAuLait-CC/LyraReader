@@ -5,6 +5,7 @@
 mod artwork;
 mod document;
 mod document_cache;
+mod draft_store;
 mod exports;
 mod marks;
 mod pages;

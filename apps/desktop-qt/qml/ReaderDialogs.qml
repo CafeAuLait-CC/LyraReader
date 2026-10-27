@@ -16,25 +16,32 @@ Item {
     property alias exportMenu: exports
     property alias saveDialog: save
     property int closeIndex: -1
+    property var closeReader: null
+    readonly property bool closePromptVisible: closeConfirmation.visible
     function confirmClose(index) {
         closeIndex = index;
+        closeReader=app.closeTarget(index);
+        if (!closeReader) return;
         closeConfirmation.open();
     }
     Dialog {
         id: closeConfirmation
         objectName: "closeChangesConfirmation"
-        title: qsTr("Unapplied Changes")
+        width: Math.min(480, Math.max(240, app.width - 48))
+        title: qsTr("Unsaved Changes")
         parent: Overlay.overlay
         anchors.centerIn: parent
         modal: true
-        standardButtons: Dialog.Discard | Dialog.Cancel
+        standardButtons: Dialog.Save | Dialog.Discard | Dialog.Cancel
+        onOpened: standardButton(Dialog.Save).text=app.closeNeedsReview(dialogs.closeReader) ? qsTr("Review") : qsTr("Save")
         Label {
             textFormat: Text.PlainText
             width: Math.min(400, app.width - 80)
             wrapMode: Text.Wrap
-            text: qsTr("Page edits, form edits, redaction marks, pending deletions, or unsaved annotation notes have not been written to the PDF. Discard them and close? Choose Cancel to apply or export your changes first. Saved annotations remain in their sidecar.")
+            text: app.closeNeedsReview(dialogs.closeReader) ? qsTr("Review the pending form values or note before closing. Discard removes the unsaved draft; Cancel keeps the document open.") : ((dialogs.closeReader && (dialogs.closeReader.data.signature_status || {}).signed) ? qsTr("Save an unsigned copy before closing, or discard the draft. The signed original stays unchanged.") : qsTr("Save changes to the PDF before closing, or discard the draft. Cancel keeps the document open."))
         }
-        onDiscarded: app.discardAndClose(dialogs.closeIndex)
+        onAccepted: app.beginCloseOperation("save",dialogs.closeReader,dialogs.closeIndex<0)
+        onDiscarded: app.beginCloseOperation("discard",dialogs.closeReader,dialogs.closeIndex<0)
     }
     property var noteReader: null
     property string noteId: ""
@@ -226,10 +233,12 @@ Item {
     }
     FileDialog {
         id: save
+        objectName: "documentSaveDialog"
         fileMode: FileDialog.SaveFile
         title: qsTr("Save a copy")
         nameFilters: app.exportKind === "bibtex" ? [qsTr("BibTeX (*.bib)")] : app.exportKind === "markdown" ? [qsTr("Markdown (*.md)")] : app.exportKind === "csv" ? [qsTr("CSV (*.csv)")] : [qsTr("PDF documents (*.pdf)")]
         onAccepted: app.exportTo(selectedFile)
+        onRejected: if (app.exportContext && app.exportContext.closeTicket === app.closeOperation) app.cancelCloseOperation("")
     }
     Menu {
         id: selection

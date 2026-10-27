@@ -30,6 +30,8 @@ class ReaderController : public QObject {
     Q_PROPERTY(QVariantMap editDrafts READ editDrafts NOTIFY editDraftsChanged)
     Q_PROPERTY(bool hasEditDrafts READ hasEditDrafts NOTIFY editDraftsChanged)
     Q_PROPERTY(QVariantMap noteDrafts READ noteDrafts NOTIFY noteDraftsChanged)
+    Q_PROPERTY(bool hasUnsavedChanges READ hasUnsavedChanges NOTIFY unsavedChangesChanged)
+    Q_PROPERTY(qulonglong editRevision READ editRevision NOTIFY commandsChanged)
     Q_PROPERTY(QVariantMap data READ data NOTIFY dataChanged)
     Q_PROPERTY(QVariantMap textPages READ textPages NOTIFY textPagesChanged)
     Q_PROPERTY(int pendingCommands READ pendingCommands NOTIFY commandsChanged)
@@ -58,6 +60,8 @@ public:
     bool hasEditDrafts()const{return !m_editDrafts.isEmpty();}
     Q_INVOKABLE void setEditDraft(const QString &key,const QVariant &value);
     QVariantMap noteDrafts()const{return m_noteDrafts;}
+    bool hasUnsavedChanges()const;
+    qulonglong editRevision()const{return m_mutationSequence;}
     Q_INVOKABLE void setNoteDraft(const QString &id,const QString &text){m_noteDrafts.insert(id,text);emit noteDraftsChanged();}
     Q_INVOKABLE void clearNoteDraft(const QString &id){if(m_noteDrafts.remove(id))emit noteDraftsChanged();}
     QVariantMap data() const { return m_data; }
@@ -102,6 +106,7 @@ signals:
     void commandFinished(quint64 id, const QString &operation, const QVariant &result, const QString &error);
     void dataChanged();
     void noteDraftsChanged();
+    void unsavedChangesChanged();
     void editDraftsChanged();
     void aiStateChanged();
     void textPagesChanged();

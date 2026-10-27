@@ -98,14 +98,24 @@ impl DesktopDocument {
             .map(|d| Arc::clone(&d))
             .map_err(|_| "Document state is unavailable".into())
     }
+    pub(super) fn source_signature(&self, current: &LyraReaderDocument) -> SignatureStatusRecord {
+        // A private editing revision is unsigned; the source must retain its original protection.
+        // Discard can reopen a source replaced outside the app, so refresh that source's status.
+        if Path::new(&current.path()) == self.original_path {
+            current.signature_status()
+        } else {
+            self.original_signature.clone()
+        }
+    }
     pub fn info(&self) -> Result<Value, String> {
+        let current = self.active()?;
         let layout = self
             .layout
             .read()
             .map_err(|_| "Layout state is unavailable")?;
         Ok(json!({
             "pages":layout.placements().iter().map(|p|json!({"index":p.index,"width":p.width_pt,"height":p.height_pt,"top":p.top_pt,"left":p.left_pt})).collect::<Vec<_>>(),
-            "width":layout.content_width_pt(),"height":layout.content_height_pt(),"gap":layout.gap_pt(),"path":self.original_path,"revision":self.active()?.path(),"signature_status":self.original_signature,"xfa_status":self.active()?.xfa_status(),"recovery":self.recovery_status.lock().map_err(|_|"Recovery state is unavailable")?.clone(),
+            "width":layout.content_width_pt(),"height":layout.content_height_pt(),"gap":layout.gap_pt(),"path":self.original_path,"revision":self.active()?.path(),"signature_status":self.source_signature(&current),"xfa_status":self.active()?.xfa_status(),"recovery":self.recovery_status.lock().map_err(|_|"Recovery state is unavailable")?.clone(),
         }))
     }
 
@@ -164,6 +174,7 @@ impl DesktopDocument {
                 | "page_discard"
                 | "page_apply"
                 | "document_save"
+                | "document_discard"
         ) {
             return self.page_command(op, &r);
         }
@@ -288,7 +299,7 @@ impl DesktopDocument {
             "outline" => value(d.outline()),
             "metadata" => value(d.metadata()),
             "signature_status" => {
-                serde_json::to_value(&self.original_signature).map_err(|e| e.to_string())
+                serde_json::to_value(self.source_signature(self.active()?.as_ref())).map_err(|e| e.to_string())
             }
             "document_info" => value(d.document_info()),
             "forms" => value(d.form_info()),
@@ -687,44 +698,46 @@ mod tests {
     #[test]
     fn pdf_owned_ink_pieces_are_staged_until_saved_and_discard_cannot_duplicate_them() {
         let fixture = Fixture::new("annotated-ink-review.pdf");
+        let original_pdf = fs::read(&fixture.path).unwrap();
         let doc = fixture.open();
         doc.command(json!({"op":"file_adopt","id":"nm:review-ink-bare"}))
             .unwrap();
-        let sidecar = cache_path(&fixture.path);
-        let before = fs::read(&sidecar).unwrap();
-        // Freeze the persisted snapshot before the cut. The shared Foundation codec
-        // writes integral geometry as JSON integers rather than floating-point literals.
-        let original =
-            fixture.open().command(json!({"op":"marks"})).unwrap()["annotations"].clone();
+        let records = cache_path(&fixture.path);
+        let before = fs::read(&records).unwrap();
         doc.command(json!({"op":"ink_erase_begin","token":"cut","page":0,"zoom":1,"segments":[{"from":{"x":250,"y":200},"to":{"x":250,"y":350}}]})).unwrap();
         let cut = doc
             .command(json!({"op":"ink_erase_commit","token":"cut","segments":[]}))
             .unwrap();
         assert_eq!(cut["erase_requires_pdf_save"], true);
         assert_eq!(cut["annotations"].as_array().unwrap().len(), 2);
-        assert_eq!(fs::read(&sidecar).unwrap(), before);
+        assert_ne!(fs::read(&records).unwrap(), before);
         let reopened = fixture.open().command(json!({"op":"marks"})).unwrap();
-        assert_eq!(reopened["annotations"], original);
-        assert_eq!(reopened["pending_deletions"], 0);
-        // Cutting an already staged piece must keep its descendants staged too.
+        assert_eq!(reopened["annotations"].as_array().unwrap().len(), 2);
+        assert_eq!(reopened["pending_deletions"], 1);
+        assert!(
+            !reopened["file_annotations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["id"] == "nm:review-ink-bare")
+        );
         doc.command(json!({"op":"ink_erase_begin","token":"again","page":0,"zoom":1,"segments":[{"from":{"x":150,"y":200},"to":{"x":150,"y":350}}]})).unwrap();
         let again = doc
             .command(json!({"op":"ink_erase_commit","token":"again","segments":[]}))
             .unwrap();
-        assert_eq!(again["erase_requires_pdf_save"], true);
         assert_eq!(again["annotations"].as_array().unwrap().len(), 3);
-        assert_eq!(fs::read(&sidecar).unwrap(), before);
         let undo = doc.command(json!({"op":"marks_undo"})).unwrap();
         assert_eq!(undo["annotations"], cut["annotations"]);
         doc.command(json!({"op":"marks_redo"})).unwrap();
-        assert_eq!(fs::read(&sidecar).unwrap(), before);
-        // Ordinary sidecar annotations made after the cut must still persist.
-        let created=doc.command(json!({"op":"mark_create","entry":{"kind":"square","page":0,"version":1,"rect":{"x":10,"y":10,"width":20,"height":20},"strokeWidth":2,"color":"#000000FF","note":"keep square"}})).unwrap();
-        assert_eq!(created["annotations"].as_array().unwrap().len(), 4);
-        let reopened = fixture.open().command(json!({"op":"marks"})).unwrap();
-        assert_eq!(reopened["annotations"].as_array().unwrap().len(), 2);
-        assert_eq!(reopened["annotations"][0], original[0]);
-        assert_eq!(reopened["annotations"][1]["kind"], "square");
+        doc.command(json!({"op":"mark_create","entry":{"kind":"square","page":0,"version":1,"rect":{"x":10,"y":10,"width":20,"height":20},"strokeWidth":2,"color":"#000000FF","note":"keep square"}})).unwrap();
+        assert_eq!(
+            fixture.open().command(json!({"op":"marks"})).unwrap()["annotations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(fs::read(&fixture.path).unwrap(), original_pdf);
         doc.command(json!({"op":"replace_current_annotations"}))
             .unwrap();
         let reopened = fixture.open();
@@ -1415,6 +1428,29 @@ mod tests {
     }
 
     #[test]
+    fn discard_refreshes_the_signature_of_an_externally_replaced_source() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let original = fs::read(&fixture.path).unwrap();
+        let signed = fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/signed-signature.pdf"),
+        )
+        .unwrap();
+        fs::write(&fixture.path, &signed).unwrap();
+        let discarded = doc.command(json!({"op":"document_discard"})).unwrap();
+        assert_eq!(discarded["info"]["signature_status"]["signed"], true);
+        assert_eq!(
+            doc.command(json!({"op":"signature_status"})).unwrap()["signed"],
+            true
+        );
+        assert!(doc.command(json!({"op":"document_save"})).is_err());
+        assert_eq!(fs::read(&fixture.path).unwrap(), signed);
+        fs::write(&fixture.path, &original).unwrap();
+        let discarded = doc.command(json!({"op":"document_discard"})).unwrap();
+        assert_eq!(discarded["info"]["signature_status"]["signed"], false);
+    }
+
+    #[test]
     fn signed_original_status_survives_derived_page_revisions() {
         let fixture = Fixture::new("signed-signature.pdf");
         let doc = fixture.open();
@@ -1762,6 +1798,235 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn dirty_baseline_survives_reopen_undo_and_last_embedded_bookmark_deletion() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        assert_eq!(
+            doc.command(json!({"op":"marks"})).unwrap()["pdf_dirty"],
+            false
+        );
+        doc.command(json!({"op":"bookmark_create","page":0,"title":"First","yPt":10}))
+            .unwrap();
+        assert_eq!(
+            doc.command(json!({"op":"marks_undo"})).unwrap()["pdf_dirty"],
+            false
+        );
+        assert_eq!(
+            doc.command(json!({"op":"marks_redo"})).unwrap()["pdf_dirty"],
+            true
+        );
+        doc.command(json!({"op":"bookmark_create","page":0,"title":"Second","yPt":20}))
+            .unwrap();
+        let saved = doc.command(json!({"op":"document_save"})).unwrap();
+        assert_eq!(saved["marks"]["pdf_dirty"], false);
+        let bookmarks = saved["marks"]["bookmarks"].as_array().unwrap();
+        let moved = doc
+            .command(json!({"op":"bookmark_move","id":bookmarks[1]["id"],"delta":-1}))
+            .unwrap();
+        assert_eq!(moved["pdf_dirty"], true);
+        assert_eq!(
+            doc.command(json!({"op":"marks_undo"})).unwrap()["pdf_dirty"],
+            false
+        );
+        for bookmark in bookmarks {
+            doc.command(json!({"op":"bookmark_delete","id":bookmark["id"]}))
+                .unwrap();
+        }
+        assert_eq!(
+            doc.command(json!({"op":"marks"})).unwrap()["pdf_dirty"],
+            true
+        );
+        drop(doc);
+        let reopened = fixture.open();
+        let marks = reopened.command(json!({"op":"marks"})).unwrap();
+        assert!(marks["bookmarks"].as_array().unwrap().is_empty());
+        assert_eq!(marks["pdf_dirty"], true);
+        reopened.command(json!({"op":"document_save"})).unwrap();
+        assert!(
+            reopened
+                .command(json!({"op":"outline"}))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["is_bookmark_subtree"] != true)
+        );
+        let marks = fixture.open().command(json!({"op":"marks"})).unwrap();
+        assert_eq!(marks["pdf_dirty"], false);
+        assert!(marks["bookmarks"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn discard_known_drafts_preserves_foreign_bytes_and_refuses_changed_pending_state() {
+        let fixture = Fixture::new("text-page.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let path = cache_path(&fixture.path);
+        let foreign = r#"{ "kind":"future", "id":"9CD73B7D-7A3A-4FB0-814A-AF0211B7DDEF", "page":0, "raw":1.0000000000000001 }"#;
+        fs::write(&path, format!("[{foreign}]\n")).unwrap();
+        let doc = fixture.open();
+        doc.command(json!({"op":"bookmark_create","page":0,"title":"Drop me","yPt":20}))
+            .unwrap();
+        let discarded = doc.command(json!({"op":"document_discard"})).unwrap();
+        assert_eq!(discarded["info"]["pages"].as_array().unwrap().len(), 1);
+        assert_eq!(discarded["marks"]["preserved"], 1);
+        assert_eq!(discarded["marks"]["pdf_dirty"], false);
+        assert!(
+            discarded["marks"]["bookmarks"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(fs::read_to_string(&path).unwrap().contains(foreign));
+        doc.command(json!({"op":"bookmark_create","page":0,"title":"Must remain","yPt":40}))
+            .unwrap();
+        let pending = path.parent().unwrap().join("changes.json");
+        let mut external = fs::read(&pending).unwrap();
+        external.extend_from_slice(b" \n");
+        fs::write(&pending, &external).unwrap();
+        let records = fs::read(&path).unwrap();
+        assert!(doc.command(json!({"op":"document_discard"})).is_err());
+        assert_eq!(fs::read(&path).unwrap(), records);
+        assert_eq!(fs::read(&pending).unwrap(), external);
+        assert_eq!(
+            doc.command(json!({"op":"marks"})).unwrap()["bookmarks"][0]["title"],
+            "Must remain"
+        );
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+    }
+
+    #[test]
+    fn discard_page_session_rolls_back_root_drafts_if_retiring_the_manifest_fails() {
+        let fixture = Fixture::new("text-page.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        doc.command(json!({"op":"mark_create","entry":{"kind":"highlight","page":0,"start":0,"end":3,"color":"#E8BC5552","note":"Keep on failure"}})).unwrap();
+        doc.command(json!({"op":"bookmark_create","page":0,"title":"Keep bookmark","yPt":20}))
+            .unwrap();
+        let records = cache_path(&fixture.path);
+        let pending = records.parent().unwrap().join("changes.json");
+        let before_records = fs::read(&records).unwrap();
+        let before_pending = fs::read(&pending).unwrap();
+        doc.command(json!({"op":"page_stage","operation":{"InsertBlank":{"index":0}}}))
+            .unwrap();
+        let manifest = records.parent().unwrap().join("session.json");
+        let mut foreign = fs::read(&manifest).unwrap();
+        foreign.push(b' ');
+        fs::write(&manifest, &foreign).unwrap();
+        assert!(doc.command(json!({"op":"document_discard"})).is_err());
+        assert_eq!(fs::read(&records).unwrap(), before_records);
+        assert_eq!(fs::read(&pending).unwrap(), before_pending);
+        assert_eq!(fs::read(&manifest).unwrap(), foreign);
+        assert_eq!(doc.info().unwrap()["pages"].as_array().unwrap().len(), 2);
+        drop(doc);
+        let restored = fixture.open();
+        let discarded = restored.command(json!({"op":"document_discard"})).unwrap();
+        assert_eq!(discarded["info"]["pages"].as_array().unwrap().len(), 1);
+        assert!(
+            discarded["marks"]["annotations"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            discarded["marks"]["bookmarks"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(discarded["marks"]["pdf_dirty"], false);
+        assert!(!manifest.exists());
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+    }
+
+    #[test]
+    fn damaged_pending_state_keeps_readable_records_and_explicit_recovery_backs_up_both_files() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        doc.command(json!({"op":"bookmark_create","page":0,"title":"Readable draft","yPt":40}))
+            .unwrap();
+        drop(doc);
+        let path = cache_path(&fixture.path);
+        let records = fs::read(&path).unwrap();
+        let pending = path.parent().unwrap().join("changes.json");
+        fs::write(&pending, b"broken pending JSON").unwrap();
+        let reopened = fixture.open();
+        let marks = reopened.command(json!({"op":"marks"})).unwrap();
+        assert!(marks["error"].is_string());
+        assert_eq!(marks["bookmarks"][0]["title"], "Readable draft");
+        assert!(reopened.command(json!({"op":"document_save"})).is_err());
+        let recovered = reopened.command(json!({"op":"marks_recover"})).unwrap();
+        assert_eq!(recovered["pdf_dirty"], false);
+        assert!(recovered["bookmarks"].as_array().unwrap().is_empty());
+        let backup = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("discard-recovery-")
+            })
+            .unwrap()
+            .path();
+        assert_eq!(fs::read(backup.join("annotations.json")).unwrap(), records);
+        assert_eq!(
+            fs::read(backup.join("changes.json")).unwrap(),
+            b"broken pending JSON"
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture used by the pending ink recovery check"]
+    fn write_pending_ink_then_exit_without_running_destructors() {
+        let path = PathBuf::from(std::env::var_os("LYRA_READER_TEST_RECOVERY_PATH").unwrap());
+        let doc = open_fixture_document(&path, None).unwrap();
+        doc.command(json!({"op":"ink_erase_begin","token":"crash","page":0,"zoom":1,"segments":[{"from":{"x":250,"y":200},"to":{"x":250,"y":350}}]})).unwrap();
+        let cut = doc
+            .command(json!({"op":"ink_erase_commit","token":"crash","segments":[]}))
+            .unwrap();
+        assert_eq!(cut["annotations"].as_array().unwrap().len(), 2);
+        assert_eq!(cut["pending_deletions"], 1);
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn process_exit_restores_pending_ink_without_duplication_and_discard_restores_the_source() {
+        let fixture = Fixture::new("annotated-ink-review.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "document::tests::write_pending_ink_then_exit_without_running_destructors",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("LYRA_READER_TEST_RECOVERY_PATH", &fixture.path)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let doc = fixture.open();
+        let marks = doc.command(json!({"op":"marks"})).unwrap();
+        assert_eq!(marks["annotations"].as_array().unwrap().len(), 2);
+        assert_eq!(marks["pending_deletions"], 1);
+        assert!(
+            !marks["file_annotations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["id"] == "nm:review-ink-bare")
+        );
+        doc.command(json!({"op":"document_discard"})).unwrap();
+        let marks = fixture.open().command(json!({"op":"marks"})).unwrap();
+        assert!(marks["annotations"].as_array().unwrap().is_empty());
+        assert_eq!(marks["pending_deletions"], 0);
+        assert_eq!(marks["file_annotations"].as_array().unwrap().len(), 4);
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
     }
 
     #[test]

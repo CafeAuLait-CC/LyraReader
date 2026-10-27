@@ -15,11 +15,7 @@ fn materialize(
     marks: &crate::marks::Marks,
 ) -> Result<ExportSource, String> {
     let payload = marks.payload(source)?;
-    if payload.annotations.is_empty()
-        && payload.bookmarks.is_empty()
-        && payload.updates.is_empty()
-        && payload.deletions.is_empty()
-    {
+    if payload.is_empty() {
         return Ok(ExportSource {
             document: Arc::clone(source),
             _directory: None,

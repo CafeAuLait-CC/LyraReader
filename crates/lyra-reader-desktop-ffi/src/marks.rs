@@ -1,4 +1,5 @@
 //! Native-shell persistence adapter for the shared annotation codec and rules.
+use lyra_reader_edit::draft::{CleanSnapshot, Deletion, PendingState};
 use lyra_reader_edit::{kind::AnnotationKind, records, rules};
 use lyra_reader_ffi::api::*;
 use lyra_reader_ffi::{DocumentTransactionInputRecord, DocumentTransactionStateRecord};
@@ -29,6 +30,7 @@ struct Snapshot {
     bytes: usize,
     entries: Vec<Entry>,
     deletions: Vec<AnnotationDeleteRecord>,
+    dirty: bool,
 }
 #[derive(Clone)]
 pub struct Marks {
@@ -44,6 +46,8 @@ pub struct Marks {
     session: Option<crate::session::SessionContext>,
     owns_recovery: bool,
     baseline: Option<Vec<u8>>,
+    pending_baseline: Option<Vec<u8>>,
+    pending: PendingState,
     entries: Vec<Entry>,
     deletions: Vec<AnnotationDeleteRecord>,
     undo: Vec<Snapshot>,
@@ -57,6 +61,7 @@ pub struct Payload {
     pub updates: Vec<AnnotationUpdateRecord>,
     pub deletions: Vec<AnnotationDeleteRecord>,
     pub ids: HashSet<String>,
+    pub has_bookmark_subtree: bool,
 }
 impl Payload {
     pub fn is_empty(&self) -> bool {
@@ -64,6 +69,7 @@ impl Payload {
             && self.bookmarks.is_empty()
             && self.updates.is_empty()
             && self.deletions.is_empty()
+            && !self.has_bookmark_subtree
     }
 }
 
@@ -203,6 +209,72 @@ fn validate(v: &Value, pages: u32) -> Result<bool, String> {
 }
 
 impl Marks {
+    fn clean_snapshot(&self) -> CleanSnapshot {
+        let mut annotations = Vec::new();
+        let mut bookmarks = Vec::new();
+        for entry in &self.entries {
+            if let Entry::Known(value) = entry {
+                if kind(value) == "bookmark" {
+                    bookmarks.push(value.clone());
+                } else {
+                    annotations.push(value.clone());
+                }
+            }
+        }
+        CleanSnapshot::new(annotations, bookmarks)
+    }
+    fn refresh_pending(&mut self) {
+        self.pending.deletions = self
+            .deletions
+            .iter()
+            .map(|d| Deletion {
+                identity: d.target.clone(),
+                page: d.page,
+            })
+            .collect();
+        self.pending.erased_ink = self.hidden_ink.iter().cloned().collect();
+        self.pending.erased_ink.sort();
+        self.pending.refresh(&self.clean_snapshot());
+    }
+    fn cache_pair(&self) -> crate::draft_store::Pair {
+        crate::draft_store::Pair {
+            records: self.baseline.clone(),
+            pending: self.pending_baseline.clone(),
+        }
+    }
+    pub fn discard_known(&self, document: &LyraReaderDocument) -> Result<Self, String> {
+        if self.session.is_some() {
+            return Err("Discard the page transaction through its original cache".into());
+        }
+        let mut next = self.clone();
+        next.entries
+            .retain(|entry| matches!(entry, Entry::Opaque(_)));
+        next.deletions.clear();
+        next.hidden_ink.clear();
+        next.transient_ink.clear();
+        next.embedded_bookmarks.clear();
+        next.erase = None;
+        next.pending.mark_clean(next.clean_snapshot());
+        next.persist()?;
+        next.undo.clear();
+        next.redo.clear();
+        next.seed_bookmarks(document)?;
+        Ok(next)
+    }
+    pub fn rollback_discard(&self, before: &Self) -> Result<(), String> {
+        let _guard = WRITES
+            .lock()
+            .map_err(|_| "Annotation cache writer is unavailable")?;
+        crate::draft_store::rollback(&self.path, &before.cache_pair(), &self.cache_pair()).map_err(
+            |error| match crate::draft_store::backup(&self.path, &before.cache_pair()) {
+                Ok(path) => format!(
+                    "{error}. The previous draft is backed up at {}",
+                    path.display()
+                ),
+                Err(backup) => format!("{error}. {backup}"),
+            },
+        )
+    }
     pub fn validate_source(&self) -> Result<(), String> {
         let cache = self
             .cache
@@ -301,9 +373,7 @@ impl Marks {
             slots_json: serde_json::to_string(&slots).map_err(|e| e.to_string())?,
             deletions_json: serde_json::to_string(&deletions).map_err(|e| e.to_string())?,
             erased_ink_json: serde_json::to_string(&hidden).map_err(|e| e.to_string())?,
-            annotation_dirty: !annotations.is_empty()
-                || !bookmarks.is_empty()
-                || !deletions.is_empty(),
+            annotation_dirty: self.pending.dirty || !deletions.is_empty() || !hidden.is_empty(),
             current_page: page,
             selection: selection.to_vec(),
         })
@@ -313,6 +383,7 @@ impl Marks {
         state: &DocumentTransactionStateRecord,
         control: std::sync::Arc<crate::session::SessionControl>,
         document: &LyraReaderDocument,
+        original: &Marks,
     ) -> Result<Self, String> {
         let annotations: Vec<Value> =
             serde_json::from_str(&state.annotations_json).map_err(|e| e.to_string())?;
@@ -368,6 +439,8 @@ impl Marks {
             .map_err(|e| e.to_string())?
             .into_iter()
             .collect();
+        result.pending = original.pending.clone();
+        result.pending.dirty = state.annotation_dirty;
         // The shared manifest now persists pieces and their deletions together. Private
         // session records can keep both; the original document cache is never rewritten.
         result.transient_ink.clear();
@@ -401,6 +474,7 @@ impl Marks {
         result.transient_ink.clear();
         result.undo.clear();
         result.redo.clear();
+        result.pending.mark_clean(result.clean_snapshot());
         result
     }
     pub fn validate_export(&self, remapping: bool) -> Result<(), String> {
@@ -485,6 +559,9 @@ impl Marks {
         result.source_error = cache.validate_source().err();
         result.cache = Some(cache);
         result.baseline = None;
+        result.pending_baseline = None;
+        result.session = None;
+        result.owns_recovery = false;
         result.page_count = new.page_count();
         result.undo.clear();
         result.redo.clear();
@@ -532,6 +609,12 @@ impl Marks {
                 })
             })
             .collect::<Result<_, String>>()?;
+        // These outputs were materialised through the verified PDF writer. Their
+        // projected cache is clean and must never retain the source session handle.
+        result.entries.retain(|e|!matches!(e,Entry::Known(v) if v["id"].as_str().is_some_and(|id|self.hidden_ink.contains(id))));
+        result.hidden_ink.clear();
+        result.transient_ink.clear();
+        result.pending.mark_clean(result.clean_snapshot());
         result.persist()?;
         Ok(result)
     }
@@ -541,6 +624,9 @@ impl Marks {
         publish: impl FnOnce() -> Result<T, String>,
     ) -> Result<(T, Self, Option<PathBuf>), String> {
         original.validate_source()?;
+        if let Some(error) = &original.error {
+            return Err(format!("Annotation cache writes are blocked: {error}"));
+        }
         let mut prepared = self.clone();
         prepared.session = None;
         prepared.path = original
@@ -551,12 +637,9 @@ impl Marks {
         let _write_guard = WRITES
             .lock()
             .map_err(|_| "Annotation cache writer is unavailable")?;
-        let current = if original.path.exists() {
-            Some(fs::read(&original.path).map_err(|e| e.to_string())?)
-        } else {
-            None
-        };
-        if current != original.baseline {
+        let pair = crate::draft_store::read(&original.path)?;
+        let current = pair.records.clone();
+        if pair != original.cache_pair() {
             let _ = fs::remove_file(&prepared.path);
             return Err("The original annotation cache changed during page editing. The original PDF was not replaced.".into());
         }
@@ -600,18 +683,36 @@ impl Marks {
         result.session = None;
         result.owns_recovery = false;
         result.path = original.path.clone();
-        result.baseline = prepared.baseline.clone();
+        result.baseline = original.baseline.clone();
+        result.pending_baseline = original.pending_baseline.clone();
         result.undo.clear();
         result.redo.clear();
-        if let Err(error) = fs::rename(&prepared.path, &original.path) {
+        let published = crate::draft_store::write(
+            &original.path,
+            &pair,
+            prepared
+                .baseline
+                .clone()
+                .ok_or("Missing prepared annotation records")?,
+            &result.pending,
+        );
+        if let Err(error) = &published {
             result.error = Some(format!(
                 "The PDF was saved, but the remapped annotation cache could not be published: {error}. Recovery data: {}",
                 prepared.path.display()
             ));
-        } else if let Err(error) = result.after_save() {
-            result.error = Some(format!(
-                "The PDF was saved, but its document cache needs recovery: {error}"
-            ));
+        } else if let Ok((pair, mut pending)) = published {
+            result.baseline = pair.records;
+            result.pending_baseline = pair.pending;
+            pending.commit = None;
+            result.pending = pending;
+            // A private prepared mirror is redundant after the recoverable pair is published.
+            let _ = fs::remove_file(&prepared.path);
+            if let Err(error) = result.after_save() {
+                result.error = Some(format!(
+                    "The PDF was saved, but its document cache needs recovery: {error}"
+                ));
+            }
         }
         Ok((report, result, backup))
     }
@@ -619,6 +720,13 @@ impl Marks {
         self.validate_source()?;
         if let Some(session) = &self.session {
             session.control.check()?;
+        } else if crate::draft_store::is_root(&self.path) {
+            let _guard = WRITES
+                .lock()
+                .map_err(|_| "Annotation cache writer is unavailable")?;
+            if crate::draft_store::read(&self.path)? != self.cache_pair() {
+                return Err("The annotation cache or pending state changed outside this window. Reopen before saving the PDF.".into());
+            }
         }
         if let Some(error) = &self.error {
             return Err(format!("Annotation cache writes are blocked: {error}"));
@@ -630,6 +738,11 @@ impl Marks {
             updates: vec![],
             deletions: self.deletions.clone(),
             ids: HashSet::new(),
+            has_bookmark_subtree: document
+                .outline()
+                .map_err(|e| e.to_string())?
+                .iter()
+                .any(|e| e.is_bookmark_subtree),
         };
         for entry in &self.entries {
             let Entry::Known(v) = entry else { continue };
@@ -782,14 +895,17 @@ impl Marks {
     }
     pub fn clear_saved(&mut self, ids: &HashSet<String>) -> Result<(), String> {
         let old = self.snapshot();
+        let old_pending = self.pending.clone();
         self.entries.retain(
             |e| !matches!(e,Entry::Known(v)if v["id"].as_str().is_some_and(|id|ids.contains(id))),
         );
         self.deletions.clear();
         self.transient_ink.clear();
         self.hidden_ink.clear();
+        self.pending.mark_clean(self.clean_snapshot());
         if let Err(error) = self.persist() {
             self.restore(old);
+            self.pending = old_pending;
             return Err(error);
         }
         self.undo.clear();
@@ -810,9 +926,25 @@ impl Marks {
                 identities.insert(id.to_uppercase());
             }
         }
+        let removed: HashSet<_> = if self.pending.dirty {
+            self.pending
+                .clean
+                .as_ref()
+                .map(|c| {
+                    c.bookmarks
+                        .iter()
+                        .filter_map(|b| b["id"].as_str().map(str::to_uppercase))
+                        .filter(|id| !identities.contains(id))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            HashSet::new()
+        };
         for outline in document.outline().map_err(|e| e.to_string())? {
             if let (Some(id), Some(page)) = (outline.bookmark_id, outline.page)
                 && valid_uuid(&id)
+                && !removed.contains(&id.to_uppercase())
             {
                 let y = outline.y_pt.unwrap_or(0.0);
                 if identities.insert(id.to_uppercase()) {
@@ -826,6 +958,9 @@ impl Marks {
                     self.embedded_bookmarks.insert(v["id"].as_str().unwrap().to_string());
                 }
             }
+        }
+        if !self.pending.dirty {
+            self.pending.clean = Some(self.clean_snapshot());
         }
         Ok(())
     }
@@ -871,6 +1006,8 @@ impl Marks {
             session: None,
             owns_recovery: false,
             baseline: None,
+            pending_baseline: None,
+            pending: PendingState::new(false, None),
             entries: vec![],
             deletions: vec![],
             undo: vec![],
@@ -882,21 +1019,45 @@ impl Marks {
             if let Some(error) = &result.error {
                 return Err(error.clone());
             }
-            if !result.path.exists() {
-                return Ok(());
+            let _guard = WRITES
+                .lock()
+                .map_err(|_| "Annotation cache writer is unavailable")?;
+            let mut pair = crate::draft_store::read(&result.path)?;
+            result.baseline = pair.records.clone();
+            result.pending_baseline = pair.pending.clone();
+            if let Some(bytes) = &pair.records {
+                result.entries = decode_entries(bytes, page_count)?;
             }
-            if fs::metadata(&result.path).map_err(|e| e.to_string())?.len()
-                > MAX_SIDECAR_BYTES as u64
-            {
-                return Err("Annotation cache exceeds the 16 MiB limit".into());
+            let pending = crate::draft_store::recover(&result.path, &mut pair, page_count)?;
+            if let Some(bytes) = &pair.records {
+                result.entries = decode_entries(bytes, page_count)?;
             }
-            let bytes = fs::read(&result.path).map_err(|e| e.to_string())?;
-            result.entries = decode_entries(&bytes, page_count)?;
-            result.baseline = Some(bytes);
+            result.baseline = pair.records;
+            result.pending_baseline = pair.pending;
+            result.pending = pending.unwrap_or_else(|| {
+                PendingState::new(
+                    result.entries.iter().any(|e| matches!(e, Entry::Known(_))),
+                    None,
+                )
+            });
+            result.deletions = result
+                .pending
+                .deletions
+                .iter()
+                .map(|d| AnnotationDeleteRecord {
+                    target: d.identity.clone(),
+                    page: d.page,
+                })
+                .collect();
+            result.hidden_ink = result.pending.erased_ink.iter().cloned().collect();
+            result.pending.commit = None;
             Ok(())
         })();
         if let Err(error) = parsed {
-            result.entries.clear();
+            result.pending.dirty = result
+                .entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Known(_)));
             result.error = Some(error)
         }
         result
@@ -936,6 +1097,7 @@ impl Marks {
             bytes: self.storage_bytes(),
             entries: self.entries.clone(),
             deletions: self.deletions.clone(),
+            dirty: self.pending.dirty,
         }
     }
     fn restore(&mut self, s: Snapshot) {
@@ -945,8 +1107,10 @@ impl Marks {
         self.embedded_bookmarks = s.embedded_bookmarks;
         self.entries = s.entries;
         self.deletions = s.deletions;
+        self.pending.dirty = s.dirty;
     }
     fn persist(&mut self) -> Result<(), String> {
+        self.refresh_pending();
         if let Some(context) = self.session.clone() {
             let input = self.transaction_input(context.current_page, &context.selection)?;
             let state = context.control.mutate(|handle| {
@@ -968,6 +1132,18 @@ impl Marks {
             .map_err(|_| "Annotation cache writer is unavailable")?;
         if let Some(error) = &self.error {
             return Err(format!("Annotation cache writes are blocked: {error}"));
+        }
+        if crate::draft_store::is_root(&self.path) {
+            // The state commit couples PDF-owned ink fragments with their deletion and hidden
+            // originals, so every record can now survive a crash without duplicating ink.
+            let bytes = encode_entries(&self.entries, self.page_count, &HashSet::new())?;
+            let (pair, mut pending) =
+                crate::draft_store::write(&self.path, &self.cache_pair(), bytes, &self.pending)?;
+            self.baseline = pair.records;
+            self.pending_baseline = pair.pending;
+            pending.commit = None;
+            self.pending = pending;
+            return Ok(());
         }
         let current = if self.path.exists() {
             Some(fs::read(&self.path).map_err(|e| e.to_string())?)
@@ -1106,7 +1282,7 @@ impl Marks {
             .collect();
         let file = crate::artwork::annotations(file)?;
         Ok(
-            json!({"annotations":own,"file_annotations":file,"bookmarks":bookmarks,"can_undo":!self.undo.is_empty(),"can_redo":!self.redo.is_empty(),"preserved":self.entries.iter().filter(|e|matches!(e,Entry::Opaque(_))).count(),"error":self.error.as_ref().or(self.source_error.as_ref()),"path":self.path,"pdf_dirty":!own.is_empty()||!self.deletions.is_empty(),"pending_deletions":self.deletions.len()}),
+            json!({"annotations":own,"file_annotations":file,"bookmarks":bookmarks,"can_undo":!self.undo.is_empty(),"can_redo":!self.redo.is_empty(),"preserved":self.entries.iter().filter(|e|matches!(e,Entry::Opaque(_))).count(),"error":self.error.as_ref().or(self.source_error.as_ref()),"path":self.path,"pdf_dirty":self.pending.dirty || !self.deletions.is_empty() || !self.hidden_ink.is_empty(),"pending_deletions":self.deletions.len()}),
         )
     }
     fn display(&self, v: &Value, document: &LyraReaderDocument) -> Result<Value, String> {
@@ -1486,14 +1662,18 @@ impl Marks {
                 if let Some(cache) = &self.cache {
                     cache.validate_recovery()?;
                 }
-                let bytes = fs::read(&self.path).map_err(|e| e.to_string())?;
-                let backup = self.path.with_extension(format!("json.backup-{}", uuid()?));
-                fs::copy(&self.path, &backup).map_err(|e| e.to_string())?;
-                if fs::read(&backup).map_err(|e| e.to_string())? != bytes {
-                    return Err("Annotation cache backup verification failed".into());
-                }
+                let previous = self.clone();
+                let (pair, backup) = {
+                    let _guard = WRITES
+                        .lock()
+                        .map_err(|_| "Annotation cache writer is unavailable")?;
+                    let pair = crate::draft_store::read(&self.path)?;
+                    let backup = crate::draft_store::backup(&self.path, &pair)?;
+                    (pair, backup)
+                };
                 self.error = None;
-                self.baseline = Some(bytes);
+                self.baseline = pair.records;
+                self.pending_baseline = pair.pending;
                 self.entries.clear();
                 self.deletions.clear();
                 self.transient_ink.clear();
@@ -1502,7 +1682,15 @@ impl Marks {
                 self.embedded_bookmarks.clear();
                 self.undo.clear();
                 self.redo.clear();
-                self.persist()?;
+                self.pending = PendingState::new(false, Some(self.clean_snapshot()));
+                if let Err(error) = self.persist() {
+                    *self = previous;
+                    return Err(format!(
+                        "{error}. Recovery data is backed up at {}",
+                        backup.display()
+                    ));
+                }
+                self.seed_bookmarks(document)?;
             }
             _ => return Err("Unknown mark operation".into()),
         }

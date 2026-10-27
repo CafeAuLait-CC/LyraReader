@@ -41,6 +41,16 @@ static QQuickItem *visualItem(QQuickItem *root,const QString &name) {
     for(auto *child:root->childItems())if(auto *found=visualItem(child,name))return found;
     return nullptr;
 }
+static bool clickDialogButton(QQuickWindow *window,QObject *dialog,const QString &text) {
+    auto *footer=qvariant_cast<QQuickItem *>(dialog->property("footer"));
+    if(!footer)return false;
+    for(auto *button:footer->findChildren<QQuickItem *>())if(button->property("text").toString()==text &&
+        button->metaObject()->indexOfSignal("clicked()")>=0 && button->isVisible() && button->isEnabled()) {
+        QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,button->mapToScene(QPointF(button->width()/2,button->height()/2)).toPoint());
+        return true;
+    }
+    return false;
+}
 
 class ReaderChecks : public QObject {
     Q_OBJECT
@@ -615,8 +625,8 @@ private slots:
         QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,point(250,380));QTRY_VERIFY_WITH_TIMEOUT(idle(),10000);QCOMPARE(entries().size(),2);QCOMPARE(state().value("pending_deletions").toInt(),1);QVERIFY(window->property("operationStatus").toString().contains("protected PDF ink"));
         const auto file=state().value("file_annotations").toList();QCOMPARE(file.size(),3);int replies=0;for(const auto &value:file){const auto a=value.toMap();if(a.value("is_reply").toBool()){++replies;QVERIFY(!a.value("visible").toBool());}}
         QCOMPARE(replies,2);
-        // A discarded/crashed reader must not leave detached pieces over the original PDF ink.
-        ReaderController discarded;discarded.openFile(QUrl::fromLocalFile(reviewPath));QTRY_COMPARE_WITH_TIMEOUT(discarded.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(discarded.pendingCommands(),0,10000);QVERIFY(discarded.data().value("marks").toMap().value("annotations").toList().isEmpty());QCOMPARE(discarded.data().value("annotations").toList().size(),4);
+        // Reopening restores the deletion and its pieces together; explicit discard removes both.
+        ReaderController discarded;discarded.openFile(QUrl::fromLocalFile(reviewPath));QTRY_COMPARE_WITH_TIMEOUT(discarded.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(discarded.pendingCommands(),0,10000);QCOMPARE(discarded.data().value("marks").toMap().value("annotations").toList().size(),2);QCOMPARE(discarded.data().value("marks").toMap().value("pending_deletions").toInt(),1);QCOMPARE(discarded.data().value("marks").toMap().value("file_annotations").toList().size(),3);QCOMPARE(discarded.data().value("annotations").toList().size(),4);
         const auto output=scratch.path()+"/cut.pdf";reader.submit("save_current_annotations",{{"destination",output}});QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QVERIFY2(reader.error().isEmpty(),qPrintable(reader.error()));
         ReaderController reopened;reopened.openFile(QUrl::fromLocalFile(output));QTRY_COMPARE_WITH_TIMEOUT(reopened.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reopened.pendingCommands(),0,10000);QCOMPARE(reopened.data().value("annotations").toList().size(),5);
     }
@@ -1294,6 +1304,64 @@ private slots:
             preview->close();
         }
     }
+    void cachedDraftCloseSavesOnlyTheChosenBackgroundTab() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto firstPath=scratch.path()+"/first.pdf",secondPath=scratch.path()+"/second.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",firstPath));QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",secondPath));QFile source(firstPath);QVERIFY(source.open(QIODevice::ReadOnly));const auto original=source.readAll();source.close();
+        WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        workspace.openFile(QUrl::fromLocalFile(firstPath));auto *first=workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(first->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(first->pendingCommands(),0,10000);
+        first->submit("bookmark_create",{{"page",0},{"title","Saved from background tab"},{"yPt",20}});QTRY_COMPARE_WITH_TIMEOUT(first->pendingCommands(),0,10000);QVERIFY(first->hasUnsavedChanges());
+        first->submit("marks_undo");QTRY_COMPARE_WITH_TIMEOUT(first->pendingCommands(),0,10000);QVERIFY(!first->hasUnsavedChanges());first->submit("marks_redo");QTRY_COMPARE_WITH_TIMEOUT(first->pendingCommands(),0,10000);QVERIFY(first->hasUnsavedChanges());
+        workspace.openFile(QUrl::fromLocalFile(secondPath));auto *second=workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(second->pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(second->pendingCommands(),0,10000);QVERIFY(!second->hasUnsavedChanges());
+        QPointer<ReaderController> closing=first;workspace.closeTab(0);auto *dialog=window->findChild<QObject *>("closeChangesConfirmation");QVERIFY(dialog);QTRY_VERIFY(dialog->property("opened").toBool());
+        QVERIFY(clickDialogButton(window,dialog,"Save"));QTRY_VERIFY_WITH_TIMEOUT(closing.isNull(),15000);QCOMPARE(workspace.activeReader(),second);QCOMPARE(workspace.tabs().size(),1);
+        ReaderController reopened;reopened.openFile(QUrl::fromLocalFile(firstPath));QTRY_COMPARE_WITH_TIMEOUT(reopened.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reopened.pendingCommands(),0,10000);QVERIFY(!reopened.hasUnsavedChanges());QCOMPARE(reopened.data().value("marks").toMap().value("bookmarks").toList().first().toMap().value("title").toString(),QString("Saved from background tab"));
+        QVERIFY(source.open(QIODevice::ReadOnly));QVERIFY(source.readAll()!=original);
+    }
+    void discardCloseKeepsOpaqueRecordsAndPreservesDraftsOnMetadataFailure() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/discard.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        QString recordsPath;{ReaderController probe;probe.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(probe.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(probe.pendingCommands(),0,10000);recordsPath=probe.data().value("marks").toMap().value("path").toString();}
+        const QByteArray foreign=R"({ "kind":"future", "id":"9CD73B7D-7A3A-4FB0-814A-AF0211B7DDEF", "page":0, "raw":1.0000000000000001 })";
+        QFile records(recordsPath);QVERIFY(records.open(QIODevice::WriteOnly));records.write("["+foreign+"]\n");records.close();
+        WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);reader->submit("bookmark_create",{{"page",0},{"title","Keep on failure"},{"yPt",20}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QFile pending(QFileInfo(recordsPath).dir().filePath("changes.json"));QVERIFY(pending.open(QIODevice::ReadOnly));const auto baseline=pending.readAll();pending.close();QVERIFY(pending.open(QIODevice::WriteOnly));const auto external=baseline+" \n";pending.write(external);pending.close();
+        reader->setNoteDraft("pending-note","Keep this note");reader->setEditDraft("forms",QVariantMap{{"pending",true}});
+        workspace.closeTab(0);auto *dialog=window->findChild<QObject *>("closeChangesConfirmation");QVERIFY(dialog);QTRY_VERIFY(dialog->property("opened").toBool());QVERIFY(clickDialogButton(window,dialog,"Discard"));
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTRY_VERIFY(!reader->error().isEmpty());QCOMPARE(workspace.activeReader(),reader);QVERIFY(reader->hasUnsavedChanges());QVERIFY(!reader->noteDrafts().isEmpty());QVERIFY(reader->hasEditDrafts());
+        QVERIFY(pending.open(QIODevice::ReadOnly));QCOMPARE(pending.readAll(),external);pending.close();QVERIFY(pending.open(QIODevice::WriteOnly));pending.write(baseline);pending.close();
+        QPointer<ReaderController> closing=reader;workspace.closeTab(0);QTRY_VERIFY(dialog->property("opened").toBool());QVERIFY(clickDialogButton(window,dialog,"Discard"));QTRY_VERIFY_WITH_TIMEOUT(closing.isNull(),10000);
+        QVERIFY(records.open(QIODevice::ReadOnly));QVERIFY(records.readAll().contains(foreign));records.close();ReaderController reopened;reopened.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reopened.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reopened.pendingCommands(),0,10000);QVERIFY(!reopened.hasUnsavedChanges());QCOMPARE(reopened.data().value("marks").toMap().value("preserved").toInt(),1);QVERIFY(reopened.data().value("marks").toMap().value("bookmarks").toList().isEmpty());
+    }
+    void closeReviewAndFailedOrStaleSavesKeepTheDocumentOpen() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/review.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/form-fields.pdf",path));QFile source(path);QVERIFY(source.open(QIODevice::ReadOnly));const auto original=source.readAll();source.close();
+        WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),2,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);reader->setEditDraft("forms",QVariantMap{{"review",true}});
+        workspace.closeTab(0);auto *dialog=window->findChild<QObject *>("closeChangesConfirmation");QVERIFY(dialog);QTRY_VERIFY(dialog->property("opened").toBool());QVERIFY(clickDialogButton(window,dialog,"Review"));QTRY_VERIFY(window->property("formToolActive").toBool());QVERIFY(reader->hasEditDrafts());QCOMPARE(workspace.activeReader(),reader);
+        reader->setEditDraft("forms",{});reader->submit("bookmark_create",{{"page",0},{"title","Close save"},{"yPt",20}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(source.open(QIODevice::Append));source.write("\n% external change\n");source.close();QVERIFY(source.open(QIODevice::ReadOnly));const auto external=source.readAll();source.close();
+        workspace.closeTab(0);QTRY_VERIFY(dialog->property("opened").toBool());QVERIFY(clickDialogButton(window,dialog,"Save"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTRY_VERIFY(!reader->error().isEmpty());QCOMPARE(workspace.activeReader(),reader);QVERIFY(reader->hasUnsavedChanges());QVERIFY(source.open(QIODevice::ReadOnly));QCOMPARE(source.readAll(),external);source.close();
+        QVERIFY(source.open(QIODevice::WriteOnly));source.write(original);source.close();workspace.closeTab(0);QTRY_VERIFY(dialog->property("opened").toBool());QVERIFY(clickDialogButton(window,dialog,"Save"));reader->setNoteDraft("late-note","Typed after Save was requested");
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QTRY_VERIFY(window->property("operationStatus").toString().contains("New changes"));QCOMPARE(workspace.activeReader(),reader);QVERIFY(reader->noteDrafts().contains("late-note"));
+    }
+    void signedCloseCopyCancellationAndSuccessProtectTheOriginal() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/signed.pdf",copy=scratch.path()+"/unsigned.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/signed-signature.pdf",path));QFile source(path);QVERIFY(source.open(QIODevice::ReadOnly));const auto original=source.readAll();source.close();
+        WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()>0,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);reader->submit("bookmark_create",{{"page",0},{"title","Unsigned copy bookmark"},{"yPt",20}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        auto *dialog=window->findChild<QObject *>("closeChangesConfirmation"),*save=window->findChild<QObject *>("documentSaveDialog");QVERIFY(dialog && save);workspace.closeTab(0);QTRY_VERIFY(dialog->property("opened").toBool());QVERIFY(clickDialogButton(window,dialog,"Save"));QTRY_VERIFY(save->property("visible").toBool());
+        QVERIFY(QMetaObject::invokeMethod(save,"rejected"));QVERIFY(QMetaObject::invokeMethod(save,"close"));QCOMPARE(workspace.activeReader(),reader);QVERIFY(reader->hasUnsavedChanges());
+        QPointer<ReaderController> closing=reader;workspace.closeTab(0);QTRY_VERIFY(dialog->property("opened").toBool());QVERIFY(clickDialogButton(window,dialog,"Save"));QTRY_VERIFY(save->property("visible").toBool());QVERIFY(QMetaObject::invokeMethod(window,"exportTo",Q_ARG(QVariant,QUrl::fromLocalFile(copy))));QTRY_VERIFY_WITH_TIMEOUT(closing.isNull(),15000);QMetaObject::invokeMethod(save,"close");
+        QVERIFY(source.open(QIODevice::ReadOnly));QCOMPARE(source.readAll(),original);ReaderController reopened;reopened.openFile(QUrl::fromLocalFile(copy));QTRY_VERIFY_WITH_TIMEOUT(reopened.pageCount()>0,10000);QTRY_COMPARE_WITH_TIMEOUT(reopened.pendingCommands(),0,10000);QVERIFY(!reopened.data().value("signature_status").toMap().value("signed").toBool());QVERIFY(!reopened.hasUnsavedChanges());QCOMPARE(reopened.data().value("marks").toMap().value("bookmarks").toList().first().toMap().value("title").toString(),QString("Unsigned copy bookmark"));
+    }
+    void windowCloseReviewsEachDirtyTabAndCancelKeepsTheRemainder() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto firstPath=scratch.path()+"/first.pdf",secondPath=scratch.path()+"/second.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",firstPath));QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",secondPath));
+        WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        workspace.openFile(QUrl::fromLocalFile(firstPath));auto *first=workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(first->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(first->pendingCommands(),0,10000);first->submit("bookmark_create",{{"page",0},{"title","Discard first"},{"yPt",20}});QTRY_COMPARE_WITH_TIMEOUT(first->pendingCommands(),0,10000);
+        workspace.openFile(QUrl::fromLocalFile(secondPath));auto *second=workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(second->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(second->pendingCommands(),0,10000);second->submit("bookmark_create",{{"page",0},{"title","Save second"},{"yPt",20}});QTRY_COMPARE_WITH_TIMEOUT(second->pendingCommands(),0,10000);
+        auto *dialog=window->findChild<QObject *>("closeChangesConfirmation");QVERIFY(dialog);QPointer<ReaderController> firstClosing=first;QVERIFY(QMetaObject::invokeMethod(window,"close"));QTRY_VERIFY(dialog->property("opened").toBool());QVERIFY(clickDialogButton(window,dialog,"Discard"));QTRY_VERIFY_WITH_TIMEOUT(firstClosing.isNull(),10000);QTRY_COMPARE(workspace.tabs().size(),1);QTRY_VERIFY(dialog->property("opened").toBool());QVERIFY(QMetaObject::invokeMethod(dialog,"reject"));QVERIFY(window->isVisible());QCOMPARE(workspace.activeReader(),second);QVERIFY(second->hasUnsavedChanges());
+        QPointer<ReaderController> secondClosing=second;QVERIFY(QMetaObject::invokeMethod(window,"close"));QTRY_VERIFY(dialog->property("opened").toBool());QVERIFY(clickDialogButton(window,dialog,"Save"));QTRY_VERIFY_WITH_TIMEOUT(secondClosing.isNull(),15000);QTRY_VERIFY(!window->isVisible());
+        ReaderController untouched;untouched.openFile(QUrl::fromLocalFile(firstPath));QTRY_COMPARE_WITH_TIMEOUT(untouched.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(untouched.pendingCommands(),0,10000);QVERIFY(untouched.data().value("marks").toMap().value("bookmarks").toList().isEmpty());
+        ReaderController saved;saved.openFile(QUrl::fromLocalFile(secondPath));QTRY_COMPARE_WITH_TIMEOUT(saved.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(saved.pendingCommands(),0,10000);QVERIFY(!saved.hasUnsavedChanges());QCOMPARE(saved.data().value("marks").toMap().value("bookmarks").toList().first().toMap().value("title").toString(),QString("Save second"));
+    }
     void unifiedSaveCombinesTheActiveRevisionAndDraftsAndReopensRenderedContent() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/save.pdf",copy=scratch.path()+"/copy.pdf";
         QVERIFY(QFile::copy(root+"/tests/fixtures/form-fields.pdf",path));QFile source(path);QVERIFY(source.open(QIODevice::ReadOnly));const auto original=source.readAll();source.close();
@@ -1445,7 +1513,9 @@ int main(int argc, char **argv) {
     QTemporaryDir documentCacheDirectory;
     if(!documentCacheDirectory.isValid())return 2;
     qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",documentCacheDirectory.path().toUtf8());
+    QCoreApplication::setAttribute(Qt::AA_DontUseNativeDialogs);
     QApplication application(argc, argv);
+    application.setQuitOnLastWindowClosed(false);
     QFontDatabase::addApplicationFont(QStringLiteral(":/fonts/LyraReaderSansSC-Regular.ttf"));
     QCoreApplication::setOrganizationName("LyraReaderChecks");
     QCoreApplication::setApplicationName("LyraReaderChecks");

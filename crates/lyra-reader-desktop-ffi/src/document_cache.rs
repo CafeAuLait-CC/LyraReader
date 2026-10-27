@@ -95,7 +95,7 @@ fn private_directory(path: &Path) -> Result<(), String> {
     options.create(path).map_err(|e| e.to_string())
 }
 
-fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, String> {
+pub(super) fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, String> {
     let file = match fs::File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),

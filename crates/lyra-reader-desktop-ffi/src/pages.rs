@@ -149,6 +149,9 @@ impl PageEdits {
         marks: &Marks,
         input: DocumentTransactionInputRecord,
     ) -> Result<DocumentTransactionStateRecord, String> {
+        if let Some(error) = &marks.error {
+            return Err(format!("Annotation cache writes are blocked: {error}"));
+        }
         marks.validate_source()?;
         let cache = marks.cache_location()?;
         let path = cache.directory.join("session.json");
@@ -376,7 +379,15 @@ impl DesktopDocument {
                 };
                 let result = (|| {
                     let next = self.revision(&state)?;
-                    let restored = marks.restored_transaction(&state, edits.control()?, &next)?;
+                    let restored = marks.restored_transaction(
+                        &state,
+                        edits.control()?,
+                        &next,
+                        edits
+                            .original
+                            .as_ref()
+                            .ok_or("Missing original annotation state")?,
+                    )?;
                     Ok::<_, String>((next, restored))
                 })();
                 if result.is_err() {
@@ -391,7 +402,15 @@ impl DesktopDocument {
                     marks.can_stage(&operation)?;
                     let input = edits.input(&marks, r, current.page_count())?;
                     let state = edits.begin(&current, &marks, input)?;
-                    *marks = marks.restored_transaction(&state, edits.control()?, &current)?;
+                    *marks = marks.restored_transaction(
+                        &state,
+                        edits.control()?,
+                        &current,
+                        edits
+                            .original
+                            .as_ref()
+                            .ok_or("Missing original annotation state")?,
+                    )?;
                 }
                 marks.can_stage(&operation)?;
                 let control = edits.control()?;
@@ -483,7 +502,15 @@ impl DesktopDocument {
                     outcome.state.recovery_error = Some(error);
                 }
                 let next = self.revision(&outcome.state)?;
-                let next_marks = marks.restored_transaction(&outcome.state, control, &next)?;
+                let next_marks = marks.restored_transaction(
+                    &outcome.state,
+                    control,
+                    &next,
+                    edits
+                        .original
+                        .as_ref()
+                        .ok_or("Missing original annotation state")?,
+                )?;
                 report = json!({"page_count":outcome.page_count,"page_map":outcome.page_map,"inserted_page":outcome.inserted_page,
                     "location":{"page":outcome.state.current_page-1,"selection":outcome.state.selection},"recovery_warning":outcome.state.recovery_error});
                 edits.adopt(&outcome.state);
@@ -500,7 +527,15 @@ impl DesktopDocument {
                 };
                 let state = target.ok_or("No page change to undo or redo")?;
                 let next = self.revision(&state)?;
-                let next_marks = marks.restored_transaction(&state, control, &next)?;
+                let next_marks = marks.restored_transaction(
+                    &state,
+                    control,
+                    &next,
+                    edits
+                        .original
+                        .as_ref()
+                        .ok_or("Missing original annotation state")?,
+                )?;
                 report = json!({"location":{"page":state.current_page-1,"selection":state.selection},"recovery_warning":state.recovery_error});
                 edits.adopt(&state);
                 (next, next_marks)
@@ -522,20 +557,53 @@ impl DesktopDocument {
                 restored.seed_bookmarks(&next)?;
                 (next, restored)
             }
+            "document_discard" => {
+                let root = marks.cache_root().map(Path::to_path_buf);
+                let next = LyraReaderEngine::new()
+                    .open_document(
+                        self.original_path.to_string_lossy().into_owned(),
+                        self.password.clone(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let original = edits.original.as_ref().unwrap_or(&marks).clone();
+                let discarded = original.discard_known(&next)?;
+                if let Err(error) = edits.retire() {
+                    if let Err(rollback) = discarded.rollback_discard(&original) {
+                        marks.recovery_notice(rollback.clone());
+                        return Err(format!("{error}. {rollback}"));
+                    }
+                    return Err(error);
+                }
+                *self
+                    .recovery_status
+                    .lock()
+                    .map_err(|_| "Recovery state is unavailable")? = Value::Null;
+                let mut restored = Marks::load_opened(&next, root.as_deref());
+                restored.seed_bookmarks(&next)?;
+                (next, restored)
+            }
             "page_apply" | "document_save" => {
                 crate::saving::check_revision(&current, r)?;
                 if let Some(reason) = current.xfa_status().read_only_reason {
                     return Err(reason);
                 }
                 if op == "document_save"
-                    && let Some(reason) = &self.original_signature.read_only_reason
+                    && let Some(reason) = &self.source_signature(&current).read_only_reason
                 {
                     return Err(reason.clone());
                 }
                 if op == "document_save" && !edits.has_session() {
                     let input = edits.input(&marks, r, current.page_count())?;
                     let state = edits.begin(&current, &marks, input)?;
-                    *marks = marks.restored_transaction(&state, edits.control()?, &current)?;
+                    *marks = marks.restored_transaction(
+                        &state,
+                        edits.control()?,
+                        &current,
+                        edits
+                            .original
+                            .as_ref()
+                            .ok_or("Missing original annotation state")?,
+                    )?;
                 }
                 let original = edits
                     .original

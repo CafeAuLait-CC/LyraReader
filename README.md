@@ -34,8 +34,11 @@ Page edits use the shared Rust transaction, with revision/annotation recovery an
 the application cache. Rotating a marked page embeds the cached marks into a working revision first;
 undo restores the preceding PDF and its cached marks together. Save combines the active revision,
 annotations, bookmarks and pending form values, verifies a backup, then reopens the saved original.
-Save As writes a combined copy and keeps the original session open. Several newer macOS features
-are still being ported.
+Save As writes a combined copy and keeps the original session open. Closing a dirty tab offers
+Save, Discard or Cancel, with pending form edits reviewed first. Failed writes keep the tab open;
+Discard clears known drafts while preserving foreign cache records. Pending ink deletions and
+their replacement strokes recover together after an interrupted process. Several newer macOS
+features are still being ported.
 The Linux branch is not yet a release or a claim of full feature parity.
 
 ## Capabilities

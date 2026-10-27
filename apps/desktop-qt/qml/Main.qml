@@ -161,6 +161,7 @@ ApplicationWindow {
     }
     property bool closeApproved: false
     property int closingTab: -2
+    property var pendingCloseReader: null
     function saveReadingPosition() {
         positionTimer.stop();
         if (session && currentReader.pageCount > 0 && !positionRestoring) {
@@ -192,76 +193,106 @@ ApplicationWindow {
         });
     }
     function hasUnsavedChanges(index) {
-        const tabs = session ? session.tabs : [
-            {
-                reader: currentReader
-            }
-        ];
-        return tabs.some(function (tab, i) {
-            const marks = tab.reader.data.marks || {};
-            return (index < 0 || i === index) && (marks.page_pending || marks.pending_deletions > 0 || Object.keys(tab.reader.noteDrafts).length > 0 || tab.reader.hasEditDrafts);
-        });
+        const tabs = session ? session.tabs : [{reader:currentReader}];
+        return tabs.some(function (tab,i) { return (index < 0 || i === index) && tab.reader.hasUnsavedChanges; });
+    }
+    function closeTarget(index) {
+        const tabs = session ? session.tabs : [{reader:currentReader}];
+        if (index >= 0) return index < tabs.length ? tabs[index].reader : null;
+        const dirty = tabs.find(function (tab) { return tab.reader.hasUnsavedChanges; });
+        return dirty ? dirty.reader : null;
+    }
+    function readerIndex(owner) {
+        return session ? session.tabs.findIndex(function (tab) { return tab.reader === owner; }) : (owner === currentReader ? 0 : -1);
+    }
+    function closeNeedsReview(owner) {
+        return !!owner && (owner.hasEditDrafts || Object.keys(owner.noteDrafts).length > 0);
+    }
+    function reviewClose(owner) {
+        if (!owner) return;
+        if (session) session.selectTab(readerIndex(owner));
+        const forms=owner.editDrafts.forms || {};
+        if (Object.keys(forms).length) {
+            formToolActive=true;
+            owner.submit("forms");
+            operationStatus=qsTr("Review the form values, then use Save before closing.");
+        } else {
+            const ids=Object.keys(owner.noteDrafts);
+            const annotation=annotations.find(function (item) { return ids.indexOf(item.id)>=0; });
+            if (annotation) selectAnnotation(annotation,true);
+            operationStatus=qsTr("Review the pending edit before saving or discarding it.");
+        }
     }
     function requestCloseTab(index) {
-        if (!session)
-            return;
+        if (!session || closeOperation || dialogs.closePromptVisible) return;
+        const owner=closeTarget(index);
+        if (!owner) return;
         dialogs.flushAnnotation();
-        closingTab = index;
-        if (hasPendingCloseWork(index)) {
-            closeRetry.start();
+        closingTab=index;
+        pendingCloseReader=owner;
+        if (owner.pendingCommands>0) { closeRetry.start(); return; }
+        closingTab=-2;
+        pendingCloseReader=null;
+        const currentIndex=readerIndex(owner);
+        if (owner.hasUnsavedChanges) dialogs.confirmClose(currentIndex);
+        else session.closeTab(currentIndex);
+    }
+    property var closeOperation: null
+    function cancelCloseOperation(message) {
+        closeOperation=null;
+        if (message) operationStatus=message;
+    }
+    function closeCommand(ticket,operation,args) {
+        ticket.phase="command";
+        ticket.id=ticket.reader.submit(operation,args || {});
+        ticket.revision=ticket.reader.editRevision;
+    }
+    function beginCloseOperation(kind,owner,wholeWindow) {
+        if (!owner || closeOperation || owner.pendingCommands>0) return;
+        if (kind === "save" && closeNeedsReview(owner)) { reviewClose(owner); return; }
+        if (dialogs.noteReader === owner && kind === "discard") dialogs.cancelAnnotationDraft();
+        const ticket={reader:owner,window:wholeWindow,phase:"command",id:-1,revision:owner.editRevision,next:"finish"};
+        closeOperation=ticket;
+        if (kind === "discard") closeCommand(ticket,"document_discard",{});
+        else if ((owner.data.signature_status || {}).signed) {
+            exportKind="document";
+            exportContext={reader:owner,revision:owner.data.document_revision,kind:"document",forms:[],closeTicket:ticket};
+            ticket.phase="panel";
+            dialogs.saveDialog.open();
+        } else closeCommand(ticket,"document_save",{expected_revision:owner.data.document_revision});
+    }
+    function discardAndClose(index) { beginCloseOperation("discard",closeTarget(index),index<0); }
+    function closeCommandFinished(owner,id,operation,result,error) {
+        const ticket=closeOperation;
+        if (!ticket || ticket.reader !== owner || ticket.id !== id) return;
+        if (error.length) { cancelCloseOperation(error); return; }
+        const report=result.report || result;
+        const warning=report.cache_cleanup_error || report.sidecar_error || report.sidecar_cleanup_error || report.recovery_warning;
+        if (warning) { cancelCloseOperation(qsTr("The PDF was saved, but its draft needs attention: %1").arg(warning)); return; }
+        ticket.next=operation === "save_document_copy" ? "discard-copy-draft" : "finish";
+        ticket.phase="draining";
+        Qt.callLater(advanceCloseOperation);
+    }
+    function advanceCloseOperation() {
+        const ticket=closeOperation;
+        if (!ticket || ticket.phase !== "draining") return;
+        const owner=ticket.reader;
+        if (!owner || readerIndex(owner)<0) { closeOperation=null; return; }
+        if (owner.pendingCommands>0) return;
+        if (owner.editRevision !== ticket.revision || Object.keys(owner.noteDrafts).length || owner.hasEditDrafts) {
+            cancelCloseOperation(qsTr("New changes remain unsaved. The document is still open."));
             return;
         }
-        closingTab = -2;
-        if (hasUnsavedChanges(index))
-            dialogs.confirmClose(index);
-        else
-            session.closeTab(index);
-    }
-    function discardAndClose(index) {
-        dialogs.cancelAnnotationDraft();
-        saveReadingPosition();
-        if (discardCloseIndex !== -2 || hasPendingCloseWork(index))
-            return;
-        discardCloseIndex = index;
-        const tabs = session ? session.tabs : [{reader: currentReader}];
-        const requests = [];
-        tabs.forEach(function (tab, i) {
-            if (index < 0 || index === i) {
-                Object.keys(tab.reader.editDrafts).forEach(function (key) { tab.reader.setEditDraft(key, null); });
-                Object.keys(tab.reader.noteDrafts).forEach(function (key) { tab.reader.clearNoteDraft(key); });
-                if ((tab.reader.data.marks || {}).page_session_active)
-                    requests.push({reader: tab.reader, id: tab.reader.submit("page_discard")});
-            }
-        });
-        discardCloseRequests = requests;
-        if (!requests.length) finishDiscardClose();
-    }
-    property int discardCloseIndex: -2
-    property var discardCloseRequests: []
-    function discardedSession(reader, id, error) {
-        if (discardCloseIndex === -2) return;
-        const found = discardCloseRequests.some(function (request) { return request.reader === reader && request.id === id; });
-        if (!found) return;
-        discardCloseRequests = discardCloseRequests.filter(function (request) { return request.reader !== reader || request.id !== id; });
-        if (error.length) {
-            operationStatus = error;
-            discardCloseIndex = -2;
-            discardCloseRequests = [];
-            return;
-        }
-        if (!discardCloseRequests.length) finishDiscardClose();
-    }
-    function finishDiscardClose() {
-        const index = discardCloseIndex;
-        discardCloseIndex = -2;
-        if (index < 0) {
-            closeApproved = true;
-            root.close();
-        } else if (session)
-            session.closeTab(index, true);
+        if (ticket.next === "discard-copy-draft") { closeCommand(ticket,"document_discard",{}); return; }
+        if (owner.hasUnsavedChanges) { cancelCloseOperation(qsTr("Changes remain unsaved. The document is still open.")); return; }
+        const index=readerIndex(owner),wholeWindow=ticket.window;
+        closeOperation=null;
+        if (session) session.closeTab(index,true);
+        if (wholeWindow) Qt.callLater(function () { root.close(); });
     }
     onClosing: function (event) {
         cancelErase();
+        if (closeOperation || dialogs.closePromptVisible) {event.accepted=false;return;}
         if (closeApproved)
             return;
         dialogs.flushAnnotation();
@@ -269,6 +300,7 @@ ApplicationWindow {
         if (hasPendingCloseWork(-1)) {
             event.accepted = false;
             closingTab = -1;
+            pendingCloseReader=null;
             closeRetry.start();
             return;
         }
@@ -278,15 +310,19 @@ ApplicationWindow {
         }
     }
     function retryPendingClose() {
-        if (closingTab === -2 || hasPendingCloseWork(closingTab))
-            return;
-        if (dialogs.annotationWriteError.length) {
+        if (closingTab === -2) return;
+        const owner=pendingCloseReader;
+        if (closingTab >= 0 && (!owner || readerIndex(owner)<0)) {closingTab=-2;pendingCloseReader=null;return;}
+        if (closingTab < 0 ? hasPendingCloseWork(-1) : owner.pendingCommands>0) return;
+        if (dialogs.annotationWriteError.length && (closingTab<0 || dialogs.noteReader === owner)) {
             operationStatus = dialogs.annotationWriteError;
             closingTab = -2;
+            pendingCloseReader=null;
             return;
         }
-        const index = closingTab;
+        const index = closingTab<0 ? -1 : readerIndex(owner);
         closingTab = -2;
+        pendingCloseReader=null;
         if (index < 0)
             root.close();
         else
@@ -302,7 +338,7 @@ ApplicationWindow {
             required property var modelData
             target: modelData.reader
             function onCommandFinished(id, operation, result, error) {
-                root.discardedSession(modelData.reader, id, error);
+                root.closeCommandFinished(modelData.reader,id,operation,result,error);
             }
             function onCommandsChanged() {
                 // Defer until the command's data/error notifications finish.
@@ -311,6 +347,8 @@ ApplicationWindow {
                     Qt.callLater(root.retryPendingClose);
                 if (root.pendingDocumentSave)
                     Qt.callLater(root.finishDocumentSave);
+                if (root.closeOperation)
+                    Qt.callLater(root.advanceCloseOperation);
             }
         }
     }
@@ -320,11 +358,8 @@ ApplicationWindow {
         onTriggered: {
             if (root.closingTab === -2)
                 return;
-            if (root.hasPendingCloseWork(root.closingTab)) {
-                restart();
-                return;
-            }
             root.retryPendingClose();
+            if (root.closingTab !== -2) restart();
         }
     }
     SystemPalette {
@@ -1018,6 +1053,7 @@ ApplicationWindow {
     property var pendingSavePosition: null
     property var pendingDocumentSave: null
     function saveDocument(copy) {
+        if (closeOperation || pendingDocumentSave) return;
         if (xfaReadOnly) {operationStatus=currentReader.data.xfa_status.read_only_reason;return;}
         if (pendingRedactions.length) {
             operationStatus = qsTr("Finish or clear the content redaction before saving.");
@@ -1129,7 +1165,11 @@ ApplicationWindow {
             return;
         const destination = session.localPath(url);
         if (context.kind === "document")
-            owner.submit("save_document_copy", Object.assign({destination: destination, forms: context.forms},context.revision ? {expected_revision:context.revision} : {}));
+            {
+                const args=Object.assign({destination:destination,forms:context.forms},context.revision ? {expected_revision:context.revision} : {});
+                if (context.closeTicket && context.closeTicket === closeOperation) closeCommand(context.closeTicket,"save_document_copy",args);
+                else owner.submit("save_document_copy",args);
+            }
         else if (context.kind === "redactions")
             owner.submit("save_redactions", {
                 destination: destination,
@@ -1260,7 +1300,7 @@ ApplicationWindow {
         objectName: "saveDocumentAction"
         text: qsTr("Save")
         shortcut: StandardKey.Save
-        enabled: currentReader.pageCount > 0 && currentReader.pendingCommands === 0 && !root.positionRestoring && !root.xfaReadOnly
+        enabled: currentReader.pageCount > 0 && currentReader.pendingCommands === 0 && !root.positionRestoring && !root.xfaReadOnly && !root.closeOperation && !root.pendingDocumentSave && (currentReader.hasUnsavedChanges || root.originalReadOnly)
         onTriggered: root.saveDocument()
     }
     Action {
@@ -1268,7 +1308,7 @@ ApplicationWindow {
         objectName: "saveDocumentAsAction"
         text: qsTr("Save As…")
         shortcut: StandardKey.SaveAs
-        enabled: saveDocumentAction.enabled
+        enabled: currentReader.pageCount > 0 && currentReader.pendingCommands === 0 && !root.positionRestoring && !root.xfaReadOnly && !root.closeOperation && !root.pendingDocumentSave
         onTriggered: root.saveDocument(true)
     }
     Action {
@@ -1868,7 +1908,7 @@ ApplicationWindow {
                     root.operationStatus = qsTr("Artwork placed. Saved in the annotation sidecar.");
                 }
             }
-            if ((op.indexOf("page_") === 0 && op !== "page_operation") || op === "document_save") {
+            if ((op.indexOf("page_") === 0 && op !== "page_operation") || op === "document_save" || op === "document_discard") {
                 root.pageEditBusy = false;
                 if (!error.length) {
                     const map = result.report ? result.report.page_map : null;

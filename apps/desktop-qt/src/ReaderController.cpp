@@ -65,7 +65,18 @@ double quantizedRasterScale(double scale) {
 }
 }
 
-ReaderController::ReaderController(QObject *parent) : QObject(parent),m_cachePrefix(QUuid::createUuid().toString()+QLatin1Char('/')),m_mutations(std::make_shared<CommandQueue>()) {initAi();}
+ReaderController::ReaderController(QObject *parent) : QObject(parent),m_cachePrefix(QUuid::createUuid().toString()+QLatin1Char('/')),m_mutations(std::make_shared<CommandQueue>()) {
+    initAi();
+    connect(this,&ReaderController::dataChanged,this,&ReaderController::unsavedChangesChanged);
+    connect(this,&ReaderController::noteDraftsChanged,this,&ReaderController::unsavedChangesChanged);
+    connect(this,&ReaderController::editDraftsChanged,this,&ReaderController::unsavedChangesChanged);
+}
+bool ReaderController::hasUnsavedChanges()const {
+    const auto marks=m_data.value(QStringLiteral("marks")).toMap();
+    const bool localOnly=m_data.value(QStringLiteral("xfa_status")).toMap().value(QStringLiteral("is_xfa")).toBool();
+    return marks.value(QStringLiteral("page_pending")).toBool() ||
+        (!localOnly && marks.value(QStringLiteral("pdf_dirty")).toBool()) || !m_noteDrafts.isEmpty() || hasEditDrafts();
+}
 ReaderController::~ReaderController(){clearRasterCache();}
 void ReaderController::clearRasterCache(){RasterJobs::cancel(m_activeRaster);RasterCache::clearPrefix(m_cachePrefix);m_tileDemand.clear();m_pageDemand.clear();m_manualDemand.clear();}
 int ReaderController::cpuCacheKiB(){return RasterCache::costKiB();}
@@ -198,6 +209,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
     const QString draftKey=(unifiedSave || operation==QStringLiteral("save_forms") || operation==QStringLiteral("replace_forms")) ? QStringLiteral("forms") :
         ((operation==QStringLiteral("save_redactions") || operation==QStringLiteral("replace_redactions")) ? QStringLiteral("redactions") : QString{});
     const auto savedDraft=m_editDrafts.value(draftKey);
+    const auto discardedNotes=m_noteDrafts,discardedEdits=m_editDrafts;
     QVariantList draftValues;
     if(draftKey==QStringLiteral("forms")) {const auto fields=savedDraft.toMap();for(const auto &field:fields)draftValues.append(field);}
     const bool draftMatchesRequest=!draftKey.isEmpty() && !savedDraft.isNull() &&
@@ -206,7 +218,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
     request.insert(QStringLiteral("op"), operation);
     const auto bytes = QJsonDocument(request).toJson(QJsonDocument::Compact);
     const bool eraseControl=operation.startsWith(QStringLiteral("ink_erase_")) && operation!=QStringLiteral("ink_erase_commit");
-    const bool mutation=operation==QStringLiteral("document_save") || operation==QStringLiteral("ink_erase_commit") || operation.startsWith(QStringLiteral("mark_")) || operation.startsWith(QStringLiteral("marks_")) || operation.startsWith(QStringLiteral("bookmark_")) || operation.startsWith(QStringLiteral("file_")) || operation.startsWith(QStringLiteral("page_")) || operation.startsWith(QStringLiteral("save_")) || operation.startsWith(QStringLiteral("replace_")) || operation==QStringLiteral("extract_pages");
+    const bool mutation=operation==QStringLiteral("document_discard") || operation==QStringLiteral("document_save") || operation==QStringLiteral("ink_erase_commit") || operation.startsWith(QStringLiteral("mark_")) || operation.startsWith(QStringLiteral("marks_")) || operation.startsWith(QStringLiteral("bookmark_")) || operation.startsWith(QStringLiteral("file_")) || operation.startsWith(QStringLiteral("page_")) || operation.startsWith(QStringLiteral("save_")) || operation.startsWith(QStringLiteral("replace_")) || operation==QStringLiteral("extract_pages");
     if(mutation)++m_mutationSequence;
     const auto mutationSequence=m_mutationSequence;
     const auto generation = m_generation;
@@ -215,7 +227,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
     ++m_pendingCommands;
     emit commandsChanged();
     auto *watcher = new QFutureWatcher<CommandResult>(this);
-    connect(watcher, &QFutureWatcher<CommandResult>::finished, this, [this,watcher,id,operation,arguments,generation,latestOnly,document,mutation,eraseControl,mutationSequence,draftKey,savedDraft,draftMatchesRequest] {
+    connect(watcher, &QFutureWatcher<CommandResult>::finished, this, [this,watcher,id,operation,arguments,generation,latestOnly,document,mutation,eraseControl,mutationSequence,draftKey,savedDraft,draftMatchesRequest,discardedNotes,discardedEdits] {
         const auto outcome = watcher->result();
         watcher->deleteLater();
         --m_pendingCommands;
@@ -226,7 +238,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         if(operation==QStringLiteral("marks") && mutationSequence!=m_mutationSequence)return;
         if(latestOnly && m_latestRead.value(operation)!=id)return;
         if (!outcome.error.isEmpty() && operation!=QStringLiteral("split_plan") && !operation.startsWith(QStringLiteral("ai_"))) setError(outcome.error);
-        else if (operation==QStringLiteral("page_stage") || operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo") || operation==QStringLiteral("page_discard") || operation==QStringLiteral("page_apply") || operation==QStringLiteral("document_save")) {
+        else if (operation==QStringLiteral("page_stage") || operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo") || operation==QStringLiteral("page_discard") || operation==QStringLiteral("page_apply") || operation==QStringLiteral("document_save") || operation==QStringLiteral("document_discard")) {
             m_source=outcome.source;
             const auto revision=outcome.result.toMap();
             const auto info=revision.value(QStringLiteral("info")).toMap();
@@ -251,7 +263,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
             m_documentHeight = layout.value(QStringLiteral("height")).toDouble();
             emit documentChanged();
         } else if (!eraseControl) {
-            const bool marks=operation==QStringLiteral("ink_erase_commit") || operation==QStringLiteral("marks") || operation.startsWith(QStringLiteral("mark_")) || operation.startsWith(QStringLiteral("bookmark_")) || operation.startsWith(QStringLiteral("marks_")) || operation.startsWith(QStringLiteral("file_"));
+            const bool marks=operation==QStringLiteral("ink_erase_commit") || operation==QStringLiteral("marks") || operation.startsWith(QStringLiteral("mark_")) || operation.startsWith(QStringLiteral("marks_")) || operation.startsWith(QStringLiteral("bookmark_")) || operation.startsWith(QStringLiteral("file_"));
             m_data.insert(marks ? QStringLiteral("marks") : operation, outcome.result);
             emit dataChanged();
         }
@@ -259,6 +271,10 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
             m_textPending.remove(arguments.value(QStringLiteral("page")).toInt());
         if(outcome.error.isEmpty() && draftMatchesRequest && m_editDrafts.value(draftKey)==savedDraft)
             setEditDraft(draftKey,{});
+        if(outcome.error.isEmpty() && operation==QStringLiteral("document_discard")) {
+            for(auto it=discardedNotes.cbegin();it!=discardedNotes.cend();++it)if(m_noteDrafts.value(it.key())==it.value())clearNoteDraft(it.key());
+            for(auto it=discardedEdits.cbegin();it!=discardedEdits.cend();++it)if(m_editDrafts.value(it.key())==it.value())setEditDraft(it.key(),{});
+        }
         if(outcome.error.isEmpty() && operation==QStringLiteral("mark_update")) {
             const auto annotationId=arguments.value(QStringLiteral("id")).toString();
             const auto patch=arguments.value(QStringLiteral("patch")).toMap();
@@ -279,7 +295,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         if (parseError.error != QJsonParseError::NoError || !json.isObject())
             result.error = QStringLiteral("The document service returned an invalid response.");
         else result.result = json.object().value(QStringLiteral("result")).toVariant();
-        if(result.error.isEmpty() && (operation==QStringLiteral("page_stage") || operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo") || operation==QStringLiteral("page_discard") || operation==QStringLiteral("page_apply") || operation==QStringLiteral("document_save")))
+        if(result.error.isEmpty() && (operation==QStringLiteral("page_stage") || operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo") || operation==QStringLiteral("page_discard") || operation==QStringLiteral("page_apply") || operation==QStringLiteral("document_save") || operation==QStringLiteral("document_discard")))
             result.source=NativeRasterSource::prepare(document,false,&result.error);
         return result;
     };

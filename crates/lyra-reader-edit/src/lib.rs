@@ -17,6 +17,7 @@
 //! signature consequences of that choice belong to `lyra-reader-pdfium` and the shell; this crate
 //! does not define a save policy.
 
+pub mod draft;
 pub mod kind;
 pub mod records;
 pub mod rules;
