@@ -18,6 +18,8 @@
 //! * **scroll** — for each step, the wall time to rasterize the tiles that step newly needs
 //!   (tiles already in the cache cost ~0). This is *raster* work per scroll step, not a
 //!   presented frame: the compositor and the display link live in the shell, not here.
+//!   **This tool has no surface: no queue wait, no GPU upload, no composite and no present are
+//!   measured**, and every step completes all of its work before the next step starts.
 //! * **RSS peak** — `getrusage(RUSAGE_SELF).ru_maxrss`, the kernel's own peak resident set
 //!   size for the whole process (bytes on macOS). It is the run's peak, so it covers every
 //!   phase; `--skip-*` exists to attribute it to one phase.
@@ -673,7 +675,7 @@ fn phase_scroll(plan: &Plan, backend: &impl DocumentBackend) -> Result<(), Strin
         sorted.len(),
     );
     println!(
-        "  ... of which the viewport was waiting for (tiles on screen that were not ready): p50 {:.3} · p95 {:.3} · max {:.3} · {visible_misses} visible miss(es), {visible_within}/{} step(s) inside the frame budget",
+        "  visible-miss raster time (sum for this step): p50 {:.3} · p95 {:.3} · max {:.3} · {visible_misses} visible miss(es), {visible_within}/{} step(s) whose visible-miss raster time fits 16.7 ms",
         percentile(&visible_sorted, 0.50),
         percentile(&visible_sorted, 0.95),
         visible_sorted.last().copied().unwrap_or(0.0),
@@ -685,7 +687,7 @@ fn phase_scroll(plan: &Plan, backend: &impl DocumentBackend) -> Result<(), Strin
         cache.used_bytes() as f64 / (1024.0 * 1024.0),
     );
     println!(
-        "  steps whose raster work fits one 60 fps frame (<= {budget:.1} ms): {within_budget}/{} ({:.1}%)",
+        "  steps whose raster work fits 16.7 ms (not presented frames): {within_budget}/{} ({:.1}%)",
         sorted.len(),
         100.0 * within_budget as f64 / sorted.len() as f64
     );
@@ -715,7 +717,7 @@ fn phase_scroll(plan: &Plan, backend: &impl DocumentBackend) -> Result<(), Strin
         );
     }
     println!(
-        "  note: these are raster times, not presented frames - no GPU upload/composite/present happens in the CLI"
+        "  note: these are raster times, not presented frames - the CLI has no surface, no queue wait and no GPU upload/composite/present"
     );
     Ok(())
 }
