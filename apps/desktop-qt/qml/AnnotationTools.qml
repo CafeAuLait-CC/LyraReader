@@ -8,7 +8,7 @@ ToolBar {
     id: tools
     required property var app
     enabled: app.canModifyPdf
-    implicitHeight: 44
+    implicitHeight: 46
     background: Rectangle {
         color: app.colors.panelBg
         border.width: 1
@@ -43,11 +43,6 @@ ToolBar {
                         kind: "strikeout",
                         icon: "strikeout",
                         name: qsTr("Strikethrough")
-                    },
-                    {
-                        kind: "select",
-                        icon: "select",
-                        name: qsTr("Select")
                     },
                     {
                         kind: "ink",
@@ -96,60 +91,6 @@ ToolBar {
                     text: modelData.name
                     selected: app.annotationTool === modelData.kind
                     onClicked: app.setAnnotationTool(modelData.kind)
-                }
-            }
-            ToolSeparator {}
-            LyraToolButton {
-                objectName: "stampToolButton"
-                symbol: "stamp"
-                text: qsTr("Stamp")
-                selected: app.annotationTool === "stamp"
-                enabled: app.currentReader.pageCount > 0
-                onClicked: stampMenu.open()
-                Menu {
-                    id: stampMenu
-                    y: parent.height
-                    Repeater {
-                        model: [
-                            {
-                                style: "approved",
-                                title: qsTr("Approved")
-                            },
-                            {
-                                style: "reviewed",
-                                title: qsTr("Reviewed")
-                            },
-                            {
-                                style: "draft",
-                                title: qsTr("Draft")
-                            },
-                            {
-                                style: "confidential",
-                                title: qsTr("Confidential")
-                            },
-                            {
-                                style: "date",
-                                title: qsTr("Date")
-                            }
-                        ]
-                        MenuItem {
-                            required property var modelData
-                            text: modelData.title
-                            objectName: "stampStyle" + modelData.style
-                            onTriggered: app.armStamp(modelData.style)
-                        }
-                    }
-                }
-            }
-            LyraToolButton {
-                objectName: "signatureToolButton"
-                symbol: "signature"
-                text: qsTr("Signature Image")
-                selected: app.annotationTool === "signature"
-                enabled: app.currentReader.pageCount > 0
-                onClicked: {
-                    signaturePicker.owner = app.currentReader;
-                    signaturePicker.open();
                 }
             }
             ToolSeparator {}
@@ -207,22 +148,6 @@ ToolBar {
                 }
             }
         }
-    }
-    FileDialog {
-        id: signaturePicker
-        objectName: "signatureImagePicker"
-        property var owner: null
-        title: qsTr("Choose a Signature Image")
-        nameFilters: [qsTr("Signature images (*.png *.jpg *.jpeg)")]
-        fileMode: FileDialog.OpenFile
-        onAccepted: {
-            if (owner === app.currentReader)
-                app.armSignature(selectedFile);
-            else
-                app.operationStatus = qsTr("The document changed. Choose the signature image again.");
-            owner = null;
-        }
-        onRejected: owner = null
     }
     ColorDialog {
         id: customColor

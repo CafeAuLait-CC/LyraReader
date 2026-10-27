@@ -39,6 +39,7 @@ ApplicationWindow {
         annotationToolsVisible=false;
         formToolActive=false;
         selectedAnnotation=null;
+        setSecondaryRow("",true);
     }
     readonly property var colors: theme
     readonly property var pageList: canvas.view
@@ -47,6 +48,8 @@ ApplicationWindow {
     property bool aiPanelVisible: false
     property real aiPanelWidth: session ? Number(session.preference("aiPanelWidth", 360)) : 360
     function showAiPanel(show) {
+        if (show && secondaryRow==="edit" && contentController.deferAction({kind:"assistant",value:true})) return;
+        if (show) setSecondaryRow("lyra",true);
         aiPanelVisible = show;
         if (show && width < 1200) searchVisible = false;
     }
@@ -56,13 +59,69 @@ ApplicationWindow {
         aiPanelWidth = Math.max(280, Math.min(520, value));
         if (save && session) session.setPreference("aiPanelWidth", aiPanelWidth);
     }
+    property string secondaryRow: ""
+    property alias contentEditor: contentController
+    readonly property var fillTools: secondaryTools.fillTools
+    property string fillTool: ""
+    property string fillText: "Text"
+    property int fillFontSize: 14
+    property color fillColor: theme.documentInk
+    readonly property bool editInspectorVisible: currentReader.pageCount>0 && secondaryRow==="edit" && (contentController.tool!=="select" || !!contentController.selected || contentController.hasDraft)
+    readonly property bool fillInspectorVisible: currentReader.pageCount>0 && secondaryRow==="fill" && fillTool.length>0
+    onSecondaryRowChanged: {
+        annotationToolsVisible=secondaryRow==="annotate";
+        if (secondaryRow!=="fill") {clearFillTool();formToolActive=false;}
+        if (secondaryRow==="edit" || secondaryRow==="fill") aiPanelVisible=false;
+        if (secondaryRow!=="annotate" && secondaryRow!=="fill") {cancelErase();annotationTool="select";}
+        if (secondaryRow==="edit") {overviewVisible=false;textViewVisible=false;contentController.reload();}
+        else if (secondaryRow==="fill") currentReader.submit("forms");
+    }
+    function toggleSecondaryRow(value) {setSecondaryRow(secondaryRow===value && !overviewVisible ? "" : value);}
+    function setSecondaryRow(value,force) {
+        if (!force && secondaryRow==="edit" && contentController.deferAction({kind:"row",value:value})) return;
+        if (value.length && !currentReader.pageCount) return;
+        if (["annotate","edit","fill"].indexOf(value)>=0 && blockXfaWrite()) return;
+        dialogs.flushAnnotation();
+        if(value.length){overviewVisible=false;textViewVisible=false;dialogs.annotationDialog.close();}
+        secondaryRow=value;
+        if (value!=="edit") {contentController.tool="select";contentController.selected=null;contentController.inlineEditing=false;contentController.gesture=null;}
+    }
+    function selectReaderTab(index,force) {
+        if (!session || index<0 || index>=session.tabs.length) return;
+        if (!force && secondaryRow==="edit" && contentController.deferAction({kind:"tab",reader:session.tabs[index].reader})) return;
+        session.selectTab(index);
+    }
+    function showOverview(force) {
+        if (!force && secondaryRow==="edit" && contentController.deferAction({kind:"overview"})) return;
+        overviewVisible=!overviewVisible;
+    }
+    function clearFillTool() {fillTool="";pendingStampStyle="";pendingSignatureImage=null;annotationTool="select";}
+    function setFillTool(value) {
+        if (blockXfaWrite()) return;
+        if (secondaryRow!=="fill") setSecondaryRow("fill");
+        if (secondaryRow!=="fill") return;
+        const next=fillTool===value ? "" : value;
+        clearFillTool();fillTool=next;
+        if (["text","date","check","cross"].indexOf(next)>=0) {
+            annotationTool="textBox";
+            fillText=next==="date" ? Qt.formatDate(new Date(),"yyyy-MM-dd") : next==="check" ? "✓" : next==="cross" ? "✕" : qsTr("Text");
+        }
+        setTextViewEnabled(false);overviewVisible=false;
+    }
+    function fillColour() {return "#"+Logic.hex(fillColor.r*255)+Logic.hex(fillColor.g*255)+Logic.hex(fillColor.b*255)+Logic.hex(fillColor.a*255);}
+    ContentEditing {id:contentController;app:root}
     property bool annotationToolsVisible: false
+    onAnnotationToolsVisibleChanged: {
+        if(annotationToolsVisible && secondaryRow!=="annotate")secondaryRow="annotate";
+        else if(!annotationToolsVisible && secondaryRow==="annotate")secondaryRow="";
+    }
     property bool overviewVisible: false
     property bool textViewVisible: false
     readonly property real textViewZoom: accessibleTextView.textSize / 16
     onOverviewVisibleChanged: if (overviewVisible)
         textViewVisible = false
     function setTextViewEnabled(show) {
+        if (show && secondaryRow==="edit" && contentController.deferAction({kind:"textView",value:show})) return;
         const returningToPage = textViewVisible && !show;
         const page = currentPage;
         textViewVisible = show;
@@ -144,6 +203,8 @@ ApplicationWindow {
     onAppearanceChanged: if (session)
         session.setPreference("appearance", appearance)
     onCurrentReaderChanged: {
+        Qt.callLater(function(){contentController.reset();});
+        fillTool="";
         cancelErase();
         pendingArtworkRequest = -1;
         pendingStampStyle = "";
@@ -224,6 +285,13 @@ ApplicationWindow {
     function reviewClose(owner) {
         if (!owner) return;
         if (session) session.selectTab(readerIndex(owner));
+        if (owner.editDrafts.content && Object.keys(owner.editDrafts.content).length) {
+            setSecondaryRow("edit",true);
+            contentController.inlineEditing=contentController.textDraft;
+            navigate(owner.editDrafts.content.page);
+            operationStatus=qsTr("Review the preserved PDF content draft before closing.");
+            return;
+        }
         const forms=owner.editDrafts.forms || {};
         if (Object.keys(forms).length) {
             formToolActive=true;
@@ -237,6 +305,7 @@ ApplicationWindow {
         }
     }
     function requestCloseTab(index) {
+        if (session && session.tabs[index] && session.tabs[index].reader===currentReader && secondaryRow==="edit" && contentController.deferAction({kind:"tabClose",reader:currentReader})) return;
         if (!session || closeOperation || dialogs.closePromptVisible) return;
         const owner=closeTarget(index);
         if (!owner) return;
@@ -304,6 +373,7 @@ ApplicationWindow {
         if (wholeWindow) Qt.callLater(function () { root.close(); });
     }
     onClosing: function (event) {
+        if (secondaryRow==="edit" && contentController.deferAction({kind:"windowClose"})) {event.accepted=false;return;}
         cancelErase();
         if (closeOperation || dialogs.closePromptVisible) {event.accepted=false;return;}
         if (closeApproved)
@@ -432,6 +502,7 @@ ApplicationWindow {
     }
     property bool sidebarVisible: true
     property int currentPage: 0
+    onCurrentPageChanged: if (secondaryRow==="edit")contentController.reload()
 
     function navigate(page, y) {
         if (currentReader.pageCount === 0)
@@ -609,6 +680,17 @@ ApplicationWindow {
             pendingArtworkRequest = currentReader.submit("mark_create", {
                 entry: entry
             });
+        } else if (secondaryRow==="fill" && ["text","date","check","cross"].indexOf(fillTool)>=0) {
+            if(pendingArtworkRequest>=0)return;
+            const size=currentReader.pages[page],symbol=["check","cross"].indexOf(fillTool)>=0;
+            const width=Math.min(size.width,symbol ? 30 : 180),height=Math.min(size.height,symbol ? 32 : 50);
+            const left=Math.max(0,Math.min(size.width-width,x)),top=Math.max(0,Math.min(size.height-height,y));
+            if(symbol) {
+                const paths=fillTool==="check" ? [[{x:left+3,y:top+15},{x:left+11,y:top+24},{x:left+27,y:top+4}]] :
+                    [[{x:left+4,y:top+4},{x:left+26,y:top+26}],[{x:left+26,y:top+4},{x:left+4,y:top+26}]];
+                pendingArtworkRequest=currentReader.submit("mark_create",{entry:{kind:"ink",page:page,version:1,paths:paths,strokeWidth:2.5,color:fillColour(),note:""}});
+            } else pendingArtworkRequest=currentReader.submit("mark_create",{entry:{kind:"textBox",page:page,version:1,
+                rect:{x:left,y:top,width:width,height:height},fontSize:fillFontSize,color:fillColour(),note:fillText}});
         } else if (annotationTool === "stickyNote" || annotationTool === "textBox") {
             const size = currentReader.pages[page];
             const width = annotationTool === "stickyNote" ? 22 : Math.min(180, size.width);
@@ -738,6 +820,7 @@ ApplicationWindow {
     }
     function toggleForms() {
         if (blockXfaWrite()) return;
+        if(secondaryRow!=="fill")setSecondaryRow("fill");
         setTextViewEnabled(false);
         formToolActive = !formToolActive;
         if (formToolActive)
@@ -807,7 +890,9 @@ ApplicationWindow {
         setTextViewEnabled(false);
         overviewVisible = false;
         formToolActive = false;
-        annotationToolsVisible = true;
+        setSecondaryRow("fill");
+        if (secondaryRow!=="fill") return;
+        fillTool="stamp";
         annotationTool = "stamp";
         pendingStampStyle = style;
         selectedAnnotation = null;
@@ -826,7 +911,9 @@ ApplicationWindow {
         setTextViewEnabled(false);
         overviewVisible = false;
         formToolActive = false;
-        annotationToolsVisible = true;
+        setSecondaryRow("fill");
+        if (secondaryRow!=="fill") return false;
+        fillTool="signature";
         annotationTool = "signature";
         pendingSignatureImage = image;
         selectedAnnotation = null;
@@ -1043,6 +1130,7 @@ ApplicationWindow {
         dialogs.confirmDiscardPages();
     }
     function undo() {
+        if (secondaryRow==="edit" && contentController.deferAction({kind:"undo"})) return;
         if (markState.can_undo)
             currentReader.submit("marks_undo");
         else if (markState.can_page_undo) {
@@ -1051,6 +1139,7 @@ ApplicationWindow {
         }
     }
     function redo() {
+        if (secondaryRow==="edit" && contentController.deferAction({kind:"redo"})) return;
         if (markState.can_redo)
             currentReader.submit("marks_redo");
         else if (markState.can_page_redo) {
@@ -1060,6 +1149,7 @@ ApplicationWindow {
     }
     property bool printRequested: false
     function printDocument() {
+        if (secondaryRow==="edit" && contentController.deferAction({kind:"print"})) return;
         if (dialogs.annotationWriteError.length) {
             operationStatus = dialogs.annotationWriteError;
             printRequested = false;
@@ -1085,6 +1175,7 @@ ApplicationWindow {
     property var pendingSavePosition: null
     property var pendingDocumentSave: null
     function saveDocument(copy) {
+        if (secondaryRow==="edit" && contentController.deferAction({kind:"save",value:!!copy})) return;
         if (closeOperation || pendingDocumentSave) return;
         if (xfaReadOnly) {operationStatus=currentReader.data.xfa_status.read_only_reason;return;}
         if (pendingRedactions.length) {
@@ -1115,6 +1206,7 @@ ApplicationWindow {
         }
     }
     function chooseExport(kind) {
+        if (secondaryRow==="edit" && contentController.deferAction({kind:"export",value:kind})) return;
         if (["bibtex","markdown","csv"].indexOf(kind)<0 && blockXfaWrite()) return;
         exportKind = kind;
         exportContext = {
@@ -1438,12 +1530,7 @@ ApplicationWindow {
     }
     Shortcut {
         sequences: [StandardKey.Find]
-        onActivated: {
-            root.searchVisible = true;
-            const field = root.findSearchField();
-            if (field)
-                field.forceActiveFocus();
-        }
+        onActivated: root.focusSearch()
     }
     Shortcut {
         sequence: "Ctrl+D"
@@ -1457,10 +1544,16 @@ ApplicationWindow {
     Shortcut {
         sequence: "Ctrl+Tab"
         onActivated: if (root.session)
-            root.session.selectTab((root.session.activeIndex + 1) % root.session.tabs.length)
+            root.selectReaderTab((root.session.activeIndex + 1) % root.session.tabs.length)
+    }
+    function focusSearch() {
+        if (secondaryRow==="edit" && contentController.deferAction({kind:"search"})) return;
+        if (editInspectorVisible || fillInspectorVisible) setSecondaryRow("",true);
+        searchVisible=true;
+        Qt.callLater(function(){const field=findSearchField();if(field)field.forceActiveFocus();});
     }
     function findSearchField() {
-        return chromeSearchField;
+        return chromeSearchField && chromeSearchField.visible ? chromeSearchField : searchPane.field;
     }
     property var chromeSearchField: null
 
@@ -1598,6 +1691,16 @@ ApplicationWindow {
                 }
             }
         }
+        SecondaryTools {
+            id:secondaryTools
+            objectName:"secondaryTools"
+            app:root
+            visible:root.secondaryRow.length>0 && currentReader.pageCount>0 && !root.overviewVisible && !root.textViewVisible
+            Layout.fillWidth:true
+            Layout.preferredHeight:46
+            Layout.minimumHeight:46
+            Layout.maximumHeight:46
+        }
         DocumentDraftBar {
             app: root
             Layout.fillWidth: true
@@ -1609,13 +1712,13 @@ ApplicationWindow {
             ReaderSidebar {
                 objectName: "readerSidebar"
                 app: root
-                visible: root.sidebarVisible && currentReader.pageCount > 0 && !(root.searchVisible && root.width < 950) && !(root.aiPanelVisible && root.width < 1100)
+                visible: root.sidebarVisible && currentReader.pageCount > 0 && !(root.searchVisible && root.width < 950) && !((root.aiPanelVisible || root.editInspectorVisible || root.fillInspectorVisible) && root.width < 1100)
                 Layout.preferredWidth: root.width < 850 ? 210 : 246
                 Layout.fillHeight: true
             }
 
             Rectangle {
-                visible: root.sidebarVisible && currentReader.pageCount > 0 && !(root.searchVisible && root.width < 950) && !(root.aiPanelVisible && root.width < 1100)
+                visible: root.sidebarVisible && currentReader.pageCount > 0 && !(root.searchVisible && root.width < 950) && !((root.aiPanelVisible || root.editInspectorVisible || root.fillInspectorVisible) && root.width < 1100)
                 Layout.preferredWidth: 1
                 Layout.fillHeight: true
                 color: theme.separator
@@ -1647,14 +1750,6 @@ ApplicationWindow {
                     app: root
                     visible: root.overviewVisible && currentReader.pageCount > 0
                 }
-                AnnotationTools {
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    anchors.top: parent.top
-                    app: root
-                    visible: root.annotationToolsVisible && currentReader.pageCount > 0 && !root.overviewVisible
-                    z: 5
-                }
                 WelcomeView {
                     anchors.fill: parent
                     visible: currentReader.pageCount === 0
@@ -1673,10 +1768,19 @@ ApplicationWindow {
                     }
                 }
             }
+            ContentInspector {
+                objectName:"contentInspector";app:root;visible:root.editInspectorVisible
+                Layout.preferredWidth:Math.min(310,root.width*.4);Layout.fillHeight:true
+            }
+            FillSignInspector {
+                objectName:"fillSignInspector";app:root;visible:root.fillInspectorVisible
+                Layout.preferredWidth:Math.min(310,root.width*.4);Layout.fillHeight:true
+            }
             SearchPanel {
+                id:searchPane
                 objectName: "searchPanel"
                 app: root
-                visible: root.searchVisible && currentReader.pageCount > 0
+                visible: root.searchVisible && currentReader.pageCount > 0 && !root.editInspectorVisible && !root.fillInspectorVisible
                 Layout.preferredWidth: Math.min(280, root.width / 3)
                 Layout.fillHeight: true
             }
@@ -1926,7 +2030,7 @@ ApplicationWindow {
                     const refused = (result.erase_refused || []).length;
                     root.cancelErase();
                     root.operationStatus = changed ? qsTr("Cut %1 ink strokes into %2 pieces.").arg(changed).arg(result.erase_pieces || 0) : qsTr("No ink was changed.");
-                    if (changed) root.operationStatus += " " + (result.erase_requires_pdf_save ? qsTr("PDF ink cuts are staged. Save to PDF to keep them; Discard and Close restores the original ink.") : qsTr("Saved in the annotation sidecar; the PDF on disk is unchanged."));
+                    if (changed) root.operationStatus += " " + (result.erase_requires_pdf_save ? qsTr("PDF ink cuts are staged. Save to PDF to keep them; Discard and Close restores the original ink.") : qsTr("Saved in the application cache; the PDF on disk is unchanged."));
                     if (refused) root.operationStatus += " " + qsTr("Left %1 protected PDF ink strokes unchanged. Comments and reply threads are preserved.").arg(refused);
                 } else {
                     root.eraseDraft = result.hidden || [];
@@ -1940,11 +2044,11 @@ ApplicationWindow {
             if (id === root.pendingArtworkRequest) {
                 root.pendingArtworkRequest = -1;
                 if (!error.length) {
-                    root.annotationTool = "select";
-                    root.operationStatus = qsTr("Artwork placed. Saved in the annotation sidecar.");
+                    root.clearFillTool();
+                    root.operationStatus = qsTr("Placement cached. Save writes it into the PDF.");
                 }
             }
-            if ((op.indexOf("page_") === 0 && op !== "page_operation") || op === "document_save" || op === "document_discard") {
+            if ((op.indexOf("page_") === 0 && op !== "page_operation") || op === "content_stage" || op === "document_save" || op === "document_discard") {
                 root.pageEditBusy = false;
                 if (!error.length) {
                     const map = result.report ? result.report.page_map : null;
@@ -1984,7 +2088,7 @@ ApplicationWindow {
                     root.selectedAnnotation = root.annotations.find(function (a) {
                         return a.id === result.selected_id;
                     }) || null;
-                    if (root.selectedAnnotation && (root.selectedAnnotation.kind === "stickyNote" || root.selectedAnnotation.kind === "textBox"))
+                    if (root.secondaryRow!=="fill" && root.selectedAnnotation && (root.selectedAnnotation.kind === "stickyNote" || root.selectedAnnotation.kind === "textBox"))
                         dialogs.showAnnotation();
                 }
             } else if (op.indexOf("mark_") === 0 || op.indexOf("marks_") === 0) {
@@ -2038,7 +2142,7 @@ ApplicationWindow {
             else if (op === "save_merge")
                 root.operationStatus = qsTr("Merged %1 pages into %2. Appended outline entries not imported: %3.").arg(result.page_count).arg(result.destination_path).arg(result.dropped_outline_entries);
             else if (op === "save_split")
-                root.operationStatus = qsTr("Wrote %1 verified split PDFs with their annotation sidecars.").arg(result.parts.length);
+                root.operationStatus = qsTr("Wrote %1 verified split PDFs with their application caches.").arg(result.parts.length);
             else if (op === "save_redactions") {
                 root.annotationTool = "select";
                 root.operationStatus = qsTr("Verified redacted copy saved: %1 · %2 characters removed.").arg(result.destination_path).arg(result.removed_characters);

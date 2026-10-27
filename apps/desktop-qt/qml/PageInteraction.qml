@@ -44,7 +44,7 @@ Item {
         objectName: "pdfPointer"
         anchors.fill: parent
         acceptedButtons: Qt.LeftButton | Qt.RightButton
-        cursorShape: app.annotationTool === "select" || ["highlight", "underline", "strikeout"].indexOf(app.annotationTool) >= 0 ? Qt.IBeamCursor : Qt.CrossCursor
+        cursorShape: app.secondaryRow==="fill" && app.fillTool.length ? Qt.CrossCursor : app.annotationTool === "select" || ["highlight", "underline", "strikeout"].indexOf(app.annotationTool) >= 0 ? Qt.IBeamCursor : Qt.CrossCursor
         hoverEnabled: true
         property int start: -1
         property real pressX: 0
@@ -339,4 +339,5 @@ Item {
         app: annotationLayer.app
         page: annotationLayer.page
     }
+    ContentPageLayer {anchors.fill:parent;app:annotationLayer.app;page:annotationLayer.page;visible:app.secondaryRow==="edit" && app.canModifyPdf;z:20}
 }

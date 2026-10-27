@@ -82,18 +82,18 @@ ColumnLayout {
                         onClicked: {
                             forceActiveFocus();
                             if (app.session)
-                                app.session.selectTab(tab.index);
+                                app.selectReaderTab(tab.index);
                         }
                         Keys.onReturnPressed: if (app.session)
-                            app.session.selectTab(tab.index)
+                            app.selectReaderTab(tab.index)
                         Keys.onSpacePressed: if (app.session)
-                            app.session.selectTab(tab.index)
+                            app.selectReaderTab(tab.index)
                         Accessible.role: Accessible.PageTab
                         Accessible.name: modelData.title
                         Accessible.selectable: true
                         Accessible.selected: tab.selected
                         Accessible.onPressAction: if (app.session)
-                            app.session.selectTab(tab.index)
+                            app.selectReaderTab(tab.index)
                     }
                     Rectangle {
                         anchors.bottom: parent.bottom
@@ -148,7 +148,7 @@ ColumnLayout {
                 text: qsTr("Page overview")
                 selected: app.overviewVisible
                 enabled: app.currentReader.pageCount > 0
-                onClicked: app.overviewVisible = !app.overviewVisible
+                onClicked: app.showOverview()
             }
             LyraToolButton {
                 symbol: "view"
@@ -237,43 +237,46 @@ ColumnLayout {
                 objectName: "annotateButton"
                 symbol: "annotations"
                 text: qsTr("Annotate")
-                selected: app.annotationToolsVisible
-                display: app.width < 1100 ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
+                selected: app.secondaryRow === "annotate"
+                display: app.width < 1250 ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
                 enabled: app.canModifyPdf
-                onClicked: {
-                    app.overviewVisible = false;
-                    app.setTextViewEnabled(false);
-                    app.annotationToolsVisible = !app.annotationToolsVisible;
-                }
+                onClicked: app.toggleSecondaryRow("annotate")
             }
             LyraToolButton {
-                visible: app.width >= 1100
-                symbol: "pages"
-                text: qsTr("Page operations")
-                enabled: app.currentReader.pageCount > 0
-                onClicked: app.overviewVisible = !app.overviewVisible
+                objectName: "editPdfButton"
+                symbol: "pen"
+                text: qsTr("Edit")
+                selected: app.secondaryRow === "edit"
+                display: app.width < 1250 ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
+                enabled: app.canModifyPdf
+                onClicked: app.toggleSecondaryRow("edit")
             }
             LyraToolButton {
-                symbol: "export"
-                text: qsTr("Export and Save")
-                enabled: app.currentReader.pageCount > 0
-                onClicked: app.showExportMenu(this)
-            }
-            LyraToolButton {
-                visible: app.width >= 850
                 objectName: "fillSignButton"
                 symbol: "form"
                 text: qsTr("Fill & Sign")
-                selected: app.formToolActive
+                selected: app.secondaryRow === "fill"
+                display: app.width < 1250 ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
                 enabled: app.canModifyPdf
-                onClicked: app.toggleForms()
+                onClicked: app.toggleSecondaryRow("fill")
             }
             LyraToolButton {
-                visible: app.width >= 850
+                objectName: "exportButton"
+                symbol: "export"
+                text: qsTr("Export")
+                selected: app.secondaryRow === "export"
+                display: app.width < 1250 ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
+                enabled: app.currentReader.pageCount > 0
+                onClicked: app.toggleSecondaryRow("export")
+            }
+            LyraToolButton {
+                objectName: "lyraButton"
                 symbol: "ai"
-                text: qsTr("AI Assistant")
-                selected: app.aiPanelVisible
-                onClicked: app.showAiPanel(!app.aiPanelVisible)
+                text: qsTr("Lyra")
+                selected: app.secondaryRow === "lyra"
+                display: app.width < 1250 ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
+                enabled: app.currentReader.pageCount > 0
+                onClicked: app.toggleSecondaryRow("lyra")
             }
             LyraToolButton {
                 objectName: "moreCommands"
@@ -297,7 +300,7 @@ ColumnLayout {
                 MenuItem {
                     text: qsTr("Page operations")
                     enabled: app.currentReader.pageCount > 0
-                    onTriggered: app.overviewVisible = !app.overviewVisible
+                    onTriggered: app.showOverview()
                 }
                 MenuSeparator {}
                 MenuItem {
@@ -350,7 +353,14 @@ ColumnLayout {
             Item {
                 Layout.fillWidth: true
             }
+            LyraToolButton {
+                objectName:"searchButton"
+                visible:app.width<850
+                symbol:"search";text:qsTr("Search document (Ctrl+F)")
+                onClicked:app.focusSearch()
+            }
             TextField {
+                visible:app.width>=850
                 id: searchField
                 objectName: "searchField"
                 Layout.preferredWidth: app.width < 850 ? 120 : app.width < 1000 ? 135 : 220

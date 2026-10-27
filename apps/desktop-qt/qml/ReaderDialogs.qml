@@ -38,7 +38,7 @@ Item {
             textFormat: Text.PlainText
             width: Math.min(400, app.width - 80)
             wrapMode: Text.Wrap
-            text: app.closeNeedsReview(dialogs.closeReader) ? qsTr("Review the pending form values or note before closing. Discard removes the unsaved draft; Cancel keeps the document open.") : ((dialogs.closeReader && (dialogs.closeReader.data.signature_status || {}).signed) ? qsTr("Save an unsigned copy before closing, or discard the draft. The signed original stays unchanged.") : qsTr("Save changes to the PDF before closing, or discard the draft. Cancel keeps the document open."))
+            text: app.closeNeedsReview(dialogs.closeReader) ? qsTr("Review the pending edit before closing. Discard removes the unsaved draft; Cancel keeps the document open.") : ((dialogs.closeReader && (dialogs.closeReader.data.signature_status || {}).signed) ? qsTr("Save an unsigned copy before closing, or discard the draft. The signed original stays unchanged.") : qsTr("Save changes to the PDF before closing, or discard the draft. Cancel keeps the document open."))
         }
         onAccepted: app.beginCloseOperation("save",dialogs.closeReader,dialogs.closeIndex<0)
         onDiscarded: app.beginCloseOperation("discard",dialogs.closeReader,dialogs.closeIndex<0)
@@ -612,7 +612,7 @@ Item {
                             visible: modelData.kind === "text"
                             Accessible.name: modelData.name
                             Layout.fillWidth: true
-                            text: parent.draft && parent.draft.text !== null ? parent.draft.text : modelData.value || ""
+                            text: parent.draft && typeof parent.draft.text === "string" ? parent.draft.text : modelData.value || ""
                             enabled: modelData.editable
                             maximumLength: modelData.max_length || 32767
                             onTextEdited: app.updateFormValue(modelData.id, {
@@ -624,7 +624,7 @@ Item {
                         CheckBox {
                             visible: modelData.kind === "checkBox"
                             text: modelData.name
-                            checked: parent.draft && parent.draft.checked !== null ? parent.draft.checked : modelData.checked
+                            checked: parent.draft && typeof parent.draft.checked === "boolean" ? parent.draft.checked : !!modelData.checked
                             enabled: modelData.editable
                             function toggleField() {
                                 if (enabled)
@@ -648,7 +648,7 @@ Item {
                             Layout.fillWidth: true
                             model: modelData.options
                             textRole: "label"
-                            currentIndex: parent.draft && parent.draft.selected !== null ? parent.draft.selected : modelData.selected.length ? modelData.selected[0] : -1
+                            currentIndex: parent.draft && typeof parent.draft.selected === "number" ? parent.draft.selected : modelData.selected.length ? modelData.selected[0] : -1
                             enabled: modelData.editable
                             onActivated: app.updateFormValue(modelData.id, {
                                 text: null,

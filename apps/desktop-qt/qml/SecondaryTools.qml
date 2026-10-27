@@ -1,0 +1,56 @@
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+
+Item {
+    id:rows
+    required property var app
+    property alias fillTools:fill
+    implicitHeight:46
+    AnnotationTools {objectName:"annotationToolRow";anchors.fill:parent;app:rows.app;visible:app.secondaryRow==="annotate"}
+    FillSignTools {id:fill;objectName:"fillSignToolRow";anchors.fill:parent;app:rows.app;visible:app.secondaryRow==="fill"}
+    Rectangle {anchors.fill:parent;color:app.colors.panelBg;visible:["edit","export","lyra"].indexOf(app.secondaryRow)>=0}
+    RowLayout {
+        objectName:"editToolRow"
+        anchors.centerIn:parent;spacing:6
+        visible:app.secondaryRow==="edit"
+        LyraToolButton {objectName:"editTextTool";symbol:"free-text";text:qsTr("Text");display:AbstractButton.TextBesideIcon;selected:app.contentEditor.tool==="text";enabled:app.canModifyPdf;onClicked:app.contentEditor.arm("text")}
+        LyraToolButton {symbol:"view";text:qsTr("Image");display:AbstractButton.TextBesideIcon;selected:app.contentEditor.tool==="image";enabled:app.canModifyPdf;onClicked:app.contentEditor.arm("image")}
+        LyraToolButton {symbol:"arrow";text:qsTr("Link");display:AbstractButton.TextBesideIcon;selected:app.contentEditor.tool==="link";enabled:app.canModifyPdf;onClicked:app.contentEditor.arm("link")}
+        LyraToolButton {
+            id:redactButton
+            objectName:"editRedactTool"
+            symbol:"redact";text:qsTr("Redact");display:AbstractButton.TextBesideIcon
+            selected:["erase","blackout"].indexOf(app.contentEditor.tool)>=0;enabled:app.canModifyPdf
+            onClicked:redactMenu.popup(0,height)
+            Menu {
+                id:redactMenu
+                MenuItem {objectName:"contentBlackoutAction";text:qsTr("Blackout");onTriggered:app.contentEditor.arm("blackout")}
+                MenuItem {objectName:"contentEraseAction";text:qsTr("Erase");onTriggered:app.contentEditor.arm("erase")}
+            }
+        }
+        ToolSeparator {}
+        LyraToolButton {symbol:"pages";text:qsTr("Page operations");enabled:app.canModifyPdf;onClicked:app.showOverview()}
+        LyraToolButton {symbol:"undo";text:qsTr("Undo");enabled:!!app.markState.can_page_undo || !!app.markState.can_undo;onClicked:app.undo()}
+        LyraToolButton {symbol:"redo";text:qsTr("Redo");enabled:!!app.markState.can_page_redo || !!app.markState.can_redo;onClicked:app.redo()}
+    }
+    RowLayout {
+        objectName:"exportToolRow"
+        anchors.centerIn:parent;spacing:6
+        visible:app.secondaryRow==="export"
+        Button {text:qsTr("Save");enabled:app.canModifyPdf && app.currentReader.hasUnsavedChanges;onClicked:app.saveDocument(false)}
+        Button {text:qsTr("Save As…");enabled:app.canModifyPdf;onClicked:app.saveDocument(true)}
+        Button {text:app.width<1000 ? qsTr("Annotated…") : qsTr("Annotated Copy…");enabled:app.canModifyPdf;onClicked:app.chooseExport("annotations")}
+        Button {text:qsTr("Annotations…");onClicked:app.showExportMenu(this)}
+        Button {text:qsTr("Print…");onClicked:app.printDocument()}
+    }
+    RowLayout {
+        objectName:"lyraToolRow"
+        anchors.centerIn:parent;spacing:6
+        visible:app.secondaryRow==="lyra"
+        LyraToolButton {symbol:"ai";text:qsTr("Assistant");display:AbstractButton.TextBesideIcon;selected:app.aiPanelVisible;onClicked:app.showAiPanel(!app.aiPanelVisible)}
+        Button {text:qsTr("Ask about Selection");enabled:!!app.selection;onClicked:app.showSidebar("ai")}
+        Button {text:qsTr("AI Settings…");onClicked:app.showSettings()}
+    }
+    Rectangle {anchors.bottom:parent.bottom;width:parent.width;height:1;color:app.colors.separator}
+}

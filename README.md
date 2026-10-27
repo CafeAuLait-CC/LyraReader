@@ -40,6 +40,12 @@ Discard clears known drafts while preserving foreign cache records. Pending ink 
 their replacement strokes recover together after an interrupted process. Several newer macOS
 features are still being ported. XFA documents keep local reading bookmarks; PDF editing and
 derivative exports are refused, including forms selected as merge inputs.
+The five exclusive secondary rows are Annotate, Edit, Fill & Sign, Export and Lyra. The Edit row
+stages actual text/object/link edits through the shared typed commands and recoverable transaction;
+failed or superseded text drafts remain available to copy or retry. Redact → Blackout/Erase removes
+PDF content and asks explicitly before a fallback replaces an entire page with an image. Fill & Sign
+places text, dates, vector checkmarks/crosses, stamps and image signatures; other signature methods,
+image crop/export and the newer AI overlays remain work in progress.
 The Linux branch is not yet a release or a claim of full feature parity.
 
 ## Capabilities

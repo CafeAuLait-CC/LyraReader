@@ -5,6 +5,7 @@ import QtQuick.Layouts
 Pane {
     id: panel
     required property var app
+    property alias field: query
     padding: 10
     background: Rectangle {
         color: app.colors.panelBg
@@ -25,6 +26,8 @@ Pane {
             }
         }
         TextField {
+            id:query
+            objectName:"panelSearchField"
             Layout.fillWidth: true
             Accessible.name: qsTr("Search document")
             placeholderText: qsTr("Search document")
