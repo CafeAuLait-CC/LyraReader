@@ -783,6 +783,14 @@ struct ReaderChecks {
             print("Canvas-clear checks passed")
             return
         }
+        // The direct-invalidation regression on its own while it is being worked on: it needs a
+        // presentable surface, so it is kept runnable outside the full suite.
+        if CommandLine.arguments.contains("--check-canvas-commit") {
+            let root = checkRoot(CommandLine.arguments.dropFirst().first)
+            try await canvasCommitChecks(source: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
+            print("Canvas-commit checks passed")
+            return
+        }
         let root = checkRoot(CommandLine.arguments.dropFirst().first)
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("lyra-reader-checks-\(UUID())")
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
@@ -875,6 +883,11 @@ struct ReaderChecks {
                 try await coldClickChecks(
                     citationsURL: root.appendingPathComponent("tests/fixtures/two-column-references.pdf"),
                     mentionsURL: root.appendingPathComponent("tests/fixtures/cross-references.pdf"))
+            }),
+            ("startup-prefetch", {
+                // Pure shell ordering: a controlled engine holds the first visible page raster
+                // open and records whether any offscreen index scan was requested behind it.
+                try await startupPrefetchChecks(url: b)
             }),
             ("screen-page", {
                 try await screenPageChecks(url: b)
@@ -1269,6 +1282,13 @@ struct ReaderChecks {
             }),
             ("frame-scheduling", {
                 try await frameSchedulingChecks()
+            }),
+            ("canvas-commit", {
+                // The presentation-path fix: a model commit must draw before the SwiftUI
+                // publish returns, with the same chrome geometry and sharp stamp, and the
+                // following update must not draw a second frame. Registered with the surface
+                // checks because it needs a window wgpu will actually present.
+                try await canvasCommitChecks(source: a)
             }),
             ("perf-trace", {
                 // The measurement layer itself: a synthetic wheel scroll through the real

@@ -587,6 +587,12 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
         didSet { refreshTranslationPaperColors() }
     }
     private var canvasTiles: [CanvasPage] = []
+    /// The canvas drawing this window's page list, registered by ``PDFCanvasView``.
+    ///
+    /// Weak, because the window owns the view. ``reloadVisiblePages()`` tells it that the commit
+    /// has landed so it can submit the frame before the SwiftUI publish reaches `updateNSView`;
+    /// a window whose canvas has not attached yet simply keeps the old path.
+    package weak var attachedCanvas: MetalCanvasView?
     /// Scroll offset in content points; 0 is the top of the first page.
     @Published public internal(set) var scrollYPt: CGFloat = 0
     /// True while the user is scrolling, so the indicator stays on screen.
@@ -823,6 +829,26 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     private static let renderStatsEnabled =
         ProcessInfo.processInfo.environment["LYRA_READER_RENDER_STATS"] == "1"
     private var pendingTiles: [(TileKey, PagePlacement)] = []
+    /// A tile finished and its bytes are already in the cache, but the canvas page list has not
+    /// been rebuilt for it yet.
+    ///
+    /// Several tiles can finish inside one run-loop turn at deep zoom. Rebuilding the plan,
+    /// reassembling every page quad and republishing the page list once per tile makes the main
+    /// actor the throughput limit instead of PDFium; these three flags let one drain commit the
+    /// whole burst while the cache insert itself still happens immediately (so a viewport update
+    /// between the completion and the drain cannot queue the same tile twice).
+    private var tileCommitDirty = false
+    /// One main-queue drain is already scheduled for the pending commit.
+    private var tileCommitScheduled = false
+    /// A failed tile needs the startup gate checked once the burst has been drained.
+    private var tileCommitNeedsStartupCheck = false
+    /// The tiles the current band shows on screen, by page.
+    ///
+    /// Only the adaptive-flush test reads this: when a finished tile has just made every
+    /// on-screen tile of its page present, waiting for the rest of the burst would hold the page
+    /// back for up to one coalescing window. The set is rebuilt by every viewport update, like
+    /// `wantedTiles`.
+    private var visibleTileKeysByPage: [Int: Set<TileKey>] = [:]
 
     // MARK: Performance trace state (`LYRA_READER_PERF_TRACE=1`)
     //
@@ -2817,6 +2843,25 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var references: [Reference] = []
     private var referencesLoadCompleted = false
 
+    /// Document-wide indexes that no reader can see while the first page is still being
+    /// rasterised, held back until a visible raster has been produced.
+    ///
+    /// The engine runs every PDFium operation on one serial queue, and citations, the caption
+    /// index and the reference list are document-wide scans: on a 115-page paper they occupied
+    /// that queue for hundreds of milliseconds *ahead* of the first page and sidebar thumbnail,
+    /// which are the only content on screen. Deferring them changes when that offscreen work
+    /// runs, not what is drawn. The optional is the gate: `nil` means the normal path where
+    /// every loader starts immediately (checks, tab switches after the first raster, older
+    /// callers). `beginStartupPrefetchDeferral()` arms it for one open and
+    /// `releaseStartupPrefetch()` runs the loaders that were skipped, once.
+    private struct DeferredStartupPrefetch {
+        var references = false
+        var figures = false
+        var citations = false
+        var captionMentions = false
+    }
+    private var deferredStartupPrefetch: DeferredStartupPrefetch?
+
     /// `Figure 3` / `Table 2` mentions per page, and the document's caption index.
     ///
     /// Mentions are keyed by `(kind, label)`, which is exactly how `figures` is looked up:
@@ -3079,6 +3124,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         wantedTiles.removeAll()
         lastTilePlan = nil
         pendingTiles = []
+        // Stale completions are dropped by the render epoch; a commit that was already queued
+        // belongs to the page list this call is replacing.
+        tileCommitDirty = false
+        tileCommitNeedsStartupCheck = false
+        visibleTileKeysByPage = [:]
         failedTiles = []
         pagePreviews = [:]
         pagePreviewScales = [:]
@@ -3750,6 +3800,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 pageEditIsApplied = false
             }
             document = loaded
+            // The visible page raster and the sidebar thumbnail are created by the reload below;
+            // document-wide click/AI indexes are not on screen yet and must not occupy the
+            // engine's serial queue ahead of them.
+            beginStartupPrefetchDeferral()
             DocumentEditCache.adopt(documentId: loaded.documentId, for: url)
             lastError = nil
             recoverableErrorBanner = nil
@@ -3805,6 +3859,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             loadRegionHistory(for: url)
             refreshTranslationPaperColors()
             inPlaceTranslation.loadDocument(url: url, pageCount: loaded.pageCount)
+            // A document with no pages, or one whose viewport asked for neither a page raster
+            // nor a tile, has no visible raster completion to wait for.
+            releaseStartupPrefetchIfNoVisibleWork()
             return true
 
         } catch {
@@ -3906,6 +3963,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         referencesLoadCompleted = false
         figuresLoadCompleted = false
         figuresLoadTask = nil
+        // A previous document's deferred scans must not run against the new one.
+        deferredStartupPrefetch = nil
         metadataLoadCompleted = false
         documentAnnotationsLoadCompleted = false
         isRestoringDocument = false
@@ -12421,6 +12480,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Called from `reloadVisiblePages`, so a page that has just been scrolled into view gets
     /// its mentions before the pointer can reach them; the cache makes the repeated calls free.
     private func loadCaptionMentions() {
+        if deferStartupPrefetch(\.captionMentions) { return }
         for placement in visiblePagePlacements where captionMentionsByPage[placement.index] == nil {
             guard !captionMentionsInFlight.contains(placement.index) else { continue }
             captionMentionsInFlight.insert(placement.index)
@@ -12440,8 +12500,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// Loads the figure/table caption index once per open document (see `open(url:)`).
-    private func loadFigures() {
+    ///
+    /// `force` lets a reader action that is waiting on the index (a region selection or a figure
+    /// click made before the first page raster completes) bypass the startup gate: the scan is
+    /// then visible work, because its result decides what that action draws.
+    private func loadFigures(force: Bool = false) {
         guard !figuresLoadCompleted else { return }
+        if !force, deferStartupPrefetch(\.figures) { return }
         figuresLoadCompleted = true
         let epoch = documentEpoch
         let task = Task { @MainActor [weak self] in
@@ -12466,6 +12531,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// figure because the answer had not arrived. The scan always completes (a failure yields an
     /// empty list), so this cannot hang on a broken document.
     func awaitFiguresForPlacement() async {
+        // A reader can start a region selection before the startup gate released the index.
+        // The placement depends on this scan, so it is visible work here: start it now rather
+        // than awaiting a task that was never created.
+        if figuresLoadTask == nil, !figuresLoadCompleted {
+            loadFigures(force: true)
+        }
         await figuresLoadTask?.value
     }
 
@@ -12537,6 +12608,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Fetches the citations of every visible page, so a click resolves immediately.
     private func loadCitations() {
+        if deferStartupPrefetch(\.citations) { return }
         for placement in visiblePagePlacements where citationsByPage[placement.index] == nil {
             startCitationLoad(page: placement.index)
         }
@@ -12570,6 +12642,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Loads the reference list once (it never changes for an open document).
     private func loadReferences() {
         guard !referencesLoadCompleted else { return }
+        if deferStartupPrefetch(\.references) { return }
         referencesLoadCompleted = true
         let epoch = documentEpoch
         Task { @MainActor [weak self] in
@@ -12582,6 +12655,66 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 Data("lyra-reader-references: \(self.references.count) entries\n".utf8)
             )
         }
+    }
+
+    /// Records one offscreen document-wide scan for the startup gate.
+    ///
+    /// Returns `true` while the gate is armed, so the caller can return without starting the
+    /// scan. The flag is a `WritableKeyPath` into the small pending record rather than five
+    /// near-identical accessors; the engine call itself is unchanged when the gate is `nil`.
+    private func deferStartupPrefetch(
+        _ pending: WritableKeyPath<DeferredStartupPrefetch, Bool>
+    ) -> Bool {
+        guard var deferred = deferredStartupPrefetch else { return false }
+        deferred[keyPath: pending] = true
+        deferredStartupPrefetch = deferred
+        return true
+    }
+
+    /// Arms the startup gate for one document open.
+    private func beginStartupPrefetchDeferral() {
+        deferredStartupPrefetch = DeferredStartupPrefetch()
+    }
+
+    /// Runs the scans the gate held back. Called once the first visible raster has been folded in,
+    /// or immediately when there is no visible raster to wait for.
+    private func releaseStartupPrefetch() {
+        guard let deferred = deferredStartupPrefetch else { return }
+        deferredStartupPrefetch = nil
+        if deferred.references { loadReferences() }
+        if deferred.figures { loadFigures() }
+        if deferred.citations { loadCitations() }
+        if deferred.captionMentions { loadCaptionMentions() }
+    }
+
+    /// Ends the startup deferral early for a surface the reader just opened.
+    ///
+    /// The AI panel reads the reference list and the summary coverage, so showing it makes that
+    /// work visible; it no longer has to wait for the first page raster. A no-op when the gate is
+    /// already released or was never armed.
+    public func resumeDeferredStartupPrefetch() {
+        releaseStartupPrefetch()
+    }
+
+    /// Releases the gate if the open produced no visible raster at all (a document with no pages,
+    /// or a viewport that asks for neither a page raster nor a tile). Without this the deferred
+    /// scans would wait for a completion that cannot happen.
+    private func releaseStartupPrefetchIfNoVisibleWork() {
+        guard deferredStartupPrefetch != nil else { return }
+        guard pagePreviewInFlight == nil,
+              pendingTiles.isEmpty,
+              tilesInFlight.isEmpty
+        else { return }
+        releaseStartupPrefetch()
+    }
+
+    /// An on-screen page became fully sharp in the committed page list. The first one ends the
+    /// startup deferral; later calls are a cheap optional test. The whole-page path reaches this
+    /// after one raster; the 400% tile path waits for its first complete page so the remaining
+    /// visible tiles are not pushed behind the deferred scans.
+    private func noteFirstSharpVisiblePage() {
+        guard deferredStartupPrefetch != nil else { return }
+        releaseStartupPrefetch()
     }
 
     /// Loads the recognised metadata once per open document.
@@ -14368,6 +14501,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// to promise this retention removed a "visible diagonal sweep" of preview plus tiles,
     /// which overstates what the base did.
     public func reloadVisiblePages() {
+        // A full rebuild reads the cache as it is now, so it already includes every tile whose
+        // completion queued this drain; the queued block will find nothing left to commit.
+        tileCommitDirty = false
         // Any explicit rebuild supersedes a width-only rebuild that was waiting to settle.
         pendingViewportReload?.cancel()
         pendingViewportReload = nil
@@ -14377,6 +14513,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             canvasTiles = []
             contentHeightPt = 0
             lastTilePlan = nil
+            visibleTileKeysByPage = [:]
+            invalidateCanvasForModelCommit()
             return
         }
 
@@ -14465,6 +14603,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // The shell cannot produce an invalid request; report it rather than draw a
             // fabricated plan. The previous canvas stays as it was.
             lastTilePlan = nil
+            visibleTileKeysByPage = [:]
             lastError = "Tile plan rejected: invalid viewport geometry"
             return
         }
@@ -14519,16 +14658,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         schedulePagePreview()
         var pages: [CanvasPage] = []
         var bandReport = BandReport()
+        var visibleKeysByPage: [Int: Set<TileKey>] = [:]
         // Tiles this update missed, with the placement the plan named. They are queued after the
         // page assembly, in the plan's submission order.
         var missedTiles = Set<TileKey>()
         var tilePlacements: [TileKey: PagePlacement] = [:]
         var queuedTiles: [TilePlanSnapshot.Tile] = []
-        // Trace-only: which on-screen pages the committed page list covers at target sharpness.
-        // `nil` (no allocation) whenever the trace is off.
-        let perfOnScreen: Set<Int>? = PerfTrace.enabled
-            ? Set(onScreen.map(\.placement.index)) : nil
+        // Which pages the reader can actually see. The trace uses the same set, but the startup
+        // gate needs it whether or not the trace is enabled.
+        let onScreenPageIndices = Set(onScreen.map(\.placement.index))
+        let perfOnScreen: Set<Int>? = PerfTrace.enabled ? onScreenPageIndices : nil
         var perfSharpSources: [Int: String]? = perfOnScreen == nil ? nil : [:]
+        // At least one on-screen page is fully covered by a sharp source in the page list that
+        // is about to be committed. This is the point where the startup gate releases the
+        // document-wide index scans that were held behind the visible page.
+        var anyOnScreenPageSharp = false
 
         for span in band {
             let placement = span.placement
@@ -14555,6 +14699,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     }
                     if let perfOnScreen, perfOnScreen.contains(placement.index), pageSharp {
                         perfSharpSources?[placement.index] = "page-raster"
+                    }
+                    if pageSharp, onScreenPageIndices.contains(placement.index) {
+                        anyOnScreenPageSharp = true
                     }
                     continue
                 }
@@ -14594,6 +14741,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                                      width: tilePlacement.widthPt, height: tilePlacement.heightPt),
                         viewport: viewport
                     )
+                    if classOf == .visible {
+                        visibleKeysByPage[placement.index, default: []].insert(key)
+                    }
 
                     if let cached = tileCache.image(for: key) {
                         rowReady.append(CanvasPage(placement: tilePlacement, image: cached))
@@ -14644,7 +14794,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             if let perfOnScreen, perfOnScreen.contains(placement.index), complete {
                 perfSharpSources?[placement.index] = "tile"
             }
+            if complete, onScreenPageIndices.contains(placement.index) {
+                anyOnScreenPageSharp = true
+            }
         }
+        visibleTileKeysByPage = visibleKeysByPage
         // Submit in the plan's order: visible tiles first, then the ring by distance. The
         // planner's sort is stable, so equal distances keep the band's page/row/column order —
         // the same order the shell's own sort produced before the plan moved to Rust.
@@ -14675,6 +14829,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // complementary source rectangles.
         pages = applyPageTears(to: pages)
         canvasPages = pages
+        if anyOnScreenPageSharp {
+            // The first page the reader can see is fully covered by its sharp source in the
+            // committed list. Work that is not on screen (references, citations, caption
+            // mentions) may now use the serial queue.
+            noteFirstSharpVisiblePage()
+        }
         if let perfOnScreen, let perfSharpSources {
             finishPerfViewport(pages: pages, sharpSources: perfSharpSources, onScreen: perfOnScreen,
                                path: usesScreenPageRasters ? "page-raster" : "tile", lod: lod,
@@ -14687,6 +14847,24 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             wanted: wanted.count, scheduled: pendingTiles.count, band: bandReport,
             ringVh: ringVh, lod: lod, tilePt: tilePt, pages: pages.count
         )
+        // The commit is complete: page list, viewport transform, chrome geometry and (with the
+        // trace on) the sharp stamp all belong to the same moment. Draw it now through the
+        // canvas's existing interaction path instead of waiting for the SwiftUI publish and
+        // `updateNSView` hop that used to add 6-16 ms plus the coalesced main-queue job.
+        invalidateCanvasForModelCommit()
+    }
+
+    /// Tells the attached canvas that a model commit has landed, so it can submit that commit's
+    /// frame inside the same CATransaction as the chrome instead of after the next SwiftUI pass.
+    ///
+    /// The canvas applies ``CanvasModelCommit`` — exactly the values `PDFCanvasView.configure`
+    /// will apply on that pass — and then reuses `syncInteraction`, the wheel handler's path.
+    /// Nothing about `renderFrame`, `presentsWithTransaction`, the transaction itself or the
+    /// drawable count changes. A commit that changed nothing visible leaves the canvas'
+    /// `needsRender` false and submits no frame; the canvas' coalescing job also makes the
+    /// following SwiftUI pass a no-op rather than a second draw.
+    private func invalidateCanvasForModelCommit() {
+        attachedCanvas?.applyModelCommit()
     }
 
     /// Where one wanted tile sits relative to what the viewport shows. The band HUD reports
@@ -15877,6 +16055,64 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
+    /// Coalesces the page-list commit for one burst of finished tiles.
+    ///
+    /// The bitmap is already in `tileCache` when this is called, so the cache is never behind
+    /// the scheduler; only the plan rebuild, page assembly, texture sync and SwiftUI publish
+    /// wait for the next main-queue turn. That is what lets several completions share one
+    /// `reloadVisiblePages` pass instead of paying for a whole viewport update each.
+    private func scheduleTileCommit(startupCheck: Bool = false) {
+        tileCommitDirty = true
+        if startupCheck { tileCommitNeedsStartupCheck = true }
+        guard !tileCommitScheduled else { return }
+        tileCommitScheduled = true
+        // Wait a fraction of a frame instead of merely the next main-queue turn: the two raster
+        // slots finish a tile every few milliseconds at deep zoom, so an immediate block would
+        // still run once per tile and coalesce nothing. Half a 120 Hz refresh bounds the delay
+        // below one 60 Hz frame, which is the progressive-appearance budget this path accepts.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.tileCommitCoalescingDelay) {
+            [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.tileCommitScheduled = false
+                self.drainTileCommits()
+            }
+        }
+    }
+
+    /// Upper bound on how long a finished tile waits for the rest of its burst.
+    private static let tileCommitCoalescingDelay: TimeInterval = 1.0 / 120.0
+
+    /// Whether this completion has just made every on-screen tile of its page present.
+    ///
+    /// The coalescing window is bounded to one frame, but the *last* missing tile of a page is
+    /// the one that turns that page sharp. Holding exactly that tile for the rest of the window
+    /// adds the window to the tail latency for no batching benefit, so the caller commits it
+    /// immediately. Off-screen ring tiles and partial page bursts still share one drain.
+    private func tileCompletionSharpensPage(_ key: TileKey) -> Bool {
+        guard let visible = visibleTileKeysByPage[key.page], visible.contains(key) else {
+            return false
+        }
+        return visible.allSatisfy { tileCache.contains($0) }
+    }
+
+    /// Commits every tile that finished since the last viewport update in one pass.
+    ///
+    /// A synchronous `reloadVisiblePages` (a scroll, a resize, a zoom) already read the cache
+    /// after those inserts and clears `tileCommitDirty`, so the drain has nothing to redraw in
+    /// that case; it still runs the startup-gate check a failed tile asked for.
+    private func drainTileCommits() {
+        let needsStartupCheck = tileCommitNeedsStartupCheck
+        tileCommitNeedsStartupCheck = false
+        guard tileCommitDirty else {
+            if needsStartupCheck { releaseStartupPrefetchIfNoVisibleWork() }
+            return
+        }
+        tileCommitDirty = false
+        reloadVisiblePages()
+        if needsStartupCheck { releaseStartupPrefetchIfNoVisibleWork() }
+    }
+
     private func startTile(_ key: TileKey, placement: PagePlacement) {
         tilesInFlight.insert(key)
 
@@ -15927,7 +16163,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                                                generation: image.generation)
                 }
                 self.tileCache.insert(image, for: key)
-                self.reloadVisiblePages()
+                // Keep the byte budget and the eviction order exactly as the old
+                // insert→reload→evict sequence did. Only the page-list rebuild is coalesced:
+                // evicting here also keeps the cache inside the budget while the drain waits.
+                self.evictTiles()
+                self.pumpTiles()
+                if self.tileCompletionSharpensPage(key) {
+                    // This was the last on-screen tile of its page; do not hold the page-sharp
+                    // commit for the rest of the coalescing window.
+                    self.tileCommitDirty = false
+                    self.reloadVisiblePages()
+                } else {
+                    self.scheduleTileCommit()
+                }
             } catch {
                 guard epoch == self.renderEpoch else { return }
                 self.tilesInFlight.remove(key)
@@ -15942,7 +16190,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                                    offsetPt: self.scrollYPt,
                                    detail: String(describing: error))
                 }
-                self.reloadVisiblePages()
+                // The failed slot is free now, so the next queued tile can start without
+                // waiting for the coalesced commit. The startup gate is checked after that
+                // commit, because that is where a successfully sharp page would release it.
+                self.pumpTiles()
+                self.scheduleTileCommit(startupCheck: true)
             }
         }
     }
@@ -16165,6 +16417,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             }
             self.pagePreviewInFlight = nil
             self.reloadVisiblePages()
+            // On success the reload above released the gate when the page became sharp. A
+            // failure (or a page whose raster was rejected) must not strand the deferred scans
+            // when no other visible raster is pending.
+            self.releaseStartupPrefetchIfNoVisibleWork()
         }
     }
 

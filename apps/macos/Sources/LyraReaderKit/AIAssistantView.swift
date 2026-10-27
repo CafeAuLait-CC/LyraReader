@@ -13,15 +13,21 @@ public struct AIAssistantPanel: View {
     @ObservedObject private var chatGPT: ChatGPTAccountStore
     @ObservedObject private var audit: AIAuditTrail
     @State private var confirmingAuditClear = false
+    /// The right-hand drawer keeps its content in the hierarchy at zero width (an answer must
+    /// survive closing it). That means `onAppear` also runs while the panel is hidden, and a
+    /// summary refresh there scans the document on the serial raster queue ahead of the first
+    /// visible page. `isActive` gates that hidden preload; becoming visible attaches at once.
+    private let isActive: Bool
 
     private var displaysCurrentRequest: Bool {
         guard let action = model.plan?.action else { return true }
         return (action == .translateSelection) == (model.selectedTab == .translation)
     }
 
-    public init(state: AppState, model: AIAssistantModel) {
+    public init(state: AppState, model: AIAssistantModel, isActive: Bool = true) {
         self.state = state
         self.model = model
+        self.isActive = isActive
         _settings = ObservedObject(wrappedValue: model.settings)
         _chatGPT = ObservedObject(wrappedValue: model.settings.chatGPT)
         _audit = ObservedObject(wrappedValue: model.audit)
@@ -99,7 +105,8 @@ public struct AIAssistantPanel: View {
         .background(LyraReaderTheme.panelBg)
         .buttonStyle(ReaderPanelButtonStyle())
         .textFieldStyle(ReaderPanelFieldStyle())
-        .onAppear(perform: sync)
+        .onAppear { if isActive { sync() } }
+        .onChange(of: isActive) { _, active in if active { sync() } }
         .onChange(of: state.document?.id) { _, _ in sync() }
         .onChange(of: state.outline.count) { _, _ in syncLayered() }
     }
@@ -702,6 +709,10 @@ public struct AIAssistantPanel: View {
     }
 
     private func sync() {
+        guard isActive else { return }
+        // Opening the panel makes the reference list and summary coverage visible work; stop
+        // waiting for the first page raster to release them.
+        state.resumeDeferredStartupPrefetch()
         model.attach(service: state.aiChatService, context: state.aiReaderContext)
         syncLayered()
     }
@@ -710,6 +721,7 @@ public struct AIAssistantPanel: View {
     /// attached again when its entry count changes. The model ignores a repeated attach for the
     /// same document and outline.
     private func syncLayered() {
+        guard isActive else { return }
         model.layeredSummary.attach(
             service: state.aiChatService,
             context: state.aiReaderContext,
@@ -724,10 +736,15 @@ public struct AIAssistantPanel: View {
 public struct AIAssistantRightPanelContent: View {
     @ObservedObject private var state: AppState
     @ObservedObject private var model: AIAssistantModel
+    /// Whether the drawer currently occupies width. It stays in the hierarchy at zero width so a
+    /// conversation is not discarded when the panel closes; the summary tab must not preload
+    /// document-wide scans while it is clipped away.
+    private let isActive: Bool
 
-    public init(state: AppState, model: AIAssistantModel) {
+    public init(state: AppState, model: AIAssistantModel, isActive: Bool = true) {
         self.state = state
         self.model = model
+        self.isActive = isActive
     }
 
     public var body: some View {
@@ -750,7 +767,7 @@ public struct AIAssistantRightPanelContent: View {
                 AIRegionHistoryView(state: state, aiAssistant: model)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                AIAssistantPanel(state: state, model: model)
+                AIAssistantPanel(state: state, model: model, isActive: isActive)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

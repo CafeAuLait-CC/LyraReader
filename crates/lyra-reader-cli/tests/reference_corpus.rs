@@ -31,8 +31,8 @@ fn sample_citations_resolve_to_bibliography_entries() {
     // These are coverage floors, not precision/recall scores: detection also has
     // false positives (e.g. a conference/year in parentheses). Check identities below.
     for (prefix, minimum_hits) in [
-        ("2022-04-05", 0),
-        ("Candidacy", 0),
+        ("CR2", 0),
+        ("CR1", 0),
         ("Dvoro", 9),
         ("Pan", 25),
         ("Wang et al. - 2025 - InstructAvatar", 25),
@@ -160,7 +160,7 @@ fn sample_citations_resolve_to_bibliography_entries() {
             );
             assert!(references.iter().all(|e| e.page == 8));
         }
-        if prefix == "Candidacy" {
+        if prefix == "CR1" {
             assert_eq!(
                 references.len(),
                 185,

@@ -717,8 +717,8 @@ fn default_pages() -> Vec<(PathBuf, u32)> {
     };
     [
         ("manuscript_0925.pdf", 2),
-        ("2022-04-05 QualifyExam_Peizhi.pdf", 4),
-        ("Candidacy Report - Ghaith Chrit.pdf", 4),
+        ("CR2.pdf", 4),
+        ("CR1.pdf", 4),
         (
             "[HumanML3D] Guo_Generating_Diverse_and_Natural_3D_Human_Motions_From_Text_CVPR_2022_paper.pdf",
             1,
