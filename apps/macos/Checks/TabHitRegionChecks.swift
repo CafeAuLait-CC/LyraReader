@@ -5,18 +5,17 @@ import SwiftUI
 
 /// The window-ownership checks for the 44 pt tab row.
 ///
-/// A tab drag is started by the native input view that covers the tab; the window itself is
-/// dragged by AppKit from any point whose hit view allows a background drag. Those two decisions
-/// are made at different levels, so the title/padding checks in `TabPointerChecks` (which call a
-/// tab input's `mouseDown` directly) cannot see a press that AppKit takes for the window before
-/// the tab input is asked. This check builds the real hierarchy — a `.fullSizeContentView` window
-/// configured by `ReaderSession`, `ReaderTitlebarLayout` attached, an `NSHostingView` with the real
-/// `TabStrip` — and dispatches every press through `window.sendEvent`.
+/// The native titlebar can move asynchronously even when a tab input receives the gesture and
+/// reports `mouseDownCanMoveWindow == false`. Direct input calls and a `performDrag` override
+/// cannot observe that Window Server path. Assert that native movement is disabled before any
+/// press, and that the row is at the actual window top. This check hosts a `.fullSizeContentView`
+/// window configured by `ReaderSession`, with `ReaderTitlebarLayout` attached and an
+/// `NSHostingView` containing the real `TabStrip`, and dispatches presses through `window.sendEvent`.
 ///
 /// The positive control is the explicit `ReaderWindowDragArea`: `performDrag(with:)` hands the
 /// actual move to the Window Server and returns immediately, so a headless check cannot observe a
 /// moved frame. The check therefore records both the window's `performDrag(with:)` call (the same
-/// call the real window receives for a background drag) and `ReaderTitlebarDragView.mouseDownHook`
+/// explicit call the real window receives) and `ReaderTitlebarDragView.mouseDownHook`
 /// (a test-only seam that says the explicit drag area received the press). All other regions must
 /// produce neither.
 extension ReaderChecks {
@@ -96,7 +95,7 @@ extension ReaderChecks {
                 TabStrip(state: state)
                     .padding(.leading, TabRowLayout.tabStripLeadingInset)
                     .background(LyraReaderTheme.tabbarBg)
-                Color.clear.frame(height: 120)
+                Spacer(minLength: 0)
             }.ignoresSafeArea(.container, edges: .top)))
             window.contentView = host
             let session = ReaderSession(state: state, registry: registry)
@@ -150,6 +149,8 @@ extension ReaderChecks {
             let tabFrames = hostedInputs.map(frameInWindow)
             let row = tabFrames.dropFirst().reduce(tabFrames[0]) { $0.union($1) }
             let rowMid = row.midY
+            expect(abs(row.maxY - host.convert(host.bounds, to: nil).maxY) < 1,
+                   "the tab row is flush with the window top, as in ReaderWindowRoot (row \(row), host \(host.convert(host.bounds, to: nil)))")
             let stripStart = TabRowLayout.tabStripLeadingInset
             let stripEnd = window.contentView!.bounds.width
             guard let drag = dragView(host) else { fatalError("FAIL: the explicit window-drag area is missing") }
@@ -173,6 +174,8 @@ extension ReaderChecks {
                    "the title is hidden (tabs=\(tabCount))")
             expect(window.titlebarSeparatorStyle == .none,
                    "the titlebar separator is off (tabs=\(tabCount))")
+            expect(!window.isMovable,
+                   "native titlebar movement is disabled before a tab press; Window Server must not move the upper tab region (tabs=\(tabCount))")
             expect(window.standardWindowButton(.closeButton)?.superview?.frame.height == TabRowLayout.height,
                    "ReaderTitlebarLayout extends the native titlebar over the 44 pt row (tabs=\(tabCount))")
             expect(abs(dragRect.minX - viewport.maxX - 6) <= 1,
@@ -183,7 +186,7 @@ extension ReaderChecks {
             // Every point of every tab rectangle is owned by the tab input, not by the window.
             for (index, tab) in visibleTabFrames.enumerated() {
                 guard !tab.isNull, tab.width > 1 else { continue }
-                for y in [tab.minY + 2, rowMid, tab.maxY - 2] {
+                for y in [tab.minY + 2, rowMid, tab.maxY - 8, tab.maxY - 2] {
                     let hit = hitTest(host, windowPoint: NSPoint(x: tab.midX, y: y))
                     expect(hit is TabDragInputView,
                            "the title of tab \(index) at y=\(y - tab.minY) is a tab input, got \(hitDescription(hit)) (tabs=\(tabCount))")
@@ -194,7 +197,7 @@ extension ReaderChecks {
             for (index, tab) in tabFrames.enumerated() {
                 let visible = visibleTabFrames[index]
                 guard !visible.isNull, visible.width > 1 else { continue }
-                for y in [tab.minY + 2, rowMid, tab.maxY - 2] {
+                for y in [tab.minY + 2, rowMid, tab.maxY - 8, tab.maxY - 2] {
                     probes.append(("tab \(index) title", NSPoint(x: visible.midX, y: y)))
                     if tab.minX >= viewport.minX - 0.5 {
                         probes.append(("tab \(index) leading padding", NSPoint(x: tab.minX + 2, y: y)))
@@ -207,18 +210,18 @@ extension ReaderChecks {
             for index in 0..<(tabFrames.count - 1) {
                 let gap = (tabFrames[index].maxX + tabFrames[index + 1].minX) / 2
                 guard gap >= viewport.minX, gap <= viewport.maxX else { continue }
-                for y in [row.minY + 2, rowMid, row.maxY - 2] {
+                for y in [row.minY + 2, rowMid, row.maxY - 8, row.maxY - 2] {
                     probes.append(("\(TabRowLayout.tabSpacing) pt gap after tab \(index)",
                                    NSPoint(x: gap, y: y)))
                 }
             }
             let plus = plusRect(tabFrames.last!)
             if plus.minX >= viewport.minX, plus.maxX <= viewport.maxX {
-                for y in [row.minY + 2, rowMid, row.maxY - 2] {
+                for y in [row.minY + 2, rowMid, row.maxY - 8, row.maxY - 2] {
                     probes.append(("tab-to-plus gap", NSPoint(x: tabFrames.last!.maxX + 1, y: y)))
                 }
             }
-            for y in [row.minY + 2, rowMid, row.maxY - 2] {
+            for y in [row.minY + 2, rowMid, row.maxY - 8, row.maxY - 2] {
                 probes.append(("strip leading padding", NSPoint(x: stripStart + TabRowLayout.tabStripHorizontalPadding / 2, y: y)))
                 probes.append(("strip trailing padding", NSPoint(x: stripEnd - TabRowLayout.tabStripHorizontalPadding + 1, y: y)))
                 probes.append(("scroll-to-drag-area gap", NSPoint(x: dragRect.minX - 3, y: y)))
@@ -226,12 +229,12 @@ extension ReaderChecks {
 
             for (name, point) in probes {
                 guard point.x >= stripStart, point.x <= stripEnd else { continue }
-                // The strip's trailing 10 pt padding is flush with the window's right edge. A
-                // press there on the top row (row.maxY - 2) is in the window's top-right resize
-                // corner, and AppKit's live-resize tracking loop never returns in a headless
-                // check. The two lower rows exercise the press; all three rows are still
-                // hit-tested above.
-                if name == "strip trailing padding", point.y > rowMid + 1 { continue }
+                // At the actual window top, the 2 pt probe is in AppKit's resize border.
+                // Its synchronous hysteresis loop needs physical input, so only hit-test it.
+                // The right corner's resize target also extends into the 8 pt upper probe;
+                // elsewhere upper, centre and bottom probes dispatch complete presses.
+                if point.y > row.maxY - 5
+                    || (name == "strip trailing padding" && point.y > rowMid + 1) { continue }
                 let hit = hitTest(host, windowPoint: point)
                 let result = press(window, at: point)
                 expect(result.drags == 0,
@@ -248,10 +251,9 @@ extension ReaderChecks {
 
             // The positive control, in two steps.
             //
-            // 1. A press in the explicit drag area, dispatched through the window, must reach
-            //    AppKit's window drag (performDrag). A non-key check window does not deliver the
-            //    first mouse to a plain NSView, so this can be AppKit's background drag rather
-            //    than `ReaderTitlebarDragView.mouseDown`; the next step asserts our own view.
+            // 1. A press in the explicit drag area must reach its own handler even in a non-key
+            //    window. Native titlebar movement is disabled, so background dragging cannot
+            //    substitute for the explicit performDrag call.
             // 2. Drive that view's real `mouseDown` to prove its hook fires and it asks AppKit for
             //    the drag. That is the same handler a key window's press reaches.
             let dragPoint = NSPoint(x: dragRect.midX, y: rowMid)
@@ -264,6 +266,8 @@ extension ReaderChecks {
                   + "\(windowDispatchedDrag) (tabs=\(tabCount))")
             expect(windowDispatchedDrag,
                    "positive control: a window-dispatched press in the explicit drag area starts the window drag (tabs=\(tabCount))")
+            expect(hook.count == 1 && !window.isMovable,
+                   "the explicit drag view accepts the first press without re-enabling automatic titlebar movement (tabs=\(tabCount))")
 
             hook.count = 0
             window.resetDrags()
@@ -336,7 +340,7 @@ extension ReaderChecks {
                     $0.maxX <= scrolledViewport.maxX + 0.5 && $0.minX >= scrolledViewport.minX - 0.5
                 }) {
                     let tab = scrolledFrames[index]
-                    for y in [tab.minY + 2, scrolledRow.midY, tab.maxY - 2] {
+                    for y in [tab.minY + 2, scrolledRow.midY, tab.maxY - 8] {
                         let point = NSPoint(x: tab.maxX - 2, y: y)
                         let hit = hitTest(host, windowPoint: point)
                         let result = press(window, at: point)

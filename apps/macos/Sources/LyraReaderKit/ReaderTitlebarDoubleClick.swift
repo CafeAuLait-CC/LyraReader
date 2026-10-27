@@ -82,6 +82,7 @@ public final class ReaderTitlebarDragView: NSView {
     public static var mouseDownHook: (() -> Void)?
 
     public override var mouseDownCanMoveWindow: Bool { true }
+    public override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     public override func mouseDown(with event: NSEvent) {
         ReaderTitlebarDragView.mouseDownHook?()
