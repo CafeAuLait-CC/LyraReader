@@ -960,7 +960,7 @@ impl Marks {
             }
         }
         if !self.pending.dirty {
-            self.pending.clean = Some(self.clean_snapshot());
+            self.pending.set_clean_baseline(self.clean_snapshot());
         }
         Ok(())
     }

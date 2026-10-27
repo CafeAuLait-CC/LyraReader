@@ -90,9 +90,20 @@ impl PendingState {
             || !self.deletions.is_empty()
             || !self.erased_ink.is_empty();
     }
+    pub fn set_clean_baseline(&mut self, mut current: CleanSnapshot) {
+        if let Some(previous) = &self.clean {
+            for (key, value) in &previous.extra {
+                current
+                    .extra
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+        self.clean = Some(current);
+    }
     pub fn mark_clean(&mut self, current: CleanSnapshot) {
         self.dirty = false;
-        self.clean = Some(current);
+        self.set_clean_baseline(current);
         self.deletions.clear();
         self.erased_ink.clear();
     }
@@ -227,6 +238,19 @@ mod tests {
             PendingState::decode(&state.encode().unwrap(), 1).unwrap(),
             state
         );
+    }
+    #[test]
+    fn saving_or_discarding_retains_unknown_clean_snapshot_metadata() {
+        let bytes=br#"{"dirty":true,"deletions":[],"erasedInk":[],"cleanSnapshot":{"annotations":[],"bookmarks":[],"future":{"revision":7}},"foreign":true}"#;
+        let mut state = PendingState::decode(bytes, 1).unwrap();
+        state.mark_clean(CleanSnapshot::new(vec![], vec![json!({"id":"new"})]));
+        let encoded: Value = serde_json::from_slice(&state.encode().unwrap()).unwrap();
+        assert_eq!(encoded["cleanSnapshot"]["future"], json!({"revision":7}));
+        assert_eq!(encoded["foreign"], true);
+        assert_eq!(encoded["dirty"], false);
+        state.set_clean_baseline(CleanSnapshot::new(vec![], vec![]));
+        let encoded: Value = serde_json::from_slice(&state.encode().unwrap()).unwrap();
+        assert_eq!(encoded["cleanSnapshot"]["future"], json!({"revision":7}));
     }
     #[test]
     fn dirty_is_independent_of_history_depth_and_detects_last_bookmark_removal_and_order() {
