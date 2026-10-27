@@ -40,6 +40,10 @@ fn navigation_borders_render_without_burning_content_annotations() {
     let mut request = RasterRequest::full_page(PageIndex(0), 2.0);
     assert!(!request.flags.annotations);
     let tile = backend.rasterize(&request).expect("render navigation only");
+    assert!(
+        backend.link_border_cache_is_parsed(),
+        "a page with a positive /Border width must still run the dictionary pass"
+    );
     assert!(count(&tile, Rect::new(70.0, 170.0, 152.0, 24.0), green) > 300);
     assert!(count(&tile, Rect::new(258.0, 170.0, 44.0, 24.0), red) > 100);
     assert_eq!(
@@ -194,4 +198,77 @@ fn compressed_rotated_and_cropped_pages_keep_link_borders_in_their_view_coordina
         "deep-zoom tiles use the same rotated CropBox transform as the page raster"
     );
     drop(backend);
+}
+
+#[test]
+fn borderless_link_pages_never_read_the_border_dictionaries() {
+    if !crate::is_available() {
+        return;
+    }
+    // `annotated.pdf` carries a /Link with the legacy border explicitly suppressed
+    // (`/Border [0 0 0]`), the shape a 115-page real paper repeated 1950 times while the
+    // lopdf pass found zero borders. Rasterizing the page must clear it through PDFium and
+    // never load the document graph for link borders.
+    let fixture = fixture("annotated.pdf");
+    let backend = PdfiumBackend::open(&fixture, None).expect("open");
+    assert!(!backend.link_border_cache_is_parsed());
+    let pages = backend.page_count();
+    assert!(pages > 0);
+    for page in 0..pages {
+        let request = RasterRequest::full_page(PageIndex(page), 1.0);
+        backend.rasterize(&request).expect("render page");
+        assert!(
+            !backend.link_border_cache_is_parsed(),
+            "page {page} has no border and must not trigger the dictionary pass"
+        );
+    }
+    assert_eq!(
+        backend.link_border_scanned_pages(),
+        pages as usize,
+        "every painted page is cleared once by the PDFium gate"
+    );
+    // A second tile of an already-cleared page must not scan or parse again.
+    backend
+        .rasterize(&RasterRequest::full_page(PageIndex(0), 1.0))
+        .expect("render again");
+    assert!(!backend.link_border_cache_is_parsed());
+    assert_eq!(backend.link_border_scanned_pages(), pages as usize);
+}
+
+#[test]
+fn pages_without_annotations_never_read_the_border_dictionaries() {
+    if !crate::is_available() {
+        return;
+    }
+    let fixture = fixture("multipage.pdf");
+    let backend = PdfiumBackend::open(&fixture, None).expect("open");
+    assert!(!backend.link_border_cache_is_parsed());
+    let pages = backend.page_count();
+    assert!(pages > 1, "the fixture must still be multi-page");
+    for page in 0..pages {
+        backend
+            .rasterize(&RasterRequest::full_page(PageIndex(page), 0.5))
+            .expect("render page");
+        assert!(
+            !backend.link_border_cache_is_parsed(),
+            "page {page} has no annotation and must not trigger the dictionary pass"
+        );
+    }
+    assert_eq!(backend.link_border_scanned_pages(), pages as usize);
+}
+
+#[test]
+fn a_border_on_the_page_still_runs_the_dictionary_pass() {
+    if !crate::is_available() {
+        return;
+    }
+    let fixture = fixture("link-borders.pdf");
+    let backend = PdfiumBackend::open(&fixture, None).expect("open");
+    assert!(!backend.link_border_cache_is_parsed());
+    let request = RasterRequest::full_page(PageIndex(0), 1.0);
+    backend.rasterize(&request).expect("render navigation only");
+    assert!(
+        backend.link_border_cache_is_parsed(),
+        "a /Border with a positive width or a /BS must reach the lopdf pass"
+    );
 }

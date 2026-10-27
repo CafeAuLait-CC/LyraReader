@@ -1132,6 +1132,118 @@ impl AnnotationReader {
         self.page_report_locked(page)
     }
 
+    /// Whether `page` could carry a legacy `/Link` border that the raster path must paint.
+    ///
+    /// This is the gate in front of [`crate::link_borders::read`], which has to load the whole
+    /// file with lopdf and was measured at ~100 ms on a 115-page paper that turned out to carry
+    /// **zero** borders. Scanning only the page that is about to be painted keeps that cost off
+    /// the first paint; a page is scanned at most once (the raster path caches the answer), and
+    /// a document that never paints a bordered link never runs the dictionary pass at all.
+    ///
+    /// The answer is deliberately one-sided:
+    ///
+    /// * `Some(false)` means every `/Link` annotation on the page has a direct, well-formed
+    ///   `/Border` array of width 0, no `/BS` key, and no invisible/hidden/no-view flag;
+    ///   annotations of other subtypes cannot paint a link border. Only that exact shape is
+    ///   skipped. A missing, indirect or malformed `/Border`, a `/BS` key (whose `/W` PDFium's
+    ///   `FPDFAnnot_GetBorder` does not read), a positive width, a failed call, or a page that
+    ///   does not load all answer `Some(true)`.
+    /// * `None` means the page could not be inspected at all; the caller must fail open and run
+    ///   the lopdf pass.
+    ///
+    /// Soundness rests on the gate being a **superset** of what [`crate::link_borders::parse`]
+    /// paints: it never needs to know the colour, opacity, dash or appearance stream, because
+    /// those can only remove a border that the width and key checks already accepted. The one
+    /// place where the two readers could disagree — a `/Border` array with three entries but a
+    /// non-numeric third entry, which PDFium reports as width 0 while lopdf's `numbers()` cannot
+    /// read it — is handled by treating that shape as width 0 in `parse` too (see
+    /// `malformed_border_width_is_read_as_zero_like_pdfium`).
+    ///
+    /// The caller already holds `PDFIUM_LOCK`.
+    pub(crate) fn page_may_have_link_borders_locked(&self, page: PageIndex) -> Option<bool> {
+        let index = pdfium_page_index(page.get()).ok()?;
+        // SAFETY: the document handle is live for as long as `self`; the caller holds
+        // `PDFIUM_LOCK`, so no other PDFium page operation can run concurrently.
+        let page_handle = unsafe { (self.api.load_page)(self.document, index) };
+        if page_handle.is_null() {
+            return None;
+        }
+
+        // SAFETY: `page_handle` came from `load_page` and is closed before this method returns.
+        let count = unsafe { (self.api.get_annot_count)(page_handle) };
+        if count < 0 {
+            // SAFETY: the handle is live and not used afterwards.
+            unsafe { (self.api.close_page)(page_handle) };
+            return None;
+        }
+
+        let mut answer = Some(false);
+        for slot in 0..count {
+            // SAFETY: `slot` is inside the annotation count just read.
+            let handle = unsafe { (self.api.get_annot)(page_handle, slot) };
+            if handle.is_null() {
+                // A null handle means the page could not be enumerated in full; fail open.
+                answer = None;
+                break;
+            }
+            // SAFETY: `handle` is live for this call and not used afterwards.
+            let may_have = self.link_may_have_border(handle);
+            // SAFETY: the handle came from `get_annot` and is not used after this point.
+            unsafe { (self.api.close_annot)(handle) };
+            match may_have {
+                Some(true) => {
+                    answer = Some(true);
+                    break;
+                }
+                Some(false) => {}
+                None => {
+                    answer = None;
+                    break;
+                }
+            }
+        }
+        // SAFETY: the handle came from `load_page` and holds no borrowed data after this point.
+        unsafe { (self.api.close_page)(page_handle) };
+        answer
+    }
+
+    /// The per-annotation half of [`Self::page_may_have_link_borders_locked`].
+    ///
+    /// Conservative by construction: a PDFium call that cannot answer makes the whole page
+    /// inconclusive instead of being mistaken for "no border".
+    fn link_may_have_border(&self, annot: FpdfAnnotation) -> Option<bool> {
+        // SAFETY: `annot` is a live annotation handle, and every call below is serialised by
+        // the caller's `PDFIUM_LOCK`.
+        if unsafe { (self.api.get_subtype)(annot) } != ANNOT_LINK {
+            return Some(false);
+        }
+        // Invisible, Hidden and NoView annotations never paint a border (`parse` skips them).
+        // A failed call reports 0, which is also the "visible" flag set, so it stays conservative.
+        if unsafe { (self.api.get_flags)(annot) } & (1 | 2 | 32) != 0 {
+            return Some(false);
+        }
+        // `/BS` supersedes `/Border`, and `FPDFAnnot_GetBorder` reads the legacy array only.
+        if self.has_key(annot, c"BS") {
+            return Some(true);
+        }
+        if !self.has_key(annot, c"Border") {
+            // The PDF default border is `[0 0 1]`: a link with neither key paints 1 pt.
+            return Some(true);
+        }
+        let (mut horizontal, mut vertical, mut width) = (0.0f32, 0.0f32, 0.0f32);
+        // SAFETY: `annot` is live and all three out-pointers are valid.
+        let ok =
+            unsafe { (self.api.get_border)(annot, &mut horizontal, &mut vertical, &mut width) };
+        if ok == 0 {
+            // An indirect or malformed `/Border` may still be readable by lopdf; fail open.
+            return Some(true);
+        }
+        if !horizontal.is_finite() || !vertical.is_finite() || !width.is_finite() {
+            return Some(true);
+        }
+        Some(width > 0.0)
+    }
+
     /// The caller already holds `PDFIUM_LOCK` for a larger PDFium transaction.
     pub(crate) fn page_report_locked(&self, page: PageIndex) -> Result<AnnotationPageReport> {
         let index = pdfium_page_index(page.get())?;
