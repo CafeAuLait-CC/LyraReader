@@ -38,7 +38,8 @@ Save As writes a combined copy and keeps the original session open. Closing a di
 Save, Discard or Cancel, with pending form edits reviewed first. Failed writes keep the tab open;
 Discard clears known drafts while preserving foreign cache records. Pending ink deletions and
 their replacement strokes recover together after an interrupted process. Several newer macOS
-features are still being ported.
+features are still being ported. XFA documents keep local reading bookmarks; PDF editing and
+derivative exports are refused, including forms selected as merge inputs.
 The Linux branch is not yet a release or a claim of full feature parity.
 
 ## Capabilities

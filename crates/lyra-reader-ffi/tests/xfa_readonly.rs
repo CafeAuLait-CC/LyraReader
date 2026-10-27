@@ -1,4 +1,4 @@
-//! Read-only XFA coverage against the real sample on this machine.
+//! Read-only XFA coverage with required synthetic fixtures and an optional local sample.
 //!
 //! The sample is the user's file under `~/Downloads`; it is copied to a scratch directory and
 //! never written in place. When it is absent (CI, another machine) the check returns after a
@@ -365,4 +365,34 @@ fn a_genuinely_password_protected_pdf_still_refuses_to_open() {
         Ok(_) => panic!("a genuinely password-protected PDF opened without a password"),
     }
     let _ = fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn merge_refuses_an_appended_xfa_form_before_creating_output() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+    let directory = scratch("appended-form");
+    let source = directory.join("source.pdf");
+    let form = directory.join("form.pdf");
+    fs::copy(fixtures.join("text-page.pdf"), &source).expect("copy synthetic source");
+    fs::copy(fixtures.join("xfa-refusal.pdf"), &form).expect("copy synthetic XFA form");
+    let source_bytes = fs::read(&source).expect("source bytes");
+    let form_bytes = fs::read(&form).expect("form bytes");
+    let document = open(&LyraReaderEngine::new(), &source);
+    let destination = directory.join("merged.pdf");
+    expect_read_only(
+        "appended XFA form",
+        document
+            .merge_documents(
+                vec![form.to_string_lossy().into_owned()],
+                destination.to_string_lossy().into_owned(),
+            )
+            .map(|_| ()),
+    );
+    assert!(
+        !destination.exists(),
+        "no synthetic/blank form derivative is published"
+    );
+    assert_eq!(fs::read(source).expect("unchanged source"), source_bytes);
+    assert_eq!(fs::read(form).expect("unchanged form"), form_bytes);
+    fs::remove_dir_all(directory).expect("remove scratch");
 }

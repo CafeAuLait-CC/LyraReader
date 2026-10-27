@@ -2967,6 +2967,7 @@ impl LyraReaderDocument {
                         .to_string(),
             });
         }
+        Self::ensure_merge_inputs_not_xfa(&others)?;
         let others: Vec<PathBuf> = others.into_iter().map(PathBuf::from).collect();
         let report = merge_documents(
             Path::new(&self.path),
@@ -4617,6 +4618,41 @@ impl LyraReaderDocument {
             return Err(
                 lyra_reader_core::LyraReaderError::new(ErrorCode::ReadOnly, message).into(),
             );
+        }
+        Ok(())
+    }
+
+    /// An appended form is also read-only: importing its fallback page would silently lose
+    /// the XML form. Use the existing structural detector without generating synthetic pages.
+    fn ensure_merge_inputs_not_xfa(paths: &[String]) -> Result<(), LyraReaderFfiError> {
+        use lyra_reader_xfa::{Detection, XfaError};
+        for path in paths {
+            match lyra_reader_xfa::packets::detect(Path::new(path), None) {
+                Ok(Detection::Xfa(_)) | Err(XfaError::Malformed(_)) => {
+                    return Err(lyra_reader_core::LyraReaderError::new(
+                        ErrorCode::ReadOnly,
+                        lyra_reader_xfa::READ_ONLY_REASON,
+                    )
+                    .into());
+                }
+                Ok(Detection::NotXfa { .. } | Detection::PasswordRequired)
+                | Err(XfaError::PasswordRequired) => {
+                    // The native merge writer retains its existing role-specific encrypted
+                    // input refusal, including forms whose password prevents structural detection.
+                }
+                Err(error) => {
+                    let code = match &error {
+                        XfaError::Io(_) => ErrorCode::Io,
+                        _ => ErrorCode::CorruptDocument,
+                    };
+                    return Err(lyra_reader_core::LyraReaderError::new(
+                        code,
+                        "An appended PDF could not be checked for XFA; no output was written.",
+                    )
+                    .with_detail(error.to_string())
+                    .into());
+                }
+            }
         }
         Ok(())
     }
