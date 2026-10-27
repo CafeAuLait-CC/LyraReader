@@ -297,7 +297,11 @@ public struct ReaderWindow: View {
             onResize: { state.resizeRightPanel(to: $0) },
             onResizeEnded: { state.endRightPanelResize(); state.commitRightPanelWidth() }
         ) {
-            AIAssistantRightPanelContent(state: state, model: aiAssistant)
+            AIAssistantRightPanelContent(
+                state: state,
+                model: aiAssistant,
+                isActive: state.rightPanelVisible && state.document != nil
+            )
         }
         .animation(panelAnimation, value: state.rightPanelVisible)
     }
