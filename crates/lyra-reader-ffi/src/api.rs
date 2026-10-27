@@ -6866,6 +6866,7 @@ pub struct AnnotationSaveReport {
 /// with the open page's own geometry before the engine sees it. `crop` is the exception: it is a
 /// normalized fraction of the image and is already independent of page space.
 #[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct ContentBoxRecord {
     pub x: f64,
     pub y: f64,
@@ -6892,6 +6893,7 @@ impl From<ContentBoxRecord> for lyra_reader_pdfium::content_edit::ContentBox {
 /// validated by [`content_command`] because UniFFI has no fixed-length array type. `alignment`
 /// stays the engine's integer form (0 left, 1 centre, 2 right), validated by the layout writer.
 #[derive(Debug, Clone, uniffi::Enum)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub enum ContentCommandRecord {
     Transform {
         revision: String,
@@ -6950,6 +6952,39 @@ pub enum ContentCommandRecord {
         page: Option<u32>,
         uri: Option<String>,
     },
+}
+
+impl ContentCommandRecord {
+    /// The immutable PDF revision the shell inspected before constructing this command.
+    pub fn revision(&self) -> &str {
+        match self {
+            Self::Transform { revision, .. }
+            | Self::ReplaceText { revision, .. }
+            | Self::InsertText { revision, .. }
+            | Self::Delete { revision, .. }
+            | Self::Redact { revision, .. }
+            | Self::InsertImage { revision, .. }
+            | Self::ReplaceImage { revision, .. }
+            | Self::CropImage { revision, .. }
+            | Self::SetLink { revision, .. } => revision,
+        }
+    }
+    /// Rebase only after the original command revision was checked and cached annotations
+    /// were materialized in the working PDF. Object identity and all edit values stay intact.
+    pub fn replacing_revision(mut self, value: String) -> Self {
+        match &mut self {
+            Self::Transform { revision, .. }
+            | Self::ReplaceText { revision, .. }
+            | Self::InsertText { revision, .. }
+            | Self::Delete { revision, .. }
+            | Self::Redact { revision, .. }
+            | Self::InsertImage { revision, .. }
+            | Self::ReplaceImage { revision, .. }
+            | Self::CropImage { revision, .. }
+            | Self::SetLink { revision, .. } => *revision = value,
+        }
+        self
+    }
 }
 
 /// Converts the typed shell request into the engine command.
@@ -11041,6 +11076,33 @@ mod content_command_tests {
                 }
                 other => panic!("expected an invalid-argument error, got {other:?}"),
             }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "desktop-json"))]
+mod desktop_content_wire_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn typed_content_commands_round_trip_and_rebase_only_the_revision() {
+        let cases = [
+            json!({"Transform":{"revision":"old","target":"image:0","bounds":{"x":1,"y":2,"width":3,"height":4},"rotation":90}}),
+            json!({"ReplaceText":{"revision":"old","target":"text:0","text":"  A\r\nB  ","bounds":{"x":1,"y":2,"width":30,"height":40},"font":"Helvetica","size":12,"colour":[0,1,2,255],"alignment":0}}),
+            json!({"Delete":{"revision":"old","target":"text:0"}}),
+            json!({"Redact":{"revision":"old","bounds":{"x":1,"y":2,"width":3,"height":4},"blackout":false}}),
+            json!({"SetLink":{"revision":"old","target":null,"bounds":{"x":1,"y":2,"width":3,"height":4},"page":0,"uri":null}}),
+        ];
+        for value in cases {
+            let command: ContentCommandRecord = serde_json::from_value(value).unwrap();
+            assert_eq!(command.revision(), "old");
+            let before = serde_json::to_value(&command).unwrap();
+            let changed = command.replacing_revision("new".into());
+            let mut expected = before;
+            for payload in expected.as_object_mut().unwrap().values_mut() {
+                payload["revision"] = json!("new");
+            }
+            assert_eq!(serde_json::to_value(changed).unwrap(), expected);
         }
     }
 }

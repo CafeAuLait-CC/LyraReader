@@ -3,6 +3,7 @@
 #![allow(unsafe_code)]
 
 mod artwork;
+mod content;
 mod document;
 mod document_cache;
 mod draft_store;

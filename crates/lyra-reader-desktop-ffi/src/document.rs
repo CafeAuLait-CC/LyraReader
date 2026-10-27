@@ -169,6 +169,8 @@ impl DesktopDocument {
                 "marks_erase"
                     | "extract_pages"
                     | "page_operation"
+                    | "content_stage"
+                    | "content_redaction_preflight"
                     | "page_stage"
                     | "page_undo"
                     | "page_redo"
@@ -205,7 +207,8 @@ impl DesktopDocument {
         }
         if matches!(
             op,
-            "page_stage"
+            "content_stage"
+                | "page_stage"
                 | "page_undo"
                 | "page_redo"
                 | "page_discard"
@@ -332,6 +335,13 @@ impl DesktopDocument {
                 result["sidecar_cleanup_error"] = json!(cleanup);
                 Ok(result)
             }
+            "content_objects" => {
+                let snapshot = d.content_objects(arg(&r, "page")?).map_err(|e| e.to_string())?;
+                serde_json::from_str(&snapshot).map_err(|e| format!("Invalid content snapshot: {e}"))
+            }
+            "content_redaction_preflight" => value(d.content_redaction_raster_pages(
+                arg(&r, "page")?, arg(&r, "command")?,
+            )),
             "info" => self.info(),
             "outline" => value(d.outline()),
             "metadata" => value(d.metadata()),
@@ -1487,6 +1497,279 @@ mod tests {
         assert_eq!(discarded["info"]["signature_status"]["signed"], false);
     }
 
+    fn replacement_command(doc: &DesktopDocument, text: &str) -> Value {
+        let snapshot = doc
+            .command(json!({"op":"content_objects","page":0}))
+            .unwrap();
+        let item = snapshot["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["kind"] == "text" && item["can_edit_text"] == true)
+            .expect("editable synthetic text");
+        json!({"ReplaceText":{"revision":snapshot["revision"],"target":item["id"],
+            "text":text,"bounds":item["bounds"],"font":"Helvetica","size":12.0,
+            "colour":[0,0,0,255],"alignment":0}})
+    }
+    fn stage_replacement(doc: &DesktopDocument, text: &str) -> Value {
+        doc.command(json!({"op":"content_stage","page":0,"command":replacement_command(doc,text)}))
+            .unwrap()
+    }
+    #[test]
+    fn content_stage_materializes_marks_once_and_undo_redo_save_keep_the_source_contract() {
+        let fixture = Fixture::new("text-page.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let path = cache_path(&fixture.path);
+        let foreign = r#"{ "kind":"future", "page":0, "precision":1.0000000000000001 }"#;
+        fs::write(&path, format!("[{foreign}]")).unwrap();
+        let doc = fixture.open();
+        doc.command(json!({"op":"mark_create","entry":{"kind":"square","page":0,"version":1,
+            "rect":{"x":20,"y":20,"width":30,"height":30},"strokeWidth":2,"color":"#1B7F3BFF","note":"Materialized once"}})).unwrap();
+        doc.command(
+            json!({"op":"bookmark_create","page":0,"title":"Preserved destination","yPt":12}),
+        )
+        .unwrap();
+        let staged = stage_replacement(&doc, "Staged native text");
+        assert_eq!(staged["marks"]["page_pending"], true);
+        assert_eq!(staged["marks"]["annotations"].as_array().unwrap().len(), 0);
+        assert_eq!(staged["marks"]["preserved"], 1);
+        assert_eq!(
+            doc.command(json!({"op":"annotations"}))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            doc.command(json!({"op":"text","page":0})).unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .contains("Staged native text")
+        );
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        let undone = doc.command(json!({"op":"page_undo"})).unwrap();
+        assert_eq!(undone["info"]["revision"], json!(fixture.path));
+        assert_eq!(undone["marks"]["annotations"].as_array().unwrap().len(), 1);
+        doc.command(json!({"op":"page_redo"})).unwrap();
+        let saved = doc.command(json!({"op":"document_save"})).unwrap();
+        assert_eq!(saved["marks"]["page_pending"], false);
+        let reopened = fixture.open();
+        assert!(
+            reopened.command(json!({"op":"text","page":0})).unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .contains("Staged native text")
+        );
+        assert_eq!(
+            reopened
+                .command(json!({"op":"annotations"}))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            reopened.command(json!({"op":"marks"})).unwrap()["bookmarks"][0]["title"],
+            "Preserved destination"
+        );
+        assert!(
+            fs::read_to_string(cache_path(&fixture.path))
+                .unwrap()
+                .contains(foreign)
+        );
+    }
+    #[test]
+    fn stale_content_commands_create_no_session_and_failed_edits_keep_redo() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let mut stale = replacement_command(&doc, "Never written");
+        stale["ReplaceText"]["revision"] = json!("0".repeat(64));
+        assert!(
+            doc.command(json!({"op":"content_stage","page":0,"command":stale}))
+                .unwrap_err()
+                .contains("page changed")
+        );
+        assert!(
+            !cache_path(&fixture.path)
+                .with_file_name("session.json")
+                .exists()
+        );
+        stage_replacement(&doc, "Redo survives failure");
+        doc.command(json!({"op":"page_undo"})).unwrap();
+        let snapshot = doc
+            .command(json!({"op":"content_objects","page":0}))
+            .unwrap();
+        assert!(
+            doc.command(json!({"op":"content_stage","page":0,"command":{"Delete":{
+            "revision":snapshot["revision"],"target":"missing-target"}}}))
+                .is_err()
+        );
+        let marks = doc.command(json!({"op":"marks"})).unwrap();
+        assert_eq!(marks["can_page_redo"], true);
+        doc.command(json!({"op":"page_redo"})).unwrap();
+        assert!(
+            doc.command(json!({"op":"text","page":0})).unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .contains("Redo survives failure")
+        );
+    }
+    #[test]
+    fn erase_removes_actual_text_and_a_copy_does_not_change_the_original() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let original = fs::read(&fixture.path).unwrap();
+        let snapshot = doc
+            .command(json!({"op":"content_objects","page":0}))
+            .unwrap();
+        let item = snapshot["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| {
+                v["kind"] == "text"
+                    && v["text"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("LyraReader fixture"))
+            })
+            .unwrap();
+        let command = json!({"Redact":{"revision":snapshot["revision"],"bounds":item["bounds"],"blackout":false}});
+        let preflight = doc
+            .command(json!({"op":"content_redaction_preflight","page":0,"command":command}))
+            .unwrap();
+        assert!(preflight.as_array().unwrap().is_empty());
+        let staged = doc
+            .command(json!({"op":"content_stage","page":0,"command":command}))
+            .unwrap();
+        assert!(
+            staged["report"]["rasterized_pages"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let output = fixture.directory.join("erased.pdf");
+        doc.command(json!({"op":"save_document_copy","destination":output}))
+            .unwrap();
+        let copy = open_fixture_document(&output, None).unwrap();
+        assert!(
+            !copy.command(json!({"op":"text","page":0})).unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .contains("LyraReader fixture")
+        );
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        doc.command(json!({"op":"page_undo"})).unwrap();
+        assert!(
+            doc.command(json!({"op":"text","page":0})).unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .contains("LyraReader fixture")
+        );
+    }
+    #[test]
+    fn content_redaction_requires_explicit_raster_consent_and_keeps_other_pages() {
+        let fixture = Fixture::new("form-text-pages.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        let snapshot = doc
+            .command(json!({"op":"content_objects","page":0}))
+            .unwrap();
+        let item = snapshot["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| {
+                v["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("In shared form"))
+            })
+            .unwrap();
+        let command = json!({"Redact":{"revision":snapshot["revision"],"bounds":item["bounds"],"blackout":true}});
+        assert_eq!(
+            doc.command(json!({"op":"content_redaction_preflight","page":0,"command":command}))
+                .unwrap(),
+            json!([0])
+        );
+        assert!(
+            doc.command(json!({"op":"content_stage","page":0,"command":command}))
+                .is_err()
+        );
+        assert_eq!(
+            doc.command(json!({"op":"marks"})).unwrap()["page_pending"],
+            false
+        );
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        let staged = doc
+            .command(json!({"op":"content_stage","page":0,"command":command,"allow_raster":true}))
+            .unwrap();
+        assert_eq!(staged["report"]["rasterized_pages"], json!([0]));
+        assert!(
+            doc.command(json!({"op":"text","page":0})).unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .trim()
+                .is_empty()
+        );
+        assert!(
+            !doc.command(json!({"op":"text","page":1})).unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .trim()
+                .is_empty()
+        );
+        doc.command(json!({"op":"page_undo"})).unwrap();
+        assert!(
+            doc.command(json!({"op":"text","page":0})).unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .contains("In shared form")
+        );
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture used by the content recovery check"]
+    fn write_content_revision_then_exit_without_running_destructors() {
+        let path = PathBuf::from(std::env::var_os("LYRA_READER_TEST_RECOVERY_PATH").unwrap());
+        let doc = open_fixture_document(&path, None).unwrap();
+        stage_replacement(&doc, "Content recovered after exit");
+        std::process::exit(0);
+    }
+    #[test]
+    fn content_revisions_recover_after_process_exit_and_discard_restores_the_source() {
+        let fixture = Fixture::new("text-page.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "document::tests::write_content_revision_then_exit_without_running_destructors",
+                "--ignored",
+            ])
+            .env("LYRA_READER_TEST_RECOVERY_PATH", &fixture.path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let doc = fixture.open();
+        assert!(
+            doc.command(json!({"op":"text","page":0})).unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .contains("Content recovered after exit")
+        );
+        assert_eq!(
+            doc.command(json!({"op":"marks"})).unwrap()["page_pending"],
+            true
+        );
+        doc.command(json!({"op":"document_discard"})).unwrap();
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        assert_eq!(
+            fixture.open().command(json!({"op":"marks"})).unwrap()["page_pending"],
+            false
+        );
+    }
+
     #[test]
     fn private_working_pdf_cannot_remove_the_source_xfa_read_only_contract() {
         let fixture = Fixture::new("xfa-refusal.pdf");
@@ -1523,6 +1806,8 @@ mod tests {
             "ink_erase_begin",
             "ink_erase_update",
             "ink_erase_commit",
+            "content_stage",
+            "content_redaction_preflight",
             "page_stage",
             "page_undo",
             "page_redo",

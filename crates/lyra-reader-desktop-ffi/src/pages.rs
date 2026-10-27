@@ -20,7 +20,7 @@ use std::{
 pub struct PageEdits {
     pub(super) directory: Option<Arc<SessionDirectory>>,
     control: Option<Arc<SessionControl>>,
-    original: Option<Marks>,
+    pub(super) original: Option<Marks>,
     view: Option<PageView>,
 }
 struct PageView {
@@ -35,7 +35,7 @@ impl PageEdits {
     pub fn has_session(&self) -> bool {
         self.control.is_some()
     }
-    fn adopt(&mut self, state: &DocumentTransactionStateRecord) {
+    pub(super) fn adopt(&mut self, state: &DocumentTransactionStateRecord) {
         self.view = Some(PageView {
             can_undo: state.can_undo,
             can_redo: state.can_redo,
@@ -61,7 +61,7 @@ impl PageEdits {
         }
         state
     }
-    fn input(
+    pub(super) fn input(
         &self,
         marks: &Marks,
         request: &Value,
@@ -143,7 +143,7 @@ impl PageEdits {
             xfa_read_only_reason: original.xfa_status().read_only_reason,
         })
     }
-    fn begin(
+    pub(super) fn begin(
         &mut self,
         original: &LyraReaderDocument,
         marks: &Marks,
@@ -220,7 +220,7 @@ impl PageEdits {
         self.adopt(&state);
         Ok(Some(state))
     }
-    fn retire(&mut self) -> Result<(), String> {
+    pub(super) fn retire(&mut self) -> Result<(), String> {
         if let Some(directory) = &self.directory {
             directory.retire()?;
         }
@@ -230,7 +230,7 @@ impl PageEdits {
         self.view = None;
         Ok(())
     }
-    fn control(&self) -> Result<Arc<SessionControl>, String> {
+    pub(super) fn control(&self) -> Result<Arc<SessionControl>, String> {
         self.control
             .clone()
             .ok_or_else(|| "There is no active editing session".into())
@@ -330,7 +330,7 @@ impl DesktopDocument {
             .map_err(|_| "Annotation state is unavailable")? = marks;
         Ok(())
     }
-    fn revision(
+    pub(super) fn revision(
         &self,
         state: &DocumentTransactionStateRecord,
     ) -> Result<Arc<LyraReaderDocument>, String> {
@@ -394,6 +394,11 @@ impl DesktopDocument {
                     *edits = PageEdits::default();
                 }
                 result?
+            }
+            "content_stage" => {
+                let staged = self.stage_content(r, &mut edits, &current, &mut marks)?;
+                report = staged.report;
+                (staged.document, staged.marks)
             }
             "page_stage" => {
                 let operation: PageOperationRecord =
@@ -478,6 +483,8 @@ impl DesktopDocument {
                         }
                         if before.revision_url == before.original_url
                             && before.operations.is_empty()
+                            && !before.can_undo
+                            && !before.can_redo
                         {
                             let root = marks.cache_root().map(Path::to_path_buf);
                             if let Err(e) = edits.retire() {
