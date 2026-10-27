@@ -10,7 +10,7 @@ Item {
     readonly property var selected: app.selectedAnnotation
     readonly property var shown: app.annotationDraft && selected && app.annotationDraft.id === selected.id ? app.annotationDraft : selected
     readonly property bool line: shown && (shown.kind === "line" || shown.kind === "arrow")
-    visible: !!selected && selected.page === page && Logic.editableGeometry(selected) && app.annotationTool === "select"
+    visible: app.canModifyPdf && !!selected && selected.page === page && Logic.editableGeometry(selected) && app.annotationTool === "select"
     property var base: null
     property var patch: null
     property bool changed: false

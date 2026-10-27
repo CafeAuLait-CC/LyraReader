@@ -26,7 +26,20 @@ ApplicationWindow {
     readonly property var signatureStatus: currentReader.data.signature_status || {}
     readonly property bool originalReadOnly: !!signatureStatus.signed
     readonly property bool xfaReadOnly: !!(currentReader.data.xfa_status || {}).is_xfa
-    readonly property string readOnlyReason: signatureStatus.read_only_reason || ""
+    readonly property string readOnlyReason: (currentReader.data.xfa_status || {}).read_only_reason || signatureStatus.read_only_reason || ""
+    readonly property bool canModifyPdf: currentReader.pageCount > 0 && !xfaReadOnly
+    function blockXfaWrite() {
+        if (!xfaReadOnly) return false;
+        operationStatus=readOnlyReason;
+        return true;
+    }
+    onXfaReadOnlyChanged: if (xfaReadOnly) {
+        cancelErase();
+        annotationTool="select";
+        annotationToolsVisible=false;
+        formToolActive=false;
+        selectedAnnotation=null;
+    }
     readonly property var colors: theme
     readonly property var pageList: canvas.view
     property string appearance: session ? session.preference("appearance", "light") : "light"
@@ -675,9 +688,11 @@ ApplicationWindow {
         }
     }
     function showMergeDialog() {
+        if (blockXfaWrite()) return;
         pageExports.show(true);
     }
     function showSplitDialog() {
+        if (blockXfaWrite()) return;
         pageExports.show(false);
     }
     PageExports {
@@ -722,6 +737,7 @@ ApplicationWindow {
         dialogs.formsDialog.open();
     }
     function toggleForms() {
+        if (blockXfaWrite()) return;
         setTextViewEnabled(false);
         formToolActive = !formToolActive;
         if (formToolActive)
@@ -731,6 +747,12 @@ ApplicationWindow {
         dialogs.flushAnnotation();
         if (edit === false)
             dialogs.annotationDialog.close();
+        if (xfaReadOnly) {
+            selectedAnnotation=annotation;
+            if (edit !== false) dialogs.showAnnotation();
+            operationStatus=readOnlyReason;
+            return;
+        }
         const reason = Logic.annotationUnsupportedReason(annotation);
         if (reason.length) {
             selectedAnnotation = annotation;
@@ -772,12 +794,14 @@ ApplicationWindow {
         return null;
     }
     function setAnnotationTool(tool) {
+        if (tool !== "select" && blockXfaWrite()) return;
         annotationTool = annotationTool === tool ? "select" : tool;
         if (["highlight", "underline", "strikeout"].indexOf(annotationTool) >= 0 && selection)
             markSelection(annotationTool);
     }
     property double pendingArtworkRequest: -1
     function armStamp(style) {
+        if (blockXfaWrite()) return;
         if (currentReader.pageCount === 0 || ["approved", "reviewed", "draft", "confidential", "date"].indexOf(style) < 0)
             return;
         setTextViewEnabled(false);
@@ -791,6 +815,7 @@ ApplicationWindow {
         operationStatus = qsTr("Click on the page to place the stamp. Escape cancels.");
     }
     function armSignature(url) {
+        if (blockXfaWrite()) return false;
         if (currentReader.pageCount === 0)
             return false;
         const image = currentReader.signatureImage(url);
@@ -847,6 +872,7 @@ ApplicationWindow {
         redactionReview.review(replacing);
     }
     function markSelection(kind) {
+        if (blockXfaWrite()) return;
         if (!selection)
             return;
         currentReader.submit("mark_create", {
@@ -862,6 +888,7 @@ ApplicationWindow {
         selection = null;
     }
     function updateSelectedAnnotation(patch) {
+        if (blockXfaWrite()) return -1;
         if (selectedAnnotation && !selectedAnnotation.foreign)
             return currentReader.submit("mark_update", {
                 id: selectedAnnotation.id,
@@ -870,6 +897,7 @@ ApplicationWindow {
         return -1;
     }
     function commitAnnotationGeometry(id, patch) {
+        if (blockXfaWrite()) return;
         if (!annotationDraft || annotationDraft.id !== id)
             return;
         pendingDraftRequestId = currentReader.submit("mark_update", {
@@ -878,6 +906,7 @@ ApplicationWindow {
         });
     }
     function updateAnnotationNote(note) {
+        if (blockXfaWrite()) return;
         if (selectedAnnotation)
             currentReader.submit("mark_update", {
                 id: selectedAnnotation.id,
@@ -887,6 +916,7 @@ ApplicationWindow {
             });
     }
     function deleteSelectedAnnotation() {
+        if (blockXfaWrite()) return;
         dialogs.cancelAnnotationDraft();
         if (selectedAnnotation)
             currentReader.clearNoteDraft(selectedAnnotation.id);
@@ -918,6 +948,7 @@ ApplicationWindow {
         erasePreview = [];
     }
     function beginErase(page, point) {
+        if (blockXfaWrite()) return;
         cancelErase();
         dialogs.flushAnnotation();
         selectedAnnotation = null;
@@ -984,6 +1015,7 @@ ApplicationWindow {
         currentPage = index;
     }
     function pageOperation(operation) {
+        if (blockXfaWrite()) return;
         if (pageEditBusy)
             return;
         pageEditBusy = true;
@@ -1083,6 +1115,7 @@ ApplicationWindow {
         }
     }
     function chooseExport(kind) {
+        if (["bibtex","markdown","csv"].indexOf(kind)<0 && blockXfaWrite()) return;
         exportKind = kind;
         exportContext = {
             reader: currentReader,
@@ -1105,6 +1138,7 @@ ApplicationWindow {
         dialogs.saveDialog.open();
     }
     function updateFormValue(id, value) {
+        if (blockXfaWrite()) return;
         const next = Object.assign({}, formValues);
         const field = currentReader.data.forms ? currentReader.data.forms.fields.find(function (f) {
             return f.id === id;
@@ -1223,6 +1257,7 @@ ApplicationWindow {
         }).join("\n");
     }
     function confirmReplace(kind) {
+        if (blockXfaWrite()) return;
         if (originalReadOnly) {
             operationStatus = readOnlyReason;
             return;
@@ -1230,6 +1265,7 @@ ApplicationWindow {
         dialogs.confirmReplacement(kind);
     }
     function performReplace(kind) {
+        if (blockXfaWrite()) return;
         if (originalReadOnly) {
             operationStatus = readOnlyReason;
             return;

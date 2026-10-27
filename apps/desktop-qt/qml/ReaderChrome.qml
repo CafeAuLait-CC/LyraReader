@@ -234,11 +234,12 @@ ColumnLayout {
             }
             ToolSeparator {}
             LyraToolButton {
+                objectName: "annotateButton"
                 symbol: "annotations"
                 text: qsTr("Annotate")
                 selected: app.annotationToolsVisible
                 display: app.width < 1100 ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
-                enabled: app.currentReader.pageCount > 0
+                enabled: app.canModifyPdf
                 onClicked: {
                     app.overviewVisible = false;
                     app.setTextViewEnabled(false);
@@ -260,10 +261,11 @@ ColumnLayout {
             }
             LyraToolButton {
                 visible: app.width >= 850
+                objectName: "fillSignButton"
                 symbol: "form"
                 text: qsTr("Fill & Sign")
                 selected: app.formToolActive
-                enabled: app.currentReader.pageCount > 0
+                enabled: app.canModifyPdf
                 onClicked: app.toggleForms()
             }
             LyraToolButton {
@@ -284,7 +286,7 @@ ColumnLayout {
                 objectName: "moreCommandsMenu"
                 MenuItem {
                     text: qsTr("Fill & Sign")
-                    enabled: app.currentReader.pageCount > 0
+                    enabled: app.canModifyPdf
                     onTriggered: app.toggleForms()
                 }
                 MenuItem {
@@ -309,12 +311,12 @@ ColumnLayout {
                 }
                 MenuItem {
                     text: qsTr("Merge PDFs…")
-                    enabled: app.currentReader.pageCount > 0 && !app.currentReader.hasEditDrafts
+                    enabled: app.canModifyPdf && !app.currentReader.hasEditDrafts
                     onTriggered: app.showMergeDialog()
                 }
                 MenuItem {
                     text: qsTr("Split PDF…")
-                    enabled: app.currentReader.pageCount > 0 && !app.currentReader.hasEditDrafts
+                    enabled: app.canModifyPdf && !app.currentReader.hasEditDrafts
                     onTriggered: app.showSplitDialog()
                 }
                 MenuItem {
@@ -335,8 +337,8 @@ ColumnLayout {
             }
             Label {
                 textFormat: Text.PlainText
-                visible: app.originalReadOnly && app.width >= 1000
-                text: qsTr("Signed · edits to copy")
+                visible: (app.originalReadOnly || app.xfaReadOnly) && app.width >= 1000
+                text: app.xfaReadOnly ? qsTr("XFA · read only") : qsTr("Signed · edits to copy")
                 color: app.colors.textSecondary
                 font.pixelSize: 11
                 ToolTip.visible: signedHover.hovered

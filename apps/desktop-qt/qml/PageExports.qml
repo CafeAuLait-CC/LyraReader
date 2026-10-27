@@ -16,7 +16,7 @@ Dialog {
     property string error: ""
     property url outputDirectory: ""
     readonly property bool busy: owner ? owner.pendingCommands > 0 : false
-    readonly property string blockedReason: !owner ? "" : owner.hasEditDrafts ? qsTr("Save or clear pending form edits and redaction marks first.") : owner.data.marks && owner.data.marks.pending_deletions > 0 ? qsTr("Write pending file annotation deletions to a PDF first.") : !merging && owner.data.marks && owner.data.marks.preserved > 0 ? qsTr("Unknown sidecar entries cannot be remapped safely into split files.") : ""
+    readonly property string blockedReason: !owner ? "" : (owner.data.xfa_status || {}).is_xfa ? owner.data.xfa_status.read_only_reason : owner.hasEditDrafts ? qsTr("Save or clear pending form edits and redaction marks first.") : owner.data.marks && owner.data.marks.pending_deletions > 0 ? qsTr("Write pending file annotation deletions to a PDF first.") : !merging && owner.data.marks && owner.data.marks.preserved > 0 ? qsTr("Unknown cached entries cannot be remapped safely into split files.") : ""
     readonly property bool canWrite: !!owner && !!app.session && !blockedReason.length && !busy && (merging ? additions.length > 0 : !!plan && plan.parts.length > 0 && !plan.conflicts.length && !error.length && !planning)
     parent: Overlay.overlay
     anchors.centerIn: parent
@@ -67,7 +67,7 @@ Dialog {
         });
     }
     function saveMergeTo(url) {
-        if (!owner || !additions.length || owner.hasEditDrafts || !app.session)
+        if (!owner || !additions.length || blockedReason.length || !app.session)
             return;
         const others = additions.map(function (file) {
             return app.session.localPath(file);
@@ -142,13 +142,13 @@ Dialog {
         anchors.fill: parent
         Label {
             textFormat: Text.PlainText
-            text: exportsDialog.merging ? qsTr("The open document comes first. PDFs below are appended in order. The first outline is kept; appended outlines are not imported. Embedded annotations travel with their pages.") : qsTr("Type disjoint page ranges using the page numbers shown by the reader, or split every N pages. Existing PDFs or annotation sidecars stop the split before writing.")
+            text: exportsDialog.merging ? qsTr("The open document comes first. PDFs below are appended in order. Appended outlines are imported as labelled groups. Embedded annotations travel with their pages.") : qsTr("Type disjoint page ranges using the page numbers shown by the reader, or split every N pages. Existing PDFs stop the split before writing.")
             wrapMode: Text.Wrap
             Layout.fillWidth: true
         }
         Label {
             textFormat: Text.PlainText
-            text: qsTr("LyraReader annotations are carried in adjacent sidecars. Other documents' sidecars are not imported. The open document is unchanged.")
+            text: qsTr("LyraReader annotations are embedded in the output PDFs. Other documents' application-cache drafts are not imported. The open document is unchanged.")
             wrapMode: Text.Wrap
             Layout.fillWidth: true
             color: app.colors.textSecondary
@@ -273,7 +273,7 @@ Dialog {
         Label {
             textFormat: Text.PlainText
             visible: !!exportsDialog.plan && exportsDialog.plan.conflicts.length > 0
-            text: qsTr("One or more output files or sidecars already exist. Choose another folder.")
+            text: qsTr("One or more output files already exist. Choose another folder.")
             color: app.colors.errorFg
             Layout.fillWidth: true
             wrapMode: Text.Wrap

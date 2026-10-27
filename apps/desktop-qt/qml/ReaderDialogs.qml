@@ -250,17 +250,17 @@ Item {
         }
         MenuItem {
             text: qsTr("Highlight")
-            enabled: !!app.selection
+            enabled: app.canModifyPdf && !!app.selection
             onTriggered: app.markSelection("highlight")
         }
         MenuItem {
             text: qsTr("Underline")
-            enabled: !!app.selection
+            enabled: app.canModifyPdf && !!app.selection
             onTriggered: app.markSelection("underline")
         }
         MenuItem {
             text: qsTr("Strikethrough")
-            enabled: !!app.selection
+            enabled: app.canModifyPdf && !!app.selection
             onTriggered: app.markSelection("strikeout")
         }
         MenuSeparator {}
@@ -275,21 +275,23 @@ Item {
         parent: Overlay.overlay
         MenuItem {
             text: qsTr("Save Annotated Copy…")
+            enabled: app.canModifyPdf
             onTriggered: app.chooseExport("annotations")
         }
         MenuItem {
             text: qsTr("Save and Replace Original…")
-            enabled: !app.originalReadOnly
+            enabled: app.canModifyPdf && !app.originalReadOnly
             onTriggered: app.confirmReplace("annotations")
         }
         MenuSeparator {}
         MenuItem {
             text: qsTr("Save Filled Form Copy…")
+            enabled: app.canModifyPdf
             onTriggered: app.chooseExport("forms")
         }
         MenuItem {
             text: qsTr("Save Edited Copy…")
-            enabled: app.pageEditsPending
+            enabled: app.canModifyPdf && app.pageEditsPending
             onTriggered: app.chooseExport("pages")
         }
         MenuItem {
@@ -454,24 +456,28 @@ Item {
                 }
                 TextField {
                     id: titleField
+                    readOnly: app.xfaReadOnly
                     Layout.fillWidth: true
                     text: app.infoData.title || ""
                     placeholderText: qsTr("Title")
                 }
                 TextField {
                     id: authorField
+                    readOnly: app.xfaReadOnly
                     Layout.fillWidth: true
                     text: app.infoData.author || ""
                     placeholderText: qsTr("Author")
                 }
                 TextField {
                     id: subjectField
+                    readOnly: app.xfaReadOnly
                     Layout.fillWidth: true
                     text: app.infoData.subject || ""
                     placeholderText: qsTr("Subject")
                 }
                 TextField {
                     id: keywordsField
+                    readOnly: app.xfaReadOnly
                     Layout.fillWidth: true
                     text: app.infoData.keywords || ""
                     placeholderText: qsTr("Keywords")
@@ -484,12 +490,12 @@ Item {
                 RowLayout {
                     Button {
                         text: qsTr("Save Properties Copy…")
-                        enabled: !app.infoData.is_encrypted && !app.originalReadOnly
+                        enabled: app.canModifyPdf && !app.infoData.is_encrypted && !app.originalReadOnly
                         onClicked: app.chooseExport("properties")
                     }
                     Button {
                         text: qsTr("Write to Original…")
-                        enabled: !app.infoData.is_encrypted && !app.originalReadOnly
+                        enabled: app.canModifyPdf && !app.infoData.is_encrypted && !app.originalReadOnly
                         onClicked: app.confirmReplace("properties")
                     }
                 }
@@ -666,7 +672,7 @@ Item {
                     }
                     Button {
                         text: qsTr("Write to Original…")
-                        enabled: !app.originalReadOnly
+                        enabled: app.canModifyPdf && !app.originalReadOnly
                         onClicked: app.confirmReplace("forms")
                     }
                 }
@@ -712,7 +718,7 @@ Item {
                 color: app.colors.textTertiary
             }
             RowLayout {
-                enabled: !!app.selectedAnnotation && !app.selectedAnnotation.foreign
+                enabled: app.canModifyPdf && !!app.selectedAnnotation && !app.selectedAnnotation.foreign
                 visible: !app.selectedAnnotation || app.selectedAnnotation.kind !== "signature"
                 Label {
                     textFormat: Text.PlainText
@@ -750,7 +756,7 @@ Item {
                 }
             }
             RowLayout {
-                enabled: !!app.selectedAnnotation && !app.selectedAnnotation.foreign
+                enabled: app.canModifyPdf && !!app.selectedAnnotation && !app.selectedAnnotation.foreign
                 Label {
                     textFormat: Text.PlainText
                     text: qsTr("Opacity")
@@ -784,7 +790,7 @@ Item {
             }
             RowLayout {
                 visible: !!app.selectedAnnotation && app.selectedAnnotation.kind === "textBox"
-                enabled: !!app.selectedAnnotation && !app.selectedAnnotation.foreign
+                enabled: app.canModifyPdf && !!app.selectedAnnotation && !app.selectedAnnotation.foreign
                 Label {
                     textFormat: Text.PlainText
                     text: qsTr("Text size")
@@ -824,7 +830,7 @@ Item {
                 objectName: "annotationNoteText"
                 Layout.fillWidth: true
                 implicitHeight: 150
-                readOnly: !!(app.selectedAnnotation && (app.selectedAnnotation.foreign || app.selectedAnnotation.kind === "signature"))
+                readOnly: app.xfaReadOnly || !!(app.selectedAnnotation && (app.selectedAnnotation.foreign || app.selectedAnnotation.kind === "signature"))
                 wrapMode: Text.Wrap
                 placeholderText: qsTr("Note")
                 onTextChanged: if (dialogs.noteReady && annotation.visible && !readOnly) {
@@ -863,7 +869,7 @@ Item {
                 }
                 Button {
                     text: qsTr("Delete Annotation")
-                    enabled: !!app.selectedAnnotation && !Logic.annotationUnsupportedReason(app.selectedAnnotation).length
+                    enabled: app.canModifyPdf && !!app.selectedAnnotation && !Logic.annotationUnsupportedReason(app.selectedAnnotation).length
                     onClicked: {
                         app.deleteSelectedAnnotation();
                         annotation.close();

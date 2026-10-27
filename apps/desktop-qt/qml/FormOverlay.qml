@@ -33,7 +33,7 @@ Item {
             y: modelData.box.y_pt * app.zoom
             width: modelData.box.width_pt * app.zoom
             height: modelData.box.height_pt * app.zoom
-            enabled: field.editable && app.currentReader.pendingCommands === 0
+            enabled: app.canModifyPdf && field.editable && app.currentReader.pendingCommands === 0
             Rectangle {
                 anchors.fill: parent
                 color: app.colors.fieldBg

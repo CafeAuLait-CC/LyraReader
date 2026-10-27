@@ -7,6 +7,7 @@ import "ReaderLogic.js" as Logic
 ToolBar {
     id: tools
     required property var app
+    enabled: app.canModifyPdf
     implicitHeight: 44
     background: Rectangle {
         color: app.colors.panelBg

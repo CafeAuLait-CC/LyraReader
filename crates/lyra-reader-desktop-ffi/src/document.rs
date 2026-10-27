@@ -15,6 +15,7 @@ pub struct DesktopDocument {
     pub(super) engine: RwLock<Arc<LyraReaderDocument>>,
     pub(super) layout: RwLock<DocumentLayout>,
     pub(super) original_signature: SignatureStatusRecord,
+    original_xfa: XfaStatusRecord,
     ai: Mutex<Option<Arc<LyraReaderAiRequest>>>,
     pub(super) marks: Mutex<crate::marks::Marks>,
     pub(super) edits: Mutex<crate::pages::PageEdits>,
@@ -72,6 +73,7 @@ impl DesktopDocument {
         let marks = Mutex::new(mark_state);
         let document = Self {
             original_signature: engine.signature_status(),
+            original_xfa: engine.xfa_status(),
             engine: RwLock::new(engine),
             layout: RwLock::new(DocumentLayout::new(sizes, PAGE_GAP_PT)),
             edits: Mutex::new(crate::pages::PageEdits::default()),
@@ -107,6 +109,14 @@ impl DesktopDocument {
             self.original_signature.clone()
         }
     }
+    fn source_xfa(&self, current: &LyraReaderDocument) -> XfaStatusRecord {
+        // Cached working PDFs must not erase the source form's read-only contract.
+        if Path::new(&current.path()) == self.original_path {
+            current.xfa_status()
+        } else {
+            self.original_xfa.clone()
+        }
+    }
     pub fn info(&self) -> Result<Value, String> {
         let current = self.active()?;
         let layout = self
@@ -115,7 +125,7 @@ impl DesktopDocument {
             .map_err(|_| "Layout state is unavailable")?;
         Ok(json!({
             "pages":layout.placements().iter().map(|p|json!({"index":p.index,"width":p.width_pt,"height":p.height_pt,"top":p.top_pt,"left":p.left_pt})).collect::<Vec<_>>(),
-            "width":layout.content_width_pt(),"height":layout.content_height_pt(),"gap":layout.gap_pt(),"path":self.original_path,"revision":self.active()?.path(),"signature_status":self.source_signature(&current),"xfa_status":self.active()?.xfa_status(),"recovery":self.recovery_status.lock().map_err(|_|"Recovery state is unavailable")?.clone(),
+            "width":layout.content_width_pt(),"height":layout.content_height_pt(),"gap":layout.gap_pt(),"path":self.original_path,"revision":self.active()?.path(),"signature_status":self.source_signature(&current),"xfa_status":self.source_xfa(&current),"recovery":self.recovery_status.lock().map_err(|_|"Recovery state is unavailable")?.clone(),
         }))
     }
 
@@ -146,6 +156,33 @@ impl DesktopDocument {
             .get("op")
             .and_then(Value::as_str)
             .ok_or("Missing operation")?;
+        // The shared writer already rejects XFA derivatives. Gate shell-side mutations too,
+        // before creating a cache/session or turning a synthetic form page into an editable draft.
+        // Local reading bookmarks and their undo history remain available.
+        let writes_pdf_or_annotations = op.starts_with("save_")
+            || op.starts_with("replace_")
+            || op.starts_with("mark_")
+            || op.starts_with("file_")
+            || (op.starts_with("ink_erase_") && op != "ink_erase_cancel")
+            || matches!(
+                op,
+                "marks_erase"
+                    | "extract_pages"
+                    | "page_operation"
+                    | "page_stage"
+                    | "page_undo"
+                    | "page_redo"
+                    | "page_apply"
+                    | "document_save"
+            );
+        if writes_pdf_or_annotations {
+            let status = self.source_xfa(self.active()?.as_ref());
+            if status.is_xfa {
+                return Err(status
+                    .read_only_reason
+                    .ok_or("The XFA read-only status is incomplete")?);
+            }
+        }
         if matches!(op, "save_merge" | "save_split" | "split_plan") {
             return self.export_command(op, &r);
         }
@@ -1448,6 +1485,95 @@ mod tests {
         fs::write(&fixture.path, &original).unwrap();
         let discarded = doc.command(json!({"op":"document_discard"})).unwrap();
         assert_eq!(discarded["info"]["signature_status"]["signed"], false);
+    }
+
+    #[test]
+    fn private_working_pdf_cannot_remove_the_source_xfa_read_only_contract() {
+        let fixture = Fixture::new("xfa-refusal.pdf");
+        let working = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let source = fs::read(&fixture.path).unwrap();
+        // Model a legacy recovered synthetic revision. Its plain PDF status cannot authorize
+        // overwriting an XFA source or enabling annotation tools in the native shell.
+        *doc.engine.write().unwrap() = working.open().active().unwrap();
+        assert_eq!(doc.info().unwrap()["xfa_status"]["is_xfa"], true);
+        assert!(doc.command(json!({"op":"mark_create"})).is_err());
+        assert!(doc.command(json!({"op":"document_save"})).is_err());
+        assert_eq!(fs::read(&fixture.path).unwrap(), source);
+        doc.command(json!({"op":"document_discard"})).unwrap();
+        assert_eq!(doc.info().unwrap()["xfa_status"]["is_xfa"], true);
+    }
+
+    #[test]
+    fn xfa_all_write_routes_are_read_only_but_reading_bookmarks_survive() {
+        let fixture = Fixture::new("xfa-refusal.pdf");
+        let doc = fixture.open();
+        let source = fs::read(&fixture.path).unwrap();
+        let reason = doc.info().unwrap()["xfa_status"]["read_only_reason"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for op in [
+            "mark_create",
+            "mark_update",
+            "mark_delete",
+            "file_delete",
+            "file_adopt",
+            "marks_erase",
+            "ink_erase_begin",
+            "ink_erase_update",
+            "ink_erase_commit",
+            "page_stage",
+            "page_undo",
+            "page_redo",
+            "page_apply",
+            "document_save",
+            "page_operation",
+            "extract_pages",
+            "save_document_copy",
+            "save_current_edited_copy",
+            "save_current_annotations",
+            "replace_current_annotations",
+            "save_annotations",
+            "replace_annotations",
+            "save_forms",
+            "replace_forms",
+            "save_properties",
+            "replace_properties",
+            "save_edited_copy",
+            "replace_edited_pages",
+            "save_merge",
+            "save_split",
+        ] {
+            let output = fixture.directory.join(format!("{op}.pdf"));
+            let error = doc
+                .command(json!({"op":op,"destination":output}))
+                .unwrap_err();
+            assert_eq!(error, reason, "{op}");
+            assert!(!output.exists(), "{op}");
+            assert!(!cache_path(&fixture.path).exists(), "{op}");
+            assert!(
+                !cache_path(&fixture.path)
+                    .with_file_name("session.json")
+                    .exists()
+            );
+            assert_eq!(fs::read(&fixture.path).unwrap(), source);
+        }
+        assert!(!doc.render(0, 0.5, true).unwrap().pixels.is_empty());
+        doc.command(json!({"op":"text","page":0})).unwrap();
+        doc.command(json!({"op":"search","pattern":"form","limit":10}))
+            .unwrap();
+        doc.command(json!({"op":"layout","mode":"Facing","gap":12}))
+            .unwrap();
+        let created = doc.command(json!({"op":"bookmark_create","page":0,"title":"Local XFA reading position","yPt":0})).unwrap();
+        let id = created["bookmarks"][0]["id"].as_str().unwrap();
+        doc.command(json!({"op":"bookmark_update","id":id,"patch":{"title":"Kept locally"}}))
+            .unwrap();
+        doc.command(json!({"op":"marks_undo"})).unwrap();
+        doc.command(json!({"op":"marks_redo"})).unwrap();
+        let reopened = fixture.open().command(json!({"op":"marks"})).unwrap();
+        assert_eq!(reopened["bookmarks"][0]["title"], "Kept locally");
+        assert_eq!(fs::read(&fixture.path).unwrap(), source);
     }
 
     #[test]

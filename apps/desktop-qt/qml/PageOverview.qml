@@ -24,6 +24,7 @@ Item {
                 LyraToolButton {
                     symbol: "plus"
                     text: qsTr("Insert Blank Page")
+                    enabled: app.canModifyPdf
                     onClicked: app.pageOperation({
                         InsertBlank: {
                             index: Math.min(app.currentReader.pageCount, app.currentPage + 1)
@@ -33,7 +34,7 @@ Item {
                 LyraToolButton {
                     symbol: "rotate"
                     text: qsTr("Rotate Selected Pages")
-                    enabled: app.selectedPages.length > 0
+                    enabled: app.canModifyPdf && app.selectedPages.length > 0
                     onClicked: app.pageOperation({
                         Rotate: {
                             pages: app.selectedPages,
@@ -44,25 +45,25 @@ Item {
                 LyraToolButton {
                     symbol: "export"
                     text: qsTr("Extract Selected Pages…")
-                    enabled: app.selectedPages.length > 0
+                    enabled: app.canModifyPdf && app.selectedPages.length > 0
                     onClicked: app.chooseExport("extract")
                 }
                 LyraToolButton {
                     symbol: "delete"
                     text: qsTr("Delete Selected Pages")
-                    enabled: app.selectedPages.length > 0 && app.selectedPages.length < app.currentReader.pageCount
+                    enabled: app.canModifyPdf && app.selectedPages.length > 0 && app.selectedPages.length < app.currentReader.pageCount
                     onClicked: app.confirmPageDeletion()
                 }
                 LyraToolButton {
                     symbol: "back"
                     text: qsTr("Move Pages Earlier")
-                    enabled: app.selectedPages.length > 0 && Math.min.apply(null, app.selectedPages) > 0
+                    enabled: app.canModifyPdf && app.selectedPages.length > 0 && Math.min.apply(null, app.selectedPages) > 0
                     onClicked: app.movePages(Math.min.apply(null, app.selectedPages) - 1)
                 }
                 LyraToolButton {
                     symbol: "next"
                     text: qsTr("Move Pages Later")
-                    enabled: app.selectedPages.length > 0
+                    enabled: app.canModifyPdf && app.selectedPages.length > 0
                     onClicked: app.movePages(Math.min(app.currentReader.pageCount, Math.max.apply(null, app.selectedPages) + 2))
                 }
                 Label {
@@ -76,7 +77,7 @@ Item {
                 }
                 Button {
                     text: qsTr("Apply to Original…")
-                    enabled: !app.originalReadOnly
+                    enabled: app.canModifyPdf && !app.originalReadOnly
                     visible: app.pageEditsPending
                     onClicked: app.confirmReplace("pages")
                 }
@@ -97,7 +98,7 @@ Item {
             Layout.fillWidth: true
             Layout.margins: 10
             wrapMode: Text.Wrap
-            text: app.originalReadOnly ? qsTr("Signed PDF: export changes to a new copy. The signed original cannot be replaced.") : app.pageEditsPending ? qsTr("Page changes are staged. The original PDF stays unchanged until Apply. Undo restores pages and their marks.") : qsTr("Space selects; Ctrl+Space toggles; Shift+Space selects a range. Enter opens a page. Drag to reorder.")
+            text: app.xfaReadOnly ? app.readOnlyReason : app.originalReadOnly ? qsTr("Signed PDF: export changes to a new copy. The signed original cannot be replaced.") : app.pageEditsPending ? qsTr("Page changes are staged. The original PDF stays unchanged until Apply. Undo restores pages and their marks.") : qsTr("Space selects; Ctrl+Space toggles; Shift+Space selects a range. Enter opens a page. Drag to reorder.")
             color: app.colors.textSecondary
             font.pixelSize: 11
         }
@@ -212,6 +213,7 @@ Item {
                     }
                     DragHandler {
                         id: drag
+                        enabled: app.canModifyPdf
                         target: null
                         onActiveChanged: {
                             if (active) {
