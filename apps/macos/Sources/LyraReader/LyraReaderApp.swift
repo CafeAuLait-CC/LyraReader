@@ -24,6 +24,9 @@ struct LyraReaderApp: App {
     private static var quitWatchdog: DispatchSourceTimer?
 
     init() {
+        // The perf trace's t0: the earliest point this process can observe. With
+        // `LYRA_READER_PERF_TRACE` unset this is one bool test and no record.
+        PerfTrace.reportLaunchOnce()
         ReaderDataCompatibility.migratePreferences()
         AppState.recordsRecentDocuments = true
         // A packaged app must use its own PDFium before the engine's development-directory

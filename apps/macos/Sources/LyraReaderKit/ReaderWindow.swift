@@ -424,6 +424,8 @@ public struct ReaderWindow: View {
                 onUndo: { state.undo() },
                 onRedo: { state.redo() },
                 interactionSnapshot: { (state.canvasPages, state.scrollYPt, state.zoomFactor) },
+                perfStamp: state.perfViewportStamp,
+                onPerfStamp: { state.perfViewportStamp },
                 fileDrop: opener,
                 // A right-click is a command surface on the page: copy, highlight, note, follow
                 // the link under the pointer, or stage a page command. The items are built from

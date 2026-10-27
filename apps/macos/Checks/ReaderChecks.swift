@@ -148,6 +148,15 @@ struct ReaderChecks {
             return
         }
         let fastRoot = checkRoot(CommandLine.arguments.dropFirst(2).first)
+        if CommandLine.arguments.contains("--check-perf-trace") {
+            // Opt-in first (`LyraReaderChecks <root> --check-perf-trace`), and also a registered
+            // suite below, so the normal run covers it without a separate invocation. The root is
+            // the first non-flag argument, so both `<root> --check-perf-trace` and
+            // `--check-perf-trace <root>` work.
+            let rootArgument = CommandLine.arguments.dropFirst().first { !$0.hasPrefix("--") }
+            try await perfTraceChecks(root: checkRoot(rootArgument))
+            return
+        }
         if CommandLine.arguments.contains("--capture-ai-plan-goldens") {
             try await captureAIPlanGoldens(root: fastRoot)
             return
@@ -1260,6 +1269,13 @@ struct ReaderChecks {
             }),
             ("frame-scheduling", {
                 try await frameSchedulingChecks()
+            }),
+            ("perf-trace", {
+                // The measurement layer itself: a synthetic wheel scroll through the real
+                // AppState/canvas must produce a well-ordered trace, and turning the trace off
+                // must leave the tile counters and the drawn page list identical. Registered
+                // with the surface checks because it needs a canvas whose frames can submit.
+                try await perfTraceChecks(root: root)
             }),
             ("contract-cleanup", {
                 // Before xfa: pure value checks plus one scratch document; no window or GPU surface.
