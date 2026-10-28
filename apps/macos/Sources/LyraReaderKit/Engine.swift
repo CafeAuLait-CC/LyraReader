@@ -1998,8 +1998,17 @@ public protocol PDFEngine: AnyObject {
     /// Every figure and table caption in the document, each carrying the region to preview
     /// (empty when none can be found). Document-wide, so implementations cache it.
     func figures() async throws -> [Figure]
+    /// One bounded step of the document-wide figure scan. Returns the records found so far and
+    /// whether the scan is complete; the shell yields to visible raster work between steps.
+    func figuresScanStep(pages: Int) async throws -> (figures: [Figure], done: Bool)
     /// The document's reference list (empty when none can be parsed).
     func references() async throws -> [Reference]
+    /// One bounded step of the document-wide reference/citation scan. Returns the records found
+    /// so far and whether the scan is complete; the shell yields between steps.
+    func referencesScanStep(
+        pageBatch: Int,
+        entryBatch: Int
+    ) async throws -> (references: [Reference], done: Bool)
     /// Resolves a citation's labels to **every** reference entry they name, in label order,
     /// against the reference list of the section the citation's `page` belongs to (one
     /// implementation, in Rust; empty when nothing resolves). The page is what attributes a
@@ -2054,6 +2063,17 @@ public protocol PDFEngine: AnyObject {
 }
 
 public extension PDFEngine {
+    /// Engines that cannot scan incrementally still answer the shell's bounded-step loop: they
+    /// run their one-shot scan and report it complete. The real engine overrides both.
+    func figuresScanStep(pages: Int) async throws -> (figures: [Figure], done: Bool) {
+        (try await figures(), true)
+    }
+    func referencesScanStep(
+        pageBatch: Int,
+        entryBatch: Int
+    ) async throws -> (references: [Reference], done: Bool) {
+        (try await references(), true)
+    }
     /// Test doubles without a text layer have no region text; the picture path still works.
     func regionText(
         page: Int,
@@ -2855,8 +2875,23 @@ public final class RustEngine: PDFEngine {
     public func citations(_ page: Int) async throws -> [Citation] {
         guard let document else { return [] }
 
+        let perfCall = PerfTrace.enabled ? PerfTrace.now : 0
         return try await withCheckedThrowingContinuation { continuation in
             rasterQueue.async {
+                let perfStart = PerfTrace.enabled ? PerfTrace.now : 0
+                if PerfTrace.enabled {
+                    PerfTrace.stage("queue_dispatch", source: "index", page: page,
+                                    milliseconds: (perfStart - perfCall) * 1000,
+                                    queueWaitMs: (perfStart - perfCall) * 1000,
+                                    detail: "citations")
+                }
+                defer {
+                    if PerfTrace.enabled {
+                        PerfTrace.stage("queue_core", source: "index", page: page,
+                                        milliseconds: (PerfTrace.now - perfStart) * 1000,
+                                        detail: "citations")
+                    }
+                }
                 do {
                     let found = try document.citations(page: UInt32(page))
                     continuation.resume(
@@ -2882,8 +2917,23 @@ public final class RustEngine: PDFEngine {
     public func captionMentions(page: Int) async throws -> [CaptionMention] {
         guard let document else { return [] }
 
+        let perfCall = PerfTrace.enabled ? PerfTrace.now : 0
         return try await withCheckedThrowingContinuation { continuation in
             rasterQueue.async {
+                let perfStart = PerfTrace.enabled ? PerfTrace.now : 0
+                if PerfTrace.enabled {
+                    PerfTrace.stage("queue_dispatch", source: "index", page: page,
+                                    milliseconds: (perfStart - perfCall) * 1000,
+                                    queueWaitMs: (perfStart - perfCall) * 1000,
+                                    detail: "caption-mentions")
+                }
+                defer {
+                    if PerfTrace.enabled {
+                        PerfTrace.stage("queue_core", source: "index", page: page,
+                                        milliseconds: (PerfTrace.now - perfStart) * 1000,
+                                        detail: "caption-mentions")
+                    }
+                }
                 do {
                     let found = try document.captionMentions(page: UInt32(page))
                     continuation.resume(
@@ -2917,9 +2967,24 @@ public final class RustEngine: PDFEngine {
         // fetches the readable records and their unreadable count in one scan.
         guard let document else { return .empty }
 
+        let perfCall = PerfTrace.enabled ? PerfTrace.now : 0
         let (records, status): ([AnnotationRecord], AnnotationReadStatus) =
             try await withCheckedThrowingContinuation { continuation in
                 rasterQueue.async {
+                    let perfStart = PerfTrace.enabled ? PerfTrace.now : 0
+                    if PerfTrace.enabled {
+                        PerfTrace.stage("queue_dispatch", source: "index",
+                                        milliseconds: (perfStart - perfCall) * 1000,
+                                        queueWaitMs: (perfStart - perfCall) * 1000,
+                                        detail: "annotations")
+                    }
+                    defer {
+                        if PerfTrace.enabled {
+                            PerfTrace.stage("queue_core", source: "index",
+                                            milliseconds: (PerfTrace.now - perfStart) * 1000,
+                                            detail: "annotations")
+                        }
+                    }
                     do {
                         let records = try document.annotations()
                         let status = try document.annotationReadStatus()
@@ -2930,7 +2995,14 @@ public final class RustEngine: PDFEngine {
                 }
             }
 
-        return DocumentAnnotationScan(
+        return Self.annotationScan(from: records, status: status)
+    }
+
+    private static func annotationScan(
+        from records: [AnnotationRecord],
+        status: AnnotationReadStatus
+    ) -> DocumentAnnotationScan {
+        DocumentAnnotationScan(
             annotations: records.map(Self.documentAnnotation(from:)),
             unreadableAnnotations: Int(status.unreadableAnnotations),
             unreadablePages: status.pages.map(Int.init),
@@ -3807,8 +3879,23 @@ public final class RustEngine: PDFEngine {
         let epoch = documentEpoch
         guard let document else { return [] }
 
+        let perfCall = PerfTrace.enabled ? PerfTrace.now : 0
         let records: [FigureRecord] = try await withCheckedThrowingContinuation { continuation in
             rasterQueue.async {
+                let perfStart = PerfTrace.enabled ? PerfTrace.now : 0
+                if PerfTrace.enabled {
+                    PerfTrace.stage("queue_dispatch", source: "index",
+                                    milliseconds: (perfStart - perfCall) * 1000,
+                                    queueWaitMs: (perfStart - perfCall) * 1000,
+                                    detail: "figures")
+                }
+                defer {
+                    if PerfTrace.enabled {
+                        PerfTrace.stage("queue_core", source: "index",
+                                        milliseconds: (PerfTrace.now - perfStart) * 1000,
+                                        detail: "figures")
+                    }
+                }
                 do {
                     continuation.resume(returning: try document.figures())
                 } catch {
@@ -3816,7 +3903,60 @@ public final class RustEngine: PDFEngine {
                 }
             }
         }
-        let figures = records.map { record in
+        let figures = Self.figures(from: records)
+        if epoch == documentEpoch {
+            figuresCache = figures
+            if let activeDocumentURL { figuresCaches[activeDocumentURL] = figures }
+        }
+        return figures
+    }
+
+    /// One bounded step of the document-wide figure scan.
+    ///
+    /// The shell calls this in a loop and yields to visible raster work between steps, so the
+    /// scan occupies the serial PDFium queue in short slices instead of one 300–500 ms block.
+    /// When the last step completes, this fills the same Swift cache [`figures`] fills, so a
+    /// later call cannot scan the document a second time.
+    public func figuresScanStep(pages: Int) async throws -> (figures: [Figure], done: Bool) {
+        if let figuresCache { return (figuresCache, true) }
+        let epoch = documentEpoch
+        guard let document else { return ([], true) }
+
+        let perfCall = PerfTrace.enabled ? PerfTrace.now : 0
+        let progress: FigureScanProgress = try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                let perfStart = PerfTrace.enabled ? PerfTrace.now : 0
+                if PerfTrace.enabled {
+                    PerfTrace.stage("queue_dispatch", source: "index",
+                                    milliseconds: (perfStart - perfCall) * 1000,
+                                    queueWaitMs: (perfStart - perfCall) * 1000,
+                                    detail: "figures")
+                }
+                defer {
+                    if PerfTrace.enabled {
+                        PerfTrace.stage("queue_core", source: "index",
+                                        milliseconds: (PerfTrace.now - perfStart) * 1000,
+                                        detail: "figures")
+                    }
+                }
+                do {
+                    continuation.resume(returning: try document.figuresScanStep(
+                        pages: UInt32(clamping: pages)))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        let figures = Self.figures(from: progress.records)
+        if progress.done, epoch == documentEpoch {
+            figuresCache = figures
+            if let activeDocumentURL { figuresCaches[activeDocumentURL] = figures }
+        }
+        return (figures, progress.done)
+    }
+
+    private static func figures(from records: [FigureRecord]) -> [Figure] {
+        records.map { record in
             Figure(
                 kind: record.kind,
                 label: record.label,
@@ -3828,18 +3968,79 @@ public final class RustEngine: PDFEngine {
                 heightPt: CGFloat(record.heightPt)
             )
         }
-        if epoch == documentEpoch {
-            figuresCache = figures
-            if let activeDocumentURL { figuresCaches[activeDocumentURL] = figures }
+    }
+
+    /// One bounded step of the document-wide reference/citation scan.
+    ///
+    /// The shell calls this in a loop and yields to visible raster work between steps. Rust
+    /// keeps the working set across calls; results are identical to [`references`].
+    public func referencesScanStep(
+        pageBatch: Int,
+        entryBatch: Int
+    ) async throws -> (references: [Reference], done: Bool) {
+        guard let document else { return ([], true) }
+
+        let perfCall = PerfTrace.enabled ? PerfTrace.now : 0
+        let progress: ReferenceScanProgress = try await withCheckedThrowingContinuation {
+            continuation in
+            rasterQueue.async {
+                let perfStart = PerfTrace.enabled ? PerfTrace.now : 0
+                if PerfTrace.enabled {
+                    PerfTrace.stage("queue_dispatch", source: "index",
+                                    milliseconds: (perfStart - perfCall) * 1000,
+                                    queueWaitMs: (perfStart - perfCall) * 1000,
+                                    detail: "references")
+                }
+                defer {
+                    if PerfTrace.enabled {
+                        PerfTrace.stage("queue_core", source: "index",
+                                        milliseconds: (PerfTrace.now - perfStart) * 1000,
+                                        detail: "references")
+                    }
+                }
+                do {
+                    continuation.resume(returning: try document.referencesScanStep(
+                        pageBatch: UInt32(clamping: pageBatch),
+                        entryBatch: UInt32(clamping: entryBatch)))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
         }
-        return figures
+        let references = progress.records.map { entry in
+            Reference(
+                label: entry.label,
+                text: entry.text,
+                page: Int(entry.page),
+                xPt: CGFloat(entry.xPt),
+                yPt: CGFloat(entry.yPt),
+                widthPt: CGFloat(entry.widthPt),
+                heightPt: CGFloat(entry.heightPt)
+            )
+        }
+        return (references, progress.done)
     }
 
     public func references() async throws -> [Reference] {
         guard let document else { return [] }
 
+        let perfCall = PerfTrace.enabled ? PerfTrace.now : 0
         return try await withCheckedThrowingContinuation { continuation in
             rasterQueue.async {
+                let perfStart = PerfTrace.enabled ? PerfTrace.now : 0
+                if PerfTrace.enabled {
+                    PerfTrace.stage("queue_dispatch", source: "index",
+                                    milliseconds: (perfStart - perfCall) * 1000,
+                                    queueWaitMs: (perfStart - perfCall) * 1000,
+                                    detail: "references")
+                }
+                defer {
+                    if PerfTrace.enabled {
+                        PerfTrace.stage("queue_core", source: "index",
+                                        milliseconds: (PerfTrace.now - perfStart) * 1000,
+                                        detail: "references")
+                    }
+                }
                 do {
                     let entries = try document.references()
                     continuation.resume(
@@ -4084,8 +4285,23 @@ public final class RustEngine: PDFEngine {
     public func search(_ pattern: String, limit: Int) async throws -> [SearchHit] {
         guard let document else { return [] }
 
+        let perfCall = PerfTrace.enabled ? PerfTrace.now : 0
         return try await withCheckedThrowingContinuation { continuation in
             rasterQueue.async {
+                let perfStart = PerfTrace.enabled ? PerfTrace.now : 0
+                if PerfTrace.enabled {
+                    PerfTrace.stage("queue_dispatch", source: "index",
+                                    milliseconds: (perfStart - perfCall) * 1000,
+                                    queueWaitMs: (perfStart - perfCall) * 1000,
+                                    detail: "search")
+                }
+                defer {
+                    if PerfTrace.enabled {
+                        PerfTrace.stage("queue_core", source: "index",
+                                        milliseconds: (PerfTrace.now - perfStart) * 1000,
+                                        detail: "search")
+                    }
+                }
                 do {
                     let hits = try document.search(pattern: pattern, limit: UInt32(limit))
                     continuation.resume(
@@ -4392,7 +4608,18 @@ public final class MockEngine: PDFEngine {
 
     public func figures() async throws -> [Figure] { [] }
 
+    public func figuresScanStep(pages: Int) async throws -> (figures: [Figure], done: Bool) {
+        ([], true)
+    }
+
     public func references() async throws -> [Reference] { [] }
+
+    public func referencesScanStep(
+        pageBatch: Int,
+        entryBatch: Int
+    ) async throws -> (references: [Reference], done: Bool) {
+        ([], true)
+    }
 
     public func resolveCitations(labels: [String], page: Int) async throws -> [Reference] { [] }
 

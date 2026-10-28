@@ -277,6 +277,11 @@ public enum PerfTrace {
     /// * `raster_dispatch` — engine method entry (the shell task resumed) → the work running on
     ///   the engine's serial raster queue. `ms` is that dispatch wait.
     /// * `raster_core` — the Rust/PDFium raster call itself. `ms` is the real rasterisation time.
+    /// * `queue_dispatch` — the same split for a non-raster task on the serial queue (the
+    ///   document-wide index scans): engine method entry → the block starting to run. `ms` and
+    ///   `queue_wait_ms` are that wait; `detail` names the scan.
+    /// * `queue_core` — the index scan itself, from the block starting to the end of the call.
+    ///   Emitted even when the scan throws, so a failed scan's cost is not invisible.
     /// * `raster_resume_scheduled` — emitted by the engine immediately *before* resuming the
     ///   awaiting task. No `ms`; the gap to `raster_resumed` is the main-actor wait.
     /// * `raster_resumed` — the shell task resumed after the await. Page raster and tile tasks
