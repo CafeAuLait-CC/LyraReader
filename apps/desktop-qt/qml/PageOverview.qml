@@ -168,7 +168,7 @@ Item {
                             readonly property real thumbnailScale: Math.min(145 / cell.modelData.width, 190 / cell.modelData.height)
                             width: cell.modelData.width * thumbnailScale
                             height: cell.modelData.height * thumbnailScale
-                            color: "white"
+                            color: app.currentReader.paperBackground(app.paperAppearance)
                             border.color: app.colors.pageEdge
                             PdfPage {
                                 resourceActive: cell.y + cell.height > grid.contentY && cell.y < grid.contentY + grid.height

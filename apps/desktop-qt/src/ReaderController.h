@@ -4,6 +4,7 @@
 #include <QRectF>
 #include <QImage>
 #include <QObject>
+#include <QColor>
 #include <QSet>
 #include <QTimer>
 #include <QUrl>
@@ -87,6 +88,7 @@ public:
     Q_INVOKABLE void setLayout(const QString &mode, double gap);
     Q_INVOKABLE double zoomOffset(double offset, double anchor, double oldZoom, double newZoom) const;
     Q_INVOKABLE QVariantMap signatureImage(const QUrl &url) const;
+    Q_INVOKABLE QColor paperBackground(const QString &appearance) const;
     Q_INVOKABLE QStringList signatureFonts() const;
     Q_INVOKABLE QVariantMap typedSignatureImage(const QString &name,const QString &family) const;
     Q_INVOKABLE QUrl contentPreviewUrl(int page,const QString &target,const QString &revision,
@@ -96,6 +98,7 @@ public:
     void requestPageForConsumer(quintptr consumer,int page,double scale,bool embedded=false);
     void clearRasterDemand(quintptr consumer);
     QImage cachedPage(int page, double scale,bool embedded=false) const;
+    QImage cachedBackdrop(int page,bool embedded=false)const;
     QList<TileSpec> requestTiles(quintptr consumer,int page,int level,const QRectF &visible,const QSet<QString> &retained);
     void clearTileDemand(quintptr consumer);
     QImage cachedTile(const QString &key)const;
@@ -122,6 +125,7 @@ signals:
     void commandsChanged();
 private:
     void setRasterSource(std::shared_ptr<NativeRasterSource> source);
+    QString backdropKey(int page)const;
     QString m_contentSourceKey;
     struct Request { int page; double scale; QString key; bool embedded=false; bool tile=false; QRectF region; int priority=0; };
     quint64 submitSnapshot(quint64 id,const QString &operation,const QVariantMap &arguments);

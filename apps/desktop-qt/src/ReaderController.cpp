@@ -18,6 +18,7 @@
 #include <QJSValue>
 #include <QUrlQuery>
 #include "SignatureArtwork.h"
+#include "PaperAppearance.h"
 #include <cmath>
 #include <deque>
 #include <functional>
@@ -60,7 +61,7 @@ struct OpenResult {
     QString revision;
     QString error;
 };
-struct RasterResult { ResidentImage image; QString error; double actualScale = 0; qint64 elapsedMs = 0;bool cancelled=false,pressure=false; };
+struct RasterResult { ResidentImage image,backdrop; QString error; double actualScale = 0; qint64 elapsedMs = 0;bool cancelled=false,pressure=false; };
 struct CommandResult { QVariant result; QString error; std::shared_ptr<NativeRasterSource> source; };
 double quantizedRasterScale(double scale) {
     return scale>=.125 ? std::ceil(scale*8)/8.0 : std::exp2(std::ceil(std::log2(scale)*4)/4);
@@ -389,6 +390,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
 }
 
 QStringList ReaderController::signatureFonts() const {return SignatureArtwork::fonts();}
+QColor ReaderController::paperBackground(const QString &appearance)const{return PaperAppearance::displayColor(Qt::white,PaperAppearance::mode(appearance));}
 QVariantMap ReaderController::typedSignatureImage(const QString &name,const QString &family) const {return SignatureArtwork::typed(name,family);}
 QVariantMap ReaderController::signatureImage(const QUrl &url) const {
     if(!url.isLocalFile())return {{"error",tr("Choose a local PNG or JPEG signature image.")}};
@@ -420,6 +422,8 @@ QImage ReaderController::cachedPage(int page,double scale,bool embedded) const {
     return RasterCache::get(m_cachePrefix+rasterKey(page,scale,embedded));
 }
 QImage ReaderController::cachedTile(const QString &key)const{return RasterCache::get(m_cachePrefix+key);}
+QString ReaderController::backdropKey(int page)const{return m_cachePrefix+QStringLiteral("backdrop:")+QString::number(page);}
+QImage ReaderController::cachedBackdrop(int page,bool embedded)const{return embedded ? QImage{} : RasterCache::backdrop(backdropKey(page));}
 double ReaderController::tileScale(int level){return std::exp2(double(level)/4.0);}
 void ReaderController::enqueue(const Request &request) {
     if(RasterCache::contains(m_cachePrefix+request.key) || m_pending.contains(request.key) || m_failed.contains(request.key))return;
@@ -490,6 +494,7 @@ void ReaderController::startNextRaster() {
     // Preview snapshots have no annotation overlay: bake PDF-owned annotations into each
     // raster without disabling PageItem's bounded tile path (the embedded-thumbnail flag).
     const bool annotated=request.embedded || m_snapshotMode;
+    const bool retainBackdrop=!request.tile && !request.embedded && !RasterCache::hasBackdrop(backdropKey(request.page));
     m_rendering=true;m_activeRaster=ticket;m_activeRasterKey=request.key;m_activeRasterIsTile=request.tile;
     auto *watcher=new QFutureWatcher<RasterResult>(this);
     connect(watcher,&QFutureWatcher<RasterResult>::finished,this,[this,watcher,request,generation]{
@@ -509,20 +514,28 @@ void ReaderController::startNextRaster() {
             if(result.image.isNull()){m_failed.insert(request.key);setError(result.error);}
             else {
                 RasterCache::put(m_cachePrefix+request.key,result.image.pixels);++m_completed;
+                if(!result.backdrop.isNull())RasterCache::putBackdrop(backdropKey(request.page),result.backdrop);
                 if(request.tile)emit tileReady(request.page);
                 else {qInfo().nospace()<<"lyra-reader-qt-raster: page="<<request.page<<" requested="<<request.scale<<" actual="<<result.actualScale<<" bytes="<<result.image.pixels.sizeInBytes()<<" ms="<<result.elapsedMs<<" global-cache-kib="<<RasterCache::costKiB();emit pageReady(request.page,request.scale);}
             }
         }
         emit statisticsChanged();startNextRaster();
     });
-    watcher->setFuture(QtConcurrent::run(RasterJobs::pool(),[source,request,ticket,annotated]{
+    watcher->setFuture(QtConcurrent::run(RasterJobs::pool(),[source,request,ticket,annotated,retainBackdrop]{
         RasterJobs::Run run(ticket);RasterResult result;QElapsedTimer timer;timer.start();
         if(ticket->cancelled.load()){result.cancelled=true;return result;}
         auto reservation=RenderBudget::reserve(RenderBudget::Kind::Resident,RenderBudget::maximumJobBytes);
         if(!reservation){result.pressure=true;return result;}
         auto image=source->crop(request.page,request.region,request.scale,annotated,false,&result.error,&result.actualScale);
         if(!image.isNull())result.image=ResidentImage::publish(std::move(reservation),std::move(image));
-        if(ticket->cancelled.load()){result.image={};result.cancelled=true;}
+        if(retainBackdrop && !result.image.isNull() && !ticket->cancelled.load()) {
+            // No extra PDFium work or GUI-thread downsampling. Reserve before allocating the
+            // bounded reduction; cache pressure may skip this optional history entry.
+            if(result.image.pixels.width()<=512 && result.image.pixels.height()<=1024)result.backdrop=result.image;
+            else if(auto charge=RenderBudget::reserve(RenderBudget::Kind::Resident,512LL*1024*4))
+                result.backdrop=ResidentImage::publish(std::move(charge),result.image.pixels.scaled(512,1024,Qt::KeepAspectRatio,Qt::SmoothTransformation));
+        }
+        if(ticket->cancelled.load()){result.image={};result.backdrop={};result.cancelled=true;}
         result.elapsedMs=timer.elapsed();return result;
     }));
 }

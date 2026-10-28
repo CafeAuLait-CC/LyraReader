@@ -123,7 +123,7 @@ Pane {
                             readonly property real thumbnailScale: Math.min(102 / thumbnail.modelData.width, 135 / thumbnail.modelData.height)
                             width: thumbnail.modelData.width * thumbnailScale
                             height: thumbnail.modelData.height * thumbnailScale
-                            color: "white"
+                            color: app.currentReader.paperBackground(app.paperAppearance)
                             border.width: thumbnail.highlighted ? 2 : 1
                             border.color: thumbnail.highlighted ? app.colors.accentBorder : app.colors.pageEdge
                             PdfPage {

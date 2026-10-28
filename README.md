@@ -52,6 +52,8 @@ Both preserve the PDF and its working revision.
 Bitmap and graphic previews retain their working revision and load only while the inspector needs
 them. Drawn signatures, rotated dates and the newer AI overlays remain work in
 progress.
+A byte-bounded revisit cache retains reduced page images after sharp sources leave the working
+set. Unloaded pages already use the selected reading-mode paper colour.
 Tabs reorder after half a tab width of travel, retain their reader state, and support
 Alt+Shift+Left/Right; cross-window drag and tear-off remain work in progress.
 Settings and detached PDF previews open as resizable native dialogs, with a transient owner and a

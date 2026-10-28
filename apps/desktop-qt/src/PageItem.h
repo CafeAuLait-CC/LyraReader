@@ -16,6 +16,7 @@ class PageItem : public QQuickItem {
     Q_PROPERTY(bool tilesEnabled READ tilesEnabled WRITE setTilesEnabled NOTIFY tilesEnabledChanged)
     Q_PROPERTY(QRectF visibleRegion READ visibleRegion WRITE setVisibleRegion NOTIFY visibleRegionChanged)
     Q_PROPERTY(bool refined READ refined NOTIFY refinementChanged)
+    Q_PROPERTY(bool backdropVisible READ backdropVisible NOTIFY refinementChanged)
     Q_PROPERTY(int loadedTileCount READ loadedTileCount NOTIFY refinementChanged)
     Q_PROPERTY(bool resourceActive READ resourceActive WRITE setResourceActive NOTIFY resourceActiveChanged)
     Q_PROPERTY(bool texturesReady READ texturesReady NOTIFY texturesReadyChanged)
@@ -28,6 +29,7 @@ public:
     QString paperAppearance() const {return m_paperAppearance;}
     bool loaded() const {return !m_image.isNull() || !m_tileImages.isEmpty();}
     bool refined() const {return m_refined;}
+    bool backdropVisible()const{return m_usingBackdrop && !m_refined && !m_image.isNull();}
     int loadedTileCount() const {return int(m_tileImages.size());}
     bool embeddedAnnotations() const {return m_embedded;}
     bool resourceActive()const{return m_resourceActive;}
@@ -74,6 +76,7 @@ private:
     QString m_paperAppearance=QStringLiteral("original");
     bool m_embedded=false,m_tilesEnabled=false,m_refined=false,m_demandCurrent=false;
     bool m_resourceActive=true;
+    bool m_usingBackdrop=false;
     qint64 m_targetBytes=0;
     bool m_texturesReady=false;
     quint64 m_textureEpoch=0;

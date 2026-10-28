@@ -16,6 +16,11 @@
 #include <QUuid>
 #include <QPrinter>
 #include <QPainter>
+#include <QScopeGuard>
+#include <QSemaphore>
+#include <QThreadPool>
+#include <QtConcurrentRun>
+#include "RasterCache.h"
 #include "AnnotationOverlay.h"
 #include "WorkspaceController.h"
 #include <QApplication>
@@ -1235,6 +1240,40 @@ private slots:
         QVERIFY(RasterJobs::statistics().value("peakRunning").toInt()<=RasterJobs::maximumRunning);
         if(inputIntervals.size()<6 || !focusMaintained)QSKIP("Insufficient input-period frames or lost native focus; interactive performance remains unmeasured. Diagnostic JSON was saved.");
     }
+    void revisitBackdropCacheIsBoundedAndKeepsItsResidentLease() {
+        QTRY_COMPARE_WITH_TIMEOUT(RenderBudget::statistics().value("residentBytes").toLongLong(),0,10000);
+        const auto prefix=QUuid::createUuid().toString()+"/backdrop-test/";
+        const auto cleanup=qScopeGuard([&]{RasterCache::clearPrefix(prefix);});
+        QImage small(512,512,QImage::Format_ARGB32);small.fill(Qt::white);auto image=ResidentImage::retain(small);QVERIFY(!image.isNull());
+        for(int i=0;i<8;++i)RasterCache::putBackdrop(prefix+QString::number(i),image);
+        QCOMPARE(RasterCache::backdropCostKiB(),RasterCache::maximumBackdropKiB);QVERIFY(!RasterCache::backdrop(prefix+"0").isNull());
+        RasterCache::putBackdrop(prefix+"8",image);QVERIFY(RasterCache::hasBackdrop(prefix+"0"));QVERIFY(!RasterCache::hasBackdrop(prefix+"1"));
+        QImage large(2048,1152,QImage::Format_ARGB32);large.fill(Qt::white);auto oversized=ResidentImage::retain(large);QVERIFY(!oversized.isNull());RasterCache::putBackdrop(prefix+"oversized",oversized);QVERIFY(!RasterCache::hasBackdrop(prefix+"oversized"));QCOMPARE(RasterCache::backdropCostKiB(),RasterCache::maximumBackdropKiB);
+        oversized={};large={};image={};small={};QCOMPARE(RenderBudget::statistics().value("residentBytes").toLongLong(),1024*1024);RasterCache::clearPrefix(prefix);QCOMPARE(RasterCache::backdropCostKiB(),0);QCOMPARE(RenderBudget::statistics().value("residentBytes").toLongLong(),0);
+    }
+    void distantRevisitsUseCachedContentAndUnloadedPaperFollowsAppearance() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/distant-pages.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/index-past-120.pdf",path));QFile input(path);QVERIFY(input.open(QIODevice::ReadOnly));const auto original=input.readAll();input.close();
+        ReaderController reader;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("reader",&reader);engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);reader.openFile(QUrl::fromLocalFile(path));QTRY_VERIFY_WITH_TIMEOUT(reader.pageCount()>100,10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QTRY_VERIFY(!window->property("positionRestoring").toBool());window->setProperty("fitting",false);QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,1.0),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+        auto page=[&](int index){return qobject_cast<PageItem *>(visualItem(window->contentItem(),"pdfPage"+QString::number(index)));};
+        QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,50),Q_ARG(QVariant,0)));QTRY_VERIFY_WITH_TIMEOUT(page(50) && page(50)->refined(),10000);QTRY_VERIFY(!reader.cachedBackdrop(50).isNull());QVERIFY(reader.cachedBackdrop(50,true).isNull());QVERIFY(reader.cachedBackdrop(50).width()<=512 && reader.cachedBackdrop(50).height()<=1024);
+        QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,100),Q_ARG(QVariant,0)));QTRY_VERIFY_WITH_TIMEOUT(page(100) && page(100)->refined(),10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingRasters(),0,10000);QVERIFY(!reader.cachedBackdrop(50).isNull());
+        // Shared synthetic buffers evict CPU-LRU costs without allocating 100 MiB of pixels.
+        const auto filler=QUuid::createUuid().toString()+"/working-set-test/";const auto cleanup=qScopeGuard([&]{RasterCache::clearPrefix(filler);});QImage pixels(1024,512,QImage::Format_ARGB32);pixels.fill(Qt::white);for(int i=0;i<50;++i)RasterCache::put(filler+QString::number(i),pixels);QCOMPARE(RasterCache::costKiB(),RasterCache::maximumKiB);QVERIFY(!RasterCache::contains(filler+"0"));
+        QSemaphore release;std::atomic_int started{0};QList<QFuture<void>> blockers;
+        auto unblock=qScopeGuard([&]{release.release(RasterJobs::maximumRunning);for(auto &future:blockers)future.waitForFinished();});
+        for(int i=0;i<RasterJobs::maximumRunning;++i)blockers.append(QtConcurrent::run(RasterJobs::pool(),[&]{++started;release.acquire();}));QTRY_COMPARE(started.load(),RasterJobs::maximumRunning);
+        const auto completed=reader.completedRasters();QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,50),Q_ARG(QVariant,0)));QTRY_VERIFY_WITH_TIMEOUT(page(50) && page(50)->loaded() && page(50)->backdropVisible(),10000);QVERIFY(!page(50)->refined());QCOMPARE(reader.completedRasters(),completed);
+        const auto evidence=qEnvironmentVariable("LYRA_READER_BACKDROP_SNAPSHOT");if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence));
+        QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,75),Q_ARG(QVariant,0)));QTRY_VERIFY(page(75));QVERIFY(!page(75)->loaded());
+        for(const auto &appearance:{"original","warm","night"}) {
+            window->setProperty("paperAppearance",appearance);const auto expected=reader.paperBackground(appearance);
+            auto correctPaper=[&]{const auto frame=window->grabWindow();if(frame.isNull() || !page(75))return false;const auto p=page(75)->mapToScene(QPointF(10,10));const int x=qRound(p.x()*frame.width()/window->width()),y=qRound(p.y()*frame.height()/window->height());if(x<0 || y<0 || x>=frame.width() || y>=frame.height())return false;const auto c=frame.pixelColor(x,y);return qAbs(c.red()-expected.red())<=2 && qAbs(c.green()-expected.green())<=2 && qAbs(c.blue()-expected.blue())<=2;};
+            QTRY_VERIFY_WITH_TIMEOUT(correctPaper(),10000);QVERIFY(!page(75)->loaded());QCOMPARE(reader.completedRasters(),completed);
+        }
+        if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+".night.png"));
+        release.release(RasterJobs::maximumRunning);for(auto &future:blockers)future.waitForFinished();unblock.dismiss();QTRY_VERIFY_WITH_TIMEOUT(page(75) && page(75)->refined() && page(75)->texturesReady(),15000);QVERIFY(!page(75)->backdropVisible());QVERIFY(RasterCache::backdropCostKiB()<=RasterCache::maximumBackdropKiB);QVERIFY(input.open(QIODevice::ReadOnly));QCOMPARE(input.readAll(),original);input.close();
+        reader.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QVERIFY(reader.cachedBackdrop(50).isNull());
+    }
     void completedBackgroundPixelsStayChargedWhileTheGuiIsBusy() {
         QTRY_COMPARE_WITH_TIMEOUT(RenderBudget::statistics().value("residentBytes").toLongLong(),0,10000);
         const auto denied=RenderBudget::statistics().value("residentDenied").toLongLong();
@@ -1286,9 +1325,12 @@ private slots:
         one->hide();one->releaseResources();
         auto *page=visualItem(one->contentItem(),"pdfPage0");QVERIFY(page);QTRY_VERIFY(!page->property("loaded").toBool());
         two->hide();two->releaseResources();
-        QTRY_COMPARE_WITH_TIMEOUT(RenderBudget::statistics().value("residentBytes").toLongLong(),0,10000);
+        // Hidden canvases release their working sets; the new byte-bounded revisit history
+        // intentionally survives while its reader is open, and stays charged to the ledger.
+        QTRY_VERIFY_WITH_TIMEOUT(RenderBudget::statistics().value("residentBytes").toLongLong()<=qint64(RasterCache::maximumBackdropKiB)*1024,10000);
         QTRY_COMPARE_WITH_TIMEOUT(RenderBudget::statistics().value("textureBytes").toLongLong(),0,10000);
         one->show();QTRY_VERIFY_WITH_TIMEOUT(ready(one),15000);QVERIFY(!one->grabWindow().isNull());
+        one->hide();one->releaseResources();first.closeTab(0);second.closeTab(0);QTRY_COMPARE_WITH_TIMEOUT(RenderBudget::statistics().value("residentBytes").toLongLong(),0,10000);
     }
     void deepZoomRefinesVisibleTilesWithoutSeamsAndSharesTheCacheBudget() {
         ReaderController reader;QQmlApplicationEngine engine;

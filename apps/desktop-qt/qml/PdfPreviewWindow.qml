@@ -119,6 +119,7 @@ ApplicationWindow {
         onWidthChanged:{if(preview.pendingPoint)preview.placePending();else if(preview.fitting && preview.initialized)preview.fitWidth();}
         onHeightChanged:if(preview.pendingPoint)preview.placePending()
         Rectangle {parent:view;color:preview.colors.canvasBg;anchors.fill:parent;z:-1}
+        Rectangle {x:pdf.x;y:pdf.y;width:pdf.width;height:pdf.height;z:-0.5;color:preview.previewReader ? preview.previewReader.paperBackground(preview.app.paperAppearance) : preview.colors.documentPaper}
         PdfPage {
             id:pdf
             objectName:"pdfPreviewPage"

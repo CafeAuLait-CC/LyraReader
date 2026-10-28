@@ -55,7 +55,7 @@ void PageItem::setResourceActive(bool active) {
 }
 void PageItem::resetImages() {
     if(m_controller)m_controller->clearRasterDemand(quintptr(this));
-    m_image={};m_tiles.clear();m_tileImages.clear();m_previousTiles.clear();m_previousImages.clear();m_level=-1000;m_demandCurrent=false;
+    m_image={};m_usingBackdrop=false;m_tiles.clear();m_tileImages.clear();m_previousTiles.clear();m_previousImages.clear();m_level=-1000;m_demandCurrent=false;
     setRefined(false);update();emit loadedChanged();emit refinementChanged();
 }
 void PageItem::setController(ReaderController *controller) {
@@ -70,14 +70,14 @@ void PageItem::setController(ReaderController *controller) {
     }
     m_requestTimer.start();update();emit controllerChanged();
 }
-void PageItem::setPageIndex(int page) {if(m_page==page)return;resetImages();m_page=page;m_requestTimer.start();emit pageIndexChanged();}
+void PageItem::setPageIndex(int page) {if(m_page==page)return;resetImages();m_page=page;refresh();m_requestTimer.start();emit pageIndexChanged();}
 void PageItem::setRasterScale(double scale) {if(!std::isfinite(scale) || scale<=0 || scale>128 || qFuzzyCompare(m_scale,scale))return;m_scale=scale;m_demandCurrent=false;setRefined(false);m_requestTimer.start();refresh();emit rasterScaleChanged();update();}
 void PageItem::setPaperAppearance(const QString &appearance) {if(m_paperAppearance==appearance)return;m_paperAppearance=appearance;update();emit paperAppearanceChanged();}
 void PageItem::setEmbeddedAnnotations(bool enabled) {if(m_embedded==enabled)return;m_embedded=enabled;resetImages();m_requestTimer.start();emit embeddedAnnotationsChanged();}
 void PageItem::setTilesEnabled(bool enabled) {if(m_tilesEnabled==enabled)return;m_tilesEnabled=enabled;m_demandCurrent=false;setRefined(false);m_requestTimer.start();emit tilesEnabledChanged();}
 void PageItem::setVisibleRegion(const QRectF &region) {
     if(m_visibleRegion==region)return;m_visibleRegion=region;m_demandCurrent=false;setRefined(false);syncBudget();
-    if(!demandVisible()){resetImages();m_requestTimer.stop();}else m_requestTimer.start(16);emit visibleRegionChanged();
+    if(!demandVisible()){resetImages();m_requestTimer.stop();}else {refresh();m_requestTimer.start(16);}emit visibleRegionChanged();
 }
 double PageItem::effectiveScale() const {
     double device=window()?window()->effectiveDevicePixelRatio():1.0;
@@ -107,6 +107,12 @@ void PageItem::refresh() {
         auto retained=ResidentImage::retain(fallback);
         if(!retained.isNull())m_image=std::move(retained);else blocked=true;
     }
+    const bool fallbackReady=!fallback.isNull() && m_image.pixels.cacheKey()==fallback.cacheKey();
+    if(fallbackReady)m_usingBackdrop=false;
+    else if(m_image.isNull()) {
+        auto retained=ResidentImage::retain(m_controller->cachedBackdrop(m_page,m_embedded));
+        if(!retained.isNull()){m_image=std::move(retained);m_usingBackdrop=true;}
+    }
     QSet<QString> wanted;bool complete=true;
     for(const auto &tile:m_tiles) {
         wanted.insert(tile.key);
@@ -122,7 +128,7 @@ void PageItem::refresh() {
     for(auto it=m_tileImages.begin();it!=m_tileImages.end();)if(!wanted.contains(it.key()))it=m_tileImages.erase(it);else ++it;
     if(complete && m_demandCurrent){m_previousTiles.clear();m_previousImages.clear();}
     if(blocked){m_previousTiles.clear();m_previousImages.clear();m_requestTimer.start(200);}
-    setRefined(m_demandCurrent && (needsTiles()?complete:!fallback.isNull()));
+    setRefined(m_demandCurrent && (needsTiles()?complete:fallbackReady));
     update();emit refinementChanged();if(wasLoaded!=loaded())emit loadedChanged();
 }
 void PageItem::request() {

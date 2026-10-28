@@ -184,7 +184,7 @@ Item {
                     width: modelData.width * app.zoom
                     height: modelData.height * app.zoom
                     x: (pageList.contentWidth - app.currentReader.documentWidth * app.zoom) / 2 + modelData.left * app.zoom
-                    color: "white"
+                    color: app.currentReader.paperBackground(app.paperAppearance)
                     PdfPage {
                         id: pdfPage
                         objectName: "pdfPage" + sheet.modelData.index
