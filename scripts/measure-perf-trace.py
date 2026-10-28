@@ -333,7 +333,7 @@ def summarize_run(records, idle_ms):
     first_document_frame = None
     document_epoch = (opened or {}).get('epoch')
     for frame in frames:
-        if frame.get('quads', 0) > 0 and frame['time'] >= (open_start or launch or frames[0])['time']:
+        if frame.get('document_quads', frame.get('quads', 0)) > 0 and frame['time'] >= (open_start or launch or frames[0])['time']:
             if document_epoch is not None and frame.get('epoch') != document_epoch:
                 continue  # another surface (the floating preview) draws its own document state
             if first_document_frame is None:
@@ -414,6 +414,8 @@ def summarize_run(records, idle_ms):
                   if isinstance(r.get('tile_cache_bytes'), (int, float))]
     page_bytes = [r['page_raster_bytes'] for r in memory
                   if isinstance(r.get('page_raster_bytes'), (int, float))]
+    backdrop_bytes = [r['page_backdrop_bytes'] for r in memory
+                      if isinstance(r.get('page_backdrop_bytes'), (int, float))]
 
     def frame_reason():
         if not frames:
@@ -484,6 +486,7 @@ def summarize_run(records, idle_ms):
             'rss_peak_bytes': max(rss) if rss else None,
             'tile_cache_peak_bytes': max(tile_bytes) if tile_bytes else None,
             'page_raster_peak_bytes': max(page_bytes) if page_bytes else None,
+            'page_backdrop_peak_bytes': max(backdrop_bytes) if backdrop_bytes else None,
             'phases': sorted({r.get('phase') for r in memory}),
             'scroll_stop_samples': [r for r in memory if r.get('phase') == 'scroll_stop'],
             'document_close_samples': [r for r in memory

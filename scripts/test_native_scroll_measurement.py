@@ -174,6 +174,17 @@ class PerfTraceMetricTests(unittest.TestCase):
         self.assertEqual(result['presentation']['frames_presented'], 0)
         self.assertEqual(result['presentation']['frames_presented_unavailable_timestamp'], 1)
 
+    def test_paper_placeholder_is_not_the_first_document_pixels(self):
+        records = self.base() + [
+            dict(kind='frame', presented=True, presented_time=100.4, time=100.3,
+                 quads=1, paper_quads=1, document_quads=0, epoch=1, token=0, offset_pt=0),
+            dict(kind='frame', presented=True, presented_time=100.9, time=100.8,
+                 quads=2, paper_quads=1, document_quads=1, epoch=1, token=1, offset_pt=0),
+        ]
+        result = perf_trace.summarize_run(records, 120)
+        self.assertAlmostEqual(result['first_present_ms'], 900)
+        self.assertAlmostEqual(result['presentation']['first_document_submit_ms'], 800)
+
     def test_scroll_stop_pairs_with_sharp_at_its_resting_offset(self):
         records = self.base() + [
             dict(kind='input', seq=1, time=101.0, offset_pt=50.0, destination_pt=50.0, epoch=1),

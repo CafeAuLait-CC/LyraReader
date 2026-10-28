@@ -26,6 +26,7 @@ final class PresentationTraceLayer: CAMetalLayer {
     /// CPU submission uptime, captured by `renderFrame` before the draw call.
     var traceSubmitTime: Double = 0
     var traceQuads: Int = 0
+    var tracePaperQuads: Int = 0
     var traceTileQuads: Int = 0
     var traceFrameIndex: UInt64 = 0
     /// Draw-call wall time, written after the draw returns; the handler reads it at presentation.
@@ -51,6 +52,7 @@ final class PresentationTraceLayer: CAMetalLayer {
         let stamp = traceStamp
         let submitTime = traceSubmitTime
         let quads = traceQuads
+        let paperQuads = tracePaperQuads
         let tileQuads = traceTileQuads
         let frameIndex = traceFrameIndex
         let cpu = traceCPU
@@ -72,7 +74,7 @@ final class PresentationTraceLayer: CAMetalLayer {
                     : "Metal reported a zero host presentation timestamp (display asleep or window occluded)",
                 submitTime: submitTime, surface: surface, sequence: sequence, stamp: stamp,
                 cpuUs: cpu.microseconds, quads: quads, tileQuads: tileQuads,
-                frameIndex: frameIndex, uploadMs: uploadMs > 0 ? uploadMs : nil)
+                frameIndex: frameIndex, uploadMs: uploadMs > 0 ? uploadMs : nil, paperQuads: paperQuads)
         }
         return drawable
     }
@@ -615,6 +617,8 @@ public final class MetalCanvasView: NSView {
     /// Page quads in the most recent frame handed to the engine, presented or not. `0` means the
     /// submission was a clearing frame: the background with nothing drawn over it.
     package private(set) var lastAttemptedQuadCount: Int?
+    package private(set) var lastAttemptedPaperQuadCount = 0
+    private var paperTexture: UInt64?
     /// The viewport stamp the most recent frame handed to the engine carried.
     ///
     /// The `frame` trace record is written from Metal's presentation callback, which is
@@ -1710,6 +1714,8 @@ public final class MetalCanvasView: NSView {
     }
 
     private func releaseAllTextures() {
+        if let paperTexture { _ = lyra_reader_gpu_release_texture(paperTexture) }
+        paperTexture = nil
         for (_, texture) in textures {
             _ = lyra_reader_gpu_release_texture(texture.id)
         }
@@ -1778,6 +1784,26 @@ public final class MetalCanvasView: NSView {
         var blends: [UInt8] = []
         var submitted: [String] = []
         var tileQuadCount = 0
+        // Paper exists independently of its raster. All page segments share one white texel,
+        // converted by the same appearance shader as PDF pixels, beneath every content quad.
+        if paperTexture == nil, !annotationPageFrames.isEmpty {
+            paperTexture = uploadTexture(PageImage(pixelWidth: 1, pixelHeight: 1,
+                pointSize: CGSize(width: 1, height: 1), bgra: Data([255, 255, 255, 255]), generation: 0))
+        }
+        if let paperTexture {
+            for frame in annotationPageFrames {
+                let rect = CanvasGeometry.pageRectInDevicePixels(pageTopPt: frame.topPt,
+                    pageLeftPt: frame.leftPt, widthPt: frame.widthPt, heightPt: frame.heightPt,
+                    scrollYPt: scrollYPt, zoom: zoom, backingScale: scale, contentOffsetXPx: offsetX)
+                guard rect.intersects(CGRect(x: 0, y: 0, width: CGFloat(surfaceWidth),
+                                             height: bounds.height * scale)) else { continue }
+                textureIds.append(paperTexture)
+                rects.append(contentsOf: [Float(rect.minX), Float(rect.minY), Float(rect.width), Float(rect.height)])
+                sources.append(contentsOf: [0, 0, 1, 1])
+                blends.append(QuadBlend.normal.rawValue)
+            }
+        }
+        let paperQuadCount = textureIds.count
         for page in pages {
             guard let texture = textures[page.placement.index] else { continue }
             // Tiles are the only positive placement block (`PlacementIndex`); this is what the
@@ -1864,6 +1890,7 @@ public final class MetalCanvasView: NSView {
             traceLayer.traceStamp = perfStamp
             traceLayer.traceSubmitTime = perfSubmitTime
             traceLayer.traceQuads = textureIds.count
+            traceLayer.tracePaperQuads = paperQuadCount
             traceLayer.traceTileQuads = tileQuadCount
             traceLayer.traceFrameIndex = frameAttemptCount + 1
             traceLayer.traceUploadMs = perfUploadMs
@@ -1916,7 +1943,7 @@ public final class MetalCanvasView: NSView {
                     sequence: (layer as? PresentationTraceLayer)?.traceSequence ?? 0,
                     stamp: perfStamp, cpuUs: UInt64(stats.elapsed_us), quads: textureIds.count,
                     tileQuads: tileQuadCount, frameIndex: frameAttemptCount + 1,
-                    uploadMs: perfUploadMs > 0 ? perfUploadMs : nil)
+                    uploadMs: perfUploadMs > 0 ? perfUploadMs : nil, paperQuads: paperQuadCount)
             } else if (layer as? PresentationTraceLayer)?.tracePerfEnabled != true {
                 // Presentation happened, but without the observing layer there is no host
                 // timestamp to report. Say so instead of reusing the submit time as if it were
@@ -1927,7 +1954,7 @@ public final class MetalCanvasView: NSView {
                     submitTime: perfSubmitTime, surface: UInt64(surfaceId), sequence: 0,
                     stamp: perfStamp, cpuUs: UInt64(stats.elapsed_us), quads: textureIds.count,
                     tileQuads: tileQuadCount, frameIndex: frameAttemptCount + 1,
-                    uploadMs: perfUploadMs > 0 ? perfUploadMs : nil)
+                    uploadMs: perfUploadMs > 0 ? perfUploadMs : nil, paperQuads: paperQuadCount)
             }
         }
 
@@ -1936,6 +1963,7 @@ public final class MetalCanvasView: NSView {
         // drawable once the window can present again.
         frameAttemptCount += 1
         lastAttemptedQuadCount = textureIds.count
+        lastAttemptedPaperQuadCount = paperQuadCount
         lastAttemptStamp = perfStamp
 
         if stats.presented == 0 {
