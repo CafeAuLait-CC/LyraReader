@@ -21,7 +21,12 @@ them written back into the PDF, staged page editing with undo, merge and split, 
 content, printing, bookmarks, citation / figure / table previews, paper metadata with BibTeX, annotation
 export, an index cache, and the AI assistant.
 
-Deliberately not done: cross-platform shells (Linux, Windows), localisation, automatic updates, and a handful
+A measured performance pass now covers the cold first frame, sharp-on-scroll-stop, deep-zoom tile batching,
+on-demand sidebar thumbnails and a memory-lifecycle audit; the numbers, conditions and remaining limits live
+in the design notes (document 26), not in this overview. A native Linux port is in progress on a separate,
+unmerged branch.
+
+Deliberately not done: a Windows shell, localisation, automatic updates, and a handful
 of editing niceties documented in the task list. In-place body-text editing and full content editing exist as
 separate features with their own documented limits.
 
@@ -144,6 +149,7 @@ carries the overview, and the only documents that ship with the code are this fi
 | [23](docs/23-audit-todo.md) | The audit's remediation list: what was moved, with PR numbers and the evidence each entry requires |
 | [24](docs/24-drift-checklist.md) | Periodic drift checklist and the measured baselines (line counts, unsafe/unwrap, goldens, corpora) |
 | [25](docs/25-post-refactor-independent-audit.md) | Independent post-refactor audit: the three regressions it found, their fixes, and what remains |
+| [26](docs/26-performance-baseline-and-plan.md) | Performance baseline and plan: measurement definitions, first-frame attribution, the fixes merged so far, the memory audit, and what is deliberately not done |
 | [ADR](docs/adr/) | Architecture decision records |
 
 ## Milestones at a glance
@@ -156,8 +162,8 @@ carries the overview, and the only documents that ship with the code are this fi
 | M3 | Annotation and editing | Complete: annotations (incl. stamps, image signatures, typed/drawn/Continuity signatures), page operations, forms filling without a tool, redaction (Edit workspace), flattened copies, printing |
 | M4 | Advanced reading | Complete: citation/figure/table previews, citation attribution, captions, metadata and BibTeX |
 | M5 | AI assistant | Broadly complete: document chat, region questions with an inline card, layered summaries, in-place translation, vision on both connections, local request log; cross-document Q&A not done |
-| M6 | Cross-platform | Not started (Linux and Windows shells) |
-| M7 | Polish: accessibility, i18n, updates | Not started |
+| M6 | Cross-platform | In progress: native Linux port on a separate, unmerged branch; Windows shell not started |
+| M7 | Polish: accessibility, i18n, updates | In progress: performance pass delivered (startup, sharp-on-stop, memory audit); accessibility, i18n and updates not started |
 
 Per-milestone detail, measurements and the remaining work live in the design notes, not here.
 
