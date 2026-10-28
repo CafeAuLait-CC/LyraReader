@@ -329,14 +329,97 @@ pub(super) fn save_content_image(
     {
         return Err("An image export cannot overwrite the active PDF revision.".into());
     }
-    let png = document
-        .content_image_png(page, string("target")?.into(), string("revision")?.into())
-        .map_err(|e| e.to_string())?;
+    let target = string("target")?;
+    let revision = string("revision")?;
+    let kind = match request.get("kind") {
+        None => "image",
+        Some(value) => value.as_str().ok_or("Invalid image kind")?,
+    };
+    // Older clients omit kind and export an original bitmap. Graphic exports resolve their
+    // current object through the shared snapshot, never trusting a rectangle from the UI.
+    let png = match kind {
+        "image" => document
+            .content_image_png(page, target.into(), revision.into())
+            .map_err(|e| e.to_string())?,
+        "graphic" => {
+            let snapshot: lyra_reader_pdfium::content_edit::ContentPage =
+                serde_json::from_str(&document.content_objects(page).map_err(|e| e.to_string())?)
+                    .map_err(|e| format!("Invalid content snapshot: {e}"))?;
+            if snapshot.revision != revision {
+                return Err("The graphic belongs to an older document revision.".into());
+            }
+            let item = snapshot
+                .items
+                .iter()
+                .find(|item| item.id == target && item.kind == "graphic")
+                .ok_or("Select a graphic to export.")?;
+            let bounds = item.bounds;
+            // Match the native macOS content-image path: view-space region at 2x, original
+            // colours, opaque background, without the editable annotation overlay. The shared
+            // renderer validates geometry and clamps dimensions before PDFium allocation.
+            opaque_graphic_png(
+                document
+                    .rasterize_region(
+                        page,
+                        2.0,
+                        bounds.x,
+                        bounds.y,
+                        bounds.width,
+                        bounds.height,
+                        false,
+                    )
+                    .map_err(|e| e.to_string())?,
+            )?
+        }
+        _ => return Err("Only bitmap images and graphics can be exported as PNG.".into()),
+    };
     if !png.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Err("The image engine did not return a PNG.".into());
     }
     let warning = publish_image_asset(destination, &png)?;
     Ok(json!({"destination_path":destination,"bytes":png.len(),"publication_warning":warning}))
+}
+
+/// Encode the shared opaque BGRA raster as a straight RGBA PNG. Compact row padding in the
+/// owned buffer, avoiding a second full-sized pixel allocation in the native export adapter.
+fn opaque_graphic_png(mut bitmap: PageBitmap) -> Result<Vec<u8>, String> {
+    use image::{ExtendedColorType, ImageEncoder};
+    let invalid = || "The graphic renderer returned an invalid pixel buffer".to_string();
+    if bitmap.width_px == 0
+        || bitmap.height_px == 0
+        || bitmap.width_px > 8192
+        || bitmap.height_px > 8192
+    {
+        return Err(invalid());
+    }
+    let width = usize::try_from(bitmap.width_px).map_err(|_| invalid())?;
+    let height = usize::try_from(bitmap.height_px).map_err(|_| invalid())?;
+    let stride = usize::try_from(bitmap.stride).map_err(|_| invalid())?;
+    let row = width.checked_mul(4).ok_or_else(invalid)?;
+    let required = stride.checked_mul(height).ok_or_else(invalid)?;
+    if stride < row || bitmap.pixels.len() < required {
+        return Err(invalid());
+    }
+    for y in 0..height {
+        bitmap
+            .pixels
+            .copy_within(y * stride..y * stride + row, y * row);
+    }
+    bitmap.pixels.truncate(row * height);
+    for pixel in bitmap.pixels.as_chunks_mut::<4>().0 {
+        // The renderer cleared to opaque white, so premultiplied and straight RGB coincide.
+        pixel.swap(0, 2);
+    }
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(
+            &bitmap.pixels,
+            bitmap.width_px,
+            bitmap.height_px,
+            ExtendedColorType::Rgba8,
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(png)
 }
 
 fn publish_image_asset(destination: &Path, bytes: &[u8]) -> Result<Option<String>, String> {
@@ -409,6 +492,40 @@ fn publish_image_asset(destination: &Path, bytes: &[u8]) -> Result<Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graphic_png_compacts_bgra_rows_and_rejects_truncated_buffers() {
+        let bitmap = PageBitmap {
+            width_px: 2,
+            height_px: 2,
+            stride: 12,
+            width_pt: 1.0,
+            height_pt: 1.0,
+            scale_used: 2.0,
+            pixels: vec![
+                0, 0, 255, 255, 255, 0, 0, 255, 9, 9, 9, 9, 0, 255, 0, 255, 255, 255, 255, 255, 8,
+                8, 8, 8,
+            ],
+        };
+        let png = opaque_graphic_png(bitmap.clone()).unwrap();
+        let decoded = image::load_from_memory(&png).unwrap().into_rgba8();
+        assert_eq!(decoded.dimensions(), (2, 2));
+        assert_eq!(
+            decoded.into_raw(),
+            vec![
+                255, 0, 0, 255, 0, 0, 255, 255, 0, 255, 0, 255, 255, 255, 255, 255
+            ]
+        );
+        let mut truncated = bitmap.clone();
+        truncated.pixels.pop();
+        assert!(opaque_graphic_png(truncated).is_err());
+        let mut short_stride = bitmap.clone();
+        short_stride.stride = 7;
+        assert!(opaque_graphic_png(short_stride).is_err());
+        let mut oversized = bitmap;
+        oversized.width_px = u32::MAX;
+        assert!(opaque_graphic_png(oversized).is_err());
+    }
     #[test]
     #[cfg(unix)]
     fn image_publication_reports_directory_sync_failure_after_successful_rename() {

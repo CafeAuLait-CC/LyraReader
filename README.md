@@ -46,9 +46,10 @@ failed or superseded text drafts remain available to copy or retry. Redact → B
 PDF content and asks explicitly before a fallback replaces an entire page with an image. Fill & Sign
 places text, dates, vector checkmarks/crosses, stamps and image signatures. The Edit inspector crops
 selected top-level images or graphics by retained edge percentages through the shared undo/save
-transaction. Selected bitmap images export as PNG without changing the PDF or its working revision.
+transaction. Selected bitmap images export their original pixels as PNG; graphics export their page region.
+Both preserve the PDF and its working revision.
 Bitmap and graphic previews retain their working revision and load only while the inspector needs
-them. Other signature methods, graphic export and the newer AI overlays remain work in
+them. Other signature methods and the newer AI overlays remain work in
 progress.
 Tabs reorder after half a tab width of travel, retain their reader state, and support
 Alt+Shift+Left/Right; cross-window drag and tear-off remain work in progress.

@@ -1808,6 +1808,109 @@ mod tests {
     }
 
     #[test]
+    fn graphic_export_resolves_the_working_object_and_protects_existing_output() {
+        let fixture = Fixture::new("form-text-pages.pdf");
+        let doc = fixture.open();
+        let original = fs::read(&fixture.path).unwrap();
+        let snapshot = doc
+            .command(json!({"op":"content_objects","page":0}))
+            .unwrap();
+        let graphic = snapshot["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["kind"] == "graphic")
+            .unwrap();
+        let mut moved = graphic["bounds"].clone();
+        moved["x"] = json!(moved["x"].as_f64().unwrap() + 35.0);
+        moved["y"] = json!(moved["y"].as_f64().unwrap() + 17.0);
+        doc.command(json!({"op":"content_stage","page":0,"command":{"Transform":{"revision":snapshot["revision"],"target":graphic["id"],"bounds":moved,"rotation":0.0}}})).unwrap();
+        let current = doc
+            .command(json!({"op":"content_objects","page":0}))
+            .unwrap();
+        assert_ne!(current["revision"], snapshot["revision"]);
+        let item = current["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| {
+                i["kind"] == "graphic"
+                    && (i["bounds"]["x"].as_f64().unwrap() - moved["x"].as_f64().unwrap()).abs()
+                        < 0.1
+            })
+            .unwrap();
+        let b = &item["bounds"];
+        let expected = doc
+            .active()
+            .unwrap()
+            .rasterize_region(
+                0,
+                2.0,
+                b["x"].as_f64().unwrap(),
+                b["y"].as_f64().unwrap(),
+                b["width"].as_f64().unwrap(),
+                b["height"].as_f64().unwrap(),
+                false,
+            )
+            .unwrap();
+        let destination = fixture.directory.join("graphic.png");
+        // A forged UI rectangle cannot override the shared object's actual geometry.
+        let request = json!({"op":"save_content_image","page":0,"kind":"graphic","target":item["id"],"revision":current["revision"],"destination":destination,"bounds":{"x":0,"y":0,"width":1,"height":1}});
+        doc.command(request.clone()).unwrap();
+        let written = fs::read(&destination).unwrap();
+        let rgba = image::load_from_memory(&written).unwrap().into_rgba8();
+        assert_eq!(rgba.dimensions(), (expected.width_px, expected.height_px));
+        let mut brown = 0;
+        for (x, y, pixel) in rgba.enumerate_pixels() {
+            let offset = (y * expected.stride + x * 4) as usize;
+            assert_eq!(
+                pixel.0,
+                [
+                    expected.pixels[offset + 2],
+                    expected.pixels[offset + 1],
+                    expected.pixels[offset],
+                    255
+                ]
+            );
+            if pixel[0] > 110 && pixel[0] < 170 && pixel[1] > 50 && pixel[1] < 110 && pixel[2] < 90
+            {
+                brown += 1;
+            }
+        }
+        assert!(brown > 10);
+        let mut stale = request.clone();
+        stale["revision"] = snapshot["revision"].clone();
+        assert!(
+            doc.command(stale)
+                .unwrap_err()
+                .contains("older document revision")
+        );
+        let text = current["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["kind"] == "text")
+            .unwrap();
+        let mut wrong = request.clone();
+        wrong["target"] = text["id"].clone();
+        assert!(doc.command(wrong).unwrap_err().contains("Select a graphic"));
+        let mut malformed = request;
+        malformed["kind"] = json!(42);
+        assert!(
+            doc.command(malformed)
+                .unwrap_err()
+                .contains("Invalid image kind")
+        );
+        assert_eq!(fs::read(&destination).unwrap(), written);
+        assert_eq!(
+            doc.command(json!({"op":"content_objects","page":0}))
+                .unwrap()["revision"],
+            current["revision"]
+        );
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+    }
+
+    #[test]
     fn content_preview_pins_original_bytes_across_atomic_save_and_source_removal() {
         let fixture = Fixture::new("text-page.pdf");
         let doc = fixture.open();

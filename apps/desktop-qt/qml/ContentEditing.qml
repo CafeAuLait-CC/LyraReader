@@ -113,17 +113,17 @@ Item {
         imagePicker.open();
     }
     function chooseImageExport() {
-        if(hasDraft || pending || owner.pendingCommands>0 || !selected || selected.kind!=="image" || app.blockXfaWrite())return;
-        imageExportRequest={reader:owner,revision:model.revision,page:model.page,target:selected.id};
+        if(hasDraft || pending || owner.pendingCommands>0 || !selected || (selected.kind!=="image" && selected.kind!=="graphic") || app.blockXfaWrite())return;
+        imageExportRequest={reader:owner,revision:model.revision,page:model.page,target:selected.id,kind:selected.kind};
         imageExportPicker.open();
     }
     function exportImageTo(destination) {
         const request=imageExportRequest;imageExportRequest=null;
-        if(!request || request.reader!==owner || request.revision!==model.revision || request.page!==model.page || !selected || selected.id!==request.target || hasDraft || owner.pendingCommands>0) {
+        if(!request || request.reader!==owner || request.revision!==model.revision || request.page!==model.page || !selected || selected.id!==request.target || selected.kind!==request.kind || hasDraft || owner.pendingCommands>0) {
             app.operationStatus=qsTr("The page changed. Choose the image again before exporting.");return;
         }
         const path=app.session ? app.session.localPath(destination) : "";if(!path.length)return;
-        owner.submit("save_content_image",{page:request.page,target:request.target,revision:request.revision,destination:path});
+        owner.submit("save_content_image",{page:request.page,target:request.target,revision:request.revision,kind:request.kind,destination:path});
     }
     function redact(rect,page) {
         if (hasDraft || pending || owner.pendingCommands>0) return;

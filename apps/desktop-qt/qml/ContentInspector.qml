@@ -143,7 +143,7 @@ Pane {
                 }
                 Button {
                     objectName:"exportContentImage"
-                    visible:!!item && item.kind==="image";text:qsTr("Export Image…")
+                    visible:!!item && (item.kind==="image" || item.kind==="graphic");text:qsTr("Export Image…")
                     enabled:!editor.hasDraft && app.canModifyPdf && editor.owner.pendingCommands===0
                     onClicked:editor.chooseImageExport()
                 }
