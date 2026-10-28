@@ -88,16 +88,78 @@ extension ReaderChecks {
         state.zoomIn() // 2x -> 4x raster LOD
         require(state.canvasPages.map(\.image.generation) == initial,
                 "zoom immediately retains the old page raster")
-        try await eventually("zoom replaces a complete LOD together", {
-            let tiles = state.canvasPages.filter { $0.placement.index >= 0 }
-            let levels = Set(tiles.map { ($0.placement.index >> 20) & 15 })
-            require(levels.count == 1, "zoom never mixes partially ready LODs")
-            return levels == [2]
-        })
-        let sharp = state.canvasPages.map(\.image.generation)
+        func tileKey(_ page: CanvasPage) -> TileKey {
+            let id = page.placement.index
+            return TileKey(page: id >> 24, lod: UInt8((id >> 20) & 15),
+                           x: id & 1023, y: (id >> 10) & 1023)
+        }
+        func tileGenerations() -> [TileKey: UInt64] {
+            var map: [TileKey: UInt64] = [:]
+            for page in state.canvasPages where page.placement.index >= 0 {
+                map[tileKey(page)] = page.image.generation
+            }
+            return map
+        }
+        // Wait for the target LOD to be complete **and committed**, not merely visible. A tile
+        // bitmap enters `tileCache` the moment it is rasterized, but a prefetch-ring row is
+        // published to `canvasPages` only when the coalesced tile commit runs (up to
+        // `tileCommitCoalescingDelay` later). The zoom below is synchronous and rebuilds from
+        // the cache, so a snapshot taken from the page list during that gap would report
+        // pre-existing ring-row pixels as new even though the zoom rasterized nothing. Requiring
+        // the whole pinned band to be cached and drawn, the plan to be at LOD 2, and both
+        // scheduler queues to be empty means the cache and the page list agree, and nothing is
+        // in flight that the next synchronous rebuild could fold in.
+        try await eventuallyExplaining(
+            "zoom replaces a complete LOD together",
+            {
+                let tiles = state.canvasPages.filter { $0.placement.index >= 0 }
+                let drawn = Set(tiles.map(tileKey))
+                let cachedPinned = state.pinnedTiles.filter { state.isTileCached($0) }.count
+                return "drawn=\(drawn.count) pinned=\(state.pinnedTiles.count) "
+                    + "cachedPinned=\(cachedPinned) "
+                    + "planLod=\(String(describing: state.lastTilePlan?.lod)) "
+                    + "work=\(state.scheduledTileWork) "
+                    + "requests=\(state.tileRequestCount) rasters=\(state.tileRasterCount) "
+                    + "cache=\(state.tileCacheTileCount)"
+            },
+            {
+                let tiles = state.canvasPages.filter { $0.placement.index >= 0 }
+                let levels = Set(tiles.map { ($0.placement.index >> 20) & 15 })
+                require(levels.count == 1, "zoom never mixes partially ready LODs")
+                guard levels == [2], state.lastTilePlan?.lod == 2 else { return false }
+                let drawn = Set(tiles.map(tileKey))
+                return drawn == state.pinnedTiles
+                    && drawn.allSatisfy { state.isTileCached($0) }
+                    && state.scheduledTileWork == (0, 0)
+            })
+        // Snapshot the map the zoom must preserve: every tile key in the page list to its raster
+        // generation, the plan's LOD, and the engine counters. Comparing keys as well as
+        // generations catches a dropped or re-keyed tile (an empty or shrunken page list
+        // satisfied the old set-containment assertion), and the counters catch a rebuild that
+        // re-requests or re-rasterizes a tile the cache already held.
+        let sharp = tileGenerations()
+        let planLod = state.lastTilePlan?.lod
+        let zoomBefore = state.zoomPercent
+        let requestsBefore = state.tileRequestCount
+        let rastersBefore = state.tileRasterCount
         state.zoomIn() // Still 4x: no rasterization or texture churn.
-        require(state.canvasPages.allSatisfy { sharp.contains($0.image.generation) },
-                "zoom within a LOD reuses existing tiles")
+        require(state.zoomPercent > zoomBefore, "zoom within a LOD advances the zoom percentage")
+        require(state.lastTilePlan?.lod == planLod, "zoom within a LOD stays on the same raster LOD")
+        let zoomed = tileGenerations()
+        if zoomed != sharp {
+            func describe(_ key: TileKey) -> String { "\(key.page)/\(key.lod)/\(key.x)/\(key.y)" }
+            let added = zoomed.keys.filter { sharp[$0] == nil }.map(describe).sorted()
+            let removed = sharp.keys.filter { zoomed[$0] == nil }.map(describe).sorted()
+            let changed = sharp.keys
+                .filter { zoomed[$0] != nil && zoomed[$0] != sharp[$0] }
+                .map { "\(describe($0)):\(sharp[$0]!)->\(zoomed[$0]!)" }
+                .sorted()
+            FileHandle.standardError.write(Data(
+                "zoom within a LOD: added=\(added) removed=\(removed) changed=\(changed)\n".utf8))
+        }
+        require(zoomed == sharp, "zoom within a LOD reuses existing tiles")
+        require(state.tileRequestCount == requestsBefore && state.tileRasterCount == rastersBefore,
+                "zoom within a LOD neither queues nor runs a tile raster")
         state.zoomActual()
         require(state.canvasPages.map(\.image.generation) == initial,
                 "zooming back reuses the previous cached LOD")
