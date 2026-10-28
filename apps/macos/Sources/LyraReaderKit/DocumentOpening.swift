@@ -497,6 +497,39 @@ public final class LyraReaderAppDelegate: NSObject, NSApplicationDelegate {
         registry.markReady()
     }
 
+    /// True while a Save All decision is being applied after AppKit deferred termination.
+    private var terminationResolutionInProgress = false
+
+    /// AppKit's one confirmation point for ⌘Q, the app menu and `NSApplication.terminate`.
+    ///
+    /// With no unsaved document this answers immediately; AppKit then flushes the reading
+    /// positions in `applicationWillTerminate` exactly as before. A decision that needs
+    /// asynchronous saves returns `.terminateLater` and replies after every document was saved,
+    /// or after the attempt aborted without losing anything.
+    ///
+    /// The prompt itself lives in ``QuitUnsavedCoordinator`` so its Save All / Discard All /
+    /// Cancel behaviour is exercised without a modal alert. The coordinator writes the clean-exit
+    /// marker only after a fully successful Save All or Discard All; the signal handlers in
+    /// `AppState.installTerminationHandling()` never write it, so a SIGTERM/SIGKILL still leaves
+    /// the drafts recoverable.
+    public func applicationShouldTerminate(
+        _ sender: NSApplication
+    ) -> NSApplication.TerminateReply {
+        guard !terminationResolutionInProgress else { return .terminateCancel }
+        let coordinator = QuitUnsavedCoordinator(windows: registry.sessions.map(\.state))
+        let documents = coordinator.documents()
+        guard !documents.isEmpty else { return .terminateNow }
+        let decision = coordinator.decision(for: documents)
+        guard decision != .cancel else { return .terminateCancel }
+        terminationResolutionInProgress = true
+        Task { @MainActor [weak self] in
+            let mayQuit = await coordinator.resolve(decision, documents: documents)
+            self?.terminationResolutionInProgress = false
+            sender.reply(toApplicationShouldTerminate: mayQuit)
+        }
+        return .terminateLater
+    }
+
     /// Clicking the Dock icon with nothing on screen is the “reopen” request.
     ///
     /// The answer stays AppKit's default (`true`) so SwiftUI keeps restoring its own window —
