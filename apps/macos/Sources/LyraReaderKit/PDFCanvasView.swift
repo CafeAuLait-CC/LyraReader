@@ -570,6 +570,11 @@ public final class MetalCanvasView: NSView {
     /// the page chrome inside that same transaction; because the page geometry was applied
     /// above, the chrome and the paper describe the same commit. A commit that changed nothing
     /// visible leaves `needsRender` false, and this submits no frame.
+    func applyPaperMotionCommit() {
+        needsRender = true
+        applyModelCommit()
+    }
+
     func applyModelCommit() {
         guard let commit = modelCommitSnapshot?() else { return }
         pages = commit.pages

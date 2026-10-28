@@ -499,6 +499,34 @@ public final class AIRegionOverlayPassthroughView: NSView {
     }
 }
 
+/// The full-size SwiftUI paper stays laid out while its native viewport opens from the top.
+/// Clipping rather than scaling keeps text, caret and transcript positions stable.
+final class PaperRegionHost: NSView {
+    let content: NSHostingView<AIRegionCardView>
+    var rejectInput = false
+    override var isFlipped: Bool { true }
+    init(rootView: AIRegionCardView) {
+        content = NSHostingView(rootView: rootView)
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.masksToBounds = true
+        content.sizingOptions = []
+        addSubview(content)
+    }
+    @available(*, unavailable) required init?(coder: NSCoder) { fatalError() }
+    func place(_ restingFrame: CGRect, progress: CGFloat) {
+        var revealed = restingFrame
+        revealed.size.height *= min(1, max(0, progress))
+        frame = revealed
+        content.frame = CGRect(origin: .zero, size: restingFrame.size)
+        alphaValue = 0.65 + 0.35 * progress
+    }
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !rejectInput, bounds.contains(convert(point, from: superview)) else { return nil }
+        return super.hitTest(point)
+    }
+}
+
 /// Native children move in the same transaction as the Metal paper and page borders.
 /// Root views survive scroll frames, preserving focus, selection and the transcript's scroll.
 @MainActor
@@ -507,7 +535,7 @@ final class AIRegionCanvasHost: NSView {
     private weak var state: AppState?
     private var onOpenInPanel: (AIRegionHistoryEntry) -> Void = { _ in }
     private var onShowHistory: () -> Void = {}
-    private var hosts: [UUID: NSHostingView<AIRegionCardView>] = [:]
+    private var hosts: [UUID: PaperRegionHost] = [:]
     private var sizes: [UUID: CGSize] = [:]
     private var placementSignature = ""
     private var markers: [UUID: AIRegionMarkerButton] = [:]
@@ -544,24 +572,25 @@ final class AIRegionCanvasHost: NSView {
                                                           scroll: scroll, zoom: zoom, viewport: viewport) else { continue }
             let maxHeight = AIRegionCard.maximumHeight(in: viewport.height)
             let dimensions = CGSize(width: place.width, height: maxHeight)
-            let host: NSHostingView<AIRegionCardView>
+            let host: PaperRegionHost
             if let existing = hosts[card.id] {
                 host = existing
                 if sizes[card.id] != dimensions {
-                    host.rootView = AIRegionCardView(state: state, card: card, width: place.width,
+                    host.content.rootView = AIRegionCardView(state: state, card: card, width: place.width,
                         maximumHeight: maxHeight, onOpenInPanel: onOpenInPanel, onShowHistory: onShowHistory)
                 }
             } else {
-                host = NSHostingView(rootView: AIRegionCardView(state: state, card: card, width: place.width,
+                host = PaperRegionHost(rootView: AIRegionCardView(state: state, card: card, width: place.width,
                     maximumHeight: maxHeight, onOpenInPanel: onOpenInPanel, onShowHistory: onShowHistory))
-                host.sizingOptions = []
                 addSubview(host)
                 hosts[card.id] = host
             }
             sizes[card.id] = dimensions
             let frame = CGRect(x: place.x, y: place.y, width: place.width, height: card.heightViewPt)
-            if host.frame != frame { host.frame = frame }
-            host.isHidden = host.frame.maxY <= 0 || host.frame.minY >= size.height
+            let progress = state.regionPaperRevealProgress(for: card.id)
+            host.place(frame, progress: progress)
+            host.rejectInput = state.closingRegionPapers.contains(card.id)
+            host.isHidden = progress <= 0 || host.frame.maxY <= 0 || host.frame.minY >= size.height
         }
     }
     private func syncMarkers(state: AppState, size: CGSize, viewport: CGRect,
