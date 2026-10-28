@@ -2859,6 +2859,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private var citationLoads: [Int: Task<[Citation]?, Never>] = [:]
     @Published public private(set) var references: [Reference] = []
     private var referencesLoadCompleted = false
+    /// Set once the reference/citation index is fully built (or was served from the index
+    /// cache). Background citation lookups wait for it: starting one while the reference scan
+    /// is still stepping would make it finish the whole index in one queue block.
+    private var referencesIndexReady = false
 
     /// Document-wide indexes that no reader can see while the first page is still being
     /// rasterised, held back until a visible raster has been produced.
@@ -2889,6 +2893,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private var captionMentionsInFlight: Set<Int> = []
     @Published public private(set) var figures: [Figure] = []
     private var figuresLoadCompleted = false
+    /// Set when the cooperative figure scan completed (not merely started), so a tab switch
+    /// during the scan cannot leave a restored tab believing it has the full caption index.
+    private var figuresIndexReady = false
 
     /// The in-flight caption-index load, so a region tear can wait (briefly) for the boxes it
     /// must not cut through.
@@ -3002,8 +3009,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var captionMentionsByPage: [Int: [CaptionMention]]
         var references: [Reference]
         var referencesLoadCompleted: Bool
+        var referencesIndexReady: Bool
         var figures: [Figure]
         var figuresLoadCompleted: Bool
+        var figuresIndexReady: Bool
         var metadata: DocumentMetadata?
         var metadataDraft: MetadataDraft
         var metadataBibtex: String
@@ -3495,6 +3504,40 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 }
             }
 
+            // Measurement-only navigation: LYRA_READER_PERF_JUMPS="600:0.9,900:0.2" drives
+            // `scroll(toFraction:)` at those milliseconds after the open hook, through the
+            // exact model path a scrollbar drag uses. It changes no scheduling decision; it
+            // exists so the stale-task behaviour across repeated far jumps can be measured
+            // without synthesising pointer events.
+            if let raw = ProcessInfo.processInfo.environment["LYRA_READER_PERF_JUMPS"],
+               !raw.isEmpty {
+                let jumps: [(Int, Double)] = raw.split(separator: ",").compactMap { item in
+                    let parts = item.split(separator: ":")
+                    guard parts.count == 2,
+                          let milliseconds = Int(parts[0]),
+                          let fraction = Double(parts[1]),
+                          milliseconds >= 0, fraction.isFinite else { return nil }
+                    return (milliseconds, min(max(fraction, 0), 1))
+                }
+                if !jumps.isEmpty {
+                    Task { @MainActor [weak self] in
+                        var previous = 0
+                        for (milliseconds, fraction) in jumps {
+                            let delay = milliseconds - previous
+                            previous = milliseconds
+                            if delay > 0 {
+                                try? await Task.sleep(for: .milliseconds(delay))
+                            }
+                            guard let self, self.document != nil else { return }
+                            self.scroll(toFraction: fraction)
+                            FileHandle.standardError.write(
+                                Data("lyra-reader-position: hook jumped to \(Int(self.scrollYPt)) pt at +\(milliseconds) ms (\(fraction) of the content)\n".utf8)
+                            )
+                        }
+                    }
+                }
+            }
+
             // Measurement-only input calls the model method used by wheel events, paced
             // by wall time without waiting for rasters. It bypasses scrollWheel's immediate
             // canvas draw, exercising the queued redraw path rather than NSEvent delivery.
@@ -3980,7 +4023,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         captionMentionsByPage = [:]
         captionMentionsInFlight = []
         figures = []
+        figuresIndexReady = false
         references = []
+        referencesIndexReady = false
         metadata = nil
         metadataDraft = .empty
         metadataBibtex = ""
@@ -12856,12 +12901,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
             let page = placement.index
             let epoch = documentEpoch
+            let perfEnqueued: Double? = PerfTrace.enabled ? PerfTrace.now : nil
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 guard epoch == self.documentEpoch else { return }
                 defer { if epoch == self.documentEpoch { self.captionMentionsInFlight.remove(page) } }
-                if let found = try? await self.engine.captionMentions(page: page) {
-                    guard epoch == self.documentEpoch else { return }
+                let perfStarted: Double? = PerfTrace.enabled ? PerfTrace.now : nil
+                let found = try? await self.engine.captionMentions(page: page)
+                if PerfTrace.enabled, let perfEnqueued, let perfStarted {
+                    PerfTrace.queue(instance: self.perfTraceInstanceID, category: "index", page: page,
+                                    waitMs: max(0, (perfStarted - perfEnqueued) * 1000),
+                                    execMs: max(0, (PerfTrace.now - perfStarted) * 1000),
+                                    epoch: epoch, detail: "caption-mentions")
+                }
+                guard epoch == self.documentEpoch else { return }
+                if let found {
                     self.captionMentionsByPage[page] = found
                 }
             }
@@ -12878,18 +12932,76 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         if !force, deferStartupPrefetch(\.figures) { return }
         figuresLoadCompleted = true
         let epoch = documentEpoch
+        let perfEnqueued: Double? = PerfTrace.enabled ? PerfTrace.now : nil
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             guard epoch == self.documentEpoch else { return }
-            let found = (try? await self.engine.figures()) ?? []
+            let perfStarted: Double? = PerfTrace.enabled ? PerfTrace.now : nil
+            var found: [Figure] = []
+            var done = false
+            var failed = false
+            while !done {
+                guard epoch == self.documentEpoch else { return }
+                await self.yieldToVisibleRasterWork()
+                guard epoch == self.documentEpoch else { return }
+                guard let step = try? await self.engine.figuresScanStep(
+                    pages: Self.indexScanPageBatch) else {
+                    failed = true
+                    break
+                }
+                found = step.figures
+                done = step.done
+            }
+            // A failed scan reports the empty list the monolithic path returned; a partial
+            // caption set would make a missing figure look like a document that has none.
+            if failed || !done { found = [] }
+            if PerfTrace.enabled, let perfEnqueued, let perfStarted {
+                PerfTrace.queue(instance: self.perfTraceInstanceID, category: "index", page: nil,
+                                waitMs: max(0, (perfStarted - perfEnqueued) * 1000),
+                                execMs: max(0, (PerfTrace.now - perfStarted) * 1000),
+                                epoch: epoch, detail: "figures")
+            }
             guard epoch == self.documentEpoch else { return }
             self.figures = found
+            self.figuresIndexReady = done && !failed
             self.figuresLoadTask = nil
             FileHandle.standardError.write(
                 Data("lyra-reader-figures: \(self.figures.count) caption(s)\n".utf8)
             )
         }
         figuresLoadTask = task
+    }
+
+    /// Pages one cooperative index-scan step reads before returning to the serial queue.
+    ///
+    /// 4 pages bounds one figure step at ~35 ms even on the graph-heavy pages that cost ~17 ms
+    /// each; the bound that matters is the longest a visible raster can wait behind one step,
+    /// not the scan's total time.
+    private static let indexScanPageBatch = 4
+
+    /// Pages and reference entries one cooperative reference-scan step may process.
+    ///
+    /// The parse phase is a separate step (~65 ms on the 115-page review paper); these bounds
+    /// keep the page-read and geometry steps below ~15 ms each.
+    private static let indexScanReferencePageBatch = 4
+    private static let indexScanReferenceEntryBatch = 12
+
+    /// Lets visible raster work run before the next background index step.
+    ///
+    /// The serial queue is FIFO, so once the next step is enqueued it runs before anything
+    /// enqueued after it. Waiting for the current visible work to drain here means a far jump's
+    /// page-raster/tile tasks go first; the 250 ms cap keeps a reader who scrolls continuously
+    /// from starving the index scan forever.
+    private func yieldToVisibleRasterWork() async {
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.25
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            if pagePreviewInFlight == nil,
+               pendingTiles.isEmpty,
+               tilesInFlight.isEmpty {
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
     }
 
     /// Waits for the caption index a tear must consult.
@@ -12921,12 +13033,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         documentAnnotationsLoading = true
         documentAnnotationsError = nil
         let epoch = documentEpoch
+        let perfEnqueued: Double? = PerfTrace.enabled ? PerfTrace.now : nil
         Task { @MainActor [weak self] in
             guard let self else { return }
             guard epoch == self.documentEpoch else { return }
             defer { if epoch == self.documentEpoch { self.documentAnnotationsLoading = false } }
             do {
+                let perfStarted: Double? = PerfTrace.enabled ? PerfTrace.now : nil
                 let scan = try await self.engine.annotationScan()
+                if PerfTrace.enabled, let perfEnqueued, let perfStarted {
+                    PerfTrace.queue(instance: self.perfTraceInstanceID, category: "index", page: nil,
+                                    waitMs: max(0, (perfStarted - perfEnqueued) * 1000),
+                                    execMs: max(0, (PerfTrace.now - perfStarted) * 1000),
+                                    epoch: epoch, detail: "annotations")
+                }
                 guard epoch == self.documentEpoch else { return }
                 let found = scan.annotations
                 // One notice per document: the scan is document-wide and cached, so this
@@ -12978,6 +13098,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Fetches the citations of every visible page, so a click resolves immediately.
     private func loadCitations() {
         if deferStartupPrefetch(\.citations) { return }
+        // The reference scan owns the queue in bounded steps; a page's citation lookup needs
+        // its style and may fold into the same scan. Starting those lookups before the index is
+        // ready would hand the whole scan to one queue block again, so wait for it. A click
+        // that needs citations immediately still calls `startCitationLoad` directly.
+        guard referencesIndexReady else { return }
         for placement in visiblePagePlacements where citationsByPage[placement.index] == nil {
             startCitationLoad(page: placement.index)
         }
@@ -12995,9 +13120,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func startCitationLoad(page: Int) -> Task<[Citation]?, Never> {
         if let started = citationLoads[page] { return started }
         let epoch = documentEpoch
+        let perfEnqueued: Double? = PerfTrace.enabled ? PerfTrace.now : nil
         let task: Task<[Citation]?, Never> = Task { @MainActor [weak self] in
             guard let self, epoch == self.documentEpoch else { return nil }
+            let perfStarted: Double? = PerfTrace.enabled ? PerfTrace.now : nil
             let found = try? await self.engine.citations(page)
+            if PerfTrace.enabled, let perfEnqueued, let perfStarted {
+                PerfTrace.queue(instance: self.perfTraceInstanceID, category: "index", page: page,
+                                waitMs: max(0, (perfStarted - perfEnqueued) * 1000),
+                                execMs: max(0, (PerfTrace.now - perfStarted) * 1000),
+                                epoch: epoch, detail: "citations")
+            }
             guard epoch == self.documentEpoch else { return nil }
             self.citationLoads[page] = nil
             guard let found else { return nil }
@@ -13014,12 +13147,42 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         if deferStartupPrefetch(\.references) { return }
         referencesLoadCompleted = true
         let epoch = documentEpoch
+        let perfEnqueued: Double? = PerfTrace.enabled ? PerfTrace.now : nil
         Task { @MainActor [weak self] in
             guard let self else { return }
             guard epoch == self.documentEpoch else { return }
-            let found = (try? await self.engine.references()) ?? []
+            let perfStarted: Double? = PerfTrace.enabled ? PerfTrace.now : nil
+            var found: [Reference] = []
+            var done = false
+            var failed = false
+            while !done {
+                guard epoch == self.documentEpoch else { return }
+                await self.yieldToVisibleRasterWork()
+                guard epoch == self.documentEpoch else { return }
+                guard let step = try? await self.engine.referencesScanStep(
+                    pageBatch: Self.indexScanReferencePageBatch,
+                    entryBatch: Self.indexScanReferenceEntryBatch) else {
+                    failed = true
+                    break
+                }
+                found = step.references
+                done = step.done
+            }
+            // A failed scan is reported as the empty list the monolithic path returned; a
+            // partial list would make a missing section look like a document with fewer
+            // references. The index is still marked ready so citation lookups can fall back
+            // to their one-page path instead of waiting forever.
+            if failed || !done { found = [] }
+            if PerfTrace.enabled, let perfEnqueued, let perfStarted {
+                PerfTrace.queue(instance: self.perfTraceInstanceID, category: "index", page: nil,
+                                waitMs: max(0, (perfStarted - perfEnqueued) * 1000),
+                                execMs: max(0, (PerfTrace.now - perfStarted) * 1000),
+                                epoch: epoch, detail: "references")
+            }
             guard epoch == self.documentEpoch else { return }
             self.references = found
+            self.referencesIndexReady = done && !failed
+            if self.referencesIndexReady { self.loadCitations() }
             FileHandle.standardError.write(
                 Data("lyra-reader-references: \(self.references.count) entries\n".utf8)
             )
@@ -14152,8 +14315,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             captionMentionsByPage: captionMentionsByPage,
             references: references,
             referencesLoadCompleted: referencesLoadCompleted,
+            referencesIndexReady: referencesIndexReady,
             figures: figures,
             figuresLoadCompleted: figuresLoadCompleted,
+            figuresIndexReady: figuresIndexReady,
             metadata: metadata,
             metadataDraft: metadataDraft,
             metadataBibtex: metadataBibtex,
@@ -14272,8 +14437,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         captionMentionsByPage = state.captionMentionsByPage
         references = state.references
         referencesLoadCompleted = state.referencesLoadCompleted
+        referencesIndexReady = state.referencesIndexReady
+        // A tab switched away mid-scan kept its "completed" flag but not a cache. Let the
+        // post-restore loaders below start the scan again instead of leaving clicks without an
+        // index for the rest of the tab's life.
+        if referencesLoadCompleted && !referencesIndexReady {
+            referencesLoadCompleted = false
+        }
         figures = state.figures
         figuresLoadCompleted = state.figuresLoadCompleted
+        figuresIndexReady = state.figuresIndexReady
+        if figuresLoadCompleted && !figuresIndexReady {
+            figuresLoadCompleted = false
+        }
         metadata = state.metadata
         metadataDraft = state.metadataDraft
         metadataBibtex = state.metadataBibtex
