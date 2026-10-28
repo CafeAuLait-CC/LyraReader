@@ -47,6 +47,13 @@ extension ReaderChecks {
             previewPanels: ReferencePreviewPanelController()))
         window.contentView = host
         window.makeKeyAndOrderFront(nil)
+        // The focus assertions below need this process to be the active application: AppKit
+        // only makes a window's field editor first responder while the app is active, and a
+        // full-suite run may leave another app frontmost. Activation is what every other
+        // window-hosting check does (e.g. canvas-commit, frame-scheduling); without it the
+        // editor check depends on which window happened to be key before.
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        window.makeKey()
         state.gotoPage(notes.page + 1)
 
         // ── The multiline editor: scrolls, wraps, Enter is a newline, ⌘Return commits ───────
@@ -120,6 +127,10 @@ extension ReaderChecks {
                 "the click-away keeps the committed draft")
 
         // ── The single-line editor: Return commits and can never carry a newline ───────────
+        // Re-activate here: the multiline part above ends with a click that can move key status
+        // in a headless full-suite run, and the field editor below needs our app active.
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
         state.gotoPage(fullName.page + 1)
         state.focusFormField(fullName.id)
         try await eventually("the single-line field uses the single-line editor", {
