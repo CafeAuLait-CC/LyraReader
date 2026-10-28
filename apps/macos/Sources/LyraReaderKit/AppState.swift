@@ -16777,20 +16777,23 @@ extension AppState {
         let token = UUID()
         contentLoadToken = token
         contentEditLoading = true
+        // A viewport change can make this result stale without starting another request yet.
+        // Only the current request owns the busy flag, including stale/cancelled returns.
+        defer { if contentLoadToken == token { contentEditLoading = false } }
         contentEditPage = nil
         contentEditSelection = nil
         let page = currentPage - 1
         do {
             let snapshot = try await engine.contentObjects(page: page)
-            guard token == contentLoadToken, document?.url == url, currentPage - 1 == page else {
+            guard token == contentLoadToken, contentEditEnabled,
+                  document?.url == url, currentPage - 1 == page else {
                 return
             }
             contentEditPage = snapshot
-            contentEditLoading = false
         } catch {
-            guard token == contentLoadToken else { return }
+            guard token == contentLoadToken, !Task.isCancelled,
+                  document?.url == url, currentPage - 1 == page else { return }
             lastError = "Could not inspect page content: \(error.localizedDescription)"
-            contentEditLoading = false
         }
     }
 
