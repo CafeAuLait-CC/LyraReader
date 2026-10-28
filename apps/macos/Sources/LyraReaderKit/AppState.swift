@@ -855,6 +855,8 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     // Every field below is only written when `PerfTrace.enabled`; when the trace is off the
     // scheduling path performs one predictable bool test per event site and keeps no state.
     // The counters classify rasters for the close-of-document `summary` record.
+    /// Stable for this window model; epochs and sequence numbers are local to it.
+    package let perfTraceInstanceID = UUID().uuidString
     private var perfViewportSeq: UInt64 = 0
     private var perfInputSeq: UInt64 = 0
     private var perfSharpToken: UInt64 = 0
@@ -3800,7 +3802,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // still reports the open latency instead of "not measured".
             performanceProbe.beginOpenToFirstFrameMeasurement()
             if PerfTrace.enabled {
-                PerfTrace.document(phase: "open_start", epoch: documentEpoch)
+                PerfTrace.document(instance: self.perfTraceInstanceID, phase: "open_start", epoch: documentEpoch)
             }
             let loaded = try engine.openDocument(at: url)
             resetDocumentState()
@@ -3840,7 +3842,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             scrollYPt = 0
             if PerfTrace.enabled {
                 resetPerfDocumentState()
-                PerfTrace.document(phase: "opened", epoch: documentEpoch, pages: loaded.pageCount)
+                PerfTrace.document(instance: self.perfTraceInstanceID, phase: "opened", epoch: documentEpoch, pages: loaded.pageCount)
                 startPerfMemorySampling()
             }
 
@@ -4751,7 +4753,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             if PerfTrace.enabled, let perfEnqueued, let perfStarted {
                 // The whole-document search pass is the shell's only index-consuming task; the
                 // per-page text layer that feeds it is the `text` category.
-                PerfTrace.queue(category: "index", page: nil,
+                PerfTrace.queue(instance: self.perfTraceInstanceID, category: "index", page: nil,
                                 waitMs: max(0, (perfStarted - perfEnqueued) * 1000),
                                 execMs: max(0, (PerfTrace.now - perfStarted) * 1000),
                                 epoch: epoch)
@@ -14099,7 +14101,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             else { pendingThumbnails.append(page) }
             if PerfTrace.enabled {
                 perfThumbnailEnqueuedAt[page] = PerfTrace.now
-                PerfTrace.tile(phase: "enqueue", source: "thumbnail", page: page, lod: 0, x: 0,
+                PerfTrace.tile(instance: self.perfTraceInstanceID, phase: "enqueue", source: "thumbnail", page: page, lod: 0, x: 0,
                                y: 0, epoch: documentEpoch, contentVersion: perfContentVersion,
                                offsetPt: scrollYPt)
             }
@@ -14125,13 +14127,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             if PerfTrace.enabled {
                 // Emitted when the task body actually runs (not when the pump queued it), so the
                 // gap from the enqueue is main-actor wait, not "the queue handed it out".
-                PerfTrace.tile(phase: "start", source: "thumbnail", page: page, lod: 0, x: 0, y: 0,
+                PerfTrace.tile(instance: self.perfTraceInstanceID, phase: "start", source: "thumbnail", page: page, lod: 0, x: 0, y: 0,
                                epoch: self.documentEpoch, contentVersion: self.perfContentVersion,
                                offsetPt: self.scrollYPt)
             }
             let image = try? await self.engine.renderThumbnail(page, scale: scale)
             if PerfTrace.enabled, let image {
-                PerfTrace.stage("raster_resumed", source: "thumbnail", page: page,
+                PerfTrace.stage("raster_resumed", instance: self.perfTraceInstanceID, source: "thumbnail", page: page,
                                 generation: image.generation, scale: Double(scale),
                                 epoch: self.documentEpoch)
             }
@@ -14142,7 +14144,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 if PerfTrace.enabled {
                     // The only image decode/convert stage in the reading path: CGImage reduction
                     // for a sidebar thumbnail (the canvas path receives BGRA straight from PDFium).
-                    PerfTrace.stage("thumbnail_downsample", source: "thumbnail", page: page,
+                    PerfTrace.stage("thumbnail_downsample", instance: self.perfTraceInstanceID, source: "thumbnail", page: page,
                                     generation: image.generation,
                                     milliseconds: (PerfTrace.now - perfDownsample) * 1000,
                                     epoch: self.documentEpoch)
@@ -14154,11 +14156,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 self.pendingThumbnails.insert(page, at: 0)
             }
             if PerfTrace.enabled, let perfEnqueued, let perfStarted {
-                PerfTrace.queue(category: "thumbnail", page: page,
+                PerfTrace.queue(instance: self.perfTraceInstanceID, category: "thumbnail", page: page,
                                 waitMs: max(0, (perfStarted - perfEnqueued) * 1000),
                                 execMs: max(0, (PerfTrace.now - perfStarted) * 1000),
                                 epoch: self.documentEpoch)
-                PerfTrace.tile(phase: "done", source: "thumbnail", page: page, lod: 0, x: 0, y: 0,
+                PerfTrace.tile(instance: self.perfTraceInstanceID, phase: "done", source: "thumbnail", page: page, lod: 0, x: 0, y: 0,
                                epoch: self.documentEpoch, contentVersion: self.perfContentVersion,
                                offsetPt: self.scrollYPt,
                                bytes: self.thumbnails[page]?.bgra.count, scale: scale)
@@ -15790,7 +15792,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     guard epoch == self.documentEpoch else { return }
                     self.textPages[page] = extracted
                     if PerfTrace.enabled, let perfEnqueued, let perfStarted {
-                        PerfTrace.queue(category: "text", page: page,
+                        PerfTrace.queue(instance: self.perfTraceInstanceID, category: "text", page: page,
                                         waitMs: max(0, (perfStarted - perfEnqueued) * 1000),
                                         execMs: max(0, (PerfTrace.now - perfStarted) * 1000),
                                         epoch: self.documentEpoch)
@@ -16084,7 +16086,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         if PerfTrace.enabled {
             perfTileEnqueuedAt[key] = PerfTrace.now
             perfTilePrefetch[key] = prefetch
-            PerfTrace.tile(phase: "enqueue", source: "tile", page: key.page, lod: Int(key.lod),
+            PerfTrace.tile(instance: self.perfTraceInstanceID, phase: "enqueue", source: "tile", page: key.page, lod: Int(key.lod),
                            x: key.x, y: key.y, epoch: documentEpoch,
                            contentVersion: perfContentVersion, offsetPt: scrollYPt,
                            detail: prefetch ? "prefetch" : "visible")
@@ -16164,7 +16166,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let started = DispatchTime.now().uptimeNanoseconds
         if PerfTrace.enabled {
             perfTileStartedAt[key] = PerfTrace.now
-            PerfTrace.tile(phase: "start", source: "tile", page: key.page, lod: Int(key.lod),
+            PerfTrace.tile(instance: self.perfTraceInstanceID, phase: "start", source: "tile", page: key.page, lod: Int(key.lod),
                            x: key.x, y: key.y, epoch: documentEpoch,
                            contentVersion: perfContentVersion, offsetPt: scrollYPt)
         }
@@ -16181,7 +16183,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 )
                 if PerfTrace.enabled {
                     // Gap from the engine's `raster_resume_scheduled` to here is main-actor wait.
-                    PerfTrace.stage("raster_resumed", source: "tile", page: key.page,
+                    PerfTrace.stage("raster_resumed", instance: self.perfTraceInstanceID, source: "tile", page: key.page,
                                     generation: tile.generation, epoch: self.documentEpoch)
                 }
                 guard epoch == self.renderEpoch else { return }
@@ -16197,7 +16199,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 if PerfTrace.enabled {
                     // Edge tiles are cropped row by row into their placement bitmap; that copy
                     // is the tile path's only image conversion, and it is measured, not guessed.
-                    PerfTrace.stage("image_copy", source: "tile", page: key.page,
+                    PerfTrace.stage("image_copy", instance: self.perfTraceInstanceID, source: "tile", page: key.page,
                                     generation: tile.generation,
                                     milliseconds: (PerfTrace.now - perfCopy) * 1000,
                                     epoch: self.documentEpoch)
@@ -16227,7 +16229,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 if PerfTrace.enabled {
                     _ = self.perfTileEnqueuedAt.removeValue(forKey: key)
                     _ = self.perfTileStartedAt.removeValue(forKey: key)
-                    PerfTrace.tile(phase: "failed", source: "tile", page: key.page,
+                    PerfTrace.tile(instance: self.perfTraceInstanceID, phase: "failed", source: "tile", page: key.page,
                                    lod: Int(key.lod), x: key.x, y: key.y, epoch: documentEpoch,
                                    contentVersion: self.perfContentVersion,
                                    offsetPt: self.scrollYPt,
@@ -16413,7 +16415,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let source = usesScreenPageRasters ? "page-raster" : "preview"
         let perfEnqueued: Double? = PerfTrace.enabled ? PerfTrace.now : nil
         if PerfTrace.enabled {
-            PerfTrace.tile(phase: "enqueue", source: source, page: page, lod: 0, x: 0, y: 0,
+            PerfTrace.tile(instance: self.perfTraceInstanceID, phase: "enqueue", source: source, page: page, lod: 0, x: 0, y: 0,
                            epoch: documentEpoch, contentVersion: perfContentVersion,
                            offsetPt: scrollYPt, scale: scale)
         }
@@ -16421,7 +16423,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             guard let self, epoch == self.renderEpoch else { return }
             let perfStarted: Double? = PerfTrace.enabled ? PerfTrace.now : nil
             if PerfTrace.enabled {
-                PerfTrace.tile(phase: "start", source: source, page: page, lod: 0, x: 0, y: 0,
+                PerfTrace.tile(instance: self.perfTraceInstanceID, phase: "start", source: source, page: page, lod: 0, x: 0, y: 0,
                                epoch: self.documentEpoch, contentVersion: self.perfContentVersion,
                                offsetPt: self.scrollYPt, scale: scale)
             }
@@ -16430,7 +16432,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 if PerfTrace.enabled {
                     // The shell task resumed here: the gap from the engine's
                     // `raster_resume_scheduled` stage to this instant is main-actor wait.
-                    PerfTrace.stage("raster_resumed", source: source, page: page,
+                    PerfTrace.stage("raster_resumed", instance: self.perfTraceInstanceID, source: source, page: page,
                                     generation: image.generation, scale: Double(scale),
                                     epoch: self.documentEpoch)
                 }
@@ -16448,11 +16450,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 self.failedPreviewPages.insert(page)
             }
             if let perfEnqueued, let perfStarted {
-                PerfTrace.queue(category: "page-raster", page: page,
+                PerfTrace.queue(instance: self.perfTraceInstanceID, category: "page-raster", page: page,
                                 waitMs: max(0, (perfStarted - perfEnqueued) * 1000),
                                 execMs: max(0, (PerfTrace.now - perfStarted) * 1000),
                                 epoch: self.documentEpoch)
-                PerfTrace.tile(phase: "done", source: source, page: page, lod: 0, x: 0, y: 0,
+                PerfTrace.tile(instance: self.perfTraceInstanceID, phase: "done", source: source, page: page, lod: 0, x: 0, y: 0,
                                epoch: self.documentEpoch, contentVersion: self.perfContentVersion,
                                offsetPt: self.scrollYPt,
                                execMs: max(0, (PerfTrace.now - perfStarted) * 1000),
@@ -17323,7 +17325,7 @@ extension AppState {
                                 destination: CGFloat?) {
         guard PerfTrace.enabled else { return }
         perfInputSeq &+= 1
-        PerfTrace.input(seq: perfInputSeq, source: source, phase: phase, offsetPt: offset,
+        PerfTrace.input(instance: self.perfTraceInstanceID, seq: perfInputSeq, source: source, phase: phase, offsetPt: offset,
                         deltaPt: delta, destinationPt: destination, epoch: documentEpoch)
     }
 
@@ -17333,7 +17335,7 @@ extension AppState {
     /// version; the grid recreating a cell does not inflate the count.
     public func noteThumbnailDrawn(_ page: Int) {
         guard PerfTrace.enabled, perfDrawnThumbnails.insert(page).inserted else { return }
-        PerfTrace.tile(phase: "drawn", source: "thumbnail", page: page, lod: 0, x: 0, y: 0,
+        PerfTrace.tile(instance: self.perfTraceInstanceID, phase: "drawn", source: "thumbnail", page: page, lod: 0, x: 0, y: 0,
                        epoch: documentEpoch, contentVersion: perfContentVersion,
                        offsetPt: scrollYPt, detail: "sidebar")
     }
@@ -17342,7 +17344,7 @@ extension AppState {
     /// window), `document_close_before` (rasters still resident) or `document_close` (dropped).
     private func samplePerfMemory(phase: String) {
         guard PerfTrace.enabled else { return }
-        PerfTrace.memory(phase: phase, rssBytes: PerfTrace.residentBytes(),
+        PerfTrace.memory(instance: self.perfTraceInstanceID, phase: phase, rssBytes: PerfTrace.residentBytes(),
                          tileCacheBytes: tileCache.usedBytes,
                          pageRasterBytes: pageRasterCacheUsedBytes,
                          thumbnailBytes: thumbnailCacheBytes,
@@ -17376,7 +17378,7 @@ extension AppState {
     private func reportPerfDocumentClose() {
         guard PerfTrace.enabled else { return }
         samplePerfMemory(phase: "document_close_before")
-        PerfTrace.summary(
+        PerfTrace.summary(instance: self.perfTraceInstanceID,
             epoch: documentEpoch,
             contentVersion: perfContentVersion,
             rasteredTiles: perfRasteredKeys.count,
@@ -17386,7 +17388,7 @@ extension AppState {
             prefetchRasteredNeverDrawn: perfPrefetchRastered.subtracting(perfDrawnTiles).count,
             uploadsAfterCacheHit: PerfTrace.uploadsAfterCacheHit,
             evictions: tileCache.stats.evictions)
-        PerfTrace.document(phase: "closed", epoch: documentEpoch, pages: document?.pageCount)
+        PerfTrace.document(instance: self.perfTraceInstanceID, phase: "closed", epoch: documentEpoch, pages: document?.pageCount)
     }
 
     /// Drops the per-document classification state and starts a fresh content version.
@@ -17407,7 +17409,7 @@ extension AppState {
         PerfTrace.resetUploadsAfterCacheHit()
         // The stamp belongs to the page list that was just dropped: keep the monotonic sharp
         // token (a frame can then only match a newer commit) but clear the viewport identity.
-        perfViewportStamp = PerfViewportStamp(token: perfSharpToken, epoch: documentEpoch,
+        perfViewportStamp = PerfViewportStamp(instance: perfTraceInstanceID, token: perfSharpToken, epoch: documentEpoch,
                                               contentVersion: perfContentVersion)
     }
 
@@ -17420,17 +17422,17 @@ extension AppState {
         let classification = first ? "first" : "repeat-after-eviction"
         if first { perfFirstRasters += 1 } else { perfRepeatRasters += 1 }
         if perfTilePrefetch[key] == true { perfPrefetchRastered.insert(key) }
-        PerfTrace.raster(classification: classification, source: "tile", page: key.page,
+        PerfTrace.raster(instance: self.perfTraceInstanceID, classification: classification, source: "tile", page: key.page,
                          lod: Int(key.lod), x: key.x, y: key.y,
                          generation: generation, epoch: documentEpoch,
                          contentVersion: perfContentVersion)
         let enqueued = perfTileEnqueuedAt.removeValue(forKey: key) ?? started
         perfTileStartedAt.removeValue(forKey: key)
-        PerfTrace.queue(category: "tile", page: key.page,
+        PerfTrace.queue(instance: self.perfTraceInstanceID, category: "tile", page: key.page,
                         waitMs: max(0, (started - enqueued) * 1000),
                         execMs: max(0, (finished - started) * 1000),
                         epoch: documentEpoch)
-        PerfTrace.tile(phase: "done", source: "tile", page: key.page, lod: Int(key.lod),
+        PerfTrace.tile(instance: self.perfTraceInstanceID, phase: "done", source: "tile", page: key.page, lod: Int(key.lod),
                        x: key.x, y: key.y, epoch: documentEpoch,
                        contentVersion: perfContentVersion, offsetPt: scrollYPt,
                        waitMs: max(0, (started - enqueued) * 1000),
@@ -17448,7 +17450,7 @@ extension AppState {
                 let key = TileKey(page: id >> 24, lod: UInt8((id >> 20) & 15),
                                   x: id & 1023, y: (id >> 10) & 1023)
                 guard perfDrawnTiles.insert(key).inserted else { continue }
-                PerfTrace.tile(phase: "drawn", source: "tile", page: key.page, lod: Int(key.lod),
+                PerfTrace.tile(instance: self.perfTraceInstanceID, phase: "drawn", source: "tile", page: key.page, lod: Int(key.lod),
                                x: key.x, y: key.y, epoch: documentEpoch,
                                contentVersion: perfContentVersion, offsetPt: scrollYPt)
                 continue
@@ -17466,7 +17468,7 @@ extension AppState {
             } else {
                 source = "thumbnail"
             }
-            PerfTrace.tile(phase: "drawn", source: source, page: pageIndex, lod: 0, x: 0, y: 0,
+            PerfTrace.tile(instance: self.perfTraceInstanceID, phase: "drawn", source: source, page: pageIndex, lod: 0, x: 0, y: 0,
                            epoch: documentEpoch, contentVersion: perfContentVersion,
                            offsetPt: scrollYPt,
                            scale: Double(page.image.pixelWidth) / max(1, Double(page.placement.widthPt)))
@@ -17488,7 +17490,7 @@ extension AppState {
         // reported sharp, even though there is nothing blurry either.
         let sharpNow = !visiblePages.isEmpty && sources.count == visiblePages.count
         let sourcePath = Set(sources).count == 1 ? (sources.first ?? path) : "mixed"
-        PerfTrace.viewport(seq: perfViewportSeq, epoch: documentEpoch,
+        PerfTrace.viewport(instance: self.perfTraceInstanceID, seq: perfViewportSeq, epoch: documentEpoch,
                            contentVersion: perfContentVersion, offsetPt: scrollYPt,
                            path: sharpNow ? sourcePath : path, lod: lod,
                            visiblePages: visiblePages, viewport: viewport, sharp: sharpNow,
@@ -17496,13 +17498,13 @@ extension AppState {
                            wantedTiles: wanted, pageRasters: pagePreviews.count)
         if sharpNow {
             perfSharpToken &+= 1
-            PerfTrace.sharp(token: perfSharpToken, viewportSeq: perfViewportSeq,
+            PerfTrace.sharp(instance: self.perfTraceInstanceID, token: perfSharpToken, viewportSeq: perfViewportSeq,
                             epoch: documentEpoch, contentVersion: perfContentVersion,
                             offsetPt: scrollYPt, path: sourcePath, lod: lod,
                             pages: visiblePages, sources: sources,
                             afterInputSeq: perfInputSeq == 0 ? nil : perfInputSeq)
         }
-        perfViewportStamp = PerfViewportStamp(token: perfSharpToken, epoch: documentEpoch,
+        perfViewportStamp = PerfViewportStamp(instance: perfTraceInstanceID, token: perfSharpToken, epoch: documentEpoch,
                                               contentVersion: perfContentVersion,
                                               path: sharpNow ? sourcePath : path, lod: lod,
                                               offsetPt: scrollYPt)

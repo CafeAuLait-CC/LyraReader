@@ -142,10 +142,11 @@ public enum PerfTrace {
     }
 
     /// Emits one record. `time` is added automatically unless the caller supplies it.
-    public static func event(_ kind: String, _ fields: [String: Value]) {
+    public static func event(_ kind: String, _ fields: [String: Value], instance: String? = nil) {
         guard enabledStorage else { return }
         var json = "{\"kind\":\"\(escape(kind))\",\"time\":"
         json += serialize(fields["time"] ?? .double(now))
+        if let instance { json += ",\"instance\":\"\(escape(instance))\"" }
         for key in fields.keys.sorted() where key != "time" {
             json += ",\"\(escape(key))\":"
             json += serialize(fields[key]!)
@@ -166,19 +167,19 @@ public enum PerfTrace {
     }
 
     /// The document lifecycle. `pages` is unknown at `open_start` and filled in at `opened`.
-    public static func document(phase: String, epoch: UInt64, pages: Int? = nil, detail: String? = nil) {
+    public static func document(instance: String? = nil, phase: String, epoch: UInt64, pages: Int? = nil, detail: String? = nil) {
         guard enabledStorage else { return }
         var fields: [String: Value] = ["phase": .string(phase), "epoch": .int(Int(epoch))]
         if let pages { fields["pages"] = .int(pages) }
         if let detail { fields["detail"] = .string(detail) }
-        event("document", fields)
+        event("document", fields, instance: instance)
     }
 
     /// A scroll input that moved (or aimed to move) the content offset.
     ///
     /// `seq` is a monotonic input number, `source` names the input path (`wheel`, `keyboard`,
     /// `fraction`, `scrollbar`) and `epoch` is the document epoch the input belongs to.
-    public static func input(seq: UInt64, source: String, phase: String, offsetPt: CGFloat,
+    public static func input(instance: String? = nil, seq: UInt64, source: String, phase: String, offsetPt: CGFloat,
                              deltaPt: CGFloat, destinationPt: CGFloat?, epoch: UInt64) {
         guard enabledStorage else { return }
         var fields: [String: Value] = [
@@ -194,12 +195,12 @@ public enum PerfTrace {
         } else {
             fields["destination_pt"] = .unavailable
         }
-        event("input", fields)
+        event("input", fields, instance: instance)
     }
 
     /// The committed visible-band plan for one `reloadVisiblePages` pass. `seq` is the viewport
-    /// sequence number (monotonic per process); `path` is the page's drawing path.
-    public static func viewport(seq: UInt64, epoch: UInt64, contentVersion: UInt64,
+    /// sequence number (monotonic per reader instance); `path` is the page's drawing path.
+    public static func viewport(instance: String? = nil, seq: UInt64, epoch: UInt64, contentVersion: UInt64,
                                 offsetPt: CGFloat, path: String, lod: UInt8,
                                 visiblePages: [Int], viewport: CGRect, sharp: Bool,
                                 visibleMisses: Int, queuedTiles: Int, wantedTiles: Int,
@@ -221,12 +222,12 @@ public enum PerfTrace {
             "queued_tiles": .int(queuedTiles),
             "wanted_tiles": .int(wantedTiles),
             "page_rasters": .int(pageRasters),
-        ])
+        ], instance: instance)
     }
 
     /// One raster unit's lifecycle. `lod`/`x`/`y` are 0 for whole-page sources (they have no
     /// pyramid position); `scale` keeps their real resolution visible next to them.
-    public static func tile(phase: String, source: String, page: Int, lod: Int, x: Int, y: Int,
+    public static func tile(instance: String? = nil, phase: String, source: String, page: Int, lod: Int, x: Int, y: Int,
                             epoch: UInt64, contentVersion: UInt64, offsetPt: CGFloat,
                             waitMs: Double? = nil, execMs: Double? = nil, bytes: Int? = nil,
                             scale: CGFloat? = nil, detail: String? = nil) {
@@ -247,7 +248,7 @@ public enum PerfTrace {
         if let bytes { fields["bytes"] = .int(bytes) }
         if let scale { fields["scale"] = .double(Double(scale)) }
         if let detail { fields["detail"] = .string(detail) }
-        event("tile", fields)
+        event("tile", fields, instance: instance)
     }
 
     /// One queued task: `wait_ms` is enqueue → start (time spent behind other work), `exec_ms`
@@ -256,7 +257,7 @@ public enum PerfTrace {
     /// pure raster time**: the engine's own `lyra-reader-raster:` lines carry the raster figure.
     /// Emitted at completion, so a task still waiting when the document closes has no record and
     /// is never counted as zero.
-    public static func queue(category: String, page: Int?, waitMs: Double, execMs: Double,
+    public static func queue(instance: String? = nil, category: String, page: Int?, waitMs: Double, execMs: Double,
                              epoch: UInt64, detail: String? = nil) {
         guard enabledStorage else { return }
         var fields: [String: Value] = [
@@ -267,7 +268,7 @@ public enum PerfTrace {
         ]
         if let page { fields["page"] = .int(page) }
         if let detail { fields["detail"] = .string(detail) }
-        event("queue", fields)
+        event("queue", fields, instance: instance)
     }
 
     /// One stage inside a raster/frame path, for attributing latency the `queue` record alone
@@ -287,7 +288,7 @@ public enum PerfTrace {
     /// A stage that does not exist on a path is simply absent. In particular the whole-page
     /// raster path has no decode/colour-conversion stage: the FFI hands back BGRA bytes that go
     /// straight to the GPU, and this trace does not invent an empty one.
-    public static func stage(_ name: String, source: String, page: Int? = nil,
+    public static func stage(_ name: String, instance: String? = nil, source: String, page: Int? = nil,
                              generation: UInt64? = nil, milliseconds: Double? = nil,
                              queueWaitMs: Double? = nil, scale: Double? = nil,
                              epoch: UInt64? = nil, detail: String? = nil,
@@ -305,11 +306,11 @@ public enum PerfTrace {
         if let epoch { fields["epoch"] = .int(Int(epoch)) }
         if let detail { fields["detail"] = .string(detail) }
         if let time { fields["time"] = .double(time) }
-        event("stage", fields)
+        event("stage", fields, instance: instance)
     }
 
     /// A raster classification transition (counted in the tile layer / canvas, see the type doc).
-    public static func raster(classification: String, source: String, page: Int, lod: Int,
+    public static func raster(instance: String? = nil, classification: String, source: String, page: Int, lod: Int,
                               x: Int, y: Int, generation: UInt64?, epoch: UInt64,
                               contentVersion: UInt64) {
         guard enabledStorage else { return }
@@ -324,7 +325,7 @@ public enum PerfTrace {
             "content_version": .int(Int(contentVersion)),
         ]
         if let generation { fields["generation"] = .int(Int(generation)) }
-        event("raster", fields)
+        event("raster", fields, instance: instance)
     }
 
     /// A presented (or deliberately not presented) frame.
@@ -360,12 +361,12 @@ public enum PerfTrace {
             fields["presented_time"] = .unavailable
             fields["presented_reason"] = .string(reason ?? "presentation timestamp unavailable")
         }
-        event("frame", fields)
+        event("frame", fields, instance: stamp.instance)
     }
 
     /// The committed page list became fully sharp. `sources` names which sharp source each
     /// visible page used (`page-raster` or `tile`); previews and thumbnails are never listed.
-    public static func sharp(token: UInt64, viewportSeq: UInt64, epoch: UInt64,
+    public static func sharp(instance: String? = nil, token: UInt64, viewportSeq: UInt64, epoch: UInt64,
                              contentVersion: UInt64, offsetPt: CGFloat, path: String, lod: UInt8,
                              pages: [Int], sources: [String], afterInputSeq: UInt64?) {
         guard enabledStorage else { return }
@@ -381,12 +382,12 @@ public enum PerfTrace {
             "sources": .stringArray(sources),
         ]
         if let afterInputSeq { fields["after_input_seq"] = .int(Int(afterInputSeq)) }
-        event("sharp", fields)
+        event("sharp", fields, instance: instance)
     }
 
     /// One RSS / cache memory sample. `rssBytes` is nil when the kernel call failed, which is
     /// reported as `"unavailable"` rather than as a zero-memory process.
-    public static func memory(phase: String, rssBytes: UInt64?, tileCacheBytes: Int,
+    public static func memory(instance: String? = nil, phase: String, rssBytes: UInt64?, tileCacheBytes: Int,
                               pageRasterBytes: Int, thumbnailBytes: Int, tileCount: Int,
                               pageRasterCount: Int, peakBytes: Int, evictions: Int,
                               epoch: UInt64) {
@@ -407,11 +408,11 @@ public enum PerfTrace {
         } else {
             fields["rss_bytes"] = .unavailable
         }
-        event("memory", fields)
+        event("memory", fields, instance: instance)
     }
 
     /// The raster-classification counters for the document that is closing.
-    public static func summary(epoch: UInt64, contentVersion: UInt64, rasteredTiles: Int,
+    public static func summary(instance: String? = nil, epoch: UInt64, contentVersion: UInt64, rasteredTiles: Int,
                                drawnTiles: Int, firstRasters: Int, repeatsAfterEviction: Int,
                                prefetchRasteredNeverDrawn: Int, uploadsAfterCacheHit: Int,
                                evictions: Int) {
@@ -426,7 +427,7 @@ public enum PerfTrace {
             "prefetch_rastered_never_drawn": .int(prefetchRasteredNeverDrawn),
             "upload_after_cache_hit": .int(uploadsAfterCacheHit),
             "evictions": .int(evictions),
-        ])
+        ], instance: instance)
     }
 
     // MARK: - Kernel memory
@@ -516,6 +517,7 @@ public enum PerfTrace {
 /// drawable, which happens inside the same main-actor turn that draws `pages`, so a frame can
 /// only carry the stamp of the page list it actually submitted.
 public struct PerfViewportStamp: Sendable, Equatable {
+    public var instance: String
     public var token: UInt64
     public var epoch: UInt64
     /// The document's content version (bumped whenever the caches are deliberately emptied), so
@@ -526,8 +528,9 @@ public struct PerfViewportStamp: Sendable, Equatable {
     public var lod: UInt8
     public var offsetPt: CGFloat
 
-    public init(token: UInt64 = 0, epoch: UInt64 = 0, contentVersion: UInt64 = 0,
+    public init(instance: String = "", token: UInt64 = 0, epoch: UInt64 = 0, contentVersion: UInt64 = 0,
                 path: String = "unknown", lod: UInt8 = 0, offsetPt: CGFloat = 0) {
+        self.instance = instance
         self.token = token
         self.epoch = epoch
         self.contentVersion = contentVersion
