@@ -147,7 +147,14 @@ public struct SidebarView: View {
                         }
                     }
                     .buttonStyle(.plain)
+                    // The cell is the demand: request its own page (plus the prefetch rows) when
+                    // it appears, and again when a document/scale change invalidated every
+                    // thumbnail while the cell stayed mounted. The strip no longer rasterizes
+                    // pages that are nowhere near the viewport.
                     .onAppear { state.loadThumbnails(page: page) }
+                    .onChange(of: state.thumbnailDemandGeneration) { _, _ in
+                        state.loadThumbnails(page: page)
+                    }
                     .padding(4)
                     .background(
                         RoundedRectangle(cornerRadius: 6)
@@ -289,6 +296,9 @@ public struct SidebarView: View {
                 .background(Color.white)
                 .modifier(PaperImageAppearance(mode: appearance.mode))
                 .overlay(Rectangle().stroke(LyraReaderTheme.pageEdge, lineWidth: 0.5))
+                // Trace-only: the page's pixels reached a cell. With the trace off this is one
+                // bool test in an onAppear that SwiftUI already schedules.
+                .onAppear { state.noteThumbnailDrawn(page) }
         } else {
             RoundedRectangle(cornerRadius: 2)
                 .fill(Color.primary.opacity(0.06))
