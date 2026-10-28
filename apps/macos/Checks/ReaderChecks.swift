@@ -785,6 +785,10 @@ struct ReaderChecks {
         }
         // The direct-invalidation regression on its own while it is being worked on: it needs a
         // presentable surface, so it is kept runnable outside the full suite.
+        if CommandLine.arguments.contains("--check-canvas-resize") {
+            try await canvasResizeChecks()
+            return
+        }
         if CommandLine.arguments.contains("--check-canvas-commit") {
             let root = checkRoot(CommandLine.arguments.dropFirst().first)
             try await canvasCommitChecks(source: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
@@ -1296,6 +1300,7 @@ struct ReaderChecks {
             ("frame-scheduling", {
                 try await frameSchedulingChecks()
             }),
+            ("canvas-resize", { try await canvasResizeChecks() }),
             ("canvas-commit", {
                 // The presentation-path fix: a model commit must draw before the SwiftUI
                 // publish returns, with the same chrome geometry and sharp stamp, and the

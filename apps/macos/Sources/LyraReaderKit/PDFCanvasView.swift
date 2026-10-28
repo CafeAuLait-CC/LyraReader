@@ -580,7 +580,8 @@ public final class MetalCanvasView: NSView {
         translationPaperColors = commit.translationPaperColors
         syncInteraction()
     }
-    private var configuredSize: CGSize = .zero
+    private var configuredPixelSize: CGSize = .zero
+    private var configuredScale: CGFloat = 0
     private var reportedDeviceScale: CGFloat = 0
     /// The last calibration sent to the shell, so a redundant screen notification does not
     /// rebuild the band. Factor equality is what matters; the reason only changes on fallback.
@@ -621,6 +622,8 @@ public final class MetalCanvasView: NSView {
     /// asynchronous; a native check that has just driven a commit needs the synchronous copy to
     /// assert that the frame it caused describes that commit (same sharp token).
     package private(set) var lastAttemptStamp = PerfViewportStamp()
+    package private(set) var lastAttemptViewportSize: CGSize = .zero
+    package private(set) var lastAttemptDrawableSize: CGSize = .zero
     /// Whether this view's layer is attached to an engine surface. Checks use it where they
     /// cannot ask for a presented frame (an occluded window never presents).
     package var hasAttachedSurface: Bool { surfaceId != 0 }
@@ -649,6 +652,9 @@ public final class MetalCanvasView: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         layerContentsRedrawPolicy = .duringViewResize
+        // A previous drawable may survive until the next transaction. Never stretch its
+        // pixels independently on each axis while AppKit animates the window's bounds.
+        layerContentsPlacement = .topLeft
         // Files dragged in from Finder, the Dock or a browser download shelf (T2.12).
         registerForDraggedTypes(Self.fileDropTypes)
         // Ink and shapes are vector overlays above the Metal surface: a `CAShapeLayer` path is
@@ -800,6 +806,9 @@ public final class MetalCanvasView: NSView {
     }
 
     public override func layout() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
         super.layout()
         pageChrome?.frame = bounds
         annotationOverlay?.frame = bounds
@@ -807,8 +816,15 @@ public final class MetalCanvasView: NSView {
         regionMarquee?.frame = bounds
         eraserRing.frame = bounds
         syncAnnotationOverlay()
-        resizeSurfaceIfNeeded()
+        let resized = resizeSurfaceIfNeeded()
         onViewportSize?(bounds.size)
+        if resized {
+            // The old path only queued a main-loop job here: the new border geometry could
+            // be composited with a drawable of the previous size during zoom/restore.
+            // Reuse current page textures and submit inside this layout transaction.
+            if modelCommitSnapshot != nil { applyModelCommit() }
+            else { syncInteraction() }
+        }
     }
 
     // MARK: - Eraser cursor ring
@@ -1569,7 +1585,8 @@ public final class MetalCanvasView: NSView {
         }
 
         surfaceId = newSurfaceId
-        configuredSize = bounds.size
+        configuredPixelSize = CGSize(width: width, height: height)
+        configuredScale = backingScale()
         reportDeviceScale()
         reportDisplayCalibration()
         onViewportSize?(bounds.size)
@@ -1586,16 +1603,20 @@ public final class MetalCanvasView: NSView {
         }
     }
 
-    private func resizeSurfaceIfNeeded() {
-        guard surfaceId != 0, bounds.size != configuredSize, bounds.size.width > 0 else { return }
+    @discardableResult private func resizeSurfaceIfNeeded() -> Bool {
+        guard surfaceId != 0, bounds.width > 0, bounds.height > 0 else { return false }
         let (width, height) = pixelSize()
+        let pixels = CGSize(width: width, height: height)
+        guard pixels != configuredPixelSize || backingScale() != configuredScale else { return false }
         let code = lyra_reader_surface_resize(surfaceId, UInt32(width), UInt32(height), backingScale())
         if code != LyraReaderStatus.ok.rawValue {
             report("lyra_reader_surface_resize failed (\(LyraReaderStatus.describe(code)))")
-            return
+            return false
         }
-        configuredSize = bounds.size
+        configuredPixelSize = pixels
+        configuredScale = backingScale()
         markNeedsRender()
+        return true
     }
 
     private func detachSurface() {
@@ -1755,6 +1776,9 @@ public final class MetalCanvasView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
+        // A model commit can arrive after bounds changed but before AppKit's layout pass.
+        // Its projection and drawable must still use the same dimensions (and backing scale).
+        if resizeSurfaceIfNeeded() { needsRender = false }
         // Borders and paper quads must use the same submitted scroll position. Publishing
         // borders from a setter moved the gap a frame ahead of Metal during scrollbar tracking.
         syncPageChrome()
@@ -1937,6 +1961,8 @@ public final class MetalCanvasView: NSView {
         frameAttemptCount += 1
         lastAttemptedQuadCount = textureIds.count
         lastAttemptStamp = perfStamp
+        lastAttemptViewportSize = bounds.size
+        lastAttemptDrawableSize = configuredPixelSize
 
         if stats.presented == 0 {
             // The window is occluded (minimised, hidden, or covered by another app): wgpu
