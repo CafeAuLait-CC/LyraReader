@@ -343,6 +343,10 @@ struct ReaderChecks {
             print("AI assistant checks passed")
             return
         }
+        if CommandLine.arguments.contains("--check-canvas-resize") {
+            try await canvasResizeChecks()
+            return
+        }
         if CommandLine.arguments.contains("--check-inplace-translation") {
             try await inPlaceTranslationChecks(root: fastRoot)
             print("In-place translation checks passed")
@@ -785,10 +789,6 @@ struct ReaderChecks {
         }
         // The direct-invalidation regression on its own while it is being worked on: it needs a
         // presentable surface, so it is kept runnable outside the full suite.
-        if CommandLine.arguments.contains("--check-canvas-resize") {
-            try await canvasResizeChecks()
-            return
-        }
         if CommandLine.arguments.contains("--check-canvas-commit") {
             let root = checkRoot(CommandLine.arguments.dropFirst().first)
             try await canvasCommitChecks(source: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
@@ -1297,10 +1297,10 @@ struct ReaderChecks {
                 // last tab closes, so it needs a window wgpu will actually present.
                 try await canvasClearChecks(a: a, b: b)
             }),
+            ("canvas-resize", { try await canvasResizeChecks() }),
             ("frame-scheduling", {
                 try await frameSchedulingChecks()
             }),
-            ("canvas-resize", { try await canvasResizeChecks() }),
             ("canvas-commit", {
                 // The presentation-path fix: a model commit must draw before the SwiftUI
                 // publish returns, with the same chrome geometry and sharp stamp, and the
