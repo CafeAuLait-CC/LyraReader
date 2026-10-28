@@ -52,7 +52,8 @@ The five exclusive secondary rows are Annotate, Edit, Fill & Sign, Export and Ly
 stages actual text/object/link edits through the shared typed commands and recoverable transaction;
 failed or superseded text drafts remain available to copy or retry. Redact → Blackout/Erase removes
 PDF content and asks explicitly before a fallback replaces an entire page with an image. Fill & Sign
-places text, dates, vector checkmarks/crosses, stamps and typed or imported signature images.
+places text, dates, vector checkmarks/crosses, stamps, drawn vector signatures and typed or imported
+signature images. Drawing multiple strokes produces one ink annotation with a single undo step.
 Pictures have Small, Medium and Large placement sizes, with the default read from the shared engine.
 Image and typed-signature confirmations are bound to the document generation that opened them.
 The Edit inspector crops
@@ -60,7 +61,7 @@ selected top-level images or graphics by retained edge percentages through the s
 transaction. Selected bitmap images export their original pixels as PNG; graphics export their page region.
 Both preserve the PDF and its working revision.
 Bitmap and graphic previews retain their working revision and load only while the inspector needs
-them. Drawn signatures, rotated dates and the newer AI overlays remain work in
+them. Rotated dates and the newer AI overlays remain work in
 progress.
 A byte-bounded revisit cache retains reduced page images after sharp sources leave the working
 set. Unloaded pages already use the selected reading-mode paper colour.

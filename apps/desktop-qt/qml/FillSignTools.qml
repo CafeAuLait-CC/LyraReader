@@ -36,7 +36,9 @@ ToolBar {
     }
     function chooseImage(kind) {imagePicker.owner=app.currentReader;imagePicker.ownerGeneration=app.currentReader.documentGeneration;imagePicker.kind=kind;imagePicker.open();}
     function chooseTypedSignature() {if(app.blockXfaWrite() || app.fillTool!=="signature")return;typedSignature.prepare(app.currentReader);typedSignature.open();}
+    function chooseDrawnSignature() {if(app.blockXfaWrite() || app.fillTool!=="signature")return;drawnSignature.prepare(app.currentReader);drawnSignature.open();}
     TypedSignatureDialog {id:typedSignature;app:tools.app}
+    DrawnSignatureDialog {id:drawnSignature;app:tools.app}
     Menu {
         id:stampMenu
         Repeater {

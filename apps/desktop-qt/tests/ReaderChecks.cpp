@@ -37,6 +37,7 @@
 #include <QProcess>
 #include <QQuickStyle>
 #include <QQuickWindow>
+#include <QQmlProperty>
 #include <QSGRendererInterface>
 #include <QSettings>
 #include <QTemporaryDir>
@@ -659,6 +660,53 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(window,"saveDocument",Q_ARG(QVariant,false)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QTRY_VERIFY_WITH_TIMEOUT(!reader->hasUnsavedChanges(),15000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));ReaderController reopened;reopened.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reopened.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reopened.pendingCommands(),0,10000);const auto saved=reopened.data().value("annotations").toList();QCOMPARE(saved.size(),1);QCOMPARE(saved.first().toMap().value("kind").toString(),QString("stamp"));QImage recovered;QVERIFY(recovered.loadFromData(QByteArray::fromBase64(saved.first().toMap().value("stamp").toMap().value("image").toByteArray())));QCOMPARE(recovered.convertToFormat(QImage::Format_RGBA8888),expected.convertToFormat(QImage::Format_RGBA8888));
         // A late confirmation cannot place the name into a new document reusing this reader.
         QVERIFY(QMetaObject::invokeMethod(window,"clearFillTool"));QVERIFY(QMetaObject::invokeMethod(window,"setFillTool",Q_ARG(QVariant,"signature")));QVERIFY(QMetaObject::invokeMethod(typeButton,"clicked"));QTRY_VERIFY(dialog->property("opened").toBool());name->setProperty("text","Dana Example");QTRY_VERIFY(dialog->property("canPlace").toBool());reader->openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTRY_VERIFY(!dialog->property("canPlace").toBool());QVERIFY(!place->isEnabled());QVERIFY(QMetaObject::invokeMethod(dialog,"accept"));QTRY_VERIFY(!dialog->property("visible").toBool());QVERIFY(window->property("annotationTool").toString()!="signature");QVERIFY(!reader->hasUnsavedChanges());
+    }
+    void drawnSignaturesKeepMultipleVectorPathsInOneUndoAndSavedInk() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/drawn.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);
+        if(qEnvironmentVariableIsSet("LYRA_READER_DRAWN_DARK_NARROW")){view.window->setProperty("appearance","dark");view.window->resize(700,600);}
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"signature")));
+        auto *draw=visualItem(view.window->contentItem(),"drawSignatureButton");QVERIFY(draw);QVERIFY(QMetaObject::invokeMethod(draw,"clicked"));
+        auto *dialog=view.window->findChild<QObject *>("drawnSignatureDialog");auto *pad=visualItem(view.window->contentItem(),"signaturePad");auto *pointer=visualItem(view.window->contentItem(),"signaturePadPointer");
+        QVERIFY(dialog && pad && pointer);QTRY_VERIFY(dialog->property("opened").toBool());
+        const auto point=[&](int x,int y){return pointer->mapToScene(QPointF(x,y)).toPoint();};
+        QTest::mouseClick(view.window,Qt::LeftButton,Qt::NoModifier,point(20,30));QVERIFY(!dialog->property("canPlace").toBool());
+        QTest::mousePress(view.window,Qt::LeftButton,Qt::NoModifier,point(20,30));QTRY_VERIFY(pointer->property("pressed").toBool());
+        QTest::mouseMove(view.window,point(100,60),20);QTest::mouseMove(view.window,point(180,25),20);QTest::mouseRelease(view.window,Qt::LeftButton,Qt::NoModifier,point(180,25),20);QTRY_COMPARE(pad->property("pointCount").toInt(),3);
+        QTest::mousePress(view.window,Qt::LeftButton,Qt::NoModifier,point(40,110));QTRY_VERIFY(pointer->property("pressed").toBool());QTest::mouseMove(view.window,point(160,110),20);QTest::mouseRelease(view.window,Qt::LeftButton,Qt::NoModifier,point(160,110),20);QTRY_COMPARE(pad->property("pointCount").toInt(),5);
+        QTRY_VERIFY(dialog->property("canPlace").toBool());
+        if(!qEnvironmentVariableIsEmpty("LYRA_READER_DRAWN_SNAPSHOT")){QTest::qWait(50);QVERIFY(view.window->grabWindow().save(qEnvironmentVariable("LYRA_READER_DRAWN_SNAPSHOT")));}
+        QVERIFY(QMetaObject::invokeMethod(dialog,"accept"));QTRY_VERIFY(!dialog->property("visible").toBool());
+        QVERIFY(QMetaObject::invokeMethod(view.window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,200),Q_ARG(QVariant,400),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto entries=[&]{return reader->data().value("marks").toMap().value("annotations").toList();};
+        QTRY_COMPARE(entries().size(),1);const auto ink=entries().first().toMap();const auto paths=ink.value("paths").toList();
+        QCOMPARE(ink.value("kind").toString(),QString("ink"));QVERIFY(!ink.contains("image"));QCOMPARE(paths.size(),2);QCOMPARE(paths[0].toList().size(),3);QCOMPARE(paths[1].toList().size(),2);
+        const auto rules=reader->data().value("annotation_rules").toMap();QCOMPARE(ink.value("strokeWidth").toDouble(),rules.value("default_stroke_width_pt").toDouble());
+        const auto rect=ink.value("rect").toMap();QCOMPARE(rect.value("height").toDouble(),rules.value("default_signature_height_pt").toDouble());
+        QVERIFY(paths[0].toList()[1].toMap().value("y").toDouble()>paths[0].toList()[0].toMap().value("y").toDouble());
+        QVERIFY(QMetaObject::invokeMethod(view.window,"undo"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QCOMPARE(entries().size(),0);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"redo"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QCOMPARE(entries().size(),1);QCOMPARE(entries().first().toMap().value("paths"),ink.value("paths"));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"saveDocument",Q_ARG(QVariant,false)));QTRY_VERIFY_WITH_TIMEOUT(!reader->hasUnsavedChanges() && reader->pendingCommands()==0,15000);
+        ReaderController saved;saved.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(saved.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(saved.pendingCommands(),0,10000);
+        const auto annotations=saved.data().value("annotations").toList();QCOMPARE(annotations.size(),1);const auto fileInk=annotations.first().toMap();QCOMPARE(fileInk.value("kind").toString(),QString("ink"));QCOMPARE(fileInk.value("ink_paths").toList().size(),2);
+    }
+    void drawnSignatureCancelClearAndSameUrlReopenCannotPlaceOldStrokes() {
+        NativeCorpus::Viewer view;QVERIFY(view.window);const auto url=QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf");view.workspace.openFile(url);auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"signature")));auto *draw=visualItem(view.window->contentItem(),"drawSignatureButton");QVERIFY(draw);
+        QVERIFY(QMetaObject::invokeMethod(draw,"clicked"));auto *dialog=view.window->findChild<QObject *>("drawnSignatureDialog");auto *pointer=visualItem(view.window->contentItem(),"signaturePadPointer");auto *clear=visualItem(view.window->contentItem(),"clearDrawnSignature");QVERIFY(dialog && pointer && clear);QTRY_VERIFY(dialog->property("opened").toBool());
+        const auto stroke=[&]{QTest::mousePress(view.window,Qt::LeftButton,Qt::NoModifier,pointer->mapToScene(QPointF(20,50)).toPoint());QTest::mouseMove(view.window,pointer->mapToScene(QPointF(100,50)).toPoint(),20);QTest::mouseRelease(view.window,Qt::LeftButton,Qt::NoModifier,pointer->mapToScene(QPointF(100,50)).toPoint(),20);};
+        auto *pad=visualItem(view.window->contentItem(),"signaturePad");QVERIFY(pad);const auto rules=reader->data().value("annotation_rules").toMap();auto limited=rules;limited["max_ink_points"]=2;limited["max_ink_paths"]=1;QVERIFY(QQmlProperty(pad,"rules").write(limited));QCOMPARE(pad->property("pointLimit").toInt(),2);QCOMPARE(pad->property("pathLimit").toInt(),1);
+        stroke();QCOMPARE(pad->property("pointCount").toInt(),2);QCOMPARE(pad->property("pointLimit").toInt(),2);stroke();QVERIFY(pad->property("limitReached").toBool());QCOMPARE(pad->property("pointCount").toInt(),2);QVERIFY(QMetaObject::invokeMethod(clear,"clicked"));
+        QTest::mousePress(view.window,Qt::LeftButton,Qt::NoModifier,pointer->mapToScene(QPointF(20,50)).toPoint());QTest::mouseMove(view.window,pointer->mapToScene(QPointF(60,50)).toPoint(),20);QTest::mouseMove(view.window,pointer->mapToScene(QPointF(100,50)).toPoint(),20);QTest::mouseRelease(view.window,Qt::LeftButton,Qt::NoModifier,pointer->mapToScene(QPointF(100,50)).toPoint(),20);QVERIFY(pad->property("limitReached").toBool());QCOMPARE(pad->property("pointCount").toInt(),2);QVERIFY(QMetaObject::invokeMethod(clear,"clicked"));pad->setProperty("rules",rules);
+        stroke();QTRY_VERIFY(dialog->property("canPlace").toBool());QVERIFY(QMetaObject::invokeMethod(clear,"clicked"));QVERIFY(!dialog->property("canPlace").toBool());stroke();QVERIFY(QMetaObject::invokeMethod(dialog,"reject"));QTRY_VERIFY(!dialog->property("visible").toBool());QVERIFY(!reader->hasUnsavedChanges());QVERIFY(view.window->property("pendingDrawnSignature").isNull());
+        QVERIFY(QMetaObject::invokeMethod(draw,"clicked"));QTRY_VERIFY(dialog->property("opened").toBool());stroke();QTRY_VERIFY(dialog->property("canPlace").toBool());reader->openFile(url);QTRY_VERIFY_WITH_TIMEOUT(!reader->loading() && reader->pendingCommands()==0 && reader->pageCount()==1,10000);QVERIFY(!dialog->property("canPlace").toBool());QVERIFY(QMetaObject::invokeMethod(dialog,"accept"));QVERIFY(view.window->property("pendingDrawnSignature").isNull());
+        QVERIFY(QMetaObject::invokeMethod(draw,"clicked"));QTRY_VERIFY(dialog->property("opened").toBool());stroke();QTRY_VERIFY(dialog->property("canPlace").toBool());QVERIFY(QMetaObject::invokeMethod(dialog,"accept"));QTRY_VERIFY(!dialog->property("visible").toBool());reader->openFile(url);QTRY_VERIFY_WITH_TIMEOUT(!reader->loading() && reader->pendingCommands()==0 && reader->pageCount()==1,10000);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,200),Q_ARG(QVariant,400),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QVERIFY(!reader->hasUnsavedChanges());QVERIFY(view.window->property("pendingDrawnSignature").isNull());
     }
     void pictureSizesUseSharedDefaultsAndStalePickersCannotArmANewGeneration() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/pictures.pdf",imagePath=scratch.path()+"/picture.png";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));QImage image(64,32,QImage::Format_RGBA8888);image.fill(QColor(240,20,40,128));QVERIFY(image.save(imagePath));QFile original(path);QVERIFY(original.open(QIODevice::ReadOnly));const auto before=original.readAll();original.close();

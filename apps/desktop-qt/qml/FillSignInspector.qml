@@ -38,6 +38,12 @@ Pane {
             text:qsTr("Type a Signature…");onClicked:app.fillTools.chooseTypedSignature()
         }
         Button {
+            objectName:"drawSignatureButton"
+            visible:app.fillTool==="signature"
+            text:qsTr("Draw a Signature…");onClicked:app.fillTools.chooseDrawnSignature()
+        }
+        Label {Layout.fillWidth:true;wrapMode:Text.Wrap;visible:!!app.pendingDrawnSignature;text:qsTr("Hand-drawn signature ready. Click a page to place it.");color:app.colors.textSecondary}
+        Button {
             visible:["signature","image"].indexOf(app.fillTool)>=0
             text:qsTr("Choose Image…");onClicked:app.fillTools.chooseImage(app.fillTool)
         }

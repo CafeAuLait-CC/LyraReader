@@ -103,7 +103,7 @@ ApplicationWindow {
         if (!force && secondaryRow==="edit" && contentController.deferAction({kind:"overview"})) return;
         overviewVisible=!overviewVisible;
     }
-    function clearFillTool() {fillTool="";pendingStampStyle="";pendingSignatureImage=null;annotationTool="select";}
+    function clearFillTool() {fillTool="";pendingStampStyle="";pendingSignatureImage=null;pendingDrawnSignature=null;annotationTool="select";}
     function setFillTool(value) {
         if (blockXfaWrite()) return;
         if (secondaryRow!=="fill") setSecondaryRow("fill");
@@ -148,13 +148,17 @@ ApplicationWindow {
     property string annotationTool: "select"
     property string pendingStampStyle: ""
     property var pendingSignatureImage: null
+    property var pendingDrawnSignature: null
+    property var pendingDrawnGeneration: null
     onAnnotationToolChanged: {
         if (annotationTool !== "eraser")
             cancelErase();
         if (annotationTool !== "stamp")
             pendingStampStyle = "";
-        if (annotationTool !== "signature")
+        if (annotationTool !== "signature") {
             pendingSignatureImage = null;
+            pendingDrawnSignature = null;
+        }
     }
     property string layoutMode: "Continuous"
     property real pageGap: 12
@@ -217,6 +221,7 @@ ApplicationWindow {
         pendingArtworkRequest = -1;
         pendingStampStyle = "";
         pendingSignatureImage = null;
+        pendingDrawnSignature = null;
         if (annotationTool === "stamp" || annotationTool === "signature")
             annotationTool = "select";
         ++positionRestoreEpoch;
@@ -659,7 +664,16 @@ ApplicationWindow {
     }
     function pageClicked(page, x, y, sceneX, sceneY) {
         currentPage = page;
-        if (annotationTool === "stamp" || annotationTool === "signature") {
+        if (annotationTool === "signature" && pendingDrawnSignature) {
+            if(pendingArtworkRequest>=0 || blockXfaWrite())return;
+            if(pendingDrawnGeneration!==currentReader.documentGeneration){clearFillTool();operationStatus=qsTr("The document changed. Draw the signature again.");return;}
+            const size=currentReader.pages[page],rules=currentReader.data.annotation_rules,signature=pendingDrawnSignature;
+            if(!size || !rules || !Number.isFinite(rules.default_signature_height_pt) || rules.default_signature_height_pt<=0 || !Number.isFinite(rules.default_stroke_width_pt) || rules.default_stroke_width_pt<=0){operationStatus=qsTr("The document service did not provide valid placement defaults. Reopen the document.");return;}
+            const height=Math.min(size.height,rules.default_signature_height_pt),width=Math.min(size.width,rules.default_signature_height_pt*signature.aspect);
+            const left=Math.max(0,Math.min(size.width-width,x-width/2)),top=Math.max(0,Math.min(size.height-height,y-height/2));
+            const paths=signature.strokes.map(function(path){return path.map(function(p){return {x:left+p.x*width,y:top+p.y*height};});});
+            pendingArtworkRequest=currentReader.submit("mark_create",{entry:{kind:"ink",page:page,version:rules.geometry_version,paths:paths,rect:{x:left,y:top,width:width,height:height},strokeWidth:rules.default_stroke_width_pt,color:fillColour(),note:""}});
+        } else if (annotationTool === "stamp" || annotationTool === "signature") {
             if (pendingArtworkRequest >= 0)
                 return;
             const size = currentReader.pages[page];
@@ -953,6 +967,13 @@ ApplicationWindow {
         return armImageData(image,!!picture);
     }
     function armSignatureData(image) {return armImageData(image,false);}
+    function armDrawnSignature(signature) {
+        if(blockXfaWrite() || currentReader.pageCount===0 || !signature || !Number.isFinite(signature.aspect) || signature.aspect<.3 || signature.aspect>6 || !signature.strokes || !signature.strokes.length)return false;
+        setTextViewEnabled(false);overviewVisible=false;formToolActive=false;setSecondaryRow("fill");
+        if(secondaryRow!=="fill")return false;
+        fillTool="signature";annotationTool="signature";pendingSignatureImage=null;pendingDrawnSignature=signature;pendingDrawnGeneration=currentReader.documentGeneration;selectedAnnotation=null;selection=null;
+        operationStatus=qsTr("Click on the page to place the drawn signature. Escape cancels.");return true;
+    }
     function armImageData(image,picture) {
         if (blockXfaWrite() || currentReader.pageCount===0) return false;
         if (!image || (!image.error && (!image.image || !Number.isFinite(image.width) || !Number.isFinite(image.height) || image.width<=0 || image.height<=0))) {
@@ -970,6 +991,7 @@ ApplicationWindow {
         fillTool=picture ? "image" : "signature";
         annotationTool = "signature";
         pendingSignatureImage = image;
+        pendingDrawnSignature = null;
         selectedAnnotation = null;
         selection = null;
         operationStatus = picture ? qsTr("Click on the page to place the picture. Escape cancels.") : qsTr("Click on the page to place the signature image. Escape cancels.");
