@@ -22,6 +22,8 @@ use std::sync::OnceLock;
 /// [`PdfiumBackend`] own its `PdfDocument<'static>` without self-referential
 /// lifetime tricks.
 static PDFIUM: OnceLock<Pdfium> = OnceLock::new();
+static RAW_PDFIUM_BINDINGS: OnceLock<std::result::Result<Box<dyn PdfiumLibraryBindings>, String>> =
+    OnceLock::new();
 
 /// Candidate locations for the PDFium dynamic library, in priority order.
 pub fn library_candidates() -> Vec<PathBuf> {
@@ -146,6 +148,12 @@ pub(crate) fn pdfium_instance() -> Result<&'static Pdfium> {
             Ok(bindings) => {
                 // Another thread may have won the race; either way the facade is
                 // equivalent because the bindings are process-global.
+                // pdfium-render intentionally forbids binding again after Pdfium::new.
+                // Bind the same selected library now, without a second facade/global init.
+                // Preserve an optional binding failure so image tools cannot break reading.
+                let raw = Pdfium::bind_to_library(&candidate).map_err(|error| error.to_string());
+                // Only this initialiser writes the once-cell, under PDFIUM_INIT.
+                let _ = RAW_PDFIUM_BINDINGS.set(raw);
                 let _ = PDFIUM.set(Pdfium::new(bindings));
                 if let Some(pdfium) = PDFIUM.get() {
                     return Ok(pdfium);
@@ -164,6 +172,25 @@ pub(crate) fn pdfium_instance() -> Result<&'static Pdfium> {
         attempts.join("\n  "),
         crate::PDFIUM_PATH_ENV
     )))
+}
+
+/// Uses the facade's exact library for operations requiring checked raw-buffer access.
+/// Binding symbols does not initialise a second PDFium instance. The process-wide facade
+/// keeps the library and global PDFium state alive; callers still take `PDFIUM_LOCK`.
+pub(crate) fn raw_pdfium_bindings() -> Result<&'static dyn PdfiumLibraryBindings> {
+    pdfium_instance()?;
+    match RAW_PDFIUM_BINDINGS.get() {
+        Some(Ok(bindings)) => Ok(bindings.as_ref()),
+        Some(Err(error)) => Err(LyraReaderError::new(
+            ErrorCode::BackendUnavailable,
+            "PDFium bitmap bindings are unavailable",
+        )
+        .with_detail(error.clone())),
+        None => Err(LyraReaderError::new(
+            ErrorCode::BackendUnavailable,
+            "PDFium bitmap bindings are not initialised",
+        )),
+    }
 }
 
 /// A link the shell can act on.

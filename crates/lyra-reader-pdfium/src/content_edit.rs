@@ -18,6 +18,9 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 mod flat;
+// This leaf alone accesses native bitmap pointers to validate stride before copying bytes.
+#[allow(unsafe_code)]
+mod image_pixels;
 mod layout;
 mod links;
 mod nested;
@@ -721,6 +724,23 @@ fn build_revision(
             return Ok(output);
         }
     }
+    let mut crop_pixels = if let ContentCommand::CropImage { crop, .. } = command {
+        if !crop.valid()
+            || crop.x < 0.0
+            || crop.y < 0.0
+            || crop.right() > 1.000001
+            || crop.top() > 1.000001
+        {
+            return Err(failure("The crop must lie inside the image."));
+        }
+        let item = item.ok_or_else(|| failure("No image selected."))?;
+        if item.paths.len() != 1 || item.paths[0].len() != 1 {
+            return Err(failure("Select a top-level bitmap image to crop it."));
+        }
+        Some(image_pixels::read(bytes, index, &item.paths[0])?)
+    } else {
+        None
+    };
     let pdfium = pdfium_instance()?;
     let _guard = crate::backend::lock_pdfium()?;
     let mut doc = pdfium
@@ -913,32 +933,28 @@ fn build_revision(
         }
         ContentCommand::CropImage { crop, .. } => {
             let item = item.ok_or_else(|| failure("No image selected."))?;
-            if !crop.valid()
-                || crop.x < 0.0
-                || crop.y < 0.0
-                || crop.right() > 1.000001
-                || crop.top() > 1.000001
-            {
-                return Err(failure("The crop must lie inside the image."));
-            }
             if item.paths.len() != 1 || item.paths[0].len() != 1 {
                 return Err(failure("Select a top-level bitmap image to crop it."));
             }
-            let (width, height, rgba, matrix) = {
+            let matrix = {
                 let object = page.objects().get(item.paths[0][0]).map_err(pdf_error)?;
                 let image = object
                     .as_image_object()
                     .ok_or_else(|| failure("Cropping requires a bitmap image."))?;
-                let bitmap = image.get_raw_bitmap().map_err(pdf_error)?;
-                (
-                    bitmap.width() as u32,
-                    bitmap.height() as u32,
-                    bitmap.as_rgba_bytes(),
-                    image.matrix().map_err(pdf_error)?,
-                )
+                image.matrix().map_err(pdf_error)?
             };
+            let image_pixels::Pixels {
+                width,
+                height,
+                rgba,
+            } = crop_pixels
+                .take()
+                .ok_or_else(|| failure("The checked image pixels are unavailable."))?;
             let x = (crop.x * f64::from(width)).round() as u32;
             let y = (crop.y * f64::from(height)).round() as u32;
+            if x >= width || y >= height {
+                return Err(failure("The crop has no image pixels."));
+            }
             let w = (crop.width * f64::from(width)).round().max(1.0) as u32;
             let h = (crop.height * f64::from(height)).round().max(1.0) as u32;
             let w = w.min(width - x);
@@ -946,7 +962,10 @@ fn build_revision(
             if w == 0 || h == 0 {
                 return Err(failure("The crop has no image pixels."));
             }
-            let mut pixels = Vec::with_capacity(w as usize * h as usize * 4);
+            let mut pixels = Vec::new();
+            pixels
+                .try_reserve_exact(image_pixels::rgba_length(w, h)?)
+                .map_err(|_| failure("There is not enough memory to crop this image."))?;
             for row in y..y + h {
                 let start = ((row * width + x) * 4) as usize;
                 pixels.extend_from_slice(&rgba[start..start + w as usize * 4]);
@@ -990,21 +1009,21 @@ fn decode_png(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info().map_err(pdf_error)?;
     let info = reader.info();
-    if info.width == 0
-        || info.height == 0
-        || u64::from(info.width) * u64::from(info.height) > 40_000_000
-    {
-        return Err(failure("The image exceeds the 40 megapixel editing limit."));
-    }
-    let mut buffer = vec![
-        0;
-        reader
-            .output_buffer_size()
-            .ok_or_else(|| failure("The image is too large."))?
-    ];
+    let rgba_length = image_pixels::rgba_length(info.width, info.height)?;
+    let output_length = reader
+        .output_buffer_size()
+        .filter(|&length| length <= rgba_length)
+        .ok_or_else(|| failure("The image is too large."))?;
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(output_length)
+        .map_err(|_| failure("There is not enough memory to decode this image."))?;
+    buffer.resize(output_length, 0);
     let info = reader.next_frame(&mut buffer).map_err(pdf_error)?;
     let samples = &buffer[..info.buffer_size()];
-    let mut rgba = Vec::with_capacity(info.width as usize * info.height as usize * 4);
+    let mut rgba = Vec::new();
+    rgba.try_reserve_exact(rgba_length)
+        .map_err(|_| failure("There is not enough memory to decode this image."))?;
     match info.color_type {
         png::ColorType::Rgba => rgba.extend_from_slice(samples),
         png::ColorType::Rgb => {
@@ -1037,6 +1056,9 @@ fn new_image<'a>(
     mut rgba: Vec<u8>,
     matrix: PdfMatrix,
 ) -> Result<PdfPageImageObject<'a>> {
+    if rgba.len() != image_pixels::rgba_length(width, height)? {
+        return Err(failure("The image pixel buffer has an invalid length."));
+    }
     for pixel in rgba.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2)
     }
@@ -1067,43 +1089,18 @@ pub fn content_image(source: &Path, index: u32, target: &str, revision: &str) ->
     if fingerprint(&bytes) != snapshot.revision {
         return Err(failure("The source changed while exporting this image."));
     }
-    let pdfium = pdfium_instance()?;
-    let _guard = crate::backend::lock_pdfium()?;
-    let doc = pdfium
-        .load_pdf_from_byte_slice(&bytes, None)
-        .map_err(pdf_error)?;
-    let page = doc
-        .pages()
-        .get(index.try_into().map_err(pdf_error)?)
-        .map_err(pdf_error)?;
-    let object = page.objects().get(item.paths[0][0]).map_err(pdf_error)?;
-    export_nested(object, &item.paths[0][1..])
-}
-fn export_nested(object: PdfPageObject<'_>, path: &[usize]) -> Result<Vec<u8>> {
-    if let Some((&index, rest)) = path.split_first() {
-        return export_nested(
-            object
-                .as_x_object_form_object()
-                .ok_or_else(|| failure("The image hierarchy changed."))?
-                .get(index)
-                .map_err(pdf_error)?,
-            rest,
-        );
-    }
-    let image = object
-        .as_image_object()
-        .ok_or_else(|| failure("The object is not a bitmap image."))?;
-    let bitmap = image.get_raw_bitmap().map_err(pdf_error)?;
+    let path = item
+        .paths
+        .first()
+        .ok_or_else(|| failure("The image path is empty."))?;
+    let pixels = image_pixels::read(&bytes, index, path)?;
     let mut output = Vec::new();
     {
-        let mut encoder =
-            png::Encoder::new(&mut output, bitmap.width() as u32, bitmap.height() as u32);
+        let mut encoder = png::Encoder::new(&mut output, pixels.width, pixels.height);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().map_err(pdf_error)?;
-        writer
-            .write_image_data(&bitmap.as_rgba_bytes())
-            .map_err(pdf_error)?;
+        writer.write_image_data(&pixels.rgba).map_err(pdf_error)?;
     }
     Ok(output)
 }

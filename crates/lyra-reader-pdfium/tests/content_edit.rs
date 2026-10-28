@@ -1097,3 +1097,145 @@ fn erase_tj_after_another_show_keeps_operator_local_character_indices() {
         "{text}"
     );
 }
+
+fn embedded_image_fixture(
+    name: &str,
+    width: i64,
+    height: i64,
+    samples: Vec<u8>,
+    nested: bool,
+) -> PathBuf {
+    let source = fixture(name, b"BT /F1 12 Tf 72 700 Td (Retained text) Tj ET");
+    let mut doc = Document::load(&source).unwrap();
+    let page = *doc.get_pages().values().next().unwrap();
+    let image=doc.add_object(Stream::new(dictionary! {"Type"=>"XObject","Subtype"=>"Image","Width"=>width,"Height"=>height,"ColorSpace"=>"DeviceGray","BitsPerComponent"=>8},samples));
+    let drawable = if nested {
+        doc.add_object(Stream::new(dictionary! {"Type"=>"XObject","Subtype"=>"Form","BBox"=>vec![0.into(),0.into(),1.into(),1.into()],"Resources"=>dictionary! {"XObject"=>dictionary! {"Im0"=>image}}},b"/Im0 Do".to_vec()))
+    } else {
+        image
+    };
+    doc.get_object_mut(page)
+        .unwrap()
+        .as_dict_mut()
+        .unwrap()
+        .get_mut(b"Resources")
+        .unwrap()
+        .as_dict_mut()
+        .unwrap()
+        .set("XObject", dictionary! {"Im0"=>drawable});
+    let stream = doc.add_object(Stream::new(
+        dictionary! {},
+        b"q 100 0 0 50 72 500 cm /Im0 Do Q BT /F1 12 Tf 72 700 Td (Retained text) Tj ET".to_vec(),
+    ));
+    doc.get_object_mut(page)
+        .unwrap()
+        .as_dict_mut()
+        .unwrap()
+        .set("Contents", stream);
+    doc.save(&source).unwrap();
+    source
+}
+
+#[test]
+fn oversized_embedded_images_refuse_export_and_crop_without_touching_files() {
+    let source =
+        embedded_image_fixture("oversized-raw-image", 1_000_000, 1_000_000, vec![0], false);
+    let original = std::fs::read(&source).unwrap();
+    let page = inspect_content(&source, 0).unwrap();
+    let image = page.items.iter().find(|i| i.kind == "image").unwrap();
+    let error = content_image(&source, 0, &image.id, &page.revision).unwrap_err();
+    assert!(error.to_string().contains("40 megapixel"), "{error}");
+    let destination = source.with_file_name("retained-output.pdf");
+    std::fs::write(&destination, b"Previous output").unwrap();
+    let error = edit_content(
+        &source,
+        &destination,
+        0,
+        &ContentCommand::CropImage {
+            revision: page.revision,
+            target: image.id.clone(),
+            crop: ContentBox {
+                x: 0.0,
+                y: 0.0,
+                width: 0.5,
+                height: 1.0,
+            },
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("40 megapixel"), "{error}");
+    assert_eq!(std::fs::read(&destination).unwrap(), b"Previous output");
+    assert_eq!(std::fs::read(&source).unwrap(), original);
+}
+
+#[test]
+fn grayscale_and_nested_image_exports_preserve_pixels_without_stride_padding() {
+    for nested in [false, true] {
+        let source = embedded_image_fixture(
+            if nested {
+                "nested-gray-image"
+            } else {
+                "gray-image"
+            },
+            3,
+            2,
+            vec![10, 20, 30, 40, 50, 60],
+            nested,
+        );
+        let original = std::fs::read(&source).unwrap();
+        let page = inspect_content(&source, 0).unwrap();
+        let image = page.items.iter().find(|i| i.kind == "image").unwrap();
+        let bytes = content_image(&source, 0, &image.id, &page.revision).unwrap();
+        let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes))
+            .read_info()
+            .unwrap();
+        assert_eq!((decoder.info().width, decoder.info().height), (3, 2));
+        let mut pixels = vec![0; decoder.output_buffer_size().unwrap()];
+        decoder.next_frame(&mut pixels).unwrap();
+        let expected: Vec<u8> = [10, 20, 30, 40, 50, 60]
+            .into_iter()
+            .flat_map(|v| [v, v, v, 255])
+            .collect();
+        assert_eq!(pixels, expected);
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        if !nested {
+            let destination = source.with_file_name("cropped-gray.pdf");
+            if destination.exists() {
+                std::fs::remove_file(&destination).unwrap();
+            }
+            edit_content(
+                &source,
+                &destination,
+                0,
+                &ContentCommand::CropImage {
+                    revision: page.revision,
+                    target: image.id.clone(),
+                    crop: ContentBox {
+                        x: 1.0 / 3.0,
+                        y: 0.0,
+                        width: 2.0 / 3.0,
+                        height: 1.0,
+                    },
+                },
+            )
+            .unwrap();
+            let page = inspect_content(&destination, 0).unwrap();
+            let image = page.items.iter().find(|i| i.kind == "image").unwrap();
+            let bytes = content_image(&destination, 0, &image.id, &page.revision).unwrap();
+            let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes))
+                .read_info()
+                .unwrap();
+            assert_eq!((decoder.info().width, decoder.info().height), (2, 2));
+            let mut pixels = vec![0; decoder.output_buffer_size().unwrap()];
+            decoder.next_frame(&mut pixels).unwrap();
+            assert_eq!(
+                pixels,
+                [20, 30, 50, 60]
+                    .into_iter()
+                    .flat_map(|v| [v, v, v, 255])
+                    .collect::<Vec<u8>>()
+            );
+            assert_eq!(std::fs::read(&source).unwrap(), original);
+        }
+    }
+}
