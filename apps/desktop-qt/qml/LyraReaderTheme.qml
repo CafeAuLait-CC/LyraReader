@@ -17,6 +17,8 @@ QtObject {
     readonly property color emptyBg: dark ? "#1B1A18" : "#EEEAE3"
     readonly property color statusbarBg: dark ? "#24221F" : "#F4F1EC"
     readonly property color documentInk: "#302B25"
+    // Transparent artwork is previewed on original paper, independently of the UI theme.
+    readonly property color documentPaper: "#FFFFFF"
     readonly property color textPrimary: dark ? "#F1ECE3" : "#302B25"
     readonly property color textSecondary: dark ? "#C8BFAF" : "#655C50"
     readonly property color textTertiary: dark ? "#B4A995" : "#675C50"

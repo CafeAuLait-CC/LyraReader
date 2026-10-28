@@ -87,6 +87,8 @@ public:
     Q_INVOKABLE void setLayout(const QString &mode, double gap);
     Q_INVOKABLE double zoomOffset(double offset, double anchor, double oldZoom, double newZoom) const;
     Q_INVOKABLE QVariantMap signatureImage(const QUrl &url) const;
+    Q_INVOKABLE QStringList signatureFonts() const;
+    Q_INVOKABLE QVariantMap typedSignatureImage(const QString &name,const QString &family) const;
     Q_INVOKABLE QUrl contentPreviewUrl(int page,const QString &target,const QString &revision,
                                       double width,double height,double deviceScale);
     std::shared_ptr<LyraReaderDesktopDocument> documentHandle()const{return m_document;}

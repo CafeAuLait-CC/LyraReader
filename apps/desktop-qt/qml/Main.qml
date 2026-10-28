@@ -926,6 +926,13 @@ ApplicationWindow {
         if (currentReader.pageCount === 0)
             return false;
         const image = currentReader.signatureImage(url);
+        return armSignatureData(image);
+    }
+    function armSignatureData(image) {
+        if (blockXfaWrite() || currentReader.pageCount===0) return false;
+        if (!image || (!image.error && (!image.image || !Number.isFinite(image.width) || !Number.isFinite(image.height) || image.width<=0 || image.height<=0))) {
+            operationStatus=qsTr("The signature preview is unavailable.");return false;
+        }
         if (image.error) {
             operationStatus = image.error;
             return false;

@@ -29,12 +29,14 @@ ToolBar {
                 onClicked: {
                     app.setFillTool(modelData.kind);
                     if (modelData.kind==="stamp" && app.fillTool==="stamp") {stampMenu.parent=button;stampMenu.popup(0,button.height);}
-                    else if (["signature","image"].indexOf(modelData.kind)>=0 && app.fillTool===modelData.kind) chooseImage(modelData.kind);
+                    else if (modelData.kind==="image" && app.fillTool==="image") chooseImage("image");
                 }
             }
         }
     }
     function chooseImage(kind) {imagePicker.owner=app.currentReader;imagePicker.kind=kind;imagePicker.open();}
+    function chooseTypedSignature() {if(app.blockXfaWrite() || app.fillTool!=="signature")return;typedSignature.owner=app.currentReader;typedSignature.open();}
+    TypedSignatureDialog {id:typedSignature;app:tools.app}
     Menu {
         id:stampMenu
         Repeater {

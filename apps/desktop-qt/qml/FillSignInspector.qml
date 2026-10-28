@@ -28,16 +28,24 @@ Pane {
         SpinBox {from:8;to:96;value:app.fillFontSize;editable:true;onValueModified:app.fillFontSize=value;Accessible.name:qsTr("Fill and Sign text size")}
         Button {text:qsTr("Colour…");onClicked:colour.open()}
         Button {
+            objectName:"typeSignatureButton"
+            visible:app.fillTool==="signature"
+            text:qsTr("Type a Signature…");onClicked:app.fillTools.chooseTypedSignature()
+        }
+        Button {
             visible:["signature","image"].indexOf(app.fillTool)>=0
             text:qsTr("Choose Image…");onClicked:app.fillTools.chooseImage(app.fillTool)
         }
-        Image {
+        Rectangle {
             visible:!!app.pendingSignatureImage
             Layout.fillWidth:true;Layout.preferredHeight:100
-            fillMode:Image.PreserveAspectFit
-            source:app.pendingSignatureImage ? "data:image/png;base64,"+app.pendingSignatureImage.image : ""
-            sourceSize.width:400;sourceSize.height:200
-            Accessible.name:qsTr("Placement image preview")
+            color:app.colors.documentPaper;border.color:app.colors.pageEdge;radius:4
+            Image {
+                anchors.fill:parent;anchors.margins:8;fillMode:Image.PreserveAspectFit
+                source:app.pendingSignatureImage ? "data:image/png;base64,"+app.pendingSignatureImage.image : ""
+                sourceSize.width:400;sourceSize.height:200
+                Accessible.name:qsTr("Placement image preview")
+            }
         }
         Label {text:qsTr("Form fields");font.bold:true;Layout.topMargin:12}
         Button {text:qsTr("Edit Form Fields…");enabled:!!app.currentReader.data.forms && app.currentReader.data.forms.fields.length>0;onClicked:app.toggleForms()}

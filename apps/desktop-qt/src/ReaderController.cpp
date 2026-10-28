@@ -17,6 +17,7 @@
 #include <QPromise>
 #include <QJSValue>
 #include <QUrlQuery>
+#include "SignatureArtwork.h"
 #include <cmath>
 #include <deque>
 #include <functional>
@@ -387,6 +388,8 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
     return id;
 }
 
+QStringList ReaderController::signatureFonts() const {return SignatureArtwork::fonts();}
+QVariantMap ReaderController::typedSignatureImage(const QString &name,const QString &family) const {return SignatureArtwork::typed(name,family);}
 QVariantMap ReaderController::signatureImage(const QUrl &url) const {
     if(!url.isLocalFile())return {{"error",tr("Choose a local PNG or JPEG signature image.")}};
     QFile file(url.toLocalFile());
