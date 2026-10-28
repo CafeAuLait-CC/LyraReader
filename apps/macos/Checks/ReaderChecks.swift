@@ -344,6 +344,10 @@ struct ReaderChecks {
             print("AI assistant checks passed")
             return
         }
+        if CommandLine.arguments.contains("--check-canvas-resize") {
+            try await canvasResizeChecks()
+            return
+        }
         if CommandLine.arguments.contains("--check-inplace-translation") {
             try await inPlaceTranslationChecks(root: fastRoot)
             print("In-place translation checks passed")
@@ -1312,6 +1316,7 @@ struct ReaderChecks {
                 // last tab closes, so it needs a window wgpu will actually present.
                 try await canvasClearChecks(a: a, b: b)
             }),
+            ("canvas-resize", { try await canvasResizeChecks() }),
             ("frame-scheduling", {
                 try await frameSchedulingChecks()
             }),
