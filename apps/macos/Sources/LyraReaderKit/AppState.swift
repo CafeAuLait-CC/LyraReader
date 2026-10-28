@@ -870,6 +870,10 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     private var perfTileStartedAt: [TileKey: Double] = [:]
     private var perfTilePrefetch: [TileKey: Bool] = [:]
     private var perfThumbnailEnqueuedAt: [Int: Double] = [:]
+    /// Sidebar pages whose thumbnail image has entered a cell. The trace uses this to separate
+    /// "rastered" from "drawn" for the strip: the generator pumps every requested page, but only
+    /// the cells the lazy grid builds ever show one.
+    private var perfDrawnThumbnails: Set<Int> = []
     /// Raster generations whose `drawn` record was already emitted (a preview can be drawn by
     /// many frames; only the first draw is a lifecycle event).
     private var perfDrawnRasterGenerations: Set<UInt64> = []
@@ -922,6 +926,9 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     func cachedTextPage(_ page: Int) -> TextPage? { textPages[page] }
     /// Page placements from the last layout pass (hit-testing needs them).
     var visiblePagePlacements: [PagePlacement] = []
+    /// Pages the canvas can actually show after the last layout pass. They are the only pages its
+    /// first frame can fall back to a thumbnail for, so `loadThumbnails()` seeds exactly these.
+    private var onScreenThumbnailPages: [Int] = []
 
     /// The small, honest set of stamps a reader actually uses.
 ///
@@ -3058,9 +3065,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private var pendingThumbnails: [Int] = []
     /// Thumbnail width in points; height follows the page's aspect ratio.
     public let thumbnailWidthPt: CGFloat = 132
-    /// How many pages get a preview. Loading every page of a 2000-page manual up front would
-    /// be wasteful; the strip grows on demand (T2.5).
-    private let thumbnailLimit = 24
+    /// How many pages past a newly visible cell the strip asks for ahead of time. The strip is a
+    /// lazy grid: a cell requests itself when it is built, and this look-ahead (one row per page
+    /// in the normal single-column strip) keeps the next page ready without rasterizing the pages
+    /// the reader is not near.
+    private static let thumbnailPrefetchPages = 2
+    /// Bumped when every loaded thumbnail must be requested again: another document/revision, or
+    /// a backing-scale change that emptied the cache. Mounted cells watch this because they stay
+    /// in the hierarchy across such a change and their `onAppear` would not run again.
+    public private(set) var thumbnailDemandGeneration: UInt64 = 0
 
     /// Search state. A hit is shown by selecting its character range, so highlighting and
     /// scrolling come for free.
@@ -3971,6 +3984,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         thumbnails = [:]
         thumbnailsInFlight = []
         pendingThumbnails = []
+        // A mounted strip cell must ask for its page again; the old images belong to the
+        // document (or revision) that is leaving.
+        thumbnailDemandGeneration &+= 1
+        onScreenThumbnailPages = []
         searchHits = []
         currentHitIndex = nil
         isSearching = false
@@ -4366,6 +4383,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard scale > 0, abs(scale - deviceScale) > 0.01 else { return }
         deviceScale = scale
         thumbnails = [:]
+        // Mounted cells stay in the hierarchy; this asks each of them for its page at the new
+        // scale. The canvas pages are seeded below even when the sidebar is closed.
+        thumbnailDemandGeneration &+= 1
         loadThumbnails()
         reloadVisiblePages()
     }
@@ -14046,17 +14066,36 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
-    /// Rasterizes the first pages at thumbnail size for the sidebar.
+    /// Requests sidebar thumbnails for the cells the strip is building.
+    ///
+    /// `page` is a cell that is (or is about to be) on screen: it goes to the front of the queue,
+    /// followed by ``thumbnailPrefetchRows`` rows of look-ahead. With no page — document open,
+    /// backing-scale change, tab restore — the only pages requested are the ones the canvas can
+    /// show right now. Its first frame falls back to a thumbnail before the page raster is ready,
+    /// so those must still exist at open; the visible strip cells request themselves as the lazy
+    /// grid builds or rebuilds them. Nothing rasterizes pages the reader is not near: the old
+    /// open-time batch of 24 is gone.
     public func loadThumbnails(page requestedPage: Int? = nil) {
         guard let document, document.pageCount > 0 else {
             thumbnails = [:]
             return
         }
 
-        let pages = requestedPage.map { [$0] } ?? Array(0..<min(document.pageCount, thumbnailLimit))
-        for page in pages where page >= 0 && page < document.pageCount {
+        let requested: [Int]
+        if let requestedPage {
+            requested = [requestedPage]
+                + (1...Self.thumbnailPrefetchPages).map { requestedPage + $0 }
+        } else if onScreenThumbnailPages.isEmpty {
+            // The canvas has not reported a viewport yet (the native checks open a document
+            // before hosting a surface). Its first frame will show the current page, whose
+            // thumbnail is the fallback backdrop; request exactly that one.
+            requested = [min(max(currentPage - 1, 0), document.pageCount - 1)]
+        } else {
+            requested = onScreenThumbnailPages
+        }
+        for page in requested where page >= 0 && page < document.pageCount {
             guard thumbnails[page] == nil, !thumbnailsInFlight.contains(page), !pendingThumbnails.contains(page) else { continue }
-            if requestedPage != nil { pendingThumbnails.insert(page, at: 0) }
+            if let requestedPage, page == requestedPage { pendingThumbnails.insert(page, at: 0) }
             else { pendingThumbnails.append(page) }
             if PerfTrace.enabled {
                 perfThumbnailEnqueuedAt[page] = PerfTrace.now
@@ -14514,6 +14553,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             contentHeightPt = 0
             lastTilePlan = nil
             visibleTileKeysByPage = [:]
+            onScreenThumbnailPages = []
             invalidateCanvasForModelCommit()
             return
         }
@@ -14648,6 +14688,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             let p = $0.placement
             return CGRect(x: p.leftPt, y: p.topPt, width: p.widthPt, height: p.heightPt).intersects(viewport)
         }
+        // The canvas first frame can only use a thumbnail for a page it is showing, so this is
+        // the batch `loadThumbnails()` seeds; every other page arrives with its sidebar cell.
+        onScreenThumbnailPages = onScreen.map(\.placement.index).sorted()
         let screenPagePath = screenPagePathDecision(onScreen: onScreen, band: band, scale: screenScale)
         usesScreenPageRasters = screenPagePath.enabled
         screenPagePathNote = screenPagePath.note
@@ -17284,6 +17327,17 @@ extension AppState {
                         deltaPt: delta, destinationPt: destination, epoch: documentEpoch)
     }
 
+    /// Records that a sidebar cell actually drew a page's thumbnail. Called from the strip's
+    /// image branch on appearance, so a page that was rastered but never built into a cell (the
+    /// old open-time 24-page batch) has no `drawn` record. Emitted once per page per content
+    /// version; the grid recreating a cell does not inflate the count.
+    public func noteThumbnailDrawn(_ page: Int) {
+        guard PerfTrace.enabled, perfDrawnThumbnails.insert(page).inserted else { return }
+        PerfTrace.tile(phase: "drawn", source: "thumbnail", page: page, lod: 0, x: 0, y: 0,
+                       epoch: documentEpoch, contentVersion: perfContentVersion,
+                       offsetPt: scrollYPt, detail: "sidebar")
+    }
+
     /// One RSS + cache sample. `phase` is `sample` (1 Hz), `scroll_stop` (the indicator's idle
     /// window), `document_close_before` (rasters still resident) or `document_close` (dropped).
     private func samplePerfMemory(phase: String) {
@@ -17346,6 +17400,7 @@ extension AppState {
         perfTileStartedAt.removeAll(keepingCapacity: false)
         perfTilePrefetch.removeAll(keepingCapacity: false)
         perfThumbnailEnqueuedAt.removeAll(keepingCapacity: false)
+        perfDrawnThumbnails.removeAll(keepingCapacity: false)
         perfFirstRasters = 0
         perfRepeatRasters = 0
         perfContentVersion &+= 1

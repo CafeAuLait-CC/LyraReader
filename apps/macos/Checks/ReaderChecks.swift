@@ -907,6 +907,11 @@ struct ReaderChecks {
             ("thumbnails", {
                 try await thumbnailChecks(url: root.appendingPathComponent("tests/fixtures/thin-lines.pdf"))
             }),
+            ("thumbnail-demand", {
+                // Only the on-screen seed rasterizes at open; a page the strip scrolls to is
+                // rasterized once, and returning to the top reuses the cache.
+                try await thumbnailDemandChecks(root: root)
+            }),
             ("link-border-canvas", {
                 try await linkBorderCanvasChecks(url: root.appendingPathComponent("tests/fixtures/link-borders.pdf"))
             }),

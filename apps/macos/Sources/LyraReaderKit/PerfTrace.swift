@@ -55,7 +55,7 @@ import Darwin
 /// | `document` | open started / opened / closed | `phase`, `epoch`, `pages` |
 /// | `input` | a scroll input landed | `seq`, `source`, `phase`, `offset_pt`, `delta_pt`, `destination_pt`, `epoch` |
 /// | `viewport` | one committed visible-band plan | `seq`, `offset_pt`, `path`, `lod`, `visible_pages`, `viewport`, `sharp`, `visible_misses`, `queued_tiles`, `wanted_tiles`, `page_rasters`, `content_version` |
-/// | `tile` | raster lifecycle for one unit | `phase` (`enqueue`/`start`/`done`/`failed`/`drawn`), `source` (`tile`/`page-raster`/`thumbnail`/`preview`), `page`, `lod`, `x`, `y`, `wait_ms`, `exec_ms`, `bytes`, `scale` |
+/// | `tile` | raster lifecycle for one unit | `phase` (`enqueue`/`start`/`done`/`failed`/`drawn`), `source` (`tile`/`page-raster`/`thumbnail`/`preview`), `page`, `lod`, `x`, `y`, `wait_ms`, `exec_ms`, `bytes`, `scale`, `detail` (`thumbnail` + `drawn` + `detail: sidebar` is a strip cell, not the canvas backdrop) |
 /// | `queue` | one queued task finished | `category` (`tile`/`page-raster`/`thumbnail`/`text`/`index`), `wait_ms`, `exec_ms`, `page` |
 /// | `frame` | a frame reached a terminal state | `presented`, `presented_time` (host seconds or `"unavailable"`), `presented_reason`, `time` (submit), `surface`, `sequence`, `token`, `epoch`, `quads`, `tile_quads`, `cpu_us`, `upload_ms`, `frame_index` |
 /// | `sharp` | committed page list is fully sharp | `token`, `viewport_seq`, `offset_pt`, `path`, `lod`, `pages`, `sources`, `epoch`, `content_version`, `after_input_seq` (absent on the first open) |
