@@ -63,6 +63,7 @@ package struct PlacedTextEditorOverlay: View {
                     }
                 }
                 .frame(width: frame.width, height: frame.height)
+                .transition(isNote ? ReaderMotion.paperTransition : .identity)
                 .position(x: frame.midX, y: frame.midY)
                 .id(annotation.id)
                 .onAppear {
@@ -82,12 +83,12 @@ package struct PlacedTextEditorOverlay: View {
                     if newValue == nil {
                         focused = false
                         loadedID = nil
-                        text = ""
-                        missingGlyphs = []
+                        // Keep the departing paper intact during its closing transition.
                     }
                 }
             }
         }
+        .animation(ReaderMotion.paperAnimation, value: state.editingAnnotationID)
     }
 
     /// A missing character is never `?` and never dropped from `/Contents`; the appearance uses

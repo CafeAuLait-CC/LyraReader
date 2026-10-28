@@ -344,6 +344,10 @@ struct ReaderChecks {
             print("AI assistant checks passed")
             return
         }
+        if CommandLine.arguments.contains("--check-canvas-resize") {
+            try await canvasResizeChecks()
+            return
+        }
         if CommandLine.arguments.contains("--check-inplace-translation") {
             try await inPlaceTranslationChecks(root: fastRoot)
             print("In-place translation checks passed")
@@ -449,6 +453,10 @@ struct ReaderChecks {
         }
         // The sidebar and secondary-row transitions on their own, while they are being worked on
         // (`LyraReaderChecks --check-transitions .`).
+        if CommandLine.arguments.contains("--check-paper-reveal") {
+            try await paperRevealChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-transitions") {
             let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await transitionChecks(root: root)
@@ -1112,6 +1120,9 @@ struct ReaderChecks {
             ("hosted-preview", {
                 try await hostedPreviewChecks(root: root)
             }),
+            ("paper-reveal", {
+                try await paperRevealChecks(root: root)
+            }),
             ("transitions", {
                 try await transitionChecks(root: root)
             }),
@@ -1305,6 +1316,7 @@ struct ReaderChecks {
                 // last tab closes, so it needs a window wgpu will actually present.
                 try await canvasClearChecks(a: a, b: b)
             }),
+            ("canvas-resize", { try await canvasResizeChecks() }),
             ("frame-scheduling", {
                 try await frameSchedulingChecks()
             }),

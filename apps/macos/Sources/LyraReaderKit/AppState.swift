@@ -1806,6 +1806,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     // the helpers in AIRegionState.swift; the engine's layout is untouched, so removing a card
     // restores every page offset exactly.
     @Published public internal(set) var regionCards: [AIRegionCard] = []
+    var regionPaperProgress: [UUID: CGFloat] = [:]
+    var regionPaperMotionTasks: [UUID: Task<Void, Never>] = [:]
+    var regionPaperMotionIDs: [UUID: UUID] = [:]
+    var closingRegionPapers: Set<UUID> = []
     /// Finished conversations by document key. Kept for this window's session; deliberately not
     /// written to disk (see AIRegionState.swift's persistence note).
     @Published public internal(set) var regionHistory: [String: [AIRegionHistoryEntry]] = [:]
@@ -3896,6 +3900,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     private func resetDocumentState() {
+        cancelRegionPaperMotions()
         // The perf trace's close records describe the state the document still has, so they run
         // before any of it is cleared; the first open (no document yet) emits nothing.
         let hadDocument = document != nil
@@ -14526,6 +14531,32 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Viewport height in content points (the canvas draws at zoom × backing scale).
     private var viewportHeightContentPt: CGFloat {
         max(viewportSizePt.height / max(zoomFactor, 0.01), 1)
+    }
+
+    /// Re-map retained rasters as a paper gap opens. Animation frames change geometry only:
+    /// no tile plan, text prefetch, cache eviction, or new PDFium request is introduced.
+    func refreshRegionPaperGeometry() {
+        guard document != nil else { return }
+        let old = Dictionary(uniqueKeysWithValues: visiblePagePlacements.map { ($0.index, $0) })
+        let visible = regionVisiblePages(scrollYPt: scrollYPt, viewportHeightPt: viewportHeightContentPt,
+                                        marginPt: viewportHeightContentPt * 2)
+        let next = Dictionary(uniqueKeysWithValues: visible.map { ($0.index, $0) })
+        canvasTiles = canvasTiles.compactMap { quad in
+            let page = quad.placement.index >= 0 ? quad.placement.index >> 24
+                : PlacementIndex.pageRasterPage(quad.placement.index)
+            guard let page, let before = old[page], let after = next[page] else { return nil }
+            let p = quad.placement
+            return CanvasPage(placement: PagePlacement(index: p.index,
+                topPt: p.topPt + after.topPt - before.topPt, leftPt: p.leftPt,
+                widthPt: p.widthPt, heightPt: p.heightPt), image: quad.image,
+                blend: quad.blend, source: quad.source)
+        }
+        visiblePagePlacements = visible
+        contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode) + regionGapTotalPt
+        var pages = canvasTiles
+        appendSelectionHighlights(to: &pages)
+        canvasPages = applyPageTears(to: pages)
+        attachedCanvas?.applyPaperMotionCommit()
     }
 
     /// Ordinary zoom uses an atomic screen-resolution page plus a byte-bounded neighborhood.

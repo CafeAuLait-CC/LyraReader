@@ -33,10 +33,12 @@ struct DocumentNoteOverlay: View {
                 .clipShape(RoundedRectangle(cornerRadius: 6))
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(LyraReaderTheme.border))
                 .shadow(color: .black.opacity(0.2), radius: 6, y: 3)
+                .transition(ReaderMotion.paperTransition)
                 .position(x: frame.midX, y: frame.midY)
                 .id(note.id)
             }
         }
+        .animation(ReaderMotion.paperAnimation, value: state.openDocumentNoteID)
     }
 }
 

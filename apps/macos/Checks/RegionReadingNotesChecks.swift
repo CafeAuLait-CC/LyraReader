@@ -23,6 +23,7 @@ private final class ReadingNotesService: AIChatServicing {
 extension ReaderChecks {
     @MainActor
     static func regionReadingNotesChecks(root: URL) async throws {
+        try await optionalDocumentKnowledgeChecks(root: root)
         let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("lyra-reading-notes-\(UUID())")
         try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: scratch) }
@@ -138,7 +139,11 @@ extension ReaderChecks {
         try await eventually("first AI use asks to read the document") { knowledge.phase == .consent }
         require(service.starts == before, "the first-use prompt sends nothing before Start Reading")
         knowledge.proceed()
-        let prior = try await reading.value
+        let immediate = try await reading.value
+        require(immediate.isEmpty && !knowledge.isPresented,
+                "background consent releases the original AI action and closes its sheet")
+        try await eventually("background document reading completes") { knowledge.phase == .ready }
+        let prior = knowledge.record?.summary ?? ""
         require(!prior.isEmpty && knowledge.record?.pages == [1], "a completed full reading records its source coverage")
         let count = service.starts
         let restored = AIDocumentKnowledge(); restored.settings = settings
