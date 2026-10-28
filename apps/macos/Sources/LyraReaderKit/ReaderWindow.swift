@@ -190,6 +190,10 @@ public struct ReaderWindow: View {
         .foregroundStyle(LyraReaderTheme.textPrimary)
         .tint(LyraReaderTheme.accent)
         .preferredColorScheme(appearance.mode.colorScheme)
+        .overlay(alignment: .bottomTrailing) {
+            AIDocumentKnowledgeStatus(knowledge: documentKnowledge)
+                .padding(.trailing, 24).padding(.bottom, 44)
+        }
         .sheet(isPresented: $documentKnowledge.isPresented) {
             AIDocumentKnowledgeSheet(knowledge: documentKnowledge)
         }

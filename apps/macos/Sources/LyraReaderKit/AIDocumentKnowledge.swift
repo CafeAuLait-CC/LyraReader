@@ -14,8 +14,8 @@ public struct AIDocumentKnowledgeRecord: Codable, Equatable, Sendable {
     public let readAt: Date
 }
 
-/// A shared prerequisite for every AI action except translation. Preparing is local; the
-/// dedicated consent sheet is the only entry into the full-document requests and consolidation.
+/// Optional shared context. Consent decides whether to start a background reading; AI actions
+/// may proceed immediately with their own source passages while that reading is in progress.
 @MainActor
 public final class AIDocumentKnowledge: ObservableObject {
     public enum Phase: Equatable { case idle, preparing, consent, reading, ready, failed }
@@ -24,34 +24,38 @@ public final class AIDocumentKnowledge: ObservableObject {
     @Published public private(set) var record: AIDocumentKnowledgeRecord?
     @Published public private(set) var reader: AIAssistantModel?
     @Published public private(set) var message: String?
+    @Published public private(set) var failureDetail: String?
+    @Published public private(set) var statusVisible = false
     public var settings: AISettingsStore = .shared
     private var pending: Task<String, Error>?
-    private var approval: CheckedContinuation<Void, Error>?
+    private var background: Task<Void, Never>?
+    private var approval: CheckedContinuation<Bool, Error>?
     private var epoch = UUID()
     private var sourceIdentity: String?
+    private var allowsWithoutSummary = false
+    private var retryAction: (() -> Void)?
     public init() {}
 
     public func ensure(service: any AIChatServicing, context: AIReaderContext,
                        sourceURL: URL, cacheDocumentURL: URL) async throws -> String {
-        let sourceKey = DocumentEditCache.documentIdentity(for: sourceURL)
-            ?? sourceURL.standardizedFileURL.path
-        let cacheKey = DocumentEditCache.documentIdentity(for: cacheDocumentURL)
-            ?? cacheDocumentURL.standardizedFileURL.path
+        let sourceKey = DocumentEditCache.documentIdentity(for: sourceURL) ?? sourceURL.standardizedFileURL.path
+        let cacheKey = DocumentEditCache.documentIdentity(for: cacheDocumentURL) ?? cacheDocumentURL.standardizedFileURL.path
         let identity = sourceKey + "|" + cacheKey
         if let sourceIdentity, sourceIdentity != identity { invalidate() }
         sourceIdentity = identity
         if let pending { return try await pending.value }
+        if background != nil || (allowsWithoutSummary && record == nil) { return "" }
         let token = epoch
-        let settings = settings
         let task = Task { @MainActor [weak self] () throws -> String in
             guard let self else { throw CancellationError() }
             self.phase = .preparing
-            let hash = try await Task.detached(priority: .utility) {
-                let data = try Data(contentsOf: sourceURL, options: .mappedIfSafe)
-                return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-            }.value
+            let hash = try await Self.hash(sourceURL)
             try Task.checkCancellation()
             guard self.epoch == token else { throw CancellationError() }
+            if let record = self.record, record.sourceHash == hash {
+                self.phase = .ready
+                return record.summary
+            }
             let file = DocumentEditCache.directory(for: cacheDocumentURL).appendingPathComponent("document-knowledge-v1.json")
             if let data = try? Data(contentsOf: file),
                let cached = try? JSONDecoder().decode(AIDocumentKnowledgeRecord.self, from: data),
@@ -60,25 +64,59 @@ public final class AIDocumentKnowledge: ObservableObject {
                 return cached.summary
             }
             self.record = nil
-            while true {
-                let model = AIAssistantModel(settings: settings)
-                model.attach(service: service, context: context)
-                self.reader = model
-                await model.prepare(action: .summarizeDocument, context: context, documentKnowledge: true)
-                try Task.checkCancellation()
-                guard self.epoch == token else { throw CancellationError() }
-                self.phase = .consent
-                self.message = model.errorMessage
-                self.isPresented = true
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                    self.approval = continuation
+            let model = AIAssistantModel(settings: self.settings)
+            model.attach(service: service, context: context)
+            self.reader = model
+            await model.prepare(action: .summarizeDocument, context: context, documentKnowledge: true)
+            try Task.checkCancellation()
+            guard self.epoch == token else { throw CancellationError() }
+            self.phase = .consent
+            self.message = model.errorMessage
+            self.isPresented = true
+            self.retryAction = { [weak self] in
+                Task { @MainActor [weak self] in
+                    _ = try? await self?.ensure(service: service, context: context,
+                        sourceURL: sourceURL, cacheDocumentURL: cacheDocumentURL)
                 }
-                try Task.checkCancellation()
-                guard self.epoch == token else { throw CancellationError() }
-                guard let plan = model.plan, model.phase == .preview else { continue }
-                self.phase = .reading; self.message = nil
-                model.send()
-                var consolidated = plan.parts.count <= 1
+            }
+            let startReading = try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Bool, Error>) in self.approval = continuation
+            }
+            try Task.checkCancellation()
+            guard self.epoch == token else { throw CancellationError() }
+            self.isPresented = false
+            self.allowsWithoutSummary = true
+            if startReading, let plan = model.plan, model.phase == .preview {
+                self.startBackground(model: model, plan: plan, sourceURL: sourceURL,
+                                     file: file, hash: hash, token: token)
+            } else {
+                self.phase = .idle
+                self.message = nil
+            }
+            // The action that opened this choice keeps going; it never waits for provider I/O.
+            return ""
+        }
+        pending = task
+        defer { if epoch == token { pending = nil } }
+        return try await task.value
+    }
+
+    private static func hash(_ url: URL) async throws -> String {
+        try await Task.detached(priority: .utility) {
+            let data = try Data(contentsOf: url, options: .mappedIfSafe)
+            return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        }.value
+    }
+
+    private func startBackground(model: AIAssistantModel, plan: AiPlanRecord, sourceURL: URL,
+                                 file: URL, hash: String, token: UUID) {
+        phase = .reading; message = nil; failureDetail = nil; statusVisible = true
+        background = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { if self.epoch == token { self.background = nil } }
+            model.send()
+            var consolidated = plan.parts.count <= 1
+            do {
                 while true {
                     try Task.checkCancellation()
                     guard self.epoch == token else { throw CancellationError() }
@@ -89,53 +127,58 @@ public final class AIDocumentKnowledge: ObservableObject {
                     if model.phase.isTerminal { break }
                     try await Task.sleep(for: .milliseconds(50))
                 }
-                if model.phase == .finished, !model.answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                   consolidated, model.errorMessage == nil {
-                    // The PDF may have changed after the initial hash while the user approved
-                    // and the provider read it. Never label a result with a stale source hash.
-                    let completedHash = try await Task.detached(priority: .utility) {
-                        let data = try Data(contentsOf: sourceURL, options: .mappedIfSafe)
-                        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-                    }.value
-                    try Task.checkCancellation()
-                    guard self.epoch == token else { throw CancellationError() }
-                    if completedHash != hash {
-                        let message = "The PDF changed while it was being read. Reopen the current PDF before starting again."
-                        self.phase = .failed
-                        self.message = message
-                        throw AISettingsError.invalid(message)
-                    }
-                    let record = AIDocumentKnowledgeRecord(version: 1, sourceHash: hash,
-                        summary: model.answer, pages: plan.sourcePages.map(Int.init),
-                        model: plan.model, readAt: Date())
-                    // Cache only a complete successful reading. A failure preserves any older
-                    // record on disk, which remains invalid for this source hash.
-                    do { try JSONEncoder().encode(record).write(to: file, options: .atomic) }
-                    catch { self.message = "Read successfully, but could not save it: \(error.localizedDescription)" }
-                    self.record = record; self.phase = .ready; self.isPresented = false
-                    return record.summary
+                guard model.phase == .finished, consolidated, model.errorMessage == nil,
+                      !model.answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw AISettingsError.invalid(model.errorMessage ?? "The document reading did not finish.")
                 }
+                let completedHash = try await Self.hash(sourceURL)
+                try Task.checkCancellation()
+                guard self.epoch == token else { throw CancellationError() }
+                guard completedHash == hash else {
+                    throw AISettingsError.invalid("The PDF changed while it was being read. Start again with the current PDF.")
+                }
+                let record = AIDocumentKnowledgeRecord(version: 1, sourceHash: hash,
+                    summary: model.answer, pages: plan.sourcePages.map(Int.init), model: plan.model, readAt: Date())
+                self.record = record
+                self.phase = .ready
+                self.message = "Document reading is ready. New questions can use it."
+                do { try JSONEncoder().encode(record).write(to: file, options: .atomic) }
+                catch { self.message = "Document reading is ready, but could not be saved for next time." }
+            } catch is CancellationError {
+                guard self.epoch == token else { return }
+                self.phase = .idle
+                self.message = "Document reading stopped. You can keep using Lyra without it."
+            } catch {
+                guard self.epoch == token else { return }
                 self.phase = .failed
-                self.message = model.errorMessage ?? "The document reading did not finish. Try again to continue using AI."
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                    self.approval = continuation
-                }
+                self.message = "Document reading paused. You can keep using Lyra without it."
+                self.failureDetail = AIReadableError.message(error)
             }
         }
-        pending = task
-        defer { if epoch == token { pending = nil } }
-        do { return try await task.value }
-        catch {
-            if epoch == token { phase = .idle; isPresented = false }
-            throw error
-        }
     }
-    public func proceed() { approval?.resume(); approval = nil }
+
+    public func proceed() { approval?.resume(returning: true); approval = nil }
+    public func continueWithoutSummary() { approval?.resume(returning: false); approval = nil }
+    public func dismissStatus() { statusVisible = false }
+    public func retry() {
+        guard background == nil else { return }
+        allowsWithoutSummary = false; message = nil; failureDetail = nil; statusVisible = false
+        retryAction?()
+    }
+    public func stopReading() {
+        background?.cancel(); reader?.cancelRegionWork()
+        pending?.cancel(); pending = nil
+        epoch = UUID()
+        background = nil; phase = .idle
+        message = "Document reading stopped. You can keep using Lyra without it."
+    }
     public func cancel() {
         approval?.resume(throwing: CancellationError()); approval = nil
         reader?.cancelRegionWork()
         pending?.cancel(); pending = nil
-        epoch = UUID(); phase = .idle; isPresented = false
+        background?.cancel(); background = nil
+        epoch = UUID(); phase = .idle; isPresented = false; statusVisible = false
+        allowsWithoutSummary = false; retryAction = nil; message = nil; failureDetail = nil
     }
     public func invalidate() { cancel(); record = nil }
 }
@@ -163,12 +206,14 @@ package final class DocumentKnowledgeService: AIChatServicing {
     package func prepare(_ request: AIMakePlanRequest) async throws -> AiPlanRecord {
         if request.action == .translateSelection { return try await base.prepare(request) }
         let prior = try await priorWithPages()
+        if prior.text.isEmpty { return try await base.prepare(request) }
         return try await base.prepare(
             request.withDocumentContext()
                 .withDocumentKnowledge(prior.text, pages: prior.pages))
     }
     package func prepareMerge(_ request: AIMergePlanRequest) async throws -> AiPlanRecord {
         let prior = try await priorWithPages()
+        if prior.text.isEmpty { return try await base.prepareMerge(request) }
         return try await base.prepareMerge(
             request.withDocumentKnowledge(prior.text, pages: prior.pages))
     }
@@ -177,6 +222,7 @@ package final class DocumentKnowledgeService: AIChatServicing {
     }
     package func prepareSummary(_ request: AiSummaryRequestRecord) async throws -> AiSummaryPlanRecord {
         let prior = try await priorWithPages()
+        if prior.text.isEmpty { return try await base.prepareSummary(request) }
         return try await base.prepareSummary(
             request.withDocumentKnowledge(prior.text, pages: prior.pages))
     }
@@ -214,23 +260,64 @@ struct AIDocumentKnowledgeSheet: View {
                 Text(knowledge.phase == .reading ? "Getting to know your document…" : "Get to know this document")
                     .font(.system(size: 18, weight: .semibold))
             }
-            Text("Lyra reads it once to connect ideas across summaries and conversations. This understanding is saved locally for next time. Translating selected text can skip this step.")
+            Text("Lyra can read this document once to connect ideas across your questions, and save that understanding locally. It works in the background while you read. You can also continue without it; answers may have less context about the whole document.")
                 .font(.system(size: 13)).foregroundStyle(LyraReaderTheme.textSecondary)
             if let reader = knowledge.reader { AIDocumentKnowledgeProgress(reader: reader, reading: knowledge.phase == .reading) }
             if let message = knowledge.message {
                 Text(message).font(.caption).foregroundStyle(LyraReaderTheme.warningFg).textSelection(.enabled)
             }
             HStack {
-                Button(knowledge.phase == .reading ? "Stop" : "Not Now") { knowledge.cancel() }
+                Button("Continue Without Reading") { knowledge.continueWithoutSummary() }
                     .buttonStyle(ReaderPanelButtonStyle())
                 if knowledge.phase != .reading {
-                    Button(knowledge.phase == .failed || knowledge.message != nil ? "Try Again" : "Start Reading") { knowledge.proceed() }
+                    Button("Read in Background") { knowledge.proceed() }
                         .buttonStyle(ReaderPanelButtonStyle(prominent: true))
                         .keyboardShortcut(.defaultAction)
+                        .disabled(knowledge.reader?.plan == nil || knowledge.reader?.phase != .preview)
                 }
             }
         }.padding(24).frame(width: 460).foregroundStyle(LyraReaderTheme.textPrimary)
             .background(LyraReaderTheme.panelBg).interactiveDismissDisabled()
+    }
+}
+
+/// A background task is visible without taking the document's pointer or keyboard focus.
+struct AIDocumentKnowledgeStatus: View {
+    @ObservedObject var knowledge: AIDocumentKnowledge
+    var body: some View {
+        if knowledge.statusVisible {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text(knowledge.phase == .reading ? "Reading your document…" : "Document reading")
+                        .font(.system(size: 13, weight: .semibold))
+                    Spacer()
+                    Button { knowledge.dismissStatus() } label: {
+                        Image(systemName: "xmark").font(.system(size: 10, weight: .semibold))
+                    }.buttonStyle(.plain).help("Hide document reading status")
+                        .accessibilityLabel("Hide document reading status")
+                }
+                if knowledge.phase == .reading, let reader = knowledge.reader {
+                    AIDocumentKnowledgeProgress(reader: reader, reading: true)
+                    Button("Stop Reading") { knowledge.stopReading() }.buttonStyle(.plain)
+                } else {
+                    if let message = knowledge.message {
+                        Text(message).font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
+                    }
+                    if let detail = knowledge.failureDetail {
+                        DisclosureGroup("Details") { Text(detail).font(.caption).textSelection(.enabled) }
+                            .font(.caption)
+                    }
+                    if knowledge.record == nil {
+                        Button("Read Document…") { knowledge.retry() }.buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(14).frame(width: 320, alignment: .leading)
+            .foregroundStyle(LyraReaderTheme.textPrimary)
+            .background(RoundedRectangle(cornerRadius: 10).fill(LyraReaderTheme.panelBg)
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(LyraReaderTheme.border))
+                .shadow(color: .black.opacity(0.1), radius: 8, y: 3))
+        }
     }
 }
 private struct AIDocumentKnowledgeProgress: View {
