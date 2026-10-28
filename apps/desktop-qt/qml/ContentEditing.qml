@@ -14,6 +14,7 @@ Item {
     property var pending: null
     property var rasterRequest: null
     property var imageRequest: null
+    property var imageExportRequest:null
     readonly property var owner: app.currentReader
     readonly property var model: owner.data.content_objects || ({revision:"",page:-1,items:[]})
     readonly property var draft: owner.editDrafts.content || ({})
@@ -111,6 +112,19 @@ Item {
         imageRequest={reader:owner,revision:model.revision,page:model.page,bounds:bounds,target:target || null};
         imagePicker.open();
     }
+    function chooseImageExport() {
+        if(hasDraft || pending || owner.pendingCommands>0 || !selected || selected.kind!=="image" || app.blockXfaWrite())return;
+        imageExportRequest={reader:owner,revision:model.revision,page:model.page,target:selected.id};
+        imageExportPicker.open();
+    }
+    function exportImageTo(destination) {
+        const request=imageExportRequest;imageExportRequest=null;
+        if(!request || request.reader!==owner || request.revision!==model.revision || request.page!==model.page || !selected || selected.id!==request.target || hasDraft || owner.pendingCommands>0) {
+            app.operationStatus=qsTr("The page changed. Choose the image again before exporting.");return;
+        }
+        const path=app.session ? app.session.localPath(destination) : "";if(!path.length)return;
+        owner.submit("save_content_image",{page:request.page,target:request.target,revision:request.revision,destination:path});
+    }
     function redact(rect,page) {
         if (hasDraft || pending || owner.pendingCommands>0) return;
         const command={Redact:{revision:model.revision,bounds:rect,blackout:tool==="blackout"}};
@@ -197,6 +211,16 @@ Item {
             if (request && request.reader===editing.owner) editing.submit(request.command,request.page,true);
         }
         onRejected: editing.rasterRequest=null
+    }
+    FileDialog {
+        id:imageExportPicker
+        objectName:"contentImageExportDialog"
+        title:qsTr("Export Image")
+        fileMode:FileDialog.SaveFile
+        defaultSuffix:"png"
+        nameFilters:[qsTr("PNG images (*.png)")]
+        onAccepted:editing.exportImageTo(selectedFile)
+        onRejected:editing.imageExportRequest=null
     }
     FileDialog {
         id: imagePicker

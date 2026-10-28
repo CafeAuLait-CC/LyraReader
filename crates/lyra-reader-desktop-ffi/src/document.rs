@@ -394,6 +394,7 @@ impl DesktopDocument {
             "content_redaction_preflight" => {
                 value(d.content_redaction_raster_pages(arg(&r, "page")?, arg(&r, "command")?))
             }
+            "save_content_image" => crate::exports::save_content_image(&d, &r),
             "info" => self.info(),
             "outline" => value(d.outline()),
             "metadata" => value(d.metadata()),
@@ -1702,6 +1703,111 @@ mod tests {
         );
     }
     #[test]
+    fn content_image_export_preserves_revisions_source_permissions_and_failed_destinations() {
+        let fixture = Fixture::new("text-page.pdf");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fixture.directory, fs::Permissions::from_mode(0o750)).unwrap();
+        }
+        let doc = fixture.open();
+        let original = fs::read(&fixture.path).unwrap();
+        let input = fixture.directory.join("input.png");
+        image::RgbaImage::from_pixel(4, 2, image::Rgba([255, 0, 0, 255]))
+            .save(&input)
+            .unwrap();
+        let snapshot = doc
+            .command(json!({"op":"content_objects","page":0}))
+            .unwrap();
+        doc.command(json!({"op":"content_stage","page":0,"command":{"InsertImage":{"revision":snapshot["revision"],"bounds":{"x":72,"y":500,"width":100,"height":50},"image_path":input}}})).unwrap();
+        let snapshot = doc
+            .command(json!({"op":"content_objects","page":0}))
+            .unwrap();
+        let item = snapshot["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["kind"] == "image")
+            .unwrap();
+        let destination = fixture.directory.join("image.png");
+        let revision = doc.info().unwrap()["revision"].clone();
+        let request = json!({"op":"save_content_image","page":0,"target":item["id"],"revision":snapshot["revision"],"destination":destination});
+        let expected = doc
+            .active()
+            .unwrap()
+            .content_image_png(
+                0,
+                item["id"].as_str().unwrap().into(),
+                snapshot["revision"].as_str().unwrap().into(),
+            )
+            .unwrap();
+        let result = doc.command(request.clone()).unwrap();
+        assert_eq!(result["bytes"], expected.len());
+        assert_eq!(fs::read(&destination).unwrap(), expected);
+        assert_eq!(doc.info().unwrap()["revision"], revision);
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&fixture.directory)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o750
+            );
+        }
+        let mut stale = request.clone();
+        stale["revision"] = json!("stale");
+        assert!(doc.command(stale).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), expected);
+        let mut original_target = request.clone();
+        original_target["destination"] = json!(fixture.path);
+        assert!(
+            doc.command(original_target)
+                .unwrap_err()
+                .contains("original PDF")
+        );
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        let blocked = fixture.directory.join("blocked.png");
+        fs::create_dir(&blocked).unwrap();
+        let mut failed = request.clone();
+        failed["destination"] = json!(blocked);
+        assert!(doc.command(failed).is_err());
+        assert!(blocked.is_dir());
+        assert_eq!(fs::read(&destination).unwrap(), expected);
+        assert!(!fs::read_dir(&fixture.directory).unwrap().any(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".lyra-image-")
+        }));
+        let mut wrong = request.clone();
+        let wrong_path = fixture.directory.join("wrong.jpg");
+        wrong["destination"] = json!(wrong_path);
+        assert!(doc.command(wrong).unwrap_err().contains("PNG file name"));
+        assert!(!wrong_path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let alias = fixture.directory.join("active.png");
+            symlink(revision.as_str().unwrap(), &alias).unwrap();
+            let before = fs::read(&alias).unwrap();
+            let mut active = request;
+            active["destination"] = json!(alias);
+            assert!(
+                doc.command(active)
+                    .unwrap_err()
+                    .contains("active PDF revision")
+            );
+            assert_eq!(fs::read(&alias).unwrap(), before);
+        }
+        assert_eq!(doc.info().unwrap()["revision"], revision);
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+    }
+
+    #[test]
     fn frozen_preview_layout_and_text_survive_later_edits_save_and_discard() {
         let fixture = Fixture::new("text-page.pdf");
         let doc = fixture.open();
@@ -1902,6 +2008,7 @@ mod tests {
             "save_annotations",
             "replace_annotations",
             "save_forms",
+            "save_content_image",
             "replace_forms",
             "save_properties",
             "replace_properties",

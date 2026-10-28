@@ -301,6 +301,111 @@ impl DesktopDocument {
     }
 }
 
+// Asset publication must not use the cache writer, which makes its parent private.
+// The native save panel owns destination selection; the document command has already
+// rejected the original PDF and XFA writes before reaching this adapter.
+pub(super) fn save_content_image(
+    document: &LyraReaderDocument,
+    request: &Value,
+) -> Result<Value, String> {
+    let page: u32 = serde_json::from_value(request["page"].clone())
+        .map_err(|e| format!("Invalid image page: {e}"))?;
+    let string = |key: &str| {
+        request[key]
+            .as_str()
+            .ok_or_else(|| format!("Missing image {key}"))
+    };
+    let destination = Path::new(string("destination")?);
+    if !destination
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("png"))
+    {
+        return Err("Choose a PNG file name for the exported image.".into());
+    }
+    if destination.exists()
+        && fs::canonicalize(destination).map_err(|e| e.to_string())?
+            == fs::canonicalize(document.path()).map_err(|e| e.to_string())?
+    {
+        return Err("An image export cannot overwrite the active PDF revision.".into());
+    }
+    let png = document
+        .content_image_png(page, string("target")?.into(), string("revision")?.into())
+        .map_err(|e| e.to_string())?;
+    if !png.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err("The image engine did not return a PNG.".into());
+    }
+    let warning = publish_image_asset(destination, &png)?;
+    Ok(json!({"destination_path":destination,"bytes":png.len(),"publication_warning":warning}))
+}
+
+fn publish_image_asset(destination: &Path, bytes: &[u8]) -> Result<Option<String>, String> {
+    use std::io::{Read, Write};
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let temporary = parent.join(format!(".lyra-image-{}.tmp", crate::marks::uuid()?));
+    let mut created = false;
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary).map_err(|e| e.to_string())?;
+        created = true;
+        file.write_all(bytes)
+            .and_then(|()| file.flush())
+            .and_then(|()| file.sync_all())
+            .map_err(|e| e.to_string())?;
+        drop(file);
+        let mut verify = fs::File::open(&temporary).map_err(|e| e.to_string())?;
+        let mut block = [0u8; 8192];
+        let mut offset = 0usize;
+        loop {
+            let count = verify.read(&mut block).map_err(|e| e.to_string())?;
+            if count == 0 {
+                break;
+            }
+            let end = offset
+                .checked_add(count)
+                .ok_or("Image verification size overflow")?;
+            if bytes.get(offset..end) != Some(&block[..count]) {
+                return Err("Image export verification failed".into());
+            }
+            offset = end;
+        }
+        if offset != bytes.len() {
+            return Err("Image export verification was truncated".into());
+        }
+        drop(verify);
+        fs::rename(&temporary, destination).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            // Publication succeeded. Report a directory durability failure as a warning,
+            // rather than claiming the already exported PNG was not written.
+            if let Err(error) = fs::File::open(parent).and_then(|f| f.sync_all()) {
+                return Ok(Some(format!(
+                    "Image saved, but directory synchronization failed: {error}"
+                )));
+            }
+        }
+        Ok(None)
+    })();
+    if let Err(original) = &result
+        && created
+        && let Err(error) = fs::remove_file(&temporary)
+    {
+        return Err(format!(
+            "{original}; Temporary image cleanup failed: {error}"
+        ));
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

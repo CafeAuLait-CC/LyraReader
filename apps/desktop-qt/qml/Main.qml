@@ -2169,6 +2169,9 @@ ApplicationWindow {
             else if (op === "save_redactions") {
                 root.annotationTool = "select";
                 root.operationStatus = qsTr("Verified redacted copy saved: %1 · %2 characters removed.").arg(result.destination_path).arg(result.removed_characters);
+            } else if (op === "save_content_image") {
+                root.operationStatus=qsTr("Image exported to %1").arg(result.destination_path);
+                if(result.publication_warning)root.operationStatus+=" · "+result.publication_warning;
             } else if (op.indexOf("save_") === 0) {
                 root.operationStatus = qsTr("Saved to %1").arg(result.destination_path || "");
                 if (result.cache_cleanup_error) root.operationStatus += " " + result.cache_cleanup_error;

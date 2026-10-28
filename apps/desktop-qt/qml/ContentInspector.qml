@@ -112,6 +112,12 @@ Pane {
                     onClicked:editor.chooseImage(item.bounds,item.id)
                 }
                 Button {
+                    objectName:"exportContentImage"
+                    visible:!!item && item.kind==="image";text:qsTr("Export Image…")
+                    enabled:!editor.hasDraft && app.canModifyPdf && editor.owner.pendingCommands===0
+                    onClicked:editor.chooseImageExport()
+                }
+                Button {
                     objectName:"toggleContentCrop"
                     visible:inspector.croppable;text:qsTr("Crop…");enabled:!editor.hasDraft && app.canModifyPdf && editor.owner.pendingCommands===0
                     onClicked:inspector.cropping=!inspector.cropping
