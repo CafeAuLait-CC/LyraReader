@@ -41,6 +41,7 @@ extension ReaderChecks {
         state.setViewportSize(CGSize(width: 959, height: 715))
         require(state.open(url: root.appendingPathComponent("tests/fixtures/index-past-120.pdf")),
                 "long jump fixture opens")
+        defer { state.closeTab(0) }
         state.gotoPage(50)
         try await eventually("a visited distant page retains a small preview", {
             state.isScreenPageCached(50) && state.isPageBackdropCached(50)
