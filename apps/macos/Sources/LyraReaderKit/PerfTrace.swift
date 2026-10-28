@@ -336,7 +336,7 @@ public enum PerfTrace {
     public static func frame(presented: Bool, presentedTime: Double?, reason: String?,
                              submitTime: Double, surface: UInt64, sequence: UInt64,
                              stamp: PerfViewportStamp, cpuUs: UInt64, quads: Int,
-                             tileQuads: Int, frameIndex: UInt64, uploadMs: Double? = nil) {
+                             tileQuads: Int, frameIndex: UInt64, uploadMs: Double? = nil, paperQuads: Int = 0) {
         guard enabledStorage else { return }
         var fields: [String: Value] = [
             "presented": .bool(presented),
@@ -350,6 +350,8 @@ public enum PerfTrace {
             "offset_pt": .double(Double(stamp.offsetPt)),
             "cpu_us": .int(Int(cpuUs)),
             "quads": .int(quads),
+            "paper_quads": .int(paperQuads),
+            "document_quads": .int(max(0, quads - paperQuads)),
             "tile_quads": .int(tileQuads),
             "frame_index": .int(Int(frameIndex)),
         ]
@@ -390,7 +392,7 @@ public enum PerfTrace {
     public static func memory(instance: String? = nil, phase: String, rssBytes: UInt64?, tileCacheBytes: Int,
                               pageRasterBytes: Int, thumbnailBytes: Int, tileCount: Int,
                               pageRasterCount: Int, peakBytes: Int, evictions: Int,
-                              epoch: UInt64) {
+                              epoch: UInt64, backdropBytes: Int = 0) {
         guard enabledStorage else { return }
         var fields: [String: Value] = [
             "phase": .string(phase),
@@ -398,6 +400,7 @@ public enum PerfTrace {
             "tile_cache_bytes": .int(tileCacheBytes),
             "page_raster_bytes": .int(pageRasterBytes),
             "thumbnail_bytes": .int(thumbnailBytes),
+            "page_backdrop_bytes": .int(backdropBytes),
             "tile_count": .int(tileCount),
             "page_raster_count": .int(pageRasterCount),
             "peak_bytes": .int(peakBytes),

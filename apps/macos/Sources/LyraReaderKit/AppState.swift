@@ -883,6 +883,10 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     /// What the canvas copies into its `frame` records, published with `canvasPages`.
     public private(set) var perfViewportStamp = PerfViewportStamp()
     private var pagePreviews: [Int: PageImage] = [:]
+    private var pageBackdrops = PageBackdropCache()
+    private var pageBackdropsInFlight: Set<Int> = []
+    public var pageBackdropCacheUsedBytes: Int { pageBackdrops.usedBytes }
+    public func isPageBackdropCached(_ page: Int) -> Bool { pageBackdrops.contains(page) }
     private var pagePreviewScales: [Int: CGFloat] = [:]
     private var desiredPreviewScale: CGFloat = 1
     private let preferFullPageRasters: Bool
@@ -2967,6 +2971,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var tileRasterMilliseconds: Double
         var pageRasterCount: Int
         var pageRasterMilliseconds: Double
+        var pageBackdrops: PageBackdropCache
         var pagePreviews: [Int: PageImage]
         var pagePreviewScales: [Int: CGFloat]
         var desiredPreviewScale: CGFloat
@@ -3146,6 +3151,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         visibleTileKeysByPage = [:]
         failedTiles = []
         pagePreviews = [:]
+        pageBackdrops.removeAll()
+        pageBackdropsInFlight.removeAll()
         pagePreviewScales = [:]
         pagePreviewInFlight = nil
         desiredPreviewPages = []
@@ -13785,6 +13792,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             tileRasterMilliseconds: tileRasterMilliseconds,
             pageRasterCount: pageRasterCount,
             pageRasterMilliseconds: pageRasterMilliseconds,
+            pageBackdrops: pageBackdrops,
             pagePreviews: pagePreviews,
             pagePreviewScales: pagePreviewScales,
             desiredPreviewScale: desiredPreviewScale,
@@ -13904,6 +13912,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         tileRasterMilliseconds = state.tileRasterMilliseconds
         pageRasterCount = state.pageRasterCount
         pageRasterMilliseconds = state.pageRasterMilliseconds
+        pageBackdrops = state.pageBackdrops
         pagePreviews = state.pagePreviews
         pagePreviewScales = state.pagePreviewScales
         desiredPreviewScale = state.desiredPreviewScale
@@ -14739,7 +14748,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                         pageSharp = isScreenPageCached(placement.index)
                     } else if !previous.isEmpty {
                         pages.append(contentsOf: previous)
-                    } else if let thumbnail = thumbnails[placement.index] {
+                    } else if let thumbnail = pageBackdrops.image(for: placement.index) ?? thumbnails[placement.index] {
                         pages.append(canvasPageRaster(thumbnail, placement: placement))
                     }
                     if let perfOnScreen, perfOnScreen.contains(placement.index), pageSharp {
@@ -14821,7 +14830,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 }
             }
             if !complete, !changingLOD,
-               let preview = pagePreviews[placement.index] ?? thumbnails[placement.index] {
+               let preview = pagePreviews[placement.index] ?? pageBackdrops.image(for: placement.index) ?? thumbnails[placement.index] {
                 // The preview is only a backdrop for uncovered rows, never a replacement
                 // for the sharp content the reader is already looking at.
                 pages.append(CanvasPage(placement: PagePlacement(index: PlacementIndex.pageRaster(placement.index),
@@ -15104,14 +15113,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let sharedBytes = tileCache.usedBytes + pageRasterBytes
         let screenPages = screenPagePathSummary
         let line = String(
-            format: "lyra-reader-stats: cache %d tiles · tiles %.1f/%.1f MiB · pageRasters %.1f MiB · shared %.1f/%.1f MiB · peak tiles %.1f MiB · thumbnails %.1f MiB · text %.1f MiB · rasters total %.1f MiB · screenPages %@ · wanted %d · queued %d · hits %d · misses %d · hit rate %.1f%% · insertions %d · evictions %d (%.1f MiB)\n",
+            format: "lyra-reader-stats: cache %d tiles · tiles %.1f/%.1f MiB · pageRasters %.1f MiB · shared %.1f/%.1f MiB · peak tiles %.1f MiB · thumbnails %.1f MiB · text %.1f MiB · rasters total %.1f MiB · backdrops %.1f MiB · screenPages %@ · wanted %d · queued %d · hits %d · misses %d · hit rate %.1f%% · insertions %d · evictions %d (%.1f MiB)\n",
             tileCache.count,
             Double(tileCache.usedBytes) / mib, Double(tileCache.budgetBytes) / mib,
             Double(pageRasterBytes) / mib,
             Double(sharedBytes) / mib, Double(tileCache.budgetBytes) / mib,
             Double(tileCache.peakBytes) / mib,
             Double(thumbnailBytes) / mib, Double(textBytes) / mib,
-            Double(sharedBytes + thumbnailBytes + textBytes) / mib,
+            Double(sharedBytes + thumbnailBytes + textBytes + pageBackdrops.usedBytes) / mib,
+            Double(pageBackdrops.usedBytes) / mib,
             screenPages,
             wanted, scheduled, stats.hits, stats.misses, stats.hitRate * 100.0,
             stats.insertions, stats.evictions, Double(stats.evictedBytes) / mib
@@ -16244,6 +16254,30 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
+    /// Reduce a page the reader reached, outside the main actor, for the next distant revisit.
+    /// Eight MiB bounds retained previews independently of the existing sharp working set.
+    private func retainPageBackdrop(_ image: PageImage, page: Int) {
+        guard !pageBackdrops.contains(page), pageBackdropsInFlight.insert(page).inserted else { return }
+        let epoch = renderEpoch
+        Task { @MainActor [weak self] in
+            let reduced = await Task.detached(priority: .utility) {
+                let width = max(1, min(512, image.pixelWidth,
+                    Int(Double(image.pixelWidth) * 1024 / Double(max(1, image.pixelHeight)))))
+                let small = image.downsampled(toWidth: width)
+                // The reduced bitmap must not share the sharp source's GPU generation.
+                return PageImage(pixelWidth: small.pixelWidth, pixelHeight: small.pixelHeight,
+                    pointSize: small.pointSize, bgra: small.bgra,
+                    generation: small.generation | (UInt64(1) << 62))
+            }.value
+            guard let self, epoch == self.renderEpoch else { return }
+            self.pageBackdropsInFlight.remove(page)
+            self.pageBackdrops.insert(reduced, for: page)
+            if self.onScreenThumbnailPages.contains(page), self.pagePreviews[page] == nil {
+                self.reloadVisiblePages()
+            }
+        }
+    }
+
     private func canvasPageRaster(_ image: PageImage, placement: PagePlacement) -> CanvasPage {
         CanvasPage(placement: PagePlacement(index: PlacementIndex.pageRaster(placement.index),
             topPt: placement.topPt, leftPt: placement.leftPt,
@@ -16439,6 +16473,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 guard epoch == self.renderEpoch else { return }
                 if self.desiredPreviewPages.contains(page), scale >= (self.pagePreviewScales[page] ?? 0) {
                     self.pagePreviews[page] = image
+                    if self.onScreenThumbnailPages.contains(page) { self.retainPageBackdrop(image, page: page) }
                     self.pagePreviewScales[page] = scale
                     // Self-report around the engine call, same caveat as the tile figure.
                     self.pageRasterCount += 1
@@ -17352,7 +17387,7 @@ extension AppState {
                          pageRasterCount: pagePreviews.count,
                          peakBytes: tileCache.peakBytes,
                          evictions: tileCache.stats.evictions,
-                         epoch: documentEpoch)
+                         epoch: documentEpoch, backdropBytes: pageBackdrops.usedBytes)
     }
 
     private func startPerfMemorySampling() {
