@@ -639,6 +639,7 @@ struct ReaderChecks {
                     mentionsURL: root.appendingPathComponent("tests/fixtures/cross-references.pdf"))
             } else {
                 scrollGlideTailChecks()
+                try wheelGestureReplayChecks(root: root)
                 try await scrollTailDriverChecks(
                     url: fastRoot.appendingPathComponent("tests/fixtures/multipage.pdf"))
             }
@@ -1157,6 +1158,7 @@ struct ReaderChecks {
             }),
             ("scroll-glide-tail", {
                 scrollGlideTailChecks()
+                try wheelGestureReplayChecks(root: root)
             }),
             ("scroll-tail-driver", {
                 try await scrollTailDriverChecks(url: b)
