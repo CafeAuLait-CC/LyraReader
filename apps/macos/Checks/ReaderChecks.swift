@@ -244,6 +244,7 @@ struct ReaderChecks {
             return
         }
         if CommandLine.arguments.contains("--check-content-editing") {
+            try await contentScrollRecoveryChecks(root: fastRoot)
             try await contentEditingChecks(root:fastRoot)
             return
         }
@@ -639,6 +640,7 @@ struct ReaderChecks {
                     mentionsURL: root.appendingPathComponent("tests/fixtures/cross-references.pdf"))
             } else {
                 scrollGlideTailChecks()
+                try wheelGestureReplayChecks(root: root)
                 try await scrollTailDriverChecks(
                     url: fastRoot.appendingPathComponent("tests/fixtures/multipage.pdf"))
             }
@@ -785,6 +787,10 @@ struct ReaderChecks {
         }
         // The direct-invalidation regression on its own while it is being worked on: it needs a
         // presentable surface, so it is kept runnable outside the full suite.
+        if CommandLine.arguments.contains("--check-page-jump-fallback") {
+            try await pageJumpFallbackChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-canvas-commit") {
             let root = checkRoot(CommandLine.arguments.dropFirst().first)
             try await canvasCommitChecks(source: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
@@ -833,11 +839,13 @@ struct ReaderChecks {
                 var wheel = WheelMotion()
                 let first = wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 1)
                 let fast = wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 1.05)
-                require(first == 40 && fast > first, "wheel has useful step and burst acceleration")
-                require(wheel.delta(scrollingDeltaY: 1, precise: false, timestamp: 1.1) == -40,
-                        "reversing wheel resets acceleration")
-                require(wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 2) == 40,
-                        "pausing wheel resets acceleration")
+                require(first == 25 && fast == first, "wheel cadence does not accelerate delivered system deltas twice")
+                require(wheel.delta(scrollingDeltaY: -3, precise: false, timestamp: 1.075) == 75,
+                        "wheel preserves acceleration already delivered by macOS")
+                require(wheel.delta(scrollingDeltaY: 1, precise: false, timestamp: 1.1) == -25,
+                        "reversing wheel changes direction immediately")
+                require(wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 2) == 25,
+                        "pausing wheel carries no retained acceleration")
                 require(wheel.delta(scrollingDeltaY: 2.5, precise: true, timestamp: 2.1) == -2.5,
                         "trackpad preserves system precision and direction")
                 let textEngine = try RustEngine()
@@ -979,6 +987,9 @@ struct ReaderChecks {
             }),
             ("stamp-signature", {
                 try await stampSignatureChecks(root: root)
+            }),
+            ("content-scroll-recovery", {
+                try await contentScrollRecoveryChecks(root: root)
             }),
             ("content-editing", {
                 try await contentEditingChecks(root: root)
@@ -1157,6 +1168,7 @@ struct ReaderChecks {
             }),
             ("scroll-glide-tail", {
                 scrollGlideTailChecks()
+                try wheelGestureReplayChecks(root: root)
             }),
             ("scroll-tail-driver", {
                 try await scrollTailDriverChecks(url: b)
@@ -1295,6 +1307,9 @@ struct ReaderChecks {
             }),
             ("frame-scheduling", {
                 try await frameSchedulingChecks()
+            }),
+            ("page-jump-fallback", {
+                try await pageJumpFallbackChecks(root: root)
             }),
             ("canvas-commit", {
                 // The presentation-path fix: a model commit must draw before the SwiftUI

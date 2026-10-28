@@ -472,7 +472,7 @@ public struct ReaderWindow: View {
             if state.contentEditEnabled {
                 PDFContentEditor(state:state)
                     .task(id:"\(state.document?.url?.path ?? "")-\(state.currentPage)-\(state.activeTabIndex)") {
-                        if !state.contentEditLoading, state.contentEditPage?.page != state.currentPage - 1 {
+                        if state.contentEditPage?.page != state.currentPage - 1 {
                             await state.reloadContentObjects()
                         }
                     }

@@ -143,6 +143,7 @@ extension ReaderChecks {
     /// Settings validation, Keychain hygiene, citation rendering and the panel state machine.
     @MainActor
     static func aiAssistantChecks(root: URL) async throws {
+        try await aiCredentialSessionChecks()
         try aiSettingsChecks()
         try aiKeyHygieneChecks()
         try aiCitationChecks()

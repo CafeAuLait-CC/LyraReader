@@ -16,22 +16,49 @@ extension ReaderChecks {
         let slow = distance(interval: 0.15)
         let medium = distance(interval: 0.05)
         let fast = distance(interval: 0.01)
-        require(slow == 400 && medium > slow && fast > medium,
-                "faster wheel rotation increases distance (slow \(slow), medium \(medium), fast \(fast) pt)")
+        require(slow == 250 && medium == slow && fast == slow,
+                "event cadence never accelerates the system wheel distance a second time")
         var wheel = WheelMotion()
         _ = wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 1)
-        require(wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 1.01) == 120,
-                "a fast wheel event reaches the bounded 3x gain")
-        require(abs(wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 1.11) - 40) < 1e-6,
-                "slowing the wheel lowers gain immediately rather than retaining a burst boost")
-        require(wheel.delta(scrollingDeltaY: 1, precise: false, timestamp: 1.12) == -40,
-                "direction reversal resets acceleration")
-        require(wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 2) == 40,
-                "a pause resets acceleration")
+        require(wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 1.01) == 25,
+                "a rapid event keeps the calibrated line distance")
+        require(wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 1.11) == 25,
+                "slowing the wheel leaves no retained boost")
+        require(wheel.delta(scrollingDeltaY: 1, precise: false, timestamp: 1.12) == -25,
+                "direction reversal moves immediately")
+        require(wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 2) == 25,
+                "a pause carries no acceleration debt")
         require(wheel.delta(scrollingDeltaY: 2.5, precise: true, timestamp: 2.1) == -2.5,
                 "precise input preserves its system distance")
-        require(wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 2.11) == 40,
-                "precise input resets the discrete wheel cadence")
+        require(wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 2.11) == 25,
+                "a discrete event after precise input uses its own units")
+    }
+
+    @MainActor static func wheelGestureReplayChecks(root: URL) throws {
+        struct Event: Decodable { let t: Double; let dy: CGFloat; let precise: Bool }
+        struct Gesture: Decodable { let mode: String; let events: [Event] }
+        struct Recording: Decodable {
+            let reference_page_height_pt: CGFloat
+            let gestures: [Gesture]
+        }
+        let data = try Data(contentsOf: root.appendingPathComponent("tests/fixtures/mouse-wheel-gestures.json"))
+        let recording = try JSONDecoder().decode(Recording.self, from: data)
+        var pages: [String: [CGFloat]] = [:]
+        for gesture in recording.gestures {
+            var wheel = WheelMotion()
+            let distance = gesture.events.reduce(CGFloat(0)) { sum, event in
+                sum + wheel.delta(scrollingDeltaY: event.dy, precise: event.precise,
+                                  timestamp: event.t)
+            }
+            pages[gesture.mode, default: []].append(abs(distance) / recording.reference_page_height_pt)
+        }
+        func median(_ mode: String) -> CGFloat {
+            let sorted = pages[mode, default: []].sorted()
+            guard !sorted.isEmpty else { fatalError("Missing real \(mode) wheel samples") }
+            return (sorted[(sorted.count - 1) / 2] + sorted[sorted.count / 2]) / 2
+        }
+        require((0.7...1.5).contains(median("slow")), "real slow flick travels about one page")
+        require((1.5...2.5).contains(median("fast")), "real quick flick travels about two pages")
     }
 
     @MainActor static func scrollTailDriverChecks(url: URL) async throws {
@@ -57,11 +84,8 @@ extension ReaderChecks {
                         "wheel event \(index + 1) at \(Int(interval * 1000)) ms moves immediately with no debt")
             }
             let parked = state.scrollYPt
-            require(parked - start >= 320, "a burst keeps at least its unaccelerated distance")
-            if interval == 0.01 {
-                require(parked - start > 800,
-                        "a fast spin keeps accelerated distance instead of losing it to the glide ceiling")
-            }
+            require(abs((parked - start) * state.zoomFactor - 200) < 1e-6,
+                    "eight wheel notches keep the same calibrated screen distance at every cadence")
             // Advance both the production arithmetic and the real driver's clock after input.
             for _ in 0..<20 { state.advanceScrollGlide(elapsed: 0.04) }
             try await Task.sleep(for: .milliseconds(160))

@@ -50,6 +50,7 @@ public final class ChatGPTAccountStore: ObservableObject {
     static let tokenURL = URL(string: "https://auth.openai.com/api/accounts/oauth/token")!
     private let defaults: UserDefaults
     private let vault: any AIAPIKeyStore
+    private var credentialSession: [String: Credential]?
     package let session: URLSession
     private let openBrowser: (URL) -> Bool
     private var loginTask: Task<Void, Never>?
@@ -272,8 +273,13 @@ public final class ChatGPTAccountStore: ObservableObject {
         defaults.set(id, forKey: "chatGPTHostID"); return id
     }
     private func credentials() throws -> [String: Credential] {
-        guard let text = try vault.readKey() else { return [:] }
-        return try JSONDecoder().decode([String: Credential].self, from: Data(text.utf8))
+        if let credentialSession { return credentialSession }
+        let decoded: [String: Credential]
+        if let text = try vault.readKey() {
+            decoded = try JSONDecoder().decode([String: Credential].self, from: Data(text.utf8))
+        } else { decoded = [:] }
+        credentialSession = decoded
+        return decoded
     }
     private func saveCredential(_ credential: Credential, id: UUID) throws {
         var all = try credentials(); all[id.uuidString] = credential; try writeCredentials(all)
@@ -281,6 +287,7 @@ public final class ChatGPTAccountStore: ObservableObject {
     private func writeCredentials(_ all: [String: Credential]) throws {
         if all.isEmpty { try vault.deleteKey() }
         else { try vault.saveKey(String(decoding: JSONEncoder().encode(all), as: UTF8.self)) }
+        credentialSession = all
     }
     private func persistMetadata() {
         defaults.set(try? JSONEncoder().encode(accounts), forKey: "chatGPTAccounts")

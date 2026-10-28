@@ -148,6 +148,7 @@ struct PDFContentEditor: NSViewRepresentable {
   }
   func updateNSView(_ view: ContentEditorView, context: Context) {
     view.state = state
+    view.synchronizePointer()
     view.needsDisplay = true
     view.window?.acceptsMouseMovedEvents = true
   }
@@ -160,6 +161,10 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
   private var tracking: NSTrackingArea?
   private var hover: String?
   var hoveredContentID: String? { hover }
+  var showsMoveCursor: Bool {
+    guard let hover else { return false }
+    return hover == state?.contentEditSelection
+  }
   private var origin: CGPoint?
   private var original: CGRect?
   private var preview: CGRect?
@@ -225,16 +230,27 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
   }
   override func mouseMoved(with event: NSEvent) {
     let point = convert(event.locationInWindow, from: nil)
+    updateHover(at: point)
+  }
+  private func updateHover(at point: CGPoint) {
     hover = hit(point)?.id
-    if hover == state?.contentEditSelection {
+    if showsMoveCursor {
       NSCursor.openHand.set()
     } else {
       NSCursor.arrow.set()
     }
     needsDisplay = true
   }
+  /// Scrolling can replace the inspected page while the pointer stays still.
+  func synchronizePointer() {
+    guard let window else { return }
+    let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+    if bounds.contains(point) { updateHover(at: point) }
+    else { hover = nil }
+  }
   override func mouseExited(with event: NSEvent) {
     hover = nil
+    NSCursor.arrow.set()
     needsDisplay = true
   }
   override func mouseDown(with event: NSEvent) {
