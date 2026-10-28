@@ -34,8 +34,8 @@ ToolBar {
             }
         }
     }
-    function chooseImage(kind) {imagePicker.owner=app.currentReader;imagePicker.kind=kind;imagePicker.open();}
-    function chooseTypedSignature() {if(app.blockXfaWrite() || app.fillTool!=="signature")return;typedSignature.owner=app.currentReader;typedSignature.open();}
+    function chooseImage(kind) {imagePicker.owner=app.currentReader;imagePicker.ownerGeneration=app.currentReader.documentGeneration;imagePicker.kind=kind;imagePicker.open();}
+    function chooseTypedSignature() {if(app.blockXfaWrite() || app.fillTool!=="signature")return;typedSignature.prepare(app.currentReader);typedSignature.open();}
     TypedSignatureDialog {id:typedSignature;app:tools.app}
     Menu {
         id:stampMenu
@@ -49,13 +49,16 @@ ToolBar {
         id:imagePicker
         objectName:"signatureImagePicker"
         property var owner:null
+        property var ownerGeneration:null
         property string kind:"signature"
         title:kind==="signature" ? qsTr("Choose a Signature Image") : qsTr("Choose an Image")
         nameFilters:[qsTr("Images (*.png *.jpg *.jpeg)")]
         fileMode:FileDialog.OpenFile
         onAccepted: {
-            if(owner===app.currentReader && app.armSignature(selectedFile))app.fillTool=kind;
-            else if(owner!==app.currentReader)app.operationStatus=qsTr("The document changed. Choose the image again.");
+            if(owner && owner===app.currentReader && !owner.loading && owner.documentGeneration===ownerGeneration) {
+                if(kind==="image")app.armPicture(selectedFile);else app.armSignature(selectedFile);
+            }
+            else app.operationStatus=qsTr("The document changed. Choose the image again.");
             owner=null;
         }
         onRejected:owner=null

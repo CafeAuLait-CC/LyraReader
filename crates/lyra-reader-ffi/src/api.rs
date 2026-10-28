@@ -6158,6 +6158,7 @@ pub struct AnnotationKindFlagsRecord {
 /// The shell reads these instead of restating them, so a change to a limit or a default is one
 /// Rust edit and both sides move together.
 #[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize))]
 pub struct AnnotationRulesRecord {
     pub max_annotations: u32,
     pub max_bookmarks: u32,

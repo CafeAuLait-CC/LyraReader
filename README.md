@@ -53,6 +53,8 @@ stages actual text/object/link edits through the shared typed commands and recov
 failed or superseded text drafts remain available to copy or retry. Redact → Blackout/Erase removes
 PDF content and asks explicitly before a fallback replaces an entire page with an image. Fill & Sign
 places text, dates, vector checkmarks/crosses, stamps and typed or imported signature images.
+Pictures have Small, Medium and Large placement sizes, with the default read from the shared engine.
+Image and typed-signature confirmations are bound to the document generation that opened them.
 The Edit inspector crops
 selected top-level images or graphics by retained edge percentages through the shared undo/save
 transaction. Selected bitmap images export their original pixels as PNG; graphics export their page region.

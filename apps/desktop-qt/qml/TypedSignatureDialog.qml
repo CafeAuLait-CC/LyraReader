@@ -10,8 +10,9 @@ Dialog {
     property string ownerUrl:""
     property var ownerRevision:null
     property var ownerMutation:null
+    property var ownerGeneration:null
     property var rendered:null
-    readonly property bool contextMatches:!!owner && owner===app.currentReader && !owner.loading && String(owner.fileUrl)===ownerUrl && owner.data.document_revision===ownerRevision && owner.editRevision===ownerMutation
+    readonly property bool contextMatches:!!owner && owner===app.currentReader && !owner.loading && owner.documentGeneration===ownerGeneration && String(owner.fileUrl)===ownerUrl && owner.data.document_revision===ownerRevision && owner.editRevision===ownerMutation
     readonly property bool canPlace:contextMatches && !!rendered && !!rendered.image && app.canModifyPdf
     title:qsTr("Type a Signature")
     modal:true;focus:true
@@ -20,7 +21,8 @@ Dialog {
     height:Math.min(implicitHeight,app.height-32)
     padding:16
     background:Rectangle {color:app.colors.raisedBg;border.color:app.colors.controlBorder;radius:6}
-    onOpened: {ownerUrl=String(owner.fileUrl);ownerRevision=owner.data.document_revision;ownerMutation=owner.editRevision;rendered=null;name.text="";fontChoice.currentIndex=0;name.forceActiveFocus();refresh.restart();}
+    function prepare(reader) {owner=reader;ownerUrl=String(reader.fileUrl);ownerRevision=reader.data.document_revision;ownerMutation=reader.editRevision;ownerGeneration=reader.documentGeneration;rendered=null;}
+    onOpened: {name.text="";fontChoice.currentIndex=0;name.forceActiveFocus();refresh.restart();}
     onClosed: {refresh.stop();Qt.callLater(function(){if(!dialog.visible){dialog.rendered=null;dialog.owner=null;}});}
     onAccepted: {
         if(canPlace)app.armSignatureData(rendered);

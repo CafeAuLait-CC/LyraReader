@@ -33,6 +33,7 @@ class ReaderController : public QObject {
     Q_PROPERTY(QVariantMap noteDrafts READ noteDrafts NOTIFY noteDraftsChanged)
     Q_PROPERTY(bool hasUnsavedChanges READ hasUnsavedChanges NOTIFY unsavedChangesChanged)
     Q_PROPERTY(qulonglong editRevision READ editRevision NOTIFY commandsChanged)
+    Q_PROPERTY(qulonglong documentGeneration READ documentGeneration NOTIFY documentChanged)
     Q_PROPERTY(QVariantMap data READ data NOTIFY dataChanged)
     Q_PROPERTY(QVariantMap textPages READ textPages NOTIFY textPagesChanged)
     Q_PROPERTY(int pendingCommands READ pendingCommands NOTIFY commandsChanged)
@@ -64,6 +65,7 @@ public:
     QVariantMap noteDrafts()const{return m_noteDrafts;}
     bool hasUnsavedChanges()const;
     qulonglong editRevision()const{return m_mutationSequence;}
+    qulonglong documentGeneration()const{return m_generation;}
     Q_INVOKABLE void setNoteDraft(const QString &id,const QString &text){m_noteDrafts.insert(id,text);emit noteDraftsChanged();}
     Q_INVOKABLE void clearNoteDraft(const QString &id){if(m_noteDrafts.remove(id))emit noteDraftsChanged();}
     QVariantMap data() const { return m_data; }

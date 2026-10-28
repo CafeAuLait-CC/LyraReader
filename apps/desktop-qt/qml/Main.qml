@@ -65,6 +65,7 @@ ApplicationWindow {
     property string fillTool: ""
     property string fillText: "Text"
     property int fillFontSize: 14
+    property string fillImageSize: "medium"
     property color fillColor: theme.documentInk
     readonly property bool editInspectorVisible: currentReader.pageCount>0 && secondaryRow==="edit" && (contentController.tool!=="select" || !!contentController.selected || contentController.hasDraft)
     readonly property bool fillInspectorVisible: currentReader.pageCount>0 && secondaryRow==="fill" && fillTool.length>0
@@ -667,8 +668,14 @@ ApplicationWindow {
             if (!size || (annotationTool === "stamp" && !style.length) || (annotationTool === "signature" && !image))
                 return;
             const signature = annotationTool === "signature";
-            const height = Math.min(size.height, signature ? 64 : 50);
-            const width = Math.min(size.width, signature ? height * Math.max(.2, Math.min(8, image.width / image.height)) : 150);
+            const rules=currentReader.data.annotation_rules;
+            if (!rules || ![rules.default_signature_height_pt,rules.default_picture_height_pt,rules.default_stamp_height_pt,rules.default_stamp_width_pt].every(function(n){return Number.isFinite(n) && n>0;})) {
+                operationStatus=qsTr("The document service did not provide valid placement defaults. Reopen the document.");return;
+            }
+            const picture=signature && fillTool==="image";
+            const requestedHeight=signature ? (picture ? (fillImageSize==="small" ? 80 : fillImageSize==="large" ? 220 : rules.default_picture_height_pt) : rules.default_signature_height_pt) : rules.default_stamp_height_pt;
+            const height = Math.min(size.height, requestedHeight);
+            const width = Math.min(size.width, signature ? requestedHeight * Math.max(.2, Math.min(8, image.width / image.height)) : rules.default_stamp_width_pt);
             const words = {
                 approved: "APPROVED",
                 reviewed: "REVIEWED",
@@ -686,7 +693,7 @@ ApplicationWindow {
             const entry = {
                 kind: annotationTool,
                 page: page,
-                version: 1,
+                version: signature ? rules.signature_version : rules.stamp_version,
                 rect: {
                     x: Math.max(0, Math.min(size.width - width, x - width / 2)),
                     y: Math.max(0, Math.min(size.height - height, y - height / 2)),
@@ -695,7 +702,7 @@ ApplicationWindow {
                 },
                 color: signature ? "#000000FF" : colors[style],
                 note: signature ? "" : words[style],
-                stampStyle: signature ? "signature" : style
+                stampStyle: signature ? (picture ? "image" : "signature") : style
             };
             if (signature)
                 entry.image = image.image;
@@ -936,14 +943,17 @@ ApplicationWindow {
         selection = null;
         operationStatus = qsTr("Click on the page to place the stamp. Escape cancels.");
     }
-    function armSignature(url) {
+    function armSignature(url) {return armImage(url,false);}
+    function armPicture(url) {return armImage(url,true);}
+    function armImage(url,picture) {
         if (blockXfaWrite()) return false;
         if (currentReader.pageCount === 0)
             return false;
         const image = currentReader.signatureImage(url);
-        return armSignatureData(image);
+        return armImageData(image,!!picture);
     }
-    function armSignatureData(image) {
+    function armSignatureData(image) {return armImageData(image,false);}
+    function armImageData(image,picture) {
         if (blockXfaWrite() || currentReader.pageCount===0) return false;
         if (!image || (!image.error && (!image.image || !Number.isFinite(image.width) || !Number.isFinite(image.height) || image.width<=0 || image.height<=0))) {
             operationStatus=qsTr("The signature preview is unavailable.");return false;
@@ -957,12 +967,12 @@ ApplicationWindow {
         formToolActive = false;
         setSecondaryRow("fill");
         if (secondaryRow!=="fill") return false;
-        fillTool="signature";
+        fillTool=picture ? "image" : "signature";
         annotationTool = "signature";
         pendingSignatureImage = image;
         selectedAnnotation = null;
         selection = null;
-        operationStatus = qsTr("Click on the page to place the signature image. Escape cancels.");
+        operationStatus = picture ? qsTr("Click on the page to place the picture. Escape cancels.") : qsTr("Click on the page to place the signature image. Escape cancels.");
         return true;
     }
     function addRedaction(page, rect) {
