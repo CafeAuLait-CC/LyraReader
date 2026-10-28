@@ -41,6 +41,9 @@ separate features with their own documented limits.
   while a tool or a selected object needs it; text markup, ink, shapes, sticky notes, text boxes, stamps and image
   signatures, all with undo,
   recovery in the application cache and verified saving into the original PDF. Signed originals use Save As.
+- **Quit safely**: quitting with unsaved changes asks Save All / Discard All / Cancel across every window; a
+  resolved quit does not restore those drafts on the next launch, while a crash or SIGTERM still offers them as
+  recovery. Closing a dirty tab uses the same decision model.
 - **Edit pages**: rotate, delete, reorder, insert, extract, merge and split, redaction consolidated in the Edit
   workspace (Blackout / Erase), flattened copies that bake annotations and form values into the page, all staged with
   undo and verified

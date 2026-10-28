@@ -2932,6 +2932,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var tabs: [OpenTab] = []
     @Published public private(set) var activeTabIndex: Int?
 
+    /// The identity of the tab on screen, if any. The quit coordinator captures these to put the
+    /// window back exactly where it was when a Save All attempt is cancelled or aborts.
+    public var activeTabID: UUID? {
+        guard let index = activeTabIndex, tabs.indices.contains(index) else { return nil }
+        return tabs[index].id
+    }
+
     // MARK: - Tab document retention (LRU)
 
     /// How many documents (the active one plus the retained inactive ones) stay fully open.
@@ -3672,6 +3679,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// window would vanish on a SIGTERM from a harness. The normal quit path needs no such
     /// treatment: `willTerminateNotification` reaches every observer, so each state flushes its
     /// own pending writes and they cannot race with each other.
+    ///
+    /// **A signal is not a resolved quit.** It has no user decision behind it, so it must not
+    /// write the clean-exit marker the quit prompt writes: the drafts stay on disk and the next
+    /// launch still offers crash recovery. Only `LyraReaderAppDelegate.applicationShouldTerminate`
+    /// writes that marker, after Save All or Discard All actually resolved every document.
     public func installTerminationHandling() {
         guard terminationObserver == nil else { return }
 
@@ -3718,6 +3730,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 MainActor.assumeIsolated {
                     for state in AppState.liveStates { state.value?.flushPendingWrites() }
                 }
+                // Deliberately no clean-exit marker: a signal has no user decision behind it, so
+                // the next launch must still offer the drafts as crash recovery.
                 exit(128 + number) // the conventional "terminated by signal N" status
             }
             source.resume()
@@ -3857,7 +3871,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 startPerfMemorySampling()
             }
 
-            loadAnnotations(for: url)
+            // A quit the reader resolved with Save or Discard leaves a marker; consume it before
+            // either recovery path runs so those drafts are not offered again. A crash that never
+            // reached the quit handshake leaves no marker, and recovery is unchanged.
+            let cleanExit = DocumentEditCache.resolvedCleanExit(for: url)
+            let annotationsClean = loadAnnotations(for: url, cleanExit: cleanExit)
             noticeInterruptedSave(at: url)
             if let restoringTabScroll {
                 contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode)
@@ -3877,7 +3895,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             loadMetadata()
             loadDocumentAnnotations()
             loadFormInfo()
-            restoreCachedPageEdits(for: url)
+            let pageEditsClean = restoreCachedPageEdits(for: url, cleanExit: cleanExit)
+            if cleanExit != nil {
+                if annotationsClean && pageEditsClean {
+                    DocumentEditCache.clearCleanExit(for: url)
+                } else if lastError == nil {
+                    lastError = "The last quit was resolved, but its cached drafts could not be "
+                        + "cleaned up; they were not restored and the cleanup will be retried."
+                }
+            }
             // In-place translations belong to the original file's document cache. Load after a
             // cached page-edit session has opened its working revision, so the cache directory is
             // still the original PDF's, never a revision path.
@@ -9078,6 +9104,175 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return await replaceOriginalWithSavedAnnotations()
     }
 
+    // MARK: - Quitting with unsaved changes
+
+    /// Brings one tab to the screen for a Save All pass, and reports whether it is there.
+    ///
+    /// Inactive tabs live in retained snapshots, so the one existing save path (which acts on the
+    /// active document) can only save them after a tab switch. This is the same activation the
+    /// per-tab close prompt already performs.
+    @discardableResult
+    public func activateTabForQuit(id: UUID) -> Bool {
+        guard let index = tabs.firstIndex(where: { $0.id == id }) else { return false }
+        if index != activeTabIndex { selectTab(index) }
+        return activeTabIndex == index
+    }
+
+    /// The documents in this window the quit prompt must cover, in tab order.
+    ///
+    /// Uses the same predicate as the tab dot, the tab-close prompt and the transfer guard:
+    /// `tabHasUnsavedChanges`. That is the one definition of "unsaved"; the quit prompt must not
+    /// invent a second one.
+    public func unsavedQuitDocuments(windowIndex: Int) -> [QuitUnsavedDocument] {
+        var documents: [QuitUnsavedDocument] = []
+        for (index, tab) in tabs.enumerated() {
+            guard tabHasUnsavedChanges(index) else { continue }
+            let isActive = index == activeTabIndex
+            let retained = retainedTabs[tab.id]
+            let sourceURL: URL
+            let isReadOnly: Bool
+            let title: String
+            if isActive {
+                sourceURL = pageEditSession?.originalURL ?? document?.url ?? tab.url
+                isReadOnly = isReadOnlyDocument
+                title = document?.title ?? tab.title
+            } else if let retained {
+                sourceURL = retained.state.pageEditSession?.originalURL
+                    ?? retained.state.document.url ?? tab.url
+                isReadOnly = retained.state.pageEditSession?.originalSignature.signed == true
+                    || retained.state.document.signature.signed
+                    || retained.state.document.xfa.isXfa
+                title = retained.state.document.title
+            } else {
+                // `tabHasUnsavedChanges` only reports an inactive tab when its retained snapshot
+                // exists, so this is unreachable rather than a silently dropped document.
+                continue
+            }
+            documents.append(QuitUnsavedDocument(
+                id: tab.id,
+                windowIndex: windowIndex,
+                title: title,
+                documentURL: sourceURL,
+                isReadOnly: isReadOnly,
+                changeSummary: quitChangeSummary(isActive: isActive, retained: retained?.state)
+            ))
+        }
+        return documents
+    }
+
+    /// The reader-facing list of what is pending in one tab, e.g. "page edits, annotations".
+    private func quitChangeSummary(isActive: Bool, retained: TabDocumentState?) -> String {
+        var parts: [String] = []
+        let pageEdits = isActive
+            ? pageEditHasPendingChanges
+            : retained?.pageEditPendingOperations.isEmpty == false
+        if pageEdits { parts.append("page edits") }
+        let contentDraft = isActive && (contentTextEditing || contentTextRecovery != nil)
+        if contentDraft { parts.append("text draft") }
+        let annotations = isActive
+            ? annotationCacheIsDirty || hasPendingInkErasure || !pendingFileDeletions.isEmpty
+            : retained?.annotationCacheIsDirty == true
+                || retained?.erasedInkStrokeIDs.isEmpty == false
+                || retained?.pendingFileDeletions.isEmpty == false
+        if annotations { parts.append("annotations") }
+        let forms = isActive ? formHasPendingChanges : retained?.formHasPendingChanges == true
+        if forms { parts.append("form values") }
+        return parts.isEmpty ? "unsaved changes" : parts.joined(separator: ", ")
+    }
+
+    /// How the active document would be saved if the reader answers Save All.
+    ///
+    /// This mirrors the existing commands rather than defining a new save path: ordinary
+    /// documents go through ``saveDocumentToOriginal()``, signed originals through the existing
+    /// copy writers, and a form-only draft through the form writer. Form values combined with
+    /// page/annotation changes have no combined writer in this app (the close prompt already
+    /// refuses to save them together), so Save All refuses that document instead of guessing an
+    /// order that could silently drop one of the two.
+    public var quitSavePlan: QuitSavePlan {
+        guard let document, let sourceURL = pageEditSession?.originalURL ?? document.url else {
+            return .blocked("No document is open.")
+        }
+        if isXfaDocument {
+            return .blocked(readOnlyReason ?? "This XFA form is read-only.")
+        }
+        if contentTextRecovery != nil {
+            return .blocked("Finish or discard the recovered text draft before saving.")
+        }
+        let pageEdits = pageEditHasPendingChanges
+        let contentDraft = contentTextEditing
+        let annotations = annotationCacheIsDirty || hasPendingInkErasure
+            || !pendingFileDeletions.isEmpty
+        let forms = formHasPendingChanges
+        if forms && (pageEdits || contentDraft || annotations) {
+            return .blocked(
+                "“\(document.title)” has form values and other unsaved changes. "
+                + "Save or discard the form in Fill & Sign first, then quit.")
+        }
+        if forms {
+            return isReadOnlyDocument
+                ? .copy(suggestion: engine.suggestedFilledCopyURL(for: sourceURL))
+                : .inPlace
+        }
+        if isReadOnlyDocument {
+            let suggestion = canSavePageEditsCopy
+                ? Self.suggestedPageEditsCopyURL(for: sourceURL)
+                : engine.suggestedAnnotatedCopyURL(for: sourceURL)
+            return .copy(suggestion: suggestion)
+        }
+        return .inPlace
+    }
+
+    private static func suggestedPageEditsCopyURL(for url: URL) -> URL {
+        url.deletingLastPathComponent().appendingPathComponent(
+            "\(url.deletingPathExtension().lastPathComponent) (page edits).pdf")
+    }
+
+    /// Saves the active document through the existing Save path for a Save All decision.
+    ///
+    /// A copy-only document returns ``QuitSaveOutcome/needsCopy(_:)``; the caller asks for a
+    /// destination and calls ``saveDocumentCopyForQuit(to:)``.
+    public func saveDocumentForQuit() async -> QuitSaveOutcome {
+        switch quitSavePlan {
+        case .inPlace:
+            if formHasPendingChanges {
+                let saved = await replaceOriginalWithFilledForm()
+                return saved ? .saved : .failed(lastError ?? "Could not save the filled form.")
+            }
+            let saved = await saveDocumentToOriginal()
+            return saved ? .saved : .failed(lastError ?? "Could not save the document.")
+        case .copy(let suggestion):
+            return .needsCopy(suggestion)
+        case .blocked(let reason):
+            return .failed(reason)
+        }
+    }
+
+    /// Writes the active read-only document's changes through the existing Save As writers.
+    public func saveDocumentCopyForQuit(to destination: URL) async -> QuitSaveOutcome {
+        guard let sourceURL = pageEditSession?.originalURL ?? document?.url else {
+            return .failed("No document is open.")
+        }
+        guard !Self.resolvesToSameFile(destination, sourceURL) else {
+            return .failed("The copy would replace the original. Choose another name.")
+        }
+        switch quitSavePlan {
+        case .copy:
+            let saved: Bool
+            if formHasPendingChanges {
+                saved = await saveFilledForm(to: destination)
+            } else if canSavePageEditsCopy {
+                saved = await savePageEditsCopy(to: destination)
+            } else {
+                saved = await saveAnnotatedCopy(to: destination)
+            }
+            return saved ? .saved : .failed(lastError ?? "Could not save a copy.")
+        case .inPlace:
+            return await saveDocumentForQuit()
+        case .blocked(let reason):
+            return .failed(reason)
+        }
+    }
+
     /// Whether the two PDF-writing commands can run.
     ///
     /// The cache holds unsaved work, but it is not the feature: saving is always an explicit
@@ -9859,7 +10054,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         DocumentEditCache.annotationsURL(for: document)
     }
 
-    private func loadAnnotations(for url: URL) {
+    /// Loads the cached annotation records.
+    ///
+    /// `cleanExit` is the resolved-quit marker found before any recovery ran. When present, the
+    /// pending dirty state is not restored: the cached marks are retired (preserving entries this
+    /// build cannot interpret) and `changes.json` is rewritten clean. The return value is false
+    /// only when that cleanup could not be written, so the caller keeps the marker for a retry.
+    @discardableResult
+    private func loadAnnotations(
+        for url: URL,
+        cleanExit: DocumentEditCache.CleanExitRecord? = nil
+    ) -> Bool {
         let wasChanging = isChangingDocumentState
         isChangingDocumentState = true
         defer { isChangingDocumentState = wasChanging }
@@ -9917,7 +10122,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 Data("lyra-reader-annotate: read failed; writes blocked: \(error)\n".utf8)
             )
         }
-        if annotationWritesBlockedReason == nil,
+        var cleanExitCleanupSucceeded = true
+        if let cleanExit {
+            // The reader already answered Save or Discard for these drafts. Restoring the dirty
+            // state here is exactly what made the next launch show marks that Undo could not
+            // explain; retire them instead. Entries this build cannot interpret stay untouched.
+            cleanExitCleanupSucceeded = discardResolvedCleanExitAnnotations(for: url)
+            // The resolved quit also lifts the "PDF changed outside" refusal: there is no cached
+            // work left to preserve. Adopt the current bytes so a later save is not blocked.
+            if annotationWritesBlockedReason == nil, let source = document?.url {
+                try? DocumentEditCache.recordSource(for: source)
+            }
+        } else if annotationWritesBlockedReason == nil,
            FileManager.default.fileExists(atPath: DocumentEditCache.pendingStateURL(for: url).path) {
             do {
                 let data = try Data(contentsOf: DocumentEditCache.pendingStateURL(for: url))
@@ -9938,7 +10154,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // to lose, adopt the current bytes as the new identity and carry on silently. Otherwise
         // keep every record, allow annotation editing, and let the explicit recovery action
         // reset the identity: replacing the original PDF stays blocked by `validateSource`.
-        if annotationWritesBlockedReason == nil,
+        if cleanExit == nil,
+           annotationWritesBlockedReason == nil,
            let source = document?.url {
             let status = DocumentEditCache.sourceStatus(for: source)
             let hasCachedWork = !annotations.isEmpty || !bookmarks.isEmpty
@@ -9983,6 +10200,54 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             }
         }
         if !annotationCacheIsDirty { annotationCleanSnapshot = currentAnnotationSnapshot }
+        return cleanExitCleanupSucceeded
+    }
+
+    /// Retires the unsaved annotation state of a document whose quit the reader resolved.
+    ///
+    /// Every annotation and bookmark in the cache was unsaved (a save removes the entries it
+    /// wrote), so a resolved quit clears them. Entries this build only preserves verbatim are
+    /// written back in their original order, exactly as the explicit Discard path does. A write
+    /// failure is reported and leaves the marker in place; the drafts are not restored either
+    /// way, so a failed cleanup can never turn into a surprise recovery.
+    private func discardResolvedCleanExitAnnotations(for url: URL) -> Bool {
+        guard annotationWritesBlockedReason == nil, let records = annotationsURL else {
+            return false
+        }
+        let opaqueSlots = annotationRecordSlots.filter {
+            if case .opaque = $0 { return true }
+            return false
+        }
+        do {
+            let data = try AnnotationRecords.encode(
+                annotations: [], bookmarks: [], slots: opaqueSlots)
+            try data.write(to: records, options: .atomic)
+            let clean = PendingAnnotationState(
+                dirty: false, deletions: [], erasedInk: [], cleanSnapshot: nil)
+            try JSONEncoder().encode(clean).write(
+                to: DocumentEditCache.pendingStateURL(for: url), options: .atomic)
+            annotations = []
+            bookmarks = []
+            annotationRecordSlots = opaqueSlots
+            preservedAnnotationEntryCount = opaqueSlots.count
+            pendingFileDeletions = []
+            erasedInkStrokeIDs = []
+            annotationCacheIsDirty = false
+            annotationCleanSnapshot = nil
+            FileHandle.standardError.write(Data((
+                "lyra-reader-quit: discarded the resolved unsaved annotation cache for "
+                + "\(url.lastPathComponent)\n"
+            ).utf8))
+            return true
+        } catch {
+            lastError = "The last quit was resolved, but its unsaved annotation cache could not "
+                + "be cleaned up: \(error.localizedDescription)"
+            FileHandle.standardError.write(Data((
+                "lyra-reader-quit: could not clean the resolved annotation cache for "
+                + "\(url.lastPathComponent): \(error)\n"
+            ).utf8))
+            return false
+        }
     }
 
     private struct PendingAnnotationState: Codable {
@@ -10719,6 +10984,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Test visibility for the equivalence freeze: current page → original page.
     package var pageEditCurrentToOriginalForChecks: [Int] {
         pageEditSession?.currentToOriginal ?? []
+    }
+
+    /// Why the last open did or did not restore a cached page-edit session.
+    ///
+    /// Recorded because the restore path is deliberately silent when another `AppState` in the
+    /// same process still owns the session (a tab switch or an in-process crash simulation). A
+    /// native check that hits that branch otherwise fails with only "no session", which is not
+    /// the same fact as "the manifest was missing". Production code never reads this.
+    package private(set) var lastPageEditRestoreOutcomeForChecks: String?
+
+    /// Whether an `AppState` in this process still claims the document's page-edit session.
+    package static func hasLivePageEditOwnerForChecks(at document: URL) -> Bool {
+        pageEditOwners[DocumentEditCache.recoveryURL(for: document).path]?.value != nil
     }
 
     /// The pages a command acts on: the thumbnail selection, or the current page when there is
@@ -12061,8 +12339,29 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The Rust transaction reads and validates the manifest (the PDF it names, its source
     /// stamp, the session directory and every revision URL); this reloads the revision it names
     /// and hands the saved annotations/bookmarks back to the model.
-    private func restoreCachedPageEdits(for original: URL) {
-        guard pageEditSession == nil else { return }
+    ///
+    /// With a resolved-quit marker the session is *not* restored: the reader already chose Save
+    /// or Discard, so the manifest and its working directory are retired instead. Returns false
+    /// only when that retirement could not be completed, so the marker stays for a retry.
+    @discardableResult
+    private func restoreCachedPageEdits(
+        for original: URL,
+        cleanExit: DocumentEditCache.CleanExitRecord? = nil
+    ) -> Bool {
+        lastPageEditRestoreOutcomeForChecks = "not attempted"
+        guard pageEditSession == nil else {
+            lastPageEditRestoreOutcomeForChecks = "skipped: a page-edit session is already active"
+            return true
+        }
+        if cleanExit != nil {
+            let retired = DocumentEditCache.retireResolvedRecoverySession(for: original)
+            if !retired {
+                lastError = "The last quit was resolved, but its cached editing session could not "
+                    + "be retired; it was not restored and the cleanup will be retried."
+            }
+            lastPageEditRestoreOutcomeForChecks = "resolved clean exit (retired: \(retired))"
+            return retired
+        }
         let recoveryURL = DocumentEditCache.recoveryURL(for: original)
         // The directory lookup above may have tried to migrate an old path-hash cache. If its
         // page-edit manifest could not be retargeted, the staged edits were kept in the old
@@ -12070,10 +12369,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // them.
         if let failure = DocumentEditCache.migrationFailure(for: original) {
             lastError = lastError.map { "\($0)\n\(failure)" } ?? failure
-            return
+            lastPageEditRestoreOutcomeForChecks = "skipped: migration failure: \(failure)"
+            return true
         }
-        if let owner = Self.pageEditOwners[recoveryURL.path]?.value, owner !== self { return }
-        guard FileManager.default.fileExists(atPath: recoveryURL.path) else { return }
+        if let owner = Self.pageEditOwners[recoveryURL.path]?.value, owner !== self {
+            lastPageEditRestoreOutcomeForChecks =
+                "skipped: the session is owned by another live AppState in this process"
+            return true
+        }
+        guard FileManager.default.fileExists(atPath: recoveryURL.path) else {
+            lastPageEditRestoreOutcomeForChecks = "no cached session.json"
+            return true
+        }
         do {
             let sourceStamp = try DocumentEditCache.SourceStamp(original)
             let title = document?.title ?? original.deletingPathExtension().lastPathComponent
@@ -12127,8 +12434,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             pageEditPendingOperations = session.operations
             persistPageEditRecovery()
             statusMessage = "Recovered unsaved PDF changes · Save to update \(original.lastPathComponent)"
+            lastPageEditRestoreOutcomeForChecks =
+                "restored revision \(session.revisionNumber) with \(session.operations.count) operation(s)"
+            return true
         } catch {
             lastError = "The cached editing session was kept but could not be restored: \(AnnotationRecords.message(error))"
+            lastPageEditRestoreOutcomeForChecks =
+                "failed: \(AnnotationRecords.message(error))"
+            return true
         }
     }
 
@@ -17197,7 +17510,11 @@ extension AppState {
         guard !closeRequiresReview else { reviewChangesBeforeClosing(); return }
         contentCloseRequested = false
         var destination: URL?
-        if isReadOnlyDocument {
+        let readOnly = isReadOnlyDocument
+        // The original the drafts belong to, captured before a Save Edited Copy may switch the
+        // open document to the new file.
+        let readOnlyOriginal = pageEditSession?.originalURL ?? document?.url
+        if readOnly {
             let panel = NSSavePanel()
             panel.allowedContentTypes = [.pdf]
             panel.nameFieldStringValue = "Edited document.pdf"
@@ -17207,9 +17524,36 @@ extension AppState {
         Task { @MainActor [weak self] in
             guard let self else { return }
             let saved: Bool
-            if let destination { saved = await savePageEditsCopy(to: destination) }
-            else { saved = await saveDocumentToOriginal() }
+            if let destination {
+                // Route through the same copy writers as Save As: page/content edits first (they
+                // carry the materialised annotations), otherwise the annotation/bookmark writer.
+                if pageEditHasPendingChanges || contentTextEditing {
+                    saved = await savePageEditsCopy(to: destination)
+                } else {
+                    saved = await saveAnnotatedCopy(to: destination)
+                }
+            } else {
+                saved = await saveDocumentToOriginal()
+            }
             guard saved else { return }
+            if readOnly, let readOnlyOriginal {
+                // The copy now holds the changes. Record the same resolved-quit handshake the
+                // quit prompt uses, so opening the original later cannot restore the drafts that
+                // were just saved to a copy. The original stays byte-identical.
+                guard DocumentEditCache.recordCleanExit(
+                    for: readOnlyOriginal, resolution: .save
+                ) else {
+                    lastError = "The copy was saved, but the clean exit could not be recorded; "
+                        + "the document remains open."
+                    return
+                }
+                if let openURL = pageEditSession?.originalURL ?? document?.url,
+                   openURL == readOnlyOriginal {
+                    // An annotation-only copy save leaves the shared cache dirty in memory; the
+                    // copy already carries the marks, so retire the cache before closing.
+                    guard discardResolvedCleanExitAnnotations(for: readOnlyOriginal) else { return }
+                }
+            }
             guard !hasUnsavedDocumentChanges else {
                 statusMessage = "Changes remain unsaved · the document is still open"
                 return
