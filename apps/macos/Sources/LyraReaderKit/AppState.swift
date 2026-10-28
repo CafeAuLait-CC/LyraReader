@@ -4057,6 +4057,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         openDocumentNoteID = nil
         noteGlyphTextures = [:]
         placedGlyphTextures = [:]
+        // The stamp and signature bitmaps are the fourth annotation glyph cache and were the
+        // one app-level cache with no cleanup (P3 memory audit, docs/26 §13). They are rebuild-
+        // on-demand from the annotation that asks for them, so a closed document must not keep
+        // a stamped page's textures alive. Deliberately *not* captured in `TabDocumentState`
+        // with the other glyph caches: a tab switch is a document change, `StampGlyphKey`
+        // carries no document identity, and the regenerated bitmap is pixel-identical.
+        stampGlyphTextures = [:]
         scrollYPt = 0
         contentHeightPt = 0
         contentWidthPt = 0
@@ -7253,6 +7260,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             imageData: annotation.stampImageData,
             boxPt: CGSize(width: box.widthPt, height: box.heightPt),
             cacheKey: "doc-check:\(index)")
+    }
+
+    /// How many stamp/signature glyph bitmaps `stampGlyphTextures` holds right now.
+    ///
+    /// Check-only, like ``documentStampBitmapForCheck(_:)``: it lets
+    /// `stampSignatureChecks` prove the cache is released when a document closes and that a
+    /// reopened document regenerates the same bitmap. Insertion stays private, so nothing can
+    /// use this to fill the cache behind the reader's back.
+    package var stampGlyphTextureCountForChecks: Int { stampGlyphTextures.count }
+
+    /// The BGRA bytes those bitmaps hold, so the same check can report what close released.
+    ///
+    /// The cache has no byte budget of its own; this is a measurement, not an accounting hook.
+    package var stampGlyphTextureBytesForChecks: Int {
+        stampGlyphTextures.values.reduce(0) { $0 + $1.bgra.count }
     }
 
     // MARK: - Adopting and deleting annotations the PDF carries

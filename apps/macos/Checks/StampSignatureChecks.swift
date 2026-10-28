@@ -358,6 +358,93 @@ extension ReaderChecks {
         require(afterRefusal == signedBytes,
                 "the refused in-place write leaves the signed original byte-identical")
 
+        // ── 9. The glyph cache is released at close and a reopen draws the same stamp ────
+        // `stampGlyphTextures` is the one app-level bitmap cache the P3 audit found with no
+        // close cleanup (docs/26 §13). A stamped document is the only way to fill it — CR1 has
+        // no stamp/signature annotations — so this opens a fresh copy of the PDFKit stamp
+        // written above, asks for the glyph at 100% and at 400% (two power-of-two texture
+        // scales), closes the document, and reopens it: the texture must be gone after close
+        // and byte-identical when the reopened document draws the same stamp again.
+        let cacheFixture = scratch.appendingPathComponent("stamp-cache.pdf")
+        try fileManager.copyItem(at: fixture, to: cacheFixture)
+        try writePDFKitStamp(to: cacheFixture)
+        let glyphCache = AppState(engine: try RustEngine())
+        glyphCache.setViewportSize(CGSize(width: 900, height: 700))
+        glyphCache.newTab(url: cacheFixture)
+        try await eventually("the glyph-cache fixture reads its /Stamp") {
+            glyphCache.documentAnnotations.contains(where: { $0.drawing == .stamp })
+        }
+        /// The quad the canvas was handed for the file's stamp, carrying its bitmap.
+        func stampQuad(_ state: AppState) -> CanvasPage? {
+            state.canvasPages.first { PlacementIndex.isDocumentNote($0.placement.index) }
+        }
+
+        glyphCache.zoomPercent = 100
+        glyphCache.reloadVisiblePages()
+        guard let quadAt100 = stampQuad(glyphCache) else {
+            fatalError("FAIL: at 100% the canvas is handed the stamp's glyph")
+        }
+        require(glyphCache.stampGlyphTextureCountForChecks == 1,
+                "one stamp fills exactly one glyph texture at 100% (got \(glyphCache.stampGlyphTextureCountForChecks))")
+        let bytesAt100 = glyphCache.stampGlyphTextureBytesForChecks
+        require(bytesAt100 == quadAt100.image.bgra.count,
+                "the cached texture is the bitmap the canvas draws (\(bytesAt100) bytes)")
+
+        glyphCache.zoomPercent = 400
+        glyphCache.reloadVisiblePages()
+        guard let quadAt400 = stampQuad(glyphCache) else {
+            fatalError("FAIL: at 400% the canvas is still handed the stamp's glyph")
+        }
+        require(glyphCache.stampGlyphTextureCountForChecks == 2,
+                "400% adds a deeper texture instead of replacing the 100% one (got \(glyphCache.stampGlyphTextureCountForChecks))")
+        require(quadAt400.image.pixelWidth > quadAt100.image.pixelWidth,
+                "the 400% glyph is sharper than the 100% one (\(quadAt400.image.pixelWidth) vs \(quadAt100.image.pixelWidth) px wide)")
+        let bytesAt400 = glyphCache.stampGlyphTextureBytesForChecks
+        require(bytesAt400 > bytesAt100,
+                "the two scales hold \(bytesAt400) bytes, more than the \(bytesAt100) the 100% texture alone takes")
+
+        // Closing the only tab is the real document-close path: `closeTab` → `resetDocumentState`
+        // → `invalidateTiles`, which is the same path that drops tiles, page rasters, thumbnails
+        // and backdrops.
+        glyphCache.closeTab(0)
+        require(glyphCache.document == nil, "the stamped document closes")
+        let countAfterClose = glyphCache.stampGlyphTextureCountForChecks
+        let bytesAfterClose = glyphCache.stampGlyphTextureBytesForChecks
+        print("stamp glyph cache before close: 2 textures / \(bytesAt400) bytes; "
+                + "after close: \(countAfterClose) textures / \(bytesAfterClose) bytes")
+        require(countAfterClose == 0 && bytesAfterClose == 0,
+                "closing the document releases every stamp glyph texture (got \(countAfterClose) textures / \(bytesAfterClose) bytes)")
+
+        // Reopening regenerates the texture on demand, and the pixels are the ones it drew before.
+        // The zoom survives a close, so ask for the 100% texture explicitly: the point of the
+        // comparison is that the reopened bitmap is the one this check held before the close.
+        glyphCache.zoomPercent = 100
+        glyphCache.newTab(url: cacheFixture)
+        try await eventually("the reopened stamped document reads its /Stamp again") {
+            glyphCache.documentAnnotations.contains(where: { $0.drawing == .stamp })
+        }
+        glyphCache.zoomPercent = 100
+        glyphCache.reloadVisiblePages()
+        guard let quadReopened = stampQuad(glyphCache) else {
+            fatalError("FAIL: the reopened document draws its stamp again")
+        }
+        require(glyphCache.stampGlyphTextureCountForChecks == 1,
+                "the reopened document regenerates one stamp texture on demand (got \(glyphCache.stampGlyphTextureCountForChecks))")
+        require(quadReopened.image.bgra == quadAt100.image.bgra
+                    && quadReopened.image.pixelWidth == quadAt100.image.pixelWidth
+                    && quadReopened.image.pixelHeight == quadAt100.image.pixelHeight
+                    && quadReopened.image.pointSize == quadAt100.image.pointSize,
+                "the reopened stamp is pixel-identical to the one drawn before the close")
+
+        // A switch to another document clears it as well: `StampGlyphKey` carries no document
+        // identity, so the bitmap must belong to the page list that is on screen, not outlive it.
+        let plain = scratch.appendingPathComponent("stamp-cache-plain.pdf")
+        try fileManager.copyItem(at: fixture, to: plain)
+        require(glyphCache.newTab(url: plain), "a second document opens in the same window")
+        require(glyphCache.stampGlyphTextureCountForChecks == 0,
+                "switching documents drops the previous document's stamp texture (got \(glyphCache.stampGlyphTextureCountForChecks))")
+        glyphCache.closeTab(0)
+
         print("Stamp and signature checks passed")
     }
 
