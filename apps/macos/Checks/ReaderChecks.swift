@@ -907,6 +907,19 @@ struct ReaderChecks {
             ("thumbnails", {
                 try await thumbnailChecks(url: root.appendingPathComponent("tests/fixtures/thin-lines.pdf"))
             }),
+            ("thumbnail-demand", {
+                // Only the on-screen seed rasterizes at open; a page the strip scrolls to is
+                // rasterized once, and returning to the top reuses the cache.
+                try await thumbnailDemandChecks(root: root)
+            }),
+            ("thumbnail-facing-seed", {
+                // A facing spread must seed both visible pages at open, and no more.
+                try await thumbnailFacingSeedChecks(root: root)
+            }),
+            ("thumbnail-overview", {
+                // The multi-column overview grid must fill every cell a fast scroll builds.
+                try await thumbnailOverviewChecks(root: root)
+            }),
             ("link-border-canvas", {
                 try await linkBorderCanvasChecks(url: root.appendingPathComponent("tests/fixtures/link-borders.pdf"))
             }),
