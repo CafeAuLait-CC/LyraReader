@@ -410,6 +410,45 @@ fn publish_image_asset(destination: &Path, bytes: &[u8]) -> Result<Option<String
 mod tests {
     use super::*;
     #[test]
+    #[cfg(unix)]
+    fn image_publication_reports_directory_sync_failure_after_successful_rename() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent =
+            std::env::temp_dir().join(format!("lyra-image-sync-{}", crate::marks::uuid().unwrap()));
+        fs::create_dir(&parent).unwrap();
+        let destination = parent.join("output.png");
+        // Write/search permission permits create/rename, while directory read permission
+        // is withheld specifically to fail the post-publication File::open for sync.
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o300)).unwrap();
+        let permission_failure = fs::File::open(&parent).is_err();
+        let result = publish_image_asset(&destination, b"Synthetic exported bytes");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let written = fs::read(&destination);
+        let count = fs::read_dir(&parent).unwrap().count();
+        if destination.exists() {
+            fs::remove_file(&destination).unwrap();
+        }
+        fs::remove_dir(&parent).unwrap();
+        let warning = result.unwrap();
+        assert_eq!(written.unwrap(), b"Synthetic exported bytes");
+        assert_eq!(count, 1);
+        if permission_failure {
+            assert!(
+                warning
+                    .unwrap()
+                    .contains("Image saved, but directory synchronization failed")
+            );
+            eprintln!(
+                "Exercised post-publication directory permission failure; exported bytes remained available"
+            );
+        } else {
+            eprintln!(
+                "Notice: privileged filesystem access bypassed the directory permission failure; forced sync-failure assertion was not run"
+            );
+        }
+    }
+
+    #[test]
     fn range_plans_are_disjoint_sorted_and_bounded_before_writing() {
         assert_eq!(
             groups(&json!({"ranges":" 7, 1–3, 4—6 "}), 8).unwrap(),
