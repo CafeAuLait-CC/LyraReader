@@ -299,6 +299,7 @@ extension AppState {
         card.regionNumber = entry?.regionNumber ?? ((currentRegionHistory.compactMap(\.regionNumber).max() ?? 0) + 1)
         if let entry { card.restore(entry); card.focusesComposerOnOpen = false }
         card.updateHeight(card.heightViewPt)
+        let revealsPaper = beginRegionPaperReveal(card.id)
         regionCards.append(card)
         regionContentObservers[card.id] = card.objectWillChange
             .throttle(for: .milliseconds(750), scheduler: RunLoop.main, latest: true)
@@ -307,6 +308,14 @@ extension AppState {
             }
         refreshRegionLayout(preservingScroll: true)
         scrollToRegionCard(card)
+        if revealsPaper {
+            animateRegionPaper(card.id, to: 1) { [weak self, weak card] in
+                guard let self, let card else { return }
+                self.regionPaperProgress[card.id] = nil
+                self.scrollToRegionCard(card)
+                self.reloadVisiblePages()
+            }
+        }
         let fallback = card.tearFallbackReason.map { " · \($0)" } ?? ""
         if attachment.textTruncated {
             regionStatusMessage = "Region question opened · page \(attachment.page + 1) · text truncated to \(attachment.text.count) characters.\(fallback)"
@@ -355,11 +364,18 @@ extension AppState {
 
     /// Close one card. `keepHistory` is what separates Done/Collapse from Delete: Done keeps the
     /// question and answer in Region questions, Delete does not.
-    public func closeRegionCard(
-        id: UUID,
-        keepHistory: Bool,
-        reason: String? = nil
-    ) {
+    public func closeRegionCard(id: UUID, keepHistory: Bool, reason: String? = nil) {
+        guard let card = regionCards.first(where: { $0.id == id }), !closingRegionPapers.contains(id) else { return }
+        card.assistant.cancelRegionWork(); card.notesAssistant.cancelRegionWork()
+        if canAnimateRegionPaper {
+            closingRegionPapers.insert(id)
+            animateRegionPaper(id, to: 0) { [weak self] in
+                self?.finishClosingRegionCard(id: id, keepHistory: keepHistory, reason: reason)
+            }
+        } else { finishClosingRegionCard(id: id, keepHistory: keepHistory, reason: reason) }
+    }
+
+    private func finishClosingRegionCard(id: UUID, keepHistory: Bool, reason: String?) {
         guard let index = regionCards.firstIndex(where: { $0.id == id }) else { return }
         let card = regionCards[index]
         card.assistant.cancelRegionWork()
@@ -374,6 +390,8 @@ extension AppState {
             scrollYPt = max(gapTop, scrollYPt - gapHeight)
         }
         regionCards.remove(at: index)
+        regionPaperProgress[id] = nil
+        closingRegionPapers.remove(id)
         regionContentObservers[id] = nil
         if !keepHistory, let key = regionDocumentKey {
             regionHistory[key]?.removeAll { $0.id == id }
@@ -411,6 +429,7 @@ extension AppState {
         }
         if removedShift > 0 { scrollYPt = max(0, scrollYPt - removedShift) }
         regionCards.removeAll()
+        cancelRegionPaperMotions()
         regionContentObservers.removeAll()
         persistRegionHistory()
         refreshRegionLayout(preservingScroll: false)
@@ -568,7 +587,7 @@ extension AppState {
     /// (so its typography does not scale with the document), which is why the measured height is
     /// divided by the reader's current zoom.
     package func regionGapHeightPt(_ card: AIRegionCard) -> CGFloat {
-        max(44, card.heightViewPt) / max(zoomFactor, 0.01)
+        max(44, card.heightViewPt) / max(zoomFactor, 0.01) * regionPaperRevealProgress(for: card.id)
     }
 
     var regionGapTotalPt: CGFloat {

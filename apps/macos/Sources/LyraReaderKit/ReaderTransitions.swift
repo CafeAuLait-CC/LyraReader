@@ -109,6 +109,13 @@ public struct ReaderTransitionProgress: Equatable, Sendable {
 /// schedule a raster or a tile per frame.
 @MainActor
 public enum ReaderMotion {
+    public static let paperDuration: TimeInterval = 0.22
+    public static var paperAnimation: Animation? {
+        reduceMotionEnabled ? nil : .easeInOut(duration: paperDuration)
+    }
+    static var paperTransition: AnyTransition {
+        .modifier(active: PaperUnfoldModifier(progress: 0), identity: PaperUnfoldModifier(progress: 1))
+    }
     public static let sidebarDuration: TimeInterval = 0.22
     public static let secondaryRowDuration: TimeInterval = 0.18
 

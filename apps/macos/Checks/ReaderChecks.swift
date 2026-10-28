@@ -448,6 +448,10 @@ struct ReaderChecks {
         }
         // The sidebar and secondary-row transitions on their own, while they are being worked on
         // (`LyraReaderChecks --check-transitions .`).
+        if CommandLine.arguments.contains("--check-paper-reveal") {
+            try await paperRevealChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-transitions") {
             let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await transitionChecks(root: root)
@@ -1100,6 +1104,9 @@ struct ReaderChecks {
             }),
             ("hosted-preview", {
                 try await hostedPreviewChecks(root: root)
+            }),
+            ("paper-reveal", {
+                try await paperRevealChecks(root: root)
             }),
             ("transitions", {
                 try await transitionChecks(root: root)
