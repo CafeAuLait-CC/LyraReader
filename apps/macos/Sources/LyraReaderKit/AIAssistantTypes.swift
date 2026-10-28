@@ -934,8 +934,12 @@ public final class KeychainAPIKeyStore: AIAPIKeyStore {
         for service in readServices {
             var query = baseQuery(service: service)
             query[kSecMatchLimit as String] = kSecMatchLimitOne
+            // A status check must never unlock the keychain or present an authentication UI.
+            // The explicit first request is the point where accessing secret bytes is allowed.
+            query[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail
             let status = SecItemCopyMatching(query as CFDictionary, nil)
             if status == errSecSuccess { return true }
+            if status == errSecInteractionNotAllowed { return true }
             guard status == errSecItemNotFound else { throw AIKeyStoreError.keychain(status) }
         }
         return false
@@ -1063,7 +1067,10 @@ public final class AISettingsStore: ObservableObject {
     @Published public private(set) var modelAcceptsImages: Bool
     @Published public private(set) var hasKey: Bool
     @Published public var connectionMode: AIConnectionMode {
-        didSet { defaults.set(connectionMode.rawValue, forKey: "aiConnectionMode") }
+        didSet {
+            if connectionMode != oldValue { sessionAPIKey = nil }
+            defaults.set(connectionMode.rawValue, forKey: "aiConnectionMode")
+        }
     }
     public let chatGPT: ChatGPTAccountStore
     public var canUseAI: Bool { connectionMode == .chatGPT ? chatGPT.isConnected : hasKey }
@@ -1073,6 +1080,9 @@ public final class AISettingsStore: ObservableObject {
 
     public let keyStore: any AIAPIKeyStore
     public let defaults: UserDefaults
+    /// An unlocked credential belongs to this in-memory provider session. Multi-part summaries
+    /// and follow-up questions share it; no secret is copied to defaults, caches or diagnostics.
+    private var sessionAPIKey: String?
 
     public init(
         defaults: UserDefaults = .standard,
@@ -1145,6 +1155,8 @@ public final class AISettingsStore: ObservableObject {
             return false
         }
 
+        if baseURL != endpoint.baseUrl { sessionAPIKey = nil }
+
         if let apiKey {
             let candidate = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
             if !candidate.isEmpty {
@@ -1156,6 +1168,7 @@ public final class AISettingsStore: ObservableObject {
                 }
                 do {
                     try keyStore.saveKey(candidate)
+                    sessionAPIKey = candidate
                 } catch {
                     invalidSettingsMessage = AIReadableError.message(error)
                     return false
@@ -1184,6 +1197,7 @@ public final class AISettingsStore: ObservableObject {
 
     @discardableResult
     public func clearKey() -> Bool {
+        sessionAPIKey = nil
         do {
             try keyStore.deleteKey()
             hasKey = false
@@ -1195,9 +1209,11 @@ public final class AISettingsStore: ObservableObject {
         }
     }
 
-    /// Read the key only when a request is about to start. Callers must not retain it.
+    /// Unlock lazily on the first request, then reuse for this provider session.
     public func readKey() throws -> String? {
+        if let sessionAPIKey { return sessionAPIKey }
         guard let key = try keyStore.readKey(), !key.isEmpty else { return nil }
+        sessionAPIKey = key
         return key
     }
 
