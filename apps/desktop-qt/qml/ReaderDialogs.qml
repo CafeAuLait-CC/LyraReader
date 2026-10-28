@@ -231,6 +231,8 @@ Item {
         }
         onAccepted: app.currentReader.submit("page_discard")
     }
+    QuitDialog { app: dialogs.app }
+
     FileDialog {
         id: save
         objectName: "documentSaveDialog"

@@ -16,7 +16,7 @@
 #include <cmath>
 
 namespace {
-QSet<WorkspaceController *> &workspaces() {static QSet<WorkspaceController *> all;return all;}
+QList<WorkspaceController *> &workspaces() {static QList<WorkspaceController *> all;return all;}
 QVariantList normalizedRecents(const QVariantList &entries) {
     QVariantList result;QSet<QString> seen;
     for(const auto &value:entries) {
@@ -41,10 +41,12 @@ WorkspaceController::WorkspaceController(QObject *parent) : QObject(parent) {
     connect(m_preview,&PreviewController::externalRequested,this,&WorkspaceController::openExternal);
     QSettings settings;
     m_recent = normalizedRecents(settings.value(QStringLiteral("reader/recentDocuments")).toList());
-    workspaces().insert(this);
+    workspaces().append(this);
     appendTab();
 }
-WorkspaceController::~WorkspaceController() {workspaces().remove(this);}
+WorkspaceController::~WorkspaceController() {workspaces().removeAll(this);}
+QList<WorkspaceController *> WorkspaceController::allWorkspaces(){return workspaces();}
+QuitCoordinator *WorkspaceController::quitCoordinator()const{return QuitCoordinator::instance();}
 void WorkspaceController::publishRecents(const QVariantList &entries) {
     // Signals can close another window; never keep an unguarded raw pointer across one.
     QList<QPointer<WorkspaceController>> recipients;
@@ -113,10 +115,7 @@ void WorkspaceController::openFile(const QUrl &url) {
     reader->openFile(QUrl::fromLocalFile(path));
 }
 void WorkspaceController::requestQuit() {
-    // Each reader window flushes notes, waits for writes and confirms its own drafts.
-    // A cancelled close keeps the application alive; do not bypass that with quit().
-    const auto windows=QGuiApplication::topLevelWindows();
-    for(auto *window:windows)if(window->isVisible() && window->objectName()==QStringLiteral("readerWindow"))window->close();
+    quitCoordinator()->request(this);
 }
 
 void WorkspaceController::newTab() {

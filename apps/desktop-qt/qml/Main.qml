@@ -243,6 +243,21 @@ ApplicationWindow {
     property bool closeApproved: false
     property int closingTab: -2
     property var pendingCloseReader: null
+    function prepareForQuit() {
+        if (closeOperation || pendingDocumentSave || dialogs.closePromptVisible || dialogs.saveDialog.visible) return false;
+        cancelErase();dialogs.flushAnnotation();saveReadingPosition();return true;
+    }
+    function prepareDiscardForQuit() {dialogs.cancelAnnotationDraft();}
+    function prepareQuitSave(operation) {
+        saveReadingPosition();
+        if (operation==="document_save") {
+            pendingSavePosition={reader:currentReader,position:session ? session.viewState(currentReader) : {page:currentPage,zoom:zoom,fitting:fitting}};
+            pendingPage=currentPage;pendingPageSelection=selectedPages.slice();
+        }
+        // A restore in progress keeps the previously captured viewport, without waiting
+        // for an animation frame or replacing it with an intermediate page-list position.
+        return positionRestoring ? {} : {current_page:currentPage,selected_pages:selectedPages.slice()};
+    }
     function saveReadingPosition() {
         positionTimer.stop();
         if (session && currentReader.pageCount > 0 && !positionRestoring) {
@@ -380,11 +395,11 @@ ApplicationWindow {
         if (wholeWindow) Qt.callLater(function () { root.close(); });
     }
     onClosing: function (event) {
+        if (closeApproved) return;
+        if (session && session.quitCoordinator.busy) {event.accepted=false;return;}
         if (secondaryRow==="edit" && contentController.deferAction({kind:"windowClose"})) {event.accepted=false;return;}
         cancelErase();
         if (closeOperation || dialogs.closePromptVisible) {event.accepted=false;return;}
-        if (closeApproved)
-            return;
         dialogs.flushAnnotation();
         saveReadingPosition();
         if (hasPendingCloseWork(-1)) {

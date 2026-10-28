@@ -42,7 +42,10 @@ annotations, bookmarks and pending form values, verifies a backup, then reopens 
 Save As writes a combined copy and keeps the original session open. Closing a dirty tab offers
 Save, Discard or Cancel, with pending form edits reviewed first. Failed writes keep the tab open;
 Discard clears known drafts while preserving foreign cache records. Pending ink deletions and
-their replacement strokes recover together after an interrupted process. Several newer macOS
+their replacement strokes recover together after an interrupted process. Quit collects unsaved
+tabs across every reader window, with Save All, Discard All Changes and Cancel. Copy destinations
+are collected before writing; a failed resolution keeps every window open and reports operations
+already completed. Reading positions survive an aborted Save All attempt. Several newer macOS
 features are still being ported. XFA documents keep local reading bookmarks; PDF editing and
 derivative exports are refused, including forms selected as merge inputs.
 The five exclusive secondary rows are Annotate, Edit, Fill & Sign, Export and Lyra. The Edit row

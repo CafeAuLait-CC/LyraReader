@@ -4,6 +4,7 @@
 #include "CropItem.h"
 #include "ReaderController.h"
 #include "WorkspaceController.h"
+#include "QuitCoordinator.h"
 #include "AnnotationOverlay.h"
 #include "NativeRaster.h"
 #include <QCommandLineParser>
@@ -38,6 +39,8 @@ int main(int argc, char **argv) {
     QCoreApplication::setApplicationName(QStringLiteral("LyraReader"));
     QCoreApplication::setOrganizationName(QStringLiteral("Alex"));
     QCoreApplication::setOrganizationDomain(QStringLiteral("alex.com"));
+    application.installEventFilter(QuitCoordinator::instance());
+    QObject::connect(QuitCoordinator::instance(),&QuitCoordinator::accepted,&application,&QCoreApplication::quit,Qt::QueuedConnection);
     // Installed builds have a desktop entry the portal can resolve. An uninstalled
     // development binary should not register a nonexistent desktop identity.
     if (!QStandardPaths::locate(QStandardPaths::GenericDataLocation,
