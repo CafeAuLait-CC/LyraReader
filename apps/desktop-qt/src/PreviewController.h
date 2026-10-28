@@ -30,11 +30,12 @@ public:
     Q_INVOKABLE QUrl imageUrl(double width,double deviceScale,const QString &paper) const;
     Q_INVOKABLE void jump();
     Q_INVOKABLE void openWindow();
+    Q_INVOKABLE ReaderController *createWindowReader(QObject *owner);
 signals:
     void changed();
     void statusMessage(const QString &message);
     void navigateRequested(int page,double y);
-    void newWindowRequested(const QUrl &url,int page,double y);
+    void windowRequested();
     void externalRequested(const QUrl &url);
 private:
     void imageRegion(int page,const QVariantMap &region,const QVariantList &fragments = {});

@@ -63,5 +63,7 @@ QVariantMap AuxiliaryWindowPolicy::geometry() const {
 
 void AuxiliaryWindowPolicy::returnFocus() {
     const auto owner=m_owner;
-    QTimer::singleShot(0,this,[owner]{if(owner && owner->isVisible())owner->requestActivate();});
+    // A one-shot preview destroys its policy on close. Keep the deferred activation
+    // scoped to the surviving owner instead, so that destruction cannot cancel it.
+    if(owner)QTimer::singleShot(0,owner,[owner]{if(owner && owner->isVisible())owner->requestActivate();});
 }

@@ -177,4 +177,10 @@ QUrl PreviewController::imageUrl(double width,double deviceScale,const QString &
     const auto segments=imageSegments(width,deviceScale,paper);return segments.isEmpty()?QUrl{}:segments.first().toMap().value(QStringLiteral("url")).toUrl();
 }
 void PreviewController::jump() {if(visible())emit navigateRequested(m_model.value(QStringLiteral("page")).toInt(),box(m_model.value(QStringLiteral("region")).toMap()).y());}
-void PreviewController::openWindow() {if(visible())emit newWindowRequested(m_url,m_model.value(QStringLiteral("page")).toInt(),box(m_model.value(QStringLiteral("region")).toMap()).y());}
+void PreviewController::openWindow() {if(visible() && m_source)emit windowRequested();}
+ReaderController *PreviewController::createWindowReader(QObject *owner) {
+    if(!owner || !visible() || !m_source)return nullptr;
+    auto *reader=new ReaderController(owner);
+    if(!reader->openSnapshot(m_source,m_url,m_reader ? m_reader->title() : m_url.fileName())){delete reader;return nullptr;}
+    return reader;
+}

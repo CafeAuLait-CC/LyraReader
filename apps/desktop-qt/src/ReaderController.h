@@ -18,7 +18,7 @@ struct TileSpec {
     QRectF target,render;
 };
 
-// One controller per tab; windows own independent sets of tabs.
+// One controller per tab or immutable preview; windows retain independent reader state.
 class ReaderController : public QObject {
     Q_OBJECT
     Q_PROPERTY(QVariantList pages READ pages NOTIFY documentChanged)
@@ -38,6 +38,7 @@ class ReaderController : public QObject {
     Q_PROPERTY(QString title READ title NOTIFY documentChanged)
     Q_PROPERTY(QString error READ error NOTIFY errorChanged)
     Q_PROPERTY(bool loading READ loading NOTIFY loadingChanged)
+    Q_PROPERTY(bool snapshotReadOnly READ snapshotReadOnly NOTIFY documentChanged)
     Q_PROPERTY(bool passwordRequired READ passwordRequired NOTIFY passwordRequiredChanged)
     Q_PROPERTY(qulonglong completedRasters READ completedRasters NOTIFY statisticsChanged)
     Q_PROPERTY(qulonglong discardedRasters READ discardedRasters NOTIFY statisticsChanged)
@@ -70,6 +71,10 @@ public:
     QString title() const { return m_title; }
     QString error() const { return m_error; }
     bool loading() const { return m_loading; }
+    bool snapshotReadOnly()const{return m_snapshotMode;}
+    bool openSnapshot(const std::shared_ptr<NativeRasterSource> &source,const QUrl &identity,const QString &title);
+    Q_INVOKABLE void closeSnapshot();
+    std::shared_ptr<NativeRasterSource> renderSource()const{return m_source;}
     bool passwordRequired() const { return m_passwordRequired; }
     qulonglong completedRasters() const { return m_completed; }
     qulonglong discardedRasters() const { return m_discarded; }
@@ -113,6 +118,7 @@ signals:
     void commandsChanged();
 private:
     struct Request { int page; double scale; QString key; bool embedded=false; bool tile=false; QRectF region; int priority=0; };
+    quint64 submitSnapshot(quint64 id,const QString &operation,const QVariantMap &arguments);
     void initAi();
     void resetAi();
     void handleAiCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error);
@@ -148,6 +154,7 @@ private:
     QString m_title = QStringLiteral("LyraReader");
     QString m_error;
     bool m_loading = false;
+    bool m_snapshotMode = false;
     bool m_passwordRequired = false;
     bool m_rendering = false;
     bool m_rasterRetryQueued=false;

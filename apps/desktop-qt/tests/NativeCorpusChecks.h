@@ -104,7 +104,18 @@ inline void realPapers(const QString &root) {
                 const auto entries=preview->model().value("entries").toList();QVERIFY(!entries.isEmpty());
                 for(const auto &entry:entries)QVERIFY(!entry.toMap().value("text").toString().isEmpty());
                 QVERIFY(textEvidence(view,id));preview->showEntry(0);QTRY_VERIFY_WITH_TIMEOUT(view.cropReady(),15000);QVERIFY(cropEvidence(view,id));
-                report.append(QVariantMap{{"id",id},{"pages",reader->pageCount()},{"references",references.size()},{"sourcePage",page},{"previewPage",preview->model().value("page")},{"region",preview->model().value("region")},{"fragments",preview->model().value("fragments")},{"devicePixelRatio",view.window->effectiveDevicePixelRatio()}});
+                const auto target=preview->model();preview->openWindow();
+                QPointer<QQuickWindow> auxiliary=view.window->findChild<QQuickWindow *>("pdfPreviewWindow");QVERIFY(auxiliary);QTRY_VERIFY(auxiliary->isVisible());
+                auto *snapshot=qobject_cast<ReaderController *>(auxiliary->property("previewReader").value<QObject *>());QVERIFY(snapshot);QVERIFY(snapshot->snapshotReadOnly());
+                QTRY_COMPARE_WITH_TIMEOUT(snapshot->pageCount(),reader->pageCount(),30000);QTRY_COMPARE_WITH_TIMEOUT(auxiliary->property("page").toInt(),target.value("page").toInt(),10000);
+                auto *pdf=item(auxiliary->contentItem(),"pdfPreviewPage");QVERIFY(pdf);QTRY_VERIFY_WITH_TIMEOUT(pdf->property("texturesReady").toBool(),15000);
+                snapshot->requestText(target.value("page").toInt());QTRY_COMPARE_WITH_TIMEOUT(snapshot->pendingCommands(),0,30000);
+                QVERIFY(snapshot->textPages().value(QString::number(target.value("page").toInt())).toMap().value("text").toString().size()>100);
+                QVERIFY(QMetaObject::invokeMethod(auxiliary,"changeZoom",Q_ARG(QVariant,3.0),Q_ARG(QVariant,200),Q_ARG(QVariant,160)));
+                QTRY_VERIFY_WITH_TIMEOUT(pdf->property("refined").toBool() && pdf->property("loadedTileCount").toInt()>0 && pdf->property("texturesReady").toBool(),30000);
+                const auto directory=qEnvironmentVariable("LYRA_READER_CORPUS_SNAPSHOTS");if(!directory.isEmpty())QVERIFY(auxiliary->grabWindow().save(directory+"/"+id+"-qt-window.png"));
+                report.append(QVariantMap{{"id",id},{"pages",reader->pageCount()},{"references",references.size()},{"sourcePage",page},{"previewPage",target.value("page")},{"region",target.value("region")},{"fragments",target.value("fragments")},{"devicePixelRatio",view.window->effectiveDevicePixelRatio()},{"snapshotWidth",auxiliary->width()},{"snapshotHeight",auxiliary->height()},{"snapshotDevicePixelRatio",auxiliary->effectiveDevicePixelRatio()},{"snapshotTileCount",pdf->property("loadedTileCount")}});
+                QVERIFY(auxiliary->close());QTRY_VERIFY_WITH_TIMEOUT(auxiliary.isNull(),10000);
                 preview->close();resolved=true;break;
             }
         }

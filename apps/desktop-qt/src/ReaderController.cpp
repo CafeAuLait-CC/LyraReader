@@ -99,6 +99,7 @@ void ReaderController::setError(const QString &error) {
 void ReaderController::dismissError() { setError({}); }
 
 void ReaderController::openFile(const QUrl &url, const QString &password) {
+    if(m_snapshotMode){setError(tr("This preview is read-only."));return;}
     if (!url.isLocalFile()) {
         setError(tr("Choose a local PDF file. This version cannot open remote URLs."));
         return;
@@ -184,11 +185,55 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
     }));
 }
 
+bool ReaderController::openSnapshot(const std::shared_ptr<NativeRasterSource> &source,const QUrl &identity,const QString &title) {
+    if(!source || m_document || m_source || m_snapshotMode)return false;
+    m_snapshotMode=true;m_source=source;m_lastUrl=identity;m_title=title;++m_generation;
+    m_loading=true;emit documentChanged();emit loadingChanged();
+    submit(QStringLiteral("layout"),{{QStringLiteral("mode"),QStringLiteral("Continuous")},{QStringLiteral("gap"),12}});
+    return true;
+}
+void ReaderController::closeSnapshot() {
+    if(!m_snapshotMode)return;
+    ++m_generation;clearRasterCache();m_requests.clear();m_pending.clear();m_failed.clear();
+    m_source.reset();m_pages.clear();m_textPages.clear();m_textPending.clear();m_data.clear();
+    m_documentWidth=0;m_documentHeight=0;m_loading=false;
+    emit documentReset();emit documentChanged();emit textPagesChanged();emit dataChanged();emit loadingChanged();
+}
+quint64 ReaderController::submitSnapshot(quint64 id,const QString &operation,const QVariantMap &arguments) {
+    static const QSet<QString> readable{QStringLiteral("layout"),QStringLiteral("text"),QStringLiteral("outline"),QStringLiteral("references"),QStringLiteral("figures"),QStringLiteral("page_targets"),QStringLiteral("resolve_citations")};
+    const auto source=m_source;const auto generation=m_generation;
+    if(!source || !readable.contains(operation)) {
+        const auto error=source ? tr("This preview is read-only.") : tr("This preview is closed.");
+        QMetaObject::invokeMethod(this,[this,id,operation,error]{setError(error);emit commandFinished(id,operation,{},error);},Qt::QueuedConnection);return id;
+    }
+    const bool latest=operation==QStringLiteral("layout");if(latest)m_latestRead.insert(operation,id);
+    ++m_pendingCommands;emit commandsChanged();
+    auto *watcher=new QFutureWatcher<CommandResult>(this);
+    connect(watcher,&QFutureWatcher<CommandResult>::finished,this,[this,watcher,id,operation,arguments,source,generation,latest]{
+        const auto result=watcher->result();watcher->deleteLater();--m_pendingCommands;emit commandsChanged();
+        if(source!=m_source || generation!=m_generation || (latest && m_latestRead.value(operation)!=id))return;
+        const bool opening=m_loading && operation==QStringLiteral("layout");
+        if(!result.error.isEmpty())setError(result.error);
+        else if(operation==QStringLiteral("layout")) {
+            const auto layout=result.result.toMap();m_pages=layout.value(QStringLiteral("pages")).toList();
+            m_documentWidth=layout.value(QStringLiteral("width")).toDouble();m_documentHeight=layout.value(QStringLiteral("height")).toDouble();emit documentChanged();
+        }else if(operation==QStringLiteral("text")) {
+            const auto page=arguments.value(QStringLiteral("page")).toInt();m_textPages.insert(QString::number(page),result.result);emit textPagesChanged();
+        }else {m_data.insert(operation,result.result);emit dataChanged();}
+        if(operation==QStringLiteral("text"))m_textPending.remove(arguments.value(QStringLiteral("page")).toInt());
+        if(opening){m_loading=false;emit loadingChanged();emit openFinished(result.error.isEmpty());}
+        emit commandFinished(id,operation,result.result,result.error);
+    });
+    watcher->setFuture(QtConcurrent::run([source,operation,arguments]{CommandResult result;auto request=arguments;request.insert(QStringLiteral("op"),operation);result.result=source->query(request,&result.error);return result;}));
+    return id;
+}
+
 void ReaderController::retryPassword(const QString &password) { openFile(m_lastUrl, password); }
 
 quint64 ReaderController::submit(const QString &operation, const QVariantMap &arguments) {
     const auto id = ++m_commandSequence;
     const auto document = m_document;
+    if(m_snapshotMode)return submitSnapshot(id,operation,arguments);
     if (!document) {
         QMetaObject::invokeMethod(this, [this,id,operation] {
             emit commandFinished(id, operation, {}, tr("No document is open."));
@@ -414,6 +459,9 @@ void ReaderController::startNextRaster() {
         return;
     }
     const auto request=m_requests.takeFirst();const auto generation=m_generation;const auto source=m_source;
+    // Preview snapshots have no annotation overlay: bake PDF-owned annotations into each
+    // raster without disabling PageItem's bounded tile path (the embedded-thumbnail flag).
+    const bool annotated=request.embedded || m_snapshotMode;
     m_rendering=true;m_activeRaster=ticket;m_activeRasterKey=request.key;m_activeRasterIsTile=request.tile;
     auto *watcher=new QFutureWatcher<RasterResult>(this);
     connect(watcher,&QFutureWatcher<RasterResult>::finished,this,[this,watcher,request,generation]{
@@ -439,12 +487,12 @@ void ReaderController::startNextRaster() {
         }
         emit statisticsChanged();startNextRaster();
     });
-    watcher->setFuture(QtConcurrent::run(RasterJobs::pool(),[source,request,ticket]{
+    watcher->setFuture(QtConcurrent::run(RasterJobs::pool(),[source,request,ticket,annotated]{
         RasterJobs::Run run(ticket);RasterResult result;QElapsedTimer timer;timer.start();
         if(ticket->cancelled.load()){result.cancelled=true;return result;}
         auto reservation=RenderBudget::reserve(RenderBudget::Kind::Resident,RenderBudget::maximumJobBytes);
         if(!reservation){result.pressure=true;return result;}
-        auto image=source->crop(request.page,request.region,request.scale,request.embedded,false,&result.error,&result.actualScale);
+        auto image=source->crop(request.page,request.region,request.scale,annotated,false,&result.error,&result.actualScale);
         if(!image.isNull())result.image=ResidentImage::publish(std::move(reservation),std::move(image));
         if(ticket->cancelled.load()){result.image={};result.cancelled=true;}
         result.elapsedMs=timer.elapsed();return result;

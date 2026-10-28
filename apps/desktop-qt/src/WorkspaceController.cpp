@@ -38,7 +38,6 @@ QString positionKey(const ReaderController *reader) {
 }
 
 WorkspaceController::WorkspaceController(QObject *parent) : QObject(parent) {
-    connect(m_preview,&PreviewController::newWindowRequested,this,&WorkspaceController::openInNewWindow);
     connect(m_preview,&PreviewController::externalRequested,this,&WorkspaceController::openExternal);
     QSettings settings;
     m_recent = normalizedRecents(settings.value(QStringLiteral("reader/recentDocuments")).toList());

@@ -813,6 +813,21 @@ ApplicationWindow {
         dialogs.exportMenu.y = point.y;
         dialogs.exportMenu.open();
     }
+    Component {id:pdfPreviewFactory;PdfPreviewWindow {}}
+    function showPdfPreviewWindow() {
+        if(!previewController || !previewController.visible)return null;
+        const target=previewController.model;
+        const window=pdfPreviewFactory.createObject(root,{app:root});
+        if(!window){operationStatus=qsTr("The PDF preview window could not be created.");return null;}
+        window.previewReader=previewController.createWindowReader(window);
+        window.requestedPage=target.page;window.targetRegion=target.region || ({});
+        if(!window.previewReader || !window.open()){window.destroy();operationStatus=qsTr("The PDF preview window could not be opened.");return null;}
+        previewController.close();return window;
+    }
+    Connections {
+        target:root.previewController
+        function onWindowRequested(){root.showPdfPreviewWindow();}
+    }
     function showSettings() {
         dialogs.settingsDialog.open();
     }

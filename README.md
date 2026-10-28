@@ -48,9 +48,12 @@ places text, dates, vector checkmarks/crosses, stamps and image signatures; othe
 image crop/export and the newer AI overlays remain work in progress.
 Tabs reorder after half a tab width of travel, retain their reader state, and support
 Alt+Shift+Left/Right; cross-window drag and tear-off remain work in progress.
-Settings opens as a separate resizable native dialog, with a transient owner and a bounded initial
-size. Its first map was observed floating on niri; other compositors and dedicated PDF preview
-windows still need their own acceptance.
+Settings and detached PDF previews open as resizable native dialogs, with a transient owner and a
+bounded initial size. Both were observed floating on their first map on niri while the main reader
+remained tiled; other compositors still need acceptance. Detached previews hold an immutable working
+revision, retain page navigation, tiled zoom and selectable page text after the source tab changes or
+closes, and release that revision when closed. Uncommitted annotation drafts are not added to this
+snapshot; PDF annotations already present in its working revision remain visible.
 The Linux branch is not yet a release or a claim of full feature parity.
 
 ## Capabilities

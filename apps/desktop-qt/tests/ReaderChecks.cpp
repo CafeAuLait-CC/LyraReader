@@ -18,6 +18,7 @@
 #include "AnnotationOverlay.h"
 #include "WorkspaceController.h"
 #include <QApplication>
+#include <QClipboard>
 #include <QAccessible>
 #include <QFontDatabase>
 #include <QDir>
@@ -70,6 +71,28 @@ private slots:
         qmlRegisterType<PageItem>("LyraReader", 1, 0, "PdfPage");
         qmlRegisterType<CropItem>("LyraReader",1,0,"PdfCrop");
         qmlRegisterType<AnnotationOverlay>("LyraReader",1,0,"PdfAnnotations");
+    }
+    void snapshotRastersIncludePdfAnnotationsWithoutATextureOverlay() {
+        ReaderController original;original.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/annotated.pdf"));QTRY_COMPARE_WITH_TIMEOUT(original.pageCount(),2,10000);QTRY_COMPARE_WITH_TIMEOUT(original.pendingCommands(),0,10000);QString error;const auto source=NativeRasterSource::prepare(original.documentHandle(),false,&error);QVERIFY2(source,qPrintable(error));ReaderController frozen;QVERIFY(frozen.openSnapshot(source,original.fileUrl(),"Synthetic snapshot"));QTRY_COMPARE_WITH_TIMEOUT(frozen.pageCount(),2,10000);frozen.requestPage(0,1);QTRY_VERIFY_WITH_TIMEOUT(!frozen.cachedPage(0,1).isNull(),10000);const auto page=frozen.pages().first().toMap();const QRectF region(0,0,page.value("width").toDouble(),page.value("height").toDouble());const auto marked=source->crop(0,region,1,true,false,&error),bare=source->crop(0,region,1,false,false,&error);QVERIFY2(error.isEmpty(),qPrintable(error));QCOMPARE(frozen.cachedPage(0,1),marked);QVERIFY(marked!=bare);
+    }
+    void pdfPreviewFreezesTheWorkingRevisionAndKeepsTilesAndTextAfterSave() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/snapshot.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/numeric-citations.pdf",path));
+        WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),2,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        reader->submit("page_stage",{{"operation",QVariantMap{{"InsertBlank",QVariantMap{{"index",0}}}}}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QCOMPARE(reader->pageCount(),3);reader->submit("citations",{{"page",1}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);const auto citations=reader->data().value("citations").toList();QVERIFY(!citations.isEmpty());const auto hit=citations.first().toMap();auto *preview=workspace.preview();preview->openAt(reader,1,hit.value("x_pt").toDouble()+hit.value("width_pt").toDouble()/2,hit.value("y_pt").toDouble()+hit.value("height_pt").toDouble()/2,320,200,1);QTRY_VERIFY_WITH_TIMEOUT(preview->visible(),10000);const auto target=preview->model();preview->openWindow();
+        QPointer<QQuickWindow> auxiliary=window->findChild<QQuickWindow *>("pdfPreviewWindow");QVERIFY(auxiliary);QTRY_VERIFY(auxiliary->isVisible());QCOMPARE(auxiliary->transientParent(),window);QCOMPARE(auxiliary->type(),Qt::Dialog);QVERIFY(auxiliary->minimumWidth()<auxiliary->maximumWidth());QVERIFY(!preview->visible());
+        auto *frozen=qobject_cast<ReaderController *>(auxiliary->property("previewReader").value<QObject *>());QVERIFY(frozen);QVERIFY(frozen->snapshotReadOnly());QVERIFY(!frozen->documentHandle());QTRY_COMPARE_WITH_TIMEOUT(frozen->pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(frozen->pendingCommands(),0,10000);QTRY_COMPARE(auxiliary->property("page").toInt(),target.value("page").toInt());
+        auto *pdf=visualItem(auxiliary->contentItem(),"pdfPreviewPage");auto *view=visualItem(auxiliary->contentItem(),"pdfPreviewViewport");QVERIFY(pdf && view);QTRY_VERIFY_WITH_TIMEOUT(pdf->property("texturesReady").toBool(),10000);QTRY_VERIFY(qAbs(view->property("contentY").toDouble()-qBound(0.0,pdf->y()+target.value("region").toMap().value("y_pt").toDouble()*auxiliary->property("zoom").toDouble()-16,qMax(0.0,view->property("contentHeight").toDouble()-view->height())))<2);
+        const auto evidence=qEnvironmentVariable("LYRA_READER_PDF_PREVIEW_SNAPSHOT");if(!evidence.isEmpty()){QTest::qWait(100);QVERIFY(auxiliary->grabWindow().save(evidence));}
+        reader->submit("page_stage",{{"operation",QVariantMap{{"InsertBlank",QVariantMap{{"index",0}}}}}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QCOMPARE(reader->pageCount(),4);QVERIFY(QMetaObject::invokeMethod(window,"saveDocument",Q_ARG(QVariant,false)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QCOMPARE(frozen->pageCount(),3);
+        frozen->requestText(target.value("page").toInt());QTRY_COMPARE_WITH_TIMEOUT(frozen->pendingCommands(),0,10000);const auto snapshotText=frozen->textPages().value(QString::number(target.value("page").toInt())).toMap().value("text").toString();QVERIFY(!snapshotText.trimmed().isEmpty());
+        QFile saved(path);QVERIFY(saved.open(QIODevice::ReadOnly));const auto bytes=saved.readAll();saved.close();frozen->submit("document_discard");QTRY_VERIFY(!frozen->error().isEmpty());QVERIFY(frozen->error().contains("read-only"));QVERIFY(saved.open(QIODevice::ReadOnly));QCOMPARE(saved.readAll(),bytes);saved.close();frozen->dismissError();
+        QVERIFY(QMetaObject::invokeMethod(auxiliary,"changeZoom",Q_ARG(QVariant,4.0),Q_ARG(QVariant,200),Q_ARG(QVariant,200)));QTRY_VERIFY_WITH_TIMEOUT(pdf->property("refined").toBool() && pdf->property("loadedTileCount").toInt()>0 && pdf->property("texturesReady").toBool(),15000);QVERIFY(QMetaObject::invokeMethod(auxiliary,"readText"));QTRY_VERIFY(!visualItem(auxiliary->contentItem(),"pdfPreviewText")->property("text").toString().isEmpty());
+        // QQuickTextEdit exposes CRLF paragraphs as LF; the controller and explicit page copy
+        // retain the exact engine string rather than changing the frozen text in place.
+        QCOMPARE(visualItem(auxiliary->contentItem(),"pdfPreviewText")->property("text").toString(),QString(snapshotText).replace("\r\n","\n"));QCOMPARE(frozen->textPages().value(QString::number(target.value("page").toInt())).toMap().value("text").toString(),snapshotText);
+        if(QGuiApplication::platformName()=="offscreen"){QVERIFY(QMetaObject::invokeMethod(auxiliary,"copyPageText"));QCOMPARE(QGuiApplication::clipboard()->text(),snapshotText);}
+
+        workspace.newTab();QPointer<ReaderController> closedTab=reader;workspace.closeTab(0);QTRY_VERIFY_WITH_TIMEOUT(closedTab.isNull(),10000);QVERIFY(auxiliary->isVisible());QCOMPARE(frozen->pageCount(),3);QVERIFY(QMetaObject::invokeMethod(auxiliary,"navigate",Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QTRY_COMPARE(auxiliary->property("page").toInt(),0);QTRY_VERIFY_WITH_TIMEOUT(frozen->textPages().contains("0"),10000);std::weak_ptr<NativeRasterSource> lifetime=frozen->renderSource();window->hide();QTRY_VERIFY_WITH_TIMEOUT(auxiliary.isNull(),10000);QTRY_VERIFY_WITH_TIMEOUT(lifetime.expired(),10000);
     }
     void nativeTabsReorderAfterHalfTheirWidthAndKeepReaderOwnership() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
@@ -1334,8 +1357,8 @@ private slots:
         preview->jump();QTRY_VERIFY(window->property("canGoBack").toBool());
         QVERIFY(QMetaObject::invokeMethod(window,"goBack"));
         QTRY_VERIFY(qAbs(window->property("pageList").value<QObject *>()->property("contentY").toDouble()-offset)<.1);
-        QSignalSpy newWindow(&workspace,&WorkspaceController::newWindowRequested);preview->openWindow();QCOMPARE(newWindow.size(),1);
-        QCOMPARE(newWindow.first().at(2).toDouble(),preview->model().value("region").toMap().value("y_pt").toDouble());
+        const auto target=preview->model();QSignalSpy ordinaryWindow(&workspace,&WorkspaceController::newWindowRequested);preview->openWindow();QCOMPARE(ordinaryWindow.size(),0);
+        auto *auxiliary=window->findChild<QQuickWindow *>("pdfPreviewWindow");QVERIFY(auxiliary);QTRY_VERIFY(auxiliary->isVisible());QCOMPARE(auxiliary->property("requestedPage").toInt(),target.value("page").toInt());QCOMPARE(auxiliary->property("targetRegion").toMap().value("y_pt"),target.value("region").toMap().value("y_pt"));if(qEnvironmentVariableIsSet("LYRA_READER_CHECK_PDF_AUX_OBSERVE"))QTest::qWait(1800);QVERIFY(auxiliary->close());if(qEnvironmentVariableIsSet("LYRA_READER_CHECK_PDF_AUX_OBSERVE"))QTest::qWait(800);
         workspace.openFile(QUrl::fromLocalFile(scratch.path()+"/cross-references.pdf"));
         QVERIFY(!preview->visible());reader=workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),3,10000);
         reader->submit("caption_mentions",{{"page",0}});QTRY_VERIFY_WITH_TIMEOUT(reader->data().contains("caption_mentions"),10000);

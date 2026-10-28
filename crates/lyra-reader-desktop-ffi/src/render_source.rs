@@ -2,12 +2,14 @@ use crate::document::DesktopDocument;
 use lyra_reader_core::{Rect, Size};
 use lyra_reader_ffi::api::*;
 use lyra_reader_runtime::{MAX_PAGE_BYTES, bounded_raster_scale};
+use lyra_reader_session::DocumentLayout;
 use serde_json::{Value, json};
 use std::{fs, path::PathBuf, sync::Arc};
 
 /// An immutable revision, independent of the active tab and its later page edits.
 pub struct RenderSource {
     engine: Arc<LyraReaderDocument>,
+    layout: DocumentLayout,
     _temporary: Option<OwnedDirectory>,
     _session_directory: Option<crate::session::RevisionLease>,
 }
@@ -24,6 +26,11 @@ impl RenderSource {
             .lock()
             .map_err(|_| "Page-edit state is unavailable")?;
         let engine = document.active()?;
+        let layout = document
+            .layout
+            .read()
+            .map_err(|_| "Layout state is unavailable")?
+            .clone();
         let session_directory = edits
             .directory
             .as_ref()
@@ -32,6 +39,7 @@ impl RenderSource {
         if !include_edits {
             return Ok(Self {
                 engine,
+                layout,
                 _temporary: None,
                 _session_directory: session_directory,
             });
@@ -47,6 +55,7 @@ impl RenderSource {
         {
             return Ok(Self {
                 engine,
+                layout,
                 _temporary: None,
                 _session_directory: session_directory,
             });
@@ -81,6 +90,7 @@ impl RenderSource {
         match prepared {
             Ok(engine) => Ok(Self {
                 engine,
+                layout,
                 _temporary: Some(OwnedDirectory(directory)),
                 _session_directory: session_directory,
             }),
@@ -108,6 +118,7 @@ impl RenderSource {
                     .map(|p| self.engine.page_size_pt(p))
                     .collect::<Result<Vec<_>, _>>(),
             ),
+            "layout" => crate::document::layout_value(&self.layout, &request),
             "outline" => value(self.engine.outline()),
             "text" => value(self.engine.text_page(page()?)),
             "page_targets" => Ok(

@@ -35,6 +35,30 @@ fn text(request: &Value, key: &str) -> Result<String, String> {
     arg(request, key)
 }
 
+pub(super) fn layout_value(source_layout: &DocumentLayout, r: &Value) -> Result<Value, String> {
+    let gap = r.get("gap").and_then(Value::as_f64).unwrap_or(PAGE_GAP_PT);
+    if !gap.is_finite() || !(0.0..=200.0).contains(&gap) {
+        return Err("Invalid page gap".into());
+    }
+    let mode = match r
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("Continuous")
+    {
+        "Continuous" => LayoutMode::Continuous,
+        "Facing" => LayoutMode::Facing,
+        _ => return Err("Unknown page layout".into()),
+    };
+    let sizes = source_layout
+        .placements()
+        .iter()
+        .map(|p| (p.width_pt, p.height_pt));
+    let layout = DocumentLayout::new_with_mode(sizes, gap, mode);
+    Ok(json!({"pages": layout.placements().iter().map(|p|json!({
+        "index":p.index,"top":p.top_pt,"left":p.left_pt,"width":p.width_pt,"height":p.height_pt
+    })).collect::<Vec<_>>(), "width":layout.content_width_pt(),"height":layout.content_height_pt(),"gap":gap}))
+}
+
 impl DesktopDocument {
     pub fn open(path: &Path, password: Option<&str>) -> Result<Self, String> {
         Self::open_with_cache_root(path, password, None)
@@ -286,21 +310,43 @@ impl DesktopDocument {
                     .lock()
                     .map_err(|_| "Annotation state is unavailable")?;
                 let destination = text(&r, "destination")?;
-                let original = crate::marks::Marks::load_with_root(Path::new(&destination), d.page_count(), marks.cache_root());
-                let payload=marks.payload(&d)?;
-                let prepared=crate::saving::prepare(&d,&marks.cache_location()?.directory,&r,self.password.clone())?;
-                let d=&prepared.document;
-                let clean=marks.cleaned_for_save(&payload.ids);
+                let original = crate::marks::Marks::load_with_root(
+                    Path::new(&destination),
+                    d.page_count(),
+                    marks.cache_root(),
+                );
+                let payload = marks.payload(&d)?;
+                let prepared = crate::saving::prepare(
+                    &d,
+                    &marks.cache_location()?.directory,
+                    &r,
+                    self.password.clone(),
+                )?;
+                let d = &prepared.document;
+                let clean = marks.cleaned_for_save(&payload.ids);
                 let (report, published, _) = clean.publish_page_revision(&original, || {
                     if payload.is_empty() {
-                        serde_json::to_value(d.save_edited_copy(destination).map_err(|e|e.to_string())?).map_err(|e|e.to_string())
+                        serde_json::to_value(
+                            d.save_edited_copy(destination).map_err(|e| e.to_string())?,
+                        )
+                        .map_err(|e| e.to_string())
                     } else {
-                        serde_json::to_value(d.save_annotation_changes_copy(destination,payload.annotations,payload.bookmarks,payload.updates,payload.deletions).map_err(|e|e.to_string())?).map_err(|e|e.to_string())
+                        serde_json::to_value(
+                            d.save_annotation_changes_copy(
+                                destination,
+                                payload.annotations,
+                                payload.bookmarks,
+                                payload.updates,
+                                payload.deletions,
+                            )
+                            .map_err(|e| e.to_string())?,
+                        )
+                        .map_err(|e| e.to_string())
                     }
                 })?;
-                let mut report=report;
-                report["forms"]=prepared.form_report;
-                report["cache_cleanup_error"]=json!(published.error);
+                let mut report = report;
+                report["forms"] = prepared.form_report;
+                report["cache_cleanup_error"] = json!(published.error);
                 value(Ok(report))
             }
             "save_current_annotations" | "replace_current_annotations" => {
@@ -327,7 +373,10 @@ impl DesktopDocument {
                 }
                 .map_err(|e| e.to_string())?;
                 let cleanup = if op == "replace_current_annotations" {
-                    marks.clear_saved(&payload.ids).and_then(|()| marks.after_save()).err()
+                    marks
+                        .clear_saved(&payload.ids)
+                        .and_then(|()| marks.after_save())
+                        .err()
                 } else {
                     None
                 };
@@ -336,17 +385,21 @@ impl DesktopDocument {
                 Ok(result)
             }
             "content_objects" => {
-                let snapshot = d.content_objects(arg(&r, "page")?).map_err(|e| e.to_string())?;
-                serde_json::from_str(&snapshot).map_err(|e| format!("Invalid content snapshot: {e}"))
+                let snapshot = d
+                    .content_objects(arg(&r, "page")?)
+                    .map_err(|e| e.to_string())?;
+                serde_json::from_str(&snapshot)
+                    .map_err(|e| format!("Invalid content snapshot: {e}"))
             }
-            "content_redaction_preflight" => value(d.content_redaction_raster_pages(
-                arg(&r, "page")?, arg(&r, "command")?,
-            )),
+            "content_redaction_preflight" => {
+                value(d.content_redaction_raster_pages(arg(&r, "page")?, arg(&r, "command")?))
+            }
             "info" => self.info(),
             "outline" => value(d.outline()),
             "metadata" => value(d.metadata()),
             "signature_status" => {
-                serde_json::to_value(self.source_signature(self.active()?.as_ref())).map_err(|e| e.to_string())
+                serde_json::to_value(self.source_signature(self.active()?.as_ref()))
+                    .map_err(|e| e.to_string())
             }
             "document_info" => value(d.document_info()),
             "forms" => value(d.form_info()),
@@ -376,31 +429,11 @@ impl DesktopDocument {
                 serde_json::to_value(d.index_cache_report()).map_err(|e| e.to_string())
             }
             "layout" => {
-                let gap = r.get("gap").and_then(Value::as_f64).unwrap_or(PAGE_GAP_PT);
-                if !gap.is_finite() || !(0.0..=200.0).contains(&gap) {
-                    return Err("Invalid page gap".into());
-                }
-                let mode = match r
-                    .get("mode")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Continuous")
-                {
-                    "Continuous" => LayoutMode::Continuous,
-                    "Facing" => LayoutMode::Facing,
-                    _ => return Err("Unknown page layout".into()),
-                };
                 let source_layout = self
                     .layout
                     .read()
                     .map_err(|_| "Layout state is unavailable")?;
-                let sizes = source_layout
-                    .placements()
-                    .iter()
-                    .map(|p| (p.width_pt, p.height_pt));
-                let layout = DocumentLayout::new_with_mode(sizes, gap, mode);
-                Ok(json!({"pages": layout.placements().iter().map(|p|json!({
-                    "index":p.index,"top":p.top_pt,"left":p.left_pt,"width":p.width_pt,"height":p.height_pt
-                })).collect::<Vec<_>>(), "width":layout.content_width_pt(),"height":layout.content_height_pt(),"gap":gap}))
+                layout_value(&source_layout, &r)
             }
             "bibtex" => Ok(Value::String(generate_bibtex_entry(arg(&r, "draft")?))),
             "font_coverage" => value(appearance_font_coverage(text(&r, "text")?)),
@@ -441,7 +474,7 @@ impl DesktopDocument {
             "save_edited_copy" => value(d.save_edited_copy(text(&r, "destination")?)),
             "replace_edited_pages" => value(d.replace_with_edited_pages(text(&r, "original")?)),
             "preview_redactions" | "save_redactions" | "replace_redactions" => Err(
-                "Annotation redaction has been retired. The content editor's Blackout and Erase tools are not connected in this Linux build yet.".into(),
+                "Annotation redaction has been retired. Use Edit → Redact → Blackout/Erase.".into(),
             ),
             "ai_preview" => value(
                 d.prepare_ai_plan(arg(&r, "request")?)
@@ -1668,6 +1701,53 @@ mod tests {
                 .contains("LyraReader fixture")
         );
     }
+    #[test]
+    fn frozen_preview_layout_and_text_survive_later_edits_save_and_discard() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        stage_replacement(&doc, "Frozen preview");
+        let source = crate::render_source::RenderSource::new(&doc, false).unwrap();
+        let first = source
+            .query(json!({"op":"layout","mode":"Continuous","gap":12}))
+            .unwrap();
+        stage_replacement(&doc, "Later revision");
+        doc.command(json!({"op":"page_stage","operation":{"InsertBlank":{"index":0}}}))
+            .unwrap();
+        doc.command(json!({"op":"document_save"})).unwrap();
+        assert_eq!(
+            source
+                .query(json!({"op":"layout","mode":"Continuous","gap":12}))
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            source
+                .query(json!({"op":"layout","mode":"Facing","gap":18}))
+                .unwrap()["pages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            source.query(json!({"op":"text","page":0})).unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .contains("Frozen preview")
+        );
+        assert_eq!(doc.info().unwrap()["pages"].as_array().unwrap().len(), 2);
+        let saved = fs::read(&fixture.path).unwrap();
+        assert!(source.query(json!({"op":"document_discard"})).is_err());
+        assert_eq!(fs::read(&fixture.path).unwrap(), saved);
+        doc.command(json!({"op":"document_discard"})).unwrap();
+        assert_eq!(
+            source
+                .query(json!({"op":"layout","mode":"Continuous","gap":12}))
+                .unwrap(),
+            first
+        );
+    }
+
     #[test]
     fn content_redaction_requires_explicit_raster_consent_and_keeps_other_pages() {
         let fixture = Fixture::new("form-text-pages.pdf");
