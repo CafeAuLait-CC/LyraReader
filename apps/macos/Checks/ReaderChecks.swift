@@ -244,6 +244,7 @@ struct ReaderChecks {
             return
         }
         if CommandLine.arguments.contains("--check-content-editing") {
+            try await contentScrollRecoveryChecks(root: fastRoot)
             try await contentEditingChecks(root:fastRoot)
             return
         }
@@ -979,6 +980,9 @@ struct ReaderChecks {
             }),
             ("stamp-signature", {
                 try await stampSignatureChecks(root: root)
+            }),
+            ("content-scroll-recovery", {
+                try await contentScrollRecoveryChecks(root: root)
             }),
             ("content-editing", {
                 try await contentEditingChecks(root: root)
