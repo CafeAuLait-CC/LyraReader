@@ -97,6 +97,10 @@ Item {
         if (hasDraft || !selected) return;
         submit({Delete:{revision:model.revision,target:selected.id}},model.page,false);
     }
+    function crop(rect) {
+        if (hasDraft || !selected) return;
+        submit({CropImage:{revision:model.revision,target:selected.id,crop:rect}},model.page,false);
+    }
     function setLink(bounds,page,uri) {
         if (hasDraft || !bounds) return;
         submit({SetLink:{revision:model.revision,target:selected && selected.kind==="link" ? selected.id : null,

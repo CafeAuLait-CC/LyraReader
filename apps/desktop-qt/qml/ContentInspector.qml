@@ -7,9 +7,13 @@ Pane {
     required property var app
     readonly property var editor: app.contentEditor
     readonly property var item: editor.selected
+    property bool cropping:false
+    readonly property bool croppable:!!item && (item.kind==="image" || item.kind==="graphic") &&
+        (item.paths || []).length>0 && item.paths.every(function(path){return path.length===1;})
     padding: 12
     background: Rectangle {color:app.colors.sidebarBg;border.color:app.colors.separator}
     function sync() {
+        cropping=false;cropLeft.text="0";cropTop.text="0";cropRight.text="100";cropBottom.text="100";
         const r=item ? item.bounds : {x:0,y:0,width:100,height:40};
         gx.text=String(r.x);gy.text=String(r.y);gw.text=String(r.width);gh.text=String(r.height);
         linkPage.value=item && item.link_page!==null ? item.link_page+1 : 1;
@@ -106,6 +110,33 @@ Pane {
                 Button {
                     visible:!!item && item.kind==="image";text:qsTr("Replace Image…");enabled:!editor.hasDraft
                     onClicked:editor.chooseImage(item.bounds,item.id)
+                }
+                Button {
+                    objectName:"toggleContentCrop"
+                    visible:inspector.croppable;text:qsTr("Crop…");enabled:!editor.hasDraft && app.canModifyPdf && editor.owner.pendingCommands===0
+                    onClicked:inspector.cropping=!inspector.cropping
+                }
+                ColumnLayout {
+                    visible:inspector.croppable && inspector.cropping
+                    enabled:!editor.hasDraft && editor.owner.pendingCommands===0
+                    Layout.fillWidth:true
+                    Label {text:qsTr("Retained edges (%)");color:app.colors.textSecondary}
+                    GridLayout {
+                        columns:2;Layout.fillWidth:true
+                        Label {text:qsTr("Left")}
+                        TextField {id:cropLeft;objectName:"contentCropLeft";text:"0";Layout.fillWidth:true;validator:DoubleValidator {bottom:0;top:100;locale:"C";notation:DoubleValidator.StandardNotation}Accessible.name:qsTr("Crop left edge in percent")}
+                        Label {text:qsTr("Right")}
+                        TextField {id:cropRight;objectName:"contentCropRight";text:"100";Layout.fillWidth:true;validator:DoubleValidator {bottom:0;top:100;locale:"C";notation:DoubleValidator.StandardNotation}Accessible.name:qsTr("Crop right edge in percent")}
+                        Label {text:qsTr("Top")}
+                        TextField {id:cropTop;objectName:"contentCropTop";text:"0";Layout.fillWidth:true;validator:DoubleValidator {bottom:0;top:100;locale:"C";notation:DoubleValidator.StandardNotation}Accessible.name:qsTr("Crop top edge in percent")}
+                        Label {text:qsTr("Bottom")}
+                        TextField {id:cropBottom;objectName:"contentCropBottom";text:"100";Layout.fillWidth:true;validator:DoubleValidator {bottom:0;top:100;locale:"C";notation:DoubleValidator.StandardNotation}Accessible.name:qsTr("Crop bottom edge in percent")}
+                    }
+                    Button {
+                        objectName:"applyContentCrop";text:qsTr("Apply Crop")
+                        enabled:!editor.hasDraft && app.canModifyPdf && editor.owner.pendingCommands===0 && cropLeft.acceptableInput && cropRight.acceptableInput && cropTop.acceptableInput && cropBottom.acceptableInput && Number(cropRight.text)>Number(cropLeft.text) && Number(cropBottom.text)>Number(cropTop.text)
+                        onClicked:editor.crop({x:Number(cropLeft.text)/100,y:Number(cropTop.text)/100,width:(Number(cropRight.text)-Number(cropLeft.text))/100,height:(Number(cropBottom.text)-Number(cropTop.text))/100})
+                    }
                 }
                 Label {visible:editor.tool==="link" || !!item && item.kind==="link";text:qsTr("Link destination");font.bold:true}
                 ComboBox {id:linkKind;visible:editor.tool==="link" || !!item && item.kind==="link";model:[qsTr("Page"),qsTr("Web address")];Layout.fillWidth:true}
