@@ -1,5 +1,5 @@
 import AppKit
-import LyraReaderKit
+@testable import LyraReaderKit
 
 /// Native regression for the P0 measurement layer (`LYRA_READER_PERF_TRACE=1`).
 ///
@@ -18,6 +18,7 @@ import LyraReaderKit
 /// Rust engine, with the same viewport and one identical scroll step from a settled start.
 extension ReaderChecks {
     @MainActor static func perfTraceChecks(root: URL) async throws {
+        try await perfTraceInstanceChecks(root: root)
         let fixture = root.appendingPathComponent("tests/fixtures/multipage.pdf")
         require(FileManager.default.fileExists(atPath: fixture.path),
                 "perf trace: multipage fixture exists")
@@ -64,6 +65,8 @@ extension ReaderChecks {
                         "an unavailable presentation time names its reason")
             }
         }
+        require(frames.contains { (($0["quads"] as? NSNumber)?.intValue ?? 0) > 0 },
+                "the scoped trace includes a frame with actual document pixels")
         require(frames.allSatisfy { ($0["quads"] as? NSNumber) != nil },
                 "frame records carry a quad count")
 
@@ -182,6 +185,32 @@ extension ReaderChecks {
                 "the final drawn page list is identical with the trace off")
     }
 
+    @MainActor private static func perfTraceInstanceChecks(root: URL) async throws {
+        let collector = PerfTraceCollector()
+        PerfTrace.setEnabled(true)
+        PerfTrace.setCapture { collector.append($0) }
+        let first = AppState(engine: try RustEngine())
+        let second = AppState(engine: try RustEngine())
+        defer {
+            first.closeTab(0); second.closeTab(0)
+            PerfTrace.setEnabled(false); PerfTrace.setCapture(nil)
+        }
+        let source = root.appendingPathComponent("tests/fixtures/multipage.pdf")
+        require(first.open(url: source) && second.open(url: source), "two trace instances open")
+        first.reloadVisiblePages(); second.reloadVisiblePages()
+        let records = collector.lines.compactMap(parsePerfRecord)
+        let viewports = records.filter { $0["kind"] as? String == "viewport" }
+        let instances = Set(viewports.compactMap { $0["instance"] as? String })
+        require(first.perfTraceInstanceID != second.perfTraceInstanceID && instances.count == 2,
+                "overlapping per-window sequences carry distinct instance identities")
+        for state in [first, second] {
+            let owned = viewports.filter { $0["instance"] as? String == state.perfTraceInstanceID }
+            let sequences = owned.compactMap { ($0["seq"] as? NSNumber)?.uint64Value }
+            require(!sequences.isEmpty && zip(sequences, sequences.dropFirst()).allSatisfy { $0 < $1 },
+                    "viewport sequences remain ordered within their owning instance")
+        }
+    }
+
     private struct PerfScenarioCounters {
         let insertions: Int
         let evictions: Int
@@ -227,8 +256,10 @@ extension ReaderChecks {
         let frame = CGRect(x: 0, y: 0, width: 700, height: 500)
         let window = NSWindow(contentRect: frame, styleMask: [.titled], backing: .buffered,
                               defer: false)
-        defer { window.orderOut(nil) }
+        defer { window.orderOut(nil); window.contentView = nil; state.closeTab(0) }
         let view = MetalCanvasView(frame: frame)
+        state.attachedCanvas = view
+        view.modelCommitSnapshot = { CanvasModelCommit(state: state) }
         view.onScroll = { delta in state.scroll(byScreenPoints: delta) }
         view.onViewportSize = { size in state.setViewportSize(size) }
         view.interactionSnapshot = { (state.canvasPages, state.scrollYPt, state.zoomFactor) }
@@ -236,6 +267,8 @@ extension ReaderChecks {
         view.onFailure = { fatalError("perf trace canvas regression: \($0)") }
         window.contentView = view
         window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+        view.applyModelCommit()
         NSApplication.shared.activate(ignoringOtherApps: true)
 
         try await waitForSettledCanvas(state: state, view: view, requiringSharp: tracing)
@@ -247,7 +280,11 @@ extension ReaderChecks {
 
         let stats = state.tileCacheSnapshot
         return PerfScenarioResult(
-            records: collector.lines.compactMap(parsePerfRecord),
+            records: collector.lines.compactMap(parsePerfRecord).filter {
+                // Other windows may still complete work while this scenario is recording.
+                // Engine stages have no window model; retain their numerical timing checks.
+                $0["instance"] == nil || $0["instance"] as? String == state.perfTraceInstanceID
+            },
             lines: collector.lines,
             counters: PerfScenarioCounters(
                 insertions: stats.insertions,

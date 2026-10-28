@@ -308,6 +308,11 @@ def scroll_stop_breakdown(records, inputs, sharps, idle_ms, presented, epoch_fil
 
 
 def summarize_run(records, idle_ms):
+    instances = {r.get('instance') for r in records
+                 if r.get('kind') in {'document', 'input', 'viewport', 'sharp', 'frame'}
+                 and r.get('instance')}
+    if len(instances) > 1:
+        raise ValueError('trace contains multiple reader instances; select one instance before summarizing')
     launch = next((r for r in records if r.get('kind') == 'launch'), None)
     opened = next((r for r in records if r.get('kind') == 'document'
                    and r.get('phase') == 'opened'), None)
