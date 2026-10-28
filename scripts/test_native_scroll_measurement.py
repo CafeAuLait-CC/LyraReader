@@ -146,6 +146,13 @@ class PerfTraceMetricTests(unittest.TestCase):
                 dict(kind='document', phase='open_start', time=100.05, epoch=0),
                 dict(kind='document', phase='opened', time=100.2, epoch=1, pages=115)]
 
+    def test_multiple_instances_with_reused_sequences_are_not_combined(self):
+        records = self.base() + [
+            dict(kind='viewport', instance='one', seq=1, time=101, epoch=1),
+            dict(kind='viewport', instance='two', seq=1, time=101.1, epoch=1)]
+        with self.assertRaisesRegex(ValueError, 'multiple reader instances'):
+            perf_trace.summarize_run(records, 120)
+
     def test_unreported_presentation_time_is_null_not_zero(self):
         records = self.base() + [
             dict(kind='tile', phase='enqueue', source='thumbnail', page=0, lod=0, x=0, y=0,
