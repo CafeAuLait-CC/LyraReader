@@ -1360,6 +1360,12 @@ struct ReaderChecks {
                 try checkTextSelectionParity(
                     fixture: root.appendingPathComponent("tests/fixtures/text-selection-parity.json"))
             }),
+            ("quit-unsaved", {
+                // Quit (⌘Q) with unsaved documents: Cancel, Discard All, Save All, a cancelled
+                // Save As, the clean-exit handshake, and the crash-recovery path that must keep
+                // working when no handshake was written.
+                try await quitUnsavedChecks(root: root)
+            }),
             ("xfa", {
                 // Last: this check opens the local XFA sample and leaves no window behind, but it is
                 // kept after the long-lived surface/window checks so its raster timers cannot influence

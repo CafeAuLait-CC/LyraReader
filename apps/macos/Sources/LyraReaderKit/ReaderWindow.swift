@@ -15,7 +15,7 @@ private struct ReaderConfirmationModifier: ViewModifier {
 
     private var title: String {
         if let prompt = state.rasterRedactionPrompt { return prompt.title }
-        return "Save PDF changes before closing?"
+        return UnsavedChangesPrompt.closeTitle(documentTitle: state.document?.title)
     }
 
     private var isPresented: Binding<Bool> {
@@ -36,17 +36,19 @@ private struct ReaderConfirmationModifier: ViewModifier {
             if state.rasterRedactionPrompt != nil {
                 // Cancel is the safe default: nothing exists until Continue stages the revision.
                 Button("Continue", role: .destructive) { state.confirmRasterRedaction() }
-                Button("Cancel", role: .cancel) { state.cancelRasterRedaction() }
+                Button(UnsavedChangesPrompt.cancel, role: .cancel) { state.cancelRasterRedaction() }
             } else {
                 if state.closeRequiresReview {
-                    Button("Review Changes") { state.reviewChangesBeforeClosing() }
+                    Button(UnsavedChangesPrompt.review) { state.reviewChangesBeforeClosing() }
                 } else {
-                    Button(state.isReadOnlyDocument ? "Save a Copy…" : "Save") {
+                    Button(state.isReadOnlyDocument ? UnsavedChangesPrompt.saveCopy : UnsavedChangesPrompt.save) {
                         state.saveContentAndClose()
                     }
                 }
-                Button("Discard Changes", role: .destructive) { state.discardContentAndClose() }
-                Button("Cancel", role: .cancel) { state.cancelContentClose() }
+                Button(UnsavedChangesPrompt.discard, role: .destructive) {
+                    state.discardContentAndClose()
+                }
+                Button(UnsavedChangesPrompt.cancel, role: .cancel) { state.cancelContentClose() }
             }
         } message: {
             if let prompt = state.rasterRedactionPrompt {

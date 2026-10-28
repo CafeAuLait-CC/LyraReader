@@ -472,6 +472,208 @@ import LyraReaderBindings
         try FileManager.default.createDirectory(at: result, withIntermediateDirectories: true)
         return result
     }
+
+    // MARK: - Resolved (clean) quit handshake
+
+    /// The marker that records a quit the reader resolved with Save or Discard.
+    ///
+    /// **Why a marker instead of deleting the drafts at quit.** A crash, SIGKILL or power loss
+    /// before the quit handshake must still be recoverable: the next launch offers the same
+    /// drafts it always did. Only a quit the reader actually answered writes this marker, and
+    /// the next open of that document consumes it *before* either recovery path runs, so the
+    /// resolved drafts are retired exactly once.
+    ///
+    /// The marker lives in the legacy path-keyed cache root rather than in the content-identity
+    /// directory: an external edit after the quit copies the draft files into the new identity's
+    /// directory, and the handshake has to resolve those copies too.
+    package struct CleanExitRecord: Codable, Equatable {
+        package let version: Int
+        package let resolution: String
+        package let resolvedAt: Double
+        /// Whether `session.json` existed when the quit was resolved. A session that appears
+        /// later (which a normal quit cannot do) invalidates the marker rather than looking like
+        /// the resolved one.
+        package let hadPageEditSession: Bool
+        package let sessionDirectory: String?
+        package let sessionRevision: UInt32?
+        package let sessionOperationCount: Int?
+        /// SHA-256 of `changes.json` at the moment the quit was resolved, or nil when the file
+        /// did not exist. New annotation work rewrites that file, which makes a marker left over
+        /// from an abort stale instead of swallowing the new work on the next launch.
+        package let changesDigest: String?
+    }
+
+    package enum CleanExitResolution: String, Sendable {
+        case save
+        case discard
+    }
+
+    private static func cleanExitURL(for document: URL) -> URL {
+        root.appendingPathComponent(legacyKey(for: document) + ".clean-exit.json")
+    }
+
+    private static func fileDigest(_ url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Whether a resolved-quit marker is present, for diagnostics and the native checks.
+    package static func hasCleanExitMarker(for document: URL) -> Bool {
+        FileManager.default.fileExists(atPath: cleanExitURL(for: document).path)
+    }
+
+    private struct RecoveryFingerprint {
+        let directory: String?
+        let revision: UInt32?
+        let operationCount: Int?
+    }
+
+    /// The stable identity of the recovery session: its directory, revision and operation count.
+    /// A termination flush rewrites `session.json` without changing any of them, so a flush
+    /// between the marker write and process exit cannot invalidate the handshake.
+    private static func recoveryFingerprint(for document: URL) -> RecoveryFingerprint? {
+        guard let data = try? Data(contentsOf: recoveryURL(for: document)),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let root = object as? [String: Any],
+              let session = root["session"] as? [String: Any] else { return nil }
+        return RecoveryFingerprint(
+            directory: session["directory"] as? String,
+            revision: (session["revisionNumber"] as? NSNumber)?.uint32Value,
+            operationCount: (session["operations"] as? [Any])?.count
+        )
+    }
+
+    /// Records the reader's resolved quit for `document`.
+    ///
+    /// Writes nothing but this marker: the drafts stay where they are until the next open, so a
+    /// crash after the decision and before exit still cannot lose the bytes the reader has not
+    /// seen resolved. Returns false when the marker itself cannot be written; the caller must
+    /// then abort the quit instead of claiming a clean exit.
+    @discardableResult
+    package static func recordCleanExit(
+        for document: URL,
+        resolution: CleanExitResolution
+    ) -> Bool {
+        let hadSession = FileManager.default.fileExists(atPath: recoveryURL(for: document).path)
+        let fingerprint = recoveryFingerprint(for: document)
+        let record = CleanExitRecord(
+            version: 1,
+            resolution: resolution.rawValue,
+            resolvedAt: Date().timeIntervalSince1970,
+            hadPageEditSession: hadSession,
+            sessionDirectory: fingerprint?.directory,
+            sessionRevision: fingerprint?.revision,
+            sessionOperationCount: fingerprint?.operationCount,
+            changesDigest: fileDigest(pendingStateURL(for: document))
+        )
+        do {
+            let data = try JSONEncoder().encode(record)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            try data.write(to: cleanExitURL(for: document), options: .atomic)
+            FileHandle.standardError.write(Data((
+                "lyra-reader-quit: recorded a resolved \(resolution.rawValue) quit for "
+                + "\(document.lastPathComponent)\n"
+            ).utf8))
+            return true
+        } catch {
+            FileHandle.standardError.write(Data((
+                "lyra-reader-quit: could not record the resolved quit for "
+                + "\(document.lastPathComponent): \(error)\n"
+            ).utf8))
+            return false
+        }
+    }
+
+    /// The marker for `document` when it still describes the drafts on disk.
+    ///
+    /// A marker whose page-edit session was replaced by a later session is stale: it is removed
+    /// and normal recovery is allowed. An unreadable session cannot be compared, so it still
+    /// counts as the resolved one — restoring a manifest that no longer parses is not recovery.
+    package static func resolvedCleanExit(for document: URL) -> CleanExitRecord? {
+        let url = cleanExitURL(for: document)
+        guard let data = try? Data(contentsOf: url),
+              let record = try? JSONDecoder().decode(CleanExitRecord.self, from: data),
+              record.version == 1 else { return nil }
+
+        // New annotation work after the marker rewrites changes.json; that makes the marker
+        // stale, and the new draft must be recovered rather than resolved away.
+        guard fileDigest(pendingStateURL(for: document)) == record.changesDigest else {
+            FileHandle.standardError.write(Data((
+                "lyra-reader-quit: unsaved annotation work appeared after the resolved quit; "
+                + "keeping recovery for \(document.lastPathComponent)\n"
+            ).utf8))
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        }
+
+        let manifest = recoveryURL(for: document)
+        let manifestExists = FileManager.default.fileExists(atPath: manifest.path)
+        guard record.hadPageEditSession else {
+            if manifestExists {
+                FileHandle.standardError.write(Data((
+                    "lyra-reader-quit: a page-edit session appeared after the resolved quit; "
+                    + "keeping recovery for \(document.lastPathComponent)\n"
+                ).utf8))
+                try? FileManager.default.removeItem(at: url)
+                return nil
+            }
+            return record
+        }
+        guard manifestExists else { return record }
+        guard let fingerprint = recoveryFingerprint(for: document) else { return record }
+        if fingerprint.directory == record.sessionDirectory,
+           fingerprint.revision == record.sessionRevision,
+           fingerprint.operationCount == record.sessionOperationCount {
+            return record
+        }
+        FileHandle.standardError.write(Data((
+            "lyra-reader-quit: the resolved quit marker is older than the cached editing session; "
+            + "keeping recovery for \(document.lastPathComponent)\n"
+        ).utf8))
+        try? FileManager.default.removeItem(at: url)
+        return nil
+    }
+
+    /// Removes the marker after the launch-side cleanup succeeded. A cleanup failure leaves it
+    /// in place so the next open retries; the drafts are never restored meanwhile.
+    package static func clearCleanExit(for document: URL) {
+        try? FileManager.default.removeItem(at: cleanExitURL(for: document))
+    }
+
+    /// Retires the resolved page-edit session without restoring it.
+    ///
+    /// The manifest is moved aside, never deleted, and the session directory it names is removed
+    /// only when it is a `session-*` child of this document's cache directory. The reader already
+    /// chose Save or Discard, so this is the deferred half of that decision, not a silent discard
+    /// during the quit.
+    @discardableResult
+    package static func retireResolvedRecoverySession(for document: URL) -> Bool {
+        let manifest = recoveryURL(for: document)
+        guard FileManager.default.fileExists(atPath: manifest.path) else { return true }
+        let cacheDirectory = directory(for: document).standardizedFileURL
+        if let directoryString = recoveryFingerprint(for: document)?.directory,
+           let sessionDirectory = URL(string: directoryString)?.standardizedFileURL,
+           sessionDirectory.path.hasPrefix(cacheDirectory.path + "/"),
+           sessionDirectory.lastPathComponent.hasPrefix("session-") {
+            try? FileManager.default.removeItem(at: sessionDirectory)
+        }
+        let manager = FileManager.default
+        var retired = manifest.appendingPathExtension("resolved")
+        if manager.fileExists(atPath: retired.path) {
+            retired = manifest.deletingLastPathComponent()
+                .appendingPathComponent("session-\(UUID().uuidString).resolved.json")
+        }
+        do {
+            try manager.moveItem(at: manifest, to: retired)
+            return true
+        } catch {
+            FileHandle.standardError.write(Data((
+                "lyra-reader-quit: could not retire the resolved editing session for "
+                + "\(document.lastPathComponent): \(error)\n"
+            ).utf8))
+            return false
+        }
+    }
 }
 
 extension String {
