@@ -2377,32 +2377,3 @@ public struct PDFCanvasView: NSViewRepresentable {
         if let fileDrop { fileDrop.connect(view) }
     }
 }
-
-/// Precise devices carry system acceleration. Discrete wheels scale with event cadence;
-/// a pause or reversal resets the gain, and no velocity survives the final event.
-public struct WheelMotion {
-    public static let pointsPerLine: CGFloat = 40
-    private var lastTime: TimeInterval?
-    private var lastDelta: CGFloat = 0
-    public init() {}
-    public mutating func reset() {
-        lastTime = nil
-        lastDelta = 0
-    }
-    public mutating func delta(scrollingDeltaY: CGFloat, precise: Bool, timestamp: TimeInterval) -> CGFloat {
-        if precise {
-            reset()
-            return -scrollingDeltaY
-        }
-        guard scrollingDeltaY != 0 else { return 0 }
-        var gain: CGFloat = 1
-        if let lastTime, timestamp > lastTime, scrollingDeltaY * lastDelta > 0 {
-            // 100 ms per event is a deliberate line scroll; faster turns increase the distance,
-            // up to 3x at 33 ms. This uses the current rate rather than the length of a burst.
-            gain = min(3, max(1, CGFloat(0.1 / (timestamp - lastTime))))
-        }
-        lastTime = timestamp
-        lastDelta = scrollingDeltaY
-        return -scrollingDeltaY * Self.pointsPerLine * gain
-    }
-}

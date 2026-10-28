@@ -640,6 +640,7 @@ struct ReaderChecks {
                     mentionsURL: root.appendingPathComponent("tests/fixtures/cross-references.pdf"))
             } else {
                 scrollGlideTailChecks()
+                try wheelGestureReplayChecks(root: root)
                 try await scrollTailDriverChecks(
                     url: fastRoot.appendingPathComponent("tests/fixtures/multipage.pdf"))
             }
@@ -838,11 +839,13 @@ struct ReaderChecks {
                 var wheel = WheelMotion()
                 let first = wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 1)
                 let fast = wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 1.05)
-                require(first == 40 && fast > first, "wheel has useful step and burst acceleration")
-                require(wheel.delta(scrollingDeltaY: 1, precise: false, timestamp: 1.1) == -40,
-                        "reversing wheel resets acceleration")
-                require(wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 2) == 40,
-                        "pausing wheel resets acceleration")
+                require(first == 25 && fast == first, "wheel cadence does not accelerate delivered system deltas twice")
+                require(wheel.delta(scrollingDeltaY: -3, precise: false, timestamp: 1.075) == 75,
+                        "wheel preserves acceleration already delivered by macOS")
+                require(wheel.delta(scrollingDeltaY: 1, precise: false, timestamp: 1.1) == -25,
+                        "reversing wheel changes direction immediately")
+                require(wheel.delta(scrollingDeltaY: -1, precise: false, timestamp: 2) == 25,
+                        "pausing wheel carries no retained acceleration")
                 require(wheel.delta(scrollingDeltaY: 2.5, precise: true, timestamp: 2.1) == -2.5,
                         "trackpad preserves system precision and direction")
                 let textEngine = try RustEngine()
@@ -1165,6 +1168,7 @@ struct ReaderChecks {
             }),
             ("scroll-glide-tail", {
                 scrollGlideTailChecks()
+                try wheelGestureReplayChecks(root: root)
             }),
             ("scroll-tail-driver", {
                 try await scrollTailDriverChecks(url: b)
