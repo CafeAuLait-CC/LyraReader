@@ -1,5 +1,5 @@
 import AppKit
-import LyraReaderKit
+@testable import LyraReaderKit
 
 /// Native regression for the P0 measurement layer (`LYRA_READER_PERF_TRACE=1`).
 ///
@@ -65,6 +65,8 @@ extension ReaderChecks {
                         "an unavailable presentation time names its reason")
             }
         }
+        require(frames.contains { (($0["quads"] as? NSNumber)?.intValue ?? 0) > 0 },
+                "the scoped trace includes a frame with actual document pixels")
         require(frames.allSatisfy { ($0["quads"] as? NSNumber) != nil },
                 "frame records carry a quad count")
 
@@ -254,8 +256,10 @@ extension ReaderChecks {
         let frame = CGRect(x: 0, y: 0, width: 700, height: 500)
         let window = NSWindow(contentRect: frame, styleMask: [.titled], backing: .buffered,
                               defer: false)
-        defer { window.orderOut(nil) }
+        defer { window.orderOut(nil); window.contentView = nil; state.closeTab(0) }
         let view = MetalCanvasView(frame: frame)
+        state.attachedCanvas = view
+        view.modelCommitSnapshot = { CanvasModelCommit(state: state) }
         view.onScroll = { delta in state.scroll(byScreenPoints: delta) }
         view.onViewportSize = { size in state.setViewportSize(size) }
         view.interactionSnapshot = { (state.canvasPages, state.scrollYPt, state.zoomFactor) }
@@ -263,6 +267,8 @@ extension ReaderChecks {
         view.onFailure = { fatalError("perf trace canvas regression: \($0)") }
         window.contentView = view
         window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+        view.applyModelCommit()
         NSApplication.shared.activate(ignoringOtherApps: true)
 
         try await waitForSettledCanvas(state: state, view: view, requiringSharp: tracing)
