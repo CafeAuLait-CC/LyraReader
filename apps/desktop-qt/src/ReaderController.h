@@ -87,6 +87,8 @@ public:
     Q_INVOKABLE void setLayout(const QString &mode, double gap);
     Q_INVOKABLE double zoomOffset(double offset, double anchor, double oldZoom, double newZoom) const;
     Q_INVOKABLE QVariantMap signatureImage(const QUrl &url) const;
+    Q_INVOKABLE QUrl contentPreviewUrl(int page,const QString &target,const QString &revision,
+                                      double width,double height,double deviceScale);
     std::shared_ptr<LyraReaderDesktopDocument> documentHandle()const{return m_document;}
     void requestPage(int page, double scale,bool embedded=false);
     void requestPageForConsumer(quintptr consumer,int page,double scale,bool embedded=false);
@@ -117,6 +119,8 @@ signals:
     void textPagesChanged();
     void commandsChanged();
 private:
+    void setRasterSource(std::shared_ptr<NativeRasterSource> source);
+    QString m_contentSourceKey;
     struct Request { int page; double scale; QString key; bool embedded=false; bool tile=false; QRectF region; int priority=0; };
     quint64 submitSnapshot(quint64 id,const QString &operation,const QVariantMap &arguments);
     void initAi();

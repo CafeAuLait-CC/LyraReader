@@ -939,6 +939,7 @@ dependencies = [
  "lyra-reader-core",
  "lyra-reader-edit",
  "lyra-reader-ffi",
+ "lyra-reader-pdfium",
  "lyra-reader-runtime",
  "lyra-reader-session",
  "serde",

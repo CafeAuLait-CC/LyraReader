@@ -4,12 +4,20 @@ use lyra_reader_ffi::api::*;
 use lyra_reader_runtime::{MAX_PAGE_BYTES, bounded_raster_scale};
 use lyra_reader_session::DocumentLayout;
 use serde_json::{Value, json};
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{
+    fs,
+    io::{Read, Seek, SeekFrom},
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 /// An immutable revision, independent of the active tab and its later page edits.
 pub struct RenderSource {
     engine: Arc<LyraReaderDocument>,
     layout: DocumentLayout,
+    // Pin the inode across atomic Save/Save As without copying every PDF at open. Optional
+    // preview failure must not disable ordinary page rendering if the path is unavailable.
+    image_file: Result<Mutex<fs::File>, String>,
     _temporary: Option<OwnedDirectory>,
     _session_directory: Option<crate::session::RevisionLease>,
 }
@@ -38,6 +46,7 @@ impl RenderSource {
             .transpose()?;
         if !include_edits {
             return Ok(Self {
+                image_file: Self::pin_image_file(&engine),
                 engine,
                 layout,
                 _temporary: None,
@@ -54,6 +63,7 @@ impl RenderSource {
             && payload.deletions.is_empty()
         {
             return Ok(Self {
+                image_file: Self::pin_image_file(&engine),
                 engine,
                 layout,
                 _temporary: None,
@@ -89,6 +99,7 @@ impl RenderSource {
         })();
         match prepared {
             Ok(engine) => Ok(Self {
+                image_file: Self::pin_image_file(&engine),
                 engine,
                 layout,
                 _temporary: Some(OwnedDirectory(directory)),
@@ -99,6 +110,44 @@ impl RenderSource {
                 Err(error)
             }
         }
+    }
+    fn pin_image_file(engine: &LyraReaderDocument) -> Result<Mutex<fs::File>, String> {
+        fs::File::open(engine.path())
+            .map(Mutex::new)
+            .map_err(|e| format!("The image preview source is unavailable: {e}"))
+    }
+    pub fn image_png(&self, page: u32, target: &str, revision: &str) -> Result<Vec<u8>, String> {
+        let source = self.image_file.as_ref().map_err(Clone::clone)?;
+        let mut source = source
+            .lock()
+            .map_err(|_| "The image preview source must be reopened")?;
+        let length = source.metadata().map_err(|e| e.to_string())?.len();
+        // Preview-only input limit, independent of normal PDF reading. Original image pixels
+        // still pass the shared 40 MP check before PDFium decodes the bitmap.
+        if length > 512 * 1024 * 1024 {
+            return Err(
+                "This PDF is too large for embedded image previews. You can still read it.".into(),
+            );
+        }
+        let capacity = usize::try_from(length)
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .ok_or("The image preview source is too large")?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(|_| "There is not enough memory to prepare the image preview")?;
+        source.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        (&mut *source)
+            .take(length + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if u64::try_from(bytes.len()).map_err(|e| e.to_string())? != length {
+            return Err("The image preview source changed while it was read".into());
+        }
+        drop(source);
+        lyra_reader_pdfium::content_edit::content_image_from_bytes(&bytes, page, target, revision)
+            .map_err(|e| e.to_string())
     }
     pub fn query(&self, request: Value) -> Result<Value, String> {
         let page = || {

@@ -1076,24 +1076,45 @@ fn new_image<'a>(
 }
 
 pub fn content_image(source: &Path, index: u32, target: &str, revision: &str) -> Result<Vec<u8>> {
-    let snapshot = inspect_content(source, index)?;
-    if snapshot.revision != revision {
+    content_image_from_bytes(
+        &fs::read(source).map_err(pdf_error)?,
+        index,
+        target,
+        revision,
+    )
+}
+
+/// Reads the selected original bitmap from exactly these revision bytes. Image identity comes
+/// from the same object walk as the editor; link/text layout postprocessing cannot change it.
+pub fn content_image_from_bytes(
+    bytes: &[u8],
+    index: u32,
+    target: &str,
+    revision: &str,
+) -> Result<Vec<u8>> {
+    let actual_revision = fingerprint(bytes);
+    if actual_revision != revision {
         return Err(failure("The image belongs to an older document revision."));
     }
+    let frames = layout::frames(bytes, index)?;
+    let snapshot = {
+        let pdfium = pdfium_instance()?;
+        let _guard = crate::backend::lock_pdfium()?;
+        let document = pdfium
+            .load_pdf_from_byte_slice(bytes, None)
+            .map_err(pdf_error)?;
+        inspect_open(&document, index, actual_revision, &frames)?
+    };
     let item = snapshot
         .items
         .iter()
         .find(|i| i.id == target && i.kind == "image")
         .ok_or_else(|| failure("Select a bitmap image to export."))?;
-    let bytes = fs::read(source).map_err(pdf_error)?;
-    if fingerprint(&bytes) != snapshot.revision {
-        return Err(failure("The source changed while exporting this image."));
-    }
     let path = item
         .paths
         .first()
         .ok_or_else(|| failure("The image path is empty."))?;
-    let pixels = image_pixels::read(&bytes, index, path)?;
+    let pixels = image_pixels::read(bytes, index, path)?;
     let mut output = Vec::new();
     {
         let mut encoder = png::Encoder::new(&mut output, pixels.width, pixels.height);

@@ -33,6 +33,7 @@ static const char *graphicsName(QSGRendererInterface::GraphicsApi api) {
 
 int main(int argc, char **argv) {
     QApplication application(argc, argv);
+    if(lyra_reader_desktop_abi_version()!=LYRA_READER_DESKTOP_ABI_VERSION){qCritical("The Rust document service version does not match this application.");return 2;}
     QFontDatabase::addApplicationFont(QStringLiteral(":/fonts/LyraReaderSansSC-Regular.ttf"));
     QCoreApplication::setApplicationName(QStringLiteral("LyraReader"));
     QCoreApplication::setOrganizationName(QStringLiteral("Alex"));

@@ -8,6 +8,7 @@
 #include <QMutex>
 #include <QUuid>
 #include <QUrlQuery>
+#include <QScopeGuard>
 #include <cmath>
 
 namespace {
@@ -56,6 +57,34 @@ QImage NativeRasterSource::crop(int page,const QRectF &region,double scale,bool 
     auto *pixels=new LyraReaderBuffer(bitmap.pixels);
     return QImage(pixels->data,int(bitmap.width),int(bitmap.height),int(bitmap.stride),QImage::Format_ARGB32,releasePixels,pixels);
 }
+QImage NativeRasterSource::contentImage(int page,const QString &target,const QString &revision,
+                                      const QSize &bounds,qint64 maximumBytes,QString *error)const {
+    if(page<0 || bounds.isEmpty() || bounds.width()>2048 || bounds.height()>2048 || maximumBytes<4){*error=QStringLiteral("Invalid image preview dimensions.");return {};}
+    const auto id=target.toUtf8(),version=revision.toUtf8();LyraReaderBuffer output{},failure{};
+    if(!lyra_reader_desktop_source_image_png(m_source.get(),std::uint32_t(page),
+        reinterpret_cast<const std::uint8_t *>(id.constData()),std::size_t(id.size()),
+        reinterpret_cast<const std::uint8_t *>(version.constData()),std::size_t(version.size()),&output,&failure)){
+        *error=takeError(failure);return {};
+    }
+    const auto cleanup=qScopeGuard([&]{lyra_reader_desktop_buffer_free(output);});
+    if(!output.data || output.len>192ULL*1024*1024){*error=QStringLiteral("Invalid image preview buffer.");return {};}
+    // Borrow the owned PNG during decoding, without a second copy or a base64 transport.
+    QBuffer buffer;buffer.setData(QByteArray::fromRawData(reinterpret_cast<const char *>(output.data),qsizetype(output.len)));
+    if(!buffer.open(QIODevice::ReadOnly)){*error=QStringLiteral("The image preview buffer could not be opened.");return {};}
+    QImageReader reader(&buffer,"png");const auto size=reader.size();
+    if(size.isEmpty() || quint64(size.width())*quint64(size.height())>40000000){*error=QStringLiteral("Invalid image preview size.");return {};}
+    const double scale=qMin(1.0,qMin(double(bounds.width())/size.width(),double(bounds.height())/size.height()));
+    QSize targetSize(qMax(1,int(std::floor(size.width()*scale))),qMax(1,int(std::floor(size.height()*scale))));
+    // At most eleven halvings from 2048 px: even extreme 1×N images respect a tiny budget.
+    while(qint64(targetSize.width())*targetSize.height()>maximumBytes/4)
+        targetSize={qMax(1,targetSize.width()/2),qMax(1,targetSize.height()/2)};
+    reader.setScaledSize(targetSize);auto image=reader.read();
+    if(image.isNull()){*error=reader.errorString();return {};}
+    if(image.size()!=targetSize)image=image.scaled(targetSize,Qt::IgnoreAspectRatio,Qt::SmoothTransformation);
+    image=image.convertToFormat(QImage::Format_ARGB32);
+    if(image.isNull() || image.sizeInBytes()>maximumBytes){*error=QStringLiteral("The image preview exceeded its pixel budget.");return {};}
+    return image;
+}
 QString NativeImageProvider::registerSource(const std::shared_ptr<NativeRasterSource> &source) {
     const auto key=QUuid::createUuid().toString(QUuid::WithoutBraces);
     QMutexLocker lock(&sourcesMutex);sources.insert(key,source);return key;
@@ -73,7 +102,8 @@ QSize NativeImageProvider::artworkSize(const QByteArray &encoded) {
     if(size.isEmpty() || size.width()>8192 || size.height()>8192 || qint64(size.width())*size.height()>16LL*1024*1024)return {};
     return size;
 }
-QImage NativeImageProvider::rawImage(const QUrl &url,qint64 maximumBytes) {
+QImage NativeImageProvider::rawImage(const QUrl &url,qint64 maximumBytes,QString *failure) {
+    QString localError;auto *error=failure ? failure : &localError;
     if(url.scheme()==QStringLiteral("data")) {
         const auto path=url.path();const auto comma=path.indexOf(',');
         if(comma<0 || (path.left(comma)!=QStringLiteral("image/png;base64") && path.left(comma)!=QStringLiteral("image/jpeg;base64")) || path.size()>12*1024*1024 || maximumBytes<4)return {};
@@ -100,14 +130,21 @@ QImage NativeImageProvider::rawImage(const QUrl &url,qint64 maximumBytes) {
     bool ok=false;const int page=path.last().toInt(&ok);
     if(!ok || page<0)return {};
     const QUrlQuery query(url);
+    if(query.queryItemValue(QStringLiteral("kind"))==QStringLiteral("bitmap")){
+        bool widthOk=false,heightOk=false;
+        const auto width=query.queryItemValue(QStringLiteral("width")).toInt(&widthOk),height=query.queryItemValue(QStringLiteral("height")).toInt(&heightOk);
+        if(!widthOk || !heightOk){*error=QStringLiteral("Invalid content preview size.");return {};}
+        return source->contentImage(page,query.queryItemValue(QStringLiteral("target")),query.queryItemValue(QStringLiteral("revision")),{width,height},maximumBytes,error);
+    }
     const auto number=[&](const QString &key){bool valid=false;const double value=query.queryItemValue(key).toDouble(&valid);return valid ? value : std::nan("");};
     const QRectF region(number(QStringLiteral("x")),number(QStringLiteral("y")),number(QStringLiteral("w")),number(QStringLiteral("h")));
-    QString error;
     double scale=number(QStringLiteral("scale"));
     if(region.isEmpty() || !std::isfinite(scale) || scale<=0 || maximumBytes<4)return {};
     scale=qMin(scale,std::sqrt(double(maximumBytes)/(4*region.width()*region.height())));
     while(std::ceil(region.width()*scale)*std::ceil(region.height()*scale)*4>maximumBytes)scale*=.99;
-    return source->crop(page,region,scale,true,false,&error);
+    const auto annotations=query.queryItemValue(QStringLiteral("annotations"));
+    if(query.hasQueryItem(QStringLiteral("annotations")) && annotations!=QStringLiteral("0") && annotations!=QStringLiteral("1")){*error=QStringLiteral("Invalid preview annotation flag.");return {};}
+    return source->crop(page,region,scale,annotations!=QStringLiteral("0"),false,error);
 }
 QImage NativeImageProvider::requestImage(const QString &id,QSize *size,const QSize &) {
     const QUrl url(QStringLiteral("image://lyrapreview/")+id);const QUrlQuery query(url);

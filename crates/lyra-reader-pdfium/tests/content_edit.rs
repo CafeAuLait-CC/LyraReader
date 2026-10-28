@@ -1239,3 +1239,44 @@ fn grayscale_and_nested_image_exports_preserve_pixels_without_stride_padding() {
         }
     }
 }
+
+#[test]
+fn image_revision_bytes_do_not_reopen_a_replaced_source_path() {
+    let source = embedded_image_fixture(
+        "image-revision-bytes",
+        3,
+        2,
+        vec![10, 20, 30, 40, 50, 60],
+        true,
+    );
+    let snapshot = inspect_content(&source, 0).unwrap();
+    let item = snapshot.items.iter().find(|i| i.kind == "image").unwrap();
+    let bytes = std::fs::read(&source).unwrap();
+    let expected = content_image(&source, 0, &item.id, &snapshot.revision).unwrap();
+    std::fs::write(&source, b"An unrelated replacement").unwrap();
+    assert_eq!(
+        lyra_reader_pdfium::content_edit::content_image_from_bytes(
+            &bytes,
+            0,
+            &item.id,
+            &snapshot.revision
+        )
+        .unwrap(),
+        expected
+    );
+    assert!(
+        lyra_reader_pdfium::content_edit::content_image_from_bytes(&bytes, 0, &item.id, "stale")
+            .is_err()
+    );
+    for page in [1, u32::MAX] {
+        let error = lyra_reader_pdfium::content_edit::content_image_from_bytes(
+            &bytes,
+            page,
+            &item.id,
+            &snapshot.revision,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("page does not exist"));
+    }
+    assert_eq!(std::fs::read(&source).unwrap(), b"An unrelated replacement");
+}

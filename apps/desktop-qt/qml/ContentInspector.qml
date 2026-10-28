@@ -1,6 +1,8 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Window
+import LyraReader 1.0
 
 Pane {
     id: inspector
@@ -27,6 +29,7 @@ Pane {
             LyraToolButton {symbol:"close";text:qsTr("Close PDF editing");onClicked:app.setSecondaryRow("")}
         }
         ScrollView {
+            id:inspectorScroll
             Layout.fillWidth:true
             Layout.fillHeight:true
             contentWidth: availableWidth
@@ -39,6 +42,33 @@ Pane {
                         editor.tool==="erase" || editor.tool==="blackout" ? qsTr("Drag a rectangle to remove actual PDF content. Undo restores the preceding revision.") :
                         item ? qsTr("%1 object").arg(item.kind) : qsTr("Select text, an image or a graphic. Double-click text to edit it; Control+Return applies.")
                     color:app.colors.textSecondary
+                }
+                Rectangle {
+                    id:imageFrame
+                    visible:!!item && (item.kind==="image" || item.kind==="graphic")
+                    Layout.fillWidth:true;Layout.preferredHeight:150
+                    color:app.colors.fieldBg;radius:6
+                    readonly property real scrollY:inspectorScroll.contentItem && inspectorScroll.contentItem.contentY!==undefined ? inspectorScroll.contentItem.contentY : 0
+                    PdfCrop {
+                        id:contentPreview
+                        objectName:"contentImagePreview"
+                        readonly property real aspect:pixelSize.width>0 && pixelSize.height>0 ? pixelSize.width/pixelSize.height : 1
+                        anchors.centerIn:parent
+                        width:Math.min(parent.width-16,(parent.height-16)*aspect)
+                        height:width/aspect
+                        resourceActive:imageFrame.visible && inspector.visible && imageFrame.y+imageFrame.height>imageFrame.scrollY && imageFrame.y<imageFrame.scrollY+inspectorScroll.availableHeight
+                        source:resourceActive && inspector.item ? editor.owner.contentPreviewUrl(editor.model.page,inspector.item.id,editor.model.revision,imageFrame.width-16,imageFrame.height-16,Screen.devicePixelRatio) : ""
+                        Accessible.role:Accessible.Graphic
+                        Accessible.name:qsTr("Selected PDF object preview")
+                    }
+                    BusyIndicator {anchors.centerIn:parent;running:contentPreview.status===2;visible:running}
+                    Label {
+                        anchors.fill:parent;anchors.margins:10
+                        visible:contentPreview.status===3
+                        textFormat:Text.PlainText;wrapMode:Text.Wrap;verticalAlignment:Text.AlignVCenter
+                        text:qsTr("Preview unavailable: %1").arg(contentPreview.error)
+                        color:app.colors.warningFg
+                    }
                 }
                 RowLayout {
                     visible:editor.tool==="erase" || editor.tool==="blackout"

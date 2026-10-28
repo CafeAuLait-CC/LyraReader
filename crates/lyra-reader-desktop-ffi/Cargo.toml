@@ -19,6 +19,7 @@ serde_json = { version = "1", features = ["raw_value"] }
 lyra-reader-ffi = { workspace = true, features = ["desktop-json"] }
 lyra-reader-session = { workspace = true }
 lyra-reader-core = { workspace = true }
+lyra-reader-pdfium = { workspace = true }
 lyra-reader-edit = { workspace = true }
 sha2 = "0.11"
 serde = { version = "1", features = ["derive"] }

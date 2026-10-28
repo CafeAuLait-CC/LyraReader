@@ -16,6 +16,7 @@
 #include <QtConcurrentRun>
 #include <QPromise>
 #include <QJSValue>
+#include <QUrlQuery>
 #include <cmath>
 #include <deque>
 #include <functional>
@@ -77,7 +78,7 @@ bool ReaderController::hasUnsavedChanges()const {
     return marks.value(QStringLiteral("page_pending")).toBool() ||
         (!localOnly && marks.value(QStringLiteral("pdf_dirty")).toBool()) || !m_noteDrafts.isEmpty() || hasEditDrafts();
 }
-ReaderController::~ReaderController(){clearRasterCache();}
+ReaderController::~ReaderController(){clearRasterCache();NativeImageProvider::unregisterSource(m_contentSourceKey);}
 void ReaderController::clearRasterCache(){RasterJobs::cancel(m_activeRaster);RasterCache::clearPrefix(m_cachePrefix);m_tileDemand.clear();m_pageDemand.clear();m_manualDemand.clear();}
 int ReaderController::cpuCacheKiB(){return RasterCache::costKiB();}
 
@@ -106,7 +107,7 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
     }
     m_lastUrl = url;
     const auto generation = ++m_generation;
-    resetAi();m_document.reset();m_source.reset();
+    resetAi();m_document.reset();setRasterSource({});
     m_pages.clear();
     clearRasterCache();
     m_pending.clear();
@@ -138,7 +139,7 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
             emit openFinished(false);
             return;
         }
-        m_document = std::move(result.document);m_source=std::move(result.source);
+        m_document = std::move(result.document);setRasterSource(std::move(result.source));
         m_pages = std::move(result.pages);
         m_data.insert(QStringLiteral("signature_status"),result.signature);emit dataChanged();
         m_data.insert(QStringLiteral("recovery"),result.recovery);
@@ -187,7 +188,7 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
 
 bool ReaderController::openSnapshot(const std::shared_ptr<NativeRasterSource> &source,const QUrl &identity,const QString &title) {
     if(!source || m_document || m_source || m_snapshotMode)return false;
-    m_snapshotMode=true;m_source=source;m_lastUrl=identity;m_title=title;++m_generation;
+    m_snapshotMode=true;setRasterSource(source);m_lastUrl=identity;m_title=title;++m_generation;
     m_loading=true;emit documentChanged();emit loadingChanged();
     submit(QStringLiteral("layout"),{{QStringLiteral("mode"),QStringLiteral("Continuous")},{QStringLiteral("gap"),12}});
     return true;
@@ -195,7 +196,7 @@ bool ReaderController::openSnapshot(const std::shared_ptr<NativeRasterSource> &s
 void ReaderController::closeSnapshot() {
     if(!m_snapshotMode)return;
     ++m_generation;clearRasterCache();m_requests.clear();m_pending.clear();m_failed.clear();
-    m_source.reset();m_pages.clear();m_textPages.clear();m_textPending.clear();m_data.clear();
+    setRasterSource({});m_pages.clear();m_textPages.clear();m_textPending.clear();m_data.clear();
     m_documentWidth=0;m_documentHeight=0;m_loading=false;
     emit documentReset();emit documentChanged();emit textPagesChanged();emit dataChanged();emit loadingChanged();
 }
@@ -226,6 +227,30 @@ quint64 ReaderController::submitSnapshot(quint64 id,const QString &operation,con
     });
     watcher->setFuture(QtConcurrent::run([source,operation,arguments]{CommandResult result;auto request=arguments;request.insert(QStringLiteral("op"),operation);result.result=source->query(request,&result.error);return result;}));
     return id;
+}
+
+void ReaderController::setRasterSource(std::shared_ptr<NativeRasterSource> source) {
+    NativeImageProvider::unregisterSource(m_contentSourceKey);m_contentSourceKey.clear();m_source=std::move(source);
+}
+QUrl ReaderController::contentPreviewUrl(int page,const QString &target,const QString &revision,double width,double height,double deviceScale) {
+    if(!m_source || page<0 || page>=pageCount() || !std::isfinite(width) || !std::isfinite(height) || !std::isfinite(deviceScale) || width<=0 || height<=0 || width>8192 || height>8192 || deviceScale<=0)return {};
+    const auto snapshot=m_data.value(QStringLiteral("content_objects")).toMap();
+    if(snapshot.value(QStringLiteral("revision")).toString()!=revision || snapshot.value(QStringLiteral("page")).toInt()!=page)return {};
+    QVariantMap item;for(const auto &value:snapshot.value(QStringLiteral("items")).toList())if(value.toMap().value(QStringLiteral("id")).toString()==target){item=value.toMap();break;}
+    const auto kind=item.value(QStringLiteral("kind")).toString();if(kind!=QStringLiteral("image") && kind!=QStringLiteral("graphic"))return {};
+    if(m_contentSourceKey.isEmpty())m_contentSourceKey=NativeImageProvider::registerSource(m_source);
+    QUrl url(QStringLiteral("image://lyrapreview/")+m_contentSourceKey+QLatin1Char('/')+QString::number(page));QUrlQuery query;
+    const auto add=[&](const QString &key,double number){query.addQueryItem(key,QString::number(number,'g',15));};
+    const double pixelWidth=qBound(1.0,std::ceil(width*qBound(1.0,deviceScale,4.0)/32)*32,2048.0),pixelHeight=qBound(1.0,std::ceil(height*qBound(1.0,deviceScale,4.0)/32)*32,2048.0);
+    if(kind==QStringLiteral("image")){
+        query.addQueryItem(QStringLiteral("kind"),QStringLiteral("bitmap"));query.addQueryItem(QStringLiteral("target"),target);query.addQueryItem(QStringLiteral("revision"),revision);
+        add(QStringLiteral("width"),pixelWidth);add(QStringLiteral("height"),pixelHeight);
+    }else{
+        const auto box=item.value(QStringLiteral("bounds")).toMap();const double x=box.value(QStringLiteral("x")).toDouble(),y=box.value(QStringLiteral("y")).toDouble(),w=box.value(QStringLiteral("width")).toDouble(),h=box.value(QStringLiteral("height")).toDouble();
+        if(!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(w) || !std::isfinite(h) || w<=0 || h<=0)return {};
+        add(QStringLiteral("x"),x);add(QStringLiteral("y"),y);add(QStringLiteral("w"),w);add(QStringLiteral("h"),h);add(QStringLiteral("scale"),qBound(.01,qMin(pixelWidth/w,pixelHeight/h),16.0));query.addQueryItem(QStringLiteral("annotations"),QStringLiteral("0"));
+    }
+    url.setQuery(query);return url;
 }
 
 void ReaderController::retryPassword(const QString &password) { openFile(m_lastUrl, password); }
@@ -292,7 +317,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         if(latestOnly && m_latestRead.value(operation)!=id)return;
         if (!outcome.error.isEmpty() && operation!=QStringLiteral("split_plan") && !operation.startsWith(QStringLiteral("ai_"))) setError(outcome.error);
         else if (operation==QStringLiteral("content_stage") || operation==QStringLiteral("page_stage") || operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo") || operation==QStringLiteral("page_discard") || operation==QStringLiteral("page_apply") || operation==QStringLiteral("document_save") || operation==QStringLiteral("document_discard")) {
-            m_source=outcome.source;
+            setRasterSource(outcome.source);
             const auto revision=outcome.result.toMap();
             const auto info=revision.value(QStringLiteral("info")).toMap();
             const bool reloadForms=m_data.contains(QStringLiteral("forms"));

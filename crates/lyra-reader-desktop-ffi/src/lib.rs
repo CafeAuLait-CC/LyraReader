@@ -20,6 +20,12 @@ use std::{
     ptr, slice,
 };
 
+/// Version of the hand-written Qt C boundary, including immutable image byte access.
+#[unsafe(no_mangle)]
+pub extern "C" fn lyra_reader_desktop_abi_version() -> u32 {
+    2
+}
+
 #[repr(C)]
 pub struct Buffer {
     pub data: *mut u8,
@@ -44,6 +50,43 @@ pub struct Bitmap {
     pub stride: u32,
     pub scale: f64,
     pub pixels: Buffer,
+}
+
+/// # Safety
+/// Source remains alive during the call; target/revision address their stated readable UTF-8
+/// byte lengths. Output/error are non-aliased writable empty buffers, freed with buffer_free.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn lyra_reader_desktop_source_image_png(
+    source: *const render_source::RenderSource,
+    page: u32,
+    target: *const u8,
+    target_len: usize,
+    revision: *const u8,
+    revision_len: usize,
+    output: *mut Buffer,
+    error: *mut Buffer,
+) -> bool {
+    // SAFETY: the caller upholds the handle, slice and writable-buffer contracts above.
+    // Length limits are checked before constructing the borrowed slices; no pointer escapes.
+    unsafe {
+        run(error, || {
+            let source = source.as_ref().ok_or("render source is null")?;
+            if output.is_null() {
+                return Err("output image buffer is null".into());
+            }
+            if target_len > 4096 || revision_len > 128 {
+                return Err("Image identity is too long".into());
+            }
+            let target =
+                std::str::from_utf8(bytes(target, target_len)?).map_err(|e| e.to_string())?;
+            let revision =
+                std::str::from_utf8(bytes(revision, revision_len)?).map_err(|e| e.to_string())?;
+            output.write(Buffer::owned(source.image_png(page, target, revision)?));
+            Ok(())
+        })
+    }
+    .is_some()
 }
 
 // Every pointer contract is in the header and repeated on the unsafe entry points.
@@ -360,6 +403,37 @@ pub unsafe extern "C" fn lyra_reader_desktop_source_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_byte_boundary_rejects_null_handles_and_reports_its_version() {
+        assert_eq!(lyra_reader_desktop_abi_version(), 2);
+        let mut error = Buffer {
+            data: ptr::null_mut(),
+            len: 0,
+        };
+        let mut output = Buffer {
+            data: ptr::null_mut(),
+            len: 0,
+        };
+        // SAFETY: null handles are rejected before use; the two output structures are live,
+        // empty and distinct. The empty input slices require no readable storage.
+        assert!(!unsafe {
+            lyra_reader_desktop_source_image_png(
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+                &mut output,
+                &mut error,
+            )
+        });
+        assert!(output.data.is_null());
+        assert!(!error.data.is_null());
+        // SAFETY: error is the one owned allocation returned by the failed call above.
+        unsafe { lyra_reader_desktop_buffer_free(error) };
+    }
 
     #[test]
     fn null_handles_report_errors_without_unwinding() {

@@ -10,6 +10,8 @@ class CropItem:public QQuickItem {
     Q_OBJECT
     Q_PROPERTY(QUrl source READ source WRITE setSource NOTIFY sourceChanged)
     Q_PROPERTY(int status READ status NOTIFY statusChanged)
+    Q_PROPERTY(QString error READ error NOTIFY statusChanged)
+    Q_PROPERTY(QSize pixelSize READ pixelSize NOTIFY statusChanged)
     Q_PROPERTY(QString paperAppearance READ paperAppearance WRITE setPaperAppearance NOTIFY paperAppearanceChanged)
     Q_PROPERTY(bool resourceActive READ resourceActive WRITE setResourceActive NOTIFY resourceActiveChanged)
 public:
@@ -17,6 +19,8 @@ public:
     ~CropItem()override;
     QUrl source()const{return m_source;}
     int status()const{return m_status;}
+    QString error()const{return m_error;}
+    QSize pixelSize()const{return m_image.pixels.size();}
     QString paperAppearance()const{return m_paper;}
     bool resourceActive()const{return m_resourceActive;}
     void setSource(const QUrl &source);
@@ -32,6 +36,7 @@ private:
     bool active()const;
     void visibilityUpdated();
     QUrl m_source;QString m_paper=QStringLiteral("original");
+    QString m_error;
     ResidentImage m_image;
     QTimer m_timer;
     RasterJobs::Handle m_job;

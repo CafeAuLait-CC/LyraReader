@@ -1808,6 +1808,59 @@ mod tests {
     }
 
     #[test]
+    fn content_preview_pins_original_bytes_across_atomic_save_and_source_removal() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let input = fixture.directory.join("preview.png");
+        image::RgbaImage::from_pixel(4, 2, image::Rgba([255, 0, 0, 255]))
+            .save(&input)
+            .unwrap();
+        let snapshot = doc
+            .command(json!({"op":"content_objects","page":0}))
+            .unwrap();
+        doc.command(json!({"op":"content_stage","page":0,"command":{"InsertImage":{"revision":snapshot["revision"],"bounds":{"x":72,"y":500,"width":100,"height":50},"image_path":input}}})).unwrap();
+        doc.command(json!({"op":"document_save"})).unwrap();
+        let snapshot = doc
+            .command(json!({"op":"content_objects","page":0}))
+            .unwrap();
+        let item = snapshot["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["kind"] == "image")
+            .unwrap();
+        let target = item["id"].as_str().unwrap();
+        let revision = snapshot["revision"].as_str().unwrap();
+        let frozen = crate::render_source::RenderSource::new(&doc, false).unwrap();
+        let expected = frozen.image_png(0, target, revision).unwrap();
+        // A sparse, oversized source must be rejected before a source-sized allocation.
+        let original = fs::read(&fixture.path).unwrap();
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.path)
+            .unwrap();
+        file.set_len(512 * 1024 * 1024 + 1).unwrap();
+        assert!(
+            frozen
+                .image_png(0, target, revision)
+                .unwrap_err()
+                .contains("too large")
+        );
+        drop(file);
+        fs::write(&fixture.path, &original).unwrap();
+        image::RgbaImage::from_pixel(4, 2, image::Rgba([0, 0, 255, 255]))
+            .save(&input)
+            .unwrap();
+        doc.command(json!({"op":"content_stage","page":0,"command":{"ReplaceImage":{"revision":revision,"target":target,"image_path":input}}})).unwrap();
+        doc.command(json!({"op":"document_save"})).unwrap();
+        assert_eq!(frozen.image_png(0, target, revision).unwrap(), expected);
+        drop(doc);
+        fs::remove_file(&fixture.path).unwrap();
+        assert_eq!(frozen.image_png(0, target, revision).unwrap(), expected);
+        assert!(frozen.image_png(0, target, "stale").is_err());
+    }
+
+    #[test]
     fn frozen_preview_layout_and_text_survive_later_edits_save_and_discard() {
         let fixture = Fixture::new("text-page.pdf");
         let doc = fixture.open();

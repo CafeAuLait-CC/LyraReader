@@ -2,10 +2,13 @@
 #include <cstddef>
 #include <cstdint>
 
+inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 2;
+
 // Owned Rust allocations: free each Buffer exactly once using buffer_free.
 // Output buffers must be zero initialized; calls do not free previous contents.
 // All document operations may block and must run on a worker, not the UI thread.
 extern "C" {
+std::uint32_t lyra_reader_desktop_abi_version();
 struct LyraReaderDesktopDocument;
 struct LyraReaderRenderSource;
 struct LyraReaderBuffer { std::uint8_t *data; std::size_t len; };
@@ -27,6 +30,11 @@ bool lyra_reader_desktop_render_annotated(const LyraReaderDesktopDocument *docum
 LyraReaderRenderSource *lyra_reader_desktop_render_source(const LyraReaderDesktopDocument *, bool include_edits, LyraReaderBuffer *error);
 bool lyra_reader_desktop_source_command(const LyraReaderRenderSource *, const std::uint8_t *request,
     std::size_t request_len, LyraReaderBuffer *output, LyraReaderBuffer *error);
+// Original bitmap PNG bytes from the pinned immutable source. The UTF-8 identities are
+// borrowed during the call; free output/error buffers exactly once with buffer_free.
+bool lyra_reader_desktop_source_image_png(const LyraReaderRenderSource *, std::uint32_t page,
+    const std::uint8_t *target, std::size_t target_len, const std::uint8_t *revision,
+    std::size_t revision_len, LyraReaderBuffer *output, LyraReaderBuffer *error);
 void lyra_reader_desktop_render_source_free(LyraReaderRenderSource *);
 bool lyra_reader_desktop_render_region(const LyraReaderRenderSource *, std::uint32_t page, double scale,
     double x, double y, double width, double height, bool annotated, bool transparent,
