@@ -10986,6 +10986,19 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         pageEditSession?.currentToOriginal ?? []
     }
 
+    /// Why the last open did or did not restore a cached page-edit session.
+    ///
+    /// Recorded because the restore path is deliberately silent when another `AppState` in the
+    /// same process still owns the session (a tab switch or an in-process crash simulation). A
+    /// native check that hits that branch otherwise fails with only "no session", which is not
+    /// the same fact as "the manifest was missing". Production code never reads this.
+    package private(set) var lastPageEditRestoreOutcomeForChecks: String?
+
+    /// Whether an `AppState` in this process still claims the document's page-edit session.
+    package static func hasLivePageEditOwnerForChecks(at document: URL) -> Bool {
+        pageEditOwners[DocumentEditCache.recoveryURL(for: document).path]?.value != nil
+    }
+
     /// The pages a command acts on: the thumbnail selection, or the current page when there is
     /// no selection.
     public var selectedPageIndices: [Int] {
@@ -12335,13 +12348,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         for original: URL,
         cleanExit: DocumentEditCache.CleanExitRecord? = nil
     ) -> Bool {
-        guard pageEditSession == nil else { return true }
+        lastPageEditRestoreOutcomeForChecks = "not attempted"
+        guard pageEditSession == nil else {
+            lastPageEditRestoreOutcomeForChecks = "skipped: a page-edit session is already active"
+            return true
+        }
         if cleanExit != nil {
             let retired = DocumentEditCache.retireResolvedRecoverySession(for: original)
             if !retired {
                 lastError = "The last quit was resolved, but its cached editing session could not "
                     + "be retired; it was not restored and the cleanup will be retried."
             }
+            lastPageEditRestoreOutcomeForChecks = "resolved clean exit (retired: \(retired))"
             return retired
         }
         let recoveryURL = DocumentEditCache.recoveryURL(for: original)
@@ -12351,10 +12369,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // them.
         if let failure = DocumentEditCache.migrationFailure(for: original) {
             lastError = lastError.map { "\($0)\n\(failure)" } ?? failure
+            lastPageEditRestoreOutcomeForChecks = "skipped: migration failure: \(failure)"
             return true
         }
-        if let owner = Self.pageEditOwners[recoveryURL.path]?.value, owner !== self { return true }
-        guard FileManager.default.fileExists(atPath: recoveryURL.path) else { return true }
+        if let owner = Self.pageEditOwners[recoveryURL.path]?.value, owner !== self {
+            lastPageEditRestoreOutcomeForChecks =
+                "skipped: the session is owned by another live AppState in this process"
+            return true
+        }
+        guard FileManager.default.fileExists(atPath: recoveryURL.path) else {
+            lastPageEditRestoreOutcomeForChecks = "no cached session.json"
+            return true
+        }
         do {
             let sourceStamp = try DocumentEditCache.SourceStamp(original)
             let title = document?.title ?? original.deletingPathExtension().lastPathComponent
@@ -12408,9 +12434,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             pageEditPendingOperations = session.operations
             persistPageEditRecovery()
             statusMessage = "Recovered unsaved PDF changes · Save to update \(original.lastPathComponent)"
+            lastPageEditRestoreOutcomeForChecks =
+                "restored revision \(session.revisionNumber) with \(session.operations.count) operation(s)"
             return true
         } catch {
             lastError = "The cached editing session was kept but could not be restored: \(AnnotationRecords.message(error))"
+            lastPageEditRestoreOutcomeForChecks =
+                "failed: \(AnnotationRecords.message(error))"
             return true
         }
     }

@@ -1,8 +1,102 @@
 import AppKit
 import Foundation
-import LyraReaderKit
+@testable import LyraReaderKit
 
 extension ReaderChecks {
+    /// Child half of the crash-recovery check: starts a real annotation draft and a real page-edit
+    /// session in a separate process, then leaves through `_exit(9)`.
+    ///
+    /// A parent-process simulation cannot prove the crash guarantee: the previous `AppState` is
+    /// still alive there (ARC lifetime is not a scope guarantee, and its async work may hold it),
+    /// so `pageEditOwners` can still claim the session and the restore path correctly refuses to
+    /// open it twice. A real crash has no such owner. This child exercises the durable files at
+    /// the process boundary the product actually promises.
+    ///
+    /// Launched by the parent with `--quit-unsaved-crash-child <annotation-pdf> <page-pdf>
+    /// <cache-root>`.
+    @MainActor static func quitUnsavedCrashChild() async throws {
+        guard CommandLine.arguments.count >= 5 else { exit(2) }
+        let annotationFixture = URL(fileURLWithPath: CommandLine.arguments[2]).standardizedFileURL
+        let pageFixture = URL(fileURLWithPath: CommandLine.arguments[3]).standardizedFileURL
+        let cache = URL(fileURLWithPath: CommandLine.arguments[4], isDirectory: true)
+        DocumentEditCache.rootOverride = cache
+        setenv("LYRA_READER_DOCUMENT_CACHE_DIR", cache.path, 1)
+
+        let annotated = AppState(engine: try RustEngine())
+        guard annotated.open(url: annotationFixture) else { exit(3) }
+        guard annotated.addGeometryAnnotation(
+            kind: .square, page: 0,
+            shapeRect: CGRect(x: 40, y: 60, width: 30, height: 30)
+        ) else { exit(4) }
+        guard annotated.annotations.count == 1, annotated.annotationCacheIsDirty else { exit(5) }
+
+        let edited = AppState(engine: try RustEngine())
+        guard edited.open(url: pageFixture) else { exit(6) }
+        edited.selectPage(1, extending: false, toggling: false)
+        let applied = await edited.applyPageEditOperation(
+            .rotate(pages: [1], quarterTurns: 1), label: "Rotate page 2")
+        guard applied else { exit(7) }
+        for _ in 0..<400 {
+            if !edited.pageEditBusy { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        guard edited.pageEditPendingOperations.count == 1 else { exit(8) }
+        guard FileManager.default.fileExists(
+            atPath: DocumentEditCache.recoveryURL(for: pageFixture).path
+        ) else { exit(10) }
+        // Hard exit: no AppState deinit, no cache-owner release, no flush, no session close and no
+        // clean-exit marker. This is the state a SIGKILL leaves behind.
+        _exit(9)
+    }
+
+    /// Names the durable state behind a crash-recovery failure instead of leaving CI with only
+    /// "no session". Includes the cache directory contents, the manifest's identity/revision/
+    /// operation count, marker presence, and the restore path's own decision.
+    @MainActor private static func quitCrashRecoveryDiagnostics(
+        for url: URL,
+        state: AppState?
+    ) -> String {
+        let manager = FileManager.default
+        let directory = DocumentEditCache.directory(for: url)
+        let files = (try? manager.contentsOfDirectory(atPath: directory.path))?.sorted() ?? []
+        let manifest = DocumentEditCache.recoveryURL(for: url)
+        var manifestFields = "missing session.json"
+        if let data = try? Data(contentsOf: manifest),
+           let object = try? JSONSerialization.jsonObject(with: data),
+           let envelope = object as? [String: Any],
+           let session = envelope["session"] as? [String: Any] {
+            let directoryValue = session["directory"] as? String ?? "nil"
+            let revisionValue = (session["revisionNumber"] as? NSNumber)?.stringValue ?? "nil"
+            let operationValue = ((session["operations"] as? [Any])?.count).map(String.init) ?? "nil"
+            let originalValue = session["originalURL"] as? String ?? "nil"
+            manifestFields = "directory=\(directoryValue) revision=\(revisionValue)"
+                + " operations=\(operationValue) originalURL=\(originalValue)"
+        }
+        let annotations = DocumentEditCache.annotationsURL(for: url)
+        let changes = DocumentEditCache.pendingStateURL(for: url)
+        return [
+            "cache=\(directory.lastPathComponent)",
+            "files=[\(files.joined(separator: ", "))]",
+            "manifest=(\(manifestFields))",
+            "marker=\(DocumentEditCache.hasCleanExitMarker(for: url))",
+            "annotationsFile=\(manager.fileExists(atPath: annotations.path))",
+            "changesFile=\(manager.fileExists(atPath: changes.path))",
+            "liveOwner=\(AppState.hasLivePageEditOwnerForChecks(at: url))",
+            "restoreTrace=\(state?.lastPageEditRestoreOutcomeForChecks ?? "not opened")",
+        ].joined(separator: " · ")
+    }
+
+    /// A `require` whose failure message carries the durable state behind the assertion. The
+    /// diagnostics remain unevaluated on success, so a passing suite's log stays readable.
+    @MainActor private static func requireExplaining(
+        _ condition: @autoclosure () -> Bool,
+        _ message: String,
+        _ diagnostics: @autoclosure () -> String
+    ) {
+        guard condition() else { fatalError("FAIL: \(message) — \(diagnostics())") }
+        print("PASS: \(message)")
+    }
+
     /// The quit-with-unsaved-changes contract.
     ///
     /// The checks drive the same `QuitUnsavedCoordinator` the app delegate uses, with the modal
@@ -107,24 +201,84 @@ extension ReaderChecks {
             require(!DocumentEditCache.hasCleanExitMarker(for: textURL),
                     "Cancel writes no clean-exit marker")
         }
-        // Let the closed windows' weak page-edit ownership entries clear before the crash-recovery
-        // half opens the same cache from fresh states.
-        try await Task.sleep(for: .milliseconds(80))
 
-        // ── A crash without the handshake still restores both kinds of draft ───────────────
+        // ── A live in-process owner is not a crash ───────────────────────────────────────────
+        // `pageEditOwners` deliberately stops a second reader in this process from opening the
+        // same staged session twice. That is the branch the old in-process "crash" simulation
+        // could hit when the previous AppState had not been deallocated yet (Swift does not
+        // promise scope-end deallocation), which is why this suite exercises real crashes across
+        // a process boundary below. Assert the guard and its diagnostic here so a future failure
+        // cannot be mistaken for a missing manifest.
+        let liveOwnerURL = try copyFixture("multipage.pdf", to: "quit-live-owner.pdf")
+        do {
+            let owner = try state()
+            require(owner.newTab(url: liveOwnerURL),
+                    "the live-owner fixture opens (lastError: \(owner.lastError ?? "nil"))")
+            await rotatePageTwo(owner)
+            let secondReader = try state()
+            require(secondReader.newTab(url: liveOwnerURL),
+                    "a second reader can open the document (lastError: \(secondReader.lastError ?? "nil"))")
+            requireExplaining(
+                !secondReader.pageEditSessionActive,
+                "a second reader in the same process does not steal a live page-edit session",
+                quitCrashRecoveryDiagnostics(for: liveOwnerURL, state: secondReader))
+            requireExplaining(
+                secondReader.lastPageEditRestoreOutcomeForChecks?
+                    .contains("owned by another live AppState") == true,
+                "the restore path says a live in-process owner, not a missing session",
+                quitCrashRecoveryDiagnostics(for: liveOwnerURL, state: secondReader))
+            owner.discardPageEdits()
+            require(!DocumentEditCache.hasCleanExitMarker(for: liveOwnerURL),
+                    "the live-owner probe writes no clean-exit marker")
+        }
+
+        // ── A real process crash still restores both kinds of draft ─────────────────────────
+        // The Cancel scenario's AppStates are still alive in this process (and Swift does not
+        // guarantee scope-end deallocation), so an in-process "crash" would leave pageEditOwners
+        // claiming the session and the second reader would correctly refuse to open it. A crash
+        // guarantee is about durable files, so this half stages the drafts in a child process
+        // that exits through `_exit(9)`; the parent then opens only the cache the child left.
+        let crashTextURL = try copyFixture("text-page.pdf", to: "quit-crash-annotations.pdf")
+        let crashPageURL = try copyFixture("multipage.pdf", to: "quit-crash-pages.pdf")
+        let crashTextBytes = try Data(contentsOf: crashTextURL)
+        let crashPageBytes = try Data(contentsOf: crashPageURL)
+        let crashChild = Process()
+        crashChild.executableURL = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+        crashChild.arguments = [
+            "--quit-unsaved-crash-child",
+            crashTextURL.path,
+            crashPageURL.path,
+            DocumentEditCache.root.path,
+        ]
+        try crashChild.run()
+        crashChild.waitUntilExit()
+        require(crashChild.terminationStatus == 9,
+                "the crash child really died without cleanup (status \(crashChild.terminationStatus))")
+        require(FileManager.default.fileExists(
+            atPath: DocumentEditCache.recoveryURL(for: crashPageURL).path),
+                "the crashed child left its page-edit manifest on disk")
+        require(!DocumentEditCache.hasCleanExitMarker(for: crashTextURL)
+                    && !DocumentEditCache.hasCleanExitMarker(for: crashPageURL),
+                "the crashed child wrote no clean-exit marker")
+
         do {
             let recoveredA = try state()
             let recoveredB = try state()
-            require(recoveredA.newTab(url: textURL),
-                    "the first draft reopens after a crash (lastError: \(recoveredA.lastError ?? "nil"))")
-            require(recoveredB.newTab(url: multipageURL),
-                    "the second draft reopens after a crash (lastError: \(recoveredB.lastError ?? "nil"))")
-            require(recoveredA.annotations.count == 1 && recoveredA.annotationCacheIsDirty,
-                    "a crash without a quit handshake still restores the annotation draft")
-            require(recoveredB.pageEditSessionActive
-                        && recoveredB.pageEditPendingOperations.count == 1,
-                    "a crash without a quit handshake still restores the page-edit session")
-            require(!DocumentEditCache.hasCleanExitMarker(for: textURL),
+            require(recoveredA.newTab(url: crashTextURL),
+                    "the crashed annotation draft reopens (lastError: \(recoveredA.lastError ?? "nil"))")
+            require(recoveredB.newTab(url: crashPageURL),
+                    "the crashed page-edit document reopens (lastError: \(recoveredB.lastError ?? "nil"))")
+            requireExplaining(
+                recoveredA.annotations.count == 1 && recoveredA.annotationCacheIsDirty,
+                "a crash without a quit handshake still restores the annotation draft",
+                quitCrashRecoveryDiagnostics(for: crashTextURL, state: recoveredA))
+            requireExplaining(
+                recoveredB.pageEditSessionActive
+                    && recoveredB.pageEditPendingOperations.count == 1,
+                "a crash without a quit handshake still restores the page-edit session",
+                quitCrashRecoveryDiagnostics(for: crashPageURL, state: recoveredB))
+            require(!DocumentEditCache.hasCleanExitMarker(for: crashTextURL)
+                        && !DocumentEditCache.hasCleanExitMarker(for: crashPageURL),
                     "recovery alone writes no clean-exit marker")
 
             // ── Discard All writes the handshake, and a simulated next launch stays clean ────
@@ -137,16 +291,16 @@ extension ReaderChecks {
             require(documents.count == 2, "both recovered documents are still unsaved")
             let mayQuit = await coordinator.resolve(.discardAll, documents: documents)
             require(mayQuit, "Discard All may quit")
-            require(DocumentEditCache.hasCleanExitMarker(for: textURL),
+            require(DocumentEditCache.hasCleanExitMarker(for: crashTextURL),
                     "Discard All records a clean-exit marker for the first document")
-            require(DocumentEditCache.hasCleanExitMarker(for: multipageURL),
+            require(DocumentEditCache.hasCleanExitMarker(for: crashPageURL),
                     "Discard All records a clean-exit marker for the second document")
             // AppKit flushes every window once more in `applicationWillTerminate`. That flush
             // rewrites `session.json` and `changes.json`; the handshake must survive it, so do it
             // here before the simulated next launch.
             recoveredA.flushPendingWrites()
             recoveredB.flushPendingWrites()
-            require(DocumentEditCache.hasCleanExitMarker(for: multipageURL),
+            require(DocumentEditCache.hasCleanExitMarker(for: crashPageURL),
                     "the termination flush leaves the clean-exit marker in place")
         }
         try await Task.sleep(for: .milliseconds(80))
@@ -155,9 +309,9 @@ extension ReaderChecks {
         do {
             let nextA = try state()
             let nextB = try state()
-            require(nextA.newTab(url: textURL),
+            require(nextA.newTab(url: crashTextURL),
                     "the first document opens after a discarded quit (lastError: \(nextA.lastError ?? "nil"))")
-            require(nextB.newTab(url: multipageURL),
+            require(nextB.newTab(url: crashPageURL),
                     "the second document opens after a discarded quit (lastError: \(nextB.lastError ?? "nil"))")
             require(nextA.annotations.isEmpty && nextA.bookmarks.isEmpty,
                     "the next launch does not restore discarded annotations")
@@ -165,13 +319,13 @@ extension ReaderChecks {
                     "a discarded annotation cache does not mark the tab dirty")
             require(!nextB.pageEditSessionActive && nextB.pageEditPendingOperations.isEmpty,
                     "the next launch does not restore a discarded page-edit session")
-            require(file(textURL, equals: textBytes),
+            require(file(crashTextURL, equals: crashTextBytes),
                     "discarding never writes the first PDF")
-            require(file(multipageURL, equals: multipageBytes),
+            require(file(crashPageURL, equals: crashPageBytes),
                     "discarding never writes the second PDF")
-            require(!DocumentEditCache.hasCleanExitMarker(for: textURL),
+            require(!DocumentEditCache.hasCleanExitMarker(for: crashTextURL),
                     "the first consumed marker is cleared")
-            require(!DocumentEditCache.hasCleanExitMarker(for: multipageURL),
+            require(!DocumentEditCache.hasCleanExitMarker(for: crashPageURL),
                     "the second consumed marker is cleared")
         }
         try await Task.sleep(for: .milliseconds(80))

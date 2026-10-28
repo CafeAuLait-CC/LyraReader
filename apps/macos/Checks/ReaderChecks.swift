@@ -60,10 +60,14 @@ struct ReaderChecks {
     }
 
     @MainActor static func main() async throws {
-        // The killed-process check re-executes this binary; it must handle its arguments before
-        // the normal check cache and fixture setup.
+        // The killed-process checks re-execute this binary; they must handle their arguments
+        // before the normal check cache and fixture setup.
         if CommandLine.arguments.contains("--document-transaction-crash-child") {
             try await documentTransactionCrashChild()
+            return
+        }
+        if CommandLine.arguments.contains("--quit-unsaved-crash-child") {
+            try await quitUnsavedCrashChild()
             return
         }
         // `--shard i/n` partitions the registered suites across n processes. Parse and validate
