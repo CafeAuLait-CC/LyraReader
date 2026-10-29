@@ -48,10 +48,14 @@ are collected before writing; a failed resolution keeps every window open and re
 already completed. Reading positions survive an aborted Save All attempt. Several newer macOS
 features are still being ported. XFA documents keep local reading bookmarks; PDF editing and
 derivative exports are refused, including forms selected as merge inputs.
-The five exclusive secondary rows are Annotate, Edit, Fill & Sign, Export and Lyra. The Edit row
-stages actual text/object/link edits through the shared typed commands and recoverable transaction;
+The five exclusive secondary rows are Annotate, Edit, Fill & Sign, Export and Lyra. Export
+exposes eight direct actions, including flattened copies and form values with a verified
+original-file backup. Flattening uses the saved PDF revision; save pending annotation/form drafts
+first to include them. Links and sticky notes are kept, and the result remains editable.
+The Edit row stages actual text/object/link edits through the shared typed commands and recoverable transaction;
 failed or superseded text drafts remain available to copy or retry. Long drafts use a bounded
-scrolling editor, and position/size fields keep their labels and page-point units visible. Redact → Blackout/Erase removes
+scrolling editor, and position/size fields keep their labels and page-point units visible.
+Redact → Blackout/Erase removes
 PDF content and asks explicitly before a fallback replaces an entire page with an image. Fill & Sign
 places text, dates, vector checkmarks/crosses, stamps, drawn vector signatures and typed or imported
 signature images. Drawing multiple strokes produces one ink annotation with a single undo step.

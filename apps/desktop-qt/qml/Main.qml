@@ -1337,14 +1337,58 @@ ApplicationWindow {
             context.reader.submit("document_save",{forms:context.forms,current_page:context.page,selected_pages:context.selection,expected_revision:context.revision});
         }
     }
+    function exportActionReason(action) {
+        if(!currentReader.pageCount || currentReader.loading)return qsTr("Open a PDF first.");
+        if(action==="print")return "";
+        if(action==="annotations")return annotations.length ? "" : qsTr("This document has no annotations to export.");
+        if(xfaReadOnly)return readOnlyReason || qsTr("XFA forms are read-only.");
+        if(pageEditBusy || pendingDocumentSave || currentReader.pendingCommands>0)return qsTr("Wait for the current document operation to finish.");
+        if(action==="save" && !currentReader.hasUnsavedChanges)return qsTr("The document has no unsaved changes.");
+        if(action==="flattened") {
+            const info=currentReader.data.document_info;
+            if(!info)return qsTr("Reading the document's export options…");
+            if(info.is_encrypted)return qsTr("Flattened copies are unavailable for encrypted PDFs.");
+        }
+        if(action==="filledForm" || action==="formValues") {
+            const forms=currentReader.data.forms;
+            if(!forms)return qsTr("Reading the document's form options…");
+            if(forms.encrypted)return qsTr("Form exports are unavailable for encrypted PDFs.");
+            if(!formPayload().length)return qsTr("There are no pending form values to write.");
+            if(action==="formValues" && originalReadOnly)return readOnlyReason || qsTr("Signed originals are read-only. Save a copy instead.");
+            if(action==="formValues" && pageEditsPending)return qsTr("Save the page or content changes before replacing form values in the original.");
+            if(action==="formValues" && (markState.pdf_dirty || Object.keys(currentReader.noteDrafts).length || currentReader.editDrafts.content || pendingRedactions.length))
+                return qsTr("Save the other document changes before writing only form values to the original.");
+        }
+        return "";
+    }
+    function performExportAction(action) {
+        const reason=exportActionReason(action);
+        if(reason.length){operationStatus=reason;return;}
+        if(action==="save")saveDocument(false);
+        else if(action==="saveAs")saveDocument(true);
+        else if(action==="annotated")chooseExport("annotations");
+        else if(action==="flattened")dialogs.showFlattenNotice();
+        else if(action==="filledForm")chooseExport("forms");
+        else if(action==="formValues")confirmReplace("forms");
+        else if(action==="annotations")chooseExport("annotation-text");
+        else if(action==="print")printDocument();
+    }
+    function setAnnotationExportFormat(index) {
+        if(!exportContext || exportContext.kind!=="annotation-text")return;
+        if(index!==0 && index!==1)return;
+        const kind=index===1 ? "csv" : "markdown";
+        exportContext=Object.assign({},exportContext,{kind:kind,text:exportContext.textOptions[kind]});
+    }
     function chooseExport(kind) {
         if(placedTextController.deferAction(function(){root.chooseExport(kind);}))return;
         if (secondaryRow==="edit" && contentController.deferAction({kind:"export",value:kind})) return;
-        if (["bibtex","markdown","csv"].indexOf(kind)<0 && blockXfaWrite()) return;
+        if (["bibtex","markdown","csv","annotation-text"].indexOf(kind)<0 && blockXfaWrite()) return;
         exportKind = kind;
         exportContext = {
             reader: currentReader,
             kind: kind,
+            generation: currentReader.documentGeneration,
+            textOptions: kind==="annotation-text" ? {markdown:annotationExport("markdown"),csv:annotationExport("csv")} : null,
             forms: formPayload(),
             redactions: pendingRedactions.slice(),
             pages: selectedPages.slice(),
@@ -1422,6 +1466,13 @@ ApplicationWindow {
         const owner = context.reader;
         if (!owner)
             return;
+        if(context.generation!==undefined && context.generation!==owner.documentGeneration) {
+            operationStatus=qsTr("The document changed. Choose the export again.");exportContext=null;return;
+        }
+        if(context.kind==="annotation-text") {
+            operationStatus=qsTr("Choose Markdown or CSV before exporting annotation text.");return;
+        }
+        exportContext=null;
         const destination = session.localPath(url);
         if (context.kind === "document")
             {
@@ -1438,6 +1489,8 @@ ApplicationWindow {
             owner.submit("save_properties", Object.assign({
                 destination: destination
             }, context.properties));
+        else if (context.kind === "flattened")
+            owner.submit("save_flattened_copy",{destination:destination});
         else if (context.kind === "forms")
             owner.submit("save_forms", {
                 destination: destination,
@@ -1481,15 +1534,28 @@ ApplicationWindow {
             return "## Page " + (a.page + 1) + " · " + a.kind + "\n\n" + (a.note || a.contents || "") + "\n";
         }).join("\n");
     }
+    property var replacementContext: null
     function confirmReplace(kind) {
+        if(placedTextController.deferAction(function(){root.confirmReplace(kind);}))return;
+        if(secondaryRow==="edit" && contentController.deferAction({kind:"replace",value:kind}))return;
         if (blockXfaWrite()) return;
         if (originalReadOnly) {
             operationStatus = readOnlyReason;
             return;
         }
+        if(kind==="forms") {
+            const reason=exportActionReason("formValues");
+            if(reason.length){operationStatus=reason;return;}
+        }
+        replacementContext={reader:currentReader,generation:currentReader.documentGeneration,kind:kind,
+            forms:formPayload(),properties:kind==="properties" ? dialogs.informationDialog.draft() : null};
         dialogs.confirmReplacement(kind);
     }
     function performReplace(kind) {
+        const context=replacementContext;replacementContext=null;
+        if(!context || context.kind!==kind || context.reader!==currentReader || context.generation!==currentReader.documentGeneration) {
+            operationStatus=qsTr("The document changed. Review the replacement again.");return;
+        }
         if (blockXfaWrite()) return;
         if (originalReadOnly) {
             operationStatus = readOnlyReason;
@@ -1500,11 +1566,17 @@ ApplicationWindow {
         if (kind === "pages")
             currentReader.submit("page_apply");
         else if (kind === "properties")
-            currentReader.submit("replace_properties", dialogs.informationDialog.draft());
-        else if (kind === "forms")
-            currentReader.submit("replace_forms", {
-                values: formPayload()
-            });
+            currentReader.submit("replace_properties", context.properties);
+        else if (kind === "forms") {
+            const reason=exportActionReason("formValues");
+            if(reason.length){operationStatus=reason;return;}
+            if(JSON.stringify(context.forms)!==JSON.stringify(formPayload())) {
+                operationStatus=qsTr("The form values changed. Review the replacement again.");return;
+            }
+            // The unified save owns the source/cache identity change and reopening,
+            // including when this reader is no longer the active tab on completion.
+            saveDocument(false);
+        }
         else
             currentReader.submit("replace_current_annotations");
     }
@@ -2288,6 +2360,10 @@ ApplicationWindow {
             } else if (op === "save_content_image") {
                 root.operationStatus=qsTr("Image exported to %1").arg(result.destination_path);
                 if(result.publication_warning)root.operationStatus+=" · "+result.publication_warning;
+            } else if (op==="save_flattened_copy") {
+                root.operationStatus=qsTr("Flattened copy saved: %1 · %2 annotations and %3 fields painted; %4 annotations and %5 fields kept. Original unchanged.").arg(result.destination_path).arg(result.flattened_annotations).arg(result.flattened_fields).arg(result.kept_annotations.length).arg(result.kept_fields.length);
+                if(result.comments_not_carried)root.operationStatus+=" "+qsTr("Comments not carried: %1.").arg(result.comments_not_carried);
+                if(result.signature_fields_removed)root.operationStatus+=" "+qsTr("Signature fields removed: %1.").arg(result.signature_fields_removed);
             } else if (op.indexOf("save_") === 0) {
                 root.operationStatus = qsTr("Saved to %1").arg(result.destination_path || "");
                 if (result.cache_cleanup_error) root.operationStatus += " " + result.cache_cleanup_error;

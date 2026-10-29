@@ -45,7 +45,7 @@ endif()
 qt_add_executable(LyraReader src/main.cpp)
 target_link_libraries(LyraReader PRIVATE lyrareader_shell)
 set(LYRA_READER_QML_FILES qml/Main.qml qml/LyraReaderTheme.qml qml/LyraToolButton.qml
-    qml/PlacedTextEditing.qml qml/PlacedTextLayer.qml qml/ContentTextLayer.qml
+    qml/PlacedTextEditing.qml qml/PlacedTextLayer.qml qml/ContentTextLayer.qml qml/ExportTools.qml
     qml/SettingsWindow.qml qml/PdfPreviewWindow.qml qml/ReaderChrome.qml qml/SecondaryTools.qml qml/FillSignTools.qml qml/FillSignInspector.qml qml/TypedSignatureDialog.qml qml/DrawnSignatureDialog.qml qml/SignaturePad.qml qml/ContentEditing.qml qml/ContentInspector.qml qml/ContentPageLayer.qml qml/WelcomeView.qml qml/ReaderSidebar.qml qml/DocumentCanvas.qml qml/PageTextView.qml qml/PageInteraction.qml
     qml/PageOverview.qml qml/PageExports.qml qml/RedactionReview.qml qml/RedactionLayer.qml qml/FormOverlay.qml qml/DocumentDraftBar.qml qml/PreviewPanel.qml qml/AnnotationsLayer.qml qml/AnnotationHandles.qml qml/AnnotationTools.qml qml/SearchPanel.qml qml/AiPanel.qml qml/ReaderDialogs.qml qml/QuitDialog.qml qml/ReaderLogic.js)
 file(GLOB LYRA_READER_ICONS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/icons/*.svg")

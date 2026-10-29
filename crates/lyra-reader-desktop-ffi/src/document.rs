@@ -457,6 +457,9 @@ impl DesktopDocument {
             "save_forms" => {
                 value(d.save_filled_form_copy(text(&r, "destination")?, arg(&r, "values")?))
             }
+            // Like the macOS export, flatten the active PDF's saved bytes, not the
+            // annotation/form drafts. The shared writer owns baking and preservation.
+            "save_flattened_copy" => value(d.flatten_to_copy(text(&r, "destination")?)),
             "replace_forms" => value(d.replace_with_filled_form(arg(&r, "values")?)),
             "save_properties" => value(d.save_document_properties_copy(
                 text(&r, "destination")?,
@@ -2116,6 +2119,69 @@ mod tests {
     }
 
     #[test]
+    fn flattened_export_uses_saved_pdf_bytes_and_keeps_the_working_drafts() {
+        let fixture = Fixture::new("flatten.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        doc.command(json!({"op":"mark_create","entry":{"kind":"textBox","page":0,"version":1,"rect":{"x":20,"y":20,"width":100,"height":30},"fontSize":14,"note":"Unsaved draft","color":"#000000ff"}})).unwrap();
+        let before = doc.command(json!({"op":"marks"})).unwrap();
+        let destination = fixture.directory.join("flattened.pdf");
+        let report = doc
+            .command(json!({"op":"save_flattened_copy","destination":destination}))
+            .unwrap();
+        assert_eq!(report["flattened_annotations"], 6);
+        assert!(report["kept_annotations"].is_array());
+        assert!(report["kept_fields"].is_array());
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        assert_eq!(doc.command(json!({"op":"marks"})).unwrap(), before);
+        let output = open_fixture_document(&destination, None).unwrap();
+        let exported = output.command(json!({"op":"marks"})).unwrap();
+        assert!(
+            exported["file_annotations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|a| a["contents"] != "Unsaved draft")
+        );
+        doc.command(json!({"op":"page_stage","operation":{"Rotate":{"pages":[0],"quarter_turns":1}},"current_page":0,"selected_pages":[0]})).unwrap();
+        let active = doc.info().unwrap();
+        let staged_output = fixture.directory.join("working-flattened.pdf");
+        doc.command(json!({"op":"save_flattened_copy","destination":staged_output}))
+            .unwrap();
+        let copied = open_fixture_document(&staged_output, None)
+            .unwrap()
+            .info()
+            .unwrap();
+        assert_eq!(copied["pages"][0]["width"], active["pages"][0]["width"]);
+        assert_eq!(copied["pages"][0]["height"], active["pages"][0]["height"]);
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        assert_eq!(
+            doc.command(json!({"op":"marks"})).unwrap()["page_pending"],
+            true
+        );
+    }
+
+    #[test]
+    fn flattened_export_strips_derivative_signature_and_never_replaces_the_source() {
+        let fixture = Fixture::new("signed-signature.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        assert!(
+            doc.command(json!({"op":"save_flattened_copy","destination":fixture.path}))
+                .is_err()
+        );
+        let destination = fixture.directory.join("unsigned-flattened.pdf");
+        let report = doc
+            .command(json!({"op":"save_flattened_copy","destination":destination}))
+            .unwrap();
+        assert!(report["signature_fields_removed"].as_u64().unwrap() > 0);
+        let copied = open_fixture_document(&destination, None).unwrap();
+        assert_eq!(copied.info().unwrap()["signature_status"]["signed"], false);
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        assert_eq!(doc.info().unwrap()["signature_status"]["signed"], true);
+    }
+
+    #[test]
     fn placed_text_flushes_coalesce_and_cancel_restores_creation_and_cache() {
         let fixture = Fixture::new("text-page.pdf");
         let doc = fixture.open();
@@ -2304,6 +2370,7 @@ mod tests {
             "save_annotations",
             "replace_annotations",
             "save_forms",
+            "save_flattened_copy",
             "save_content_image",
             "replace_forms",
             "save_properties",

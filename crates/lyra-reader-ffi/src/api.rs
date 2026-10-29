@@ -637,6 +637,7 @@ pub struct FormSaveReport {
 
 /// One kind of annotation or field a flattened copy baked, and how many of it.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct FlattenKindCountRecord {
     pub kind: String,
     pub count: u32,
@@ -644,6 +645,7 @@ pub struct FlattenKindCountRecord {
 
 /// One annotation a flattened copy deliberately keeps, with the reason a person can read.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct KeptAnnotationRecord {
     pub page: u32,
     pub kind: String,
@@ -653,6 +655,7 @@ pub struct KeptAnnotationRecord {
 
 /// One form field a flattened copy deliberately keeps.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct KeptFieldRecord {
     pub name: String,
     pub kind: String,
@@ -661,6 +664,7 @@ pub struct KeptFieldRecord {
 
 /// What a successful flattened copy did.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct FlattenReportRecord {
     pub destination_path: String,
     pub pages: u32,

@@ -103,8 +103,38 @@ Item {
         replaceKind = kind;
         replaceConfirmation.open();
     }
+    property var flattenOwner: null
+    property var flattenGeneration: null
+    function showFlattenNotice() {
+        flattenOwner=app.currentReader;flattenGeneration=flattenOwner.documentGeneration;
+        flattenNotice.open();
+    }
+    Dialog {
+        id: flattenNotice
+        objectName: "flattenExportNotice"
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        width: Math.min(540,app.width-32)
+        modal: true
+        title: qsTr("Export as Flattened Copy")
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        Label {
+            width: parent.width
+            textFormat: Text.PlainText
+            wrapMode: Text.Wrap
+            text: qsTr("Paints saved annotations and form values into a new PDF. Pending annotation and form drafts are not included; save them first to include them. Links and sticky notes remain annotations, and unsupported fields are kept and reported. The original is unchanged. This is not tamper-proof: the painted content remains editable, and only a digital signature can detect later changes.")
+        }
+        onAccepted: {
+            if(dialogs.flattenOwner===app.currentReader && dialogs.flattenGeneration===app.currentReader.documentGeneration)
+                app.chooseExport("flattened");
+            else app.operationStatus=qsTr("The document changed. Choose the flattened export again.");
+            dialogs.flattenOwner=null;
+        }
+        onRejected: dialogs.flattenOwner=null
+    }
     Dialog {
         id: replaceConfirmation
+        objectName: "originalReplaceConfirmation"
         title: qsTr("Replace Original PDF?")
         parent: Overlay.overlay
         anchors.centerIn: parent
@@ -117,6 +147,7 @@ Item {
             wrapMode: Text.Wrap
         }
         onAccepted: app.performReplace(dialogs.replaceKind)
+        onRejected: app.replacementContext=null
     }
     property var editingBookmark: null
     function openBookmark(bookmark, index) {
@@ -238,10 +269,17 @@ Item {
         id: save
         objectName: "documentSaveDialog"
         fileMode: FileDialog.SaveFile
-        title: qsTr("Save a copy")
-        nameFilters: app.exportKind === "bibtex" ? [qsTr("BibTeX (*.bib)")] : app.exportKind === "markdown" ? [qsTr("Markdown (*.md)")] : app.exportKind === "csv" ? [qsTr("CSV (*.csv)")] : [qsTr("PDF documents (*.pdf)")]
-        onAccepted: app.exportTo(selectedFile)
-        onRejected: if (app.exportContext && app.exportContext.closeTicket === app.closeOperation) app.cancelCloseOperation("")
+        title: app.exportKind==="flattened" ? qsTr("Export as Flattened Copy") : app.exportKind==="annotation-text" ? qsTr("Export Annotations") : qsTr("Save a copy")
+        nameFilters: app.exportKind==="annotation-text" ? [qsTr("Markdown (*.md)"),qsTr("CSV (*.csv)")] : app.exportKind === "bibtex" ? [qsTr("BibTeX (*.bib)")] : app.exportKind === "markdown" ? [qsTr("Markdown (*.md)")] : app.exportKind === "csv" ? [qsTr("CSV (*.csv)")] : [qsTr("PDF documents (*.pdf)")]
+        defaultSuffix: app.exportKind==="annotation-text" ? (selectedNameFilter.index===1 ? "csv" : "md") : app.exportKind==="markdown" ? "md" : app.exportKind==="csv" ? "csv" : app.exportKind==="bibtex" ? "bib" : "pdf"
+        onAccepted: {
+            if(app.exportKind==="annotation-text")app.setAnnotationExportFormat(selectedNameFilter.index);
+            app.exportTo(selectedFile);
+        }
+        onRejected: {
+            if(app.exportContext && app.exportContext.closeTicket === app.closeOperation)app.cancelCloseOperation("");
+            app.exportContext=null;
+        }
     }
     Menu {
         id: selection

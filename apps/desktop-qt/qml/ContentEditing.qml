@@ -158,6 +158,7 @@ Item {
         else if (next.kind==="textView") app.setTextViewEnabled(next.value);
         else if (next.kind==="save") app.saveDocument(next.value);
         else if (next.kind==="export") app.chooseExport(next.value);
+        else if (next.kind==="replace") app.confirmReplace(next.value);
         else if (next.kind==="print") app.printDocument();
         else if (next.kind==="undo") app.undo();
         else if (next.kind==="redo") app.redo();

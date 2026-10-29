@@ -34,16 +34,7 @@ Item {
         LyraToolButton {symbol:"undo";text:qsTr("Undo");enabled:!!app.markState.can_page_undo || !!app.markState.can_undo;onClicked:app.undo()}
         LyraToolButton {symbol:"redo";text:qsTr("Redo");enabled:!!app.markState.can_page_redo || !!app.markState.can_redo;onClicked:app.redo()}
     }
-    RowLayout {
-        objectName:"exportToolRow"
-        anchors.centerIn:parent;spacing:6
-        visible:app.secondaryRow==="export"
-        Button {text:qsTr("Save");enabled:app.canModifyPdf && app.currentReader.hasUnsavedChanges;onClicked:app.saveDocument(false)}
-        Button {text:qsTr("Save As…");enabled:app.canModifyPdf;onClicked:app.saveDocument(true)}
-        Button {text:app.width<1000 ? qsTr("Annotated…") : qsTr("Annotated Copy…");enabled:app.canModifyPdf;onClicked:app.chooseExport("annotations")}
-        Button {text:qsTr("Annotations…");onClicked:app.showExportMenu(this)}
-        Button {text:qsTr("Print…");onClicked:app.printDocument()}
-    }
+    ExportTools {objectName:"exportToolRow";anchors.fill:parent;app:rows.app;visible:app.secondaryRow==="export"}
     RowLayout {
         objectName:"lyraToolRow"
         anchors.centerIn:parent;spacing:6

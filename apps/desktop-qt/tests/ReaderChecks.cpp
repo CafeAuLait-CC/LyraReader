@@ -1578,6 +1578,79 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(window,"redo"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(QMetaObject::invokeMethod(window,"saveDocument",Q_ARG(QVariant,false)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QVERIFY(!reader->hasUnsavedChanges());
         ReaderController reopened;reopened.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reopened.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reopened.pendingCommands(),0,10000);reopened.requestText(0);QTRY_VERIFY_WITH_TIMEOUT(reopened.textPages().value("0").toMap().value("text").toString().contains("Linux edit"),10000);
     }
+    void exportRowProvidesEightCommandsAndFreezesTheChosenDocument() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/export-source.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/flatten.pdf",path));QFile source(path);QVERIFY(source.open(QIODevice::ReadOnly));const auto original=source.readAll();source.close();
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setSecondaryRow",Q_ARG(QVariant,"export"),Q_ARG(QVariant,false)));
+        QTRY_VERIFY(reader->data().contains("document_info") && reader->data().contains("forms"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        auto *row=visualItem(view.window->contentItem(),"exportToolRow");QVERIFY(row);QCOMPARE(row->height(),46.0);
+        const QStringList ids{"save","saveAs","annotated","flattened","filledForm","formValues","annotations","print"};
+        for(int width:{1200,700}) {
+            view.window->setWidth(width);QTest::qWait(80);double previous=-1;
+            for(const auto &id:ids) {
+                auto *button=visualItem(view.window->contentItem(),"exportCommand"+id);QVERIFY(button && button->isVisible());
+                const auto frame=button->mapRectToItem(view.window->contentItem(),button->boundingRect());QVERIFY(frame.left()>previous);QVERIFY(frame.left()>=0 && frame.right()<=width+1);previous=frame.left();
+                auto *accessible=QAccessible::queryAccessibleInterface(button);QVERIFY(accessible && !accessible->text(QAccessible::Name).isEmpty());
+            }
+            const auto capture=qEnvironmentVariable("LYRA_READER_EXPORT_SNAPSHOT");
+            if(!capture.isEmpty())QVERIFY(view.window->grabWindow().save(capture+QString::number(width)+".png"));
+        }
+        auto *flatten=visualItem(view.window->contentItem(),"exportCommandflattened");QVERIFY(flatten && flatten->isEnabled());
+        auto *notice=view.window->findChild<QObject *>("flattenExportNotice"),*save=view.window->findChild<QObject *>("documentSaveDialog");QVERIFY(notice && save);
+        QVERIFY(QMetaObject::invokeMethod(flatten,"clicked"));QTRY_VERIFY(notice->property("visible").toBool());QVERIFY(QMetaObject::invokeMethod(notice,"reject"));QVERIFY(!save->property("visible").toBool());
+        QVERIFY(QMetaObject::invokeMethod(flatten,"clicked"));QVERIFY(QMetaObject::invokeMethod(notice,"accept"));QTRY_VERIFY(save->property("visible").toBool());
+        const auto copy=scratch.path()+"/flattened.pdf";QSignalSpy completed(reader,&ReaderController::commandFinished);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"exportTo",Q_ARG(QVariant,QUrl::fromLocalFile(copy))));QVERIFY(QMetaObject::invokeMethod(save,"reject"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
+        QVariantMap report;for(const auto &event:completed)if(event.at(1).toString()=="save_flattened_copy")report=event.at(2).toMap();QCOMPARE(report.value("flattened_annotations").toInt(),6);QVERIFY(QFileInfo::exists(copy));QVERIFY(view.window->property("operationStatus").toString().contains("Original unchanged"));
+        reader->submit("mark_create",{{"entry",QVariantMap{{"kind","textBox"},{"version",1},{"page",0},{"rect",QVariantMap{{"x",20},{"y",20},{"width",100},{"height",30}}},{"fontSize",14},{"color","#000000ff"},{"note","Frozen export before"}}}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto entry=reader->data().value("marks").toMap().value("annotations").toList().last().toMap();QVariant expected;
+        QVERIFY(QMetaObject::invokeMethod(view.window,"annotationExport",Q_RETURN_ARG(QVariant,expected),Q_ARG(QVariant,"csv")));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"performExportAction",Q_ARG(QVariant,"annotations")));QTRY_VERIFY(save->property("visible").toBool());QCOMPARE(save->property("nameFilters").toStringList().size(),2);
+        reader->submit("mark_update",{{"id",entry.value("id")},{"patch",QVariantMap{{"note","Changed after preview"}}}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setAnnotationExportFormat",Q_ARG(QVariant,1)));const auto csv=scratch.path()+"/annotations.csv";
+        QVERIFY(QMetaObject::invokeMethod(view.window,"exportTo",Q_ARG(QVariant,QUrl::fromLocalFile(csv))));QVERIFY(QMetaObject::invokeMethod(save,"reject"));QFile exported(csv);QVERIFY(exported.open(QIODevice::ReadOnly));QCOMPARE(exported.readAll(),expected.toString().toUtf8());
+        QVERIFY(QMetaObject::invokeMethod(view.window,"chooseExport",Q_ARG(QVariant,"annotations")));QTRY_VERIFY(save->property("visible").toBool());
+        reader->openFile(QUrl::fromLocalFile(path));QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && reader->pendingCommands()==0);const auto stale=scratch.path()+"/stale.pdf";
+        QVERIFY(QMetaObject::invokeMethod(view.window,"exportTo",Q_ARG(QVariant,QUrl::fromLocalFile(stale))));QVERIFY(!QFileInfo::exists(stale));QVERIFY(QMetaObject::invokeMethod(save,"reject"));
+        QVERIFY(source.open(QIODevice::ReadOnly));QCOMPARE(source.readAll(),original);source.close();
+        view.workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/xfa-refusal.pdf"));auto *xfa=view.workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(xfa->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(xfa->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setSecondaryRow",Q_ARG(QVariant,"export"),Q_ARG(QVariant,false)));QTRY_COMPARE_WITH_TIMEOUT(xfa->pendingCommands(),0,10000);
+        for(const auto &id:{"save","saveAs","annotated","flattened","filledForm","formValues"})QVERIFY(!visualItem(view.window->contentItem(),QString("exportCommand")+id)->isEnabled());
+        QVERIFY(visualItem(view.window->contentItem(),"exportCommandprint")->isEnabled());
+    }
+    void formValuesActionSavesWithVerifiedBackupAndKeepsTheReaderUsable() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/form-values.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/form-fields.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),2,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setSecondaryRow",Q_ARG(QVariant,"export"),Q_ARG(QVariant,false)));QTRY_VERIFY(reader->data().contains("forms"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVariantMap field;for(const auto &v:reader->data().value("forms").toMap().value("fields").toList())if(v.toMap().value("kind")=="text" && v.toMap().value("editable").toBool()){field=v.toMap();break;}QVERIFY(!field.isEmpty());
+        QVERIFY(QMetaObject::invokeMethod(view.window,"updateFormValue",Q_ARG(QVariant,field.value("id")),Q_ARG(QVariant,QVariantMap({{"text","Saved through unified form action"}}))));
+        auto *button=visualItem(view.window->contentItem(),"exportCommandformValues");QVERIFY(button);QTRY_VERIFY(button->isEnabled());
+        QVERIFY(QMetaObject::invokeMethod(button,"clicked"));auto *confirmation=view.window->findChild<QObject *>("originalReplaceConfirmation");QVERIFY(confirmation);QTRY_VERIFY(confirmation->property("visible").toBool());
+        QVERIFY(QMetaObject::invokeMethod(confirmation,"accept"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QVERIFY(!reader->hasUnsavedChanges());
+        QVERIFY(view.window->property("operationStatus").toString().contains("Verified backup"));
+        reader->submit("forms");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        bool found=false;for(const auto &v:reader->data().value("forms").toMap().value("fields").toList())if(v.toMap().value("id")==field.value("id"))found=v.toMap().value("value")=="Saved through unified form action";QVERIFY(found);
+        reader->submit("bookmark_create",{{"page",0},{"title","Cache identity remains usable"}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QVERIFY(reader->hasUnsavedChanges());
+    }
+    void formReplacementConfirmationRejectsAReopenedReader() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/forms-source.pdf",other=scratch.path()+"/other.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/form-fields.pdf",path));QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",other));
+        QFile source(path);QVERIFY(source.open(QIODevice::ReadOnly));const auto original=source.readAll();source.close();QFile next(other);QVERIFY(next.open(QIODevice::ReadOnly));const auto otherBytes=next.readAll();next.close();
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),2,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setSecondaryRow",Q_ARG(QVariant,"export"),Q_ARG(QVariant,false)));QTRY_VERIFY(reader->data().contains("forms"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVariantMap field;for(const auto &v:reader->data().value("forms").toMap().value("fields").toList())if(v.toMap().value("kind")=="text" && v.toMap().value("editable").toBool()){field=v.toMap();break;}QVERIFY(!field.isEmpty());
+        QVERIFY(QMetaObject::invokeMethod(view.window,"updateFormValue",Q_ARG(QVariant,field.value("id")),Q_ARG(QVariant,QVariantMap({{"text","Reviewed form value"}}))));
+        auto *button=visualItem(view.window->contentItem(),"exportCommandformValues");QVERIFY(button);QTRY_VERIFY(button->isEnabled());QVERIFY(QMetaObject::invokeMethod(button,"clicked"));
+        auto *confirmation=view.window->findChild<QObject *>("originalReplaceConfirmation");QVERIFY(confirmation);QTRY_VERIFY(confirmation->property("visible").toBool());
+        reader->openFile(QUrl::fromLocalFile(other));QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && reader->pendingCommands()==0);
+        QVERIFY(QMetaObject::invokeMethod(confirmation,"accept"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(view.window->property("operationStatus").toString().contains("Review the replacement again"));
+        QVERIFY(source.open(QIODevice::ReadOnly));QCOMPARE(source.readAll(),original);QVERIFY(next.open(QIODevice::ReadOnly));QCOMPARE(next.readAll(),otherBytes);
+    }
     void longContentDraftsStayScrollableAndGeometryFieldsKeepTheirIdentity() {
         QTemporaryDir scratch;
         QVERIFY(scratch.isValid());
