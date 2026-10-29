@@ -659,6 +659,15 @@ public final class MetalCanvasView: NSView {
         (metalLayer as? PresentationTraceLayer)?.traceScrollEnabled = traceFrames
         // Same device as wgpu's adapter (see the class comment).
         metalLayer.device = MTLCreateSystemDefaultDevice()
+        // `layerContentsPlacement = .topLeft` (below, added for resize presentation) makes the
+        // layer present the drawable's backing pixels 1:1 instead of scaling it into the layer
+        // bounds the way the default contents gravity did. That is why this mapping must be
+        // explicit: the drawable is `bounds × backingScale` pixels, so a layer whose
+        // `contentsScale` stays at its 1.0 default presents those pixels as points — an extra
+        // 2× on a Retina display — while the page edge/shadow chrome is drawn in points and
+        // stays put. `syncLayerContentsScale()` refreshes it on window, screen and layout
+        // changes. This is a presentation mapping, not the display-calibration factor.
+        metalLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 1
         metalLayer.isOpaque = true
         // wgpu's Metal backend waits until the command buffer is scheduled before presenting
         // transaction-backed drawables. This keeps the paper and its AppKit edge/shadow layers
@@ -716,6 +725,7 @@ public final class MetalCanvasView: NSView {
 
     public override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        syncLayerContentsScale()
         removeScreenObservers()
         if window == nil {
             detachSurface()
@@ -824,11 +834,24 @@ public final class MetalCanvasView: NSView {
         markNeedsRender()
     }
 
+    /// Keeps the layer's pixel-to-point mapping equal to the window's backing scale.
+    ///
+    /// `drawableSize` is set from `bounds × backingScale`, and `layerContentsPlacement = .topLeft`
+    /// stops the default contents gravity from hiding a mismatch by stretching the drawable into
+    /// the bounds. Equal values cost one comparison, so the callers can stay unconditional.
+    private func syncLayerContentsScale() {
+        guard let metalLayer = layer as? CAMetalLayer else { return }
+        let scale = backingScale()
+        guard abs(metalLayer.contentsScale - scale) > 1e-9 else { return }
+        metalLayer.contentsScale = scale
+    }
+
     public override func layout() {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
         super.layout()
+        syncLayerContentsScale()
         pageChrome?.frame = bounds
         annotationOverlay?.frame = bounds
         translationOverlay?.frame = bounds
@@ -1563,6 +1586,7 @@ public final class MetalCanvasView: NSView {
 
     public override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
+        syncLayerContentsScale()
         reportDeviceScale()
         // A display-mode change can keep the same backing scale but alter the logical width;
         // the calibration is part of that change too.
