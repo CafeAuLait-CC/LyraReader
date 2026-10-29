@@ -69,6 +69,16 @@ extension ReaderChecks {
                 "the scoped trace includes a frame with actual document pixels")
         require(frames.allSatisfy { ($0["quads"] as? NSNumber) != nil },
                 "frame records carry a quad count")
+        // The content-source metric joins a presented frame to the page list it drew through
+        // `content_seq`; a frame that carries quads must also say whether any of them are real
+        // page bitmaps (page_quads) and which commit produced them.
+        require(frames.allSatisfy {
+            let pageQuads = ($0["page_quads"] as? NSNumber)?.intValue ?? -1
+            let quads = ($0["quads"] as? NSNumber)?.intValue ?? -1
+            return pageQuads >= 0 && quads >= 0 && pageQuads <= quads
+        }, "frame records carry page quads bounded by the submitted quad count")
+        require(frames.allSatisfy { ($0["content_seq"] as? NSNumber) != nil },
+                "frame records carry the content commit they drew")
 
         // ── consistent order ────────────────────────────────────────────────────
         let inputs = records.filter { $0["kind"] as? String == "input" }
@@ -164,6 +174,45 @@ extension ReaderChecks {
                     "sharp names one source per visible page")
         }
         require(correlatedSharps > 0, "a sharp commit follows the synthetic scroll input")
+
+        // Every committed page list also carries its content classification, aligned with its
+        // pages. Sharp pages use only the two sharp sources; a lower-quality fallback is named
+        // rather than silently counted as sharp, and `none` means the canvas had only paper.
+        let contents = records.filter { $0["kind"] as? String == "content" }
+        require(!contents.isEmpty, "perf trace contains content classifications")
+        let allowedSources: Set<String> = ["tile", "page-raster", "preview", "history",
+                                           "thumbnail", "previous-tile", "previous-raster",
+                                           "partial-tile", "none"]
+        for content in contents {
+            let pages = content["pages"] as? [Any] ?? []
+            let sources = content["sources"] as? [String] ?? []
+            require(pages.count == sources.count,
+                    "content names one source per on-screen page")
+            require(sources.allSatisfy { allowedSources.contains($0) },
+                    "content sources use the documented source vocabulary")
+            let anchor = content["anchor_page"] as? NSNumber
+            require(anchor != nil, "content names the anchor page")
+            let anchorSource = content["anchor_source"] as? String
+            require(anchorSource == "none" || sources.contains(anchorSource ?? ""),
+                    "content anchor source is the anchor page's own source")
+        }
+        let contentsBySeq = Dictionary(uniqueKeysWithValues: contents.compactMap { content in
+            number(content, "content_seq").map { (Int($0), content) }
+        })
+        var correlatedContentFrames = 0
+        for frame in frames {
+            guard let seq = number(frame, "content_seq"), seq > 0 else { continue }
+            guard let content = contentsBySeq[Int(seq)],
+                  let contentTime = number(content, "time"),
+                  let frameTime = number(frame, "time") else {
+                fatalError("FAIL: frame names content_seq \(Int(seq)) that has no content record")
+            }
+            require(contentTime <= frameTime,
+                    "content commit precedes the frame that drew it")
+            correlatedContentFrames += 1
+        }
+        require(correlatedContentFrames > 0,
+                "a frame is correlated with the page list it drew")
         require(frames.contains { $0["presented"] as? Bool == true }
                     || frames.contains { $0["presented"] as? Bool == false },
                 "the canvas submitted at least one frame (presented or occluded)")
