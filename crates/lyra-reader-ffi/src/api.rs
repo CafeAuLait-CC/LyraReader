@@ -1473,8 +1473,16 @@ pub struct LyraReaderDocument {
     /// `Arc` so [`LyraReaderDocument::citations`] can borrow the style without cloning a hundred
     /// entries per page. The persistent index cache stores exactly these records.
     references: Mutex<Option<Arc<ReferenceCache>>>,
+    /// A cooperative page-by-page reference/citation scan in progress. The shell walks the
+    /// document in bounded steps so visible rasters can run between them; `references()` and
+    /// `citations()` finish any partial scan synchronously and cache the result.
+    reference_scan: Mutex<Option<ReferenceScanState>>,
     /// Figure/table captions with their preview regions; same caching rule as `references`.
     figures: Mutex<Option<Vec<FigureRecord>>>,
+    /// A cooperative page-by-page figure scan in progress. The shell walks the document in
+    /// bounded steps so visible rasters can run between them; `figures()` finishes any partial
+    /// scan synchronously and caches the result.
+    figure_scan: Mutex<Option<FigureScanState>>,
     /// Annotations already stored in the PDF, in view space; same caching rule as `figures`.
     /// The cached scan also carries what could not be decoded, so callers cannot see the
     /// readable half without being able to ask for the unreadable count.
@@ -1531,6 +1539,93 @@ struct ReferenceCache {
     /// The same lists as live `lyra_reader_text` values, with the sections/regions a citation
     /// attribution reads.
     bibliography: lyra_reader_text::Bibliography,
+}
+
+/// The phase of the cooperative reference/citation scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReferenceScanPhase {
+    /// Reading the first [`REFERENCE_SCAN_PAGES`] pages' text.
+    PageText,
+    /// Locating the document-wide list's first page from the text already in hand.
+    FirstListPage,
+    /// Reading link destinations on the body pages before that list.
+    Landings,
+    /// Parsing every reference list and the citation style.
+    Parse,
+    /// Deriving each entry's preview geometry, one entry batch at a time.
+    ListRecords,
+    /// Turning the scanned pages' text into citation spans.
+    CitationBody,
+    /// Reading and indexing the pages past the reference-locator window.
+    CitationTail,
+    /// Writing the caches and reporting the derived cost.
+    Done,
+}
+
+impl ReferenceScanPhase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::PageText => "page-text",
+            Self::FirstListPage => "first-list-page",
+            Self::Landings => "landings",
+            Self::Parse => "parse",
+            Self::ListRecords => "reference-records",
+            Self::CitationBody => "citation-body",
+            Self::CitationTail => "citation-tail",
+            Self::Done => "done",
+        }
+    }
+}
+
+/// The in-progress reference/citation scan.
+///
+/// This is the monolithic scan's working set, kept across bounded calls. `derived` accumulates
+/// only the time spent inside steps, not the idle time between them, so the index-cache report
+/// measures the scan's cost rather than how long the reader took to let it finish.
+struct ReferenceScanState {
+    total: u32,
+    scan_end: u32,
+    pages: Vec<(u32, lyra_reader_core::RawTextPage)>,
+    landings: std::collections::BTreeMap<u32, Vec<f64>>,
+    first_list_page: Option<u32>,
+    bibliography: Option<lyra_reader_text::Bibliography>,
+    style: Option<lyra_reader_text::CitationStyle>,
+    lists: Vec<CachedReferenceList>,
+    document_wide: usize,
+    transforms: std::collections::HashMap<u32, Transform2D>,
+    citations: std::collections::BTreeMap<u32, Vec<CitationRecord>>,
+    records: Vec<ReferenceRecord>,
+    phase: ReferenceScanPhase,
+    /// Page cursor for the current page-based phase.
+    next: u32,
+    /// Current list and entry for `ListRecords`.
+    list_index: usize,
+    entry_index: usize,
+    derived: Duration,
+}
+
+impl ReferenceScanState {
+    fn new(total: u32) -> Self {
+        Self {
+            total,
+            scan_end: total.min(REFERENCE_SCAN_PAGES),
+            pages: Vec::new(),
+            landings: std::collections::BTreeMap::new(),
+            first_list_page: None,
+            bibliography: None,
+            style: None,
+            lists: Vec::new(),
+            document_wide: 0,
+            transforms: std::collections::HashMap::new(),
+            citations: std::collections::BTreeMap::new(),
+            records: Vec::new(),
+            phase: ReferenceScanPhase::PageText,
+            next: 0,
+            list_index: 0,
+            entry_index: 0,
+            derived: Duration::ZERO,
+        }
+    }
 }
 
 /// One resolved reference entry and the list a citation on a page was attributed to.
@@ -2035,7 +2130,9 @@ impl LyraReaderDocument {
             page_sizes: Mutex::new(None),
             layout: Mutex::new(None),
             references: Mutex::new(None),
+            reference_scan: Mutex::new(None),
             figures: Mutex::new(None),
+            figure_scan: Mutex::new(None),
             annotations: Mutex::new(None),
             metadata: Mutex::new(None),
             outline: Mutex::new(None),
@@ -2558,61 +2655,171 @@ impl LyraReaderDocument {
             return Ok(cached.clone());
         }
 
-        let started = Instant::now();
-        let total = self.backend.page_count();
-        let mut records = Vec::new();
-        for index in 0..total {
-            let Ok(text) = self.backend.raw_text_page(PageIndex(index)) else {
-                continue;
-            };
-            let Ok(info) = self.backend.page_info(PageIndex(index)) else {
-                continue;
-            };
-            // Images are a best-effort input: a caption with no image object still previews its
-            // own box, so a page whose objects cannot be read is not a page with no figures.
-            let (images, _rule_count) = self
-                .backend
-                .page_object_summary(PageIndex(index))
-                .unwrap_or_default();
-            // A table has no object of its own; its grid is in the page's vector geometry, and
-            // the text inside the cells is what confirms it. Both are best-effort for the same
-            // reason the images are.
-            let rules = self
-                .backend
-                .page_line_segments(PageIndex(index))
-                .unwrap_or_default();
-            let lines = lyra_reader_text::lines_from(&text);
-            let evidence = lyra_reader_text::PageEvidence {
-                images: &images,
-                rules: &rules,
-                lines: &lines,
-            };
-            // Regions are derived in page space and clamped to the full visible CropBox; its
-            // origin can be non-zero. Transforming all four corners below also handles /Rotate.
-            let page_bounds = info.geometry.crop_box;
-
-            for caption in lyra_reader_text::find_captions(&text) {
-                let region = lyra_reader_text::caption_region_from(&caption, evidence, page_bounds);
-                let view = page_region_to_view(region, info.geometry);
-                records.push(FigureRecord {
-                    kind: caption.kind,
-                    label: caption.label,
-                    page: index,
-                    caption_text: caption.text,
-                    x_pt: view.origin.x,
-                    y_pt: view.origin.y,
-                    width_pt: view.size.width,
-                    height_pt: view.size.height,
-                });
+        // Finish any cooperative scan already in progress, otherwise run the whole scan as one
+        // step. Both paths share `advance_figure_scan`, so the records are page-identical.
+        loop {
+            let progress = self.advance_figure_scan(u32::MAX)?;
+            if progress.done {
+                return Ok(progress.records);
             }
         }
+    }
 
-        if let Ok(mut cache) = self.figures.lock() {
-            *cache = Some(records.clone());
+    /// One page's figure/table captions, with the preview region each one resolves to.
+    ///
+    /// The cooperative scan and the monolithic [`Self::figures`] both call this, so a page
+    /// scanned in the background cannot produce a different record from one scanned in a
+    /// single pass.
+    fn figure_records_for_page(&self, index: u32) -> Vec<FigureRecord> {
+        let Ok(text) = self.backend.raw_text_page(PageIndex(index)) else {
+            return Vec::new();
+        };
+        // Detect captions before reading the page geometry and object summary. A page with no
+        // caption produces no records, so the object/rule/geometry reads would be pure cost;
+        // on a caption-free 115-page paper that is most of the scan. Pages that do have a
+        // caption still read exactly the same inputs in the same order as before.
+        let captions = lyra_reader_text::find_captions(&text);
+        if captions.is_empty() {
+            return Vec::new();
         }
-        self.note_derived(started.elapsed());
-        self.maybe_write_index();
-        Ok(records)
+        let Ok(info) = self.backend.page_info(PageIndex(index)) else {
+            return Vec::new();
+        };
+        // Images are a best-effort input: a caption with no image object still previews its
+        // own box, so a page whose objects cannot be read is not a page with no figures.
+        let (images, _rule_count) = self
+            .backend
+            .page_object_summary(PageIndex(index))
+            .unwrap_or_default();
+        // A table has no object of its own; its grid is in the page's vector geometry, and
+        // the text inside the cells is what confirms it. Both are best-effort for the same
+        // reason the images are.
+        let rules = self
+            .backend
+            .page_line_segments(PageIndex(index))
+            .unwrap_or_default();
+        let lines = lyra_reader_text::lines_from(&text);
+        let evidence = lyra_reader_text::PageEvidence {
+            images: &images,
+            rules: &rules,
+            lines: &lines,
+        };
+        // Regions are derived in page space and clamped to the full visible CropBox; its
+        // origin can be non-zero. Transforming all four corners below also handles /Rotate.
+        let page_bounds = info.geometry.crop_box;
+
+        let mut records = Vec::new();
+        for caption in captions {
+            let region = lyra_reader_text::caption_region_from(&caption, evidence, page_bounds);
+            let view = page_region_to_view(region, info.geometry);
+            records.push(FigureRecord {
+                kind: caption.kind,
+                label: caption.label,
+                page: index,
+                caption_text: caption.text,
+                x_pt: view.origin.x,
+                y_pt: view.origin.y,
+                width_pt: view.size.width,
+                height_pt: view.size.height,
+            });
+        }
+        records
+    }
+
+    /// One bounded step of the document-wide figure scan.
+    ///
+    /// Returns after at most `pages` pages have been read, with the records found so far. The
+    /// shell calls this from the serial PDFium queue; between calls, visible raster tasks are
+    /// ahead of the next step in FIFO order, so a long scan yields. The result is identical to
+    /// [`Self::figures`]: both walk the document in page order and call
+    /// [`Self::figure_records_for_page`].
+    pub fn figures_scan_step(&self, pages: u32) -> Result<FigureScanProgress, LyraReaderFfiError> {
+        self.advance_figure_scan(pages.max(1))
+    }
+
+    /// Advances the cooperative figure scan, starting it if needed.
+    fn advance_figure_scan(&self, pages: u32) -> Result<FigureScanProgress, LyraReaderFfiError> {
+        self.ensure_index_loaded();
+        let total = self.backend.page_count();
+        if let Ok(cache) = self.figures.lock()
+            && let Some(cached) = cache.as_ref()
+        {
+            return Ok(FigureScanProgress {
+                done: true,
+                scanned_pages: total,
+                total_pages: total,
+                records: cached.clone(),
+            });
+        }
+        // Take the state out while PDFium calls run: the mutex guards ownership of the scan,
+        // not the calls, and holding it across them would block a second scanner for no reason.
+        let mut state = {
+            let mut guard = self
+                .figure_scan
+                .lock()
+                .map_err(|_| LyraReaderFfiError::Document {
+                    severity: ErrorSeverity::Document,
+                    message:
+                        "internal state was corrupted by an earlier failure; reopen the document"
+                            .to_string(),
+                })?;
+            guard.take().unwrap_or_else(|| FigureScanState {
+                next: 0,
+                total,
+                derived: Duration::ZERO,
+                records: Vec::new(),
+            })
+        };
+        let step_started = Instant::now();
+        let end = state.total.min(state.next.saturating_add(pages));
+        for index in state.next..end {
+            let records = self.figure_records_for_page(index);
+            state.records.extend(records);
+        }
+        state.next = end;
+        let done = state.next >= state.total;
+        let progress = FigureScanProgress {
+            done,
+            scanned_pages: state.next,
+            total_pages: state.total,
+            records: state.records.clone(),
+        };
+        state.derived += step_started.elapsed();
+        if done {
+            let records = state.records;
+            if let Ok(mut cache) = self.figures.lock() {
+                *cache = Some(records.clone());
+            }
+            self.note_derived(state.derived);
+            self.maybe_write_index();
+            // The completed cache replaces the in-progress state; a later step returns from it.
+            let mut guard = self
+                .figure_scan
+                .lock()
+                .map_err(|_| LyraReaderFfiError::Document {
+                    severity: ErrorSeverity::Document,
+                    message:
+                        "internal state was corrupted by an earlier failure; reopen the document"
+                            .to_string(),
+                })?;
+            *guard = None;
+            return Ok(FigureScanProgress {
+                done: true,
+                scanned_pages: progress.scanned_pages,
+                total_pages: progress.total_pages,
+                records,
+            });
+        }
+        let mut guard = self
+            .figure_scan
+            .lock()
+            .map_err(|_| LyraReaderFfiError::Document {
+                severity: ErrorSeverity::Document,
+                message: "internal state was corrupted by an earlier failure; reopen the document"
+                    .to_string(),
+            })?;
+        *guard = Some(state);
+        Ok(progress)
     }
 
     /// Links on `page`, in **view space** (points, top-left origin).
@@ -4383,195 +4590,8 @@ impl LyraReaderDocument {
         let mut status = AnnotationReadStatus::default();
         let mut geometries: std::collections::HashMap<u32, lyra_reader_core::PageGeometry> =
             std::collections::HashMap::new();
-
         for page in 0..self.backend.page_count() {
-            let geometry = match geometries.get(&page) {
-                Some(geometry) => *geometry,
-                None => match self.backend.page_info(PageIndex(page)) {
-                    Ok(info) => {
-                        let geometry = info.geometry;
-                        geometries.insert(page, geometry);
-                        geometry
-                    }
-                    Err(error) => {
-                        // No geometry means even the annotations that read could not be placed.
-                        // Count the page and keep the other pages readable.
-                        status.unreadable_annotations =
-                            status.unreadable_annotations.saturating_add(1);
-                        status.pages.push(page);
-                        status.details.push(format!("page {}: {error}", page + 1));
-                        continue;
-                    }
-                },
-            };
-
-            let report = match self.backend.annotation_page_report(PageIndex(page)) {
-                Ok(report) => report,
-                Err(error) => {
-                    status.unreadable_annotations = status.unreadable_annotations.saturating_add(1);
-                    status.pages.push(page);
-                    status.details.push(format!("page {}: {error}", page + 1));
-                    continue;
-                }
-            };
-            for unreadable in report.unreadable {
-                status.unreadable_annotations = status.unreadable_annotations.saturating_add(1);
-                if status.pages.last().copied() != Some(page) {
-                    status.pages.push(page);
-                }
-                let slot = unreadable
-                    .slot
-                    .map(|slot| format!(" annotation {slot}"))
-                    .unwrap_or_default();
-                status
-                    .details
-                    .push(format!("page {}{slot}: {}", page + 1, unreadable.reason));
-            }
-
-            for annotation in report.annotations {
-                let view = page_region_to_view(annotation.rect, geometry);
-                // Classified before the record is built: the answer travels with the annotation
-                // rather than being re-derived by every consumer from `kind` and `visible`.
-                let drawing = annotation.drawing();
-                let quads = annotation
-                    .quads
-                    .into_iter()
-                    .map(|quad| {
-                        let view = page_region_to_view(quad, geometry);
-                        AnnotationQuad {
-                            x_pt: view.origin.x,
-                            y_pt: view.origin.y,
-                            width_pt: view.size.width,
-                            height_pt: view.size.height,
-                        }
-                    })
-                    .collect();
-                let to_view = geometry.page_to_view(1.0);
-                let ink_paths = annotation
-                    .ink_paths
-                    .iter()
-                    .map(|path| {
-                        path.iter()
-                            .map(|point| {
-                                let view = to_view.apply(*point);
-                                AnnotationPoint {
-                                    x_pt: view.x,
-                                    y_pt: view.y,
-                                }
-                            })
-                            .collect()
-                    })
-                    .collect();
-                let (line_start, line_end) = match annotation.line {
-                    Some(line) => {
-                        let start = to_view.apply(line.start);
-                        let end = to_view.apply(line.end);
-                        (
-                            Some(AnnotationPoint {
-                                x_pt: start.x,
-                                y_pt: start.y,
-                            }),
-                            Some(AnnotationPoint {
-                                x_pt: end.x,
-                                y_pt: end.y,
-                            }),
-                        )
-                    }
-                    None => (None, None),
-                };
-                let kind = if annotation.kind == lyra_reader_core::RawAnnotationKind::Line
-                    && annotation.line_arrow
-                {
-                    "arrow".to_string()
-                } else {
-                    annotation.kind.as_str().to_string()
-                };
-                let kind_flags = TaxonomyKind::from_document_kind(&kind).flags();
-                let (editable, unsupported_reason) =
-                    document_editability(AnnotationEditabilityInput {
-                        kind: &kind,
-                        is_reply: annotation.is_reply,
-                        visible: annotation.visible,
-                        ink_paths_empty: annotation.ink_paths.is_empty(),
-                        line_missing: annotation.line.is_none(),
-                        stamp_text_empty: annotation.stamp.as_ref().is_none_or(|stamp| {
-                            stamp.text.as_deref().unwrap_or("").trim().is_empty()
-                        }),
-                        stamp_has_image: annotation
-                            .stamp
-                            .as_ref()
-                            .is_some_and(|stamp| stamp.image.is_some()),
-                        stamp_image_error: annotation
-                            .stamp
-                            .as_ref()
-                            .and_then(|stamp| stamp.image_error.as_deref()),
-                        drawing,
-                    });
-
-                records.push(AnnotationRecord {
-                    page,
-                    page_label: crate::format::page_label(&[page.saturating_add(1)]),
-                    id: annotation.id,
-                    parent_id: annotation.parent_id,
-                    is_reply: annotation.is_reply,
-                    has_popup: annotation.has_popup,
-                    kind,
-                    x_pt: view.origin.x,
-                    y_pt: view.origin.y,
-                    width_pt: view.size.width,
-                    height_pt: view.size.height,
-                    quads,
-                    ink_paths,
-                    line_start,
-                    line_end,
-                    line_arrow: annotation.line_arrow,
-                    border_width_pt: annotation.border_width,
-                    color: annotation.color.map(|color| AnnotationColorRecord {
-                        red: color.red,
-                        green: color.green,
-                        blue: color.blue,
-                    }),
-                    opacity: annotation.opacity,
-                    blend: annotation.blend.as_str().to_string(),
-                    contents: annotation.contents,
-                    author: annotation.author,
-                    display_date: annotation
-                        .modified
-                        .as_deref()
-                        .and_then(crate::format::pdf_date_display),
-                    modified: annotation.modified,
-                    font_size_pt: annotation.font_size_pt,
-                    alignment: annotation.alignment.as_str().to_string(),
-                    stamp: annotation.stamp.as_ref().map(|stamp| StampRecord {
-                        text: stamp.text.clone(),
-                        style: stamp.style.clone(),
-                        image: stamp
-                            .image
-                            .as_ref()
-                            .map(|image| image.data.clone())
-                            .unwrap_or_default(),
-                        image_encoding: stamp
-                            .image
-                            .as_ref()
-                            .map(|image| image.encoding.as_str().to_string())
-                            .unwrap_or_default(),
-                        image_width: stamp.image.as_ref().map_or(0, |image| image.width),
-                        image_height: stamp.image.as_ref().map_or(0, |image| image.height),
-                        image_error: stamp.image_error.clone(),
-                    }),
-                    drawing: drawing.as_str().to_string(),
-                    skip_reason: match drawing {
-                        AnnotationDrawing::Skipped(reason) => Some(reason.as_str().to_string()),
-                        _ => None,
-                    },
-                    visible: annotation.visible,
-                    is_markup: kind_flags.is_markup,
-                    is_geometry: kind_flags.is_geometry,
-                    is_note: kind_flags.is_note,
-                    editable,
-                    unsupported_reason,
-                });
-            }
+            self.annotation_page_into(page, &mut geometries, &mut records, &mut status);
         }
 
         let scan = AnnotationScanCache {
@@ -4582,6 +4602,205 @@ impl LyraReaderDocument {
             *cache = Some(scan);
         }
         Ok((records, status))
+    }
+
+    /// Reads one page's annotations into `records` and `status`.
+    ///
+    /// `geometries` remembers a page's geometry across pages of the same batch; the monolithic
+    /// scan kept the same cache for the whole document.
+    fn annotation_page_into(
+        &self,
+        page: u32,
+        geometries: &mut std::collections::HashMap<u32, lyra_reader_core::PageGeometry>,
+        records: &mut Vec<AnnotationRecord>,
+        status: &mut AnnotationReadStatus,
+    ) {
+        let geometry = match geometries.get(&page) {
+            Some(geometry) => *geometry,
+            None => match self.backend.page_info(PageIndex(page)) {
+                Ok(info) => {
+                    let geometry = info.geometry;
+                    geometries.insert(page, geometry);
+                    geometry
+                }
+                Err(error) => {
+                    // No geometry means even the annotations that read could not be placed.
+                    // Count the page and keep the other pages readable.
+                    status.unreadable_annotations = status.unreadable_annotations.saturating_add(1);
+                    status.pages.push(page);
+                    status.details.push(format!("page {}: {error}", page + 1));
+                    return;
+                }
+            },
+        };
+
+        let report = match self.backend.annotation_page_report(PageIndex(page)) {
+            Ok(report) => report,
+            Err(error) => {
+                status.unreadable_annotations = status.unreadable_annotations.saturating_add(1);
+                status.pages.push(page);
+                status.details.push(format!("page {}: {error}", page + 1));
+                return;
+            }
+        };
+        for unreadable in report.unreadable {
+            status.unreadable_annotations = status.unreadable_annotations.saturating_add(1);
+            if status.pages.last().copied() != Some(page) {
+                status.pages.push(page);
+            }
+            let slot = unreadable
+                .slot
+                .map(|slot| format!(" annotation {slot}"))
+                .unwrap_or_default();
+            status
+                .details
+                .push(format!("page {}{slot}: {}", page + 1, unreadable.reason));
+        }
+
+        for annotation in report.annotations {
+            let view = page_region_to_view(annotation.rect, geometry);
+            // Classified before the record is built: the answer travels with the annotation
+            // rather than being re-derived by every consumer from `kind` and `visible`.
+            let drawing = annotation.drawing();
+            let quads = annotation
+                .quads
+                .into_iter()
+                .map(|quad| {
+                    let view = page_region_to_view(quad, geometry);
+                    AnnotationQuad {
+                        x_pt: view.origin.x,
+                        y_pt: view.origin.y,
+                        width_pt: view.size.width,
+                        height_pt: view.size.height,
+                    }
+                })
+                .collect();
+            let to_view = geometry.page_to_view(1.0);
+            let ink_paths = annotation
+                .ink_paths
+                .iter()
+                .map(|path| {
+                    path.iter()
+                        .map(|point| {
+                            let view = to_view.apply(*point);
+                            AnnotationPoint {
+                                x_pt: view.x,
+                                y_pt: view.y,
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            let (line_start, line_end) = match annotation.line {
+                Some(line) => {
+                    let start = to_view.apply(line.start);
+                    let end = to_view.apply(line.end);
+                    (
+                        Some(AnnotationPoint {
+                            x_pt: start.x,
+                            y_pt: start.y,
+                        }),
+                        Some(AnnotationPoint {
+                            x_pt: end.x,
+                            y_pt: end.y,
+                        }),
+                    )
+                }
+                None => (None, None),
+            };
+            let kind = if annotation.kind == lyra_reader_core::RawAnnotationKind::Line
+                && annotation.line_arrow
+            {
+                "arrow".to_string()
+            } else {
+                annotation.kind.as_str().to_string()
+            };
+            let kind_flags = TaxonomyKind::from_document_kind(&kind).flags();
+            let (editable, unsupported_reason) = document_editability(AnnotationEditabilityInput {
+                kind: &kind,
+                is_reply: annotation.is_reply,
+                visible: annotation.visible,
+                ink_paths_empty: annotation.ink_paths.is_empty(),
+                line_missing: annotation.line.is_none(),
+                stamp_text_empty: annotation
+                    .stamp
+                    .as_ref()
+                    .is_none_or(|stamp| stamp.text.as_deref().unwrap_or("").trim().is_empty()),
+                stamp_has_image: annotation
+                    .stamp
+                    .as_ref()
+                    .is_some_and(|stamp| stamp.image.is_some()),
+                stamp_image_error: annotation
+                    .stamp
+                    .as_ref()
+                    .and_then(|stamp| stamp.image_error.as_deref()),
+                drawing,
+            });
+
+            records.push(AnnotationRecord {
+                page,
+                page_label: crate::format::page_label(&[page.saturating_add(1)]),
+                id: annotation.id,
+                parent_id: annotation.parent_id,
+                is_reply: annotation.is_reply,
+                has_popup: annotation.has_popup,
+                kind,
+                x_pt: view.origin.x,
+                y_pt: view.origin.y,
+                width_pt: view.size.width,
+                height_pt: view.size.height,
+                quads,
+                ink_paths,
+                line_start,
+                line_end,
+                line_arrow: annotation.line_arrow,
+                border_width_pt: annotation.border_width,
+                color: annotation.color.map(|color| AnnotationColorRecord {
+                    red: color.red,
+                    green: color.green,
+                    blue: color.blue,
+                }),
+                opacity: annotation.opacity,
+                blend: annotation.blend.as_str().to_string(),
+                contents: annotation.contents,
+                author: annotation.author,
+                display_date: annotation
+                    .modified
+                    .as_deref()
+                    .and_then(crate::format::pdf_date_display),
+                modified: annotation.modified,
+                font_size_pt: annotation.font_size_pt,
+                alignment: annotation.alignment.as_str().to_string(),
+                stamp: annotation.stamp.as_ref().map(|stamp| StampRecord {
+                    text: stamp.text.clone(),
+                    style: stamp.style.clone(),
+                    image: stamp
+                        .image
+                        .as_ref()
+                        .map(|image| image.data.clone())
+                        .unwrap_or_default(),
+                    image_encoding: stamp
+                        .image
+                        .as_ref()
+                        .map(|image| image.encoding.as_str().to_string())
+                        .unwrap_or_default(),
+                    image_width: stamp.image.as_ref().map_or(0, |image| image.width),
+                    image_height: stamp.image.as_ref().map_or(0, |image| image.height),
+                    image_error: stamp.image_error.clone(),
+                }),
+                drawing: drawing.as_str().to_string(),
+                skip_reason: match drawing {
+                    AnnotationDrawing::Skipped(reason) => Some(reason.as_str().to_string()),
+                    _ => None,
+                },
+                visible: annotation.visible,
+                is_markup: kind_flags.is_markup,
+                is_geometry: kind_flags.is_geometry,
+                is_note: kind_flags.is_note,
+                editable,
+                unsupported_reason,
+            });
+        }
     }
 
     /// The one gate for every command that would **rewrite the signed file itself**.
@@ -5317,113 +5536,314 @@ impl LyraReaderDocument {
         {
             return Ok(Arc::clone(cached));
         }
-
-        let started = Instant::now();
-        // Scanning from the front with a window, rather than only the tail: real papers put the
-        // list anywhere from a third of the way in (with appendices after it) to the very end.
-        // The window is what keeps a 2000-page manual's reference locator from holding every
-        // page's text at once; the citation index still reads the remaining pages below.
-        let total = self.backend.page_count();
-        let scan_end = total.min(REFERENCE_SCAN_PAGES);
-        let mut pages = Vec::new();
-        for index in 0..scan_end {
-            if let Ok(text) = self.backend.raw_text_page(PageIndex(index)) {
-                pages.push((index, text));
+        // The monolithic entry point is the same state machine with unbounded batches: every
+        // caller that cannot yield (the CLI, the index-cache checks) still gets one call.
+        loop {
+            let progress = self.advance_reference_scan(u32::MAX, usize::MAX)?;
+            if progress.done {
+                if let Ok(cache) = self.references.lock()
+                    && let Some(cached) = cache.as_ref()
+                {
+                    return Ok(Arc::clone(cached));
+                }
+                return Err(LyraReaderFfiError::Document {
+                    severity: ErrorSeverity::Document,
+                    message: "the reference scan finished without a cache; reopen the document"
+                        .to_string(),
+                });
             }
         }
+    }
 
-        // Ground-truth pass: a paper that links its citations into the bibliography is telling us
-        // exactly where each entry starts, and those landings beat any numbering rule. Collect
-        // them first, then let the shared locator decide page by page.
-        let mut landings: std::collections::BTreeMap<u32, Vec<f64>> =
-            std::collections::BTreeMap::new();
-        if let Some(first_list_page) =
-            lyra_reader_text::find_references(pages.iter().map(|(page, text)| (*page, text)), 2000)
-                .iter()
-                .map(|entry| entry.page)
-                .min()
+    /// Advances the reference/citation scan by at most one batch of work.
+    fn advance_reference_scan(
+        &self,
+        page_batch: u32,
+        entry_batch: usize,
+    ) -> Result<ReferenceScanProgress, LyraReaderFfiError> {
+        self.ensure_index_loaded();
+        let total = self.backend.page_count();
+        if let Ok(cache) = self.references.lock()
+            && let Some(cached) = cache.as_ref()
         {
-            // Only the body can point into the list, so there is no need to scan past it.
-            for body_page in 0..first_list_page {
-                let Ok(links) = self.backend.link_targets(PageIndex(body_page)) else {
-                    continue;
-                };
-                for link in links {
-                    if let (Some(target), Some(top)) = (link.page, link.dest_top_y)
-                        && target.get() >= first_list_page
-                    {
-                        landings.entry(target.get()).or_default().push(top);
+            return Ok(ReferenceScanProgress {
+                done: true,
+                phase: "done".to_string(),
+                total_pages: total,
+                records: cached.records.clone(),
+            });
+        }
+
+        let mut state = {
+            let mut guard = lyra_reader_core::sync::lock(&self.reference_scan)?;
+            guard
+                .take()
+                .unwrap_or_else(|| ReferenceScanState::new(total))
+        };
+        let step_started = Instant::now();
+        loop {
+            match state.phase {
+                ReferenceScanPhase::PageText => {
+                    let end = state.scan_end.min(state.next.saturating_add(page_batch));
+                    for index in state.next..end {
+                        // A page whose text cannot be read is skipped exactly as the monolithic
+                        // scan skipped it: the rest of the document still indexes.
+                        if let Ok(text) = self.backend.raw_text_page(PageIndex(index)) {
+                            state.pages.push((index, text));
+                        }
                     }
+                    state.next = end;
+                    if state.next < state.scan_end {
+                        break;
+                    }
+                    state.phase = ReferenceScanPhase::FirstListPage;
+                    state.next = 0;
+                }
+                ReferenceScanPhase::FirstListPage => {
+                    state.first_list_page = lyra_reader_text::find_references(
+                        state.pages.iter().map(|(page, text)| (*page, text)),
+                        2000,
+                    )
+                    .iter()
+                    .map(|entry| entry.page)
+                    .min();
+                    state.next = 0;
+                    if state.first_list_page.is_some() {
+                        state.phase = ReferenceScanPhase::Landings;
+                    } else {
+                        state.phase = ReferenceScanPhase::Parse;
+                        break;
+                    }
+                }
+                ReferenceScanPhase::Landings => {
+                    let body_end = state.first_list_page.unwrap_or(0);
+                    let end = body_end.min(state.next.saturating_add(page_batch));
+                    for body_page in state.next..end {
+                        // Only the body can point into the list, so there is no need to scan
+                        // past it. A page whose links cannot be read is skipped.
+                        let Ok(links) = self.backend.link_targets(PageIndex(body_page)) else {
+                            continue;
+                        };
+                        for link in links {
+                            if let (Some(target), Some(top)) = (link.page, link.dest_top_y)
+                                && target.get() >= body_end
+                            {
+                                state.landings.entry(target.get()).or_default().push(top);
+                            }
+                        }
+                    }
+                    state.next = end;
+                    if state.next < body_end {
+                        break;
+                    }
+                    state.phase = ReferenceScanPhase::Parse;
+                    break;
+                }
+                ReferenceScanPhase::Parse => {
+                    // Parsing the lists is one CPU-only pass over the page texts already in
+                    // hand. It is the largest single step the shell can see (about 65 ms on the
+                    // 115-page review paper), so it returns immediately afterwards instead of
+                    // continuing into another batch.
+                    let bibliography = lyra_reader_text::find_reference_lists_with_landings(
+                        &state.pages,
+                        &state.landings,
+                        2000,
+                    );
+                    let document_wide_entries = bibliography
+                        .document_wide_list()
+                        .map(|list| list.entries.clone())
+                        .unwrap_or_default();
+                    let style = lyra_reader_text::CitationStyle::for_document(
+                        &state.pages,
+                        &document_wide_entries,
+                    );
+                    state.lists = bibliography
+                        .lists
+                        .iter()
+                        .map(|list| cached_reference_list(list, Vec::new()))
+                        .collect();
+                    state.document_wide = bibliography.document_wide;
+                    state.bibliography = Some(bibliography);
+                    state.style = Some(style);
+                    state.next = 0;
+                    state.list_index = 0;
+                    state.entry_index = 0;
+                    state.phase = if state.lists.is_empty() {
+                        ReferenceScanPhase::CitationBody
+                    } else {
+                        ReferenceScanPhase::ListRecords
+                    };
+                    break;
+                }
+                ReferenceScanPhase::ListRecords => {
+                    let mut budget = entry_batch;
+                    while budget > 0 && state.list_index < state.lists.len() {
+                        let entries_len = state
+                            .bibliography
+                            .as_ref()
+                            .and_then(|bibliography| bibliography.lists.get(state.list_index))
+                            .map(|list| list.entries.len())
+                            .unwrap_or(0);
+                        if state.entry_index >= entries_len {
+                            state.list_index += 1;
+                            state.entry_index = 0;
+                            continue;
+                        }
+                        let take = (entries_len - state.entry_index).min(budget);
+                        let records = match state.bibliography.as_ref() {
+                            Some(bibliography) => reference_records(
+                                &self.backend,
+                                &mut state.transforms,
+                                &bibliography.lists[state.list_index].entries
+                                    [state.entry_index..state.entry_index + take],
+                            ),
+                            None => Vec::new(),
+                        };
+                        state.lists[state.list_index].records.extend(records);
+                        state.entry_index += take;
+                        budget -= take;
+                    }
+                    if state.list_index < state.lists.len() {
+                        break;
+                    }
+                    state.records = state
+                        .lists
+                        .get(state.document_wide)
+                        .map(|list| list.records.clone())
+                        .unwrap_or_default();
+                    state.bibliography =
+                        Some(bibliography_from_cached(&state.lists, state.document_wide));
+                    state.next = 0;
+                    state.phase = ReferenceScanPhase::CitationBody;
+                }
+                ReferenceScanPhase::CitationBody => {
+                    let Some(style) = state.style.clone() else {
+                        return Err(LyraReaderFfiError::Document {
+                            severity: ErrorSeverity::Document,
+                            message:
+                                "the reference scan lost its citation style; reopen the document"
+                                    .to_string(),
+                        });
+                    };
+                    let end = (state.next as usize)
+                        .saturating_add(page_batch as usize)
+                        .min(state.pages.len());
+                    for index in state.next as usize..end {
+                        let (page, text) = &state.pages[index];
+                        let Some(transform) =
+                            document_page_view(&self.backend, &mut state.transforms, *page)
+                        else {
+                            continue;
+                        };
+                        state
+                            .citations
+                            .insert(*page, citation_records(text, &style, *page, transform));
+                    }
+                    state.next = end as u32;
+                    if (state.next as usize) < state.pages.len() {
+                        break;
+                    }
+                    state.next = state.scan_end;
+                    state.phase = ReferenceScanPhase::CitationTail;
+                }
+                ReferenceScanPhase::CitationTail => {
+                    let Some(style) = state.style.clone() else {
+                        return Err(LyraReaderFfiError::Document {
+                            severity: ErrorSeverity::Document,
+                            message:
+                                "the reference scan lost its citation style; reopen the document"
+                                    .to_string(),
+                        });
+                    };
+                    let end = state.total.min(state.next.saturating_add(page_batch));
+                    for index in state.next..end {
+                        let Ok(text) = self.backend.raw_text_page(PageIndex(index)) else {
+                            continue;
+                        };
+                        let Some(transform) =
+                            document_page_view(&self.backend, &mut state.transforms, index)
+                        else {
+                            continue;
+                        };
+                        state
+                            .citations
+                            .insert(index, citation_records(&text, &style, index, transform));
+                    }
+                    state.next = end;
+                    if state.next < state.total {
+                        break;
+                    }
+                    state.phase = ReferenceScanPhase::Done;
+                }
+                ReferenceScanPhase::Done => {
+                    let Some(style) = state.style.take() else {
+                        return Err(LyraReaderFfiError::Document {
+                            severity: ErrorSeverity::Document,
+                            message:
+                                "the reference scan finished without a style; reopen the document"
+                                    .to_string(),
+                        });
+                    };
+                    let Some(bibliography) = state.bibliography.take() else {
+                        return Err(LyraReaderFfiError::Document {
+                            severity: ErrorSeverity::Document,
+                            message: "the reference scan finished without a bibliography; reopen the document"
+                                .to_string(),
+                        });
+                    };
+                    let records = state.records.clone();
+                    let cache = Arc::new(ReferenceCache {
+                        records: records.clone(),
+                        style,
+                        lists: state.lists,
+                        bibliography,
+                    });
+                    if let Ok(mut guard) = self.references.lock() {
+                        *guard = Some(Arc::clone(&cache));
+                    }
+                    if let Ok(mut guard) = self.citations.lock() {
+                        *guard = Some(state.citations);
+                    }
+                    state.derived += step_started.elapsed();
+                    self.note_derived(state.derived);
+                    self.maybe_write_index();
+                    return Ok(ReferenceScanProgress {
+                        done: true,
+                        phase: "done".to_string(),
+                        total_pages: total,
+                        records,
+                    });
                 }
             }
         }
+        state.derived += step_started.elapsed();
+        let progress = ReferenceScanProgress {
+            done: false,
+            phase: state.phase.name().to_string(),
+            total_pages: total,
+            records: state.records.clone(),
+        };
+        let mut guard = lyra_reader_core::sync::lock(&self.reference_scan)?;
+        *guard = Some(state);
+        Ok(progress)
+    }
+}
 
-        // Every reference list, with the document-wide one rebuilt from the link landings exactly
-        // as the app has always resolved against it. The other lists are what a page-aware
-        // citation needs; they are parsed once here and persisted with the index.
-        let bibliography =
-            lyra_reader_text::find_reference_lists_with_landings(&pages, &landings, 2000);
-        let document_wide_entries = bibliography
-            .document_wide_list()
-            .map(|list| list.entries.clone())
-            .unwrap_or_default();
-        let style = lyra_reader_text::CitationStyle::for_document(&pages, &document_wide_entries);
-        // One page → view transform per page, not per fragment: a bibliography page holds dozens
-        // of entries and each of their fragments asks for the same page again.
-        let mut transforms: std::collections::HashMap<u32, lyra_reader_core::Transform2D> =
-            std::collections::HashMap::new();
-        let mut lists = Vec::with_capacity(bibliography.lists.len());
-        for list in &bibliography.lists {
-            let records = reference_records(&self.backend, &mut transforms, &list.entries);
-            lists.push(cached_reference_list(list, records));
-        }
-        let records = lists
-            .get(bibliography.document_wide)
-            .map(|list| list.records.clone())
-            .unwrap_or_default();
-        // Resolution and attribution run on the records the cache carries, so an entry index is
-        // also its preview record's index.
-        let bibliography = bibliography_from_cached(&lists, bibliography.document_wide);
-
-        // The body pages are in `pages` already; turn their text into click targets now, with
-        // the same function and style a per-page call would use. Empty pages stay in the map so
-        // a click on them is a lookup, not a second text extraction.
-        let mut citations = std::collections::BTreeMap::new();
-        for (index, text) in &pages {
-            let Some(transform) = document_page_view(&self.backend, &mut transforms, *index) else {
-                continue;
-            };
-            citations.insert(*index, citation_records(text, &style, *index, transform));
-        }
-        // The reference locator stops at its window, but the citation index does not: every page
-        // past it is read once here, with the style the document's own list implied, and stored
-        // in the same map (and in the cache). This is the difference between a 900-page book
-        // indexing every page once and re-extracting a page on every click.
-        for index in scan_end..total {
-            let Ok(text) = self.backend.raw_text_page(PageIndex(index)) else {
-                continue;
-            };
-            let Some(transform) = document_page_view(&self.backend, &mut transforms, index) else {
-                continue;
-            };
-            citations.insert(index, citation_records(&text, &style, index, transform));
-        }
-
-        let cache = Arc::new(ReferenceCache {
-            records,
-            style,
-            lists,
-            bibliography,
-        });
-        if let Ok(mut guard) = self.references.lock() {
-            *guard = Some(Arc::clone(&cache));
-        }
-        if let Ok(mut guard) = self.citations.lock() {
-            *guard = Some(citations);
-        }
-        self.note_derived(started.elapsed());
-        self.maybe_write_index();
-        Ok(cache)
+#[uniffi::export]
+impl LyraReaderDocument {
+    /// One bounded step of the document-wide reference and citation scan.
+    ///
+    /// The shell calls this in a loop and yields to visible raster work between calls. Results
+    /// are identical to [`LyraReaderDocument::references`]: both run the same state machine and
+    /// the same per-page helpers. `page_batch` bounds the pages one call may read; `entry_batch`
+    /// bounds the reference entries whose preview geometry one call may derive. A zero batch is
+    /// treated as one so a caller cannot make the scan fail to progress.
+    pub fn references_scan_step(
+        &self,
+        page_batch: u32,
+        entry_batch: u32,
+    ) -> Result<ReferenceScanProgress, LyraReaderFfiError> {
+        self.advance_reference_scan(page_batch.max(1), (entry_batch.max(1)) as usize)
     }
 }
 
@@ -7371,6 +7791,42 @@ pub struct FigureRecord {
     pub height_pt: f64,
 }
 
+/// One bounded step of the cooperative reference/citation scan.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ReferenceScanProgress {
+    /// True when the scan has finished and both the reference cache and citation map are set.
+    pub done: bool,
+    /// The phase the next call will run (`done` at completion). Useful in traces and checks.
+    pub phase: String,
+    /// Pages in the document at the time the scan started.
+    pub total_pages: u32,
+    /// The reference records found so far; empty until the parse/geometry phases complete.
+    pub records: Vec<ReferenceRecord>,
+}
+
+/// One bounded step of the cooperative figure scan.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FigureScanProgress {
+    /// True when every page has been read and the records are the complete index.
+    pub done: bool,
+    /// Pages read so far (0-based count, not the next page index).
+    pub scanned_pages: u32,
+    /// Pages in the document at the time this scan started.
+    pub total_pages: u32,
+    /// The records found so far, in page order. At `done` this is the full figure index.
+    pub records: Vec<FigureRecord>,
+}
+
+/// The in-progress figure scan. `started` is the measurement origin for `note_derived`, which
+/// records the scan's cost in the persistent-index report exactly as the monolithic path does.
+struct FigureScanState {
+    next: u32,
+    total: u32,
+    /// Active time in steps, not the idle time between them (same rule as the reference scan).
+    derived: Duration,
+    records: Vec<FigureRecord>,
+}
+
 /// A `Figure N` / `Fig. N` / `Table N` / `Algorithm N` reference in the body text, boxed in **view space**.
 ///
 /// `kind` + `label` resolve against [`FigureRecord`]s; `start`/`end` address the page's text
@@ -7894,7 +8350,9 @@ impl LyraReaderEngine {
             page_sizes: Mutex::new(None),
             layout: Mutex::new(None),
             references: Mutex::new(None),
+            reference_scan: Mutex::new(None),
             figures: Mutex::new(None),
+            figure_scan: Mutex::new(None),
             annotations: Mutex::new(None),
             metadata: Mutex::new(None),
             outline: Mutex::new(None),
