@@ -860,6 +860,10 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     private var perfViewportSeq: UInt64 = 0
     private var perfInputSeq: UInt64 = 0
     private var perfSharpToken: UInt64 = 0
+    /// Every committed page list gets a number, not only the sharp ones. `frame.content_seq`
+    /// carries it, so a presented frame can be joined to the `content` record of the page list
+    /// it drew. 0 means no page list has been committed in this instance yet.
+    private var perfContentSeq: UInt64 = 0
     /// Bumped whenever the tile cache is deliberately emptied (`invalidateTiles`): a raster
     /// after that is a first raster for the new content version, not eviction thrash.
     private var perfContentVersion: UInt64 = 0
@@ -15265,6 +15269,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let onScreenPageIndices = Set(onScreen.map(\.placement.index))
         let perfOnScreen: Set<Int>? = PerfTrace.enabled ? onScreenPageIndices : nil
         var perfSharpSources: [Int: String]? = perfOnScreen == nil ? nil : [:]
+        // What each on-screen page actually draws, including lower-quality fallbacks. Only built
+        // when the trace is on; the product path never reads it.
+        var perfContentSources: [Int: String]? = perfOnScreen == nil ? nil : [:]
         // At least one on-screen page is fully covered by a sharp source in the page list that
         // is about to be committed. This is the point where the startup gate releases the
         // document-wide index scans that were held behind the visible page.
@@ -15288,10 +15295,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                         // "Sharp" on this path means a page raster at least
                         // `zoom × deviceScale`; a 1x preview is a backdrop, not sharpness.
                         pageSharp = isScreenPageCached(placement.index)
+                        perfContentSources?[placement.index] = pageSharp ? "page-raster" : "preview"
                     } else if !previous.isEmpty {
                         pages.append(contentsOf: previous)
-                    } else if let thumbnail = pageBackdrops.image(for: placement.index) ?? thumbnails[placement.index] {
+                        perfContentSources?[placement.index] = "previous-tile"
+                    } else if let backdrop = pageBackdrops.image(for: placement.index) {
+                        // The retained low-resolution history (#213): real page pixels, below
+                        // the current sharpness target, drawn while a fresh raster is pending.
+                        pages.append(canvasPageRaster(backdrop, placement: placement))
+                        perfContentSources?[placement.index] = "history"
+                    } else if let thumbnail = thumbnails[placement.index] {
                         pages.append(canvasPageRaster(thumbnail, placement: placement))
+                        perfContentSources?[placement.index] = "thumbnail"
                     }
                     if let perfOnScreen, perfOnScreen.contains(placement.index), pageSharp {
                         perfSharpSources?[placement.index] = "page-raster"
@@ -15371,16 +15386,34 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     })
                 }
             }
-            if !complete, !changingLOD,
-               let preview = pagePreviews[placement.index] ?? pageBackdrops.image(for: placement.index) ?? thumbnails[placement.index] {
-                // The preview is only a backdrop for uncovered rows, never a replacement
+            if !complete, !changingLOD {
+                // The fallback is only a backdrop for uncovered rows, never a replacement
                 // for the sharp content the reader is already looking at.
-                pages.append(CanvasPage(placement: PagePlacement(index: PlacementIndex.pageRaster(placement.index),
-                    topPt: placement.topPt, leftPt: placement.leftPt,
-                    widthPt: placement.widthPt, heightPt: placement.heightPt), image: preview))
+                let fallback = pagePreviews[placement.index]
+                    ?? pageBackdrops.image(for: placement.index)
+                    ?? thumbnails[placement.index]
+                if let fallback {
+                    pages.append(CanvasPage(placement: PagePlacement(index: PlacementIndex.pageRaster(placement.index),
+                        topPt: placement.topPt, leftPt: placement.leftPt,
+                        widthPt: placement.widthPt, heightPt: placement.heightPt), image: fallback))
+                    if perfContentSources != nil {
+                        if pagePreviews[placement.index] != nil {
+                            perfContentSources?[placement.index] = "preview"
+                        } else if pageBackdrops.contains(placement.index) {
+                            // `pageBackdrops.image(for:)` above already tells us it exists;
+                            // asking `contains` avoids a second LRU tick just to name the source.
+                            perfContentSources?[placement.index] = "history"
+                        } else {
+                            perfContentSources?[placement.index] = "thumbnail"
+                        }
+                    }
+                } else if !sharpRows.isEmpty {
+                    perfContentSources?[placement.index] = "partial-tile"
+                }
             }
             if changingLOD && !complete {
                 pages.append(contentsOf: previous)
+                perfContentSources?[placement.index] = "previous-tile"
             } else {
                 pages.append(contentsOf: sharpRows)
             }
@@ -15389,6 +15422,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // clears it; a missing ring tile does not).
             if let perfOnScreen, perfOnScreen.contains(placement.index), complete {
                 perfSharpSources?[placement.index] = "tile"
+                perfContentSources?[placement.index] = "tile"
             }
             if complete, onScreenPageIndices.contains(placement.index) {
                 anyOnScreenPageSharp = true
@@ -15432,7 +15466,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             noteFirstSharpVisiblePage()
         }
         if let perfOnScreen, let perfSharpSources {
-            finishPerfViewport(pages: pages, sharpSources: perfSharpSources, onScreen: perfOnScreen,
+            finishPerfViewport(pages: pages, sharpSources: perfSharpSources,
+                               contentSources: perfContentSources ?? [:], onScreen: perfOnScreen,
+                               anchorPage: regionCurrentPage(at: scrollYPt),
+                               bandPages: visible.map(\.index),
                                path: usesScreenPageRasters ? "page-raster" : "tile", lod: lod,
                                viewport: viewport, visibleMisses: bandReport.visibleMisses,
                                queuedTiles: queuedTiles.count, wanted: wanted.count)
@@ -18076,6 +18113,10 @@ extension AppState {
                 // sharp source; the same bitmap can become `page-raster` once it reaches the
                 // screen resolution (a later generation).
                 source = isScreenPageCached(pageIndex) ? "page-raster" : "preview"
+            } else if page.image.generation & (UInt64(1) << 62) != 0 {
+                // `retainPageBackdrop` tags its reduced bitmap with bit 62 so it cannot share the
+                // sharp source's generation; it is page content, but not a sidebar thumbnail.
+                source = "history"
             } else {
                 source = "thumbnail"
             }
@@ -18090,13 +18131,16 @@ extension AppState {
     /// every on-screen page is covered at target sharpness, publishes the stamp the canvas copies
     /// into frame records, and records first draws.
     private func finishPerfViewport(pages: [CanvasPage], sharpSources: [Int: String],
-                                    onScreen: Set<Int>, path: String, lod: UInt8,
+                                    contentSources: [Int: String], onScreen: Set<Int>,
+                                    anchorPage: Int, bandPages: [Int], path: String, lod: UInt8,
                                     viewport: CGRect, visibleMisses: Int, queuedTiles: Int,
                                     wanted: Int) {
         guard PerfTrace.enabled else { return }
         perfViewportSeq &+= 1
+        perfContentSeq &+= 1
         let visiblePages = onScreen.sorted()
         let sources = visiblePages.compactMap { sharpSources[$0] }
+        let content = visiblePages.map { contentSources[$0] ?? "none" }
         // No visible page means no "whole viewport": a plan with nothing on screen is never
         // reported sharp, even though there is nothing blurry either.
         let sharpNow = !visiblePages.isEmpty && sources.count == visiblePages.count
@@ -18107,6 +18151,13 @@ extension AppState {
                            visiblePages: visiblePages, viewport: viewport, sharp: sharpNow,
                            visibleMisses: visibleMisses, queuedTiles: queuedTiles,
                            wantedTiles: wanted, pageRasters: pagePreviews.count)
+        // The drawn page list, classified even when it is not sharp. This is what makes "first
+        // non-empty content" and the paper-only window measurable: a frame with `content_seq`
+        // pointing here can be joined to what its pages actually were.
+        PerfTrace.content(instance: perfTraceInstanceID, seq: perfViewportSeq,
+                          contentSeq: perfContentSeq, epoch: documentEpoch,
+                          offsetPt: scrollYPt, pages: visiblePages, sources: content,
+                          anchorPage: anchorPage, sharp: sharpNow, bandPages: bandPages.sorted())
         if sharpNow {
             perfSharpToken &+= 1
             PerfTrace.sharp(instance: self.perfTraceInstanceID, token: perfSharpToken, viewportSeq: perfViewportSeq,
@@ -18118,7 +18169,8 @@ extension AppState {
         perfViewportStamp = PerfViewportStamp(instance: perfTraceInstanceID, token: perfSharpToken, epoch: documentEpoch,
                                               contentVersion: perfContentVersion,
                                               path: sharpNow ? sourcePath : path, lod: lod,
-                                              offsetPt: scrollYPt)
+                                              offsetPt: scrollYPt, contentSeq: perfContentSeq,
+                                              anchorPage: anchorPage)
         tracePerfDrawnPages(pages)
     }
 }

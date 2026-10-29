@@ -28,6 +28,11 @@ final class PresentationTraceLayer: CAMetalLayer {
     var traceQuads: Int = 0
     var tracePaperQuads: Int = 0
     var traceTileQuads: Int = 0
+    /// On-screen page bitmap quads and the pages they belong to, captured with the other
+    /// submission facts so a frame presented later reports the list it actually drew.
+    var tracePageQuads: Int = 0
+    var traceAnchorPageQuads: Int = 0
+    var traceContentPages: [Int] = []
     var traceFrameIndex: UInt64 = 0
     /// Draw-call wall time, written after the draw returns; the handler reads it at presentation.
     var traceCPU = TraceCPUSample()
@@ -54,6 +59,9 @@ final class PresentationTraceLayer: CAMetalLayer {
         let quads = traceQuads
         let paperQuads = tracePaperQuads
         let tileQuads = traceTileQuads
+        let pageQuads = tracePageQuads
+        let anchorPageQuads = traceAnchorPageQuads
+        let contentPages = traceContentPages
         let frameIndex = traceFrameIndex
         let cpu = traceCPU
         let uploadMs = traceUploadMs
@@ -74,7 +82,9 @@ final class PresentationTraceLayer: CAMetalLayer {
                     : "Metal reported a zero host presentation timestamp (display asleep or window occluded)",
                 submitTime: submitTime, surface: surface, sequence: sequence, stamp: stamp,
                 cpuUs: cpu.microseconds, quads: quads, tileQuads: tileQuads,
-                frameIndex: frameIndex, uploadMs: uploadMs > 0 ? uploadMs : nil, paperQuads: paperQuads)
+                frameIndex: frameIndex, uploadMs: uploadMs > 0 ? uploadMs : nil,
+                paperQuads: paperQuads, pageQuads: pageQuads,
+                contentPages: contentPages, anchorPageQuads: anchorPageQuads)
         }
         return drawable
     }
@@ -1837,6 +1847,18 @@ public final class MetalCanvasView: NSView {
         var blends: [UInt8] = []
         var submitted: [String] = []
         var tileQuadCount = 0
+        // Whole-page/tile bitmap quads only: selection, annotation and glyph overlays are drawn
+        // from the same list but are not page content. The metric "first content" is about
+        // these, so paper-only has to mean zero of them even when an overlay is visible.
+        var pageQuadCount = 0
+        var anchorPageQuadCount = 0
+        var contentPages: [Int] = []
+        var contentPageSet = Set<Int>()
+        // The paper loop already clips to the surface; the page list is submitted whole and the
+        // GPU clips it, so a page in the two-viewport prefetch band would otherwise count as
+        // "content" while it is nowhere near the visible reading region.
+        let visibleSurfaceRect = CGRect(x: 0, y: 0, width: CGFloat(surfaceWidth),
+                                        height: bounds.height * scale)
         // Paper exists independently of its raster. All page segments share one white texel,
         // converted by the same appearance shader as PDF pixels, beneath every content quad.
         if paperTexture == nil, !annotationPageFrames.isEmpty {
@@ -1875,6 +1897,20 @@ public final class MetalCanvasView: NSView {
                 backingScale: scale,
                 contentOffsetXPx: offsetX
             )
+            // Trace-only classification: with the trace off this branch is one predictable
+            // bool test and no set or array allocation.
+            if PerfTrace.enabled, quad.intersects(visibleSurfaceRect) {
+                let pageIndex: Int? = page.placement.index >= 0
+                    ? page.placement.index >> 24
+                    : PlacementIndex.pageRasterPage(page.placement.index)
+                if let pageIndex {
+                    pageQuadCount += 1
+                    if pageIndex == perfStamp.anchorPage { anchorPageQuadCount += 1 }
+                    if contentPageSet.insert(pageIndex).inserted {
+                        contentPages.append(pageIndex)
+                    }
+                }
+            }
             let x = quad.minX
             let y = quad.minY
             let width = quad.width
@@ -1945,6 +1981,9 @@ public final class MetalCanvasView: NSView {
             traceLayer.traceQuads = textureIds.count
             traceLayer.tracePaperQuads = paperQuadCount
             traceLayer.traceTileQuads = tileQuadCount
+            traceLayer.tracePageQuads = pageQuadCount
+            traceLayer.traceAnchorPageQuads = anchorPageQuadCount
+            traceLayer.traceContentPages = contentPages.sorted()
             traceLayer.traceFrameIndex = frameAttemptCount + 1
             traceLayer.traceUploadMs = perfUploadMs
         }
@@ -1996,7 +2035,9 @@ public final class MetalCanvasView: NSView {
                     sequence: (layer as? PresentationTraceLayer)?.traceSequence ?? 0,
                     stamp: perfStamp, cpuUs: UInt64(stats.elapsed_us), quads: textureIds.count,
                     tileQuads: tileQuadCount, frameIndex: frameAttemptCount + 1,
-                    uploadMs: perfUploadMs > 0 ? perfUploadMs : nil, paperQuads: paperQuadCount)
+                    uploadMs: perfUploadMs > 0 ? perfUploadMs : nil, paperQuads: paperQuadCount,
+                    pageQuads: pageQuadCount, contentPages: contentPages.sorted(),
+                    anchorPageQuads: anchorPageQuadCount)
             } else if (layer as? PresentationTraceLayer)?.tracePerfEnabled != true {
                 // Presentation happened, but without the observing layer there is no host
                 // timestamp to report. Say so instead of reusing the submit time as if it were
@@ -2007,7 +2048,9 @@ public final class MetalCanvasView: NSView {
                     submitTime: perfSubmitTime, surface: UInt64(surfaceId), sequence: 0,
                     stamp: perfStamp, cpuUs: UInt64(stats.elapsed_us), quads: textureIds.count,
                     tileQuads: tileQuadCount, frameIndex: frameAttemptCount + 1,
-                    uploadMs: perfUploadMs > 0 ? perfUploadMs : nil, paperQuads: paperQuadCount)
+                    uploadMs: perfUploadMs > 0 ? perfUploadMs : nil, paperQuads: paperQuadCount,
+                    pageQuads: pageQuadCount, contentPages: contentPages.sorted(),
+                    anchorPageQuads: anchorPageQuadCount)
             }
         }
 
