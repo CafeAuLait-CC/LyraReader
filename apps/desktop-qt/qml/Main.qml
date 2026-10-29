@@ -65,6 +65,10 @@ ApplicationWindow {
     property string fillTool: ""
     property string fillText: "Text"
     property int fillFontSize: 14
+    property string fillDateFormat: "medium"
+    property var fillDateGeneration: null
+    property var formattedFillDate: ({})
+    onFillDateFormatChanged: if (fillTool === "date") refreshFillDate()
     property string fillImageSize: "medium"
     property color fillColor: theme.documentInk
     readonly property bool editInspectorVisible: currentReader.pageCount>0 && secondaryRow==="edit" && (contentController.tool!=="select" || !!contentController.selected || contentController.hasDraft)
@@ -103,7 +107,12 @@ ApplicationWindow {
         if (!force && secondaryRow==="edit" && contentController.deferAction({kind:"overview"})) return;
         overviewVisible=!overviewVisible;
     }
-    function clearFillTool() {fillTool="";pendingStampStyle="";pendingSignatureImage=null;pendingDrawnSignature=null;annotationTool="select";}
+    function clearFillTool() {fillTool="";fillDateGeneration=null;pendingStampStyle="";pendingSignatureImage=null;pendingDrawnSignature=null;annotationTool="select";}
+    function refreshFillDate() {
+        const result=currentReader.formattedDate(fillDateFormat,"","");
+        if(result.error){operationStatus=result.error;return false;}
+        formattedFillDate=result;fillText=result.text;return true;
+    }
     function setFillTool(value) {
         if (blockXfaWrite()) return;
         if (secondaryRow!=="fill") setSecondaryRow("fill");
@@ -112,7 +121,10 @@ ApplicationWindow {
         clearFillTool();fillTool=next;
         if (["text","date","check","cross"].indexOf(next)>=0) {
             annotationTool="textBox";
-            fillText=next==="date" ? Qt.formatDate(new Date(),"yyyy-MM-dd") : next==="check" ? "✓" : next==="cross" ? "✕" : qsTr("Text");
+            if(next==="date") {
+                fillDateGeneration=currentReader.documentGeneration;
+                if(!refreshFillDate()){clearFillTool();return;}
+            } else fillText=next==="check" ? "✓" : next==="cross" ? "✕" : qsTr("Text");
         }
         setTextViewEnabled(false);overviewVisible=false;
     }
@@ -725,15 +737,18 @@ ApplicationWindow {
             });
         } else if (secondaryRow==="fill" && ["text","date","check","cross"].indexOf(fillTool)>=0) {
             if(pendingArtworkRequest>=0)return;
+            const date=fillTool==="date";
+            if(date && fillDateGeneration!==currentReader.documentGeneration){clearFillTool();operationStatus=qsTr("The document changed. Choose Date again.");return;}
+            if(date && !refreshFillDate())return;
             const size=currentReader.pages[page],symbol=["check","cross"].indexOf(fillTool)>=0;
-            const width=Math.min(size.width,symbol ? 30 : 180),height=Math.min(size.height,symbol ? 32 : 50);
-            const left=Math.max(0,Math.min(size.width-width,x)),top=Math.max(0,Math.min(size.height-height,y));
+            const width=Math.min(size.width,date ? formattedFillDate.width : symbol ? 30 : 180),height=Math.min(size.height,date ? formattedFillDate.height : symbol ? 32 : 50);
+            const left=Math.max(0,Math.min(size.width-width,x-(date ? width/2 : 0))),top=Math.max(0,Math.min(size.height-height,y-(date ? height/2 : 0)));
             if(symbol) {
                 const paths=fillTool==="check" ? [[{x:left+3,y:top+15},{x:left+11,y:top+24},{x:left+27,y:top+4}]] :
                     [[{x:left+4,y:top+4},{x:left+26,y:top+26}],[{x:left+26,y:top+4},{x:left+4,y:top+26}]];
                 pendingArtworkRequest=currentReader.submit("mark_create",{entry:{kind:"ink",page:page,version:1,paths:paths,strokeWidth:2.5,color:fillColour(),note:""}});
             } else pendingArtworkRequest=currentReader.submit("mark_create",{entry:{kind:"textBox",page:page,version:1,
-                rect:{x:left,y:top,width:width,height:height},fontSize:fillFontSize,color:fillColour(),note:fillText}});
+                rect:{x:left,y:top,width:width,height:height},fontSize:date ? 14 : fillFontSize,color:date ? "#000000ff" : fillColour(),note:fillText}});
         } else if (annotationTool === "stickyNote" || annotationTool === "textBox") {
             const size = currentReader.pages[page];
             const width = annotationTool === "stickyNote" ? 22 : Math.min(180, size.width);

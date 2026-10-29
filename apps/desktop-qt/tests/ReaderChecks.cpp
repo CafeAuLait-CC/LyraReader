@@ -1635,6 +1635,43 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(editor,"redact",Q_ARG(QVariant,bounds),Q_ARG(QVariant,0)));QTRY_VERIFY_WITH_TIMEOUT(confirmation->property("opened").toBool(),10000);QVERIFY(clickDialogButton(window,confirmation,"OK"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QVERIFY(reader->hasUnsavedChanges());reader->requestText(0);reader->requestText(1);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(reader->textPages().value("0").toMap().value("text").toString().trimmed().isEmpty());QVERIFY(!reader->textPages().value("1").toMap().value("text").toString().trimmed().isEmpty());
         QVERIFY(QMetaObject::invokeMethod(window,"undo"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);reader->requestText(0);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(reader->textPages().value("0").toMap().value("text").toString().contains("In shared form"));
     }
+    void dateFormatsUseNativeLocaleStylesWithoutChangingTheCivilDay() {
+        ReaderController reader;
+        const QString day="2026-10-28";
+        const auto check=[&](const QString &style,const QString &locale,const QString &expected) {
+            const auto result=reader.formattedDate(style,day,locale);
+            QCOMPARE(result.value("text").toString(),expected);
+            QVERIFY(!result.contains("error"));
+            QVERIFY(result.value("width").toDouble()>16 && result.value("height").toDouble()>12);
+        };
+        check("medium","en_US","Oct 28, 2026");check("long","en_US","October 28, 2026");check("short","en_US","10/28/26");
+        check("medium","de_DE","28.10.2026");check("medium","fr_FR","28 oct. 2026");check("long","zh_CN",QString::fromUtf8("2026年10月28日"));
+        check("iso","th_TH","2026-10-28");check("iso","ar_EG","2026-10-28");
+        QVERIFY(reader.formattedDate("medium",day,"th_TH").value("text").toString().contains("2569"));
+        QVERIFY(reader.formattedDate("medium",day,"ar_EG").value("text").toString()!=day);
+        for(const auto &bad: {QString("2026-02-30"),QString("2026-2-3"),QString(10000,'1')})QVERIFY(reader.formattedDate("iso",bad,"en_US").contains("error"));
+        QVERIFY(reader.formattedDate("other",day,"en_US").contains("error"));
+        QVERIFY(reader.formattedDate("medium",day,"not-a-real-locale").contains("error"));
+        QVERIFY(!reader.hasUnsavedChanges());
+    }
+    void dateFormatInspectorPlacesEditableTextAndRejectsAReopenedDocument() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/date.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"date")));
+        auto *format=visualItem(view.window->contentItem(),"fillDateFormat"),*preview=visualItem(view.window->contentItem(),"fillDatePreview");QVERIFY(format && preview);QVERIFY(format->isVisible());
+        QVERIFY(QMetaObject::invokeMethod(format,"activated",Q_ARG(int,3)));QCOMPARE(view.window->property("fillDateFormat").toString(),QString("iso"));
+        const auto today=reader->formattedDate("iso").value("text").toString();QCOMPARE(preview->property("text").toString(),today);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,200.0),Q_ARG(QVariant,300.0),Q_ARG(QVariant,400.0),Q_ARG(QVariant,400.0)));
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
+        const auto entries=reader->data().value("marks").toMap().value("annotations").toList();QCOMPARE(entries.size(),1);const auto date=entries.first().toMap();QCOMPARE(date.value("kind").toString(),QString("textBox"));QCOMPARE(date.value("note").toString(),today);QCOMPARE(date.value("fontSize").toInt(),14);
+        reader->submit("marks_undo");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(!reader->hasUnsavedChanges());reader->submit("marks_redo");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"saveDocument",Q_ARG(QVariant,false)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QVERIFY(!reader->hasUnsavedChanges());
+        ReaderController reopened;reopened.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reopened.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reopened.pendingCommands(),0,10000);const auto saved=reopened.data().value("annotations").toList();QCOMPARE(saved.size(),1);QCOMPARE(saved.first().toMap().value("kind").toString(),QString("freeText"));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"date")));const auto generation=reader->documentGeneration();reader->openFile(QUrl::fromLocalFile(path));QTRY_VERIFY_WITH_TIMEOUT(!reader->loading() && reader->pendingCommands()==0 && reader->pageCount()==1,10000);QVERIFY(reader->documentGeneration()!=generation);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,200.0),Q_ARG(QVariant,300.0),Q_ARG(QVariant,400.0),Q_ARG(QVariant,400.0)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(!reader->hasUnsavedChanges());QVERIFY(reader->data().value("marks").toMap().value("annotations").toList().isEmpty());QCOMPARE(reader->data().value("annotations").toList().size(),1);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"date")));QVERIFY(QMetaObject::invokeMethod(view.window,"clearFillTool"));QVERIFY(!reader->hasUnsavedChanges());
+    }
     void fillAndSignUsesSevenToolsAndVectorCheckmarks() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/fill.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
         WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
@@ -1972,6 +2009,7 @@ int main(int argc, char **argv) {
     QFontDatabase::addApplicationFont(QStringLiteral(":/fonts/LyraReaderSansSC-Regular.ttf"));
     QCoreApplication::setOrganizationName("LyraReaderChecks");
     QCoreApplication::setApplicationName("LyraReaderChecks");
+    QGuiApplication::setDesktopFileName("com.alex.LyraReaderChecks");
     QTemporaryDir settingsDirectory;
     if(!settingsDirectory.isValid())return 2;
     QSettings::setDefaultFormat(QSettings::IniFormat);

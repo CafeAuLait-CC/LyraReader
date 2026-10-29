@@ -23,6 +23,11 @@ build uses the system Qt shared libraries and plugins.
 
 - QtKeychain — BSD-2-Clause (CMake helpers BSD-3-Clause). Notices are in
   `apps/desktop-qt/licenses/QtKeychain.txt`.
+- ICU4C — Unicode-3.0 and its permissive runtime data notices, for native locale date
+  styles in the Qt shell. The system shared i18n, uc and data libraries are used.
+  Upstream's complete notices are retained in `apps/desktop-qt/licenses/ICU.txt`
+  ([source](https://github.com/unicode-org/icu/blob/main/LICENSE)). The notices also
+  describe upstream configuration tools; those tools are not linked or distributed.
 - LyraReader Sans SC — a renamed subset of Noto Sans SC, SIL Open Font License 1.1.
   The font and OFL are in `apps/macos/Resources/Fonts/` and are shared by the
   PDF annotation writer and native Qt annotation display.

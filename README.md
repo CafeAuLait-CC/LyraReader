@@ -55,6 +55,8 @@ PDF content and asks explicitly before a fallback replaces an entire page with a
 places text, dates, vector checkmarks/crosses, stamps, drawn vector signatures and typed or imported
 signature images. Drawing multiple strokes produces one ink annotation with a single undo step.
 Pictures have Small, Medium and Large placement sizes, with the default read from the shared engine.
+The Date inspector offers native-locale Medium, Long and Short styles plus Gregorian ISO dates,
+using ICU's locale and calendar data. These remain editable text annotations. Building the Qt shell also requires ICU's i18n and uc development libraries.
 Image and typed-signature confirmations are bound to the document generation that opened them.
 The Edit inspector crops
 selected top-level images or graphics by retained edge percentages through the shared undo/save

@@ -1,4 +1,5 @@
 #include "ReaderController.h"
+#include "DateFormatting.h"
 #include "NativeRaster.h"
 #include "RasterCache.h"
 #include "RenderBudget.h"
@@ -396,6 +397,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
 QStringList ReaderController::signatureFonts() const {return SignatureArtwork::fonts();}
 QColor ReaderController::paperBackground(const QString &appearance)const{return PaperAppearance::displayColor(Qt::white,PaperAppearance::mode(appearance));}
 QVariantMap ReaderController::typedSignatureImage(const QString &name,const QString &family) const {return SignatureArtwork::typed(name,family);}
+QVariantMap ReaderController::formattedDate(const QString &style,const QString &isoDay,const QString &localeName) const {return DateFormatting::format(style,isoDay,localeName);}
 QVariantMap ReaderController::signatureImage(const QUrl &url) const {
     if(!url.isLocalFile())return {{"error",tr("Choose a local PNG or JPEG signature image.")}};
     QFile file(url.toLocalFile());

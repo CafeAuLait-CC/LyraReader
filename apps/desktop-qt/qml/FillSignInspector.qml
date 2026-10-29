@@ -24,14 +24,26 @@ Pane {
             Layout.fillWidth:true;wrapMode:Text.Wrap;color:app.colors.textSecondary
         }
         TextArea {
-            visible:["text","date"].indexOf(app.fillTool)>=0
+            visible:app.fillTool==="text"
             Layout.fillWidth:true;Layout.preferredHeight:100;textFormat:TextEdit.PlainText
             text:app.fillText;wrapMode:TextEdit.Wrap
             onTextChanged:if(activeFocus)app.fillText=text
             Accessible.name:qsTr("Text to place on the page")
         }
-        SpinBox {visible:["text","date"].indexOf(app.fillTool)>=0;from:8;to:96;value:app.fillFontSize;editable:true;onValueModified:app.fillFontSize=value;Accessible.name:qsTr("Fill and Sign text size")}
-        Button {visible:["text","date","check","cross"].indexOf(app.fillTool)>=0;text:qsTr("Colour…");onClicked:colour.open()}
+        Label {
+            objectName:"fillDatePreview";visible:app.fillTool==="date"
+            Layout.fillWidth:true;wrapMode:Text.Wrap;text:app.fillText
+            color:app.colors.textPrimary;Accessible.name:qsTr("Date preview")
+        }
+        ComboBox {
+            objectName:"fillDateFormat";visible:app.fillTool==="date";Layout.fillWidth:true;textRole:"name"
+            model:[{value:"medium",name:qsTr("Medium")},{value:"long",name:qsTr("Long")},{value:"short",name:qsTr("Short")},{value:"iso",name:qsTr("ISO")}]
+            currentIndex:Math.max(0,model.findIndex(function(item){return item.value===app.fillDateFormat;}))
+            onActivated:function(index){app.fillDateFormat=model[index].value;}
+            Accessible.name:qsTr("Date format")
+        }
+        SpinBox {visible:app.fillTool==="text";from:8;to:96;value:app.fillFontSize;editable:true;onValueModified:app.fillFontSize=value;Accessible.name:qsTr("Fill and Sign text size")}
+        Button {visible:["text","check","cross"].indexOf(app.fillTool)>=0;text:qsTr("Colour…");onClicked:colour.open()}
         Button {
             objectName:"typeSignatureButton"
             visible:app.fillTool==="signature"
