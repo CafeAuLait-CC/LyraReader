@@ -1677,7 +1677,7 @@ ApplicationWindow {
             if (root.previewController && root.previewController.visible)
                 root.previewController.close();
             root.cancelErase();
-            root.annotationTool = "select";
+            root.clearFillTool();
             root.annotationDraft = null;
             root.redactionDraft = null;
             root.selectedAnnotation = null;
