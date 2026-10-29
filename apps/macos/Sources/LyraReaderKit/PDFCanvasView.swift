@@ -649,6 +649,13 @@ public final class MetalCanvasView: NSView {
         (metalLayer as? PresentationTraceLayer)?.traceScrollEnabled = traceFrames
         // Same device as wgpu's adapter (see the class comment).
         metalLayer.device = MTLCreateSystemDefaultDevice()
+        // The drawable is sized in backing pixels (`bounds × backingScale`). A CAMetalLayer's
+        // default `contentsScale` is 1.0, which would present those pixels as points, i.e. at
+        // twice their intended size on a Retina display, while the AppKit page chrome — the
+        // edge and shadow around the paper — is drawn in points. Keep the two in the same
+        // coordinate system; `layout` and `viewDidChangeBackingProperties` refresh it when the
+        // window moves to another display.
+        metalLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2.0
         metalLayer.isOpaque = true
         // wgpu's Metal backend waits until the command buffer is scheduled before presenting
         // transaction-backed drawables. This keeps the paper and its AppKit edge/shadow layers
@@ -706,6 +713,7 @@ public final class MetalCanvasView: NSView {
 
     public override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        syncLayerContentsScale()
         removeScreenObservers()
         if window == nil {
             detachSurface()
@@ -814,11 +822,22 @@ public final class MetalCanvasView: NSView {
         markNeedsRender()
     }
 
+    /// Keeps the layer's point-to-pixel mapping equal to the window's backing scale.
+    ///
+    /// `CAMetalLayer.drawableSize` is set from `bounds × backingScale` when the surface is
+    /// configured; without a matching `contentsScale` the drawable's pixels are stretched over
+    /// twice the points on a Retina display. The AppKit page chrome stays in points, so the
+    /// page would look larger than its edge and shadow — the defect this method prevents.
+    private func syncLayerContentsScale() {
+        (layer as? CAMetalLayer)?.contentsScale = backingScale()
+    }
+
     public override func layout() {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
         super.layout()
+        syncLayerContentsScale()
         pageChrome?.frame = bounds
         annotationOverlay?.frame = bounds
         translationOverlay?.frame = bounds
@@ -1553,6 +1572,7 @@ public final class MetalCanvasView: NSView {
 
     public override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
+        syncLayerContentsScale()
         reportDeviceScale()
         // A display-mode change can keep the same backing scale but alter the logical width;
         // the calibration is part of that change too.
