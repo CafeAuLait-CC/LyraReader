@@ -1654,6 +1654,42 @@ private slots:
         QVERIFY(reader.formattedDate("medium",day,"not-a-real-locale").contains("error"));
         QVERIFY(!reader.hasUnsavedChanges());
     }
+    void datePicturesRotateClockwiseAndKeepTransparentSamples() {
+        ReaderController reader;
+        const auto decode=[](const QVariantMap &value){return QImage::fromData(QByteArray::fromBase64(value.value("image").toByteArray())).convertToFormat(QImage::Format_RGBA8888);};
+        const auto base=decode(reader.datePicture("Oct 28, 2026",0));QVERIFY(!base.isNull());QVERIFY(base.width()>base.height());QCOMPARE(base.pixelColor(0,0).alpha(),0);QCOMPARE(base.pixelColor(base.width()-1,base.height()-1).alpha(),0);
+        int ink=0;for(int y=0;y<base.height();++y)for(int x=0;x<base.width();++x)if(base.pixelColor(x,y).alpha()>0)++ink;QVERIFY(ink>30);
+        for(int angle:{90,180,270}) {
+            const auto result=reader.datePicture("Oct 28, 2026",angle);const auto image=decode(result);QVERIFY2(!image.isNull(),qPrintable(result.value("error").toString()));
+            QCOMPARE(image.size(),angle==180 ? base.size() : QSize(base.height(),base.width()));QCOMPARE(result.value("heightPt").toDouble(),image.height()/2.0);
+            for(int y=0;y<base.height();++y)for(int x=0;x<base.width();++x) {
+                const QPoint target=angle==90 ? QPoint(base.height()-1-y,x) : angle==180 ? QPoint(base.width()-1-x,base.height()-1-y) : QPoint(y,base.width()-1-x);
+                QCOMPARE(image.pixelColor(target),base.pixelColor(x,y));
+            }
+        }
+        for(const auto &bad:{QString(),QString("\n"),QString(10000,'W')})QVERIFY(reader.datePicture(bad,90).contains("error"));
+        QVERIFY(reader.datePicture("Date",45).contains("error"));
+        const auto bounded=reader.datePicture(QString(256,'W'),90);
+        if(!bounded.contains("error")){const auto image=decode(bounded);QVERIFY(!image.isNull());QVERIFY(image.width()<=4096 && image.height()<=4096);QVERIFY(qint64(image.width())*image.height()<=1024*1024);}
+    }
+    void rotatedDatesUseOneImageMarkAndSurvivePdfSave() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/rotated-dates.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);view.window->setProperty("fillDateFormat","iso");
+        QList<QImage> expected;
+        for(int index=0;index<3;++index) {
+            QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"date")));auto *rotation=visualItem(view.window->contentItem(),"fillDateRotation");QVERIFY(rotation && rotation->isVisible());QVERIFY(QMetaObject::invokeMethod(rotation,"activated",Q_ARG(int,index+1)));
+            const auto result=reader->datePicture(reader->formattedDate("iso").value("text").toString(),(index+1)*90);const auto image=QImage::fromData(QByteArray::fromBase64(result.value("image").toByteArray())).convertToFormat(QImage::Format_RGBA8888);QVERIFY(!image.isNull());expected.append(image);
+            QVERIFY(QMetaObject::invokeMethod(view.window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,120.0+index*160),Q_ARG(QVariant,300.0),Q_ARG(QVariant,400.0),Q_ARG(QVariant,400.0)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));const auto entries=reader->data().value("marks").toMap().value("annotations").toList();QCOMPARE(entries.size(),index+1);const auto entry=entries.last().toMap();QCOMPARE(entry.value("kind").toString(),QString("signature"));QCOMPARE(entry.value("stampStyle").toString(),QString("date"));const auto rect=entry.value("rect").toMap();QVERIFY(rect.value("x").toDouble()>=0 && rect.value("y").toDouble()>=0);QCOMPARE(rect.value("width").toDouble(),result.value("widthPt").toDouble());QCOMPARE(rect.value("height").toDouble(),result.value("heightPt").toDouble());QVERIFY(view.window->property("fillTool").toString().isEmpty());
+        }
+        reader->submit("marks_undo");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QCOMPARE(reader->data().value("marks").toMap().value("annotations").toList().size(),2);reader->submit("marks_redo");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto snapshot=qEnvironmentVariable("LYRA_READER_DATE_SNAPSHOT");if(!snapshot.isEmpty()){QTest::qWait(100);QVERIFY(view.window->grabWindow().save(snapshot));}
+        QVERIFY(QMetaObject::invokeMethod(view.window,"saveDocument",Q_ARG(QVariant,false)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QVERIFY(!reader->hasUnsavedChanges());
+        ReaderController reopened;reopened.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reopened.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reopened.pendingCommands(),0,10000);const auto saved=reopened.data().value("annotations").toList();QCOMPARE(saved.size(),3);
+        for(int index=0;index<saved.size();++index){const auto annotation=saved[index].toMap();QCOMPARE(annotation.value("kind").toString(),QString("stamp"));const auto png=annotation.value("stamp").toMap().value("image").toByteArray();const auto actual=QImage::fromData(QByteArray::fromBase64(png)).convertToFormat(QImage::Format_RGBA8888);QCOMPARE(actual,expected[index]);}
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"date")));QVERIFY(QMetaObject::invokeMethod(view.window,"clearFillTool"));QVERIFY(!reader->hasUnsavedChanges());
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"date")));const auto generation=reader->documentGeneration();reader->openFile(QUrl::fromLocalFile(path));QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()==1 && !reader->loading() && reader->pendingCommands()==0,10000);QVERIFY(reader->documentGeneration()!=generation);QVERIFY(QMetaObject::invokeMethod(view.window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,200.0),Q_ARG(QVariant,200.0),Q_ARG(QVariant,400.0),Q_ARG(QVariant,400.0)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(!reader->hasUnsavedChanges());QCOMPARE(reader->data().value("annotations").toList().size(),3);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"date")));const auto secondPath=scratch.path()+"/second-date-document.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",secondPath));view.workspace.openFile(QUrl::fromLocalFile(secondPath));auto *second=view.workspace.activeReader();QVERIFY(second!=reader);QTRY_COMPARE_WITH_TIMEOUT(second->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(second->pendingCommands(),0,10000);QVERIFY(view.window->property("fillTool").toString().isEmpty());QCOMPARE(view.window->property("annotationTool").toString(),QString("select"));QVERIFY(!second->hasUnsavedChanges());
+    }
     void dateFormatInspectorPlacesEditableTextAndRejectsAReopenedDocument() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/date.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
         NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();

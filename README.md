@@ -56,15 +56,16 @@ places text, dates, vector checkmarks/crosses, stamps, drawn vector signatures a
 signature images. Drawing multiple strokes produces one ink annotation with a single undo step.
 Pictures have Small, Medium and Large placement sizes, with the default read from the shared engine.
 The Date inspector offers native-locale Medium, Long and Short styles plus Gregorian ISO dates,
-using ICU's locale and calendar data. These remain editable text annotations. Building the Qt shell also requires ICU's i18n and uc development libraries.
+using ICU's locale and calendar data. At 0° the date remains editable text; 90°, 180° and 270° use
+transparent native-font pictures whose orientation survives PDF saving. Each picture is one undo step.
+Building the Qt shell also requires ICU's i18n and uc development libraries.
 Image and typed-signature confirmations are bound to the document generation that opened them.
 The Edit inspector crops
 selected top-level images or graphics by retained edge percentages through the shared undo/save
 transaction. Selected bitmap images export their original pixels as PNG; graphics export their page region.
 Both preserve the PDF and its working revision.
 Bitmap and graphic previews retain their working revision and load only while the inspector needs
-them. Rotated dates and the newer AI overlays remain work in
-progress.
+them. The newer AI overlays remain work in progress.
 A byte-bounded revisit cache retains reduced page images after sharp sources leave the working
 set. Unloaded pages already use the selected reading-mode paper colour.
 Tabs reorder after half a tab width of travel, retain their reader state, and support

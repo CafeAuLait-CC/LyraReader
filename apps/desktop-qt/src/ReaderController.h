@@ -94,6 +94,7 @@ public:
     Q_INVOKABLE QStringList signatureFonts() const;
     Q_INVOKABLE QVariantMap typedSignatureImage(const QString &name,const QString &family) const;
     Q_INVOKABLE QVariantMap formattedDate(const QString &style,const QString &isoDay = {},const QString &localeName = {}) const;
+    Q_INVOKABLE QVariantMap datePicture(const QString &text,int clockwiseDegrees) const;
     Q_INVOKABLE QUrl contentPreviewUrl(int page,const QString &target,const QString &revision,
                                       double width,double height,double deviceScale);
     std::shared_ptr<LyraReaderDesktopDocument> documentHandle()const{return m_document;}

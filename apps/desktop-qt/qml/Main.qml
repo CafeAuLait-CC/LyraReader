@@ -66,6 +66,7 @@ ApplicationWindow {
     property string fillText: "Text"
     property int fillFontSize: 14
     property string fillDateFormat: "medium"
+    property int fillDateRotation: 0
     property var fillDateGeneration: null
     property var formattedFillDate: ({})
     onFillDateFormatChanged: if (fillTool === "date") refreshFillDate()
@@ -228,7 +229,8 @@ ApplicationWindow {
         session.setPreference("appearance", appearance)
     onCurrentReaderChanged: {
         Qt.callLater(function(){contentController.reset();});
-        fillTool="";
+        if (fillTool.length>0) clearFillTool();
+        else fillTool="";
         cancelErase();
         pendingArtworkRequest = -1;
         pendingStampStyle = "";
@@ -741,6 +743,16 @@ ApplicationWindow {
             if(date && fillDateGeneration!==currentReader.documentGeneration){clearFillTool();operationStatus=qsTr("The document changed. Choose Date again.");return;}
             if(date && !refreshFillDate())return;
             const size=currentReader.pages[page],symbol=["check","cross"].indexOf(fillTool)>=0;
+            if(date && fillDateRotation!==0) {
+                const picture=currentReader.datePicture(fillText,fillDateRotation),rules=currentReader.data.annotation_rules;
+                if(picture.error){operationStatus=picture.error;return;}
+                if(!rules || !Number.isInteger(rules.signature_version)){operationStatus=qsTr("The document service did not provide a valid image schema. Reopen the document.");return;}
+                const fit=Math.min(1,size.width/picture.widthPt,size.height/picture.heightPt),w=picture.widthPt*fit,h=picture.heightPt*fit;
+                pendingArtworkRequest=currentReader.submit("mark_create",{entry:{kind:"signature",page:page,version:rules.signature_version,
+                    rect:{x:Math.max(0,Math.min(size.width-w,x-w/2)),y:Math.max(0,Math.min(size.height-h,y-h/2)),width:w,height:h},
+                    image:picture.image,stampStyle:"date",note:"",strokeWidth:0,color:"#000000ff"}});
+                return;
+            }
             const width=Math.min(size.width,date ? formattedFillDate.width : symbol ? 30 : 180),height=Math.min(size.height,date ? formattedFillDate.height : symbol ? 32 : 50);
             const left=Math.max(0,Math.min(size.width-width,x-(date ? width/2 : 0))),top=Math.max(0,Math.min(size.height-height,y-(date ? height/2 : 0)));
             if(symbol) {
@@ -748,7 +760,7 @@ ApplicationWindow {
                     [[{x:left+4,y:top+4},{x:left+26,y:top+26}],[{x:left+26,y:top+4},{x:left+4,y:top+26}]];
                 pendingArtworkRequest=currentReader.submit("mark_create",{entry:{kind:"ink",page:page,version:1,paths:paths,strokeWidth:2.5,color:fillColour(),note:""}});
             } else pendingArtworkRequest=currentReader.submit("mark_create",{entry:{kind:"textBox",page:page,version:1,
-                rect:{x:left,y:top,width:width,height:height},fontSize:date ? 14 : fillFontSize,color:date ? "#000000ff" : fillColour(),note:fillText}});
+                rect:{x:left,y:top,width:width,height:height},fontSize:date ? formattedFillDate.fontSize : fillFontSize,color:date ? "#000000ff" : fillColour(),note:fillText}});
         } else if (annotationTool === "stickyNote" || annotationTool === "textBox") {
             const size = currentReader.pages[page];
             const width = annotationTool === "stickyNote" ? 22 : Math.min(180, size.width);

@@ -42,6 +42,17 @@ Pane {
             onActivated:function(index){app.fillDateFormat=model[index].value;}
             Accessible.name:qsTr("Date format")
         }
+        ComboBox {
+            objectName:"fillDateRotation";visible:app.fillTool==="date";Layout.fillWidth:true
+            model:["0°","90°","180°","270°"];currentIndex:app.fillDateRotation/90
+            onActivated:function(index){app.fillDateRotation=index*90;}
+            Accessible.name:qsTr("Date rotation")
+        }
+        Label {
+            visible:app.fillTool==="date" && app.fillDateRotation!==0
+            Layout.fillWidth:true;wrapMode:Text.Wrap;color:app.colors.textSecondary
+            text:qsTr("A rotated date is placed as a picture. A 0° date stays an editable text box.")
+        }
         SpinBox {visible:app.fillTool==="text";from:8;to:96;value:app.fillFontSize;editable:true;onValueModified:app.fillFontSize=value;Accessible.name:qsTr("Fill and Sign text size")}
         Button {visible:["text","check","cross"].indexOf(app.fillTool)>=0;text:qsTr("Colour…");onClicked:colour.open()}
         Button {

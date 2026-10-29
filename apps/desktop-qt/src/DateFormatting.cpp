@@ -1,9 +1,12 @@
 #include "DateFormatting.h"
 #include <QCoreApplication>
+#include <QBuffer>
 #include <QDateTime>
 #include <QFontDatabase>
 #include <QFontMetricsF>
+#include <QImage>
 #include <QLocale>
+#include <QPainter>
 #include <QTimeZone>
 #include <array>
 #include <cmath>
@@ -50,10 +53,56 @@ QVariantMap DateFormatting::format(const QString &style, const QString &isoDay, 
         text = QString::fromUtf16(reinterpret_cast<const char16_t *>(buffer.data()), count);
     }
     QFont font = QFontDatabase::systemFont(QFontDatabase::GeneralFont);
-    font.setPixelSize(14);
+    font.setPixelSize(fontSizePt);
     const QFontMetricsF metrics(font);
     const double width = metrics.horizontalAdvance(text) + 16, height = metrics.height() + 12;
     if (!std::isfinite(width) || !std::isfinite(height) || width <= 0 || height <= 0 || width > 8192 || height > 8192)
         return failure("The date could not be measured in the system font.");
-    return {{"text", text}, {"width", width}, {"height", height}};
+    return {{"text", text}, {"width", width}, {"height", height}, {"fontSize", fontSizePt}};
+}
+
+QVariantMap DateFormatting::picture(const QString &text, int clockwiseDegrees) {
+    const auto failure = [](const char *message) {
+        return QVariantMap{{"error", QCoreApplication::translate("DateFormatting", message)}};
+    };
+    if (clockwiseDegrees != 0 && clockwiseDegrees != 90 && clockwiseDegrees != 180 && clockwiseDegrees != 270)
+        return failure("Choose a date rotation of 0, 90, 180 or 270 degrees.");
+    if (text.size() > 256 || text.trimmed().isEmpty())
+        return failure("The date must contain between 1 and 256 characters.");
+    for (const auto character : text)
+        if (character.category() == QChar::Other_Control || character == QChar::LineSeparator || character == QChar::ParagraphSeparator)
+            return failure("Use a single line for the date picture.");
+    QFont font = QFontDatabase::systemFont(QFontDatabase::GeneralFont);
+    font.setPixelSize(fontSizePt);
+    const QFontMetricsF metrics(font);
+    const auto ink = metrics.boundingRect(text);
+    if (ink.isEmpty()) return failure("The date contains no drawable text.");
+    const auto bounds = ink.united(QRectF(0, -metrics.ascent(), metrics.horizontalAdvance(text), metrics.height()));
+    const double logicalWidth = std::ceil(bounds.width()) + 4, logicalHeight = std::ceil(bounds.height()) + 4;
+    // Two page-point pixels per point, including two points of transparent padding.
+    // Bound both live images before allocation; quarter turns preserve the pixel count.
+    constexpr int scale = 2;
+    if (!std::isfinite(bounds.left()) || !std::isfinite(bounds.top()) || !std::isfinite(logicalWidth) || !std::isfinite(logicalHeight) || logicalWidth < 1 || logicalHeight < 1 || logicalWidth > 2048 || logicalHeight > 2048)
+        return failure("The date picture is too large.");
+    const int width = int(logicalWidth) * scale, height = int(logicalHeight) * scale;
+    if (quint64(width) * quint64(height) > 1024 * 1024)
+        return failure("The date picture exceeds its pixel budget.");
+    QImage source(width, height, QImage::Format_ARGB32_Premultiplied);
+    if (source.isNull()) return failure("There is not enough memory to draw the date.");
+    source.fill(Qt::transparent);
+    {
+        QPainter painter(&source);
+        painter.setRenderHint(QPainter::TextAntialiasing);
+        painter.setFont(font);painter.setPen(Qt::black);
+        painter.scale(scale, scale);painter.translate(2 - bounds.left(), 2 - bounds.top());
+        painter.drawText(QPointF(0, 0), text);
+    }
+    // QImage coordinates point downwards, so a positive quarter turn is clockwise.
+    const auto rotated = clockwiseDegrees == 0 ? source : source.transformed(QTransform().rotate(clockwiseDegrees), Qt::FastTransformation);
+    if (rotated.isNull()) return failure("The date picture could not be rotated.");
+    QByteArray encoded;QBuffer buffer(&encoded);
+    if (!buffer.open(QIODevice::WriteOnly) || !rotated.save(&buffer, "PNG"))
+        return failure("The date picture could not be encoded.");
+    return {{"image", QString::fromLatin1(encoded.toBase64())}, {"width", rotated.width()}, {"height", rotated.height()},
+            {"widthPt", rotated.width() / double(scale)}, {"heightPt", rotated.height() / double(scale)}};
 }

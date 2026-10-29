@@ -398,6 +398,7 @@ QStringList ReaderController::signatureFonts() const {return SignatureArtwork::f
 QColor ReaderController::paperBackground(const QString &appearance)const{return PaperAppearance::displayColor(Qt::white,PaperAppearance::mode(appearance));}
 QVariantMap ReaderController::typedSignatureImage(const QString &name,const QString &family) const {return SignatureArtwork::typed(name,family);}
 QVariantMap ReaderController::formattedDate(const QString &style,const QString &isoDay,const QString &localeName) const {return DateFormatting::format(style,isoDay,localeName);}
+QVariantMap ReaderController::datePicture(const QString &text,int clockwiseDegrees) const {return DateFormatting::picture(text,clockwiseDegrees);}
 QVariantMap ReaderController::signatureImage(const QUrl &url) const {
     if(!url.isLocalFile())return {{"error",tr("Choose a local PNG or JPEG signature image.")}};
     QFile file(url.toLocalFile());
