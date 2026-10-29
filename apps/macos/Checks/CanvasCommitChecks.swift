@@ -159,6 +159,32 @@ extension ReaderChecks {
                 "\(mode): the page chrome uses the same commit geometry as the frame")
         require(canvas.pageChromeRectangles != chromeBefore,
                 "\(mode): the committed frame moved the chrome with the paper")
+        // The engine draws the paper in device pixels; AppKit draws its chrome in points. The
+        // layer's contentsScale is the only thing joining the two spaces, so assert it and then
+        // compare the paper quad's rectangle (pixels / layer scale) with the chrome rectangle.
+        let windowScale = window.backingScaleFactor
+        let layerScale = (canvas.layer as? CAMetalLayer)?.contentsScale ?? 0
+        require(abs(layerScale - windowScale) < 1e-9,
+                "\(mode): the drawable maps its pixels to the window's backing scale")
+        if let paper = state.canvasPages.first(where: { $0.placement.index < 0 }) {
+            let placement = paper.placement
+            let offsetX = max(0, (canvas.bounds.width * windowScale
+                                  - state.contentWidthPt * state.zoomFactor * windowScale) / 2)
+            let pixels = CanvasGeometry.pageRectInDevicePixels(
+                pageTopPt: placement.topPt, pageLeftPt: placement.leftPt,
+                widthPt: placement.widthPt, heightPt: placement.heightPt,
+                scrollYPt: state.scrollYPt, zoom: state.zoomFactor,
+                backingScale: windowScale, contentOffsetXPx: offsetX)
+            let points = CGRect(x: pixels.minX / layerScale, y: pixels.minY / layerScale,
+                                width: pixels.width / layerScale,
+                                height: pixels.height / layerScale)
+            if let chrome = expectedChrome.first {
+                require(abs(points.minX - chrome.minX) < 0.5
+                            && abs(points.minY - chrome.minY) < 0.5
+                            && abs(points.width - chrome.width) < 0.5,
+                        "\(mode): the paper and its chrome occupy the same rectangle")
+            }
+        }
 
         // The SwiftUI publish arrives after the commit. If the frame presented, nothing about
         // the following update may submit another one. If the window is occluded, wgpu skips
