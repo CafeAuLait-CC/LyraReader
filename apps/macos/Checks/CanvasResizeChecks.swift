@@ -23,6 +23,13 @@ extension ReaderChecks {
                 "a retained drawable is anchored without independent-axis stretching")
         require((canvas.layer as? CAMetalLayer)?.presentsWithTransaction == true,
                 "resizing retains atomic presentation with native page edges")
+        // The paper is drawn in backing pixels while the edge/shadow chrome is drawn in points.
+        // A CAMetalLayer defaults its contentsScale to 1.0; without the window scale the
+        // drawable's pixels are presented as points and the paper is twice the size of its
+        // chrome on a Retina display. This is the invariant that keeps the two in one space.
+        require(abs(((canvas.layer as? CAMetalLayer)?.contentsScale ?? 0)
+                    - window.backingScaleFactor) < 1e-9,
+                "the drawable maps its pixels to the window's backing scale")
         let points = [CGSize(width: 900, height: 600), CGSize(width: 1240, height: 710),
                       CGSize(width: 1450, height: 880), CGSize(width: 1100, height: 720),
                       CGSize(width: 760, height: 540)]
@@ -39,10 +46,31 @@ extension ReaderChecks {
                                         height: (canvas.bounds.height * scale).rounded())
             require(canvas.lastAttemptDrawableSize == expectedPixels,
                     "resize step \(index) uses a matching device-pixel drawable")
+            let layerScale = (canvas.layer as? CAMetalLayer)?.contentsScale ?? 0
+            require(abs(layerScale - scale) < 1e-9,
+                    "resize step \(index) maps drawable pixels to points with the window scale")
             let chrome = PageChromeGeometry.rectangles(frames: [page], viewport: canvas.bounds.size,
                 contentWidthPt: 595, zoom: 1, scrollYPt: 0)
             require(canvas.pageChromeRectangles == chrome,
                     "resize step \(index) updates paper edges in the same transaction")
+            // Compare the paper's rectangle, converted from the drawable's pixels to points
+            // with the layer's actual scale, against the chrome rectangle. A 1.0 contentsScale
+            // leaves the paper at twice this rectangle while the chrome stays put.
+            let offsetX = max(0, (canvas.bounds.width * scale - 595 * scale) / 2)
+            let paperPixels = CanvasGeometry.pageRectInDevicePixels(
+                pageTopPt: 0, pageLeftPt: 0, widthPt: 595, heightPt: 842,
+                scrollYPt: 0, zoom: 1, backingScale: scale, contentOffsetXPx: offsetX)
+            guard let paperChrome = canvas.pageChromeRectangles.first else {
+                fatalError("FAIL: resize step \(index) drew no page chrome")
+            }
+            let paperPoints = CGRect(x: paperPixels.minX / layerScale,
+                                     y: paperPixels.minY / layerScale,
+                                     width: paperPixels.width / layerScale,
+                                     height: paperPixels.height / layerScale)
+            require(abs(paperPoints.minX - paperChrome.minX) < 0.5
+                        && abs(paperPoints.minY - paperChrome.minY) < 0.5
+                        && abs(paperPoints.width - paperChrome.width) < 0.5,
+                    "resize step \(index) draws the paper and its chrome in one coordinate space")
         }
         // Zoom and restore use AppKit's real action, including its native animation.
         for _ in 0..<2 {
@@ -51,6 +79,9 @@ extension ReaderChecks {
             canvas.layoutSubtreeIfNeeded()
             require(canvas.lastAttemptViewportSize == canvas.bounds.size,
                     "native zoom/restore settles with matching pixels and bounds")
+            require(abs(((canvas.layer as? CAMetalLayer)?.contentsScale ?? 0)
+                        - window.backingScaleFactor) < 1e-9,
+                    "native zoom/restore keeps the drawable on the window scale")
         }
         let attempts = canvas.frameAttemptCount
         try await Task.sleep(for: .milliseconds(250))
