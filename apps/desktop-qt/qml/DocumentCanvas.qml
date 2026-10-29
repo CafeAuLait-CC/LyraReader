@@ -9,12 +9,28 @@ Item {
     property alias view: pageList
     readonly property var rows: Logic.rows(app.currentReader.pages, app.pageGap)
     property bool positioning: false
+    property int placementEpoch: 0
+    clip: true
     readonly property var pageRows: {
         const result = {};
         for (let row = 0; row < rows.length; ++row)
             for (const page of rows[row].pages)
                 result[page.index] = row;
         return result;
+    }
+    // Keep the native editor outside virtualized page delegates. A layout snapshot may
+    // replace those delegates while the user is typing; its QTextDocument must survive.
+    function placedTextFrame(page, epoch) {
+        const row=pageRows[page];
+        const item=row===undefined ? null : pageList.itemAtIndex(row);
+        if(!item)return null;
+        for(let index=0;index<item.pageSheets.count;++index) {
+            const sheet=item.pageSheets.itemAt(index);
+            if(sheet && sheet.modelData.index===page)
+                return {x:item.x+sheet.x-pageList.contentX,y:item.y+sheet.y-pageList.contentY,
+                    width:sheet.width,height:sheet.height};
+        }
+        return null;
     }
     // Use actual instantiated sheets, including virtualized row origins and facing-page
     // offsets. One captured pointer can sweep across a gap into another visible page.
@@ -177,6 +193,7 @@ Item {
             height: modelData.height * app.zoom
             Repeater {
                 id: sheetRepeater
+                onItemAdded: function(index,item){++canvas.placementEpoch;}
                 model: parent.modelData.pages
                 delegate: Rectangle {
                     id: sheet
@@ -248,5 +265,17 @@ Item {
                 previousScale = activeScale;
             }
         }
+    }
+    PlacedTextLayer {
+        app: canvas.app
+        page: canvas.app.placedTextEditor && canvas.app.placedTextEditor.entry ? canvas.app.placedTextEditor.entry.page : -1
+        readonly property var paperFrame: canvas.placedTextFrame(page,canvas.placementEpoch)
+        // A temporarily absent delegate parks the editor outside the clipped viewport;
+        // it does not destroy the editor, its focus, selection or native undo history.
+        x: paperFrame ? paperFrame.x : -width-1
+        y: paperFrame ? paperFrame.y : -height-1
+        width: paperFrame ? paperFrame.width : canvas.width
+        height: paperFrame ? paperFrame.height : canvas.height
+        z: 1
     }
 }

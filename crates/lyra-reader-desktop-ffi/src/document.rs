@@ -276,6 +276,9 @@ impl DesktopDocument {
             op,
             "marks"
                 | "mark_create"
+                | "mark_text_begin"
+                | "mark_text_update"
+                | "mark_text_end"
                 | "mark_update"
                 | "mark_delete"
                 | "bookmark_create"
@@ -2109,6 +2112,143 @@ mod tests {
         assert_eq!(
             fixture.open().command(json!({"op":"marks"})).unwrap()["page_pending"],
             false
+        );
+    }
+
+    #[test]
+    fn placed_text_flushes_coalesce_and_cancel_restores_creation_and_cache() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        doc.command(json!({"op":"bookmark_create","page":0,"title":"Keep"}))
+            .unwrap();
+        let created = doc.command(json!({"op":"mark_create","entry":{"kind":"textBox","page":0,"version":1,"rect":{"x":70,"y":80,"width":100,"height":30},"fontSize":14,"note":"original","color":"#000000ff"}})).unwrap();
+        let id = created["selected_id"].as_str().unwrap();
+        let begin = doc
+            .command(json!({"op":"mark_text_begin","id":id,"created":true}))
+            .unwrap();
+        let token = &begin["text_edit_token"];
+        for text in ["first", "second", "last"] {
+            doc.command(
+                json!({"op":"mark_text_update","id":id,"edit_token":token,"patch":{"note":text}}),
+            )
+            .unwrap();
+        }
+        // Coalesced writes are durable even when the editing session never ends.
+        assert_eq!(
+            fixture.open().command(json!({"op":"marks"})).unwrap()["annotations"][0]["note"],
+            "last"
+        );
+        let cancelled = doc
+            .command(json!({"op":"mark_text_end","id":id,"edit_token":token,"cancel":true}))
+            .unwrap();
+        assert_eq!(cancelled["annotations"], json!([]));
+        assert_eq!(cancelled["bookmarks"].as_array().unwrap().len(), 1);
+        let undone = doc.command(json!({"op":"marks_undo"})).unwrap();
+        assert_eq!(undone["annotations"], json!([]));
+        assert_eq!(undone["bookmarks"], json!([]));
+    }
+
+    #[test]
+    fn placed_text_tokens_cannot_overwrite_interleaved_changes_or_saved_documents() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let created = doc.command(json!({"op":"mark_create","entry":{"kind":"textBox","page":0,"version":1,"rect":{"x":70,"y":80,"width":100,"height":30},"fontSize":14,"note":"before","color":"#000000ff"}})).unwrap();
+        let id = created["selected_id"].as_str().unwrap();
+        let begin = doc
+            .command(json!({"op":"mark_text_begin","id":id,"created":false}))
+            .unwrap();
+        let token = &begin["text_edit_token"];
+        assert!(
+            doc.command(
+                json!({"op":"mark_text_update","id":id,"edit_token":"stale","patch":{"note":"bad"}})
+            )
+            .is_err()
+        );
+        assert!(
+            doc.command(
+                json!({"op":"mark_text_update","id":id,"edit_token":token,"patch":{"kind":"stamp"}})
+            )
+            .is_err()
+        );
+        for text in ["one", "two", "final"] {
+            doc.command(
+                json!({"op":"mark_text_update","id":id,"edit_token":token,"patch":{"note":text}}),
+            )
+            .unwrap();
+        }
+        doc.command(json!({"op":"mark_text_end","id":id,"edit_token":token,"cancel":false}))
+            .unwrap();
+        assert_eq!(
+            doc.command(json!({"op":"marks_undo"})).unwrap()["annotations"][0]["note"],
+            "before"
+        );
+        assert_eq!(
+            doc.command(json!({"op":"marks_redo"})).unwrap()["annotations"][0]["note"],
+            "final"
+        );
+        let next = doc
+            .command(json!({"op":"mark_text_begin","id":id,"created":false}))
+            .unwrap();
+        doc.command(json!({"op":"bookmark_create","page":0,"title":"Later"}))
+            .unwrap();
+        assert!(doc.command(json!({"op":"mark_text_end","id":id,"edit_token":next["text_edit_token"],"cancel":true})).is_err());
+        let state = doc.command(json!({"op":"marks"})).unwrap();
+        assert_eq!(state["annotations"][0]["note"], "final");
+        assert_eq!(state["bookmarks"].as_array().unwrap().len(), 1);
+        let final_edit = doc
+            .command(json!({"op":"mark_text_begin","id":id,"created":false}))
+            .unwrap();
+        doc.command(json!({"op":"document_save"})).unwrap();
+        assert!(doc.command(json!({"op":"mark_text_end","id":id,"edit_token":final_edit["text_edit_token"],"cancel":true})).is_err());
+    }
+
+    #[test]
+    fn placed_text_write_failure_preserves_external_bytes_and_can_still_be_reviewed() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let created = doc.command(json!({"op":"mark_create","entry":{"kind":"textBox","page":0,"version":1,"rect":{"x":70,"y":80,"width":100,"height":30},"fontSize":14,"note":"before","color":"#000000ff"}})).unwrap();
+        let id = created["selected_id"].as_str().unwrap();
+        let begin = doc
+            .command(json!({"op":"mark_text_begin","id":id,"created":true}))
+            .unwrap();
+        let path = Path::new(created["path"].as_str().unwrap());
+        let mut external = fs::read(path).unwrap();
+        external.push(b' ');
+        fs::write(path, &external).unwrap();
+        assert!(doc.command(json!({"op":"mark_text_update","id":id,"edit_token":begin["text_edit_token"],"patch":{"note":"must not publish"}})).is_err());
+        assert!(doc.command(json!({"op":"mark_text_end","id":id,"edit_token":begin["text_edit_token"],"cancel":true})).is_err());
+        assert_eq!(fs::read(path).unwrap(), external);
+        let state = doc.command(json!({"op":"marks"})).unwrap();
+        assert_eq!(state["annotations"][0]["note"], "before");
+        assert_eq!(state["can_undo"], true);
+    }
+
+    #[test]
+    fn placed_text_cancellation_keeps_the_working_page_transaction() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let staged = doc.command(json!({"op":"page_stage","operation":{"Rotate":{"pages":[0],"quarter_turns":1}},"current_page":0,"selected_pages":[0]})).unwrap();
+        assert!(staged["marks"]["page_pending"].as_bool().unwrap());
+        // Page operations materialize pre-existing marks into the working PDF. Create the
+        // editable box afterwards, in that private revision's annotation cache.
+        let created = doc.command(json!({"op":"mark_create","entry":{"kind":"textBox","page":0,"version":1,"rect":{"x":70,"y":80,"width":100,"height":30},"fontSize":14,"note":"keep","color":"#000000ff"}})).unwrap();
+        let id = created["selected_id"].as_str().unwrap();
+        let begin = doc
+            .command(json!({"op":"mark_text_begin","id":id,"created":false}))
+            .unwrap();
+        doc.command(json!({"op":"mark_text_update","id":id,"edit_token":begin["text_edit_token"],"patch":{"note":"cancel this"}})).unwrap();
+        let cancelled = doc.command(json!({"op":"mark_text_end","id":id,"edit_token":begin["text_edit_token"],"cancel":true})).unwrap();
+        assert_eq!(cancelled["annotations"][0]["note"], "keep");
+        assert_eq!(cancelled["page_pending"], true);
+        let saved = doc.command(json!({"op":"document_save"})).unwrap();
+        assert_eq!(saved["marks"]["page_pending"], false);
+        let embedded = fixture.open().command(json!({"op":"marks"})).unwrap();
+        assert!(
+            embedded["file_annotations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["contents"] == "keep")
         );
     }
 

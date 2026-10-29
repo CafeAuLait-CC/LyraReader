@@ -123,7 +123,7 @@ Item {
             }
             Text {
                 anchors.fill: parent
-                visible: modelData.kind === "textBox"
+                visible: modelData.kind === "textBox" && !(!annotationLayer.ownOnly && app.placedTextEditor && app.placedTextEditor.current && app.placedTextEditor.entry && app.placedTextEditor.entry.id===modelData.id)
                 text: modelData.note || ""
                 textFormat: Text.PlainText
                 color: Logic.displayColor(Logic.color(modelData), app.paperAppearance)

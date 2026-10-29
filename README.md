@@ -56,7 +56,9 @@ places text, dates, vector checkmarks/crosses, stamps, drawn vector signatures a
 signature images. Drawing multiple strokes produces one ink annotation with a single undo step.
 Pictures have Small, Medium and Large placement sizes, with the default read from the shared engine.
 The Date inspector offers native-locale Medium, Long and Short styles plus Gregorian ISO dates,
-using ICU's locale and calendar data. At 0° the date remains editable text; 90°, 180° and 270° use
+using ICU's locale and calendar data. At 0° the date opens an inline text editor with the date selected;
+Control+Return or a page click finishes, and Escape cancels the whole placement. Background cache
+flushes form one editing undo step, and failed writes preserve the draft. At 90°, 180° and 270° it uses
 transparent native-font pictures whose orientation survives PDF saving. Each picture is one undo step.
 Building the Qt shell also requires ICU's i18n and uc development libraries.
 Image and typed-signature confirmations are bound to the document generation that opened them.

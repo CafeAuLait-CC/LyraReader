@@ -1691,6 +1691,260 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"date")));const auto secondPath=scratch.path()+"/second-date-document.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",secondPath));view.workspace.openFile(QUrl::fromLocalFile(secondPath));auto *second=view.workspace.activeReader();QVERIFY(second!=reader);QTRY_COMPARE_WITH_TIMEOUT(second->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(second->pendingCommands(),0,10000);QVERIFY(view.window->property("fillTool").toString().isEmpty());QCOMPARE(view.window->property("annotationTool").toString(),QString("select"));QVERIFY(!second->hasUnsavedChanges());
         QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"date")));auto *rotation=visualItem(view.window->contentItem(),"fillDateRotation");QVERIFY(rotation);rotation->forceActiveFocus();QTRY_VERIFY(rotation->hasActiveFocus());QTest::keyClick(view.window,Qt::Key_Escape);QTRY_VERIFY(view.window->property("fillTool").toString().isEmpty());QCOMPARE(view.window->property("annotationTool").toString(),QString("select"));QVERIFY(!second->hasUnsavedChanges());
     }
+    void unrotatedDateStartsAnInlineEditorAndSelectsTheWholeDate() {
+        QTemporaryDir scratch;
+        QVERIFY(scratch.isValid());
+        const auto path=scratch.path()+"/inline-date.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;
+        QVERIFY(view.window);
+        view.workspace.openFile(QUrl::fromLocalFile(path));
+        auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"date")));
+        view.window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",3}});
+        QVERIFY(!view.window->property("selection").isNull());
+        QVERIFY(QMetaObject::invokeMethod(view.window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,200.0),Q_ARG(QVariant,300.0),Q_ARG(QVariant,400.0),Q_ARG(QVariant,400.0)));
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QPointer<QQuickItem> input=visualItem(view.window->contentItem(),"placedTextInput0");
+        QVERIFY2(input,"A zero-degree date must open the editor over its own page box");
+        QTRY_VERIFY(input->isVisible());
+        QTRY_VERIFY(input->isVisible() && input->hasActiveFocus());
+        QVERIFY2(view.window->property("selection").isNull(),"Editing a placed date must clear the underlying PDF text selection");
+        const auto today=reader->formattedDate("medium").value("text").toString();
+        QCOMPARE(input->property("selectedText").toString(),today);
+        const auto snapshot=qEnvironmentVariable("LYRA_READER_INLINE_DATE_SNAPSHOT");
+        if(!snapshot.isEmpty()){QTest::qWait(40);QVERIFY(view.window->grabWindow().save(snapshot));}
+        view.window->setProperty("fitting",false);
+        view.window->setProperty("zoom",1.54);
+        for (char key : QByteArray("Typed through native Qt")) QTest::keyClick(view.window,key);
+        QTest::qWait(80);
+        QTRY_VERIFY2(input->property("contentHeight").toDouble()+input->property("topPadding").toDouble()+input->property("bottomPadding").toDouble()<=input->height()+1,
+            "Every typed line must fit inside the automatically sized editor");
+        QTest::keyClick(view.window,Qt::Key_Return,Qt::ControlModifier);
+        QVERIFY2(!input || !input->isVisible() || input->property("readOnly").toBool(),"Finishing freezes the acknowledged text before the asynchronous end command");
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QTRY_VERIFY(!input || !input->isVisible());
+        QVERIFY2(!input || !input->hasActiveFocus(),"A closed text editor must release keyboard focus");
+        QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
+        auto entries=reader->data().value("marks").toMap().value("annotations").toList();
+        QCOMPARE(entries.size(),1);
+        QCOMPARE(entries.first().toMap().value("note").toString(),QString("Typed through native Qt"));
+        // All keystrokes in the editing session are one edit, separate from creation.
+        reader->submit("marks_undo");
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QCOMPARE(reader->data().value("marks").toMap().value("annotations").toList().first().toMap().value("note").toString(),today);
+        reader->submit("marks_redo");
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"saveDocument",Q_ARG(QVariant,false)));
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);
+        QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
+        QVERIFY(!reader->hasUnsavedChanges());
+        ReaderController reopened;
+        reopened.openFile(QUrl::fromLocalFile(path));
+        QTRY_COMPARE_WITH_TIMEOUT(reopened.pageCount(),1,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(reopened.pendingCommands(),0,10000);
+        const auto embedded=reopened.data().value("annotations").toList();
+        QCOMPARE(embedded.size(),1);
+        QCOMPARE(embedded.first().toMap().value("contents").toString(),QString("Typed through native Qt"));
+    }
+    void inlineDateEscapeCancelsAllDurableFlushesAndTabSwitchCommitsTheLastText() {
+        QTemporaryDir scratch;
+        QVERIFY(scratch.isValid());
+        const auto path=scratch.path()+"/inline-date.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;
+        QVERIFY(view.window);
+        view.workspace.openFile(QUrl::fromLocalFile(path));
+        auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"date")));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,200.0),Q_ARG(QVariant,300.0),Q_ARG(QVariant,400.0),Q_ARG(QVariant,400.0)));
+        QPointer<QQuickItem> input;
+
+        QTRY_VERIFY((input=visualItem(view.window->contentItem(),"placedTextInput0")) && input->isVisible() && input->hasActiveFocus());
+        for(const auto &text:{QByteArray("first"),QByteArray("second")}) {
+            QTest::keyClick(view.window,Qt::Key_A,Qt::ControlModifier);
+            for(char key:text)QTest::keyClick(view.window,key);
+            QTRY_COMPARE_WITH_TIMEOUT(reader->data().value("marks").toMap().value("annotations").toList().first().toMap().value("note").toString(),QString::fromLatin1(text),10000);
+            QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        }
+        QTest::keyClick(view.window,Qt::Key_Escape);
+        QTRY_VERIFY(!input || !input->isVisible());
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(!reader->hasUnsavedChanges());
+        QVERIFY(reader->noteDrafts().isEmpty());
+        QVERIFY(reader->data().value("marks").toMap().value("annotations").toList().isEmpty());
+        QVERIFY(!reader->data().value("marks").toMap().value("can_undo").toBool());
+        // Escape also cancels a placement whose creation acknowledgement is still queued.
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"date")));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,200.0),Q_ARG(QVariant,300.0),Q_ARG(QVariant,400.0),Q_ARG(QVariant,400.0)));
+        QTest::keyClick(view.window,Qt::Key_Escape);
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(reader->data().value("marks").toMap().value("annotations").toList().isEmpty());
+        QVERIFY(!reader->hasUnsavedChanges());
+        // Merely opening and finishing the editor must not add a geometry-only undo step.
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"date")));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,200.0),Q_ARG(QVariant,300.0),Q_ARG(QVariant,400.0),Q_ARG(QVariant,400.0)));
+        QTRY_VERIFY((input=visualItem(view.window->contentItem(),"placedTextInput0")) && input->isVisible() && input->hasActiveFocus());
+        QTest::keyClick(view.window,Qt::Key_Return,Qt::ControlModifier);
+        QTRY_VERIFY(!input || !input->isVisible());
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        reader->submit("marks_undo");
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(reader->data().value("marks").toMap().value("annotations").toList().isEmpty());
+        QVERIFY(!reader->hasUnsavedChanges());
+        // Returning the desktop to another tab is deferred until the last text is durable.
+        view.workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));
+        auto *other=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(other->pageCount(),3,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(other->pendingCommands(),0,10000);
+        view.workspace.selectTab(0);
+        QTRY_COMPARE(view.workspace.activeReader(),reader);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"date")));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,200.0),Q_ARG(QVariant,300.0),Q_ARG(QVariant,400.0),Q_ARG(QVariant,400.0)));
+        input=visualItem(view.window->contentItem(),"placedTextInput0");
+        QTRY_VERIFY((input=visualItem(view.window->contentItem(),"placedTextInput0")) && input->isVisible() && input->hasActiveFocus());
+        for(char key:QByteArray("Last text before switching tabs"))QTest::keyClick(view.window,key);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"selectReaderTab",Q_ARG(QVariant,1),Q_ARG(QVariant,false)));
+        QTRY_COMPARE_WITH_TIMEOUT(view.workspace.activeReader(),other,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QCOMPARE(reader->data().value("marks").toMap().value("annotations").toList().first().toMap().value("note").toString(),QString("Last text before switching tabs"));
+        QVERIFY(reader->noteDrafts().isEmpty());
+        QVERIFY(!other->hasUnsavedChanges());
+    }
+    void inlineDatePreservesTheDraftWhenItsCacheChangedOutsideTheApp() {
+        QTemporaryDir scratch;
+        QVERIFY(scratch.isValid());
+        const auto path=scratch.path()+"/date-conflict.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        QFile original(path);QVERIFY(original.open(QIODevice::ReadOnly));const auto pdfBefore=original.readAll();original.close();
+        NativeCorpus::Viewer view;
+        QVERIFY(view.window);
+        view.workspace.openFile(QUrl::fromLocalFile(path));
+        auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"date")));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,200.0),Q_ARG(QVariant,300.0),Q_ARG(QVariant,400.0),Q_ARG(QVariant,400.0)));
+        QPointer<QQuickItem> input;
+        QTRY_VERIFY((input=visualItem(view.window->contentItem(),"placedTextInput0")) && input->isVisible() && input->hasActiveFocus());
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QFile cache(reader->data().value("marks").toMap().value("path").toString());
+        QVERIFY(cache.open(QIODevice::ReadOnly));const auto cacheBefore=cache.readAll();cache.close();
+        QVERIFY(cache.open(QIODevice::WriteOnly));QCOMPARE(cache.write(cacheBefore+" "),cacheBefore.size()+1);cache.close();
+        for(char key:QByteArray("Preserve this draft"))QTest::keyClick(view.window,key);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"saveDocument",Q_ARG(QVariant,false)));
+        QTRY_VERIFY_WITH_TIMEOUT(!reader->error().isEmpty(),10000);
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(input->isVisible());
+        QCOMPARE(input->property("text").toString(),QString("Preserve this draft"));
+        QVERIFY(!reader->noteDrafts().isEmpty());
+        QVERIFY(original.open(QIODevice::ReadOnly));QCOMPARE(original.readAll(),pdfBefore);original.close();
+        QVERIFY(cache.open(QIODevice::ReadOnly));QCOMPARE(cache.readAll(),cacheBefore+" ");cache.close();
+        QTest::keyClick(view.window,Qt::Key_Escape);
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(input->isVisible());
+        // Restore the controlled fixture's bytes, then retry cancellation. Production never
+        // performs this repair automatically or overwrites another process's cache changes.
+        QVERIFY(cache.open(QIODevice::WriteOnly));QCOMPARE(cache.write(cacheBefore),cacheBefore.size());cache.close();
+        QTest::keyClick(view.window,Qt::Key_Escape);
+        QTRY_VERIFY_WITH_TIMEOUT(!input || !input->isVisible(),10000);
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(!reader->hasUnsavedChanges());
+    }
+    void inlineDateSaveAndCloseDrainsThePendingTextSession() {
+        QTemporaryDir scratch;
+        QVERIFY(scratch.isValid());
+        const auto path=scratch.path()+"/date-close.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;
+        QVERIFY(view.window);
+        view.workspace.openFile(QUrl::fromLocalFile(path));
+        QPointer<ReaderController> reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"date")));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,200.0),Q_ARG(QVariant,300.0),Q_ARG(QVariant,400.0),Q_ARG(QVariant,400.0)));
+        QPointer<QQuickItem> input;
+        QTRY_VERIFY((input=visualItem(view.window->contentItem(),"placedTextInput0")) && input->isVisible() && input->hasActiveFocus());
+        for(char key:QByteArray("Closed without losing the last text"))QTest::keyClick(view.window,key);
+        view.workspace.closeTab(0);
+        auto *confirmation=view.window->findChild<QObject *>("closeChangesConfirmation");
+        QVERIFY(confirmation);QTRY_VERIFY_WITH_TIMEOUT(confirmation->property("opened").toBool(),10000);
+        QVERIFY(clickDialogButton(view.window,confirmation,"Save"));
+        QTRY_VERIFY_WITH_TIMEOUT(reader.isNull(),15000);
+        ReaderController reopened;
+        reopened.openFile(QUrl::fromLocalFile(path));
+        QTRY_COMPARE_WITH_TIMEOUT(reopened.pageCount(),1,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(reopened.pendingCommands(),0,10000);
+        QVERIFY2(reopened.error().isEmpty(),qPrintable(reopened.error()));
+        const auto embedded=reopened.data().value("annotations").toList();
+        QCOMPARE(embedded.size(),1);
+        QCOMPARE(embedded.first().toMap().value("contents").toString(),QString("Closed without losing the last text"));
+        QVERIFY(!reopened.hasUnsavedChanges());
+    }
+    void lateDatePlacementDoesNotOpenAnEditorAfterChangingToolRowsOrReaders() {
+        QTemporaryDir scratch;
+        QVERIFY(scratch.isValid());
+        const auto path=scratch.path()+"/date-owner.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;
+        QVERIFY(view.window);
+        view.workspace.openFile(QUrl::fromLocalFile(path));
+        auto *first=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(first->pageCount(),1,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(first->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"date")));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,200.0),Q_ARG(QVariant,300.0),Q_ARG(QVariant,400.0),Q_ARG(QVariant,400.0)));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setSecondaryRow",Q_ARG(QVariant,"edit"),Q_ARG(QVariant,true)));
+        QTRY_COMPARE_WITH_TIMEOUT(first->pendingCommands(),0,10000);
+        auto *editor=view.window->findChild<QObject *>("placedTextEditing");
+        auto *dialog=view.window->findChild<QObject *>("annotationEditor");
+        QVERIFY(editor && dialog);
+        QVERIFY(!editor->property("active").toBool());
+        QVERIFY(!dialog->property("visible").toBool());
+        QCOMPARE(view.window->property("secondaryRow").toString(),QString("edit"));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"date")));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,200.0),Q_ARG(QVariant,300.0),Q_ARG(QVariant,400.0),Q_ARG(QVariant,400.0)));
+        view.workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));
+        auto *other=view.workspace.activeReader();
+        QVERIFY(other!=first);
+        QTRY_COMPARE_WITH_TIMEOUT(other->pageCount(),3,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(other->pendingCommands(),0,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(first->pendingCommands(),0,10000);
+        QVERIFY(!editor->property("active").toBool());
+        QVERIFY(!editor->property("waitingForCreation").toBool());
+        QVERIFY(!dialog->property("visible").toBool());
+        QVERIFY(!other->hasUnsavedChanges());
+    }
+    void inlineDateKeepsFocusAndSelectionWhenPageRowsAreRebuilt() {
+        QTemporaryDir scratch;
+        QVERIFY(scratch.isValid());
+        const auto path=scratch.path()+"/date-reflow.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",path));
+        NativeCorpus::Viewer view;
+        QVERIFY(view.window);
+        view.workspace.openFile(QUrl::fromLocalFile(path));
+        auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),3,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"date")));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,200.0),Q_ARG(QVariant,300.0),Q_ARG(QVariant,400.0),Q_ARG(QVariant,400.0)));
+        QPointer<QQuickItem> input;
+        QTRY_VERIFY((input=visualItem(view.window->contentItem(),"placedTextInput0")) && input->isVisible() && input->hasActiveFocus());
+        const auto selected=input->property("selectedText").toString();
+        QVERIFY(!selected.isEmpty());
+        reader->setLayout("Facing",12);
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QTRY_VERIFY((input=visualItem(view.window->contentItem(),"placedTextInput0")) && input->isVisible() && input->hasActiveFocus());
+        QCOMPARE(input->property("selectedText").toString(),selected);
+        QTest::keyClick(view.window,Qt::Key_Escape);
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(!reader->hasUnsavedChanges());
+    }
     void dateFormatInspectorPlacesEditableTextAndRejectsAReopenedDocument() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/date.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
         NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();

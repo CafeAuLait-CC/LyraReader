@@ -13,6 +13,8 @@ use std::{
 };
 #[path = "ink_erase.rs"]
 mod ink_erase;
+#[path = "text_edit.rs"]
+mod text_edit;
 const MAX_SIDECAR_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HISTORY_BYTES: usize = 32 * 1024 * 1024;
 static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -39,6 +41,7 @@ pub struct Marks {
     transient_ink: HashSet<String>,
     hidden_ink: HashSet<String>,
     erase: Option<ink_erase::Gesture>,
+    text_edit: Option<text_edit::Session>,
     embedded_bookmarks: HashSet<String>,
     path: PathBuf,
     cache: Option<crate::document_cache::DocumentCache>,
@@ -256,6 +259,7 @@ impl Marks {
         next.erase = None;
         next.pending.mark_clean(next.clean_snapshot());
         next.persist()?;
+        next.text_edit = None;
         next.undo.clear();
         next.redo.clear();
         next.seed_bookmarks(document)?;
@@ -445,6 +449,7 @@ impl Marks {
         // session records can keep both; the original document cache is never rewritten.
         result.transient_ink.clear();
         result.embedded_bookmarks.clear();
+        result.text_edit = None;
         result.undo.clear();
         result.redo.clear();
         result.erase = None;
@@ -472,6 +477,7 @@ impl Marks {
         result.deletions.clear();
         result.hidden_ink.clear();
         result.transient_ink.clear();
+        result.text_edit = None;
         result.undo.clear();
         result.redo.clear();
         result.pending.mark_clean(result.clean_snapshot());
@@ -563,6 +569,7 @@ impl Marks {
         result.session = None;
         result.owns_recovery = false;
         result.page_count = new.page_count();
+        result.text_edit = None;
         result.undo.clear();
         result.redo.clear();
         let mut entries = vec![];
@@ -685,6 +692,7 @@ impl Marks {
         result.path = original.path.clone();
         result.baseline = original.baseline.clone();
         result.pending_baseline = original.pending_baseline.clone();
+        result.text_edit = None;
         result.undo.clear();
         result.redo.clear();
         let published = crate::draft_store::write(
@@ -908,6 +916,7 @@ impl Marks {
             self.pending = old_pending;
             return Err(error);
         }
+        self.text_edit = None;
         self.undo.clear();
         self.redo.clear();
         Ok(())
@@ -999,6 +1008,7 @@ impl Marks {
             transient_ink: HashSet::new(),
             hidden_ink: HashSet::new(),
             erase: None,
+            text_edit: None,
             embedded_bookmarks: HashSet::new(),
             path,
             source_error: cache.as_ref().and_then(|c| c.opened_source_status().err()),
@@ -1065,6 +1075,7 @@ impl Marks {
     pub fn page_snapshot(&self) -> Self {
         let mut result = self.clone();
         result.erase = None;
+        result.text_edit = None;
         result.undo.clear();
         result.redo.clear();
         result
@@ -1217,9 +1228,13 @@ impl Marks {
             }
             return Err(error);
         }
-        self.undo.push(old);
+        if let Some(edit) = &self.text_edit {
+            edit.history.record(&mut self.undo);
+        } else {
+            self.undo.push(old);
+            Self::trim_history(&mut self.undo);
+        }
         self.redo.clear();
-        Self::trim_history(&mut self.undo);
         Ok(())
     }
     pub fn state(&self, document: &LyraReaderDocument) -> Result<Value, String> {
@@ -1335,6 +1350,14 @@ impl Marks {
         r: &Value,
         document: &LyraReaderDocument,
     ) -> Result<Value, String> {
+        if op.starts_with("mark_text_") {
+            return self.text_edit_command(op, r, document);
+        }
+        // An unrelated mutation commits the durable text; its old token can no longer
+        // cancel or overwrite a later annotation operation.
+        if op != "marks" {
+            self.text_edit = None;
+        }
         if op.starts_with("ink_erase_") {
             return self.erase_command(op, r, document);
         }
@@ -1680,6 +1703,7 @@ impl Marks {
                 self.hidden_ink.clear();
                 self.erase = None;
                 self.embedded_bookmarks.clear();
+                self.text_edit = None;
                 self.undo.clear();
                 self.redo.clear();
                 self.pending = PendingState::new(false, Some(self.clean_snapshot()));

@@ -61,6 +61,7 @@ ApplicationWindow {
     }
     property string secondaryRow: ""
     property alias contentEditor: contentController
+    readonly property var placedTextEditor: placedTextController
     readonly property var fillTools: secondaryTools.fillTools
     property string fillTool: ""
     property string fillText: "Text"
@@ -84,6 +85,8 @@ ApplicationWindow {
     }
     function toggleSecondaryRow(value) {setSecondaryRow(secondaryRow===value && !overviewVisible ? "" : value);}
     function setSecondaryRow(value,force) {
+        if(placedTextController.waitingForCreation)placedTextController.suppressPendingEditor();
+        if (placedTextController.deferAction(function(){root.setSecondaryRow(value,force);})) return;
         if (!force && secondaryRow==="edit" && contentController.deferAction({kind:"row",value:value})) return;
         if (value.length && !currentReader.pageCount) return;
         if (["annotate","edit","fill"].indexOf(value)>=0 && blockXfaWrite()) return;
@@ -94,6 +97,8 @@ ApplicationWindow {
     }
     function selectReaderTab(index,force) {
         if (!session || index<0 || index>=session.tabs.length) return;
+        const target=session.tabs[index].reader;
+        if(placedTextController.deferAction(function(){root.selectReaderTab(root.readerIndex(target),force);}))return;
         if (!force && secondaryRow==="edit" && contentController.deferAction({kind:"tab",reader:session.tabs[index].reader})) return;
         session.selectTab(index);
     }
@@ -105,6 +110,8 @@ ApplicationWindow {
         if(session.moveTab(owner,before))tabReorderFinished(owner);
     }
     function showOverview(force) {
+        if(placedTextController.deferAction(function(){root.showOverview(force);}))return;
+        if(placedTextController.waitingForCreation)placedTextController.suppressPendingEditor();
         if (!force && secondaryRow==="edit" && contentController.deferAction({kind:"overview"})) return;
         overviewVisible=!overviewVisible;
     }
@@ -115,6 +122,10 @@ ApplicationWindow {
         formattedFillDate=result;fillText=result.text;return true;
     }
     function setFillTool(value) {
+        if(placedTextController.waitingForCreation || (placedTextController.active && !placedTextController.current)) {
+            operationStatus=qsTr("Wait for the pending placed-text edit to finish.");return;
+        }
+        if(placedTextController.deferAction(function(){root.setFillTool(value);}))return;
         if (blockXfaWrite()) return;
         if (secondaryRow!=="fill") setSecondaryRow("fill");
         if (secondaryRow!=="fill") return;
@@ -131,6 +142,7 @@ ApplicationWindow {
     }
     function fillColour() {return "#"+Logic.hex(fillColor.r*255)+Logic.hex(fillColor.g*255)+Logic.hex(fillColor.b*255)+Logic.hex(fillColor.a*255);}
     ContentEditing {id:contentController;app:root}
+    PlacedTextEditing {id:placedTextController;app:root}
     property bool annotationToolsVisible: false
     onAnnotationToolsVisibleChanged: {
         if(annotationToolsVisible && secondaryRow!=="annotate")secondaryRow="annotate";
@@ -142,6 +154,8 @@ ApplicationWindow {
     onOverviewVisibleChanged: if (overviewVisible)
         textViewVisible = false
     function setTextViewEnabled(show) {
+        if(placedTextController.deferAction(function(){root.setTextViewEnabled(show);}))return;
+        if(show && placedTextController.waitingForCreation)placedTextController.suppressPendingEditor();
         if (show && secondaryRow==="edit" && contentController.deferAction({kind:"textView",value:show})) return;
         const returningToPage = textViewVisible && !show;
         const page = currentPage;
@@ -677,6 +691,7 @@ ApplicationWindow {
             markSelection(annotationTool);
     }
     function pageClicked(page, x, y, sceneX, sceneY) {
+        if(placedTextController.deferAction(function(){root.pageClicked(page,x,y,sceneX,sceneY);}))return;
         currentPage = page;
         if (annotationTool === "signature" && pendingDrawnSignature) {
             if(pendingArtworkRequest>=0 || blockXfaWrite())return;
@@ -759,8 +774,11 @@ ApplicationWindow {
                 const paths=fillTool==="check" ? [[{x:left+3,y:top+15},{x:left+11,y:top+24},{x:left+27,y:top+4}]] :
                     [[{x:left+4,y:top+4},{x:left+26,y:top+26}],[{x:left+26,y:top+4},{x:left+4,y:top+26}]];
                 pendingArtworkRequest=currentReader.submit("mark_create",{entry:{kind:"ink",page:page,version:1,paths:paths,strokeWidth:2.5,color:fillColour(),note:""}});
-            } else pendingArtworkRequest=currentReader.submit("mark_create",{entry:{kind:"textBox",page:page,version:1,
-                rect:{x:left,y:top,width:width,height:height},fontSize:date ? formattedFillDate.fontSize : fillFontSize,color:date ? "#000000ff" : fillColour(),note:fillText}});
+            } else {
+                pendingArtworkRequest=currentReader.submit("mark_create",{entry:{kind:"textBox",page:page,version:1,
+                    rect:{x:left,y:top,width:width,height:height},fontSize:date ? formattedFillDate.fontSize : fillFontSize,color:date ? "#000000ff" : fillColour(),note:fillText}});
+                if(date)placedTextController.expectCreation(currentReader,pendingArtworkRequest);
+            }
         } else if (annotationTool === "stickyNote" || annotationTool === "textBox") {
             const size = currentReader.pages[page];
             const width = annotationTool === "stickyNote" ? 22 : Math.min(180, size.width);
@@ -912,6 +930,7 @@ ApplicationWindow {
             currentReader.submit("forms");
     }
     function selectAnnotation(annotation, edit) {
+        if(placedTextController.deferAction(function(){root.selectAnnotation(annotation,edit);}))return;
         dialogs.flushAnnotation();
         if (edit === false)
             dialogs.annotationDialog.close();
@@ -962,6 +981,7 @@ ApplicationWindow {
         return null;
     }
     function setAnnotationTool(tool) {
+        if(placedTextController.deferAction(function(){root.setAnnotationTool(tool);}))return;
         if (tool !== "select" && blockXfaWrite()) return;
         annotationTool = annotationTool === tool ? "select" : tool;
         if (["highlight", "underline", "strikeout"].indexOf(annotationTool) >= 0 && selection)
@@ -1078,6 +1098,11 @@ ApplicationWindow {
         selection = null;
     }
     function updateSelectedAnnotation(patch) {
+        const selected=selectedAnnotation;
+        if(selected && placedTextController.deferAction(function(){
+            root.selectedAnnotation=root.annotations.find(function(a){return a.id===selected.id;}) || null;
+            root.updateSelectedAnnotation(patch);
+        }))return -1;
         if (blockXfaWrite()) return -1;
         if (selectedAnnotation && !selectedAnnotation.foreign)
             return currentReader.submit("mark_update", {
@@ -1090,22 +1115,21 @@ ApplicationWindow {
         if (blockXfaWrite()) return;
         if (!annotationDraft || annotationDraft.id !== id)
             return;
+        if(placedTextController.deferAction(function(){root.pendingDraftRequestId=root.currentReader.submit("mark_update",{id:id,patch:patch});}))return;
         pendingDraftRequestId = currentReader.submit("mark_update", {
             id: id,
             patch: patch
         });
     }
     function updateAnnotationNote(note) {
-        if (blockXfaWrite()) return;
-        if (selectedAnnotation)
-            currentReader.submit("mark_update", {
-                id: selectedAnnotation.id,
-                patch: {
-                    note: note
-                }
-            });
+        updateSelectedAnnotation({note:note});
     }
     function deleteSelectedAnnotation() {
+        const selected=selectedAnnotation;
+        if(selected && placedTextController.deferAction(function(){
+            root.selectedAnnotation=root.annotations.find(function(a){return a.id===selected.id;}) || null;
+            root.deleteSelectedAnnotation();
+        }))return;
         if (blockXfaWrite()) return;
         dialogs.cancelAnnotationDraft();
         if (selectedAnnotation)
@@ -1205,6 +1229,7 @@ ApplicationWindow {
         currentPage = index;
     }
     function pageOperation(operation) {
+        if(placedTextController.deferAction(function(){root.pageOperation(operation);}))return;
         if (blockXfaWrite()) return;
         if (pageEditBusy)
             return;
@@ -1233,6 +1258,7 @@ ApplicationWindow {
         dialogs.confirmDiscardPages();
     }
     function undo() {
+        if(placedTextController.deferAction(function(){root.undo();}))return;
         if (secondaryRow==="edit" && contentController.deferAction({kind:"undo"})) return;
         if (markState.can_undo)
             currentReader.submit("marks_undo");
@@ -1242,6 +1268,7 @@ ApplicationWindow {
         }
     }
     function redo() {
+        if(placedTextController.deferAction(function(){root.redo();}))return;
         if (secondaryRow==="edit" && contentController.deferAction({kind:"redo"})) return;
         if (markState.can_redo)
             currentReader.submit("marks_redo");
@@ -1252,6 +1279,7 @@ ApplicationWindow {
     }
     property bool printRequested: false
     function printDocument() {
+        if(placedTextController.deferAction(function(){root.printDocument();}))return;
         if (secondaryRow==="edit" && contentController.deferAction({kind:"print"})) return;
         if (dialogs.annotationWriteError.length) {
             operationStatus = dialogs.annotationWriteError;
@@ -1278,6 +1306,7 @@ ApplicationWindow {
     property var pendingSavePosition: null
     property var pendingDocumentSave: null
     function saveDocument(copy) {
+        if(placedTextController.deferAction(function(){root.saveDocument(copy);}))return;
         if (secondaryRow==="edit" && contentController.deferAction({kind:"save",value:!!copy})) return;
         if (closeOperation || pendingDocumentSave) return;
         if (xfaReadOnly) {operationStatus=currentReader.data.xfa_status.read_only_reason;return;}
@@ -1309,6 +1338,7 @@ ApplicationWindow {
         }
     }
     function chooseExport(kind) {
+        if(placedTextController.deferAction(function(){root.chooseExport(kind);}))return;
         if (secondaryRow==="edit" && contentController.deferAction({kind:"export",value:kind})) return;
         if (["bibtex","markdown","csv"].indexOf(kind)<0 && blockXfaWrite()) return;
         exportKind = kind;
@@ -1673,6 +1703,8 @@ ApplicationWindow {
     Shortcut {
         sequence: "Escape"
         onActivated: {
+            if(placedTextController.waitingForCreation)placedTextController.cancelPendingCreation();
+            if(placedTextController.current){placedTextController.finish(true);return;}
             root.cancelTabReorder();
             if (root.previewController && root.previewController.visible)
                 root.previewController.close();
@@ -2094,6 +2126,7 @@ ApplicationWindow {
             root.requestCloseTab(index);
         }
         function onActiveReaderAboutToChange() {
+            if(placedTextController.waitingForCreation)placedTextController.suppressPendingEditor();
             dialogs.flushAnnotation();
             dialogs.annotationDialog.close();
             root.saveReadingPosition();
@@ -2120,6 +2153,7 @@ ApplicationWindow {
             }
         }
         function onCommandFinished(id, op, result, error) {
+            const artworkPlacement=id===root.pendingArtworkRequest;
             if (op.indexOf("ink_erase_") === 0) {
                 if (id !== root.eraserPending || !root.eraserToken.length)
                     return;
@@ -2192,7 +2226,7 @@ ApplicationWindow {
                     root.selectedAnnotation = root.annotations.find(function (a) {
                         return a.id === result.selected_id;
                     }) || null;
-                    if (root.secondaryRow!=="fill" && root.selectedAnnotation && (root.selectedAnnotation.kind === "stickyNote" || root.selectedAnnotation.kind === "textBox"))
+                    if (!artworkPlacement && root.secondaryRow!=="fill" && root.selectedAnnotation && (root.selectedAnnotation.kind === "stickyNote" || root.selectedAnnotation.kind === "textBox"))
                         dialogs.showAnnotation();
                 }
             } else if (op.indexOf("mark_") === 0 || op.indexOf("marks_") === 0) {

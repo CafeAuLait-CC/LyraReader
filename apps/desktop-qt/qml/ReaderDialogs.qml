@@ -68,6 +68,7 @@ Item {
         noteDirty = false;
     }
     function flushAnnotation() {
+        if(app.placedTextEditor.active)app.placedTextEditor.finish(false);
         noteSave.stop();
         if (!noteReader || !noteDirty || !noteId.length)
             return;

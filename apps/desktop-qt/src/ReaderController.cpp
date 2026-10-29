@@ -363,7 +363,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
             for(auto it=discardedNotes.cbegin();it!=discardedNotes.cend();++it)if(m_noteDrafts.value(it.key())==it.value())clearNoteDraft(it.key());
             for(auto it=discardedEdits.cbegin();it!=discardedEdits.cend();++it)if(m_editDrafts.value(it.key())==it.value())setEditDraft(it.key(),{});
         }
-        if(outcome.error.isEmpty() && operation==QStringLiteral("mark_update")) {
+        if(outcome.error.isEmpty() && (operation==QStringLiteral("mark_update") || operation==QStringLiteral("mark_text_update"))) {
             const auto annotationId=arguments.value(QStringLiteral("id")).toString();
             const auto patch=arguments.value(QStringLiteral("patch")).toMap();
             if(patch.contains(QStringLiteral("note")) && m_noteDrafts.value(annotationId)==patch.value(QStringLiteral("note")))clearNoteDraft(annotationId);

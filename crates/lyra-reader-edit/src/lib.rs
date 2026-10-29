@@ -21,6 +21,7 @@ pub mod draft;
 pub mod kind;
 pub mod records;
 pub mod rules;
+pub mod text_edit;
 pub mod transaction;
 
 pub use kind::{Drawing, KindFlags, WriteKind};
