@@ -57,8 +57,9 @@ import Darwin
 /// | `viewport` | one committed visible-band plan | `seq`, `offset_pt`, `path`, `lod`, `visible_pages`, `viewport`, `sharp`, `visible_misses`, `queued_tiles`, `wanted_tiles`, `page_rasters`, `content_version` |
 /// | `tile` | raster lifecycle for one unit | `phase` (`enqueue`/`start`/`done`/`failed`/`drawn`), `source` (`tile`/`page-raster`/`thumbnail`/`preview`), `page`, `lod`, `x`, `y`, `wait_ms`, `exec_ms`, `bytes`, `scale`, `detail` (`thumbnail` + `drawn` + `detail: sidebar` is a strip cell, not the canvas backdrop) |
 /// | `queue` | one queued task finished | `category` (`tile`/`page-raster`/`thumbnail`/`text`/`index`), `wait_ms`, `exec_ms`, `page` |
-/// | `frame` | a frame reached a terminal state | `presented`, `presented_time` (host seconds or `"unavailable"`), `presented_reason`, `time` (submit), `surface`, `sequence`, `token`, `epoch`, `quads`, `tile_quads`, `cpu_us`, `upload_ms`, `frame_index` |
+/// | `frame` | a frame reached a terminal state | `presented`, `presented_time` (host seconds or `"unavailable"`), `presented_reason`, `time` (submit), `surface`, `sequence`, `token`, `content_seq`, `epoch`, `quads`, `page_quads`, `anchor_page_quads`, `content_pages`, `paper_quads`, `tile_quads`, `cpu_us`, `upload_ms`, `frame_index` |
 /// | `sharp` | committed page list is fully sharp | `token`, `viewport_seq`, `offset_pt`, `path`, `lod`, `pages`, `sources`, `epoch`, `content_version`, `after_input_seq` (absent on the first open) |
+/// | `content` | one committed page list, classified by what each on-screen page actually draws | `seq`, `content_seq`, `epoch`, `offset_pt`, `anchor_page`, `anchor_source`, `pages`, `sources`, `band_pages`, `sharp` |
 /// | `raster` | a raster classification moved | `class` (`first`/`repeat-after-eviction`/`upload-after-cache-hit`), `source`, `page`, `lod`, `x`, `y`, `generation` |
 /// | `stage` | one split of the raster/frame path | `name` (`raster_dispatch`/`raster_core`/`raster_resume_scheduled`/`raster_resumed`/`image_copy`/`thumbnail_downsample`/`upload`), `source`, `page`, `generation`, `ms`, `queue_wait_ms`, `scale` |
 /// | `memory` | 1 Hz (`sample`), scroll idle (`scroll_stop`), quit (`terminate`), document close (`document_close_before`, `document_close`) | `phase`, `rss_bytes`, `tile_cache_bytes`, `page_raster_bytes`, `thumbnail_bytes`, `tile_count`, `page_raster_count`, `peak_bytes`, `evictions` |
@@ -341,13 +342,16 @@ public enum PerfTrace {
     public static func frame(presented: Bool, presentedTime: Double?, reason: String?,
                              submitTime: Double, surface: UInt64, sequence: UInt64,
                              stamp: PerfViewportStamp, cpuUs: UInt64, quads: Int,
-                             tileQuads: Int, frameIndex: UInt64, uploadMs: Double? = nil, paperQuads: Int = 0) {
+                             tileQuads: Int, frameIndex: UInt64, uploadMs: Double? = nil,
+                             paperQuads: Int = 0, pageQuads: Int = 0,
+                             contentPages: [Int] = [], anchorPageQuads: Int = 0) {
         guard enabledStorage else { return }
         var fields: [String: Value] = [
             "presented": .bool(presented),
             "surface": .int(Int(surface)),
             "sequence": .int(Int(sequence)),
             "token": .int(Int(stamp.token)),
+            "content_seq": .int(Int(stamp.contentSeq)),
             "epoch": .int(Int(stamp.epoch)),
             "content_version": .int(Int(stamp.contentVersion)),
             "path": .string(stamp.path),
@@ -356,6 +360,9 @@ public enum PerfTrace {
             "cpu_us": .int(Int(cpuUs)),
             "quads": .int(quads),
             "paper_quads": .int(paperQuads),
+            "page_quads": .int(pageQuads),
+            "anchor_page_quads": .int(anchorPageQuads),
+            "content_pages": .intArray(contentPages),
             "document_quads": .int(max(0, quads - paperQuads)),
             "tile_quads": .int(tileQuads),
             "frame_index": .int(Int(frameIndex)),
@@ -390,6 +397,36 @@ public enum PerfTrace {
         ]
         if let afterInputSeq { fields["after_input_seq"] = .int(Int(afterInputSeq)) }
         event("sharp", fields, instance: instance)
+    }
+
+    /// One committed page list, classified by what each on-screen page actually draws.
+    ///
+    /// `sources` is aligned with `pages` and never lies about sharpness: `page-raster` and
+    /// `tile` are the same two sources `sharp` accepts, while `preview`, `history`, `thumbnail`
+    /// and `previous-tile` are real page content at a lower quality. `none` means the page
+    /// contributed no content quad at all (the canvas draws paper/background there).
+    /// `anchor_page` is the page at the scroll offset (the far-jump destination), and
+    /// `anchor_source` is that page's source or `none` when it has not arrived.
+    ///
+    /// The matching frame is found through `content_seq` (the stamp copies it), so "first
+    /// presented frame showing content" is a real correlation rather than a time guess.
+    public static func content(instance: String? = nil, seq: UInt64, contentSeq: UInt64, epoch: UInt64,
+                               offsetPt: CGFloat, pages: [Int], sources: [String],
+                               anchorPage: Int, sharp: Bool, bandPages: [Int]) {
+        guard enabledStorage else { return }
+        let anchorSource = pages.firstIndex(of: anchorPage).map { sources[$0] } ?? "none"
+        event("content", [
+            "seq": .int(Int(seq)),
+            "content_seq": .int(Int(contentSeq)),
+            "epoch": .int(Int(epoch)),
+            "offset_pt": .double(Double(offsetPt)),
+            "anchor_page": .int(anchorPage),
+            "anchor_source": .string(anchorSource),
+            "pages": .intArray(pages),
+            "sources": .stringArray(sources),
+            "band_pages": .intArray(bandPages),
+            "sharp": .bool(sharp),
+        ], instance: instance)
     }
 
     /// One RSS / cache memory sample. `rssBytes` is nil when the kernel call failed, which is
@@ -535,9 +572,17 @@ public struct PerfViewportStamp: Sendable, Equatable {
     public var path: String
     public var lod: UInt8
     public var offsetPt: CGFloat
+    /// Monotonic commit number for this instance's page lists. `0` means no page list has been
+    /// committed yet. The canvas copies it into `frame.content_seq`, which joins a presented
+    /// frame to the `content` record of the page list it actually drew.
+    public var contentSeq: UInt64
+    /// The page at the committed scroll offset (the far-jump destination). The canvas uses it to
+    /// count only that page's on-screen content quads in `frame.anchor_page_quads`.
+    public var anchorPage: Int
 
     public init(instance: String = "", token: UInt64 = 0, epoch: UInt64 = 0, contentVersion: UInt64 = 0,
-                path: String = "unknown", lod: UInt8 = 0, offsetPt: CGFloat = 0) {
+                path: String = "unknown", lod: UInt8 = 0, offsetPt: CGFloat = 0,
+                contentSeq: UInt64 = 0, anchorPage: Int = 0) {
         self.instance = instance
         self.token = token
         self.epoch = epoch
@@ -545,5 +590,7 @@ public struct PerfViewportStamp: Sendable, Equatable {
         self.path = path
         self.lod = lod
         self.offsetPt = offsetPt
+        self.contentSeq = contentSeq
+        self.anchorPage = anchorPage
     }
 }
