@@ -562,6 +562,15 @@ extension ReaderChecks {
         await cancelModel.prepare(action: .summarizePage, context: context)
         require(cancelModel.phase == .preview, "the cancelled request has a preview")
         cancelModel.send()
+        // Wait for the request to actually start streaming rather than assuming a fixed 120 ms
+        // is enough on every machine. The cancellation below must land after the first part, or
+        // the attempt has recorded no characters yet; a slow CI runner lost that race and the
+        // "started request records the characters it began to send" assertion failed. The sleep
+        // after the wait still keeps the audited open interval at least 120 ms, so the duration
+        // assertion below stays meaningful.
+        try await eventually("the cancelled request starts streaming", {
+            cancelModel.phase == .streaming
+        })
         try await Task.sleep(for: .milliseconds(120))
         cancelModel.cancel()
         try await eventually("the cancelled request reaches a terminal state", {
