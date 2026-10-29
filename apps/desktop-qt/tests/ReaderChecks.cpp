@@ -1578,6 +1578,82 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(window,"redo"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(QMetaObject::invokeMethod(window,"saveDocument",Q_ARG(QVariant,false)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QVERIFY(!reader->hasUnsavedChanges());
         ReaderController reopened;reopened.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reopened.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reopened.pendingCommands(),0,10000);reopened.requestText(0);QTRY_VERIFY_WITH_TIMEOUT(reopened.textPages().value("0").toMap().value("text").toString().contains("Linux edit"),10000);
     }
+    void longContentDraftsStayScrollableAndGeometryFieldsKeepTheirIdentity() {
+        QTemporaryDir scratch;
+        QVERIFY(scratch.isValid());
+        const auto path=scratch.path()+"/content-long-draft.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",path));
+        QFile source(path);QVERIFY(source.open(QIODevice::ReadOnly));const auto original=source.readAll();source.close();
+        NativeCorpus::Viewer view;QVERIFY(view.window);
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),3,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setSecondaryRow",Q_ARG(QVariant,"edit"),Q_ARG(QVariant,false)));
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        auto *editor=view.window->findChild<QObject *>("contentEditing");QVERIFY(editor);
+        const auto objects=reader->data().value("content_objects").toMap();QVariantMap item;
+        for(const auto &v:objects.value("items").toList())if(v.toMap().value("can_edit_text").toBool()){item=v.toMap();break;}
+        QVERIFY(!item.isEmpty());
+        QVERIFY(QMetaObject::invokeMethod(editor,"editText",Q_ARG(QVariant,item),Q_ARG(QVariant,0)));
+        auto *text=visualItem(view.window->contentItem(),"contentInlineText0");QVERIFY(text);
+        QTRY_VERIFY(text->isVisible() && text->hasActiveFocus());
+        const auto oldHeight=text->height();
+        const QString longText=QString("A visible multiline PDF title and preserved draft. ").repeated(80);
+        QTest::keyClick(view.window,Qt::Key_A,Qt::ControlModifier);
+        QInputMethodEvent input;input.setCommitString(longText);QCoreApplication::sendEvent(view.window,&input);
+        QTRY_COMPARE(text->property("text").toString(),longText);
+        auto *scroll=visualItem(view.window->contentItem(),"contentInlineScroll0");
+        QVERIFY2(scroll,"Long actual-PDF drafts need a bounded native scrolling editor");
+        QTRY_VERIFY(scroll->height()>oldHeight);
+        QTRY_VERIFY(scroll->property("contentHeight").toDouble()>scroll->property("availableHeight").toDouble());
+        const auto cursorVisible=[&]{const auto cursor=text->mapRectToItem(scroll,text->property("cursorRectangle").toRectF());return cursor.top()>=-1 && cursor.bottom()<=scroll->height()+1;};
+        QTRY_VERIFY2(cursorVisible(),"Typing at the end of a long draft must scroll the native caret into view");
+        const auto frame=scroll->mapRectToItem(view.window->contentItem(),scroll->boundingRect());
+        QVERIFY(frame.bottom()<=view.window->height()+1);
+        const auto savedDraft=reader->editDrafts().value("content").toMap();
+        QCOMPARE(savedDraft.value("command").toMap().value("ReplaceText").toMap().value("text").toString(),longText);
+        QCOMPARE(savedDraft.value("command").toMap().value("ReplaceText").toMap().value("bounds"),item.value("bounds"));
+        const auto evidence=qEnvironmentVariable("LYRA_READER_CONTENT_LONG_SNAPSHOT");
+        if(!evidence.isEmpty()){QTest::qWait(80);QVERIFY(view.window->grabWindow().save(evidence));}
+        QPointer<QQuickItem> retained=text;
+        QVERIFY(QMetaObject::invokeMethod(text,"selectAll"));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setPageLayout",Q_ARG(QVariant,"Facing")));
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY2(retained && retained==visualItem(view.window->contentItem(),"contentInlineText0"),"Page layout replacement must retain the native content editor");
+        QTRY_VERIFY(retained->hasActiveFocus());
+        QCOMPARE(retained->property("selectedText").toString(),longText);
+        QVERIFY(QMetaObject::invokeMethod(editor,"commitDraft"));
+        QVERIFY(reader->pendingCommands()>0);
+        QVERIFY(QMetaObject::invokeMethod(editor,"discard"));
+        QVERIFY(reader->hasEditDrafts());
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);
+        QVERIFY2(!reader->error().isEmpty(),"The shared writer must reject a title that cannot fit its unchanged PDF bounds");
+        QCOMPARE(reader->editDrafts().value("content").toMap().value("command").toMap().value("ReplaceText").toMap().value("text").toString(),longText);
+        QTest::keyClick(view.window,Qt::Key_Escape);
+        QTRY_VERIFY(!reader->hasEditDrafts());QTRY_VERIFY(!text->isVisible());
+        QVERIFY(!text->hasActiveFocus());QVERIFY(!reader->hasUnsavedChanges());
+        reader->dismissError();
+        const auto oldLocale=QLocale();QLocale::setDefault(QLocale(QLocale::German,QLocale::Germany));
+        const auto restoreLocale=qScopeGuard([oldLocale]{QLocale::setDefault(oldLocale);});
+        auto *x=visualItem(view.window->contentItem(),"contentGeometryX"),*y=visualItem(view.window->contentItem(),"contentGeometryY");
+        auto *width=visualItem(view.window->contentItem(),"contentGeometryWidth"),*height=visualItem(view.window->contentItem(),"contentGeometryHeight");
+        auto *apply=visualItem(view.window->contentItem(),"applyContentGeometry");QVERIFY(x && y && width && height && apply);
+        for(const auto &name:{"contentGeometryXLabel","contentGeometryYLabel","contentGeometryWidthLabel","contentGeometryHeightLabel"}) {
+            auto *label=visualItem(view.window->contentItem(),name);QVERIFY(label && label->isVisible());QVERIFY(!label->property("text").toString().isEmpty());
+        }
+        x->setProperty("text","1,234");QTRY_VERIFY(!apply->isEnabled());
+        x->setProperty("text","nan");QTRY_VERIFY(!apply->isEnabled());
+        const auto oldBounds=item.value("bounds").toMap();const auto newX=oldBounds.value("x").toDouble()+3.25;
+        x->setProperty("text",QString::number(newX,'g',16));width->setProperty("text","0");QTRY_VERIFY(!apply->isEnabled());
+        width->setProperty("text",QString::number(oldBounds.value("width").toDouble(),'g',16));QTRY_VERIFY(apply->isEnabled());
+        QVERIFY(QMetaObject::invokeMethod(apply,"clicked"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);
+        QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QVERIFY(!reader->hasEditDrafts());QVERIFY(reader->hasUnsavedChanges());
+        const auto changed=reader->data().value("content_objects").toMap();QVERIFY(changed.value("revision")!=objects.value("revision"));
+        bool moved=false;for(const auto &v:changed.value("items").toList())if(v.toMap().value("text")==item.value("text"))moved=qAbs(v.toMap().value("bounds").toMap().value("x").toDouble()-newX)<.1;
+        QVERIFY(moved);QVERIFY(source.open(QIODevice::ReadOnly));QCOMPARE(source.readAll(),original);source.close();
+        QVERIFY(QMetaObject::invokeMethod(view.window,"undo"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(!reader->hasUnsavedChanges());
+    }
     void percentageImageCropUsesTheSharedRevisionUndoAndSave() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/crop.pdf",png=scratch.path()+"/pixels.png";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));QImage pixels(4,2,QImage::Format_RGBA8888);pixels.fill(Qt::blue);for(int y=0;y<2;++y)for(int x=0;x<2;++x)pixels.setPixelColor(x,y,Qt::red);QVERIFY(pixels.save(png));QFile file(path);QVERIFY(file.open(QIODevice::ReadOnly));const auto original=file.readAll();file.close();
         WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(QMetaObject::invokeMethod(window,"setSecondaryRow",Q_ARG(QVariant,"edit"),Q_ARG(QVariant,false)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);

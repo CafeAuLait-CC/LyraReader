@@ -9,6 +9,9 @@ Pane {
     required property var app
     readonly property var editor: app.contentEditor
     readonly property var item: editor.selected
+    readonly property bool validGeometry: gx.acceptableInput && gy.acceptableInput && gw.acceptableInput && gh.acceptableInput &&
+        [gx.text,gy.text,gw.text,gh.text].every(function(value){return value.trim().length>0 && Number.isFinite(Number(value));}) &&
+        Number(gw.text)>0 && Number(gh.text)>0
     property bool cropping:false
     readonly property bool croppable:!!item && (item.kind==="image" || item.kind==="graphic") &&
         (item.paths || []).length>0 && item.paths.every(function(path){return path.length===1;})
@@ -115,7 +118,7 @@ Pane {
                 RowLayout {
                     visible:editor.hasDraft
                     Button {objectName:"applyContentDraft";text:qsTr("Apply");enabled:editor.canCommit;onClicked:editor.commitDraft()}
-                    Button {text:qsTr("Discard Draft");onClicked:editor.discard()}
+                    Button {text:qsTr("Discard Draft");enabled:!editor.pending;onClicked:editor.discard()}
                     Button {visible:editor.textDraft;text:qsTr("Copy");onClicked:if(app.session)app.session.copyText(editor.payload.text)}
                 }
                 Label {
@@ -128,13 +131,30 @@ Pane {
                     visible:!!item
                     columns:2
                     Layout.fillWidth:true
-                    TextField {id:gx;Layout.fillWidth:true;placeholderText:"X";validator:DoubleValidator {}Accessible.name:qsTr("Object X")}
-                    TextField {id:gy;Layout.fillWidth:true;placeholderText:"Y";validator:DoubleValidator {}Accessible.name:qsTr("Object Y")}
-                    TextField {id:gw;Layout.fillWidth:true;placeholderText:qsTr("Width");validator:DoubleValidator {bottom:0.01}Accessible.name:qsTr("Object width")}
-                    TextField {id:gh;Layout.fillWidth:true;placeholderText:qsTr("Height");validator:DoubleValidator {bottom:0.01}Accessible.name:qsTr("Object height")}
+                    ColumnLayout {
+                        Layout.fillWidth:true
+                        Label {objectName:"contentGeometryXLabel";text:qsTr("X (pt)");color:app.colors.textSecondary}
+                        TextField {id:gx;objectName:"contentGeometryX";Layout.fillWidth:true;validator:DoubleValidator {locale:"C";notation:DoubleValidator.StandardNotation}Accessible.name:qsTr("Object X")}
+                    }
+                    ColumnLayout {
+                        Layout.fillWidth:true
+                        Label {objectName:"contentGeometryYLabel";text:qsTr("Y (pt)");color:app.colors.textSecondary}
+                        TextField {id:gy;objectName:"contentGeometryY";Layout.fillWidth:true;validator:DoubleValidator {locale:"C";notation:DoubleValidator.StandardNotation}Accessible.name:qsTr("Object Y")}
+                    }
+                    ColumnLayout {
+                        Layout.fillWidth:true
+                        Label {objectName:"contentGeometryWidthLabel";text:qsTr("Width (pt)");color:app.colors.textSecondary}
+                        TextField {id:gw;objectName:"contentGeometryWidth";Layout.fillWidth:true;validator:DoubleValidator {bottom:0.01;locale:"C";notation:DoubleValidator.StandardNotation}Accessible.name:qsTr("Object width")}
+                    }
+                    ColumnLayout {
+                        Layout.fillWidth:true
+                        Label {objectName:"contentGeometryHeightLabel";text:qsTr("Height (pt)");color:app.colors.textSecondary}
+                        TextField {id:gh;objectName:"contentGeometryHeight";Layout.fillWidth:true;validator:DoubleValidator {bottom:0.01;locale:"C";notation:DoubleValidator.StandardNotation}Accessible.name:qsTr("Object height")}
+                    }
                 }
                 Button {
-                    visible:!!item;text:qsTr("Apply Geometry");enabled:!editor.hasDraft && gx.acceptableInput && gy.acceptableInput && gw.acceptableInput && gh.acceptableInput
+                    objectName:"applyContentGeometry"
+                    visible:!!item;text:qsTr("Apply Geometry");enabled:!editor.hasDraft && !editor.pending && editor.owner.pendingCommands===0 && inspector.validGeometry
                     onClicked:editor.applyGeometry(item,{x:Number(gx.text),y:Number(gy.text),width:Number(gw.text),height:Number(gh.text)})
                 }
                 Button {

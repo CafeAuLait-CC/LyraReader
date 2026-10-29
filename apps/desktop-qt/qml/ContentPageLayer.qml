@@ -89,25 +89,4 @@ Item {
         }
         Keys.onDeletePressed: editor.remove()
     }
-    TextArea {
-        id: textEditor
-        objectName: "contentInlineText"+layer.page
-        visible: editor.inlineEditing && editor.textDraft && editor.draft.page===layer.page
-        x: visible ? editor.payload.bounds.x*app.zoom : 0
-        y: visible ? editor.payload.bounds.y*app.zoom : 0
-        width: visible ? Math.max(80,editor.payload.bounds.width*app.zoom) : 0
-        height: visible ? Math.max(48,editor.payload.bounds.height*app.zoom) : 0
-        textFormat: TextEdit.PlainText
-        wrapMode: TextEdit.Wrap
-        text: visible ? (editor.payload.text || "") : ""
-        font.pixelSize: visible ? Math.max(8,editor.payload.size*app.zoom) : 12
-        color: app.colors.textPrimary
-        selectByMouse: true
-        background: Rectangle {color:app.colors.fieldBg;border.color:app.colors.focusRing;border.width:2}
-        onVisibleChanged: if(visible)Qt.callLater(function(){textEditor.forceActiveFocus();});
-        onTextChanged: if(visible && activeFocus)editor.changeText(text)
-        Keys.onEscapePressed: editor.discard()
-        Keys.onPressed: function(event){if(event.key===Qt.Key_Return && (event.modifiers & Qt.ControlModifier)){editor.commitDraft();event.accepted=true;}}
-        Accessible.name: qsTr("Edit actual PDF text; Control+Return applies, Escape cancels")
-    }
 }

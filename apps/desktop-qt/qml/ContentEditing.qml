@@ -76,7 +76,10 @@ Item {
         const command={};command[draftKind]=Object.assign({},payload,patch);
         store(command,draft.page,draft.originalText);
     }
-    function discard() {owner.setEditDraft("content",{});inlineEditing=false;gesture=null;transition=null;}
+    function discard() {
+        if(pending)return;
+        inlineEditing=false;owner.setEditDraft("content",{});gesture=null;transition=null;
+    }
     function submit(command,page,allowRaster) {
         if (pending || app.blockXfaWrite() || owner.pendingCommands>0) return;
         if (!hasDraft) store(command,page,"");

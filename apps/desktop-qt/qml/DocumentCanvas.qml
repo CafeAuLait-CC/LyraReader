@@ -20,7 +20,7 @@ Item {
     }
     // Keep the native editor outside virtualized page delegates. A layout snapshot may
     // replace those delegates while the user is typing; its QTextDocument must survive.
-    function placedTextFrame(page, epoch) {
+    function pageFrame(page, epoch) {
         const row=pageRows[page];
         const item=row===undefined ? null : pageList.itemAtIndex(row);
         if(!item)return null;
@@ -269,7 +269,7 @@ Item {
     PlacedTextLayer {
         app: canvas.app
         page: canvas.app.placedTextEditor && canvas.app.placedTextEditor.entry ? canvas.app.placedTextEditor.entry.page : -1
-        readonly property var paperFrame: canvas.placedTextFrame(page,canvas.placementEpoch)
+        readonly property var paperFrame: canvas.pageFrame(page,canvas.placementEpoch)
         // A temporarily absent delegate parks the editor outside the clipped viewport;
         // it does not destroy the editor, its focus, selection or native undo history.
         x: paperFrame ? paperFrame.x : -width-1
@@ -278,4 +278,15 @@ Item {
         height: paperFrame ? paperFrame.height : canvas.height
         z: 1
     }
+    ContentTextLayer {
+        app: canvas.app
+        page: canvas.app.contentEditor.textDraft ? canvas.app.contentEditor.draft.page : -1
+        readonly property var paperFrame: canvas.pageFrame(page,canvas.placementEpoch)
+        x: paperFrame ? paperFrame.x : -width-1
+        y: paperFrame ? paperFrame.y : -height-1
+        width: paperFrame ? paperFrame.width : canvas.width
+        height: paperFrame ? paperFrame.height : canvas.height
+        z: 2
+    }
+
 }

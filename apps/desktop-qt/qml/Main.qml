@@ -1705,6 +1705,7 @@ ApplicationWindow {
         onActivated: {
             if(placedTextController.waitingForCreation)placedTextController.cancelPendingCreation();
             if(placedTextController.current){placedTextController.finish(true);return;}
+            if(contentController.inlineEditing && contentController.textDraft){contentController.discard();return;}
             root.cancelTabReorder();
             if (root.previewController && root.previewController.visible)
                 root.previewController.close();
