@@ -9,6 +9,7 @@ Pane {
     readonly property int page: app.currentPage
     readonly property var extracted: owner.textPages[page.toString()]
     property int textSize: 16
+    property alias focusTarget: pageText
     function zoomBy(factor) {
         textSize = Math.max(12, Math.min(40, Math.round(textSize * factor)));
     }

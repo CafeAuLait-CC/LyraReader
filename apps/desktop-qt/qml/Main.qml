@@ -46,6 +46,21 @@ ApplicationWindow {
     property string appearance: session ? session.preference("appearance", "light") : "light"
     property string sidebarTab: "thumbnails"
     property bool aiPanelVisible: false
+    function returnFocusFromAiPanel() {
+        let item=activeFocusItem;
+        while (item) {
+            if (item===aiDock) {
+                if (currentReader.pageCount>0) {
+                    const target=overviewVisible ? overviewContent.focusTarget : textViewVisible ? accessibleTextView.focusTarget : pageList;
+                    target.forceActiveFocus();
+                }
+                else contentItem.forceActiveFocus();
+                return;
+            }
+            item=item.parent;
+        }
+    }
+    onAiPanelVisibleChanged: if (!aiPanelVisible) returnFocusFromAiPanel()
     property real aiPanelWidth: session ? Number(session.preference("aiPanelWidth", 360)) : 360
     function openAiWorkspace(value) {
         currentReader.setAiInput("view",value);
@@ -2001,6 +2016,7 @@ ApplicationWindow {
                     visible: root.textViewVisible && currentReader.pageCount > 0
                 }
                 PageOverview {
+                    id: overviewContent
                     anchors.fill: parent
                     app: root
                     visible: root.overviewVisible && currentReader.pageCount > 0
@@ -2043,6 +2059,7 @@ ApplicationWindow {
                 id: aiDock
                 objectName: "aiDock"
                 visible: root.aiPanelVisible && currentReader.pageCount > 0
+                onVisibleChanged: if (!visible) root.returnFocusFromAiPanel()
                 padding: 0
                 Layout.minimumWidth: 280
                 Layout.maximumWidth: Math.min(520, Math.max(280, root.width - 360))

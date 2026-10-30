@@ -8,6 +8,7 @@ Item {
     required property var app
     property int draggingPage: -1
     property int dropIndex: -1
+    property alias focusTarget: grid
     ColumnLayout {
         anchors.fill: parent
         spacing: 0
