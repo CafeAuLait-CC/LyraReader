@@ -1,5 +1,13 @@
 #include "ReaderController.h"
 
+namespace {
+QString aiView(const QString &action) {
+    if(action==QStringLiteral("TranslateSelection"))return QStringLiteral("translation");
+    if(action==QStringLiteral("DocumentChat"))return QStringLiteral("chat");
+    return QStringLiteral("summary");
+}
+}
+
 void ReaderController::initAi() {
     m_aiTimer.setInterval(60);
     connect(&m_aiTimer,&QTimer::timeout,this,[this]{
@@ -12,12 +20,33 @@ void ReaderController::resetAi() {
     m_aiTimer.stop();m_aiPreviewId=0;m_aiStartId=0;m_aiPollId=0;m_aiState.clear();emit aiStateChanged();
 }
 void ReaderController::setAiInput(const QString &key,const QVariant &value) {
-    if(key!=QStringLiteral("action") && key!=QStringLiteral("question") && key!=QStringLiteral("language"))return;
     auto input=m_aiState.value(QStringLiteral("input")).toMap();
+    if(key==QStringLiteral("view")) {
+        const auto view=value.toString();
+        if(view!=QStringLiteral("summary") && view!=QStringLiteral("translation") && view!=QStringLiteral("chat"))return;
+        if(input.value(key)==value)return;
+        input.insert(key,view);
+        input.insert(QStringLiteral("action"),view==QStringLiteral("chat")?4:view==QStringLiteral("translation")?3:input.value(QStringLiteral("summaryAction"),1).toInt());
+        input.insert(QStringLiteral("question"),input.value(view==QStringLiteral("chat")?QStringLiteral("chatQuestion"):QStringLiteral("selectionQuestion")));
+        m_aiState.insert(QStringLiteral("input"),input);emit aiStateChanged();return;
+    }
+    if(key!=QStringLiteral("action") && key!=QStringLiteral("question") && key!=QStringLiteral("language"))return;
     if(input.value(key)==value)return;
+    if(key==QStringLiteral("action")) {
+        bool valid=false;const auto action=value.toInt(&valid);
+        if(!valid || action<0 || action>5)return;
+        const auto view=action==4?QStringLiteral("chat"):action==3?QStringLiteral("translation"):QStringLiteral("summary");
+        input.insert(QStringLiteral("view"),view);
+        if(view==QStringLiteral("summary"))input.insert(QStringLiteral("summaryAction"),action);
+        input.insert(QStringLiteral("question"),input.value(view==QStringLiteral("chat")?QStringLiteral("chatQuestion"):QStringLiteral("selectionQuestion")));
+    }
+    if(key==QStringLiteral("question"))input.insert(input.value(QStringLiteral("view")).toString()==QStringLiteral("chat")?QStringLiteral("chatQuestion"):QStringLiteral("selectionQuestion"),value);
     input.insert(key,value);m_aiState.insert(QStringLiteral("input"),input);
     m_aiPreviewId=0;m_aiState.remove(QStringLiteral("plan"));
-    if(!m_aiState.value(QStringLiteral("running")).toBool())m_aiState.insert(QStringLiteral("status"),tr("Preview the updated request before sending."));
+    if(!m_aiState.value(QStringLiteral("running")).toBool()) {
+        m_aiState.insert(QStringLiteral("statusView"),input.value(QStringLiteral("view"),QStringLiteral("summary")));
+        m_aiState.insert(QStringLiteral("status"),tr("Preview the updated request before sending."));
+    }
     emit aiStateChanged();
 }
 void ReaderController::invalidateAiPlan() {
@@ -27,6 +56,16 @@ void ReaderController::invalidateAiPlan() {
         if(!m_aiState.value(QStringLiteral("running")).toBool())m_aiState.insert(QStringLiteral("status"),tr("Preview the updated request before sending."));
         emit aiStateChanged();
     }
+}
+void ReaderController::clearAiChat() {
+    if(m_aiState.value(QStringLiteral("running")).toBool())return;
+    m_aiState.remove(QStringLiteral("chatTurns"));m_aiState.remove(QStringLiteral("conversationLimited"));
+    auto results=m_aiState.value(QStringLiteral("results")).toMap();results.remove(QStringLiteral("chat"));m_aiState.insert(QStringLiteral("results"),results);
+    if(m_aiState.value(QStringLiteral("previewView")).toString()==QStringLiteral("chat")){m_aiPreviewId=0;m_aiState.remove(QStringLiteral("plan"));}
+    if(m_aiState.value(QStringLiteral("responseView")).toString()==QStringLiteral("chat")) {
+        for(const auto *key:{"output","reasoning","responsePlan","usage","responseView"})m_aiState.remove(QLatin1String(key));
+    }
+    m_aiState.insert(QStringLiteral("statusView"),QStringLiteral("chat"));m_aiState.insert(QStringLiteral("status"),tr("Conversation cleared locally."));emit aiStateChanged();
 }
 void ReaderController::prepareAi(const QVariantMap &request) {
     if(!m_document || m_aiState.value(QStringLiteral("running")).toBool())return;
@@ -43,6 +82,9 @@ void ReaderController::prepareAi(const QVariantMap &request) {
         input.insert(QStringLiteral("history"),history);
     }
     m_aiState.insert(QStringLiteral("previewQuestion"),input.value(QStringLiteral("question")));
+    m_aiState.insert(QStringLiteral("planSent"),false);
+    m_aiState.insert(QStringLiteral("previewView"),aiView(input.value(QStringLiteral("action")).toString()));
+    m_aiState.insert(QStringLiteral("statusView"),m_aiState.value(QStringLiteral("previewView")));
     m_aiState.remove(QStringLiteral("plan"));m_aiState.insert(QStringLiteral("status"),tr("Preparing request locally…"));
     m_aiPlanGeneration=m_generation;emit aiStateChanged();
     m_aiPreviewId=submit(QStringLiteral("ai_preview"),{{QStringLiteral("request"),input}});
@@ -51,6 +93,9 @@ bool ReaderController::startAi(const QString &key,const QVariantMap &expectedPla
     const auto plan=m_aiState.value(QStringLiteral("plan")).toMap();
     if(!m_document || m_pendingCommands>0 || m_loading || plan.isEmpty() || plan!=expectedPlan || m_aiPlanGeneration!=m_generation || m_aiState.value(QStringLiteral("running")).toBool())return false;
     m_aiState.insert(QStringLiteral("responsePlan"),plan);
+    m_aiState.insert(QStringLiteral("planSent"),true);
+    m_aiState.insert(QStringLiteral("responseView"),aiView(plan.value(QStringLiteral("action")).toString()));
+    m_aiState.insert(QStringLiteral("statusView"),m_aiState.value(QStringLiteral("responseView")));
     m_aiState.insert(QStringLiteral("activeChat"),plan.value(QStringLiteral("action")).toString()==QStringLiteral("DocumentChat"));
     m_aiState.insert(QStringLiteral("activeQuestion"),m_aiState.value(QStringLiteral("previewQuestion")));
     m_aiState.insert(QStringLiteral("terminalReceived"),false);
@@ -63,6 +108,13 @@ bool ReaderController::startAi(const QString &key,const QVariantMap &expectedPla
     emit aiStateChanged();
     m_aiStartId=submit(QStringLiteral("ai_start"),{{QStringLiteral("plan"),plan},{QStringLiteral("api_key"),key}});
     return true;
+}
+void ReaderController::retainAiResult(const QString &state) {
+    const auto view=m_aiState.value(QStringLiteral("responseView")).toString();
+    if(view.isEmpty())return;
+    QVariantMap result{{QStringLiteral("state"),state},{QStringLiteral("generation"),m_generation}};
+    for(const auto *key:{"output","reasoning","usage","status","responsePlan"})result.insert(QLatin1String(key),m_aiState.value(QLatin1String(key)));
+    auto results=m_aiState.value(QStringLiteral("results")).toMap();results.insert(view,result);m_aiState.insert(QStringLiteral("results"),results);
 }
 void ReaderController::cancelAi() {
     if(!m_aiState.value(QStringLiteral("running")).toBool())return;
@@ -95,13 +147,13 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
     if(operation==QStringLiteral("ai_start") && id==m_aiStartId) {
         m_aiStartId=0;
         if(error.isEmpty()){m_aiState.insert(QStringLiteral("status"),tr("Receiving response…"));m_aiTimer.start();}
-        else {m_aiState.insert(QStringLiteral("running"),false);m_aiState.insert(QStringLiteral("status"),error);finishAiChat(QStringLiteral("failed"));}
+        else {m_aiState.insert(QStringLiteral("running"),false);m_aiState.insert(QStringLiteral("status"),error);finishAiChat(QStringLiteral("failed"));retainAiResult(QStringLiteral("failed"));}
         emit aiStateChanged();return;
     }
     if(operation!=QStringLiteral("ai_poll") || id!=m_aiPollId)return;
     m_aiPollId=0;
     if(!error.isEmpty()) {
-        m_aiState.insert(QStringLiteral("running"),false);m_aiState.insert(QStringLiteral("status"),error);finishAiChat(QStringLiteral("failed"));m_aiTimer.stop();emit aiStateChanged();return;
+        m_aiState.insert(QStringLiteral("running"),false);m_aiState.insert(QStringLiteral("status"),error);finishAiChat(QStringLiteral("failed"));retainAiResult(QStringLiteral("failed"));m_aiTimer.stop();emit aiStateChanged();return;
     }
     const auto batch=result.toMap();
     auto output=m_aiState.value(QStringLiteral("output")).toString(),reasoning=m_aiState.value(QStringLiteral("reasoning")).toString();
@@ -135,6 +187,6 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
         m_aiState.insert(QStringLiteral("running"),false);
     }
     if(m_aiState.value(QStringLiteral("limited")).toBool())m_aiState.insert(QStringLiteral("status"),tr("Response exceeded the 8 MiB display budget; request cancelled."));
-    if(!m_aiState.value(QStringLiteral("running")).toBool()){finishAiChat(m_aiState.value(QStringLiteral("chatOutcome")).toString());m_aiTimer.stop();}
+    if(!m_aiState.value(QStringLiteral("running")).toBool()){finishAiChat(m_aiState.value(QStringLiteral("chatOutcome")).toString());retainAiResult(m_aiState.value(QStringLiteral("chatOutcome")).toString());m_aiTimer.stop();}
     emit aiStateChanged();
 }

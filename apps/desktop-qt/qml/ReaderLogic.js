@@ -221,7 +221,12 @@ function annotationUnsupportedReason(a) {
 
 // Provider text is escaped before adding our formatting and local page links.
 // Image syntax and external URLs remain text; they cannot load resources.
-function answerMarkup(text) {
+function answerMarkup(text, citations) {
     const escaped=String(text || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
-    return "<p>"+escaped.replace(/^### (.+)$/gm,"<b>$1</b>").replace(/\*\*([^*]+)\*\*/g,"<b>$1</b>").replace(/\[p\.(\d+)\]/g,'<a href="p.$1">[p.$1]</a>').replace(/\n/g,"<br/>")+"</p>"
+    const marked=escaped.replace(/^### (.+)$/gm,"<b>$1</b>").replace(/\*\*([^*]+)\*\*/g,"<b>$1</b>")
+    const linked=citations===false ? marked : marked.replace(/\[p\.(\d+)\]/g,function(label,page) {
+        // Qt's typed sequences support indexOf but are not JavaScript Arrays.
+        return citations!==undefined && citations!==true && citations.indexOf(Number(page))<0 ? label : '<a href="p.'+page+'">'+label+'</a>'
+    })
+    return "<p>"+linked.replace(/\n/g,"<br/>")+"</p>"
 }

@@ -80,7 +80,9 @@ them. Unlocked provider keys are reused only in memory for the current endpoint 
 changing endpoints or updating/removing a key invalidates that session. Persistent keys stay
 in the system vault. Document chat keeps bounded exchanges per open document, including cancelled
 partial answers; failures remain visible and are excluded from later requests. Historical citations
-use the passages actually sent for that exchange. Newer AI workflows remain work in progress.
+use the passages actually sent for that exchange. Summary, translation and chat have separate
+drafts and results; switching views or reopening the drawer sends nothing. Chat has a bottom
+composer and collapsed source passages. Regions and newer AI workflows remain work in progress.
 A byte-bounded revisit cache retains reduced page images after sharp sources leave the working
 set. Unloaded pages already use the selected reading-mode paper colour.
 Tabs reorder after half a tab width of travel, retain their reader state, and support

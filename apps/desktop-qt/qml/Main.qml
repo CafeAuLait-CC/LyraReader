@@ -47,9 +47,17 @@ ApplicationWindow {
     property string sidebarTab: "thumbnails"
     property bool aiPanelVisible: false
     property real aiPanelWidth: session ? Number(session.preference("aiPanelWidth", 360)) : 360
+    function openAiWorkspace(value) {
+        currentReader.setAiInput("view",value);
+        showAiPanel(true);
+    }
     function showAiPanel(show) {
+        if (placedTextController.deferAction(function(){root.showAiPanel(show);})) return;
         if (show && secondaryRow==="edit" && contentController.deferAction({kind:"assistant",value:true})) return;
-        if (show) setSecondaryRow("lyra",true);
+        if (show) {
+            if (secondaryRow==="edit" || secondaryRow==="fill") setSecondaryRow("",true);
+            overviewVisible=false;
+        }
         aiPanelVisible = show;
         if (show && width < 1200) searchVisible = false;
     }
@@ -2048,7 +2056,8 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         Layout.leftMargin: 14
                         Layout.rightMargin: 8
-                        Label { text: qsTr("AI Assistant"); color: theme.textPrimary; font.weight: Font.DemiBold; Layout.fillWidth: true }
+                        Label { text: aiContent.workspaceTitle; color: theme.textPrimary; font.weight: Font.DemiBold; Layout.fillWidth: true }
+                        LyraToolButton { symbol: "settings"; text: qsTr("AI settings"); onClicked: root.showSettings() }
                         LyraToolButton {
                             objectName: "closeAiPanel"
                             symbol: "close"
@@ -2057,7 +2066,7 @@ ApplicationWindow {
                         }
                     }
                     Rectangle { Layout.fillWidth: true; height: 1; color: theme.separator }
-                    AiPanel { app: root; Layout.fillWidth: true; Layout.fillHeight: true }
+                    AiPanel { id: aiContent; app: root; Layout.fillWidth: true; Layout.fillHeight: true }
                 }
                 Rectangle {
                     width: 1; height: parent.height; color: theme.separator

@@ -59,6 +59,7 @@ public:
     Q_INVOKABLE void cancelAi();
     Q_INVOKABLE void setAiInput(const QString &key,const QVariant &value);
     Q_INVOKABLE void invalidateAiPlan();
+    Q_INVOKABLE void clearAiChat();
     QVariantMap editDrafts()const{return m_editDrafts;}
     bool hasEditDrafts()const{return !m_editDrafts.isEmpty();}
     Q_INVOKABLE void setEditDraft(const QString &key,const QVariant &value);
@@ -137,6 +138,7 @@ private:
     void resetAi();
     void handleAiCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error);
     void finishAiChat(const QString &state);
+    void retainAiResult(const QString &state);
     QTimer m_aiTimer;
     QVariantMap m_aiState;
     quint64 m_aiPreviewId=0,m_aiStartId=0,m_aiPollId=0,m_aiPlanGeneration=0;

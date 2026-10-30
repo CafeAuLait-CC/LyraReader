@@ -321,7 +321,7 @@ Item {
         MenuItem {
             text: qsTr("Ask AI about Selection")
             enabled: !!app.selection
-            onTriggered: app.showSidebar("ai")
+            onTriggered: { app.currentReader.setAiInput("action",2); app.showAiPanel(true); }
         }
     }
     Menu {

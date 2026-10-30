@@ -39,9 +39,16 @@ Item {
         objectName:"lyraToolRow"
         anchors.centerIn:parent;spacing:6
         visible:app.secondaryRow==="lyra"
-        LyraToolButton {symbol:"ai";text:qsTr("Assistant");display:AbstractButton.TextBesideIcon;selected:app.aiPanelVisible;onClicked:app.showAiPanel(!app.aiPanelVisible)}
-        Button {text:qsTr("Ask about Selection");enabled:!!app.selection;onClicked:app.showSidebar("ai")}
-        Button {text:qsTr("AI Settings…");onClicked:app.showSettings()}
+        Repeater {
+            model:[{key:"summary",title:qsTr("Summary")},{key:"translation",title:qsTr("Translate")},{key:"chat",title:qsTr("Chat")}]
+            LyraToolButton {
+                required property var modelData
+                objectName:"lyraWorkspace"+modelData.key
+                symbol:"ai";text:modelData.title;display:AbstractButton.TextBesideIcon
+                selected:app.aiPanelVisible && ((app.currentReader.aiState.input || {}).view || "summary")===modelData.key
+                onClicked:app.openAiWorkspace(modelData.key)
+            }
+        }
     }
     Rectangle {anchors.bottom:parent.bottom;width:parent.width;height:1;color:app.colors.separator}
 }
