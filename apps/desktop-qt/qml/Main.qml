@@ -1634,6 +1634,12 @@ ApplicationWindow {
         }
     }
     onAiSettingsChanged: {
+        const base=aiSettings.baseUrl || "";
+        if(base!==credentialSessionBaseUrl){
+            credentialSessionBaseUrl=base;
+            if(session)session.credentials.clearSession();
+        }
+        credentialReadId=-1;pendingAiReader=null;pendingAiPlan=null;
         if (session)
             for (const tab of session.tabs)
                 tab.reader.invalidateAiPlan();
@@ -1643,6 +1649,7 @@ ApplicationWindow {
     property int requestedPage: -1
     property real requestedY: 0
     property double credentialReadId: -1
+    property string credentialSessionBaseUrl: ""
     property var pendingAiReader: null
     property var pendingAiPlan: null
 
@@ -2215,7 +2222,8 @@ ApplicationWindow {
                     root.pendingAiReader = null;
                 } else {
                     root.operationStatus = error;
-                    dialogs.credentialDialog.open();
+                    if(error.length){root.pendingAiReader=null;root.pendingAiPlan=null;}
+                    else dialogs.credentialDialog.open();
                 }
             } else if (operation === "write" || operation === "remove")
                 root.operationStatus = error || qsTr("System keychain updated.");

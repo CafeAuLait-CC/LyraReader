@@ -48,6 +48,19 @@
 #include <atomic>
 #include <cstdlib>
 
+class FakeCredentialStore final : public CredentialStore {
+public:
+    struct Request { VaultOperation operation; QString key,secret; Completion complete; };
+    QList<Request> requests;
+    void reply(int index,const QString &secret={},const QString &error={}) {
+        auto completion=std::move(requests[index].complete);completion(secret,error);
+    }
+protected:
+    void startVault(VaultOperation operation,const QString &key,const QString &secret,Completion completion) override {
+        requests.append({operation,key,secret,std::move(completion)});
+    }
+};
+
 static void registerReaderTypes() {
     qmlRegisterUncreatableType<ReaderController>("LyraReader",1,0,"ReaderController","Created by host");
     qmlRegisterType<DisplayCalibration>("LyraReader",1,0,"DisplayCalibration");
@@ -1193,6 +1206,38 @@ private slots:
         workspace.selectTab(1);window->hide();QVERIFY(reader->submit("ai_poll")>0);QVERIFY(reader->pendingCommands()>0);
         QPointer<ReaderController> closing=reader;workspace.closeTab(0);QTRY_VERIFY_WITH_TIMEOUT(closing.isNull(),10000);QTRY_COMPARE_WITH_TIMEOUT(server.activeConnections(),0,10000);QCOMPARE(workspace.activeReader(),other);
     }
+    void sessionCredentialsReuseSuccessfulReadsAndRejectStaleOrFailedReplies() {
+        FakeCredentialStore store;QSignalSpy events(&store,&CredentialStore::finished);
+        const QString first="https://provider-a.invalid/v1",second="https://provider-b.invalid/v1",secret="synthetic-session-secret";
+        const auto a=store.read(first),b=store.read(first);QCOMPARE(store.requests.size(),1);store.reply(0,secret);QCOMPARE(events.size(),2);QCOMPARE(events[0][0].toULongLong(),a);QCOMPARE(events[1][0].toULongLong(),b);QCOMPARE(events[1][2].toString(),secret);
+        events.clear();const auto cached=store.read(first);QVERIFY(events.isEmpty());QTRY_COMPARE(events.size(),1);QCOMPARE(events[0][0].toULongLong(),cached);QCOMPARE(events[0][2].toString(),secret);QCOMPARE(store.requests.size(),1);
+        events.clear();store.clearSession();store.read(first);store.read(second);QCOMPARE(store.requests.size(),3);store.reply(1,secret);QCOMPARE(events.size(),1);QVERIFY(events[0][2].toString().isEmpty());QVERIFY(!events[0][3].toString().isEmpty());
+        store.reply(2,{},"Synthetic vault locked");QCOMPARE(events.last()[3].toString(),QString("Synthetic vault locked"));store.read(second);QCOMPARE(store.requests.size(),4);store.reply(3);store.read(second);QCOMPARE(store.requests.size(),5);store.reply(4,secret);QCOMPARE(events.last()[2].toString(),secret);
+        // A completion listener can switch providers between coalesced replies.
+        store.clearSession();events.clear();const auto firstId=store.read(first);store.read(first);
+        const auto connection=connect(&store,&CredentialStore::finished,&store,[&](quint64 id,const QString &,const QString &,const QString &){if(id==firstId)store.clearSession();});
+        store.reply(5,secret);QCOMPARE(events.size(),2);QCOMPARE(events[0][2].toString(),secret);QVERIFY(events[1][2].toString().isEmpty());QVERIFY(!events[1][3].toString().isEmpty());disconnect(connection);
+    }
+    void credentialChangesInvalidateOtherWindowsAndQueuedCacheHits() {
+        const QString account="https://provider-session.invalid/v1",oldKey="synthetic-old-key",newKey="synthetic-new-key";
+        FakeCredentialStore first,second;QSignalSpy a(&first,&CredentialStore::finished),b(&second,&CredentialStore::finished);
+        first.read(account);first.reply(0,oldKey);second.read(account);second.reply(0,oldKey);a.clear();b.clear();
+        first.read(account);second.write(account,newKey);QCOMPARE(second.requests.size(),2);QTRY_COMPARE(a.size(),1);QVERIFY(a[0][2].toString().isEmpty());QVERIFY(!a[0][3].toString().isEmpty());second.reply(1);
+        second.read(account);QTRY_COMPARE(b.size(),2);QCOMPARE(b.last()[2].toString(),newKey);QCOMPARE(second.requests.size(),2);
+        first.read(account);QCOMPARE(first.requests.size(),2);first.reply(1,newKey);a.clear();second.remove(account);first.read(account);QCOMPARE(first.requests.size(),3);second.reply(2);first.reply(2,oldKey);QVERIFY(a.last()[2].toString().isEmpty());QVERIFY(!a.last()[3].toString().isEmpty());
+        first.read(account);QCOMPARE(first.requests.size(),4);first.reply(3);QVERIFY(a.last()[2].toString().isEmpty());QVERIFY(a.last()[3].toString().isEmpty());
+        // An older write finishing after a provider switch cannot repopulate it.
+        first.write(account,newKey);first.clearSession();first.reply(4);first.read(account);QCOMPARE(first.requests.size(),6);first.reply(5,{},"Synthetic read failure");QCOMPARE(a.last()[3].toString(),QString("Synthetic read failure"));
+        first.write(account,newKey);first.reply(6,{},"Synthetic write failure");QCOMPARE(a.last()[3].toString(),QString("Synthetic write failure"));
+        first.read(account);QCOMPARE(first.requests.size(),8);first.reply(7,oldKey);QCOMPARE(a.last()[2].toString(),oldKey);
+    }
+    void changingAiSettingsRejectsAnOldPendingCredentialReply() {
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *reader=view.workspace.activeReader();
+        view.window->setProperty("credentialReadId",123);view.window->setProperty("pendingAiReader",QVariant::fromValue(reader));view.window->setProperty("pendingAiPlan",QVariantMap{{"host","old-provider.invalid"}});
+        view.window->setProperty("aiSettings",QVariantMap{{"baseUrl","https://new-provider.invalid/v1"},{"model","synthetic-model"}});
+        QCOMPARE(view.window->property("credentialReadId").toDouble(),-1.0);QVERIFY(!view.window->property("pendingAiReader").value<QObject *>());QCOMPARE(view.window->property("credentialSessionBaseUrl").toString(),QString("https://new-provider.invalid/v1"));
+        emit view.workspace.credentials()->finished(123,"read","synthetic-late-key",{});QVERIFY(!reader->aiState().value("running").toBool());
+    }
     void secureCredentialRoundTripUsesAnIsolatedEphemeralAccount() {
         if(!qEnvironmentVariableIsSet("LYRA_READER_CHECK_VAULT"))QSKIP("Opt-in real vault check; use LYRA_READER_CHECK_VAULT=1 with an unlocked system vault");
         CredentialStore store;QSignalSpy events(&store,&CredentialStore::finished);
@@ -1206,6 +1251,7 @@ private slots:
             return QVariantList{};
         };
         const auto written=completion(store.write(account,secret));
+        store.clearSession(); // Force an actual vault read, not the successful-write cache.
         const bool wrote=!written.isEmpty(),writeOk=wrote && written[3].toString().isEmpty();
         QString failure=wrote ? written[3].toString() : QString{};bool readOk=false,removed=false,absent=false;
         if(writeOk){const auto event=completion(store.read(account));readOk=!event.isEmpty() && event[2].toString()==secret && event[3].toString().isEmpty();if(!event.isEmpty() && !readOk)failure=event[3].toString();}
