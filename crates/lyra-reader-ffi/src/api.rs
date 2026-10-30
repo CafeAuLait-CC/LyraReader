@@ -8436,6 +8436,11 @@ pub struct AiConversationTurnRecord {
     pub answer: String,
 }
 
+/// Shared presentation bound for Rust desktop adapters. This is not a new C/UniFFI entry point.
+pub fn ai_chat_history_limit() -> usize {
+    lyra_reader_ai::chat::MAX_CHAT_HISTORY_TURNS
+}
+
 /// Everything needed to build a preview. The API key is deliberately absent.
 #[derive(Debug, Clone, uniffi::Record)]
 #[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]

@@ -43,11 +43,17 @@ Pane {
         });
     }
     function followLink(link) {
+        const plan=aiPanel.viewState.responsePlan || {};
+        followHistoryLink(link,{action:plan.action,sources:plan.sources || [],generation:owner.documentGeneration});
+    }
+    function followHistoryLink(link,responsePlan) {
+        if(responsePlan.generation!==owner.documentGeneration) {
+            app.operationStatus=qsTr("The document changed. This earlier citation is no longer available.");return;
+        }
         const match = /^p\.(\d+)$/.exec(link);
         if (!match)
             return;
         const page = Number(match[1]) - 1;
-        const responsePlan = aiPanel.viewState.responsePlan || {};
         if (responsePlan.action === "DocumentChat") {
             const source = (responsePlan.sources || []).find(s => s.page === page + 1);
             if (!source || page < 0 || page >= owner.pageCount) {
@@ -156,9 +162,49 @@ Pane {
             onClicked: aiPanel.owner.cancelAi()
         }
         ToolButton {
+            id:historyToggle
+            objectName:"aiHistoryToggle"
+            visible:actionBox.currentIndex===4 && (aiPanel.viewState.chatTurns || []).length>0
+            text:qsTr("Conversation (%1)").arg((aiPanel.viewState.chatTurns || []).length)
+            checkable:true
+            Accessible.name:qsTr("Show this document's previous questions and answers")
+        }
+        ScrollView {
+            objectName:"aiConversationHistory"
+            visible:historyToggle.visible && historyToggle.checked
+            Layout.fillWidth:true;Layout.fillHeight:true;Layout.minimumHeight:64
+            contentWidth:availableWidth
+            ColumnLayout {
+                width:parent.width
+                Repeater {
+                    model:aiPanel.viewState.chatTurns || []
+                    ColumnLayout {
+                        required property var modelData
+                        required property int index
+                        Layout.fillWidth:true
+                        Label {text:modelData.question;textFormat:Text.PlainText;wrapMode:Text.Wrap;Layout.fillWidth:true;color:app.colors.textPrimary}
+                        Label {text:modelData.state==="cancelled" ? qsTr("Cancelled") : modelData.state==="failed" ? qsTr("Failed") : qsTr("Completed");color:app.colors.textSecondary;font.pixelSize:11}
+                        TextArea {
+                            objectName:"aiHistoryAnswer"+index
+                            Accessible.name:qsTr("Previous AI answer")
+                            Layout.fillWidth:true;readOnly:true;selectByMouse:true;wrapMode:TextEdit.Wrap;textFormat:TextEdit.RichText
+                            text:Logic.answerMarkup(modelData.answer || "");background:null
+                            onLinkActivated:function(link){aiPanel.followHistoryLink(link,{action:"DocumentChat",sources:modelData.sources || [],generation:modelData.generation});}
+                        }
+                        Rectangle {Layout.fillWidth:true;height:1;color:app.colors.separator}
+                    }
+                }
+            }
+        }
+        Label {
+            visible:!!aiPanel.viewState.conversationLimited
+            text:qsTr("Older exchanges were removed to keep the conversation within its display budget.")
+            textFormat:Text.PlainText;wrapMode:Text.Wrap;Layout.fillWidth:true;color:app.colors.textSecondary
+        }
+        ToolButton {
             id: reasoningToggle
             objectName: "aiReasoningToggle"
-            visible: !!aiPanel.viewState.reasoning
+            visible: !!aiPanel.viewState.reasoning && !(historyToggle.visible && historyToggle.checked)
             text: qsTr("Provider reasoning") + (checked ? " ▴" : " ▾")
             checkable: true
             Accessible.name: qsTr("Show provider reasoning separately")
@@ -180,6 +226,7 @@ Pane {
             }
         }
         ScrollView {
+            visible:!(historyToggle.visible && historyToggle.checked)
             Layout.fillWidth: true
             Layout.fillHeight: true
             contentWidth: availableWidth

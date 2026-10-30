@@ -60,6 +60,7 @@ struct OpenResult {
     QVariantMap recovery;
     QVariantMap xfa;
     QVariantMap rules;
+    QVariant historyLimit;
     QString revision;
     QString error;
 };
@@ -150,6 +151,7 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
         m_data.insert(QStringLiteral("xfa_status"),result.xfa);
         m_data.insert(QStringLiteral("document_revision"),result.revision);
         m_data.insert(QStringLiteral("annotation_rules"),result.rules);
+        m_data.insert(QStringLiteral("ai_history_limit"),result.historyLimit);
         if(!result.recovery.value(QStringLiteral("error")).toString().isEmpty())setError(result.recovery.value(QStringLiteral("error")).toString());
         m_documentWidth = result.width;
         m_documentHeight = result.height;
@@ -186,6 +188,7 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
         result.recovery = object.value(QStringLiteral("recovery")).toObject().toVariantMap();
         result.xfa = object.value(QStringLiteral("xfa_status")).toObject().toVariantMap();
         result.rules = object.value(QStringLiteral("annotation_rules")).toObject().toVariantMap();
+        result.historyLimit = object.value(QStringLiteral("ai_history_limit")).toVariant();
         result.revision = object.value(QStringLiteral("revision")).toString();
         result.source=NativeRasterSource::prepare(result.document,false,&result.error);
         return result;
@@ -333,6 +336,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
             m_data.insert(QStringLiteral("xfa_status"),info.value(QStringLiteral("xfa_status")));
             m_data.insert(QStringLiteral("document_revision"),info.value(QStringLiteral("revision")));
             m_data.insert(QStringLiteral("annotation_rules"),info.value(QStringLiteral("annotation_rules")));
+            m_data.insert(QStringLiteral("ai_history_limit"),info.value(QStringLiteral("ai_history_limit")));
             emit documentReset();emit documentChanged();emit dataChanged();emit textPagesChanged();
             submit(QStringLiteral("outline"));submit(QStringLiteral("metadata"));
             if(reloadForms)submit(QStringLiteral("forms"));

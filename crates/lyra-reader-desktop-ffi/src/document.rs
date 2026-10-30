@@ -149,7 +149,7 @@ impl DesktopDocument {
             .map_err(|_| "Layout state is unavailable")?;
         Ok(json!({
             "pages":layout.placements().iter().map(|p|json!({"index":p.index,"width":p.width_pt,"height":p.height_pt,"top":p.top_pt,"left":p.left_pt})).collect::<Vec<_>>(),
-            "width":layout.content_width_pt(),"height":layout.content_height_pt(),"gap":layout.gap_pt(),"path":self.original_path,"revision":self.active()?.path(),"signature_status":self.source_signature(&current),"xfa_status":self.source_xfa(&current),"annotation_rules":annotation_rules(),"recovery":self.recovery_status.lock().map_err(|_|"Recovery state is unavailable")?.clone(),
+            "width":layout.content_width_pt(),"height":layout.content_height_pt(),"gap":layout.gap_pt(),"path":self.original_path,"revision":self.active()?.path(),"signature_status":self.source_signature(&current),"xfa_status":self.source_xfa(&current),"annotation_rules":annotation_rules(),"ai_history_limit":ai_chat_history_limit(),"recovery":self.recovery_status.lock().map_err(|_|"Recovery state is unavailable")?.clone(),
         }))
     }
 

@@ -136,6 +136,7 @@ private:
     void initAi();
     void resetAi();
     void handleAiCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error);
+    void finishAiChat(const QString &state);
     QTimer m_aiTimer;
     QVariantMap m_aiState;
     quint64 m_aiPreviewId=0,m_aiStartId=0,m_aiPollId=0,m_aiPlanGeneration=0;

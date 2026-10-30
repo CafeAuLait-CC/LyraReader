@@ -1176,6 +1176,38 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(panel,"followLink",Q_ARG(QVariant,QStringLiteral("p.99"))));QVERIFY(window->property("operationStatus").toString().contains("cannot be verified"));QCOMPARE(window->property("currentPage").toInt(),page-1);
         QVERIFY(QMetaObject::invokeMethod(panel,"followLink",Q_ARG(QVariant,QStringLiteral("p.0"))));QCOMPARE(window->property("currentPage").toInt(),page-1);
     }
+    void documentChatKeepsBoundedCompletedAndCancelledHistoryButExcludesFailures() {
+        MockChatServer server;QVERIFY(server.listen());
+        for(int i=0;i<7;++i)server.responses.append({{MockChatServer::delta({{"content",QString("Synthetic answer %1 [p.1]").arg(i)}}),QByteArray("data: [DONE]\n\n")},0,200});
+        MockChatServer::Response partial;partial.holdLast=true;partial.chunks={MockChatServer::delta({{"content","Synthetic cancelled partial"}}),QByteArray("data: [DONE]\n\n")};server.responses.append(partial);
+        server.responses.append({{QByteArray("{\"error\":{\"message\":\"synthetic failure\"}}")},0,400});
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/chat-history.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const int limit=reader->data().value("ai_history_limit").toInt();QVERIFY(limit>0);
+        view.window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","fixture"}});reader->setAiInput("action",4);auto *panel=view.window->findChild<QObject *>("aiPanel");QVERIFY(panel);
+        const auto prepare=[&](const QString &question){reader->setAiInput("question",question);return QMetaObject::invokeMethod(panel,"prepare");};
+        for(int i=0;i<7;++i) {
+            QVERIFY(prepare(QString("Which page contains body text and caching? turn%1").arg(i)));QTRY_VERIFY_WITH_TIMEOUT(reader->aiState().contains("plan"),10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+            const auto plan=reader->aiState().value("plan").toMap();QCOMPARE(plan.value("history_turns").toInt(),qMin(i,limit));QCOMPARE(server.requests.size(),i);
+            const auto body=plan.value("parts").toList().first().toMap().value("wire_body").toString().toUtf8();QVERIFY(reader->startAi("local",plan));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);
+            QCOMPARE(reader->aiState().value("chatTurns").toList().size(),qMin(i+1,limit));QCOMPARE(reader->aiState().value("chatTurns").toList().last().toMap().value("state").toString(),QString("finished"));
+            QCOMPARE(server.requests[i].mid(server.requests[i].indexOf("\r\n\r\n")+4),body);if(i)QVERIFY(body.contains("Synthetic answer"));
+        }
+        QVERIFY(prepare("Which page contains body text? CANCEL_QUESTION"));QTRY_VERIFY(reader->aiState().contains("plan"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(reader->startAi("local",reader->aiState().value("plan").toMap()));QTRY_VERIFY(reader->aiState().value("output").toString().contains("cancelled partial"));reader->cancelAi();QTRY_VERIFY(!reader->aiState().value("running").toBool());QCOMPARE(reader->aiState().value("chatTurns").toList().last().toMap().value("state").toString(),QString("cancelled"));
+        QVERIFY(prepare("Which page contains body text? FAIL_QUESTION_ONLY"));QTRY_VERIFY(reader->aiState().contains("plan"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);auto plan=reader->aiState().value("plan").toMap();QVERIFY(plan.value("parts").toList().first().toMap().value("wire_body").toString().contains("Synthetic cancelled partial"));QVERIFY(reader->startAi("local",plan));QTRY_VERIFY(!reader->aiState().value("running").toBool());QCOMPARE(reader->aiState().value("chatTurns").toList().last().toMap().value("state").toString(),QString("failed"));
+        QVERIFY(prepare("Which page contains body text? NEXT_QUESTION"));QTRY_VERIFY(reader->aiState().contains("plan"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);plan=reader->aiState().value("plan").toMap();QVERIFY(!plan.value("parts").toList().first().toMap().value("wire_body").toString().contains("FAIL_QUESTION_ONLY"));QCOMPARE(server.requests.size(),9);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,true)));auto *toggle=view.window->findChild<QObject *>("aiHistoryToggle");QVERIFY(toggle);QTRY_VERIFY(toggle->property("visible").toBool());toggle->setProperty("checked",true);QTRY_VERIFY(visualItem(view.window->contentItem(),"aiConversationHistory")->isVisible());
+        auto *retry=visualItem(view.window->contentItem(),"retryAiRequest");auto *panelItem=qobject_cast<QQuickItem *>(panel);QVERIFY(retry && panelItem);
+        QTRY_VERIFY(retry->mapRectToItem(panelItem,retry->boundingRect()).bottom()<=panelItem->height());
+        auto *answer=visualItem(view.window->contentItem(),"aiHistoryAnswer0");QVERIFY(answer);QVERIFY(answer->property("text").toString().contains("Synthetic answer"));
+        const auto capture=qEnvironmentVariable("LYRA_READER_AI_HISTORY_SNAPSHOT");if(!capture.isEmpty()){QTest::qWait(80);QVERIFY(view.window->grabWindow().save(capture));}
+        const auto oldest=reader->aiState().value("chatTurns").toList().first().toMap();const auto source=oldest.value("sources").toList().first().toMap();
+        const QVariant historicalPlan=QVariantMap{{"action","DocumentChat"},{"sources",oldest.value("sources")},{"generation",oldest.value("generation")}};
+        QVERIFY(QMetaObject::invokeMethod(panel,"followHistoryLink",Q_ARG(QVariant,QString("p.%1").arg(source.value("page").toInt())),Q_ARG(QVariant,historicalPlan)));QTRY_COMPARE(view.window->property("currentPage").toInt(),source.value("page").toInt()-1);
+        const auto turns=reader->aiState().value("chatTurns").toList();view.workspace.newTab();QVERIFY(view.workspace.activeReader()->aiState().value("chatTurns").toList().isEmpty());view.workspace.selectTab(0);QCOMPARE(reader->aiState().value("chatTurns").toList(),turns);
+        reader->submit("page_stage",{{"operation",QVariantMap{{"Rotate",QVariantMap{{"pages",QVariantList{0}},{"quarter_turns",1}}}}}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QVERIFY(reader->aiState().value("chatTurns").toList().isEmpty());QCOMPARE(reader->data().value("ai_history_limit").toInt(),limit);
+        const auto currentPage=view.window->property("currentPage").toInt();QVERIFY(QMetaObject::invokeMethod(panel,"followHistoryLink",Q_ARG(QVariant,QString("p.2")),Q_ARG(QVariant,historicalPlan)));QCOMPARE(view.window->property("currentPage").toInt(),currentPage);QVERIFY(view.window->property("operationStatus").toString().contains("document changed"));
+    }
     void aiPreviewStreamingCancellationAndTabsUseTheRealLocalTransport() {
         MockChatServer server;QVERIFY2(server.listen(),"Loopback HTTP is required for this GUI check; no external service is contacted");
         const auto imageUrl=server.baseUrl()+"/unwanted-image";
