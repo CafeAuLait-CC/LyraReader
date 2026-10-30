@@ -780,25 +780,35 @@ ApplicationWindow {
                 if(date)placedTextController.expectCreation(currentReader,pendingArtworkRequest);
             }
         } else if (annotationTool === "stickyNote" || annotationTool === "textBox") {
+            if(placedTextController.waitingForCreation)return;
             const size = currentReader.pages[page];
+            const rules=currentReader.data.annotation_rules;
+            if(!rules || !Number.isInteger(rules.placed_text_version) || !Number.isFinite(rules.default_text_box_font_size_pt)) {
+                operationStatus=qsTr("The document service did not provide valid text defaults. Reopen the document.");return;
+            }
+            const textBox=annotationTool==="textBox";
             const width = annotationTool === "stickyNote" ? 22 : Math.min(180, size.width);
             const height = annotationTool === "stickyNote" ? 22 : Math.min(60, size.height);
-            currentReader.submit("mark_create", {
+            const request=currentReader.submit("mark_create", {
                 entry: {
                     kind: annotationTool,
                     page: page,
-                    version: 1,
+                    version: rules.placed_text_version,
                     rect: {
                         x: Math.max(0, Math.min(size.width - width, x)),
                         y: Math.max(0, Math.min(size.height - height, y)),
                         width: width,
                         height: height
                     },
-                    fontSize: 14,
-                    color: brushColor + "ff",
+                    fontSize: rules.default_text_box_font_size_pt,
+                    color: textBox ? "#2B2B2EFF" : brushColor + "ff",
                     note: ""
                 }
             });
+            if(textBox) {
+                annotationTool="select";
+                placedTextController.expectCreation(currentReader,request,false);
+            }
         } else if (annotationTool === "select") {
             const hit = annotationAt(page, x, y, false);
             if (hit)
@@ -883,10 +893,21 @@ ApplicationWindow {
         onActivated: root.goBack()
     }
     function showSelectionMenu(item, page, x, y) {
+        const hit=annotationAt(page,x/zoom,y/zoom,false);
+        selectedAnnotation=hit || null;
         const point = item.mapToItem(Overlay.overlay, x, y);
         dialogs.selectionMenu.x = point.x;
         dialogs.selectionMenu.y = point.y;
         dialogs.selectionMenu.open();
+    }
+    function showAnnotationProperties() {
+        const selected=selectedAnnotation;
+        if(!selected)return;
+        if(placedTextController.deferAction(function(){
+            root.selectedAnnotation=root.annotations.find(function(a){return a.id===selected.id;}) || null;
+            root.showAnnotationProperties();
+        }))return;
+        dialogs.showAnnotation();
     }
     function showExportMenu(item) {
         const point = item.mapToItem(Overlay.overlay, 0, item.height);
@@ -946,14 +967,20 @@ ApplicationWindow {
             operationStatus = reason;
             dialogs.showAnnotation();
         } else if (annotation.foreign) {
-            currentReader.submit("file_adopt", {
+            if(edit!==false && annotation.kind==="textBox")dialogs.annotationDialog.close();
+            const request=currentReader.submit("file_adopt", {
                 id: annotation.id
             });
             selectedAnnotation = annotation;
+            if(edit!==false && annotation.kind==="textBox")placedTextController.expectCreation(currentReader,request,false,false);
         } else {
             selectedAnnotation = annotation;
-            if (edit !== false)
-                dialogs.showAnnotation();
+            if (edit !== false) {
+                if(annotation.kind==="textBox") {
+                    dialogs.annotationDialog.close();annotationTool="select";
+                    placedTextController.openExisting(annotation);
+                } else dialogs.showAnnotation();
+            }
         }
         if (edit !== false)
             navigate(annotation.page);
@@ -988,16 +1015,18 @@ ApplicationWindow {
             markSelection(annotationTool);
     }
     property double pendingArtworkRequest: -1
-    function armStamp(style) {
+    function armStamp(style) {armStampForRow(style,"fill");}
+    function armStampForRow(style,row) {
         if (blockXfaWrite()) return;
         if (currentReader.pageCount === 0 || ["approved", "reviewed", "draft", "confidential", "date"].indexOf(style) < 0)
             return;
         setTextViewEnabled(false);
         overviewVisible = false;
         formToolActive = false;
-        setSecondaryRow("fill");
-        if (secondaryRow!=="fill") return;
-        fillTool="stamp";
+        const target=row==="annotate" ? "annotate" : "fill";
+        setSecondaryRow(target);
+        if (secondaryRow!==target) return;
+        fillTool=target==="fill" ? "stamp" : "";
         annotationTool = "stamp";
         pendingStampStyle = style;
         selectedAnnotation = null;
@@ -1021,7 +1050,8 @@ ApplicationWindow {
         fillTool="signature";annotationTool="signature";pendingSignatureImage=null;pendingDrawnSignature=signature;pendingDrawnGeneration=currentReader.documentGeneration;selectedAnnotation=null;selection=null;
         operationStatus=qsTr("Click on the page to place the drawn signature. Escape cancels.");return true;
     }
-    function armImageData(image,picture) {
+    function armImageData(image,picture) {return armImageDataForRow(image,picture,"fill");}
+    function armImageDataForRow(image,picture,row) {
         if (blockXfaWrite() || currentReader.pageCount===0) return false;
         if (!image || (!image.error && (!image.image || !Number.isFinite(image.width) || !Number.isFinite(image.height) || image.width<=0 || image.height<=0))) {
             operationStatus=qsTr("The signature preview is unavailable.");return false;
@@ -1033,9 +1063,10 @@ ApplicationWindow {
         setTextViewEnabled(false);
         overviewVisible = false;
         formToolActive = false;
-        setSecondaryRow("fill");
-        if (secondaryRow!=="fill") return false;
-        fillTool=picture ? "image" : "signature";
+        const target=row==="annotate" ? "annotate" : "fill";
+        setSecondaryRow(target);
+        if (secondaryRow!==target) return false;
+        fillTool=target==="fill" ? (picture ? "image" : "signature") : "";
         annotationTool = "signature";
         pendingSignatureImage = image;
         pendingDrawnSignature = null;
@@ -2299,7 +2330,11 @@ ApplicationWindow {
                     root.selectedAnnotation = root.annotations.find(function (a) {
                         return a.id === result.selected_id;
                     }) || null;
-                    if (!artworkPlacement && root.secondaryRow!=="fill" && root.selectedAnnotation && (root.selectedAnnotation.kind === "stickyNote" || root.selectedAnnotation.kind === "textBox"))
+                    const inlineText=placedTextController.owner===root.currentReader && (placedTextController.creationRequest===id || (placedTextController.active && placedTextController.entry.id===result.selected_id));
+                    // A first click adopts/selects FreeText. Opening the legacy property
+                    // dialog here would intercept the second click of a real double-click.
+                    const selectedFreeText=op==="file_adopt" && root.selectedAnnotation && root.selectedAnnotation.kind==="textBox";
+                    if (!selectedFreeText && !inlineText && !artworkPlacement && root.secondaryRow!=="fill" && root.selectedAnnotation && (root.selectedAnnotation.kind === "stickyNote" || root.selectedAnnotation.kind === "textBox"))
                         dialogs.showAnnotation();
                 }
             } else if (op.indexOf("mark_") === 0 || op.indexOf("marks_") === 0) {

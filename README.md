@@ -48,7 +48,11 @@ are collected before writing; a failed resolution keeps every window open and re
 already completed. Reading positions survive an aborted Save All attempt. Several newer macOS
 features are still being ported. XFA documents keep local reading bookmarks; PDF editing and
 derivative exports are refused, including forms selected as merge inputs.
-The five exclusive secondary rows are Annotate, Edit, Fill & Sign, Export and Lyra. Export
+The five exclusive secondary rows are Annotate, Edit, Fill & Sign, Export and Lyra. Annotate
+uses three groups for markup, drawing and placement, with menus for shapes, stamps and signatures.
+Ordinary text boxes edit directly on the page, including adopted PDF FreeText. Control+Return
+commits one undoable edit; Escape restores the existing mark or removes a cancelled new box.
+Right-click an annotation for its properties. Export
 exposes eight direct actions, including flattened copies and form values with a verified
 original-file backup. Flattening uses the saved PDF revision; save pending annotation/form drafts
 first to include them. Links and sticky notes are kept, and the result remains editable.

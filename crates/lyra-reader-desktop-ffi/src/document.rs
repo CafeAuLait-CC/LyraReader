@@ -2182,6 +2182,44 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_text_and_adoption_undo_keep_an_idle_page_transaction_clean() {
+        let fixture = Fixture::new("flatten.pdf");
+        let doc = fixture.open();
+        doc.command(json!({"op":"page_stage","operation":{"Rotate":{"pages":[0],"quarter_turns":1}},"current_page":0,"selected_pages":[0]})).unwrap();
+        doc.command(json!({"op":"page_undo"})).unwrap();
+        let state = doc.command(json!({"op":"marks"})).unwrap();
+        assert_eq!(state["page_pending"], false);
+        assert_eq!(state["pdf_dirty"], false);
+        let annotation = state["file_annotations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["kind"] == "freeText")
+            .unwrap();
+        let adopted = doc
+            .command(json!({"op":"file_adopt","id":annotation["id"]}))
+            .unwrap();
+        let id = adopted["selected_id"].clone();
+        let begun = doc
+            .command(json!({"op":"mark_text_begin","id":id,"created":false}))
+            .unwrap();
+        let token = begun["text_edit_token"].clone();
+        doc.command(json!({"op":"mark_text_update","id":id,"edit_token":token,"patch":{"note":"Cancelled native draft"}})).unwrap();
+        doc.command(json!({"op":"mark_text_end","id":id,"edit_token":token,"cancel":true}))
+            .unwrap();
+        let undone = doc.command(json!({"op":"marks_undo"})).unwrap();
+        assert_eq!(undone["pdf_dirty"], false);
+        assert_eq!(undone["page_pending"], false);
+        assert!(undone["annotations"].as_array().unwrap().is_empty());
+        drop(doc);
+        let reopened = fixture.open();
+        let restored = reopened.command(json!({"op":"marks"})).unwrap();
+        assert_eq!(restored["pdf_dirty"], false);
+        assert_eq!(restored["page_pending"], false);
+        assert!(restored["annotations"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
     fn placed_text_flushes_coalesce_and_cancel_restores_creation_and_cache() {
         let fixture = Fixture::new("text-page.pdf");
         let doc = fixture.open();

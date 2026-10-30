@@ -824,8 +824,14 @@ private slots:
         window->setProperty("annotationTool","eraser");QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,point(200,320));QTest::mouseMove(window,point(200,380),30);
         QTRY_COMPARE_WITH_TIMEOUT(preview().size(),2,10000);QCOMPARE(hidden().size(),1);QCOMPARE(entries().first(),before);
         QVERIFY(sidecar.open(QIODevice::ReadOnly));QCOMPARE(sidecar.readAll(),baseline);sidecar.close();
-        const auto frame=window->grabWindow();QVERIFY(!frame.isNull());
+        QImage frame;
         const auto pixel=[&](double x,double y){const auto p=point(x,y);return frame.pixelColor(qRound(p.x()*frame.width()/double(window->width())),qRound(p.y()*frame.height()/double(window->height())));};
+        // The preview model can arrive before Canvas paints into the native scene.
+        // Wait for the actual clipped pixels, not merely the model or a fixed delay.
+        QElapsedTimer previewPaint;previewPaint.start();int frameSamples=0;
+        const auto previewPainted=[&]{++frameSamples;frame=window->grabWindow();if(frame.isNull())return false;const auto gap=pixel(200,350),left=pixel(140,350);return gap.red()>245 && gap.green()>245 && gap.blue()>245 && left.green()>left.red()+30;};
+        QTRY_VERIFY_WITH_TIMEOUT(previewPainted(),5000);
+        qInfo()<<"Ink preview pixels observed after"<<previewPaint.elapsed()<<"ms in"<<frameSamples<<"samples";
         const auto gap=pixel(200,350),left=pixel(140,350);QVERIFY2(gap.red()>245 && gap.green()>245 && gap.blue()>245,qPrintable(gap.name()));QVERIFY2(left.green()>left.red()+30,qPrintable(left.name()));
         QTest::mouseMove(window,point(270,380),30);QTest::mouseMove(window,point(270,320),30);QTRY_COMPARE_WITH_TIMEOUT(preview().size(),3,10000);
         const auto expected=preview();QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,point(270,320));QTRY_VERIFY_WITH_TIMEOUT(idle(),10000);QCOMPARE(entries().size(),3);
@@ -1839,6 +1845,130 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"date")));const auto generation=reader->documentGeneration();reader->openFile(QUrl::fromLocalFile(path));QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()==1 && !reader->loading() && reader->pendingCommands()==0,10000);QVERIFY(reader->documentGeneration()!=generation);QVERIFY(QMetaObject::invokeMethod(view.window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,200.0),Q_ARG(QVariant,200.0),Q_ARG(QVariant,400.0),Q_ARG(QVariant,400.0)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(!reader->hasUnsavedChanges());QCOMPARE(reader->data().value("annotations").toList().size(),3);
         QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"date")));const auto secondPath=scratch.path()+"/second-date-document.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",secondPath));view.workspace.openFile(QUrl::fromLocalFile(secondPath));auto *second=view.workspace.activeReader();QVERIFY(second!=reader);QTRY_COMPARE_WITH_TIMEOUT(second->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(second->pendingCommands(),0,10000);QVERIFY(view.window->property("fillTool").toString().isEmpty());QCOMPARE(view.window->property("annotationTool").toString(),QString("select"));QVERIFY(!second->hasUnsavedChanges());
         QVERIFY(QMetaObject::invokeMethod(view.window,"setFillTool",Q_ARG(QVariant,"date")));auto *rotation=visualItem(view.window->contentItem(),"fillDateRotation");QVERIFY(rotation);rotation->forceActiveFocus();QTRY_VERIFY(rotation->hasActiveFocus());QTest::keyClick(view.window,Qt::Key_Escape);QTRY_VERIFY(view.window->property("fillTool").toString().isEmpty());QCOMPARE(view.window->property("annotationTool").toString(),QString("select"));QVERIFY(!second->hasUnsavedChanges());
+    }
+    void annotateRowKeepsThreeGroupsAndPlacesArtworkWithoutOpeningFillAndSign() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/annotation-row.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setSecondaryRow",Q_ARG(QVariant,"annotate"),Q_ARG(QVariant,false)));
+        auto *row=visualItem(view.window->contentItem(),"annotationToolRow");QVERIFY(row);QCOMPARE(row->height(),46.0);
+        const QStringList groups{"annotateGroupMarkup","annotateGroupPointer","annotateGroupPlacement"};
+        const QStringList buttons{"annotateToolhighlight","annotateToolunderline","annotateToolstrikeout","annotateToolink","annotateTooleraser","annotateTooltextBox","annotateShapes","annotateToolstickyNote","annotateStamp","annotateSignature"};
+        for(int width:{1200,700,640}) {
+            view.window->setWidth(width);QTest::qWait(50);double right=-20;
+            for(const auto &name:groups){auto *group=visualItem(row,name);QVERIFY(group);const auto frame=group->mapRectToItem(row,group->boundingRect());QCOMPARE(frame.left()-right,34.0);right=frame.right();}
+            for(const auto &name:buttons){auto *button=visualItem(row,name);QVERIFY(button && button->isVisible());QCOMPARE(button->width(),34.0);QCOMPARE(button->height(),32.0);const auto frame=button->mapRectToItem(row,button->boundingRect());QVERIFY(frame.left()>=0 && frame.right()<=width);auto *accessible=QAccessible::queryAccessibleInterface(button);QVERIFY(accessible && !accessible->text(QAccessible::Name).isEmpty());}
+            auto *colour=visualItem(row,"annotateColour");QVERIFY(colour);QVERIFY(colour->mapRectToItem(row,colour->boundingRect()).right()<=width);
+            const auto capture=qEnvironmentVariable("LYRA_READER_ANNOTATE_SNAPSHOT");if(!capture.isEmpty())QVERIFY(view.window->grabWindow().save(capture+QString::number(width)+".png"));
+        }
+        QVERIFY(QMetaObject::invokeMethod(visualItem(row,"annotateShapes"),"clicked"));
+        QQuickItem *shape=nullptr;QTRY_VERIFY((shape=visualItem(view.window->contentItem(),"annotateShapearrow")) && shape->isVisible());QTest::mouseClick(view.window,Qt::LeftButton,Qt::NoModifier,shape->mapToScene(shape->boundingRect().center()).toPoint());QCOMPARE(view.window->property("annotationTool").toString(),QString("arrow"));
+        QVERIFY(QMetaObject::invokeMethod(visualItem(row,"annotateStamp"),"clicked"));
+        QQuickItem *stamp=nullptr;QTRY_VERIFY((stamp=visualItem(view.window->contentItem(),"annotateStampapproved")) && stamp->isVisible());QTest::mouseClick(view.window,Qt::LeftButton,Qt::NoModifier,stamp->mapToScene(stamp->boundingRect().center()).toPoint());QCOMPARE(view.window->property("annotationTool").toString(),QString("stamp"));QCOMPARE(view.window->property("secondaryRow").toString(),QString("annotate"));QVERIFY(!view.window->property("fillInspectorVisible").toBool());
+        QVERIFY(QMetaObject::invokeMethod(view.window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,150.0),Q_ARG(QVariant,250.0),Q_ARG(QVariant,400.0),Q_ARG(QVariant,400.0)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
+        QCOMPARE(reader->data().value("marks").toMap().value("annotations").toList().last().toMap().value("stampStyle").toString(),QString("approved"));QCOMPARE(view.window->property("secondaryRow").toString(),QString("annotate"));
+        QVERIFY(QMetaObject::invokeMethod(visualItem(row,"annotateSignature"),"clicked"));QQuickItem *draw=nullptr;QTRY_VERIFY((draw=visualItem(view.window->contentItem(),"annotateDrawSignature")) && draw->isVisible());QTest::mouseClick(view.window,Qt::LeftButton,Qt::NoModifier,draw->mapToScene(draw->boundingRect().center()).toPoint());QCOMPARE(view.window->property("annotationTool").toString(),QString("ink"));
+        const auto imagePath=scratch.path()+"/signature.png";QImage image(4,2,QImage::Format_RGBA8888);image.fill(Qt::black);QVERIFY(image.save(imagePath));
+        QVERIFY(QMetaObject::invokeMethod(row,"chooseSignature"));auto *picker=row->findChild<QObject *>("annotateSignatureImagePicker");QVERIFY(picker);QTRY_VERIFY(picker->property("visible").toBool());
+        QVERIFY(picker->setProperty("selectedFile",QUrl::fromLocalFile(imagePath)));QVERIFY(QMetaObject::invokeMethod(picker,"accepted"));QVERIFY(QMetaObject::invokeMethod(picker,"close"));
+        QCOMPARE(view.window->property("secondaryRow").toString(),QString("annotate"));QCOMPARE(view.window->property("annotationTool").toString(),QString("signature"));QVERIFY(!view.window->property("fillInspectorVisible").toBool());
+        QVERIFY(QMetaObject::invokeMethod(view.window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,250.0),Q_ARG(QVariant,350.0),Q_ARG(QVariant,400.0),Q_ARG(QVariant,400.0)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
+        QCOMPARE(reader->data().value("marks").toMap().value("annotations").toList().last().toMap().value("kind").toString(),QString("signature"));
+        QVERIFY(QMetaObject::invokeMethod(row,"chooseSignature"));QTRY_VERIFY(picker->property("visible").toBool());reader->openFile(QUrl::fromLocalFile(path));QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && reader->pendingCommands()==0);
+        QVERIFY(picker->setProperty("selectedFile",QUrl::fromLocalFile(imagePath)));QVERIFY(QMetaObject::invokeMethod(picker,"accepted"));QVERIFY(QMetaObject::invokeMethod(picker,"close"));QCOMPARE(view.window->property("annotationTool").toString(),QString("select"));QVERIFY(view.window->property("operationStatus").toString().contains("document changed"));
+    }
+    void ordinaryTextBoxesEditInlineAndCancelWithoutDeletingTheExistingMark() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/ordinary-text.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        reader->submit("mark_create",{{"entry",QVariantMap{{"kind","textBox"},{"page",0},{"version",1},{"rect",QVariantMap{{"x",80},{"y",250},{"width",180},{"height",60}}},{"color","#2B2B2EFF"},{"note","Existing annotation"},{"fontSize",14}}}});
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto before=reader->data().value("marks").toMap().value("annotations").toList().last().toMap();
+        QVERIFY(QMetaObject::invokeMethod(view.window,"selectAnnotation",Q_ARG(QVariant,before),Q_ARG(QVariant,true)));
+        auto *input=visualItem(view.window->contentItem(),"placedTextInput0");
+        QTRY_VERIFY2(input && input->isVisible(),"Ordinary text boxes must use the page editor, just like placed dates");
+        QTRY_VERIFY(input->hasActiveFocus());QCOMPARE(input->property("selectedText").toString(),QString());
+        auto *editing=view.window->findChild<QObject *>("placedTextEditing");QVERIFY(editing);QVERIFY(!editing->property("created").toBool());
+        QVERIFY(QMetaObject::invokeMethod(input,"selectAll"));for(char key:QByteArray("Cancelled replacement"))QTest::keyClick(view.window,key);
+        QTest::qWait(650);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QTest::keyClick(view.window,Qt::Key_Escape);QTRY_VERIFY(!editing->property("active").toBool());
+        QCOMPARE(reader->data().value("marks").toMap().value("annotations").toList().last().toMap(),before);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"selectAnnotation",Q_ARG(QVariant,before),Q_ARG(QVariant,true)));
+        QTRY_VERIFY(input->isVisible() && input->hasActiveFocus());QVERIFY(QMetaObject::invokeMethod(input,"selectAll"));
+        for(char key:QByteArray("Committed annotation"))QTest::keyClick(view.window,key);QTest::keyClick(view.window,Qt::Key_Return,Qt::ControlModifier);
+        QTRY_VERIFY(!editing->property("active").toBool());QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QCOMPARE(reader->data().value("marks").toMap().value("annotations").toList().last().toMap().value("note").toString(),QString("Committed annotation"));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"undo"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QCOMPARE(reader->data().value("marks").toMap().value("annotations").toList().last().toMap(),before);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setSecondaryRow",Q_ARG(QVariant,"annotate"),Q_ARG(QVariant,false)));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setAnnotationTool",Q_ARG(QVariant,"textBox")));
+        view.window->setProperty("fitting",false);view.window->setProperty("zoom",1.54);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,80.0),Q_ARG(QVariant,350.0),Q_ARG(QVariant,400.0),Q_ARG(QVariant,400.0)));
+        QTRY_VERIFY(editing->property("active").toBool());QTRY_VERIFY(input->isVisible() && input->hasActiveFocus());QVERIFY(editing->property("created").toBool());
+        QCOMPARE(view.window->property("annotationTool").toString(),QString("select"));
+        for(char key:QByteArray("New annotation"))QTest::keyClick(view.window,key);
+        QTRY_COMPARE(input->property("lineCount").toInt(),1);
+        QTest::keyClick(view.window,Qt::Key_Escape);
+        QTRY_VERIFY(!editing->property("active").toBool());QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QCOMPARE(reader->data().value("marks").toMap().value("annotations").toList(),QVariantList{before});
+        auto *page=visualItem(view.window->contentItem(),"pdfPage0");QVERIFY(page);const double zoom=view.window->property("zoom").toDouble();
+        QTest::mouseClick(view.window,Qt::RightButton,Qt::NoModifier,page->mapToScene(QPointF(100*zoom,270*zoom)).toPoint());
+        QQuickItem *properties=nullptr;QTRY_VERIFY((properties=visualItem(view.window->contentItem(),"annotationPropertiesAction")) && properties->isVisible() && properties->isEnabled());
+        QTest::mouseClick(view.window,Qt::LeftButton,Qt::NoModifier,properties->mapToScene(properties->boundingRect().center()).toPoint());
+        auto *dialog=view.window->findChild<QObject *>("annotationEditor");QVERIFY(dialog);QTRY_VERIFY(dialog->property("visible").toBool());
+        auto *font=view.window->findChild<QQuickItem *>("annotationFontSize");QVERIFY(font);font->forceActiveFocus();QTest::keyClick(view.window,Qt::Key_Up);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QCOMPARE(reader->data().value("marks").toMap().value("annotations").toList().last().toMap().value("fontSize").toInt(),15);
+        QVERIFY(QMetaObject::invokeMethod(dialog,"close"));
+    }
+    void savedFreeTextIsAdoptedForInlineEditingAndKeepsItsIdentityOnSave() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/saved-free-text.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        reader->submit("mark_create",{{"entry",QVariantMap{{"kind","textBox"},{"page",0},{"version",1},{"rect",QVariantMap{{"x",80},{"y",250},{"width",180},{"height",60}}},{"color","#2B2B2EFF"},{"note","PDF-owned text"},{"fontSize",14},{"textAlignment","right"}}}});
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto identity=reader->data().value("marks").toMap().value("annotations").toList().first().toMap().value("id");
+        QVERIFY(QMetaObject::invokeMethod(view.window,"saveDocument",Q_ARG(QVariant,false)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
+        const auto all=view.window->property("annotations").value<QJSValue>().toVariant().toList();QCOMPARE(all.size(),1);const auto loaded=all.first().toMap();QVERIFY(loaded.value("foreign").toBool());QCOMPARE(loaded.value("kind").toString(),QString("textBox"));
+        auto *propertiesDialog=view.window->findChild<QObject *>("annotationEditor");QVERIFY(propertiesDialog);QVERIFY(QMetaObject::invokeMethod(propertiesDialog,"close"));QTRY_VERIFY(!propertiesDialog->property("visible").toBool());
+        auto *page=visualItem(view.window->contentItem(),"pdfPage0");QVERIFY(page);const double zoom=view.window->property("zoom").toDouble();const auto point=page->mapToScene(QPointF(150*zoom,280*zoom)).toPoint();
+        QTest::mouseClick(view.window,Qt::LeftButton,Qt::NoModifier,point);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY2(!view.window->findChild<QObject *>("annotationEditor")->property("visible").toBool(),"The first click must not open a property dialog that consumes the second click");
+        QTest::mouseDClick(view.window,Qt::LeftButton,Qt::NoModifier,point);
+        QTest::mouseRelease(view.window,Qt::LeftButton,Qt::NoModifier,point);
+        auto *editing=view.window->findChild<QObject *>("placedTextEditing");QVERIFY(editing);
+        QTRY_VERIFY2(editing->property("active").toBool(),qPrintable(reader->error()+" / "+view.window->property("operationStatus").toString()));
+        QTRY_VERIFY2(!editing->property("token").toString().isEmpty(),qPrintable(editing->property("error").toString()));
+        QPointer<QQuickItem> input;QTRY_VERIFY((input=visualItem(view.window->contentItem(),"placedTextInput0")) && input->isVisible() && input->hasActiveFocus());
+        QVERIFY(!editing->property("created").toBool());QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
+        const auto entry=editing->property("entry");const auto entryMap=entry.metaType()==QMetaType::fromType<QJSValue>() ? entry.value<QJSValue>().toVariant().toMap() : entry.toMap();
+        QCOMPARE(entryMap.value("fileIdentity").toString(),"nm:"+identity.toString());
+        QCOMPARE(input->property("horizontalAlignment").toInt(),int(Qt::AlignRight));
+        QVERIFY(!view.window->findChild<QObject *>("annotationEditor")->property("visible").toBool());
+        QVERIFY(QMetaObject::invokeMethod(input,"selectAll"));for(char key:QByteArray("Saved after adoption"))QTest::keyClick(view.window,key);
+        QTest::keyClick(view.window,Qt::Key_Return,Qt::ControlModifier);QTRY_VERIFY(!editing->property("active").toBool());QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"saveDocument",Q_ARG(QVariant,false)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
+        ReaderController reopened;reopened.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reopened.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reopened.pendingCommands(),0,10000);
+        const auto saved=reopened.data().value("annotations").toList();QCOMPARE(saved.size(),1);const auto annotation=saved.first().toMap();QCOMPARE(annotation.value("contents").toString(),QString("Saved after adoption"));QCOMPARE(annotation.value("id").toString(),"nm:"+identity.toString());
+    }
+    void nativeUndoAfterCancellingAnAdoptedTextEditLeavesAnIdleTransactionClean() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/idle-transaction.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/flatten.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        reader->submit("page_stage",{{"operation",QVariantMap{{"Rotate",QVariantMap{{"pages",QVariantList{0}},{"quarter_turns",1}}}}},{"current_page",0},{"selected_pages",QVariantList{0}}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);
+        reader->submit("page_undo");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QVERIFY(!reader->hasUnsavedChanges());
+        QVariantMap annotation;const auto all=view.window->property("annotations").value<QJSValue>().toVariant().toList();for(const auto &value:all)if(value.toMap().value("kind")=="textBox"){annotation=value.toMap();break;}QVERIFY(!annotation.isEmpty());
+        QVERIFY(QMetaObject::invokeMethod(view.window,"selectAnnotation",Q_ARG(QVariant,annotation),Q_ARG(QVariant,true)));
+        auto *editing=view.window->findChild<QObject *>("placedTextEditing");QVERIFY(editing);QPointer<QQuickItem> input;QTRY_VERIFY((input=visualItem(view.window->contentItem(),"placedTextInput0")) && input->isVisible() && input->hasActiveFocus());
+        QVERIFY(QMetaObject::invokeMethod(input,"selectAll"));for(char key:QByteArray("Cancelled draft"))QTest::keyClick(view.window,key);QTest::qWait(650);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
+        const auto editRect=editing->property("rect").value<QJSValue>().toVariant().toMap();
+        QVERIFY(editRect.value("height").toDouble()>=reader->data().value("annotation_rules").toMap().value("min_text_box_height_pt").toDouble());
+        QTest::keyClick(view.window,Qt::Key_Escape);QTRY_VERIFY(!editing->property("active").toBool());QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QTest::keyClick(view.window,Qt::Key_Z,Qt::ControlModifier);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY2(!reader->hasUnsavedChanges(),qPrintable(QString("Focus after cancellation: %1; marks: %2").arg(view.window->activeFocusItem() ? view.window->activeFocusItem()->objectName() : QString("none"),QString::fromUtf8(QJsonDocument::fromVariant(reader->data().value("marks")).toJson(QJsonDocument::Compact)))));
+        QVERIFY(reader->data().value("marks").toMap().value("annotations").toList().isEmpty());
     }
     void unrotatedDateStartsAnInlineEditorAndSelectsTheWholeDate() {
         QTemporaryDir scratch;

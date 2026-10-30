@@ -67,8 +67,8 @@ Item {
         noteSave.stop();
         noteDirty = false;
     }
-    function flushAnnotation() {
-        if(app.placedTextEditor.active)app.placedTextEditor.finish(false);
+    function flushAnnotation(finishPlacedText) {
+        if(finishPlacedText!==false && app.placedTextEditor.active)app.placedTextEditor.finish(false);
         noteSave.stop();
         if (!noteReader || !noteDirty || !noteId.length)
             return;
@@ -284,6 +284,19 @@ Item {
     Menu {
         id: selection
         parent: Overlay.overlay
+        MenuItem {
+            objectName:"editAnnotationTextAction"
+            text:qsTr("Edit Annotation Text")
+            enabled:app.canModifyPdf && !!app.selectedAnnotation && app.selectedAnnotation.kind==="textBox" && !Logic.annotationUnsupportedReason(app.selectedAnnotation).length
+            onTriggered:app.selectAnnotation(app.selectedAnnotation,true)
+        }
+        MenuItem {
+            objectName:"annotationPropertiesAction"
+            text:qsTr("Annotation Properties…")
+            enabled:!!app.selectedAnnotation
+            onTriggered:app.showAnnotationProperties()
+        }
+        MenuSeparator {}
         MenuItem {
             text: qsTr("Copy Text")
             enabled: !!app.selection
@@ -626,7 +639,7 @@ Item {
         id: annotation
         objectName: "annotationEditor"
         onOpened: dialogs.loadAnnotation()
-        onClosed: dialogs.flushAnnotation()
+        onClosed: dialogs.flushAnnotation(false)
         title: qsTr("Annotation")
         parent: Overlay.overlay
         anchors.centerIn: parent

@@ -21,10 +21,18 @@ Item {
         wrapMode: Text.Wrap
         function fit() {
             if(!layer.showing || editor.cancelling)return;
+            const rules=app.currentReader.data.annotation_rules;
+            if(!rules || !Number.isFinite(rules.min_text_box_width_pt) || !Number.isFinite(rules.min_text_box_height_pt)
+                    || rules.min_text_box_width_pt<=0 || rules.min_text_box_height_pt<=0) {
+                editor.error=qsTr("The document service did not provide valid text size limits. Reopen the document.");return;
+            }
+            // An imported box can extend past the page. Keep its valid geometry
+            // rather than shrinking it below the shared writer's minimum size.
+            if(layer.maximumWidth<rules.min_text_box_width_pt || layer.maximumHeight<rules.min_text_box_height_pt)return;
             // QTextDocument can wrap a fractional-pixel edge differently from Text.
             // Keep a pixel of width slack and use the editor's actual line height.
-            const width=Math.min(layer.maximumWidth,Math.max(24,(Math.ceil(contentWidth)+1)/app.zoom+2*layer.paddingPt));
-            const height=Math.min(layer.maximumHeight,Math.max(20,(Math.ceil(Math.max(contentHeight,input.contentHeight))+1)/app.zoom+2*layer.paddingPt));
+            const width=Math.min(layer.maximumWidth,Math.max(rules.min_text_box_width_pt,(Math.ceil(contentWidth)+1)/app.zoom+2*layer.paddingPt));
+            const height=Math.min(layer.maximumHeight,Math.max(rules.min_text_box_height_pt,(Math.ceil(Math.max(contentHeight,input.contentHeight))+1)/app.zoom+2*layer.paddingPt));
             editor.resizeBox(width,height);
         }
         onContentWidthChanged: Qt.callLater(fit)
@@ -40,10 +48,16 @@ Item {
         y: visible ? editor.rect.y*app.zoom : 0
         width: visible ? editor.rect.width*app.zoom : 0
         height: visible ? editor.rect.height*app.zoom : 0
-        padding: layer.paddingPt*app.zoom
+        // Style-specific edge padding otherwise overrides the aggregate padding.
+        // Measurement and the native editor must subtract exactly the same insets.
+        leftPadding:layer.paddingPt*app.zoom
+        rightPadding:layer.paddingPt*app.zoom
+        topPadding:layer.paddingPt*app.zoom
+        bottomPadding:layer.paddingPt*app.zoom
         text: visible ? editor.text : ""
         textFormat: TextEdit.PlainText
         wrapMode: TextEdit.Wrap
+        horizontalAlignment: layer.showing && editor.entry.textAlignment==="center" ? TextEdit.AlignHCenter : layer.showing && editor.entry.textAlignment==="right" ? TextEdit.AlignRight : TextEdit.AlignLeft
         selectByMouse: true
         font.family: app.annotationFont
         font.pixelSize: visible ? Math.max(1,editor.entry.fontSize*app.zoom) : 14
@@ -81,7 +95,7 @@ Item {
         function onFocusSerialChanged() {
             if(!layer.showing)return;
             const token=editor.token;
-            Qt.callLater(function(){if(layer.showing && editor.token===token){input.forceActiveFocus();input.selectAll();}});
+            Qt.callLater(function(){if(layer.showing && editor.token===token){input.forceActiveFocus();if(editor.selectAllOnStart)input.selectAll();else input.cursorPosition=input.length;}});
         }
     }
 }

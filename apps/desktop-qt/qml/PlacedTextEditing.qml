@@ -25,20 +25,28 @@ Item {
     property string coverageText: ""
     property double creationRequest: -1
     property bool editorRequested: false
+    property bool pendingWasCreated: true
+    property bool selectAllOnStart: true
     signal layoutRequested()
     readonly property bool active: !!owner && !!entry
     readonly property bool waitingForCreation: !!owner && creationRequest>=0
     readonly property bool current: active && owner===app.currentReader && generation===owner.documentGeneration
     readonly property bool dirty: active && (text!==savedText || JSON.stringify(rect)!==JSON.stringify(savedRect))
-    function expectCreation(source,id) {
+    function expectCreation(source,id,selectAll,wasCreated) {
         owner=source;generation=source.documentGeneration;creationRequest=id;
+        pendingWasCreated=wasCreated!==false;selectAllOnStart=selectAll!==false;
         editorRequested=true;cancelling=false;closing=false;
     }
     function suppressPendingEditor() {editorRequested=false;}
     function cancelPendingCreation() {editorRequested=false;cancelling=true;closing=true;}
-    function start(annotation) {
+    function openExisting(annotation) {
+        owner=app.currentReader;generation=owner.documentGeneration;
+        closing=false;cancelling=false;selectAllOnStart=false;
+        start(annotation,false);
+    }
+    function start(annotation,wasCreated) {
         if(owner===app.currentReader)app.selection=null;
-        entry=annotation;created=true;
+        entry=annotation;created=!!wasCreated;
         text=annotation.note || "";rect=Object.assign({},annotation.rect);
         savedText=text;savedRect=Object.assign({},rect);
         error="";nextAction=null;missingGlyphs=[];
@@ -106,8 +114,8 @@ Item {
                 if(message.length || (!editing.cancelling && (!editing.editorRequested || editing.owner!==editing.app.currentReader))) {editing.abandon();return;}
                 const annotation=(result.annotations || []).find(function(a){return a.id===result.selected_id;});
                 if(!annotation || annotation.kind!=="textBox") {editing.abandon();return;}
-                editing.start(annotation);
-                if(!editing.cancelling)editing.app.operationStatus=qsTr("Placed the date. Type to replace it; Control+Return finishes, Escape cancels.");
+                editing.start(annotation,editing.pendingWasCreated);
+                if(!editing.cancelling)editing.app.operationStatus=qsTr("Edit the text on the page. Control+Return finishes, Escape cancels.");
                 return;
             }
             if(!editing.active)return;
@@ -137,6 +145,14 @@ Item {
             editing.error="";
             if(op==="mark_text_begin") {
                 if(!result.text_edit_token) {editing.error=qsTr("The text editor did not receive a valid session. Reopen the document.");return;}
+                const canonical=(result.annotations || []).find(function(a){return a.id===editing.entry.id;});
+                if(canonical) {
+                    // A preceding note flush can finish between the click and this reply.
+                    // Begin from the acknowledged mark, preserving an explicit unsaved draft.
+                    editing.entry=canonical;editing.savedText=canonical.note || "";
+                    editing.text=editing.owner.noteDrafts[canonical.id]!==undefined ? editing.owner.noteDrafts[canonical.id] : editing.savedText;
+                    editing.rect=Object.assign({},canonical.rect);editing.savedRect=Object.assign({},canonical.rect);
+                }
                 editing.token=result.text_edit_token;
                 if(!editing.cancelling){++editing.focusSerial;coverageTimer.restart();}
             } else if(op==="mark_text_update") {
@@ -146,6 +162,9 @@ Item {
                 editing.app.operationStatus=editing.cancelling ? qsTr("Text placement cancelled.") : qsTr("Text edit cached. Save writes it into the PDF.");
                 owner.clearNoteDraft(id);
                 if(editing.current && editing.app.selectedAnnotation && editing.app.selectedAnnotation.id===id)editing.app.selectedAnnotation=null;
+                // Transfer focus before hiding the editor so its text shortcuts
+                // cannot suppress the reader's undo action after cancellation.
+                if(editing.current)editing.app.pageList.forceActiveFocus();
                 editing.abandon();
                 if(action)Qt.callLater(function(){if(owner===editing.app.currentReader && owner.documentGeneration===generation)action();});
                 return;
