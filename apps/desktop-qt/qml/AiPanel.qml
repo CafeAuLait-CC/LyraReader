@@ -126,18 +126,25 @@ Pane {
             text: qsTr("Older exchanges were removed to keep the conversation within its display budget.")
             textFormat: Text.PlainText; wrapMode: Text.Wrap; Layout.fillWidth: true; color: app.colors.textSecondary; font.pixelSize: 11
         }
-        TextArea {
-            id: question
-            objectName: "aiQuestion"
+        ScrollView {
+            id: composerScroll
+            objectName: "aiComposerScroll"
             visible: aiPanel.action === 2 || aiPanel.workspace === "chat"
             Layout.fillWidth: true; Layout.preferredHeight: 64; Layout.maximumHeight: 64
-            text: aiPanel.input.question || ""
-            textFormat: TextEdit.PlainText; wrapMode: TextEdit.Wrap
-            placeholderText: aiPanel.workspace === "chat" ? qsTr("Ask about this document…") : qsTr("Question about selected text…")
-            Accessible.name: aiPanel.workspace === "chat" ? qsTr("Question about document") : qsTr("Question about selection")
-            onTextChanged: if (activeFocus) aiPanel.owner.setAiInput("question", text)
-            Keys.onPressed: function(event) {
-                if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && (event.modifiers & Qt.ControlModifier) && preview.enabled) { aiPanel.prepare(); event.accepted = true; }
+            contentWidth: availableWidth
+            clip: true
+            TextArea {
+                id: question
+                objectName: "aiQuestion"
+                width: composerScroll.availableWidth
+                text: aiPanel.input.question || ""
+                textFormat: TextEdit.PlainText; wrapMode: TextEdit.Wrap
+                placeholderText: aiPanel.workspace === "chat" ? qsTr("Ask about this document…") : qsTr("Question about selected text…")
+                Accessible.name: aiPanel.workspace === "chat" ? qsTr("Question about document") : qsTr("Question about selection")
+                onTextChanged: if (activeFocus) aiPanel.owner.setAiInput("question", text)
+                Keys.onPressed: function(event) {
+                    if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && (event.modifiers & Qt.ControlModifier) && preview.enabled) { aiPanel.prepare(); event.accepted = true; }
+                }
             }
         }
         Button {
