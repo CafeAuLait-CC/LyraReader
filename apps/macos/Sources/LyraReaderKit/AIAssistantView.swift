@@ -755,9 +755,9 @@ public struct AIAssistantRightPanelContent: View {
                 }.font(.system(size: 13, weight: .semibold))
                 Spacer()
                 SettingsLink { Image(systemName: "gearshape") }
-                    .buttonStyle(LyraReaderToolStyle()).help("AI connection settings")
+                    .lyraToolStyle().help("AI connection settings")
                 Button { state.toggleRightPanel() } label: { Image(systemName: "xmark") }
-                    .buttonStyle(LyraReaderToolStyle()).accessibilityLabel("Close AI assistant")
+                    .lyraToolStyle().accessibilityLabel("Close AI assistant")
             }.padding(.horizontal, 14).padding(.vertical, 8)
             Divider().overlay(LyraReaderTheme.separator)
             if model.selectedTab == .chat {

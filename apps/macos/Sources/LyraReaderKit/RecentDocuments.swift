@@ -135,7 +135,7 @@ struct ReaderHomeView: View {
             VStack(alignment: .leading, spacing: 28) {
                 if showAll {
                     Button { showAll = false } label: { Label("Back", systemImage: "chevron.left") }
-                        .buttonStyle(LyraReaderToolStyle()).accessibilityLabel("Back to Open File")
+                        .lyraToolStyle().accessibilityLabel("Back to Open File")
                 } else {
                     VStack(spacing: 12) {
                         Image(systemName: "doc.badge.plus").font(.system(size: 44, weight: .light))
@@ -167,9 +167,9 @@ struct ReaderHomeView: View {
                     Text("Recents").font(.system(size: showAll ? 28 : 22, weight: .semibold))
                     Spacer()
                     Button("Clear") { recents.clear() }.disabled(recents.entries.isEmpty)
-                        .buttonStyle(LyraReaderToolStyle()).help("Clear recent history; keep the original files")
+                        .lyraToolStyle().help("Clear recent history; keep the original files")
                     if !showAll {
-                        Button("View All") { showAll = true }.buttonStyle(LyraReaderToolStyle())
+                        Button("View All") { showAll = true }.lyraToolStyle()
                     }
                 }
                 if recents.entries.isEmpty {

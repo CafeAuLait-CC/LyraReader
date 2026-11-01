@@ -170,6 +170,7 @@ extension ReaderChecks {
             state.closeReferencePreview()
         }
         try await chapterPreviewChecks(root: root)
+        try await navigationNoteChecks(root: root)
         print("PASS: cold linked previews upgrade to entry text or transparent table crops; newer clicks, closes and document switches win")
     }
 }

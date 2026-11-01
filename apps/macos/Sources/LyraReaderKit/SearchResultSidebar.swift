@@ -42,7 +42,7 @@ package struct SearchResultSidebar: View {
                 Button { state.searchSidebarVisible = false } label: { Image(systemName: "xmark") }
                     .accessibilityLabel("Close search results")
             }
-            .buttonStyle(LyraReaderToolStyle())
+            .lyraToolStyle()
             .padding(8)
             Divider()
             if state.searchHits.isEmpty {

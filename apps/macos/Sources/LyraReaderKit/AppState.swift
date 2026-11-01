@@ -12863,6 +12863,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // Backwards, so the note drawn last — the one the reader can see on top — wins.
             for annotation in documentAnnotations.reversed()
             where annotation.page == hit.page && annotation.visible {
+                if annotation.isReply, let parent = annotation.parentID,
+                   documentAnnotations.contains(where: { $0.id == parent }) { continue }
                 guard annotation.drawing == .noteIcon || annotation.drawing == .freeText,
                       let box = annotation.boxes.first
                 else { continue }
@@ -13732,6 +13734,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             }
         }
         if let page = link.page {
+            if link.navigation {
+                previewLookupEpoch &+= 1
+                closeReferencePreview()
+                jumpFromPreview(to: page)
+                statusMessage = "Opened page \(page + 1)"
+                return true
+            }
             // Reserve this click before starting asynchronous resolution. A temporary page
             // preview must not cancel its own lookup; panel resizing has a separate raster epoch.
             previewLookupEpoch &+= 1
@@ -15927,6 +15936,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func appendDocumentAnnotations(to pages: inout [CanvasPage]) {
         for (annotationIndex, annotation) in documentAnnotations.enumerated() {
             guard annotation.visible else { continue }
+            // Replies belong to their parent's review thread. Review tools often store their
+            // placeholder rectangles outside the page, where a stand-alone icon has no hit target.
+            if annotation.isReply, let parent = annotation.parentID,
+               documentAnnotations.contains(where: { $0.id == parent }) { continue }
             guard let placement = visiblePagePlacements.first(where: { $0.index == annotation.page })
             else { continue }
 
@@ -16085,16 +16098,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         annotation: DocumentAnnotation,
         to pages: inout [CanvasPage]
     ) {
+        let rectangle = CGRect(x: box.xPt, y: box.yPt, width: box.widthPt, height: box.heightPt)
+        let clipped = rectangle.intersection(CGRect(x: 0, y: 0, width: placement.widthPt, height: placement.heightPt))
+        guard !clipped.isNull, !clipped.isEmpty else { return }
         pages.append(CanvasPage(
             placement: PagePlacement(
                 index: index,
-                topPt: placement.topPt + box.yPt,
-                leftPt: placement.leftPt + box.xPt,
-                widthPt: box.widthPt,
-                heightPt: box.heightPt
+                topPt: placement.topPt + clipped.minY,
+                leftPt: placement.leftPt + clipped.minX,
+                widthPt: clipped.width,
+                heightPt: clipped.height
             ),
             image: image,
-            blend: .normal
+            blend: .normal,
+            source: CGRect(x: (clipped.minX - rectangle.minX) / rectangle.width,
+                           y: (clipped.minY - rectangle.minY) / rectangle.height,
+                           width: clipped.width / rectangle.width, height: clipped.height / rectangle.height)
         ))
 
         if annotationDumpEnabled {
@@ -16129,7 +16148,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             fontSizePt: annotation.fontSizePt ?? NoteGlyph.defaultFreeTextSizePt,
             alignment: annotation.alignment,
             boxPt: boxPt,
-            scale: scale
+            scale: scale, appearance: NSApplication.shared.effectiveAppearance.name.rawValue
         )
         if let cached = noteGlyphTextures[key] { return cached }
 
@@ -16168,7 +16187,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             text: annotation.note,
             fontSize: annotation.fontSize,
             boxPt: box.size,
-            scale: scale
+            scale: scale, appearance: NSApplication.shared.effectiveAppearance.name.rawValue
         )
         if let cached = placedGlyphTextures[key] { return cached }
         // One cached bitmap per placed annotation: a resize walks through many box sizes (and a
@@ -16265,6 +16284,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let fontSize: CGFloat
         let boxPt: CGSize
         let scale: CGFloat
+        let appearance: String
     }
 
     /// Identity of one note glyph texture: every input that changes a pixel of it.
@@ -16277,12 +16297,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let alignment: String
         let boxPt: CGSize
         let scale: CGFloat
+        let appearance: String
     }
 
     private func ownInlineGlyph(annotation: Annotation, index: Int, size: CGSize) -> PageImage? {
         let scale = NoteGlyph.scale(zoom: zoomFactor, deviceScale: deviceScale)
         let key = PlacedGlyphKey(index: index, kind: "inline-comment", color: annotation.color,
-            text: "", fontSize: 0, boxPt: size, scale: scale)
+            text: "", fontSize: 0, boxPt: size, scale: scale, appearance: NSApplication.shared.effectiveAppearance.name.rawValue)
         if let image = placedGlyphTextures[key] { return image }
         placedGlyphTextures = placedGlyphTextures.filter { $0.key.index != index }
         nextAnnotationTextureGeneration &+= 1

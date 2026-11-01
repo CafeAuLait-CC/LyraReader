@@ -51,9 +51,11 @@ public enum LyraReaderTheme {
     public static let accentHover = Color(nsColor: adaptive(0x6E4C10, 0xF2D49F))
     public static let accentPressed = Color(nsColor: adaptive(0x573B09, 0xD6A654))
     public static let onAccent = Color(nsColor: adaptive(0xFFFFFF, 0x2D2417))
-    public static let accentSoft = Color(nsColor: adaptive(0xF8EDD6, 0x3B3122))
+    public static let accentSoftColor = adaptive(0xF8EDD6, 0x3B3122)
+    public static let accentSoft = Color(nsColor: accentSoftColor)
     public static let accentBorder = Color(nsColor: adaptive(0x9F752D, 0xC99B4F))
-    public static let hoverBg = Color(nsColor: adaptive(0xEDE7DE, 0x3B3429))
+    public static let hoverBgColor = adaptive(0xEDE7DE, 0x3B3429)
+    public static let hoverBg = Color(nsColor: hoverBgColor)
     public static let pressedBg = Color(nsColor: adaptive(0xE1D7C7, 0x4B3C27))
     public static let selectedBg = Color(nsColor: adaptive(0xF5DEB3, 0x514022))
     public static let selectedFg = Color(nsColor: adaptive(0x5B4319, 0xF5DEB3))
@@ -69,7 +71,8 @@ public enum LyraReaderTheme {
     public static let searchCurrentBg = Color(nsColor: adaptive(0xE6B764, 0x7A571F))
     public static let searchCurrentFg = Color(nsColor: adaptive(0x342710, 0xFFF8E7))
     public static let bookmark = Color(nsColor: adaptive(0x9A6A19, 0xE7C07B))
-    public static let noteBg = Color(nsColor: adaptive(0xFFF0E6, 0x463126))
+    public static let noteBgColor = adaptive(0xFFF0E6, 0x463126)
+    public static let noteBg = Color(nsColor: noteBgColor)
     public static let noteFg = Color(nsColor: adaptive(0x8A4C26, 0xF3BD94))
     public static let successBg = Color(nsColor: adaptive(0xE9F3ED, 0x243A2D))
     public static let successFg = Color(nsColor: adaptive(0x2F6F53, 0x96CBA9))
@@ -108,16 +111,32 @@ public enum LyraReaderTheme {
 }
 
 /// Shared by toolbar buttons; native keyboard focus and disabled behavior are preserved.
-struct LyraReaderToolStyle: ButtonStyle {
-    var selected = false
+private struct LyraToolSelectionKey: EnvironmentKey {
+    static let defaultValue = false
+}
 
+extension EnvironmentValues {
+    var lyraToolSelected: Bool {
+        get { self[LyraToolSelectionKey.self] }
+        set { self[LyraToolSelectionKey.self] = newValue }
+    }
+}
+
+extension View {
+    /// Selection is environment data so the style identity survives a drawer/layout change.
+    func lyraToolStyle(selected: Bool = false) -> some View {
+        buttonStyle(LyraReaderToolStyle()).environment(\.lyraToolSelected, selected)
+    }
+}
+
+struct LyraReaderToolStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
-        ToolBody(configuration: configuration, selected: selected)
+        ToolBody(configuration: configuration)
     }
 
     private struct ToolBody: View {
         let configuration: Configuration
-        let selected: Bool
+        @Environment(\.lyraToolSelected) private var selected
         @Environment(\.isEnabled) private var enabled
         @State private var hovered = false
 

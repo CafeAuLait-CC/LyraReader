@@ -73,7 +73,7 @@ public struct SidebarView: View {
                         Spacer(minLength: 0)
                         if state.sidebarTab == .bookmarks {
                             Button { state.addBookmarkAtCurrentPage() } label: { Image(systemName: "plus") }
-                                .buttonStyle(LyraReaderToolStyle())
+                                .lyraToolStyle()
                                 .disabled(state.document == nil)
                                 .accessibilityLabel("Add Bookmark")
                                 .help("Bookmark this page (⌘D)")

@@ -431,7 +431,7 @@ public struct PerformancePanelView: View {
                 Image(systemName: "xmark")
                     .font(.system(size: 10, weight: .semibold))
             }
-            .buttonStyle(LyraReaderToolStyle())
+            .lyraToolStyle()
             .help("Close performance panel")
             .accessibilityLabel("Close performance panel")
         }

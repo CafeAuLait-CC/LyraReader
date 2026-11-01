@@ -426,8 +426,10 @@ final class TranslationChipView: NSView {
     private var primaryAction: (() -> Void)?
     private var cancelAction: (() -> Void)?
     private var discloseAction: (() -> Void)?
+    private var hovered = false
+    private var showsTranslation = false
 
-    static let height: CGFloat = 20
+    static let height: CGFloat = 22
     static let font = NSFont.systemFont(ofSize: 10, weight: .medium)
 
     override var isFlipped: Bool { true }
@@ -439,12 +441,8 @@ final class TranslationChipView: NSView {
         layer?.cornerRadius = 5
         layer?.borderWidth = 0.5
         layer?.masksToBounds = false
-        layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.97).cgColor
-        layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.8).cgColor
-        layer?.shadowColor = NSColor.black.cgColor
-        layer?.shadowOpacity = 0.16
-        layer?.shadowRadius = 2
-        layer?.shadowOffset = CGSize(width: 0, height: 1)
+        layer?.backgroundColor = NSColor.clear.cgColor
+        layer?.borderWidth = 0
         configure(primary, size: 10, weight: .medium)
         configure(cancel, size: 11, weight: .semibold)
         configure(disclose, size: 11, weight: .semibold)
@@ -472,27 +470,33 @@ final class TranslationChipView: NSView {
         button.isBordered = false
         button.bezelStyle = .inline
         button.font = NSFont.systemFont(ofSize: size, weight: weight)
-        button.contentTintColor = .labelColor
-        button.focusRingType = .none
+        button.contentTintColor = LyraReaderTheme.accentColor
+        button.focusRingType = .exterior
     }
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         needsDisplay = true
-        layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.97).cgColor
-        layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.8).cgColor
-        for button in [primary, cancel, disclose] {
-            button.contentTintColor = .labelColor
-        }
+        for button in [primary, cancel, disclose] { button.contentTintColor = LyraReaderTheme.accentColor }
     }
 
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas { removeTrackingArea(area) }
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                      owner: self, userInfo: nil))
+    }
+    override func mouseEntered(with event: NSEvent) { hovered = true; needsDisplay = true }
+    override func mouseExited(with event: NSEvent) { hovered = false; needsDisplay = true }
+
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.controlBackgroundColor.withAlphaComponent(0.97).setFill()
+        let surface = hovered ? LyraReaderTheme.hoverBgColor
+            : (showsTranslation ? LyraReaderTheme.accentSoftColor : LyraReaderTheme.raisedBgColor)
+        surface.setFill()
         NSBezierPath(roundedRect: bounds, xRadius: 5, yRadius: 5).fill()
-        NSColor.separatorColor.withAlphaComponent(0.8).setStroke()
-        let outline = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.25, dy: 0.25),
-                                   xRadius: 5, yRadius: 5)
-        outline.lineWidth = 0.5
+        LyraReaderTheme.accentColor.withAlphaComponent(hovered ? 0.8 : 0.5).setStroke()
+        let outline = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 4.5, yRadius: 4.5)
+        outline.lineWidth = 1
         outline.stroke()
     }
 
@@ -519,7 +523,13 @@ final class TranslationChipView: NSView {
             primary.toolTip = message
             primary.setAccessibilityLabel("Retry translation")
         }
+        showsTranslation = overlay.phase == .translated
         primary.title = title
+        primary.image = NSImage(systemSymbolName: showsTranslation ? "arrow.uturn.backward" : "character.bubble",
+                                accessibilityDescription: nil)
+        primary.imagePosition = .imageLeading
+        primary.contentTintColor = LyraReaderTheme.accentColor
+        needsDisplay = true
         primary.isEnabled = primaryEnabled
         primaryAction = onPrimary
         cancelAction = onCancel
@@ -534,7 +544,7 @@ final class TranslationChipView: NSView {
     func preferredSize() -> CGSize {
         let labelWidth = ceil((primary.title as NSString).size(
             withAttributes: [.font: Self.font]).width)
-        var width: CGFloat = 14 + labelWidth
+        var width: CGFloat = 28 + labelWidth
         if !cancel.isHidden { width += 4 + 14 }
         if !disclose.isHidden { width += 4 + 14 }
         return CGSize(width: max(48, width), height: Self.height)
@@ -545,8 +555,8 @@ final class TranslationChipView: NSView {
         var x: CGFloat = 7
         let labelWidth = ceil((primary.title as NSString).size(
             withAttributes: [.font: Self.font]).width)
-        primary.frame = CGRect(x: x, y: 1, width: labelWidth + 2, height: Self.height - 2)
-        x += labelWidth + 2 + 3
+        primary.frame = CGRect(x: x, y: 1, width: labelWidth + 16, height: Self.height - 2)
+        x += labelWidth + 16 + 3
         if !disclose.isHidden {
             disclose.frame = CGRect(x: x, y: 1, width: 16, height: Self.height - 2)
             x += 16 + 2

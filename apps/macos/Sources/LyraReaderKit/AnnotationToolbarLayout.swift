@@ -282,7 +282,7 @@ struct ContentEditToolRow: View {
                 Image(systemName: icon)
             }
         }
-        .buttonStyle(LyraReaderToolStyle(selected: selected))
+        .lyraToolStyle(selected: selected)
         .help(selected ? help + " Click it again to return to the pointer." : help)
         .accessibilityLabel(title)
         .accessibilityValue(selected ? "Selected" : "")
@@ -367,7 +367,7 @@ struct AnnotationToolRow: View {
             Image(systemName: icon)
                 .modifier(ReaderToolbarIcon(id: "\(title).icon"))
         }
-        .buttonStyle(LyraReaderToolStyle(selected: state.annotationTool == tool))
+        .lyraToolStyle(selected: state.annotationTool == tool)
         .disabled(tool == .eraser ? !state.canUseEraserTool : !state.canEditAnnotations)
         .help(help)
         .accessibilityLabel(title)

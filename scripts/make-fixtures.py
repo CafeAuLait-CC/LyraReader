@@ -2246,6 +2246,30 @@ def chapter_previews_pdf() -> bytes:
         page_resources_extra=f" /XObject << /Outer {form_id} 0 R >>".encode())
 
 
+def navigation_notes_pdf() -> bytes:
+    """Contents links, an off-page reply placeholder, and clipped standalone notes."""
+    pages = [
+        (text_page("Contents", "", ["Chapter 1 ... 2", "Chapter 2 ... 3"]), 0),
+        (text_page("Chapter 1", "", ["A sentence with a review thread."]), 0),
+        (text_page("Chapter 2", "", ["A second chapter."]), 0),
+    ]
+    parent = 4 + 2 * len(pages) + 2  # Two contents links precede this annotation.
+    box = body_line_box(0, 210)
+    return build_pdf(pages, annotations={
+        0: [annotation("Link", body_line_box(i, 180),
+                       extra=f"/Border [0 0 0] /Dest [{6 + i * 2} 0 R /Fit]")
+            for i in range(2)],
+        1: [
+            annotation("Highlight", box, extra=f"/QuadPoints {quad_points([box])}",
+                       contents="Parent discussion", name="review-parent"),
+            annotation("Text", (0, -20, 20, 0), extra=f"/IRT {parent} 0 R /C [0.3 0.1 0.3]",
+                       contents="Reply in the discussion", name="offpage-reply"),
+            annotation("Text", (0, -24, 20, -4), contents="Standalone off-page note"),
+            annotation("Text", (585, 650, 611, 676), contents="Partially clipped note"),
+        ],
+    })
+
+
 def booktabs_bounds_pdf() -> bytes:
     """Top captions, three-rule tables, and a fraction bar after the first table."""
     body = text_page("Table previews", "bounds come from rules and text rows", [
@@ -2732,6 +2756,7 @@ def main() -> int:
     path.write_bytes(narrative_citation_pdf())
     (out_dir / "booktabs-bounds.pdf").write_bytes(booktabs_bounds_pdf())
     (out_dir / "chapter-previews.pdf").write_bytes(chapter_previews_pdf())
+    (out_dir / "navigation-notes.pdf").write_bytes(navigation_notes_pdf())
     print(f"  {path}  ({path.stat().st_size} bytes, narrative author-year link)")
 
     # 12) T4.52: section references in running text. Page 1 points at "Section 2" and page 2 at

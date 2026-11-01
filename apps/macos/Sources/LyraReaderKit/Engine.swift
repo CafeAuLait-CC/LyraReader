@@ -539,6 +539,8 @@ public struct DocumentLink: Sendable {
     public let page: Int?
     /// Region of the target page the citation points at (`/FitR`), in view space.
     public let region: CGRect?
+    /// Contents and figure/table lists keep direct navigation, even on numbered links.
+    public let navigation: Bool
 }
 
 /// A citation in the body text, boxed in view space.
@@ -2861,7 +2863,8 @@ public final class RustEngine: PDFEngine {
                                         width: region.widthPt,
                                         height: region.heightPt
                                     )
-                                }
+                                },
+                                navigation: link.navigation
                             )
                         }
                     )

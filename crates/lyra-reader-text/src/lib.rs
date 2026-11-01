@@ -21,6 +21,7 @@ mod bibliography_tests;
 mod equations;
 mod figures;
 mod fragments;
+mod navigation;
 mod numbered;
 mod paren;
 mod selection;
@@ -35,6 +36,7 @@ pub use figures::{
     CaptionMention, PageEvidence, caption_region, caption_region_from,
     caption_region_without_margin, find_caption_mentions,
 };
+pub use navigation::is_navigation_page;
 pub use paren::{ParenthesisedCandidate, inspect_parenthesised_citations};
 pub use selection::{
     MAX_REGION_TEXT_CHARS, SelectionLayout, SelectionLine, SelectionStop, SelectionTextPage,

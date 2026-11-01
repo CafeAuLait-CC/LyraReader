@@ -2753,6 +2753,12 @@ impl LyraReaderDocument {
     /// Only actionable links come back: a page to jump to, a URL to open, or both.
     pub fn links(&self, page: u32) -> Result<Vec<LinkRecord>, LyraReaderFfiError> {
         let geometry = self.backend.page_info(PageIndex(page))?.geometry;
+        // A missing text layer leaves the historical link behavior intact.
+        let navigation = self
+            .backend
+            .raw_text_page(PageIndex(page))
+            .map(|text| lyra_reader_text::is_navigation_page(&text))
+            .unwrap_or(false);
 
         Ok(self
             .backend
@@ -2782,6 +2788,7 @@ impl LyraReaderDocument {
                     uri: link.uri,
                     page: link.page.map(|page| page.get()),
                     region,
+                    navigation,
                 }
             })
             .collect())
@@ -6092,6 +6099,8 @@ pub struct LinkRecord {
     pub page: Option<u32>,
     /// Region of the target page the citation points at, when the destination is a `/FitR`.
     pub region: Option<LinkRegion>,
+    /// A contents/list link should navigate directly instead of opening a preview.
+    pub navigation: bool,
 }
 
 /// A rectangle on a page, in view space (points, top-left origin).
