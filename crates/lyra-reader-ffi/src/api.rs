@@ -2584,17 +2584,30 @@ impl LyraReaderDocument {
         let Ok(text) = self.backend.raw_text_page(PageIndex(index)) else {
             return Vec::new();
         };
-        // Detect captions before reading the page geometry and object summary. A page with no
-        // caption produces no records, so the object/rule/geometry reads would be pure cost;
-        // on a caption-free 115-page paper that is most of the scan. Pages that do have a
-        // caption still read exactly the same inputs in the same order as before.
+        // Equations need only text and page geometry. Read artwork and rules only when a
+        // caption needs them; most body pages have no figure or table.
         let captions = lyra_reader_text::find_captions(&text);
-        if captions.is_empty() {
-            return Vec::new();
-        }
         let Ok(info) = self.backend.page_info(PageIndex(index)) else {
             return Vec::new();
         };
+        let page_bounds = info.geometry.crop_box;
+        let mut records = Vec::new();
+        for equation in lyra_reader_text::find_numbered_equations(&text, page_bounds) {
+            let view = page_region_to_view(equation.rect, info.geometry);
+            records.push(FigureRecord {
+                kind: equation.kind,
+                label: equation.label,
+                page: index,
+                caption_text: equation.text,
+                x_pt: view.origin.x,
+                y_pt: view.origin.y,
+                width_pt: view.size.width,
+                height_pt: view.size.height,
+            });
+        }
+        if captions.is_empty() {
+            return records;
+        }
         // Images are a best-effort input: a caption with no image object still previews its
         // own box, so a page whose objects cannot be read is not a page with no figures.
         let (images, _rule_count) = self
@@ -2608,17 +2621,20 @@ impl LyraReaderDocument {
             .backend
             .page_line_segments(PageIndex(index))
             .unwrap_or_default();
+        let graphics = self
+            .backend
+            .page_graphic_bounds(PageIndex(index))
+            .unwrap_or_default();
         let lines = lyra_reader_text::lines_from(&text);
         let evidence = lyra_reader_text::PageEvidence {
             images: &images,
+            graphics: &graphics,
+            text: Some(&text),
             rules: &rules,
             lines: &lines,
         };
         // Regions are derived in page space and clamped to the full visible CropBox; its
         // origin can be non-zero. Transforming all four corners below also handles /Rotate.
-        let page_bounds = info.geometry.crop_box;
-
-        let mut records = Vec::new();
         for caption in captions {
             let region = lyra_reader_text::caption_region_from(&caption, evidence, page_bounds);
             let view = page_region_to_view(region, info.geometry);
@@ -2737,6 +2753,12 @@ impl LyraReaderDocument {
     /// Only actionable links come back: a page to jump to, a URL to open, or both.
     pub fn links(&self, page: u32) -> Result<Vec<LinkRecord>, LyraReaderFfiError> {
         let geometry = self.backend.page_info(PageIndex(page))?.geometry;
+        // A missing text layer leaves the historical link behavior intact.
+        let navigation = self
+            .backend
+            .raw_text_page(PageIndex(page))
+            .map(|text| lyra_reader_text::is_navigation_page(&text))
+            .unwrap_or(false);
 
         Ok(self
             .backend
@@ -2766,6 +2788,7 @@ impl LyraReaderDocument {
                     uri: link.uri,
                     page: link.page.map(|page| page.get()),
                     region,
+                    navigation,
                 }
             })
             .collect())
@@ -6076,6 +6099,8 @@ pub struct LinkRecord {
     pub page: Option<u32>,
     /// Region of the target page the citation points at, when the destination is a `/FitR`.
     pub region: Option<LinkRegion>,
+    /// A contents/list link should navigate directly instead of opening a preview.
+    pub navigation: bool,
 }
 
 /// A rectangle on a page, in view space (points, top-left origin).
@@ -7591,11 +7616,11 @@ pub struct ReferenceFragment {
     pub height_pt: f64,
 }
 
-/// A figure or table caption, with the region of its page a floating preview should show.
+/// A figure/table caption or numbered equation, with its floating preview region.
 #[derive(Debug, Clone, PartialEq, uniffi::Record, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FigureRecord {
-    /// `Figure`, `Table`, or `Algorithm`.
+    /// `Figure`, `Table`, `Algorithm`, or `Equation`.
     pub kind: String,
     /// The number as printed: `3`, `12`.
     pub label: String,

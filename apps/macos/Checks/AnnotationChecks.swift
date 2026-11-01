@@ -1039,9 +1039,15 @@ extension ReaderChecks {
         )
         let noteColour = colouredNote.color ?? AnnotationColor.defaultNote
         let fill = snapshot.fraction(ofColor: noteColour, inContentRect: noteBox)
-        require(fill > 0.25,
-                "the sticky note is drawn in its own colour over the page (\(Int(fill * 100))% of "
+        require(fill > 0.005 && fill < 0.15,
+                "the sticky note retains its source colour as a compact cue (\(Int(fill * 100))% of "
                     + "its box is \(noteColour.hex) \(snapshot.describe(noteBox)))")
+        let surface = LyraReaderTheme.noteBgColor.usingColorSpace(.deviceRGB)!
+        let surfaceColor = AnnotationColor(red: UInt8((surface.redComponent * 255).rounded()),
+                                          green: UInt8((surface.greenComponent * 255).rounded()),
+                                          blue: UInt8((surface.blueComponent * 255).rounded()), alpha: 255)
+        require(snapshot.fraction(ofColor: surfaceColor, inContentRect: noteBox) > 0.35,
+                "the note's main surface uses the Lyra note token")
         let textBox = CGRect(
             x: textQuad.placement.leftPt,
             y: textQuad.placement.topPt,
@@ -1052,7 +1058,7 @@ extension ReaderChecks {
         require(textInk > 0.01,
                 "the free-text annotation's text is on the page (\(Int(textInk * 100))% of its "
                     + "box is ink \(snapshot.describe(textBox)))")
-        // …and the second note, which the file gives no colour, is drawn in the default one.
+        // A colourless note uses the same Lyra surface and a default-colour cue.
         let plainQuad = state.canvasPages.first {
             $0.placement.index == PlacementIndex.documentNote(1)
         }
@@ -1067,9 +1073,11 @@ extension ReaderChecks {
                 ofColor: AnnotationColor.defaultNote,
                 inContentRect: plainBox
             )
-            require(plainFill > 0.25,
-                    "a note with no /C is still visible, in the default note colour "
+            require(plainFill > 0.005 && plainFill < 0.15,
+                    "a note with no /C keeps the default colour cue "
                         + "(\(Int(plainFill * 100))% of its box)")
+            require(snapshot.fraction(ofColor: surfaceColor, inContentRect: plainBox) > 0.35,
+                    "the colourless note shares the same Lyra surface")
         } else {
             fatalError("FAIL: the colourless note reached no quad")
         }

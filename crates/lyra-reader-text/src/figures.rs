@@ -29,6 +29,10 @@ use crate::{Caption, TextLine, union_boxes, union_rect};
 pub struct PageEvidence<'a> {
     /// Image-object boxes, from `page_object_summary`.
     pub images: &'a [Rect],
+    /// Individual vector path bounds, transformed through enclosing forms into page space.
+    pub graphics: &'a [Rect],
+    /// Raw text for line boundaries and words in the producer's text order.
+    pub text: Option<&'a RawTextPage>,
     /// Axis-aligned rules of the page's vector geometry, from `page_line_segments`.
     ///
     /// Tables are drawn as lines and have no object of their own, so this is the only handle on
@@ -90,7 +94,7 @@ const PREVIEW_MARGIN_MAX_PT: f64 = 12.0;
 /// and is not reported.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CaptionMention {
-    /// `Figure`, `Table`, or `Algorithm` (the normalised spelling, as in [`Caption::kind`]).
+    /// `Figure`, `Table`, `Algorithm`, or `Equation` (the normalised spelling).
     pub kind: String,
     /// The number as printed: `3`, `12`.
     pub label: String,
@@ -118,10 +122,8 @@ pub struct CaptionMention {
 /// as such.)
 ///
 /// The vocabulary deliberately matches `find_captions` — `Figure`, `Fig.`, `Table`, `Algorithm`,
-/// `Alg.`, then a plain
-/// number — so that a mention and a caption agree on what `Figure 3` names. Plural forms
-/// (`Figures 3 and 4`) and sub-numbers (`Fig. 3.1`) are not reported, because no caption carries
-/// those labels either; a `3` followed by a letter (`Figure 3a`) is reported as label `3`.
+/// `Alg.`, then a numeric, chapter, or appendix label (`3`, `1.1`, `A.4`). Plural forms
+/// (`Figures 3 and 4`) are not reported; a panel suffix (`Figure 3a`) names figure `3`.
 pub fn find_caption_mentions(text: &RawTextPage) -> Vec<CaptionMention> {
     let chars: Vec<char> = text
         .chars
@@ -149,7 +151,11 @@ pub fn find_caption_mentions(text: &RawTextPage) -> Vec<CaptionMention> {
             continue;
         }
 
-        let (kind, after_word) = if matches_word(&chars, index, "figure") {
+        let (kind, after_word) = if matches_word(&chars, index, "equation") {
+            ("Equation", index + 8)
+        } else if matches_word(&chars, index, "eq") && chars.get(index + 2) == Some(&'.') {
+            ("Equation", index + 3)
+        } else if matches_word(&chars, index, "figure") {
             ("Figure", index + 6)
         } else if matches_word(&chars, index, "table") {
             ("Table", index + 5)
@@ -173,22 +179,14 @@ pub fn find_caption_mentions(text: &RawTextPage) -> Vec<CaptionMention> {
             digits += 1;
         }
 
-        let mut label_end = digits;
-        while chars
-            .get(label_end)
-            .is_some_and(|character| character.is_ascii_digit() || *character == '.')
-        {
-            label_end += 1;
+        if kind == "Equation" && chars.get(digits) == Some(&'(') {
+            digits += 1;
         }
-        // Same rule as `find_captions`: a plain number, so a sentence's full stop is not part of
-        // the label (`Figure 3.`) and `Figure 3.1` is rejected rather than truncated to `3`.
-        let label: String = chars[digits..label_end].iter().collect();
-        let label = label.trim_end_matches('.').to_string();
-        if label.is_empty() || !label.chars().all(|character| character.is_ascii_digit()) {
+        let Some(length) = crate::numbered::label_len(&chars[digits..]) else {
             continue;
-        }
-
-        let end = digits + label.chars().count();
+        };
+        let end = digits + length;
+        let label: String = chars[digits..end].iter().collect();
         mentions.push(CaptionMention {
             kind: kind.to_string(),
             label,
@@ -234,10 +232,9 @@ pub fn find_caption_mentions(text: &RawTextPage) -> Vec<CaptionMention> {
 ///
 /// # Limits, stated plainly
 ///
-/// * **Vector figures and tables have no image object at all.** Those previews use the full page,
-///   preserving the artwork or grid in context instead of claiming the caption is the preview.
-///   On the Ye paper, most figures are vector art. (A `Table` does better when the caller can
-///   supply the page's rules: see [`caption_region_from`].)
+/// * **Vector figures need path bounds and text boundaries.** `caption_region_from` can use
+///   those to exclude running headers and prose. Without that evidence this entry point keeps
+///   the full page. Tables can use their grid through the same richer entry point.
 /// * **An image object's reported box is often a form's, not the picture's**, because PDFium
 ///   reports the enclosing form XObject's bounds (the core documents this in
 ///   `page_object_summary`). On page 18 of the Ye paper one such box spans two figures at once, so
@@ -263,16 +260,15 @@ pub fn caption_region(caption: &Caption, images: &[Rect], page_bounds: Rect) -> 
 
 /// [`caption_region`], with the whole page as evidence instead of only its image objects.
 ///
-/// The extra inputs buy exactly one thing, and it is the one the task asked for: a `Table`
-/// caption whose table is drawn as a grid can be bounded by that grid
-/// ([`crate::tables::table_region`]) instead of falling back to the full page. Every other
-/// decision is unchanged, so a caller that switches to this entry point cannot regress a figure.
+/// Tables use their grid (`table_region`); figures use nearby image objects or vector path
+/// bounds constrained by captions, prose, headings, and columns.
 ///
-/// The three sources are consulted in the order of how much they claim:
+/// The four sources are consulted in the order of how much they claim:
 ///
 /// 1. a table grid, for `Table` captions only — geometry the page itself draws;
 /// 2. an image object near a `Figure` caption — the historical rule;
-/// 3. the full visible page.
+/// 3. vector artwork between the caption and the preceding text boundary;
+/// 4. the full visible page when no local artwork can be established.
 ///
 /// A `Table` caption whose page yields no grid keeps the full page, which is the honest answer:
 /// the reader asked for one table and the alternative is a crop of the caption alone.
@@ -288,8 +284,7 @@ pub fn caption_region_from(
 /// [`caption_region_from`] without the white edge: the region the page's own geometry gives.
 ///
 /// The full-page fallback comes back as the page, and [`with_preview_margin`] then has nothing to
-/// grow — which is what keeps "the shell shows the whole page" true for vector figures and for
-/// tables whose grid the page does not draw.
+/// grow. Uncertain artwork and tables without a detected grid therefore keep the whole page.
 ///
 /// The two steps are separate because they are decided differently: the geometry is measured
 /// against what the page draws, and the edge is a presentation choice that is then held back by
@@ -349,7 +344,7 @@ pub fn caption_region_without_margin(
     }
 
     let region = if included.is_empty() {
-        return page_bounds;
+        return vector_figure_region(caption, evidence, page_bounds).unwrap_or(page_bounds);
     } else {
         included
             .iter()
@@ -357,6 +352,126 @@ pub fn caption_region_without_margin(
     };
 
     clamp_to_page(region, page_bounds)
+}
+
+/// Producer line breaks preserve word spacing and exclude synthetic whitespace boxes.
+/// Geometric lines remain available to the table detector, whose cell grouping uses them.
+fn preview_text_lines(evidence: PageEvidence<'_>) -> Option<Vec<TextLine>> {
+    evidence.text.map(|text| {
+        let chars: Vec<_> = text
+            .chars
+            .iter()
+            .map(|c| char::from_u32(c.unicode).unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect();
+        crate::caption_lines(text, &chars)
+            .into_iter()
+            .map(|line| TextLine {
+                rect: line.rect,
+                text: line.raw,
+                range: line.start as u32..line.end as u32,
+                ink: Vec::new(),
+            })
+            .collect::<Vec<_>>()
+    })
+}
+
+/// Bound vector artwork between its caption and the preceding prose/heading. A path alone
+/// cannot name a figure; the caption's column and the text boundaries constrain the search.
+fn vector_figure_region(caption: &Caption, evidence: PageEvidence<'_>, page: Rect) -> Option<Rect> {
+    let raw_lines = preview_text_lines(evidence);
+    let lines = raw_lines.as_deref().unwrap_or(evidence.lines);
+    let mut heights: Vec<_> = evidence
+        .text
+        .into_iter()
+        .flat_map(|text| {
+            text.chars[caption.start.min(text.chars.len())..caption.end.min(text.chars.len())]
+                .iter()
+        })
+        .filter(|c| char::from_u32(c.unicode).is_some_and(|c| !c.is_whitespace()))
+        .map(|c| c.rect.size.height)
+        .collect();
+    heights.sort_by(f64::total_cmp);
+    let caption_height = heights.get(heights.len() / 2).copied().unwrap_or(10.0);
+    let prose = |line: &TextLine| {
+        let words = line.text.split_whitespace().count();
+        let letters = line.text.chars().filter(|c| c.is_alphabetic()).count();
+        let chars: Vec<_> = line.text.trim_start().chars().collect();
+        let heading = letters >= 10
+            && line.rect.size.height >= caption_height * 0.8
+            && crate::numbered::label_len(&chars).is_some_and(|end| {
+                chars
+                    .get(end)
+                    .is_some_and(|c| c.is_whitespace() || *c == '.')
+            });
+        crate::caption_label(&line.text).is_some()
+            || heading
+            || (letters >= 15
+                && line.rect.size.height >= caption_height * 0.8
+                && words >= 2
+                && line.rect.size.width > caption.rect.size.width * 0.35)
+    };
+    let top = lines
+        .iter()
+        .filter(|line| line.rect.origin.y > caption.rect.max_y() + 3.0)
+        .filter(|line| overlaps_horizontally(line.rect, caption.rect) && prose(line))
+        .map(|line| line.rect.origin.y - 3.0)
+        .min_by(f64::total_cmp)
+        .unwrap_or(page.max_y() - 36.0);
+    if top <= caption.rect.max_y() {
+        return None;
+    }
+    let (mut left, mut right) = (page.origin.x, page.max_x());
+    if let Some(gutter) = crate::tables::column_gutter(evidence.lines, Some(caption.rect)) {
+        if caption.rect.max_x() < gutter {
+            right = gutter;
+        } else if caption.rect.origin.x > gutter {
+            left = gutter;
+        }
+    }
+    // Separate floats can share a row even in a single-column document. Their own caption
+    // labels divide that row; a short caption must still include all panels on its side.
+    for line in lines {
+        if crate::caption_label(&line.text).is_none()
+            || (line.rect.origin.y - caption.rect.origin.y).abs() > caption_height
+        {
+            continue;
+        }
+        if line.rect.origin.x > caption.rect.max_x() {
+            right = right.min((line.rect.origin.x + caption.rect.max_x()) / 2.0);
+        } else if line.rect.max_x() < caption.rect.origin.x {
+            left = left.max((line.rect.max_x() + caption.rect.origin.x) / 2.0);
+        }
+    }
+    let mut region: Option<Rect> = None;
+    for graphic in evidence.graphics {
+        // Page backgrounds, running-header rules, and artwork crossing the text boundary are
+        // not evidence for this float. Thin lines remain valid axes of a vector plot.
+        if graphic.origin.y < caption.rect.max_y() - 1.0
+            || graphic.max_y() > top
+            || graphic.size.width.max(graphic.size.height) < 0.1
+            || (graphic.size.height < 1.0 && graphic.size.width > caption.rect.size.width * 0.8)
+            || graphic.max_x() < left
+            || graphic.origin.x > right
+        {
+            continue;
+        }
+        region = Some(region.map_or(*graphic, |r| union_rect(r, *graphic)));
+    }
+    let mut region = region?;
+    if region.size.width < 12.0 || region.size.height < 12.0 {
+        return None;
+    }
+    // Plot ticks and diagram labels are text objects, often just outside the path bounds.
+    for line in lines {
+        if line.rect.origin.y >= caption.rect.max_y()
+            && line.rect.max_y() <= top
+            && !prose(line)
+            && touches(line.rect, region)
+        {
+            region = union_rect(region, line.rect);
+        }
+    }
+    Some(clamp_to_page(union_rect(region, caption.rect), page))
 }
 
 /// Grows `region` by the preview's white edge, stopping short of the page's other content.
@@ -368,8 +483,8 @@ pub fn caption_region_without_margin(
 /// applied — the nearest other content sits 1.2 pt away at the fifth percentile, 1.9 pt at the
 /// tenth and 6.6 pt at the twenty-fifth, so between a tenth and a quarter of the regions have less
 /// room around them than the edge asks for. The region itself is what stays inside the page: the
-/// grown rectangle is clamped to `page_bounds` afterwards, which leaves a full-page fallback
-/// exactly as it was.
+/// grown rectangle is clamped to `page_bounds` afterwards, which leaves an uncertain full-page
+/// fallback exactly as it was.
 fn with_preview_margin(region: Rect, evidence: PageEvidence<'_>, page_bounds: Rect) -> Rect {
     if region.size.width <= 0.0 || region.size.height <= 0.0 {
         return region;
@@ -381,11 +496,13 @@ fn with_preview_margin(region: Rect, evidence: PageEvidence<'_>, page_bounds: Re
     let mut bottom = region.origin.y - requested;
     let mut top = region.max_y() + requested;
 
-    for blocker in evidence
-        .lines
+    let raw_lines = preview_text_lines(evidence);
+    let lines = raw_lines.as_deref().unwrap_or(evidence.lines);
+    for blocker in lines
         .iter()
         .map(|line| line.rect)
         .chain(evidence.images.iter().copied())
+        .chain(evidence.graphics.iter().copied())
     {
         if blocker.size.width <= 0.0 || blocker.size.height <= 0.0 {
             continue;
@@ -639,10 +756,35 @@ mod figure_tests {
     }
 
     #[test]
-    fn a_dotted_sub_number_is_not_truncated_into_a_mention() {
-        // `Figure 3.1` must not be offered as `Figure 3`: no caption carries the dotted label.
+    fn a_dotted_sub_number_keeps_its_entire_label() {
+        // A chapter label must resolve to its own caption, never the chapter-wide integer.
         let page = crate::test_page("See Figure 3.1 for details.\n");
-        assert!(find_caption_mentions(&page).is_empty());
+        let mentions = find_caption_mentions(&page);
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].label, "3.1");
+    }
+
+    #[test]
+    fn chapter_and_appendix_captions_and_mentions_use_identical_keys() {
+        let page = crate::test_page(
+            "Figure 1.1: Overview.\nFigure A.4: Comparison.\nSee Figure 1.1 and Figure A.4, then Equation A.38 and Eq. (A.39).\n",
+        );
+        let captions = crate::find_captions(&page);
+        assert_eq!(
+            captions
+                .iter()
+                .map(|c| c.label.as_str())
+                .collect::<Vec<_>>(),
+            ["1.1", "A.4"]
+        );
+        let mentions = find_caption_mentions(&page);
+        assert_eq!(
+            mentions
+                .iter()
+                .map(|m| m.label.as_str())
+                .collect::<Vec<_>>(),
+            ["1.1", "A.4", "A.38", "A.39"]
+        );
     }
 
     #[test]

@@ -264,6 +264,9 @@ fn captions_carry_the_whole_run_of_lines_that_continues_them() {
             };
             let lines = lines_of(&text);
             let page_lines = lines_from(&text);
+            let graphics = backend
+                .page_graphic_bounds(PageIndex(index))
+                .unwrap_or_default();
             let (images, _) = backend
                 .page_object_summary(PageIndex(index))
                 .unwrap_or_default();
@@ -336,6 +339,8 @@ fn captions_carry_the_whole_run_of_lines_that_continues_them() {
                 // itself, the figure it names, or the grid of the table it names.
                 let evidence = PageEvidence {
                     images: &images,
+                    graphics: &graphics,
+                    text: Some(&text),
                     rules: &rules,
                     lines: &page_lines,
                 };

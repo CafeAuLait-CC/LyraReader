@@ -11,6 +11,7 @@ import SwiftUI
 /// real SwiftUI rows through `ReaderToolbarProbe`, so the item order is the order a reader sees.
 extension ReaderChecks {
     @MainActor static func toolbarRowsChecks(root: URL) async throws {
+        try await toolbarActivationChecks(root: root)
         _ = NSApplication.shared
         // Use a scratch copy, not the checked-in fixture: this suite places and undoes
         // annotations, and the reader's process-wide annotation cache is keyed by path. Writing
@@ -1350,7 +1351,7 @@ extension ReaderChecks {
                         && annotateButtonSource.contains("Text(\"Annotate\")"),
                     "the Annotate button keeps its icon and text")
             require(annotateButtonSource.contains(
-                        ".buttonStyle(LyraReaderToolStyle(selected: state.annotationToolsVisible"),
+                        ".lyraToolStyle(selected: state.annotationToolsVisible"),
                     "the Annotate button keeps its selected state")
             require(annotateButtonSource.contains(".help(\"Show annotation tools\")"),
                     "the Annotate button keeps its tooltip")

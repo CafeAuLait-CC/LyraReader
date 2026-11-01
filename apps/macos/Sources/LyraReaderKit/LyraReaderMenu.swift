@@ -40,7 +40,7 @@ struct LyraReaderMenu<Label: View>: View {
 
     var body: some View {
         Button { presented.toggle() } label: { label() }
-            .buttonStyle(LyraReaderToolStyle(selected: presented))
+            .lyraToolStyle(selected: presented)
             .help(title).accessibilityLabel(title)
             .accessibilityValue(presented ? "Expanded" : "Collapsed")
             .background(LyraReaderMenuAnchor(presented: $presented, items: items))

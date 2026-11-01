@@ -63,6 +63,7 @@ fn table_captions_get_a_grid_region_when_the_page_draws_one() {
     files.sort();
 
     let mut captions = 0usize;
+    let mut extended_labels = 0usize;
     let mut grids = 0usize;
     let mut manuscript_grids = 0usize;
     let mut humanmm_table_one = None;
@@ -91,6 +92,9 @@ fn table_captions_get_a_grid_region_when_the_page_draws_one() {
 
             for caption in tables {
                 file_captions += 1;
+                if !caption.label.chars().all(|c| c.is_ascii_digit()) {
+                    extended_labels += 1;
+                }
                 let (outcome, grid) = table_outcome(&caption, &rules, &lines);
                 if let Some(grid) = grid {
                     file_grids += 1;
@@ -129,7 +133,17 @@ fn table_captions_get_a_grid_region_when_the_page_draws_one() {
     // reduce …` on page 9 of the Leader paper, which was never a caption — leaving 40 captions,
     // the same 20 grid regions (the removed line was a fallback) and 20 fallbacks. A change that
     // finds *more* tables is still welcome; this pins the count so a loss is not mistaken for it.
-    assert_eq!(captions, 40, "the corpus's table caption count changed");
+    // Chapter and appendix numbering adds 18 real table captions. Preserve the old plain
+    // numeric set independently, so new detections cannot hide the loss of an existing table.
+    assert_eq!(
+        captions - extended_labels,
+        40,
+        "the plain-numbered table count changed"
+    );
+    assert_eq!(
+        extended_labels, 18,
+        "the chapter/appendix table count changed"
+    );
     assert!(
         grids >= 20,
         "the corpus had 20 grid-derived tables; found {grids}"

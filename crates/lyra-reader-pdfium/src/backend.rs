@@ -8,7 +8,7 @@ use lyra_reader_core::{
     DocMetadata, DocumentBackend, EmbeddedMetadata, ErrorCode, LineSegment, LinkInfo,
     LyraReaderError, OutlineNode, PageGeometry, PageIndex, PageInfo, Point, RasterFormat,
     RasterRequest, RasterTile, RawAnnotation, RawCharBox, RawTextPage, Rect, Result, Rotation,
-    Size,
+    Size, Transform2D,
 };
 use pdfium_render::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -415,6 +415,21 @@ impl PdfiumBackend {
         collect_page_objects(pdf_page.objects().iter(), &mut images, &mut paths, 0);
 
         Ok((images, paths))
+    }
+
+    /// Leaf path bounds in page space, including nested form transforms. Text stays in the
+    /// text layer; retaining individual paths avoids adopting an entire enclosing page form.
+    pub fn page_graphic_bounds(&self, page: PageIndex) -> Result<Vec<Rect>> {
+        let _guard = lock_pdfium()?;
+        let pdf_page = self.page(page)?;
+        let mut bounds = Vec::new();
+        collect_graphic_bounds(
+            pdf_page.objects().iter(),
+            Transform2D::IDENTITY,
+            0,
+            &mut bounds,
+        );
+        Ok(bounds)
     }
 
     /// Axis-aligned rules on a page, split into horizontal and vertical.
@@ -1495,6 +1510,50 @@ fn collect_page_objects<'a>(
                 }
             }
             _ => {}
+        }
+    }
+}
+
+fn collect_graphic_bounds<'a>(
+    objects: impl Iterator<Item = PdfPageObject<'a>>,
+    parent: Transform2D,
+    depth: u32,
+    bounds: &mut Vec<Rect>,
+) {
+    if depth > 16 {
+        return;
+    }
+    for object in objects {
+        if let PdfPageObject::XObjectForm(form) = &object {
+            let Ok(matrix) = object.matrix() else {
+                continue;
+            };
+            let transform = Transform2D::new(
+                f64::from(matrix.a()),
+                f64::from(matrix.b()),
+                f64::from(matrix.c()),
+                f64::from(matrix.d()),
+                f64::from(matrix.e()),
+                f64::from(matrix.f()),
+            )
+            .then(parent);
+            collect_graphic_bounds(form.iter(), transform, depth + 1, bounds);
+        } else if object.object_type() == PdfPageObjectType::Path
+            && let Ok(quad) = object.bounds()
+        {
+            // The leaf's bounds already include its own matrix, but not its ancestors'.
+            let rect = parent.apply_rect(rect_from_quad(quad));
+            if [
+                rect.origin.x,
+                rect.origin.y,
+                rect.size.width,
+                rect.size.height,
+            ]
+            .iter()
+            .all(|value| value.is_finite())
+            {
+                bounds.push(rect);
+            }
         }
     }
 }
