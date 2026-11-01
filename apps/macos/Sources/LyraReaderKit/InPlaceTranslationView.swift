@@ -10,6 +10,8 @@ import QuartzCore
 final class TranslationOverlayView: NSView {
     var onToggle: ((String) -> Void)?
     var onCancel: ((String) -> Void)?
+    /// Drawing, erasing, and region placement keep canvas ownership while armed.
+    var canSelectText: (() -> Bool)?
 
     private var overlays: [TranslationOverlay] = []
     /// Display **segments**, not one entry per page. A torn page is two placements that share an
@@ -22,6 +24,8 @@ final class TranslationOverlayView: NSView {
     private var paperAppearance: PaperAppearance = .original
     private var paperColors: [Int: TranslationPaperColor] = [:]
     private var chips: [String: TranslationChipView] = [:]
+    private var textPieces: [String: TranslationTextPieceView] = [:]
+    private var layoutSize: CGSize = .zero
     /// Chips that had no room outside their block and were placed in its top-right corner.
     /// The text drawing excludes the chip's rectangle, so it never covers the translated words
     /// it belongs to even at extreme zoom.
@@ -40,12 +44,12 @@ final class TranslationOverlayView: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("TranslationOverlayView is programmatic") }
 
-    /// Consume a click only on a chip. Everywhere else the canvas keeps its pointer events.
+    /// AppKit supplies points in the superview's coordinates. Let the normal view hierarchy
+    /// convert them for chips and selectable text; empty paper still passes through to the PDF.
     override func hitTest(_ point: NSPoint) -> NSView? {
-        for chip in chips.values where !chip.isHidden && chip.frame.contains(point) {
-            return chip.hitTest(convert(point, to: chip))
-        }
-        return nil
+        let hit = super.hitTest(point)
+        if hit is NSTextView, canSelectText?() == false { return nil }
+        return hit === self ? nil : hit
     }
 
     func update(overlays: [TranslationOverlay], frames: [PagePlacement], zoom: CGFloat,
@@ -57,7 +61,7 @@ final class TranslationOverlayView: NSView {
         let viewChanged = zoom != self.zoom || scrollYPt != self.scrollYPt
             || contentWidthPt != self.contentWidthPt || framesChanged
             || paperAppearance != self.paperAppearance
-            || paperColors != self.paperColors
+            || paperColors != self.paperColors || bounds.size != layoutSize
         self.overlays = overlays
         self.frames = frames
         self.zoom = zoom
@@ -66,9 +70,20 @@ final class TranslationOverlayView: NSView {
         self.paperAppearance = paperAppearance
         self.paperColors = paperColors
         if overlaysChanged || viewChanged {
+            layoutSize = bounds.size
             rebuildChips()
+            rebuildTextPieces()
             needsDisplay = true
         }
+    }
+
+    override func layout() {
+        super.layout()
+        guard bounds.size != layoutSize else { return }
+        layoutSize = bounds.size
+        rebuildChips()
+        rebuildTextPieces()
+        needsDisplay = true
     }
 
     private var contentOffsetX: CGFloat {
@@ -267,62 +282,56 @@ final class TranslationOverlayView: NSView {
             context.setFillColor(paper.nsColor.cgColor)
             for block in blocks { context.fill(block) }
 
+
+        }
+        context.restoreGState()
+    }
+
+    /// Each paper segment clips the same text layout. Moving a tear or scrolling changes only
+    /// frames, so the text view keeps its selection and never selects the covered PDF glyphs.
+    private func rebuildTextPieces() {
+        var live: Set<String> = []
+        for overlay in overlays where overlay.phase == .translated {
             guard let translated = overlay.translatedText, !translated.isEmpty else { continue }
             let pieces = segments(for: overlay.page)
             guard let first = pieces.first else { continue }
             let fit = overlay.fit ?? TranslationTextLayout.fit(
                 text: translated, in: overlay.rect, sourceFontPt: overlay.sourceFontPt)
-            let textLocal = overlay.rect.insetBy(
-                dx: TranslationTextLayout.horizontalInsetPt,
-                dy: TranslationTextLayout.verticalInsetPt
-            )
-            guard textLocal.width > 0.5, textLocal.height > 0.5 else { continue }
-
-            let font = NSFont.systemFont(ofSize: max(0.5, fit.fontSizePt * zoom))
-            let paragraph = NSMutableParagraphStyle()
-            paragraph.lineBreakMode = .byWordWrapping
-            paragraph.lineSpacing = 0
-            paragraph.paragraphSpacing = 0
-            let attributed = NSAttributedString(
-                string: translated,
-                attributes: [
-                    .font: font,
-                    .foregroundColor: paper.inkColor,
-                    .paragraphStyle: paragraph,
-                ]
-            )
-            let pageTop = first.topPt
-            let pageLeft = first.leftPt
-            for segment in pieces {
-                let segmentView = segmentViewRect(segment)
-                guard segmentView.intersects(bounds.insetBy(dx: -1, dy: -1)) else { continue }
-                // The content offset this segment's paper has relative to the page top. It is
-                // zero for the top piece and the card's gap for the bottom piece.
-                let segmentOffset = segment.topPt - pageTop - segment.sourceTopPt
-                let fullTextRect = CGRect(
-                    x: contentOffsetX + (pageLeft + textLocal.minX) * zoom,
-                    y: (pageTop + textLocal.minY + segmentOffset - scrollYPt) * zoom,
-                    width: textLocal.width * zoom,
-                    height: textLocal.height * zoom
-                )
-                context.saveGState()
-                let clip = CGMutablePath()
-                clip.addRect(segmentView)
-                if insideChips.contains(overlay.id), let chip = chips[overlay.id],
-                   chip.frame.intersects(segmentView) {
-                    clip.addRect(chip.frame)
-                }
-                context.addPath(clip)
-                context.clip(using: .evenOdd)
-                attributed.draw(
-                    with: fullTextRect,
-                    options: [.usesLineFragmentOrigin, .usesFontLeading,
-                              .truncatesLastVisibleLine]
-                )
-                context.restoreGState()
+            let local = overlay.rect.insetBy(dx: TranslationTextLayout.horizontalInsetPt,
+                                             dy: TranslationTextLayout.verticalInsetPt)
+            guard local.width > 0.5, local.height > 0.5 else { continue }
+            let paper = paperColors[overlay.page] ?? overlay.paperColor
+                ?? .forAppearance(paperAppearance)
+            for (index, segment) in pieces.enumerated() {
+                let offset = segment.topPt - first.topPt - segment.sourceTopPt
+                let block = CGRect(x: contentOffsetX + (first.leftPt + overlay.rect.minX) * zoom,
+                                   y: (first.topPt + overlay.rect.minY + offset - scrollYPt) * zoom,
+                                   width: overlay.rect.width * zoom, height: overlay.rect.height * zoom)
+                    .intersection(segmentViewRect(segment))
+                guard !block.isNull, block.intersects(bounds) else { continue }
+                let key = "\(overlay.id):\(index)"
+                live.insert(key)
+                let piece = textPieces[key] ?? {
+                    let view = TranslationTextPieceView(frame: block)
+                    addSubview(view, positioned: .below, relativeTo: chips[overlay.id])
+                    textPieces[key] = view
+                    return view
+                }()
+                piece.frame = block
+                let fullText = CGRect(x: contentOffsetX + (first.leftPt + local.minX) * zoom,
+                                      y: (first.topPt + local.minY + offset - scrollYPt) * zoom,
+                                      width: local.width * zoom, height: local.height * zoom)
+                    .offsetBy(dx: -block.minX, dy: -block.minY)
+                let excluded = insideChips.contains(overlay.id) ? chips[overlay.id]?.frame : nil
+                piece.configure(text: translated, fontSize: max(0.5, fit.fontSizePt * zoom),
+                                color: paper.inkColor, textFrame: fullText,
+                                excluded: excluded?.offsetBy(dx: -block.minX, dy: -block.minY))
             }
         }
-        context.restoreGState()
+        for (key, piece) in textPieces where !live.contains(key) {
+            piece.removeFromSuperview()
+            textPieces.removeValue(forKey: key)
+        }
     }
 
     // MARK: - Disclosure
@@ -344,6 +353,64 @@ final class TranslationOverlayView: NSView {
         popover.show(relativeTo: chip.bounds, of: chip, preferredEdge: .maxY)
         disclosurePopover = popover
     }
+}
+
+/// A selectable native text layout clipped to one piece of paper, including a torn page.
+private final class TranslationTextPieceView: NSView {
+    let textView = TranslationSelectableTextView(frame: .zero)
+    private let clipMask = CAShapeLayer()
+    private var excluded: CGRect?
+    override var isFlipped: Bool { true }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.mask = clipMask
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.drawsBackground = false
+        textView.textContainerInset = .zero
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = false
+        textView.autoresizingMask = []
+        textView.textContainer?.widthTracksTextView = false
+        textView.textContainer?.heightTracksTextView = false
+        addSubview(textView)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("TranslationTextPieceView is programmatic") }
+
+    func configure(text: String, fontSize: CGFloat, color: NSColor,
+                   textFrame: CGRect, excluded: CGRect?) {
+        if textView.string != text { textView.string = text }
+        textView.font = NSFont.systemFont(ofSize: fontSize)
+        textView.textColor = color
+        textView.frame = textFrame
+        textView.textContainer?.containerSize = textFrame.size
+        self.excluded = excluded
+        let path = CGMutablePath()
+        path.addRect(bounds)
+        if let excluded, excluded.intersects(bounds) { path.addRect(excluded.intersection(bounds)) }
+        clipMask.frame = bounds
+        clipMask.path = path
+        clipMask.fillRule = .evenOdd
+        if let container = textView.textContainer { textView.layoutManager?.ensureLayout(for: container) }
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        guard bounds.contains(local), excluded?.contains(local) != true else { return nil }
+        // The cover's inset also belongs to the translation, never to the hidden source text.
+        let hit = super.hitTest(point)
+        return hit === self || hit == nil ? textView : hit
+    }
+}
+
+private final class TranslationSelectableTextView: NSTextView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
 /// The small control next to a translated block: Show original / Translate, plus Cancel while a
@@ -489,13 +556,6 @@ final class TranslationChipView: NSView {
         }
     }
 
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        for button in [primary, cancel, disclose]
-            where !button.isHidden && button.frame.contains(point) {
-            return button
-        }
-        return bounds.contains(point) ? self : nil
-    }
 
     @objc private func primaryPressed() { primaryAction?() }
     @objc private func cancelPressed() { cancelAction?() }

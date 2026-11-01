@@ -97,7 +97,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Citation detection gained narrative parenthesized years (`Guo et al. (2022)`). Version-4
 /// indexes persisted the old, incomplete spans and table regions. Three-rule booktabs tables
 /// and short equation bars also change the derived crops, so old indexes are rebuilt on open.
-pub(crate) const FORMAT_VERSION: u32 = 5;
+///
+/// # 6
+///
+/// Chapter/appendix captions, vector artwork, numbered equations, and longer numeric citation
+/// groups change the derived records. Rebuild older indexes so cached full-page fallbacks and
+/// missing groups do not hide the corrected previews.
+pub(crate) const FORMAT_VERSION: u32 = 6;
 
 /// Tag that identifies our index cache (a JSON file at the right name is not enough).
 pub(crate) const KIND: &str = "lyra-reader-document-index";

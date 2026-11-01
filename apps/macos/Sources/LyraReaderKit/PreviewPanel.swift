@@ -952,13 +952,18 @@ struct ReferencePreviewPanelContent: View {
                                 // The title is a link when it selects one entry; the link style
                                 // supplies the palette's accent, and the size/weight make it the
                                 // body's most prominent line.
-                                Button(entry.heading) { state.selectPreviewEntry(entry.citationEntry) }
+                                Button { state.selectPreviewEntry(entry.citationEntry) } label: {
+                                    Text(entry.heading)
+                                        .multilineTextAlignment(.leading)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
                                     .buttonStyle(.link)
                                     .font(.system(size: ReferencePreviewTypography.titleFontSize,
                                                   weight: ReferencePreviewTypography.titleWeight.swiftUIWeight))
                                     .foregroundStyle(Color(nsColor: ReferencePreviewTypography.linkedTitleColor))
                             } else {
                                 Text(entry.heading)
+                                    .multilineTextAlignment(.leading)
                                     .font(.system(size: ReferencePreviewTypography.titleFontSize,
                                                   weight: ReferencePreviewTypography.titleWeight.swiftUIWeight))
                                     .foregroundStyle(Color(nsColor: ReferencePreviewTypography.plainTitleColor))

@@ -18,8 +18,10 @@ mod alphanumeric;
 mod bibliography;
 #[cfg(test)]
 mod bibliography_tests;
+mod equations;
 mod figures;
 mod fragments;
+mod numbered;
 mod paren;
 mod selection;
 mod superscript;
@@ -28,6 +30,7 @@ pub mod tables;
 pub use bibliography::{
     AttributionReason, Bibliography, CitationAttribution, ReferenceList, SectionKind, SectionRef,
 };
+pub use equations::find_numbered_equations;
 pub use figures::{
     CaptionMention, PageEvidence, caption_region, caption_region_from,
     caption_region_without_margin, find_caption_mentions,
@@ -971,11 +974,10 @@ fn caption_label(line: &str) -> Option<(&'static str, String)> {
     };
     let after: String = trimmed.chars().skip(label_start).collect();
     let after = after.trim_start();
-    let label: String = after.chars().take_while(char::is_ascii_digit).collect();
-    if label.is_empty() {
-        return None;
-    }
-    let suffix: String = after.chars().skip(label.chars().count()).collect();
+    let chars: Vec<char> = after.chars().collect();
+    let end = numbered::label_len(&chars)?;
+    let label: String = chars[..end].iter().collect();
+    let suffix: String = chars[end..].iter().collect();
     let suffix = suffix.trim_start();
     if suffix.starts_with(['.', ':', '\u{2013}', '\u{2014}']) {
         // A dot immediately followed by another digit is a sub-number, not a separator.
@@ -2337,11 +2339,11 @@ fn find_bracketed_citations(text: &RawTextPage) -> Vec<Citation> {
         }
         let mut end = index + 1;
         while end < chars.len()
-            && end - index <= 12
+            && end - index <= 256
             && (chars[end].is_ascii_digit()
                 || chars[end] == ','
                 || matches!(chars[end], '-' | '–' | '−')
-                || chars[end] == ' ')
+                || chars[end].is_whitespace())
         {
             end += 1;
         }
@@ -2543,6 +2545,15 @@ mod citation_tests {
 
     fn page(text: &str) -> RawTextPage {
         crate::test_page(text)
+    }
+
+    #[test]
+    fn long_and_wrapped_numeric_groups_keep_every_label() {
+        let found = find_citations(&page("See [28, 68, 69, 139] and [101,\n102, 103, 104]."));
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].labels, ["28", "68", "69", "139"]);
+        assert_eq!(found[1].labels, ["101", "102", "103", "104"]);
+        assert!(find_citations(&page(&format!("[{}]", "1, ".repeat(100)))).is_empty());
     }
 
     #[test]
