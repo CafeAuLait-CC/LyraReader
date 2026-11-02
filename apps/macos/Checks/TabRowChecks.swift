@@ -131,6 +131,15 @@ extension ReaderChecks {
             }
         }
         func frames() -> [NSRect] { buttons().map(\.frame) }
+        func assertWindowFrames(_ label: String) {
+            let current = buttons().map { $0.convert($0.bounds, to: nil) }
+            require(current.count == 3, "\(label): all traffic lights remain present")
+            for (index, rect) in current.enumerated() {
+                require(abs(rect.minX - TabRowLayout.trafficLightOriginsX[index]) < 0.5
+                        && abs(window.frame.height - rect.midY - TabRowLayout.contentCenterY) < 0.5,
+                        "\(label): all lights stay aligned before the next run-loop turn (\(current))")
+            }
+        }
 
         let initial = frames()
         require(initial.count == 3, "the window has three standard traffic-light buttons")
@@ -152,13 +161,21 @@ extension ReaderChecks {
             require(button.superview?.frame.height == 44,
                     "the native titlebar is extended to the full 44 pt row")
         }
+        assertWindowFrames("initial")
 
-        let widths: [CGFloat] = [900, 1200, 2400, 900, 1500, 2400, 1200]
+        let sizes: [NSSize] = [(900, 800), (1200, 950), (2400, 800), (900, 650),
+                              (1500, 900), (2400, 1000), (1200, 800)].map {
+            NSSize(width: $0.0, height: $0.1)
+        }
         var previous = initial
-        for width in widths {
-            window.setFrame(NSRect(x: 0, y: 0, width: width, height: 800), display: false)
-            window.contentView?.layoutSubtreeIfNeeded()
-            layout.alignNow()
+        for size in sizes {
+            let width = size.width
+            window.setFrame(NSRect(origin: .zero, size: size), display: true)
+            // Do not manually repair the layout or drain the main queue: AppKit can display
+            // this tick while the queued correction is still waiting during a live drag.
+            assertWindowFrames("resize to \(size)")
+            window.contentView?.superview?.layoutSubtreeIfNeeded()
+            assertWindowFrames("layout at \(size)")
             let current = frames()
             require(current.map(\.origin.y) == initial.map(\.origin.y),
                     "at width \(Int(width)) the buttons are still on the row's centre line")
