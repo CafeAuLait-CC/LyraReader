@@ -498,10 +498,25 @@ import LyraReaderBindings
         package let sessionRevision: UInt32?
         package let sessionOperationCount: Int?
         /// SHA-256 of `changes.json` at the moment the quit was resolved, or nil when the file
-        /// did not exist. New annotation work rewrites that file, which makes a marker left over
-        /// from an abort stale instead of swallowing the new work on the next launch.
+        /// did not exist. That file records the pending dirty flag, file deletions and erased
+        /// strokes, so a deletion or eraser action after the marker invalidates it.
         package let changesDigest: String?
+        /// SHA-256 of `annotations.json` at the moment the quit was resolved, or nil when the
+        /// reader had no annotation cache yet.
+        ///
+        /// New annotation work has to be detected through this file, not through
+        /// `changes.json`: the latter records only the dirty flag and the pending deletions, so
+        /// adding another annotation can leave its decoded contents (and therefore its ideal
+        /// bytes) identical. The digest of the records file changes with the work itself. A
+        /// marker that cannot prove both files are the ones the reader resolved is treated as
+        /// stale, so the drafts are recovered instead of being retired unseen.
+        package let annotationsDigest: String?
     }
+
+    /// The marker schema this build writes and accepts. Version 2 adds ``annotationsDigest``;
+    /// a version 1 marker cannot prove the annotation records were unchanged, so it is retired
+    /// and the drafts are recovered instead of being swallowed.
+    private static let cleanExitVersion = 2
 
     package enum CleanExitResolution: String, Sendable {
         case save
@@ -526,6 +541,10 @@ import LyraReaderBindings
         let directory: String?
         let revision: UInt32?
         let operationCount: Int?
+        /// Where the active page-edit session keeps the annotation records it writes. While a
+        /// session is open the shell switches `annotationsURL` to this file, so the quit marker
+        /// has to fingerprint the same file rather than the original document's cache copy.
+        let annotationRecordsURL: URL?
     }
 
     /// The stable identity of the recovery session: its directory, revision and operation count.
@@ -539,8 +558,29 @@ import LyraReaderBindings
         return RecoveryFingerprint(
             directory: session["directory"] as? String,
             revision: (session["revisionNumber"] as? NSNumber)?.uint32Value,
-            operationCount: (session["operations"] as? [Any])?.count
+            operationCount: (session["operations"] as? [Any])?.count,
+            annotationRecordsURL: (session["annotationRecordsURL"] as? String)
+                .flatMap(URL.init(string:))
         )
+    }
+
+    /// The annotation records file and the pending-state file the reader is actually writing.
+    ///
+    /// A page-edit session redirects the annotation cache to `annotationRecordsURL` inside the
+    /// session directory (and `changes.json` lives beside it). The quit marker must fingerprint
+    /// that pair; using the original document's identity-directory files would miss work done
+    /// while the session was open and would also compare against a file the reader is not using.
+    private static func cleanExitDraftFiles(
+        for document: URL
+    ) -> (annotations: URL, changes: URL) {
+        if let records = recoveryFingerprint(for: document)?.annotationRecordsURL {
+            return (
+                annotations: records,
+                changes: records.deletingLastPathComponent()
+                    .appendingPathComponent("changes.json")
+            )
+        }
+        return (annotations: annotationsURL(for: document), changes: pendingStateURL(for: document))
     }
 
     /// Records the reader's resolved quit for `document`.
@@ -556,15 +596,17 @@ import LyraReaderBindings
     ) -> Bool {
         let hadSession = FileManager.default.fileExists(atPath: recoveryURL(for: document).path)
         let fingerprint = recoveryFingerprint(for: document)
+        let drafts = cleanExitDraftFiles(for: document)
         let record = CleanExitRecord(
-            version: 1,
+            version: cleanExitVersion,
             resolution: resolution.rawValue,
             resolvedAt: Date().timeIntervalSince1970,
             hadPageEditSession: hadSession,
             sessionDirectory: fingerprint?.directory,
             sessionRevision: fingerprint?.revision,
             sessionOperationCount: fingerprint?.operationCount,
-            changesDigest: fileDigest(pendingStateURL(for: document))
+            changesDigest: fileDigest(drafts.changes),
+            annotationsDigest: fileDigest(drafts.annotations)
         )
         do {
             let data = try JSONEncoder().encode(record)
@@ -592,12 +634,25 @@ import LyraReaderBindings
     package static func resolvedCleanExit(for document: URL) -> CleanExitRecord? {
         let url = cleanExitURL(for: document)
         guard let data = try? Data(contentsOf: url),
-              let record = try? JSONDecoder().decode(CleanExitRecord.self, from: data),
-              record.version == 1 else { return nil }
+              let record = try? JSONDecoder().decode(CleanExitRecord.self, from: data) else {
+            return nil
+        }
+        guard record.version == cleanExitVersion else {
+            FileHandle.standardError.write(Data((
+                "lyra-reader-quit: ignoring a clean-exit marker from an older build; "
+                + "keeping recovery for \(document.lastPathComponent)\n"
+            ).utf8))
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        }
 
-        // New annotation work after the marker rewrites changes.json; that makes the marker
-        // stale, and the new draft must be recovered rather than resolved away.
-        guard fileDigest(pendingStateURL(for: document)) == record.changesDigest else {
+        // New annotation work after the marker rewrites one of these two files; that makes the
+        // marker stale, and the new draft must be recovered rather than resolved away. Both are
+        // required: changes.json can keep the same decoded contents when another annotation is
+        // added, while annotations.json is the work itself.
+        let drafts = cleanExitDraftFiles(for: document)
+        guard fileDigest(drafts.changes) == record.changesDigest,
+              fileDigest(drafts.annotations) == record.annotationsDigest else {
             FileHandle.standardError.write(Data((
                 "lyra-reader-quit: unsaved annotation work appeared after the resolved quit; "
                 + "keeping recovery for \(document.lastPathComponent)\n"
