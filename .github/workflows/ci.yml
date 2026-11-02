@@ -313,7 +313,6 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.capture_visual_candidates
         run: |
           python3 scripts/check-visual.py capture --output build/visual-candidates/en-light --language en --appearance light
-          python3 scripts/check-visual.py capture --output build/visual-candidates/zh-light --language zh-Hans --appearance light
           python3 scripts/check-visual.py capture --output build/visual-candidates/en-dark --language en --appearance dark
 
       - name: Preserve unreviewed visual candidates and failures

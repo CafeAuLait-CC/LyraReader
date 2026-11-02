@@ -141,7 +141,7 @@ python3 scripts/check-visual.py capture --output build/visual-en-light --languag
 ```
 
 Open the output's `index.html` to review native-size PNGs and environment details. Repeat with
-`--language zh-Hans` or `--appearance dark`. Each output directory must be new. Capture failure,
+`--appearance dark` for the second English profile. Each output directory must be new. Capture failure,
 missing GPU content, and unstable compositor pixels fail explicitly; an unreviewed candidate is not
 an accepted baseline. `--mutation scale` and `--mutation chrome` deliberately produce failing runs
 for diagnostic use. Capture waits for registered GPU content and stable native compositor pixels;
@@ -162,10 +162,10 @@ or manifest invalidates it. `--allow-unreviewed` is available solely for develop
 and marks the result as **not a regression gate**. No image baselines are accepted automatically.
 
 CI runs the comparer and approval regressions. Its manual **Capture unreviewed visual candidates**
-input additionally collects en/light, zh-Hans preference/light and en/dark candidates as artifacts;
-reviewed image baselines are required before enabling a PR image-comparison gate. The current bundle
-declares English localization; a zh-Hans request records that preference and its actual locale/fallback,
-and does not assert translated UI coverage.
+input additionally collects en/light and en/dark candidates as artifacts; reviewed image baselines
+are required before enabling a PR image-comparison gate. Chinese visual checks are deferred until
+Chinese localization is implemented. Existing zh-Hans preference captures show English fallback
+and are not accepted as evidence of Chinese UI coverage.
 
 ## Documentation index
 
