@@ -124,6 +124,49 @@ The developer commands that are not needed to build and run — headless test ho
 reference-raster comparisons, the CLI inspection commands and the measurement recipes — are documented in the
 design notes rather than here.
 
+## Paper visual regression
+
+The debug bundle supports opt-in capture of its own native window on macOS 14.4 or later.
+Keep the desktop awake and idle while capture controls its own window and full-screen Space.
+The launcher creates a separate bundle identity and scratch caches.
+It records 11 checkpoints for paper scale, native edges, sidebar changes, resizing, zoom round trips,
+and full-screen entry/exit. The source PDF is generated from synthetic content.
+
+```bash
+./scripts/build-rust.sh --debug
+./scripts/make-app-bundle.sh --debug
+python3 scripts/check-visual.py self-test
+python3 -m unittest discover -s scripts -p test_visual_regression.py
+python3 scripts/check-visual.py capture --output build/visual-en-light --language en --appearance light
+```
+
+Open the output's `index.html` to review native-size PNGs and environment details. Repeat with
+`--appearance dark` for the second English profile. Each output directory must be new. Capture failure,
+missing GPU content, and unstable compositor pixels fail explicitly; an unreviewed candidate is not
+an accepted baseline. `--mutation scale` and `--mutation chrome` deliberately produce failing runs
+for diagnostic use. Capture waits for registered GPU content and stable native compositor pixels;
+Metal presentation timestamps are recorded when available and are not a performance measurement.
+Display mode points, backing framebuffer pixels and each window's backing scale are recorded separately;
+the framebuffer dimensions do not assert the panel's physical resolution. The flows drive production
+state and native window actions; they do not cover pointer gesture delivery.
+
+```bash
+python3 scripts/check-visual.py compare --baseline BASELINE --actual ACTUAL --output build/visual-diff
+```
+
+Comparison never rescales images and defaults to exact sRGB pixels. It requires matching environments
+and an explicit `approval.json` in the baseline directory: `schema_version: 1`, `approved: true`,
+`capture_manifest_sha256` for `capture.json`, and a `sha256` object mapping every checkpoint PNG filename
+to its SHA-256 digest. Create that approval only after reviewing the images. Changing an approved image
+or manifest invalidates it. `--allow-unreviewed` is available solely for developer repeatability checks
+and marks the result as **not a regression gate**. No image baselines are accepted automatically.
+
+CI runs the comparer and approval regressions. Its manual **Capture unreviewed visual candidates**
+input additionally collects en/light and en/dark candidates as artifacts; reviewed image baselines
+are required before enabling a PR image-comparison gate. Chinese visual checks are deferred until
+Chinese localization is implemented. Existing zh-Hans preference captures show English fallback
+and are not accepted as evidence of Chinese UI coverage.
+
 ## Documentation index
 
 The design documents live in `docs/` in the working copy and are **not committed** (see the note under

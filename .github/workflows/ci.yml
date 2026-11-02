@@ -84,6 +84,10 @@ on:
     branches: [master]
   workflow_dispatch:
     inputs:
+      capture_visual_candidates:
+        description: "Capture unreviewed visual candidates (awake macOS desktop required)"
+        type: boolean
+        default: false
       fetch_eval_papers:
         description: "Download the arXiv evaluation corpus (20 PDFs) and run the reference-index evaluation"
         type: boolean
@@ -297,8 +301,32 @@ jobs:
       # Assemble and ad-hoc sign the bundle here, where the build already is. The smoke job only
       # launches it, so the app travels as a 21 MB archive instead of the ~248 MB SwiftPM build
       # directory (whose download alone cost three minutes in the first measured run).
+      - name: Visual comparison and baseline approval regressions
+        run: |
+          python3 -m unittest discover -s scripts -p test_visual_regression.py
+          python3 scripts/check-visual.py self-test
+
       - name: Package and sign the application bundle
         run: ./scripts/make-app-bundle.sh --debug
+
+      - name: Capture unreviewed visual candidates
+        if: github.event_name == 'workflow_dispatch' && inputs.capture_visual_candidates
+        run: |
+          python3 scripts/check-visual.py capture --output build/visual-candidates/en-light --language en --appearance light
+          python3 scripts/check-visual.py capture --output build/visual-candidates/en-dark --language en --appearance dark
+
+      - name: Preserve unreviewed visual candidates and failures
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.capture_visual_candidates
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-candidates-unreviewed
+          path: |
+            build/visual-candidates/**/*.png
+            build/visual-candidates/**/*.json
+            build/visual-candidates/**/*.html
+            build/visual-candidates/**/*.log
+            !build/visual-candidates/**/scratch/**
+          if-no-files-found: error
 
       - name: Archive the application bundle and the checks executable
         run: |
