@@ -539,11 +539,23 @@ extension ReaderChecks {
             require(mayQuit, "the stale-marker decision may quit")
             require(DocumentEditCache.hasCleanExitMarker(for: staleURL),
                     "the stale-marker fixture has a marker")
-            // The quit aborted and the reader kept working: the new annotation rewrites
-            // changes.json after the marker.
+            // The exact changes.json bytes the marker fingerprinted. Adding another annotation
+            // leaves every field of that file unchanged (dirty is already true and the clean
+            // snapshot is still empty), so the historical JSON encoding could reproduce these
+            // bytes and make a changes.json-only digest read as "nothing new". Capture them now
+            // and put them back below to make that collision deterministic.
+            let changesAtMarker = try Data(
+                contentsOf: DocumentEditCache.pendingStateURL(for: staleURL))
+            // The quit aborted and the reader kept working: the new annotation is written to the
+            // annotation records after the marker.
             mark(state, note: "after marker")
             require(state.annotations.count == 2,
                     "both annotations are in the in-memory cache")
+            // Simulate the encoding collision that made this flake: changes.json is byte-for-byte
+            // the file the marker recorded, while annotations.json holds the newer work. A marker
+            // that only fingerprints changes.json resolves the new annotation away here.
+            try changesAtMarker.write(
+                to: DocumentEditCache.pendingStateURL(for: staleURL), options: .atomic)
         }
         try await Task.sleep(for: .milliseconds(80))
 
@@ -551,8 +563,10 @@ extension ReaderChecks {
             let next = try state()
             require(next.newTab(url: staleURL),
                     "the stale-marker document reopens (lastError: \(next.lastError ?? "nil"))")
-            require(next.annotations.count == 2 && next.annotationCacheIsDirty,
-                    "work created after the marker is recovered instead of resolved away")
+            requireExplaining(
+                next.annotations.count == 2 && next.annotationCacheIsDirty,
+                "work created after the marker is recovered instead of resolved away",
+                quitCrashRecoveryDiagnostics(for: staleURL, state: next))
             require(!DocumentEditCache.hasCleanExitMarker(for: staleURL),
                     "the stale marker is removed so the recovered work stays intact")
         }
