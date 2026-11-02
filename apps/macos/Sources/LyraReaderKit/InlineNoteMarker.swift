@@ -59,9 +59,15 @@ extension InlineNoteMarker {
             if let fixed = annotation.fileQuads, !fixed.isEmpty {
                 // A mark the PDF carried keeps the file's own boxes; it has no character range
                 // in this reader's text layer to map a label from.
-                first = CGRect(x: fixed[0].x, y: fixed[0].y,
-                               width: fixed[0].width, height: fixed[0].height)
-                line = first
+                let boxes = fixed.map { CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height) }
+                    .filter { !$0.isEmpty && !$0.isInfinite && !$0.isNull }
+                guard let top = boxes.min(by: {
+                    $0.minY == $1.minY ? $0.minX < $1.minX : $0.minY < $1.minY
+                }) else { return nil }
+                first = top
+                // Adoption changes ownership, not the visual anchor. Resolve the same full
+                // text line as a file-owned note instead of using the highlighted word's X.
+                line = textPages[annotation.page]?.lineBounds(overlapping: first) ?? first
             } else {
                 guard let text = textPages[annotation.page],
                       let mapped = text.selectionRects(

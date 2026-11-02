@@ -1,5 +1,5 @@
 import AppKit
-import LyraReaderKit
+@testable import LyraReaderKit
 import SwiftUI
 
 extension ReaderChecks {
@@ -121,6 +121,42 @@ extension ReaderChecks {
             }
             state.zoomIn()
             require(state.documentNoteAnchor(note) != anchor, "the paper anchor follows document zoom")
+            if input == real {
+                await state.loadAnnotationPassages()
+                let target = comments.first { comment in
+                    guard let box = comment.boxes.first,
+                          let line = text.lineBounds(overlapping: CGRect(x: box.xPt, y: box.yPt,
+                              width: box.widthPt, height: box.heightPt)),
+                          let marker = markers.first(where: { $0.id == comment.id }) else { return false }
+                    return box.xPt > line.minX + 10 && !markers.contains {
+                        $0.id != marker.id && abs($0.rect.midY - marker.rect.midY) < 26
+                    }
+                }!
+                let before = state.inlineNoteMarkers.first { $0.id == target.id }!.rect
+                require(state.selectDocumentAnnotation(target.id), "selecting an interior Ashley highlight adopts it")
+                let adopted = state.annotations.first { $0.fileIdentity == target.id }!
+                func checkMargin(_ current: AppState, _ label: String) {
+                    let rect = current.ownInlineNoteMarkers.first { $0.id == adopted.id.uuidString }!.rect
+                    require(rect == before, "\(label): selecting a highlight keeps its note in the line margin")
+                }
+                checkMargin(state, "selected")
+                state.clearSelection()
+                checkMargin(state, "deselected")
+                state.zoomIn()
+                state.setViewportSize(CGSize(width: 750, height: 650))
+                checkMargin(state, "zoomed and resized")
+                state.beginEditingAnnotation(adopted.id)
+                checkMargin(state, "editing")
+                state.cancelTextEditing()
+                let reopened = AppState(engine: try RustEngine())
+                reopened.setViewportSize(CGSize(width: 1000, height: 900))
+                require(reopened.open(url: copy), "the existing adopted highlight reopens")
+                await reopened.loadAnnotationPassages()
+                try await eventually("the reopened note has its page text and file annotations", {
+                    reopened.cachedTextPage(0) != nil && !reopened.documentAnnotations.isEmpty
+                })
+                checkMargin(reopened, "reopened")
+            }
         }
     }
 }
