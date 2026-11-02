@@ -47,7 +47,7 @@ pub enum PaperAppearance {
 
 impl PaperAppearance {
     fn draw_blend(self, blend: QuadBlend) -> QuadBlend {
-        if self == Self::Night && blend == QuadBlend::Multiply {
+        if blend == QuadBlend::Interface || (self == Self::Night && blend == QuadBlend::Multiply) {
             QuadBlend::Normal
         } else {
             blend
@@ -55,7 +55,9 @@ impl PaperAppearance {
     }
 
     fn uniform_mode(self, blend: QuadBlend) -> f32 {
-        if self == Self::Night && blend == QuadBlend::Multiply {
+        if blend == QuadBlend::Interface {
+            0.0
+        } else if self == Self::Night && blend == QuadBlend::Multiply {
             3.0
         } else {
             self as u8 as f32
@@ -174,6 +176,8 @@ fn fs_page_multiply(in: VertexOutput) -> @location(0) vec4<f32> {
 pub enum QuadBlend {
     /// Straight alpha-over: pages, selection, and any overlay that should cover what is below.
     Normal,
+    /// Native interface artwork already styled for the paper; alpha-over without recolouring.
+    Interface,
     /// The PDF `/BM /Multiply` blend mode.
     ///
     /// Callers that have a constant opacity to apply should **bake it into the tint colour
@@ -190,7 +194,7 @@ impl QuadBlend {
     /// The fragment entry point and blend state that implement this mode.
     fn fragment_entry(self) -> &'static str {
         match self {
-            Self::Normal => "fs_page",
+            Self::Normal | Self::Interface => "fs_page",
             Self::Multiply => "fs_page_multiply",
         }
     }
@@ -202,7 +206,7 @@ impl QuadBlend {
     /// over-operator so a translucent highlight still ends up with a sane alpha.
     fn blend_state(self) -> wgpu::BlendState {
         match self {
-            Self::Normal => wgpu::BlendState::ALPHA_BLENDING,
+            Self::Normal | Self::Interface => wgpu::BlendState::ALPHA_BLENDING,
             Self::Multiply => wgpu::BlendState {
                 color: wgpu::BlendComponent {
                     src_factor: wgpu::BlendFactor::Dst,
@@ -951,6 +955,35 @@ fn f32s_to_bytes(values: &[f32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interface_artwork_keeps_its_palette_in_every_paper_mode() {
+        let mut context = match GpuContext::new(false) {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("skipping: {error}");
+                return;
+            }
+        };
+        let pixels = [0xD7, 0xEC, 0xF5, 255, 0x2E, 0x3B, 0x41, 255];
+        let texture = context.upload_page_texture(2, 1, &pixels).unwrap();
+        let draws = [(texture, [0.0, 0.0, 2.0, 1.0], QuadBlend::Interface)];
+        for appearance in [
+            PaperAppearance::Original,
+            PaperAppearance::Warm,
+            PaperAppearance::Night,
+        ] {
+            let actual = context
+                .offscreen_probe_layers_with_appearance(&draws, 2, 1, appearance)
+                .unwrap();
+            // Uploads are BGRA; the offscreen probe returns RGBA.
+            let expected = [0xF5, 0xEC, 0xD7, 255, 0x41, 0x3B, 0x2E, 255];
+            assert!(
+                actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 1),
+                "{appearance:?}: {actual:?}"
+            );
+        }
+    }
 
     #[test]
     fn paper_appearance_is_display_only_and_has_soft_night_contrast() {

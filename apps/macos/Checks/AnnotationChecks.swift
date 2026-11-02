@@ -1,4 +1,4 @@
-import LyraReaderKit
+@testable import LyraReaderKit
 import CoreGraphics
 import Foundation
 import ImageIO
@@ -952,7 +952,7 @@ extension ReaderChecks {
         require(iconQuad.image.pixelWidth > 8 && iconQuad.image.pixelHeight > 8,
                 "a sticky note is drawn as an icon, not as a 1x1 tint "
                     + "(\(iconQuad.image.pixelWidth)x\(iconQuad.image.pixelHeight) px)")
-        require(iconQuad.blend == .normal, "a note icon is composited alpha-over, not multiplied")
+        require(iconQuad.blend == .interface, "a note icon uses alpha-over with its own paper-aware palette")
         require(abs(iconQuad.placement.widthPt - colouredNote.widthPt) < 0.001
                     && abs(iconQuad.placement.heightPt - colouredNote.heightPt) < 0.001,
                 "the icon fills the /Rect the file gives the note")
@@ -1037,17 +1037,15 @@ extension ReaderChecks {
             width: iconQuad.placement.widthPt,
             height: iconQuad.placement.heightPt
         )
-        let noteColour = colouredNote.color ?? AnnotationColor.defaultNote
-        let fill = snapshot.fraction(ofColor: noteColour, inContentRect: noteBox)
-        require(fill > 0.005 && fill < 0.15,
-                "the sticky note retains its source colour as a compact cue (\(Int(fill * 100))% of "
-                    + "its box is \(noteColour.hex) \(snapshot.describe(noteBox)))")
-        let surface = LyraReaderTheme.noteBgColor.usingColorSpace(.deviceRGB)!
-        let surfaceColor = AnnotationColor(red: UInt8((surface.redComponent * 255).rounded()),
-                                          green: UInt8((surface.greenComponent * 255).rounded()),
-                                          blue: UInt8((surface.blueComponent * 255).rounded()), alpha: 255)
-        require(snapshot.fraction(ofColor: surfaceColor, inContentRect: noteBox) > 0.35,
-                "the note's main surface uses the Lyra note token")
+        func paletteColor(_ active: Bool) -> AnnotationColor {
+            let surface = LyraReaderTheme.noteIconColors(state: active ? .active : .normal, darkPaper: false)
+                .paper.usingColorSpace(.sRGB)!
+            return AnnotationColor(red: UInt8((surface.redComponent * 255).rounded()),
+                                   green: UInt8((surface.greenComponent * 255).rounded()),
+                                   blue: UInt8((surface.blueComponent * 255).rounded()), alpha: 255)
+        }
+        require(snapshot.fraction(ofColor: paletteColor(true), inContentRect: noteBox) > 0.25,
+                "the open note uses the active folded-paper palette")
         let textBox = CGRect(
             x: textQuad.placement.leftPt,
             y: textQuad.placement.topPt,
@@ -1069,15 +1067,8 @@ extension ReaderChecks {
                 width: plainQuad.placement.widthPt,
                 height: plainQuad.placement.heightPt
             )
-            let plainFill = snapshot.fraction(
-                ofColor: AnnotationColor.defaultNote,
-                inContentRect: plainBox
-            )
-            require(plainFill > 0.005 && plainFill < 0.15,
-                    "a note with no /C keeps the default colour cue "
-                        + "(\(Int(plainFill * 100))% of its box)")
-            require(snapshot.fraction(ofColor: surfaceColor, inContentRect: plainBox) > 0.35,
-                    "the colourless note shares the same Lyra surface")
+            require(snapshot.fraction(ofColor: paletteColor(false), inContentRect: plainBox) > 0.25,
+                    "a colourless note uses the same quiet folded-paper surface")
         } else {
             fatalError("FAIL: the colourless note reached no quad")
         }

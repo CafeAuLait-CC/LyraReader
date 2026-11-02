@@ -54,70 +54,78 @@ enum NoteGlyph {
         return scale
     }
 
-    /// A sticky note's icon: a page with its top-right corner folded over, in the note's colour.
-    ///
-    /// Returns `nil` for a box with no area, which is the one case the caller has to decide about
-    /// (`AnnotationSkipReason.EmptyRect`).
-    ///
-    /// `generation` is the caller's monotonic texture id. It must be different for every call: the
-    /// canvas skips re-uploading a quad whose generation it has already seen, so two bitmaps that
-    /// share one would leave the second drawn with the first's pixels — the same trap the page
-    /// raster and the loaded annotations fell into.
+    enum State: Hashable { case normal, hovered, active }
+
+    /// The supplied 24-point folded-paper artwork, rasterized at the canvas scale.
+    /// Inline comments share the silhouette and use three central dots instead of ruled lines.
     @MainActor static func noteIcon(color: AnnotationColor, boxPt: CGSize, scale: CGFloat,
-                                    generation: UInt64) -> PageImage? {
-        commentBadge(color: color, boxPt: boxPt, scale: scale, generation: generation, inline: false)
+                                    generation: UInt64, state: State = .normal,
+                                    paper: PaperAppearance = .original) -> PageImage? {
+        commentBadge(boxPt: boxPt, scale: scale, generation: generation, inline: false, state: state, paper: paper)
     }
 
-    /// Shared Lyra surface and colour cue; the speech glyph distinguishes a text comment.
     @MainActor static func inlineComment(color: AnnotationColor, boxPt: CGSize, scale: CGFloat,
-                                        generation: UInt64) -> PageImage? {
-        commentBadge(color: color, boxPt: boxPt, scale: scale, generation: generation, inline: true)
+                                        generation: UInt64, state: State = .normal,
+                                        paper: PaperAppearance = .original) -> PageImage? {
+        commentBadge(boxPt: boxPt, scale: scale, generation: generation, inline: true, state: state, paper: paper)
     }
 
-    @MainActor private static func commentBadge(color: AnnotationColor, boxPt: CGSize, scale: CGFloat,
-                                               generation: UInt64, inline: Bool) -> PageImage? {
+    @MainActor private static func commentBadge(boxPt: CGSize, scale: CGFloat, generation: UInt64,
+                                               inline: Bool, state: State, paper: PaperAppearance) -> PageImage? {
         guard let (width, height) = pixelSize(boxPt, scale: scale),
               let context = context(width: width, height: height) else { return nil }
-        let w = CGFloat(width), h = CGFloat(height)
-        let stroke = max(0.65 * scale, min(w, h) * 0.035)
-        let body = CGRect(x: stroke, y: stroke, width: w - stroke * 2, height: h - stroke * 2)
-        let path = CGPath(roundedRect: body, cornerWidth: min(w, h) * 0.2,
-                          cornerHeight: min(w, h) * 0.2, transform: nil)
-        context.addPath(path)
-        context.setFillColor(LyraReaderTheme.noteBgColor.cgColor)
+        let side = CGFloat(min(width, height))
+        context.translateBy(x: (CGFloat(width) - side) / 2, y: (CGFloat(height) - side) / 2)
+        context.scaleBy(x: side / 24, y: side / 24)
+        // SVG uses top-down coordinates; the bitmap context's drawing axis points upward.
+        context.translateBy(x: 0, y: 24)
+        context.scaleBy(x: 1, y: -1)
+        let colors = LyraReaderTheme.noteIconColors(state: state, darkPaper: paper == .night)
+        let outline = CGMutablePath()
+        outline.move(to: CGPoint(x: 6.5, y: 3.75))
+        outline.addLine(to: CGPoint(x: 17.5, y: 3.75))
+        outline.addCurve(to: CGPoint(x: 20.25, y: 6.5), control1: CGPoint(x: 19.019, y: 3.75),
+                         control2: CGPoint(x: 20.25, y: 4.981))
+        outline.addLine(to: CGPoint(x: 20.25, y: 14.75))
+        outline.addLine(to: CGPoint(x: 14.75, y: 20.25))
+        outline.addLine(to: CGPoint(x: 6.5, y: 20.25))
+        outline.addCurve(to: CGPoint(x: 3.75, y: 17.5), control1: CGPoint(x: 4.981, y: 20.25),
+                         control2: CGPoint(x: 3.75, y: 19.019))
+        outline.addLine(to: CGPoint(x: 3.75, y: 6.5))
+        outline.addCurve(to: CGPoint(x: 6.5, y: 3.75), control1: CGPoint(x: 3.75, y: 4.981),
+                         control2: CGPoint(x: 4.981, y: 3.75))
+        outline.closeSubpath()
+        context.addPath(outline)
+        context.setFillColor(colors.paper.cgColor)
         context.fillPath()
-        context.addPath(path)
-        context.setStrokeColor(LyraReaderTheme.noteTextColor.withAlphaComponent(0.7).cgColor)
-        context.setLineWidth(stroke)
-        context.strokePath()
-        // Preserve the annotation's own colour as a small cue, without tinting the whole badge.
-        context.setFillColor(nsColor(color).withAlphaComponent(1).cgColor)
-        context.fillEllipse(in: CGRect(x: body.minX + body.width * 0.12, y: h * 0.4,
-                                      width: min(w, h) * 0.17, height: min(w, h) * 0.17))
-        context.setStrokeColor(LyraReaderTheme.noteTextColor.cgColor)
-        context.setFillColor(LyraReaderTheme.noteTextColor.cgColor)
-        context.setLineWidth(stroke)
+        let fold = CGMutablePath()
+        fold.move(to: CGPoint(x: 20.25, y: 14.75))
+        fold.addLine(to: CGPoint(x: 17, y: 14.75))
+        fold.addCurve(to: CGPoint(x: 14.75, y: 17), control1: CGPoint(x: 15.757, y: 14.75),
+                      control2: CGPoint(x: 14.75, y: 15.757))
+        fold.addLine(to: CGPoint(x: 14.75, y: 20.25))
+        context.addPath(fold)
+        context.setFillColor(colors.fold.cgColor)
+        context.fillPath()
+        context.setStrokeColor(colors.ink.cgColor)
+        context.setLineWidth(1.35)
         context.setLineCap(.round)
-        let icon = CGRect(x: w * 0.38, y: h * 0.25, width: w * 0.45, height: h * 0.5)
+        context.setLineJoin(.round)
+        context.addPath(outline)
+        context.strokePath()
+        context.addPath(fold)
+        context.strokePath()
+        context.setFillColor(colors.ink.cgColor)
         if inline {
-            context.stroke(CGRect(x: icon.minX, y: icon.minY + icon.height * 0.2,
-                                  width: icon.width, height: icon.height * 0.8))
-            context.move(to: CGPoint(x: icon.minX + icon.width * 0.25, y: icon.minY + icon.height * 0.2))
-            context.addLine(to: CGPoint(x: icon.minX + icon.width * 0.25, y: icon.minY))
-            context.addLine(to: CGPoint(x: icon.minX + icon.width * 0.5, y: icon.minY + icon.height * 0.2))
-            context.strokePath()
-            for fraction: CGFloat in [0.25, 0.5, 0.75] {
-                let dot = max(1, h * 0.07)
-                context.fillEllipse(in: CGRect(x: icon.minX + icon.width * fraction - dot / 2,
-                                               y: icon.midY, width: dot, height: dot))
+            for x: CGFloat in [7.5, 11, 14.5] {
+                context.fillEllipse(in: CGRect(x: x, y: 9, width: 1.75, height: 1.75))
             }
         } else {
-            context.stroke(icon)
-            for fraction: CGFloat in [0.35, 0.65] {
-                context.move(to: CGPoint(x: icon.minX + icon.width * 0.2, y: icon.minY + icon.height * fraction))
-                context.addLine(to: CGPoint(x: icon.maxX - icon.width * 0.2, y: icon.minY + icon.height * fraction))
+            for line in [CGRect(x: 6.825, y: 7.575, width: 10.1, height: 1.35),
+                         CGRect(x: 6.825, y: 11.075, width: 7.35, height: 1.35)] {
+                context.addPath(CGPath(roundedRect: line, cornerWidth: 0.675, cornerHeight: 0.675, transform: nil))
+                context.fillPath()
             }
-            context.strokePath()
         }
         return finish(context, width: width, height: height, pointSize: boxPt, generation: generation)
     }

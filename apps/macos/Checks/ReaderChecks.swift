@@ -152,6 +152,10 @@ struct ReaderChecks {
             return
         }
         let fastRoot = checkRoot(CommandLine.arguments.dropFirst(2).first)
+        if CommandLine.arguments.contains("--check-note-icon") {
+            try await noteIconChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-perf-trace") {
             // Opt-in first (`LyraReaderChecks <root> --check-perf-trace`), and also a registered
             // suite below, so the normal run covers it without a separate invocation. The root is
@@ -1072,6 +1076,7 @@ struct ReaderChecks {
                 try await inlineNoteChecks(root: root)
             }),
             ("annotation-notes", {
+                try await noteIconChecks(root: root)
                 try await annotationNoteChecks(
                     url: root.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
             }),

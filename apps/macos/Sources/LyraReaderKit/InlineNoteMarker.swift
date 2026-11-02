@@ -10,7 +10,7 @@ public struct InlineNoteMarker: Identifiable {
     public let rect: CGRect
 
     public static func layout(annotations: [DocumentAnnotation], textPages: [Int: TextPage]) -> [Self] {
-        let size = CGSize(width: 24, height: 16)
+        let size = CGSize(width: 24, height: 24)
         var occupied: [Int: [CGRect]] = [:]
         var markers: [Self] = []
         for (index, annotation) in annotations.enumerated() where annotation.hasInlineNote {
@@ -70,9 +70,9 @@ extension InlineNoteMarker {
                 first = mapped
                 line = text.lineBounds(overlapping: mapped) ?? mapped
             }
-            var rect = CGRect(x: max(2, line.minX - 30), y: max(2, first.midY - 8), width: 24, height: 16)
+            var rect = CGRect(x: max(2, line.minX - 30), y: max(2, first.midY - 12), width: 24, height: 24)
             while used[annotation.page, default: []].contains(where: { $0.insetBy(dx: -1, dy: -1).intersects(rect) }) {
-                if rect.minX >= 28 { rect.origin.x -= 28 } else { rect.origin.y += 20 }
+                if rect.minX >= 28 { rect.origin.x -= 28 } else { rect.origin.y += 28 }
             }
             used[annotation.page, default: []].append(rect)
             return Self(id: annotation.id.uuidString, annotationIndex: index, page: annotation.page, rect: rect)

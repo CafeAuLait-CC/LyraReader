@@ -351,8 +351,10 @@ public final class MetalCanvasView: NSView {
     /// eraser). Returns whether a mode was left, so Escape is only consumed when it did something.
     public var onCancelTool: (() -> Bool)?
 
+    private weak var noteIconState: AppState?
     private let bookmarkHost = PageBookmarkCanvasHost()
     package func configurePageBookmarks(state: AppState?) {
+        noteIconState = state
         if bookmarkHost.superview == nil { addSubview(bookmarkHost) }
         if state != nil { window?.acceptsMouseMovedEvents = true }
         if bookmarkHost.configure(state: state) { markNeedsRender() }
@@ -796,6 +798,7 @@ public final class MetalCanvasView: NSView {
     }
 
     public override func mouseEntered(with event: NSEvent) {
+        noteIconState?.updateNoteHover(atContentPoint: contentPoint(for: event))
         bookmarkHost.updateHover(at: bookmarkHost.convert(event.locationInWindow, from: nil))
         if annotationTool == .eraser, !eraserGestureActive {
             showEraserRing(for: event)
@@ -807,6 +810,7 @@ public final class MetalCanvasView: NSView {
     }
 
     public override func mouseMoved(with event: NSEvent) {
+        noteIconState?.updateNoteHover(atContentPoint: contentPoint(for: event))
         bookmarkHost.updateHover(at: bookmarkHost.convert(event.locationInWindow, from: nil))
         guard annotationTool == .eraser, !eraserGestureActive else {
             eraserRing.hideRing()
@@ -818,6 +822,7 @@ public final class MetalCanvasView: NSView {
     }
 
     public override func mouseExited(with event: NSEvent) {
+        noteIconState?.updateNoteHover(atContentPoint: nil)
         bookmarkHost.updateHover(at: nil)
         eraserRing.hideRing()
         if annotationTool == .eraser, !eraserGestureActive { onEraserHover?(nil) }
@@ -996,6 +1001,7 @@ public final class MetalCanvasView: NSView {
     /// gesture with modifier keys to zoom" makes the system swallow the configured modifier
     /// before AppKit sees the event at all — see `AppState.zoomByScroll` for what still works.
     public override func scrollWheel(with event: NSEvent) {
+        noteIconState?.updateNoteHover(atContentPoint: nil)
         // NSEvent already applies the user's natural-scrolling preference. Convert
         // content motion to a top-origin offset exactly once; never invert by device.
         let delta = wheelMotion.delta(

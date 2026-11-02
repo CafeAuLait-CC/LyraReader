@@ -192,6 +192,7 @@ public struct ReaderWindow: View {
         .foregroundStyle(LyraReaderTheme.textPrimary)
         .tint(LyraReaderTheme.accent)
         .preferredColorScheme(appearance.mode.colorScheme)
+        .onChange(of: appearance.mode, initial: true) { _, mode in state.setNotePaperAppearance(mode) }
         .overlay(alignment: .bottomTrailing) {
             AIDocumentKnowledgeStatus(knowledge: documentKnowledge)
                 .padding(.trailing, 24).padding(.bottom, 44)

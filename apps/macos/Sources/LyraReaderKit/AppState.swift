@@ -2525,7 +2525,59 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         documentAnnotations.first { $0.visible && $0.id == openDocumentNoteID }
     }
 
-    public func closeDocumentNote() { openDocumentNoteID = nil }
+    public func closeDocumentNote() {
+        guard openDocumentNoteID != nil else { return }
+        openDocumentNoteID = nil
+        refreshSelectionOverlay()
+    }
+
+    private var hoveredNoteKey: String?
+    private var notePaperAppearance: PaperAppearance = .original
+
+    func setNotePaperAppearance(_ appearance: PaperAppearance) {
+        guard notePaperAppearance != appearance else { return }
+        notePaperAppearance = appearance
+        refreshSelectionOverlay()
+    }
+
+    private func noteState(key: String, active: Bool) -> NoteGlyph.State {
+        active ? .active : (hoveredNoteKey == key ? .hovered : .normal)
+    }
+
+    /// Hover changes artwork only. Opening or editing remains an explicit click action.
+    @discardableResult func updateNoteHover(atContentPoint point: CGPoint?) -> Bool {
+        var key: String?
+        if annotationTool == .select, !regionSelectionArmed, !contentEditEnabled,
+           let point, let hit = pagePoint(atContentPoint: point) {
+            if let marker = ownInlineNoteMarkers.reversed().first(where: {
+                $0.page == hit.page && noteHitRect($0.rect).contains(hit.point)
+            }) { key = "own:" + marker.id }
+            else if let marker = inlineNoteMarkers.reversed().first(where: {
+                $0.page == hit.page && noteHitRect($0.rect).contains(hit.point)
+            }) { key = "doc:" + marker.id }
+            else if let note = annotations.reversed().first(where: {
+                $0.kind == .stickyNote && $0.page == hit.page
+                    && $0.shapeRect.map { noteHitRect($0).contains(hit.point) } == true
+            }) { key = "own:" + note.id.uuidString }
+            else if let note = documentAnnotations.reversed().first(where: {
+                $0.visible && !$0.isReply && $0.drawing == .noteIcon && $0.page == hit.page
+                    && noteHitRect(CGRect(x: $0.xPt, y: $0.yPt, width: $0.widthPt, height: $0.heightPt))
+                        .contains(hit.point)
+            }) { key = "doc:" + note.id }
+        }
+        if hoveredNoteKey != key {
+            hoveredNoteKey = key
+            refreshSelectionOverlay()
+        }
+        return key != nil
+    }
+
+    private func noteHitRect(_ rect: CGRect) -> CGRect {
+        // The visual glyph remains at its PDF anchor; only the invisible pointer target grows.
+        let minimum: CGFloat = 26 / max(zoomFactor, 0.01)
+        return rect.insetBy(dx: -max(Self.noteClickSlackPt, (minimum - rect.width) / 2),
+                            dy: -max(Self.noteClickSlackPt, (minimum - rect.height) / 2))
+    }
 
     public var inlineNoteMarkers: [InlineNoteMarker] {
         InlineNoteMarker.layout(annotations: documentAnnotations, textPages: textPages)
@@ -4131,6 +4183,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         selectedDocumentAnnotationID = nil
         openDocumentNoteID = nil
         noteGlyphTextures = [:]
+        hoveredNoteKey = nil
         placedGlyphTextures = [:]
         // The stamp and signature bitmaps are the fourth annotation glyph cache and were the
         // one app-level cache with no cleanup (P3 memory audit, docs/26 §13). They are rebuild-
@@ -5178,6 +5231,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         case .document(let id):
             selectedDocumentAnnotationID = id
             openDocumentNoteID = id
+            refreshSelectionOverlay()
         case .own(let id): beginEditingAnnotation(id)
         }
     }
@@ -12830,6 +12884,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func showDocumentNote(_ annotation: DocumentAnnotation) {
         selectedDocumentAnnotationID = annotation.id
         openDocumentNoteID = annotation.id
+        refreshSelectionOverlay()
         let text = (annotation.contents ?? "").split(whereSeparator: \.isNewline)
             .first.map(String.init) ?? ""
         statusMessage = text.isEmpty
@@ -12841,13 +12896,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func openInlineNote(at point: CGPoint) -> Bool {
         guard let hit = pagePoint(atContentPoint: point) else { return false }
         for marker in ownInlineNoteMarkers.reversed() where marker.page == hit.page {
-            guard marker.rect.contains(hit.point),
+            guard noteHitRect(marker.rect).contains(hit.point),
                   annotations.indices.contains(marker.annotationIndex) else { continue }
             beginEditingAnnotation(annotations[marker.annotationIndex].id)
             return true
         }
         for marker in inlineNoteMarkers.reversed() where marker.page == hit.page {
-            guard marker.rect.contains(hit.point) else { continue }
+            guard noteHitRect(marker.rect).contains(hit.point) else { continue }
             let annotation = documentAnnotations[marker.annotationIndex]
             showDocumentNote(annotation)
             return true
@@ -12871,8 +12926,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 // A note's `/Rect` is its icon (20-26 pt in the review corpus), and a pointer is
                 // worth a point or two of slack on each side: the alternative is a mark that is
                 // drawn but cannot be hit.
-                let hit = CGRect(x: box.xPt, y: box.yPt, width: box.widthPt, height: box.heightPt)
-                    .insetBy(dx: -Self.noteClickSlackPt, dy: -Self.noteClickSlackPt)
+                let hit = noteHitRect(CGRect(x: box.xPt, y: box.yPt, width: box.widthPt, height: box.heightPt))
                 guard hit.contains(local) else { continue }
 
                 // A single click opens the file's own note paper, exactly as before: reading
@@ -15865,7 +15919,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     heightPt: box.height
                 ),
                 image: image,
-                blend: .normal
+                blend: annotation.kind == .stickyNote ? .interface : .normal
             ))
         }
 
@@ -15904,7 +15958,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             else { continue }
             pages.append(CanvasPage(placement: PagePlacement(index: PlacementIndex.ownNote(marker.annotationIndex),
                 topPt: placement.topPt + marker.rect.minY, leftPt: placement.leftPt + marker.rect.minX,
-                widthPt: marker.rect.width, heightPt: marker.rect.height), image: image))
+                widthPt: marker.rect.width, heightPt: marker.rect.height), image: image, blend: .interface))
         }
         appendDocumentAnnotations(to: &pages)
     }
@@ -16110,7 +16164,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 heightPt: clipped.height
             ),
             image: image,
-            blend: .normal,
+            blend: annotation.drawing == .noteIcon || annotation.hasInlineNote ? .interface : .normal,
             source: CGRect(x: (clipped.minX - rectangle.minX) / rectangle.width,
                            y: (clipped.minY - rectangle.minY) / rectangle.height,
                            width: clipped.width / rectangle.width, height: clipped.height / rectangle.height)
@@ -16140,6 +16194,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         boxPt: CGSize
     ) -> PageImage? {
         let scale = NoteGlyph.scale(zoom: zoomFactor, deviceScale: deviceScale)
+        let visualState = noteState(key: "doc:" + annotation.id, active: openDocumentNoteID == annotation.id)
         let key = NoteGlyphKey(
             index: index,
             drawing: annotation.drawing,
@@ -16148,7 +16203,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             fontSizePt: annotation.fontSizePt ?? NoteGlyph.defaultFreeTextSizePt,
             alignment: annotation.alignment,
             boxPt: boxPt,
-            scale: scale, appearance: NSApplication.shared.effectiveAppearance.name.rawValue
+            scale: scale, appearance: NSApplication.shared.effectiveAppearance.name.rawValue,
+            noteState: visualState, paper: notePaperAppearance
         )
         if let cached = noteGlyphTextures[key] { return cached }
 
@@ -16156,7 +16212,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let generation = nextAnnotationTextureGeneration
         let image: PageImage? = switch annotation.drawing {
         case .noteIcon:
-            NoteGlyph.noteIcon(color: color, boxPt: boxPt, scale: scale, generation: generation)
+            NoteGlyph.noteIcon(color: color, boxPt: boxPt, scale: scale, generation: generation,
+                               state: visualState, paper: notePaperAppearance)
         case .freeText:
             NoteGlyph.freeText(
                 annotation.contents ?? "",
@@ -16168,11 +16225,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 generation: generation
             )
         case .markup:
-            NoteGlyph.inlineComment(color: color, boxPt: boxPt, scale: scale, generation: generation)
+            NoteGlyph.inlineComment(color: color, boxPt: boxPt, scale: scale, generation: generation,
+                                    state: visualState, paper: notePaperAppearance)
         case .geometry, .stamp, .skipped:
             nil
         }
-        if let image { noteGlyphTextures[key] = image }
+        if let image {
+            noteGlyphTextures = noteGlyphTextures.filter { $0.key.index != index }
+            noteGlyphTextures[key] = image
+        }
         return image
     }
 
@@ -16180,6 +16241,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func placedGlyphTexture(for annotation: Annotation, index: Int) -> PageImage? {
         guard let box = annotation.shapeRect, box.width > 0, box.height > 0 else { return nil }
         let scale = NoteGlyph.scale(zoom: zoomFactor, deviceScale: deviceScale)
+        let visualState = noteState(key: "own:" + annotation.id.uuidString, active: editingAnnotationID == annotation.id)
         let key = PlacedGlyphKey(
             index: index,
             kind: annotation.kind.rawValue,
@@ -16187,7 +16249,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             text: annotation.note,
             fontSize: annotation.fontSize,
             boxPt: box.size,
-            scale: scale, appearance: NSApplication.shared.effectiveAppearance.name.rawValue
+            scale: scale, appearance: NSApplication.shared.effectiveAppearance.name.rawValue,
+            noteState: visualState, paper: notePaperAppearance
         )
         if let cached = placedGlyphTextures[key] { return cached }
         // One cached bitmap per placed annotation: a resize walks through many box sizes (and a
@@ -16200,7 +16263,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let image: PageImage? = switch annotation.kind {
         case .stickyNote:
             NoteGlyph.noteIcon(color: annotation.color, boxPt: box.size, scale: scale,
-                               generation: generation)
+                               generation: generation, state: visualState, paper: notePaperAppearance)
         case .textBox:
             NoteGlyph.freeText(annotation.note, color: annotation.color,
                                fontSizePt: annotation.fontSize > 0
@@ -16285,6 +16348,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let boxPt: CGSize
         let scale: CGFloat
         let appearance: String
+        let noteState: NoteGlyph.State
+        let paper: PaperAppearance
     }
 
     /// Identity of one note glyph texture: every input that changes a pixel of it.
@@ -16298,17 +16363,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let boxPt: CGSize
         let scale: CGFloat
         let appearance: String
+        let noteState: NoteGlyph.State
+        let paper: PaperAppearance
     }
 
     private func ownInlineGlyph(annotation: Annotation, index: Int, size: CGSize) -> PageImage? {
         let scale = NoteGlyph.scale(zoom: zoomFactor, deviceScale: deviceScale)
+        let visualState = noteState(key: "own:" + annotation.id.uuidString, active: editingAnnotationID == annotation.id)
         let key = PlacedGlyphKey(index: index, kind: "inline-comment", color: annotation.color,
-            text: "", fontSize: 0, boxPt: size, scale: scale, appearance: NSApplication.shared.effectiveAppearance.name.rawValue)
+            text: "", fontSize: 0, boxPt: size, scale: scale, appearance: NSApplication.shared.effectiveAppearance.name.rawValue,
+            noteState: visualState, paper: notePaperAppearance)
         if let image = placedGlyphTextures[key] { return image }
         placedGlyphTextures = placedGlyphTextures.filter { $0.key.index != index }
         nextAnnotationTextureGeneration &+= 1
         let image = NoteGlyph.inlineComment(color: annotation.color, boxPt: size, scale: scale,
-            generation: nextAnnotationTextureGeneration)
+            generation: nextAnnotationTextureGeneration, state: visualState, paper: notePaperAppearance)
         if let image { placedGlyphTextures[key] = image }
         return image
     }

@@ -122,6 +122,7 @@ int32_t lyra_reader_surface_draw_page(uint64_t surface_id,
  */
 #define LYRA_READER_BLEND_NORMAL 0
 #define LYRA_READER_BLEND_MULTIPLY 1
+#define LYRA_READER_BLEND_INTERFACE 2 /* alpha-over; preserve paper-aware UI colours */
 
 /*
  * Draws several uploaded textures into ONE frame at device-pixel rectangles
