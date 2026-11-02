@@ -70,19 +70,26 @@ package struct AnnotationSentenceMap {
     mutating func range(for annotation: DocumentAnnotation, page: TextPage) -> Range<Int>? {
         if resolvedDocumentRanges.contains(annotation.id) { return documentRanges[annotation.id] }
         resolvedDocumentRanges.insert(annotation.id)
+        let range = span(overlapping: annotation.boxes.map {
+            CGRect(x: $0.xPt, y: $0.yPt, width: $0.widthPt, height: $0.heightPt)
+        }, page: page)
+        documentRanges[annotation.id] = range
+        return range
+    }
+
+    /// File-owned and adopted markup share page-space quads. An adopted mark's 0...0 range
+    /// is only a placeholder; it does not identify the first character of the quoted text.
+    package func span(overlapping regions: [CGRect], page: TextPage) -> Range<Int>? {
         let indices = page.chars.indices.filter { index in
             let char = page.chars[index]
             let rect = CGRect(x: char.xPt, y: char.yPt, width: char.widthPt, height: char.heightPt)
             guard rect.width > 0, rect.height > 0 else { return false }
-            return annotation.boxes.contains { box in
-                let region = CGRect(x: box.xPt, y: box.yPt, width: box.widthPt, height: box.heightPt)
+            return regions.contains { region in
                 let overlap = rect.intersection(region)
                 return !overlap.isNull && overlap.width * overlap.height > rect.width * rect.height * 0.35
             }
         }
-        let range = span(indices: indices)
-        documentRanges[annotation.id] = range
-        return range
+        return span(indices: indices)
     }
 
     package func span(indices: [Int]) -> Range<Int>? {
@@ -159,9 +166,18 @@ package struct AnnotationPassage: Identifiable {
             grouped[annotation.page, default: []].append((map.sentence(containing: range), mark))
         }
         for annotation in own where annotation.kind.isTextMarkup {
-            guard let map = maps[annotation.page], let page = pages[annotation.page],
-                  annotation.start >= 0, annotation.start < page.chars.count, annotation.start <= annotation.end,
-                  let range = map.span(indices: Array(annotation.start...min(annotation.end, page.chars.count - 1))) else { continue }
+            guard let map = maps[annotation.page], let page = pages[annotation.page] else { continue }
+            let resolved: Range<Int>?
+            if let quads = annotation.fileQuads, !quads.isEmpty {
+                resolved = map.span(overlapping: quads.map {
+                    CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
+                }, page: page)
+            } else {
+                guard annotation.start >= 0, annotation.start < page.chars.count,
+                      annotation.start <= annotation.end else { continue }
+                resolved = map.span(indices: Array(annotation.start...min(annotation.end, page.chars.count - 1)))
+            }
+            guard let range = resolved else { continue }
             let mark = PassageMark(source: .own(annotation.id), range: range, kind: annotation.kind,
                 color: annotation.color, opacity: Double(annotation.color.alpha) / 255,
                 note: annotation.note, author: nil,

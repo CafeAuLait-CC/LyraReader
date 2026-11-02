@@ -305,6 +305,10 @@ struct ReaderChecks {
             try await metadataChecks(root: fastRoot)
             return
         }
+        if CommandLine.arguments.contains("--check-annotation-passages") {
+            try await annotationPassageGeometryChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-annotation-editing") {
             try await annotationEditingChecks(root: fastRoot)
             return
