@@ -728,6 +728,11 @@ struct ReaderChecks {
         }
         // Lets the tab-row and tab-switching checks be run on their own while they are being
         // worked on (`LyraReaderChecks --check-tab-row .`).
+        if CommandLine.arguments.contains("--check-titlebar-resize") {
+            titlebarResizeChecks()
+            print("Titlebar resize checks passed")
+            return
+        }
         if CommandLine.arguments.contains("--check-tab-row") {
             let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             tabRowLayoutChecks()
