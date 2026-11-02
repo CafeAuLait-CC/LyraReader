@@ -152,6 +152,10 @@ struct ReaderChecks {
             return
         }
         let fastRoot = checkRoot(CommandLine.arguments.dropFirst(2).first)
+        if CommandLine.arguments.contains("--check-toolbar-motion") {
+            try await toolbarMotionChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-annotation-threads") {
             try await annotationThreadInteractionChecks(root: fastRoot)
             return

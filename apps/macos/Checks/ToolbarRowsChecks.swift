@@ -12,6 +12,7 @@ import SwiftUI
 extension ReaderChecks {
     @MainActor static func toolbarRowsChecks(root: URL) async throws {
         try await toolbarActivationChecks(root: root)
+        try await toolbarMotionChecks(root: root)
         _ = NSApplication.shared
         // Use a scratch copy, not the checked-in fixture: this suite places and undoes
         // annotations, and the reader's process-wide annotation cache is keyed by path. Writing
