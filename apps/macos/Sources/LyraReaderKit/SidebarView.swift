@@ -491,7 +491,7 @@ public struct SidebarView: View {
     /// Everything annotation-shaped about this document, in one list.
     ///
     /// PDF and cached markup share sentence excerpts; non-text annotations and threaded
-    /// replies retain their individual rows. Only annotation-cache entries are editable here.
+    /// replies stay inside their root item. Only annotation-cache entries are editable here.
     private var annotationList: some View {
         Group {
             if state.annotations.isEmpty && state.documentAnnotations.isEmpty && !state.documentAnnotationsLoading {
@@ -510,11 +510,7 @@ public struct SidebarView: View {
                                     if !collapsedAnnotationPages.contains(page.id) {
                                         ForEach(page.rows) { row in
                                             VStack(spacing: 0) {
-                                                switch row {
-                                                case .passage(let passage): passageRow(passage)
-                                                case .document(let annotation): documentAnnotationRow(annotation)
-                                                case .own(let annotation): ownAnnotationRow(annotation)
-                                                }
+                                                annotationSidebarRow(row)
                                                 LyraReaderTheme.separator.frame(height: 1)
                                             }.id(row.id)
                                         }
@@ -522,6 +518,9 @@ public struct SidebarView: View {
                                 }
                             }
                         }
+                    }
+                    .onChange(of: state.selectedAnnotationID) { _, id in
+                        if let id { revealAnnotation(.own(id), scroll: scroll) }
                     }
                     .onChange(of: state.editingAnnotationID) { _, id in
                         if let id { revealAnnotation(.own(id), scroll: scroll) }
@@ -537,6 +536,24 @@ public struct SidebarView: View {
                     if previous != nil, previous != current { state.commitNoteEdits() }
                 }
             }
+        }
+    }
+
+    @ViewBuilder private func annotationSidebarRow(_ row: AnnotationSidebarPage.Row) -> some View {
+        if case .thread(let root, let replies) = row {
+            VStack(alignment: .leading, spacing: 0) {
+                annotationRootRow(root)
+                ForEach(replies) { documentAnnotationRow($0) }
+            }
+        } else { annotationRootRow(row) }
+    }
+
+    @ViewBuilder private func annotationRootRow(_ row: AnnotationSidebarPage.Row) -> some View {
+        switch row {
+        case .passage(let passage): passageRow(passage)
+        case .document(let annotation): documentAnnotationRow(annotation)
+        case .own(let annotation): ownAnnotationRow(annotation)
+        case .thread: EmptyView() // Projection creates a single wrapper around each root.
         }
     }
 
@@ -596,18 +613,15 @@ public struct SidebarView: View {
                     .font(.caption2).foregroundStyle(LyraReaderTheme.textTertiary)
             }
         }.padding(12)
+            .background(passage.marks.contains { state.annotationSidebarSelected($0.source) }
+                        ? LyraReaderTheme.selectedBg : .clear)
     }
 
     /// One row, at its depth in the thread. A reply shows its author, date and its own text; an
     /// orphan says why it is not under a parent instead of disappearing into a silent gap.
     private func documentAnnotationRow(_ row: AnnotationPanelRow) -> some View {
         Button {
-            // An editable annotation is adopted and selected, so its note, colour and geometry
-            // can be edited here; a reply or an unsupported kind still jumps to the page.
-            if state.selectDocumentAnnotation(row.annotation.id) {
-                return
-            }
-            state.jump(toDocumentAnnotation: row.annotation)
+            state.activateDocumentAnnotationRow(row.annotation.id)
         } label: {
             HStack(alignment: .top, spacing: 8) {
                 // The annotation's own colour, so a list entry is recognisable as the mark the
@@ -647,7 +661,7 @@ public struct SidebarView: View {
                             .foregroundStyle(LyraReaderTheme.textSecondary)
                     }
 
-                    if !row.annotation.visible {
+                    if !row.annotation.visible && !row.annotation.isReply {
                         Label("Hidden on page", systemImage: "eye.slash")
                             .font(.caption2)
                             .foregroundStyle(LyraReaderTheme.textSecondary)
@@ -673,8 +687,7 @@ public struct SidebarView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        // A note clicked on the page opens its paper overlay and still marks this row (both go
-        // through `selectedDocumentAnnotationID`); a click here jumps to the annotation's page.
+        // Reply selection belongs to the reply row even when navigation targets its parent.
         .background(state.selectedDocumentAnnotationID == row.annotation.id ? LyraReaderTheme.selectedBg : .clear)
         .contextMenu {
             if !row.annotation.isReply {
@@ -743,6 +756,7 @@ public struct SidebarView: View {
             .help("Delete annotation")
         }
         .padding(12)
+        .background(state.annotationSidebarSelected(.own(annotation.id)) ? LyraReaderTheme.selectedBg : .clear)
         .contextMenu {
             ForEach(Array(AppState.highlightPalette.enumerated()), id: \.offset) { _, entry in
                 Button(entry.name) {

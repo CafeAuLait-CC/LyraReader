@@ -46,15 +46,10 @@ extension ReaderChecks {
                 guard let quad = state.canvasPages.first(where: {
                     $0.placement.index == PlacementIndex.documentNote(marker.annotationIndex)
                 }) else { fatalError("FAIL: missing inline comment glyph") }
-                require(quad.image.pixelWidth > 8 && quad.blend == .normal,
-                        "an inline label is a normal-alpha glyph, separate from the highlight")
-                if let color = note.color {
-                    let bytes = [UInt8](quad.image.bgra)
-                    require(stride(from: 0, to: bytes.count, by: 4).contains {
-                        bytes[$0] == color.blue && bytes[$0 + 1] == color.green
-                            && bytes[$0 + 2] == color.red && bytes[$0 + 3] == 255
-                    }, "the label retains the markup's exact RGB colour")
-                }
+                require(quad.image.pixelWidth > 8 && quad.blend == .interface,
+                        "an inline label preserves its paper-aware palette separately from the highlight")
+                require(marker.rect.width == 24 && marker.rect.height == 24,
+                        "the comment uses a square icon box without covering the text line")
                 let point = CGPoint(x: quad.placement.leftPt + quad.placement.widthPt / 2,
                                     y: quad.placement.topPt + quad.placement.heightPt / 2)
                 state.endPointerInteraction(at: point, wasClick: true)

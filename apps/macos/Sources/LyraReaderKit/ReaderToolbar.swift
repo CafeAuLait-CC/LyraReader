@@ -648,12 +648,34 @@ struct ReaderCenteredTools<Content: View>: View {
     @ViewBuilder var content: () -> Content
     var body: some View {
         GeometryReader { geometry in
-            ScrollView(.horizontal, showsIndicators: false) {
-                content()
-                    .frame(minWidth: geometry.size.width, minHeight: geometry.size.height)
-                    .environment(\.readerRowWidth, geometry.size.width)
-            }
+            ReaderToolsViewport(width: geometry.size.width, height: geometry.size.height,
+                                content: content())
         }
+    }
+}
+
+/// Interpolate the shared proposal, rather than each button's drawing position. A clicked
+/// Button refreshes its pressed/selected label in a separate transaction; letting the label's
+/// own frame interpolate can put its text at the destination while its icon is still moving.
+/// Every child instead receives the same intermediate width and lays out immediately in it.
+private struct ReaderToolsViewport<Content: View>: View, Animatable {
+    nonisolated var width: CGFloat
+    let height: CGFloat
+    let content: Content
+
+    nonisolated var animatableData: CGFloat {
+        get { width }
+        set { width = newValue }
+    }
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            content
+                .frame(minWidth: width, minHeight: height)
+                .environment(\.readerRowWidth, width)
+        }
+        // The viewport owns interpolation; pressed/hover changes must not start a second one.
+        .transaction { $0.animation = nil }
     }
 }
 

@@ -1759,6 +1759,8 @@ public struct TileImage: Sendable {
 public enum QuadBlend: UInt8, Sendable {
     case normal = 0
     case multiply = 1
+    /// Interface artwork chooses its own paper palette and bypasses document recolouring.
+    case interface = 2
 }
 
 /// How the reader arranges pages horizontally (T2.10).

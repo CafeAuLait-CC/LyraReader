@@ -77,6 +77,8 @@ pub mod blend {
     pub const NORMAL: u8 = 0;
     /// `/BM /Multiply` (a highlight loaded from a PDF; see `QuadBlend`).
     pub const MULTIPLY: u8 = 1;
+    /// Alpha-over for interface artwork with an explicit paper palette.
+    pub const INTERFACE: u8 = 2;
 }
 
 /// C ABI return codes (0 = success, kept separate from Rust's `Result` so the C side can check them).
@@ -639,6 +641,7 @@ unsafe fn draw_pages(
             };
             let blend = match modes[index] {
                 blend::MULTIPLY => QuadBlend::Multiply,
+                blend::INTERFACE => QuadBlend::Interface,
                 // An unknown value would be a caller bug; drawing it as an ordinary overlay is the
                 // harmless reading, and the alternative (failing the whole frame) would blank the page.
                 _ => QuadBlend::Normal,

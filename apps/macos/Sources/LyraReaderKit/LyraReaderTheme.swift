@@ -13,6 +13,29 @@ public enum LyraReaderTheme {
         }
     }
 
+    /// Paper-bound note markers use the supplied icon palette, independent of window appearance.
+    static func noteIconColors(state: NoteGlyph.State, darkPaper: Bool) -> (paper: NSColor, fold: NSColor, ink: NSColor) {
+        let colors: (UInt32, UInt32, UInt32)
+        if darkPaper {
+            switch state {
+            case .normal: colors = (0x413B2E, 0x534A35, 0xC1AB7F)
+            case .hovered: colors = (0x4A4231, 0x60533B, 0xD3BC8C)
+            case .active: colors = (0x51452F, 0x6D5938, 0xE7C07B)
+            }
+        } else {
+            switch state {
+            case .normal: colors = (0xF5ECD7, 0xE8DABE, 0x857252)
+            case .hovered: colors = (0xEFE0BC, 0xDFCCA0, 0x79613A)
+            case .active: colors = (0xEBD7A6, 0xD7BB7D, 0x735423)
+            }
+        }
+        func color(_ hex: UInt32) -> NSColor {
+            NSColor(srgbRed: CGFloat((hex >> 16) & 255) / 255,
+                    green: CGFloat((hex >> 8) & 255) / 255, blue: CGFloat(hex & 255) / 255, alpha: 1)
+        }
+        return (color(colors.0), color(colors.1), color(colors.2))
+    }
+
     public static let windowBg = Color(nsColor: adaptive(0xFAFAFA, 0x201F1D))
     public static let titlebarBg = Color(nsColor: adaptive(0xF4F1EC, 0x24221F))
     public static let toolbarBg = Color(nsColor: adaptive(0xF7F4EF, 0x28251F))
