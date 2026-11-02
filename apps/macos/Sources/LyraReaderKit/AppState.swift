@@ -4590,7 +4590,46 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             }
             return
         }
+        // A real viewport-height change is the resize/fullscreen signal. Width-only panel
+        // movement returned above, so opening the sidebar or inspector never re-fits.
+        if applyFitPageOnViewportChange() {
+            // `applyZoomPreset` already clamped the scroll against the new viewport and rebuilt
+            // the band once; doing it again here would double the visible-set work.
+            return
+        }
+        // A multi-page document keeps its percentage. A taller viewport can still leave the
+        // offset past the last page, so the range is tightened with the same clamp every scroll
+        // path uses: 0 when the content is shorter than the viewport (top alignment), otherwise
+        // the last page's bottom at the viewport bottom. One rebuild publishes the new band.
+        scrollYPt = clampedScrollOffset(scrollYPt)
         reloadVisiblePages()
+    }
+
+    /// Re-applies Fit Page when a real viewport-height change left a one-page document's page
+    /// shorter than the viewport.
+    ///
+    /// Returns whether a fit was applied; the caller then skips its own clamp/reload because
+    /// ``applyZoomPreset`` already performed both against the new viewport. The decision itself
+    /// is ``LyraReaderBindings/fitPageOnViewportChange(pageCount:currentPercent:pageHeightPt:viewportHeightPt:calibration:)``
+    /// in `lyra-reader-session`, so the preset's inset/floor/clamp arithmetic is not duplicated
+    /// here. A multi-page document (a facing spread included) always returns nil from that
+    /// policy, so its percentage survives resize and fullscreen.
+    private func applyFitPageOnViewportChange() -> Bool {
+        guard let document, document.pageCount == 1,
+              let geometry = pageFitGeometry(),
+              let target = fitPageOnViewportChange(
+                  pageCount: UInt32(clamping: document.pageCount),
+                  currentPercent: UInt32(clamping: zoomPercent),
+                  pageHeightPt: Double(geometry.pageHeightPt),
+                  viewportHeightPt: Double(viewportSizePt.height),
+                  calibration: Double(displayCalibration.factor)
+              )
+        else { return false }
+        // The single page is the whole document, so top-anchoring lands the scroll at 0: the
+        // page's top edge at the viewport top is the top of the document.
+        applyZoomPreset(Int(target), anchoring: .pageTop(page: geometry.page))
+        statusMessage = "Fit page · \(zoomPercent)%"
+        return true
     }
 
     /// The canvas width the engine last received, in points.

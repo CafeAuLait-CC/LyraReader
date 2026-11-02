@@ -364,6 +364,14 @@ struct ReaderChecks {
             try await canvasResizeChecks()
             return
         }
+        if CommandLine.arguments.contains("--check-viewport-fit") {
+            let root = checkRoot(CommandLine.arguments.dropFirst().first)
+            try await viewportFitChecks(
+                singlePage: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
+                multipage: root.appendingPathComponent("tests/fixtures/multipage.pdf"))
+            print("Viewport-fit checks passed")
+            return
+        }
         if CommandLine.arguments.contains("--check-inplace-translation") {
             try await inPlaceTranslationChecks(root: fastRoot)
             print("In-place translation checks passed")
@@ -1335,6 +1343,12 @@ struct ReaderChecks {
                 try await canvasClearChecks(a: a, b: b)
             }),
             ("canvas-resize", { try await canvasResizeChecks() }),
+            ("viewport-fit-on-resize", {
+                // The one-page fit / multi-page scroll-range policy for real viewport-height
+                // changes, including a real window resize and fullscreen transition. A runner
+                // that refuses fullscreen records a NOTE and keeps the resize evidence.
+                try await viewportFitChecks(singlePage: a, multipage: b)
+            }),
             ("frame-scheduling", {
                 try await frameSchedulingChecks()
             }),
