@@ -113,6 +113,17 @@ extension ReaderChecks {
         require(state.zoomPercent == 115,
                 "viewport fit: shrinking the viewport does not zoom a page that is already above the fit")
         require(state.scrollYPt >= 0, "viewport fit: a shrunk single page never scrolls above its top")
+
+        // A virtual CI display can report a low logical density (38 ppi, factor 0.5278), which
+        // makes the same A4 page much shorter in view points. The policy must use the calibrated
+        // page size: (582 − 16) / (842 × 0.5278) × 100 = 127.3… → 127, not the 67% an
+        // uncalibrated readout would give.
+        state.setDisplayCalibration(DisplayCalibration(factor: 0.5278))
+        state.setViewportSize(CGSize(width: 700, height: 582))
+        require(state.zoomPercent == 127,
+                "viewport fit: the resize fit divides by the display calibration "
+                    + "(got \(state.zoomPercent)%, want 127%)")
+        require(state.scrollYPt == 0, "viewport fit: the calibrated fit is top-aligned")
     }
 
     @MainActor
@@ -215,17 +226,23 @@ extension ReaderChecks {
             fatalError("FAIL: viewport fit could not open \(singlePage.lastPathComponent) in a window")
         }
         try await Task.sleep(for: .milliseconds(250))
-        // The check display leaves a 900×700 window a ~610 pt canvas, so the A4 page is taller
-        // than the viewport at 100%. Zoom out to 50%: the page now leaves vertical blank at 50%
-        // inside the enlarged window below, which is exactly what the resize policy re-fits.
-        // (50% stays below the fit even on a short CI display; the grown canvas only has to exceed
-        // 437 pt for the policy to fire.)
-        for _ in 0..<5 { state.zoomOut() }
+        // The canvas reports the real display calibration. On a 38 ppi virtual CI display the
+        // 100% page is only 444 logical points tall, so opening a 582 pt canvas may already have
+        // auto-fitted; on a 72 ppi display it is 842 pt and 100% stays. Do not assume either:
+        // zoom to the reader's minimum, which is below the fit for every usable window, then let
+        // the real resize below re-apply Fit Page.
+        var zoomOutSteps = 0
+        while state.zoomPercent > AppState.minimumZoomPercent && zoomOutSteps < 40 {
+            state.zoomOut()
+            zoomOutSteps += 1
+        }
         let initialZoom = state.zoomPercent
-        require(initialZoom == 50, "viewport fit: window document can be zoomed out to 50%")
+        require(initialZoom == AppState.minimumZoomPercent,
+                "viewport fit: window document can be zoomed out to the minimum "
+                    + "(got \(initialZoom)%, took \(zoomOutSteps) steps)")
 
-        // A real frame resize. The grown window leaves a ~853 pt canvas on this display; Fit Page
-        // is (853 − 16) / 842 × 100 = 99.4… → 99, above the 50% the reader chose.
+        // A real frame resize. The grown window leaves a ~853 pt canvas here (less on a small
+        // display); Fit Page is always above the 25% the reader chose.
         window.setContentSize(CGSize(width: 900, height: 1000))
         window.contentView?.layoutSubtreeIfNeeded()
         var resizeWait = 0
@@ -261,7 +278,6 @@ extension ReaderChecks {
         // falls back to the resize evidence above and states the gap instead of failing on an
         // unavailable window-server feature.
         let preFullscreenZoom = state.zoomPercent
-        let preFullscreenHeight = canvas.bounds.height
         let transition = ViewportFullscreenTransition()
         let center = NotificationCenter.default
         let enterObserver = center.addObserver(
@@ -287,8 +303,7 @@ extension ReaderChecks {
             return
         }
         var fullscreenSettle = 0
-        while (canvas.bounds.height < preFullscreenHeight + 40
-                || state.zoomPercent <= preFullscreenZoom) && fullscreenSettle < 240 {
+        while state.zoomPercent <= preFullscreenZoom && fullscreenSettle < 240 {
             try await Task.sleep(for: .milliseconds(25))
             fullscreenSettle += 1
         }
@@ -333,7 +348,8 @@ extension ReaderChecks {
         state.gotoPage(2)
         state.scroll(byScreenPoints: 100_000)
         try await Task.sleep(for: .milliseconds(300))
-        let expectedBottom = max(0, state.contentHeightPt * state.zoomFactor - canvas.bounds.height)
+        // `scrollYPt` is in content points; the canvas height is in view points.
+        let expectedBottom = max(0, state.contentHeightPt - canvas.bounds.height / state.zoomFactor)
         require(abs(state.scrollYPt - expectedBottom) < 0.5,
                 "viewport fit: the multi-page window puts the last page at the canvas bottom "
                     + "(offset \(state.scrollYPt), want \(expectedBottom), canvas \(canvas.bounds.size))")

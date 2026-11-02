@@ -369,6 +369,23 @@ mod tests {
     }
 
     #[test]
+    fn the_resize_fit_uses_the_display_calibration() {
+        // A 38 ppi virtual display reports factor 0.5278: the 842 pt A4 page is only 444.4 view
+        // points tall at 100%, so a 582 pt viewport fits it at (582 - 16) / (842 × 0.5278) × 100
+        // = 127.3… → 127. The same viewport on the 72 ppi convention would only fit at 67%, and
+        // a 100% reader is already above that.
+        assert_eq!(
+            fit_page_on_viewport_change(1, 100, 842.0, 582.0, 0.5278),
+            Some(127)
+        );
+        assert_eq!(
+            fit_page_on_viewport_change(1, 127, 842.0, 582.0, 0.5278),
+            None
+        );
+        assert_eq!(fit_page_on_viewport_change(1, 100, 842.0, 582.0, 1.0), None);
+    }
+
+    #[test]
     fn the_resize_fit_uses_the_min_and_max_clamps() {
         // 884 / (10 × 1) × 100 is far past 400: the preset clamps to 400, so a 399% reader is
         // below the fit and adopts it, while 400% is at the fit and stays.
