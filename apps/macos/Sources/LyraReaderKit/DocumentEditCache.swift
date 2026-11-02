@@ -646,6 +646,17 @@ import LyraReaderBindings
             return nil
         }
 
+        let manifest = recoveryURL(for: document)
+        let manifestExists = FileManager.default.fileExists(atPath: manifest.path)
+        let fingerprint = recoveryFingerprint(for: document)
+        // An unreadable session cannot be compared, and the marker cannot locate that session's
+        // annotation files without its manifest. Keep the historical decision for this case: the
+        // resolved quit still stands, because restoring a manifest that no longer parses is not
+        // recovery.
+        if record.hadPageEditSession, manifestExists, fingerprint == nil {
+            return record
+        }
+
         // New annotation work after the marker rewrites one of these two files; that makes the
         // marker stale, and the new draft must be recovered rather than resolved away. Both are
         // required: changes.json can keep the same decoded contents when another annotation is
@@ -661,8 +672,6 @@ import LyraReaderBindings
             return nil
         }
 
-        let manifest = recoveryURL(for: document)
-        let manifestExists = FileManager.default.fileExists(atPath: manifest.path)
         guard record.hadPageEditSession else {
             if manifestExists {
                 FileHandle.standardError.write(Data((
@@ -675,7 +684,7 @@ import LyraReaderBindings
             return record
         }
         guard manifestExists else { return record }
-        guard let fingerprint = recoveryFingerprint(for: document) else { return record }
+        guard let fingerprint else { return record }
         if fingerprint.directory == record.sessionDirectory,
            fingerprint.revision == record.sessionRevision,
            fingerprint.operationCount == record.sessionOperationCount {
