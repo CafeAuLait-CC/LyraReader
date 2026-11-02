@@ -27,8 +27,16 @@ struct LyraReaderApp: App {
         // The perf trace's t0: the earliest point this process can observe. With
         // `LYRA_READER_PERF_TRACE` unset this is one bool test and no record.
         PerfTrace.reportLaunchOnce()
+        #if DEBUG
+        let visualCapture = PaperVisualCapture.prepareIfRequested()
+        if !visualCapture {
+            ReaderDataCompatibility.migratePreferences()
+            AppState.recordsRecentDocuments = true
+        }
+        #else
         ReaderDataCompatibility.migratePreferences()
         AppState.recordsRecentDocuments = true
+        #endif
         // A packaged app must use its own PDFium before the engine's development-directory
         // fallback. That fallback may point into a protected Documents checkout and block
         // dlopen on first open. Preserve an explicit, nonempty developer override.
@@ -86,6 +94,9 @@ struct LyraReaderApp: App {
             // below is the delivery point for documents macOS opens *at* LyraReader; it routes each to
             // the reader's window (`ReaderWindowRegistry`).
             ReaderWindowRoot(registry: appDelegate.registry)
+                #if DEBUG
+                .onAppear { PaperVisualCapture.startIfRequested(registry: appDelegate.registry) }
+                #endif
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1200, height: 800)
