@@ -196,11 +196,13 @@ package struct AnnotationSidebarPage: Identifiable {
     package let annotationCount: Int
     package enum Row: Identifiable {
         case passage(AnnotationPassage), document(AnnotationPanelRow), own(AppState.Annotation)
+        indirect case thread(root: Row, replies: [AnnotationPanelRow])
         package var id: String {
             switch self {
             case .passage(let value): "passage-\(value.id)"
             case .document(let value): "document-\(value.id)"
             case .own(let value): "own-\(value.id)"
+            case .thread(let root, _): root.id
             }
         }
         package func contains(_ source: AnnotationSource) -> Bool {
@@ -208,6 +210,7 @@ package struct AnnotationSidebarPage: Identifiable {
             case .passage(let value): value.marks.contains { $0.source == source }
             case .document(let value): source == .document(value.id)
             case .own(let value): source == .own(value.id)
+            case .thread(let root, let replies): root.contains(source) || replies.contains { source == .document($0.id) }
             }
         }
     }
@@ -216,22 +219,44 @@ package struct AnnotationSidebarPage: Identifiable {
                                  own: [AppState.Annotation]) -> [Self] {
         var bySource: [AnnotationSource: AnnotationPassage] = [:]
         for passage in passages { for mark in passage.marks { bySource[mark.source] = passage } }
-        var emitted: Set<String> = []
+        var emitted: [String: (page: Int, index: Int)] = [:]
         var rows: [Int: [Row]] = [:]
         var counts: [Int: Int] = [:]
-        func append(source: AnnotationSource, page: Int, fallback: Row) {
+        func append(source: AnnotationSource, page: Int, fallback: Row) -> (page: Int, index: Int) {
             counts[page, default: 0] += 1
+            if let passage = bySource[source], let existing = emitted[passage.id] { return existing }
+            let position = (page: page, index: rows[page, default: []].count)
             if let passage = bySource[source] {
-                if emitted.insert(passage.id).inserted { rows[page, default: []].append(.passage(passage)) }
+                emitted[passage.id] = position
+                rows[page, default: []].append(.passage(passage))
             } else { rows[page, default: []].append(fallback) }
+            return position
         }
-        for section in AnnotationPanelModel.build(from: document).sections {
+        func attach(_ replies: [AnnotationPanelRow], to position: (page: Int, index: Int)) {
+            guard !replies.isEmpty else { return }
+            // Positions come from append; the arrays only grow or replace existing items.
+            let root = rows[position.page]![position.index]
+            if case .thread(let parent, let existing) = root {
+                rows[position.page]![position.index] = .thread(root: parent, replies: existing + replies)
+            } else { rows[position.page]![position.index] = .thread(root: root, replies: replies) }
+            counts[position.page, default: 0] += replies.count
+        }
+        var adoptedParents: [String: Int] = [:]
+        for annotation in own {
+            if let identity = annotation.fileIdentity { adoptedParents[identity] = annotation.page }
+        }
+        let panel = AnnotationPanelModel.build(from: document, adoptedParents: adoptedParents)
+        for section in panel.sections {
+            var parent: (page: Int, index: Int)?
             for row in section.rows {
-                append(source: .document(row.id), page: section.page, fallback: .document(row))
+                if row.depth == 0 {
+                    parent = append(source: .document(row.id), page: section.page, fallback: .document(row))
+                } else if let parent { attach([row], to: parent) }
             }
         }
         for annotation in own {
-            append(source: .own(annotation.id), page: annotation.page, fallback: .own(annotation))
+            let position = append(source: .own(annotation.id), page: annotation.page, fallback: .own(annotation))
+            if let identity = annotation.fileIdentity { attach(panel.adoptedReplies[identity] ?? [], to: position) }
         }
         return rows.keys.sorted().map { Self(id: $0, rows: rows[$0]!, annotationCount: counts[$0] ?? 0) }
     }

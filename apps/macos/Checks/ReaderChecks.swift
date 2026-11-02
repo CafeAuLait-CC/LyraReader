@@ -152,6 +152,10 @@ struct ReaderChecks {
             return
         }
         let fastRoot = checkRoot(CommandLine.arguments.dropFirst(2).first)
+        if CommandLine.arguments.contains("--check-annotation-threads") {
+            try await annotationThreadInteractionChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-note-icon") {
             try await noteIconChecks(root: fastRoot)
             return
@@ -1081,6 +1085,7 @@ struct ReaderChecks {
                     url: root.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
             }),
             ("annotation-replies", {
+                try await annotationThreadInteractionChecks(root: root)
                 try await annotationReplyChecks(
                     url: root.appendingPathComponent("tests/fixtures/annotated-replies.pdf"))
             }),

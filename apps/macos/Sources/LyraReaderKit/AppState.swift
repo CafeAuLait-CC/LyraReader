@@ -2727,6 +2727,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let textAnchor: (page: Int, index: Int)?
     }
     private var pendingMarkSelection: PendingMarkSelection?
+    private var pendingNoteToggleID: UUID?
     /// The mark being dragged, and where the drag started in its page's space.
     private var moveOriginalAnnotation: Annotation?
     private var moveStartPagePoint: CGPoint?
@@ -4184,6 +4185,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         openDocumentNoteID = nil
         noteGlyphTextures = [:]
         hoveredNoteKey = nil
+        pendingNoteToggleID = nil
         placedGlyphTextures = [:]
         // The stamp and signature bitmaps are the fourth annotation glyph cache and were the
         // one app-level cache with no cleanup (P3 memory audit, docs/26 §13). They are rebuild-
@@ -5225,6 +5227,43 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
+    package func annotationSidebarSelected(_ source: AnnotationSource) -> Bool {
+        switch source {
+        case .document(let id): return selectedDocumentAnnotationID == id
+        case .own(let id):
+            guard selectedDocumentAnnotationID == nil else { return false }
+            if selectedAnnotationID == id || editingAnnotationID == id { return true }
+            guard let annotation = annotations.first(where: { $0.id == id }), annotation.kind.isTextMarkup,
+                  let selection else { return false }
+            return selection.page == annotation.page
+                && selection.range == annotation.start...max(annotation.start, annotation.end)
+        }
+    }
+
+    /// Sidebar reading follows the thread root, including a parent adopted into the editor.
+    package func activateDocumentAnnotationRow(_ id: String) {
+        guard let annotation = documentAnnotations.first(where: { $0.id == id }) else { return }
+        if annotation.isReply {
+            guard commitTextEditing() else { return }
+            markSelectionRefusalNotice = nil
+            closeDocumentNote()
+            var parents: [String: Int] = [:]
+            for own in annotations { if let identity = own.fileIdentity { parents[identity] = own.page } }
+            let root = AnnotationPanelModel.build(from: documentAnnotations, adoptedParents: parents).rootID(forReply: id)
+            if let root, let own = annotations.first(where: { $0.fileIdentity == root }) { jump(to: own) }
+            else if let root, let document = documentAnnotations.first(where: { $0.id == root }) {
+                jump(toDocumentAnnotation: document)
+            } else { jump(toDocumentAnnotation: annotation) }
+            clearAnnotationSelection()
+            selectedDocumentAnnotationID = id
+            refreshSelectionOverlay()
+            return
+        }
+        if selectDocumentAnnotation(id) {
+            if let own = annotations.first(where: { $0.fileIdentity == id }) { jump(to: own) }
+        } else { jump(toDocumentAnnotation: annotation) }
+    }
+
     package func openPassageNote(_ source: AnnotationSource) {
         jump(to: source)
         switch source {
@@ -6017,10 +6056,33 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         return edges.min(by: { $0.1 < $1.1 })?.0
     }
 
+    private func openOwnNoteID(atContentPoint point: CGPoint) -> UUID? {
+        guard let id = editingAnnotationID, let note = annotations.first(where: { $0.id == id }),
+              let hit = pagePoint(atContentPoint: point), note.page == hit.page else { return nil }
+        let rect = note.kind == .stickyNote ? note.shapeRect
+            : ownInlineNoteMarkers.first(where: { $0.id == id.uuidString })?.rect
+        guard let rect, noteHitRect(rect).contains(hit.point) else { return nil }
+        return id
+    }
+
+    private func dismissOpenDocumentNote(atContentPoint point: CGPoint) -> Bool {
+        guard let note = openDocumentNote, let hit = pagePoint(atContentPoint: point), note.page == hit.page else { return false }
+        let rect = inlineNoteMarkers.first(where: { $0.id == note.id })?.rect
+            ?? note.boxes.first.map { CGRect(x: $0.xPt, y: $0.yPt, width: $0.widthPt, height: $0.heightPt) }
+        guard let rect, noteHitRect(rect).contains(hit.point) else { return false }
+        clearSelection()
+        clearAnnotationSelection()
+        selectedDocumentAnnotationID = note.id
+        closeDocumentNote()
+        return true
+    }
+
     /// The sticky-note tool's click: open an existing icon under the pointer, or place a new
     /// note at the page point the pointer names.
     @discardableResult
     public func placeOrOpenStickyNote(atContentPoint point: CGPoint) -> Bool {
+        if openOwnNoteID(atContentPoint: point) != nil { _ = commitTextEditing(); return true }
+        if dismissOpenDocumentNote(atContentPoint: point) { return true }
         if let hit = placedTextHit(atContentPoint: point),
            let annotation = annotations.first(where: { $0.id == hit.id }),
            annotation.kind == .stickyNote {
@@ -8057,17 +8119,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Shows an annotation: selects its range (or its mark) and scrolls it into view.
     public func jump(to annotation: Annotation) {
+        selectedDocumentAnnotationID = nil
         let top = displayPageTop(annotation.page)
-        if annotation.kind.isGeometry || annotation.kind.isPlacedText {
+        let fileBounds = annotation.fileQuads?.map { CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height) }
+            .reduce(CGRect.null) { $0.union($1) }
+        if annotation.kind.isGeometry || annotation.kind.isPlacedText || fileBounds?.isNull == false {
             // A geometry mark and a placed note/box have no character range. Select the mark so
             // the overlay shows its halo, and scroll to it rather than to the page's first
             // character.
             selectedAnnotationID = annotation.id
             selection = nil
             selectionAnchor = nil
-            let y = top + (annotation.geometryBounds?.midY ?? 0) - viewportHeightContentPt / 3
-            if y < scrollYPt || y > scrollYPt + viewportHeightContentPt {
-                scrollYPt = max(0, y)
+            let localY = (annotation.geometryBounds ?? fileBounds)?.midY ?? 0
+            let anchor = contentY(forPageLocalY: localY, onPage: annotation.page) ?? top + localY
+            if anchor < scrollYPt || anchor > scrollYPt + viewportHeightContentPt {
+                scrollYPt = max(0, min(anchor - viewportHeightContentPt / 3,
+                                     max(0, contentHeightPt - viewportHeightContentPt)))
             }
             reloadVisiblePages()
             return
@@ -12766,11 +12833,22 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// before the ordinary click path can clear it. This is the other half of the deferred
     /// decision `beginSelection` starts: the press only remembered a candidate.
     public func endPointerInteraction(at point: CGPoint, wasClick: Bool) {
+        let closingOwnNote = pendingNoteToggleID ?? openOwnNoteID(atContentPoint: point)
+        pendingNoteToggleID = nil
         // A click on the page (outside the editor) ends an open editing session. A press that
         // begins a drag has already committed in `beginSelection`; this covers the plain click
         // that never passes the drag slop.
-        if editingAnnotationID != nil { commitTextEditing() }
+        if editingAnnotationID != nil, !commitTextEditing() { return }
         markSelectionRefusalNotice = nil
+        if wasClick, closingOwnNote != nil {
+            clearSelection()
+            moveOriginalAnnotation = nil; moveStartPagePoint = nil
+            resizeOriginalAnnotation = nil; resizeStartPagePoint = nil; resizeHandle = nil
+            pendingMarkSelection = nil
+            refreshSelectionOverlay()
+            return
+        }
+        if wasClick, dismissOpenDocumentNote(atContentPoint: point) { return }
         if let original = resizeOriginalAnnotation, let handle = resizeHandle,
            let start = resizeStartPagePoint {
             finishAnnotationResize(original: original, handle: handle, start: start,
@@ -16500,7 +16578,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // A click that reached the canvas is outside every field (the form overlay consumes
         // field clicks), so it ends field editing and lets the press become a text selection.
         if formFocusedFieldID != nil { blurFormField() }
-        if editingAnnotationID != nil { commitTextEditing() }
+        pendingNoteToggleID = openOwnNoteID(atContentPoint: point)
+        if editingAnnotationID != nil, !commitTextEditing() { return }
         pendingMarkSelection = nil
         if annotationTool == .select {
             if let hit = placedTextHit(atContentPoint: point),

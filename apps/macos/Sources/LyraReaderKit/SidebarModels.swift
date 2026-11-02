@@ -126,7 +126,13 @@ public struct AnnotationPanelModel {
     public let nestedReplyCount: Int
     public let orphanedReplyCount: Int
 
-    public static func build(from annotations: [DocumentAnnotation]) -> Self {
+    /// Replies keep their PDF identity after their parent moves into the editable model.
+    public let adoptedReplies: [String: [AnnotationPanelRow]]
+    private let replyRoots: [String: String]
+
+    public func rootID(forReply id: String) -> String? { replyRoots[id] }
+
+    public static func build(from annotations: [DocumentAnnotation], adoptedParents: [String: Int] = [:]) -> Self {
         var byID: [String: DocumentAnnotation] = [:]
         var order: [String] = []
         for annotation in annotations where byID[annotation.id] == nil {
@@ -140,6 +146,7 @@ public struct AnnotationPanelModel {
         })
 
         var parentFor: [String: String] = [:]
+        var replyRoots: [String: String] = [:]
         var orphanFor: [String: AnnotationOrphanReason] = [:]
         for id in order where included.contains(id) {
             guard let annotation = byID[id], annotation.isReply else { continue }
@@ -158,6 +165,11 @@ public struct AnnotationPanelModel {
                     failure = .cycle
                     break
                 }
+                if adoptedParents[parentID] != nil {
+                    if immediateParent == nil { immediateParent = parentID }
+                    replyRoots[id] = parentID
+                    break
+                }
                 guard let parent = byID[parentID] else {
                     failure = .parentMissing
                     break
@@ -170,6 +182,7 @@ public struct AnnotationPanelModel {
                     break
                 }
                 if !parent.isReply {
+                    replyRoots[id] = parentID
                     break
                 }
                 seen.insert(parentID)
@@ -220,6 +233,13 @@ public struct AnnotationPanelModel {
             rowsByPage[annotation.page, default: []].append(contentsOf: rows)
         }
 
+        var adoptedReplies: [String: [AnnotationPanelRow]] = [:]
+        for (id, page) in adoptedParents {
+            var rows: [AnnotationPanelRow] = []
+            for child in children[id] ?? [] { append(child, depth: 1, sectionPage: page, to: &rows) }
+            if !rows.isEmpty { adoptedReplies[id] = rows }
+        }
+
         let sections = rowsByPage.keys.sorted().map {
             AnnotationPanelSection(page: $0, rows: rowsByPage[$0] ?? [])
         }
@@ -228,7 +248,8 @@ public struct AnnotationPanelModel {
             sections: sections,
             replyCount: order.reduce(0) { $0 + ((byID[$1]?.isReply ?? false) ? 1 : 0) },
             nestedReplyCount: parentFor.count,
-            orphanedReplyCount: orphanFor.count
+            orphanedReplyCount: orphanFor.count,
+            adoptedReplies: adoptedReplies, replyRoots: replyRoots
         )
     }
 }

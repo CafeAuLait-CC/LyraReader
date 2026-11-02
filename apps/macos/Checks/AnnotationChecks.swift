@@ -1009,6 +1009,7 @@ extension ReaderChecks {
         // target (#55). A click on a note has to do both halves, so this pins the merge: drop the
         // first and the note opens with the old selection still highlighted behind it; drop the
         // second and a drawn note is not clickable at all.
+        state.closeDocumentNote() // This check exercises opening; repeat-click closing has its own regression.
         let seed = AppState.Annotation(
             id: UUID(),
             page: 0,

@@ -2246,6 +2246,20 @@ def chapter_previews_pdf() -> bytes:
         page_resources_extra=f" /XObject << /Outer {form_id} 0 R >>".encode())
 
 
+def adopted_note_thread_pdf() -> bytes:
+    """A sticky-note thread survives adoption into the editor, including a cross-page reply."""
+    pages = [(text_page(f"Thread page {i}", "", ["Synthetic review content."]), 0) for i in range(1, 4)]
+    first = 4 + 2 * len(pages)
+    return build_pdf(pages, annotations={
+        1: [annotation("Text", (250, 360, 270, 380), name="thread-note", contents="Root note in the page body.",
+                       author="Reviewer"),
+            annotation("Text", (0, 0, 1, 1), name="thread-status", contents="Completed", flags=26,
+                       extra=f"/IRT {first} 0 R")],
+        2: [annotation("Text", (0, 0, 1, 1), name="thread-followup", contents="A nested follow-up", flags=26,
+                       extra=f"/IRT {first + 1} 0 R")],
+    })
+
+
 def navigation_notes_pdf() -> bytes:
     """Contents links, an off-page reply placeholder, and clipped standalone notes."""
     pages = [
@@ -2757,6 +2771,7 @@ def main() -> int:
     (out_dir / "booktabs-bounds.pdf").write_bytes(booktabs_bounds_pdf())
     (out_dir / "chapter-previews.pdf").write_bytes(chapter_previews_pdf())
     (out_dir / "navigation-notes.pdf").write_bytes(navigation_notes_pdf())
+    (out_dir / "adopted-note-thread.pdf").write_bytes(adopted_note_thread_pdf())
     print(f"  {path}  ({path.stat().st_size} bytes, narrative author-year link)")
 
     # 12) T4.52: section references in running text. Page 1 points at "Section 2" and page 2 at
