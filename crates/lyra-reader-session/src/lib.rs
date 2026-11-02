@@ -21,5 +21,5 @@ pub use navigation::{
 };
 pub use viewport::{
     MAX_ZOOM_PERCENT, MIN_ZOOM_PERCENT, Viewport, ZOOM_PRESET_INSET_PT, ZoomRequest, clamp_scroll,
-    resolve_zoom_percent,
+    fit_page_on_viewport_change, resolve_zoom_percent,
 };

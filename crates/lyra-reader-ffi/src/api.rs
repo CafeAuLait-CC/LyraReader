@@ -845,6 +845,30 @@ pub fn clamp_scroll(offset_pt: f64, content_height_pt: f64, viewport_height_pt: 
     lyra_reader_session::clamp_scroll(offset_pt, content_height_pt, viewport_height_pt)
 }
 
+/// The Fit Page percentage a viewport-height change (resize/fullscreen) should adopt.
+///
+/// `Some(percent)` means the shell must apply that percentage; `None` means keep the current
+/// zoom. Only a single-page document participates, and only while `current_percent` is below the
+/// fit — a reader already at or above the fit is never shrunk. Multi-page documents always
+/// return `None`; their viewport change only tightens the scroll range. See
+/// `lyra_reader_session::fit_page_on_viewport_change`.
+#[uniffi::export]
+pub fn fit_page_on_viewport_change(
+    page_count: u32,
+    current_percent: u32,
+    page_height_pt: f64,
+    viewport_height_pt: f64,
+    calibration: f64,
+) -> Option<u32> {
+    lyra_reader_session::fit_page_on_viewport_change(
+        page_count,
+        current_percent,
+        page_height_pt,
+        viewport_height_pt,
+        calibration,
+    )
+}
+
 /// Lowest offered zoom percentage; the shell reads it instead of hard-coding 25.
 #[uniffi::export]
 pub fn zoom_min_percent() -> u32 {
