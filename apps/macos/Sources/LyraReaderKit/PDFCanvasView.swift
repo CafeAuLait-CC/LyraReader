@@ -240,6 +240,12 @@ public final class MetalCanvasView: NSView {
         didSet {
             guard annotationPageFrames != oldValue else { return }
             syncAnnotationOverlay()
+            // The frames also decide the paper quads drawn over the GPU content. A change that
+            // comes from outside a model commit (a test, clearing the geometry, a tab close that
+            // only empties the frames) still has to submit a frame of its own; the overlay sync
+            // above only repaints AppKit layers. Without this the previous paper stayed on screen
+            // until some unrelated input scheduled the next frame.
+            markNeedsRender()
         }
     }
 
