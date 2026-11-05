@@ -44,4 +44,11 @@ void lyra_reader_desktop_buffer_free(LyraReaderBuffer buffer);
 bool lyra_reader_desktop_command(const LyraReaderDesktopDocument *document,
     const std::uint8_t *request, std::size_t request_len, LyraReaderBuffer *output, LyraReaderBuffer *error);
 double lyra_reader_desktop_zoom_offset(double offset, double anchor, double old_zoom, double new_zoom);
+// Pure shared policy: zero means no fit/no change, never a valid percentage.
+std::uint32_t lyra_reader_desktop_fit_percent(bool fit_page, double page_width, double page_height,
+    double viewport_width, double viewport_height, double calibration);
+std::uint32_t lyra_reader_desktop_viewport_fit(std::uint32_t page_count, std::uint32_t current_percent,
+    double page_height, double viewport_height, double calibration);
+// NaN means no usable transient layout range; retain the previous offset.
+double lyra_reader_desktop_clamp_scroll(double offset, double content_height, double viewport_height);
 }

@@ -273,6 +273,7 @@ ApplicationWindow {
     property var aiSettings: session ? session.preference("ai", {}) : ({})
     property var previousReader: null
     property var pendingPosition: null
+    property var pendingLayoutPosition: null
     property bool positionRestoring: true
     property int positionRestoreEpoch: 0
     property alias searchDebounce: searchTimer
@@ -296,6 +297,7 @@ ApplicationWindow {
     onAppearanceChanged: if (session)
         session.setPreference("appearance", appearance)
     onCurrentReaderChanged: {
+        pendingLayoutPosition=null;
         cancelRegionSelection();if(aiRegionCard)aiRegionCard.close();
         Qt.callLater(function(){contentController.reset();});
         if (fillTool.length>0) clearFillTool();
@@ -656,23 +658,26 @@ ApplicationWindow {
             : qsTr("Actual Size · 100%");
     }
     function applyFit(preset) {
-        if (currentReader.pageCount === 0) return;
+        if (currentReader.pageCount === 0) return false;
         const page = currentPage;
         const row = canvas.rows[canvas.pageRows[page]];
-        if (!row || !row.pages.length) return;
+        if (!row || !row.pages.length) return false;
         const left = Math.min.apply(null, row.pages.map(p => p.left));
         const right = Math.max.apply(null, row.pages.map(p => p.left + p.width));
-        const extent = preset === "page" ? row.bottom - row.top : right - left;
-        // Keep the native canvas' 32 point side margins; percentages round down.
-        const available = preset === "page" ? pageList.height - 16 : pageList.width - 64;
-        if (!(extent > 0 && available > 0)) return;
-        const percent = Math.max(25, Math.min(400, Math.floor(available / extent / calibrationFactor * 100)));
+        // Shared presets provide the 8pt inset per side. Reserve another 24pt on
+        // each horizontal edge for the native canvas' existing 32pt side margins.
+        const percent = currentReader.fitPercent(preset === "page",right-left,row.bottom-row.top,
+            pageList.width-48,pageList.height,calibrationFactor);
+        if (!percent) return false;
         fitPreset = preset;
         changeZoom(percent / 100 * calibrationFactor, pageList.width / 2, 0);
         const rowCenter = (pageList.contentWidth - currentReader.documentWidth * zoom) / 2 + (left + right) / 2 * zoom;
         pageList.contentX = Math.max(0, Math.min(pageList.contentWidth - pageList.width, rowCenter - pageList.width / 2));
         if (preset === "page") navigate(page, 0);
-        fitting = true;
+        // Persist the resolved percentage. Legacy fitting records are resolved once
+        // on restore; panel movement and later window resizes never reactivate a preset.
+        fitting = false;
+        return true;
     }
     function fitWidth() { applyFit("width"); }
     function fitPage() { applyFit("page"); }
@@ -693,11 +698,12 @@ ApplicationWindow {
         overviewVisible = false;
     }
     function setPageLayout(mode) {
+        pendingLayoutPosition=null;
+        if(currentReader.pageCount>0 && !positionRestoring)
+            pendingLayoutPosition={reader:currentReader,epoch:positionRestoreEpoch,
+                revision:currentReader.data.document_revision,page:currentPage,y:canvas.pageOffset(currentPage)};
         layoutMode = mode;
         currentReader.setLayout(mode, pageGap);
-    }
-    function fitResize() {
-        resizeTimer.restart();
     }
     function schedulePositionSave() {
         positionTimer.restart();
@@ -2282,12 +2288,6 @@ ApplicationWindow {
         interval: 500
         onTriggered: root.saveReadingPosition()
     }
-    Timer {
-        id: resizeTimer
-        interval: 0
-        onTriggered: if (root.fitting)
-            root.refit()
-    }
     Connections {
         target: root.session ? root.session.credentials : null
         function onFinished(id, operation, secret, error) {
@@ -2325,6 +2325,7 @@ ApplicationWindow {
     Connections {
         target: root.currentReader
         function onDocumentReset() {
+            root.pendingLayoutPosition=null;
             root.cancelRegionSelection();aiRegionCard.close();
             root.cancelErase();
             ++root.positionRestoreEpoch;
@@ -2408,6 +2409,7 @@ ApplicationWindow {
             if (op === "marks_erase")
                 root.eraseDraft = [];
             if (error.length) {
+                if(op==="layout")root.pendingLayoutPosition=null;
                 if (op === "file_adopt")
                     dialogs.showAnnotation();
                 return;
@@ -2462,6 +2464,16 @@ ApplicationWindow {
                         root.positionRestoring = false;
                         root.schedulePositionSave();
                     });
+                } else if (root.pendingLayoutPosition) {
+                    const position=root.pendingLayoutPosition;
+                    root.pendingLayoutPosition=null;
+                    if(position.reader===currentReader && position.epoch===root.positionRestoreEpoch
+                            && position.revision===currentReader.data.document_revision) {
+                        canvas.navigate(position.page,position.y);
+                        canvas.revealPage(position.page);
+                        root.currentPage=position.page;
+                        root.schedulePositionSave();
+                    }
                 } else if (root.fitting)
                     root.refit();
             } else if (op === "search" && id === root.searchRequestId) {

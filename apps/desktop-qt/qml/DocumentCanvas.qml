@@ -10,6 +10,11 @@ Item {
     readonly property var rows: Logic.rows(app.currentReader.pages, app.pageGap)
     property bool positioning: false
     property int placementEpoch: 0
+    property real observedHeight: 0
+    property bool pendingHeightChange: false
+    property var resizeReader: null
+    property int resizeEpoch: -1
+    property var resizeRevision: null
     clip: true
     readonly property var pageRows: {
         const result = {};
@@ -55,9 +60,44 @@ Item {
         });
     }
     function clampY(value) {
-        const first = pageList.originY - pageList.topMargin;
-        return Math.max(first, Math.min(value, Math.max(first, pageList.originY + pageList.contentHeight - pageList.height + pageList.bottomMargin)));
+        const first = pageList.originY;
+        const clamped = app.currentReader.clampScroll(value-first,pageList.contentHeight,pageList.height);
+        // An incomplete ListView layout has no scroll range yet; preserve its offset.
+        return Number.isFinite(clamped) ? first+clamped : pageList.contentY;
     }
+    function viewportChanged() {
+        const heightChanged=observedHeight>0 && Math.abs(pageList.height-observedHeight)>.5;
+        observedHeight=pageList.height;
+        if(!app || app.positionRestoring || !app.currentReader || app.currentReader.loading || !rows.length
+                || app.textViewVisible || app.overviewVisible) return;
+        if(resizeReader!==app.currentReader || resizeEpoch!==app.positionRestoreEpoch)pendingHeightChange=false;
+        pendingHeightChange=pendingHeightChange || heightChanged;
+        resizeReader=app.currentReader;resizeEpoch=app.positionRestoreEpoch;
+        resizeRevision=app.currentReader.data.document_revision;
+        viewportSettle.restart();
+    }
+    function settleViewport() {
+        const changed=pendingHeightChange;pendingHeightChange=false;
+        if(resizeReader!==app.currentReader || resizeEpoch!==app.positionRestoreEpoch || app.positionRestoring
+                || resizeRevision!==app.currentReader.data.document_revision || app.currentReader.loading
+                || app.textViewVisible || app.overviewVisible || !rows.length)return;
+        pageList.forceLayout();
+        if(changed) {
+            const page=app.currentReader.pages[0];
+            // A fractional pinch percentage rounds down only at the integer policy boundary;
+            // a returned integer still strictly exceeds the actual current percentage.
+            const target=app.currentReader.viewportFitPercent(Math.floor(app.zoomPercent),page.height,pageList.height,app.calibrationFactor);
+            if(target>0 && app.applyFit("page")) {
+                app.operationStatus=qsTr("Fit page · %1%").arg(app.zoomPercent);
+                return;
+            }
+        }
+        pageList.contentY=clampY(pageList.contentY);
+        const x=app.currentReader.clampScroll(pageList.contentX,pageList.contentWidth,pageList.width);
+        if(Number.isFinite(x))pageList.contentX=x;
+        app.updateCurrentPage();app.schedulePositionSave();
+    }
+    Timer {id:viewportSettle;interval:0;onTriggered:canvas.settleViewport()}
     // ListView may move its origin when earlier, uninstantiated rows change size.
     // Capture the actual row rather than interpreting contentY as a document offset.
     function viewportAnchor(viewY) {
@@ -166,8 +206,9 @@ Item {
         model: canvas.rows
         clip: true
         contentWidth: Math.max(width, app.currentReader.documentWidth * app.zoom + 64)
-        topMargin: 24
-        bottomMargin: 24
+        // The document starts at the viewport top and ends at its bottom scroll limit.
+        topMargin: 0
+        bottomMargin: 0
         cacheBuffer: height / 2
         reuseItems: false
         boundsBehavior: Flickable.StopAtBounds
@@ -180,10 +221,8 @@ Item {
             app.updateCurrentPage();
             app.schedulePositionSave();
         }
-        onWidthChanged: if (app.fitting)
-            app.fitResize()
-        onHeightChanged: if (app.fitting && app.fitPreset === "page")
-            app.fitResize()
+        onWidthChanged: canvas.viewportChanged()
+        onHeightChanged: canvas.viewportChanged()
         delegate: Item {
             id: rowItem
             objectName: "pdfCanvasRow"

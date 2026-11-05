@@ -311,6 +311,66 @@ pub extern "C" fn lyra_reader_desktop_zoom_offset(
     lyra_reader_runtime::zoomed_offset(offset, anchor, old_zoom, new_zoom)
 }
 
+/// Pure shared zoom policy. Zero means no usable fit, outside the 25–400 percent range.
+#[unsafe(no_mangle)]
+pub extern "C" fn lyra_reader_desktop_fit_percent(
+    fit_page: bool,
+    page_width: f64,
+    page_height: f64,
+    viewport_width: f64,
+    viewport_height: f64,
+    calibration: f64,
+) -> u32 {
+    lyra_reader_session::resolve_zoom_percent(
+        if fit_page {
+            lyra_reader_session::ZoomRequest::FitPage
+        } else {
+            lyra_reader_session::ZoomRequest::FitWidth
+        },
+        lyra_reader_core::Size::new(page_width, page_height),
+        lyra_reader_core::Size::new(viewport_width, viewport_height),
+        calibration,
+    )
+    .unwrap_or(0) // Explicit optional-result sentinel, never a valid percentage.
+}
+
+/// Zero means retain the current percentage; the single-page decision lives in session.
+#[unsafe(no_mangle)]
+pub extern "C" fn lyra_reader_desktop_viewport_fit(
+    page_count: u32,
+    current_percent: u32,
+    page_height: f64,
+    viewport_height: f64,
+    calibration: f64,
+) -> u32 {
+    lyra_reader_session::fit_page_on_viewport_change(
+        page_count,
+        current_percent,
+        page_height,
+        viewport_height,
+        calibration,
+    )
+    .unwrap_or(0) // A no-change result is not replaced with a new zoom.
+}
+
+/// NaN means the shell's transient layout has no usable range; keep its previous offset.
+#[unsafe(no_mangle)]
+pub extern "C" fn lyra_reader_desktop_clamp_scroll(
+    offset: f64,
+    content_height: f64,
+    viewport_height: f64,
+) -> f64 {
+    if !offset.is_finite()
+        || !content_height.is_finite()
+        || !viewport_height.is_finite()
+        || content_height < 0.0
+        || viewport_height < 0.0
+    {
+        return f64::NAN;
+    }
+    lyra_reader_session::clamp_scroll(offset, content_height, viewport_height)
+}
+
 /// # Safety
 /// The document remains alive during preparation. The returned snapshot is independent;
 /// free it once with render_source_free, after all crop requests finish.
@@ -418,6 +478,46 @@ pub unsafe extern "C" fn lyra_reader_desktop_source_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_viewport_boundary_uses_the_shared_fit_and_scroll_contract() {
+        assert_eq!(
+            lyra_reader_desktop_fit_percent(true, 595.0, 842.0, 900.0, 900.0, 1.0),
+            104
+        );
+        assert_eq!(
+            lyra_reader_desktop_viewport_fit(1, 100, 842.0, 900.0, 1.0),
+            104
+        );
+        assert_eq!(
+            lyra_reader_desktop_viewport_fit(1, 104, 842.0, 900.0, 1.0),
+            0
+        );
+        assert_eq!(
+            lyra_reader_desktop_viewport_fit(2, 25, 842.0, 900.0, 1.0),
+            0
+        );
+        assert_eq!(
+            lyra_reader_desktop_viewport_fit(1, 100, 842.0, 582.0, 0.5278),
+            127
+        );
+        assert_eq!(
+            lyra_reader_desktop_fit_percent(false, 595.0, 842.0, 611.0, 900.0, 1.0),
+            100
+        );
+        assert_eq!(
+            lyra_reader_desktop_fit_percent(true, 595.0, 842.0, 900.0, f64::NAN, 1.0),
+            0
+        );
+        assert_eq!(lyra_reader_desktop_clamp_scroll(-5.0, 1000.0, 300.0), 0.0);
+        assert_eq!(
+            lyra_reader_desktop_clamp_scroll(9999.0, 1000.0, 300.0),
+            700.0
+        );
+        assert_eq!(lyra_reader_desktop_clamp_scroll(10.0, 200.0, 300.0), 0.0);
+        assert!(lyra_reader_desktop_clamp_scroll(f64::INFINITY, 200.0, 300.0).is_nan());
+        assert!(lyra_reader_desktop_clamp_scroll(10.0, -1.0, 300.0).is_nan());
+    }
 
     #[test]
     fn image_byte_boundary_rejects_null_handles_and_reports_its_version() {

@@ -110,6 +110,9 @@ public:
     Q_INVOKABLE void requestText(int page);
     Q_INVOKABLE void setLayout(const QString &mode, double gap);
     Q_INVOKABLE double zoomOffset(double offset, double anchor, double oldZoom, double newZoom) const;
+    Q_INVOKABLE uint fitPercent(bool fitPage,double pageWidth,double pageHeight,double viewportWidth,double viewportHeight,double calibration) const;
+    Q_INVOKABLE uint viewportFitPercent(uint currentPercent,double pageHeight,double viewportHeight,double calibration) const;
+    Q_INVOKABLE double clampScroll(double offset,double contentHeight,double viewportHeight) const;
     Q_INVOKABLE QVariantMap signatureImage(const QUrl &url) const;
     Q_INVOKABLE QColor paperBackground(const QString &appearance) const;
     Q_INVOKABLE QStringList signatureFonts() const;

@@ -48,6 +48,8 @@
 #include <thread>
 #include <vector>
 #include <atomic>
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 
 class FakeCredentialStore final : public CredentialStore {
@@ -252,6 +254,122 @@ private slots:
         for(const auto &entry:placements){const auto p=entry.toMap();if(std::abs(p.value("top").toDouble()-top)<.01){left=std::min(left,p.value("left").toDouble());right=std::max(right,p.value("left").toDouble()+p.value("width").toDouble());}}
         QVERIFY((right-left)*window->property("zoom").toDouble()<=view->width()-64+.01);
     }
+    void singlePageFitsOnlyAfterARealViewportHeightChange() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto path=scratch.path()+"/single-page.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;
+        window->resize(1100,640);view.workspace.openFile(QUrl::fromLocalFile(path));
+        auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QTRY_VERIFY(!window->property("positionRestoring").toBool());
+        auto *list=visualItem(window->contentItem(),"pageList");QVERIFY(list);
+        const double calibration=window->property("calibrationFactor").toDouble();
+        auto choose=[&](double percent){window->setProperty("fitting",false);return QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,percent/100*calibration),Q_ARG(QVariant,0),Q_ARG(QVariant,0));};
+        QVERIFY(choose(25));window->resize(1140,640);QTest::qWait(100);
+        QCOMPARE(window->property("zoomPercent").toDouble(),25.0);
+        window->resize(1140,800);
+        const auto pageHeight=reader->pages().first().toMap().value("height").toDouble();
+        const auto fit=[&]{return std::clamp(std::floor((list->height()-16)/pageHeight/calibration*100),25.0,400.0);};
+        QTRY_VERIFY(std::abs(window->property("zoomPercent").toDouble()-fit())<1e-7);
+        QVERIFY(fit()>25);QCOMPARE(window->property("currentPage").toInt(),0);
+        auto *page=visualItem(window->contentItem(),"pdfPage0");QVERIFY(page);
+        QTRY_VERIFY(std::abs(page->mapToItem(list,QPointF(0,0)).y())<1);
+        const auto snapshot=qEnvironmentVariable("LYRA_READER_VIEWPORT_SNAPSHOT");
+        if(!snapshot.isEmpty()){QTRY_VERIFY(page->property("texturesReady").toBool());QVERIFY(window->grabWindow().save(snapshot+"-single.png"));}
+        QVERIFY(choose(25));QTest::qWait(120);
+        QCOMPARE(window->property("zoomPercent").toDouble(),25.0);
+        const auto height=list->height();window->setProperty("sidebarVisible",!window->property("sidebarVisible").toBool());QTest::qWait(120);
+        QCOMPARE(list->height(),height);QCOMPARE(window->property("zoomPercent").toDouble(),25.0);
+        QVERIFY(choose(300));window->resize(1140,720);QTest::qWait(100);
+        QVERIFY(std::abs(window->property("zoomPercent").toDouble()-300)<1e-7);
+    }
+    void multiPageResizePreservesPercentAndClampsBothLayouts() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto path=scratch.path()+"/multi-page.pdf";
+        QVERIFY(QFile::copy(QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;
+        window->resize(1100,640);view.workspace.openFile(QUrl::fromLocalFile(path));
+        auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),9,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QTRY_VERIFY(!window->property("positionRestoring").toBool());
+        auto *list=visualItem(window->contentItem(),"pageList");QVERIFY(list);
+        for(const auto &layout:{QString("Continuous"),QString("Facing")}) {
+            window->resize(1100,640);
+            QVERIFY(QMetaObject::invokeMethod(window,"setPageLayout",Q_ARG(QVariant,layout)));
+            QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+            QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,8),Q_ARG(QVariant,0)));
+            QVERIFY(QMetaObject::invokeMethod(window,"fitPage"));
+            const auto percent=window->property("zoomPercent").toDouble();
+            QVERIFY(QMetaObject::invokeMethod(list,"positionViewAtEnd"));QTest::qWait(40);
+            window->resize(1140,800);QTest::qWait(120);
+            QCOMPARE(window->property("zoomPercent").toDouble(),percent);
+            const double end=list->property("originY").toDouble()+std::max(0.0,list->property("contentHeight").toDouble()-list->height());
+            QTRY_VERIFY(std::abs(list->property("contentY").toDouble()-end)<1);
+            auto *page=visualItem(window->contentItem(),"pdfPage8");QVERIFY(page);
+            QTRY_VERIFY(std::abs(page->mapToItem(list,QPointF(0,page->height())).y()-list->height())<1);
+            const auto snapshot=qEnvironmentVariable("LYRA_READER_VIEWPORT_SNAPSHOT");
+            if(!snapshot.isEmpty()){QTRY_VERIFY(page->property("texturesReady").toBool());QVERIFY(window->grabWindow().save(snapshot+"-"+layout+".png"));}
+        }
+    }
+    void viewportResizeRejectsOldTabsAndPreservesRestoredPercent() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto single=scratch.path()+"/single.pdf",multi=scratch.path()+"/multi.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",single));
+        QVERIFY(QFile::copy(QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf",multi));
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;
+        window->resize(1100,640);view.workspace.openFile(QUrl::fromLocalFile(single));
+        auto *first=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(first->pageCount(),1,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(first->pendingCommands(),0,10000);
+        QTRY_VERIFY(!window->property("positionRestoring").toBool());
+        const double calibration=window->property("calibrationFactor").toDouble();
+        window->setProperty("fitting",false);
+        QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,.375*calibration),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+        QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));
+        // Queue a real height change, then switch documents before the settle callback.
+        window->resize(1100,820);view.workspace.newTab();view.workspace.openFile(QUrl::fromLocalFile(multi));
+        auto *second=view.workspace.activeReader();QVERIFY(second!=first);
+        QTRY_COMPARE_WITH_TIMEOUT(second->pageCount(),9,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(second->pendingCommands(),0,10000);
+        QTRY_VERIFY(!window->property("positionRestoring").toBool());
+        QVERIFY(QMetaObject::invokeMethod(window,"actualSize"));QTest::qWait(120);
+        QVERIFY(std::abs(window->property("zoomPercent").toDouble()-100)<1e-7);
+        view.workspace.selectTab(0);
+        QTRY_COMPARE_WITH_TIMEOUT(first->pendingCommands(),0,10000);
+        QTRY_VERIFY(!window->property("positionRestoring").toBool());QTest::qWait(120);
+        QVERIFY(std::abs(window->property("zoomPercent").toDouble()-37.5)<1e-7);
+        QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));
+        QCOMPARE(view.workspace.viewState(first).value("zoomPercent").toDouble(),37.5);
+        // Restoring a low percentage is not itself a viewport change. The next real one is.
+        window->resize(1100,840);QTRY_VERIFY(window->property("zoomPercent").toDouble()>37.5);
+    }
+    void layoutChangesKeepTheChosenPercentageAndPageAnchor() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/layout-anchor.pdf";
+        QVERIFY(QFile::copy(QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));
+        auto *reader=view.workspace.activeReader();auto *window=view.window;
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),9,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QTRY_VERIFY(!window->property("positionRestoring").toBool());
+        const double scale=1.75*window->property("calibrationFactor").toDouble();window->setProperty("fitting",false);
+        QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,scale),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+        QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,6),Q_ARG(QVariant,150.0)));
+        auto *list=visualItem(window->contentItem(),"pageList");QVERIFY(list);
+        for(const auto &layout:{QString("Facing"),QString("Continuous")}) {
+            QVERIFY(QMetaObject::invokeMethod(window,"setPageLayout",Q_ARG(QVariant,layout)));
+            QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+            QCOMPARE(window->property("zoom").toDouble(),scale);
+            QTRY_VERIFY(visualItem(window->contentItem(),"pdfPage6"));
+            const auto atAnchor=[&]{auto *page=visualItem(window->contentItem(),"pdfPage6");return page && std::abs(page->mapToItem(list,QPointF(0,0)).y()+150*scale)<1;};
+            QTRY_VERIFY(atAnchor());QTest::qWait(60);QVERIFY(atAnchor());
+        }
+        QVERIFY(QMetaObject::invokeMethod(window,"setPageLayout",Q_ARG(QVariant,"Invalid synthetic layout")));
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(!reader->error().isEmpty());
+        const auto pending=window->property("pendingLayoutPosition");
+        QVERIFY(pending.isNull() || pending.value<QJSValue>().isNull());
+    }
     void recentHistoryIsSharedByAllReaderWindows() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());
         const auto firstPath=scratch.path()+"/first.pdf",secondPath=scratch.path()+"/second.pdf";
@@ -341,6 +459,9 @@ private slots:
             if(facing) {
                 QVERIFY(QMetaObject::invokeMethod(window,"setPageLayout",Q_ARG(QVariant,"Facing")));
                 QTRY_COMPARE_WITH_TIMEOUT(workspace.activeReader()->pendingCommands(),0,10000);
+                // Layout changes preserve the percentage. This anchor fixture explicitly
+                // fits both pages before zooming, instead of relying on a sticky preset.
+                QVERIFY(QMetaObject::invokeMethod(window,"fitWidth"));
             }
             window->setProperty("fitting",false);
             QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,6),Q_ARG(QVariant,150.0)));
@@ -1071,7 +1192,7 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(window,"toggleForms"));QTRY_VERIFY(reader->data().contains("forms"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
         const auto fields=reader->data().value("forms").toMap().value("fields").toList();QCOMPARE(fields.size(),8);QVERIFY(reader->editDrafts().isEmpty());
         auto *view=window->findChild<QQuickItem *>("pageList");QVERIFY(view);
-        const auto reveal=[&](QQuickItem *item){const auto center=item->mapToItem(view,QPointF(item->width()/2,item->height()/2));const double target=view->property("contentY").toDouble()+center.y()-view->height()/2;view->setProperty("contentY",qBound(-24.0,target,qMax(-24.0,view->property("contentHeight").toDouble()-view->height()+24)));QTest::qWait(50);};
+        const auto reveal=[&](QQuickItem *item){const auto center=item->mapToItem(view,QPointF(item->width()/2,item->height()/2));const double target=view->property("contentY").toDouble()+center.y()-view->height()/2;const double origin=view->property("originY").toDouble();view->setProperty("contentY",origin+reader->clampScroll(target-origin,view->property("contentHeight").toDouble(),view->height()));QTest::qWait(50);};
         QVariantMap textField,checkField,radioField,choiceField;
         for(const auto &value:fields){const auto f=value.toMap();if(f.value("kind")=="text" && f.value("editable").toBool() && !f.value("multiline").toBool())textField=f;else if(f.value("kind")=="checkBox")checkField=f;else if(f.value("kind")=="radio")radioField=f;else if(f.value("kind")=="comboBox")choiceField=f;}
         QVERIFY(!textField.isEmpty());auto *text=visualItem(window->contentItem(),"formText_"+textField.value("id").toString()+"_0");QVERIFY(text);QVERIFY(text->isVisible());

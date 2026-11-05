@@ -446,6 +446,15 @@ void ReaderController::setLayout(const QString &mode, double gap) {
 double ReaderController::zoomOffset(double offset, double anchor, double oldZoom, double newZoom) const {
     return lyra_reader_desktop_zoom_offset(offset, anchor, oldZoom, newZoom);
 }
+uint ReaderController::fitPercent(bool fitPage,double pageWidth,double pageHeight,double viewportWidth,double viewportHeight,double calibration) const {
+    return lyra_reader_desktop_fit_percent(fitPage,pageWidth,pageHeight,viewportWidth,viewportHeight,calibration);
+}
+uint ReaderController::viewportFitPercent(uint currentPercent,double pageHeight,double viewportHeight,double calibration) const {
+    return lyra_reader_desktop_viewport_fit(uint(pageCount()),currentPercent,pageHeight,viewportHeight,calibration);
+}
+double ReaderController::clampScroll(double offset,double contentHeight,double viewportHeight) const {
+    return lyra_reader_desktop_clamp_scroll(offset,contentHeight,viewportHeight);
+}
 
 QString ReaderController::rasterKey(int page, double scale,bool embedded) {
     return QString::number(page) + QLatin1Char(':') + QString::number(quantizedRasterScale(scale),'g',14)+(embedded?QStringLiteral(":annotations"):QString{});
