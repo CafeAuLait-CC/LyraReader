@@ -240,6 +240,12 @@ public final class MetalCanvasView: NSView {
         didSet {
             guard annotationPageFrames != oldValue else { return }
             syncAnnotationOverlay()
+            // The frames also decide the paper quads drawn over the GPU content. A change that
+            // comes from outside a model commit (a test, clearing the geometry, a tab close that
+            // only empties the frames) still has to submit a frame of its own; the overlay sync
+            // above only repaints AppKit layers. Without this the previous paper stayed on screen
+            // until some unrelated input scheduled the next frame.
+            markNeedsRender()
         }
     }
 
@@ -351,8 +357,10 @@ public final class MetalCanvasView: NSView {
     /// eraser). Returns whether a mode was left, so Escape is only consumed when it did something.
     public var onCancelTool: (() -> Bool)?
 
+    private weak var noteIconState: AppState?
     private let bookmarkHost = PageBookmarkCanvasHost()
     package func configurePageBookmarks(state: AppState?) {
+        noteIconState = state
         if bookmarkHost.superview == nil { addSubview(bookmarkHost) }
         if state != nil { window?.acceptsMouseMovedEvents = true }
         if bookmarkHost.configure(state: state) { markNeedsRender() }
@@ -700,6 +708,11 @@ public final class MetalCanvasView: NSView {
         translations.autoresizingMask = [.width, .height]
         translations.onToggle = { [weak self] id in self?.onTranslationToggle?(id) }
         translations.onCancel = { [weak self] id in self?.onTranslationCancel?(id) }
+        translations.canSelectText = { [weak self] in
+            guard let self else { return false }
+            return self.annotationTool == .select && !self.regionSelectionArmed
+                && !self.fillSignPlacementPending
+        }
         addSubview(translations)
         translationOverlay = translations
         let marquee = AIRegionMarqueeOverlayView(frame: bounds)
@@ -791,6 +804,7 @@ public final class MetalCanvasView: NSView {
     }
 
     public override func mouseEntered(with event: NSEvent) {
+        noteIconState?.updateNoteHover(atContentPoint: contentPoint(for: event))
         bookmarkHost.updateHover(at: bookmarkHost.convert(event.locationInWindow, from: nil))
         if annotationTool == .eraser, !eraserGestureActive {
             showEraserRing(for: event)
@@ -802,6 +816,7 @@ public final class MetalCanvasView: NSView {
     }
 
     public override func mouseMoved(with event: NSEvent) {
+        noteIconState?.updateNoteHover(atContentPoint: contentPoint(for: event))
         bookmarkHost.updateHover(at: bookmarkHost.convert(event.locationInWindow, from: nil))
         guard annotationTool == .eraser, !eraserGestureActive else {
             eraserRing.hideRing()
@@ -813,6 +828,7 @@ public final class MetalCanvasView: NSView {
     }
 
     public override func mouseExited(with event: NSEvent) {
+        noteIconState?.updateNoteHover(atContentPoint: nil)
         bookmarkHost.updateHover(at: nil)
         eraserRing.hideRing()
         if annotationTool == .eraser, !eraserGestureActive { onEraserHover?(nil) }
@@ -991,6 +1007,7 @@ public final class MetalCanvasView: NSView {
     /// gesture with modifier keys to zoom" makes the system swallow the configured modifier
     /// before AppKit sees the event at all — see `AppState.zoomByScroll` for what still works.
     public override func scrollWheel(with event: NSEvent) {
+        noteIconState?.updateNoteHover(atContentPoint: nil)
         // NSEvent already applies the user's natural-scrolling preference. Convert
         // content motion to a top-origin offset exactly once; never invert by device.
         let delta = wheelMotion.delta(
@@ -1820,7 +1837,14 @@ public final class MetalCanvasView: NSView {
         guard surfaceId != 0 else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        defer { CATransaction.commit() }
+        defer {
+            CATransaction.commit()
+            // Several wheel/glide commits can run before AppKit closes its implicit
+            // transaction. Submit each drawable with its matching chrome now; otherwise
+            // multiple presents share the final border geometry and leave an older paper
+            // position visible until another input event flushes the layer tree.
+            CATransaction.flush()
+        }
         // A model commit can arrive after bounds changed but before AppKit's layout pass.
         // Its projection and drawable must still use the same dimensions (and backing scale).
         if resizeSurfaceIfNeeded() { needsRender = false }
@@ -2418,7 +2442,11 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.configureRegionCards(state: regionState, onOpenInPanel: onOpenRegionInPanel,
                                   onShowHistory: onShowRegionHistory)
         view.interactionSnapshot = interactionSnapshot
-        view.perfStamp = perfStamp
+        // A SwiftUI body can have been evaluated before a newer wheel commit. Resolve all
+        // model-owned geometry from one live snapshot so that delayed updateNSView calls
+        // cannot put old rasters back over the current page edges.
+        let commit = modelCommitSnapshot?()
+        view.perfStamp = PerfTrace.enabled ? (onPerfStamp?() ?? perfStamp) : perfStamp
         view.perfStampProvider = onPerfStamp
         view.onFrame = onFrame
         view.onFailure = onFailure
@@ -2440,15 +2468,15 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.onContextMenu = onContextMenu
         view.onTranslationToggle = onTranslationToggle
         view.onTranslationCancel = onTranslationCancel
-        view.zoom = zoom
-        view.scrollYPt = scrollYPt
-        view.contentWidthPt = contentWidthPt
+        view.zoom = commit?.zoom ?? zoom
+        view.scrollYPt = commit?.scrollYPt ?? scrollYPt
+        view.contentWidthPt = commit?.contentWidthPt ?? contentWidthPt
         view.paperAppearance = paperAppearance
         view.canvasClearColor = canvasClearColor
-        view.annotationMarks = annotationMarks
-        view.annotationPageFrames = annotationPageFrames
-        view.translationOverlays = translationOverlays
-        view.translationPaperColors = translationPaperColors
+        view.annotationMarks = commit?.annotationMarks ?? annotationMarks
+        view.annotationPageFrames = commit?.pageFrames ?? annotationPageFrames
+        view.translationOverlays = commit?.translationOverlays ?? translationOverlays
+        view.translationPaperColors = commit?.translationPaperColors ?? translationPaperColors
         view.annotationTool = annotationTool
         view.regionSelectionArmed = regionSelectionArmed
         view.onRegionSelection = onRegionSelection
@@ -2469,7 +2497,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.fillSignPlacementPending = fillSignPlacementPending
         view.onPlaceFillSign = onPlaceFillSign
         view.onCancelTool = onCancelTool
-        view.pages = pages
+        view.pages = commit?.pages ?? pages
         // Drag & drop is rewired on every update: `connect` only assigns closures, and the
         // coordinator is the one long-lived object (it also serves the Dock and Finder paths).
         if let fileDrop { fileDrop.connect(view) }

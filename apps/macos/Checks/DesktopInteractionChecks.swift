@@ -263,6 +263,19 @@ extension ReaderChecks {
         require(bytesAfter == bytesBefore,
                 "a context-menu rotation leaves the original file byte-identical")
 
+        // Leave the fixture clean before the rest of the suite opens it again. The staged
+        // session is durable and keyed by this path; when this AppState has been deallocated by
+        // the next check, the new-window drop below would restore the working revision and show
+        // that revision's URL instead of `b`. Whether it was still alive (and therefore made the
+        // live-owner guard skip the restore) used to depend on ARC, which is what made "the new
+        // window opens the dropped document" intermittent. Discarding here removes the session
+        // the check itself created instead of relying on the old state's lifetime.
+        state.discardPageEdits()
+        require(!state.pageEditSessionActive && !state.pageEditHasPendingChanges,
+                "discarding the staged rotation leaves no page-edit session for later checks")
+        require(state.document?.url?.path == b.path,
+                "discarding the staged rotation reopens the original document")
+
         // A document-less state offers nothing: the menu never appears dead.
         let empty = AppState(engine: try RustEngine())
         require(PageContextMenu.sections(state: empty, page: 0, canOpenNewWindow: true).isEmpty,
@@ -316,7 +329,10 @@ extension ReaderChecks {
             fatalError("FAIL: the sidebar drop created no session")
         }
         require(opened.state.tabs.count == 1 && opened.state.document?.url?.path == b.path,
-                "the new window opens the dropped document")
+                "the new window opens the dropped document (tabs: \(opened.state.tabs.count), "
+                    + "document: \(opened.state.document?.url?.path ?? "nil"), "
+                    + "expected: \(b.path), page-edit session: "
+                    + "\(opened.state.pageEditSessionActive))")
         require(source.state.tabs.count == tabsBefore
                 && source.state.document?.url?.path == a.path,
                 "the window the file was dropped on is not replaced by the drop")

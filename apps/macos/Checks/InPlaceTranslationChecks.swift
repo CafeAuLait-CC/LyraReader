@@ -1031,6 +1031,65 @@ extension ReaderChecks {
             fatalError("The visible block has no chip frame")
         }
 
+        // Hit testing receives a point in the parent's coordinates. Exercise the actual
+        // button, including a non-zero overlay origin, instead of invoking the model toggle.
+        overlay.frame.origin = CGPoint(x: 17, y: 23)
+        host.layoutSubtreeIfNeeded()
+        var toggles: [String] = []
+        overlay.onToggle = { toggles.append($0) }
+        func pressChip(expectedTitle: String) {
+            guard let chip = overlay.chipFrameForCheck(translated.id) else {
+                fatalError("The translation toggle is missing")
+            }
+            let point = overlay.convert(CGPoint(x: chip.midX, y: chip.midY), to: host)
+            guard let button = overlay.hitTest(point) as? NSButton else {
+                fatalError("The translation chip does not route its click to an NSButton")
+            }
+            require(button.title == expectedTitle, "the reachable chip says \(expectedTitle)")
+            button.performClick(nil)
+        }
+        pressChip(expectedTitle: "Show original")
+        let original = TranslationOverlay(
+            id: translated.id, page: 0, rect: rect, sourceText: "source",
+            translatedText: nil, phase: .original, range: nil,
+            isBlock: true, sourceFontPt: 10, fit: nil, paperColor: .lightPaper)
+        overlay.update(overlays: [original], frames: onScreen, zoom: 1, scrollYPt: 0,
+                       contentWidthPt: 500, paperAppearance: .original)
+        host.layoutSubtreeIfNeeded()
+        pressChip(expectedTitle: "Translate")
+        require(toggles == [translated.id, translated.id],
+                "both toggle buttons invoke the translation action without selecting PDF text")
+        let originalPoint = overlay.convert(CGPoint(x: rect.midX, y: rect.midY), to: host)
+        require(overlay.hitTest(originalPoint) == nil, "showing the original returns selection to the PDF")
+        overlay.update(overlays: [translated], frames: onScreen, zoom: 1, scrollYPt: 0,
+                       contentWidthPt: 500, paperAppearance: .original)
+        guard let textView = overlay.hitTest(originalPoint) as? NSTextView else {
+            fatalError("The translated block does not own text selection")
+        }
+        require(textView.isSelectable && !textView.isEditable,
+                "the visible translation is selectable native text")
+        require(textView.string == "Translated text", "the selected text view contains the translation")
+        textView.selectAll(nil)
+        require(textView.selectedRange().length == (textView.string as NSString).length,
+                "native selection covers the visible translation")
+        textView.copy(nil)
+        require(NSPasteboard.general.string(forType: .string) == "Translated text",
+                "copying the translated block copies the visible translation rather than hidden PDF text")
+        overlay.canSelectText = { false }
+        require(overlay.hitTest(originalPoint) == nil,
+                "an armed canvas tool keeps its pointer over translated paper")
+        pressChip(expectedTitle: "Show original")
+        overlay.canSelectText = { true }
+        overlay.frame.origin = .zero
+        overlay.frame.size.width = 600
+        overlay.update(overlays: [translated], frames: onScreen, zoom: 1, scrollYPt: 0,
+                       contentWidthPt: 500, paperAppearance: .original)
+        host.layoutSubtreeIfNeeded()
+        let movedTextPoint = overlay.convert(CGPoint(x: rect.midX + 50, y: rect.midY), to: host)
+        require(overlay.hitTest(movedTextPoint) is NSTextView,
+                "resizing keeps translated text selection aligned with the centered paper")
+        overlay.frame.size.width = 500
+
         // The fitted text itself is drawn inside the cover, not just a coloured rectangle.
         let textHost = NSView(frame: NSRect(x: 0, y: 0, width: 500, height: 400))
         textHost.wantsLayer = true

@@ -1,4 +1,4 @@
-import LyraReaderKit
+@testable import LyraReaderKit
 import CoreGraphics
 import Foundation
 import ImageIO
@@ -952,7 +952,7 @@ extension ReaderChecks {
         require(iconQuad.image.pixelWidth > 8 && iconQuad.image.pixelHeight > 8,
                 "a sticky note is drawn as an icon, not as a 1x1 tint "
                     + "(\(iconQuad.image.pixelWidth)x\(iconQuad.image.pixelHeight) px)")
-        require(iconQuad.blend == .normal, "a note icon is composited alpha-over, not multiplied")
+        require(iconQuad.blend == .interface, "a note icon uses alpha-over with its own paper-aware palette")
         require(abs(iconQuad.placement.widthPt - colouredNote.widthPt) < 0.001
                     && abs(iconQuad.placement.heightPt - colouredNote.heightPt) < 0.001,
                 "the icon fills the /Rect the file gives the note")
@@ -1009,6 +1009,7 @@ extension ReaderChecks {
         // target (#55). A click on a note has to do both halves, so this pins the merge: drop the
         // first and the note opens with the old selection still highlighted behind it; drop the
         // second and a drawn note is not clickable at all.
+        state.closeDocumentNote() // This check exercises opening; repeat-click closing has its own regression.
         let seed = AppState.Annotation(
             id: UUID(),
             page: 0,
@@ -1037,11 +1038,15 @@ extension ReaderChecks {
             width: iconQuad.placement.widthPt,
             height: iconQuad.placement.heightPt
         )
-        let noteColour = colouredNote.color ?? AnnotationColor.defaultNote
-        let fill = snapshot.fraction(ofColor: noteColour, inContentRect: noteBox)
-        require(fill > 0.25,
-                "the sticky note is drawn in its own colour over the page (\(Int(fill * 100))% of "
-                    + "its box is \(noteColour.hex) \(snapshot.describe(noteBox)))")
+        func paletteColor(_ active: Bool) -> AnnotationColor {
+            let surface = LyraReaderTheme.noteIconColors(state: active ? .active : .normal, darkPaper: false)
+                .paper.usingColorSpace(.sRGB)!
+            return AnnotationColor(red: UInt8((surface.redComponent * 255).rounded()),
+                                   green: UInt8((surface.greenComponent * 255).rounded()),
+                                   blue: UInt8((surface.blueComponent * 255).rounded()), alpha: 255)
+        }
+        require(snapshot.fraction(ofColor: paletteColor(true), inContentRect: noteBox) > 0.25,
+                "the open note uses the active folded-paper palette")
         let textBox = CGRect(
             x: textQuad.placement.leftPt,
             y: textQuad.placement.topPt,
@@ -1052,7 +1057,7 @@ extension ReaderChecks {
         require(textInk > 0.01,
                 "the free-text annotation's text is on the page (\(Int(textInk * 100))% of its "
                     + "box is ink \(snapshot.describe(textBox)))")
-        // …and the second note, which the file gives no colour, is drawn in the default one.
+        // A colourless note uses the same Lyra surface and a default-colour cue.
         let plainQuad = state.canvasPages.first {
             $0.placement.index == PlacementIndex.documentNote(1)
         }
@@ -1063,13 +1068,8 @@ extension ReaderChecks {
                 width: plainQuad.placement.widthPt,
                 height: plainQuad.placement.heightPt
             )
-            let plainFill = snapshot.fraction(
-                ofColor: AnnotationColor.defaultNote,
-                inContentRect: plainBox
-            )
-            require(plainFill > 0.25,
-                    "a note with no /C is still visible, in the default note colour "
-                        + "(\(Int(plainFill * 100))% of its box)")
+            require(snapshot.fraction(ofColor: paletteColor(false), inContentRect: plainBox) > 0.25,
+                    "a colourless note uses the same quiet folded-paper surface")
         } else {
             fatalError("FAIL: the colourless note reached no quad")
         }

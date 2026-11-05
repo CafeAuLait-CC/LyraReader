@@ -1,0 +1,117 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R 6 0 R 8 0 R 10 0 R] /Count 4 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> /XObject << /Outer 15 0 R >> >> /Contents 5 0 R /Annots [12 0 R 13 0 R 14 0 R] >>
+endobj
+5 0 obj
+<< /Length 223 >>
+stream
+BT /F1 11 Tf 72 730 Td (See Figure 1.1 and Figure A.4 for the diagrams.) Tj ET
+BT /F1 11 Tf 72 700 Td (The derivation uses Equation A.38 and Eq. \(A.39\).) Tj ET
+BT /F1 11 Tf 72 670 Td (We compare [1, 2, 3, 4, 5, 6].) Tj ET
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> /XObject << /Outer 15 0 R >> >> /Contents 7 0 R >>
+endobj
+7 0 obj
+<< /Length 770 >>
+stream
+BT /F1 11 Tf 180 780 Td (1.2. RUNNING HEADER) Tj ET
+72 765 m 520 765 l S
+BT /F1 11 Tf 72 730 Td (This paragraph precedes the first diagram and stays outside its preview.) Tj ET
+q 1 0 0 1 120 510 cm /Outer Do Q
+BT /F1 11 Tf 72 485 Td (Figure 1.1: A vector diagram drawn in nested forms.) Tj ET
+BT /F1 11 Tf 72 440 Td (This paragraph separates the two diagrams and must not be included.) Tj ET
+BT /F1 13 Tf 72 400 Td (A.5.3 Additional Visualizations) Tj ET
+0.2 0.5 0.8 rg 130 240 90 110 re f 330 240 90 110 re f 0 g
+BT /F1 7 Tf 130 220 Td (Left panel) Tj ET
+BT /F1 7 Tf 330 220 Td (Right panel) Tj ET
+BT /F1 11 Tf 72 190 Td (Figure A.4: Two separate panels share this caption.) Tj ET
+BT /F1 11 Tf 72 140 Td (The following paragraph is not part of the second figure.) Tj ET
+endstream
+endobj
+8 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> /XObject << /Outer 15 0 R >> >> /Contents 9 0 R >>
+endobj
+9 0 obj
+<< /Length 422 >>
+stream
+BT /F1 11 Tf 72 710 Td (Assuming a linear transformation, we obtain:) Tj ET
+BT /F1 11 Tf 170 660 Td (x = alpha a + \(1 - alpha\) b) Tj ET
+BT /F1 11 Tf 170 642 Td (  = alpha x + \(1 - alpha\) y,) Tj ET
+BT /F1 11 Tf 510 642 Td (\(A.38\)) Tj ET
+BT /F1 11 Tf 180 600 Td (y = x + z,) Tj ET
+BT /F1 11 Tf 510 600 Td (\(A.39\)) Tj ET
+BT /F1 11 Tf 72 555 Td (This explanation follows the equations and stays out of the crop.) Tj ET
+endstream
+endobj
+10 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> /XObject << /Outer 15 0 R >> >> /Contents 11 0 R >>
+endobj
+11 0 obj
+<< /Length 647 >>
+stream
+BT /F1 16 Tf 72 750 Td (REFERENCES) Tj ET
+BT /F1 11 Tf 72 660 Td ([1] A. Example. Synthetic reference number 1. Journal of Tests, 2025.) Tj ET
+BT /F1 11 Tf 72 610 Td ([2] A. Example. Synthetic reference number 2. Journal of Tests, 2025.) Tj ET
+BT /F1 11 Tf 72 560 Td ([3] A. Example. Synthetic reference number 3. Journal of Tests, 2025.) Tj ET
+BT /F1 11 Tf 72 510 Td ([4] A. Example. Synthetic reference number 4. Journal of Tests, 2025.) Tj ET
+BT /F1 11 Tf 72 460 Td ([5] A. Example. Synthetic reference number 5. Journal of Tests, 2025.) Tj ET
+BT /F1 11 Tf 72 410 Td ([6] A. Example. Synthetic reference number 6. Journal of Tests, 2025.) Tj ET
+endstream
+endobj
+12 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 726 330 744] /Border [0 0 0] /Dest [6 0 R /Fit] /F 4 >>
+endobj
+13 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 696 420 714] /Border [0 0 0] /Dest [8 0 R /Fit] /F 4 >>
+endobj
+14 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 666 280 684] /Border [0 0 0] /Dest [10 0 R /Fit] /F 4 >>
+endobj
+15 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 360 130] /Resources << /XObject << /Inner 16 0 R >> >> /Length 32 >>
+stream
+q 1.5 0 0 1.5 0 0 cm /Inner Do Q
+endstream
+endobj
+16 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 220 60] /Matrix [1 0 0 1 10 20] /Resources << >> /Length 46 >>
+stream
+0.8 0.4 0.2 rg 0 0 70 45 re f 140 0 70 45 re f
+endstream
+endobj
+xref
+0 17
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000140 00000 n 
+0000000237 00000 n 
+0000000423 00000 n 
+0000000697 00000 n 
+0000000852 00000 n 
+0000001673 00000 n 
+0000001828 00000 n 
+0000002301 00000 n 
+0000002458 00000 n 
+0000003157 00000 n 
+0000003270 00000 n 
+0000003383 00000 n 
+0000003497 00000 n 
+0000003676 00000 n 
+trailer
+<< /Size 17 /Root 1 0 R >>
+startxref
+3863
+%%EOF

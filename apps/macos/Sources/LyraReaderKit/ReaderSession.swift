@@ -145,11 +145,11 @@ public final class ReaderSession: ObservableObject, Identifiable {
                 titlebarLayout = ReaderTitlebarLayout(window: window)
             }
             let center = NotificationCenter.default
-            for name in [NSWindow.didResizeNotification, NSWindow.didExitFullScreenNotification] {
-                windowObservers.append(center.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
-                    MainActor.assumeIsolated { self?.titlebarLayout?.scheduleAlignment() }
-                })
-            }
+            windowObservers.append(center.addObserver(
+                forName: NSWindow.didExitFullScreenNotification, object: window, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.titlebarLayout?.scheduleAlignment() }
+            })
             windowObservers.append(center.addObserver(
                 forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main
             ) { [weak self] _ in

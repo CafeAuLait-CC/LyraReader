@@ -4,6 +4,7 @@ import SwiftUI
 
 extension ReaderChecks {
     @MainActor static func annotationEditingChecks(root: URL) async throws {
+        try await annotationPassageGeometryChecks(root: root)
         let source = "🙂 Generating human motion with diffusion\nmodels poses several challenges. We compare diffusion models again."
         let scalars = Array(source.unicodeScalars)
         let chars = scalars.enumerated().map { index, scalar in

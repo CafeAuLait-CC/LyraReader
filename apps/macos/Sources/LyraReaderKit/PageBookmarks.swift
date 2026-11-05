@@ -28,7 +28,7 @@ package struct BookmarkEditor: View {
                     .font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
                 Spacer()
                 Button(action: close) { Image(systemName: "xmark") }
-                    .buttonStyle(LyraReaderToolStyle()).accessibilityLabel("Close bookmark editor")
+                    .lyraToolStyle().accessibilityLabel("Close bookmark editor")
             }
             Text("Bookmark name").font(.system(size: 12, weight: .medium))
             TextField("Name", text: $name)

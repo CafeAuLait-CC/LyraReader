@@ -51,7 +51,7 @@ struct ReaderInspectorHost<Body: View, Footer: View>: View {
                 }
                 Spacer()
                 Button(action: close) { Image(systemName: "xmark") }
-                    .buttonStyle(LyraReaderToolStyle())
+                    .lyraToolStyle()
                     .accessibilityLabel(closeAccessibilityLabel)
                     .help(closeHelp ?? closeAccessibilityLabel)
             }

@@ -2194,6 +2194,96 @@ def narrative_citation_pdf() -> bytes:
     ]})
 
 
+def chapter_previews_pdf() -> bytes:
+    """Dotted/appendix figures, nested vector forms, a two-line equation, and a long citation."""
+    def text(x: float, y: float, value: str, size: int = 11) -> str:
+        return f"BT /F1 {size} Tf {x} {y} Td ({escape_pdf_string(value)}) Tj ET"
+
+    source = "\n".join([
+        text(72, 730, "See Figure 1.1 and Figure A.4 for the diagrams."),
+        text(72, 700, "The derivation uses Equation A.38 and Eq. (A.39)."),
+        text(72, 670, "We compare [1, 2, 3, 4, 5, 6]."),
+    ])
+    artwork = "\n".join([
+        text(180, 780, "1.2. RUNNING HEADER"), "72 765 m 520 765 l S",
+        text(72, 730, "This paragraph precedes the first diagram and stays outside its preview."),
+        "q 1 0 0 1 120 510 cm /Outer Do Q",
+        text(72, 485, "Figure 1.1: A vector diagram drawn in nested forms."),
+        text(72, 440, "This paragraph separates the two diagrams and must not be included."),
+        text(72, 400, "A.5.3 Additional Visualizations", 13),
+        "0.2 0.5 0.8 rg 130 240 90 110 re f 330 240 90 110 re f 0 g",
+        text(130, 220, "Left panel", 7), text(330, 220, "Right panel", 7),
+        text(72, 190, "Figure A.4: Two separate panels share this caption."),
+        text(72, 140, "The following paragraph is not part of the second figure."),
+    ])
+    equations = "\n".join([
+        text(72, 710, "Assuming a linear transformation, we obtain:"),
+        text(170, 660, "x = alpha a + (1 - alpha) b"),
+        text(170, 642, "  = alpha x + (1 - alpha) y,"), text(510, 642, "(A.38)"),
+        text(180, 600, "y = x + z,"), text(510, 600, "(A.39)"),
+        text(72, 555, "This explanation follows the equations and stays out of the crop."),
+    ])
+    refs = "\n".join([text(72, 750, "REFERENCES", 16)] + [
+        text(72, 710 - i * 50, f"[{i}] A. Example. Synthetic reference number {i}. Journal of Tests, 2025.")
+        for i in range(1, 7)
+    ])
+    links = [
+        annotation("Link", (72, 726, 330, 744), extra="/Border [0 0 0] /Dest [6 0 R /Fit]"),
+        annotation("Link", (72, 696, 420, 714), extra="/Border [0 0 0] /Dest [8 0 R /Fit]"),
+        annotation("Link", (72, 666, 280, 684), extra="/Border [0 0 0] /Dest [10 0 R /Fit]"),
+    ]
+    form_id = first_extra_object_id(4, len(links))
+    inner_content = b"0.8 0.4 0.2 rg 0 0 70 45 re f 140 0 70 45 re f"
+    inner = (b"<< /Type /XObject /Subtype /Form /BBox [0 0 220 60] /Matrix [1 0 0 1 10 20] "
+             b"/Resources << >> /Length " + str(len(inner_content)).encode() +
+             b" >>\nstream\n" + inner_content + b"\nendstream")
+    outer_content = b"q 1.5 0 0 1.5 0 0 cm /Inner Do Q"
+    outer = (f"<< /Type /XObject /Subtype /Form /BBox [0 0 360 130] "
+             f"/Resources << /XObject << /Inner {form_id + 1} 0 R >> >> "
+             f"/Length {len(outer_content)} >>\nstream\n").encode() + outer_content + b"\nendstream"
+    return build_pdf([(source, 0), (artwork, 0), (equations, 0), (refs, 0)],
+        annotations={0: links}, extra_objects=[outer, inner],
+        page_resources_extra=f" /XObject << /Outer {form_id} 0 R >>".encode())
+
+
+def adopted_note_thread_pdf() -> bytes:
+    """A sticky-note thread survives adoption into the editor, including a cross-page reply."""
+    pages = [(text_page(f"Thread page {i}", "", ["Synthetic review content."]), 0) for i in range(1, 4)]
+    first = 4 + 2 * len(pages)
+    return build_pdf(pages, annotations={
+        1: [annotation("Text", (250, 360, 270, 380), name="thread-note", contents="Root note in the page body.",
+                       author="Reviewer"),
+            annotation("Text", (0, 0, 1, 1), name="thread-status", contents="Completed", flags=26,
+                       extra=f"/IRT {first} 0 R")],
+        2: [annotation("Text", (0, 0, 1, 1), name="thread-followup", contents="A nested follow-up", flags=26,
+                       extra=f"/IRT {first + 1} 0 R")],
+    })
+
+
+def navigation_notes_pdf() -> bytes:
+    """Contents links, an off-page reply placeholder, and clipped standalone notes."""
+    pages = [
+        (text_page("Contents", "", ["Chapter 1 ... 2", "Chapter 2 ... 3"]), 0),
+        (text_page("Chapter 1", "", ["A sentence with a review thread."]), 0),
+        (text_page("Chapter 2", "", ["A second chapter."]), 0),
+    ]
+    parent = 4 + 2 * len(pages) + 2  # Two contents links precede this annotation.
+    box = body_line_box(0, 210)
+    return build_pdf(pages, annotations={
+        0: [annotation("Link", body_line_box(i, 180),
+                       extra=f"/Border [0 0 0] /Dest [{6 + i * 2} 0 R /Fit]")
+            for i in range(2)],
+        1: [
+            annotation("Highlight", box, extra=f"/QuadPoints {quad_points([box])}",
+                       contents="Parent discussion", name="review-parent"),
+            annotation("Text", (0, -20, 20, 0), extra=f"/IRT {parent} 0 R /C [0.3 0.1 0.3]",
+                       contents="Reply in the discussion", name="offpage-reply"),
+            annotation("Text", (0, -24, 20, -4), contents="Standalone off-page note"),
+            annotation("Text", (585, 650, 611, 676), contents="Partially clipped note"),
+        ],
+    })
+
+
 def booktabs_bounds_pdf() -> bytes:
     """Top captions, three-rule tables, and a fraction bar after the first table."""
     body = text_page("Table previews", "bounds come from rules and text rows", [
@@ -2679,6 +2769,9 @@ def main() -> int:
     path = out_dir / "narrative-citation.pdf"
     path.write_bytes(narrative_citation_pdf())
     (out_dir / "booktabs-bounds.pdf").write_bytes(booktabs_bounds_pdf())
+    (out_dir / "chapter-previews.pdf").write_bytes(chapter_previews_pdf())
+    (out_dir / "navigation-notes.pdf").write_bytes(navigation_notes_pdf())
+    (out_dir / "adopted-note-thread.pdf").write_bytes(adopted_note_thread_pdf())
     print(f"  {path}  ({path.stat().st_size} bytes, narrative author-year link)")
 
     # 12) T4.52: section references in running text. Page 1 points at "Section 2" and page 2 at

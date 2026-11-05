@@ -39,7 +39,7 @@ struct FillSignToolRow: View {
                             .modifier(ReaderToolbarIcon(id: "\(tool.title).icon"))
                     }
                 }
-                .buttonStyle(LyraReaderToolStyle(selected: state.armedFillSignTool == tool))
+                .lyraToolStyle(selected: state.armedFillSignTool == tool)
                 .disabled(!(command?.enabled ?? false))
                 .help(command?.help ?? tool.title)
                 .accessibilityLabel(tool.title)
@@ -94,7 +94,7 @@ struct ExportToolRow: View {
                             .modifier(ReaderToolbarIcon(id: "export.\(command.id).icon"))
                     }
                 }
-                .buttonStyle(LyraReaderToolStyle())
+                .lyraToolStyle()
                 .disabled(!command.isEnabled(state))
                 .help(command.helpText(state))
                 .accessibilityLabel(command.fullTitle)

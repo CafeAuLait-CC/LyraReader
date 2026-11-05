@@ -70,19 +70,26 @@ package struct AnnotationSentenceMap {
     mutating func range(for annotation: DocumentAnnotation, page: TextPage) -> Range<Int>? {
         if resolvedDocumentRanges.contains(annotation.id) { return documentRanges[annotation.id] }
         resolvedDocumentRanges.insert(annotation.id)
+        let range = span(overlapping: annotation.boxes.map {
+            CGRect(x: $0.xPt, y: $0.yPt, width: $0.widthPt, height: $0.heightPt)
+        }, page: page)
+        documentRanges[annotation.id] = range
+        return range
+    }
+
+    /// File-owned and adopted markup share page-space quads. An adopted mark's 0...0 range
+    /// is only a placeholder; it does not identify the first character of the quoted text.
+    package func span(overlapping regions: [CGRect], page: TextPage) -> Range<Int>? {
         let indices = page.chars.indices.filter { index in
             let char = page.chars[index]
             let rect = CGRect(x: char.xPt, y: char.yPt, width: char.widthPt, height: char.heightPt)
             guard rect.width > 0, rect.height > 0 else { return false }
-            return annotation.boxes.contains { box in
-                let region = CGRect(x: box.xPt, y: box.yPt, width: box.widthPt, height: box.heightPt)
+            return regions.contains { region in
                 let overlap = rect.intersection(region)
                 return !overlap.isNull && overlap.width * overlap.height > rect.width * rect.height * 0.35
             }
         }
-        let range = span(indices: indices)
-        documentRanges[annotation.id] = range
-        return range
+        return span(indices: indices)
     }
 
     package func span(indices: [Int]) -> Range<Int>? {
@@ -159,9 +166,18 @@ package struct AnnotationPassage: Identifiable {
             grouped[annotation.page, default: []].append((map.sentence(containing: range), mark))
         }
         for annotation in own where annotation.kind.isTextMarkup {
-            guard let map = maps[annotation.page], let page = pages[annotation.page],
-                  annotation.start >= 0, annotation.start < page.chars.count, annotation.start <= annotation.end,
-                  let range = map.span(indices: Array(annotation.start...min(annotation.end, page.chars.count - 1))) else { continue }
+            guard let map = maps[annotation.page], let page = pages[annotation.page] else { continue }
+            let resolved: Range<Int>?
+            if let quads = annotation.fileQuads, !quads.isEmpty {
+                resolved = map.span(overlapping: quads.map {
+                    CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
+                }, page: page)
+            } else {
+                guard annotation.start >= 0, annotation.start < page.chars.count,
+                      annotation.start <= annotation.end else { continue }
+                resolved = map.span(indices: Array(annotation.start...min(annotation.end, page.chars.count - 1)))
+            }
+            guard let range = resolved else { continue }
             let mark = PassageMark(source: .own(annotation.id), range: range, kind: annotation.kind,
                 color: annotation.color, opacity: Double(annotation.color.alpha) / 255,
                 note: annotation.note, author: nil,
@@ -196,11 +212,13 @@ package struct AnnotationSidebarPage: Identifiable {
     package let annotationCount: Int
     package enum Row: Identifiable {
         case passage(AnnotationPassage), document(AnnotationPanelRow), own(AppState.Annotation)
+        indirect case thread(root: Row, replies: [AnnotationPanelRow])
         package var id: String {
             switch self {
             case .passage(let value): "passage-\(value.id)"
             case .document(let value): "document-\(value.id)"
             case .own(let value): "own-\(value.id)"
+            case .thread(let root, _): root.id
             }
         }
         package func contains(_ source: AnnotationSource) -> Bool {
@@ -208,6 +226,7 @@ package struct AnnotationSidebarPage: Identifiable {
             case .passage(let value): value.marks.contains { $0.source == source }
             case .document(let value): source == .document(value.id)
             case .own(let value): source == .own(value.id)
+            case .thread(let root, let replies): root.contains(source) || replies.contains { source == .document($0.id) }
             }
         }
     }
@@ -216,22 +235,44 @@ package struct AnnotationSidebarPage: Identifiable {
                                  own: [AppState.Annotation]) -> [Self] {
         var bySource: [AnnotationSource: AnnotationPassage] = [:]
         for passage in passages { for mark in passage.marks { bySource[mark.source] = passage } }
-        var emitted: Set<String> = []
+        var emitted: [String: (page: Int, index: Int)] = [:]
         var rows: [Int: [Row]] = [:]
         var counts: [Int: Int] = [:]
-        func append(source: AnnotationSource, page: Int, fallback: Row) {
+        func append(source: AnnotationSource, page: Int, fallback: Row) -> (page: Int, index: Int) {
             counts[page, default: 0] += 1
+            if let passage = bySource[source], let existing = emitted[passage.id] { return existing }
+            let position = (page: page, index: rows[page, default: []].count)
             if let passage = bySource[source] {
-                if emitted.insert(passage.id).inserted { rows[page, default: []].append(.passage(passage)) }
+                emitted[passage.id] = position
+                rows[page, default: []].append(.passage(passage))
             } else { rows[page, default: []].append(fallback) }
+            return position
         }
-        for section in AnnotationPanelModel.build(from: document).sections {
+        func attach(_ replies: [AnnotationPanelRow], to position: (page: Int, index: Int)) {
+            guard !replies.isEmpty else { return }
+            // Positions come from append; the arrays only grow or replace existing items.
+            let root = rows[position.page]![position.index]
+            if case .thread(let parent, let existing) = root {
+                rows[position.page]![position.index] = .thread(root: parent, replies: existing + replies)
+            } else { rows[position.page]![position.index] = .thread(root: root, replies: replies) }
+            counts[position.page, default: 0] += replies.count
+        }
+        var adoptedParents: [String: Int] = [:]
+        for annotation in own {
+            if let identity = annotation.fileIdentity { adoptedParents[identity] = annotation.page }
+        }
+        let panel = AnnotationPanelModel.build(from: document, adoptedParents: adoptedParents)
+        for section in panel.sections {
+            var parent: (page: Int, index: Int)?
             for row in section.rows {
-                append(source: .document(row.id), page: section.page, fallback: .document(row))
+                if row.depth == 0 {
+                    parent = append(source: .document(row.id), page: section.page, fallback: .document(row))
+                } else if let parent { attach([row], to: parent) }
             }
         }
         for annotation in own {
-            append(source: .own(annotation.id), page: annotation.page, fallback: .own(annotation))
+            let position = append(source: .own(annotation.id), page: annotation.page, fallback: .own(annotation))
+            if let identity = annotation.fileIdentity { attach(panel.adoptedReplies[identity] ?? [], to: position) }
         }
         return rows.keys.sorted().map { Self(id: $0, rows: rows[$0]!, annotationCount: counts[$0] ?? 0) }
     }

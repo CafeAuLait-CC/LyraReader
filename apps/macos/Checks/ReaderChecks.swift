@@ -152,6 +152,18 @@ struct ReaderChecks {
             return
         }
         let fastRoot = checkRoot(CommandLine.arguments.dropFirst(2).first)
+        if CommandLine.arguments.contains("--check-toolbar-motion") {
+            try await toolbarMotionChecks(root: fastRoot)
+            return
+        }
+        if CommandLine.arguments.contains("--check-annotation-threads") {
+            try await annotationThreadInteractionChecks(root: fastRoot)
+            return
+        }
+        if CommandLine.arguments.contains("--check-note-icon") {
+            try await noteIconChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-perf-trace") {
             // Opt-in first (`LyraReaderChecks <root> --check-perf-trace`), and also a registered
             // suite below, so the normal run covers it without a separate invocation. The root is
@@ -293,6 +305,10 @@ struct ReaderChecks {
             try await metadataChecks(root: fastRoot)
             return
         }
+        if CommandLine.arguments.contains("--check-annotation-passages") {
+            try await annotationPassageGeometryChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-annotation-editing") {
             try await annotationEditingChecks(root: fastRoot)
             return
@@ -350,6 +366,14 @@ struct ReaderChecks {
         }
         if CommandLine.arguments.contains("--check-canvas-resize") {
             try await canvasResizeChecks()
+            return
+        }
+        if CommandLine.arguments.contains("--check-viewport-fit") {
+            let root = checkRoot(CommandLine.arguments.dropFirst().first)
+            try await viewportFitChecks(
+                singlePage: root.appendingPathComponent("tests/fixtures/text-page.pdf"),
+                multipage: root.appendingPathComponent("tests/fixtures/multipage.pdf"))
+            print("Viewport-fit checks passed")
             return
         }
         if CommandLine.arguments.contains("--check-inplace-translation") {
@@ -708,6 +732,11 @@ struct ReaderChecks {
         }
         // Lets the tab-row and tab-switching checks be run on their own while they are being
         // worked on (`LyraReaderChecks --check-tab-row .`).
+        if CommandLine.arguments.contains("--check-titlebar-resize") {
+            titlebarResizeChecks()
+            print("Titlebar resize checks passed")
+            return
+        }
         if CommandLine.arguments.contains("--check-tab-row") {
             let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             tabRowLayoutChecks()
@@ -1072,10 +1101,12 @@ struct ReaderChecks {
                 try await inlineNoteChecks(root: root)
             }),
             ("annotation-notes", {
+                try await noteIconChecks(root: root)
                 try await annotationNoteChecks(
                     url: root.appendingPathComponent("tests/fixtures/annotated-notes.pdf"))
             }),
             ("annotation-replies", {
+                try await annotationThreadInteractionChecks(root: root)
                 try await annotationReplyChecks(
                     url: root.appendingPathComponent("tests/fixtures/annotated-replies.pdf"))
             }),
@@ -1321,6 +1352,12 @@ struct ReaderChecks {
                 try await canvasClearChecks(a: a, b: b)
             }),
             ("canvas-resize", { try await canvasResizeChecks() }),
+            ("viewport-fit-on-resize", {
+                // The one-page fit / multi-page scroll-range policy for real viewport-height
+                // changes, including a real window resize and fullscreen transition. A runner
+                // that refuses fullscreen records a NOTE and keeps the resize evidence.
+                try await viewportFitChecks(singlePage: a, multipage: b)
+            }),
             ("frame-scheduling", {
                 try await frameSchedulingChecks()
             }),

@@ -32,9 +32,16 @@ extension ReaderChecks {
         })
         require(canvas.pages.isEmpty, "paper fallback queues no document raster or fake content")
         canvas.annotationPageFrames = []
-        try await eventually("closing geometry removes the paper too", {
-            canvas.lastAttemptedQuadCount == 0 && canvas.lastAttemptedPaperQuadCount == 0
-        })
+        try await eventuallyExplaining(
+            "closing geometry removes the paper too",
+            {
+                let quads = canvas.lastAttemptedQuadCount.map(String.init) ?? "nil"
+                return "attempts=\(canvas.frameAttemptCount) quads=\(quads) "
+                    + "paper=\(canvas.lastAttemptedPaperQuadCount)"
+            },
+            {
+                canvas.lastAttemptedQuadCount == 0 && canvas.lastAttemptedPaperQuadCount == 0
+            })
 
         let state = AppState(engine: try RustEngine())
         state.setDeviceScale(2)

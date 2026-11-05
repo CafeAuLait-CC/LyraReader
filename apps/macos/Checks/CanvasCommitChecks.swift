@@ -34,6 +34,49 @@ extension ReaderChecks {
         try FileManager.default.copyItem(at: source, to: fixture)
         try await runCanvasCommitScenario(fixture: fixture, tracing: true)
         try await runCanvasCommitScenario(fixture: fixture, tracing: false)
+        try await delayedCanvasUpdateChecks()
+    }
+
+    /// Force the ordering a fast wheel burst can expose: an old SwiftUI value arrives after
+    /// a newer direct canvas commit. A changed appearance proves updateNSView actually ran.
+    @MainActor private static func delayedCanvasUpdateChecks() async throws {
+        let original = PagePlacement(index: 0, topPt: 0, leftPt: 0, widthPt: 595, heightPt: 842)
+        let moved = PagePlacement(index: 0, topPt: 70, leftPt: 0, widthPt: 595, heightPt: 842)
+        let image = PageImage(pixelWidth: 1, pixelHeight: 1, pointSize: CGSize(width: 595, height: 842),
+                              bgra: Data([255, 255, 255, 255]), generation: 1)
+        let oldPages = [CanvasPage(placement: original, image: image)]
+        let newPages = [CanvasPage(placement: moved, image: image)]
+        var latest = CanvasModelCommit(pages: oldPages, scrollYPt: 0, zoom: 1,
+            contentWidthPt: 595, pageFrames: [original], annotationMarks: [],
+            translationOverlays: [], translationPaperColors: [:])
+        func staleView(_ appearance: PaperAppearance) -> PDFCanvasView {
+            PDFCanvasView(pages: oldPages, scrollYPt: 0, zoom: 1, contentWidthPt: 595,
+                paperAppearance: appearance, annotationPageFrames: [original],
+                modelCommitSnapshot: { latest })
+        }
+        let host = NSHostingView(rootView: staleView(.original))
+        let window = NSWindow(contentRect: CGRect(x: 30, y: 80, width: 700, height: 500),
+            styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = host
+        window.makeKeyAndOrderFront(nil)
+        defer { window.orderOut(nil); window.contentView = nil }
+        func find(_ view: NSView) -> MetalCanvasView? {
+            if let canvas = view as? MetalCanvasView { return canvas }
+            return view.subviews.lazy.compactMap { find($0) }.first
+        }
+        try await eventually("the delayed-update canvas is attached", { find(host)?.hasAttachedSurface == true })
+        guard let canvas = find(host) else { fatalError("Missing delayed-update canvas") }
+        latest.pages = newPages
+        latest.pageFrames = [moved]
+        latest.scrollYPt = 250
+        canvas.pages = newPages
+        canvas.annotationPageFrames = [moved]
+        canvas.scrollYPt = 250
+        host.rootView = staleView(.warm)
+        try await eventually("the delayed SwiftUI update was applied", { canvas.paperAppearance == .warm })
+        require(canvas.scrollYPt == 250 && canvas.pages.first?.placement == moved
+                    && canvas.annotationPageFrames == [moved],
+                "an old SwiftUI value cannot roll back the latest raster, offset, or page edges")
     }
 
     /// One scenario: a real `ReaderWindow` around a real engine and canvas. The zoom is forced
@@ -226,6 +269,17 @@ extension ReaderChecks {
                         "\(mode): the traced frame draws the committed page list")
             }
         }
+
+        // A burst stays on one run-loop turn, then stops without a final corrective event.
+        // The last drawable and page chrome must keep the final committed geometry.
+        for index in 0..<24 { state.scrollByWheelStep(index.isMultiple(of: 2) ? 38 : -27) }
+        let burstOffset = state.scrollYPt
+        let burstChrome = PageChromeGeometry.rectangles(frames: state.canvasPageSegments,
+            viewport: canvas.bounds.size, contentWidthPt: state.contentWidthPt,
+            zoom: state.zoomFactor, scrollYPt: burstOffset)
+        try await Task.sleep(for: .milliseconds(400))
+        require(canvas.scrollYPt == burstOffset && canvas.pageChromeRectangles == burstChrome,
+                "\(mode): a stopped wheel burst keeps paper and edges at its last commit")
 
         // ── a commit with no visible change submits nothing ──────────────────
         try await waitForQuiescentCanvas(state: state, canvas: canvas)

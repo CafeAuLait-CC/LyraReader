@@ -1625,6 +1625,60 @@ private slots:
         QVERIFY(ReaderController::cpuCacheKiB()<=96*1024);QVERIFY(refined());
         const auto snapshots=qEnvironmentVariable("LYRA_READER_CHECK_SNAPSHOTS");if(!snapshots.isEmpty())QVERIFY(window->grabWindow().save(snapshots+"/lyrareader-deep-zoom.png"));
     }
+    void contentsLinksNavigateWhileChapterReferencesKeepTheirLocalPreviews() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        for(const auto &name:{"navigation-notes.pdf","chapter-previews.pdf"})
+            QVERIFY(QFile::copy(root+"/tests/fixtures/"+name,scratch.path()+"/"+name));
+        WorkspaceController workspace;QQmlApplicationEngine engine;
+        engine.addImageProvider("lyrapreview",new NativeImageProvider);
+        engine.rootContext()->setContextProperty("workspace",&workspace);
+        engine.rootContext()->setContextProperty("reader",workspace.activeReader());
+        engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
+        auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        auto *preview=workspace.preview();
+        workspace.openFile(QUrl::fromLocalFile(scratch.path()+"/navigation-notes.pdf"));
+        auto *reader=workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),3,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QTRY_VERIFY(!window->property("positionRestoring").toBool());
+        reader->submit("links",{{"page",0}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto links=reader->data().value("links").toList();QCOMPARE(links.size(),2);
+        const auto click=[&](const QVariantMap &hit) {
+            return QMetaObject::invokeMethod(window,"pageClicked",Q_ARG(QVariant,0),
+                Q_ARG(QVariant,hit.value("x_pt").toDouble()+hit.value("width_pt").toDouble()-2),
+                Q_ARG(QVariant,hit.value("y_pt").toDouble()+hit.value("height_pt").toDouble()/2),
+                Q_ARG(QVariant,320),Q_ARG(QVariant,200));
+        };
+        for(const auto &value:links) {
+            const auto link=value.toMap();QVERIFY(link.value("navigation").toBool());
+            QVERIFY(click(link));
+            QTRY_COMPARE_WITH_TIMEOUT(window->property("currentPage").toInt(),link.value("page").toInt(),10000);
+            QVERIFY(!preview->visible());QVERIFY(!preview->loading());
+            QVERIFY(QMetaObject::invokeMethod(window,"goBack"));
+            QTRY_COMPARE(window->property("currentPage").toInt(),0);
+        }
+        workspace.openFile(QUrl::fromLocalFile(scratch.path()+"/chapter-previews.pdf"));reader=workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),4,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        reader->submit("caption_mentions",{{"page",0}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto mentions=reader->data().value("caption_mentions").toList();QCOMPARE(mentions.size(),4);
+        for(const auto &value:mentions) {
+            const auto mention=value.toMap();QVERIFY(click(mention));
+            QTRY_VERIFY_WITH_TIMEOUT(preview->visible(),10000);
+            QCOMPARE(preview->model().value("kind").toString(),QString("figure"));
+            QCOMPARE(preview->model().value("title").toString(),mention.value("kind").toString()+" "+mention.value("label").toString());
+            const auto region=preview->model().value("region").toMap();
+            QVERIFY(region.value("height_pt").toDouble()>0 && region.value("height_pt").toDouble()<180);
+            if(mention.value("kind").toString()=="Equation")QVERIFY(region.value("height_pt").toDouble()<50);
+            preview->close();
+        }
+        reader->submit("citations",{{"page",0}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto citations=reader->data().value("citations").toList();QVariantMap group;
+        for(const auto &value:citations)if(value.toMap().value("labels").toList().size()==6)group=value.toMap();
+        QVERIFY(!group.isEmpty());QVERIFY(click(group));QTRY_VERIFY_WITH_TIMEOUT(preview->visible(),10000);
+        QCOMPARE(preview->model().value("kind").toString(),QString("reference"));
+        QCOMPARE(preview->model().value("entries").toList().size(),6);
+    }
     void referencesFiguresAndSectionsUseRealAsynchronousPreviews() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());
         for(const auto &name:{"numeric-citations.pdf","cross-references.pdf","section-references.pdf"})

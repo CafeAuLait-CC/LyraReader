@@ -66,7 +66,7 @@ public struct TabStrip: View {
                                            height: TabRowLayout.height)
                             }
                             Button { state.showFileImporter = true } label: { Image(systemName: "plus") }
-                                .buttonStyle(LyraReaderToolStyle())
+                                .lyraToolStyle()
                                 .frame(width: TabRowLayout.plusButtonSize,
                                        height: TabRowLayout.plusButtonSize, alignment: .center)
                                 .help("Open a PDF in a new tab (⌘O)")
@@ -229,7 +229,7 @@ struct ReaderToolbar: View {
         .padding(.vertical, 7)
         .background(LyraReaderTheme.toolbarBg)
         .overlay(alignment: .bottom) { LyraReaderTheme.separator.frame(height: 1) }
-        .buttonStyle(LyraReaderToolStyle())
+        .lyraToolStyle()
         .fixedSize(horizontal: false, vertical: true)
     }
 
@@ -277,7 +277,7 @@ struct ReaderToolbar: View {
                     }
                 }.padding(.horizontal, 6)
             }
-            .buttonStyle(LyraReaderToolStyle(selected: state.annotationToolsVisible && !state.pageOverviewVisible))
+            .lyraToolStyle(selected: state.annotationToolsVisible && !state.pageOverviewVisible)
             .help("Show annotation tools").accessibilityLabel("Annotation tools")
             .accessibilityValue(state.annotationToolsVisible ? "Expanded" : "Collapsed")
             .background(AnnotationToolbarFrameReader(id: "toolbar.annotate"))
@@ -289,7 +289,7 @@ struct ReaderToolbar: View {
                             .background(AnnotationToolbarFrameReader(id: "toolbar.edit.label"))
                     }
                 }.padding(.horizontal, 6)
-            }.buttonStyle(LyraReaderToolStyle(selected: state.contentEditEnabled))
+            }.lyraToolStyle(selected: state.contentEditEnabled)
                 .disabled(!state.canPageEdit)
                 .help("Show PDF editing tools").accessibilityLabel("Edit")
                 .accessibilityValue(state.contentEditEnabled ? "Expanded" : "Collapsed")
@@ -306,7 +306,7 @@ struct ReaderToolbar: View {
                     }
                 }.padding(.horizontal, 6)
             }
-            .buttonStyle(LyraReaderToolStyle(selected: state.fillAndSignVisible))
+            .lyraToolStyle(selected: state.fillAndSignVisible)
             .disabled(!state.canOpenFillAndSign)
             .help(state.fillAndSignHelp)
             .accessibilityLabel(AnnotationToolbarLayout.fillAndSignLabel)
@@ -323,7 +323,7 @@ struct ReaderToolbar: View {
                     }
                 }.padding(.horizontal, 6)
             }
-            .buttonStyle(LyraReaderToolStyle(selected: state.exportVisible))
+            .lyraToolStyle(selected: state.exportVisible)
             .disabled(state.document == nil)
             .help("Export and save: Save, Save As, annotated and flattened copies, form copies, "
                   + "annotation export and Print")
@@ -344,7 +344,7 @@ struct ReaderToolbar: View {
                     }
                 }.padding(.horizontal, 6)
             }
-            .buttonStyle(LyraReaderToolStyle(selected: state.aiToolsVisible))
+            .lyraToolStyle(selected: state.aiToolsVisible)
             .help("Show Lyra tools (⇧⌘A)")
             .accessibilityLabel("Lyra tools")
             .accessibilityValue(state.aiToolsVisible ? "Expanded" : "Collapsed")
@@ -392,7 +392,7 @@ struct ReaderToolbar: View {
     private func tool(_ title: String, _ icon: String, selected: Bool = false,
                       action: @escaping () -> Void) -> some View {
         Button(action: action) { Image(systemName: icon) }
-            .buttonStyle(LyraReaderToolStyle(selected: selected))
+            .lyraToolStyle(selected: selected)
             .help(title).accessibilityLabel(title)
             .accessibilityValue(selected ? "Selected" : "")
     }
@@ -463,7 +463,7 @@ struct ReaderSecondaryToolbar: View {
         .background(ReaderChromeMarkerHost(kind: .secondaryToolbar))
         .background(LyraReaderTheme.panelBg)
         .overlay(alignment: .bottom) { LyraReaderTheme.separator.frame(height: 1) }
-        .buttonStyle(LyraReaderToolStyle())
+        .lyraToolStyle()
     }
 
     /// Help for a tool that changes the document: a signed file says where the edit can go.
@@ -597,8 +597,9 @@ struct LyraToolRow: View {
                 ReaderToolbarLabel(title: "Interleaf", id: "lyra.interleaf") {
                     InterleafIcon()
                 }
-            }.buttonStyle(LyraReaderToolStyle(selected: state.regionSelectionArmed))
-                .disabled(!state.canArmRegionSelection).help("Select & Ask").accessibilityLabel("Interleaf · Select & Ask")
+            }.lyraToolStyle(selected: state.regionSelectionArmed)
+                .disabled(!state.regionSelectionArmed && !state.canArmRegionSelection)
+                .help("Select & Ask").accessibilityLabel("Interleaf · Select & Ask")
                 .background(AnnotationToolbarFrameReader(id: "lyra.interleaf"))
             workspace("Summary", icon: "text.alignleft", tab: .summary)
             workspace("Translate", icon: "character.bubble", tab: .translation)
@@ -608,9 +609,7 @@ struct LyraToolRow: View {
     }
     private func workspace(_ title: String, icon: String, tab: AIAssistantTab) -> some View {
         Button {
-            state.cancelRegionSelection()
-            model.selectedTab = tab
-            state.rightPanelVisible = true
+            state.toggleAssistantWorkspace(tab, model: model)
         } label: {
             ReaderToolbarLabel(title: title, id: "lyra.\(tab.rawValue)") {
                 if tab == .translation {
@@ -620,8 +619,8 @@ struct LyraToolRow: View {
                 }
             }
         }
-            .buttonStyle(LyraReaderToolStyle(selected: state.rightPanelVisible && model.selectedTab == tab))
-            .disabled(state.document == nil).help(title)
+            .lyraToolStyle(selected: state.rightPanelVisible && model.selectedTab == tab)
+            .disabled(state.document == nil).help(title).accessibilityLabel(title)
             .background(AnnotationToolbarFrameReader(id: "lyra.\(tab.rawValue)"))
     }
 }
@@ -649,11 +648,43 @@ struct ReaderCenteredTools<Content: View>: View {
     @ViewBuilder var content: () -> Content
     var body: some View {
         GeometryReader { geometry in
-            ScrollView(.horizontal, showsIndicators: false) {
-                content()
-                    .frame(minWidth: geometry.size.width, minHeight: geometry.size.height)
-                    .environment(\.readerRowWidth, geometry.size.width)
-            }
+            ReaderToolsViewport(width: geometry.size.width, height: geometry.size.height,
+                                content: content())
         }
+    }
+}
+
+/// Interpolate the shared proposal, rather than each button's drawing position. A clicked
+/// Button refreshes its pressed/selected label in a separate transaction; letting the label's
+/// own frame interpolate can put its text at the destination while its icon is still moving.
+/// Every child instead receives the same intermediate width and lays out immediately in it.
+private struct ReaderToolsViewport<Content: View>: View, Animatable {
+    nonisolated var width: CGFloat
+    let height: CGFloat
+    let content: Content
+
+    nonisolated var animatableData: CGFloat {
+        get { width }
+        set { width = newValue }
+    }
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            content
+                .frame(minWidth: width, minHeight: height)
+                .environment(\.readerRowWidth, width)
+        }
+        // The viewport owns interpolation; pressed/hover changes must not start a second one.
+        .transaction { $0.animation = nil }
+    }
+}
+
+// The toolbar and its command checks share the same workspace selection action.
+extension AppState {
+    func toggleAssistantWorkspace(_ tab: AIAssistantTab, model: AIAssistantModel) {
+        let close = rightPanelVisible && model.selectedTab == tab
+        cancelRegionSelection()
+        model.selectedTab = tab
+        rightPanelVisible = !close
     }
 }

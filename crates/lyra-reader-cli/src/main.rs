@@ -2736,8 +2736,13 @@ fn figures_of_file(path: &str, page_cap: u32) -> Result<(usize, usize, usize), E
             .page_line_segments(PageIndex(index))
             .unwrap_or_default();
         let lines = lyra_reader_text::lines_from(&text);
+        let graphics = backend
+            .page_graphic_bounds(PageIndex(index))
+            .unwrap_or_default();
         let evidence = lyra_reader_text::PageEvidence {
             images: &images,
+            graphics: &graphics,
+            text: Some(&text),
             rules: &rules,
             lines: &lines,
         };
@@ -2910,6 +2915,8 @@ fn cmd_tables(args: &[String]) -> ExitCode {
                     &caption,
                     lyra_reader_text::PageEvidence {
                         images: &images,
+                        graphics: &[],
+                        text: None,
                         rules: &rules,
                         lines: &lines,
                     },

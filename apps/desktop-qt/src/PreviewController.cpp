@@ -53,6 +53,7 @@ struct Result {
     QRectF clicked;
     QString error,message;
     QUrl external;
+    int destination=-1;
 };
 Result resolve(const std::shared_ptr<LyraReaderDesktopDocument> &document,int page,const QPointF &point) {
     Result r;r.source=NativeRasterSource::prepare(document,false,&r.error);if(!r.source)return r;
@@ -64,6 +65,12 @@ Result resolve(const std::shared_ptr<LyraReaderDesktopDocument> &document,int pa
     if(!link.isEmpty()) {
         const QUrl uri(link.value(QStringLiteral("uri")).toString());
         if(uri.scheme().compare(QStringLiteral("https"),Qt::CaseInsensitive)==0 || uri.scheme().compare(QStringLiteral("http"),Qt::CaseInsensitive)==0 || uri.scheme().compare(QStringLiteral("mailto"),Qt::CaseInsensitive)==0){r.external=uri;return r;}
+        // The shared text engine identifies contents and figure/table lists. Their PDF
+        // destinations take precedence over citation-looking numbers on the source page.
+        if(link.value(QStringLiteral("navigation")).toBool() && !link.value(QStringLiteral("page")).isNull()) {
+            const auto destination=link.value(QStringLiteral("page")).toInt();
+            if(destination>=0 && destination<r.sizes.size()){r.destination=destination;return r;}
+        }
     }
     const auto citation=containing(targets.value(QStringLiteral("citations")).toList(),point);
     if(!citation.isEmpty()) {
@@ -135,6 +142,7 @@ void PreviewController::openAt(ReaderController *reader,int page,double x,double
         m_loading=false;
         if(!result.error.isEmpty()){emit changed();emit statusMessage(result.error);return;}
         if(!result.external.isEmpty()){emit changed();emit externalRequested(result.external);return;}
+        if(result.destination>=0){emit changed();emit navigateRequested(result.destination,0);emit statusMessage(tr("Opened page %1").arg(result.destination+1));return;}
         if(result.model.isEmpty()){emit changed();if(!result.message.isEmpty())emit statusMessage(result.message);return;}
         m_model=std::move(result.model);m_textModel=m_model;m_sizes=std::move(result.sizes);m_source=std::move(result.source);
         m_sourceKey=NativeImageProvider::registerSource(m_source);
