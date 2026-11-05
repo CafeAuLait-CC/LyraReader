@@ -21,9 +21,11 @@ lyra-reader-session = { workspace = true }
 lyra-reader-core = { workspace = true }
 lyra-reader-pdfium = { workspace = true }
 lyra-reader-edit = { workspace = true }
+lyra-reader-ai = { workspace = true }
 sha2 = "0.11"
 serde = { version = "1", features = ["derive"] }
 getrandom = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 base64 = "0.23"
+fs2 = "0.4.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

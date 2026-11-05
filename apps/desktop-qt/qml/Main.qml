@@ -46,15 +46,41 @@ ApplicationWindow {
     property string appearance: session ? session.preference("appearance", "light") : "light"
     property string sidebarTab: "thumbnails"
     property bool aiPanelVisible: false
+    property bool regionSelecting: false
+    property var regionDraft: null
+    function cancelRegionSelection() {regionSelecting=false;regionDraft=null;}
+    function armRegion(force) {
+        if(placedTextController.deferAction(function(){root.armRegion(force);}))return;
+        if(!force && secondaryRow==="edit" && contentController.deferAction({kind:"region"}))return;
+        if(!currentReader.pageCount || currentReader.loading || currentReader.pendingCommands || currentReader.aiState.running)return;
+        setSecondaryRow("lyra",true);
+        aiRegionCard.close();cancelErase();clearFillTool();annotationTool="select";selection=null;selectedAnnotation=null;
+        overviewVisible=false;textViewVisible=false;regionDraft=null;regionSelecting=true;
+        operationStatus=qsTr("Drag an area of the page to ask about it. Escape cancels.");
+    }
+    function openRegionTool() {
+        if(regionSelecting){cancelRegionSelection();return;}
+        if(currentReader.aiRegion.image_png || currentReader.aiRegion.loading || currentReader.aiRegion.error){aiRegionCard.open();return;}
+        armRegion();
+    }
+    function finishRegionSelection(page,rect) {
+        if(!regionSelecting)return;
+        cancelRegionSelection();
+        if(currentReader.captureAiRegion(page,rect,zoom) || currentReader.aiRegion.error)aiRegionCard.open();
+        else operationStatus=qsTr("The document is busy or changed. Select the area again when it is ready.");
+    }
+    AiRegionCard {id:aiRegionCard;app:root}
+    function focusReadingView() {
+        if(currentReader.pageCount>0) {
+            const target=overviewVisible ? overviewContent.focusTarget : textViewVisible ? accessibleTextView.focusTarget : pageList;
+            if(target)target.forceActiveFocus();
+        } else contentItem.forceActiveFocus();
+    }
     function returnFocusFromAiPanel() {
         let item=activeFocusItem;
         while (item) {
             if (item===aiDock) {
-                if (currentReader.pageCount>0) {
-                    const target=overviewVisible ? overviewContent.focusTarget : textViewVisible ? accessibleTextView.focusTarget : pageList;
-                    target.forceActiveFocus();
-                }
-                else contentItem.forceActiveFocus();
+                focusReadingView();
                 return;
             }
             item=item.parent;
@@ -99,6 +125,7 @@ ApplicationWindow {
     readonly property bool editInspectorVisible: currentReader.pageCount>0 && secondaryRow==="edit" && (contentController.tool!=="select" || !!contentController.selected || contentController.hasDraft)
     readonly property bool fillInspectorVisible: currentReader.pageCount>0 && secondaryRow==="fill" && fillTool.length>0
     onSecondaryRowChanged: {
+        if(secondaryRow!=="lyra"){cancelRegionSelection();aiRegionCard.close();}
         annotationToolsVisible=secondaryRow==="annotate";
         if (secondaryRow!=="fill") {clearFillTool();formToolActive=false;}
         if (secondaryRow==="edit" || secondaryRow==="fill") aiPanelVisible=false;
@@ -265,6 +292,7 @@ ApplicationWindow {
     onAppearanceChanged: if (session)
         session.setPreference("appearance", appearance)
     onCurrentReaderChanged: {
+        cancelRegionSelection();if(aiRegionCard)aiRegionCard.close();
         Qt.callLater(function(){contentController.reset();});
         if (fillTool.length>0) clearFillTool();
         else fillTool="";
@@ -1840,6 +1868,7 @@ ApplicationWindow {
             if(placedTextController.current){placedTextController.finish(true);return;}
             if(contentController.inlineEditing && contentController.textDraft){contentController.discard();return;}
             root.cancelTabReorder();
+            root.cancelRegionSelection();
             if (root.previewController && root.previewController.visible)
                 root.previewController.close();
             root.cancelErase();
@@ -2264,6 +2293,7 @@ ApplicationWindow {
             root.requestCloseTab(index);
         }
         function onActiveReaderAboutToChange() {
+            root.currentReader.cancelAiRegionCapture();root.cancelRegionSelection();aiRegionCard.close();
             if(placedTextController.waitingForCreation)placedTextController.suppressPendingEditor();
             dialogs.flushAnnotation();
             dialogs.annotationDialog.close();
@@ -2273,6 +2303,7 @@ ApplicationWindow {
     Connections {
         target: root.currentReader
         function onDocumentReset() {
+            root.cancelRegionSelection();aiRegionCard.close();
             root.cancelErase();
             ++root.positionRestoreEpoch;
             root.positionRestoring = true;

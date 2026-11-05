@@ -39,6 +39,13 @@ Item {
         objectName:"lyraToolRow"
         anchors.centerIn:parent;spacing:6
         visible:app.secondaryRow==="lyra"
+        LyraToolButton {
+            objectName:"lyraRegionTool"
+            symbol:"ai";text:qsTr("Select & Ask");display:AbstractButton.TextBesideIcon
+            selected:app.regionSelecting
+            enabled:app.currentReader.pageCount>0 && !app.currentReader.loading && (!!app.currentReader.aiRegion.image_png || !app.currentReader.aiState.running)
+            onClicked:app.openRegionTool()
+        }
         Repeater {
             model:[{key:"summary",title:qsTr("Summary")},{key:"translation",title:qsTr("Translate")},{key:"chat",title:qsTr("Chat")}]
             LyraToolButton {

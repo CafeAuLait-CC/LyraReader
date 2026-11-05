@@ -11,6 +11,8 @@ use lyra_reader_pdfium::PdfiumBackend;
 use lyra_reader_session::DocumentLayout;
 use std::path::Path;
 
+pub mod region;
+
 /// A whole-page preview never exceeds this allocation. Deep-zoom tiles will refine it later.
 pub const MAX_PAGE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_PAGE_EDGE: f64 = 8192.0;

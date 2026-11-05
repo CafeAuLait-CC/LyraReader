@@ -448,11 +448,55 @@ pub trait Transport: Send + Sync {
     ) -> Result<Box<dyn ResponseStream>, AiError>;
 }
 
+/// Fixed metadata only: an observer never receives the URL, model, key, body or error text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestOutcome {
+    Sent,
+    HttpError(u16),
+    Cancelled,
+    Failed(RequestFailure),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestFailure {
+    Unauthorized,
+    RateLimited,
+    Offline,
+    LocalServer,
+    Unreachable,
+    Timeout,
+    Protocol,
+    Settings,
+    Other,
+}
+fn request_outcome(error: &AiError) -> RequestOutcome {
+    use RequestFailure as F;
+    match error {
+        AiError::Cancelled => RequestOutcome::Cancelled,
+        AiError::Unauthorized => RequestOutcome::Failed(F::Unauthorized),
+        AiError::RateLimited => RequestOutcome::Failed(F::RateLimited),
+        AiError::Offline(_) => RequestOutcome::Failed(F::Offline),
+        AiError::LocalServer(_) => RequestOutcome::Failed(F::LocalServer),
+        AiError::Unreachable(_) => RequestOutcome::Failed(F::Unreachable),
+        AiError::Timeout(_) => RequestOutcome::Failed(F::Timeout),
+        AiError::Protocol(_) => RequestOutcome::Failed(F::Protocol),
+        AiError::InvalidSettings(_) | AiError::NotConfigured => RequestOutcome::Failed(F::Settings),
+        _ => RequestOutcome::Failed(F::Other),
+    }
+}
+pub trait RequestAudit: Send + Sync {
+    /// Called immediately before each HTTP attempt, including capability retries. Failure
+    /// prevents the request. A durable in-progress record survives an interrupted process.
+    fn started(&self) -> Result<(), AiError>;
+    /// Finalize the current attempt, or do nothing if no attempt is pending.
+    fn finished(&self, outcome: RequestOutcome) -> Result<(), AiError>;
+}
+
 /// The one production transport. Both `http://` and `https://` go through the same ureq agent;
 /// only the `TlsConfig` is different (system roots in the app, injected roots in the TLS test).
 pub struct UreqTransport {
     config: ClientConfig,
     roots: RootCerts,
+    audit: Option<Arc<dyn RequestAudit>>,
 }
 
 impl UreqTransport {
@@ -461,6 +505,7 @@ impl UreqTransport {
         Self {
             config,
             roots: system_roots(),
+            audit: None,
         }
     }
 
@@ -472,13 +517,18 @@ impl UreqTransport {
         Self {
             config,
             roots: RootCerts::from(certificates),
+            audit: None,
         }
     }
 
     /// A transport with a pre-built root set. Exposed for tests and for a future platform shell
     /// that wants to supply its own trust policy.
     pub fn with_roots(config: ClientConfig, roots: RootCerts) -> Self {
-        Self { config, roots }
+        Self {
+            config,
+            roots,
+            audit: None,
+        }
     }
 
     fn make_agent(&self, cancel: &CancellationToken) -> ureq::Agent {
@@ -522,10 +572,25 @@ impl Transport for UreqTransport {
         }
         // `http_status_as_error(false)` above is what makes a 401 body readable instead of an
         // opaque status error.
-        let response = request
-            .send(&spec.body)
-            .map_err(|error| map_ureq_error(error, cancel, spec.is_local))?;
+        if let Some(audit) = &self.audit {
+            audit.started()?;
+        }
+        let response = match request.send(&spec.body) {
+            Ok(response) => response,
+            Err(error) => {
+                let error = map_ureq_error(error, cancel, spec.is_local);
+                if let Some(audit) = &self.audit {
+                    audit.finished(request_outcome(&error))?;
+                }
+                return Err(error);
+            }
+        };
         let status = response.status().as_u16();
+        if !(200..300).contains(&status)
+            && let Some(audit) = &self.audit
+        {
+            audit.finished(RequestOutcome::HttpError(status))?;
+        }
         let reason = response
             .status()
             .canonical_reason()
@@ -1297,6 +1362,48 @@ pub fn run_plan(
         run_plan_with_transport(plan, api_key, transport.as_ref(), cancel, emit)
     })();
     result.map_err(|error| redact_error(error, api_key))
+}
+
+/// Production runner with a platform-owned durable audit sink. Counting happens at send,
+/// not at PartStarted: a single part can make two real HTTP attempts.
+pub fn run_plan_audited(
+    plan: &ChatPlan,
+    api_key: &str,
+    cancel: &CancellationToken,
+    emit: &mut dyn FnMut(RunEvent),
+    audit: Arc<dyn RequestAudit>,
+) -> Result<(), AiError> {
+    let lower = plan.endpoint.to_ascii_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+        return Err(AiError::InvalidSettings(
+            "The endpoint must use http:// or https://.".into(),
+        ));
+    }
+    let transport = UreqTransport {
+        config: ClientConfig::default(),
+        roots: system_roots(),
+        audit: Some(Arc::clone(&audit)),
+    };
+    let mut audit_error = None;
+    let outcome = run_plan_with_transport(plan, api_key, &transport, cancel, &mut |event| {
+        if matches!(event, RunEvent::PartStarted { .. } | RunEvent::Done)
+            && let Err(error) = audit.finished(RequestOutcome::Sent)
+        {
+            audit_error = Some(error);
+            cancel.cancel();
+        }
+        emit(event);
+    });
+    let ending = outcome
+        .as_ref()
+        .err()
+        .map(request_outcome)
+        .unwrap_or(RequestOutcome::Sent);
+    audit.finished(ending)?;
+    if let Some(error) = audit_error {
+        return Err(error);
+    }
+    outcome
 }
 
 /// The transport-injected form, used by the local mock-server tests.

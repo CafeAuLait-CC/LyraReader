@@ -44,7 +44,7 @@ Item {
         objectName: "pdfPointer"
         anchors.fill: parent
         acceptedButtons: Qt.LeftButton | Qt.RightButton
-        cursorShape: app.secondaryRow==="fill" && app.fillTool.length ? Qt.CrossCursor : app.annotationTool === "select" || ["highlight", "underline", "strikeout"].indexOf(app.annotationTool) >= 0 ? Qt.IBeamCursor : Qt.CrossCursor
+        cursorShape: app.regionSelecting || (app.secondaryRow==="fill" && app.fillTool.length) ? Qt.CrossCursor : app.annotationTool === "select" || ["highlight", "underline", "strikeout"].indexOf(app.annotationTool) >= 0 ? Qt.IBeamCursor : Qt.CrossCursor
         hoverEnabled: true
         property int start: -1
         property real pressX: 0
@@ -174,6 +174,7 @@ Item {
             app.pendingDraftRequestId = -1;
             const p = position(mouse);
             previousPoint = p;
+            if(app.regionSelecting){gestureTool="region";app.selection=null;return;}
             if (gestureTool === "redact" && !app.canRedact) {
                 gestureTool = "canceled";
                 return;
@@ -214,6 +215,7 @@ Item {
                 };
         }
         Keys.onEscapePressed: {
+            app.cancelRegionSelection();
             app.cancelErase();
             if (app.annotationTool === "stamp" || app.annotationTool === "signature")
                 app.annotationTool = "select";
@@ -234,6 +236,11 @@ Item {
                 return;
             if (Math.abs(mouse.x - pressX) + Math.abs(mouse.y - pressY) > 3)
                 dragged = true;
+            if(gestureTool==="region") {
+                if(!app.regionSelecting){gestureTool="canceled";return;}
+                app.regionDraft={page:page,x:Math.min(pressX/app.zoom,p.x),y:Math.min(pressY/app.zoom,p.y),width:Math.abs(pressX/app.zoom-p.x),height:Math.abs(pressY/app.zoom-p.y)};
+                return;
+            }
             if (gestureTool === "move") {
                 if (!app.selectedAnnotation || app.selectedAnnotation.id !== editBase.id)
                     return;
@@ -265,6 +272,12 @@ Item {
         onReleased: function (mouse) {
             if (mouse.button !== Qt.LeftButton || gestureTool === "canceled")
                 return;
+            if(gestureTool==="region") {
+                if(!app.regionSelecting)return;
+                const p=position(mouse);
+                app.finishRegionSelection(page,{x:Math.min(pressX/app.zoom,p.x),y:Math.min(pressY/app.zoom,p.y),width:Math.abs(pressX/app.zoom-p.x),height:Math.abs(pressY/app.zoom-p.y)});
+                return;
+            }
             if (gestureTool === "move") {
                 if (dragged && app.annotationDraft)
                     app.commitAnnotationGeometry(editBase.id, Logic.geometryPatch(editBase, app.annotationDraft.rect));
@@ -303,6 +316,7 @@ Item {
                 app.selectionFinished();
         }
         onCanceled: {
+            app.cancelRegionSelection();
             app.annotationDraft = null;
             app.redactionDraft = null;
             app.cancelErase();
@@ -332,6 +346,12 @@ Item {
             };
             app.selectionFinished();
         }
+    Rectangle {
+        visible:!!app.regionDraft && app.regionDraft.page===page
+        x:app.regionDraft ? app.regionDraft.x*app.zoom : 0;y:app.regionDraft ? app.regionDraft.y*app.zoom : 0
+        width:app.regionDraft ? app.regionDraft.width*app.zoom : 0;height:app.regionDraft ? app.regionDraft.height*app.zoom : 0
+        color:app.colors.textSelectionBg;opacity:.65;border.color:app.colors.accent;border.width:2
+    }
     }
     AnnotationHandles {
         focusTarget: pointer

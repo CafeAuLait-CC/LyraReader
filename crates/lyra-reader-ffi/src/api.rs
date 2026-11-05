@@ -9137,6 +9137,16 @@ pub fn start_ai_request(
     api_key: String,
     use_mock_provider: bool,
 ) -> Result<Arc<LyraReaderAiRequest>, LyraReaderFfiError> {
+    start_ai_request_audited(plan, api_key, use_mock_provider, None)
+}
+
+/// Native shells can supply durable metadata recording without changing generated bindings.
+pub fn start_ai_request_audited(
+    plan: AiPlanRecord,
+    api_key: String,
+    use_mock_provider: bool,
+    audit: Option<Arc<dyn lyra_reader_ai::openai::RequestAudit>>,
+) -> Result<Arc<LyraReaderAiRequest>, LyraReaderFfiError> {
     if api_key.is_empty() {
         return Err(LyraReaderFfiError::Ai {
             severity: AiErrorCode::Unauthorized.severity(),
@@ -9163,6 +9173,14 @@ pub fn start_ai_request(
                 let mut emit = |event: RunEvent| worker_job.push_event(event);
                 if use_mock_provider {
                     MockProvider::preset().run(&plan, &worker_job.cancel, &mut emit)
+                } else if let Some(audit) = audit {
+                    lyra_reader_ai::openai::run_plan_audited(
+                        &plan,
+                        &api_key,
+                        &worker_job.cancel,
+                        &mut emit,
+                        audit,
+                    )
                 } else {
                     run_plan(&plan, &api_key, &worker_job.cancel, &mut emit)
                 }

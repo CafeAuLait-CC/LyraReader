@@ -28,6 +28,8 @@ class ReaderController : public QObject {
     Q_PROPERTY(double documentHeight READ documentHeight NOTIFY documentChanged)
     Q_PROPERTY(QUrl fileUrl READ fileUrl NOTIFY documentChanged)
     Q_PROPERTY(QVariantMap aiState READ aiState NOTIFY aiStateChanged)
+    Q_PROPERTY(QVariantMap aiRegion READ aiRegion NOTIFY aiRegionChanged)
+    Q_PROPERTY(QUrl aiRegionImage READ aiRegionImage NOTIFY aiRegionImageChanged)
     Q_PROPERTY(QVariantMap editDrafts READ editDrafts NOTIFY editDraftsChanged)
     Q_PROPERTY(bool hasEditDrafts READ hasEditDrafts NOTIFY editDraftsChanged)
     Q_PROPERTY(QVariantMap noteDrafts READ noteDrafts NOTIFY noteDraftsChanged)
@@ -54,6 +56,13 @@ public:
     double documentHeight() const { return m_documentHeight; }
     QUrl fileUrl() const { return m_lastUrl; }
     QVariantMap aiState()const{return m_aiState;}
+    QVariantMap aiRegion()const{return m_aiRegion;}
+    QUrl aiRegionImage()const{return m_aiRegionImage;}
+    Q_INVOKABLE bool captureAiRegion(int page,const QVariantMap &rect,double zoom);
+    Q_INVOKABLE void cancelAiRegionCapture();
+    Q_INVOKABLE void clearAiRegion();
+    Q_INVOKABLE void setAiRegionQuestion(const QString &text);
+    Q_INVOKABLE void prepareAiRegion(const QVariantMap &settings);
     Q_INVOKABLE void prepareAi(const QVariantMap &request);
     Q_INVOKABLE bool startAi(const QString &key,const QVariantMap &expectedPlan);
     Q_INVOKABLE void cancelAi();
@@ -126,6 +135,8 @@ signals:
     void unsavedChangesChanged();
     void editDraftsChanged();
     void aiStateChanged();
+    void aiRegionChanged();
+    void aiRegionImageChanged();
     void textPagesChanged();
     void commandsChanged();
 private:
@@ -141,6 +152,10 @@ private:
     void retainAiResult(const QString &state);
     QTimer m_aiTimer;
     QVariantMap m_aiState;
+    QVariantMap m_aiRegion;
+    QUrl m_aiRegionImage;
+    quint64 m_aiRegionEpoch=0;
+    RasterJobs::Handle m_aiRegionJob;
     quint64 m_aiPreviewId=0,m_aiStartId=0,m_aiPollId=0,m_aiPlanGeneration=0;
     void enqueue(const Request &request);
     void requestPageInternal(int page,double scale,bool embedded,bool manual);

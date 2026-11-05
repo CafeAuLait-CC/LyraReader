@@ -83,7 +83,7 @@ bool ReaderController::hasUnsavedChanges()const {
     return marks.value(QStringLiteral("page_pending")).toBool() ||
         (!localOnly && marks.value(QStringLiteral("pdf_dirty")).toBool()) || !m_noteDrafts.isEmpty() || hasEditDrafts();
 }
-ReaderController::~ReaderController(){clearRasterCache();NativeImageProvider::unregisterSource(m_contentSourceKey);}
+ReaderController::~ReaderController(){RasterJobs::cancel(m_aiRegionJob);clearRasterCache();NativeImageProvider::unregisterSource(m_contentSourceKey);}
 void ReaderController::clearRasterCache(){RasterJobs::cancel(m_activeRaster);RasterCache::clearPrefix(m_cachePrefix);m_tileDemand.clear();m_pageDemand.clear();m_manualDemand.clear();}
 int ReaderController::cpuCacheKiB(){return RasterCache::costKiB();}
 

@@ -162,6 +162,24 @@ impl RenderSource {
             serde_json::to_value(result.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
         }
         match request["op"].as_str().unwrap_or("") {
+            "capture_region" => {
+                let number = |key: &str| {
+                    request["rect"][key]
+                        .as_f64()
+                        .ok_or_else(|| format!("Missing region {key}"))
+                };
+                crate::region::capture(
+                    &self.engine,
+                    page()?,
+                    Rect::new(
+                        number("x")?,
+                        number("y")?,
+                        number("width")?,
+                        number("height")?,
+                    ),
+                    request["zoom"].as_f64().ok_or("Missing region zoom")?,
+                )
+            }
             "info" => value(
                 (0..self.engine.page_count())
                     .map(|p| self.engine.page_size_pt(p))

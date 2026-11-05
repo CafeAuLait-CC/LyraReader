@@ -484,7 +484,7 @@ impl DesktopDocument {
                 "Annotation redaction has been retired. Use Edit → Redact → Blackout/Erase.".into(),
             ),
             "ai_preview" => value(
-                d.prepare_ai_plan(arg(&r, "request")?)
+                d.prepare_ai_plan(crate::region::request(r["request"].clone())?)
                     .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),
             ),
             "ai_merge_preview" => value(
@@ -493,8 +493,19 @@ impl DesktopDocument {
             ),
             "ai_endpoint" => value(inspect_ai_base_url(text(&r, "base_url")?)),
             "ai_start" => {
-                let request = start_ai_request(arg(&r, "plan")?, text(&r, "api_key")?, false)
-                    .map_err(|e| e.to_string())?;
+                let plan: AiPlanRecord = arg(&r, "plan")?;
+                let root = self
+                    .marks
+                    .lock()
+                    .map_err(|_| "Annotation state is unavailable")?
+                    .cache_root()
+                    .map(Path::to_path_buf)
+                    .map(Ok)
+                    .unwrap_or_else(crate::document_cache::default_root)?;
+                let audit = crate::audit::observer(root, plan.action, plan.is_local);
+                let request =
+                    start_ai_request_audited(plan, text(&r, "api_key")?, false, Some(audit))
+                        .map_err(|e| e.to_string())?;
                 let mut current = self.ai.lock().map_err(|_| "AI state is unavailable")?;
                 if let Some(old) = current.replace(request) {
                     old.cancel();
@@ -1969,6 +1980,49 @@ mod tests {
         assert!(frozen.image_png(0, target, "stale").is_err());
     }
 
+    #[test]
+    fn region_captures_freeze_working_pixels_text_and_original_colours() {
+        use base64::Engine as _;
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        stage_replacement(&doc, "Frozen area");
+        let source = crate::render_source::RenderSource::new(&doc, false).unwrap();
+        let request = json!({"op":"capture_region","page":0,"zoom":1.0,"rect":{"x":0,"y":0,"width":595,"height":842}});
+        let before = source.query(request.clone()).unwrap();
+        assert!(before["text"].as_str().unwrap().contains("Frozen area"));
+        assert_eq!(
+            (
+                before["image_width_px"].as_u64(),
+                before["image_height_px"].as_u64()
+            ),
+            (Some(1190), Some(1684))
+        );
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(before["image_png"].as_str().unwrap())
+            .unwrap();
+        let image = image::load_from_memory(&png).unwrap().into_rgba8();
+        assert_eq!(image.get_pixel(0, 0).0, [255, 255, 255, 255]);
+        stage_replacement(&doc, "Later area");
+        doc.command(json!({"op":"document_save"})).unwrap();
+        assert_eq!(source.query(request.clone()).unwrap(), before);
+        doc.command(json!({"op":"document_discard"})).unwrap();
+        assert_eq!(source.query(request).unwrap(), before);
+        assert!(source.query(json!({"op":"capture_region","page":0,"zoom":1e300,"rect":{"x":0,"y":0,"width":10,"height":10}})).is_err());
+        assert!(source.query(json!({"op":"capture_region","page":0,"zoom":1,"rect":{"x":0,"y":0,"width":1000000,"height":1000000}})).is_err());
+        assert!(source.query(json!({"op":"capture_region","page":0,"zoom":1,"rect":{"x":0,"y":0,"width":20,"height":20}})).unwrap_err().contains("blank"));
+        let rotated = Fixture::new("rotated.pdf");
+        let doc = rotated.open();
+        let source = crate::render_source::RenderSource::new(&doc, false).unwrap();
+        let sizes = source.query(json!({"op":"info"})).unwrap();
+        for (page, size) in sizes.as_array().unwrap().iter().enumerate() {
+            let result=source.query(json!({"op":"capture_region","page":page,"zoom":1,"rect":{"x":0,"y":0,"width":size["width_pt"],"height":size["height_pt"]}})).unwrap();
+            assert_eq!(
+                result["image_width_px"].as_u64().unwrap(),
+                (size["width_pt"].as_f64().unwrap() * 2.0).ceil() as u64
+            );
+            assert!(!result["text"].as_str().unwrap().is_empty());
+        }
+    }
     #[test]
     fn frozen_preview_layout_and_text_survive_later_edits_save_and_discard() {
         let fixture = Fixture::new("text-page.pdf");

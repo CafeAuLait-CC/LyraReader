@@ -21,6 +21,7 @@ ApplicationWindow {
         paper.currentIndex=["original","warm","night"].indexOf(app.paperAppearance);
         gap.value=app.pageGap;baseUrl.text=app.aiSettings.baseUrl || "http://localhost:11434/v1";
         modelName.text=app.aiSettings.model || "";
+        imageInput.checked=!!app.aiSettings.imageInput;
         reasoning.currentIndex=Math.max(0,reasoning.model.indexOf(app.aiSettings.reasoningMode || "default"));
         encoding.currentIndex=Math.max(0,encoding.model.indexOf(app.aiSettings.reasoningEncoding || "none"));
         apiKey.clear();
@@ -37,7 +38,8 @@ ApplicationWindow {
                 baseUrl: baseUrl.text,
                 model: modelName.text,
                 reasoningMode: reasoning.currentText,
-                reasoningEncoding: encoding.currentText
+                reasoningEncoding: encoding.currentText,
+                imageInput: imageInput.checked
         };
         if (app.session) {
             app.session.setPreference("ai", app.aiSettings);
@@ -121,6 +123,13 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     model: ["default", "off", "low", "high", "max"]
                     currentIndex: Math.max(0, model.indexOf(app.aiSettings.reasoningMode || "default"))
+                }
+                CheckBox {
+                    id:imageInput
+                    objectName:"settingsAiImageInput"
+                    text:qsTr("This model accepts region images")
+                    checked:!!app.aiSettings.imageInput
+                    Layout.fillWidth:true
                 }
                 ComboBox {
                     id: encoding

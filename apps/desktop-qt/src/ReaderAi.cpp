@@ -1,7 +1,12 @@
 #include "ReaderController.h"
+#include "NativeRaster.h"
+#include "RenderBudget.h"
+#include <QFutureWatcher>
+#include <QtConcurrentRun>
 
 namespace {
 QString aiView(const QString &action) {
+    if(action==QStringLiteral("RegionQuestion"))return QStringLiteral("region");
     if(action==QStringLiteral("TranslateSelection"))return QStringLiteral("translation");
     if(action==QStringLiteral("DocumentChat"))return QStringLiteral("chat");
     return QStringLiteral("summary");
@@ -17,7 +22,79 @@ void ReaderController::initAi() {
     connect(this,&ReaderController::commandFinished,this,&ReaderController::handleAiCommand);
 }
 void ReaderController::resetAi() {
+    ++m_aiRegionEpoch;RasterJobs::cancel(m_aiRegionJob);m_aiRegionJob.reset();m_aiRegion.clear();emit aiRegionChanged();
+    m_aiRegionImage=QUrl{};emit aiRegionImageChanged();
     m_aiTimer.stop();m_aiPreviewId=0;m_aiStartId=0;m_aiPollId=0;m_aiState.clear();emit aiStateChanged();
+}
+void ReaderController::cancelAiRegionCapture() {
+    ++m_aiRegionEpoch;RasterJobs::cancel(m_aiRegionJob);m_aiRegionJob.reset();
+    if(m_aiRegion.value(QStringLiteral("loading")).toBool()){m_aiRegion.clear();emit aiRegionChanged();}
+}
+void ReaderController::clearAiRegion() {
+    cancelAiRegionCapture();m_aiRegion.clear();
+    m_aiRegionImage=QUrl{};emit aiRegionImageChanged();
+    if(m_aiState.value(QStringLiteral("running")).toBool() && m_aiState.value(QStringLiteral("responseView")).toString()==QStringLiteral("region"))cancelAi();
+    if(m_aiState.value(QStringLiteral("previewView")).toString()==QStringLiteral("region"))invalidateAiPlan();
+    auto results=m_aiState.value(QStringLiteral("results")).toMap();results.remove(QStringLiteral("region"));m_aiState.insert(QStringLiteral("results"),results);
+    if(!m_aiState.value(QStringLiteral("running")).toBool() && m_aiState.value(QStringLiteral("responseView")).toString()==QStringLiteral("region")) {
+        for(const auto *key:{"output","reasoning","responsePlan","responseView","usage"})m_aiState.remove(QLatin1String(key));
+    }
+    if(!m_aiState.value(QStringLiteral("running")).toBool() && m_aiState.value(QStringLiteral("statusView")).toString()==QStringLiteral("region")) {
+        m_aiState.remove(QStringLiteral("statusView"));m_aiState.remove(QStringLiteral("status"));
+    }
+    emit aiStateChanged();
+    emit aiRegionChanged();
+}
+bool ReaderController::captureAiRegion(int page,const QVariantMap &rect,double zoom) {
+    if(!m_document || !m_source || m_loading || m_pendingCommands || m_aiState.value(QStringLiteral("running")).toBool())return false;
+    clearAiRegion();
+    // Capture and PNG conversion hold at most two four-megapixel buffers. The shared Rust
+    // guard checks exact geometry before PDFium allocates; this is the global admission lease.
+    auto reservation=RenderBudget::reserve(RenderBudget::Kind::Resident,32LL*1024*1024);
+    auto ticket=reservation ? RasterJobs::enqueue() : RasterJobs::Handle{};
+    if(!ticket){m_aiRegion={{QStringLiteral("error"),tr("The renderer is busy. Try capturing this area again.")}};emit aiRegionChanged();return false;}
+    const auto source=m_source;const auto generation=m_generation;const auto epoch=m_aiRegionEpoch;
+    m_aiRegionJob=ticket;m_aiRegion={{QStringLiteral("loading"),true}};emit aiRegionChanged();
+    struct Captured {QVariantMap data;QString error;QUrl image;};
+    auto *watcher=new QFutureWatcher<Captured>(this);
+    connect(watcher,&QFutureWatcher<Captured>::finished,this,[this,watcher,source,generation,epoch] {
+        const auto result=watcher->result();watcher->deleteLater();
+        if(epoch!=m_aiRegionEpoch || generation!=m_generation || source!=m_source)return;
+        m_aiRegionJob.reset();m_aiRegion=result.data;
+        m_aiRegionImage=result.image;emit aiRegionImageChanged();
+        if(!result.error.isEmpty())m_aiRegion={{QStringLiteral("error"),result.error}};
+        emit aiRegionChanged();
+    });
+    watcher->setFuture(QtConcurrent::run(RasterJobs::pool(),[source,ticket,reservation,page,rect,zoom] {
+        RasterJobs::Run run(ticket);Captured result;
+        if(ticket->cancelled)return result;
+        result.data=source->query({{QStringLiteral("op"),QStringLiteral("capture_region")},{QStringLiteral("page"),page},{QStringLiteral("rect"),rect},{QStringLiteral("zoom"),zoom}},&result.error).toMap();
+        // URL construction can scan several MiB. Do it once on this worker, never in a
+        // QML binding that is re-evaluated on every question keystroke or streaming poll.
+        if(result.error.isEmpty())result.image=QUrl(QStringLiteral("data:image/png;base64,")+result.data.value(QStringLiteral("image_png")).toString());
+        return result;
+    }));
+    return true;
+}
+void ReaderController::setAiRegionQuestion(const QString &text) {
+    if(m_aiRegion.value(QStringLiteral("question")).toString()==text)return;
+    m_aiRegion.insert(QStringLiteral("question"),text);
+    if(m_aiState.value(QStringLiteral("previewView")).toString()==QStringLiteral("region"))invalidateAiPlan();
+    emit aiRegionChanged();
+}
+void ReaderController::prepareAiRegion(const QVariantMap &settings) {
+    if(!m_aiRegion.contains(QStringLiteral("image_png")) || m_aiRegion.value(QStringLiteral("loading")).toBool())return;
+    auto region=m_aiRegion;
+    region.remove(QStringLiteral("question"));region.remove(QStringLiteral("capture_scale"));region.remove(QStringLiteral("text_truncated"));region.remove(QStringLiteral("text_warning"));
+    region.insert(QStringLiteral("send_image"),settings.value(QStringLiteral("imageInput"),false));
+    region.insert(QStringLiteral("include_document_context"),false);
+    prepareAi({{QStringLiteral("action"),QStringLiteral("RegionQuestion")},{QStringLiteral("current_page"),region.value(QStringLiteral("page"))},
+        {QStringLiteral("selection"),QVariant{}},{QStringLiteral("question"),m_aiRegion.value(QStringLiteral("question"))},
+        {QStringLiteral("language"),QVariant{}},{QStringLiteral("history"),QVariantList{}},{QStringLiteral("region"),region},
+        {QStringLiteral("document_knowledge"),false},{QStringLiteral("document_knowledge_text"),QVariant{}},{QStringLiteral("document_knowledge_pages"),QVariantList{}},
+        {QStringLiteral("base_url"),settings.value(QStringLiteral("baseUrl"),QStringLiteral("http://localhost:11434/v1"))},{QStringLiteral("model"),settings.value(QStringLiteral("model"),QString{})},
+        {QStringLiteral("temperature"),QVariant{}},{QStringLiteral("max_tokens"),QVariant{}},
+        {QStringLiteral("reasoning_mode"),settings.value(QStringLiteral("reasoningMode"),QStringLiteral("default"))},{QStringLiteral("reasoning_encoding"),settings.value(QStringLiteral("reasoningEncoding"),QStringLiteral("none"))}});
 }
 void ReaderController::setAiInput(const QString &key,const QVariant &value) {
     auto input=m_aiState.value(QStringLiteral("input")).toMap();

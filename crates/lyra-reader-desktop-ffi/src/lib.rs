@@ -3,6 +3,7 @@
 #![allow(unsafe_code)]
 
 mod artwork;
+mod audit;
 mod content;
 mod document;
 mod document_cache;
@@ -10,6 +11,7 @@ mod draft_store;
 mod exports;
 mod marks;
 mod pages;
+mod region;
 mod render_source;
 mod saving;
 mod session;

@@ -1273,6 +1273,82 @@ private slots:
         view.window->setProperty("textViewVisible",false);QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,true)));QVERIFY(QMetaObject::invokeMethod(view.window,"showOverview",Q_ARG(QVariant,false)));auto *grid=visualItem(view.window->contentItem(),"pageOverview");QVERIFY(grid && grid->isVisible());composer->forceActiveFocus();view.window->setProperty("aiPanelVisible",false);QTRY_VERIFY(grid->hasActiveFocus());QVERIFY(!canvas->hasActiveFocus());
         QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,true)));composer->forceActiveFocus();view.workspace.newTab();QTRY_VERIFY(!composer->hasActiveFocus());QVERIFY(view.workspace.activeReader()->aiState().value("input").toMap().value("chatQuestion").toString().isEmpty());QCOMPARE(reader->aiState().value("input").toMap().value("chatQuestion").toString(),QString("Draft retained"));
     }
+    void regionQuestionsCaptureOnceAndSendOnlyTheExplicitPreview() {
+        MockChatServer server;QVERIFY(server.listen());
+        server.responses.append({{QByteArray("{\"error\":{\"message\":\"Unsupported parameter: stream_options\"}}")},0,400});
+        server.responses.append({{MockChatServer::delta({{"content","Synthetic area answer [p.1] and [p.99]."}}),QByteArray("data: [DONE]\n\n")},20,200});
+        server.responses.append({{MockChatServer::delta({{"content","partial area answer"}}),QByteArray("data: [DONE]\n\n")},20,200,true});
+        const auto auditPath=qEnvironmentVariable("LYRA_READER_DOCUMENT_CACHE_DIR")+"/Audit/ai-requests.jsonl";
+        const auto auditRows=[&]{QList<QJsonObject> rows;QFile audit(auditPath);if(audit.open(QIODevice::ReadOnly))for(const auto &line:audit.readAll().split('\n'))if(!line.isEmpty())rows.append(QJsonDocument::fromJson(line).object());return rows;};
+        const int initialAuditCount=auditRows().size();
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/area.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        QFile file(path);QVERIFY(file.open(QIODevice::ReadOnly));const auto original=file.readAll();file.close();
+        WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);
+        engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
+        auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTRY_VERIFY(!window->property("positionRestoring").toBool());
+        window->setProperty("fitting",false);QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,1.0),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","region-audit-synthetic-model"},{"imageInput",false}});
+        QVERIFY(QMetaObject::invokeMethod(window,"armRegion",Q_ARG(QVariant,false)));QTRY_VERIFY(window->property("regionSelecting").toBool());QTest::qWait(100);
+        auto *page=visualItem(window->contentItem(),"pdfPage0");QVERIFY(page);
+        const auto start=page->mapToScene(QPointF(60,55)).toPoint(),end=page->mapToScene(QPointF(480,235)).toPoint();
+        QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,start);QTest::mouseMove(window,end,30);QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,end);
+        QTRY_VERIFY_WITH_TIMEOUT(!reader->aiRegion().value("image_png").toString().isEmpty(),15000);
+        QVERIFY2(reader->aiRegion().value("error").toString().isEmpty(),qPrintable(reader->aiRegion().value("error").toString()));QVERIFY(!window->property("regionSelecting").toBool());
+        const auto attachment=reader->aiRegion();QCOMPARE(attachment.value("capture_scale").toDouble(),2.0);QVERIFY(attachment.value("text").toString().contains("quick brown fox"));
+        const auto png=QByteArray::fromBase64(attachment.value("image_png").toByteArray());const auto picture=QImage::fromData(png);QVERIFY(!picture.isNull());QCOMPARE(picture.size(),QSize(840,360));
+        if(qEnvironmentVariableIsSet("LYRA_READER_REGION_DARK_NARROW")){window->setProperty("appearance","dark");window->resize(700,600);QTest::qWait(100);}
+        auto *card=window->findChild<QObject *>("aiRegionCard");QVERIFY(card);QTRY_VERIFY(card->property("visible").toBool());auto *crop=window->findChild<QObject *>("aiRegionImage");QVERIFY(crop);QTRY_COMPARE_WITH_TIMEOUT(crop->property("status").toInt(),1,10000);
+        QVERIFY2(qAbs(crop->property("width").toDouble()/crop->property("height").toDouble()-double(picture.width())/picture.height())<.001,"The captured area must keep its pixel aspect ratio in the bounded preview");
+        window->setProperty("paperAppearance","night");QCOMPARE(reader->aiRegion().value("image_png"),attachment.value("image_png"));QCOMPARE(crop->property("paperAppearance").toString(),QString("original"));
+        QSignalSpy imageChanges(reader,&ReaderController::aiRegionImageChanged);const auto imageUrl=reader->aiRegionImage();
+        reader->setAiRegionQuestion("What is shown in this synthetic area?");QCOMPARE(imageChanges.size(),0);QCOMPARE(reader->aiRegionImage(),imageUrl);QVERIFY(QMetaObject::invokeMethod(card,"prepare"));
+        QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("plan").toMap().isEmpty(),10000);QCOMPARE(server.requests.size(),0);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto textPlan=reader->aiState().value("plan").toMap();const auto textBody=textPlan.value("parts").toList().first().toMap().value("wire_body").toString();QVERIFY(!textBody.contains("data:image/png"));QVERIFY(textBody.contains("quick brown fox"));
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","region-audit-synthetic-model"},{"imageInput",true}});QVERIFY(!reader->startAi("local",textPlan));
+        QVERIFY(QMetaObject::invokeMethod(card,"prepare"));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("plan").toMap().isEmpty(),10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto plan=reader->aiState().value("plan").toMap();const auto body=plan.value("parts").toList().first().toMap().value("wire_body").toString();QVERIFY(body.contains("data:image/png;base64,"+attachment.value("image_png").toString()));QCOMPARE(server.requests.size(),0);
+        auto *payload=window->findChild<QObject *>("aiRegionPayload"),*displayedPayload=window->findChild<QObject *>("aiRegionDisplayedPayload");QVERIFY(payload && displayedPayload);QVERIFY(displayedPayload->property("text").toString().isEmpty());
+        QVERIFY(QMetaObject::invokeMethod(payload,"open"));QTRY_VERIFY(payload->property("visible").toBool());QVERIFY(displayedPayload->property("text").toString().contains("Captured PNG bytes"));QVERIFY(!displayedPayload->property("text").toString().contains(attachment.value("image_png").toString()));QCOMPARE(payload->property("snapshot").toMap().value("parts").toList().first().toMap().value("wire_body").toString(),body);
+        QVERIFY(QMetaObject::invokeMethod(payload,"close"));QTRY_VERIFY(!payload->property("visible").toBool());QVERIFY(displayedPayload->property("text").toString().isEmpty());
+        const auto snapshots=qEnvironmentVariable("LYRA_READER_REGION_SNAPSHOT");if(!snapshots.isEmpty()){QTest::qWait(100);QVERIFY(window->grabWindow().save(snapshots));}
+        auto *send=window->findChild<QQuickItem *>("sendAiRegion");QVERIFY(send && send->isEnabled());QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,send->mapToScene(QPointF(send->width()/2,send->height()/2)).toPoint());
+        QTRY_COMPARE_WITH_TIMEOUT(server.requests.size(),2,10000);const auto raw=server.requests.first();QCOMPARE(raw.mid(raw.indexOf("\r\n\r\n")+4),body.toUtf8());
+        auto fallback=QJsonDocument::fromJson(body.toUtf8()).object();fallback.remove("stream_options");const auto retry=server.requests[1];QCOMPARE(QJsonDocument::fromJson(retry.mid(retry.indexOf("\r\n\r\n")+4)).object(),fallback);
+        QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QVERIFY(reader->aiState().value("output").toString().contains("Synthetic area answer"));
+        auto *answer=window->findChild<QObject *>("aiRegionAnswer");QVERIFY(answer);QVERIFY(!answer->property("text").toString().contains("href=\"p.99\""));
+        const auto pageBefore=window->property("currentPage");const QVariant sentSource=QVariantMap{{"source_pages",plan.value("source_pages")},{"generation",reader->documentGeneration()}};QVERIFY(QMetaObject::invokeMethod(card,"follow",Q_ARG(QVariant,"p.99"),Q_ARG(QVariant,sentSource)));QCOMPARE(window->property("currentPage"),pageBefore);
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QCOMPARE(auditRows().size(),initialAuditCount+2);
+        QCOMPARE(auditRows().at(initialAuditCount).value("http_status").toInt(),400);QCOMPARE(auditRows().at(initialAuditCount).value("outcome").toString(),QString("failed"));QCOMPARE(auditRows().last().value("outcome").toString(),QString("sent"));
+        reader->setAiRegionQuestion("Second synthetic area question never logged");QVERIFY(QMetaObject::invokeMethod(card,"prepare"));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("plan").toMap().isEmpty(),10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,send->mapToScene(QPointF(send->width()/2,send->height()/2)).toPoint());QTRY_COMPARE_WITH_TIMEOUT(server.requests.size(),3,10000);QTRY_VERIFY(reader->aiState().value("output").toString().contains("partial area answer"));
+        auto *stop=window->findChild<QQuickItem *>("stopAiRegion");QVERIFY(stop && stop->isVisible());QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,stop->mapToScene(QPointF(stop->width()/2,stop->height()/2)).toPoint());QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QCOMPARE(auditRows().size(),initialAuditCount+3);QCOMPARE(auditRows().last().value("outcome").toString(),QString("cancelled"));
+        QFile audit(auditPath);QVERIFY(audit.open(QIODevice::ReadOnly));const auto auditBytes=audit.readAll();QVERIFY(!auditBytes.contains("quick brown fox"));QVERIFY(!auditBytes.contains("Second synthetic"));QVERIFY(!auditBytes.contains(attachment.value("image_png").toByteArray()));QVERIFY(!auditBytes.contains("area.pdf"));
+        audit.close();const auto restoreAudit=qScopeGuard([&]{QSaveFile restored(auditPath);if(restored.open(QIODevice::WriteOnly)){restored.write(auditBytes);restored.commit();}});
+        QSaveFile broken(auditPath);QVERIFY(broken.open(QIODevice::WriteOnly));QCOMPARE(broken.write("incomplete audit"),qint64(16));QVERIFY(broken.commit());
+        reader->setAiRegionQuestion("An unavailable audit must block HTTP");QVERIFY(QMetaObject::invokeMethod(card,"prepare"));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("plan").toMap().isEmpty(),10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(reader->startAi("local",reader->aiState().value("plan").toMap()));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QVERIFY(reader->aiState().value("status").toString().contains("audit"));QCOMPARE(server.requests.size(),3);
+        QFile unchangedAudit(auditPath);QVERIFY(unchangedAudit.open(QIODevice::ReadOnly));QCOMPARE(unchangedAudit.readAll(),QByteArray("incomplete audit"));
+        QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",220},{"height",440}},1));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiRegion().value("image_png").toString().isEmpty(),10000);QTRY_COMPARE_WITH_TIMEOUT(crop->property("status").toInt(),1,10000);QVERIFY(qAbs(crop->property("width").toDouble()/crop->property("height").toDouble()-.5)<.001);
+        window->setProperty("textViewVisible",true);auto *readable=visualItem(window->contentItem(),"accessiblePageText");QVERIFY(readable);QTRY_VERIFY(readable->isVisible());
+        QVERIFY(QMetaObject::invokeMethod(card,"close"));QTRY_VERIFY(readable->hasActiveFocus());QCOMPARE(server.requests.size(),3);
+        QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),original);
+    }
+    void cancelledRegionCapturesReleaseTheirBudgetAndRejectOldDocuments() {
+        ReaderController reader;reader.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        const auto before=RenderBudget::statistics().value("residentBytes").toLongLong();
+        QSemaphore entered,release;auto guard=qScopeGuard([&]{release.release(2);});
+        const auto hold=[&]{entered.release();release.acquire();};auto first=QtConcurrent::run(RasterJobs::pool(),hold),second=QtConcurrent::run(RasterJobs::pool(),hold);
+        QVERIFY(entered.tryAcquire(2,3000));
+        const QVariantMap rect{{"x",60},{"y",55},{"width",420},{"height",180}};
+        QVERIFY(reader.captureAiRegion(0,rect,1));QVERIFY(reader.aiRegion().value("loading").toBool());QVERIFY(RenderBudget::statistics().value("residentBytes").toLongLong()>before);
+        reader.cancelAiRegionCapture();QVERIFY(reader.aiRegion().isEmpty());
+        reader.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));release.release(2);guard.dismiss();first.waitForFinished();second.waitForFinished();
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QTRY_COMPARE_WITH_TIMEOUT(RasterJobs::statistics().value("queued").toInt(),0,10000);QTest::qWait(80);QVERIFY(reader.aiRegion().isEmpty());
+        QTRY_COMPARE_WITH_TIMEOUT(RenderBudget::statistics().value("residentBytes").toLongLong(),before,10000);
+        QVERIFY(reader.captureAiRegion(0,{{"x",0},{"y",0},{"width",1000000},{"height",1000000}},1));QTRY_VERIFY_WITH_TIMEOUT(reader.aiRegion().contains("error"),10000);QVERIFY(!reader.aiRegion().contains("image_png"));
+    }
     void aiPreviewStreamingCancellationAndTabsUseTheRealLocalTransport() {
         MockChatServer server;QVERIFY2(server.listen(),"Loopback HTTP is required for this GUI check; no external service is contacted");
         const auto imageUrl=server.baseUrl()+"/unwanted-image";
