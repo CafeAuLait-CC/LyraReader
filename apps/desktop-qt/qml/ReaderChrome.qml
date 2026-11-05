@@ -217,10 +217,18 @@ ColumnLayout {
                 }
             }
             LyraToolButton {
+                objectName:"navigationBack"
                 symbol: "back"
                 text: qsTr("Back to reading position (Alt+Left)")
                 visible: app.canGoBack
                 onClicked: app.goBack()
+            }
+            LyraToolButton {
+                objectName:"navigationForward"
+                symbol:"forward"
+                text:qsTr("Forward to reading position (Alt+Right)")
+                visible:app.canGoForward
+                onClicked:app.goForward()
             }
             LyraToolButton {
                 symbol: "overview"

@@ -51,6 +51,10 @@ derivative exports are refused, including forms selected as merge inputs.
 Reader resizes preserve the chosen percentage in multi-page documents, including facing spreads.
 A real viewport-height change can enlarge a single page below Fit Page; it never shrinks a chosen
 zoom. Width-only panel movement leaves the percentage unchanged, and fit presets use the shared policy.
+Back/Forward uses the shared twenty-entry history in each direction and restores the selection,
+page anchor, horizontal position and fractional calibrated percentage. Only preview jumps record
+an entry; document/revision or tab changes clear the ephemeral history. Alt+Left/Alt+Right belong
+to the focused reader, including when another transient reader window is active.
 The five exclusive secondary rows are Annotate, Edit, Fill & Sign, Export and Lyra. Annotate
 uses three groups for markup, drawing and placement, with menus for shapes, stamps and signatures.
 Ordinary text boxes edit directly on the page, including adopted PDF FreeText. Control+Return

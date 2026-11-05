@@ -20,8 +20,12 @@ ApplicationWindow {
     // Palette specification defaults to light; the user can opt into dark or system.
     readonly property var session: typeof workspace !== "undefined" ? workspace : null
     readonly property var previewController: session ? session.preview : null
-    property var navigationHistory: []
+    readonly property var navigationHistory: navigationController.state.back || []
+    readonly property var forwardHistory: navigationController.state.forward || []
     readonly property bool canGoBack: navigationHistory.length > 0
+    readonly property bool canGoForward: forwardHistory.length > 0
+    NavigationController {id:navigationController;objectName:"navigationController";window:root}
+    function clearNavigation(){if(navigationController)navigationController.clear();}
     readonly property var currentReader: session ? session.activeReader : reader
     readonly property var signatureStatus: currentReader.data.signature_status || {}
     readonly property bool originalReadOnly: !!signatureStatus.signed
@@ -312,7 +316,7 @@ ApplicationWindow {
         ++positionRestoreEpoch;
         positionRestoring = true;
         printRequested = false;
-        navigationHistory = [];
+        clearNavigation();
         previousReader = currentReader;
         selectedAnnotation = null;
         annotationDraft = null;
@@ -898,37 +902,51 @@ ApplicationWindow {
         }
     }
     function jumpFromPreview(page, y) {
-        const history = navigationHistory.slice();
-        history.push({
-            page: currentPage,
-            viewportAnchor: canvas.viewportAnchor(0),
-            offset: canvas.documentOffset(canvas.viewportAnchor(0)),
-            x: pageList.contentX,
-            zoom: zoom,
-            fitting: fitting,
-            selection: selection
-        });
-        navigationHistory = history.slice(-64);
+        if(currentReader.loading || positionRestoring || !Number.isInteger(page) || page<0 || page>=currentReader.pageCount
+                || (y!==undefined && !Number.isFinite(y)))return false;
+        if(!navigationController.record(currentNavigationLocation())) {operationStatus=navigationController.error;return false;}
         selection = null;
         navigate(page, y);
+        return true;
+    }
+    function currentNavigationLocation() {
+        const anchor=canvas.viewportAnchor(0);
+        return {
+            page: currentPage,
+            anchor: anchor,
+            offsetPt: canvas.documentOffset(anchor)/zoom,
+            xPt: canvas.documentX(),
+            zoomPercent: zoomPercent,
+            fitting: fitting,
+            fitPreset: fitPreset,
+            selection: selection
+        };
+    }
+    function applyNavigationLocation(location) {
+        if(!location || location.page===undefined)return false;
+        fitting = false;
+        // These canvas helpers force the current virtualized layout synchronously.
+        // No deferred callback can later restore this location into another tab/document.
+        canvas.changeZoom(location.zoomPercent/100*calibrationFactor,0,0);
+        if(location.anchor)canvas.navigate(location.anchor.page,location.anchor.y);
+        else canvas.restoreDocumentOffset(location.offsetPt*zoom);
+        canvas.restoreDocumentX(location.xPt);
+        currentPage=location.page;
+        selection = location.selection;
+        fitPreset=location.fitPreset;fitting=location.fitting;
+        schedulePositionSave();return true;
     }
     function goBack() {
-        if (!navigationHistory.length)
-            return;
-        const history = navigationHistory.slice(), location = history.pop();
-        navigationHistory = history;
-        fitting = false;
-        zoom = location.zoom;
-        selection = location.selection;
-        Qt.callLater(function () {
-            if (location.viewportAnchor)
-                canvas.navigate(location.viewportAnchor.page, location.viewportAnchor.y);
-            else
-                canvas.restoreDocumentOffset(location.offset);
-            root.currentPage = location.page;
-            pageList.contentX = location.x;
-            fitting = location.fitting;
-        });
+        if(currentReader.loading || positionRestoring || !canGoBack)return false;
+        const target=navigationController.back(currentNavigationLocation());
+        if(navigationController.error.length){operationStatus=navigationController.error;return false;}
+        return applyNavigationLocation(target);
+    }
+    function goForward() {
+        if(currentReader.loading || positionRestoring || !canGoForward)return false;
+        const target=navigationController.forward(currentNavigationLocation());
+        if(navigationController.error.length){operationStatus=navigationController.error;return false;}
+        return applyNavigationLocation(target);
     }
     Connections {
         target: root.previewController
@@ -964,8 +982,13 @@ ApplicationWindow {
     }
     Shortcut {
         sequence: "Alt+Left"
-        enabled: root.readerKeyboardEnabled && (root.canGoBack)
+        enabled: root.readerKeyboardEnabled && navigationController.keyboardFocus && root.canGoBack
         onActivated: root.goBack()
+    }
+    Shortcut {
+        sequence:"Alt+Right"
+        enabled:root.readerKeyboardEnabled && navigationController.keyboardFocus && root.canGoForward
+        onActivated:root.goForward()
     }
     function showSelectionMenu(item, page, x, y) {
         const hit=annotationAt(page,x/zoom,y/zoom,false);
@@ -2331,6 +2354,7 @@ ApplicationWindow {
     Connections {
         target: root.currentReader
         function onDocumentReset() {
+            root.clearNavigation();
             root.pendingLayoutPosition=null;
             root.cancelRegionSelection();aiRegionCard.close();
             root.cancelErase();

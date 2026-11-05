@@ -1,5 +1,6 @@
 #include "DisplayCalibration.h"
 #include "AuditController.h"
+#include "NavigationController.h"
 #include "AuxiliaryWindowPolicy.h"
 #include "ReaderController.h"
 #include "PageItem.h"
@@ -68,6 +69,7 @@ protected:
 static void registerReaderTypes() {
     qmlRegisterUncreatableType<ReaderController>("LyraReader",1,0,"ReaderController","Created by host");
     qmlRegisterType<AuditController>("LyraReader",1,0,"AuditController");
+    qmlRegisterType<NavigationController>("LyraReader",1,0,"NavigationController");
     qmlRegisterType<DisplayCalibration>("LyraReader",1,0,"DisplayCalibration");
     qmlRegisterType<AuxiliaryWindowPolicy>("LyraReader",1,0,"AuxiliaryWindowPolicy");
     qmlRegisterType<PageItem>("LyraReader",1,0,"PdfPage");
@@ -465,6 +467,80 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
         QVERIFY(!preview->visible());QCOMPARE(frozen->pageCount(),2);frozen->submit("references");
         QTRY_COMPARE_WITH_TIMEOUT(frozen->pendingCommands(),0,10000);QCOMPARE(frozen->data().value("references").toList().size(),8);
+    }
+    void sharedNavigationControllerKeepsFullPayloadAndTheTwentyEntryPolicy() {
+        NavigationController navigation;QCOMPARE(navigation.state().value("limit").toInt(),20);
+        const auto location=[](int page){return QVariantMap{{"page",page},{"anchor",QVariantMap{{"page",page},{"y",73.25}}},{"offsetPt",975.5},{"xPt",-43.125},{"zoomPercent",137.5},{"fitting",false},{"fitPreset","page"},{"selection",QVariantMap{{"page",page},{"start",19},{"end",4}}}};};
+        for(int page=0;page<25;++page)QVERIFY(navigation.record(location(page)));
+        QCOMPARE(navigation.state().value("back").toList().size(),20);QCOMPARE(navigation.state().value("back").toList().first().toMap().value("page").toInt(),5);
+        const auto target=navigation.back(location(30));QCOMPARE(target,location(24));QCOMPARE(navigation.forward(target),location(30));
+        const auto before=navigation.state();auto bad=location(2);bad["zoomPercent"]=qQNaN();QVERIFY(!navigation.record(bad));QVERIFY(!navigation.error().isEmpty());QCOMPARE(navigation.state(),before);
+        navigation.clear();QVERIFY(navigation.error().isEmpty());QVERIFY(navigation.state().value("back").toList().isEmpty());QVERIFY(navigation.back(location(0)).isEmpty());
+    }
+    void readingBackForwardRestoresSelectionFractionalZoomAndBothLayoutAnchors_data() {
+        QTest::addColumn<QString>("layout");QTest::newRow("continuous")<<QString("Continuous");QTest::newRow("facing")<<QString("Facing");
+    }
+    void readingBackForwardRestoresSelectionFractionalZoomAndBothLayoutAnchors() {
+        QFETCH(QString,layout);QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/navigation.pdf";
+        QVERIFY(QFile::copy(QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *window=view.window;auto *reader=view.workspace.activeReader();
+        if(qEnvironmentVariableIsSet("LYRA_READER_NAVIGATION_DARK_NARROW")){window->setProperty("appearance","dark");window->resize(700,600);}
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),9,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTRY_VERIFY(!window->property("positionRestoring").toBool());
+        QVERIFY(QMetaObject::invokeMethod(window,"setPageLayout",Q_ARG(QVariant,layout)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        window->setProperty("fitting",false);const double scale=1.375*window->property("calibrationFactor").toDouble();
+        QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,scale),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+        QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,6),Q_ARG(QVariant,150.0)));
+        auto *list=visualItem(window->contentItem(),"pageList");QVERIFY(list);list->setProperty("contentX",75.0);
+        window->setProperty("selection",QVariantMap{{"page",6},{"start",19},{"end",4}});
+        QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));const auto saved=view.workspace.viewState(reader);
+        QVERIFY(QMetaObject::invokeMethod(window,"jumpFromPreview",Q_ARG(QVariant,2),Q_ARG(QVariant,80.0)));
+        QCOMPARE(window->property("currentPage").toInt(),2);QVERIFY(window->property("canGoBack").toBool());
+        QVERIFY(QMetaObject::invokeMethod(window,"goBack"));
+        // Restoration is synchronous; no queued callback may later target another document.
+        QCOMPARE(window->property("currentPage").toInt(),6);QVERIFY(std::abs(window->property("zoomPercent").toDouble()-137.5)<1e-8);
+        auto *navigation=window->findChild<NavigationController *>("navigationController");QVERIFY(navigation);
+        const auto restored=navigation->state().value("forward").toList();QCOMPARE(restored.size(),1);
+        QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));const auto after=view.workspace.viewState(reader);
+        const auto originalAnchor=saved.value("viewportAnchor").toMap();
+        const auto anchorError=[&](const QVariantMap &state){return std::abs(state.value("viewportAnchor").toMap().value("y").toDouble()-originalAnchor.value("y").toDouble())*window->property("zoom").toDouble()*window->devicePixelRatio();};
+        QCOMPARE(after.value("viewportAnchor").toMap().value("page"),originalAnchor.value("page"));
+        // ListView can quantize its virtual row origin at fractional scale. Preserve
+        // the page and stay within one device pixel, including repeated round trips.
+        QVERIFY2(anchorError(after)<1,qPrintable(QString("Anchor error: %1 device pixels").arg(anchorError(after),0,'g',17)));
+        QVERIFY(std::abs(after.value("documentX").toDouble()-saved.value("documentX").toDouble())<.5);
+        for(int i=0;i<20;++i){
+            QVERIFY(QMetaObject::invokeMethod(window,"goForward"));QVERIFY(QMetaObject::invokeMethod(window,"goBack"));
+            QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));const auto repeated=view.workspace.viewState(reader);
+            QCOMPARE(repeated.value("viewportAnchor").toMap().value("page"),originalAnchor.value("page"));
+            QVERIFY2(anchorError(repeated)<1,qPrintable(QString("Round trip %1 anchor error: %2 device pixels").arg(i).arg(anchorError(repeated),0,'g',17)));
+        }
+        QVariant location;QVERIFY(QMetaObject::invokeMethod(window,"currentNavigationLocation",Q_RETURN_ARG(QVariant,location)));
+        const auto payload=location.metaType().id()==qMetaTypeId<QJSValue>()?location.value<QJSValue>().toVariant().toMap():location.toMap();
+        QCOMPARE(payload.value("selection").toMap().value("start").toInt(),19);QCOMPARE(payload.value("selection").toMap().value("end").toInt(),4);
+        QVERIFY(QMetaObject::invokeMethod(window,"goForward"));QCOMPARE(window->property("currentPage").toInt(),2);
+        QVERIFY(QMetaObject::invokeMethod(window,"goBack"));QVERIFY(QMetaObject::invokeMethod(window,"jumpFromPreview",Q_ARG(QVariant,3),Q_ARG(QVariant,40.0)));QVERIFY(!window->property("canGoForward").toBool());
+        const auto count=navigation->state().value("back").toList().size();QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,4),Q_ARG(QVariant,0.0)));QCOMPARE(navigation->state().value("back").toList().size(),count);
+        QVERIFY(QMetaObject::invokeMethod(window,"jumpFromPreview",Q_ARG(QVariant,-1),Q_ARG(QVariant,0)));QCOMPARE(navigation->state().value("back").toList().size(),count);QCOMPARE(window->property("currentPage").toInt(),4);
+        QVERIFY(QMetaObject::invokeMethod(window,"jumpFromPreview",Q_ARG(QVariant,5),Q_ARG(QVariant,20.0)));QVERIFY(QMetaObject::invokeMethod(window,"goBack"));
+        auto *back=visualItem(window->contentItem(),"navigationBack"),*forward=visualItem(window->contentItem(),"navigationForward");QVERIFY(back && forward);QTRY_VERIFY(back->isVisible() && forward->isVisible());
+        QVERIFY(forward->mapRectToScene(forward->boundingRect()).right()<=window->width());
+        QVERIFY(QMetaObject::invokeMethod(forward,"clicked"));QCOMPARE(window->property("currentPage").toInt(),5);QVERIFY(QMetaObject::invokeMethod(back,"clicked"));QCOMPARE(window->property("currentPage").toInt(),4);
+        const auto snapshot=qEnvironmentVariable("LYRA_READER_NAVIGATION_SNAPSHOT");if(!snapshot.isEmpty()){QTest::qWait(80);QVERIFY(window->grabWindow().save(snapshot+"-"+layout+".png"));}
+        view.workspace.newTab();QTest::qWait(60);QVERIFY(!window->property("canGoBack").toBool() && !window->property("canGoForward").toBool());
+        view.workspace.selectTab(0);QTRY_VERIFY(!window->property("positionRestoring").toBool());QVERIFY(!window->property("canGoBack").toBool());
+        QVERIFY(QMetaObject::invokeMethod(window,"jumpFromPreview",Q_ARG(QVariant,2),Q_ARG(QVariant,20.0)));reader->openFile(reader->fileUrl());
+        QTRY_VERIFY(!reader->loading() && reader->pendingCommands()==0 && !window->property("positionRestoring").toBool());QVERIFY(!window->property("canGoBack").toBool());
+    }
+    void navigationKeysBelongToTheFocusedReaderInsteadOfTransientAncestors() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/navigation-keys.pdf";
+        QVERIFY(QFile::copy(QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf",path));NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *window=view.window;auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==9 && !reader->loading() && reader->pendingCommands()==0 && !window->property("positionRestoring").toBool());
+        QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,6),Q_ARG(QVariant,100.0)));QVERIFY(QMetaObject::invokeMethod(window,"jumpFromPreview",Q_ARG(QVariant,2),Q_ARG(QVariant,20.0)));
+        auto *navigation=window->findChild<NavigationController *>("navigationController");QVERIFY(navigation);window->requestActivate();QTRY_VERIFY(navigation->keyboardFocus());
+        QTest::keyClick(window,Qt::Key_Left,Qt::AltModifier);QCOMPARE(window->property("currentPage").toInt(),6);QVERIFY(window->property("canGoForward").toBool());
+        QQuickWindow auxiliary;auxiliary.setTransientParent(window);auxiliary.setFlag(Qt::Dialog);auxiliary.show();auxiliary.requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),&auxiliary);QVERIFY(!navigation->keyboardFocus());
+        QTest::keyClick(&auxiliary,Qt::Key_Right,Qt::AltModifier);QCOMPARE(window->property("currentPage").toInt(),6);QVERIFY(window->property("canGoForward").toBool());
+        QVERIFY(auxiliary.close());window->requestActivate();QTRY_VERIFY(navigation->keyboardFocus());QTest::keyClick(window,Qt::Key_Right,Qt::AltModifier);QCOMPARE(window->property("currentPage").toInt(),2);
     }
     void recentHistoryIsSharedByAllReaderWindows() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());

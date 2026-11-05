@@ -48,22 +48,33 @@ pub struct ReaderLocation {
 }
 
 /// The Back and Forward stacks for one reading session.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct NavigationHistory {
+#[derive(Clone, Debug, PartialEq)]
+pub struct NavigationHistory<Location = ReaderLocation> {
     /// Oldest first. The last element is what Back returns next.
-    back: Vec<ReaderLocation>,
+    back: Vec<Location>,
     /// Oldest first. The last element is what Forward returns next.
-    forward: Vec<ReaderLocation>,
+    forward: Vec<Location>,
 }
 
-impl NavigationHistory {
+impl<Location> Default for NavigationHistory<Location> {
+    fn default() -> Self {
+        Self {
+            back: Vec::new(),
+            forward: Vec::new(),
+        }
+    }
+}
+
+// The transition rules do not inspect a location. A shell may retain its complete
+// viewport payload without a second stack or changing the default macOS DTO.
+impl<Location> NavigationHistory<Location> {
     /// The back stack, oldest first. The last element is the next Back target.
-    pub fn back(&self) -> &[ReaderLocation] {
+    pub fn back(&self) -> &[Location] {
         &self.back
     }
 
     /// The forward stack, oldest first. The last element is the next Forward target.
-    pub fn forward(&self) -> &[ReaderLocation] {
+    pub fn forward(&self) -> &[Location] {
         &self.forward
     }
 
@@ -84,7 +95,7 @@ impl NavigationHistory {
     }
 
     /// Records `location` as the place to return to and drops the stale forward branch.
-    pub fn record(&mut self, location: ReaderLocation) {
+    pub fn record(&mut self, location: Location) {
         self.back.push(location);
         // A new jump has a new future: the branch the reader backed out of is stale.
         self.forward.clear();
@@ -94,7 +105,7 @@ impl NavigationHistory {
     /// Pops the newest back entry and records `current` as the next Forward target.
     ///
     /// Returns `None` — and leaves both stacks untouched — when there is nowhere to go back to.
-    pub fn go_back(&mut self, current: ReaderLocation) -> Option<ReaderLocation> {
+    pub fn go_back(&mut self, current: Location) -> Option<Location> {
         let target = self.back.pop()?;
         self.forward.push(current);
         self.trim();
@@ -102,7 +113,7 @@ impl NavigationHistory {
     }
 
     /// Mirror of [`Self::go_back`].
-    pub fn go_forward(&mut self, current: ReaderLocation) -> Option<ReaderLocation> {
+    pub fn go_forward(&mut self, current: Location) -> Option<Location> {
         let target = self.forward.pop()?;
         self.back.push(current);
         self.trim();
@@ -127,7 +138,7 @@ impl NavigationHistory {
 /// only grow by a Back, which shrinks Back below the limit first), but it is kept because the
 /// pre-change Swift code trimmed both stacks and this type must stay a faithful replacement for
 /// any future caller that adds another entry point.
-fn trim_stack(stack: &mut Vec<ReaderLocation>) {
+fn trim_stack<Location>(stack: &mut Vec<Location>) {
     let excess = stack.len().saturating_sub(NAVIGATION_HISTORY_LIMIT);
     if excess > 0 {
         stack.drain(..excess);

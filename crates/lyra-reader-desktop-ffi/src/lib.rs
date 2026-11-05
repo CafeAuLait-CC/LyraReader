@@ -10,6 +10,7 @@ mod document_cache;
 mod draft_store;
 mod exports;
 mod marks;
+mod navigation;
 mod pages;
 mod region;
 mod region_store;
@@ -27,6 +28,62 @@ use std::{
 #[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_desktop_abi_version() -> u32 {
     2
+}
+
+/// # Safety
+/// Error is writable and empty; free its returned buffer once with buffer_free.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_history_new(
+    error: *mut Buffer,
+) -> *mut navigation::History {
+    // SAFETY: caller provides the documented empty error buffer. The returned owner
+    // is opaque and must outlive every history_command borrow before history_free.
+    unsafe {
+        run(error, || {
+            Ok(Box::into_raw(Box::new(navigation::History::new())))
+        })
+        .unwrap_or(ptr::null_mut())
+    }
+}
+/// # Safety
+/// History is null or the unique owner from history_new; no command is in flight.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_history_free(history: *mut navigation::History) {
+    // SAFETY: caller retires the one owner after all synchronous borrows finish.
+    if !history.is_null() {
+        drop(unsafe { Box::from_raw(history) });
+    }
+}
+/// # Safety
+/// History is null (rejected) or remains alive; request spans request_len readable bytes. Output/error are
+/// writable empty distinct buffers, each freed once with buffer_free after the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_history_command(
+    history: *const navigation::History,
+    request: *const u8,
+    request_len: usize,
+    output: *mut Buffer,
+    error: *mut Buffer,
+) -> bool {
+    // SAFETY: all pointers obey the stated ownership, slice and empty-buffer contracts.
+    unsafe {
+        run(error, || {
+            if request_len > 64 * 1024 {
+                return Err("Navigation request exceeds its byte limit".into());
+            }
+            if output.is_null() {
+                return Err("Navigation output is null".into());
+            }
+            let history = history.as_ref().ok_or("Navigation history is closed")?;
+            let request =
+                serde_json::from_slice(bytes(request, request_len)?).map_err(|e| e.to_string())?;
+            output.write(Buffer::owned(
+                serde_json::to_vec(&history.query(request)?).map_err(|e| e.to_string())?,
+            ));
+            Ok(())
+        })
+        .is_some()
+    }
 }
 
 #[repr(C)]
@@ -478,6 +535,70 @@ pub unsafe extern "C" fn lyra_reader_desktop_source_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn navigation_handle_and_packet_boundaries_keep_owned_buffers_balanced() {
+        let mut error = Buffer {
+            data: ptr::null_mut(),
+            len: 0,
+        };
+        let mut output = Buffer {
+            data: ptr::null_mut(),
+            len: 0,
+        };
+        // SAFETY: unique empty buffers, a live opaque owner, and owned readable packets.
+        // Every returned buffer/owner is freed once after its synchronous borrow ends.
+        unsafe {
+            let history = lyra_reader_desktop_history_new(&mut error);
+            assert!(!history.is_null());
+            assert!(error.data.is_null());
+            let request = br#"{"op":"snapshot"}"#;
+            assert!(lyra_reader_desktop_history_command(
+                history,
+                request.as_ptr(),
+                request.len(),
+                &mut output,
+                &mut error
+            ));
+            let response: serde_json::Value =
+                serde_json::from_slice(slice::from_raw_parts(output.data, output.len)).unwrap();
+            assert_eq!(
+                response["state"]["limit"],
+                lyra_reader_session::NAVIGATION_HISTORY_LIMIT
+            );
+            lyra_reader_desktop_buffer_free(output);
+            output = Buffer {
+                data: ptr::null_mut(),
+                len: 0,
+            };
+            let oversized = vec![b' '; 64 * 1024 + 1];
+            assert!(!lyra_reader_desktop_history_command(
+                history,
+                oversized.as_ptr(),
+                oversized.len(),
+                &mut output,
+                &mut error
+            ));
+            assert!(output.data.is_null());
+            assert!(!error.data.is_null());
+            lyra_reader_desktop_buffer_free(error);
+            error = Buffer {
+                data: ptr::null_mut(),
+                len: 0,
+            };
+            assert!(!lyra_reader_desktop_history_command(
+                ptr::null(),
+                request.as_ptr(),
+                request.len(),
+                &mut output,
+                &mut error
+            ));
+            assert!(output.data.is_null());
+            lyra_reader_desktop_buffer_free(error);
+            lyra_reader_desktop_history_free(history);
+            lyra_reader_desktop_history_free(ptr::null_mut());
+        }
+    }
 
     #[test]
     fn native_viewport_boundary_uses_the_shared_fit_and_scroll_contract() {
