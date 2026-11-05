@@ -46,6 +46,8 @@ ApplicationWindow {
     property string appearance: session ? session.preference("appearance", "light") : "light"
     property string sidebarTab: "thumbnails"
     property bool aiPanelVisible: false
+    // Qt considers transient ancestors active too. Settings owns reader shortcuts while focused.
+    readonly property bool readerKeyboardEnabled: !dialogs.settingsDialog || !dialogs.settingsDialog.visible || !dialogs.settingsDialog.active
     property bool regionSelecting: false
     property var regionDraft: null
     function cancelRegionSelection() {regionSelecting=false;regionDraft=null;}
@@ -951,7 +953,7 @@ ApplicationWindow {
     }
     Shortcut {
         sequence: "Alt+Left"
-        enabled: root.canGoBack
+        enabled: root.readerKeyboardEnabled && (root.canGoBack)
         onActivated: root.goBack()
     }
     function showSelectionMenu(item, page, x, y) {
@@ -995,6 +997,7 @@ ApplicationWindow {
     function showSettings() {
         dialogs.settingsDialog.open();
     }
+    function showAuditTrail(){dialogs.settingsDialog.openAudit();}
     function showDocumentInformation() {
         currentReader.submit("document_info");
         currentReader.submit("metadata");
@@ -1718,21 +1721,21 @@ ApplicationWindow {
     Action {
         objectName: "toggleAiPanelAction"
         text: qsTr("AI Assistant")
-        shortcut: "Ctrl+Shift+A"
+        shortcut: root.readerKeyboardEnabled ? "Ctrl+Shift+A" : ""
         enabled: currentReader.pageCount > 0
         onTriggered: root.showAiPanel(!root.aiPanelVisible)
     }
     Action {
         id: openAction
         text: qsTr("Open PDF…")
-        shortcut: StandardKey.Open
+        shortcut: root.readerKeyboardEnabled ? StandardKey.Open : ""
         onTriggered: fileDialog.open()
     }
     Action {
         id: saveDocumentAction
         objectName: "saveDocumentAction"
         text: qsTr("Save")
-        shortcut: StandardKey.Save
+        shortcut: root.readerKeyboardEnabled ? StandardKey.Save : ""
         enabled: currentReader.pageCount > 0 && currentReader.pendingCommands === 0 && !root.positionRestoring && !root.xfaReadOnly && !root.closeOperation && !root.pendingDocumentSave && (currentReader.hasUnsavedChanges || root.originalReadOnly)
         onTriggered: root.saveDocument()
     }
@@ -1740,7 +1743,7 @@ ApplicationWindow {
         id: saveDocumentAsAction
         objectName: "saveDocumentAsAction"
         text: qsTr("Save As…")
-        shortcut: StandardKey.SaveAs
+        shortcut: root.readerKeyboardEnabled ? StandardKey.SaveAs : ""
         enabled: currentReader.pageCount > 0 && currentReader.pendingCommands === 0 && !root.positionRestoring && !root.xfaReadOnly && !root.closeOperation && !root.pendingDocumentSave
         onTriggered: root.saveDocument(true)
     }
@@ -1756,28 +1759,28 @@ ApplicationWindow {
     Action {
         id: zoomIn
         text: qsTr("Zoom In")
-        shortcut: StandardKey.ZoomIn
+        shortcut: root.readerKeyboardEnabled ? StandardKey.ZoomIn : ""
         enabled: currentReader.pageCount > 0
         onTriggered: root.zoomBy(1.2)
     }
     Action {
         id: zoomOut
         text: qsTr("Zoom Out")
-        shortcut: StandardKey.ZoomOut
+        shortcut: root.readerKeyboardEnabled ? StandardKey.ZoomOut : ""
         enabled: currentReader.pageCount > 0
         onTriggered: root.zoomBy(1 / 1.2)
     }
     Action {
         id: fitAction
         text: qsTr("Fit Width")
-        shortcut: "Ctrl+1"
+        shortcut: root.readerKeyboardEnabled ? "Ctrl+1" : ""
         enabled: currentReader.pageCount > 0 && !root.textViewVisible
         onTriggered: root.fitWidth()
     }
     Action {
         id: actualAction
         text: qsTr("Actual Size")
-        shortcut: "Ctrl+0"
+        shortcut: root.readerKeyboardEnabled ? "Ctrl+0" : ""
         enabled: currentReader.pageCount > 0 && !root.textViewVisible
         onTriggered: {
             root.actualSize();
@@ -1787,7 +1790,7 @@ ApplicationWindow {
         id: readPageTextAction
         objectName: "readPageTextAction"
         text: qsTr("Read Page Text")
-        shortcut: "Ctrl+Shift+R"
+        shortcut: root.readerKeyboardEnabled ? "Ctrl+Shift+R" : ""
         enabled: currentReader.pageCount > 0
         checkable: true
         checked: root.textViewVisible
@@ -1795,25 +1798,26 @@ ApplicationWindow {
     }
     Shortcut {
         sequence: "PageDown"
-        enabled: !root.textViewVisible
+        enabled: root.readerKeyboardEnabled && (!root.textViewVisible)
         onActivated: root.navigate(root.currentPage + 1)
     }
     Shortcut {
         sequence: "PageUp"
-        enabled: !root.textViewVisible
+        enabled: root.readerKeyboardEnabled && (!root.textViewVisible)
         onActivated: root.navigate(root.currentPage - 1)
     }
     Shortcut {
         sequence: "Ctrl+Home"
-        enabled: !root.textViewVisible
+        enabled: root.readerKeyboardEnabled && (!root.textViewVisible)
         onActivated: root.navigate(0)
     }
     Shortcut {
         sequence: "Ctrl+End"
-        enabled: !root.textViewVisible
+        enabled: root.readerKeyboardEnabled && (!root.textViewVisible)
         onActivated: root.navigate(currentReader.pageCount - 1)
     }
     Shortcut {
+        enabled: root.readerKeyboardEnabled
         sequence: "Ctrl+L"
         onActivated: {
             pageNumber.forceActiveFocus();
@@ -1821,32 +1825,38 @@ ApplicationWindow {
         }
     }
     Shortcut {
+        enabled: root.readerKeyboardEnabled
         sequence: "Ctrl+B"
         onActivated: root.sidebarVisible = !root.sidebarVisible
     }
     Shortcut {
+        enabled: root.readerKeyboardEnabled
         sequence: "F11"
         onActivated: root.visibility = root.visibility === Window.FullScreen ? Window.Windowed : Window.FullScreen
     }
     Shortcut {
         sequences: [StandardKey.Copy]
-        enabled: !!root.selection && root.activeFocusItem && root.activeFocusItem.objectName === "pdfPointer"
+        enabled: root.readerKeyboardEnabled && (!!root.selection && root.activeFocusItem && root.activeFocusItem.objectName === "pdfPointer")
         onActivated: root.copySelection()
     }
     Shortcut {
+        enabled: root.readerKeyboardEnabled
         sequences: [StandardKey.Find]
         onActivated: root.focusSearch()
     }
     Shortcut {
+        enabled: root.readerKeyboardEnabled
         sequence: "Ctrl+D"
         onActivated: root.addBookmark()
     }
     Shortcut {
+        enabled: root.readerKeyboardEnabled
         sequence: "Ctrl+W"
         onActivated: if (root.session)
             root.requestCloseTab(root.session.activeIndex)
     }
     Shortcut {
+        enabled: root.readerKeyboardEnabled
         sequence: "Ctrl+Tab"
         onActivated: if (root.session)
             root.selectReaderTab((root.session.activeIndex + 1) % root.session.tabs.length)
@@ -1864,15 +1874,16 @@ ApplicationWindow {
 
     Shortcut {
         sequences: [StandardKey.Undo]
-        enabled: !(root.activeFocusItem && typeof root.activeFocusItem.selectedText !== "undefined")
+        enabled: root.readerKeyboardEnabled && (!(root.activeFocusItem && typeof root.activeFocusItem.selectedText !== "undefined"))
         onActivated: root.undo()
     }
     Shortcut {
         sequences: [StandardKey.Redo]
-        enabled: !(root.activeFocusItem && typeof root.activeFocusItem.selectedText !== "undefined")
+        enabled: root.readerKeyboardEnabled && (!(root.activeFocusItem && typeof root.activeFocusItem.selectedText !== "undefined"))
         onActivated: root.redo()
     }
     Shortcut {
+        enabled: root.readerKeyboardEnabled
         sequence: "Escape"
         onActivated: {
             if(placedTextController.waitingForCreation)placedTextController.cancelPendingCreation();

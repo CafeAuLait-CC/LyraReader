@@ -89,7 +89,9 @@ snapshots and edits local knowledge notes without sending a request. Saving is c
 automatic region persistence, reopening multiple cards and Interleaf layout remain work in progress.
 Unfinished knowledge-note drafts and failed snapshot saves keep the document open until resolved.
 Legacy answer page markers stay plain text. Actual HTTP attempts have a bounded local metadata audit
-trail, including retries; the audit viewer and newer AI workflows remain work in progress.
+trail, including retries. Settings and the AI panel open a metadata-only viewer, available without a
+PDF. Clearing it requires confirmation of the displayed snapshot; concurrent changes require a refresh.
+Newer AI workflows remain work in progress.
 A byte-bounded revisit cache retains reduced page images after sharp sources leave the working
 set. Unloaded pages already use the selected reading-mode paper colour.
 Tabs reorder after half a tab width of travel, retain their reader state, and support

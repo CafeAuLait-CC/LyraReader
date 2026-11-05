@@ -403,6 +403,11 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         if (parseError.error != QJsonParseError::NoError || !json.isObject())
             result.error = QStringLiteral("The document service returned an invalid response.");
         else result.result = json.object().value(QStringLiteral("result")).toVariant();
+        if(result.error.isEmpty() && operation==QStringLiteral("region_get")) {
+            auto detail=result.result.toMap();
+            detail.insert(QStringLiteral("image_url"),QUrl(QStringLiteral("data:image/png;base64,")+detail.value(QStringLiteral("attachment")).toMap().value(QStringLiteral("png")).toString()));
+            result.result=detail;
+        }
         if(result.error.isEmpty() && (operation==QStringLiteral("content_stage") || operation==QStringLiteral("page_stage") || operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo") || operation==QStringLiteral("page_discard") || operation==QStringLiteral("page_apply") || operation==QStringLiteral("document_save") || operation==QStringLiteral("document_discard")))
             result.source=NativeRasterSource::prepare(document,false,&result.error);
         return result;

@@ -1,4 +1,5 @@
 #include "DisplayCalibration.h"
+#include "AuditController.h"
 #include "AuxiliaryWindowPolicy.h"
 #include "PageItem.h"
 #include "CropItem.h"
@@ -67,6 +68,7 @@ int main(int argc, char **argv) {
 #endif
     }
     qmlRegisterUncreatableType<ReaderController>("LyraReader", 1, 0, "ReaderController", QStringLiteral("Created by the application"));
+    qmlRegisterType<AuditController>("LyraReader",1,0,"AuditController");
     qmlRegisterType<DisplayCalibration>("LyraReader",1,0,"DisplayCalibration");
     qmlRegisterType<AuxiliaryWindowPolicy>("LyraReader",1,0,"AuxiliaryWindowPolicy");
     qmlRegisterType<PageItem>("LyraReader", 1, 0, "PdfPage");

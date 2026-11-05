@@ -40,6 +40,7 @@ bool lyra_reader_desktop_render_region(const LyraReaderRenderSource *, std::uint
     double x, double y, double width, double height, bool annotated, bool transparent,
     LyraReaderBitmap *output, LyraReaderBuffer *error);
 void lyra_reader_desktop_buffer_free(LyraReaderBuffer buffer);
+// Document may be null only for the global audit_records and audit_clear operations.
 bool lyra_reader_desktop_command(const LyraReaderDesktopDocument *document,
     const std::uint8_t *request, std::size_t request_len, LyraReaderBuffer *output, LyraReaderBuffer *error);
 double lyra_reader_desktop_zoom_offset(double offset, double anchor, double old_zoom, double new_zoom);

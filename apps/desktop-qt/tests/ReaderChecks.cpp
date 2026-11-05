@@ -1,4 +1,5 @@
 #include "DisplayCalibration.h"
+#include "AuditController.h"
 #include "AuxiliaryWindowPolicy.h"
 #include "ReaderController.h"
 #include "PageItem.h"
@@ -64,6 +65,7 @@ protected:
 
 static void registerReaderTypes() {
     qmlRegisterUncreatableType<ReaderController>("LyraReader",1,0,"ReaderController","Created by host");
+    qmlRegisterType<AuditController>("LyraReader",1,0,"AuditController");
     qmlRegisterType<DisplayCalibration>("LyraReader",1,0,"DisplayCalibration");
     qmlRegisterType<AuxiliaryWindowPolicy>("LyraReader",1,0,"AuxiliaryWindowPolicy");
     qmlRegisterType<PageItem>("LyraReader",1,0,"PdfPage");
@@ -1273,6 +1275,34 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,true)));view.window->setProperty("textViewVisible",true);auto *text=visualItem(view.window->contentItem(),"accessiblePageText");QVERIFY(text);QTRY_VERIFY(text->isVisible());QTest::qWait(30);composer->forceActiveFocus();view.window->setProperty("aiPanelVisible",false);QTRY_VERIFY(text->hasActiveFocus());QVERIFY(!canvas->hasActiveFocus());
         view.window->setProperty("textViewVisible",false);QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,true)));QVERIFY(QMetaObject::invokeMethod(view.window,"showOverview",Q_ARG(QVariant,false)));auto *grid=visualItem(view.window->contentItem(),"pageOverview");QVERIFY(grid && grid->isVisible());composer->forceActiveFocus();view.window->setProperty("aiPanelVisible",false);QTRY_VERIFY(grid->hasActiveFocus());QVERIFY(!canvas->hasActiveFocus());
         QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,true)));composer->forceActiveFocus();view.workspace.newTab();QTRY_VERIFY(!composer->hasActiveFocus());QVERIFY(view.workspace.activeReader()->aiState().value("input").toMap().value("chatQuestion").toString().isEmpty());QCOMPARE(reader->aiState().value("input").toMap().value("chatQuestion").toString(),QString("Draft retained"));
+    }
+    void auditViewerWorksWithoutAPdfAndClearsOnlyTheReviewedLocalSnapshot() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});const auto cache=scratch.path()+"/cache";qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",cache.toUtf8());
+        MockChatServer sentinel;QVERIFY(sentinel.listen());NativeCorpus::Viewer view;QVERIFY(view.window);auto *main=view.window;main->setProperty("aiSettings",QVariantMap{{"baseUrl",sentinel.baseUrl()},{"model","audit-no-send-synthetic-model"}});
+        auto *settings=main->findChild<QQuickWindow *>("settingsWindow");QVERIFY(settings);QVERIFY(QMetaObject::invokeMethod(settings,"open"));QTRY_VERIFY(settings->isVisible());
+        auto *button=settings->findChild<QObject *>("openAuditTrail");QVERIFY(button);QVERIFY(QMetaObject::invokeMethod(button,"clicked"));auto *dialog=settings->findChild<QObject *>("auditDialog");auto *controller=settings->findChild<AuditController *>("auditController");QVERIFY(dialog && controller);QTRY_VERIFY(dialog->property("visible").toBool());QTRY_VERIFY_WITH_TIMEOUT(!controller->busy(),10000);
+        QCOMPARE(view.workspace.activeReader()->pageCount(),0);QCOMPARE(controller->state().value("records").toList().size(),0);QVERIFY2(controller->error().isEmpty(),qPrintable(controller->error()));QVERIFY(!QDir(cache+"/Audit").exists());QCOMPARE(sentinel.requests.size(),0);
+        QVERIFY(QDir().mkpath(cache+"/Audit"));const auto path=cache+"/Audit/ai-requests.jsonl";
+        QJsonObject first{{"version",1},{"id","00000001-1111-4222-8333-000000000001"},{"at_unix_ms",qint64(1793800000000)},{"action","region_question"},{"local",true},{"outcome","sent"},{"code",QJsonValue::Null},{"http_status",QJsonValue::Null},{"duration_ms",31}};
+        auto second=first;second["id"]="00000002-1111-4222-8333-000000000002";second["action"]="document_chat";second["outcome"]="failed";second["code"]="http_error";second["http_status"]=400;second["local"]=false;
+        const auto rows=(QJsonDocument(first).toJson(QJsonDocument::Compact)+"\n"+QJsonDocument(second).toJson(QJsonDocument::Compact)+"\n").replace("\"duration_ms\":31","\"duration_ms\":18446744073709551615");
+        QSaveFile file(path);QVERIFY(file.open(QIODevice::WriteOnly));QCOMPARE(file.write(rows),rows.size());QVERIFY(file.commit());controller->reload();QTRY_VERIFY_WITH_TIMEOUT(!controller->busy(),10000);QVERIFY(controller->error().isEmpty());QCOMPARE(controller->state().value("records").toList().size(),2);QCOMPARE(controller->state().value("records").toList()[0].toMap().value("http_status").toInt(),400);QVERIFY(controller->metadata().contains("18446744073709551615"));
+        auto *clear=settings->findChild<QObject *>("clearAuditTrail");auto *confirm=settings->findChild<QObject *>("clearAuditConfirmation");QVERIFY(clear && confirm);QVERIFY(clear->property("enabled").toBool());QVERIFY(QMetaObject::invokeMethod(clear,"clicked"));QTRY_VERIFY(confirm->property("opened").toBool());
+        auto *auditContent=qvariant_cast<QQuickItem *>(dialog->property("contentItem"));auto *confirmContent=qvariant_cast<QQuickItem *>(confirm->property("contentItem"));QVERIFY(auditContent && confirmContent);
+        const auto diagnostic=qEnvironmentVariable("LYRA_READER_AUDIT_SNAPSHOT");if(!diagnostic.isEmpty())QVERIFY(settings->grabWindow().save(diagnostic+"-confirm.png"));
+        QCOMPARE(auditContent->window(),settings);QCOMPARE(confirmContent->window(),settings);
+        QTest::keyClick(settings,Qt::Key_Escape);
+        QTRY_VERIFY(!confirm->property("visible").toBool());QVERIFY(dialog->property("visible").toBool());QVERIFY(settings->isVisible());
+        QFile unchanged(path);QVERIFY(unchanged.open(QIODevice::ReadOnly));QCOMPARE(unchanged.readAll(),rows);unchanged.close();
+        if(qEnvironmentVariableIsSet("LYRA_READER_AUDIT_DARK_NARROW")){main->setProperty("appearance","dark");settings->resize(380,600);}
+        const auto snapshot=qEnvironmentVariable("LYRA_READER_AUDIT_SNAPSHOT");if(!snapshot.isEmpty()){QTest::qWait(100);QVERIFY(settings->grabWindow().save(snapshot));}
+        QVERIFY(QMetaObject::invokeMethod(clear,"clicked"));QTRY_VERIFY(confirm->property("opened").toBool());auto third=first;third["id"]="00000003-1111-4222-8333-000000000003";const auto newer=rows+QJsonDocument(third).toJson(QJsonDocument::Compact)+"\n";
+        QSaveFile concurrent(path);QVERIFY(concurrent.open(QIODevice::WriteOnly));QCOMPARE(concurrent.write(newer),newer.size());QVERIFY(concurrent.commit());QVERIFY(QMetaObject::invokeMethod(confirm,"accept"));QTRY_VERIFY_WITH_TIMEOUT(!controller->busy(),10000);QVERIFY(controller->error().contains("changed"));QVERIFY(unchanged.open(QIODevice::ReadOnly));QCOMPARE(unchanged.readAll(),newer);unchanged.close();QCOMPARE(sentinel.requests.size(),0);
+        controller->reload();QTRY_VERIFY_WITH_TIMEOUT(!controller->busy(),10000);QVERIFY(controller->error().isEmpty());QCOMPARE(controller->state().value("records").toList().size(),3);QVERIFY(QMetaObject::invokeMethod(clear,"clicked"));QTRY_VERIFY(confirm->property("opened").toBool());QVERIFY(QMetaObject::invokeMethod(confirm,"accept"));QTRY_VERIFY_WITH_TIMEOUT(!controller->busy(),10000);QVERIFY(controller->error().isEmpty());QCOMPARE(controller->state().value("records").toList().size(),0);
+        QVERIFY(unchanged.open(QIODevice::ReadOnly));QVERIFY(unchanged.readAll().isEmpty());unchanged.close();
+        auto bad=first;bad["question"]="synthetic content that must never enter an audit snapshot";const auto damaged=QJsonDocument(bad).toJson(QJsonDocument::Compact)+"\n";QSaveFile corrupt(path);QVERIFY(corrupt.open(QIODevice::WriteOnly));QCOMPARE(corrupt.write(damaged),damaged.size());QVERIFY(corrupt.commit());controller->reload();QTRY_VERIFY_WITH_TIMEOUT(!controller->busy(),10000);QVERIFY(!controller->error().isEmpty());QVERIFY(!controller->metadata().contains("synthetic content"));QVERIFY(!clear->property("enabled").toBool());auto *empty=settings->findChild<QObject *>("auditEmpty");QVERIFY(empty);QVERIFY(!empty->property("visible").toBool());
+        QVERIFY(unchanged.open(QIODevice::ReadOnly));QCOMPARE(unchanged.readAll(),damaged);QCOMPARE(sentinel.requests.size(),0);QVERIFY(QMetaObject::invokeMethod(dialog,"close"));QVERIFY(settings->isVisible());QVERIFY(settings->close());
+        QVERIFY(QMetaObject::invokeMethod(main,"showAuditTrail"));QTRY_VERIFY(settings->isVisible());QTRY_VERIFY(dialog->property("visible").toBool());QTRY_VERIFY_WITH_TIMEOUT(!controller->busy(),10000);QCOMPARE(sentinel.requests.size(),0);QVERIFY(QMetaObject::invokeMethod(dialog,"close"));QVERIFY(settings->close());
     }
     void regionQuestionsCaptureOnceAndSendOnlyTheExplicitPreview() {
         MockChatServer server;QVERIFY(server.listen());

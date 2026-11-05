@@ -204,6 +204,7 @@ Pane {
                 onClicked: aiPanel.owner.clearAiChat()
             }
         }
+        Button {objectName:"aiAuditTrail";text:qsTr("Local audit trail…");Layout.fillWidth:true;onClicked:app.showAuditTrail()}
     }
     Dialog {
         id: payload

@@ -66,7 +66,7 @@ Dialog {
                         anchors.centerIn:parent
                         readonly property var attachment:notes.detail ? notes.detail.attachment : ({})
                         width:Math.min(parent.width,160*(attachment.pixelWidth || 1)/(attachment.pixelHeight || 1));height:width*(attachment.pixelHeight || 1)/(attachment.pixelWidth || 1)
-                        source:attachment.png ? "data:image/png;base64,"+attachment.png : ""
+                        source:notes.detail ? notes.detail.image_url || "" : ""
                         Accessible.role:Accessible.Graphic;Accessible.name:qsTr("Saved region capture")
                     }
                 }

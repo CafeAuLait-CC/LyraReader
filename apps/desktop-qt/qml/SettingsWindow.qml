@@ -29,6 +29,7 @@ ApplicationWindow {
         if(!policy.prepare(settings,app,saved,560,650)){app.operationStatus=qsTr("The Settings window could not find an available display.");return;}
         show();requestActivate();
     }
+    function openAudit(){open();if(visible)auditDialog.open();}
     function save() {
         app.appearance = ["light", "dark", "system"][appearance.currentIndex];
         app.paperAppearance = ["original", "warm", "night"][paper.currentIndex];
@@ -52,9 +53,10 @@ ApplicationWindow {
     }
     onClosing: {
         if(app.session)app.session.setPreference("auxiliarySettingsGeometry",policy.geometry());
-        apiKey.clear();policy.returnFocus();
+        auditDialog.close();apiKey.clear();policy.returnFocus();
     }
-    Shortcut {sequence:"Escape";onActivated:settings.close()}
+    Shortcut {sequence:"Escape";onActivated:{if(auditDialog.visible)auditDialog.cancelTop();else settings.close();}}
+    AuditDialog {id:auditDialog;host:settings;colors:settings.colors;session:settings.app.session}
     ColumnLayout {
         anchors.fill:parent
         anchors.margins:16
@@ -153,6 +155,7 @@ ApplicationWindow {
                     color: app.colors.textSecondary
                     font.pixelSize: 11
                 }
+                Button {objectName:"openAuditTrail";text:qsTr("Local audit trail…");onClicked:auditDialog.open()}
                 Button {
                     text: qsTr("Remove Saved Key")
                     onClicked: app.removeAiCredential(baseUrl.text)

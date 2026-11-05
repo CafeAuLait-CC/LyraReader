@@ -7,6 +7,9 @@ use lyra_reader_ai::{
 };
 use lyra_reader_ffi::api::AiActionRecord;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::{
     fs,
     io::Read,
@@ -86,9 +89,88 @@ fn valid_id(id: &str) -> bool {
             }
         })
 }
+fn read_records(directory: &Path) -> Result<(Vec<Record>, Vec<u8>), AiError> {
+    let path = directory.join("ai-requests.jsonl");
+    if directory.is_symlink() || path.is_symlink() || directory.join("audit.lock").is_symlink() {
+        return Err(failure());
+    }
+    let mut bytes = Vec::new();
+    match fs::File::open(&path) {
+        Ok(mut file) => {
+            if file.metadata().map_err(|_| failure())?.len() > MAX_BYTES as u64 {
+                return Err(failure());
+            }
+            file.by_ref()
+                .take(MAX_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| failure())?;
+            if bytes.len() > MAX_BYTES || (!bytes.is_empty() && !bytes.ends_with(b"\n")) {
+                return Err(failure());
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(failure()),
+    }
+    let mut records = Vec::new();
+    let mut ids = HashSet::new();
+    for line in bytes.split(|c| *c == b'\n').filter(|l| !l.is_empty()) {
+        let record: Record = serde_json::from_slice(line).map_err(|_| failure())?;
+        if record.version != 1
+            || !valid_id(&record.id)
+            || !ids.insert(record.id.to_ascii_lowercase())
+            || records.len() >= MAX_RECORDS
+        {
+            return Err(failure());
+        }
+        records.push(record);
+    }
+    Ok((records, bytes))
+}
+fn digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A metadata-only snapshot reads the existing file without creating a directory or lock.
+fn snapshot(root: &Path) -> Result<Value, AiError> {
+    let (mut records, bytes) = read_records(&root.join("Audit"))?;
+    records.reverse();
+    Ok(
+        json!({"version":1,"records":records,"fingerprint":digest(&bytes),"max_records":MAX_RECORDS,"max_bytes":MAX_BYTES}),
+    )
+}
+/// Additive global control-plane operations; no document, PDFium call or provider is involved.
+pub(super) fn query(root: &Path, request: &Value) -> Result<Value, String> {
+    let op = request["op"].as_str().ok_or("Invalid audit operation")?;
+    match op {
+        "audit_records" => snapshot(root).map_err(|e| e.to_string()),
+        "audit_clear" => {
+            let expected = request["fingerprint"]
+                .as_str()
+                .filter(|s| s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit()))
+                .ok_or("Review the current audit snapshot before clearing it")?;
+            mutate(&root.join("Audit"),false,|rows,bytes|{
+                if digest(bytes)!=expected{return Err(AiError::Other("The audit trail changed. Refresh and review it before clearing; no entries were removed.".into()));}
+                rows.clear();Ok(())
+            }).map_err(|e|e.to_string())?;
+            snapshot(root).map_err(|e| e.to_string())
+        }
+        _ => Err("Unknown audit operation".into()),
+    }
+}
+
 fn update(
     directory: &Path,
     change: impl FnOnce(&mut Vec<Record>) -> Result<(), AiError>,
+) -> Result<(), AiError> {
+    mutate(directory, true, |rows, _| change(rows))
+}
+fn mutate(
+    directory: &Path,
+    wait: bool,
+    change: impl FnOnce(&mut Vec<Record>, &[u8]) -> Result<(), AiError>,
 ) -> Result<(), AiError> {
     if directory.is_symlink() {
         return Err(failure());
@@ -114,33 +196,35 @@ fn update(
         options.mode(0o600);
     }
     let lock = options.open(lock_path).map_err(|_| failure())?;
-    FileExt::lock_exclusive(&lock).map_err(|_| failure())?; // The handle releases its cross-process lock on every exit.
-    let mut bytes = Vec::new();
-    match fs::File::open(&path) {
-        Ok(mut file) => {
-            if file.metadata().map_err(|_| failure())?.len() > MAX_BYTES as u64 {
-                return Err(failure());
-            }
-            file.by_ref()
-                .take(MAX_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|_| failure())?;
-            if bytes.len() > MAX_BYTES || (!bytes.is_empty() && !bytes.ends_with(b"\n")) {
-                return Err(failure());
+    if wait {
+        FileExt::lock_exclusive(&lock).map_err(|_| failure())?;
+    } else {
+        // A normal writer may be finishing a rename. Allow a short, bounded worker-side
+        // wait, then refuse rather than hanging a UI command behind another process.
+        let started = Instant::now();
+        loop {
+            match FileExt::try_lock_exclusive(&lock) {
+                Ok(()) => break,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    if started.elapsed() >= std::time::Duration::from_millis(50) {
+                        return Err(AiError::Other(
+                            "Another process is updating the audit trail. Refresh and try again."
+                                .into(),
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => return Err(failure()),
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return Err(failure()),
-    }
-    let mut records = Vec::new();
-    for line in bytes.split(|c| *c == b'\n').filter(|l| !l.is_empty()) {
-        let record: Record = serde_json::from_slice(line).map_err(|_| failure())?;
-        if record.version != 1 || !valid_id(&record.id) || records.len() >= MAX_RECORDS {
-            return Err(failure());
-        }
-        records.push(record);
-    }
-    change(&mut records)?;
+    } // The handle releases its cross-process lock on every exit.
+    let (mut records, original) = read_records(directory)?;
+    change(&mut records, &original)?;
     while records.len() > MAX_RECORDS {
         records.remove(0);
     }
@@ -248,6 +332,162 @@ impl RequestAudit for Audit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshots_are_read_only_and_clear_requires_the_exact_reviewed_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "lyra-reader-audit-view-{}",
+            crate::marks::uuid().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let empty = query(&root, &serde_json::json!({"op":"audit_records"})).unwrap();
+        assert_eq!(empty["records"].as_array().unwrap().len(), 0);
+        assert!(!root.join("Audit").exists());
+        let audit = observer(root.clone(), AiActionRecord::RegionQuestion, true);
+        audit.started().unwrap();
+        audit.finished(RequestOutcome::HttpError(400)).unwrap();
+        let path = root.join("Audit/ai-requests.jsonl");
+        let before = fs::read(&path).unwrap();
+        let first = query(&root, &serde_json::json!({"op":"audit_records"})).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(first["records"][0]["http_status"], 400);
+        audit.started().unwrap();
+        audit.finished(RequestOutcome::Cancelled).unwrap();
+        let two = fs::read(&path).unwrap();
+        assert!(
+            query(
+                &root,
+                &serde_json::json!({"op":"audit_clear","fingerprint":first["fingerprint"]})
+            )
+            .unwrap_err()
+            .contains("changed")
+        );
+        assert_eq!(fs::read(&path).unwrap(), two);
+        let current = query(&root, &serde_json::json!({"op":"audit_records"})).unwrap();
+        let clear = query(
+            &root,
+            &serde_json::json!({"op":"audit_clear","fingerprint":current["fingerprint"]}),
+        )
+        .unwrap();
+        assert!(clear["records"].as_array().unwrap().is_empty());
+        assert!(fs::read(&path).unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn corrupt_or_duplicate_metadata_is_never_cleared_or_reinterpreted_as_empty() {
+        let root = std::env::temp_dir().join(format!(
+            "lyra-reader-audit-corrupt-{}",
+            crate::marks::uuid().unwrap()
+        ));
+        let audit = observer(root.clone(), AiActionRecord::DocumentChat, false);
+        audit.started().unwrap();
+        audit.finished(RequestOutcome::Sent).unwrap();
+        let path = root.join("Audit/ai-requests.jsonl");
+        let good = fs::read(&path).unwrap();
+        for bad in [
+            b"incomplete metadata".to_vec(),
+            [good.clone(), good.clone()].concat(),
+            vec![b'x'; MAX_BYTES + 1],
+        ] {
+            fs::write(&path, &bad).unwrap();
+            assert!(query(&root, &serde_json::json!({"op":"audit_records"})).is_err());
+            assert!(
+                query(
+                    &root,
+                    &serde_json::json!({"op":"audit_clear","fingerprint":digest(&bad)})
+                )
+                .is_err()
+            );
+            assert_eq!(fs::read(&path).unwrap(), bad);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn explicitly_cleared_inflight_records_are_not_revived_on_completion() {
+        let root = std::env::temp_dir().join(format!(
+            "lyra-reader-audit-clear-live-{}",
+            crate::marks::uuid().unwrap()
+        ));
+        let audit = observer(root.clone(), AiActionRecord::AskSelection, true);
+        audit.started().unwrap();
+        let view = query(&root, &serde_json::json!({"op":"audit_records"})).unwrap();
+        query(
+            &root,
+            &serde_json::json!({"op":"audit_clear","fingerprint":view["fingerprint"]}),
+        )
+        .unwrap();
+        audit.finished(RequestOutcome::Sent).unwrap();
+        assert!(
+            query(&root, &serde_json::json!({"op":"audit_records"})).unwrap()["records"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn document_free_global_commands_run_in_an_isolated_process() {
+        let root = std::env::temp_dir().join(format!(
+            "lyra-reader-audit-global-{}",
+            crate::marks::uuid().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "audit::tests::document_free_global_command_worker",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("LYRA_READER_DOCUMENT_CACHE_DIR", &root)
+            .env("LYRA_READER_AUDIT_GLOBAL_WORKER", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(!root.join("Audit").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    #[ignore = "launched only by the parent with its isolated cache root"]
+    fn document_free_global_command_worker() {
+        if std::env::var("LYRA_READER_AUDIT_GLOBAL_WORKER")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            return;
+        }
+        let input = serde_json::to_vec(&serde_json::json!({"op":"audit_records"})).unwrap();
+        let mut output = crate::Buffer {
+            data: std::ptr::null_mut(),
+            len: 0,
+        };
+        let mut error = crate::Buffer {
+            data: std::ptr::null_mut(),
+            len: 0,
+        };
+        // SAFETY: only the documented global query uses a null document. Input owns its
+        // stated bytes and both buffers are unique writable empty values until freed below.
+        unsafe {
+            assert!(crate::lyra_reader_desktop_command(
+                std::ptr::null(),
+                input.as_ptr(),
+                input.len(),
+                &mut output,
+                &mut error
+            ));
+            let decoded: serde_json::Value =
+                serde_json::from_slice(std::slice::from_raw_parts(output.data, output.len))
+                    .unwrap();
+            assert_eq!(decoded["result"]["version"], 1);
+            assert!(decoded["result"]["records"].as_array().unwrap().is_empty());
+            crate::lyra_reader_desktop_buffer_free(output);
+            crate::lyra_reader_desktop_buffer_free(error);
+        }
+    }
     #[test]
     fn records_rotate_atomically_and_corruption_blocks_requests_without_overwriting() {
         let root = std::env::temp_dir().join(format!(

@@ -244,7 +244,8 @@ pub unsafe extern "C" fn lyra_reader_desktop_render_annotated(
 }
 
 /// # Safety
-/// Document stays alive during the call; request addresses request_len readable bytes.
+/// For document operations, document stays alive during the call. It may be null for
+/// audit_records/audit_clear, which ignore it. Request addresses request_len readable bytes.
 /// Output and error are writable, empty buffers and must be freed by buffer_free.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lyra_reader_desktop_command(
@@ -256,13 +257,24 @@ pub unsafe extern "C" fn lyra_reader_desktop_command(
 ) -> bool {
     unsafe {
         run(error, || {
-            let doc = document.as_ref().ok_or("document handle is null")?;
             if output.is_null() {
                 return Err("output buffer is null".into());
             }
-            let request =
+            // SAFETY: the caller owns the request slice and writable output as documented;
+            // a document handle is inspected only after excluding document-free audit queries.
+            let request: serde_json::Value =
                 serde_json::from_slice(bytes(request, request_len)?).map_err(|e| e.to_string())?;
-            let result = doc.command(request)?;
+            let result = if matches!(
+                request["op"].as_str(),
+                Some("audit_records" | "audit_clear")
+            ) {
+                crate::audit::query(&crate::document_cache::default_root()?, &request)?
+            } else {
+                document
+                    .as_ref()
+                    .ok_or("document handle is null")?
+                    .command(request)?
+            };
             let response = serde_json::to_vec(&serde_json::json!({"result":result}))
                 .map_err(|e| e.to_string())?;
             output.write(Buffer::owned(response));
