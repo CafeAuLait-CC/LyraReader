@@ -95,6 +95,10 @@ Legacy answer page markers stay plain text. Actual HTTP attempts have a bounded 
 trail, including retries. Settings and the AI panel open a metadata-only viewer, available without a
 PDF. Clearing it requires confirmation of the displayed snapshot; concurrent changes require a refresh.
 Newer AI workflows remain work in progress.
+Reference and figure indices use bounded shared-engine steps, yielding between steps to admitted
+raster work. Page-local citation lookups use the same cooperative gate. Previews share the pinned
+revision and completed indices; closing or switching a reader cancels its pending scan without
+publishing a partial collection or cancelling a different frozen reader's query.
 A byte-bounded revisit cache retains reduced page images after sharp sources leave the working
 set. Unloaded pages already use the selected reading-mode paper colour.
 Tabs reorder after half a tab width of travel, retain their reader state, and support

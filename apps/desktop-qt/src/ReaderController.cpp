@@ -83,7 +83,7 @@ bool ReaderController::hasUnsavedChanges()const {
     return marks.value(QStringLiteral("page_pending")).toBool() ||
         (!localOnly && marks.value(QStringLiteral("pdf_dirty")).toBool()) || !m_noteDrafts.isEmpty() || hasEditDrafts();
 }
-ReaderController::~ReaderController(){RasterJobs::cancel(m_aiRegionJob);clearRasterCache();NativeImageProvider::unregisterSource(m_contentSourceKey);}
+ReaderController::~ReaderController(){m_indexCancellation->store(true);RasterJobs::cancel(m_aiRegionJob);clearRasterCache();NativeImageProvider::unregisterSource(m_contentSourceKey);}
 void ReaderController::clearRasterCache(){RasterJobs::cancel(m_activeRaster);RasterCache::clearPrefix(m_cachePrefix);m_tileDemand.clear();m_pageDemand.clear();m_manualDemand.clear();}
 int ReaderController::cpuCacheKiB(){return RasterCache::costKiB();}
 
@@ -211,8 +211,9 @@ void ReaderController::closeSnapshot() {
     emit documentReset();emit documentChanged();emit textPagesChanged();emit dataChanged();emit loadingChanged();
 }
 quint64 ReaderController::submitSnapshot(quint64 id,const QString &operation,const QVariantMap &arguments) {
-    static const QSet<QString> readable{QStringLiteral("layout"),QStringLiteral("text"),QStringLiteral("outline"),QStringLiteral("references"),QStringLiteral("figures"),QStringLiteral("page_targets"),QStringLiteral("resolve_citations")};
+    static const QSet<QString> readable{QStringLiteral("layout"),QStringLiteral("text"),QStringLiteral("outline"),QStringLiteral("references"),QStringLiteral("figures"),QStringLiteral("citations"),QStringLiteral("page_targets"),QStringLiteral("resolve_citations")};
     const auto source=m_source;const auto generation=m_generation;
+    const auto cancelled=NativeRasterSource::isIndexQuery(operation)?m_indexCancellation:NativeRasterSource::Cancellation{};
     if(!source || !readable.contains(operation)) {
         const auto error=source ? tr("This preview is read-only.") : tr("This preview is closed.");
         QMetaObject::invokeMethod(this,[this,id,operation,error]{setError(error);emit commandFinished(id,operation,{},error);},Qt::QueuedConnection);return id;
@@ -220,9 +221,9 @@ quint64 ReaderController::submitSnapshot(quint64 id,const QString &operation,con
     const bool latest=operation==QStringLiteral("layout");if(latest)m_latestRead.insert(operation,id);
     ++m_pendingCommands;emit commandsChanged();
     auto *watcher=new QFutureWatcher<CommandResult>(this);
-    connect(watcher,&QFutureWatcher<CommandResult>::finished,this,[this,watcher,id,operation,arguments,source,generation,latest]{
+    connect(watcher,&QFutureWatcher<CommandResult>::finished,this,[this,watcher,id,operation,arguments,source,generation,latest,cancelled]{
         const auto result=watcher->result();watcher->deleteLater();--m_pendingCommands;emit commandsChanged();
-        if(source!=m_source || generation!=m_generation || (latest && m_latestRead.value(operation)!=id))return;
+        if(source!=m_source || generation!=m_generation || (cancelled && cancelled->load()) || (latest && m_latestRead.value(operation)!=id))return;
         const bool opening=m_loading && operation==QStringLiteral("layout");
         if(!result.error.isEmpty())setError(result.error);
         else if(operation==QStringLiteral("layout")) {
@@ -235,13 +236,15 @@ quint64 ReaderController::submitSnapshot(quint64 id,const QString &operation,con
         if(opening){m_loading=false;emit loadingChanged();emit openFinished(result.error.isEmpty());}
         emit commandFinished(id,operation,result.result,result.error);
     });
-    watcher->setFuture(QtConcurrent::run([source,operation,arguments]{CommandResult result;auto request=arguments;request.insert(QStringLiteral("op"),operation);result.result=source->query(request,&result.error);return result;}));
+    watcher->setFuture(QtConcurrent::run([source,operation,arguments,cancelled]{CommandResult result;auto request=arguments;request.insert(QStringLiteral("op"),operation);result.result=source->query(request,&result.error,cancelled);return result;}));
     return id;
 }
 
 void ReaderController::setRasterSource(std::shared_ptr<NativeRasterSource> source) {
+    cancelIndexQueries();
     NativeImageProvider::unregisterSource(m_contentSourceKey);m_contentSourceKey.clear();m_source=std::move(source);
 }
+void ReaderController::cancelIndexQueries(){m_indexCancellation->store(true);m_indexCancellation=std::make_shared<std::atomic_bool>(false);}
 QUrl ReaderController::contentPreviewUrl(int page,const QString &target,const QString &revision,double width,double height,double deviceScale) {
     if(!m_source || page<0 || page>=pageCount() || !std::isfinite(width) || !std::isfinite(height) || !std::isfinite(deviceScale) || width<=0 || height<=0 || width>8192 || height>8192 || deviceScale<=0)return {};
     const auto snapshot=m_data.value(QStringLiteral("content_objects")).toMap();
@@ -275,6 +278,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         }, Qt::QueuedConnection);
         return id;
     }
+    if(NativeRasterSource::isIndexQuery(operation))return submitSnapshot(id,operation,arguments);
     if(hasUnsavedReadingNotes() && (operation==QStringLiteral("content_stage") || operation.startsWith(QStringLiteral("page_")) || operation.startsWith(QStringLiteral("replace_")) || operation==QStringLiteral("document_save") || operation==QStringLiteral("document_discard"))) {
         const auto error=tr("Save or discard the reading-note draft before changing this document.");
         QMetaObject::invokeMethod(this,[this,id,operation,error]{setError(error);emit commandFinished(id,operation,{},error);},Qt::QueuedConnection);return id;

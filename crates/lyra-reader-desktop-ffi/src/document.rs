@@ -646,6 +646,108 @@ mod tests {
         doc.command(json!({"op":"region_create","id":id,"attachment":capture,"draft":"Keep this synthetic draft"})).unwrap();
         id
     }
+
+    #[test]
+    fn native_incremental_index_contract_runs_with_its_own_cold_cache_policy() {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "document::tests::native_incremental_index_contract_worker",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("LYRA_READER_INDEX_CACHE", "disabled")
+            .env("LYRA_READER_INCREMENTAL_INDEX_WORKER", "1")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "run by the parent with an isolated cold-index policy"]
+    fn native_incremental_index_contract_worker() {
+        if std::env::var("LYRA_READER_INCREMENTAL_INDEX_WORKER")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            return;
+        }
+        let mut partial_seen = false;
+        for file in [
+            "narrative-citation.pdf",
+            "booktabs-bounds.pdf",
+            "two-column-references.pdf",
+        ] {
+            let fixture = Fixture::new(file);
+            for kind in ["references", "figures"] {
+                let expected_doc = fixture.open();
+                let expected_source =
+                    crate::render_source::RenderSource::new(&expected_doc, false).unwrap();
+                let expected = expected_source.query(json!({"op":kind})).unwrap();
+                let doc = fixture.open();
+                let source = crate::render_source::RenderSource::new(&doc, false).unwrap();
+                let mut complete = false;
+                for _ in 0..400 {
+                    let step = source
+                        .query(json!({"op":format!("{kind}_scan_step"),"pages":1,"entries":1}))
+                        .unwrap();
+                    assert!(step["total_pages"].as_u64().unwrap() > 0);
+                    if step["done"].as_bool().unwrap() {
+                        assert_eq!(step["records"], expected, "{file}/{kind}");
+                        complete = true;
+                        break;
+                    }
+                    partial_seen = true;
+                    assert!(step["records"].as_array().unwrap().is_empty());
+                }
+                assert!(
+                    complete,
+                    "bounded fixture scan failed to finish: {file}/{kind}"
+                );
+                assert_eq!(source.query(json!({"op":kind})).unwrap(), expected);
+            }
+        }
+        assert!(
+            partial_seen,
+            "cold multi-page fixtures must expose an incomplete step"
+        );
+    }
+
+    #[test]
+    fn native_index_batches_reject_invalid_values_before_advancing() {
+        let fixture = Fixture::new("narrative-citation.pdf");
+        let doc = fixture.open();
+        let source = crate::render_source::RenderSource::new(&doc, false).unwrap();
+        for pages in [
+            json!(0),
+            json!(-1),
+            json!(5),
+            json!(u64::MAX),
+            json!("one"),
+            Value::Null,
+        ] {
+            for op in ["references_scan_step", "figures_scan_step"] {
+                assert!(
+                    source
+                        .query(json!({"op":op,"pages":pages}))
+                        .unwrap_err()
+                        .contains("Invalid index pages batch")
+                );
+            }
+        }
+        assert!(
+            source
+                .query(json!({"op":"references_scan_step","entries":13}))
+                .unwrap_err()
+                .contains("Invalid index entries batch")
+        );
+    }
     fn region_path(path: &Path) -> PathBuf {
         cache_path(path)
             .parent()

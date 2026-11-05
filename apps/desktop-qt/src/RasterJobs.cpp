@@ -28,3 +28,4 @@ QVariantMap RasterJobs::statistics() {
     return {{"running",s.active},{"queued",s.queued},{"peakRunning",s.peak},{"peakQueued",s.peakQueued},{"completed",s.done},{"cancelled",s.cancelled},
             {"maximumRunning",maximumRunning},{"maximumQueued",maximumQueued},{"waitP50Ms",percentile(s.wait,.5)},{"waitP95Ms",percentile(s.wait,.95)},{"workP50Ms",percentile(s.work,.5)},{"workP95Ms",percentile(s.work,.95)}};
 }
+bool RasterJobs::foregroundBusy(){auto &s=state();std::lock_guard lock(s.mutex);return s.queued>0 || s.active>0;}

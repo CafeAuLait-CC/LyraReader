@@ -1,5 +1,6 @@
 #include "NativeRaster.h"
 #include "PaperAppearance.h"
+#include "RasterJobs.h"
 #include <QHash>
 #include <QBuffer>
 #include <QImageReader>
@@ -9,6 +10,8 @@
 #include <QUuid>
 #include <QUrlQuery>
 #include <QScopeGuard>
+#include <QElapsedTimer>
+#include <QThread>
 #include <cmath>
 
 namespace {
@@ -31,7 +34,75 @@ std::shared_ptr<NativeRasterSource> NativeRasterSource::prepare(
     return std::shared_ptr<NativeRasterSource>(new NativeRasterSource(
         std::shared_ptr<LyraReaderRenderSource>(handle,lyra_reader_desktop_render_source_free)));
 }
-QVariant NativeRasterSource::query(const QVariantMap &request,QString *error) const {
+bool NativeRasterSource::queryCancelled(const Cancellation &cancelled,QString *error)const {
+    if(!cancelled || !cancelled->load())return false;
+    *error=QStringLiteral("The document query was cancelled.");
+    QMutexLocker lock(&m_indexStatsMutex);++m_cancelledQueries;return true;
+}
+bool NativeRasterSource::isIndexQuery(const QString &op) {
+    return op==QStringLiteral("references") || op==QStringLiteral("figures") || op==QStringLiteral("citations")
+        || op==QStringLiteral("page_targets") || op==QStringLiteral("resolve_citations");
+}
+QVariantMap NativeRasterSource::indexStatistics()const {
+    QMutexLocker lock(&m_indexStatsMutex);
+    return {{"referenceSteps",m_referenceSteps},{"figureSteps",m_figureSteps},{"rasterDeferrals",m_rasterDeferrals},
+        {"cancelledQueries",m_cancelledQueries},{"maxStepMs",m_maxIndexStepMs},{"maxRasterYieldMs",m_maxRasterYieldMs}};
+}
+QVariantList NativeRasterSource::scanIndex(bool figures,QString *error,const Cancellation &cancelled)const {
+    const auto cache=[&]{QMutexLocker lock(&m_indexCacheMutex);return figures?m_figureIndex:m_referenceIndex;};
+    // A completed reference lookup must not wait behind a cold figure scan (or vice versa).
+    if(const auto found=cache())return *found;
+    // A main reader, its preview and a detached frozen reader share this owner. Only one
+    // scanner may advance this source's Rust state; waiting consumers remain cancellable.
+    while(!m_indexMutex.tryLock(5))if(queryCancelled(cancelled,error))return {};
+    const auto unlock=qScopeGuard([&]{m_indexMutex.unlock();});
+    if(queryCancelled(cancelled,error))return {};
+    if(const auto found=cache())return *found;
+    for(;;) {
+        if(queryCancelled(cancelled,error))return {};
+        QElapsedTimer wait;wait.start();const bool deferred=RasterJobs::foregroundBusy();
+        if(deferred){QMutexLocker lock(&m_indexStatsMutex);++m_rasterDeferrals;}
+        // This observes the actual Qt raster admission counters, not an AppKit FIFO.
+        // Bound the wait so continuous scrolling cannot permanently starve an index.
+        while(RasterJobs::foregroundBusy() && wait.elapsed()<250) {
+            if(queryCancelled(cancelled,error))return {};QThread::msleep(5);
+        }
+        if(deferred){QMutexLocker lock(&m_indexStatsMutex);m_maxRasterYieldMs=qMax(m_maxRasterYieldMs,wait.nsecsElapsed()/1e6);}
+        if(queryCancelled(cancelled,error))return {};
+        QElapsedTimer step;step.start();
+        const auto result=queryDirect({{"op",figures?QStringLiteral("figures_scan_step"):QStringLiteral("references_scan_step")},{"pages",4},{"entries",12}},error).toMap();
+        {QMutexLocker lock(&m_indexStatsMutex);if(figures)++m_figureSteps;else ++m_referenceSteps;m_maxIndexStepMs=qMax(m_maxIndexStepMs,step.nsecsElapsed()/1e6);}
+        if(!error->isEmpty())return {};
+        if(result.value("done").metaType().id()!=QMetaType::Bool || result.value("records").metaType().id()!=QMetaType::QVariantList) {
+            *error=QStringLiteral("The document service returned invalid index progress.");return {};
+        }
+        if(result.value("done").toBool()) {
+            const auto records=result.value("records").toList();
+            {QMutexLocker lock(&m_indexCacheMutex);(figures?m_figureIndex:m_referenceIndex)=records;}
+            if(queryCancelled(cancelled,error))return {};
+            return records;
+        }
+        // No partial collection escapes. The next bounded step gives newly admitted
+        // raster work another chance, while Rust retains its own intermediate state.
+        QThread::yieldCurrentThread();
+    }
+}
+QVariant NativeRasterSource::query(const QVariantMap &request,QString *error,const Cancellation &cancelled)const {
+    if(queryCancelled(cancelled,error))return {};
+    const auto op=request.value("op").toString();
+    if(op==QStringLiteral("references") || op==QStringLiteral("figures")) {
+        const auto records=scanIndex(op==QStringLiteral("figures"),error,cancelled);
+        return error->isEmpty()?QVariant(records):QVariant{};
+    }
+    if(op==QStringLiteral("citations") || op==QStringLiteral("page_targets") || op==QStringLiteral("resolve_citations")) {
+        // Those seemingly page-local accessors consult reference_cache(). Finish it
+        // cooperatively first, so they cannot silently restart a monolithic cold scan.
+        scanIndex(false,error,cancelled);if(!error->isEmpty())return {};
+    }
+    if(queryCancelled(cancelled,error))return {};
+    return queryDirect(request,error);
+}
+QVariant NativeRasterSource::queryDirect(const QVariantMap &request,QString *error) const {
     const auto bytes=QJsonDocument::fromVariant(request).toJson(QJsonDocument::Compact);
     LyraReaderBuffer output{},failure{};
     if(!lyra_reader_desktop_source_command(m_source.get(),reinterpret_cast<const std::uint8_t *>(bytes.constData()),std::size_t(bytes.size()),&output,&failure)) {

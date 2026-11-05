@@ -55,9 +55,9 @@ struct Result {
     QUrl external;
     int destination=-1;
 };
-Result resolve(const std::shared_ptr<LyraReaderDesktopDocument> &document,int page,const QPointF &point) {
-    Result r;r.source=NativeRasterSource::prepare(document,false,&r.error);if(!r.source)return r;
-    const auto query=[&](const QString &op,QVariantMap args=QVariantMap{}) {args.insert(QStringLiteral("op"),op);return r.source->query(args,&r.error);};
+Result resolve(const std::shared_ptr<NativeRasterSource> &source,int page,const QPointF &point,const NativeRasterSource::Cancellation &cancelled) {
+    Result r;r.source=source;if(!r.source){r.error=QObject::tr("The document snapshot is unavailable.");return r;}
+    const auto query=[&](const QString &op,QVariantMap args=QVariantMap{}) {if(!r.error.isEmpty())return QVariant{};args.insert(QStringLiteral("op"),op);return r.source->query(args,&r.error,cancelled);};
     r.sizes=query(QStringLiteral("info")).toList();
     if(page<0 || page>=r.sizes.size())return r;
     const auto targets=query(QStringLiteral("page_targets"),{{QStringLiteral("page"),page}}).toMap();
@@ -121,20 +121,23 @@ Result resolve(const std::shared_ptr<LyraReaderDesktopDocument> &document,int pa
 }
 }
 
-PreviewController::~PreviewController() { NativeImageProvider::unregisterSource(m_sourceKey); }
+PreviewController::~PreviewController() {m_queryCancellation->store(true);NativeImageProvider::unregisterSource(m_sourceKey);}
 void PreviewController::close() {
+    m_queryCancellation->store(true);
     ++m_epoch;m_loading=false;m_pinned=false;m_model.clear();m_textModel.clear();m_sizes.clear();
     NativeImageProvider::unregisterSource(m_sourceKey);m_sourceKey.clear();m_source.reset();
-    QObject::disconnect(m_resetConnection);m_reader.clear();emit changed();
+    QObject::disconnect(m_resetConnection);QObject::disconnect(m_ownerConnection);m_reader.clear();emit changed();
 }
 void PreviewController::togglePin() { if(!visible())return;m_pinned=!m_pinned;emit changed(); }
 void PreviewController::openAt(ReaderController *reader,int page,double x,double y,double sceneX,double sceneY,double zoom) {
-    if(!reader || !reader->documentHandle())return;
+    if(!reader || !reader->renderSource())return;
     if(m_pinned){emit statusMessage(tr("Preview pinned — unpin it to preview another reference."));return;}
     if(!std::isfinite(x) || !std::isfinite(y))return;
     close();m_reader=reader;m_url=reader->fileUrl();m_loading=true;emit changed();
+    m_queryCancellation=std::make_shared<std::atomic_bool>(false);
     m_resetConnection=connect(reader,&ReaderController::documentReset,this,&PreviewController::close);
-    const auto epoch=m_epoch;const auto document=reader->documentHandle();
+    m_ownerConnection=connect(reader,&QObject::destroyed,this,&PreviewController::close);
+    const auto epoch=m_epoch;const auto source=reader->renderSource();const auto cancelled=m_queryCancellation;
     auto *watcher=new QFutureWatcher<Result>(this);
     connect(watcher,&QFutureWatcher<Result>::finished,this,[this,watcher,epoch,x,y,sceneX,sceneY,zoom] {
         auto result=watcher->result();watcher->deleteLater();
@@ -149,7 +152,7 @@ void PreviewController::openAt(ReaderController *reader,int page,double x,double
         m_anchor=QRectF(sceneX+(result.clicked.x()-x)*zoom,sceneY+(result.clicked.y()-y)*zoom,result.clicked.width()*zoom,result.clicked.height()*zoom);
         emit changed();
     });
-    watcher->setFuture(QtConcurrent::run([document,page,x,y]{return resolve(document,page,{x,y});}));
+    watcher->setFuture(QtConcurrent::run([source,page,x,y,cancelled]{return resolve(source,page,{x,y},cancelled);}));
 }
 void PreviewController::imageRegion(int page,const QVariantMap &region,const QVariantList &fragments) {
     if(page<0 || page>=m_sizes.size())return;

@@ -113,6 +113,7 @@ public:
     Q_INVOKABLE uint fitPercent(bool fitPage,double pageWidth,double pageHeight,double viewportWidth,double viewportHeight,double calibration) const;
     Q_INVOKABLE uint viewportFitPercent(uint currentPercent,double pageHeight,double viewportHeight,double calibration) const;
     Q_INVOKABLE double clampScroll(double offset,double contentHeight,double viewportHeight) const;
+    Q_INVOKABLE void cancelIndexQueries();
     Q_INVOKABLE QVariantMap signatureImage(const QUrl &url) const;
     Q_INVOKABLE QColor paperBackground(const QString &appearance) const;
     Q_INVOKABLE QStringList signatureFonts() const;
@@ -186,6 +187,7 @@ private:
     void setError(const QString &error);
     std::shared_ptr<LyraReaderDesktopDocument> m_document;
     std::shared_ptr<NativeRasterSource> m_source;
+    std::shared_ptr<std::atomic_bool> m_indexCancellation=std::make_shared<std::atomic_bool>(false);
     QString m_cachePrefix;
     QHash<quintptr,QSet<QString>> m_tileDemand;
     QHash<quintptr,QString> m_pageDemand;

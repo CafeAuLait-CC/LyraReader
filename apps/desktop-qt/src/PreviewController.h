@@ -47,6 +47,8 @@ private:
     QUrl m_url;
     QPointer<ReaderController> m_reader;
     QMetaObject::Connection m_resetConnection;
+    QMetaObject::Connection m_ownerConnection;
+    NativeRasterSource::Cancellation m_queryCancellation=std::make_shared<std::atomic_bool>(false);
     QString m_sourceKey;
     std::shared_ptr<NativeRasterSource> m_source;
 };

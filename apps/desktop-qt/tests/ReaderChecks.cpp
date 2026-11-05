@@ -75,6 +75,14 @@ static void registerReaderTypes() {
     qmlRegisterType<AnnotationOverlay>("LyraReader",1,0,"PdfAnnotations");
 }
 
+// Reserve a real raster admission slot without starting a worker. Cleanup balances the
+// counters even when a test assertion returns before it explicitly releases the slot.
+struct HeldRasterAdmission {
+    RasterJobs::Handle ticket=RasterJobs::enqueue();
+    void release(){if(ticket){RasterJobs::Run completed(std::move(ticket));}}
+    ~HeldRasterAdmission(){release();}
+};
+
 // A real process boundary: no QObject destructors or cleanup can retire the crash fixture.
 static int quitRecoveryChild(int argc,char **argv) {
     if(argc!=5)return 2;
@@ -159,7 +167,12 @@ private slots:
         window->setProperty("appearance","dark");children[0]->resize(360,400);QTRY_COMPARE(children[0]->color(),window->color());auto *more=visualItem(children[0]->contentItem(),"previewMoreButton");QVERIFY(more);QTRY_VERIFY(more->isVisible());QTRY_VERIFY_WITH_TIMEOUT(more->mapRectToScene(QRectF(0,0,more->width(),more->height())).left()>=0 && more->mapRectToScene(QRectF(0,0,more->width(),more->height())).right()<=children[0]->width(),10000);auto *pdf=visualItem(children[0]->contentItem(),"pdfPreviewPage");QVERIFY(pdf);QTRY_VERIFY_WITH_TIMEOUT(pdf->property("texturesReady").toBool(),10000);
         const auto evidence=qEnvironmentVariable("LYRA_READER_PDF_PREVIEW_DARK_SNAPSHOT");if(!evidence.isEmpty()){QTest::qWait(100);QVERIFY(children[0]->grabWindow().save(evidence));}
         QVERIFY(children[0]->close());QTRY_VERIFY_WITH_TIMEOUT(children[0].isNull(),10000);QVERIFY(children[1]->isVisible());
-        auto *snapshot=qobject_cast<ReaderController *>(children[1]->property("previewReader").value<QObject *>());QVERIFY(snapshot);std::weak_ptr<NativeRasterSource> lifetime=snapshot->renderSource();snapshot->requestText(0);QVERIFY(snapshot->pendingCommands()>0);window->hide();QTRY_VERIFY_WITH_TIMEOUT(children[1].isNull(),10000);QTRY_VERIFY_WITH_TIMEOUT(lifetime.expired(),10000);
+        auto *snapshot=qobject_cast<ReaderController *>(children[1]->property("previewReader").value<QObject *>());QVERIFY(snapshot);std::weak_ptr<NativeRasterSource> lifetime=snapshot->renderSource();snapshot->requestText(0);QVERIFY(snapshot->pendingCommands()>0);window->hide();QTRY_VERIFY_WITH_TIMEOUT(children[1].isNull(),10000);
+        // The main reader intentionally owns the same immutable source. Closing its
+        // children releases their leases; reopening the last owner must release the source.
+        QCOMPARE(lifetime.lock(),reader->renderSource());reader->openFile(reader->fileUrl());
+        QTRY_VERIFY_WITH_TIMEOUT(!reader->loading() && reader->pageCount()==2 && reader->pendingCommands()==0,10000);
+        QTRY_VERIFY_WITH_TIMEOUT(lifetime.expired(),10000);
     }
     void nativeTabsReorderAfterHalfTheirWidthAndKeepReaderOwnership() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
@@ -369,6 +382,89 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(!reader->error().isEmpty());
         const auto pending=window->property("pendingLayoutPosition");
         QVERIFY(pending.isNull() || pending.value<QJSValue>().isNull());
+    }
+    void cooperativeIndexesYieldCancelAndPublishOnlyCompletedCollections() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto narrative=scratch.path()+"/narrative.pdf",figures=scratch.path()+"/figures.pdf",longer=scratch.path()+"/nine.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/narrative-citation.pdf",narrative));
+        QVERIFY(QFile::copy(root+"/tests/fixtures/booktabs-bounds.pdf",figures));
+        QVERIFY(QFile::copy(QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf",longer));
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(narrative));
+        auto *reader=view.workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),2,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto source=reader->renderSource();QVERIFY(source);HeldRasterAdmission held;QVERIFY(held.ticket);
+        auto cancelled=std::make_shared<std::atomic_bool>(false);
+        auto waiting=QtConcurrent::run([source,cancelled]{QString error;const auto records=source->query({{"op","references"}},&error,cancelled);return QVariantMap{{"error",error},{"records",records}};});
+        QTRY_VERIFY(source->indexStatistics().value("rasterDeferrals").toULongLong()>0);
+        cancelled->store(true);QTRY_VERIFY_WITH_TIMEOUT(waiting.isFinished(),10000);
+        QVERIFY(waiting.result().value("error").toString().contains("cancelled"));QVERIFY(!waiting.result().value("records").isValid());
+        QVERIFY(!reader->data().contains("references"));held.release();
+        reader->submit("references");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QCOMPARE(reader->data().value("references").toList().size(),8);
+        const auto steps=source->indexStatistics().value("referenceSteps").toULongLong();QVERIFY(steps>1);
+        reader->submit("references");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QCOMPARE(source->indexStatistics().value("referenceSteps").toULongLong(),steps);
+        view.workspace.openFile(QUrl::fromLocalFile(figures));reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        reader->submit("figures");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(reader->data().value("figures").toList().size()>=2);
+        view.workspace.openFile(QUrl::fromLocalFile(longer));reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),9,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto nine=reader->renderSource();HeldRasterAdmission second;QVERIFY(second.ticket);
+        reader->submit("figures");QTRY_VERIFY(nine->indexStatistics().value("rasterDeferrals").toULongLong()>0);
+        QVERIFY(!reader->data().contains("figures"));second.release();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(reader->data().contains("figures"));QVERIFY(reader->data().value("figures").toList().isEmpty());
+        QCOMPARE(nine->indexStatistics().value("figureSteps").toULongLong(),qulonglong(3));
+    }
+    void coldCitationQueriesUseTheCooperativeReferenceGate() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/citation.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/narrative-citation.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),2,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto source=reader->renderSource();reader->submit("citations",{{"page",0}});
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(!reader->data().value("citations").toList().isEmpty());
+        const auto steps=source->indexStatistics().value("referenceSteps").toULongLong();QVERIFY(steps>1);
+        reader->submit("references");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QCOMPARE(reader->data().value("references").toList().size(),8);QCOMPARE(source->indexStatistics().value("referenceSteps").toULongLong(),steps);
+    }
+    void indexQueriesCancelOnTabSwitchTabCloseAndGlobalQuit() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/index-close.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/narrative-citation.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));
+        auto *reader=view.workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),2,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto source=reader->renderSource();HeldRasterAdmission held;QVERIFY(held.ticket);
+        reader->submit("references");view.workspace.newTab();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(!reader->data().contains("references"));QVERIFY(reader->error().isEmpty());
+        view.workspace.selectTab(0);QTRY_VERIFY(!view.window->property("positionRestoring").toBool());
+        reader->submit("references");QPointer<ReaderController> old=reader;
+        QVERIFY(QMetaObject::invokeMethod(view.window,"requestCloseTab",Q_ARG(QVariant,0)));
+        QTRY_COMPARE_WITH_TIMEOUT(view.workspace.tabs().size(),1,10000);QTRY_VERIFY(old.isNull());
+        QVERIFY(source->indexStatistics().value("cancelledQueries").toULongLong()>0);
+        view.workspace.openFile(QUrl::fromLocalFile(path));reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),2,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        reader->submit("references");QSignalSpy accepted(view.workspace.quitCoordinator(),&QuitCoordinator::accepted);
+        view.workspace.requestQuit();QTRY_COMPARE_WITH_TIMEOUT(accepted.count(),1,10000);
+        QVERIFY(!view.window->isVisible());held.release();
+    }
+    void previewIndexesShareTheFrozenSourceAndKeepIndependentCancellation() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/preview-index.pdf",other=scratch.path()+"/other.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/narrative-citation.pdf",path));QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",other));
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),2,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto source=reader->renderSource();auto *preview=view.workspace.preview();const double y=reader->pages().first().toMap().value("height").toDouble()-694;
+        HeldRasterAdmission held;QVERIFY(held.ticket);preview->openAt(reader,0,144,y,320,200,1);
+        QTRY_VERIFY(source->indexStatistics().value("rasterDeferrals").toULongLong()>0);preview->close();
+        QTRY_VERIFY(source->indexStatistics().value("cancelledQueries").toULongLong()>0);QVERIFY(!preview->visible() && !preview->loading());held.release();
+        reader->submit("references");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(reader->error().isEmpty());
+        const auto steps=source->indexStatistics().value("referenceSteps").toULongLong();
+        preview->openAt(reader,0,144,y,320,200,1);QTRY_VERIFY_WITH_TIMEOUT(preview->visible(),10000);
+        QCOMPARE(preview->model().value("kind").toString(),QString("reference"));QCOMPARE(source->indexStatistics().value("referenceSteps").toULongLong(),steps);
+        QObject owner;auto *frozen=preview->createWindowReader(&owner);QVERIFY(frozen);QCOMPARE(frozen->renderSource(),source);
+        QTRY_COMPARE_WITH_TIMEOUT(frozen->pendingCommands(),0,10000);reader->openFile(QUrl::fromLocalFile(other));
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(!preview->visible());QCOMPARE(frozen->pageCount(),2);frozen->submit("references");
+        QTRY_COMPARE_WITH_TIMEOUT(frozen->pendingCommands(),0,10000);QCOMPARE(frozen->data().value("references").toList().size(),8);
     }
     void recentHistoryIsSharedByAllReaderWindows() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());

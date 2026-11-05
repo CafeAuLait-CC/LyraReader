@@ -161,7 +161,38 @@ impl RenderSource {
         ) -> Result<Value, String> {
             serde_json::to_value(result.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
         }
+        let batch = |name: &str, maximum: u32| -> Result<u32, String> {
+            match request.get(name) {
+                None => Ok(maximum),
+                Some(value) => value
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .filter(|n| (1..=maximum).contains(n))
+                    .ok_or_else(|| format!("Invalid index {name} batch")),
+            }
+        };
         match request["op"].as_str().unwrap_or("") {
+            "references_scan_step" => {
+                let progress = self
+                    .engine
+                    .references_scan_step(batch("pages", 4)?, batch("entries", 12)?)
+                    .map_err(|e| e.to_string())?;
+                // Partial records are working state, never a published sidebar index.
+                Ok(
+                    json!({"done":progress.done,"phase":progress.phase,"total_pages":progress.total_pages,
+                    "records":if progress.done {serde_json::to_value(progress.records).map_err(|e|e.to_string())?} else {json!([])}}),
+                )
+            }
+            "figures_scan_step" => {
+                let progress = self
+                    .engine
+                    .figures_scan_step(batch("pages", 4)?)
+                    .map_err(|e| e.to_string())?;
+                Ok(
+                    json!({"done":progress.done,"scanned_pages":progress.scanned_pages,"total_pages":progress.total_pages,
+                    "records":if progress.done {serde_json::to_value(progress.records).map_err(|e|e.to_string())?} else {json!([])}}),
+                )
+            }
             "capture_region" => {
                 let number = |key: &str| {
                     request["rect"][key]
@@ -188,6 +219,7 @@ impl RenderSource {
             "layout" => crate::document::layout_value(&self.layout, &request),
             "outline" => value(self.engine.outline()),
             "text" => value(self.engine.text_page(page()?)),
+            "citations" => value(self.engine.citations(page()?)),
             "page_targets" => Ok(
                 json!({"links":self.engine.links(page()?).map_err(|e|e.to_string())?,"citations":self.engine.citations(page()?).map_err(|e|e.to_string())?,"mentions":self.engine.caption_mentions(page()?).map_err(|e|e.to_string())?}),
             ),

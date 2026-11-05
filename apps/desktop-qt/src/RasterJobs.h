@@ -12,6 +12,7 @@ QThreadPool *pool();
 Handle enqueue();
 void cancel(const Handle &ticket);
 QVariantMap statistics();
+bool foregroundBusy();
 class Run {
 public:
     explicit Run(Handle ticket);
