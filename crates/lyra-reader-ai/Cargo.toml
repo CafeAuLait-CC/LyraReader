@@ -11,6 +11,8 @@ workspace = true
 
 [dependencies]
 lyra-reader-core = { workspace = true }
+lyra-reader-edit = { workspace = true }
+serde = { version = "1", features = ["derive"] }
 # The document-knowledge block and its character counters keep the pre-refactor Swift unit:
 # extended grapheme clusters, not Unicode scalars.
 unicode-segmentation = { workspace = true }

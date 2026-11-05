@@ -46,6 +46,7 @@ Item {
             enabled:app.currentReader.pageCount>0 && !app.currentReader.loading && (!!app.currentReader.aiRegion.image_png || !app.currentReader.aiState.running)
             onClicked:app.openRegionTool()
         }
+        LyraToolButton {objectName:"lyraReadingNotes";symbol:"note";text:qsTr("Notes");Accessible.name:qsTr("Reading notes");display:AbstractButton.TextBesideIcon;enabled:app.currentReader.pageCount>0;onClicked:app.openRegionNotes()}
         Repeater {
             model:[{key:"summary",title:qsTr("Summary")},{key:"translation",title:qsTr("Translate")},{key:"chat",title:qsTr("Chat")}]
             LyraToolButton {

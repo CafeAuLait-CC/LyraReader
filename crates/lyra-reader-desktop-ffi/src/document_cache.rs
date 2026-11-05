@@ -300,7 +300,15 @@ impl DocumentCache {
         if next.directory != self.directory {
             for name in CARRIED_FILES.iter().filter(|n| **n != "source.json") {
                 if let Some(bytes) = read_optional(&self.directory.join(name))? {
-                    atomic_write(&next.directory.join(name), &bytes)?;
+                    let destination = next.directory.join(name);
+                    if *name == "region-conversations-v1.json"
+                        && read_optional(&destination)?
+                            .as_ref()
+                            .is_some_and(|existing| existing != &bytes)
+                    {
+                        return Err("The PDF was saved, but destination reading notes differ. Both cache versions were kept".into());
+                    }
+                    atomic_write(&destination, &bytes)?;
                 }
             }
         }

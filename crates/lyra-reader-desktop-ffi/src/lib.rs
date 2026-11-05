@@ -12,6 +12,7 @@ mod exports;
 mod marks;
 mod pages;
 mod region;
+mod region_store;
 mod render_source;
 mod saving;
 mod session;

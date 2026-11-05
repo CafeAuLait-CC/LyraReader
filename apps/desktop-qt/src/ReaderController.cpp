@@ -105,6 +105,7 @@ void ReaderController::setError(const QString &error) {
 void ReaderController::dismissError() { setError({}); }
 
 void ReaderController::openFile(const QUrl &url, const QString &password) {
+    if(hasUnsavedReadingNotes()){setError(tr("Save or discard the reading-note draft before replacing this document."));return;}
     if(m_snapshotMode){setError(tr("This preview is read-only."));return;}
     if (!url.isLocalFile()) {
         setError(tr("Choose a local PDF file. This version cannot open remote URLs."));
@@ -274,6 +275,10 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         }, Qt::QueuedConnection);
         return id;
     }
+    if(hasUnsavedReadingNotes() && (operation==QStringLiteral("content_stage") || operation.startsWith(QStringLiteral("page_")) || operation.startsWith(QStringLiteral("replace_")) || operation==QStringLiteral("document_save") || operation==QStringLiteral("document_discard"))) {
+        const auto error=tr("Save or discard the reading-note draft before changing this document.");
+        QMetaObject::invokeMethod(this,[this,id,operation,error]{setError(error);emit commandFinished(id,operation,{},error);},Qt::QueuedConnection);return id;
+    }
     if((operation==QStringLiteral("content_stage") || operation.startsWith(QStringLiteral("page_")) || operation.startsWith(QStringLiteral("replace_")) || operation==QStringLiteral("document_save")) && m_aiState.value(QStringLiteral("running")).toBool()) {
         const auto error=tr("Cancel the active AI request before changing the open document.");
         QMetaObject::invokeMethod(this,[this,id,operation,error]{setError(error);emit commandFinished(id,operation,{},error);},Qt::QueuedConnection);return id;
@@ -301,9 +306,14 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         (draftKey==QStringLiteral("content") ?
             savedDraft.toMap().value(QStringLiteral("command")).toMap()==arguments.value(QStringLiteral("command")).toMap() && savedDraft.toMap().value(QStringLiteral("page")).toInt()==arguments.value(QStringLiteral("page")).toInt() :
             draftKey==QStringLiteral("forms") ? draftValues==arguments.value(unifiedSave ? QStringLiteral("forms") : QStringLiteral("values")).toList() : savedDraft.toList()==arguments.value(QStringLiteral("areas")).toList());
-    auto request = QJsonObject::fromVariantMap(arguments);
-    request.insert(QStringLiteral("op"), operation);
-    const auto bytes = QJsonDocument(request).toJson(QJsonDocument::Compact);
+    // Region snapshots contain bounded PNG/answer strings. Their controller-built maps
+    // contain plain values, so serialize their immutable copy on the command worker.
+    const bool regionPayload=operation==QStringLiteral("region_create") || operation==QStringLiteral("region_snapshot") || operation==QStringLiteral("region_note");
+    QByteArray bytes;
+    if(!regionPayload) {
+        auto request=QJsonObject::fromVariantMap(arguments);request.insert(QStringLiteral("op"),operation);
+        bytes=QJsonDocument(request).toJson(QJsonDocument::Compact);
+    }
     const bool eraseControl=operation.startsWith(QStringLiteral("ink_erase_")) && operation!=QStringLiteral("ink_erase_commit");
     const bool mutation=operation==QStringLiteral("content_stage") || operation==QStringLiteral("document_discard") || operation==QStringLiteral("document_save") || operation==QStringLiteral("ink_erase_commit") || operation.startsWith(QStringLiteral("mark_")) || operation.startsWith(QStringLiteral("marks_")) || operation.startsWith(QStringLiteral("bookmark_")) || operation.startsWith(QStringLiteral("file_")) || operation.startsWith(QStringLiteral("page_")) || operation.startsWith(QStringLiteral("save_")) || operation.startsWith(QStringLiteral("replace_")) || operation==QStringLiteral("extract_pages");
     if(mutation)++m_mutationSequence;
@@ -351,7 +361,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
             m_documentWidth = layout.value(QStringLiteral("width")).toDouble();
             m_documentHeight = layout.value(QStringLiteral("height")).toDouble();
             emit documentChanged();
-        } else if (!eraseControl) {
+        } else if (!eraseControl && !operation.startsWith(QStringLiteral("region_"))) {
             const bool marks=operation==QStringLiteral("ink_erase_commit") || operation==QStringLiteral("marks") || operation.startsWith(QStringLiteral("mark_")) || operation.startsWith(QStringLiteral("marks_")) || operation.startsWith(QStringLiteral("bookmark_")) || operation.startsWith(QStringLiteral("file_"));
             m_data.insert(marks ? QStringLiteral("marks") : operation, outcome.result);
             emit dataChanged();
@@ -374,10 +384,16 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         }
         emit commandFinished(id, operation, outcome.result, outcome.error);
     });
-    auto task=[document,bytes,operation] {
+    const auto regionArguments=regionPayload ? arguments : QVariantMap{};
+    auto task=[document,bytes,operation,regionArguments,regionPayload] {
+        auto payload=bytes;
+        if(regionPayload) {
+            auto request=QJsonObject::fromVariantMap(regionArguments);request.insert(QStringLiteral("op"),operation);
+            payload=QJsonDocument(request).toJson(QJsonDocument::Compact);
+        }
         CommandResult result;
         LyraReaderBuffer output{}, error{};
-        if (!lyra_reader_desktop_command(document.get(), reinterpret_cast<const std::uint8_t *>(bytes.constData()), bytes.size(), &output, &error)) {
+        if (!lyra_reader_desktop_command(document.get(), reinterpret_cast<const std::uint8_t *>(payload.constData()), payload.size(), &output, &error)) {
             result.error = takeError(error);
             return result;
         }
@@ -391,7 +407,8 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
             result.source=NativeRasterSource::prepare(document,false,&result.error);
         return result;
     };
-    if(mutation || eraseControl || operation==QStringLiteral("ai_start") || operation==QStringLiteral("ai_cancel")){
+    const bool regionWrite=operation.startsWith(QStringLiteral("region_")) && operation!=QStringLiteral("region_get") && operation!=QStringLiteral("region_list");
+    if(mutation || regionWrite || eraseControl || operation==QStringLiteral("ai_start") || operation==QStringLiteral("ai_cancel")){
         auto promise=std::make_shared<QPromise<CommandResult>>();promise->start();watcher->setFuture(promise->future());
         m_mutations->append([task,promise]{try{promise->addResult(task());}catch(...){promise->addResult(CommandResult{{},QStringLiteral("The command worker stopped unexpectedly.")});}promise->finish();});
     }else watcher->setFuture(QtConcurrent::run(std::move(task)));

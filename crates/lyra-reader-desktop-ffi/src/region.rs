@@ -116,7 +116,7 @@ pub fn capture(
         .map_err(|e| e.to_string())?;
     Ok(
         json!({"page":page,"x_pt":rect.origin.x,"y_pt":rect.origin.y,"width_pt":rect.size.width,"height_pt":rect.size.height,
-        "text":text.text,"text_truncated":text.truncated,"text_warning":text_warning,"image_png":STANDARD.encode(&png.0),
+        "source_sha256":document.document_identity().sha256,"text":text.text,"text_truncated":text.truncated,"text_warning":text_warning,"image_png":STANDARD.encode(&png.0),
         "image_width_px":bitmap.width_px,"image_height_px":bitmap.height_px,"capture_scale":spec.scale}),
     )
 }

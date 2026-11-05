@@ -908,9 +908,11 @@ name = "lyra-reader-ai"
 version = "0.0.0"
 dependencies = [
  "lyra-reader-core",
+ "lyra-reader-edit",
  "rcgen",
  "rustls",
  "rustls-native-certs",
+ "serde",
  "serde_json",
  "sha2",
  "unicode-segmentation",

@@ -1219,7 +1219,8 @@ fn render(value: &Json, indent: usize) -> String {
     }
 }
 
-fn render_string(text: &str) -> String {
+/// JSON string escaping shared with other Foundation-compatible durable caches.
+pub fn render_string(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len() + 2);
     escaped.push('"');
     for character in text.chars() {

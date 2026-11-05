@@ -28,6 +28,7 @@
 #include <QAccessible>
 #include <QFontDatabase>
 #include <QDir>
+#include <QDirIterator>
 #include <QSignalSpy>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
@@ -1317,6 +1318,12 @@ private slots:
         auto fallback=QJsonDocument::fromJson(body.toUtf8()).object();fallback.remove("stream_options");const auto retry=server.requests[1];QCOMPARE(QJsonDocument::fromJson(retry.mid(retry.indexOf("\r\n\r\n")+4)).object(),fallback);
         QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QVERIFY(reader->aiState().value("output").toString().contains("Synthetic area answer"));
         auto *answer=window->findChild<QObject *>("aiRegionAnswer");QVERIFY(answer);QVERIFY(!answer->property("text").toString().contains("href=\"p.99\""));
+        QVERIFY(reader->saveAiRegionNote());QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto savedRegionId=reader->aiRegion().value("history_id").toString();QSignalSpy regionReads(reader,&ReaderController::commandFinished);
+        const auto firstRead=reader->submit("region_get",{{"id",savedRegionId}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVariantMap firstEntry;
+        for(const auto &row:regionReads)if(row[0].toULongLong()==firstRead){QVERIFY(row[3].toString().isEmpty());firstEntry=row[2].toMap();}
+        QVERIFY(!firstEntry.isEmpty());QCOMPARE(firstEntry.value("turns").toList().size(),1);QCOMPARE(firstEntry.value("turns").toList()[0].toMap().value("sourcePages").toList(),plan.value("source_pages").toList());
+
         const auto pageBefore=window->property("currentPage");const QVariant sentSource=QVariantMap{{"source_pages",plan.value("source_pages")},{"generation",reader->documentGeneration()}};QVERIFY(QMetaObject::invokeMethod(card,"follow",Q_ARG(QVariant,"p.99"),Q_ARG(QVariant,sentSource)));QCOMPARE(window->property("currentPage"),pageBefore);
         QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QCOMPARE(auditRows().size(),initialAuditCount+2);
         QCOMPARE(auditRows().at(initialAuditCount).value("http_status").toInt(),400);QCOMPARE(auditRows().at(initialAuditCount).value("outcome").toString(),QString("failed"));QCOMPARE(auditRows().last().value("outcome").toString(),QString("sent"));
@@ -1330,10 +1337,70 @@ private slots:
         reader->setAiRegionQuestion("An unavailable audit must block HTTP");QVERIFY(QMetaObject::invokeMethod(card,"prepare"));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("plan").toMap().isEmpty(),10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
         QVERIFY(reader->startAi("local",reader->aiState().value("plan").toMap()));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QVERIFY(reader->aiState().value("status").toString().contains("audit"));QCOMPARE(server.requests.size(),3);
         QFile unchangedAudit(auditPath);QVERIFY(unchangedAudit.open(QIODevice::ReadOnly));QCOMPARE(unchangedAudit.readAll(),QByteArray("incomplete audit"));
+        QVERIFY(reader->saveAiRegionNote());QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);regionReads.clear();
+        const auto blockedRead=reader->submit("region_get",{{"id",savedRegionId}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVariantMap blockedEntry;
+        for(const auto &row:regionReads)if(row[0].toULongLong()==blockedRead){QVERIFY(row[3].toString().isEmpty());blockedEntry=row[2].toMap();}
+        QCOMPARE(blockedEntry.value("turns").toList().size(),2);QVERIFY(!blockedEntry.value("turns").toList().last().toMap().contains("sourcePages"));QCOMPARE(server.requests.size(),3);
+
         QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",220},{"height",440}},1));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiRegion().value("image_png").toString().isEmpty(),10000);QTRY_COMPARE_WITH_TIMEOUT(crop->property("status").toInt(),1,10000);QVERIFY(qAbs(crop->property("width").toDouble()/crop->property("height").toDouble()-.5)<.001);
         window->setProperty("textViewVisible",true);auto *readable=visualItem(window->contentItem(),"accessiblePageText");QVERIFY(readable);QTRY_VERIFY(readable->isVisible());
         QVERIFY(QMetaObject::invokeMethod(card,"close"));QTRY_VERIFY(readable->hasActiveFocus());QCOMPARE(server.requests.size(),3);
         QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),original);
+    }
+    void savedRegionNotesRetainCapturesLateDraftsAndKnowledgeAcrossReopen() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/reading-notes.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",420},{"height",180}},1));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiRegion().value("image_png").toString().isEmpty(),10000);
+        const auto id=reader->aiRegion().value("history_id").toString();const auto png=reader->aiRegion().value("image_png").toString();QVERIFY(!id.isEmpty());
+        reader->setAiRegionQuestion("Initial local draft");QVERIFY(reader->saveAiRegionNote());reader->setAiRegionQuestion("Late draft is retained");
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(reader->aiRegion().value("persisted").toBool());QVERIFY(!reader->aiRegion().value("saved").toBool());
+        QVERIFY(reader->saveAiRegionNote());QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(reader->aiRegion().value("saved").toBool());QCOMPARE(reader->regionHistory().value("entries").toList().size(),1);QVERIFY(!reader->hasUnsavedChanges());
+        reader->clearAiRegion();QVERIFY(QMetaObject::invokeMethod(window,"openRegionNotes"));auto *notes=window->findChild<QObject *>("regionNotes");QVERIFY(notes);QTRY_VERIFY(notes->property("visible").toBool());QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(notes,"load",Q_ARG(QVariant,id)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto toMap=[](const QVariant &v){return v.metaType()==QMetaType::fromType<QJSValue>() ? v.value<QJSValue>().toVariant().toMap():v.toMap();};
+        QTRY_COMPARE_WITH_TIMEOUT(toMap(notes->property("detail")).value("draftQuestion").toString(),QString("Late draft is retained"),10000);QCOMPARE(toMap(notes->property("detail")).value("attachment").toMap().value("png").toString(),png);
+        auto *crop=window->findChild<QObject *>("regionNoteImage");QVERIFY(crop);QTRY_COMPARE_WITH_TIMEOUT(crop->property("status").toInt(),1,10000);QVERIFY(qAbs(crop->property("width").toDouble()/crop->property("height").toDouble()-420.0/180.0)<.001);
+        auto *text=window->findChild<QObject *>("regionKnowledgeNote");auto *save=window->findChild<QObject *>("saveRegionKnowledgeNote");QVERIFY(text && save);text->setProperty("text","A synthetic local knowledge note α/β");QVERIFY(QMetaObject::invokeMethod(save,"clicked"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
+        QString historyPath;QDirIterator files(qEnvironmentVariable("LYRA_READER_DOCUMENT_CACHE_DIR"),{"region-conversations-v1.json"},QDir::Files,QDirIterator::Subdirectories);
+        while(files.hasNext()){const auto candidate=files.next();QFile record(candidate);if(record.open(QIODevice::ReadOnly) && record.readAll().contains(id.toUtf8())){historyPath=candidate;break;}}QVERIFY(!historyPath.isEmpty());
+        if(qEnvironmentVariableIsSet("LYRA_READER_NOTES_DARK_NARROW")){window->setProperty("appearance","dark");window->resize(700,600);}
+        const auto snapshot=qEnvironmentVariable("LYRA_READER_NOTES_SNAPSHOT");if(!snapshot.isEmpty()){QTest::qWait(100);QVERIFY(window->grabWindow().save(snapshot));}
+        QVERIFY(QMetaObject::invokeMethod(notes,"close"));reader->openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(window,"openRegionNotes"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QCOMPARE(reader->regionHistory().value("entries").toList().size(),1);
+        QVERIFY(QMetaObject::invokeMethod(notes,"load",Q_ARG(QVariant,id)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTRY_COMPARE_WITH_TIMEOUT(toMap(notes->property("detail")).value("knowledgeNote").toString(),QString("A synthetic local knowledge note α/β"),10000);
+        QVERIFY(toMap(notes->property("detail")).value("turns").toList().isEmpty());
+        auto *remove=window->findChild<QObject *>("deleteRegionKnowledgeNote");QVERIFY(remove);QVERIFY(QMetaObject::invokeMethod(remove,"clicked"));
+        auto *confirm=notes->findChild<QObject *>("deleteRegionNoteConfirmation");QVERIFY(confirm);QTRY_VERIFY(confirm->property("visible").toBool());QVERIFY(QMetaObject::invokeMethod(confirm,"reject"));QCOMPARE(reader->regionHistory().value("entries").toList().size(),1);
+        reader->submit("region_delete",{{"id",id}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QCOMPARE(reader->regionHistory().value("entries").toList().size(),0);QTRY_VERIFY(toMap(notes->property("detail")).isEmpty());
+        QSaveFile corrupt(historyPath);QVERIFY(corrupt.open(QIODevice::WriteOnly));QCOMPARE(corrupt.write("invalid saved history"),qint64(21));QVERIFY(corrupt.commit());
+        reader->openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(window,"openRegionNotes"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(reader->regionHistory().value("error").toString().contains("could not be read"));
+        auto *empty=window->findChild<QObject *>("regionNotesEmpty");QVERIFY(empty);QVERIFY(!empty->property("visible").toBool());QFile preserved(historyPath);QVERIFY(preserved.open(QIODevice::ReadOnly));QCOMPARE(preserved.readAll(),QByteArray("invalid saved history"));
+
+    }
+    void readingNoteDraftsAndFailedSavesBlockCloseAndKeepLateText() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/note-close.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;view.workspace.openFile(QUrl::fromLocalFile(path));QPointer<ReaderController> reader=view.workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",420},{"height",180}},1));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiRegion().value("image_png").toString().isEmpty(),10000);reader->setAiRegionQuestion("Keep this area");QVERIFY(reader->saveAiRegionNote());QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto id=reader->aiRegion().value("history_id").toString();QVERIFY(reader->setRegionNoteDraft(id,"First note"));QVERIFY(reader->hasUnsavedReadingNotes());
+        QVERIFY(QMetaObject::invokeMethod(window,"requestCloseTab",Q_ARG(QVariant,0)));QVERIFY(reader && window->isVisible());QVERIFY(window->property("operationStatus").toString().contains("reading note"));
+        QVERIFY(reader->saveRegionNoteDraft());QVERIFY(reader->setRegionNoteDraft(id,"Late local note"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(reader->hasUnsavedReadingNotes());QCOMPARE(reader->regionNoteDraft().value("text").toString(),QString("Late local note"));
+        QVERIFY(QMetaObject::invokeMethod(window,"openRegionNotes"));auto *notes=window->findChild<QObject *>("regionNotes");QVERIFY(notes);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);auto *text=window->findChild<QObject *>("regionKnowledgeNote");QVERIFY(text);QTRY_COMPARE(text->property("text").toString(),QString("Late local note"));
+        QVERIFY(QMetaObject::invokeMethod(notes,"close"));QVERIFY(reader->hasUnsavedReadingNotes());QVERIFY(QMetaObject::invokeMethod(window,"openRegionNotes"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTRY_COMPARE(text->property("text").toString(),QString("Late local note"));
+        auto *discard=window->findChild<QObject *>("discardRegionNoteDraft");QVERIFY(discard);QVERIFY(QMetaObject::invokeMethod(discard,"clicked"));QVERIFY(!reader->hasUnsavedReadingNotes());QCOMPARE(text->property("text").toString(),QString("First note"));
+        text->setProperty("text","Pending replacement");QVERIFY(reader->saveRegionNoteDraft());text->setProperty("text","First note");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(reader->hasUnsavedReadingNotes());QCOMPARE(reader->regionNoteDraft().value("text").toString(),QString("First note"));
+        QVERIFY(QMetaObject::invokeMethod(discard,"clicked"));QVERIFY(!reader->hasUnsavedReadingNotes());QCOMPARE(text->property("text").toString(),QString("Pending replacement"));QVERIFY(QMetaObject::invokeMethod(notes,"close"));
+        QString historyPath;QDirIterator files(qEnvironmentVariable("LYRA_READER_DOCUMENT_CACHE_DIR"),{"region-conversations-v1.json"},QDir::Files,QDirIterator::Subdirectories);
+        while(files.hasNext()){const auto candidate=files.next();QFile record(candidate);if(record.open(QIODevice::ReadOnly) && record.readAll().contains(id.toUtf8())){historyPath=candidate;break;}}QVERIFY(!historyPath.isEmpty());
+        QFile external(historyPath);QVERIFY(external.open(QIODevice::Append));QCOMPARE(external.write(" "),qint64(1));external.close();
+        reader->setAiRegionQuestion("A failed snapshot save must remain in this tab");QVERIFY(reader->saveAiRegionNote());QVERIFY(QMetaObject::invokeMethod(window,"requestCloseTab",Q_ARG(QVariant,0)));
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTRY_VERIFY(reader->hasUnsavedReadingNotes());QTRY_COMPARE(window->property("closingTab").toInt(),-2);QVERIFY(reader && window->isVisible());QCOMPARE(reader->aiRegion().value("question").toString(),QString("A failed snapshot save must remain in this tab"));
+        QVERIFY(!window->close());QVERIFY(window->isVisible());reader->clearAiRegion();QVERIFY(!reader->hasUnsavedReadingNotes());
+        QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",420},{"height",180}},1));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiRegion().value("image_png").toString().isEmpty(),10000);
+        auto *quit=view.workspace.quitCoordinator();const auto cleanup=qScopeGuard([&]{quit->cancel();});QSignalSpy accepted(quit,&QuitCoordinator::accepted);
+        QVERIFY(reader->saveAiRegionNote());view.workspace.requestQuit();QTRY_VERIFY_WITH_TIMEOUT(!quit->busy(),10000);QCOMPARE(accepted.size(),0);QVERIFY(quit->message().contains("reading-note"));QVERIFY(reader && window->isVisible());QVERIFY(reader->hasUnsavedReadingNotes());reader->clearAiRegion();
+
     }
     void cancelledRegionCapturesReleaseTheirBudgetAndRejectOldDocuments() {
         ReaderController reader;reader.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);

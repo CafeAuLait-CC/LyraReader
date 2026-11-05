@@ -1,0 +1,359 @@
+//! Host I/O over portable region history. The existing DocumentId cache carries this file
+//! through Save/Save As. PDF bytes and annotation dirty state are never changed here.
+use crate::document::DesktopDocument;
+use crate::document_cache::{DocumentCache, atomic_write, read_optional};
+use fs2::FileExt;
+use lyra_reader_ai::region_history::{AnswerState, Attachment, Entry, History, Turn};
+use serde_json::{Value, json};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
+use lyra_reader_ai::{
+    AiError,
+    openai::{RequestAudit, RequestOutcome},
+};
+
+pub(super) struct RequestProvenance {
+    id: String,
+    turn: String,
+    pages: Vec<u32>,
+    attempted: AtomicBool,
+}
+struct TrackedRequest {
+    audit: Arc<dyn RequestAudit>,
+    proof: Arc<RequestProvenance>,
+}
+impl RequestAudit for TrackedRequest {
+    fn started(&self) -> Result<(), AiError> {
+        self.audit.started()?;
+        // This is the same hook immediately before actual HTTP, after durable audit admission.
+        // A preview, PartStarted event or failed audit cannot manufacture sent-source evidence.
+        self.proof.attempted.store(true, Ordering::Release);
+        Ok(())
+    }
+    fn finished(&self, outcome: RequestOutcome) -> Result<(), AiError> {
+        self.audit.finished(outcome)
+    }
+}
+pub(super) fn track_request(
+    audit: Arc<dyn RequestAudit>,
+    id: String,
+    turn: String,
+    pages: Vec<u32>,
+) -> (Arc<dyn RequestAudit>, Arc<RequestProvenance>) {
+    let proof = Arc::new(RequestProvenance {
+        id,
+        turn,
+        pages,
+        attempted: AtomicBool::new(false),
+    });
+    (
+        Arc::new(TrackedRequest {
+            audit,
+            proof: Arc::clone(&proof),
+        }),
+        proof,
+    )
+}
+
+const FILE: &str = "region-conversations-v1.json";
+#[derive(Default)]
+pub(super) struct RegionStore {
+    path: Option<PathBuf>,
+    baseline: Option<Vec<u8>>,
+    history: History,
+    error: Option<String>,
+}
+impl RegionStore {
+    fn load(&mut self, cache: &DocumentCache) -> Result<(), String> {
+        let path = cache.directory.join(FILE);
+        if self.path.as_ref() == Some(&path) {
+            return Ok(());
+        }
+        let bytes = read_optional(&path)?;
+        if self.path.is_some() && bytes != self.baseline {
+            return Err("Reading notes changed during the document's cache migration; both copies were kept".into());
+        }
+        let (history, error) = match &bytes {
+            Some(bytes) => match History::decode(bytes) {
+                Ok(h) => (h, None),
+                Err(e) => (History::default(), Some(e)),
+            },
+            None => (History::default(), None),
+        };
+        self.path = Some(path);
+        self.baseline = bytes;
+        self.history = history;
+        self.error = error;
+        Ok(())
+    }
+    fn persist(&mut self, cache: &DocumentCache, next: History) -> Result<(), String> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
+        let path = self.path.as_ref().ok_or("Reading notes are not loaded")?;
+        let lock_path = cache.directory.join(".region-conversations.lock");
+        let mut options = fs::OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let lock = options.open(lock_path).map_err(|e| e.to_string())?;
+        // Waiting on another process must not hang a native document command indefinitely.
+        FileExt::try_lock_exclusive(&lock)
+            .map_err(|e| format!("Another window is saving reading notes. Try again: {e}"))?;
+        if read_optional(path)? != self.baseline {
+            return Err("Reading notes changed outside this window. Reopen before editing; original data was kept".into());
+        }
+        let bytes = next.encode()?;
+        if self.baseline.as_deref() == Some(&bytes) {
+            return Ok(());
+        }
+        if let Some(previous) = &self.baseline {
+            atomic_write(
+                &cache
+                    .directory
+                    .join("region-conversations-v1.previous.json"),
+                previous,
+            )?;
+        }
+        atomic_write(path,&bytes).map_err(|e|format!("Could not finish saving reading notes; the previous file was backed up. Reopen to check the saved state: {e}"))?;
+        self.baseline = Some(bytes);
+        self.history = next;
+        Ok(())
+    }
+}
+fn now() -> f64 {
+    chrono::Utc::now().timestamp_millis() as f64 / 1000.0 - 978_307_200.0
+}
+fn field<'a>(r: &'a Value, k: &str) -> Result<&'a str, String> {
+    r[k].as_str()
+        .ok_or_else(|| format!("Missing reading-note {k}"))
+}
+fn page(r: &Value, k: &str) -> Result<u32, String> {
+    r[k].as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| format!("Invalid capture {k}"))
+}
+fn number(r: &Value, k: &str) -> Result<f64, String> {
+    r[k].as_f64()
+        .filter(|n| n.is_finite())
+        .ok_or_else(|| format!("Invalid capture {k}"))
+}
+impl DesktopDocument {
+    pub(super) fn region_command(&self, op: &str, r: &Value) -> Result<Value, String> {
+        let _edits = self
+            .edits
+            .lock()
+            .map_err(|_| "Page-edit state is unavailable")?;
+        let marks = self
+            .marks
+            .lock()
+            .map_err(|_| "Annotation state is unavailable")?;
+        let cache = marks.cache_location()?;
+        let active = self.active()?;
+        let identity = active.document_identity();
+        let key = cache
+            .directory
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("Invalid document cache identity")?;
+        let mut store = self
+            .regions
+            .lock()
+            .map_err(|_| "Reading-note state is unavailable")?;
+        store.load(cache)?;
+        if op == "region_list" {
+            let mut state = store.history.summaries(key, &identity.sha256)?;
+            state["error"] = json!(store.error);
+            return Ok(state);
+        }
+        if op == "region_get" {
+            let entry = store
+                .history
+                .migrated_entries(key)?
+                .into_iter()
+                .find(|e| e.id == r["id"])
+                .ok_or("This region is unavailable")?;
+            let mut value = serde_json::to_value(&entry).map_err(|e| e.to_string())?;
+            value["locationInvalidated"] = json!(
+                entry.location_invalidated == Some(true)
+                    || entry
+                        .capture_sha256
+                        .as_deref()
+                        .is_some_and(|s| s != identity.sha256)
+            );
+            return Ok(value);
+        }
+        marks.validate_source()?;
+        if let Some(error) = &store.error {
+            return Err(error.clone());
+        }
+        let mut next = store.history.clone();
+        let id = field(r, "id")?.to_owned();
+        if op == "region_delete" {
+            next.remove(&id)?;
+        } else {
+            let mut entry = if op == "region_create" {
+                if next.entries().any(|e| e.id == id) {
+                    return Err("This region is already saved; refresh the reading notes".into());
+                }
+                let a = &r["attachment"];
+                if field(a, "source_sha256")? != identity.sha256 {
+                    return Err(
+                        "This region belongs to an older document revision; capture it again"
+                            .into(),
+                    );
+                }
+                let attachment = Attachment {
+                    page: page(a, "page")?,
+                    rect: [
+                        [number(a, "x_pt")?, number(a, "y_pt")?],
+                        [number(a, "width_pt")?, number(a, "height_pt")?],
+                    ],
+                    text: field(a, "text")?.into(),
+                    png: field(a, "image_png")?.into(),
+                    pixel_width: page(a, "image_width_px")?,
+                    pixel_height: page(a, "image_height_px")?,
+                    capture_scale: number(a, "capture_scale")?,
+                    text_truncated: a["text_truncated"]
+                        .as_bool()
+                        .ok_or("Missing region truncation status")?,
+                };
+                if attachment.page >= active.page_count() {
+                    return Err("The captured region is outside this document".into());
+                }
+                let number = next
+                    .migrated_entries(key)?
+                    .iter()
+                    .filter_map(|e| e.region_number)
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or("Region numbering overflow")?;
+                Entry {
+                    id: id.clone(),
+                    document_key: key.into(),
+                    attachment,
+                    question: String::new(),
+                    answer: String::new(),
+                    state: AnswerState::Empty,
+                    error: None,
+                    failure: None,
+                    created_at: now(),
+                    turns: Vec::new(),
+                    knowledge_note: String::new(),
+                    region_number: Some(number),
+                    draft_question: None,
+                    location_invalidated: None,
+                    capture_sha256: Some(identity.sha256.clone()),
+                }
+            } else {
+                next.migrated_entries(key)?
+                    .into_iter()
+                    .find(|e| e.id == id)
+                    .ok_or("This region is unavailable")?
+            };
+            match op {
+                "region_create" | "region_snapshot" => {
+                    entry.draft_question = Some(field(r, "draft")?.into());
+                    if let Some(turn) = r.get("turn").filter(|t| !t.is_null()) {
+                        let turn_id = field(turn, "id")?.to_owned();
+                        let state: AnswerState = serde_json::from_value(turn["state"].clone())
+                            .map_err(|e| e.to_string())?;
+                        let provenance = self
+                            .ai_region_sources
+                            .lock()
+                            .map_err(|_| "Region request state is unavailable")?;
+                        let sources = provenance
+                            .as_ref()
+                            .filter(|proof| {
+                                proof.id == id
+                                    && proof.turn == turn_id
+                                    && proof.attempted.load(Ordering::Acquire)
+                            })
+                            .map(|proof| proof.pages.clone());
+                        let previous = entry.turns.iter().find(|t| t.id == turn_id);
+                        let record = Turn {
+                            id: turn_id.clone(),
+                            question: field(turn, "question")?.into(),
+                            answer: field(turn, "answer")?.into(),
+                            state,
+                            error: turn.get("error").and_then(Value::as_str).map(str::to_owned),
+                            created_at: previous.map(|t| t.created_at).unwrap_or_else(now),
+                            source_pages: previous.and_then(|t| t.source_pages.clone()).or(sources),
+                        };
+                        if previous.is_some_and(|old| {
+                            old.question != record.question
+                                || old.answer != record.answer
+                                || old.state != record.state
+                                || old.error != record.error
+                        }) {
+                            return Err("This answer was already saved with different contents; the historical turn was kept".into());
+                        }
+                        entry.question = record.question.clone();
+                        entry.answer = record.answer.clone();
+                        entry.state = state;
+                        entry.error = record.error.clone();
+                        if let Some(old) = entry.turns.iter_mut().find(|t| t.id == turn_id) {
+                            *old = record;
+                        } else {
+                            entry.turns.push(record);
+                        }
+                    }
+                }
+                "region_note" => entry.knowledge_note = field(r, "text")?.into(),
+                _ => return Err("Unknown reading-note operation".into()),
+            }
+            next.put(entry)?;
+        }
+        store.persist(cache, next)?;
+        let mut state = store.history.summaries(key, &identity.sha256)?;
+        state["saved_id"] = json!(id);
+        if op == "region_note" {
+            state["saved_note"] = r["text"].clone();
+        }
+        Ok(state)
+    }
+}
+
+/// Save As carries local notes without replacing an existing destination's different history.
+/// PDF publication has already succeeded; callers report this failure as a cache warning.
+pub(super) fn carry_notes(
+    source: &DocumentCache,
+    destination: &DocumentCache,
+) -> Result<(), String> {
+    if source.directory == destination.directory {
+        return Ok(());
+    }
+    let Some(bytes) = read_optional(&source.directory.join(FILE))? else {
+        return Ok(());
+    };
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options
+        .open(destination.directory.join(".region-conversations.lock"))
+        .map_err(|e| format!("The PDF was saved, but its reading-note lock is unavailable: {e}"))?;
+    FileExt::try_lock_exclusive(&lock).map_err(|e| {
+        format!("The PDF was saved, but another window is saving destination reading notes: {e}")
+    })?;
+    let path = destination.directory.join(FILE);
+    match read_optional(&path)? {
+        Some(existing) if existing!=bytes=>Err("The PDF was saved, but destination reading notes differ. Both versions were kept in their original caches".into()),
+        Some(_)=>Ok(()),
+        None=>atomic_write(&path,&bytes).map_err(|e|format!("The PDF was saved, but reading notes could not be carried to the copy. Original notes were kept: {e}")),
+    }
+}

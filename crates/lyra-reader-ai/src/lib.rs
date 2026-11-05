@@ -11,6 +11,7 @@ pub mod citation;
 pub mod mock;
 pub mod openai;
 pub mod provider;
+pub mod region_history;
 pub mod sections;
 
 pub use chat::{

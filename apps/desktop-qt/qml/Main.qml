@@ -70,6 +70,8 @@ ApplicationWindow {
         else operationStatus=qsTr("The document is busy or changed. Select the area again when it is ready.");
     }
     AiRegionCard {id:aiRegionCard;app:root}
+    RegionNotes {id:regionNotes;app:root}
+    function openRegionNotes(){aiRegionCard.close();regionNotes.open();}
     function focusReadingView() {
         if(currentReader.pageCount>0) {
             const target=overviewVisible ? overviewContent.focusTarget : textViewVisible ? accessibleTextView.focusTarget : pageList;
@@ -330,6 +332,7 @@ ApplicationWindow {
     property var pendingCloseReader: null
     function prepareForQuit() {
         if (closeOperation || pendingDocumentSave || dialogs.closePromptVisible || dialogs.saveDialog.visible) return false;
+        if(readingNotesBlockClose(-1))return false;
         cancelErase();dialogs.flushAnnotation();saveReadingPosition();return true;
     }
     function prepareDiscardForQuit() {dialogs.cancelAnnotationDraft();}
@@ -362,6 +365,12 @@ ApplicationWindow {
             }
             session.saveViewState(currentReader, state);
         }
+    }
+    function readingNotesBlockClose(index) {
+        const tabs=session ? session.tabs : [{reader:currentReader}];
+        const blocked=tabs.some((tab,i)=>(index<0 || index===i) && tab.reader.hasUnsavedReadingNotes);
+        if(blocked)operationStatus=qsTr("Save or discard the unsaved reading note before closing. A failed save keeps its draft in this tab.");
+        return blocked;
     }
     function hasPendingCloseWork(index) {
         const tabs = session ? session.tabs : [
@@ -423,6 +432,7 @@ ApplicationWindow {
         closingTab=-2;
         pendingCloseReader=null;
         const currentIndex=readerIndex(owner);
+        if(readingNotesBlockClose(currentIndex))return;
         if (owner.hasUnsavedChanges) dialogs.confirmClose(currentIndex);
         else session.closeTab(currentIndex);
     }
@@ -494,6 +504,7 @@ ApplicationWindow {
             closeRetry.start();
             return;
         }
+        if(readingNotesBlockClose(-1)){event.accepted=false;return;}
         if (hasUnsavedChanges(-1)) {
             event.accepted = false;
             dialogs.confirmClose(-1);

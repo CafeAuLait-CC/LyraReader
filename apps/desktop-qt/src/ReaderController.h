@@ -29,6 +29,9 @@ class ReaderController : public QObject {
     Q_PROPERTY(QUrl fileUrl READ fileUrl NOTIFY documentChanged)
     Q_PROPERTY(QVariantMap aiState READ aiState NOTIFY aiStateChanged)
     Q_PROPERTY(QVariantMap aiRegion READ aiRegion NOTIFY aiRegionChanged)
+    Q_PROPERTY(QVariantMap regionNoteDraft READ regionNoteDraft NOTIFY regionNoteDraftChanged)
+    Q_PROPERTY(bool hasUnsavedReadingNotes READ hasUnsavedReadingNotes NOTIFY regionNoteDraftChanged)
+    Q_PROPERTY(QVariantMap regionHistory READ regionHistory NOTIFY regionHistoryChanged)
     Q_PROPERTY(QUrl aiRegionImage READ aiRegionImage NOTIFY aiRegionImageChanged)
     Q_PROPERTY(QVariantMap editDrafts READ editDrafts NOTIFY editDraftsChanged)
     Q_PROPERTY(bool hasEditDrafts READ hasEditDrafts NOTIFY editDraftsChanged)
@@ -57,6 +60,14 @@ public:
     QUrl fileUrl() const { return m_lastUrl; }
     QVariantMap aiState()const{return m_aiState;}
     QVariantMap aiRegion()const{return m_aiRegion;}
+    QVariantMap regionNoteDraft()const{return m_regionNoteDraft;}
+    bool hasUnsavedReadingNotes()const{return !m_regionNoteDraft.isEmpty() || !m_regionSaveError.isEmpty();}
+    Q_INVOKABLE bool setRegionNoteDraft(const QString &id,const QString &text);
+    Q_INVOKABLE void discardRegionNoteDraft();
+    Q_INVOKABLE quint64 saveRegionNoteDraft();
+    Q_INVOKABLE bool isSavingRegionNote()const{return m_regionNoteSaveId!=0;}
+    QVariantMap regionHistory()const{return m_regionHistory;}
+    Q_INVOKABLE quint64 saveAiRegionNote();
     QUrl aiRegionImage()const{return m_aiRegionImage;}
     Q_INVOKABLE bool captureAiRegion(int page,const QVariantMap &rect,double zoom);
     Q_INVOKABLE void cancelAiRegionCapture();
@@ -137,6 +148,8 @@ signals:
     void aiStateChanged();
     void aiRegionChanged();
     void aiRegionImageChanged();
+    void regionHistoryChanged();
+    void regionNoteDraftChanged();
     void textPagesChanged();
     void commandsChanged();
 private:
@@ -153,6 +166,11 @@ private:
     QTimer m_aiTimer;
     QVariantMap m_aiState;
     QVariantMap m_aiRegion;
+    QVariantMap m_regionHistory,m_regionNoteDraft,m_regionNoteSaveSnapshot;
+    QString m_regionSaveError;
+    quint64 m_regionNoteSaveId=0;
+    quint64 m_aiRegionSaveId=0;
+    QString m_aiRegionSaveDraft,m_aiRegionSaveTurn;
     QUrl m_aiRegionImage;
     quint64 m_aiRegionEpoch=0;
     RasterJobs::Handle m_aiRegionJob;

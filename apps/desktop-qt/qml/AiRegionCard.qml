@@ -101,6 +101,12 @@ Popup {
             Button {objectName:"inspectAiRegion";text:qsTr("Inspect payload");enabled:card.previewReady;onClicked:payload.open()}
             Button {objectName:"sendAiRegion";text:qsTr("Send");enabled:card.previewReady && !card.running && card.owner && card.owner.pendingCommands===0;onClicked:card.app.sendAi(card.owner,card.plan)}
         }
+        Label {
+            Layout.fillWidth:true;wrapMode:Text.Wrap;font.pixelSize:11;color:card.app.colors.textSecondary
+            text:card.attachment.saved ? qsTr("Saved in Reading notes on this device.") : qsTr("This area is in memory. Save to Reading notes to keep its capture, draft and answer locally.")
+        }
+        Label {text:card.owner ? card.owner.regionHistory.error || "" : "";visible:text.length>0;wrapMode:Text.Wrap;Layout.fillWidth:true;color:card.app.colors.warningFg;textFormat:Text.PlainText}
+        Button {objectName:"saveAiRegionNote";text:qsTr("Save to Reading notes");enabled:!!card.attachment.image_png && !card.running && card.owner && !card.owner.pendingCommands;onClicked:card.owner.saveAiRegionNote()}
         RowLayout {
             Button {objectName:"newAiRegion";text:qsTr("New area");enabled:!card.running && !card.attachment.loading;onClicked:card.app.armRegion()}
             Button {objectName:"stopAiRegion";visible:card.running && card.state.responseView==="region";text:qsTr("Stop response");onClicked:card.owner.cancelAi()}

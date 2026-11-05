@@ -81,6 +81,7 @@ void QuitCoordinator::collect() {
         for(const auto &tab:entry.workspace->tabs()) {
             auto *reader=tab.toMap().value(QStringLiteral("reader")).value<ReaderController *>();
             entry.readers.append(reader);
+            if(reader && reader->hasUnsavedReadingNotes()){abort(tr("Save or discard the reading-note draft before quitting. All reader windows stay open."));return;}
             if(!reader || !reader->hasUnsavedChanges())continue;
             const auto marks=reader->data().value(QStringLiteral("marks")).toMap();QStringList parts;
             if(marks.value(QStringLiteral("page_pending")).toBool())parts.append(tr("page edits"));
@@ -236,7 +237,7 @@ void QuitCoordinator::finish() {
         if(!window.window || !window.workspace || window.workspace->tabs().size()!=window.readers.size()){abort(tr("The reader tabs changed while resolving the quit."));return;}
         for(const auto &tab:window.workspace->tabs())if(!window.readers.contains(tab.toMap().value(QStringLiteral("reader")).value<ReaderController *>())){abort(tr("The reader tabs changed while resolving the quit."));return;}
     }
-    for(const auto &window:m_windows)for(const auto &tab:window.workspace->tabs()){auto *reader=tab.toMap().value(QStringLiteral("reader")).value<ReaderController *>();if(reader && (reader->hasUnsavedChanges() || reader->pendingCommands()>0)){abort(tr("New changes remain unsaved. All reader windows stay open."));return;}}
+    for(const auto &window:m_windows)for(const auto &tab:window.workspace->tabs()){auto *reader=tab.toMap().value(QStringLiteral("reader")).value<ReaderController *>();if(reader && (reader->hasUnsavedChanges() || reader->hasUnsavedReadingNotes() || reader->pendingCommands()>0)){abort(tr("New changes remain unsaved. All reader windows stay open."));return;}}
     m_timer.stop();m_accepting=true;restoreWindows();
     for(const auto &window:m_windows)if(window.window)window.window->setProperty("closeApproved",true);
     for(const auto &window:m_windows)if(window.window)window.window->close();

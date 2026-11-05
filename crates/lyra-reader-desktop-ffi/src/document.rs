@@ -17,6 +17,8 @@ pub struct DesktopDocument {
     pub(super) original_signature: SignatureStatusRecord,
     original_xfa: XfaStatusRecord,
     ai: Mutex<Option<Arc<LyraReaderAiRequest>>>,
+    pub(super) regions: Mutex<crate::region_store::RegionStore>,
+    pub(super) ai_region_sources: Mutex<Option<Arc<crate::region_store::RequestProvenance>>>,
     pub(super) marks: Mutex<crate::marks::Marks>,
     pub(super) edits: Mutex<crate::pages::PageEdits>,
     pub(super) original_path: PathBuf,
@@ -105,6 +107,8 @@ impl DesktopDocument {
             recovery_status: Mutex::new(Value::Null),
             password: password.map(str::to_owned),
             ai: Mutex::new(None),
+            regions: Mutex::new(crate::region_store::RegionStore::default()),
+            ai_region_sources: Mutex::new(None),
             marks,
         };
         if let Err(error) = document.restore_cached_pages() {
@@ -208,6 +212,9 @@ impl DesktopDocument {
                     .read_only_reason
                     .ok_or("The XFA read-only status is incomplete")?);
             }
+        }
+        if op.starts_with("region_") {
+            return self.region_command(op, &r);
         }
         if matches!(op, "save_merge" | "save_split" | "split_plan") {
             return self.export_command(op, &r);
@@ -349,7 +356,17 @@ impl DesktopDocument {
                 })?;
                 let mut report = report;
                 report["forms"] = prepared.form_report;
-                report["cache_cleanup_error"] = json!(published.error);
+                let region_error = (|| {
+                    crate::region_store::carry_notes(
+                        marks.cache_location()?,
+                        published.cache_location()?,
+                    )
+                })()
+                .err();
+                report["cache_cleanup_error"] = json!(match (published.error, region_error) {
+                    (Some(a), Some(b)) => Some(format!("{a}. {b}")),
+                    (a, b) => a.or(b),
+                });
                 value(Ok(report))
             }
             "save_current_annotations" | "replace_current_annotations" => {
@@ -503,6 +520,30 @@ impl DesktopDocument {
                     .map(Ok)
                     .unwrap_or_else(crate::document_cache::default_root)?;
                 let audit = crate::audit::observer(root, plan.action, plan.is_local);
+                let (audit, provenance) =
+                    if plan.action == AiActionRecord::RegionQuestion && plan.parts.len() == 1 {
+                        if let Some((id, turn)) = r
+                            .get("region_id")
+                            .and_then(Value::as_str)
+                            .zip(r.get("turn_id").and_then(Value::as_str))
+                        {
+                            let (audit, proof) = crate::region_store::track_request(
+                                audit,
+                                id.to_owned(),
+                                turn.to_owned(),
+                                plan.source_pages.clone(),
+                            );
+                            (audit, Some(proof))
+                        } else {
+                            (audit, None)
+                        }
+                    } else {
+                        (audit, None)
+                    };
+                *self
+                    .ai_region_sources
+                    .lock()
+                    .map_err(|_| "Region request state is unavailable")? = provenance;
                 let request =
                     start_ai_request_audited(plan, text(&r, "api_key")?, false, Some(audit))
                         .map_err(|e| e.to_string())?;
@@ -599,6 +640,199 @@ mod tests {
         }
     }
 
+    fn saved_region(doc: &DesktopDocument) -> String {
+        let capture=crate::render_source::RenderSource::new(doc,false).unwrap().query(json!({"op":"capture_region","page":0,"zoom":1,"rect":{"x":0,"y":0,"width":595,"height":842}})).unwrap();
+        let id = crate::marks::uuid().unwrap();
+        doc.command(json!({"op":"region_create","id":id,"attachment":capture,"draft":"Keep this synthetic draft"})).unwrap();
+        id
+    }
+    fn region_path(path: &Path) -> PathBuf {
+        cache_path(path)
+            .parent()
+            .unwrap()
+            .join("region-conversations-v1.json")
+    }
+    #[test]
+    fn region_history_reopens_without_raster_or_pdf_writes_and_retains_saved_drafts() {
+        let fixture = Fixture::new("text-page.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        let id = saved_region(&doc);
+        let before = doc.command(json!({"op":"region_get","id":id})).unwrap();
+        assert_eq!(before["draftQuestion"], "Keep this synthetic draft");
+        assert!(
+            before["attachment"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("quick brown fox")
+        );
+        assert_eq!(
+            doc.command(json!({"op":"marks"})).unwrap()["pdf_dirty"],
+            false
+        );
+        drop(doc);
+        let doc = fixture.open();
+        assert_eq!(
+            doc.command(json!({"op":"region_get","id":id})).unwrap(),
+            before
+        );
+        doc.command(json!({"op":"region_note","id":id,"text":"My / knowledge note"}))
+            .unwrap();
+        let raw = fs::read(region_path(&fixture.path)).unwrap();
+        let next = fixture.open();
+        assert_eq!(
+            next.command(json!({"op":"region_get","id":id})).unwrap()["knowledgeNote"],
+            "My / knowledge note"
+        );
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        assert!(raw.windows(2).any(|p| p == b"\\/"));
+        let backup =
+            region_path(&fixture.path).with_file_name("region-conversations-v1.previous.json");
+        assert!(backup.exists());
+    }
+    #[test]
+    fn region_history_keeps_frozen_content_through_edits_discard_save_and_save_as() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let id = saved_region(&doc);
+        let before = doc.command(json!({"op":"region_get","id":id})).unwrap();
+        doc.command(
+            json!({"op":"page_stage","operation":{"Rotate":{"pages":[0],"quarter_turns":1}}}),
+        )
+        .unwrap();
+        let changed = doc.command(json!({"op":"region_get","id":id})).unwrap();
+        assert_eq!(changed["attachment"], before["attachment"]);
+        assert_eq!(changed["locationInvalidated"], true);
+        doc.command(json!({"op":"document_discard"})).unwrap();
+        assert_eq!(
+            doc.command(json!({"op":"region_get","id":id})).unwrap()["locationInvalidated"],
+            false
+        );
+        let copy = fixture.directory.join("copy.pdf");
+        let outcome = doc
+            .command(json!({"op":"save_document_copy","destination":copy}))
+            .unwrap();
+        assert!(outcome["cache_cleanup_error"].is_null(), "{outcome}");
+        let copied = open_fixture_document(&copy, None).unwrap();
+        copied.command(json!({"op":"region_note","id":id,"text":"Keep destination's different local history"})).unwrap();
+        let copy_cache = region_path(&copy);
+        let copy_notes = fs::read(&copy_cache).unwrap();
+        let repeated = doc
+            .command(json!({"op":"save_document_copy","destination":copy}))
+            .unwrap();
+        assert!(
+            repeated["cache_cleanup_error"]
+                .as_str()
+                .unwrap()
+                .contains("reading notes"),
+            "{repeated}"
+        );
+        assert_eq!(fs::read(&copy_cache).unwrap(), copy_notes);
+
+        assert_eq!(
+            copied.command(json!({"op":"region_get","id":id})).unwrap()["attachment"],
+            before["attachment"]
+        );
+        doc.command(json!({"op":"mark_create","entry":{"kind":"highlight","page":0,"start":0,"end":3,"color":"#E8BC5552","note":"A saved mark"}})).unwrap();
+        let bytes = fs::read(region_path(&fixture.path)).unwrap();
+        doc.command(json!({"op":"document_save"})).unwrap();
+        assert_eq!(fs::read(region_path(&fixture.path)).unwrap(), bytes);
+        assert_eq!(
+            doc.command(json!({"op":"region_get","id":id})).unwrap()["attachment"],
+            before["attachment"]
+        );
+    }
+    #[test]
+    fn region_history_refuses_external_cache_edits_corruption_and_changed_pdf_without_overwriting()
+    {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let id = saved_region(&doc);
+        let other = fixture.open();
+        other.command(json!({"op":"region_list"})).unwrap();
+        doc.command(json!({"op":"region_note","id":id,"text":"First window"}))
+            .unwrap();
+        let raw = fs::read(region_path(&fixture.path)).unwrap();
+        assert!(
+            other
+                .command(json!({"op":"region_note","id":id,"text":"Stale window"}))
+                .unwrap_err()
+                .contains("outside")
+        );
+        assert_eq!(fs::read(region_path(&fixture.path)).unwrap(), raw);
+        fs::write(region_path(&fixture.path), b"broken history").unwrap();
+        let broken = fixture.open();
+        assert!(
+            broken.command(json!({"op":"region_list"})).unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("could not be read")
+        );
+        assert!(
+            broken
+                .command(json!({"op":"region_delete","id":id}))
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(region_path(&fixture.path)).unwrap(),
+            b"broken history"
+        );
+        fs::write(region_path(&fixture.path), &raw).unwrap();
+        let clean = fixture.open();
+        clean.command(json!({"op":"region_list"})).unwrap();
+        let mut pdf = fs::read(&fixture.path).unwrap();
+        pdf.extend_from_slice(b"\n% external edit");
+        fs::write(&fixture.path, &pdf).unwrap();
+        assert!(
+            clean
+                .command(json!({"op":"region_note","id":id,"text":"Blocked"}))
+                .unwrap_err()
+                .contains("changed outside")
+        );
+        assert_eq!(fs::read(region_path(&fixture.path)).unwrap(), raw);
+    }
+    #[test]
+    fn region_history_never_trusts_ui_supplied_page_markers_and_snapshot_retry_is_idempotent() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let id = saved_region(&doc);
+        let turn = crate::marks::uuid().unwrap();
+        let snapshot = json!({"op":"region_snapshot","id":id,"draft":"Follow-up draft","turn":{"id":turn,"state":"finished","question":"Question","answer":"Answer [p.999]","source_pages":[999]}});
+        doc.command(snapshot.clone()).unwrap();
+        let first = doc.command(json!({"op":"region_get","id":id})).unwrap();
+        assert!(first["turns"][0]["sourcePages"].is_null());
+        doc.command(snapshot).unwrap();
+        let after = doc.command(json!({"op":"region_get","id":id})).unwrap();
+        assert_eq!(after["turns"].as_array().unwrap().len(), 1);
+        assert_eq!(first, after);
+        let forged = json!({"op":"region_snapshot","id":id,"draft":"","turn":{"id":turn,"state":"finished","question":"Question","answer":"Changed answer"}});
+        assert!(
+            doc.command(forged.clone())
+                .unwrap_err()
+                .contains("different contents")
+        );
+        assert_eq!(
+            doc.command(json!({"op":"region_get","id":id})).unwrap(),
+            after
+        );
+
+        let path = region_path(&fixture.path);
+        let original = fs::read(&path).unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_file_name(".region-conversations.lock"))
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+        assert!(
+            doc.command(json!({"op":"region_delete","id":id}))
+                .unwrap_err()
+                .contains("Another window")
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
     #[test]
     fn partial_ink_preview_is_transient_and_one_atomic_history_step() {
         let fixture = Fixture::new("text-page.pdf");

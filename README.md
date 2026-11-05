@@ -82,7 +82,14 @@ in the system vault. Document chat keeps bounded exchanges per open document, in
 partial answers; failures remain visible and are excluded from later requests. Historical citations
 use the passages actually sent for that exchange. Summary, translation and chat have separate
 drafts and results; switching views or reopening the drawer sends nothing. Chat has a bottom
-composer and collapsed source passages. Regions and newer AI workflows remain work in progress.
+composer and collapsed source passages. Select & Ask captures a bounded area in its original colours
+and requires a request preview before sending. Save to Reading notes keeps its frozen image, text,
+question draft and completed or partial answer in the application cache; the Notes view reads these
+snapshots and edits local knowledge notes without sending a request. Saving is currently explicit;
+automatic region persistence, reopening multiple cards and Interleaf layout remain work in progress.
+Unfinished knowledge-note drafts and failed snapshot saves keep the document open until resolved.
+Legacy answer page markers stay plain text. Actual HTTP attempts have a bounded local metadata audit
+trail, including retries; the audit viewer and newer AI workflows remain work in progress.
 A byte-bounded revisit cache retains reduced page images after sharp sources leave the working
 set. Unloaded pages already use the selected reading-mode paper colour.
 Tabs reorder after half a tab width of travel, retain their reader state, and support
