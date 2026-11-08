@@ -402,6 +402,7 @@ Item {
         anchors.fill: parent
         app: annotationLayer.app
         page: annotationLayer.page
+        paperMap: annotationLayer.paperMap
     }
-    ContentPageLayer {anchors.fill:parent;app:annotationLayer.app;page:annotationLayer.page;visible:app.secondaryRow==="edit" && app.canModifyPdf;z:20}
+    ContentPageLayer {anchors.fill:parent;app:annotationLayer.app;page:annotationLayer.page;paperMap:annotationLayer.paperMap;visible:app.secondaryRow==="edit" && app.canModifyPdf;z:20}
 }

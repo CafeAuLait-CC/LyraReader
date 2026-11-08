@@ -42,6 +42,31 @@ pub struct Hit {
 const _: () = assert!(std::mem::size_of::<Hit>() == 24);
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub struct Axis {
+    pub present: u32,
+    pub reserved: u32,
+    pub y: f64,
+}
+const _: () = assert!(std::mem::size_of::<Axis>() == 16);
+pub fn axis(layout: Layout, y: f64, direction: u32) -> Result<Axis, String> {
+    if !y.is_finite() {
+        return Err("Paper anchor is not finite".into());
+    }
+    let paper = PaperLayout::try_from(layout)?;
+    let mapped = match direction {
+        0 => Some(paper.display_y(y).ok_or("Paper anchor overflowed")?),
+        1 => paper.paper_y(y),
+        _ => return Err("Invalid paper anchor direction".into()),
+    };
+    // An absent inverse anchor denotes a gap/outside, with an explicitly excluded zero slot.
+    Ok(Axis {
+        present: u32::from(mapped.is_some()),
+        reserved: 0,
+        y: mapped.unwrap_or(0.0),
+    })
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub struct Region {
     pub count: u32,
     pub reserved: u32,

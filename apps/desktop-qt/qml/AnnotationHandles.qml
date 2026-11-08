@@ -7,6 +7,7 @@ Item {
     required property var app
     required property int page
     property var focusTarget: null
+    property var paperMap: null
     readonly property var selected: app.selectedAnnotation
     readonly property var shown: app.annotationDraft && selected && app.annotationDraft.id === selected.id ? app.annotationDraft : selected
     readonly property bool line: shown && (shown.kind === "line" || shown.kind === "arrow")
@@ -14,20 +15,30 @@ Item {
     property var base: null
     property var patch: null
     property bool changed: false
+    property var editOwner: null
+    property var editGeneration: null
+    function currentGesture() {return !!editOwner && editOwner===app.currentReader && editGeneration===app.currentReader.documentGeneration;}
     function begin() {
+        editOwner=app.currentReader;editGeneration=app.currentReader.documentGeneration;
         base = selected;
         changed = false;
         patch = null;
         app.pendingDraftRequestId = -1;
     }
     function resizeAt(index, x, y) {
-        if (!base || !selected || base.id !== selected.id)
+        if (!base || !selected || base.id !== selected.id || !currentGesture())
             return;
         const size = app.currentReader.pages[page];
-        const p = {
+        let p = {
             x: Math.max(0, Math.min(size.width, x / app.zoom)),
             y: Math.max(0, Math.min(size.height, y / app.zoom))
         };
+        if(paperMap && paperMap.paperGeometryActive) {
+            const mapped=paperMap.paperPoint(Qt.point(x/app.zoom,y/app.zoom));
+            if(mapped.error)app.operationStatus=mapped.error;
+            if(!mapped.hit)return;
+            p={x:mapped.x,y:mapped.y};
+        }
         let target;
         if (line) {
             patch = index === 0 ? {
@@ -64,18 +75,22 @@ Item {
         });
     }
     function finish() {
-        if (changed && app.annotationDraft && base && selected && base.id === selected.id)
+        const owned=currentGesture();
+        if (owned && changed && app.annotationDraft && base && selected && base.id === selected.id && app.annotationDraft.id===base.id)
             app.commitAnnotationGeometry(base.id, patch);
         base = null;
         patch = null;
-        if (focusTarget)
+        editOwner=null;editGeneration=null;
+        if (owned && focusTarget)
             focusTarget.forceActiveFocus();
     }
     function cancel() {
-        app.annotationDraft = null;
+        const owned=currentGesture();
+        if(owned && (!base || !app.annotationDraft || app.annotationDraft.id===base.id))app.annotationDraft = null;
         base = null;
         patch = null;
-        if (focusTarget)
+        editOwner=null;editGeneration=null;
+        if (owned && focusTarget)
             focusTarget.forceActiveFocus();
     }
     Repeater {
@@ -91,8 +106,13 @@ Item {
                     x: handles.shown.rect.x + (index % 2 ? handles.shown.rect.width : 0),
                     y: handles.shown.rect.y + (index >= 2 ? handles.shown.rect.height : 0)
                 })
+            readonly property var displayY: handles.paperMap && handles.paperMap.controller!==app.currentReader ? {hit:false}
+                : handles.paperMap && handles.paperMap.paperGeometryActive
+                    ? handles.paperMap.paperAxisY(position.y,true,handles.paperMap.paperGeometryRevision) : {hit:true,y:position.y}
+            onDisplayYChanged: if(displayY.error)app.operationStatus=displayY.error
+            visible: displayY.hit===true
             x: position.x * app.zoom - width / 2
-            y: position.y * app.zoom - height / 2
+            y: displayY.hit ? displayY.y * app.zoom - height / 2 : 0
             width: 10
             height: 10
             radius: handles.line ? 5 : 2

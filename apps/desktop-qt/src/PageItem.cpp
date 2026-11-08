@@ -9,6 +9,7 @@
 
 namespace {
 constexpr double maximumRasterScale=128;
+constexpr double sceneCoordinateLimit=double(std::numeric_limits<float>::max())/(4*maximumRasterScale);
 // An explicit transform root preserves item transforms and software clips.
 class PageScene final:public QSGTransformNode {
 public:
@@ -77,8 +78,7 @@ void PageItem::setPageIndex(int page) {if(m_page==page)return;resetImages();clea
 bool PageItem::configurePaper(double height,double split,double gap) {
     const LyraReaderPaperLayout layout{height,split,gap,1,0};LyraReaderBuffer error{};
     // Cover every later supported zoom as well, before converting targets to QSG float data.
-    const double limit=double(std::numeric_limits<float>::max())/(4*maximumRasterScale);
-    if(height>limit || gap>limit) {m_paperError=tr("The inserted paper is outside the scene coordinate range.");emit paperGeometryChanged();return false;}
+    if(height>sceneCoordinateLimit || gap>sceneCoordinateLimit) {m_paperError=tr("The inserted paper is outside the scene coordinate range.");emit paperGeometryChanged();return false;}
     if(!lyra_reader_desktop_paper_quads(layout,nullptr,0,nullptr,&error)) {
         m_paperError=QString::fromUtf8(reinterpret_cast<const char *>(error.data),qsizetype(error.len));
         lyra_reader_desktop_buffer_free(error);emit paperGeometryChanged();return false;
@@ -89,6 +89,21 @@ bool PageItem::configurePaper(double height,double split,double gap) {
 void PageItem::clearPaperGeometry() {
     if(!m_paperLayout && m_paperError.isEmpty())return;
     ++m_paperEpoch;m_paperLayout.reset();m_paperError.clear();update();emit paperGeometryChanged();
+}
+QVariantMap PageItem::paperAxisY(double y,bool toDisplay,qulonglong revision)const {
+    if(!m_controller || m_controller->loading() || m_page<0 || m_page>=m_controller->pageCount() || revision!=m_paperEpoch)return {{QStringLiteral("error"),tr("The page layout changed. Try again.")}};
+    const double originalHeight=m_controller->pages().at(m_page).toMap().value(QStringLiteral("height")).toDouble();
+    const auto layout=m_paperLayout.value_or(LyraReaderPaperLayout{originalHeight,0,0,0,0});
+    LyraReaderPaperAxis output{};LyraReaderBuffer error{};
+    if(!lyra_reader_desktop_paper_axis(layout,y,toDisplay?0u:1u,&output,&error)) {
+        const auto message=QString::fromUtf8(reinterpret_cast<const char *>(error.data),qsizetype(error.len));lyra_reader_desktop_buffer_free(error);return {{QStringLiteral("error"),message}};
+    }
+    if(output.present>1)return {{QStringLiteral("error"),tr("The paper mapper returned an invalid anchor.")}};
+    if(!output.present)return {{QStringLiteral("hit"),false}};
+    // The shared anchor remains unclamped. Reject an unrepresentable Qt scene position
+    // before a file-controlled double reaches QML's eventual QSG float transform.
+    if(std::abs(output.y)>sceneCoordinateLimit)return {{QStringLiteral("error"),tr("The paper anchor is outside the scene coordinate range.")}};
+    return {{QStringLiteral("hit"),true},{QStringLiteral("y"),output.y}};
 }
 QVariantMap PageItem::paperRegion(const QRectF &source,qulonglong revision)const {
     if(!m_controller || m_controller->loading() || m_page<0 || m_page>=m_controller->pageCount() || revision!=m_paperEpoch)return {{QStringLiteral("error"),tr("The page layout changed. Try again.")}};

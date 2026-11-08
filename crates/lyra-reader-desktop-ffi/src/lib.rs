@@ -30,7 +30,35 @@ use std::{
 /// Version of the hand-written Qt C boundary, including bounded paper-quad batches.
 #[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_desktop_abi_version() -> u32 {
-    6
+    7
+}
+
+/// # Safety
+/// Output is a live aligned writable Axis, distinct from an empty writable error Buffer.
+/// By-value inputs contain no borrowed memory; direction is 0=source to display, 1=inverse.
+/// Errors leave output intact; an inverse gap is a successful absent value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_paper_axis(
+    layout: paper::Layout,
+    y: f64,
+    direction: u32,
+    output: *mut paper::Axis,
+    error: *mut Buffer,
+) -> bool {
+    // SAFETY: distinct caller-owned output/error slots with checked output null/alignment.
+    // The shared pure mapping borrows no pointers or document resources before the write.
+    unsafe {
+        run(error, || {
+            if output.is_null()
+                || !(output as usize).is_multiple_of(std::mem::align_of::<paper::Axis>())
+            {
+                return Err("Paper anchor output is null or misaligned".into());
+            }
+            output.write(paper::axis(layout, y, direction)?);
+            Ok(())
+        })
+        .is_some()
+    }
 }
 
 /// # Safety
@@ -718,6 +746,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn paper_axis_packet_retains_shared_extrapolation_and_gap_contracts() {
+        let layout = paper::tests::layout();
+        let mut out = paper::Axis {
+            present: 99,
+            reserved: 98,
+            y: 97.0,
+        };
+        let mut error = Buffer {
+            data: ptr::null_mut(),
+            len: 0,
+        };
+        // SAFETY: distinct writable live output/error; rejected pointers are never accessed,
+        // and errors are freed once before reinitializing the empty error slot.
+        unsafe {
+            for slot in [
+                ptr::null_mut(),
+                ptr::without_provenance_mut::<paper::Axis>(1),
+            ] {
+                assert!(!lyra_reader_desktop_paper_axis(
+                    layout, 4.0, 0, slot, &mut error
+                ));
+                lyra_reader_desktop_buffer_free(error);
+                error = Buffer {
+                    data: ptr::null_mut(),
+                    len: 0,
+                };
+            }
+            for (y, direction) in [(f64::NAN, 0), (1.0, 2)] {
+                assert!(!lyra_reader_desktop_paper_axis(
+                    layout, y, direction, &mut out, &mut error
+                ));
+                assert_eq!(out.present, 99);
+                assert_eq!(out.y, 97.0);
+                lyra_reader_desktop_buffer_free(error);
+                error = Buffer {
+                    data: ptr::null_mut(),
+                    len: 0,
+                };
+            }
+            assert!(lyra_reader_desktop_paper_axis(
+                layout, 4.0, 0, &mut out, &mut error
+            ));
+            assert_eq!(out.present, 1);
+            assert_eq!(out.y, 7.0);
+            assert!(lyra_reader_desktop_paper_axis(
+                layout, 4.0, 1, &mut out, &mut error
+            ));
+            assert_eq!(out.present, 0);
+            assert!(lyra_reader_desktop_paper_axis(
+                layout, 7.0, 1, &mut out, &mut error
+            ));
+            assert_eq!(out.present, 1);
+            assert_eq!(out.y, 4.0);
+            assert!(lyra_reader_desktop_paper_axis(
+                layout, 20.0, 0, &mut out, &mut error
+            ));
+            assert_eq!(out.y, 23.0);
+            assert!(error.data.is_null());
+        }
+    }
+
+    #[test]
     fn paper_region_packet_bounds_and_failure_are_explicit() {
         let layout = paper::tests::layout();
         let source = tile_plan::Rect {
@@ -1132,7 +1222,7 @@ mod tests {
 
     #[test]
     fn image_byte_boundary_rejects_null_handles_and_reports_its_version() {
-        assert_eq!(lyra_reader_desktop_abi_version(), 6);
+        assert_eq!(lyra_reader_desktop_abi_version(), 7);
         let mut error = Buffer {
             data: ptr::null_mut(),
             len: 0,

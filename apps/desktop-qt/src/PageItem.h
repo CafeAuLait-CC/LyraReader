@@ -47,6 +47,7 @@ public:
     Q_INVOKABLE QVariantMap paperEraserSegments(const QPointF &from,const QPointF &to)const;
     Q_INVOKABLE QVariantMap paperPoint(const QPointF &display)const;
     Q_INVOKABLE QVariantMap paperRegion(const QRectF &source,qulonglong revision)const;
+    Q_INVOKABLE QVariantMap paperAxisY(double y,bool toDisplay,qulonglong revision)const;
     void setResourceActive(bool active);
     bool tilesEnabled() const {return m_tilesEnabled;}
     QRectF visibleRegion() const {return m_visibleRegion;}
