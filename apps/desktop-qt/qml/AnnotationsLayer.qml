@@ -9,6 +9,7 @@ Item {
     required property int page
     property real zoom: app.zoom
     property bool ownOnly: false
+    property var paperMap: null
     property rect visibleRegion: Qt.rect(0, 0, width / zoom, height / zoom)
     readonly property var marks: {
         const values = app.annotations.filter(function (a) {
@@ -25,12 +26,14 @@ Item {
         zoom: annotationLayer.zoom
         paperAppearance: app.paperAppearance
         selectedId: ownOnly ? "" : (app.selectedAnnotation ? app.selectedAnnotation.id : "")
+        paperMap: annotationLayer.paperMap
     }
     PdfAnnotations {
         anchors.fill: parent
         annotations: app.annotationDraft && !app.annotationDraft.id && app.annotationDraft.page === annotationLayer.page ? [app.annotationDraft] : []
         zoom: annotationLayer.zoom
         paperAppearance: app.paperAppearance
+        paperMap: annotationLayer.paperMap
     }
     Repeater {
         model: app.annotations.filter(function (a) {

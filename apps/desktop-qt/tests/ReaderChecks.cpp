@@ -2165,12 +2165,14 @@ private slots:
         QVERIFY(lyra_reader_desktop_paper_quads(layout,nullptr,0,nullptr,&error));QVERIFY(!error.data);
     }
     void paperSegmentsKeepPixelsTexturePayloadAndRasterDemand_data() {
-        QTest::addColumn<double>("zoom");QTest::addColumn<bool>("tiles");QTest::addColumn<QString>("appearance");
-        QTest::newRow("100-percent")<<1.0<<false<<QString("original");QTest::newRow("150-percent")<<1.5<<false<<QString("original");QTest::newRow("400-percent-tiles")<<4.0<<true<<QString("original");
-        QTest::newRow("100-percent-warm")<<1.0<<false<<QString("warm");QTest::newRow("400-percent-night-tiles")<<4.0<<true<<QString("night");
+        QTest::addColumn<double>("zoom");QTest::addColumn<bool>("tiles");QTest::addColumn<QString>("appearance");QTest::addColumn<bool>("paintMarks");QTest::addColumn<double>("rotation");
+        QTest::newRow("100-percent")<<1.0<<false<<QString("original")<<false<<0.0;QTest::newRow("150-percent")<<1.5<<false<<QString("original")<<false<<0.0;QTest::newRow("400-percent-tiles")<<4.0<<true<<QString("original")<<false<<0.0;
+        QTest::newRow("100-percent-warm")<<1.0<<false<<QString("warm")<<false<<0.0;QTest::newRow("400-percent-night-tiles")<<4.0<<true<<QString("night")<<false<<0.0;
+        QTest::newRow("100-percent-annotations")<<1.0<<false<<QString("original")<<true<<0.0;QTest::newRow("150-percent-annotations")<<1.5<<false<<QString("original")<<true<<0.0;QTest::newRow("400-percent-night-annotations")<<4.0<<true<<QString("night")<<true<<0.0;
+        QTest::newRow("100-percent-rotated-annotations")<<1.0<<false<<QString("original")<<true<<10.0;
     }
     void paperSegmentsKeepPixelsTexturePayloadAndRasterDemand() {
-        QFETCH(double,zoom);QFETCH(bool,tiles);QFETCH(QString,appearance);const double paperWidth=tiles?480:160,paperHeight=tiles?720:240,split=tiles?40:84,gapLimit=tiles?30:60;QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("paper-stripes.pdf");
+        QFETCH(double,zoom);QFETCH(bool,tiles);QFETCH(QString,appearance);QFETCH(bool,paintMarks);QFETCH(double,rotation);const double paperWidth=tiles?480:160,paperHeight=tiles?720:240,split=tiles?40:84,gapLimit=tiles?30:60;QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("paper-stripes.pdf");
         {
             QPdfWriter pdf(path);pdf.setResolution(72);pdf.setPageSize(QPageSize(QSizeF(paperWidth,paperHeight),QPageSize::Point));pdf.setPageMargins(QMarginsF(0,0,0,0));
             QPainter painter(&pdf);QVERIFY(painter.isActive());
@@ -2181,15 +2183,22 @@ private slots:
         const auto size=reader.pages().first().toMap();QCOMPARE(size.value("width").toDouble(),paperWidth);QCOMPARE(size.value("height").toDouble(),paperHeight);
         QQuickWindow window;window.resize(420,600);window.setColor(QColor(11,19,29));window.setPersistentSceneGraph(false);
         if(QGuiApplication::platformName()!="offscreen")window.setMaximumSize(QSize(420,600));
-        PageItem page;page.setParentItem(window.contentItem());page.setPosition(QPointF(20,20));page.setSize(QSizeF(paperWidth*zoom,paperHeight*zoom));page.setRasterScale(zoom);page.setPaperAppearance(appearance);page.setController(&reader);page.setPageIndex(0);page.setTilesEnabled(true);page.setVisibleRegion(QRectF(0,0,qMin(paperWidth,400/zoom),qMin(paperHeight,580/zoom)));
+        QQuickItem group(window.contentItem());group.setPosition(QPointF(20,20));group.setTransformOrigin(QQuickItem::TopLeft);group.setRotation(rotation);
+        PageItem page;page.setParentItem(&group);page.setPosition(QPointF(0,0));page.setSize(QSizeF(paperWidth*zoom,paperHeight*zoom));page.setRasterScale(zoom);page.setPaperAppearance(appearance);page.setController(&reader);page.setPageIndex(0);page.setTilesEnabled(true);page.setVisibleRegion(QRectF(0,0,qMin(paperWidth,400/zoom),qMin(paperHeight,580/zoom)));
+        AnnotationOverlay annotations;annotations.setParentItem(&group);annotations.setPosition(page.position());annotations.setSize(page.size());annotations.setZoom(zoom);annotations.setPaperAppearance(appearance);annotations.setPaperMap(&page);
+        if(paintMarks)annotations.setAnnotations({
+            QVariantMap{{"id","tear-highlight"},{"kind","highlight"},{"color","#FFCC4080"},{"blend","multiply"},{"quads",QVariantList{QVariantMap{{"x",5},{"y",5},{"width",145},{"height",225}}}}},
+            QVariantMap{{"id","tear-ink"},{"kind","ink"},{"color","#C03030FF"},{"strokeWidth",3},{"paths",QVariantList{QVariantList{QVariantMap{{"x",20},{"y",20}},QVariantMap{{"x",140},{"y",220}}}}}}
+        });
         window.show();QTRY_VERIFY2_WITH_TIMEOUT(page.refined() && page.texturesReady(),qPrintable(QString("loaded=%1 refined=%2 pending=%3 error=%4").arg(page.loaded()).arg(page.refined()).arg(reader.pendingRasters()).arg(reader.error())),15000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingRasters(),0,15000);QTest::qWait(80);
-        if(tiles)QVERIFY(page.loadedTileCount()>0);const auto before=window.grabWindow();QVERIFY(!before.isNull());const auto evidence=qEnvironmentVariable("LYRA_READER_PAPER_EVIDENCE_DIR");const auto prefix=QString("/paper-%1-%2").arg(int(zoom*100)).arg(appearance);if(!evidence.isEmpty()){QVERIFY(QDir().mkpath(evidence));QVERIFY(before.save(evidence+prefix+"-before.png"));}const auto completed=reader.completedRasters();const auto textureBytes=RenderBudget::statistics().value("textureBytes").toLongLong();QVERIFY(textureBytes>0);
-        const auto sample=[&](const QImage &image,double x,double y){return image.pixelColor(qBound(0,int(x*image.width()/window.width()),image.width()-1),qBound(0,int(y*image.height()/window.height()),image.height()-1));};
+        qInfo()<<"Paper segment graphics API:"<<window.rendererInterface()->graphicsApi()<<"platform:"<<QGuiApplication::platformName();
+        if(tiles)QVERIFY(page.loadedTileCount()>0);const auto before=window.grabWindow();QVERIFY(!before.isNull());const auto evidence=qEnvironmentVariable("LYRA_READER_PAPER_EVIDENCE_DIR");const auto prefix=QString("/paper-%1-%2-%3-r%4").arg(int(zoom*100)).arg(appearance).arg(paintMarks?"annotations":"plain").arg(int(rotation));if(!evidence.isEmpty()){QVERIFY(QDir().mkpath(evidence));QVERIFY(before.save(evidence+prefix+"-before.png"));}const auto completed=reader.completedRasters();const auto textureBytes=RenderBudget::statistics().value("textureBytes").toLongLong();QVERIFY(textureBytes>0);
+        const auto sample=[&](const QImage &image,double x,double y){const auto scene=group.mapToScene(QPointF(x-20,y-20));return image.pixelColor(qBound(0,int(scene.x()*image.width()/window.width()),image.width()-1),qBound(0,int(scene.y()*image.height()/window.height()),image.height()-1));};
         const auto closeColour=[](const QColor &a,const QColor &b){return std::abs(a.red()-b.red())<=2 && std::abs(a.green()-b.green())<=2 && std::abs(a.blue()-b.blue())<=2;};
         QVERIFY(!closeColour(sample(before,40,20+15*zoom),window.color()));
-        QSignalSpy frames(&window,&QQuickWindow::frameSwapped);
+        QSignalSpy frames(&window,&QQuickWindow::frameSwapped);qulonglong stableBuilds=0;
         for(int step=0;step<=4;++step) {
-            const double gap=gapLimit*step/4;const auto previous=frames.size();QVERIFY(page.configurePaper(paperHeight,split,gap));page.setHeight((paperHeight+gap)*zoom);window.update();
+            const double gap=gapLimit*step/4;const auto previous=frames.size();QVERIFY(page.configurePaper(paperHeight,split,gap));page.setHeight((paperHeight+gap)*zoom);annotations.setHeight(page.height());window.update();
             QTRY_VERIFY_WITH_TIMEOUT(frames.size()>previous,3000);QTest::qWait(40);const auto opened=window.grabWindow();QVERIFY(!opened.isNull());if(!evidence.isEmpty())QVERIFY(opened.save(evidence+prefix+QString("-step%1.png").arg(step)));
             for(int row:{0,2,5,7,10,13,17,22}) {
                 const double originalY=row*10+5,shift=originalY>=split?gap:0;
@@ -2198,11 +2207,12 @@ private slots:
             }
             if(gap>0)QVERIFY(closeColour(sample(opened,20+80*zoom,20+(split+gap/2)*zoom),window.color()));
             QCOMPARE(reader.completedRasters(),completed);QCOMPARE(reader.pendingRasters(),0);QCOMPARE(RenderBudget::statistics().value("textureBytes").toLongLong(),textureBytes);QVERIFY(page.paperGeometryError().isEmpty());
+            if(step==1)stableBuilds=annotations.geometryBuildCount();else if(step>1)QCOMPARE(annotations.geometryBuildCount(),stableBuilds);
         }
         QVERIFY(!page.configurePaper(paperHeight,split,qQNaN()));QVERIFY(page.paperGeometryActive());QVERIFY(!page.paperGeometryError().isEmpty());
         QVERIFY(!page.configurePaper(paperHeight,split,1e300));QVERIFY(!page.paperGeometryError().isEmpty());
         QVERIFY(page.configurePaper(paperHeight,split,gapLimit));QVERIFY(page.paperGeometryError().isEmpty());
-        page.clearPaperGeometry();page.setHeight(paperHeight*zoom);window.update();QTest::qWait(50);const auto closed=window.grabWindow();QVERIFY(!closed.isNull());
+        page.clearPaperGeometry();page.setHeight(paperHeight*zoom);annotations.setHeight(page.height());window.update();QTest::qWait(50);const auto closed=window.grabWindow();QVERIFY(!closed.isNull());
         for(int row:{2,7,10})QVERIFY(closeColour(sample(before,20+80*zoom,20+(row*10+5)*zoom),sample(closed,20+80*zoom,20+(row*10+5)*zoom)));
         QCOMPARE(reader.completedRasters(),completed);QVERIFY(page.configurePaper(paperHeight,split,gapLimit));reader.openFile(QUrl::fromLocalFile(path));QTRY_VERIFY(!reader.loading() && reader.pendingCommands()==0);QVERIFY(!page.paperGeometryActive());
         window.hide();window.releaseResources();page.setController(nullptr);QTRY_COMPARE_WITH_TIMEOUT(RenderBudget::statistics().value("textureBytes").toLongLong(),0,10000);

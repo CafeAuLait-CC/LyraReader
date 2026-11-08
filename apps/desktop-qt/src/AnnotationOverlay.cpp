@@ -1,5 +1,7 @@
 #include "AnnotationOverlay.h"
 #include "PaperAppearance.h"
+#include "PageItem.h"
+#include <QSGClipNode>
 #include <QSGGeometryNode>
 #include <QSGTransformNode>
 #include <QSGFlatColorMaterial>
@@ -13,6 +15,23 @@
 #include <cstring>
 
 namespace {
+class AnnotationScene final:public QSGTransformNode {
+public:
+    quint64 contentEpoch=0;
+    double width=0,paperHeight=0,split=0;
+    bool torn=false;
+    QSGNode *upper=nullptr;
+    QSGTransformNode *lower=nullptr;
+};
+QSGClipNode *paperClip(const QRectF &rect) {
+    auto *node=new QSGClipNode;
+    // Rectangular scissoring is only a hint. Keep real geometry for stencil clipping when
+    // an ancestor transform is not axis aligned, as required by QSGClipNode's contract.
+    auto *geometry=new QSGGeometry(QSGGeometry::defaultAttributes_Point2D(),4);
+    geometry->setDrawingMode(QSGGeometry::DrawTriangleStrip);QSGGeometry::updateRectGeometry(geometry,rect);
+    node->setGeometry(geometry);node->setFlag(QSGNode::OwnsGeometry,true);
+    node->setIsRectangular(true);node->setClipRect(rect);return node;
+}
 class SoftwareNode final:public QSGRenderNode {
 public:
     QQuickWindow *window=nullptr;
@@ -106,9 +125,54 @@ void append(QSGNode *root,const QVector<QPointF>&vertices,const QColor &color,bo
     node->setFlag(QSGNode::OwnsMaterial,true);root->appendChildNode(node);
 }
 }
+PageItem *AnnotationOverlay::paperMap()const{return m_paperMap;}
+void AnnotationOverlay::setPaperMap(PageItem *page) {
+    if(m_paperMap==page)return;
+    for(const auto &connection:m_paperConnections)QObject::disconnect(connection);m_paperConnections.clear();m_paperMap=page;
+    if(page) {
+        m_paperConnections.append(connect(page,&PageItem::paperGeometryChanged,this,[this]{update();}));
+        m_paperConnections.append(connect(page,&QObject::destroyed,this,[this]{++m_contentEpoch;update();emit paperMapChanged();}));
+    }
+    ++m_contentEpoch;update();emit paperMapChanged();
+}
 QSGNode *AnnotationOverlay::updatePaintNode(QSGNode *old,UpdatePaintNodeData *){
-    delete old;
-    auto *root=new QSGTransformNode;
+    auto *root=static_cast<AnnotationScene *>(old);
+    if(width()<=0 || height()<=0 || !std::isfinite(m_zoom) || m_zoom<=0){delete root;return nullptr;}
+    const auto layout=m_paperMap?m_paperMap->paperLayout():std::optional<LyraReaderPaperLayout>{};
+    double originalHeight=height(),split=0,gap=0;bool torn=false;
+    if(layout) {
+        const LyraReaderPaperQuad input{{0,0,width()/m_zoom,layout->height},{0,0,1,1}};
+        LyraReaderPaperQuadPair output{};LyraReaderBuffer error{};
+        if(!lyra_reader_desktop_paper_quads(*layout,&input,1,&output,&error)) {
+            qWarning("Paper annotation geometry could not be mapped.");lyra_reader_desktop_buffer_free(error);delete root;return nullptr;
+        }
+        originalHeight=layout->height*m_zoom;torn=output.count==2;
+        if(torn){split=output.pieces[0].target.height*m_zoom;gap=layout->gap*m_zoom;}
+    }
+    const auto shiftLower=[&] {
+        if(root->lower){QMatrix4x4 move;move.translate(0,float(gap));root->lower->setMatrix(move);}
+    };
+    if(root && root->contentEpoch==m_contentEpoch && root->width==width()
+            && root->paperHeight==originalHeight && root->split==split && root->torn==torn) {
+        // Gap-only animation keeps every triangle/material. Native clips and one transform
+        // move them; no vertex rebuild, source query, tile plan or raster request is involved.
+        shiftLower();return root;
+    }
+    delete root;root=new AnnotationScene;
+    root->contentEpoch=m_contentEpoch;root->width=width();root->paperHeight=originalHeight;root->split=split;root->torn=torn;
+    if(torn) {
+        auto *upper=paperClip(QRectF(0,0,width(),split));
+        // Explicit transform roots also preserve software sibling clips and parent offsets.
+        auto *upperRoot=new QSGTransformNode;upperRoot->appendChildNode(upper);root->appendChildNode(upperRoot);root->upper=upper;
+        root->lower=new QSGTransformNode;auto *lower=paperClip(QRectF(0,split,width(),originalHeight-split));
+        root->lower->appendChildNode(lower);root->appendChildNode(root->lower);shiftLower();
+    }else root->upper=root;
+    ++m_geometryBuilds;QMetaObject::invokeMethod(this,[this]{emit geometryRebuilt();},Qt::QueuedConnection);
+    const auto draw=[&](const QVector<QPointF> &vertices,const QColor &color,bool multiply) {
+        const QRectF bounds(0,0,width(),originalHeight);
+        append(root->upper,vertices,color,multiply,m_zoom,window(),bounds);
+        if(root->lower)append(root->lower->firstChild(),vertices,color,multiply,m_zoom,window(),bounds);
+    };
     for(const auto &entry:m_annotations){
         const auto a=entry.toMap();if(a.value(QStringLiteral("visible"),true).toBool()==false)continue;
         const auto kind=a.value(QStringLiteral("kind")).toString();
@@ -142,11 +206,11 @@ QSGNode *AnnotationOverlay::updatePaintNode(QSGNode *old,UpdatePaintNodeData *){
             QList<QPointF> points;for(int i=0;i<=64;++i){const double angle=double(i)/64*6.283185307179586;points<<bounds.center()+QPointF(std::cos(angle)*bounds.width()/2,std::sin(angle)*bounds.height()/2);}
             stroke(vertices,points,width);
         }
-        append(root,vertices,color,multiply,m_zoom,window(),boundingRect());
+        draw(vertices,color,multiply);
         if(a.value(QStringLiteral("id")).toString()==m_selected && !bounds.isEmpty()){
             QVector<QPointF> frame;const auto r=bounds.adjusted(-2,-2,2,2);
             stroke(frame,{r.topLeft(),r.topRight(),r.bottomRight(),r.bottomLeft(),r.topLeft()},1.0/m_zoom);
-            append(root,frame,QColor(154,106,25),false,m_zoom,window(),boundingRect());
+            draw(frame,QColor(154,106,25),false);
         }
     }
     return root;

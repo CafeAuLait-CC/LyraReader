@@ -259,6 +259,7 @@ Item {
                         app: canvas.app
                         page: sheet.modelData.index
                         visibleRegion: pdfPage.visibleRegion
+                        paperMap: pdfPage
                     }
                     RedactionLayer {
                         anchors.fill: parent

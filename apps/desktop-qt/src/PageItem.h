@@ -38,6 +38,7 @@ public:
     bool texturesReady()const{return m_texturesReady;}
     QString paperGeometryError()const{return m_paperError;}
     bool paperGeometryActive()const{return m_paperLayout.has_value();}
+    std::optional<LyraReaderPaperLayout> paperLayout()const{return m_paperLayout;}
     // One atomic geometry update. It does not change source pixels, raster demand or zoom.
     Q_INVOKABLE bool configurePaper(double originalHeightPt,double splitPt,double gapPt);
     Q_INVOKABLE void clearPaperGeometry();
