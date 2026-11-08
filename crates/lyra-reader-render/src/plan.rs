@@ -18,12 +18,13 @@
 //!
 //! The page placements, the viewport rect, the current LOD, the resolved prefetch settings and
 //! an inventory of what the cache already holds are **inputs**. So is the page-tear geometry:
-//! a torn page's display block is presentation, and only the shell knows how its two segments
-//! map back to page-local Y.
+//! the shell supplies the torn page's display placement, and shared session geometry maps its
+//! two paper segments back to page-local Y before rows are named.
 
 use crate::grid::{
     AxisSpan, MAX_GRID_COORDINATE, MAX_LEGACY_TILES, UpperEdge, axis_span, coordinates, count,
 };
+use lyra_reader_session::paper::PaperLayout;
 use std::collections::HashMap;
 
 /// Longest prefetch ring, in viewport heights (ADR 0007 shipped 2.5 viewports of *ring* plus
@@ -424,29 +425,12 @@ pub fn page_local_band(page: &PlanPage, top: f64, bottom: f64) -> Option<(f64, f
         return (high > low).then_some((low, high));
     };
 
-    let page_top = page.display_top_pt;
     let split = split_pt.max(0.01).min(height - 0.01);
-    let top_segment = (page_top, page_top + split);
-    let bottom_start = page_top + split + page.tear_gap_pt;
-    let bottom_segment = (bottom_start, page_top + height + page.tear_gap_pt);
-
-    let mut locals: Vec<f64> = Vec::with_capacity(4);
-    let top_low = top.max(top_segment.0);
-    let top_high = bottom.min(top_segment.1);
-    if top_low < top_high {
-        locals.push(top_low - page_top);
-        locals.push(top_high - page_top);
-    }
-    let bottom_low = top.max(bottom_segment.0);
-    let bottom_high = bottom.min(bottom_segment.1);
-    if bottom_low < bottom_high {
-        locals.push(bottom_low - bottom_start + split);
-        locals.push(bottom_high - bottom_start + split);
-    }
-
-    let low = locals.iter().copied().reduce(f64::min)?;
-    let high = locals.iter().copied().reduce(f64::max)?;
-    (high > low).then_some((low.max(0.0), high.min(height)))
+    // Retain the legacy edge clamp at this boundary. New paper-layout callers validate an
+    // interior split instead. The shared map allocates no per-page interval vector.
+    PaperLayout::new(height, Some(split), page.tear_gap_pt)
+        .ok()?
+        .paper_band(top - page.display_top_pt, bottom - page.display_top_pt)
 }
 
 /// The ring above and below the viewport, as distances from the viewport's top edge.
@@ -718,6 +702,78 @@ mod tests {
             pages,
             cached_tiles: Vec::new(),
             prior_tiles: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn shared_paper_mapping_preserves_the_previous_band_contract() {
+        // Frozen pre-migration algorithm. Keep this independent of PaperLayout so a changed
+        // mapping cannot validate itself; tiny floating-point reassociations allow 1e-8 pt.
+        fn previous(page: &PlanPage, top: f64, bottom: f64) -> Option<(f64, f64)> {
+            let height = page.height_pt;
+            let Some(split) = page.tear_split_pt.filter(|_| page.tear_gap_pt > 0.01) else {
+                let low = (top - page.top_pt).max(0.0);
+                let high = (bottom - page.top_pt).min(height);
+                return (high > low).then_some((low, high));
+            };
+            let split = split.max(0.01).min(height - 0.01);
+            let bottom_start = page.display_top_pt + split + page.tear_gap_pt;
+            let mut locals = vec![];
+            let a = top.max(page.display_top_pt);
+            let b = bottom.min(page.display_top_pt + split);
+            if a < b {
+                locals.extend([a - page.display_top_pt, b - page.display_top_pt]);
+            }
+            let a = top.max(bottom_start);
+            let b = bottom.min(page.display_top_pt + height + page.tear_gap_pt);
+            if a < b {
+                locals.extend([a - bottom_start + split, b - bottom_start + split]);
+            }
+            let low = locals.iter().copied().reduce(f64::min)?;
+            let high = locals.iter().copied().reduce(f64::max)?;
+            (high > low).then_some((low.max(0.0), high.min(height)))
+        }
+        for height in [12.0, 842.0, 1200.0, 2165.5] {
+            for origin in [-40.5, 0.0, 2100.25] {
+                for split in [
+                    None,
+                    Some(-3.0),
+                    Some(0.0),
+                    Some(height / 3.0),
+                    Some(height),
+                ] {
+                    for gap in [0.0, 0.005, 0.01, 0.25, 83.5, 300.0] {
+                        let mut p = page(0);
+                        p.height_pt = height;
+                        p.top_pt = origin;
+                        p.display_top_pt = origin + 125.5;
+                        p.tear_split_pt = split;
+                        p.tear_gap_pt = gap;
+                        for start in [
+                            -50.0,
+                            0.0,
+                            0.01,
+                            100.0,
+                            height / 3.0,
+                            height - 2.0,
+                            height + gap,
+                        ] {
+                            for length in [0.001, 1.0, 83.5, 300.0, 2500.0] {
+                                let (top, bottom) = (start + origin, start + origin + length);
+                                match (previous(&p, top, bottom), page_local_band(&p, top, bottom))
+                                {
+                                    (None, None) => {}
+                                    (Some(a), Some(b)) => assert!(
+                                        (a.0 - b.0).abs() < 1e-8 && (a.1 - b.1).abs() < 1e-8,
+                                        "{p:?} {top} {bottom}: {a:?} != {b:?}"
+                                    ),
+                                    (a, b) => panic!("{p:?} {top} {bottom}: {a:?} != {b:?}"),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

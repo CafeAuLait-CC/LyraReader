@@ -13,6 +13,7 @@ pub mod command;
 pub mod ink;
 pub mod layout;
 pub mod navigation;
+pub mod paper;
 pub mod viewport;
 
 pub use command::{Anchor, Command, Event, Layout, Zoom};

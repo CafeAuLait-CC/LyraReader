@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 lyra-reader-core = { workspace = true }
+lyra-reader-session = { workspace = true }
 
 [dev-dependencies]
 serde_json = "1"
