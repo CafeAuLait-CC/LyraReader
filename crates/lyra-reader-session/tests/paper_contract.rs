@@ -311,3 +311,61 @@ fn malformed_layouts_quads_and_overflow_are_rejected() {
     );
     assert_eq!(paper.paper_band(f64::NEG_INFINITY, 20.0), None);
 }
+
+#[test]
+fn raw_pointer_sweeps_are_clipped_before_the_gap_is_removed() {
+    use lyra_reader_core::{LineSegment, Point};
+    let p = Point::new;
+    let paper = PaperLayout::new(1200.0, Some(190.0), 300.0).unwrap();
+    let out = paper
+        .pointer_segments(600.0, p(0.0, 100.0), p(400.0, 700.0))
+        .unwrap();
+    assert_eq!(
+        out,
+        [
+            Some(LineSegment::new(p(0.0, 100.0), p(60.0, 190.0))),
+            Some(LineSegment::new(p(260.0, 190.0), p(400.0, 400.0)))
+        ]
+    );
+    assert_eq!(
+        paper
+            .pointer_segments(600.0, p(50.0, 200.0), p(50.0, 300.0))
+            .unwrap(),
+        [None, None]
+    );
+    assert_eq!(
+        paper
+            .pointer_segments(600.0, p(-1.0, 100.0), p(-1.0, 1200.0))
+            .unwrap(),
+        [None, None]
+    );
+    let reverse = paper
+        .pointer_segments(600.0, p(50.0, 1200.0), p(50.0, 100.0))
+        .unwrap();
+    assert_eq!(
+        reverse,
+        [
+            Some(LineSegment::new(p(50.0, 190.0), p(50.0, 100.0))),
+            Some(LineSegment::new(p(50.0, 900.0), p(50.0, 190.0)))
+        ]
+    );
+    for gap in [0.0, 0.005, 0.01] {
+        let plain = PaperLayout::new(1200.0, Some(190.0), gap).unwrap();
+        assert_eq!(
+            plain
+                .pointer_segments(600.0, p(50.0, 100.0), p(50.0, 900.0))
+                .unwrap(),
+            [Some(LineSegment::new(p(50.0, 100.0), p(50.0, 900.0))), None]
+        );
+    }
+    assert!(
+        paper
+            .pointer_segments(f64::NAN, p(0.0, 0.0), p(1.0, 1.0))
+            .is_err()
+    );
+    assert!(
+        paper
+            .pointer_segments(600.0, p(-1e308, 0.0), p(1e308, 1.0))
+            .is_err()
+    );
+}

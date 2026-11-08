@@ -52,12 +52,17 @@ Item {
                 if (sheet.modelData.index === sourcePage) source = sheet;
             }
         }
-        if (!source) return [];
-        return sheets.map(function(sheet) {
+        if (!source) return {error:qsTr("The page moved. Try the eraser again.")};
+        const segments=[];
+        for(const sheet of sheets) {
+            if(!sheet.paperMap)return {error:qsTr("The page moved. Try the eraser again.")};
             const a = source.mapToItem(sheet, from.x * app.zoom, from.y * app.zoom);
             const b = source.mapToItem(sheet, to.x * app.zoom, to.y * app.zoom);
-            return {page: sheet.modelData.index, from: {x: a.x / app.zoom, y: a.y / app.zoom}, to: {x: b.x / app.zoom, y: b.y / app.zoom}};
-        });
+            const mapped=sheet.paperMap.paperEraserSegments(Qt.point(a.x/app.zoom,a.y/app.zoom),Qt.point(b.x/app.zoom,b.y/app.zoom));
+            if(mapped.error)return {error:mapped.error};
+            for(const line of mapped.segments)segments.push({page:sheet.modelData.index,from:line.from,to:line.to});
+        }
+        return {segments:segments};
     }
     function clampY(value) {
         const first = pageList.originY;
@@ -236,6 +241,7 @@ Item {
                 model: parent.modelData.pages
                 delegate: Rectangle {
                     id: sheet
+                    property alias paperMap: pdfPage
                     required property var modelData
                     width: modelData.width * app.zoom
                     height: modelData.height * app.zoom

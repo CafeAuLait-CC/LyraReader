@@ -2,7 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 
-inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 3;
+inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 4;
 
 // Owned Rust allocations: free each Buffer exactly once using buffer_free.
 // Output buffers must be zero initialized; calls do not free previous contents.
@@ -23,6 +23,13 @@ struct LyraReaderTileRect {double x,y,width,height;};
 struct LyraReaderPaperLayout {double height,split,gap;std::uint32_t has_split,reserved;};
 struct LyraReaderPaperQuad {LyraReaderTileRect target,source;};
 struct LyraReaderPaperQuadPair {std::uint32_t count,reserved;LyraReaderPaperQuad pieces[2];};
+struct LyraReaderPaperPoint {double x,y;};
+struct LyraReaderPaperSegment {LyraReaderPaperPoint from,to;};
+struct LyraReaderPaperSegments {std::uint32_t count,reserved;LyraReaderPaperSegment pieces[2];};
+// Clip the raw display sweep to each actual piece of paper, then map back to original points.
+// Output is caller-owned/aligned and untouched on failure; it contains at most two segments.
+bool lyra_reader_desktop_paper_segments(LyraReaderPaperLayout layout,double width,
+    LyraReaderPaperPoint from,LyraReaderPaperPoint to,LyraReaderPaperSegments *output,LyraReaderBuffer *error);
 // Pure display geometry. Caller-owned, non-overlapping arrays, at most 256 quads. Geometry
 // is page-local 100% view points; no PDF, texture or I/O. Successful mapping allocates nothing. Zero count validates
 // layout only and permits null arrays. All outputs stay untouched on invalid input.

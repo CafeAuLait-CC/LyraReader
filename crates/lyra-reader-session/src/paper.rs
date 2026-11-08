@@ -3,7 +3,7 @@
 //! The PDF, glyph indices and raster bytes stay unchanged. Shells retain texture ownership
 //! and apply these piecewise maps to drawing, hit testing and anchors together. Placement
 //! consumes already available glyph/figure boxes; it never starts a document-wide scan.
-use lyra_reader_core::Rect;
+use lyra_reader_core::{LineSegment, Point, Rect};
 
 /// Bound caller-controlled geometry before allocating or sorting it.
 pub const MAX_PAPER_GEOMETRY_ITEMS: usize = 1 << 18;
@@ -189,6 +189,11 @@ pub struct PaperLayout {
 }
 
 impl PaperLayout {
+    fn displayed_split(self) -> Option<f64> {
+        self.split_pt.filter(|s| {
+            self.gap_pt > CUT_EPSILON && *s > CUT_EPSILON && *s < self.height_pt - CUT_EPSILON
+        })
+    }
     pub fn new(
         height_pt: f64,
         split_pt: Option<f64>,
@@ -280,6 +285,44 @@ impl PaperLayout {
         band
     }
 
+    /// Clip the raw display-space pointer sweep to each actual paper segment, then map
+    /// endpoints back to the original page. Folding endpoints into one paper-space line
+    /// first invents an eraser capsule through the conversation gap. Pieces follow segment
+    /// order even for a reverse drag. Zero/tiny gaps follow the raster's unsplit rule.
+    pub fn pointer_segments(
+        self,
+        width_pt: f64,
+        from: Point,
+        to: Point,
+    ) -> Result<[Option<LineSegment>; 2], InvalidPaperGeometry> {
+        if !width_pt.is_finite() || width_pt <= 0.0 {
+            return Err(InvalidPaperGeometry);
+        }
+        let segments = if self.displayed_split().is_some() {
+            self.segments()
+        } else {
+            [
+                Some(PaperSegment {
+                    source_top_pt: 0.0,
+                    display_top_pt: 0.0,
+                    height_pt: self.height_pt,
+                }),
+                None,
+            ]
+        };
+        let mut output = [None, None];
+        for (index, segment) in segments.into_iter().flatten().enumerate() {
+            let rect = Rect::new(0.0, segment.display_top_pt, width_pt, segment.height_pt);
+            if let Some(line) = clipped_segment(from, to, rect)? {
+                let local = |p: Point| {
+                    Point::new(p.x, p.y - segment.display_top_pt + segment.source_top_pt)
+                };
+                output[index] = Some(LineSegment::new(local(line.from), local(line.to)));
+            }
+        }
+        Ok(output)
+    }
+
     /// Split one already page-owned quad. Later pages and facing partners must be excluded by
     /// identity before calling; never infer ownership from Y alone. Target coordinates are
     /// page-local, before inserting the gap. Original source rect and horizontal extent stay
@@ -296,9 +339,7 @@ impl PaperLayout {
             first,
             second: None,
         };
-        let Some(split) = self.split_pt.filter(|s| {
-            self.gap_pt > CUT_EPSILON && *s > CUT_EPSILON && *s < self.height_pt - CUT_EPSILON
-        }) else {
+        let Some(split) = self.displayed_split() else {
             return Ok(unchanged(quad));
         };
         let top = quad.target.min_y();
@@ -351,6 +392,60 @@ impl PaperLayout {
             }),
         })
     }
+}
+
+/// Liang-Barsky clipping with the macOS pointer tolerance. Endpoint differences must also
+/// be finite: two huge finite endpoints can otherwise overflow their delta before clipping.
+fn clipped_segment(
+    from: Point,
+    to: Point,
+    rect: Rect,
+) -> Result<Option<LineSegment>, InvalidPaperGeometry> {
+    let (dx, dy) = (to.x - from.x, to.y - from.y);
+    if !finite_rect(rect)
+        || rect.is_empty()
+        || [from.x, from.y, to.x, to.y, dx, dy]
+            .iter()
+            .any(|v| !v.is_finite())
+    {
+        return Err(InvalidPaperGeometry);
+    }
+    let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+    for (p, q) in [
+        (-dx, from.x - rect.min_x()),
+        (dx, rect.max_x() - from.x),
+        (-dy, from.y - rect.min_y()),
+        (dy, rect.max_y() - from.y),
+    ] {
+        if !q.is_finite() {
+            return Err(InvalidPaperGeometry);
+        }
+        if p.abs() < 1e-12 {
+            if q < 0.0 {
+                return Ok(None);
+            }
+            continue;
+        }
+        let r = q / p;
+        if !r.is_finite() {
+            return Err(InvalidPaperGeometry);
+        }
+        if p < 0.0 {
+            if r > t1 {
+                return Ok(None);
+            }
+            t0 = t0.max(r);
+        } else {
+            if r < t0 {
+                return Ok(None);
+            }
+            t1 = t1.min(r);
+        }
+    }
+    Ok(Some(LineSegment::new(
+        Point::new(from.x + t0 * dx, from.y + t0 * dy),
+        Point::new(from.x + t1 * dx, from.y + t1 * dy),
+    )))
 }
 
 /// Smoothstep used by paper reveal/close. The shell owns timers, epochs and Reduce Motion.

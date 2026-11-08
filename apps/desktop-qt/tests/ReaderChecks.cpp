@@ -2151,6 +2151,8 @@ private slots:
         QVERIFY(lyra_reader_desktop_plan_tiles(nullptr,0,&empty,&error));QCOMPARE(empty.len,std::size_t(0));QVERIFY(empty.plans==nullptr);QVERIFY(error.data==nullptr);
     }
     void nativePaperBatchPreservesPacketShapesAndRejectsPartialOutput() {
+        static_assert(sizeof(LyraReaderPaperSegments)==72 && sizeof(LyraReaderPaperPoint)==16);
+        PageItem unowned;unowned.setSize(QSizeF(160,240));QVERIFY(unowned.paperEraserSegments(QPointF(10,10),QPointF(20,20)).contains("error"));
         static_assert(sizeof(LyraReaderPaperLayout)==32 && sizeof(LyraReaderPaperQuad)==64 && sizeof(LyraReaderPaperQuadPair)==136);
         static_assert(sizeof(LyraReaderTilePlanRequest)==80 && offsetof(LyraReaderPaperQuadPair,pieces)==8);
         QCOMPARE(lyra_reader_desktop_abi_version(),LYRA_READER_DESKTOP_ABI_VERSION);
@@ -2163,6 +2165,29 @@ private slots:
         QVERIFY(!lyra_reader_desktop_paper_quads(layout,input,2,output,&error));QVERIFY(error.data);lyra_reader_desktop_buffer_free(error);error={};
         QCOMPARE(output[0].count,std::uint32_t(99));QCOMPARE(output[1].count,std::uint32_t(98));
         QVERIFY(lyra_reader_desktop_paper_quads(layout,nullptr,0,nullptr,&error));QVERIFY(!error.data);
+    }
+    void eraserPaperGapDoesNotCutHiddenInkAndTheVisibleSweepHasOneUndo() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("paper-eraser.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        ReaderController reader;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("reader",&reader);engine.load(QUrl("qrc:/qml/Main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        reader.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),1,10000);QTRY_COMPARE(reader.pendingCommands(),0);
+        window->setProperty("fitting",false);QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,1.0),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+        QTRY_VERIFY(visualItem(window->contentItem(),"pdfPage0"));auto *page=qobject_cast<PageItem *>(visualItem(window->contentItem(),"pdfPage0"));QVERIFY(page);
+        const auto height=reader.pages().first().toMap().value("height").toDouble();QVERIFY(page->configurePaper(height,200,200));
+        const auto entries=[&]{return reader.data().value("marks").toMap().value("annotations").toList();};
+        const QVariantMap ink{{"kind","ink"},{"page",0},{"version",1},{"paths",QVariantList{QVariantList{QVariantMap{{"x",200},{"y",250}},QVariantMap{{"x",300},{"y",250}}}}},{"strokeWidth",2},{"color","#1B7F3BFF"},{"note","paper sweep fixture"}};
+        reader.submit("mark_create",{{"entry",ink}});QTRY_COMPARE(reader.pendingCommands(),0);QCOMPARE(entries().size(),1);const auto original=entries();
+        window->setProperty("annotationTool","eraser");
+        const auto begin=[&](double y){const QVariant point=QVariantMap{{"x",250},{"y",y}};return QMetaObject::invokeMethod(window,"beginErase",Q_ARG(QVariant,0),Q_ARG(QVariant,point));};
+        const auto finish=[&]{return QMetaObject::invokeMethod(window,"commitErase");};
+        const auto idle=[&]{return reader.pendingCommands()==0 && window->property("eraserToken").toString().isEmpty();};
+        QVERIFY(begin(250));QTRY_COMPARE(reader.pendingCommands(),0);QVERIFY(finish());QTRY_VERIFY_WITH_TIMEOUT(idle(),10000);QCOMPARE(entries(),original);
+        QVERIFY(begin(450));QTRY_COMPARE(reader.pendingCommands(),0);
+        const auto value=window->property("erasePreview");const auto preview=value.metaType()==QMetaType::fromType<QJSValue>()?value.value<QJSValue>().toVariant().toList():value.toList();QCOMPARE(preview.size(),2);
+        QVERIFY(finish());QTRY_VERIFY_WITH_TIMEOUT(idle(),10000);QCOMPARE(entries().size(),2);
+        for(int i=0;i<2;++i)QCOMPARE(entries()[i].toMap().value("paths"),preview[i].toMap().value("paths"));
+        reader.submit("marks_undo");QTRY_COMPARE(reader.pendingCommands(),0);QCOMPARE(entries(),original);
+        const auto invalid=page->paperEraserSegments(QPointF(qQNaN(),0),QPointF(0,0));QVERIFY(invalid.contains("error"));
     }
     void paperSegmentsKeepPixelsTexturePayloadAndRasterDemand_data() {
         QTest::addColumn<double>("zoom");QTest::addColumn<bool>("tiles");QTest::addColumn<QString>("appearance");QTest::addColumn<bool>("paintMarks");QTest::addColumn<double>("rotation");

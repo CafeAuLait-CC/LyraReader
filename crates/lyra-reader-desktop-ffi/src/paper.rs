@@ -26,6 +26,53 @@ pub struct Pair {
     pub reserved: u32,
     pub pieces: [Quad; 2],
 }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Point {
+    pub x: f64,
+    pub y: f64,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Segment {
+    pub from: Point,
+    pub to: Point,
+}
+#[repr(C)]
+pub struct Segments {
+    pub count: u32,
+    pub reserved: u32,
+    pub pieces: [Segment; 2],
+}
+const _: () = assert!(std::mem::size_of::<Segments>() == 72);
+pub fn segments(layout: Layout, width: f64, from: Point, to: Point) -> Result<Segments, String> {
+    let p = |v: Point| lyra_reader_core::Point::new(v.x, v.y);
+    let mapped = PaperLayout::try_from(layout)?
+        .pointer_segments(width, p(from), p(to))
+        .map_err(|e| e.to_string())?;
+    let mut output = Segments {
+        count: 0,
+        reserved: 0,
+        pieces: [Segment {
+            from: Point { x: 0.0, y: 0.0 },
+            to: Point { x: 0.0, y: 0.0 },
+        }; 2],
+    };
+    for line in mapped.into_iter().flatten() {
+        output.pieces[output.count as usize] = Segment {
+            from: Point {
+                x: line.from.x,
+                y: line.from.y,
+            },
+            to: Point {
+                x: line.to.x,
+                y: line.to.y,
+            },
+        };
+        output.count += 1;
+    }
+    Ok(output)
+}
 const _: () = assert!(std::mem::size_of::<Layout>() == 32);
 const _: () = assert!(std::mem::size_of::<Quad>() == 64);
 const _: () = assert!(std::mem::size_of::<Pair>() == 136);

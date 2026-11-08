@@ -90,6 +90,19 @@ void PageItem::clearPaperGeometry() {
     if(!m_paperLayout && m_paperError.isEmpty())return;
     ++m_paperEpoch;m_paperLayout.reset();m_paperError.clear();update();emit paperGeometryChanged();
 }
+QVariantMap PageItem::paperEraserSegments(const QPointF &from,const QPointF &to)const {
+    if(!m_controller || m_controller->loading() || m_page<0 || m_page>=m_controller->pageCount())return {{QStringLiteral("error"),tr("The page is not ready. Try the eraser again.")}};
+    const double originalHeight=m_controller->pages().at(m_page).toMap().value(QStringLiteral("height")).toDouble();
+    const auto layout=m_paperLayout.value_or(LyraReaderPaperLayout{originalHeight,0,0,0,0});
+    LyraReaderPaperSegments output{};LyraReaderBuffer error{};
+    if(!lyra_reader_desktop_paper_segments(layout,width()/m_scale,{from.x(),from.y()},{to.x(),to.y()},&output,&error)) {
+        const auto message=QString::fromUtf8(reinterpret_cast<const char *>(error.data),qsizetype(error.len));lyra_reader_desktop_buffer_free(error);return {{QStringLiteral("error"),message}};
+    }
+    if(output.count>2)return {{QStringLiteral("error"),tr("The paper mapper returned an invalid segment count.")}};
+    QVariantList result;
+    for(std::uint32_t i=0;i<output.count;++i){const auto &s=output.pieces[i];result.append(QVariantMap{{QStringLiteral("from"),QVariantMap{{QStringLiteral("x"),s.from.x},{QStringLiteral("y"),s.from.y}}},{QStringLiteral("to"),QVariantMap{{QStringLiteral("x"),s.to.x},{QStringLiteral("y"),s.to.y}}}});}
+    return {{QStringLiteral("segments"),result}};
+}
 void PageItem::setRasterScale(double scale) {if(!std::isfinite(scale) || scale<=0 || scale>maximumRasterScale || qFuzzyCompare(m_scale,scale))return;m_scale=scale;m_demandCurrent=false;setRefined(false);m_requestTimer.start();refresh();emit rasterScaleChanged();update();}
 void PageItem::setPaperAppearance(const QString &appearance) {if(m_paperAppearance==appearance)return;m_paperAppearance=appearance;update();emit paperAppearanceChanged();}
 void PageItem::setEmbeddedAnnotations(bool enabled) {if(m_embedded==enabled)return;m_embedded=enabled;resetImages();m_requestTimer.start();emit embeddedAnnotationsChanged();}

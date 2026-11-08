@@ -42,6 +42,7 @@ public:
     // One atomic geometry update. It does not change source pixels, raster demand or zoom.
     Q_INVOKABLE bool configurePaper(double originalHeightPt,double splitPt,double gapPt);
     Q_INVOKABLE void clearPaperGeometry();
+    Q_INVOKABLE QVariantMap paperEraserSegments(const QPointF &from,const QPointF &to)const;
     void setResourceActive(bool active);
     bool tilesEnabled() const {return m_tilesEnabled;}
     QRectF visibleRegion() const {return m_visibleRegion;}

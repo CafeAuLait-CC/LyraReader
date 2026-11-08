@@ -30,7 +30,37 @@ use std::{
 /// Version of the hand-written Qt C boundary, including bounded paper-quad batches.
 #[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_desktop_abi_version() -> u32 {
-    3
+    4
+}
+
+/// # Safety
+/// Output is a writable aligned Segments slot, distinct from the empty writable error Buffer.
+/// All input records are passed by value. Free an error once with buffer_free; output owns
+/// no memory. Null/misaligned output is rejected before access, and failures leave it intact.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_paper_segments(
+    layout: paper::Layout,
+    width: f64,
+    from: paper::Point,
+    to: paper::Point,
+    output: *mut paper::Segments,
+    error: *mut Buffer,
+) -> bool {
+    // SAFETY: caller supplies the documented writable slots with distinct ownership. Check
+    // output alignment/null before write; no input pointer or unbounded allocation is involved.
+    unsafe {
+        run(error, || {
+            if output.is_null()
+                || !(output as usize).is_multiple_of(std::mem::align_of::<paper::Segments>())
+            {
+                return Err("Paper segment output is null or misaligned".into());
+            }
+            let result = paper::segments(layout, width, from, to)?;
+            output.write(result);
+            Ok(())
+        })
+        .is_some()
+    }
 }
 
 /// # Safety
@@ -633,6 +663,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn paper_sweep_output_guards_preserve_the_previous_packet() {
+        let layout = paper::tests::layout();
+        let from = paper::Point { x: 1.0, y: 1.0 };
+        let to = paper::Point { x: 1.0, y: 10.0 };
+        let mut output = paper::segments(layout, 8.0, from, to).unwrap();
+        output.count = 99;
+        let mut error = Buffer {
+            data: ptr::null_mut(),
+            len: 0,
+        };
+        // SAFETY: by-value inputs, live aligned output and distinct empty error. Null and
+        // misaligned outputs must be rejected before any access; errors are retired once.
+        unsafe {
+            assert!(!lyra_reader_desktop_paper_segments(
+                layout,
+                f64::NAN,
+                from,
+                to,
+                &mut output,
+                &mut error
+            ));
+            assert_eq!(output.count, 99);
+            lyra_reader_desktop_buffer_free(error);
+            error = Buffer {
+                data: ptr::null_mut(),
+                len: 0,
+            };
+            for out in [
+                ptr::null_mut(),
+                ptr::without_provenance_mut::<paper::Segments>(1),
+            ] {
+                assert!(!lyra_reader_desktop_paper_segments(
+                    layout, 8.0, from, to, out, &mut error
+                ));
+                lyra_reader_desktop_buffer_free(error);
+                error = Buffer {
+                    data: ptr::null_mut(),
+                    len: 0,
+                };
+            }
+            assert!(lyra_reader_desktop_paper_segments(
+                layout,
+                8.0,
+                from,
+                to,
+                &mut output,
+                &mut error
+            ));
+            assert_eq!(output.count, 2);
+            assert!(error.data.is_null());
+        }
+    }
+
+    #[test]
     fn paper_quad_packet_guards_precede_pointer_access() {
         let mut error = Buffer {
             data: ptr::null_mut(),
@@ -866,7 +950,7 @@ mod tests {
 
     #[test]
     fn image_byte_boundary_rejects_null_handles_and_reports_its_version() {
-        assert_eq!(lyra_reader_desktop_abi_version(), 3);
+        assert_eq!(lyra_reader_desktop_abi_version(), 4);
         let mut error = Buffer {
             data: ptr::null_mut(),
             len: 0,

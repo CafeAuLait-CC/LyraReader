@@ -1297,13 +1297,15 @@ ApplicationWindow {
         if (blockXfaWrite()) return;
         cancelErase();
         dialogs.flushAnnotation();
+        const sweep=canvas.eraserSegments(page,point,point);
+        if(sweep.error){operationStatus=sweep.error;return;}
         selectedAnnotation = null;
         selection = null;
         eraserOwner = currentReader;
         eraserToken = "erase-" + (++eraserSequence) + "-" + Date.now();
         eraserPending = eraserOwner.submit("ink_erase_begin", {
             token: eraserToken, page: page, zoom: zoom,
-            segments: canvas.eraserSegments(page, point, point)
+            segments: sweep.segments
         });
     }
     function eraseAlong(page, start, end) {
@@ -1318,7 +1320,9 @@ ApplicationWindow {
             operationStatus = qsTr("The eraser is busy. Try a shorter stroke; no cut was saved.");
             return;
         }
-        eraserQueue = eraserQueue.concat(canvas.eraserSegments(page, start, end));
+        const sweep=canvas.eraserSegments(page,start,end);
+        if(sweep.error){cancelErase();operationStatus=sweep.error;return;}
+        eraserQueue = eraserQueue.concat(sweep.segments);
         flushErase();
     }
     function flushErase() {
