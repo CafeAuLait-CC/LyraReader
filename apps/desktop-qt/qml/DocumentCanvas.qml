@@ -33,7 +33,7 @@ Item {
             const sheet=item.pageSheets.itemAt(index);
             if(sheet && sheet.modelData.index===page)
                 return {x:item.x+sheet.x-pageList.contentX,y:item.y+sheet.y-pageList.contentY,
-                    width:sheet.width,height:sheet.height};
+                    width:sheet.width,height:sheet.height,paperMap:sheet.paperMap};
         }
         return null;
     }
@@ -282,6 +282,7 @@ Item {
                         anchors.fill: parent
                         app: canvas.app
                         page: sheet.modelData.index
+                        paperMap: pdfPage
                     }
                     BusyIndicator {
                         anchors.centerIn: parent
@@ -317,6 +318,7 @@ Item {
         app: canvas.app
         page: canvas.app.placedTextEditor && canvas.app.placedTextEditor.entry ? canvas.app.placedTextEditor.entry.page : -1
         readonly property var paperFrame: canvas.pageFrame(page,canvas.placementEpoch)
+        paperMap: paperFrame ? paperFrame.paperMap : null
         // A temporarily absent delegate parks the editor outside the clipped viewport;
         // it does not destroy the editor, its focus, selection or native undo history.
         x: paperFrame ? paperFrame.x : -width-1
@@ -329,6 +331,7 @@ Item {
         app: canvas.app
         page: canvas.app.contentEditor.textDraft ? canvas.app.contentEditor.draft.page : -1
         readonly property var paperFrame: canvas.pageFrame(page,canvas.placementEpoch)
+        paperMap: paperFrame ? paperFrame.paperMap : null
         x: paperFrame ? paperFrame.x : -width-1
         y: paperFrame ? paperFrame.y : -height-1
         width: paperFrame ? paperFrame.width : canvas.width

@@ -408,3 +408,51 @@ fn strict_pointer_hits_do_not_clamp_gaps_or_outside_paper() {
         assert_eq!(plain.pointer_point(400.0, p(20.0, 500.0)).unwrap(), None);
     }
 }
+
+#[test]
+fn native_control_regions_clip_pieces_and_union_without_authoring_the_gap() {
+    let paper = PaperLayout::new(500.0, Some(150.0), 80.0).unwrap();
+    let crossing = paper
+        .region(400.0, Rect::new(-10.0, 130.0, 80.0, 40.0))
+        .unwrap();
+    assert_eq!(
+        crossing.pieces,
+        [
+            Some(Rect::new(0.0, 130.0, 70.0, 20.0)),
+            Some(Rect::new(0.0, 230.0, 70.0, 20.0))
+        ]
+    );
+    assert_eq!(crossing.bounds, Some(Rect::new(0.0, 130.0, 70.0, 120.0)));
+    let source = Rect::new(10.0, 270.0, 100.0, 50.0);
+    assert_eq!(
+        paper.region(400.0, source).unwrap().bounds,
+        Some(Rect::new(10.0, 350.0, 100.0, 50.0))
+    );
+    assert_eq!(source, Rect::new(10.0, 270.0, 100.0, 50.0));
+    for rect in [
+        Rect::new(0.0, 600.0, 100.0, 20.0),
+        Rect::new(0.0, 0.0, 0.0, 0.0),
+        Rect::new(0.0, 0.0, 0.005, 10.0),
+    ] {
+        let empty = paper.region(400.0, rect).unwrap();
+        assert_eq!(empty.bounds, None);
+        assert_eq!(empty.pieces, [None, None]);
+    }
+    for bad in [
+        Rect::new(f64::NAN, 0.0, 1.0, 1.0),
+        Rect::new(1e308, 0.0, 1e308, 1.0),
+        Rect::new(0.0, 0.0, -1.0, 1.0),
+    ] {
+        assert!(paper.region(400.0, bad).is_err());
+    }
+    for gap in [0.0, 0.005, 0.01] {
+        assert_eq!(
+            PaperLayout::new(500.0, Some(150.0), gap)
+                .unwrap()
+                .region(400.0, source)
+                .unwrap()
+                .bounds,
+            Some(source)
+        );
+    }
+}

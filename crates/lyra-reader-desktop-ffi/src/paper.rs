@@ -40,6 +40,39 @@ pub struct Hit {
     pub point: Point,
 }
 const _: () = assert!(std::mem::size_of::<Hit>() == 24);
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Region {
+    pub count: u32,
+    pub reserved: u32,
+    pub bounds: Rect,
+    pub pieces: [Rect; 2],
+}
+const _: () = assert!(std::mem::size_of::<Region>() == 104);
+pub fn region(layout: Layout, width: f64, source: Rect) -> Result<Region, String> {
+    let mapped = PaperLayout::try_from(layout)?
+        .region(width, source.into())
+        .map_err(|e| e.to_string())?;
+    // Absent geometry has count zero; initialize its excluded storage rather than exposing
+    // uninitialized coordinates across the boundary.
+    let empty = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 0.0,
+        height: 0.0,
+    };
+    let mut out = Region {
+        count: 0,
+        reserved: 0,
+        bounds: mapped.bounds.map(Rect::from).unwrap_or(empty),
+        pieces: [empty; 2],
+    };
+    for rect in mapped.pieces.into_iter().flatten() {
+        out.pieces[out.count as usize] = rect.into();
+        out.count += 1;
+    }
+    Ok(out)
+}
 pub fn hit(layout: Layout, width: f64, point: Point) -> Result<Hit, String> {
     let mapped = PaperLayout::try_from(layout)?
         .pointer_point(width, lyra_reader_core::Point::new(point.x, point.y))

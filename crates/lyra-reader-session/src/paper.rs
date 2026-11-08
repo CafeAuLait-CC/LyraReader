@@ -188,6 +188,14 @@ pub struct PaperLayout {
     gap_pt: f64,
 }
 
+/// Display rectangles for one native control. A single focused editor uses the union;
+/// non-interactive drawing can use the individual pieces without covering the gap.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaperRegion {
+    pub pieces: [Option<Rect>; 2],
+    pub bounds: Option<Rect>,
+}
+
 impl PaperLayout {
     fn displayed_split(self) -> Option<f64> {
         self.split_pt.filter(|s| {
@@ -283,6 +291,54 @@ impl PaperLayout {
             }
         }
         band
+    }
+
+    /// Clip a source region to the original paper before mapping each display segment.
+    /// Matches the native CanvasGeometry region contract, including the 0.01-point minimum
+    /// intersection. Empty/outside is distinct from malformed geometry and never clamped
+    /// into a fabricated visible control. No display height is an authored source height.
+    pub fn region(self, width: f64, source: Rect) -> Result<PaperRegion, InvalidPaperGeometry> {
+        if !width.is_finite()
+            || width <= 0.0
+            || !finite_rect(source)
+            || source.size.width < 0.0
+            || source.size.height < 0.0
+        {
+            return Err(InvalidPaperGeometry);
+        }
+        let segments = if self.displayed_split().is_some() {
+            self.segments()
+        } else {
+            [
+                Some(PaperSegment {
+                    source_top_pt: 0.0,
+                    display_top_pt: 0.0,
+                    height_pt: self.height_pt,
+                }),
+                None,
+            ]
+        };
+        let mut mapped = PaperRegion {
+            pieces: [None, None],
+            bounds: None,
+        };
+        for (index, segment) in segments.into_iter().flatten().enumerate() {
+            let paper = Rect::new(0.0, segment.source_top_pt, width, segment.height_pt);
+            let Some(clipped) = source.intersection(paper) else {
+                continue;
+            };
+            if clipped.size.width <= CUT_EPSILON || clipped.size.height <= CUT_EPSILON {
+                continue;
+            }
+            let rect = clipped.translated(0.0, segment.display_top_pt - segment.source_top_pt);
+            let bounds = mapped.bounds.map_or(rect, |old| old.union(rect));
+            if !finite_rect(rect) || !finite_rect(bounds) {
+                return Err(InvalidPaperGeometry);
+            }
+            mapped.pieces[index] = Some(rect);
+            mapped.bounds = Some(bounds);
+        }
+        Ok(mapped)
     }
 
     /// A strict pointer hit, unlike extrapolatable reading anchors. Edges are half open as

@@ -90,6 +90,20 @@ void PageItem::clearPaperGeometry() {
     if(!m_paperLayout && m_paperError.isEmpty())return;
     ++m_paperEpoch;m_paperLayout.reset();m_paperError.clear();update();emit paperGeometryChanged();
 }
+QVariantMap PageItem::paperRegion(const QRectF &source,qulonglong revision)const {
+    if(!m_controller || m_controller->loading() || m_page<0 || m_page>=m_controller->pageCount() || revision!=m_paperEpoch)return {{QStringLiteral("error"),tr("The page layout changed. Try again.")}};
+    const double originalHeight=m_controller->pages().at(m_page).toMap().value(QStringLiteral("height")).toDouble();
+    const auto layout=m_paperLayout.value_or(LyraReaderPaperLayout{originalHeight,0,0,0,0});
+    LyraReaderPaperRegion output{};LyraReaderBuffer error{};
+    if(!lyra_reader_desktop_paper_region(layout,width()/m_scale,{source.x(),source.y(),source.width(),source.height()},&output,&error)) {
+        const auto message=QString::fromUtf8(reinterpret_cast<const char *>(error.data),qsizetype(error.len));lyra_reader_desktop_buffer_free(error);return {{QStringLiteral("error"),message}};
+    }
+    if(output.count>2)return {{QStringLiteral("error"),tr("The paper mapper returned an invalid region count.")}};
+    if(!output.count)return {{QStringLiteral("hit"),false}};
+    const auto rect=[](const LyraReaderTileRect &r){return QVariantMap{{QStringLiteral("x"),r.x},{QStringLiteral("y"),r.y},{QStringLiteral("width"),r.width},{QStringLiteral("height"),r.height}};};
+    QVariantList pieces;for(std::uint32_t i=0;i<output.count;++i)pieces.append(rect(output.pieces[i]));
+    return {{QStringLiteral("hit"),true},{QStringLiteral("bounds"),rect(output.bounds)},{QStringLiteral("pieces"),pieces}};
+}
 QVariantMap PageItem::paperPoint(const QPointF &display)const {
     if(!m_controller || m_controller->loading() || m_page<0 || m_page>=m_controller->pageCount())return {{QStringLiteral("error"),tr("The page is not ready. Try again.")}};
     const double originalHeight=m_controller->pages().at(m_page).toMap().value(QStringLiteral("height")).toDouble();

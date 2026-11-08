@@ -5,6 +5,7 @@ Item {
     id: formOverlay
     required property var app
     required property int page
+    property var paperMap: null
     visible: app.formToolActive
     readonly property var widgets: {
         const fields = app.currentReader.data.forms ? app.currentReader.data.forms.fields : [];
@@ -29,10 +30,17 @@ Item {
             readonly property string textValue: draft && draft.text !== null && draft.text !== undefined ? draft.text : field.value || ""
             readonly property int selectedIndex: draft && draft.selected !== null && draft.selected !== undefined ? draft.selected : field.selected.length ? field.selected[0] : -1
             readonly property bool checkedValue: draft && draft.checked !== null && draft.checked !== undefined ? draft.checked : field.checked
-            x: modelData.box.x_pt * app.zoom
-            y: modelData.box.y_pt * app.zoom
-            width: modelData.box.width_pt * app.zoom
-            height: modelData.box.height_pt * app.zoom
+            PaperRegion {
+                id: display
+                app: formOverlay.app
+                paperMap: formOverlay.paperMap
+                sourceRect: Qt.rect(widget.modelData.box.x_pt,widget.modelData.box.y_pt,widget.modelData.box.width_pt,widget.modelData.box.height_pt)
+            }
+            visible: display.hit
+            x: display.bounds.x * app.zoom
+            y: display.bounds.y * app.zoom
+            width: display.bounds.width * app.zoom
+            height: display.bounds.height * app.zoom
             enabled: app.canModifyPdf && field.editable && app.currentReader.pendingCommands === 0
             Rectangle {
                 anchors.fill: parent

@@ -5,21 +5,29 @@ Item {
     id: layer
     required property var app
     required property int page
+    property var paperMap: null
     readonly property var editor: app.contentEditor
+    readonly property bool editing: app.secondaryRow==="edit" && editor.inlineEditing && editor.textDraft && editor.draft.page===layer.page
+    PaperRegion {
+        id: display
+        app: layer.app
+        paperMap: layer.paperMap
+        sourceRect: layer.editing ? Qt.rect(editor.payload.bounds.x,editor.payload.bounds.y,editor.payload.bounds.width,editor.payload.bounds.height) : Qt.rect(0,0,0,0)
+    }
     ScrollView {
         id: textScroll
         objectName: "contentInlineScroll"+layer.page
-        visible: app.secondaryRow==="edit" && editor.inlineEditing && editor.textDraft && editor.draft.page===layer.page
-        x: visible ? Math.max(0,editor.payload.bounds.x*app.zoom) : 0
-        y: visible ? Math.max(0,editor.payload.bounds.y*app.zoom) : 0
-        width: visible ? Math.max(1,Math.min(layer.width-x,Math.max(80,editor.payload.bounds.width*app.zoom))) : 0
+        visible: layer.editing && display.hit
+        x: visible ? Math.max(0,display.bounds.x*app.zoom) : 0
+        y: visible ? Math.max(0,display.bounds.y*app.zoom) : 0
+        width: visible ? Math.max(1,Math.min(layer.width-x,Math.max(80,display.bounds.width*app.zoom))) : 0
         readonly property real viewportY: {
             const scrollPosition=app.pageList.contentY;
             return layer.mapToItem(app.pageList,0,y).y;
         }
         readonly property real heightLimit: Math.max(48,Math.min(layer.height-y,app.pageList.height-viewportY-8))
         // This changes only the native editing viewport, never the command's PDF bounds.
-        height: visible ? Math.min(heightLimit,Math.max(48,editor.payload.bounds.height*app.zoom,
+        height: visible ? Math.min(heightLimit,Math.max(48,display.bounds.height*app.zoom,
             Math.ceil(textEditor.contentHeight+textEditor.topPadding+textEditor.bottomPadding+2))) : 0
         contentWidth: availableWidth
         clip: true

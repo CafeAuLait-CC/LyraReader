@@ -30,7 +30,34 @@ use std::{
 /// Version of the hand-written Qt C boundary, including bounded paper-quad batches.
 #[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_desktop_abi_version() -> u32 {
-    5
+    6
+}
+
+/// # Safety
+/// Output is one live aligned writable Region, distinct from an empty writable error Buffer.
+/// Inputs are by value. Errors leave output intact; count zero is a successful empty region.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_paper_region(
+    layout: paper::Layout,
+    width: f64,
+    source: tile_plan::Rect,
+    output: *mut paper::Region,
+    error: *mut Buffer,
+) -> bool {
+    // SAFETY: distinct live caller-owned slots; null/alignment guards precede the sole write.
+    // The bounded by-value calculation borrows no pointers and performs no PDF or I/O work.
+    unsafe {
+        run(error, || {
+            if output.is_null()
+                || !(output as usize).is_multiple_of(std::mem::align_of::<paper::Region>())
+            {
+                return Err("Paper region output is null or misaligned".into());
+            }
+            output.write(paper::region(layout, width, source)?);
+            Ok(())
+        })
+        .is_some()
+    }
 }
 
 /// # Safety
@@ -691,6 +718,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn paper_region_packet_bounds_and_failure_are_explicit() {
+        let layout = paper::tests::layout();
+        let source = tile_plan::Rect {
+            x: 1.0,
+            y: 2.0,
+            width: 3.0,
+            height: 6.0,
+        };
+        let mut out = paper::region(layout, 8.0, source).unwrap();
+        assert_eq!(out.count, 2);
+        assert_eq!(out.bounds.height, 9.0);
+        out.count = 99;
+        let mut error = Buffer {
+            data: ptr::null_mut(),
+            len: 0,
+        };
+        // SAFETY: outputs are distinct live aligned slots. Invalid pointers are rejected
+        // before access and every owned error is freed once before its slot is reused.
+        unsafe {
+            for slot in [
+                ptr::null_mut(),
+                ptr::without_provenance_mut::<paper::Region>(1),
+            ] {
+                assert!(!lyra_reader_desktop_paper_region(
+                    layout, 8.0, source, slot, &mut error
+                ));
+                lyra_reader_desktop_buffer_free(error);
+                error = Buffer {
+                    data: ptr::null_mut(),
+                    len: 0,
+                };
+            }
+            assert!(!lyra_reader_desktop_paper_region(
+                layout,
+                f64::NAN,
+                source,
+                &mut out,
+                &mut error
+            ));
+            assert_eq!(out.count, 99);
+            lyra_reader_desktop_buffer_free(error);
+            error = Buffer {
+                data: ptr::null_mut(),
+                len: 0,
+            };
+            assert!(lyra_reader_desktop_paper_region(
+                layout, 8.0, source, &mut out, &mut error
+            ));
+            assert_eq!(out.count, 2);
+            assert!(error.data.is_null());
+            let outside = tile_plan::Rect { x: 20.0, ..source };
+            assert!(lyra_reader_desktop_paper_region(
+                layout, 8.0, outside, &mut out, &mut error
+            ));
+            assert_eq!(out.count, 0);
+        }
+    }
+
+    #[test]
     fn paper_hit_has_distinct_absence_and_error_and_atomic_output() {
         let layout = paper::tests::layout();
         let mut output = paper::Hit {
@@ -1046,7 +1132,7 @@ mod tests {
 
     #[test]
     fn image_byte_boundary_rejects_null_handles_and_reports_its_version() {
-        assert_eq!(lyra_reader_desktop_abi_version(), 5);
+        assert_eq!(lyra_reader_desktop_abi_version(), 6);
         let mut error = Buffer {
             data: ptr::null_mut(),
             len: 0,

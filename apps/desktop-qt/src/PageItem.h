@@ -22,6 +22,7 @@ class PageItem : public QQuickItem {
     Q_PROPERTY(bool texturesReady READ texturesReady NOTIFY texturesReadyChanged)
     Q_PROPERTY(QString paperGeometryError READ paperGeometryError NOTIFY paperGeometryChanged)
     Q_PROPERTY(bool paperGeometryActive READ paperGeometryActive NOTIFY paperGeometryChanged)
+    Q_PROPERTY(qulonglong paperGeometryRevision READ paperGeometryRevision NOTIFY paperGeometryChanged)
 public:
     explicit PageItem(QQuickItem *parent=nullptr);
     ~PageItem() override;
@@ -38,12 +39,14 @@ public:
     bool texturesReady()const{return m_texturesReady;}
     QString paperGeometryError()const{return m_paperError;}
     bool paperGeometryActive()const{return m_paperLayout.has_value();}
+    qulonglong paperGeometryRevision()const{return m_paperEpoch;}
     std::optional<LyraReaderPaperLayout> paperLayout()const{return m_paperLayout;}
     // One atomic geometry update. It does not change source pixels, raster demand or zoom.
     Q_INVOKABLE bool configurePaper(double originalHeightPt,double splitPt,double gapPt);
     Q_INVOKABLE void clearPaperGeometry();
     Q_INVOKABLE QVariantMap paperEraserSegments(const QPointF &from,const QPointF &to)const;
     Q_INVOKABLE QVariantMap paperPoint(const QPointF &display)const;
+    Q_INVOKABLE QVariantMap paperRegion(const QRectF &source,qulonglong revision)const;
     void setResourceActive(bool active);
     bool tilesEnabled() const {return m_tilesEnabled;}
     QRectF visibleRegion() const {return m_visibleRegion;}

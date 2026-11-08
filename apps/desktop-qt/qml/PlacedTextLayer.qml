@@ -6,11 +6,18 @@ Item {
     id: layer
     required property var app
     required property int page
+    property var paperMap: null
     readonly property var editor: app.placedTextEditor
     readonly property bool showing: editor.current && !!editor.entry && editor.entry.page===page && editor.token.length>0 && !editor.cancelling
     readonly property real paddingPt: 3
     readonly property real maximumWidth: showing ? Math.max(1,app.currentReader.pages[page].width-editor.rect.x) : 1
     readonly property real maximumHeight: showing ? Math.max(1,app.currentReader.pages[page].height-editor.rect.y) : 1
+    PaperRegion {
+        id: display
+        app: layer.app
+        paperMap: layer.paperMap
+        sourceRect: layer.showing ? Qt.rect(editor.rect.x,editor.rect.y,editor.rect.width,editor.rect.height) : Qt.rect(0,0,0,0)
+    }
     Text {
         id: measure
         visible: false
@@ -41,13 +48,13 @@ Item {
     TextArea {
         id: input
         objectName: "placedTextInput"+layer.page
-        visible: layer.showing
+        visible: layer.showing && display.hit
         enabled: !editor.cancelling
         readOnly: editor.closing
-        x: visible ? editor.rect.x*app.zoom : 0
-        y: visible ? editor.rect.y*app.zoom : 0
-        width: visible ? editor.rect.width*app.zoom : 0
-        height: visible ? editor.rect.height*app.zoom : 0
+        x: visible ? display.bounds.x*app.zoom : 0
+        y: visible ? display.bounds.y*app.zoom : 0
+        width: visible ? display.bounds.width*app.zoom : 0
+        height: visible ? display.bounds.height*app.zoom : 0
         // Style-specific edge padding otherwise overrides the aggregate padding.
         // Measurement and the native editor must subtract exactly the same insets.
         leftPadding:layer.paddingPt*app.zoom

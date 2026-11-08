@@ -2,7 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 
-inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 5;
+inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 6;
 
 // Owned Rust allocations: free each Buffer exactly once using buffer_free.
 // Output buffers must be zero initialized; calls do not free previous contents.
@@ -25,6 +25,11 @@ struct LyraReaderPaperQuad {LyraReaderTileRect target,source;};
 struct LyraReaderPaperQuadPair {std::uint32_t count,reserved;LyraReaderPaperQuad pieces[2];};
 struct LyraReaderPaperPoint {double x,y;};
 struct LyraReaderPaperHit {std::uint32_t present,reserved;LyraReaderPaperPoint point;};
+struct LyraReaderPaperRegion {std::uint32_t count,reserved;LyraReaderTileRect bounds,pieces[2];};
+// Clips source to original paper; native single-owner controls use bounds, static paint uses
+// pieces. Successful count=0 is absent, not an error. Failures leave the output intact.
+bool lyra_reader_desktop_paper_region(LyraReaderPaperLayout layout,double width,
+    LyraReaderTileRect source,LyraReaderPaperRegion *output,LyraReaderBuffer *error);
 // Half-open original paper hit. present=0 denotes a gap/outside; errors leave output intact.
 bool lyra_reader_desktop_paper_hit(LyraReaderPaperLayout layout,double width,
     LyraReaderPaperPoint point,LyraReaderPaperHit *output,LyraReaderBuffer *error);
