@@ -992,8 +992,8 @@ ApplicationWindow {
         enabled:root.readerKeyboardEnabled && navigationController.keyboardFocus && root.canGoForward
         onActivated:root.goForward()
     }
-    function showSelectionMenu(item, page, x, y) {
-        const hit=annotationAt(page,x/zoom,y/zoom,false);
+    function showSelectionMenu(item, page, x, y, paperPoint) {
+        const hit=annotationAt(page,paperPoint ? paperPoint.x : x/zoom,paperPoint ? paperPoint.y : y/zoom,false);
         selectedAnnotation=hit || null;
         const point = item.mapToItem(Overlay.overlay, x, y);
         dialogs.selectionMenu.x = point.x;

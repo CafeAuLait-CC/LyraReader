@@ -43,6 +43,7 @@ public:
     Q_INVOKABLE bool configurePaper(double originalHeightPt,double splitPt,double gapPt);
     Q_INVOKABLE void clearPaperGeometry();
     Q_INVOKABLE QVariantMap paperEraserSegments(const QPointF &from,const QPointF &to)const;
+    Q_INVOKABLE QVariantMap paperPoint(const QPointF &display)const;
     void setResourceActive(bool active);
     bool tilesEnabled() const {return m_tilesEnabled;}
     QRectF visibleRegion() const {return m_visibleRegion;}

@@ -1,11 +1,14 @@
 import QtQuick
 import QtQuick.Controls
+import LyraReader 1.0
 import "ReaderLogic.js" as Logic
 
 Item {
     id: annotationLayer
     required property var app
     required property int page
+    property var paperMap: null
+    readonly property bool paperActive: !!paperMap && paperMap.paperGeometryActive
     readonly property var textPage: app.currentReader.textPages[page.toString()] || {
         chars: [],
         text: ""
@@ -14,7 +17,7 @@ Item {
     readonly property var searchRects: app.activeSearchHit && app.activeSearchHit.page === page ? Logic.quads(textPage.chars, app.activeSearchHit.start, app.activeSearchHit.end - 1) : []
     Component.onCompleted: app.currentReader.requestText(page)
     Repeater {
-        model: annotationLayer.searchRects
+        model: annotationLayer.paperActive ? [] : annotationLayer.searchRects
         Rectangle {
             required property var modelData
             x: modelData.x * app.zoom
@@ -28,7 +31,7 @@ Item {
         }
     }
     Repeater {
-        model: annotationLayer.selectedRects
+        model: annotationLayer.paperActive ? [] : annotationLayer.selectedRects
         Rectangle {
             required property var modelData
             x: modelData.x * app.zoom
@@ -38,6 +41,26 @@ Item {
             color: app.colors.textSelectionBg
             opacity: 0.55
         }
+    }
+    // Reuse the native clipped vector renderer; selection colors remain UI colors rather
+    // than document-paper colors, and ordinary untorn pages retain their existing nodes.
+    PdfAnnotations {
+        objectName: "paperTextSelection"
+        anchors.fill: parent
+        visible: annotationLayer.paperActive
+        zoom: app.zoom
+        paperMap: annotationLayer.paperMap
+        opacity: .55
+        annotations: annotationLayer.paperActive ? [ {id:"ui-text-selection",kind:"highlight",blend:"normal",color:app.colors.textSelectionBg,quads:annotationLayer.selectedRects} ] : []
+    }
+    PdfAnnotations {
+        objectName: "paperSearchSelection"
+        anchors.fill: parent
+        visible: annotationLayer.paperActive
+        zoom: app.zoom
+        paperMap: annotationLayer.paperMap
+        opacity: .55
+        annotations: annotationLayer.paperActive ? [{id:"ui-search-selection",kind:"highlight",blend:"normal",color:app.colors.searchCurrentBg,quads:annotationLayer.searchRects}].concat(annotationLayer.searchRects.map(function(r){return {id:"ui-search-border",kind:"square",rect:r,color:app.colors.accentBorder,strokeWidth:1/app.zoom};})) : []
     }
     MouseArea {
         id: pointer
@@ -53,6 +76,9 @@ Item {
         property string gestureTool: "select"
         property var points: []
         property var previousPoint: null
+        property var firstPaperPoint: null
+        property var gestureOwner: null
+        property var gestureGeneration: null
         property var editBase: null
         property var keyBase: null
         property var keyOwner: null
@@ -111,20 +137,22 @@ Item {
             }
         }
         preventStealing: pressed
+        function paperPosition(mouse) {
+            if (annotationLayer.paperActive) {
+                const hit=annotationLayer.paperMap.paperPoint(Qt.point(mouse.x/app.zoom,mouse.y/app.zoom));
+                if(hit.error)app.operationStatus=hit.error;
+                return hit.hit ? {x:hit.x,y:hit.y} : null;
+            }
+            const size = app.currentReader.pages[page];
+            return size ? {x:Math.max(0,Math.min(size.width,mouse.x/app.zoom)),y:Math.max(0,Math.min(size.height,mouse.y/app.zoom))} : null;
+        }
         function position(mouse) {
             if (gestureTool === "eraser")
                 return {x: mouse.x / app.zoom, y: mouse.y / app.zoom};
-            const size = app.currentReader.pages[page];
-            return {
-                x: Math.max(0, Math.min(size.width, mouse.x / app.zoom)),
-                y: Math.max(0, Math.min(size.height, mouse.y / app.zoom))
-            };
+            return paperPosition(mouse);
         }
         function draw(p) {
-            const first = {
-                x: pressX / app.zoom,
-                y: pressY / app.zoom
-            };
+            const first = firstPaperPoint;
             const entry = {
                 kind: gestureTool,
                 page: page,
@@ -162,17 +190,22 @@ Item {
         }
         onPressed: function (mouse) {
             if (mouse.button === Qt.RightButton) {
-                app.showSelectionMenu(annotationLayer, page, mouse.x, mouse.y);
+                const p=paperPosition(mouse);
+                if(p)app.showSelectionMenu(annotationLayer, page, mouse.x, mouse.y, p);
                 return;
             }
-            forceActiveFocus();
             pressX = mouse.x;
             pressY = mouse.y;
             dragged = false;
             gestureTool = app.annotationTool;
+            gestureOwner=app.currentReader;
+            gestureGeneration=app.currentReader.documentGeneration;
             points = [];
-            app.pendingDraftRequestId = -1;
             const p = position(mouse);
+            if(!p){gestureTool="canceled";return;}
+            forceActiveFocus();
+            app.pendingDraftRequestId = -1;
+            firstPaperPoint=p;
             previousPoint = p;
             if(app.regionSelecting){gestureTool="region";app.selection=null;return;}
             if (gestureTool === "redact" && !app.canRedact) {
@@ -231,20 +264,24 @@ Item {
         onPositionChanged: function (mouse) {
             if (gestureTool === "canceled")
                 return;
-            const p = position(mouse);
             if (!(pressedButtons & Qt.LeftButton))
                 return;
+            if(gestureOwner!==app.currentReader || gestureGeneration!==app.currentReader.documentGeneration) {
+                gestureTool="canceled";editBase=null;points=[];return;
+            }
             if (Math.abs(mouse.x - pressX) + Math.abs(mouse.y - pressY) > 3)
                 dragged = true;
+            const p = position(mouse);
+            if(!p)return;
             if(gestureTool==="region") {
                 if(!app.regionSelecting){gestureTool="canceled";return;}
-                app.regionDraft={page:page,x:Math.min(pressX/app.zoom,p.x),y:Math.min(pressY/app.zoom,p.y),width:Math.abs(pressX/app.zoom-p.x),height:Math.abs(pressY/app.zoom-p.y)};
+                app.regionDraft={page:page,x:Math.min(firstPaperPoint.x,p.x),y:Math.min(firstPaperPoint.y,p.y),width:Math.abs(firstPaperPoint.x-p.x),height:Math.abs(firstPaperPoint.y-p.y)};
                 return;
             }
             if (gestureTool === "move") {
                 if (!app.selectedAnnotation || app.selectedAnnotation.id !== editBase.id)
                     return;
-                const target = Logic.translatedRect(editBase.rect, p.x - pressX / app.zoom, p.y - pressY / app.zoom, app.currentReader.pages[page]);
+                const target = Logic.translatedRect(editBase.rect, p.x - firstPaperPoint.x, p.y - firstPaperPoint.y, app.currentReader.pages[page]);
                 app.annotationDraft = Object.assign({}, editBase, Logic.geometryPatch(editBase, target), {
                     rect: target
                 });
@@ -272,10 +309,12 @@ Item {
         onReleased: function (mouse) {
             if (mouse.button !== Qt.LeftButton || gestureTool === "canceled")
                 return;
+            if(gestureOwner!==app.currentReader || gestureGeneration!==app.currentReader.documentGeneration){gestureTool="canceled";editBase=null;points=[];return;}
             if(gestureTool==="region") {
                 if(!app.regionSelecting)return;
                 const p=position(mouse);
-                app.finishRegionSelection(page,{x:Math.min(pressX/app.zoom,p.x),y:Math.min(pressY/app.zoom,p.y),width:Math.abs(pressX/app.zoom-p.x),height:Math.abs(pressY/app.zoom-p.y)});
+                if(!p){app.cancelRegionSelection();return;}
+                app.finishRegionSelection(page,{x:Math.min(firstPaperPoint.x,p.x),y:Math.min(firstPaperPoint.y,p.y),width:Math.abs(firstPaperPoint.x-p.x),height:Math.abs(firstPaperPoint.y-p.y)});
                 return;
             }
             if (gestureTool === "move") {
@@ -310,25 +349,30 @@ Item {
                 return;
             }
             if (!dragged) {
+                const p=position(mouse);
+                if(!p)return;
                 const scene = annotationLayer.mapToItem(null, mouse.x, mouse.y);
-                app.pageClicked(page, mouse.x / app.zoom, mouse.y / app.zoom, scene.x, scene.y);
+                app.pageClicked(page, p.x, p.y, scene.x, scene.y);
             } else
                 app.selectionFinished();
         }
         onCanceled: {
+            if(gestureOwner!==app.currentReader || gestureGeneration!==app.currentReader.documentGeneration)return;
             app.cancelRegionSelection();
             app.annotationDraft = null;
             app.redactionDraft = null;
             app.cancelErase();
         }
         onDoubleClicked: function (mouse) {
-            const hit = app.annotationAt(page, mouse.x / app.zoom, mouse.y / app.zoom, false);
+            const p=paperPosition(mouse);
+            if(!p)return;
+            const hit = app.annotationAt(page, p.x, p.y, false);
             if (hit) {
                 app.selectAnnotation(hit);
                 return;
             }
             const chars = annotationLayer.textPage.chars;
-            const at = Logic.nearestCharacter(chars, mouse.x / app.zoom, mouse.y / app.zoom);
+            const at = Logic.nearestCharacter(chars, p.x, p.y);
             if (at < 0)
                 return;
             let first = at, last = at;

@@ -285,6 +285,35 @@ impl PaperLayout {
         band
     }
 
+    /// A strict pointer hit, unlike extrapolatable reading anchors. Edges are half open as
+    /// in the native page rectangles: the cut belongs to the gap and its far edge to the
+    /// lower paper. Tiny gaps use the same unsplit geometry as the raster and eraser.
+    pub fn pointer_point(
+        self,
+        width: f64,
+        display: lyra_reader_core::Point,
+    ) -> Result<Option<lyra_reader_core::Point>, InvalidPaperGeometry> {
+        if !width.is_finite() || width <= 0.0 || !display.x.is_finite() || !display.y.is_finite() {
+            return Err(InvalidPaperGeometry);
+        }
+        if display.x < 0.0 || display.x >= width || display.y < 0.0 {
+            return Ok(None);
+        }
+        let y = if let Some(split) = self.displayed_split() {
+            if display.y >= split && display.y < split + self.gap_pt {
+                return Ok(None);
+            }
+            if display.y >= split + self.gap_pt {
+                display.y - self.gap_pt
+            } else {
+                display.y
+            }
+        } else {
+            display.y
+        };
+        Ok((y < self.height_pt).then_some(lyra_reader_core::Point::new(display.x, y)))
+    }
+
     /// Clip the raw display-space pointer sweep to each actual paper segment, then map
     /// endpoints back to the original page. Folding endpoints into one paper-space line
     /// first invents an eraser capsule through the conversation gap. Pieces follow segment

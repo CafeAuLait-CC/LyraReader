@@ -369,3 +369,42 @@ fn raw_pointer_sweeps_are_clipped_before_the_gap_is_removed() {
             .is_err()
     );
 }
+
+#[test]
+fn strict_pointer_hits_do_not_clamp_gaps_or_outside_paper() {
+    use lyra_reader_core::Point;
+    let p = Point::new;
+    let paper = PaperLayout::new(500.0, Some(150.0), 80.0).unwrap();
+    for display in [
+        p(-0.001, 100.0),
+        p(400.0, 100.0),
+        p(20.0, -0.001),
+        p(20.0, 150.0),
+        p(20.0, 229.999),
+        p(20.0, 580.0),
+    ] {
+        assert_eq!(paper.pointer_point(400.0, display).unwrap(), None);
+    }
+    assert_eq!(
+        paper.pointer_point(400.0, p(0.0, 0.0)).unwrap(),
+        Some(p(0.0, 0.0))
+    );
+    assert_eq!(
+        paper.pointer_point(400.0, p(20.0, 230.0)).unwrap(),
+        Some(p(20.0, 150.0))
+    );
+    assert_eq!(
+        paper.pointer_point(400.0, p(20.0, 579.0)).unwrap(),
+        Some(p(20.0, 499.0))
+    );
+    assert!(paper.pointer_point(f64::NAN, p(0.0, 0.0)).is_err());
+    assert!(paper.pointer_point(400.0, p(f64::INFINITY, 0.0)).is_err());
+    for gap in [0.0, 0.005, 0.01] {
+        let plain = PaperLayout::new(500.0, Some(150.0), gap).unwrap();
+        assert_eq!(
+            plain.pointer_point(400.0, p(20.0, 150.0)).unwrap(),
+            Some(p(20.0, 150.0))
+        );
+        assert_eq!(plain.pointer_point(400.0, p(20.0, 500.0)).unwrap(), None);
+    }
+}

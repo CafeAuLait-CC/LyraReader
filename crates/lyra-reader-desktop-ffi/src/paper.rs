@@ -34,6 +34,26 @@ pub struct Point {
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub struct Hit {
+    pub present: u32,
+    pub reserved: u32,
+    pub point: Point,
+}
+const _: () = assert!(std::mem::size_of::<Hit>() == 24);
+pub fn hit(layout: Layout, width: f64, point: Point) -> Result<Hit, String> {
+    let mapped = PaperLayout::try_from(layout)?
+        .pointer_point(width, lyra_reader_core::Point::new(point.x, point.y))
+        .map_err(|e| e.to_string())?;
+    Ok(Hit {
+        present: u32::from(mapped.is_some()),
+        reserved: 0,
+        point: mapped
+            .map(|p| Point { x: p.x, y: p.y })
+            .unwrap_or(Point { x: 0.0, y: 0.0 }),
+    })
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub struct Segment {
     pub from: Point,
     pub to: Point,

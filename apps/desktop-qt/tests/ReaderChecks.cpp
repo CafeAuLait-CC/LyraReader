@@ -2166,6 +2166,38 @@ private slots:
         QCOMPARE(output[0].count,std::uint32_t(99));QCOMPARE(output[1].count,std::uint32_t(98));
         QVERIFY(lyra_reader_desktop_paper_quads(layout,nullptr,0,nullptr,&error));QVERIFY(!error.data);
     }
+    void paperPointerSelectionAndInkSkipTheGap_data() {
+        QTest::addColumn<double>("zoom");QTest::newRow("100-percent")<<1.0;QTest::newRow("125-percent")<<1.25;
+    }
+    void paperPointerSelectionAndInkSkipTheGap() {
+        QFETCH(double,zoom);QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("paper-pointer.pdf");
+        {QPdfWriter pdf(path);pdf.setResolution(72);pdf.setPageSize(QPageSize(QSizeF(400,500),QPageSize::Point));pdf.setPageMargins(QMarginsF(0,0,0,0));QPainter painter(&pdf);QVERIFY(painter.isActive());painter.setFont(QFont("DejaVu Sans",16));painter.drawText(QPointF(50,90),"UPPER");painter.drawText(QPointF(50,270),"LOWER");}
+        ReaderController reader;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("reader",&reader);engine.load(QUrl("qrc:/qml/Main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);reader.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),1,10000);QTRY_COMPARE(reader.pendingCommands(),0);QVERIFY(settleReaderViewport(window));
+        // Opening the 46-point row can legitimately refit the viewport. Finish that change
+        // before freezing the scale used for native pointer coordinates.
+        window->setProperty("secondaryRow","annotate");QVERIFY(settleReaderViewport(window));window->setProperty("fitting",false);QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,zoom),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QTRY_VERIFY(std::abs(window->property("zoom").toDouble()-zoom)<.001);
+        auto *page=qobject_cast<PageItem *>(visualItem(window->contentItem(),"pdfPage0"));QVERIFY(page);QVERIFY(page->configurePaper(500,150,80));reader.requestText(0);QTRY_VERIFY(reader.textPages().contains("0"));
+        const auto entries=[&]{return reader.data().value("marks").toMap().value("annotations").toList();};
+        const auto point=[&](double x,double y){return page->mapToScene(QPointF(x*zoom,y*zoom)).toPoint();};
+        const auto value=[](const QVariant &v){return v.metaType()==QMetaType::fromType<QJSValue>()?v.value<QJSValue>().toVariant():v;};
+        QCOMPARE(page->paperPoint(QPointF(50,190)).value("hit").toBool(),false);QCOMPARE(page->paperPoint(QPointF(50,350)).value("y").toDouble(),270.0);QVERIFY(page->paperPoint(QPointF(qQNaN(),0)).contains("error"));
+        window->setProperty("annotationTool","select");window->setProperty("selection",QVariant());QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,point(70,190));QVERIFY(!value(window->property("selection")).isValid() || value(window->property("selection")).isNull());
+        const auto chars=reader.textPages().value("0").toMap().value("chars").toList();QVariantMap lower;
+        for(const auto &v:chars){const auto c=v.toMap();if(c.value("unicode").toInt()=='L' && c.value("y_pt").toDouble()>150){lower=c;break;}}
+        QVERIFY(!lower.isEmpty());const auto lowerPoint=point(lower.value("x_pt").toDouble()+lower.value("width_pt").toDouble()/2,lower.value("y_pt").toDouble()+lower.value("height_pt").toDouble()/2+80);
+        QTest::mouseDClick(window,Qt::LeftButton,Qt::NoModifier,lowerPoint,20);QVariant selected;QVERIFY(QMetaObject::invokeMethod(window,"selectedText",Q_RETURN_ARG(QVariant,selected)));QCOMPARE(selected.toString(),QString("LOWER"));
+        auto *selection=visualItem(window->contentItem(),"paperTextSelection");QVERIFY(selection && selection->isVisible());QVERIFY(selection->property("paperMap").value<PageItem *>()==page);
+        if(qEnvironmentVariableIsSet("LYRA_READER_PAPER_EVIDENCE_DIR")){const auto folder=qEnvironmentVariable("LYRA_READER_PAPER_EVIDENCE_DIR");QVERIFY(QDir().mkpath(folder));QTest::qWait(40);QVERIFY(window->grabWindow().save(folder+QString("/pointer-selection-%1.png").arg(zoom)));}
+        window->setProperty("selection",QVariant());window->setProperty("annotationTool","ink");
+        QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,point(50,130));QTest::mouseMove(window,point(180,190),20);QTest::mouseMove(window,point(80,350),20);QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,point(80,350),20);QTRY_COMPARE(reader.pendingCommands(),0);QCOMPARE(entries().size(),1);
+        auto points=entries().first().toMap().value("paths").toList().first().toList();QCOMPARE(points.size(),2);QVERIFY(std::abs(points.first().toMap().value("y").toDouble()-130)<1);QVERIFY(std::abs(points.last().toMap().value("y").toDouble()-270)<1);
+        reader.submit("marks_undo");QTRY_COMPARE(reader.pendingCommands(),0);QVERIFY(entries().isEmpty());
+        QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,point(50,350));QTest::mouseMove(window,point(80,360),20);QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,point(80,360),20);QTRY_COMPARE(reader.pendingCommands(),0);QCOMPARE(entries().size(),1);points=entries().first().toMap().value("paths").toList().first().toList();QVERIFY(std::abs(points.first().toMap().value("y").toDouble()-270)<1);
+        reader.submit("marks_undo");QTRY_COMPARE(reader.pendingCommands(),0);QVERIFY(entries().isEmpty());
+        QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,point(50,190));QTest::mouseMove(window,point(80,350),20);QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,point(80,350),20);QTRY_COMPARE(reader.pendingCommands(),0);QVERIFY(entries().isEmpty());
+        qInfo()<<"paper-pointer graphicsApi"<<int(window->rendererInterface()->graphicsApi())<<QGuiApplication::platformName();
+    }
     void eraserPaperGapDoesNotCutHiddenInkAndTheVisibleSweepHasOneUndo() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("paper-eraser.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
         ReaderController reader;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("reader",&reader);engine.load(QUrl("qrc:/qml/Main.qml"));

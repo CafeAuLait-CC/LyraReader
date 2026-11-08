@@ -2,7 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 
-inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 4;
+inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 5;
 
 // Owned Rust allocations: free each Buffer exactly once using buffer_free.
 // Output buffers must be zero initialized; calls do not free previous contents.
@@ -24,6 +24,10 @@ struct LyraReaderPaperLayout {double height,split,gap;std::uint32_t has_split,re
 struct LyraReaderPaperQuad {LyraReaderTileRect target,source;};
 struct LyraReaderPaperQuadPair {std::uint32_t count,reserved;LyraReaderPaperQuad pieces[2];};
 struct LyraReaderPaperPoint {double x,y;};
+struct LyraReaderPaperHit {std::uint32_t present,reserved;LyraReaderPaperPoint point;};
+// Half-open original paper hit. present=0 denotes a gap/outside; errors leave output intact.
+bool lyra_reader_desktop_paper_hit(LyraReaderPaperLayout layout,double width,
+    LyraReaderPaperPoint point,LyraReaderPaperHit *output,LyraReaderBuffer *error);
 struct LyraReaderPaperSegment {LyraReaderPaperPoint from,to;};
 struct LyraReaderPaperSegments {std::uint32_t count,reserved;LyraReaderPaperSegment pieces[2];};
 // Clip the raw display sweep to each actual piece of paper, then map back to original points.

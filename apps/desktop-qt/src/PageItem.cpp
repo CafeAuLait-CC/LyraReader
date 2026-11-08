@@ -90,6 +90,18 @@ void PageItem::clearPaperGeometry() {
     if(!m_paperLayout && m_paperError.isEmpty())return;
     ++m_paperEpoch;m_paperLayout.reset();m_paperError.clear();update();emit paperGeometryChanged();
 }
+QVariantMap PageItem::paperPoint(const QPointF &display)const {
+    if(!m_controller || m_controller->loading() || m_page<0 || m_page>=m_controller->pageCount())return {{QStringLiteral("error"),tr("The page is not ready. Try again.")}};
+    const double originalHeight=m_controller->pages().at(m_page).toMap().value(QStringLiteral("height")).toDouble();
+    const auto layout=m_paperLayout.value_or(LyraReaderPaperLayout{originalHeight,0,0,0,0});
+    LyraReaderPaperHit output{};LyraReaderBuffer error{};
+    if(!lyra_reader_desktop_paper_hit(layout,width()/m_scale,{display.x(),display.y()},&output,&error)) {
+        const auto message=QString::fromUtf8(reinterpret_cast<const char *>(error.data),qsizetype(error.len));lyra_reader_desktop_buffer_free(error);return {{QStringLiteral("error"),message}};
+    }
+    if(output.present>1)return {{QStringLiteral("error"),tr("The paper mapper returned an invalid hit.")}};
+    if(!output.present)return {{QStringLiteral("hit"),false}};
+    return {{QStringLiteral("hit"),true},{QStringLiteral("x"),output.point.x},{QStringLiteral("y"),output.point.y}};
+}
 QVariantMap PageItem::paperEraserSegments(const QPointF &from,const QPointF &to)const {
     if(!m_controller || m_controller->loading() || m_page<0 || m_page>=m_controller->pageCount())return {{QStringLiteral("error"),tr("The page is not ready. Try the eraser again.")}};
     const double originalHeight=m_controller->pages().at(m_page).toMap().value(QStringLiteral("height")).toDouble();
