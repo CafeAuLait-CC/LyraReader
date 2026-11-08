@@ -553,6 +553,16 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(window,"jumpFromPreview",Q_ARG(QVariant,2),Q_ARG(QVariant,20.0)));reader->openFile(reader->fileUrl());
         QTRY_VERIFY(!reader->loading() && reader->pendingCommands()==0 && !window->property("positionRestoring").toBool());QVERIFY(!window->property("canGoBack").toBool());
     }
+    void readerShortcutsDoNotCaptureKeysFromTheNativeOpenDialog() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/reader.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;
+        view.workspace.openFile(QUrl::fromLocalFile(path));QTRY_VERIFY(view.workspace.activeReader()->pageCount()==1 && !view.workspace.activeReader()->loading() && view.workspace.activeReader()->pendingCommands()==0);
+        QVERIFY(settleReaderViewport(window));window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);QVERIFY(window->property("readerKeyboardEnabled").toBool());
+        auto *picker=window->findChild<QObject *>("documentOpenDialog");QVERIFY(picker);QVERIFY(picker->setProperty("currentFolder",QUrl::fromLocalFile(scratch.path())));
+        const auto closePicker=qScopeGuard([&]{picker->setProperty("visible",false);});QVERIFY(QMetaObject::invokeMethod(window,"openDialog"));QTRY_VERIFY(picker->property("visible").toBool());
+        QTRY_VERIFY(QGuiApplication::focusWindow()!=window);QVERIFY(!window->property("readerKeyboardEnabled").toBool());
+        auto *dialog=QGuiApplication::focusWindow();if(!dialog)QSKIP("The platform file picker is outside this process; real keyboard acceptance remains required.");
+        QTest::keyClick(dialog,Qt::Key_Escape);QTRY_VERIFY(!picker->property("visible").toBool());window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);QVERIFY(window->property("readerKeyboardEnabled").toBool());
+    }
     void navigationKeysBelongToTheFocusedReaderInsteadOfTransientAncestors() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/navigation-keys.pdf";
         QVERIFY(QFile::copy(QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf",path));NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *window=view.window;auto *reader=view.workspace.activeReader();

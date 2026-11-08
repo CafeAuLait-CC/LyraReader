@@ -50,8 +50,8 @@ ApplicationWindow {
     property string appearance: session ? session.preference("appearance", "light") : "light"
     property string sidebarTab: "thumbnails"
     property bool aiPanelVisible: false
-    // Qt considers transient ancestors active too. Settings owns reader shortcuts while focused.
-    readonly property bool readerKeyboardEnabled: !dialogs.settingsDialog || !dialogs.settingsDialog.visible || !dialogs.settingsDialog.active
+    // Transient ancestors can stay active; only the focused reader owns its shortcuts.
+    readonly property bool readerKeyboardEnabled: navigationController.keyboardFocus && (!dialogs.settingsDialog || !dialogs.settingsDialog.visible || !dialogs.settingsDialog.active)
     property bool regionSelecting: false
     property var regionDraft: null
     function cancelRegionSelection() {regionSelecting=false;regionDraft=null;}
@@ -2267,6 +2267,7 @@ ApplicationWindow {
     }
     FileDialog {
         id: fileDialog
+        objectName: "documentOpenDialog"
         title: qsTr("Open a PDF")
         nameFilters: [qsTr("PDF documents (*.pdf)"), qsTr("All files (*)")]
         fileMode: FileDialog.OpenFiles
