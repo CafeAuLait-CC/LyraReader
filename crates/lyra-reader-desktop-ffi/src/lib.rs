@@ -13,6 +13,7 @@ mod knowledge;
 mod marks;
 mod navigation;
 mod pages;
+mod paper;
 mod region;
 mod region_store;
 mod render_source;
@@ -26,10 +27,51 @@ use std::{
     ptr, slice,
 };
 
-/// Version of the hand-written Qt C boundary, including immutable image byte access.
+/// Version of the hand-written Qt C boundary, including bounded paper-quad batches.
 #[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_desktop_abi_version() -> u32 {
-    2
+    3
+}
+
+/// # Safety
+/// For count <= 256, input spans initialized readable Quad records and output spans count
+/// writable Pair records, with no overlapping ranges or concurrent mutation. Null pointers
+/// are permitted only for count zero; alignment is checked before borrowing. Error is a
+/// distinct empty writable Buffer, freed once with buffer_free. No output owns allocations.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_paper_quads(
+    layout: paper::Layout,
+    input: *const paper::Quad,
+    count: usize,
+    output: *mut paper::Pair,
+    error: *mut Buffer,
+) -> bool {
+    // SAFETY: caller supplies the documented non-overlapping, live, initialized ranges and
+    // empty error slot. Count/null/alignment guards run before constructing either slice;
+    // the fixed batch cap bounds byte lengths well below isize::MAX.
+    unsafe {
+        run(error, || {
+            if count > paper::MAX_QUADS {
+                return Err("Paper mapping exceeds its quad batch limit".into());
+            }
+            if count == 0 {
+                return paper::map(layout, &[], &mut []);
+            }
+            if input.is_null()
+                || output.is_null()
+                || !(input as usize).is_multiple_of(std::mem::align_of::<paper::Quad>())
+                || !(output as usize).is_multiple_of(std::mem::align_of::<paper::Pair>())
+            {
+                return Err("Paper quad buffer is null or misaligned".into());
+            }
+            paper::map(
+                layout,
+                slice::from_raw_parts(input, count),
+                slice::from_raw_parts_mut(output, count),
+            )
+        })
+        .is_some()
+    }
 }
 
 /// # Safety
@@ -591,6 +633,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn paper_quad_packet_guards_precede_pointer_access() {
+        let mut error = Buffer {
+            data: ptr::null_mut(),
+            len: 0,
+        };
+        let q = paper::tests::quad();
+        let mut output = paper::tests::untouched();
+        let layout = paper::tests::layout();
+        // SAFETY: valid cases use live, aligned, non-overlapping records. Rejected cases
+        // supply null/misaligned/oversized buffers that must never be read or written.
+        // Each returned error allocation is freed exactly once before the next call.
+        unsafe {
+            assert!(lyra_reader_desktop_paper_quads(
+                layout,
+                &q,
+                1,
+                &mut output,
+                &mut error
+            ));
+            assert_eq!(output.count, 2);
+            assert!(error.data.is_null());
+            assert!(lyra_reader_desktop_paper_quads(
+                layout,
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+                &mut error
+            ));
+            let misaligned_input = ptr::without_provenance::<paper::Quad>(1);
+            let misaligned_output = ptr::without_provenance_mut::<paper::Pair>(1);
+            for (input, count, out) in [
+                (ptr::null(), 1, &mut output as *mut _),
+                (&q, 1, ptr::null_mut()),
+                (misaligned_input, 1, &mut output),
+                (&q, 1, misaligned_output),
+                (ptr::null(), 257, ptr::null_mut()),
+            ] {
+                assert!(!lyra_reader_desktop_paper_quads(
+                    layout, input, count, out, &mut error
+                ));
+                assert!(!error.data.is_null());
+                lyra_reader_desktop_buffer_free(error);
+                error = Buffer {
+                    data: ptr::null_mut(),
+                    len: 0,
+                };
+            }
+        }
+    }
+
+    #[test]
     fn tile_plan_packet_boundaries_keep_owned_buffers_balanced() {
         let empty = || Buffer {
             data: ptr::null_mut(),
@@ -773,7 +866,7 @@ mod tests {
 
     #[test]
     fn image_byte_boundary_rejects_null_handles_and_reports_its_version() {
-        assert_eq!(lyra_reader_desktop_abi_version(), 2);
+        assert_eq!(lyra_reader_desktop_abi_version(), 3);
         let mut error = Buffer {
             data: ptr::null_mut(),
             len: 0,

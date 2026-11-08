@@ -114,8 +114,26 @@ QSGNode *PaperAppearance::createNode(QQuickWindow *window,const QImage &source,i
     return node;
 }
 void PaperAppearance::updateNode(QSGNode *base,const QRectF &bounds,int mode,const QRectF &sourceRect) {
+    const Quad quad{bounds,sourceRect};updateNodeQuads(base,&quad,1,mode);
+}
+void PaperAppearance::updateNodeQuads(QSGNode *base,const Quad *quads,int count,int mode) {
+    Q_ASSERT(count==1 || count==2);
     auto *node=static_cast<PaperNode *>(base);
-    QSGGeometry::updateTexturedRectGeometry(&node->vertices,bounds,sourceRect);
+    if(count==1) {
+        if(node->vertices.vertexCount()!=4)node->vertices.allocate(4);
+        node->vertices.setDrawingMode(QSGGeometry::DrawTriangleStrip);
+        QSGGeometry::updateTexturedRectGeometry(&node->vertices,quads[0].target,quads[0].source);
+    }else {
+        if(node->vertices.vertexCount()!=12)node->vertices.allocate(12);
+        node->vertices.setDrawingMode(QSGGeometry::DrawTriangles);
+        auto *vertices=node->vertices.vertexDataAsTexturedPoint2D();
+        for(int i=0;i<2;++i) {
+            const auto &r=quads[i].target;const auto &uv=quads[i].source;
+            const std::array<QPointF,6> positions{r.topLeft(),r.bottomLeft(),r.topRight(),r.topRight(),r.bottomLeft(),r.bottomRight()};
+            const std::array<QPointF,6> sources{uv.topLeft(),uv.bottomLeft(),uv.topRight(),uv.topRight(),uv.bottomLeft(),uv.bottomRight()};
+            for(int v=0;v<6;++v)vertices[i*6+v].set(float(positions[v].x()),float(positions[v].y()),float(sources[v].x()),float(sources[v].y()));
+        }
+    }
     node->markDirty(QSGNode::DirtyGeometry);
     if(node->paint.appearance!=mode) {
         node->paint.appearance=mode;

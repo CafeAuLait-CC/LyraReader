@@ -1,5 +1,6 @@
 #pragma once
 #include "RenderBudget.h"
+#include "PaperAppearance.h"
 #include <QSGTransformNode>
 class QQuickWindow;
 class QQuickItem;
@@ -12,6 +13,7 @@ public:
     ~BudgetedTexture()override;
     bool setImage(QQuickWindow *window,const ResidentImage &image,int appearance);
     void setRect(const QRectF &target,const QRectF &source=QRectF(0,0,1,1));
+    bool setRects(const PaperAppearance::Quad *quads,int count);
     bool empty()const{return !m_child;}
 private:
     void clear();

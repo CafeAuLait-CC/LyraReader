@@ -2,7 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 
-inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 2;
+inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 3;
 
 // Owned Rust allocations: free each Buffer exactly once using buffer_free.
 // Output buffers must be zero initialized; calls do not free previous contents.
@@ -20,6 +20,14 @@ struct LyraReaderBitmap {
 };
 // Returned page-local point geometry is immutable until its one batch owner is freed.
 struct LyraReaderTileRect {double x,y,width,height;};
+struct LyraReaderPaperLayout {double height,split,gap;std::uint32_t has_split,reserved;};
+struct LyraReaderPaperQuad {LyraReaderTileRect target,source;};
+struct LyraReaderPaperQuadPair {std::uint32_t count,reserved;LyraReaderPaperQuad pieces[2];};
+// Pure display geometry. Caller-owned, non-overlapping arrays, at most 256 quads. Geometry
+// is page-local 100% view points; no PDF, texture or I/O. Successful mapping allocates nothing. Zero count validates
+// layout only and permits null arrays. All outputs stay untouched on invalid input.
+bool lyra_reader_desktop_paper_quads(LyraReaderPaperLayout layout,const LyraReaderPaperQuad *input,
+    std::size_t count,LyraReaderPaperQuadPair *output,LyraReaderBuffer *error);
 struct LyraReaderPlannedTile {std::uint32_t column,row;LyraReaderTileRect target,render;};
 struct LyraReaderPagePlan {
     std::uint32_t page;std::int32_t tier;double scale;std::size_t tile_count;

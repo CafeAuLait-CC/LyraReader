@@ -20,6 +20,8 @@ class PageItem : public QQuickItem {
     Q_PROPERTY(int loadedTileCount READ loadedTileCount NOTIFY refinementChanged)
     Q_PROPERTY(bool resourceActive READ resourceActive WRITE setResourceActive NOTIFY resourceActiveChanged)
     Q_PROPERTY(bool texturesReady READ texturesReady NOTIFY texturesReadyChanged)
+    Q_PROPERTY(QString paperGeometryError READ paperGeometryError NOTIFY paperGeometryChanged)
+    Q_PROPERTY(bool paperGeometryActive READ paperGeometryActive NOTIFY paperGeometryChanged)
 public:
     explicit PageItem(QQuickItem *parent=nullptr);
     ~PageItem() override;
@@ -34,6 +36,11 @@ public:
     bool embeddedAnnotations() const {return m_embedded;}
     bool resourceActive()const{return m_resourceActive;}
     bool texturesReady()const{return m_texturesReady;}
+    QString paperGeometryError()const{return m_paperError;}
+    bool paperGeometryActive()const{return m_paperLayout.has_value();}
+    // One atomic geometry update. It does not change source pixels, raster demand or zoom.
+    Q_INVOKABLE bool configurePaper(double originalHeightPt,double splitPt,double gapPt);
+    Q_INVOKABLE void clearPaperGeometry();
     void setResourceActive(bool active);
     bool tilesEnabled() const {return m_tilesEnabled;}
     QRectF visibleRegion() const {return m_visibleRegion;}
@@ -50,6 +57,7 @@ signals:
     void visibleRegionChanged();void refinementChanged();
     void resourceActiveChanged();
     void texturesReadyChanged();
+    void paperGeometryChanged();
 protected:
     QSGNode *updatePaintNode(QSGNode *node,UpdatePaintNodeData *) override;
     void itemChange(ItemChange change,const ItemChangeData &data) override;
@@ -81,4 +89,7 @@ private:
     bool m_texturesReady=false;
     quint64 m_textureEpoch=0;
     QTimer m_requestTimer;
+    std::optional<LyraReaderPaperLayout> m_paperLayout;
+    QString m_paperError;
+    quint64 m_paperEpoch=0;
 };

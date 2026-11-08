@@ -5,8 +5,10 @@
 #include <QSGImageNode>
 #include <QSGTransformNode>
 #include <cmath>
+#include <limits>
 
 namespace {
+constexpr double maximumRasterScale=128;
 // An explicit transform root preserves item transforms and software clips.
 class PageScene final:public QSGTransformNode {
 public:
@@ -60,18 +62,35 @@ void PageItem::resetImages() {
 }
 void PageItem::setController(ReaderController *controller) {
     if(m_controller==controller)return;
-    resetImages();for(const auto &connection:m_connections)QObject::disconnect(connection);m_connections.clear();
+    resetImages();clearPaperGeometry();for(const auto &connection:m_connections)QObject::disconnect(connection);m_connections.clear();
     m_controller=controller;
     if(controller) {
         m_connections.append(connect(controller,&ReaderController::pageReady,this,[this](int page,double){if(page==m_page)refresh();}));
         m_connections.append(connect(controller,&ReaderController::tileReady,this,[this](int page){if(page==m_page)refresh();}));
         m_connections.append(connect(controller,&ReaderController::documentReset,this,&PageItem::resetImages));
+        m_connections.append(connect(controller,&ReaderController::documentReset,this,&PageItem::clearPaperGeometry));
         m_connections.append(connect(controller,&ReaderController::documentChanged,this,[this]{m_requestTimer.start();}));
     }
     m_requestTimer.start();update();emit controllerChanged();
 }
-void PageItem::setPageIndex(int page) {if(m_page==page)return;resetImages();m_page=page;refresh();m_requestTimer.start();emit pageIndexChanged();}
-void PageItem::setRasterScale(double scale) {if(!std::isfinite(scale) || scale<=0 || scale>128 || qFuzzyCompare(m_scale,scale))return;m_scale=scale;m_demandCurrent=false;setRefined(false);m_requestTimer.start();refresh();emit rasterScaleChanged();update();}
+void PageItem::setPageIndex(int page) {if(m_page==page)return;resetImages();clearPaperGeometry();m_page=page;refresh();m_requestTimer.start();emit pageIndexChanged();}
+bool PageItem::configurePaper(double height,double split,double gap) {
+    const LyraReaderPaperLayout layout{height,split,gap,1,0};LyraReaderBuffer error{};
+    // Cover every later supported zoom as well, before converting targets to QSG float data.
+    const double limit=double(std::numeric_limits<float>::max())/(4*maximumRasterScale);
+    if(height>limit || gap>limit) {m_paperError=tr("The inserted paper is outside the scene coordinate range.");emit paperGeometryChanged();return false;}
+    if(!lyra_reader_desktop_paper_quads(layout,nullptr,0,nullptr,&error)) {
+        m_paperError=QString::fromUtf8(reinterpret_cast<const char *>(error.data),qsizetype(error.len));
+        lyra_reader_desktop_buffer_free(error);emit paperGeometryChanged();return false;
+    }
+    if(m_paperLayout && m_paperLayout->height==height && m_paperLayout->split==split && m_paperLayout->gap==gap && m_paperError.isEmpty())return true;
+    ++m_paperEpoch;m_paperLayout=layout;m_paperError.clear();update();emit paperGeometryChanged();return true;
+}
+void PageItem::clearPaperGeometry() {
+    if(!m_paperLayout && m_paperError.isEmpty())return;
+    ++m_paperEpoch;m_paperLayout.reset();m_paperError.clear();update();emit paperGeometryChanged();
+}
+void PageItem::setRasterScale(double scale) {if(!std::isfinite(scale) || scale<=0 || scale>maximumRasterScale || qFuzzyCompare(m_scale,scale))return;m_scale=scale;m_demandCurrent=false;setRefined(false);m_requestTimer.start();refresh();emit rasterScaleChanged();update();}
 void PageItem::setPaperAppearance(const QString &appearance) {if(m_paperAppearance==appearance)return;m_paperAppearance=appearance;update();emit paperAppearanceChanged();}
 void PageItem::setEmbeddedAnnotations(bool enabled) {if(m_embedded==enabled)return;m_embedded=enabled;resetImages();m_requestTimer.start();emit embeddedAnnotationsChanged();}
 void PageItem::setTilesEnabled(bool enabled) {if(m_tilesEnabled==enabled)return;m_tilesEnabled=enabled;m_demandCurrent=false;setRefined(false);m_requestTimer.start();emit tilesEnabledChanged();}
@@ -171,28 +190,58 @@ void PageItem::itemChange(ItemChange change,const ItemChangeData &data) {
 }
 QSGNode *PageItem::updatePaintNode(QSGNode *old,UpdatePaintNodeData *) {
     auto *root=static_cast<PageScene *>(old);
-    if(!loaded()){delete root;return nullptr;}
+    if(!loaded() || width()<=0 || height()<=0){delete root;return nullptr;}
     if(!root)root=new PageScene;
     const int appearance=PaperAppearance::mode(m_paperAppearance);
     QStringList order;bool orderChanged=false,blocked=false;
-    const auto append=[&](const QString &key,const ResidentImage &image,const QRectF &target,const QRectF &source) {
+    const auto append=[&](const QString &key,const ResidentImage &image,const PaperAppearance::Quad *quads,int count) {
         if(image.isNull())return;
         auto *node=root->images.value(key);
         if(!node){node=new BudgetedTexture(this);root->images.insert(key,node);root->appendChildNode(node);orderChanged=true;}
         if(!node->setImage(window(),image,appearance))blocked=true;
         if(node->empty())return;
-        node->setRect(target,source);order.append(key);
+        if(!node->setRects(quads,count))blocked=true;order.append(key);
     };
-    append(QStringLiteral("base"),m_image,boundingRect(),QRectF(0,0,1,1));
+    struct Draw {QString key;ResidentImage image;QRectF target,source;};
+    QVector<Draw> draws;
+    const auto collect=[&](const QString &key,const ResidentImage &image,const QRectF &target,const QRectF &source) {
+        if(image.isNull())return;
+        if(m_paperLayout){draws.append({key,image,target,source});return;}
+        // Keep the ordinary reader path free of paper-batch allocations or FFI calls.
+        const QRectF logical=key==QStringLiteral("base")?boundingRect():QRectF(target.x()*m_scale,target.y()*m_scale,target.width()*m_scale,target.height()*m_scale);
+        const PaperAppearance::Quad quad{logical,source};append(key,image,&quad,1);
+    };
+    const QRectF paper= m_paperLayout ? QRectF(0,0,width()/m_scale,m_paperLayout->height) : QRectF(0,0,width()/m_scale,height()/m_scale);
+    collect(QStringLiteral("base"),m_image,paper,QRectF(0,0,1,1));
     const auto tiles=[&](const QList<TileSpec> &specs,const QHash<QString,ResidentImage> &images) {
         for(const auto &tile:specs) {
             if(!tile.target.intersects(m_visibleRegion))continue;
             const auto image=images.value(tile.key);if(image.isNull())continue;
             const QRectF texture((tile.target.x()-tile.render.x())*tile.scale/image.pixels.width(),(tile.target.y()-tile.render.y())*tile.scale/image.pixels.height(),tile.target.width()*tile.scale/image.pixels.width(),tile.target.height()*tile.scale/image.pixels.height());
-            append(tile.key,image,QRectF(tile.target.x()*m_scale,tile.target.y()*m_scale,tile.target.width()*m_scale,tile.target.height()*m_scale),texture);
+            collect(tile.key,image,tile.target,texture);
         }
     };
     tiles(m_previousTiles,m_previousImages);tiles(m_tiles,m_tileImages);
+    QVector<LyraReaderPaperQuadPair> mapped;
+    if(m_paperLayout) {
+        QVector<LyraReaderPaperQuad> requests;requests.reserve(draws.size());
+        const auto rect=[](const QRectF &r){return LyraReaderTileRect{r.x(),r.y(),r.width(),r.height()};};
+        for(const auto &draw:draws)requests.append({rect(draw.target),rect(draw.source)});
+        mapped.resize(draws.size());LyraReaderBuffer error{};
+        if(!lyra_reader_desktop_paper_quads(*m_paperLayout,requests.constData(),std::size_t(requests.size()),mapped.data(),&error)) {
+            const auto message=QString::fromUtf8(reinterpret_cast<const char *>(error.data),qsizetype(error.len));lyra_reader_desktop_buffer_free(error);
+            const auto epoch=m_paperEpoch;
+            QMetaObject::invokeMethod(this,[this,epoch,message]{if(epoch==m_paperEpoch && message!=m_paperError){m_paperError=message;emit paperGeometryChanged();}},Qt::QueuedConnection);
+            delete root;return nullptr;
+        }
+    }
+    for(qsizetype i=0;i<draws.size();++i) {
+        const auto &draw=draws[i];PaperAppearance::Quad quads[2];int count=1;
+        const auto &pair=mapped[i];count=int(pair.count);
+        for(int k=0;k<count;++k){const auto &q=pair.pieces[k];quads[k]={QRectF(q.target.x,q.target.y,q.target.width,q.target.height),QRectF(q.source.x,q.source.y,q.source.width,q.source.height)};}
+        for(int k=0;k<count;++k){auto &r=quads[k].target;r=QRectF(r.x()*m_scale,r.y()*m_scale,r.width()*m_scale,r.height()*m_scale);}
+        append(draw.key,draw.image,quads,count);
+    }
     for(auto it=root->images.begin();it!=root->images.end();) {
         if(!order.contains(it.key())){root->removeChildNode(it.value());delete it.value();it=root->images.erase(it);}else ++it;
     }

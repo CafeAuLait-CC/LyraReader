@@ -4,6 +4,40 @@
 #include <QSGImageNode>
 #include <QQuickItem>
 
+namespace {
+// The software renderer needs one image node per rect, but both borrow exactly one texture.
+// Destroy every borrowing node before its texture, and keep the existing one payload lease.
+// An explicit transform root preserves the parent's offset for both software image siblings.
+class SoftwarePaperNode final:public QSGTransformNode {
+public:
+    SoftwarePaperNode(QQuickWindow *window,QSGImageNode *first,QSGTexture *texture)
+        :m_window(window),m_texture(texture),m_first(first) {
+        configure(first);appendChildNode(first);
+    }
+    ~SoftwarePaperNode()override {
+        while(auto *child=firstChild()){removeChildNode(child);delete child;}
+        delete m_texture;
+    }
+    bool setRects(const PaperAppearance::Quad *quads,int count,const QSize &pixels) {
+        if(count==2 && !m_second) {
+            m_second=m_window->createImageNode();if(!m_second)return false;
+            configure(m_second);appendChildNode(m_second);
+        }else if(count==1 && m_second){removeChildNode(m_second);delete m_second;m_second=nullptr;}
+        for(int i=0;i<count;++i) {
+            auto *node=i?m_second:m_first;const auto &r=quads[i].source;
+            node->setRect(quads[i].target);
+            node->setSourceRect(QRectF(r.x()*pixels.width(),r.y()*pixels.height(),r.width()*pixels.width(),r.height()*pixels.height()));
+        }
+        return true;
+    }
+private:
+    void configure(QSGImageNode *node){node->setTexture(m_texture);node->setOwnsTexture(false);node->setFiltering(QSGTexture::Linear);}
+    QQuickWindow *m_window;
+    QSGTexture *m_texture;
+    QSGImageNode *m_first,*m_second=nullptr;
+};
+}
+
 void BudgetedTexture::clear(){if(m_child){removeChildNode(m_child);delete m_child;m_child=nullptr;}m_texture.reset();m_source={};}
 BudgetedTexture::~BudgetedTexture(){QObject::disconnect(m_stopConnection);clear();}
 bool BudgetedTexture::setImage(QQuickWindow *window,const ResidentImage &image,int appearance) {
@@ -22,7 +56,7 @@ bool BudgetedTexture::setImage(QQuickWindow *window,const ResidentImage &image,i
         auto *node=window->createImageNode();
         if(node) {
             auto *texture=window->createTextureFromImage(PaperAppearance::displayImage(image.pixels,appearance));
-            if(texture){node->setTexture(texture);node->setOwnsTexture(true);node->setFiltering(QSGTexture::Linear);replacement=node;}
+            if(texture)replacement=new SoftwarePaperNode(window,node,texture);
             else delete node;
         }
     }else replacement=PaperAppearance::createNode(window,image.pixels,appearance);
@@ -32,9 +66,10 @@ bool BudgetedTexture::setImage(QQuickWindow *window,const ResidentImage &image,i
     appendChildNode(m_child);return true;
 }
 void BudgetedTexture::setRect(const QRectF &target,const QRectF &source) {
-    if(!m_child)return;
-    if(m_software) {
-        auto *node=static_cast<QSGImageNode *>(m_child);const auto &image=m_source.pixels;
-        node->setRect(target);node->setSourceRect(QRectF(source.x()*image.width(),source.y()*image.height(),source.width()*image.width(),source.height()*image.height()));
-    }else PaperAppearance::updateNode(m_child,target,m_appearance,source);
+    const PaperAppearance::Quad quad{target,source};setRects(&quad,1);
+}
+bool BudgetedTexture::setRects(const PaperAppearance::Quad *quads,int count) {
+    if(!m_child || !quads || (count!=1 && count!=2))return false;
+    if(m_software)return static_cast<SoftwarePaperNode *>(m_child)->setRects(quads,count,m_source.pixels.size());
+    PaperAppearance::updateNodeQuads(m_child,quads,count,m_appearance);return true;
 }

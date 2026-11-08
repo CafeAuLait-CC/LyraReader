@@ -1,0 +1,190 @@
+//! Typed, allocation-free paper-quad batch control for the Qt scene graph.
+use crate::tile_plan::Rect;
+use lyra_reader_session::paper::{PaperLayout, PaperQuad};
+
+pub const MAX_QUADS: usize = 256;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Layout {
+    pub height: f64,
+    pub split: f64,
+    pub gap: f64,
+    pub has_split: u32,
+    pub reserved: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Quad {
+    pub target: Rect,
+    pub source: Rect,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Pair {
+    pub count: u32,
+    pub reserved: u32,
+    pub pieces: [Quad; 2],
+}
+const _: () = assert!(std::mem::size_of::<Layout>() == 32);
+const _: () = assert!(std::mem::size_of::<Quad>() == 64);
+const _: () = assert!(std::mem::size_of::<Pair>() == 136);
+
+impl From<Rect> for lyra_reader_core::Rect {
+    fn from(r: Rect) -> Self {
+        Self::new(r.x, r.y, r.width, r.height)
+    }
+}
+impl From<lyra_reader_core::Rect> for Rect {
+    fn from(r: lyra_reader_core::Rect) -> Self {
+        Self {
+            x: r.min_x(),
+            y: r.min_y(),
+            width: r.size.width,
+            height: r.size.height,
+        }
+    }
+}
+impl From<Quad> for PaperQuad {
+    fn from(q: Quad) -> Self {
+        Self {
+            target: q.target.into(),
+            source: q.source.into(),
+        }
+    }
+}
+impl From<PaperQuad> for Quad {
+    fn from(q: PaperQuad) -> Self {
+        Self {
+            target: q.target.into(),
+            source: q.source.into(),
+        }
+    }
+}
+impl TryFrom<Layout> for PaperLayout {
+    type Error = String;
+    fn try_from(layout: Layout) -> Result<Self, String> {
+        if layout.reserved != 0
+            || layout.has_split > 1
+            || layout.has_split == 0 && layout.split != 0.0
+        {
+            return Err("Invalid paper-layout flags".into());
+        }
+        Self::new(
+            layout.height,
+            (layout.has_split == 1).then_some(layout.split),
+            layout.gap,
+        )
+        .map_err(|e| e.to_string())
+    }
+}
+
+pub fn map(layout: Layout, input: &[Quad], output: &mut [Pair]) -> Result<(), String> {
+    if input.len() > MAX_QUADS || output.len() != input.len() {
+        return Err("Invalid paper-quad batch size".into());
+    }
+    let paper = PaperLayout::try_from(layout)?;
+    // Validate the entire immutable input before publishing any output. The second small
+    // arithmetic pass avoids allocating a temporary batch on every scene-graph update.
+    for q in input {
+        paper.quads((*q).into()).map_err(|e| e.to_string())?;
+    }
+    for (q, out) in input.iter().zip(output) {
+        let pieces = paper.quads((*q).into()).map_err(|e| e.to_string())?;
+        let first: Quad = pieces.first.into();
+        *out = Pair {
+            count: if pieces.second.is_some() { 2 } else { 1 },
+            reserved: 0,
+            // The tail is excluded by count; keeping initialized geometry avoids exposing
+            // padding/uninitialized values if a native diagnostic inspects the packet.
+            pieces: [first, pieces.second.map(Quad::from).unwrap_or(first)],
+        };
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    pub(crate) fn layout() -> Layout {
+        Layout {
+            height: 12.0,
+            split: 4.0,
+            gap: 3.0,
+            has_split: 1,
+            reserved: 0,
+        }
+    }
+    pub(crate) fn quad() -> Quad {
+        Quad {
+            target: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 8.0,
+                height: 12.0,
+            },
+            source: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        }
+    }
+    pub(crate) fn untouched() -> Pair {
+        Pair {
+            count: 99,
+            reserved: 98,
+            pieces: [quad(); 2],
+        }
+    }
+    #[test]
+    fn typed_batch_uses_original_uvs_and_all_outputs_are_atomic() {
+        let mut output = [untouched(); 2];
+        let original = quad();
+        map(layout(), &[original, original], &mut output).unwrap();
+        assert_eq!(output[0].count, 2);
+        assert_eq!(output[0].pieces[0].target.height, 4.0);
+        assert_eq!(output[0].pieces[1].target.y, 7.0);
+        assert_eq!(output[0].pieces[1].target.height, 8.0);
+        assert_eq!(output[0].pieces[1].source.y, 1.0 / 3.0);
+        let mut bad = quad();
+        bad.source.width = f64::NAN;
+        output = [untouched(); 2];
+        assert!(map(layout(), &[original, bad], &mut output).is_err());
+        assert!(output.iter().all(|p| p.count == 99 && p.reserved == 98));
+    }
+    #[test]
+    fn flags_bounds_and_empty_validation_are_explicit() {
+        assert!(map(layout(), &[], &mut []).is_ok());
+        for bad in [
+            Layout {
+                reserved: 1,
+                ..layout()
+            },
+            Layout {
+                has_split: 2,
+                ..layout()
+            },
+            Layout {
+                has_split: 0,
+                ..layout()
+            },
+            Layout {
+                gap: f64::NAN,
+                ..layout()
+            },
+        ] {
+            assert!(map(bad, &[], &mut []).is_err());
+        }
+        assert!(
+            map(
+                layout(),
+                &[quad(); MAX_QUADS + 1],
+                &mut [untouched(); MAX_QUADS + 1]
+            )
+            .is_err()
+        );
+        assert!(map(layout(), &[quad()], &mut []).is_err());
+    }
+}
