@@ -103,6 +103,11 @@ Reference and figure indices use bounded shared-engine steps, yielding between s
 raster work. Page-local citation lookups use the same cooperative gate. Previews share the pinned
 revision and completed indices; closing or switching a reader cancels its pending scan without
 publishing a partial collection or cancelling a different frozen reader's query.
+Page surfaces request bounded batches of tile geometry, density and submission order from the shared
+Rust grid planner. Qt retains its caches, resident-pixel and texture leases, cancellation and GPU
+uploads. Quarter-octave density tiers and visible-only demand remain unchanged; equal-distance
+submissions have a stable row/column tie order. The macOS planner retains its existing boundary,
+prefetch and drawer-retention defaults over the same grid primitives.
 A byte-bounded revisit cache retains reduced page images after sharp sources leave the working
 set. Unloaded pages already use the selected reading-mode paper colour.
 Tabs reorder after half a tab width of travel, retain their reader state, and support

@@ -126,6 +126,19 @@ static bool clickDialogButton(QQuickWindow *window,QObject *dialog,const QString
     return false;
 }
 
+// A native compositor can acknowledge a different initial size after engine data
+// is ready. Drain that configuration and the viewport's queued fit before input.
+static bool settleReaderViewport(QQuickWindow *window) {
+    QElapsedTimer timer;timer.start();QVariantList previous;int stable=0;
+    while(timer.elapsed()<5000) {
+        QTest::qWait(40);auto *list=visualItem(window->contentItem(),"pageList");if(!list)return false;
+        const QVariantList current{window->width(),window->height(),window->effectiveDevicePixelRatio(),window->property("calibrationFactor"),window->property("zoom"),list->width(),list->height(),list->property("contentWidth"),list->property("contentHeight")};
+        if(current==previous && !window->property("positionRestoring").toBool())++stable;else stable=0;
+        if(stable>=3)return true;previous=current;
+    }
+    return false;
+}
+
 class ReaderChecks : public QObject {
     Q_OBJECT
 public:
@@ -250,11 +263,15 @@ private slots:
         engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("reader",reader);engine.rootContext()->setContextProperty("workspace",&workspace);
         engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
         reader->openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),9,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(settleReaderViewport(window));
         QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,6),Q_ARG(QVariant,0)));QTRY_COMPARE(window->property("currentPage").toInt(),6);
         QVERIFY(QMetaObject::invokeMethod(window,"actualSize"));const auto factor=window->property("calibrationFactor").toDouble();
         QVERIFY(std::abs(window->property("zoom").toDouble()-factor)<1e-9);QVERIFY(std::abs(window->property("zoomPercent").toDouble()-100)<1e-9);
         QVERIFY(QMetaObject::invokeMethod(window,"zoomBy",Q_ARG(QVariant,1.2)));QVERIFY(std::abs(window->property("zoomPercent").toDouble()-110)<1e-9);
         QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));QVERIFY(std::abs(workspace.viewState(reader).value("zoomPercent").toDouble()-110)<1e-9);
+        // Centre-anchored zoom may legitimately put a preceding page under the
+        // viewport's reading probe. Select the fit target explicitly.
+        QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,6),Q_ARG(QVariant,0)));
         QVERIFY(QMetaObject::invokeMethod(window,"fitPage"));QTRY_COMPARE(window->property("currentPage").toInt(),6);QCOMPARE(window->property("fitPreset").toString(),QStringLiteral("page"));
         const double fit=window->property("zoom").toDouble();auto *view=visualItem(window->contentItem(),"pageList");QVERIFY(view);
         const auto page=reader->pages().at(6).toMap();QVERIFY(page.value("height").toDouble()*fit<=view->height()-16+.01);
@@ -280,11 +297,15 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
         QTRY_VERIFY(!window->property("positionRestoring").toBool());
         auto *list=visualItem(window->contentItem(),"pageList");QVERIFY(list);
+        QVERIFY(settleReaderViewport(window));
+        // The tool row changes the real viewport even when a tiling compositor
+        // owns the top-level height and declines application resize requests.
+        QVERIFY(QMetaObject::invokeMethod(window,"toggleSecondaryRow",Q_ARG(QVariant,"annotate")));QVERIFY(settleReaderViewport(window));
         const double calibration=window->property("calibrationFactor").toDouble();
         auto choose=[&](double percent){window->setProperty("fitting",false);return QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,percent/100*calibration),Q_ARG(QVariant,0),Q_ARG(QVariant,0));};
-        QVERIFY(choose(25));window->resize(1140,640);QTest::qWait(100);
+        QVERIFY(choose(25));window->resize(window->width()+40,window->height());QVERIFY(settleReaderViewport(window));
         QCOMPARE(window->property("zoomPercent").toDouble(),25.0);
-        window->resize(1140,800);
+        QVERIFY(QMetaObject::invokeMethod(window,"toggleSecondaryRow",Q_ARG(QVariant,"annotate")));
         const auto pageHeight=reader->pages().first().toMap().value("height").toDouble();
         const auto fit=[&]{return std::clamp(std::floor((list->height()-16)/pageHeight/calibration*100),25.0,400.0);};
         QTRY_VERIFY(std::abs(window->property("zoomPercent").toDouble()-fit())<1e-7);
@@ -297,7 +318,7 @@ private slots:
         QCOMPARE(window->property("zoomPercent").toDouble(),25.0);
         const auto height=list->height();window->setProperty("sidebarVisible",!window->property("sidebarVisible").toBool());QTest::qWait(120);
         QCOMPARE(list->height(),height);QCOMPARE(window->property("zoomPercent").toDouble(),25.0);
-        QVERIFY(choose(300));window->resize(1140,720);QTest::qWait(100);
+        QVERIFY(choose(300));QVERIFY(QMetaObject::invokeMethod(window,"toggleSecondaryRow",Q_ARG(QVariant,"annotate")));QVERIFY(settleReaderViewport(window));
         QVERIFY(std::abs(window->property("zoomPercent").toDouble()-300)<1e-7);
     }
     void multiPageResizePreservesPercentAndClampsBothLayouts() {
@@ -487,10 +508,11 @@ private slots:
         if(qEnvironmentVariableIsSet("LYRA_READER_NAVIGATION_DARK_NARROW")){window->setProperty("appearance","dark");window->resize(700,600);}
         QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),9,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTRY_VERIFY(!window->property("positionRestoring").toBool());
         QVERIFY(QMetaObject::invokeMethod(window,"setPageLayout",Q_ARG(QVariant,layout)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(settleReaderViewport(window));
         window->setProperty("fitting",false);const double scale=1.375*window->property("calibrationFactor").toDouble();
         QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,scale),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
         QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,6),Q_ARG(QVariant,150.0)));
-        auto *list=visualItem(window->contentItem(),"pageList");QVERIFY(list);list->setProperty("contentX",75.0);
+        auto *list=visualItem(window->contentItem(),"pageList");QVERIFY(list);list->setProperty("contentX",std::min(75.0,std::max(0.0,list->property("contentWidth").toDouble()-list->width())));
         window->setProperty("selection",QVariantMap{{"page",6},{"start",19},{"end",4}});
         QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));const auto saved=view.workspace.viewState(reader);
         QVERIFY(QMetaObject::invokeMethod(window,"jumpFromPreview",Q_ARG(QVariant,2),Q_ARG(QVariant,80.0)));
@@ -635,7 +657,11 @@ private slots:
                 // fits both pages before zooming, instead of relying on a sticky preset.
                 QVERIFY(QMetaObject::invokeMethod(window,"fitWidth"));
             }
+            QVERIFY(settleReaderViewport(window));
             window->setProperty("fitting",false);
+            // Start at the loop's minimum scale so the chosen anchor remains
+            // representable: zoom-out clamping is exercised by separate cases.
+            QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,2.7),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
             QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,6),Q_ARG(QVariant,150.0)));
             const auto page=[&]{return visualItem(window->contentItem(),"pdfPage6");};
             QTRY_VERIFY_WITH_TIMEOUT(page() && page()->property("texturesReady").toBool(),10000);
@@ -646,7 +672,7 @@ private slots:
                 QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,scale),Q_ARG(QVariant,anchor.x()),Q_ARG(QVariant,anchor.y())));
                 QTest::qWait(16);QVERIFY(page());
                 const auto actual=page()->mapFromItem(view,anchor)/scale;
-                QVERIFY2(QLineF(point,actual).length()<0.5,qPrintable(QString("Zoom anchor drift: %1 pt").arg(QLineF(point,actual).length())));
+                QVERIFY2(QLineF(point,actual).length()<0.5,qPrintable(QString("Zoom anchor drift: %1 pt step=%2 initial=(%3,%4) actual=(%5,%6) zoom=%7 width=%8").arg(QLineF(point,actual).length()).arg(step).arg(point.x()).arg(point.y()).arg(actual.x()).arg(actual.y()).arg(window->property("zoom").toDouble()).arg(view->width())));
             }
             QTRY_VERIFY_WITH_TIMEOUT(page() && page()->property("texturesReady").toBool(),10000);QCOMPARE(window->property("currentPage").toInt(),facing?5:6);
             // Retain a specifically selected right-hand page as well as the row anchor.
@@ -1053,10 +1079,11 @@ private slots:
         reader.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),1,10000);
         QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
         QTRY_VERIFY_WITH_TIMEOUT(visualItem(window->contentItem(),"pdfPage0") && visualItem(window->contentItem(),"pdfPage0")->property("texturesReady").toBool(),10000);
+        QVERIFY(settleReaderViewport(window));
         window->setProperty("fitting",false);window->setProperty("paperAppearance","original");
         QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,1.0),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
         QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QTest::qWait(150);
-        const auto point=[&](double x,double y){return visualItem(window->contentItem(),"pdfPage0")->mapToScene(QPointF(x,y)).toPoint();};
+        const auto point=[&](double x,double y){return visualItem(window->contentItem(),"pdfPage0")->mapToScene(QPointF(x,y)*window->property("zoom").toDouble()).toPoint();};
         const auto entries=[&]{return reader.data().value("marks").toMap().value("annotations").toList();};
         QVERIFY(QMetaObject::invokeMethod(window,"armStamp",Q_ARG(QVariant,"approved")));QTest::qWait(50);
         QVERIFY(visualItem(window->contentItem(),"stampToolButton"));QVERIFY(visualItem(window->contentItem(),"signatureToolButton"));
@@ -1085,7 +1112,7 @@ private slots:
         const auto jobs=RasterJobs::statistics().value("completed");auto *crop=artworkItem();
         auto draft=entry;auto rect=draft.value("rect").toMap();rect["x"]=rect.value("x").toDouble()+10;draft["rect"]=rect;
         window->setProperty("annotationDraft",draft);QTest::qWait(100);
-        QCOMPARE(artworkItem(),crop);QCOMPARE(crop->parentItem()->x(),rect.value("x").toDouble());
+        QCOMPARE(artworkItem(),crop);QCOMPARE(crop->parentItem()->x(),rect.value("x").toDouble()*window->property("zoom").toDouble());
         QCOMPARE(RasterJobs::statistics().value("completed"),jobs);window->setProperty("annotationDraft",QVariant::fromValue(nullptr));
         window->setProperty("paperAppearance","night");QTest::qWait(100);QVERIFY(!window->grabWindow().isNull());QCOMPARE(RasterJobs::statistics().value("completed"),jobs);
         window->setProperty("paperAppearance","original");
@@ -1611,16 +1638,20 @@ private slots:
         engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
         auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();
         QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTRY_VERIFY(!window->property("positionRestoring").toBool());
+        QVERIFY(settleReaderViewport(window));
         window->setProperty("fitting",false);QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,1.0),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
         window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","region-audit-synthetic-model"},{"imageInput",false}});
-        QVERIFY(QMetaObject::invokeMethod(window,"armRegion",Q_ARG(QVariant,false)));QTRY_VERIFY(window->property("regionSelecting").toBool());QTest::qWait(100);
+        QVERIFY(QMetaObject::invokeMethod(window,"armRegion",Q_ARG(QVariant,false)));QTRY_VERIFY(window->property("regionSelecting").toBool());QVERIFY(settleReaderViewport(window));
         auto *page=visualItem(window->contentItem(),"pdfPage0");QVERIFY(page);
-        const auto start=page->mapToScene(QPointF(60,55)).toPoint(),end=page->mapToScene(QPointF(480,235)).toPoint();
+        const auto start=page->mapToScene(QPointF(60,55)*window->property("zoom").toDouble()).toPoint(),end=page->mapToScene(QPointF(480,235)*window->property("zoom").toDouble()).toPoint();
         QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,start);QTest::mouseMove(window,end,30);QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,end);
         QTRY_VERIFY_WITH_TIMEOUT(!reader->aiRegion().value("image_png").toString().isEmpty(),15000);
         QVERIFY2(reader->aiRegion().value("error").toString().isEmpty(),qPrintable(reader->aiRegion().value("error").toString()));QVERIFY(!window->property("regionSelecting").toBool());
         const auto attachment=reader->aiRegion();QCOMPARE(attachment.value("capture_scale").toDouble(),2.0);QVERIFY(attachment.value("text").toString().contains("quick brown fox"));
-        const auto png=QByteArray::fromBase64(attachment.value("image_png").toByteArray());const auto picture=QImage::fromData(png);QVERIFY(!picture.isNull());QCOMPARE(picture.size(),QSize(840,360));
+        const auto png=QByteArray::fromBase64(attachment.value("image_png").toByteArray());const auto picture=QImage::fromData(png);QVERIFY(!picture.isNull());QCOMPARE(picture.size(),QSize(attachment.value("image_width_px").toInt(),attachment.value("image_height_px").toInt()));
+        const double pointerTolerance=1.01/window->property("zoom").toDouble();
+        QVERIFY(std::abs(attachment.value("width_pt").toDouble()-420)<pointerTolerance);QVERIFY(std::abs(attachment.value("height_pt").toDouble()-180)<pointerTolerance);
+        QVERIFY(std::abs(picture.width()-840)<=std::ceil(pointerTolerance*2));QVERIFY(std::abs(picture.height()-360)<=std::ceil(pointerTolerance*2));
         if(qEnvironmentVariableIsSet("LYRA_READER_REGION_DARK_NARROW")){window->setProperty("appearance","dark");window->resize(700,600);QTest::qWait(100);}
         auto *card=window->findChild<QObject *>("aiRegionCard");QVERIFY(card);QTRY_VERIFY(card->property("visible").toBool());auto *crop=window->findChild<QObject *>("aiRegionImage");QVERIFY(crop);QTRY_COMPARE_WITH_TIMEOUT(crop->property("status").toInt(),1,10000);
         QVERIFY2(qAbs(crop->property("width").toDouble()/crop->property("height").toDouble()-double(picture.width())/picture.height())<.001,"The captured area must keep its pixel aspect ratio in the bounded preview");
@@ -2046,6 +2077,51 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(RenderBudget::statistics().value("textureBytes").toLongLong(),0,10000);
         one->show();QTRY_VERIFY_WITH_TIMEOUT(ready(one),15000);QVERIFY(!one->grabWindow().isNull());
         one->hide();one->releaseResources();first.closeTab(0);second.closeTab(0);QTRY_COMPARE_WITH_TIMEOUT(RenderBudget::statistics().value("residentBytes").toLongLong(),0,10000);
+    }
+    void nativeTilePlanArrayLayoutSupportsMultiplePagesAndOwnsItsBuffer() {
+        LyraReaderTilePlanRequest requests[2]{};for(auto &r:requests){r.width=595;r.height=842;r.visible={0,0,256,256};}requests[0].tier=4;requests[1].tier=-3;requests[1].page=7;
+        {
+            LyraReaderTilePlanBatch batch{};LyraReaderBuffer error{};const auto retire=qScopeGuard([&]{lyra_reader_desktop_tile_plan_free(batch);lyra_reader_desktop_buffer_free(error);});
+            QVERIFY(lyra_reader_desktop_plan_tiles(requests,2,&batch,&error));QVERIFY(error.data==nullptr);QCOMPARE(batch.len,std::size_t(2));QVERIFY(batch.plans);QCOMPARE(reinterpret_cast<std::uintptr_t>(batch.plans)%alignof(LyraReaderPagePlan),std::uintptr_t(0));
+            QCOMPARE(batch.plans[0].page,std::uint32_t(0));QCOMPARE(batch.plans[0].tile_count,std::size_t(1));QCOMPARE(batch.plans[0].tiles[0].target.width,256.0);
+            QCOMPARE(batch.plans[1].page,std::uint32_t(7));QCOMPARE(batch.plans[1].tier,-3);QCOMPARE(batch.plans[1].scale,std::exp2(-.75));QCOMPARE(batch.plans[1].tile_count,std::size_t(1));
+        }
+        LyraReaderTilePlanBatch empty{};LyraReaderBuffer error{};const auto retire=qScopeGuard([&]{lyra_reader_desktop_tile_plan_free(empty);lyra_reader_desktop_buffer_free(error);});
+        QVERIFY(lyra_reader_desktop_plan_tiles(nullptr,0,&empty,&error));QCOMPARE(empty.len,std::size_t(0));QVERIFY(empty.plans==nullptr);QVERIFY(error.data==nullptr);
+    }
+    void surfaceDensityPlansKeepTheResidentBudgetAndReportRejection() {
+        ReaderController reader;reader.openFile(QUrl::fromLocalFile(QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf"));QTRY_VERIFY(reader.pageCount()==9 && !reader.loading() && reader.pendingCommands()==0);
+        QTRY_VERIFY(RasterJobs::statistics().value("queued").toInt()==0 && RasterJobs::statistics().value("running").toInt()==0);
+        std::vector<RasterJobs::Handle> admissions;while(auto ticket=RasterJobs::enqueue())admissions.push_back(ticket);
+        const auto release=qScopeGuard([&]{reader.clearRasterDemand(987);for(auto &ticket:admissions){RasterJobs::Run run(ticket);}});
+        const auto size=reader.pages().first().toMap();const QRectF visible(0,0,size.value("width").toDouble(),size.value("height").toDouble());
+        const auto plan=reader.requestTilesForSurface(987,0,4.0,2*1024*1024,visible,{});QVERIFY(plan.accepted);QCOMPARE(plan.tiles.size(),1);QCOMPARE(plan.tiles.first().level,-3);
+        const auto bad=reader.requestTilesForSurface(987,0,4.0,0,visible,{});QVERIFY(!bad.accepted);QVERIFY(bad.tiles.isEmpty());QVERIFY(!reader.error().isEmpty());
+        const auto retried=reader.requestTilesForSurface(987,0,4.0,2*1024*1024,visible,{});QVERIFY(retried.accepted);QCOMPARE(retried.tiles.size(),1);
+    }
+    void densityGridMatchesThePreMigrationNativeRequests() {
+        QFile golden(root+"/tests/fixtures/tile-plan/native-density.json");QVERIFY(golden.open(QIODevice::ReadOnly));
+        const auto frozen=QJsonDocument::fromJson(golden.readAll()).object();const auto cases=frozen.value("cases").toArray();QCOMPARE(cases.size(),20);
+        ReaderController reader;reader.openFile(QUrl::fromLocalFile(QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf"));
+        QTRY_VERIFY(reader.pageCount()==9 && !reader.loading() && reader.pendingCommands()==0);
+        const auto size=reader.pages().first().toMap();QCOMPARE(size.value("width").toDouble(),frozen.value("pageSize").toObject().value("width").toDouble());QCOMPARE(size.value("height").toDouble(),frozen.value("pageSize").toObject().value("height").toDouble());
+        QTRY_VERIFY(RasterJobs::statistics().value("queued").toInt()==0 && RasterJobs::statistics().value("running").toInt()==0);
+        std::vector<RasterJobs::Handle> admissions;while(auto ticket=RasterJobs::enqueue())admissions.push_back(ticket);
+        const auto release=qScopeGuard([&]{reader.clearRasterDemand(988);for(auto &ticket:admissions){RasterJobs::Run run(ticket);}});
+        QCOMPARE(admissions.size(),size_t(RasterJobs::maximumQueued));
+        const auto rectangle=[](const QJsonObject &r){return QRectF(r.value("x").toDouble(qQNaN()),r.value("y").toDouble(qQNaN()),r.value("width").toDouble(qQNaN()),r.value("height").toDouble(qQNaN()));};
+        const auto near=[](const QRectF &a,const QRectF &b){return std::abs(a.x()-b.x())<1e-8 && std::abs(a.y()-b.y())<1e-8 && std::abs(a.width()-b.width())<1e-8 && std::abs(a.height()-b.height())<1e-8;};
+        for(const auto &item:cases){const auto c=item.toObject();const auto name=c.value("name").toString();const auto visible=rectangle(c.value("visible").toObject());
+            const auto actual=reader.requestTiles(988,c.value("page").toInt(),c.value("requestedLevel").toInt(),visible,{});const auto expected=c.value("tiles").toArray();
+            QCOMPARE(actual.size(),expected.size());QMap<QString,QJsonObject> byKey;for(const auto &e:expected)byKey.insert(e.toObject().value("key").toString(),e.toObject());
+            double previous=-1;
+            for(const auto &tile:actual){QVERIFY2(byKey.contains(tile.key),qPrintable(name+": "+tile.key));const auto e=byKey.take(tile.key);
+                QCOMPARE(tile.page,e.value("page").toInt());QCOMPARE(tile.level,e.value("level").toInt());QCOMPARE(tile.column,e.value("column").toInt());QCOMPARE(tile.row,e.value("row").toInt());
+                QVERIFY(std::abs(tile.scale-e.value("scale").toDouble())<1e-12);QVERIFY2(near(tile.target,rectangle(e.value("target").toObject())),qPrintable(name));QVERIFY2(near(tile.render,rectangle(e.value("render").toObject())),qPrintable(name));
+                const auto clipped=visible.intersected(QRectF(0,0,size.value("width").toDouble(),size.value("height").toDouble()));const double distance=QLineF(tile.target.center(),clipped.center()).length();QVERIFY(distance+1e-8>=previous);previous=distance;
+            }
+            QVERIFY(byKey.isEmpty());QVERIFY(reader.error().isEmpty());reader.clearTileDemand(988);
+        }
     }
     void deepZoomRefinesVisibleTilesWithoutSeamsAndSharesTheCacheBudget() {
         ReaderController reader;QQmlApplicationEngine engine;

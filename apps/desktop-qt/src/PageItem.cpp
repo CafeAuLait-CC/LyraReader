@@ -134,16 +134,12 @@ void PageItem::refresh() {
 void PageItem::request() {
     syncBudget();if(!demandVisible())return;
     if(needsTiles()) {
-        int requested=qBound(-24,int(std::ceil(std::log2(effectiveScale())*4)),28);
-        const auto dimensions=m_controller->pages().at(m_page).toMap();
-        const auto view=m_visibleRegion.intersected(QRectF(0,0,dimensions.value("width").toDouble(),dimensions.value("height").toDouble()));
-        while(requested>-24) {
-            const double edge=512/ReaderController::tileScale(requested);
-            const double count=(std::ceil(view.right()/edge)-std::floor(view.left()/edge))*(std::ceil(view.bottom()/edge)-std::floor(view.top()/edge));
-            if(count*515*515*4<=m_targetBytes-qMin<qint64>(4*1024*1024,m_targetBytes/4))break;--requested;
-        }
-        const auto next=m_controller->requestTiles(quintptr(this),m_page,requested,m_visibleRegion,QSet<QString>(m_tileImages.keyBegin(),m_tileImages.keyEnd()));
-        const int level=next.isEmpty()?requested:next.first().level;
+        const auto plan=m_controller->requestTilesForSurface(quintptr(this),m_page,effectiveScale(),m_targetBytes,m_visibleRegion,QSet<QString>(m_tileImages.keyBegin(),m_tileImages.keyEnd()));
+        // A rejected plan is not an empty, completed demand. Keep any old image
+        // available while the Reader reports the failure, without claiming refinement.
+        if(!plan.accepted){m_demandCurrent=false;setRefined(false);refresh();return;}
+        const auto &next=plan.tiles;
+        const int level=next.isEmpty()?m_level:next.first().level;
         if(level!=m_level) {
             m_previousTiles.clear();m_previousImages.clear();qsizetype retained=0;
             for(const auto &tile:m_tiles)if(tile.target.intersects(m_visibleRegion) && m_tileImages.contains(tile.key)) {

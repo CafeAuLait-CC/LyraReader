@@ -4,7 +4,6 @@
 #include "RasterCache.h"
 #include "RenderBudget.h"
 #include <QUuid>
-#include <QLineF>
 #include <algorithm>
 #include <QElapsedTimer>
 #include <QFileInfo>
@@ -13,6 +12,7 @@
 #include <QJsonDocument>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QScopeGuard>
 #include <QLoggingCategory>
 #include <QtConcurrentRun>
 #include <QPromise>
@@ -470,7 +470,6 @@ QImage ReaderController::cachedPage(int page,double scale,bool embedded) const {
 QImage ReaderController::cachedTile(const QString &key)const{return RasterCache::get(m_cachePrefix+key);}
 QString ReaderController::backdropKey(int page)const{return m_cachePrefix+QStringLiteral("backdrop:")+QString::number(page);}
 QImage ReaderController::cachedBackdrop(int page,bool embedded)const{return embedded ? QImage{} : RasterCache::backdrop(backdropKey(page));}
-double ReaderController::tileScale(int level){return std::exp2(double(level)/4.0);}
 void ReaderController::enqueue(const Request &request) {
     if(RasterCache::contains(m_cachePrefix+request.key) || m_pending.contains(request.key) || m_failed.contains(request.key))return;
     while(m_requests.size()>=128){m_pending.remove(m_requests.last().key);m_manualDemand.remove(m_requests.last().key);m_requests.removeLast();}
@@ -504,32 +503,38 @@ void ReaderController::pruneTileRequests() {
 void ReaderController::clearTileDemand(quintptr consumer){m_tileDemand.remove(consumer);pruneTileRequests();}
 void ReaderController::clearRasterDemand(quintptr consumer){m_pageDemand.remove(consumer);clearTileDemand(consumer);}
 QList<TileSpec> ReaderController::requestTiles(quintptr consumer,int page,int level,const QRectF &visible,const QSet<QString> &retained) {
+    LyraReaderTilePlanRequest density{};density.tier=level;return requestPlannedTiles(consumer,page,density,visible,retained).tiles;
+}
+TilePlanResult ReaderController::requestTilesForSurface(quintptr consumer,int page,double scale,qint64 bytes,const QRectF &visible,const QSet<QString> &retained) {
+    if(bytes<0){clearTileDemand(consumer);setError(tr("The surface pixel budget is invalid."));return {};}
+    LyraReaderTilePlanRequest density{};density.density_kind=1;density.required_scale=scale;density.resident_bytes=std::uint64_t(bytes);return requestPlannedTiles(consumer,page,density,visible,retained);
+}
+TilePlanResult ReaderController::requestPlannedTiles(quintptr consumer,int page,const LyraReaderTilePlanRequest &density,const QRectF &visible,const QSet<QString> &retained) {
     if(!m_source || page<0 || page>=pageCount() || visible.isEmpty() || !std::isfinite(visible.x()) || !std::isfinite(visible.y()) || !std::isfinite(visible.width()) || !std::isfinite(visible.height())){clearTileDemand(consumer);return {};}
     const auto dimensions=m_pages.at(page).toMap();
-    const QRectF full(0,0,dimensions.value(QStringLiteral("width")).toDouble(),dimensions.value(QStringLiteral("height")).toDouble());
-    const auto view=visible.intersected(full);if(view.isEmpty()){clearTileDemand(consumer);return {};}
-    level=qBound(-24,level,28);
-    // Quarter-octave density tiers limit oversampling to 1.42x the visible pixel area.
-    // Very large displays lower one tier if needed to keep this page's demand bounded.
-    while(level>-24){const double edge=512/tileScale(level);const auto count=(std::ceil(view.right()/edge)-std::floor(view.left()/edge))*(std::ceil(view.bottom()/edge)-std::floor(view.top()/edge));if(count<=96)break;--level;}
-    const double scale=tileScale(level),edge=512/scale;
-    if(!std::isfinite(full.width()) || !std::isfinite(full.height()) || full.width()/edge>2147483645.0 || full.height()/edge>2147483645.0){clearTileDemand(consumer);return {};}
-    const int left=qMax(0,int(std::floor(view.left()/edge))),top=qMax(0,int(std::floor(view.top()/edge)));
-    const int right=qMin(int(std::ceil(full.width()/edge)),int(std::ceil(view.right()/edge)));
-    const int bottom=qMin(int(std::ceil(full.height()/edge)),int(std::ceil(view.bottom()/edge)));
-    QList<TileSpec> result;
-    for(int row=top;row<bottom;++row)for(int column=left;column<right;++column){
-        const auto target=QRectF(column*edge,row*edge,edge,edge).intersected(full);
-        const auto render=target.adjusted(-1/scale,-1/scale,1/scale,1/scale).intersected(full);
-        const auto key=QStringLiteral("tile:%1:%2:%3:%4").arg(page).arg(level).arg(column).arg(row);
-        result.append({key,page,level,column,row,scale,target,render});
+    auto request=density;request.page=std::uint32_t(page);request.width=dimensions.value("width").toDouble();request.height=dimensions.value("height").toDouble();request.visible={visible.x(),visible.y(),visible.width(),visible.height()};
+    LyraReaderTilePlanBatch output{};LyraReaderBuffer error{};
+    const auto release=qScopeGuard([&]{lyra_reader_desktop_tile_plan_free(output);});
+    if(!lyra_reader_desktop_plan_tiles(&request,1,&output,&error)) {
+        const auto message=takeError(error);clearTileDemand(consumer);setError(message);return {};
     }
-    std::sort(result.begin(),result.end(),[&](const auto &a,const auto &b){return QLineF(a.target.center(),view.center()).length()<QLineF(b.target.center(),view.center()).length();});
+    lyra_reader_desktop_buffer_free(error);
+    if(output.len!=1 || !output.plans){clearTileDemand(consumer);setError(tr("The tile planner returned an invalid batch."));return {};}
+    const auto &plan=output.plans[0];const int level=plan.tier;const double scale=plan.scale;
+    if(plan.page!=std::uint32_t(page) || level< -24 || level>28 || !std::isfinite(scale) || scale<=0 || plan.tile_count>96){clearTileDemand(consumer);setError(tr("The tile planner returned an invalid batch."));return {};}
+    QList<TileSpec> result;result.reserve(qsizetype(plan.tile_count));
+    const auto decode=[](const LyraReaderTileRect &r){return QRectF(r.x,r.y,r.width,r.height);};
+    const auto finite=[](const QRectF &r){return std::isfinite(r.x()) && std::isfinite(r.y()) && std::isfinite(r.width()) && std::isfinite(r.height()) && r.width()>0 && r.height()>0;};
+    for(std::size_t i=0;i<plan.tile_count;++i){const auto &t=plan.tiles[i];const auto target=decode(t.target),render=decode(t.render);
+        if(t.column>2147483645u || t.row>2147483645u || !finite(target) || !finite(render)){clearTileDemand(consumer);setError(tr("The tile planner returned invalid tile geometry."));return {};}
+        const int column=int(t.column),row=int(t.row);const auto key=QStringLiteral("tile:%1:%2:%3:%4").arg(page).arg(level).arg(column).arg(row);result.append({key,page,level,column,row,scale,target,render});
+    }
     QSet<QString> wanted;for(const auto &tile:result)wanted.insert(tile.key);
     m_tileDemand.insert(consumer,wanted);pruneTileRequests();
     for(const auto &tile:result)if(!retained.contains(tile.key))enqueue({page,scale,tile.key,false,true,tile.render,1});
-    startNextRaster();return result;
+    startNextRaster();return {result,true};
 }
+
 void ReaderController::startNextRaster() {
     if(m_rendering || m_requests.isEmpty() || !m_source)return;
     auto ticket=RasterJobs::enqueue();if(!ticket){

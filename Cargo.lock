@@ -954,6 +954,7 @@ dependencies = [
  "lyra-reader-edit",
  "lyra-reader-ffi",
  "lyra-reader-pdfium",
+ "lyra-reader-render",
  "lyra-reader-runtime",
  "lyra-reader-session",
  "serde",
@@ -1030,6 +1031,7 @@ name = "lyra-reader-render"
 version = "0.0.0"
 dependencies = [
  "lyra-reader-core",
+ "serde_json",
 ]
 
 [[package]]

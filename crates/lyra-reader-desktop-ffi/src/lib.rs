@@ -17,6 +17,7 @@ mod region_store;
 mod render_source;
 mod saving;
 mod session;
+mod tile_plan;
 use document::DesktopDocument as Document;
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
@@ -83,6 +84,58 @@ pub unsafe extern "C" fn lyra_reader_desktop_history_command(
             Ok(())
         })
         .is_some()
+    }
+}
+
+/// # Safety
+/// For counts within the 128-page limit, requests points to fully initialized
+/// readable records (null is accepted only for zero count). Misalignment is
+/// rejected before access. Output/error are distinct empty writable slots;
+/// free results with tile_plan_free and errors with buffer_free, each once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_plan_tiles(
+    requests: *const tile_plan::Request,
+    count: usize,
+    output: *mut tile_plan::Batch,
+    error: *mut Buffer,
+) -> bool {
+    // SAFETY: the caller provides the stated live records and writable outputs.
+    // Count/null/alignment are checked before slice construction; 128 records
+    // bound both the readable byte range and every resulting allocation.
+    unsafe {
+        run(error, || {
+            if count > lyra_reader_render::grid::MAX_BATCH_PAGES {
+                return Err("Tile planning exceeds its page batch limit".into());
+            }
+            if output.is_null() {
+                return Err("Tile plan output is null".into());
+            }
+            let requests = if count == 0 {
+                &[]
+            } else {
+                if requests.is_null()
+                    || !(requests as usize)
+                        .is_multiple_of(std::mem::align_of::<tile_plan::Request>())
+                {
+                    return Err("Tile plan request is null or misaligned".into());
+                }
+                slice::from_raw_parts(requests, count)
+            };
+            output.write(tile_plan::Batch::owned(tile_plan::query(requests)?));
+            Ok(())
+        })
+        .is_some()
+    }
+}
+/// # Safety
+/// Batch is empty or the exact unique owner returned by plan_tiles, with its
+/// original pointer/count. All synchronous borrows must end before this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_tile_plan_free(batch: tile_plan::Batch) {
+    if !batch.plans.is_null() {
+        // SAFETY: this exact aligned allocation/count came from Box<[PagePlan]>;
+        // the caller retires it once, after every C++ tile read has finished.
+        drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(batch.plans, batch.len)) });
     }
 }
 
@@ -535,6 +588,83 @@ pub unsafe extern "C" fn lyra_reader_desktop_source_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tile_plan_packet_boundaries_keep_owned_buffers_balanced() {
+        let empty = || Buffer {
+            data: ptr::null_mut(),
+            len: 0,
+        };
+        let mut output = tile_plan::Batch::empty();
+        let mut error = empty();
+        let request = tile_plan::tests::request();
+        // SAFETY: initialized live records, distinct empty outputs, and exact unique
+        // result owners. Oversized/null/misaligned input is rejected before reads.
+        unsafe {
+            assert!(lyra_reader_desktop_plan_tiles(
+                &request,
+                1,
+                &mut output,
+                &mut error
+            ));
+            assert!(error.data.is_null());
+            assert_eq!(output.len, 1);
+            let response = &*output.plans;
+            assert_eq!(response.page, 0);
+            assert_eq!(response.tile_count, 1);
+            assert_eq!(response.tiles[0].target.width, 256.0);
+            lyra_reader_desktop_tile_plan_free(output);
+            output = tile_plan::Batch::empty();
+            let oversized = vec![request; 129];
+            assert!(!lyra_reader_desktop_plan_tiles(
+                oversized.as_ptr(),
+                oversized.len(),
+                &mut output,
+                &mut error
+            ));
+            assert!(output.plans.is_null());
+            lyra_reader_desktop_buffer_free(error);
+            error = empty();
+            assert!(!lyra_reader_desktop_plan_tiles(
+                ptr::null(),
+                1,
+                &mut output,
+                &mut error
+            ));
+            lyra_reader_desktop_buffer_free(error);
+            error = empty();
+            assert!(!lyra_reader_desktop_plan_tiles(
+                &request,
+                1,
+                ptr::null_mut(),
+                &mut error
+            ));
+            lyra_reader_desktop_buffer_free(error);
+            error = empty();
+            let align = std::mem::align_of::<tile_plan::Request>();
+            let bytes = vec![0u8; std::mem::size_of::<tile_plan::Request>() + align];
+            let offset = (0..align)
+                .find(|n| !(bytes.as_ptr().add(*n) as usize).is_multiple_of(align))
+                .unwrap();
+            assert!(!lyra_reader_desktop_plan_tiles(
+                bytes.as_ptr().add(offset).cast(),
+                1,
+                &mut output,
+                &mut error
+            ));
+            assert!(output.plans.is_null());
+            lyra_reader_desktop_buffer_free(error);
+            error = empty();
+            assert!(lyra_reader_desktop_plan_tiles(
+                ptr::null(),
+                0,
+                &mut output,
+                &mut error
+            ));
+            assert!(output.plans.is_null() && output.len == 0 && error.data.is_null());
+            lyra_reader_desktop_tile_plan_free(output);
+        }
+    }
 
     #[test]
     fn navigation_handle_and_packet_boundaries_keep_owned_buffers_balanced() {

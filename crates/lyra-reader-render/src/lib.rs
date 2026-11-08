@@ -12,6 +12,7 @@
 //! ```
 
 pub mod cache;
+pub mod grid;
 pub mod plan;
 pub mod tile;
 

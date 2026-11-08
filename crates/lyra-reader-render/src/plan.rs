@@ -21,6 +21,9 @@
 //! a torn page's display block is presentation, and only the shell knows how its two segments
 //! map back to page-local Y.
 
+use crate::grid::{
+    AxisSpan, MAX_GRID_COORDINATE, MAX_LEGACY_TILES, UpperEdge, axis_span, coordinates, count,
+};
 use std::collections::HashMap;
 
 /// Longest prefetch ring, in viewport heights (ADR 0007 shipped 2.5 viewports of *ring* plus
@@ -334,33 +337,40 @@ pub fn plan_tiles(request: &PlanRequest) -> Option<TilePlan> {
     let mut pinned: Vec<PlannedKey> = Vec::new();
     for span in &spans {
         let page = &request.pages[span.slot];
-        for row in span.page.first_row..=span.page.last_row {
-            for column in span.page.first_column..=span.page.last_column {
-                let key = PlannedKey {
-                    page: page.page,
-                    lod: request.lod,
-                    x: column,
-                    y: row,
-                };
-                let rect = tile_rect(page, column, row, tile_pt);
-                let visible = rect.intersects(request.viewport);
-                pinned.push(key);
-                sortable.push((
-                    distance(request, rect),
-                    PlannedTile {
-                        page: key.page,
-                        lod: key.lod,
-                        x: key.x,
-                        y: key.y,
-                        priority: if visible {
-                            TilePriority::Visible
-                        } else {
-                            TilePriority::TargetLodPrefetch
-                        },
-                        prefetch: !visible,
+        for (column, row) in coordinates(
+            AxisSpan {
+                first: span.page.first_column,
+                last: span.page.last_column,
+            },
+            AxisSpan {
+                first: span.page.first_row,
+                last: span.page.last_row,
+            },
+        ) {
+            let key = PlannedKey {
+                page: page.page,
+                lod: request.lod,
+                x: column,
+                y: row,
+            };
+            let rect = tile_rect(page, column, row, tile_pt);
+            let visible = rect.intersects(request.viewport);
+            pinned.push(key);
+            sortable.push((
+                distance(request, rect),
+                PlannedTile {
+                    page: key.page,
+                    lod: key.lod,
+                    x: key.x,
+                    y: key.y,
+                    priority: if visible {
+                        TilePriority::Visible
+                    } else {
+                        TilePriority::TargetLodPrefetch
                     },
-                ));
-            }
+                    prefetch: !visible,
+                },
+            ));
         }
     }
 
@@ -470,33 +480,46 @@ fn band_span(
     let top = request.viewport.min_y() - request.viewport.height * above;
     let bottom = request.viewport.min_y() + request.viewport.height * below;
 
-    let rows = (page.height_pt / tile_pt).ceil() as i64;
     let (low, high) = page_local_band(page, top, bottom)?;
-    let first_row = (low / tile_pt).floor().max(0.0) as i64;
-    let last_row = (((high - 0.001) / tile_pt).floor() as i64).min(rows - 1);
-    if first_row > last_row {
-        return None;
-    }
-
-    let columns = (page.width_pt / tile_pt).ceil() as i64;
-    let mut first_column = 0;
-    let mut last_column = columns - 1;
-    if !request.want_all_columns {
-        let visible_first = ((request.viewport.min_x() - page.left_pt) / tile_pt).floor() as i64;
-        first_column = visible_first.max(0).min(columns - 1);
-        let visible_last = ((request.viewport.max_x() - page.left_pt) / tile_pt).floor() as i64
-            + request.prefetch_columns as i64;
-        last_column = visible_last.max(first_column).min(columns - 1);
-    }
+    let y = axis_span(
+        low,
+        high,
+        page.height_pt,
+        tile_pt,
+        UpperEdge::Inset(0.001),
+        false,
+        0,
+    )?;
+    let x = if request.want_all_columns {
+        axis_span(
+            0.0,
+            page.width_pt,
+            page.width_pt,
+            tile_pt,
+            UpperEdge::HalfOpen,
+            false,
+            0,
+        )?
+    } else {
+        axis_span(
+            request.viewport.min_x() - page.left_pt,
+            request.viewport.max_x() - page.left_pt,
+            page.width_pt,
+            tile_pt,
+            UpperEdge::Inclusive,
+            true,
+            request.prefetch_columns,
+        )?
+    };
 
     Some(Span {
         slot,
         page: PlannedPage {
             page: page.page,
-            first_column: first_column as u32,
-            last_column: last_column as u32,
-            first_row: first_row as u32,
-            last_row: last_row as u32,
+            first_column: x.first,
+            last_column: x.last,
+            first_row: y.first,
+            last_row: y.last,
         },
     })
 }
@@ -525,17 +548,23 @@ fn choose_ring(
     for rung in PREFETCH_RING_LADDER {
         let mut bytes = 0u64;
         for span in band_spans(request, rung, tile_pt) {
-            for row in span.page.first_row..=span.page.last_row {
-                for column in span.page.first_column..=span.page.last_column {
-                    let key = PlannedKey {
-                        page: span.page.page,
-                        lod: request.lod,
-                        x: column,
-                        y: row,
-                    };
-                    bytes =
-                        bytes.saturating_add(cached.get(&key).copied().unwrap_or(full_tile_bytes));
-                }
+            for (column, row) in coordinates(
+                AxisSpan {
+                    first: span.page.first_column,
+                    last: span.page.last_column,
+                },
+                AxisSpan {
+                    first: span.page.first_row,
+                    last: span.page.last_row,
+                },
+            ) {
+                let key = PlannedKey {
+                    page: span.page.page,
+                    lod: request.lod,
+                    x: column,
+                    y: row,
+                };
+                bytes = bytes.saturating_add(cached.get(&key).copied().unwrap_or(full_tile_bytes));
             }
         }
         if bytes <= budget {
@@ -615,6 +644,43 @@ fn validate(request: &PlanRequest) -> Option<()> {
     {
         return None;
     }
+    let edge = f64::from(request.tile_size_px) / (1u64 << request.lod) as f64;
+    if ![viewport.max_x(), viewport.max_y()]
+        .iter()
+        .all(|v| v.is_finite())
+    {
+        return None;
+    }
+    for page in &request.pages {
+        if (page.width_pt / edge).ceil() > MAX_GRID_COORDINATE
+            || (page.height_pt / edge).ceil() > MAX_GRID_COORDINATE
+        {
+            return None;
+        }
+    }
+    let mut total = 0usize;
+    for span in band_spans(
+        request,
+        request
+            .ring_override_vh
+            .unwrap_or(MAX_PREFETCH_RING_VH)
+            .min(MAX_PREFETCH_RING_VH),
+        edge,
+    ) {
+        total = total.checked_add(count(
+            AxisSpan {
+                first: span.page.first_column,
+                last: span.page.last_column,
+            },
+            AxisSpan {
+                first: span.page.first_row,
+                last: span.page.last_row,
+            },
+        )?)?;
+        if total > MAX_LEGACY_TILES {
+            return None;
+        }
+    }
     Some(())
 }
 
@@ -660,6 +726,18 @@ mod tests {
             .iter()
             .map(|tile| (tile.page, tile.lod, tile.x, tile.y))
             .collect()
+    }
+
+    #[test]
+    fn impossible_legacy_bands_are_rejected_before_enumeration() {
+        let mut r = request(vec![page(0)]);
+        r.pages[0].width_pt = 1e300;
+        assert!(plan_tiles(&r).is_none());
+        r = request(vec![page(0)]);
+        r.lod = 16;
+        r.viewport = PlanRect::new(0.0, 0.0, 600.0, 1200.0);
+        r.want_all_columns = true;
+        assert!(plan_tiles(&r).is_none());
     }
 
     #[test]

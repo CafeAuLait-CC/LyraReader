@@ -18,6 +18,24 @@ struct LyraReaderBitmap {
     double scale;
     LyraReaderBuffer pixels;
 };
+// Returned page-local point geometry is immutable until its one batch owner is freed.
+struct LyraReaderTileRect {double x,y,width,height;};
+struct LyraReaderPlannedTile {std::uint32_t column,row;LyraReaderTileRect target,render;};
+struct LyraReaderPagePlan {
+    std::uint32_t page;std::int32_t tier;double scale;std::size_t tile_count;
+    LyraReaderPlannedTile tiles[96];
+};
+struct LyraReaderTilePlanBatch {LyraReaderPagePlan *plans;std::size_t len;};
+// Density kind 0=tier,1=surface scale/budget; reserved must be zero.
+struct LyraReaderTilePlanRequest {
+    std::uint32_t page,density_kind;std::int32_t tier;std::uint32_t reserved;
+    double width,height;LyraReaderTileRect visible;double required_scale;
+    std::uint64_t resident_bytes;
+};
+// Pure bounded density-grid batch. At most 128 pages/96 tiles per page; no PDFium or I/O.
+bool lyra_reader_desktop_plan_tiles(const LyraReaderTilePlanRequest *requests,std::size_t count,
+    LyraReaderTilePlanBatch *output,LyraReaderBuffer *error);
+void lyra_reader_desktop_tile_plan_free(LyraReaderTilePlanBatch batch);
 // Pure bounded history control. The owner must outlive each synchronous borrow;
 // retire it once after all commands finish. No PDFium, disk or network operation.
 LyraReaderDesktopHistory *lyra_reader_desktop_history_new(LyraReaderBuffer *error);

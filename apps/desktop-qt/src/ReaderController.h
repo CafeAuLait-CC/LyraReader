@@ -19,6 +19,8 @@ struct TileSpec {
     QRectF target,render;
 };
 
+struct TilePlanResult {QList<TileSpec> tiles;bool accepted=false;};
+
 // One controller per tab or immutable preview; windows retain independent reader state.
 class ReaderController : public QObject {
     Q_OBJECT
@@ -131,7 +133,7 @@ public:
     QList<TileSpec> requestTiles(quintptr consumer,int page,int level,const QRectF &visible,const QSet<QString> &retained);
     void clearTileDemand(quintptr consumer);
     QImage cachedTile(const QString &key)const;
-    static double tileScale(int level);
+    TilePlanResult requestTilesForSurface(quintptr consumer,int page,double requiredScale,qint64 residentBytes,const QRectF &visible,const QSet<QString> &retained);
     static int cpuCacheKiB();
     static QString rasterKey(int page, double scale,bool embedded=false);
 signals:
@@ -157,6 +159,7 @@ signals:
     void textPagesChanged();
     void commandsChanged();
 private:
+    TilePlanResult requestPlannedTiles(quintptr consumer,int page,const LyraReaderTilePlanRequest &density,const QRectF &visible,const QSet<QString> &retained);
     void setRasterSource(std::shared_ptr<NativeRasterSource> source);
     QString backdropKey(int page)const;
     QString m_contentSourceKey;
