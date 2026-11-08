@@ -8,6 +8,7 @@
 
 pub mod chat;
 pub mod citation;
+pub mod knowledge;
 pub mod mock;
 pub mod openai;
 pub mod provider;

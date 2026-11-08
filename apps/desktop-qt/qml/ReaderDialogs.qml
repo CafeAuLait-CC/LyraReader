@@ -844,7 +844,7 @@ Item {
             }
         }
         onAccepted: {
-            if (app.pendingAiReader && !app.pendingAiReader.startAi(requestKey.text, app.pendingAiPlan))
+            if (app.pendingAiReader && !app.startPreparedAi(app.pendingAiReader,requestKey.text,app.pendingAiPlan,app.pendingAiPurpose,app.pendingAiToken))
                 app.operationStatus = qsTr("The request changed or the document is busy. Preview and Send again.");
             requestKey.clear();
             app.pendingAiReader = null;

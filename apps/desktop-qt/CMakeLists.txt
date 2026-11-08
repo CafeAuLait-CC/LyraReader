@@ -34,6 +34,7 @@ add_custom_target(lyra_reader_build
 add_dependencies(lyra_reader_rust lyra_reader_build)
 add_library(lyrareader_shell STATIC src/QuitCoordinator.cpp src/QuitCoordinator.h src/SignatureArtwork.cpp src/SignatureArtwork.h src/DisplayCalibration.cpp src/DisplayCalibration.h src/AuxiliaryWindowPolicy.cpp src/AuxiliaryWindowPolicy.h src/ReaderController.cpp src/ReaderController.h src/ReaderAi.cpp src/PageItem.cpp src/PageItem.h src/CropItem.cpp src/CropItem.h src/WorkspaceController.cpp src/WorkspaceController.h src/CredentialStore.cpp src/CredentialStore.h src/AnnotationOverlay.cpp src/AnnotationOverlay.h src/PaperAppearance.cpp src/PaperAppearance.h src/PdfPrintJob.cpp src/PdfPrintJob.h src/RasterCache.cpp src/RasterCache.h src/RasterJobs.cpp src/RasterJobs.h src/RenderBudget.cpp src/RenderBudget.h src/BudgetedTexture.cpp src/BudgetedTexture.h src/NativeRaster.cpp src/NativeRaster.h src/PreviewController.cpp src/PreviewController.h)
 target_include_directories(lyrareader_shell PUBLIC src)
+target_sources(lyrareader_shell PRIVATE src/ReaderDocumentReading.cpp)
 target_sources(lyrareader_shell PRIVATE src/DateFormatting.cpp src/DateFormatting.h src/AuditController.cpp src/AuditController.h src/NavigationController.cpp src/NavigationController.h)
 target_link_libraries(lyrareader_shell PUBLIC ICU::i18n ICU::uc)
 target_link_libraries(lyrareader_shell PUBLIC Qt6::Quick Qt6::QuickControls2 Qt6::Concurrent Qt6::Widgets Qt6::PrintSupport Qt6Keychain::Qt6Keychain lyra_reader_rust Threads::Threads ${CMAKE_DL_LIBS})
@@ -44,7 +45,7 @@ elseif(UNIX AND NOT APPLE)
 endif()
 qt_add_executable(LyraReader src/main.cpp)
 target_link_libraries(LyraReader PRIVATE lyrareader_shell)
-set(LYRA_READER_QML_FILES qml/Main.qml qml/LyraReaderTheme.qml qml/LyraToolButton.qml
+set(LYRA_READER_QML_FILES qml/Main.qml qml/LyraReaderTheme.qml qml/LyraToolButton.qml qml/DocumentReading.qml
     qml/PlacedTextEditing.qml qml/PlacedTextLayer.qml qml/ContentTextLayer.qml qml/ExportTools.qml qml/AiRegionCard.qml qml/RegionNotes.qml qml/AuditDialog.qml
     qml/SettingsWindow.qml qml/PdfPreviewWindow.qml qml/ReaderChrome.qml qml/SecondaryTools.qml qml/FillSignTools.qml qml/FillSignInspector.qml qml/TypedSignatureDialog.qml qml/DrawnSignatureDialog.qml qml/SignaturePad.qml qml/ContentEditing.qml qml/ContentInspector.qml qml/ContentPageLayer.qml qml/WelcomeView.qml qml/ReaderSidebar.qml qml/DocumentCanvas.qml qml/PageTextView.qml qml/PageInteraction.qml
     qml/PageOverview.qml qml/PageExports.qml qml/RedactionReview.qml qml/RedactionLayer.qml qml/FormOverlay.qml qml/DocumentDraftBar.qml qml/PreviewPanel.qml qml/AnnotationsLayer.qml qml/AnnotationHandles.qml qml/AnnotationTools.qml qml/SearchPanel.qml qml/AiPanel.qml qml/AiResult.qml qml/AiConversation.qml qml/ReaderDialogs.qml qml/QuitDialog.qml qml/ReaderLogic.js)

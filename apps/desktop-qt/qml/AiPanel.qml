@@ -85,6 +85,11 @@ Pane {
             text: aiPanel.running ? qsTr("Receiving: %1 · %2").arg(aiPanel.viewState.activeModel || "").arg(aiPanel.viewState.activeHost || "") : (app.aiSettings.model || qsTr("Choose an AI model in Settings"))
             color: app.colors.textSecondary; font.pixelSize: 11
         }
+        RowLayout {
+            Layout.fillWidth:true
+            Button {objectName:"openDocumentReading";text:aiPanel.owner.documentReading.choice_pending ? qsTr("Read document (optional)…") : qsTr("Document Reading…");Layout.fillWidth:true;enabled:!aiPanel.owner.snapshotReadOnly;onClicked:app.openDocumentReading()}
+            ToolButton {objectName:"skipDocumentReadingChoice";text:qsTr("Skip");visible:!!aiPanel.owner.documentReading.choice_pending;Accessible.name:qsTr("Continue without document reading");onClicked:aiPanel.owner.dismissDocumentReadingChoice()}
+        }
         ComboBox {
             objectName: "aiSummaryTarget"
             visible: aiPanel.workspace === "summary"

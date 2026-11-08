@@ -17,6 +17,7 @@ pub struct DesktopDocument {
     pub(super) original_signature: SignatureStatusRecord,
     original_xfa: XfaStatusRecord,
     ai: Mutex<Option<Arc<LyraReaderAiRequest>>>,
+    pub(super) knowledge: Mutex<crate::knowledge::Knowledge>,
     pub(super) regions: Mutex<crate::region_store::RegionStore>,
     pub(super) ai_region_sources: Mutex<Option<Arc<crate::region_store::RequestProvenance>>>,
     pub(super) marks: Mutex<crate::marks::Marks>,
@@ -65,7 +66,7 @@ impl DesktopDocument {
     pub fn open(path: &Path, password: Option<&str>) -> Result<Self, String> {
         Self::open_with_cache_root(path, password, None)
     }
-    fn open_with_cache_root(
+    pub(super) fn open_with_cache_root(
         path: &Path,
         password: Option<&str>,
         cache_root: Option<&Path>,
@@ -107,6 +108,7 @@ impl DesktopDocument {
             recovery_status: Mutex::new(Value::Null),
             password: password.map(str::to_owned),
             ai: Mutex::new(None),
+            knowledge: Mutex::new(crate::knowledge::Knowledge::default()),
             regions: Mutex::new(crate::region_store::RegionStore::default()),
             ai_region_sources: Mutex::new(None),
             marks,
@@ -184,6 +186,24 @@ impl DesktopDocument {
             .get("op")
             .and_then(Value::as_str)
             .ok_or("Missing operation")?;
+        if op.starts_with("knowledge_") {
+            return self.knowledge_command(op, &r);
+        }
+        if op.starts_with("replace_")
+            || matches!(
+                op,
+                "content_stage"
+                    | "page_stage"
+                    | "page_undo"
+                    | "page_redo"
+                    | "page_discard"
+                    | "page_apply"
+                    | "document_save"
+                    | "document_discard"
+            )
+        {
+            self.invalidate_reading()?;
+        }
         // The shared writer already rejects XFA derivatives. Gate shell-side mutations too,
         // before creating a cache/session or turning a synthetic form page into an editable draft.
         // Local reading bookmarks and their undo history remain available.
@@ -500,10 +520,14 @@ impl DesktopDocument {
             "preview_redactions" | "save_redactions" | "replace_redactions" => Err(
                 "Annotation redaction has been retired. Use Edit → Redact → Blackout/Erase.".into(),
             ),
-            "ai_preview" => value(
-                d.prepare_ai_plan(crate::region::request(r["request"].clone())?)
-                    .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),
-            ),
+            "ai_preview" => {
+                let mut request = crate::region::request(r["request"].clone())?;
+                self.enrich_reading(&mut request, &d.document_identity().sha256)?;
+                value(
+                    d.prepare_ai_plan(request)
+                        .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),
+                )
+            }
             "ai_merge_preview" => value(
                 build_ai_merge_plan(arg(&r, "request")?)
                     .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),

@@ -15,6 +15,7 @@ QString aiView(const QString &action) {
 }
 
 void ReaderController::initAi() {
+    initDocumentReading();
     m_aiTimer.setInterval(60);
     connect(&m_aiTimer,&QTimer::timeout,this,[this]{
         if(!m_aiState.value(QStringLiteral("running")).toBool()){m_aiTimer.stop();return;}
@@ -23,6 +24,7 @@ void ReaderController::initAi() {
     connect(this,&ReaderController::commandFinished,this,&ReaderController::handleAiCommand);
 }
 void ReaderController::resetAi() {
+    resetDocumentReading();
     ++m_aiRegionEpoch;RasterJobs::cancel(m_aiRegionJob);m_aiRegionJob.reset();m_aiRegion.clear();emit aiRegionChanged();
     m_aiRegionImage=QUrl{};emit aiRegionImageChanged();
     m_regionHistory.clear();m_aiRegionSaveId=0;emit regionHistoryChanged();
@@ -150,6 +152,9 @@ void ReaderController::clearAiChat() {
 }
 void ReaderController::prepareAi(const QVariantMap &request) {
     if(!m_document || m_aiState.value(QStringLiteral("running")).toBool())return;
+    if(request.value(QStringLiteral("action")).toString()!=QStringLiteral("TranslateSelection") && !m_readingChoiceShown && !m_documentReading.value(QStringLiteral("ready")).toBool()) {
+        m_readingChoiceShown=true;m_readingChoicePending=true;emit documentReadingChanged();
+    }
     auto input=request;
     if(input.value(QStringLiteral("action")).toString()==QStringLiteral("DocumentChat")) {
         bool valid=false;const auto limit=m_data.value(QStringLiteral("ai_history_limit")).toUInt(&valid);
@@ -253,6 +258,7 @@ quint64 ReaderController::saveAiRegionNote() {
     m_aiRegionSaveId=submit(exists ? QStringLiteral("region_snapshot"):QStringLiteral("region_create"),args);return m_aiRegionSaveId;
 }
 void ReaderController::handleAiCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error) {
+    if(operation.startsWith(QStringLiteral("knowledge_"))){handleDocumentReadingCommand(id,operation,result,error);return;}
     if(operation.startsWith(QStringLiteral("region_")) && operation!=QStringLiteral("region_get")) {
         if(error.isEmpty())m_regionHistory=result.toMap();else m_regionHistory.insert(QStringLiteral("error"),error);
         emit regionHistoryChanged();

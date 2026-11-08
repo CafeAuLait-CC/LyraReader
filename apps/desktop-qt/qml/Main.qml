@@ -76,6 +76,8 @@ ApplicationWindow {
         else operationStatus=qsTr("The document is busy or changed. Select the area again when it is ready.");
     }
     AiRegionCard {id:aiRegionCard;app:root}
+    DocumentReading {id:documentReadingPopup;app:root}
+    function openDocumentReading(){aiRegionCard.close();regionNotes.close();documentReadingPopup.open();}
     RegionNotes {id:regionNotes;app:root}
     function openRegionNotes(){aiRegionCard.close();regionNotes.open();}
     function focusReadingView() {
@@ -1718,15 +1720,19 @@ ApplicationWindow {
         if (session)
             session.credentials.remove(account);
     }
-    function sendAi(owner, plan) {
+    function startPreparedAi(owner,key,plan,purpose,token) {
+        return purpose==="document-reading" ? owner.startDocumentReading(key,plan,token) : owner.startAi(key,plan);
+    }
+    function sendAi(owner, plan, purpose, token) {
         if (!owner || !plan)
             return;
         if (plan.is_local) {
-            if (!owner.startAi("local", plan))
+            if (!startPreparedAi(owner,"local",plan,purpose,token || ""))
                 operationStatus = qsTr("The request changed or the document is busy. Preview and Send again.");
         } else {
             pendingAiReader = owner;
             pendingAiPlan = plan;
+            pendingAiPurpose=purpose || "assistant";pendingAiToken=token || "";
             credentialReadId = session ? session.credentials.read(plan.base_url) : -1;
             if (!session)
                 dialogs.credentialDialog.open();
@@ -1740,10 +1746,14 @@ ApplicationWindow {
         }
         credentialReadId=-1;pendingAiReader=null;pendingAiPlan=null;
         if (session)
-            for (const tab of session.tabs)
+            for (const tab of session.tabs) {
                 tab.reader.invalidateAiPlan();
-        else if (currentReader)
+                tab.reader.invalidateDocumentReadingPreview();
+            }
+        else if (currentReader) {
             currentReader.invalidateAiPlan();
+            currentReader.invalidateDocumentReadingPreview();
+        }
     }
     property int requestedPage: -1
     property real requestedY: 0
@@ -1751,6 +1761,16 @@ ApplicationWindow {
     property string credentialSessionBaseUrl: ""
     property var pendingAiReader: null
     property var pendingAiPlan: null
+    property string pendingAiPurpose:"assistant"
+    property string pendingAiToken:""
+
+    Action {
+        objectName:"documentReadingAction"
+        text:qsTr("Document Reading…")
+        shortcut:root.readerKeyboardEnabled ? "Ctrl+Shift+K" : ""
+        enabled:currentReader.pageCount>0 && !currentReader.snapshotReadOnly
+        onTriggered:root.openDocumentReading()
+    }
 
     Action {
         objectName: "toggleAiPanelAction"
@@ -2253,6 +2273,12 @@ ApplicationWindow {
                 visible: text.length > 0
             }
             ToolButton {
+                objectName:"documentReadingStatusButton"
+                text:currentReader.documentReading.phase==="reading" ? qsTr("Reading document…") : qsTr("Document reading")
+                visible:["preparing","starting","reading","failed"].indexOf(currentReader.documentReading.phase)>=0
+                onClicked:root.openDocumentReading()
+            }
+            ToolButton {
                 action: fitAction
             }
             Label {
@@ -2322,7 +2348,7 @@ ApplicationWindow {
         function onFinished(id, operation, secret, error) {
             if (operation === "read" && id === root.credentialReadId && root.pendingAiReader) {
                 if (secret.length) {
-                    if (!root.pendingAiReader.startAi(secret, root.pendingAiPlan))
+                    if (!root.startPreparedAi(root.pendingAiReader,secret,root.pendingAiPlan,root.pendingAiPurpose,root.pendingAiToken))
                         root.operationStatus = qsTr("The request changed or the document is busy. Preview and Send again.");
                     root.pendingAiPlan = null;
                     root.pendingAiReader = null;
@@ -2358,6 +2384,7 @@ ApplicationWindow {
             root.clearNavigation();
             root.pendingLayoutPosition=null;
             root.cancelRegionSelection();aiRegionCard.close();
+            documentReadingPopup.close();
             root.cancelErase();
             ++root.positionRestoreEpoch;
             root.positionRestoring = true;

@@ -30,6 +30,7 @@ class ReaderController : public QObject {
     Q_PROPERTY(double documentHeight READ documentHeight NOTIFY documentChanged)
     Q_PROPERTY(QUrl fileUrl READ fileUrl NOTIFY documentChanged)
     Q_PROPERTY(QVariantMap aiState READ aiState NOTIFY aiStateChanged)
+    Q_PROPERTY(QVariantMap documentReading READ documentReading NOTIFY documentReadingChanged)
     Q_PROPERTY(QVariantMap aiRegion READ aiRegion NOTIFY aiRegionChanged)
     Q_PROPERTY(QVariantMap regionNoteDraft READ regionNoteDraft NOTIFY regionNoteDraftChanged)
     Q_PROPERTY(bool hasUnsavedReadingNotes READ hasUnsavedReadingNotes NOTIFY regionNoteDraftChanged)
@@ -61,6 +62,12 @@ public:
     double documentHeight() const { return m_documentHeight; }
     QUrl fileUrl() const { return m_lastUrl; }
     QVariantMap aiState()const{return m_aiState;}
+    QVariantMap documentReading()const{auto state=m_documentReading;state.insert(QStringLiteral("choice_pending"),m_readingChoicePending);return state;}
+    Q_INVOKABLE void prepareDocumentReading(const QVariantMap &request);
+    Q_INVOKABLE bool startDocumentReading(const QString &key,const QVariantMap &plan,const QString &token);
+    Q_INVOKABLE void stopDocumentReading();
+    Q_INVOKABLE void invalidateDocumentReadingPreview();
+    Q_INVOKABLE void dismissDocumentReadingChoice();
     QVariantMap aiRegion()const{return m_aiRegion;}
     QVariantMap regionNoteDraft()const{return m_regionNoteDraft;}
     bool hasUnsavedReadingNotes()const{return !m_regionNoteDraft.isEmpty() || !m_regionSaveError.isEmpty();}
@@ -152,6 +159,7 @@ signals:
     void unsavedChangesChanged();
     void editDraftsChanged();
     void aiStateChanged();
+    void documentReadingChanged();
     void aiRegionChanged();
     void aiRegionImageChanged();
     void regionHistoryChanged();
@@ -167,6 +175,13 @@ private:
     quint64 submitSnapshot(quint64 id,const QString &operation,const QVariantMap &arguments);
     void initAi();
     void resetAi();
+    void initDocumentReading();
+    void resetDocumentReading();
+    void handleDocumentReadingCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error);
+    QTimer m_readingTimer;
+    QVariantMap m_documentReading;
+    bool m_readingChoiceShown=false,m_readingChoicePending=false;
+    quint64 m_readingPreviewId=0,m_readingStartId=0,m_readingPollId=0,m_readingCancelId=0;
     void handleAiCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error);
     void finishAiChat(const QString &state);
     void retainAiResult(const QString &state);

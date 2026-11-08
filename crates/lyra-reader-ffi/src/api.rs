@@ -9381,7 +9381,9 @@ fn ai_action_record(action: AiAction) -> AiActionRecord {
     }
 }
 
-fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, LyraReaderFfiError> {
+/// Convert a control-plane plan for a native shell's independent reading worker.
+/// Preserves previewed wire bodies without performing transport or adding wrappers.
+pub fn chat_plan_from_record(plan: AiPlanRecord) -> Result<ChatPlan, LyraReaderFfiError> {
     let action = match plan.action {
         AiActionRecord::SummarizePage => AiAction::SummarizePage,
         AiActionRecord::SummarizeSelection => AiAction::SummarizeSelection,

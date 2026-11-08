@@ -96,23 +96,30 @@ fn private_directory(path: &Path) -> Result<(), String> {
 }
 
 pub(super) fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    read_optional_bounded(path, 64 * 1024 * 1024)
+}
+pub(super) fn read_optional_bounded(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
     let file = match fs::File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.to_string()),
     };
-    const LIMIT: u64 = 64 * 1024 * 1024;
-    let oversized =
-        || "A document cache file exceeds the 64 MiB read limit; its data was kept".to_string();
-    if file.metadata().map_err(|e| e.to_string())?.len() > LIMIT {
+    let maximum = limit.checked_add(1).ok_or("Invalid cache read limit")?;
+    let oversized = || {
+        format!(
+            "A document cache file exceeds the {} MiB read limit; its data was kept",
+            limit / (1024 * 1024)
+        )
+    };
+    if file.metadata().map_err(|e| e.to_string())?.len() > limit {
         return Err(oversized());
     }
     // The actual read is bounded too, in case another process grows the file after metadata.
     let mut bytes = Vec::new();
-    file.take(LIMIT + 1)
+    file.take(maximum)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > LIMIT {
+    if bytes.len() as u64 > limit {
         return Err(oversized());
     }
     Ok(Some(bytes))
@@ -301,12 +308,18 @@ impl DocumentCache {
             for name in CARRIED_FILES.iter().filter(|n| **n != "source.json") {
                 if let Some(bytes) = read_optional(&self.directory.join(name))? {
                     let destination = next.directory.join(name);
-                    if *name == "region-conversations-v1.json"
-                        && read_optional(&destination)?
-                            .as_ref()
-                            .is_some_and(|existing| existing != &bytes)
+                    if matches!(
+                        *name,
+                        "region-conversations-v1.json" | "document-knowledge-v1.json"
+                    ) && read_optional(&destination)?
+                        .as_ref()
+                        .is_some_and(|existing| existing != &bytes)
                     {
-                        return Err("The PDF was saved, but destination reading notes differ. Both cache versions were kept".into());
+                        return Err(if *name=="region-conversations-v1.json" {
+                            "The PDF was saved, but destination reading notes differ. Both cache versions were kept"
+                        } else {
+                            "The PDF was saved, but destination document reading differs. Both cache versions were kept"
+                        }.into());
                     }
                     atomic_write(&destination, &bytes)?;
                 }

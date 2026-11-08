@@ -9,6 +9,7 @@ mod document;
 mod document_cache;
 mod draft_store;
 mod exports;
+mod knowledge;
 mod marks;
 mod navigation;
 mod pages;

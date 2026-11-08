@@ -310,9 +310,9 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         (draftKey==QStringLiteral("content") ?
             savedDraft.toMap().value(QStringLiteral("command")).toMap()==arguments.value(QStringLiteral("command")).toMap() && savedDraft.toMap().value(QStringLiteral("page")).toInt()==arguments.value(QStringLiteral("page")).toInt() :
             draftKey==QStringLiteral("forms") ? draftValues==arguments.value(unifiedSave ? QStringLiteral("forms") : QStringLiteral("values")).toList() : savedDraft.toList()==arguments.value(QStringLiteral("areas")).toList());
-    // Region snapshots contain bounded PNG/answer strings. Their controller-built maps
-    // contain plain values, so serialize their immutable copy on the command worker.
-    const bool regionPayload=operation==QStringLiteral("region_create") || operation==QStringLiteral("region_snapshot") || operation==QStringLiteral("region_note");
+    // Region snapshots and complete document-reading previews can be large. Their
+    // controller-built maps contain plain values; serialize the immutable copy on the worker.
+    const bool regionPayload=operation==QStringLiteral("region_create") || operation==QStringLiteral("region_snapshot") || operation==QStringLiteral("region_note") || operation==QStringLiteral("knowledge_start");
     QByteArray bytes;
     if(!regionPayload) {
         auto request=QJsonObject::fromVariantMap(arguments);request.insert(QStringLiteral("op"),operation);
@@ -338,7 +338,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         if(document!=m_document || (!mutation && generation!=m_generation))return;
         if((operation==QStringLiteral("marks") || operation==QStringLiteral("content_objects")) && mutationSequence!=m_mutationSequence)return;
         if(latestOnly && m_latestRead.value(operation)!=id)return;
-        if (!outcome.error.isEmpty() && operation!=QStringLiteral("split_plan") && !operation.startsWith(QStringLiteral("ai_"))) setError(outcome.error);
+        if (!outcome.error.isEmpty() && operation!=QStringLiteral("split_plan") && !operation.startsWith(QStringLiteral("ai_")) && !operation.startsWith(QStringLiteral("knowledge_"))) setError(outcome.error);
         else if (operation==QStringLiteral("content_stage") || operation==QStringLiteral("page_stage") || operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo") || operation==QStringLiteral("page_discard") || operation==QStringLiteral("page_apply") || operation==QStringLiteral("document_save") || operation==QStringLiteral("document_discard")) {
             setRasterSource(outcome.source);
             const auto revision=outcome.result.toMap();
@@ -365,7 +365,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
             m_documentWidth = layout.value(QStringLiteral("width")).toDouble();
             m_documentHeight = layout.value(QStringLiteral("height")).toDouble();
             emit documentChanged();
-        } else if (!eraseControl && !operation.startsWith(QStringLiteral("region_"))) {
+        } else if (!eraseControl && !operation.startsWith(QStringLiteral("region_")) && !operation.startsWith(QStringLiteral("knowledge_"))) {
             const bool marks=operation==QStringLiteral("ink_erase_commit") || operation==QStringLiteral("marks") || operation.startsWith(QStringLiteral("mark_")) || operation.startsWith(QStringLiteral("marks_")) || operation.startsWith(QStringLiteral("bookmark_")) || operation.startsWith(QStringLiteral("file_"));
             m_data.insert(marks ? QStringLiteral("marks") : operation, outcome.result);
             emit dataChanged();
@@ -417,7 +417,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         return result;
     };
     const bool regionWrite=operation.startsWith(QStringLiteral("region_")) && operation!=QStringLiteral("region_get") && operation!=QStringLiteral("region_list");
-    if(mutation || regionWrite || eraseControl || operation==QStringLiteral("ai_start") || operation==QStringLiteral("ai_cancel")){
+    if(mutation || regionWrite || eraseControl || operation==QStringLiteral("ai_start") || operation==QStringLiteral("ai_cancel") || operation==QStringLiteral("knowledge_start") || operation==QStringLiteral("knowledge_cancel")){
         auto promise=std::make_shared<QPromise<CommandResult>>();promise->start();watcher->setFuture(promise->future());
         m_mutations->append([task,promise]{try{promise->addResult(task());}catch(...){promise->addResult(CommandResult{{},QStringLiteral("The command worker stopped unexpectedly.")});}promise->finish();});
     }else watcher->setFuture(QtConcurrent::run(std::move(task)));

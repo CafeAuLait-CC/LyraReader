@@ -96,6 +96,12 @@ Popup {
             color:card.app.colors.infoFg;font.pixelSize:11
         }
         RowLayout {
+            visible:card.owner && !!card.owner.documentReading.choice_pending
+            Layout.fillWidth:true
+            Button {text:qsTr("Read document (optional)…");Layout.fillWidth:true;onClicked:card.app.openDocumentReading()}
+            ToolButton {text:qsTr("Skip");Accessible.name:qsTr("Continue without document reading");onClicked:card.owner.dismissDocumentReadingChoice()}
+        }
+        RowLayout {
             Layout.fillWidth:true
             Button {objectName:"prepareAiRegion";text:qsTr("Preview Question");enabled:!!card.attachment.image_png && !!(card.attachment.question || "").trim() && !card.running && card.owner && card.owner.pendingCommands===0;onClicked:card.prepare()}
             Button {objectName:"inspectAiRegion";text:qsTr("Inspect payload");enabled:card.previewReady;onClicked:payload.open()}

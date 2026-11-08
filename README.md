@@ -98,6 +98,13 @@ Unfinished knowledge-note drafts and failed snapshot saves keep the document ope
 Legacy answer page markers stay plain text. Actual HTTP attempts have a bounded local metadata audit
 trail, including retries. Settings and the AI panel open a metadata-only viewer, available without a
 PDF. Clearing it requires confirmation of the displayed snapshot; concurrent changes require a refresh.
+Document reading is optional: the first eligible question offers reading or Skip without blocking
+its request preview. Document Reading (Ctrl+Shift+K) previews the complete extracted text before an
+explicit background start, including the disclosed extra consolidation for multipart readings.
+Questions continue independently; Stop, retry and document changes cannot publish partial or stale
+understanding. A completed reading enriches new previews and is cached by PDF fingerprint; selected
+text translation keeps its original context. Corrupt, foreign or concurrently changed cache files
+are retained, with an in-memory result and a warning when a completed reading cannot be cached.
 Newer AI workflows remain work in progress.
 Reference and figure indices use bounded shared-engine steps, yielding between steps to admitted
 raster work. Page-local citation lookups use the same cooperative gate. Previews share the pinned
