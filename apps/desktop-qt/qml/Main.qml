@@ -52,6 +52,8 @@ ApplicationWindow {
     property bool aiPanelVisible: false
     // Transient ancestors can stay active; only the focused reader owns its shortcuts.
     readonly property bool readerKeyboardEnabled: navigationController.keyboardFocus && (!dialogs.settingsDialog || !dialogs.settingsDialog.visible || !dialogs.settingsDialog.active)
+    readonly property bool readerPageNavigationEnabled: readerKeyboardEnabled && !textViewVisible
+        && !(activeFocusItem && typeof activeFocusItem.selectedText !== "undefined")
     property bool regionSelecting: false
     property var regionDraft: null
     function cancelRegionSelection() {regionSelecting=false;regionDraft=null;}
@@ -1855,23 +1857,23 @@ ApplicationWindow {
         onTriggered: root.setTextViewEnabled(!root.textViewVisible)
     }
     Shortcut {
-        sequence: "PageDown"
-        enabled: root.readerKeyboardEnabled && (!root.textViewVisible)
+        sequence: "PgDown"
+        enabled: root.readerPageNavigationEnabled
         onActivated: root.navigate(root.currentPage + 1)
     }
     Shortcut {
-        sequence: "PageUp"
-        enabled: root.readerKeyboardEnabled && (!root.textViewVisible)
+        sequence: "PgUp"
+        enabled: root.readerPageNavigationEnabled
         onActivated: root.navigate(root.currentPage - 1)
     }
     Shortcut {
         sequence: "Ctrl+Home"
-        enabled: root.readerKeyboardEnabled && (!root.textViewVisible)
+        enabled: root.readerPageNavigationEnabled
         onActivated: root.navigate(0)
     }
     Shortcut {
         sequence: "Ctrl+End"
-        enabled: root.readerKeyboardEnabled && (!root.textViewVisible)
+        enabled: root.readerPageNavigationEnabled
         onActivated: root.navigate(currentReader.pageCount - 1)
     }
     Shortcut {

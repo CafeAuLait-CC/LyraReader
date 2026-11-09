@@ -571,9 +571,18 @@ private slots:
         QTRY_VERIFY(reader->pageCount()==9 && !reader->loading() && reader->pendingCommands()==0 && !window->property("positionRestoring").toBool());
         QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,6),Q_ARG(QVariant,100.0)));QVERIFY(QMetaObject::invokeMethod(window,"jumpFromPreview",Q_ARG(QVariant,2),Q_ARG(QVariant,20.0)));
         auto *navigation=window->findChild<NavigationController *>("navigationController");QVERIFY(navigation);window->requestActivate();QTRY_VERIFY(navigation->keyboardFocus());
+        QTest::keyClick(window,Qt::Key_PageDown);QTRY_COMPARE_WITH_TIMEOUT(window->property("currentPage").toInt(),3,3000);
+        QTest::keyClick(window,Qt::Key_PageUp);QTRY_COMPARE_WITH_TIMEOUT(window->property("currentPage").toInt(),2,3000);
+        auto *pageNumber=visualItem(window->contentItem(),"pageNumber");QVERIFY(pageNumber);pageNumber->forceActiveFocus();QTRY_VERIFY(pageNumber->hasActiveFocus());
+        QTest::keyClick(window,Qt::Key_PageDown);QCOMPARE(window->property("currentPage").toInt(),2);
+        QTest::keyClick(window,Qt::Key_PageUp);QCOMPARE(window->property("currentPage").toInt(),2);
+        QTest::keyClick(window,Qt::Key_Home,Qt::ControlModifier);QCOMPARE(window->property("currentPage").toInt(),2);
+        QTest::keyClick(window,Qt::Key_End,Qt::ControlModifier);QCOMPARE(window->property("currentPage").toInt(),2);
+        QVERIFY(QMetaObject::invokeMethod(window,"focusReadingView"));
         QTest::keyClick(window,Qt::Key_Left,Qt::AltModifier);QCOMPARE(window->property("currentPage").toInt(),6);QVERIFY(window->property("canGoForward").toBool());
         QQuickWindow auxiliary;auxiliary.setTransientParent(window);auxiliary.setFlag(Qt::Dialog);auxiliary.show();auxiliary.requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),&auxiliary);QVERIFY(!navigation->keyboardFocus());
         QTest::keyClick(&auxiliary,Qt::Key_Right,Qt::AltModifier);QCOMPARE(window->property("currentPage").toInt(),6);QVERIFY(window->property("canGoForward").toBool());
+        QTest::keyClick(&auxiliary,Qt::Key_PageDown);QCOMPARE(window->property("currentPage").toInt(),6);
         QVERIFY(auxiliary.close());window->requestActivate();QTRY_VERIFY(navigation->keyboardFocus());QTest::keyClick(window,Qt::Key_Right,Qt::AltModifier);QCOMPARE(window->property("currentPage").toInt(),2);
     }
     void recentHistoryIsSharedByAllReaderWindows() {
