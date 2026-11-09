@@ -53,12 +53,15 @@ Item {
             clip: true
             Loader {
                 objectName: "paperFragmentPaint"+piece.index
-                active: piece.present && staticRegion.visible
+                // Geometry bindings can briefly disagree on a revision during one update.
+                // Keep paint alive and source-sized; only its clip/visibility follows pieces.
+                active: staticRegion.mapped && staticRegion.bounded
+                visible: piece.present && staticRegion.visible
                 sourceComponent: staticRegion.paint
                 x: piece.present ? (staticRegion.sourceRect.x-piece.original.x)*staticRegion.zoom : 0
                 y: piece.present ? (staticRegion.sourceRect.y-piece.original.y)*staticRegion.zoom : 0
-                width: piece.present ? staticRegion.sourceRect.width*staticRegion.zoom : 0
-                height: piece.present ? staticRegion.sourceRect.height*staticRegion.zoom : 0
+                width: staticRegion.bounded ? staticRegion.sourceRect.width*staticRegion.zoom : 0
+                height: staticRegion.bounded ? staticRegion.sourceRect.height*staticRegion.zoom : 0
             }
         }
     }

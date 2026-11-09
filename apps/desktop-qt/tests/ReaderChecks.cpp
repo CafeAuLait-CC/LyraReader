@@ -28,6 +28,7 @@
 #include "WorkspaceController.h"
 #include <QApplication>
 #include <QClipboard>
+#include <QBuffer>
 #include <QAccessible>
 #include <QFontDatabase>
 #include <QDir>
@@ -2167,6 +2168,40 @@ private slots:
         QVERIFY(!lyra_reader_desktop_paper_quads(layout,input,2,output,&error));QVERIFY(error.data);lyra_reader_desktop_buffer_free(error);error={};
         QCOMPARE(output[0].count,std::uint32_t(99));QCOMPARE(output[1].count,std::uint32_t(98));
         QVERIFY(lyra_reader_desktop_paper_quads(layout,nullptr,0,nullptr,&error));QVERIFY(!error.data);
+    }
+    void paperArtworkUsesOneTextureAndOriginalUvs_data() {
+        QTest::addColumn<double>("zoom");QTest::addColumn<QString>("appearance");
+        QTest::newRow("100-original")<<1.0<<QString("original");QTest::newRow("125-night")<<1.25<<QString("night");
+    }
+    void paperArtworkUsesOneTextureAndOriginalUvs() {
+        QFETCH(double,zoom);QFETCH(QString,appearance);
+        QImage pixels(64,80,QImage::Format_RGBA8888);pixels.fill(Qt::transparent);{QPainter p(&pixels);p.fillRect(QRect(20,0,44,40),QColor(190,35,45));p.fillRect(QRect(20,40,44,40),QColor(35,155,75));}
+        QByteArray png;QBuffer buffer(&png);QVERIFY(buffer.open(QIODevice::WriteOnly));QVERIFY(pixels.save(&buffer,"PNG"));
+        QQuickWindow window;window.resize(260,340);window.setColor(QColor(11,19,29));window.setPersistentSceneGraph(false);if(QGuiApplication::platformName()!="offscreen")window.setMaximumSize(QSize(260,340));
+        PageItem page;CropItem crop;crop.setParentItem(window.contentItem());crop.setPosition(QPointF(40*zoom,40*zoom));crop.setSize(QSizeF(80*zoom,100*zoom));crop.setPaperAppearance(appearance);crop.setOpacity(.7);crop.setSource(QUrl("data:image/png;base64,"+QString::fromLatin1(png.toBase64())));crop.setPaperMap(&page);crop.setPaperRect(QRectF(40,40,80,100));crop.setPaperOrigin(QPointF(40,40));crop.setPaperZoom(zoom);
+        window.show();QTRY_COMPARE_WITH_TIMEOUT(crop.status(),1,15000);QTest::qWait(80);const auto before=window.grabWindow();QVERIFY(!before.isNull());QCOMPARE(crop.pixelSize(),pixels.size());
+        const auto colour=[&](const QImage &image,double x,double y){return image.pixelColor(int(x*zoom*image.width()/window.width()),int(y*zoom*image.height()/window.height()));};const auto close=[](QColor a,QColor b){return std::abs(a.red()-b.red())<=2 && std::abs(a.green()-b.green())<=2 && std::abs(a.blue()-b.blue())<=2;};QVERIFY(!close(colour(before,100,50),window.color()));QVERIFY(close(colour(before,45,50),window.color()));
+        const auto textures=RenderBudget::statistics().value("textureBytes").toLongLong(),resident=RenderBudget::statistics().value("residentBytes").toLongLong(),completed=RasterJobs::statistics().value("completed").toLongLong();QVERIFY(textures>0);QSignalSpy frames(&window,&QQuickWindow::frameSwapped);
+        for(double gap:{.00001,20.0,60.0,30.0,0.0}) {
+            const int previous=frames.size();QVERIFY(page.configurePaper(240,100,gap));crop.setHeight((100+gap)*zoom);window.update();QTRY_VERIFY_WITH_TIMEOUT(frames.size()>previous,3000);QTest::qWait(40);const auto opened=window.grabWindow();QVERIFY(!opened.isNull());const double shift=gap<.001?0:gap;
+            for(double y:{50.0,75.0,95.0,115.0,135.0})QVERIFY2(close(colour(before,100,y),colour(opened,100,y+(y>=100?shift:0))),qPrintable(QString("Source sample %1 gap %2").arg(y).arg(gap)));
+            if(gap>=20)QVERIFY(close(colour(opened,100,100+gap/2),window.color()));QVERIFY(close(colour(opened,45,50),window.color()));QVERIFY(crop.paperGeometryError().isEmpty());QCOMPARE(crop.pixelSize(),pixels.size());QCOMPARE(RenderBudget::statistics().value("textureBytes").toLongLong(),textures);QCOMPARE(RenderBudget::statistics().value("residentBytes").toLongLong(),resident);QCOMPARE(RasterJobs::statistics().value("completed").toLongLong(),completed);
+            if(qEnvironmentVariableIsSet("LYRA_READER_PAPER_EVIDENCE_DIR") && gap==60){const auto dir=qEnvironmentVariable("LYRA_READER_PAPER_EVIDENCE_DIR");QVERIFY(QDir().mkpath(dir));QVERIFY(opened.save(dir+QString("/artwork-%1-%2.png").arg(zoom).arg(appearance)));}
+        }
+        crop.setPaperRect(QRectF(0,0,1e300,1e300));window.update();QTRY_VERIFY(!crop.paperGeometryError().isEmpty());QCOMPARE(RasterJobs::statistics().value("completed").toLongLong(),completed);crop.setPaperRect(QRectF(40,40,80,100));QTRY_VERIFY(crop.paperGeometryError().isEmpty());
+        page.clearPaperGeometry();crop.setSize(QSizeF(80*zoom,100*zoom));window.update();QTest::qWait(40);QVERIFY(close(colour(window.grabWindow(),100,115),colour(before,100,115)));
+        auto *borrowed=new PageItem;QVERIFY(borrowed->configurePaper(240,100,40));crop.setPaperMap(borrowed);QTest::qWait(40);QVERIFY(!window.grabWindow().isNull());delete borrowed;QTRY_VERIFY(!crop.paperMap());QTest::qWait(40);QVERIFY(close(colour(window.grabWindow(),100,115),colour(before,100,115)));
+        window.hide();crop.setResourceActive(false);window.releaseResources();QTRY_COMPARE_WITH_TIMEOUT(RenderBudget::statistics().value("textureBytes").toLongLong(),0,10000);
+    }
+    void paperArtworkDelegatesKeepDisplayCullingAndSourceRecords() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("paper-artwork.pdf");{QPdfWriter pdf(path);pdf.setResolution(72);pdf.setPageSize(QPageSize(QSizeF(400,500),QPageSize::Point));pdf.setPageMargins(QMarginsF(0,0,0,0));QPainter p(&pdf);QVERIFY(p.isActive());p.fillRect(QRectF(0,0,400,500),Qt::white);}
+        QImage picture(8,8,QImage::Format_RGBA8888);picture.fill(QColor(160,65,30));QByteArray png;QBuffer buffer(&png);QVERIFY(buffer.open(QIODevice::WriteOnly));QVERIFY(picture.save(&buffer,"PNG"));
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE(reader->pendingCommands(),0);view.window->setProperty("secondaryRow","fill");QVERIFY(settleReaderViewport(view.window));view.window->setProperty("fitting",false);QVERIFY(QMetaObject::invokeMethod(view.window,"changeZoom",Q_ARG(QVariant,1.0),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+        for(const auto &kind:{QString("stamp"),QString("signature")}){QVariantMap mark{{"kind",kind},{"page",0},{"version",1},{"rect",QVariantMap{{"x",kind=="stamp"?20:220},{"y",200},{"width",160},{"height",100}}},{"color","#88611BFF"},{"note",kind=="stamp"?"APPROVED":""},{"stampStyle",kind=="stamp"?"approved":"image"}};if(kind=="signature")mark.insert("image",QString::fromLatin1(png.toBase64()));reader->submit("mark_create",{{"entry",mark}});QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));}
+        const auto entries=reader->data().value("marks").toMap().value("annotations").toList();QCOMPARE(entries.size(),2);QString stampId,imageId;for(const auto &v:entries){const auto m=v.toMap();(m.value("kind")=="stamp"?stampId:imageId)=m.value("id").toString();}auto *page=qobject_cast<PageItem *>(visualItem(view.window->contentItem(),"pdfPage0"));QVERIFY(page);QVERIFY(page->configurePaper(500,240,40));auto *rootItem=page->parentItem();auto *image=qobject_cast<CropItem *>(visualItem(rootItem,"signatureArt"+imageId));auto *stamp=visualItem(rootItem,"staticArtwork"+stampId);QVERIFY(image && stamp);QTRY_COMPARE_WITH_TIMEOUT(image->status(),1,15000);QTRY_VERIFY(stamp->isVisible());auto *lower=visualItem(stamp,"paperFragmentPaint1");QVERIFY(lower);QPointer<QQuickItem> paint;QTRY_VERIFY((paint=lower->property("item").value<QQuickItem *>()));auto *text=visualItem(paint,"staticStampText");QVERIFY(text);QTRY_VERIFY(text->width()>100);const auto font=text->property("font");const auto textWidth=text->width();const auto url=image->source();QTRY_COMPARE(reader->pendingRasters(),0);const auto completed=reader->completedRasters();QTest::qWait(100);const auto jobs=RasterJobs::statistics().value("completed").toLongLong();const QString status="Paper geometry ready";view.window->setProperty("operationStatus",status);
+        for(double gap:{40.0,80.0,20.0}){QVERIFY(page->configurePaper(500,240,gap));QTRY_VERIFY(std::abs(image->height()-(100+gap))<.75);QCOMPARE(image->source(),url);QVERIFY(lower->property("item").value<QQuickItem *>()==paint);QTRY_VERIFY(std::abs(lower->y()+40)<.75);QVERIFY(image->isVisible() && image->paperGeometryError().isEmpty());QCOMPARE(text->property("font"),font);QCOMPARE(text->width(),textWidth);QVERIFY(std::abs(paint->width()-160)<.75);QCOMPARE(reader->completedRasters(),completed);QCOMPARE(reader->data().value("marks").toMap().value("annotations").toList(),entries);QTest::qWait(90);QCOMPARE(RasterJobs::statistics().value("completed").toLongLong(),jobs);QCOMPARE(view.window->property("operationStatus").toString(),status);}
+        if(qEnvironmentVariableIsSet("LYRA_READER_PAPER_EVIDENCE_DIR")){const auto dir=qEnvironmentVariable("LYRA_READER_PAPER_EVIDENCE_DIR");QVERIFY(QDir().mkpath(dir));QTest::qWait(40);QVERIFY(view.window->grabWindow().save(dir+"/artwork-delegates.png"));}
+        auto *art=visualItem(rootItem,"artwork"+imageId);QVERIFY(art);auto *annotationLayer=art->parentItem();QVERIFY(annotationLayer && annotationLayer->property("visibleRegion").isValid());QVERIFY(QQmlProperty(annotationLayer,"visibleRegion").write(QRectF(210,310,180,50)));QVERIFY(page->configurePaper(500,240,80));QTRY_VERIFY(art->isVisible());QVERIFY(QQmlProperty(annotationLayer,"visibleRegion").write(QRectF(210,450,180,20)));QTRY_VERIFY(!art->isVisible());
     }
     void paperStaticTextPreservesSourceLayoutAndPaintInstances_data() {
         QTest::addColumn<double>("zoom");QTest::newRow("100-percent")<<1.0;QTest::newRow("125-percent")<<1.25;

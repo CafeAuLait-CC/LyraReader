@@ -2,8 +2,11 @@
 #include "RenderBudget.h"
 #include "RasterJobs.h"
 #include <QQuickItem>
+#include <QPointer>
 #include <QTimer>
 #include <QUrl>
+class PageItem;
+Q_MOC_INCLUDE("PageItem.h")
 
 // Preview regions use the same accounting and render pool as the PDF canvas.
 class CropItem:public QQuickItem {
@@ -14,6 +17,11 @@ class CropItem:public QQuickItem {
     Q_PROPERTY(QSize pixelSize READ pixelSize NOTIFY statusChanged)
     Q_PROPERTY(QString paperAppearance READ paperAppearance WRITE setPaperAppearance NOTIFY paperAppearanceChanged)
     Q_PROPERTY(bool resourceActive READ resourceActive WRITE setResourceActive NOTIFY resourceActiveChanged)
+    Q_PROPERTY(PageItem *paperMap READ paperMap WRITE setPaperMap NOTIFY paperGeometryChanged)
+    Q_PROPERTY(QRectF paperRect READ paperRect WRITE setPaperRect NOTIFY paperGeometryChanged)
+    Q_PROPERTY(double paperZoom READ paperZoom WRITE setPaperZoom NOTIFY paperGeometryChanged)
+    Q_PROPERTY(QPointF paperOrigin READ paperOrigin WRITE setPaperOrigin NOTIFY paperGeometryChanged)
+    Q_PROPERTY(QString paperGeometryError READ paperGeometryError NOTIFY paperGeometryChanged)
 public:
     explicit CropItem(QQuickItem *parent=nullptr);
     ~CropItem()override;
@@ -26,15 +34,28 @@ public:
     void setSource(const QUrl &source);
     void setPaperAppearance(const QString &paper);
     void setResourceActive(bool active);
+    // Page-owned artwork: source bounds and displayed parent origin are points, before zoom.
+    // The page is borrowed only during scene sync; geometry changes never invalidate pixels.
+    PageItem *paperMap()const;
+    QRectF paperRect()const{return m_paperRect;}
+    double paperZoom()const{return m_paperZoom;}
+    QPointF paperOrigin()const{return m_paperOrigin;}
+    QString paperGeometryError()const{return m_geometryError;}
+    void setPaperMap(PageItem *page);
+    void setPaperRect(const QRectF &rect);
+    void setPaperZoom(double zoom);
+    void setPaperOrigin(const QPointF &origin);
 signals:
     void sourceChanged();void statusChanged();void paperAppearanceChanged();void resourceActiveChanged();
+    void paperGeometryChanged();
 protected:
     QSGNode *updatePaintNode(QSGNode *,UpdatePaintNodeData *)override;
     void itemChange(ItemChange,const ItemChangeData &)override;
 private:
     void request();void invalidate();void setStatus(int status);void syncBudget();
     bool active()const;
-    void visibilityUpdated();
+    void visibilityUpdated();void scheduleVisibilityUpdate();
+    void geometryUpdated();void reportGeometryError(const QString &error);
     QUrl m_source;QString m_paper=QStringLiteral("original");
     QString m_error;
     ResidentImage m_image;
@@ -44,5 +65,13 @@ private:
     qint64 m_target=0;
     int m_status=0;
     bool m_resourceActive=true;
+    bool m_visibilityPending=false,m_lastActive=false;
     QMetaObject::Connection m_visibilityConnection;
+    QPointer<PageItem> m_paperMap;
+    QVector<QMetaObject::Connection> m_paperConnections;
+    QRectF m_paperRect;
+    QPointF m_paperOrigin;
+    double m_paperZoom=1;
+    quint64 m_geometryEpoch=0;
+    QString m_geometryError;
 };

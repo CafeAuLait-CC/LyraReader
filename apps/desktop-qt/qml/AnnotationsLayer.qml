@@ -40,43 +40,72 @@ Item {
             return a.page === page && a.visible && (!ownOnly || !a.foreign) && (a.kind === "stamp" || a.kind === "signature");
         })
         Item {
+            id: artworkDelegate
             required property var modelData
             readonly property var artwork: app.annotationDraft && app.annotationDraft.id === modelData.id ? app.annotationDraft : modelData
+            readonly property bool torn: !!annotationLayer.paperMap && annotationLayer.paperMap.paperGeometryActive
+            PaperRegion {
+                id: artworkGeometry
+                app: annotationLayer.app
+                paperMap: annotationLayer.paperMap
+                sourceRect: Qt.rect(artwork.rect.x,artwork.rect.y,artwork.rect.width,artwork.rect.height)
+            }
             objectName: "artwork" + artwork.id
-            x: artwork.rect.x * annotationLayer.zoom
-            y: artwork.rect.y * annotationLayer.zoom
-            width: artwork.rect.width * annotationLayer.zoom
-            height: artwork.rect.height * annotationLayer.zoom
+            x: displayBounds.x * annotationLayer.zoom
+            y: displayBounds.y * annotationLayer.zoom
+            width: displayBounds.width * annotationLayer.zoom
+            height: displayBounds.height * annotationLayer.zoom
             readonly property color ink: Logic.displayColor(Logic.color(artwork), app.paperAppearance)
-            visible: artwork.rect.x < annotationLayer.visibleRegion.x + annotationLayer.visibleRegion.width && artwork.rect.x + artwork.rect.width > annotationLayer.visibleRegion.x && artwork.rect.y < annotationLayer.visibleRegion.y + annotationLayer.visibleRegion.height && artwork.rect.y + artwork.rect.height > annotationLayer.visibleRegion.y
+            readonly property rect displayBounds: artworkGeometry.bounds
+            visible: artworkGeometry.hit && displayBounds.x < annotationLayer.visibleRegion.x + annotationLayer.visibleRegion.width && displayBounds.x + displayBounds.width > annotationLayer.visibleRegion.x && displayBounds.y < annotationLayer.visibleRegion.y + annotationLayer.visibleRegion.height && displayBounds.y + displayBounds.height > annotationLayer.visibleRegion.y
             Accessible.role: Accessible.Graphic
             Accessible.name: artwork.kind === "stamp" ? qsTr("%1 stamp on page %2").arg(artwork.note).arg(page + 1) : qsTr("Signature image on page %1").arg(page + 1)
             Accessible.selectable: true
             Accessible.selected: !!app.selectedAnnotation && app.selectedAnnotation.id === artwork.id
             Accessible.onPressAction: if (visible)
                 app.selectAnnotation(artwork, false)
-            Rectangle {
-                anchors.fill: parent
-                visible: artwork.kind === "stamp"
-                color: "transparent"
-                border.color: parent.ink
-                border.width: Math.min(2, Math.max(.75, artwork.rect.height * .035)) * annotationLayer.zoom
-                Text {
-                    Accessible.ignored: true
+            Component {
+                id: stampPaint
+                Rectangle {
                     anchors.fill: parent
-                    anchors.margins: (Math.min(2, Math.max(.75, artwork.rect.height * .035)) + 3) * annotationLayer.zoom
-                    text: String(artwork.note || "").trim().replace(/\s+/g, " ")
-                    textFormat: Text.PlainText
-                    color: parent.border.color
-                    horizontalAlignment: Text.AlignHCenter
-                    verticalAlignment: Text.AlignVCenter
-                    font.family: app.annotationFont
-                    font.pixelSize: Math.max(1, Math.round(artwork.rect.height * .56 * annotationLayer.zoom))
-                    fontSizeMode: Text.Fit
-                    minimumPixelSize: 1
-                    wrapMode: Text.NoWrap
-                    clip: true
+                    color: "transparent"
+                    border.color: artworkDelegate.ink
+                    border.width: Math.min(2, Math.max(.75, artworkDelegate.artwork.rect.height * .035)) * annotationLayer.zoom
+                    Text {
+                        objectName: "staticStampText"
+                        Accessible.ignored: true
+                        anchors.fill: parent
+                        anchors.margins: (Math.min(2, Math.max(.75, artworkDelegate.artwork.rect.height * .035)) + 3) * annotationLayer.zoom
+                        text: String(artworkDelegate.artwork.note || "").trim().replace(/\s+/g, " ")
+                        textFormat: Text.PlainText
+                        color: parent.border.color
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                        font.family: app.annotationFont
+                        font.pixelSize: Math.max(1, Math.round(artworkDelegate.artwork.rect.height * .56 * annotationLayer.zoom))
+                        fontSizeMode: Text.Fit
+                        minimumPixelSize: 1
+                        wrapMode: Text.NoWrap
+                        clip: true
+                    }
                 }
+            }
+            Loader {
+                anchors.fill: parent
+                active: artworkDelegate.artwork.kind==="stamp" && !artworkDelegate.torn
+                sourceComponent: stampPaint
+            }
+            PaperStaticRegion {
+                objectName: "staticArtwork"+artworkDelegate.artwork.id
+                x: 0
+                y: 0
+                app: annotationLayer.app
+                paperMap: artworkDelegate.artwork.kind==="stamp" ? annotationLayer.paperMap : null
+                sourceRect: Qt.rect(artworkDelegate.artwork.rect.x,artworkDelegate.artwork.rect.y,artworkDelegate.artwork.rect.width,artworkDelegate.artwork.rect.height)
+                zoom: annotationLayer.zoom
+                paint: stampPaint
+                // The parent remains the one accessible/selectable artwork owner.
+                Accessible.ignored: true
             }
             PdfCrop {
                 id: signatureCrop
@@ -87,12 +116,16 @@ Item {
                 // Geometry drafts must not rebuild a potentially large data URL.
                 source: modelData.image ? "data:image/png;base64," + modelData.image : ""
                 paperAppearance: app.paperAppearance
+                paperMap: annotationLayer.paperMap
+                paperRect: Qt.rect(artwork.rect.x,artwork.rect.y,artwork.rect.width,artwork.rect.height)
+                paperZoom: annotationLayer.zoom
+                paperOrigin: Qt.point(artworkDelegate.displayBounds.x,artworkDelegate.displayBounds.y)
                 opacity: Logic.color(artwork).a
             }
             Text {
                 anchors.fill: parent
-                visible: artwork.kind === "signature" && signatureCrop.status === 3
-                text: qsTr("Image could not be decoded")
+                visible: artwork.kind === "signature" && (signatureCrop.status === 3 || signatureCrop.paperGeometryError.length>0)
+                text: signatureCrop.paperGeometryError.length ? signatureCrop.paperGeometryError : qsTr("Image could not be decoded")
                 textFormat: Text.PlainText
                 color: app.colors.textSecondary
                 wrapMode: Text.Wrap
