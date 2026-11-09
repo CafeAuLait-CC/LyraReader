@@ -27,10 +27,10 @@ use std::{
     ptr, slice,
 };
 
-/// Version of the hand-written Qt C boundary, including bounded paper-quad batches.
+/// Version of the Qt boundary, including the mandatory authoritative layout-row packet.
 #[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_desktop_abi_version() -> u32 {
-    7
+    8
 }
 
 /// # Safety
@@ -1222,7 +1222,7 @@ mod tests {
 
     #[test]
     fn image_byte_boundary_rejects_null_handles_and_reports_its_version() {
-        assert_eq!(lyra_reader_desktop_abi_version(), 7);
+        assert_eq!(lyra_reader_desktop_abi_version(), 8);
         let mut error = Buffer {
             data: ptr::null_mut(),
             len: 0,

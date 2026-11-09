@@ -17,7 +17,7 @@ pub mod paper;
 pub mod viewport;
 
 pub use command::{Anchor, Command, Event, Layout, Zoom};
-pub use layout::{DocumentLayout, LayoutMode, PagePlacement};
+pub use layout::{DocumentLayout, LayoutMode, PagePlacement, PageRow};
 pub use navigation::{
     NAVIGATION_HISTORY_LIMIT, NavigationHistory, ReaderLocation, ReaderSelection,
 };

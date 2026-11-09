@@ -25,6 +25,7 @@ struct TilePlanResult {QList<TileSpec> tiles;bool accepted=false;};
 class ReaderController : public QObject {
     Q_OBJECT
     Q_PROPERTY(QVariantList pages READ pages NOTIFY documentChanged)
+    Q_PROPERTY(QVariantList layoutRows READ layoutRows NOTIFY documentChanged)
     Q_PROPERTY(int pageCount READ pageCount NOTIFY documentChanged)
     Q_PROPERTY(double documentWidth READ documentWidth NOTIFY documentChanged)
     Q_PROPERTY(double documentHeight READ documentHeight NOTIFY documentChanged)
@@ -57,6 +58,7 @@ public:
     explicit ReaderController(QObject *parent = nullptr);
     ~ReaderController() override;
     QVariantList pages() const { return m_pages; }
+    QVariantList layoutRows() const { return m_layoutRows; }
     int pageCount() const { return int(m_pages.size()); }
     double documentWidth() const { return m_documentWidth; }
     double documentHeight() const { return m_documentHeight; }
@@ -215,6 +217,7 @@ private:
     bool m_activeRasterIsTile=false;
     QUrl m_lastUrl;
     QVariantList m_pages;
+    QVariantList m_layoutRows;
     double m_documentWidth = 0;
     double m_documentHeight = 0;
     QVariantMap m_data, m_textPages, m_noteDrafts, m_editDrafts;

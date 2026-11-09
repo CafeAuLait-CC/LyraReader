@@ -53,7 +53,7 @@ QString takeError(LyraReaderBuffer &buffer) {
 struct OpenResult {
     std::shared_ptr<LyraReaderDesktopDocument> document;
     std::shared_ptr<NativeRasterSource> source;
-    QVariantList pages;
+    QVariantList pages,rows;
     double width = 0;
     double height = 0;
     QVariantMap signature;
@@ -114,7 +114,7 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
     m_lastUrl = url;
     const auto generation = ++m_generation;
     resetAi();m_document.reset();setRasterSource({});
-    m_pages.clear();
+    m_pages.clear();m_layoutRows.clear();
     clearRasterCache();
     m_pending.clear();
     m_failed.clear();
@@ -146,7 +146,7 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
             return;
         }
         m_document = std::move(result.document);setRasterSource(std::move(result.source));
-        m_pages = std::move(result.pages);
+        m_pages = std::move(result.pages);m_layoutRows=std::move(result.rows);
         m_data.insert(QStringLiteral("signature_status"),result.signature);emit dataChanged();
         m_data.insert(QStringLiteral("recovery"),result.recovery);
         m_data.insert(QStringLiteral("xfa_status"),result.xfa);
@@ -183,6 +183,7 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
         }
         const auto object = json.object();
         result.pages = object.value(QStringLiteral("pages")).toArray().toVariantList();
+        result.rows = object.value(QStringLiteral("rows")).toArray().toVariantList();
         result.width = object.value(QStringLiteral("width")).toDouble();
         result.height = object.value(QStringLiteral("height")).toDouble();
         result.signature = object.value(QStringLiteral("signature_status")).toObject().toVariantMap();
@@ -206,7 +207,7 @@ bool ReaderController::openSnapshot(const std::shared_ptr<NativeRasterSource> &s
 void ReaderController::closeSnapshot() {
     if(!m_snapshotMode)return;
     ++m_generation;clearRasterCache();m_requests.clear();m_pending.clear();m_failed.clear();
-    setRasterSource({});m_pages.clear();m_textPages.clear();m_textPending.clear();m_data.clear();
+    setRasterSource({});m_pages.clear();m_layoutRows.clear();m_textPages.clear();m_textPending.clear();m_data.clear();
     m_documentWidth=0;m_documentHeight=0;m_loading=false;
     emit documentReset();emit documentChanged();emit textPagesChanged();emit dataChanged();emit loadingChanged();
 }
@@ -227,7 +228,7 @@ quint64 ReaderController::submitSnapshot(quint64 id,const QString &operation,con
         const bool opening=m_loading && operation==QStringLiteral("layout");
         if(!result.error.isEmpty())setError(result.error);
         else if(operation==QStringLiteral("layout")) {
-            const auto layout=result.result.toMap();m_pages=layout.value(QStringLiteral("pages")).toList();
+            const auto layout=result.result.toMap();m_pages=layout.value(QStringLiteral("pages")).toList();m_layoutRows=layout.value(QStringLiteral("rows")).toList();
             m_documentWidth=layout.value(QStringLiteral("width")).toDouble();m_documentHeight=layout.value(QStringLiteral("height")).toDouble();emit documentChanged();
         }else if(operation==QStringLiteral("text")) {
             const auto page=arguments.value(QStringLiteral("page")).toInt();m_textPages.insert(QString::number(page),result.result);emit textPagesChanged();
@@ -345,7 +346,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
             const auto info=revision.value(QStringLiteral("info")).toMap();
             const bool reloadForms=m_data.contains(QStringLiteral("forms"));
             ++m_generation;resetAi();clearRasterCache();m_pending.clear();m_failed.clear();m_requests.clear();m_textPages.clear();m_textPending.clear();
-            m_pages=info.value(QStringLiteral("pages")).toList();m_documentWidth=info.value(QStringLiteral("width")).toDouble();m_documentHeight=info.value(QStringLiteral("height")).toDouble();
+            m_pages=info.value(QStringLiteral("pages")).toList();m_layoutRows=info.value(QStringLiteral("rows")).toList();m_documentWidth=info.value(QStringLiteral("width")).toDouble();m_documentHeight=info.value(QStringLiteral("height")).toDouble();
             m_data.clear();m_data.insert(QStringLiteral("marks"),revision.value(QStringLiteral("marks")));m_data.insert(QStringLiteral("signature_status"),info.value(QStringLiteral("signature_status")));
             m_data.insert(QStringLiteral("xfa_status"),info.value(QStringLiteral("xfa_status")));
             m_data.insert(QStringLiteral("document_revision"),info.value(QStringLiteral("revision")));
@@ -362,6 +363,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         } else if (operation == QStringLiteral("layout")) {
             const auto layout = outcome.result.toMap();
             m_pages = layout.value(QStringLiteral("pages")).toList();
+            m_layoutRows = layout.value(QStringLiteral("rows")).toList();
             m_documentWidth = layout.value(QStringLiteral("width")).toDouble();
             m_documentHeight = layout.value(QStringLiteral("height")).toDouble();
             emit documentChanged();

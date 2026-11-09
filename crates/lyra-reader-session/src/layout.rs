@@ -72,6 +72,17 @@ struct Row {
     end: usize,
 }
 
+/// One authoritative row in content points, including its following inter-row gap.
+/// `first_page` and `page_count` index the same layout's placements; a facing pair is one row.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PageRow {
+    pub top_pt: f64,
+    pub bottom_pt: f64,
+    pub height_pt: f64,
+    pub first_page: usize,
+    pub page_count: usize,
+}
+
 /// Layout of a whole document at a given zoom.
 ///
 /// The layout is computed for a *zoom-independent* point space: the shell multiplies by
@@ -146,6 +157,23 @@ impl DocumentLayout {
 
     pub fn placements(&self) -> &[PagePlacement] {
         &self.placements
+    }
+
+    /// Borrow the existing row index without re-grouping pages by approximate Y in a shell.
+    /// No row snapshot or page data is allocated; the last row has no trailing gap.
+    pub fn rows(&self) -> impl ExactSizeIterator<Item = PageRow> + '_ {
+        self.rows.iter().enumerate().map(|(index, row)| PageRow {
+            top_pt: row.top_pt,
+            bottom_pt: row.bottom_pt,
+            height_pt: row.bottom_pt - row.top_pt
+                + if index + 1 < self.rows.len() {
+                    self.gap_pt
+                } else {
+                    0.0
+                },
+            first_page: row.start,
+            page_count: row.end - row.start,
+        })
     }
 
     /// Top edge of a page (for "go to page" and for scroll anchoring).
@@ -354,6 +382,95 @@ fn build_facing(sizes: Vec<(f64, f64)>, gap: f64, max_width: f64) -> DocumentLay
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_packets_preserve_fractional_gaps_without_a_trailing_gap() {
+        assert_eq!(DocumentLayout::new([], 12.5).rows().len(), 0);
+        let layout = DocumentLayout::new([(100.0, 80.0), (200.0, 240.0), (150.0, 120.0)], 12.5);
+        let rows: Vec<_> = layout.rows().collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0],
+            PageRow {
+                top_pt: 0.0,
+                bottom_pt: 80.0,
+                height_pt: 92.5,
+                first_page: 0,
+                page_count: 1
+            }
+        );
+        assert_eq!(
+            rows[1],
+            PageRow {
+                top_pt: 92.5,
+                bottom_pt: 332.5,
+                height_pt: 252.5,
+                first_page: 1,
+                page_count: 1
+            }
+        );
+        assert_eq!(
+            rows[2],
+            PageRow {
+                top_pt: 345.0,
+                bottom_pt: 465.0,
+                height_pt: 120.0,
+                first_page: 2,
+                page_count: 1
+            }
+        );
+        assert_eq!(
+            rows.iter().map(|r| r.height_pt).sum::<f64>(),
+            layout.content_height_pt()
+        );
+    }
+
+    #[test]
+    fn facing_row_packets_use_the_taller_partner_and_cover_every_page_once() {
+        let layout = DocumentLayout::new_with_mode(
+            [
+                (100.0, 80.0),
+                (200.0, 240.0),
+                (150.0, 500.0),
+                (120.0, 140.0),
+            ],
+            12.5,
+            LayoutMode::Facing,
+        );
+        let pages = layout.placements().to_vec();
+        let rows: Vec<_> = layout.rows().collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[1],
+            PageRow {
+                top_pt: 92.5,
+                bottom_pt: 592.5,
+                height_pt: 512.5,
+                first_page: 1,
+                page_count: 2
+            }
+        );
+        assert_eq!(
+            rows[2],
+            PageRow {
+                top_pt: 605.0,
+                bottom_pt: 745.0,
+                height_pt: 140.0,
+                first_page: 3,
+                page_count: 1
+            }
+        );
+        let indices: Vec<_> = rows
+            .iter()
+            .flat_map(|r| r.first_page..r.first_page + r.page_count)
+            .collect();
+        assert_eq!(indices, [0, 1, 2, 3]);
+        assert_eq!(layout.placements(), pages);
+        assert_eq!(
+            rows.iter().map(|r| r.height_pt).sum::<f64>(),
+            layout.content_height_pt()
+        );
+    }
 
     /// Three A4 pages with the default 12 pt gap.
     fn three_pages() -> DocumentLayout {

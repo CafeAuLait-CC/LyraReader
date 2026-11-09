@@ -1,13 +1,17 @@
 import QtQuick
 import QtQuick.Controls
 import LyraReader 1.0
-import "ReaderLogic.js" as Logic
 
 Item {
     id: canvas
     required property var app
     property alias view: pageList
-    readonly property var rows: Logic.rows(app.currentReader.pages, app.pageGap)
+    // Rust owns row grouping, unequal facing heights and the last-row gap. The shell only
+    // attaches the corresponding existing page objects for its visual Repeater.
+    readonly property var rows: app.currentReader.layoutRows.map(function(row) {
+        return {top:row.top,bottom:row.bottom,height:row.height,
+            pages:app.currentReader.pages.slice(row.first,row.first+row.count)};
+    })
     property bool positioning: false
     property int placementEpoch: 0
     property real observedHeight: 0

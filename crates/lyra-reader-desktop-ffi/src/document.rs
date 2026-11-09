@@ -38,6 +38,25 @@ fn text(request: &Value, key: &str) -> Result<String, String> {
     arg(request, key)
 }
 
+fn layout_rows(layout: &DocumentLayout) -> Result<Value, String> {
+    // Ranges reference the packet's existing pages, avoiding a second serialized page table.
+    // Reuse the shared paper geometry count bound before allocating a file-sized snapshot.
+    let count = layout.rows().len();
+    if count > lyra_reader_session::paper::MAX_PAPER_GEOMETRY_ITEMS {
+        return Err("The layout row snapshot exceeds its geometry limit".into());
+    }
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(count)
+        .map_err(|_| "The layout row snapshot could not be allocated")?;
+    for row in layout.rows() {
+        rows.push(
+            json!({"top":row.top_pt,"bottom":row.bottom_pt,"height":row.height_pt,
+            "first":row.first_page,"count":row.page_count}),
+        );
+    }
+    Ok(Value::Array(rows))
+}
+
 pub(super) fn layout_value(source_layout: &DocumentLayout, r: &Value) -> Result<Value, String> {
     let gap = r.get("gap").and_then(Value::as_f64).unwrap_or(PAGE_GAP_PT);
     if !gap.is_finite() || !(0.0..=200.0).contains(&gap) {
@@ -57,9 +76,13 @@ pub(super) fn layout_value(source_layout: &DocumentLayout, r: &Value) -> Result<
         .iter()
         .map(|p| (p.width_pt, p.height_pt));
     let layout = DocumentLayout::new_with_mode(sizes, gap, mode);
-    Ok(json!({"pages": layout.placements().iter().map(|p|json!({
+    let rows = layout_rows(&layout)?;
+    let mut value = json!({"pages": layout.placements().iter().map(|p|json!({
         "index":p.index,"top":p.top_pt,"left":p.left_pt,"width":p.width_pt,"height":p.height_pt
-    })).collect::<Vec<_>>(), "width":layout.content_width_pt(),"height":layout.content_height_pt(),"gap":gap}))
+    })).collect::<Vec<_>>(), "width":layout.content_width_pt(),"height":layout.content_height_pt(),"gap":gap});
+    // The literal above is an object; move the bounded array without serializing it twice.
+    value["rows"] = rows;
+    Ok(value)
 }
 
 impl DesktopDocument {
@@ -153,10 +176,14 @@ impl DesktopDocument {
             .layout
             .read()
             .map_err(|_| "Layout state is unavailable")?;
-        Ok(json!({
+        let rows = layout_rows(&layout)?;
+        let mut value = json!({
             "pages":layout.placements().iter().map(|p|json!({"index":p.index,"width":p.width_pt,"height":p.height_pt,"top":p.top_pt,"left":p.left_pt})).collect::<Vec<_>>(),
             "width":layout.content_width_pt(),"height":layout.content_height_pt(),"gap":layout.gap_pt(),"path":self.original_path,"revision":self.active()?.path(),"signature_status":self.source_signature(&current),"xfa_status":self.source_xfa(&current),"annotation_rules":annotation_rules(),"ai_history_limit":ai_chat_history_limit(),"recovery":self.recovery_status.lock().map_err(|_|"Recovery state is unavailable")?.clone(),
-        }))
+        });
+        // This object is constructed here; indexing cannot depend on a file-supplied type.
+        value["rows"] = rows;
+        Ok(value)
     }
 
     pub fn render(
@@ -604,6 +631,21 @@ impl DesktopDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_row_snapshot_is_rejected_before_serialization() {
+        let layout = DocumentLayout::new(
+            std::iter::repeat_n(
+                (1.0, 1.0),
+                lyra_reader_session::paper::MAX_PAPER_GEOMETRY_ITEMS + 1,
+            ),
+            0.0,
+        );
+        assert_eq!(
+            layout_rows(&layout).unwrap_err(),
+            "The layout row snapshot exceeds its geometry limit"
+        );
+    }
     use std::{
         fs,
         path::PathBuf,
@@ -1494,6 +1536,13 @@ mod tests {
     fn native_transport_reuses_search_text_metadata_and_facing_geometry() {
         let fixture = Fixture::new("outlined.pdf");
         let doc = fixture.open();
+        let info = doc.info().unwrap();
+        assert_eq!(
+            info["rows"].as_array().unwrap().len(),
+            info["pages"].as_array().unwrap().len()
+        );
+        assert_eq!(info["rows"][0]["first"], 0);
+        assert_eq!(info["rows"][0]["count"], 1);
         let outline = doc.command(json!({"op":"outline"})).unwrap();
         assert!(!outline.as_array().unwrap().is_empty());
         let layout = doc
@@ -1501,6 +1550,9 @@ mod tests {
             .unwrap();
         assert_eq!(layout["pages"][1]["top"], layout["pages"][2]["top"]);
         assert_ne!(layout["pages"][1]["left"], layout["pages"][2]["left"]);
+        assert_eq!(layout["rows"][1]["first"], 1);
+        assert_eq!(layout["rows"][1]["count"], 2);
+        assert_eq!(layout["rows"][1]["top"], layout["pages"][1]["top"]);
         let text = doc.command(json!({"op":"text","page":0})).unwrap();
         let pattern = text["text"]
             .as_str()

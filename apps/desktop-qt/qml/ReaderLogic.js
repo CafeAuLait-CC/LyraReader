@@ -1,20 +1,5 @@
 .pragma library
 
-function rows(pages, gap) {
-    const result = []
-    for (const page of pages) {
-        let row = result[result.length - 1]
-        if (!row || Math.abs(row.top - page.top) > 0.01) {
-            row = {top: page.top, bottom: page.top + page.height, pages: []}
-            result.push(row)
-        }
-        row.pages.push(page)
-        row.bottom = Math.max(row.bottom, page.top + page.height)
-    }
-    for (let i = 0; i < result.length; ++i)
-        result[i].height = result[i].bottom - result[i].top + (i + 1 < result.length ? gap : 0)
-    return result
-}
 function nearestCharacter(chars, x, y) {
     let best = -1, distance = Infinity
     for (let i = 0; i < chars.length; ++i) {
