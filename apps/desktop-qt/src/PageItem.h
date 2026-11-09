@@ -23,6 +23,7 @@ class PageItem : public QQuickItem {
     Q_PROPERTY(QString paperGeometryError READ paperGeometryError NOTIFY paperGeometryChanged)
     Q_PROPERTY(bool paperGeometryActive READ paperGeometryActive NOTIFY paperGeometryChanged)
     Q_PROPERTY(qulonglong paperGeometryRevision READ paperGeometryRevision NOTIFY paperGeometryChanged)
+    Q_PROPERTY(double paperSceneLimit READ paperSceneLimit CONSTANT)
 public:
     explicit PageItem(QQuickItem *parent=nullptr);
     ~PageItem() override;
@@ -40,6 +41,7 @@ public:
     QString paperGeometryError()const{return m_paperError;}
     bool paperGeometryActive()const{return m_paperLayout.has_value();}
     qulonglong paperGeometryRevision()const{return m_paperEpoch;}
+    double paperSceneLimit()const;
     std::optional<LyraReaderPaperLayout> paperLayout()const{return m_paperLayout;}
     // One atomic geometry update. It does not change source pixels, raster demand or zoom.
     Q_INVOKABLE bool configurePaper(double originalHeightPt,double splitPt,double gapPt);

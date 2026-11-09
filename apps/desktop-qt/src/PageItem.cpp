@@ -28,6 +28,7 @@ PageItem::~PageItem() {
     if(m_controller)m_controller->clearRasterDemand(quintptr(this));
     for(const auto &connection:m_connections)QObject::disconnect(connection);
 }
+double PageItem::paperSceneLimit()const{return sceneCoordinateLimit;}
 void PageItem::setRefined(bool value) {
     if(!value){++m_textureEpoch;if(m_texturesReady){m_texturesReady=false;emit texturesReadyChanged();}}
     if(m_refined==value)return;m_refined=value;emit refinementChanged();

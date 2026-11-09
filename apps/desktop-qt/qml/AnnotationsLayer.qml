@@ -105,36 +105,61 @@ Item {
             return a.kind === "stickyNote" || a.kind === "textBox";
         })
         Item {
+            id: noteDelegate
             required property var modelData
-            x: modelData.rect.x * annotationLayer.zoom
-            y: modelData.rect.y * annotationLayer.zoom
-            width: modelData.rect.width * annotationLayer.zoom
-            height: modelData.rect.height * annotationLayer.zoom
-            Rectangle {
-                visible: modelData.kind === "stickyNote"
-                anchors.fill: parent
-                radius: Math.min(3, parent.width / 6)
-                color: app.colors.noteBg
-                border.color: app.colors.noteFg
-                Label {
-                    textFormat: Text.PlainText
-                    anchors.centerIn: parent
-                    text: "✎"
-                    font.pixelSize: Math.max(6, Math.min(18, parent.height * .7))
-                    color: app.colors.noteFg
+            readonly property bool torn: !!annotationLayer.paperMap && annotationLayer.paperMap.paperGeometryActive
+            x: torn ? 0 : modelData.rect.x * annotationLayer.zoom
+            y: torn ? 0 : modelData.rect.y * annotationLayer.zoom
+            width: torn ? annotationLayer.width : modelData.rect.width * annotationLayer.zoom
+            height: torn ? annotationLayer.height : modelData.rect.height * annotationLayer.zoom
+            Component {
+                id: notePaint
+                Item {
+                    Rectangle {
+                        visible: noteDelegate.modelData.kind === "stickyNote"
+                        anchors.fill: parent
+                        radius: Math.min(3, parent.width / 6)
+                        color: app.colors.noteBg
+                        border.color: app.colors.noteFg
+                        Label {
+                            Accessible.ignored: noteDelegate.torn
+                            textFormat: Text.PlainText
+                            anchors.centerIn: parent
+                            text: "✎"
+                            font.pixelSize: Math.max(6, Math.min(18, parent.height * .7))
+                            color: app.colors.noteFg
+                        }
+                    }
+                    Text {
+                        objectName: "staticNoteText"
+                        Accessible.ignored: noteDelegate.torn
+                        anchors.fill: parent
+                        visible: noteDelegate.modelData.kind === "textBox" && !(!annotationLayer.ownOnly && app.placedTextEditor && app.placedTextEditor.current && app.placedTextEditor.entry && app.placedTextEditor.entry.id===noteDelegate.modelData.id)
+                        text: noteDelegate.modelData.note || ""
+                        textFormat: Text.PlainText
+                        color: Logic.displayColor(Logic.color(noteDelegate.modelData), app.paperAppearance)
+                        font.pixelSize: Math.max(1, Math.round((noteDelegate.modelData.fontSize || 14) * annotationLayer.zoom))
+                        font.family: app.annotationFont
+                        wrapMode: Text.Wrap
+                        clip: true
+                        horizontalAlignment: noteDelegate.modelData.textAlignment === "center" ? Text.AlignHCenter : noteDelegate.modelData.textAlignment === "right" ? Text.AlignRight : Text.AlignLeft
+                    }
                 }
             }
-            Text {
+            Loader {
                 anchors.fill: parent
-                visible: modelData.kind === "textBox" && !(!annotationLayer.ownOnly && app.placedTextEditor && app.placedTextEditor.current && app.placedTextEditor.entry && app.placedTextEditor.entry.id===modelData.id)
-                text: modelData.note || ""
-                textFormat: Text.PlainText
-                color: Logic.displayColor(Logic.color(modelData), app.paperAppearance)
-                font.pixelSize: Math.max(1, Math.round((modelData.fontSize || 14) * annotationLayer.zoom))
-                font.family: app.annotationFont
-                wrapMode: Text.Wrap
-                clip: true
-                horizontalAlignment: modelData.textAlignment === "center" ? Text.AlignHCenter : modelData.textAlignment === "right" ? Text.AlignRight : Text.AlignLeft
+                active: !noteDelegate.torn
+                sourceComponent: notePaint
+            }
+            PaperStaticRegion {
+                objectName: "staticAnnotation"+noteDelegate.modelData.id
+                app: annotationLayer.app
+                paperMap: annotationLayer.paperMap
+                sourceRect: Qt.rect(noteDelegate.modelData.rect.x,noteDelegate.modelData.rect.y,noteDelegate.modelData.rect.width,noteDelegate.modelData.rect.height)
+                zoom: annotationLayer.zoom
+                paint: notePaint
+                accessibleName: noteDelegate.modelData.kind==="stickyNote" ? qsTr("Sticky note on page %1: %2").arg(annotationLayer.page+1).arg(noteDelegate.modelData.note || "") : qsTr("Text annotation on page %1: %2").arg(annotationLayer.page+1).arg(noteDelegate.modelData.note || "")
+                onPressed: app.selectAnnotation(noteDelegate.modelData,false)
             }
         }
     }
