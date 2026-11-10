@@ -8,7 +8,7 @@ Item {
     required property int page
     property var paperMap: null
     readonly property var editor: app.placedTextEditor
-    readonly property bool showing: editor.current && !!editor.entry && editor.entry.page===page && editor.token.length>0 && !editor.cancelling
+    readonly property bool showing: !editor.noteOnly && editor.current && !!editor.entry && editor.entry.page===page && editor.token.length>0 && !editor.cancelling
     readonly property real paddingPt: 3
     readonly property real maximumWidth: showing ? Math.max(1,app.currentReader.pages[page].width-editor.rect.x) : 1
     readonly property real maximumHeight: showing ? Math.max(1,app.currentReader.pages[page].height-editor.rect.y) : 1

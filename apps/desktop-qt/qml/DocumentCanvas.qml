@@ -7,6 +7,7 @@ Item {
     objectName:"documentCanvas"
     required property var app
     property alias view: pageList
+    property alias annotationNotePaper: annotationPaper
     // Rust owns row grouping, unequal facing heights and the last-row gap. The shell only
     // attaches the corresponding existing page objects for its visual Repeater.
     readonly property var rows: app.currentReader.layoutRows.map(function(row) {
@@ -448,6 +449,7 @@ Item {
         height: paperFrame ? paperFrame.height : canvas.height
         z: 1
     }
+    AnnotationNotePaper {id:annotationPaper;app:canvas.app;anchors.fill:parent;z:7}
     ContentTextLayer {
         app: canvas.app
         page: canvas.app.contentEditor.textDraft ? canvas.app.contentEditor.draft.page : -1

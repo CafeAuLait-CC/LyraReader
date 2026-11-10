@@ -1,12 +1,17 @@
 //! Persistence adapter for the shared placed-text history group.
 use super::*;
-use lyra_reader_edit::text_edit::TextEditGroup;
+use lyra_reader_edit::text_edit::{TextEditGroup, TextEditMode};
 
 #[derive(Clone)]
 pub(super) struct Session {
     token: String,
     id: String,
+    mode: TextEditMode,
     pub(super) history: TextEditGroup<Snapshot>,
+}
+
+fn editable_mode(entry: &Value, mode: TextEditMode) -> bool {
+    AnnotationKind::from_record_kind(kind(entry)).is_some_and(|kind| mode.supports_kind(&kind))
 }
 
 impl Marks {
@@ -25,11 +30,22 @@ impl Marks {
                 return Err("Finish the current placed-text editor first".into());
             }
             let id = string(r, "id")?;
+            // Absent in older text-box callers; note mode can never move a mark's geometry.
+            let note_only = r
+                .get("note_only")
+                .map(|v| v.as_bool().ok_or("Invalid note editing mode"))
+                .transpose()?
+                .unwrap_or(false);
+            let mode = if note_only {
+                TextEditMode::Note
+            } else {
+                TextEditMode::TextBox
+            };
             let entry = self
                 .entries
                 .iter()
                 .find_map(|e| match e {
-                    Entry::Known(v) if v["id"] == id && kind(v) == "textBox" => Some(v),
+                    Entry::Known(v) if v["id"] == id && editable_mode(v, mode) => Some(v),
                     _ => None,
                 })
                 .ok_or("Editable text box not found")?;
@@ -59,6 +75,7 @@ impl Marks {
             self.text_edit = Some(Session {
                 token: token.clone(),
                 id,
+                mode,
                 history: TextEditGroup::new(self.snapshot(), self.undo.len(), before_creation)?,
             });
             state["text_edit_token"] = json!(token);
@@ -75,7 +92,7 @@ impl Marks {
         match op {
             "mark_text_update" => {
                 let patch = r["patch"].as_object().ok_or("Missing text changes")?;
-                if patch.is_empty() || patch.keys().any(|k| k != "note" && k != "rect") {
+                if patch.is_empty() || patch.keys().any(|key| !session.mode.permits_field(key)) {
                     return Err("Placed-text editing changes only the text and its box".into());
                 }
                 self.change(|s| {
@@ -83,7 +100,9 @@ impl Marks {
                         .entries
                         .iter_mut()
                         .find_map(|e| match e {
-                            Entry::Known(v) if v["id"] == session.id && kind(v) == "textBox" => {
+                            Entry::Known(v)
+                                if v["id"] == session.id && editable_mode(v, session.mode) =>
+                            {
                                 Some(v)
                             }
                             _ => None,

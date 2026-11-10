@@ -39,6 +39,18 @@ fn text(request: &Value, key: &str) -> Result<String, String> {
     arg(request, key)
 }
 
+fn desktop_annotation_rules() -> Result<Value, String> {
+    let mut value = serde_json::to_value(annotation_rules()).map_err(|e| e.to_string())?;
+    let object = value
+        .as_object_mut()
+        .ok_or("Invalid annotation rule snapshot")?;
+    object.insert(
+        "kind_flags".into(),
+        json!(annotation_kind_flags().into_iter().map(|kind| { let editable=lyra_reader_edit::kind::AnnotationKind::from_record_kind(&kind.kind).is_some_and(|k|lyra_reader_edit::text_edit::TextEditMode::Note.supports_kind(&k)); json!({"kind":kind.kind,"is_note":kind.is_note,"is_text_markup":kind.is_text_markup,"note_editable":editable}) }).collect::<Vec<_>>()),
+    );
+    Ok(value)
+}
+
 fn layout_rows(layout: &DocumentLayout) -> Result<Value, String> {
     // Ranges reference the packet's existing pages, avoiding a second serialized page table.
     // Reuse the shared paper geometry count bound before allocating a file-sized snapshot.
@@ -241,7 +253,7 @@ impl DesktopDocument {
         let rows = layout_rows(&layout)?;
         let mut value = json!({
             "pages":layout.placements().iter().map(|p|json!({"index":p.index,"width":p.width_pt,"height":p.height_pt,"top":p.top_pt,"left":p.left_pt})).collect::<Vec<_>>(),
-            "width":layout.content_width_pt(),"height":layout.content_height_pt(),"gap":layout.gap_pt(),"path":self.original_path,"revision":self.active()?.path(),"signature_status":self.source_signature(&current),"xfa_status":self.source_xfa(&current),"annotation_rules":annotation_rules(),"ai_history_limit":ai_chat_history_limit(),"recovery":self.recovery_status.lock().map_err(|_|"Recovery state is unavailable")?.clone(),
+            "width":layout.content_width_pt(),"height":layout.content_height_pt(),"gap":layout.gap_pt(),"path":self.original_path,"revision":self.active()?.path(),"signature_status":self.source_signature(&current),"xfa_status":self.source_xfa(&current),"annotation_rules":desktop_annotation_rules()?,"ai_history_limit":ai_chat_history_limit(),"recovery":self.recovery_status.lock().map_err(|_|"Recovery state is unavailable")?.clone(),
         });
         // This object is constructed here; indexing cannot depend on a file-supplied type.
         value["rows"] = rows;
@@ -3087,6 +3099,68 @@ mod tests {
         assert_eq!(copied.info().unwrap()["signature_status"]["signed"], false);
         assert_eq!(fs::read(&fixture.path).unwrap(), original);
         assert_eq!(doc.info().unwrap()["signature_status"]["signed"], true);
+    }
+
+    #[test]
+    fn note_text_groups_use_shared_kinds_preserve_geometry_and_cancel_as_one_step() {
+        let fixture = Fixture::new("text-page.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        let kinds = doc.info().unwrap()["annotation_rules"]["kind_flags"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(
+            kinds
+                .iter()
+                .any(|k| k["kind"] == "stickyNote" && k["is_note"] == true)
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|k| k["kind"] == "highlight" && k["is_text_markup"] == true)
+        );
+        for entry in [
+            json!({"kind":"stickyNote","page":0,"version":1,"rect":{"x":70,"y":80,"width":22,"height":22},"fontSize":14,"note":"original","color":"#E8BC55ff"}),
+            json!({"kind":"highlight","page":0,"start":0,"end":3,"note":"original","color":"#E8BC5552"}),
+        ] {
+            let created = doc
+                .command(json!({"op":"mark_create","entry":entry}))
+                .unwrap();
+            let id = created["selected_id"].clone();
+            let before = created["annotations"].clone();
+            assert!(
+                doc.command(json!({"op":"mark_text_begin","id":id,"created":false}))
+                    .is_err()
+            );
+            let begun = doc
+                .command(json!({"op":"mark_text_begin","id":id,"created":false,"note_only":true}))
+                .unwrap();
+            let token = begun["text_edit_token"].clone();
+            assert!(doc.command(json!({"op":"mark_text_update","id":id,"edit_token":token,"patch":{"note":"forged","rect":{"x":0,"y":0,"width":200,"height":200}}})).is_err());
+            for note in ["first", "second", "last"] {
+                doc.command(json!({"op":"mark_text_update","id":id,"edit_token":token,"patch":{"note":note}})).unwrap();
+            }
+            let stored = fixture.open().command(json!({"op":"marks"})).unwrap();
+            assert_eq!(
+                stored["annotations"].as_array().unwrap().last().unwrap()["note"],
+                "last"
+            );
+            doc.command(json!({"op":"mark_text_end","id":id,"edit_token":token,"cancel":false}))
+                .unwrap();
+            let undone = doc.command(json!({"op":"marks_undo"})).unwrap();
+            assert_eq!(undone["annotations"], before);
+            let begun = doc
+                .command(json!({"op":"mark_text_begin","id":id,"created":false,"note_only":true}))
+                .unwrap();
+            let token = begun["text_edit_token"].clone();
+            doc.command(json!({"op":"mark_text_update","id":id,"edit_token":token,"patch":{"note":"cancelled"}})).unwrap();
+            let cancelled = doc
+                .command(json!({"op":"mark_text_end","id":id,"edit_token":token,"cancel":true}))
+                .unwrap();
+            assert_eq!(cancelled["annotations"], before);
+        }
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
     }
 
     #[test]

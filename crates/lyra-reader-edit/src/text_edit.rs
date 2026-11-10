@@ -1,6 +1,29 @@
 //! One native placed-text editing session, independent of a shell's snapshot format.
 //! Durable writes may be coalesced independently; history keeps one pre-edit snapshot.
 
+use crate::kind::AnnotationKind;
+
+/// Portable admission rules for text-box content versus an annotation's comment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextEditMode {
+    TextBox,
+    Note,
+}
+impl TextEditMode {
+    pub fn supports_kind(self, kind: &AnnotationKind) -> bool {
+        match self {
+            Self::TextBox => *kind == AnnotationKind::TextBox,
+            Self::Note => {
+                let flags = kind.flags();
+                flags.drawing == crate::kind::Drawing::NoteIcon || flags.is_text_markup
+            }
+        }
+    }
+    pub fn permits_field(self, field: &str) -> bool {
+        field == "note" || (self == Self::TextBox && field == "rect")
+    }
+}
+
 #[derive(Clone)]
 pub struct TextEditGroup<S> {
     before: S,
@@ -52,6 +75,32 @@ impl<S: Clone> TextEditGroup<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn note_mode_uses_the_taxonomy_and_never_admits_box_geometry() {
+        for kind in AnnotationKind::RECORD_KINDS {
+            let expected = matches!(
+                kind,
+                AnnotationKind::StickyNote
+                    | AnnotationKind::Highlight
+                    | AnnotationKind::Underline
+                    | AnnotationKind::Strikeout
+            );
+            assert_eq!(TextEditMode::Note.supports_kind(kind), expected);
+            assert_eq!(
+                TextEditMode::TextBox.supports_kind(kind),
+                *kind == AnnotationKind::TextBox
+            );
+        }
+        assert!(TextEditMode::Note.permits_field("note"));
+        assert!(!TextEditMode::Note.permits_field("rect"));
+        assert!(TextEditMode::TextBox.permits_field("rect"));
+        for mode in [TextEditMode::Note, TextEditMode::TextBox] {
+            for field in ["kind", "page", "color", "fileIdentity"] {
+                assert!(!mode.permits_field(field));
+            }
+        }
+    }
 
     #[test]
     fn many_flushes_are_one_edit_and_cancel_new_text_drops_creation() {

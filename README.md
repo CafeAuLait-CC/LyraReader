@@ -59,7 +59,11 @@ The five exclusive secondary rows are Annotate, Edit, Fill & Sign, Export and Ly
 uses three groups for markup, drawing and placement, with menus for shapes, stamps and signatures.
 Ordinary text boxes edit directly on the page, including adopted PDF FreeText. Control+Return
 commits one undoable edit; Escape restores the existing mark or removes a cancelled new box.
-Right-click an annotation for its properties. Export
+Existing sticky notes and markup comments open in one anchored reading paper without adoption or writes.
+A body click or Edit explicitly starts a note edit; a PDF-owned note is adopted at that point.
+New sticky notes start editing immediately. Note edits use the same grouped undo/cancel mechanism as text
+boxes, preserve the icon/quads, and keep their own text when switching between notes. The paper's text
+and scrollbar colours stay independent of PDF zoom. Right-click an annotation for its properties. Export
 exposes eight direct actions, including flattened copies and form values with a verified
 original-file backup. Flattening uses the saved PDF revision; save pending annotation/form drafts
 first to include them. Links and sticky notes are kept, and the result remains editable.

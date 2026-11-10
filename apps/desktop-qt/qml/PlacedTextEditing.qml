@@ -29,6 +29,7 @@ Item {
     property bool selectAllOnStart: true
     signal layoutRequested()
     readonly property bool active: !!owner && !!entry
+    readonly property bool noteOnly: active && entry.kind!=="textBox"
     readonly property bool waitingForCreation: !!owner && creationRequest>=0
     readonly property bool current: active && owner===app.currentReader && generation===owner.documentGeneration
     readonly property bool dirty: active && (text!==savedText || JSON.stringify(rect)!==JSON.stringify(savedRect))
@@ -51,7 +52,7 @@ Item {
         savedText=text;savedRect=Object.assign({},rect);
         error="";nextAction=null;missingGlyphs=[];
         token="";
-        request=owner.submit("mark_text_begin",{id:entry.id,created:created});
+        request=owner.submit("mark_text_begin",{id:entry.id,created:created,note_only:noteOnly});
     }
     function change(value) {
         if (!current || !token.length || closing || cancelling || value===text) return;
@@ -59,7 +60,7 @@ Item {
         saveTimer.restart();coverageTimer.restart();
     }
     function resizeBox(width,height) {
-        if (!current || !token.length || closing || cancelling || !Number.isFinite(width) || !Number.isFinite(height)) return;
+        if (noteOnly || !current || !token.length || closing || cancelling || !Number.isFinite(width) || !Number.isFinite(height)) return;
         if(text===(entry.note || "")){width=entry.rect.width;height=entry.rect.height;}
         if (Math.abs(rect.width-width)<.05 && Math.abs(rect.height-height)<.05) return;
         rect={x:rect.x,y:rect.y,width:width,height:height};
@@ -69,7 +70,7 @@ Item {
         saveTimer.stop();
         if (!active || request>=0 || !token.length || !dirty || cancelling) return;
         sent={text:text,rect:Object.assign({},rect)};
-        request=owner.submit("mark_text_update",{id:entry.id,edit_token:token,patch:{note:sent.text,rect:sent.rect}});
+        request=owner.submit("mark_text_update",{id:entry.id,edit_token:token,patch:noteOnly ? {note:sent.text} : {note:sent.text,rect:sent.rect}});
     }
     function finish(cancel) {
         if (!active) return;
@@ -80,7 +81,7 @@ Item {
         if(cancel)nextAction=null;
         if(request>=0)return;
         if (!token.length) {
-            request=owner.submit("mark_text_begin",{id:entry.id,created:created});
+            request=owner.submit("mark_text_begin",{id:entry.id,created:created,note_only:noteOnly});
             return;
         }
         if (!cancelling && dirty) {flush();return;}
@@ -99,7 +100,7 @@ Item {
     Timer {id:saveTimer;interval:500;onTriggered:editing.flush()}
     Timer {
         id:coverageTimer;interval:350
-        onTriggered: if (editing.active) {
+        onTriggered: if (editing.active && !editing.noteOnly) {
             editing.coverageText=editing.text;
             editing.coverageRequest=editing.owner.submit("font_coverage",{text:editing.coverageText});
         }
@@ -113,7 +114,7 @@ Item {
                 editing.creationRequest=-1;
                 if(message.length || (!editing.cancelling && (!editing.editorRequested || editing.owner!==editing.app.currentReader))) {editing.abandon();return;}
                 const annotation=(result.annotations || []).find(function(a){return a.id===result.selected_id;});
-                if(!annotation || annotation.kind!=="textBox") {editing.abandon();return;}
+                if(!annotation || (annotation.kind!=="textBox" && !editing.app.annotationNoteKind(annotation))) {editing.abandon();return;}
                 editing.start(annotation,editing.pendingWasCreated);
                 if(!editing.cancelling)editing.app.operationStatus=qsTr("Edit the text on the page. Control+Return finishes, Escape cancels.");
                 return;

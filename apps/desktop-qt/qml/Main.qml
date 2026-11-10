@@ -48,6 +48,7 @@ ApplicationWindow {
     readonly property var colors: theme
     readonly property var pageList: canvas.view
     readonly property var documentCanvas:canvas
+    readonly property var annotationNotePaper:canvas.annotationNotePaper
     readonly property var regionPaper:aiRegionCard
     property string appearance: session ? session.preference("appearance", "light") : "light"
     property bool reduceMotion:session ? !!session.preference("reduceMotion",false) : false
@@ -874,6 +875,7 @@ ApplicationWindow {
             }
         } else if (annotationTool === "stickyNote" || annotationTool === "textBox") {
             if(placedTextController.waitingForCreation)return;
+            if(annotationTool==="stickyNote") {const existing=annotationAt(page,x,y,false);if(existing && existing.kind==="stickyNote"){selectAnnotation(existing,false);return;}}
             const size = currentReader.pages[page];
             const rules=currentReader.data.annotation_rules;
             if(!rules || !Number.isInteger(rules.placed_text_version) || !Number.isFinite(rules.default_text_box_font_size_pt)) {
@@ -898,10 +900,8 @@ ApplicationWindow {
                     note: ""
                 }
             });
-            if(textBox) {
-                annotationTool="select";
-                placedTextController.expectCreation(currentReader,request,false);
-            }
+            annotationTool="select";
+            placedTextController.expectCreation(currentReader,request,false);
         } else if (annotationTool === "select") {
             const hit = annotationAt(page, x, y, false);
             if (hit)
@@ -1063,9 +1063,17 @@ ApplicationWindow {
         if (formToolActive)
             currentReader.submit("forms");
     }
+    function annotationNoteKind(annotation) {
+        if(!annotation)return false;
+        const flags=(currentReader.data.annotation_rules && currentReader.data.annotation_rules.kind_flags || []).find(function(k){return k.kind===annotation.kind;});
+        return !!flags && flags.note_editable===true;
+    }
     function selectAnnotation(annotation, edit) {
         if(placedTextController.deferAction(function(){root.selectAnnotation(annotation,edit);}))return;
         dialogs.flushAnnotation();
+        if(annotation && (annotation.kind==="stickyNote" || (edit!==false && (annotation.note || annotation.contents) && (annotationNoteKind(annotation) || annotation.drawing==="markup")))) {
+            dialogs.annotationDialog.close();annotationNotePaper.openNote(annotation,edit===false,edit!==false);return;
+        }
         if (edit === false)
             dialogs.annotationDialog.close();
         if (xfaReadOnly) {
@@ -2491,7 +2499,7 @@ ApplicationWindow {
                 root.eraseDraft = [];
             if (error.length) {
                 if(op==="layout")root.pendingLayoutPosition=null;
-                if (op === "file_adopt")
+                if (op === "file_adopt" && !root.annotationNotePaper.handlesAdoption(root.currentReader,id))
                     dialogs.showAnnotation();
                 return;
             }
@@ -2504,7 +2512,7 @@ ApplicationWindow {
                     // A first click adopts/selects FreeText. Opening the legacy property
                     // dialog here would intercept the second click of a real double-click.
                     const selectedFreeText=op==="file_adopt" && root.selectedAnnotation && root.selectedAnnotation.kind==="textBox";
-                    if (!selectedFreeText && !inlineText && !artworkPlacement && root.secondaryRow!=="fill" && root.selectedAnnotation && (root.selectedAnnotation.kind === "stickyNote" || root.selectedAnnotation.kind === "textBox"))
+                    if (!root.annotationNotePaper.handlesAdoption(root.currentReader,id) && !selectedFreeText && !inlineText && !artworkPlacement && root.secondaryRow!=="fill" && root.selectedAnnotation && (root.selectedAnnotation.kind === "stickyNote" || root.selectedAnnotation.kind === "textBox"))
                         dialogs.showAnnotation();
                 }
             } else if (op.indexOf("mark_") === 0 || op.indexOf("marks_") === 0) {
