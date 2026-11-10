@@ -443,6 +443,25 @@ impl SelectionTextPage {
     }
 }
 
+/// Clipboard text is derived only after resolving the original character range. PDFium uses
+/// U+0002 for a discretionary line-end hyphen; U+00AD is its Unicode equivalent. Join the word
+/// and its wrap whitespace without changing ordinary hyphens, spaces or paragraph structure.
+pub fn normalize_copied_text(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut joining_word = false;
+    for character in text.chars() {
+        match character {
+            '\u{2}' | '\u{ad}' => joining_word = true,
+            c if joining_word && c.is_whitespace() => {}
+            c => {
+                output.push(c);
+                joining_word = false;
+            }
+        }
+    }
+    output
+}
+
 /// Port of `Unicode.Scalar(c).map(CharacterSet.whitespaces.contains) == true`.
 ///
 /// On macOS 26.3 `CharacterSet.whitespaces` is exactly these ranges (enumerated with a
@@ -634,6 +653,27 @@ pub fn region_text(chars: &[CharBox], region: Rect, limit: usize) -> (String, bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copied_text_joins_discretionary_word_breaks_without_reflowing_prose() {
+        for (source, expected) in [
+            (
+                "con\u{2} ditioning and ordi\u{2}\r\n  nary",
+                "conditioning and ordinary",
+            ),
+            ("En\u{2}\n\t coder", "Encoder"),
+            ("foun\u{ad}\n dation", "foundation"),
+            ("\u{2} fragment\u{2}", "fragment"),
+            (
+                "fine-grained Time-Aware\n  42 [12]\n\n    code\tvalue",
+                "fine-grained Time-Aware\n  42 [12]\n\n    code\tvalue",
+            ),
+            ("literal <0x02> label", "literal <0x02> label"),
+            ("汉字\n段落", "汉字\n段落"),
+        ] {
+            assert_eq!(normalize_copied_text(source), expected);
+        }
+    }
 
     fn character(unicode: u32, x: f64, y: f64, width: f64, height: f64) -> CharBox {
         CharBox {

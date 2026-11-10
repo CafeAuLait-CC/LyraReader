@@ -41,7 +41,7 @@ pub use navigation::is_navigation_page;
 pub use paren::{ParenthesisedCandidate, inspect_parenthesised_citations};
 pub use selection::{
     MAX_REGION_TEXT_CHARS, SelectionLayout, SelectionLine, SelectionStop, SelectionTextPage,
-    is_swift_whitespace, is_swift_whitespace_or_newline, region_text,
+    is_swift_whitespace, is_swift_whitespace_or_newline, normalize_copied_text, region_text,
 };
 pub use superscript::CitationStyle;
 pub use tables::table_region;

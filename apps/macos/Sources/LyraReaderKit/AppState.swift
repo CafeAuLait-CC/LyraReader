@@ -464,7 +464,10 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     @Published public var aiToolsVisible: Bool = false {
         didSet {
             if aiToolsVisible { closeOtherSecondaryRows(except: .lyra) }
-            else { cancelRegionSelection() }
+            else {
+                cancelRegionSelection()
+                if oldValue { deactivateSecondaryRowTool(.lyra) }
+            }
         }
     }
     /// 100% means actual physical size, scaled by the current screen's calibration.
@@ -8499,11 +8502,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         document != nil && fillAndSignVisible && armedFillSignTool != nil
     }
 
-    /// The Edit inspector is visible while Edit is open *and* a content tool is armed (or a page
-    /// object is selected with the implicit pointer). Opening Edit alone does not open it.
+    /// Selecting or dragging text keeps the viewport stable. Its properties appear when the
+    /// caret opens; armed tools, selected graphics and recoverable drafts retain their options.
     public var contentEditInspectorVisible: Bool {
         document != nil && contentEditEnabled
-            && (contentEditTool != "select" || contentEditSelection != nil)
+            && (contentEditTool != "select" || contentTextEditing || contentTextRecovery != nil
+                || selectedContentItem.map { $0.kind != "text" } == true)
     }
 
     /// Width the right-hand inspector column takes from the canvas. There is one inspector slot
@@ -17019,18 +17023,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// Copies the selected characters (⌘C from the canvas).
-    public func copySelection() {
+    public func copySelection(to pasteboard: NSPasteboard = .general) {
         guard let selection, let textPage = textPages[selection.page] else { return }
         let range = selection.range.clamped(to: 0...(textPage.chars.count - 1))
         guard !range.isEmpty else { return }
 
         // One range→string entry point (Rust for engine-loaded pages, the same Swift rule for
         // synthetic ones); decoding scalars here would be the second copy this task removed.
-        let string = textPage.string(in: range)
+        let string = textPage.copyText(in: range)
         guard !string.isEmpty else { return }
 
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(string, forType: .string)
+        pasteboard.clearContents()
+        pasteboard.setString(string, forType: .string)
         statusMessage = "Copied \(string.count) characters"
     }
 
@@ -17685,7 +17689,7 @@ extension AppState {
     /// to another row, opening page overview or closing the document must all leave the page in
     /// the implicit pointer state rather than keep applying a tool whose control is gone.
     ///
-    /// Export and Lyra own no persistent page tool, so they have nothing to clear.
+    /// Export has no persistent page tool; Lyra owns the assistant drawer.
     private func deactivateSecondaryRowTool(_ row: SecondaryRow) {
         switch row {
         case .annotations:
@@ -17696,7 +17700,9 @@ extension AppState {
             contentLinkDraft = nil
         case .fillAndSign:
             clearFillSignTool()
-        case .export, .lyra:
+        case .lyra:
+            rightPanelVisible = false
+        case .export:
             break
         }
     }

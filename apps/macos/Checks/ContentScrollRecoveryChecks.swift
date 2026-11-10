@@ -9,6 +9,7 @@ extension ReaderChecks {
         state.setViewportSize(CGSize(width: 800, height: 600))
         require(state.open(url: root.appendingPathComponent("tests/fixtures/text-page.pdf")),
                 "content scroll fixture opens")
+        state.gotoPage(0)
         state.contentEditEnabled = true
         let first = Task { @MainActor in await state.reloadContentObjects() }
         try await eventually("first inspection is in flight", { engine.waiting[0] != nil })
@@ -58,6 +59,7 @@ extension ReaderChecks {
             let state = AppState(engine: engine)
             state.setViewportSize(CGSize(width: 800, height: 600))
             state.newTab(url: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
+            state.gotoPage(0)
             state.contentEditEnabled = true
             let item = PDFContentItem(id: "moving-text", kind: "text",
                 bounds: PDFContentBox(CGRect(x: 100, y: 100, width: 200, height: 30)),

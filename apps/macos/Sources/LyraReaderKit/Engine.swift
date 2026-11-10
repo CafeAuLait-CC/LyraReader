@@ -4696,6 +4696,11 @@ public final class MockEngine: PDFEngine {
 // PDF glyph boxes describe ink, not a text selection. Join adjacent glyphs on each
 // line so spaces and the gaps between letters are included, without bridging columns.
 extension TextPage {
+    /// Resolve the original range first, then join discretionary PDF word breaks for copying.
+    public func copyText(in range: ClosedRange<Int>) -> String {
+        selectionCopyText(text: string(in: range))
+    }
+
     /// The text those characters spell, with the same Unicode-scalar mapping the engine uses.
     /// Empty when the range is empty or contains no decodable scalar.
     ///

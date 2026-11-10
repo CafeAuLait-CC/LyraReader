@@ -298,6 +298,46 @@ extension ReaderChecks {
                     "the production loading path uses the same exclusions for text and highlights")
         }
 
+        do {
+            let source = fixtures.appendingPathComponent("selection-discretionary-hyphens.pdf")
+            let wrapper = try RustEngine()
+            let state = AppState(engine: wrapper)
+            state.setViewportSize(CGSize(width: 1000, height: 800))
+            state.newTab(url: source)
+            let page = try await wrapper.textPage(0)
+            let range = 0...(page.chars.count - 1)
+            let raw = page.string(in: range)
+            require(raw.contains("\u{2}"), "the PDF fixture produces real discretionary hyphen markers")
+            let copied = page.copyText(in: range)
+            require(!copied.contains("\u{2}") && copied.contains("conditioning") && copied.contains("ordinary")
+                    && !copied.contains("con ditioning") && !copied.contains("ordi nary")
+                    && copied.contains("fine-grained") && copied.contains("Time-Aware"),
+                    "copy joins wrapped words while preserving actual hyphens")
+            require(page.string(in: range) == raw,
+                    "copy normalization leaves raw text and character indices unchanged")
+            let rects = page.selectionRects(in: range)
+            let first = try required(rects.first, "the copy fixture has first-line geometry")
+            let last = try required(rects.last, "the copy fixture has last-line geometry")
+            try await eventually("the canvas text can be selected for copying") {
+                guard let placement = state.canvasPageFrames.first(where: { $0.index == 0 }) else { return false }
+                state.beginSelection(at: CGPoint(x: placement.leftPt + first.minX + 1,
+                    y: placement.topPt + first.midY))
+                return state.selection != nil
+            }
+            let placement = state.canvasPageFrames.first { $0.index == 0 }!
+            let end = CGPoint(x: placement.leftPt + last.maxX - 1, y: placement.topPt + last.midY)
+            state.extendSelection(to: end)
+            state.endPointerInteraction(at: end, wasClick: false)
+            let pasteboard = NSPasteboard.withUniqueName()
+            defer { pasteboard.releaseGlobally() }
+            state.copySelection(to: pasteboard)
+            let clipboard = pasteboard.string(forType: .string) ?? ""
+            require(clipboard.contains("conditioning") && clipboard.contains("ordinary")
+                    && !clipboard.contains("\u{2}") && !clipboard.contains("001")
+                    && clipboard.contains("fine-grained"),
+                    "the canvas copy action writes cleaned text without line numbers to the pasteboard")
+        }
+
         let diagnosticEngine = LyraReaderBindings.LyraReaderEngine()
         let diagnosticDocument = try diagnosticEngine.openDocument(
             path: multipage.path, password: nil)

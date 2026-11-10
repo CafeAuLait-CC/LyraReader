@@ -1146,6 +1146,12 @@ pub fn plan_tiles(request: TilePlanRequestRecord) -> Option<TilePlanRecord> {
     })
 }
 
+/// Join discretionary word breaks after extracting a selection, without changing PDF indices.
+#[uniffi::export]
+pub fn selection_copy_text(text: String) -> String {
+    lyra_reader_text::normalize_copied_text(&text)
+}
+
 /// `Page 3`, `Pages 1-3`, `Pages 1, 3, 5` (1-based, sorted and de-duplicated).
 #[uniffi::export]
 pub fn page_label(pages: Vec<u32>) -> String {

@@ -84,6 +84,8 @@ extension ReaderChecks {
     let moved = CGPoint(x: p.x + 20 * state.zoomFactor, y: p.y + 12 * state.zoomFactor)
     view.mouseDown(with: event(.leftMouseDown, p))
     view.mouseDragged(with: event(.leftMouseDragged, moved))
+    require(!state.contentEditInspectorVisible && state.secondaryInspectorWidth == 0,
+            "dragging selected text keeps the property inspector closed")
     try await eventually("PDF text pixels follow the held pointer before mouse-up") {
       state.canvasPages.contains { $0.placement.index == PlacementIndex.contentDragForeground }
     }
@@ -123,6 +125,8 @@ extension ReaderChecks {
       editor.selectedRange().length == 0,
       "second click places a caret instead of selecting all text")
     editor.string = "Edited"
+    require(state.contentEditInspectorVisible,
+            "entering a native text caret opens the text property inspector")
     view.mouseDown(with: event(.leftMouseDown, CGPoint(x: 5, y: 5)))
     try await eventually("typing changes actual page content in a new revision") {
       state.pageEditPendingOperations.count == 2 && !state.contentEditLoading && !state.pageEditBusy
@@ -407,6 +411,8 @@ extension ReaderChecks {
     view.mouseDown(with: event(.leftMouseDown))
     view.mouseUp(with: event(.leftMouseUp))
     require(state.contentEditSelection == item.id, "hosted first click selects the paragraph")
+    require(!state.contentEditInspectorVisible && state.secondaryInspectorWidth == 0,
+            "hosted text selection keeps the canvas width and inspector closed")
     host.layoutSubtreeIfNeeded()
     if let directory = ProcessInfo.processInfo.environment["LYRA_CONTENT_EVIDENCE"] {
       // Wait for the secondary-row reveal and selection properties before capturing chrome.
@@ -430,6 +436,19 @@ extension ReaderChecks {
     require(
       !contentTextViews(view).isEmpty,
       "hosted second click opens a native text caret")
+    require(state.contentEditInspectorVisible,
+            "hosted caret editing opens the text inspector")
+    try await eventually("the caret's inspector finishes changing the canvas width") {
+      host.layoutSubtreeIfNeeded()
+      let expectedWidth = host.bounds.width - ReaderChrome.scrollIndicatorLaneWidthPt
+        - ReaderEditingPanelTransition<ContentEditInspector>.width
+      return abs(state.canvasViewportWidthPt - expectedWidth) < 0.5
+    }
+    guard let caret = contentTextViews(view).first?.enclosingScrollView,
+          let expected = state.viewRect(local: item.bounds.rect, onPage: 0)?.insetBy(dx: -2, dy: -3)
+    else { fatalError("Hosted text caret geometry is missing") }
+    require(abs(caret.frame.minX - expected.minX) < 0.5 && abs(caret.frame.minY - expected.minY) < 0.5,
+            "the native caret remains aligned with PDF text after its inspector opens")
     if ProcessInfo.processInfo.environment["LYRA_CONTENT_UI_PAUSE"] != nil {
       try await Task.sleep(for: .seconds(55))
     }
