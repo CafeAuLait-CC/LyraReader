@@ -722,7 +722,8 @@ public struct SidebarView: View {
 
             Button {
                 state.jump(to: annotation)
-                if annotation.kind.isPlacedText { state.beginEditingAnnotation(annotation.id) }
+                if annotation.kind == .stickyNote { state.readAnnotationNote(annotation.id) }
+                else if annotation.kind == .textBox { state.beginEditingAnnotation(annotation.id) }
             } label: {
                 VStack(alignment: .leading, spacing: 2) {
                     if annotation.kind == .signature {
