@@ -19,7 +19,7 @@ Pane {
     readonly property var turns:detail ? detail.turns || [] : []
     readonly property var turn:turns.length ? turns[Math.min(turnIndex,turns.length-1)] : detail && detail.question ? detail : null
     readonly property var verifiedPages:detail && !detail.locationInvalidated ? (detail.verified_source_pages || [])[turnIndex] || [] : []
-    function stateLabel(state){return state==="finished" ? qsTr("Completed") : state==="cancelled" ? qsTr("Stopped") : state==="failed" ? qsTr("Failed") : qsTr("No answer yet");}
+    function stateLabel(state){return state==="finished" ? qsTr("Completed") : state==="cancelled" ? qsTr("Stopped") : state==="failed" ? qsTr("Failed") : qsTr("Unfinished");}
     readonly property bool active:app.aiPanelVisible && app.aiPanelMode==="notes" && app.currentReader.pageCount>0
     property string readError:""
     property int ownerGeneration:-1
@@ -121,7 +121,7 @@ Pane {
         }
         Label {text:qsTr("Local captures and conversations. Opening notes sends no request.");wrapMode:Text.Wrap;Layout.fillWidth:true;color:notes.app.colors.textSecondary}
         Label {text:notes.readError || notes.history.error || (notes.history.warnings || []).join("\n");visible:text.length>0;textFormat:Text.PlainText;wrapMode:Text.Wrap;Layout.fillWidth:true;color:notes.app.colors.warningFg}
-        Label {objectName:"regionNotesEmpty";visible:!list.count && !notes.history.error && !notes.history.foreign_count && !notes.history.writes_blocked;text:qsTr("No saved areas. Use Select & Ask, then Save to Reading notes.");wrapMode:Text.Wrap;Layout.fillWidth:true}
+        Label {objectName:"regionNotesEmpty";visible:!list.count && !notes.history.error && !notes.history.foreign_count && !notes.history.writes_blocked;text:qsTr("No saved areas. Select & Ask automatically keeps captured areas and conversations in Reading notes.");wrapMode:Text.Wrap;Layout.fillWidth:true}
         ListView {
             id:list;objectName:"regionNotesList"
             visible:!notes.detail && !notes.readId;activeFocusOnTab:true

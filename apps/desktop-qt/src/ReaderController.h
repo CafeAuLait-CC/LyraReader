@@ -37,6 +37,8 @@ class ReaderController : public QObject {
     Q_PROPERTY(QVariantMap aiRegionPaper READ aiRegionPaper NOTIFY aiRegionPaperChanged)
     Q_PROPERTY(QVariantMap regionNoteDraft READ regionNoteDraft NOTIFY regionNoteDraftChanged)
     Q_PROPERTY(bool hasUnsavedReadingNotes READ hasUnsavedReadingNotes NOTIFY regionNoteDraftChanged)
+    Q_PROPERTY(bool regionPersistencePending READ regionPersistencePending NOTIFY regionNoteDraftChanged)
+    Q_PROPERTY(QString regionPersistenceError READ regionPersistenceError NOTIFY regionNoteDraftChanged)
     Q_PROPERTY(QVariantMap regionHistory READ regionHistory NOTIFY regionHistoryChanged)
     Q_PROPERTY(QUrl aiRegionImage READ aiRegionImage NOTIFY aiRegionImageChanged)
     Q_PROPERTY(QVariantMap editDrafts READ editDrafts NOTIFY editDraftsChanged)
@@ -80,7 +82,12 @@ public:
     Q_INVOKABLE double unshiftedPaperScroll(double displayY,double reveal=1.0) const;
     Q_INVOKABLE double shiftedPaperScroll(double sourceY,double reveal=1.0) const;
     QVariantMap regionNoteDraft()const{return m_regionNoteDraft;}
-    bool hasUnsavedReadingNotes()const{return !m_regionNoteDraft.isEmpty() || !m_regionSaveError.isEmpty();}
+    bool hasUnsavedReadingNotes()const{return !m_regionNoteDraft.isEmpty() || !m_regionSaveError.isEmpty() || regionNeedsSave() || m_aiRegionSaveId || regionRequestRunning();}
+    bool regionPersistencePending()const;
+    QString regionPersistenceError()const{return m_regionSaveError;}
+    Q_INVOKABLE void flushAiRegionNote(bool stopResponse=true);
+    Q_INVOKABLE QVariantMap regionDiscardContext()const;
+    Q_INVOKABLE bool discardAiRegionChanges(const QVariantMap &expected);
     Q_INVOKABLE bool setRegionNoteDraft(const QString &id,const QString &text);
     Q_INVOKABLE void discardRegionNoteDraft();
     Q_INVOKABLE quint64 saveRegionNoteDraft();
@@ -187,6 +194,20 @@ private:
     struct Request { int page; double scale; QString key; bool embedded=false; bool tile=false; QRectF region; int priority=0; };
     quint64 submitSnapshot(quint64 id,const QString &operation,const QVariantMap &arguments);
     void initAi();
+    void initRegionPersistence();
+    void resetRegionPersistence();
+    void resetAiRegion();
+    void markRegionDirty(bool localInput=false);
+    void scheduleRegionPersistence();
+    void finishAiRegionSave(const QVariantMap &result,const QString &error);
+    void finishDeferredRegionAction();
+    bool regionNeedsSave()const;
+    bool regionRequestRunning()const;
+    QVariantMap regionSnapshotResult()const;
+    QTimer m_regionSaveTimer;
+    quint64 m_regionRevision=0,m_regionSnapshotRevision=0;
+    bool m_regionFlushRequested=false,m_regionCancelRequested=false,m_regionClearPending=false;
+    QVariantMap m_pendingRegionCapture;
     void resetAi();
     void initDocumentReading();
     void resetDocumentReading();
@@ -212,7 +233,6 @@ private:
     QString m_regionSaveError;
     quint64 m_regionNoteSaveId=0;
     quint64 m_aiRegionSaveId=0;
-    QString m_aiRegionSaveDraft,m_aiRegionSaveTurn;
     quint64 m_aiRegionRestoreId=0,m_aiRegionRestoreEpoch=0,m_regionContinuationEpoch=0;
     QVariantMap m_regionContinuationSettings;
     QString m_regionContinuationQuestion;

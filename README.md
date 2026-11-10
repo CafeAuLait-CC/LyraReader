@@ -98,9 +98,12 @@ answer-written page markers remain plain text. Saved notes export to a new Markd
 their original PNG captures, preserving existing exports and the PDF. Continue conversation reopens
 the frozen capture in the single active card and uses completed turns as bounded request context.
 Preparing a follow-up saves the previous turn before previewing; new requests still require Send.
-Saving the current conversation remains explicit; timed persistence and remaining Interleaf lifecycle
-work are in progress.
-Unfinished knowledge-note drafts and failed snapshot saves keep the document open until resolved.
+The active conversation is autosaved with a 750 ms throttle during ongoing edits, including unfinished
+streamed answers. Closing the card, changing tabs or closing a document flushes its latest draft;
+a running area response is cancelled and its partial answer is kept. Saved completed exchanges stay
+immutable. Save to Reading notes remains available for an explicit retry after a write failure.
+Unfinished knowledge-note drafts and failed snapshot saves keep the document open until resolved. Failed conversation snapshots
+can be retried or explicitly discarded after confirmation; discarding leaves saved notes and the PDF intact.
 Legacy answer page markers stay plain text. Actual HTTP attempts have a bounded local metadata audit
 trail, including retries. Settings and the AI panel open a metadata-only viewer, available without a
 PDF. Clearing it requires confirmation of the displayed snapshot; concurrent changes require a refresh.

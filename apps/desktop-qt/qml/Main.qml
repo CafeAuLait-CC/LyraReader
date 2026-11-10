@@ -351,8 +351,9 @@ ApplicationWindow {
     property var pendingCloseReader: null
     function prepareForQuit() {
         if (closeOperation || pendingDocumentSave || dialogs.closePromptVisible || dialogs.saveDialog.visible) return false;
-        if(readingNotesBlockClose(-1))return false;
         const tabs=session?session.tabs:[{reader:currentReader}];
+        tabs.forEach(tab=>tab.reader.flushAiRegionNote());
+        if(tabs.some(tab=>tab.reader.hasUnsavedReadingNotes && !tab.reader.regionPersistencePending)){readingNotesBlockClose(-1);return false;}
         tabs.forEach(tab=>tab.reader.cancelIndexQueries());
         cancelErase();dialogs.flushAnnotation();saveReadingPosition();return true;
     }
@@ -401,7 +402,7 @@ ApplicationWindow {
             }
         ];
         return tabs.some(function (tab, i) {
-            return (index < 0 || i === index) && tab.reader.pendingCommands > 0;
+            return (index < 0 || i === index) && (tab.reader.pendingCommands > 0 || tab.reader.regionPersistencePending);
         });
     }
     function hasUnsavedChanges(index) {
@@ -447,11 +448,11 @@ ApplicationWindow {
         if (!session || closeOperation || dialogs.closePromptVisible) return;
         const owner=closeTarget(index);
         if (!owner) return;
-        owner.cancelIndexQueries();
+        owner.cancelIndexQueries();owner.flushAiRegionNote();
         dialogs.flushAnnotation();
         closingTab=index;
         pendingCloseReader=owner;
-        if (owner.pendingCommands>0) { closeRetry.start(); return; }
+        if (owner.pendingCommands>0 || owner.regionPersistencePending) { closeRetry.start(); return; }
         closingTab=-2;
         pendingCloseReader=null;
         const currentIndex=readerIndex(owner);
@@ -519,7 +520,7 @@ ApplicationWindow {
         cancelErase();
         if (closeOperation || dialogs.closePromptVisible) {event.accepted=false;return;}
         const tabs=session?session.tabs:[{reader:currentReader}];
-        tabs.forEach(tab=>tab.reader.cancelIndexQueries());
+        tabs.forEach(tab=>{tab.reader.cancelIndexQueries();tab.reader.flushAiRegionNote();});
         dialogs.flushAnnotation();
         saveReadingPosition();
         if (hasPendingCloseWork(-1)) {
@@ -539,7 +540,7 @@ ApplicationWindow {
         if (closingTab === -2) return;
         const owner=pendingCloseReader;
         if (closingTab >= 0 && (!owner || readerIndex(owner)<0)) {closingTab=-2;pendingCloseReader=null;return;}
-        if (closingTab < 0 ? hasPendingCloseWork(-1) : owner.pendingCommands>0) return;
+        if (closingTab < 0 ? hasPendingCloseWork(-1) : (owner.pendingCommands>0 || owner.regionPersistencePending)) return;
         if (dialogs.annotationWriteError.length && (closingTab<0 || dialogs.noteReader === owner)) {
             operationStatus = dialogs.annotationWriteError;
             closingTab = -2;
@@ -2391,7 +2392,7 @@ ApplicationWindow {
             root.requestCloseTab(index);
         }
         function onActiveReaderAboutToChange() {
-            root.currentReader.cancelIndexQueries();
+            root.currentReader.cancelIndexQueries();root.currentReader.flushAiRegionNote();
             regionNotes.close();aiRegionCard.close();root.currentReader.cancelAiRegionCapture();root.cancelRegionSelection();
             if(placedTextController.waitingForCreation)placedTextController.suppressPendingEditor();
             dialogs.flushAnnotation();

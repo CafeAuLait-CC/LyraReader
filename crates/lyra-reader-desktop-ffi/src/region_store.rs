@@ -489,13 +489,11 @@ impl DesktopDocument {
                             created_at: previous.map(|t| t.created_at).unwrap_or_else(now),
                             source_pages: previous.and_then(|t| t.source_pages.clone()).or(sources),
                         };
-                        if previous.is_some_and(|old| {
-                            old.question != record.question
-                                || old.answer != record.answer
-                                || old.state != record.state
-                                || old.error != record.error
-                        }) {
-                            return Err("This answer was already saved with different contents; the historical turn was kept".into());
+                        if let Some(old) = previous {
+                            let active_request = provenance
+                                .as_ref()
+                                .is_some_and(|proof| proof.id == id && proof.turn == turn_id);
+                            old.validate_snapshot_replacement(&record, active_request)?;
                         }
                         entry.question = record.question.clone();
                         entry.answer = record.answer.clone();

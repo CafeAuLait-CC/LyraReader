@@ -53,6 +53,7 @@ Item {
     }
     function closeAnimated() {
         if(!opened || closing)return;
+        if(owner)owner.flushAiRegionNote();
         if(!canAnimate || !located){close();return;}
         reveal.stop();closing=true;needsReveal=false;
         motionAnchor=app.documentCanvas.viewportAnchor(0);motionInteraction=app.documentCanvas.interactionEpoch;
@@ -94,8 +95,8 @@ Item {
         if(!opened)return;
         const current=owner===app.currentReader && ownerGeneration===owner.documentGeneration;
         const anchor=preserve && current ? app.documentCanvas.viewportAnchor(0) : null;
-        opened=false;needsReveal=false;closing=false;reveal.stop();layoutSettle.stop();layoutApply.stop();payload.close();
-        if(owner)owner.clearAiRegionPaper();
+        opened=false;needsReveal=false;closing=false;reveal.stop();layoutSettle.stop();layoutApply.stop();payload.close();discardChanges.close();
+        if(owner){if(preserve)owner.flushAiRegionNote();owner.clearAiRegionPaper();}
         if(anchor && current)app.documentCanvas.restoreViewportAnchor(anchor,0);
         if(current)app.focusReadingView();
         closed();
@@ -256,17 +257,33 @@ Item {
             Button {objectName:"sendAiRegion";text:qsTr("Send");enabled:card.previewReady && !card.running && card.owner && card.owner.pendingCommands===0;onClicked:card.app.sendAi(card.owner,card.plan)}
         }
         Label {
+            objectName:"aiRegionPersistenceStatus"
             Layout.fillWidth:true;wrapMode:Text.Wrap;font.pixelSize:11;color:card.app.colors.textSecondary
-            text:card.attachment.saved ? qsTr("Saved in Reading notes on this device.") : qsTr("This area is in memory. Save to Reading notes to keep its capture, draft and answer locally.")
+            text:card.attachment.saved ? qsTr("Saved in Reading notes on this device.") : card.owner && card.owner.regionPersistenceError ? qsTr("This conversation has not been saved. Retry saving to keep the latest changes.") : qsTr("Saving this area and its conversation to Reading notes on this device…")
         }
         Label {text:card.owner ? card.owner.regionHistory.error || "" : "";visible:text.length>0;wrapMode:Text.Wrap;Layout.fillWidth:true;color:card.app.colors.warningFg;textFormat:Text.PlainText}
         Button {objectName:"saveAiRegionNote";text:qsTr("Save to Reading notes");enabled:!!card.attachment.image_png && !card.running && card.owner && !card.owner.pendingCommands;onClicked:card.owner.saveAiRegionNote()}
+        Button {objectName:"discardFailedAiRegion";text:qsTr("Discard unsaved changes…");visible:!!card.attachment.image_png && card.owner && !!card.owner.regionPersistenceError;enabled:card.owner && !card.running && !card.owner.pendingCommands;onClicked:discardChanges.open()}
         RowLayout {
             Button {objectName:"newAiRegion";text:qsTr("New area");enabled:!card.running && !card.attachment.loading;onClicked:card.app.armRegion()}
             Button {objectName:"stopAiRegion";visible:card.running && card.state.responseView==="region";text:qsTr("Stop response");onClicked:card.owner.cancelAi()}
-            Button {objectName:"clearAiRegion";text:qsTr("Clear area");enabled:!card.running;onClicked:{const reader=card.owner;card.close();reader.clearAiRegion();}}
+            Button {objectName:"clearAiRegion";text:qsTr("Clear area");enabled:!card.running;onClicked:card.owner.clearAiRegion()}
         }
     }
+    }
+    Dialog {
+        id:discardChanges;objectName:"discardAiRegionConfirmation";title:qsTr("Discard unsaved conversation changes?");modal:true
+        parent:Overlay.overlay;x:(card.app.width-width)/2;y:(card.app.height-height)/2
+        standardButtons:Dialog.Cancel|Dialog.Discard
+        property var targetOwner:null
+        property var targetContext:null
+        onAboutToShow:{targetOwner=card.owner;targetContext=targetOwner ? targetOwner.regionDiscardContext() : null;}
+        onDiscarded:{
+            if(!targetOwner || targetOwner!==card.owner || targetOwner!==card.app.currentReader || !targetOwner.discardAiRegionChanges(targetContext || {}))
+                card.app.operationStatus=qsTr("The conversation changed. Review the latest changes before discarding them.");
+        }
+        onClosed:{targetOwner=null;targetContext=null;}
+        Label {text:qsTr("The latest unsaved capture, question and answer will be discarded. Previously saved Reading notes and the PDF remain unchanged.");width:Math.min(360,card.app.width-64);wrapMode:Text.Wrap}
     }
     Dialog {
         id:payload;objectName:"aiRegionPayload"

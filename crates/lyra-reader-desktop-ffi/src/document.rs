@@ -1324,6 +1324,68 @@ mod tests {
         assert_eq!(fs::read(region_path(&fixture.path)).unwrap(), raw);
     }
     #[test]
+    fn region_autosave_extends_only_the_current_unfinished_request_and_keeps_durable_drafts() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let id = saved_region(&doc);
+        let turn = crate::marks::uuid().unwrap();
+        let audit = crate::audit::observer(
+            fixture.directory.clone(),
+            AiActionRecord::RegionQuestion,
+            true,
+        );
+        let (audit, proof) =
+            crate::region_store::track_request(audit, id.clone(), turn.clone(), vec![1]);
+        audit.started().unwrap();
+        *doc.ai_region_sources.lock().unwrap() = Some(proof);
+        let snapshot = |answer: &str, state: &str| json!({"op":"region_snapshot","id":id,"draft":"LATEST_LOCAL_DRAFT","turn":{"id":turn,"state":state,"question":"SENT_QUESTION","answer":answer}});
+        doc.command(snapshot("Partial", "empty")).unwrap();
+        let first = doc.command(json!({"op":"region_get","id":id})).unwrap();
+        assert_eq!(first["turns"][0]["sourcePages"], json!([1]));
+        let created = first["turns"][0]["createdAt"].clone();
+        // A second reader has no current-request proof, including after process restart.
+        let reopened = fixture.open();
+        assert_eq!(
+            reopened
+                .command(json!({"op":"region_get","id":id}))
+                .unwrap(),
+            first
+        );
+        let before = fs::read(region_path(&fixture.path)).unwrap();
+        assert!(
+            reopened
+                .command(snapshot("Partial forged", "finished"))
+                .unwrap_err()
+                .contains("different contents")
+        );
+        assert_eq!(fs::read(region_path(&fixture.path)).unwrap(), before);
+        doc.command(snapshot("Partial answer", "empty")).unwrap();
+        assert!(doc.command(snapshot("Replacement", "empty")).is_err());
+        doc.command(snapshot("Partial answer", "cancelled"))
+            .unwrap();
+        let final_record = doc.command(json!({"op":"region_get","id":id})).unwrap();
+        assert_eq!(final_record["turns"].as_array().unwrap().len(), 1);
+        assert_eq!(final_record["turns"][0]["createdAt"], created);
+        assert_eq!(final_record["draftQuestion"], "LATEST_LOCAL_DRAFT");
+        assert_eq!(final_record["turns"][0]["state"], "cancelled");
+        let final_bytes = fs::read(region_path(&fixture.path)).unwrap();
+        assert!(
+            doc.command(snapshot("Partial answer edited", "finished"))
+                .is_err()
+        );
+        assert_eq!(fs::read(region_path(&fixture.path)).unwrap(), final_bytes);
+        drop(reopened);
+        drop(doc);
+        assert_eq!(
+            fixture
+                .open()
+                .command(json!({"op":"region_get","id":id}))
+                .unwrap(),
+            final_record
+        );
+    }
+
+    #[test]
     fn region_history_never_trusts_ui_supplied_page_markers_and_snapshot_retry_is_idempotent() {
         let fixture = Fixture::new("text-page.pdf");
         let doc = fixture.open();

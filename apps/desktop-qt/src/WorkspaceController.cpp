@@ -125,8 +125,9 @@ void WorkspaceController::newTab() {
 void WorkspaceController::closeTab(int index, bool discardPending) {
     if (index < 0 || index >= m_tabs.size()) return;
     auto *candidate=m_tabs.at(index);
+    candidate->flushAiRegionNote();
     const auto marks=candidate->data().value(QStringLiteral("marks")).toMap();
-    if(candidate->pendingCommands()>0 || candidate->hasUnsavedChanges() ||
+    if(candidate->pendingCommands()>0 || candidate->regionPersistencePending() || candidate->hasUnsavedReadingNotes() || candidate->hasUnsavedChanges() ||
         (discardPending && marks.value(QStringLiteral("page_session_active")).toBool())) {
         emit closeTabRequested(index);
         return;

@@ -54,6 +54,42 @@ pub struct Turn {
     pub source_pages: Option<Vec<u32>>,
 }
 
+impl Turn {
+    /// Only the host's current request can extend an unfinished snapshot. Final and
+    /// orphaned historical exchanges remain immutable, including after reopening.
+    pub fn validate_snapshot_replacement(
+        &self,
+        next: &Self,
+        active_request: bool,
+    ) -> Result<(), String> {
+        if self.id != next.id
+            || self.created_at != next.created_at
+            || (self.source_pages.is_some() && self.source_pages != next.source_pages)
+        {
+            return Err("The saved turn identity, date or verified sources changed".into());
+        }
+        if self.question == next.question
+            && self.answer == next.answer
+            && self.state == next.state
+            && self.error == next.error
+        {
+            return Ok(());
+        }
+        if active_request
+            && self.state == AnswerState::Empty
+            && self.error.is_none()
+            && self.question == next.question
+            && next.answer.starts_with(&self.answer)
+        {
+            return Ok(());
+        }
+        Err(
+            "This answer was already saved with different contents; the historical turn was kept"
+                .into(),
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Entry {
@@ -614,6 +650,40 @@ mod tests {
             .next()
             .unwrap()
             .clone()
+    }
+    #[test]
+    fn only_the_current_unfinished_turn_can_grow_or_finish() {
+        let turn = Turn {
+            id: "00000000-0000-4000-8000-000000000001".into(),
+            question: "Question".into(),
+            answer: "partial".into(),
+            state: AnswerState::Empty,
+            error: None,
+            created_at: 1.0,
+            source_pages: None,
+        };
+        let mut next = turn.clone();
+        next.answer.push_str(" answer");
+        assert!(turn.validate_snapshot_replacement(&next, true).is_ok());
+        assert!(turn.validate_snapshot_replacement(&next, false).is_err());
+        next.question = "Changed".into();
+        assert!(turn.validate_snapshot_replacement(&next, true).is_err());
+        next.question = turn.question.clone();
+        next.answer = "replacement".into();
+        assert!(turn.validate_snapshot_replacement(&next, true).is_err());
+        next.answer = turn.answer.clone();
+        for state in [
+            AnswerState::Finished,
+            AnswerState::Cancelled,
+            AnswerState::Failed,
+        ] {
+            next.state = state;
+            assert!(turn.validate_snapshot_replacement(&next, true).is_ok());
+            let mut later = next.clone();
+            later.answer.push('!');
+            assert!(next.validate_snapshot_replacement(&later, true).is_err());
+            assert!(next.validate_snapshot_replacement(&next, false).is_ok());
+        }
     }
     #[test]
     fn legacy_materialization_keeps_the_original_exchange_date_identity_and_missing_proof() {

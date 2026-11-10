@@ -199,7 +199,7 @@ void QuitCoordinator::advance() {
     if(all.size()!=m_windows.size()){abort(tr("The reader windows changed while quitting. Try again."));return;}
     for(const auto &window:m_windows)if(!window.workspace || !window.window || !all.contains(window.workspace)){abort(tr("The reader windows changed while quitting. Try again."));return;}
     if(m_phase==QStringLiteral("preparing")) {
-        for(const auto &window:m_windows)if(window.workspace)for(const auto &tab:window.workspace->tabs()){auto *reader=tab.toMap().value(QStringLiteral("reader")).value<ReaderController *>();if(reader && (reader->loading() || reader->pendingCommands()>0))return;}
+        for(const auto &window:m_windows)if(window.workspace)for(const auto &tab:window.workspace->tabs()){auto *reader=tab.toMap().value(QStringLiteral("reader")).value<ReaderController *>();if(reader && (reader->loading() || reader->pendingCommands()>0 || reader->regionPersistencePending()))return;}
         collect();return;
     }
     if(m_phase!=QStringLiteral("saving") && m_phase!=QStringLiteral("discarding") && m_phase!=QStringLiteral("retiring"))return;
