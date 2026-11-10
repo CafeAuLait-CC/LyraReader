@@ -327,6 +327,10 @@ extension ReaderChecks {
         let inside = contentPoint(state, page: 0,
                                   point: CGPoint(x: coverRect.midX, y: coverRect.midY))
         state.extendSelection(to: CGPoint(x: inside.x + 15, y: inside.y + 9))
+        let movingText = state.canvasPages.first { $0.placement.index == PlacementIndex.ownNote(state.annotations.firstIndex { $0.id == coverID }!) }!
+        let pageFrame = state.canvasPageFrames.first { $0.index == 0 }!
+        require(abs(movingText.placement.leftPt - pageFrame.leftPt - coverRect.minX - 15) < 0.01,
+                "annotation text glyphs follow the pointer before mouse-up")
         state.endPointerInteraction(at: CGPoint(x: inside.x + 15, y: inside.y + 9),
                                     wasClick: false)
         require(state.annotations.first(where: { $0.id == coverID })?.shapeRect?.minX ==

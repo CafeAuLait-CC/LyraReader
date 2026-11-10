@@ -32,5 +32,24 @@ extension ReaderChecks {
         state.toggleAssistantWorkspace(.translation, model: model)
         require(!state.regionSelectionArmed && state.rightPanelVisible,
                 "opening a workspace cancels Interleaf selection")
+        state.toggleAITools()
+        require(!state.aiToolsVisible && !state.rightPanelVisible && model.selectedTab == .translation,
+                "closing Lyra closes its drawer and retains the chosen workspace")
+        state.toggleAITools()
+        require(!state.rightPanelVisible, "reopening Lyra starts with its drawer closed")
+        for close: @MainActor () -> Void in [
+            { state.aiToolsVisible = false },
+            { state.toggleAnnotationTools() },
+            { state.toggleContentEditing() },
+            { state.toggleFillAndSign() },
+            { state.toggleExport() },
+        ] {
+            state.aiToolsVisible = true
+            state.rightPanelVisible = false
+            state.toggleAssistantWorkspace(.chat, model: model)
+            close()
+            require(!state.aiToolsVisible && !state.rightPanelVisible && model.selectedTab == .chat,
+                    "each secondary-row close path dismisses Lyra's drawer without resetting its workspace")
+        }
     }
 }

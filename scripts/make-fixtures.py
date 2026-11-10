@@ -2260,6 +2260,27 @@ def adopted_note_thread_pdf() -> bytes:
     })
 
 
+def two_column_line_numbers_pdf(with_hyphens: bool = False) -> bytes:
+    """Margin counters are interleaved with prose in both columns, as in review manuscripts."""
+    operations = []
+    for column in range(2):
+        for line in range(10):
+            y = 700 - line * 15
+            number = f"{line + column * 10 + 1:03}"
+            body = f"Column {column + 1} body {line + 1}: values 42 and [12] remain."
+            if with_hyphens:
+                body = [
+                    "A descriptive con-",
+                    "ditioning mechanism has fine-grained parts.",
+                    "Another ordinary example has ordi-",
+                    "nary words and Time-Aware labels.",
+                ][line % 4]
+            counter = f"BT /F1 7 Tf 1 0 0 1 {20 if column == 0 else 568} {y} Tm ({number}) Tj ET"
+            prose = f"BT /F1 10 Tf 1 0 0 1 {60 if column == 0 else 320} {y} Tm ({body}) Tj ET"
+            operations.extend([counter, prose] if column == 0 else [prose, counter])
+    return build_pdf([("\n".join(operations), 0)])
+
+
 def navigation_notes_pdf() -> bytes:
     """Contents links, an off-page reply placeholder, and clipped standalone notes."""
     pages = [
@@ -2772,6 +2793,8 @@ def main() -> int:
     (out_dir / "chapter-previews.pdf").write_bytes(chapter_previews_pdf())
     (out_dir / "navigation-notes.pdf").write_bytes(navigation_notes_pdf())
     (out_dir / "adopted-note-thread.pdf").write_bytes(adopted_note_thread_pdf())
+    (out_dir / "two-column-line-numbers.pdf").write_bytes(two_column_line_numbers_pdf())
+    (out_dir / "selection-discretionary-hyphens.pdf").write_bytes(two_column_line_numbers_pdf(with_hyphens=True))
     print(f"  {path}  ({path.stat().st_size} bytes, narrative author-year link)")
 
     # 12) T4.52: section references in running text. Page 1 points at "Section 2" and page 2 at

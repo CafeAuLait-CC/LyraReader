@@ -12,10 +12,15 @@
 //!
 //! * a box that overlaps two columns selects the **whole span** between them (Swift's
 //!   `first...last` range has no line/column awareness), and
-//! * a loose line-number gutter box participates in the column and vertical-overlap rules.
+//! * an isolated loose gutter box participates in the column and vertical-overlap rules.
 //!
 //! Those are deliberately reproduced for parity and recorded as future work rather than
 //! "fixed", because changing them would change pointer and annotation behaviour.
+//!
+//! Recognized manuscript line-number gutters are now excluded from selection. Their original
+//! indices and raw text remain intact; Rust supplies the same exclusions to Swift's fallback.
+//! Recognition requires repeated consecutive small counters outside prose, leaving inline
+//! numbers, equation labels, lists and same-size table values selectable.
 //!
 //! # Coordinate space
 //!
@@ -63,6 +68,7 @@ pub struct SelectionLine {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SelectionLayout {
     lines: Vec<SelectionLine>,
+    excluded_indices: Vec<u32>,
 }
 
 impl SelectionLayout {
@@ -78,10 +84,14 @@ impl SelectionLayout {
     /// 5. missing space boxes between the previous stop and this glyph are interpolated across
     ///    the horizontal gap before the line box is widened.
     pub fn build(chars: &[CharBox]) -> Self {
+        let excluded_indices = crate::line_numbers::selection_exclusions(chars);
         let mut lines: Vec<SelectionLine> = Vec::new();
         let mut current: Option<SelectionLine> = None;
 
         for (index, character) in chars.iter().enumerate() {
+            if u32::try_from(index).is_ok_and(|i| excluded_indices.binary_search(&i).is_ok()) {
+                continue;
+            }
             if character.unicode == 10 || character.unicode == 13 {
                 if let Some(line) = current.take() {
                     lines.push(line);
@@ -148,11 +158,19 @@ impl SelectionLayout {
             line.stops.shrink_to_fit();
         }
         lines.shrink_to_fit();
-        Self { lines }
+        Self {
+            lines,
+            excluded_indices,
+        }
     }
 
     pub fn lines(&self) -> &[SelectionLine] {
         &self.lines
+    }
+
+    /// Original PDF character indices of confidently recognized manuscript line numbers.
+    pub fn excluded_indices(&self) -> &[u32] {
+        &self.excluded_indices
     }
 
     pub fn is_empty(&self) -> bool {
@@ -162,6 +180,7 @@ impl SelectionLayout {
     /// Approximate heap size of this layout, used by the engine's byte-bounded cache.
     pub fn estimated_bytes(&self) -> usize {
         self.lines.capacity() * std::mem::size_of::<SelectionLine>()
+            + self.excluded_indices.capacity() * std::mem::size_of::<u32>()
             + self
                 .lines
                 .iter()
@@ -407,7 +426,12 @@ impl SelectionTextPage {
         }
         chars[low..=high]
             .iter()
-            .filter_map(|character| char::from_u32(*character))
+            .enumerate()
+            .filter(|(offset, _)| {
+                !u32::try_from(low + offset)
+                    .is_ok_and(|i| self.layout.excluded_indices.binary_search(&i).is_ok())
+            })
+            .filter_map(|(_, character)| char::from_u32(*character))
             .collect()
     }
 
@@ -417,6 +441,25 @@ impl SelectionTextPage {
             + self.chars.capacity() * std::mem::size_of::<u32>()
             + self.layout.estimated_bytes()
     }
+}
+
+/// Clipboard text is derived only after resolving the original character range. PDFium uses
+/// U+0002 for a discretionary line-end hyphen; U+00AD is its Unicode equivalent. Join the word
+/// and its wrap whitespace without changing ordinary hyphens, spaces or paragraph structure.
+pub fn normalize_copied_text(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut joining_word = false;
+    for character in text.chars() {
+        match character {
+            '\u{2}' | '\u{ad}' => joining_word = true,
+            c if joining_word && c.is_whitespace() => {}
+            c => {
+                output.push(c);
+                joining_word = false;
+            }
+        }
+    }
+    output
 }
 
 /// Port of `Unicode.Scalar(c).map(CharacterSet.whitespaces.contains) == true`.
@@ -611,6 +654,27 @@ pub fn region_text(chars: &[CharBox], region: Rect, limit: usize) -> (String, bo
 mod tests {
     use super::*;
 
+    #[test]
+    fn copied_text_joins_discretionary_word_breaks_without_reflowing_prose() {
+        for (source, expected) in [
+            (
+                "con\u{2} ditioning and ordi\u{2}\r\n  nary",
+                "conditioning and ordinary",
+            ),
+            ("En\u{2}\n\t coder", "Encoder"),
+            ("foun\u{ad}\n dation", "foundation"),
+            ("\u{2} fragment\u{2}", "fragment"),
+            (
+                "fine-grained Time-Aware\n  42 [12]\n\n    code\tvalue",
+                "fine-grained Time-Aware\n  42 [12]\n\n    code\tvalue",
+            ),
+            ("literal <0x02> label", "literal <0x02> label"),
+            ("汉字\n段落", "汉字\n段落"),
+        ] {
+            assert_eq!(normalize_copied_text(source), expected);
+        }
+    }
+
     fn character(unicode: u32, x: f64, y: f64, width: f64, height: f64) -> CharBox {
         CharBox {
             rect: Rect::new(x, y, width, height),
@@ -631,6 +695,116 @@ mod tests {
             cursor += if scalar == ' ' { size * 0.25 } else { width };
         }
         chars
+    }
+
+    fn manuscript_numbers(size: f64, punctuation: bool) -> Vec<CharBox> {
+        let mut chars = Vec::new();
+        for column in 0..2 {
+            for line in 0..10 {
+                let number = if punctuation {
+                    format!("{}.", line + 1)
+                } else {
+                    format!("{:03}", line + column * 10 + 1)
+                };
+                let y = 30.0 + f64::from(line) * 15.0;
+                if column == 0 {
+                    chars.extend(word(&number, 15.0, y + 1.0, size));
+                }
+                chars.extend(word(
+                    "Body 42 has useful prose",
+                    60.0 + f64::from(column) * 260.0,
+                    y,
+                    10.0,
+                ));
+                if column == 1 {
+                    chars.extend(word(&number, 550.0, y + 1.0, size));
+                }
+                chars.push(character(10, 0.0, 0.0, 0.0, 0.0));
+            }
+        }
+        chars
+    }
+
+    #[test]
+    fn interleaved_two_column_line_numbers_are_not_selection_stops_or_copied_text() {
+        let chars = manuscript_numbers(7.0, false);
+        let raw_text: String = chars
+            .iter()
+            .filter_map(|c| char::from_u32(c.unicode))
+            .collect();
+        let page = SelectionTextPage::new(TextPage {
+            chars: chars.clone(),
+            text: raw_text.clone(),
+            ..TextPage::default()
+        });
+        assert_eq!(
+            page.chars().len(),
+            chars.len(),
+            "PDF indices must not change"
+        );
+        assert_eq!(page.layout().excluded_indices().len(), 60);
+        assert!(
+            page.layout()
+                .lines()
+                .iter()
+                .flat_map(|l| &l.stops)
+                .all(|s| s.rect.min_x() >= 60.0 && s.rect.max_x() < 550.0)
+        );
+        let selected = page.string_in_range(0, u32::try_from(chars.len() - 1).unwrap());
+        assert!(!selected.contains("001") && !selected.contains("020"));
+        assert_eq!(selected.matches("Body 42 has useful prose").count(), 20);
+        assert!(raw_text.contains("001"), "raw extraction remains complete");
+        let body = chars
+            .iter()
+            .position(|c| c.unicode == u32::from('B'))
+            .unwrap();
+        assert_eq!(
+            page.char_index_at(Point::new(61.0, 32.0), false),
+            Some(CharIndex(u32::try_from(body).unwrap()))
+        );
+    }
+
+    #[test]
+    fn lists_table_values_and_isolated_margin_numbers_remain_selectable() {
+        assert!(
+            SelectionLayout::build(&manuscript_numbers(10.0, false))
+                .excluded_indices()
+                .is_empty(),
+            "same-size table values"
+        );
+        assert!(
+            SelectionLayout::build(&manuscript_numbers(7.0, true))
+                .excluded_indices()
+                .is_empty(),
+            "punctuated list counters"
+        );
+        let mut chars = word("001", 15.0, 31.0, 7.0);
+        chars.extend(word(
+            "Body text with inline 2026 and [12]",
+            60.0,
+            30.0,
+            10.0,
+        ));
+        assert!(
+            SelectionLayout::build(&chars).excluded_indices().is_empty(),
+            "one number is not a gutter"
+        );
+        let mut irregular = manuscript_numbers(7.0, false);
+        for (index, c) in irregular
+            .iter_mut()
+            .filter(|c| {
+                (48..=57).contains(&c.unicode) && (c.rect.min_x() < 40.0 || c.rect.min_x() > 540.0)
+            })
+            .enumerate()
+        {
+            c.unicode = 48 + u32::try_from((index * 7) % 10).unwrap();
+        }
+        assert!(
+            SelectionLayout::build(&irregular)
+                .excluded_indices()
+                .is_empty(),
+            "unrelated numeric columns are not line numbers"
+        );
     }
 
     #[test]

@@ -464,7 +464,10 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     @Published public var aiToolsVisible: Bool = false {
         didSet {
             if aiToolsVisible { closeOtherSecondaryRows(except: .lyra) }
-            else { cancelRegionSelection() }
+            else {
+                cancelRegionSelection()
+                if oldValue { deactivateSecondaryRowTool(.lyra) }
+            }
         }
     }
     /// 100% means actual physical size, scaled by the current screen's calibration.
@@ -548,6 +551,7 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
                 blurFormField()
                 cancelRegionSelection(reason: "Region selection cancelled: Edit PDF took the pointer.")
             } else {
+                clearContentDrag()
                 // Leaving Edit leaves its tool too. Reopening the row starts in the implicit
                 // pointer state, so the inspector (which follows an armed tool) stays closed.
                 if rasterRedactionPrompt != nil {
@@ -590,6 +594,25 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     /// Display-only pixels from the visible revision, never entries in the new render cache.
     /// Each page is retired atomically once its replacement covers the viewport.
     private var revisionCanvasFallbacks: [Int: [CanvasPage]] = [:]
+    private struct LiveContentDrag {
+        var pixels: ContentDragPreview
+        var page: Int
+        var delta: CGPoint
+        var retiringEpoch: UInt64?
+    }
+    private var liveContentDrag: LiveContentDrag?
+
+    package func showContentDrag(_ pixels: ContentDragPreview, page: Int, delta: CGPoint) {
+        liveContentDrag = LiveContentDrag(pixels: pixels, page: page, delta: delta)
+        refreshSelectionOverlay()
+    }
+
+    package func clearContentDrag() {
+        guard liveContentDrag != nil else { return }
+        liveContentDrag = nil
+        refreshSelectionOverlay()
+    }
+
     /// The canvas drawing this window's page list, registered by ``PDFCanvasView``.
     ///
     /// Weak, because the window owns the view. ``reloadVisiblePages()`` tells it that the commit
@@ -4064,6 +4087,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         isChangingDocumentState = true
         defer { isChangingDocumentState = wasChanging }
         contentLoadToken = UUID()
+        liveContentDrag = nil
         contentEditPage = nil
         contentEditSelection = nil
         contentLinkDraft = nil
@@ -8478,11 +8502,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         document != nil && fillAndSignVisible && armedFillSignTool != nil
     }
 
-    /// The Edit inspector is visible while Edit is open *and* a content tool is armed (or a page
-    /// object is selected with the implicit pointer). Opening Edit alone does not open it.
+    /// Selecting or dragging text keeps the viewport stable. Its properties appear when the
+    /// caret opens; armed tools, selected graphics and recoverable drafts retain their options.
     public var contentEditInspectorVisible: Bool {
         document != nil && contentEditEnabled
-            && (contentEditTool != "select" || contentEditSelection != nil)
+            && (contentEditTool != "select" || contentTextEditing || contentTextRecovery != nil
+                || selectedContentItem.map { $0.kind != "text" } == true)
     }
 
     /// Width the right-hand inspector column takes from the canvas. There is one inspector slot
@@ -12486,6 +12511,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let previousDocumentURL = document?.url
         let translationURL = translationCacheDocumentURL
         let previousScroll = scrollYPt
+        let drag = preservingViewport ? liveContentDrag : nil
         let previousPageCount = document?.pageCount
         let previousFrames = visiblePagePlacements
         let viewport = visibleContentRect(viewportHeight: viewportHeightContentPt)
@@ -12514,6 +12540,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let fallbacks = Dictionary(grouping: retained, by: { $0.0 }).mapValues { $0.map { $0.1 } }
         resetDocumentState(keepingCanvas: keepCanvas)
         revisionCanvasFallbacks = fallbacks
+        if keepCanvas, var drag {
+            drag.retiringEpoch = renderEpoch
+            liveContentDrag = drag
+        }
         loaded.title = title
         document = loaded
         // The working revision is not a new document for translation-cache purposes. The caller
@@ -12561,6 +12591,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         pageEditSession = nil
         pageEditPendingOperations = []
         pageEditIsApplied = false
+        // An empty failed session can end without reopening the original. Restore its records
+        // target before deleting the directory, so later annotation edits cannot write into it.
+        if let session, annotationsURL == session.annotationRecordsURL {
+            annotationsURL = session.originalRecordsURL
+        }
         if let revisionURL = session?.revisionURL, revisionURL != session?.originalURL {
             engine.closeDocument(at: revisionURL)
         }
@@ -15710,6 +15745,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 if onScreenPageIndices.contains(placement.index) { anyOnScreenPageSharp = true }
             }
         }
+        if let drag = liveContentDrag, drag.retiringEpoch == renderEpoch,
+           revisedPagesReady.contains(drag.page) || failedPreviewPages.contains(drag.page)
+                || failedTiles.contains(where: { $0.page == drag.page }) {
+            liveContentDrag = nil
+        }
         // Keep each old page intact while its new raster/tiles are incomplete, rather than
         // publishing a blank or a mixture of old and edited page content. Failed renders retire
         // old pixels too, so a failed redaction never masquerades as the resulting page.
@@ -16047,6 +16087,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Everything translucent — the selection and every highlight — is drawn by the same
     /// textured-quad pipeline as the pages, so annotation rendering needs no new GPU path.
     private func appendSelectionHighlights(to pages: inout [CanvasPage]) {
+        if let drag = liveContentDrag,
+           let placement = visiblePagePlacements.first(where: { $0.index == drag.page }) {
+            for (index, image, delta) in [
+                (PlacementIndex.contentDragBackground, drag.pixels.background, CGPoint.zero),
+                (PlacementIndex.contentDragForeground, drag.pixels.foreground, drag.delta)
+            ] {
+                let region = drag.pixels.bounds.offsetBy(dx: delta.x, dy: delta.y)
+                pages.append(CanvasPage(placement: PagePlacement(index: index,
+                    topPt: placement.topPt + region.minY, leftPt: placement.leftPt + region.minX,
+                    widthPt: region.width, heightPt: region.height), image: image))
+            }
+        }
         if let highlight = aiSourceHighlight,
            let placement = visiblePagePlacements.first(where: { $0.index == highlight.page }) {
             let image: PageImage = switch highlight.phase {
@@ -16971,18 +17023,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// Copies the selected characters (⌘C from the canvas).
-    public func copySelection() {
+    public func copySelection(to pasteboard: NSPasteboard = .general) {
         guard let selection, let textPage = textPages[selection.page] else { return }
         let range = selection.range.clamped(to: 0...(textPage.chars.count - 1))
         guard !range.isEmpty else { return }
 
         // One range→string entry point (Rust for engine-loaded pages, the same Swift rule for
         // synthetic ones); decoding scalars here would be the second copy this task removed.
-        let string = textPage.string(in: range)
+        let string = textPage.copyText(in: range)
         guard !string.isEmpty else { return }
 
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(string, forType: .string)
+        pasteboard.clearContents()
+        pasteboard.setString(string, forType: .string)
         statusMessage = "Copied \(string.count) characters"
     }
 
@@ -17442,6 +17494,7 @@ extension AppState {
         if deferContentTransition({ [weak self] in self?.selectContentTool(tool) }) { return }
         // One click arms a content tool; a second click on the same one returns the pointer to
         // its implicit selection state, which is why the Edit row needs no Select button.
+        clearContentDrag()
         contentEditTool = (tool != "select" && contentEditTool == tool) ? "select" : tool
         contentEditSelection = nil
         contentLinkDraft = nil
@@ -17636,7 +17689,7 @@ extension AppState {
     /// to another row, opening page overview or closing the document must all leave the page in
     /// the implicit pointer state rather than keep applying a tool whose control is gone.
     ///
-    /// Export and Lyra own no persistent page tool, so they have nothing to clear.
+    /// Export has no persistent page tool; Lyra owns the assistant drawer.
     private func deactivateSecondaryRowTool(_ row: SecondaryRow) {
         switch row {
         case .annotations:
@@ -17647,7 +17700,9 @@ extension AppState {
             contentLinkDraft = nil
         case .fillAndSign:
             clearFillSignTool()
-        case .export, .lyra:
+        case .lyra:
+            rightPanelVisible = false
+        case .export:
             break
         }
     }
@@ -17947,6 +18002,7 @@ extension AppState {
     private func preserveContentFailure(
         _ command: ContentCommandRecord, _ message: String, page: Int? = nil, url: URL? = nil
     ) {
+        clearContentDrag()
         if let payload = command.replaceTextPayload {
             contentRecoveryCommand = (
                 command, page ?? contentEditPage?.page ?? currentPage - 1, url ?? document?.url
@@ -18243,6 +18299,7 @@ extension AppState {
             await reloadContentObjects()
             return true
         } catch {
+            clearContentDrag()
             pageEditSession?.transaction.cancelPrepared()
             // The edit did not land, so the blocks and their cached translations are still
             // the ones on screen. Restore them rather than making a failed command discard

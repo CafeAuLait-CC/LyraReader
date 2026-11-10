@@ -23,6 +23,52 @@ extension ReaderChecks {
             [document.appendingPathExtension("lyra-reader-annotations.json"),
              document.appendingPathExtension("aris-annotations.json")]
         }
+
+        // A failed first content command retires its empty working directory. A later note
+        // edit must write to the original document's cache, never that deleted session.
+        let failedEditFile = scratch.appendingPathComponent("failed-first-edit.pdf")
+        try fm.copyItem(at: root.appendingPathComponent("tests/fixtures/adopted-note-thread.pdf"),
+                        to: failedEditFile)
+        let failedEditOriginal = try Data(contentsOf: failedEditFile)
+        let failedEdit = AppState(engine: try RustEngine())
+        failedEdit.setViewportSize(CGSize(width: 1000, height: 800))
+        require(failedEdit.open(url: failedEditFile), "the failed-first-edit note fixture opens")
+        try await eventually("the file note loads before the failed edit") {
+            failedEdit.documentAnnotations.contains { $0.id == "nm:thread-note" }
+        }
+        failedEdit.toggleContentEditing()
+        await failedEdit.reloadContentObjects()
+        guard let text = failedEdit.contentEditPage?.items.first(where: { $0.can_edit_text }) else {
+            fatalError("FAIL: the failed-first-edit fixture has editable text")
+        }
+        failedEdit.replaceContentText(text, text: String(repeating: "Overflow ", count: 500), font: "Helvetica")
+        try await eventually("the failed first edit retains its text draft") {
+            failedEdit.contentTextRecovery != nil && !failedEdit.contentCommandInFlight
+        }
+        require(!failedEdit.pageEditSessionActive && failedEdit.pageEditPendingOperations.isEmpty,
+                "a failed first content edit retires its empty session")
+        failedEdit.discardContentTextRecovery()
+        failedEdit.toggleContentEditing()
+        failedEdit.lastError = nil
+        failedEdit.activateDocumentAnnotationRow("nm:thread-note")
+        failedEdit.editOpenNote()
+        require(failedEdit.lastError == nil && failedEdit.editingAnnotationID != nil,
+                "a note enters editing after a failed first content edit without a missing-folder alert")
+        failedEdit.updateEditingText("Note after a failed content command")
+        require(failedEdit.commitTextEditing(), "the note after the failed content command commits")
+        let failedEditRecords = DocumentEditCache.annotationsURL(for: failedEditFile)
+        let afterFailure = try AnnotationRecords.decode(Data(contentsOf: failedEditRecords),
+            pageCount: 3, paletteCount: AppState.highlightPalette.count)
+        require(afterFailure.annotations.first?.note == "Note after a failed content command",
+                "the note is persisted in the original document cache")
+        let failedEditCacheFiles = try fm.contentsOfDirectory(at: failedEditRecords.deletingLastPathComponent(),
+            includingPropertiesForKeys: nil)
+        require(failedEditCacheFiles.allSatisfy { !$0.lastPathComponent.hasPrefix("session-") },
+                "note editing does not recreate the retired working directory")
+        let afterFailedEdit = try Data(contentsOf: failedEditFile)
+        require(afterFailedEdit == failedEditOriginal,
+                "a failed content command and the subsequent note draft preserve the PDF bytes")
+
         let cleanTab = try fixture("clean-tab.pdf")
         let otherTab = try fixture("other-tab.pdf")
         let tracked = AppState(engine: try RustEngine())

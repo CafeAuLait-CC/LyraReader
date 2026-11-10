@@ -863,8 +863,8 @@ impl PdfiumBackend {
     ///
     /// Region rendering is what makes a tile pipeline affordable at all: rendering the
     /// whole page and cropping would re-interpret the content stream once per tile.
-    fn rasterize_region(
-        &self,
+    // Callers hold PDFIUM_LOCK and validate finite, bounded bitmap dimensions first.
+    pub(crate) fn rasterize_region(
         page: &PdfPage<'_>,
         request: &RasterRequest,
         region: Rect,
@@ -1217,7 +1217,7 @@ impl DocumentBackend for PdfiumBackend {
         self.prepare_annotation_rendering(&page, request.page, request.flags.annotations)?;
 
         if let Some(region) = request.region {
-            let mut tile = self.rasterize_region(&page, request, region)?;
+            let mut tile = Self::rasterize_region(&page, request, region)?;
             self.paint_link_borders(&page, request, &mut tile)?;
             return Ok(tile);
         }
