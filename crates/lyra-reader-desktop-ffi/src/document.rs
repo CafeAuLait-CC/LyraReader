@@ -612,6 +612,11 @@ impl DesktopDocument {
             ),
             "ai_preview" => {
                 let mut request = crate::region::request(r["request"].clone())?;
+                self.enrich_region_history(
+                    &mut request,
+                    r.get("region_history_id").and_then(Value::as_str),
+                    &d.document_identity().sha256,
+                )?;
                 self.enrich_reading(&mut request, &d.document_identity().sha256)?;
                 value(
                     d.prepare_ai_plan(request)
@@ -939,6 +944,170 @@ mod tests {
             .parent()
             .unwrap()
             .join("region-conversations-v1.json")
+    }
+    #[test]
+    fn legacy_region_append_preserves_the_top_level_answer_before_a_new_turn() {
+        use lyra_reader_ai::region_history::{AnswerState, History};
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let id = saved_region(&doc);
+        let path = region_path(&fixture.path);
+        drop(doc);
+        let mut history = History::decode(&fs::read(&path).unwrap()).unwrap();
+        let mut entry = history.get(&id).unwrap().clone();
+        entry.question = "LEGACY_QUESTION".into();
+        entry.answer = "LEGACY_ANSWER".into();
+        entry.state = AnswerState::Finished;
+        let date = entry.created_at;
+        history.put(entry).unwrap();
+        fs::write(&path, history.encode().unwrap()).unwrap();
+        let doc = fixture.open();
+        let state = doc.command(json!({"op":"region_list"})).unwrap();
+        let restored = doc
+            .command(
+                json!({"op":"region_reopen","id":id,"expected_history_revision":state["revision"]}),
+            )
+            .unwrap();
+        assert_eq!(restored["latest_turn"]["turn_id"], id);
+        assert_eq!(restored["latest_turn"]["output"], "LEGACY_ANSWER");
+        assert!(
+            restored["latest_turn"]["source_pages"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let turn = crate::marks::uuid().unwrap();
+        doc.command(json!({"op":"region_snapshot","id":id,"draft":"","turn":{"id":turn,"question":"NEW_QUESTION","answer":"NEW_ANSWER","state":"finished"}})).unwrap();
+        let saved = doc.command(json!({"op":"region_get","id":id})).unwrap();
+        assert_eq!(saved["turns"].as_array().unwrap().len(), 2);
+        assert_eq!(saved["turns"][0]["id"], id);
+        assert_eq!(saved["turns"][0]["createdAt"], date);
+        assert_eq!(saved["turns"][0]["answer"], "LEGACY_ANSWER");
+        assert_eq!(saved["turns"][1]["answer"], "NEW_ANSWER");
+        assert!(saved["turns"][0]["sourcePages"].is_null());
+    }
+    #[test]
+    fn region_followup_context_uses_completed_stored_turns_and_rejects_changed_capture() {
+        use lyra_reader_ai::region_history::{AnswerState, History, Turn};
+        let fixture = Fixture::new("text-page.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        let id = saved_region(&doc);
+        let path = region_path(&fixture.path);
+        drop(doc);
+        let mut history = History::decode(&fs::read(&path).unwrap()).unwrap();
+        let mut entry = history.get(&id).unwrap().clone();
+        entry.turns = [
+            AnswerState::Finished,
+            AnswerState::Cancelled,
+            AnswerState::Failed,
+            AnswerState::Empty,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, state)| Turn {
+            id: crate::marks::uuid().unwrap(),
+            question: format!("HISTORY_QUESTION_{i}"),
+            answer: format!("HISTORY_ANSWER_{i}"),
+            state,
+            error: None,
+            created_at: 0.0,
+            source_pages: None,
+        })
+        .collect();
+        history.put(entry.clone()).unwrap();
+        let cached = history.encode().unwrap();
+        fs::write(&path, &cached).unwrap();
+        let doc = fixture.open();
+        let state = doc.command(json!({"op":"region_list"})).unwrap();
+        let mut region = doc
+            .command(
+                json!({"op":"region_reopen","id":id,"expected_history_revision":state["revision"]}),
+            )
+            .unwrap();
+        region["send_image"] = json!(false);
+        region["include_document_context"] = json!(false);
+        let request = json!({"action":"RegionQuestion","document_knowledge":false,"document_knowledge_text":null,"document_knowledge_pages":[],
+            "current_page":0,"selection":null,"question":"NEXT_SYNTHETIC_QUESTION","language":null,"history":[{"question":"FORGED_UI_CONTEXT","answer":"NOT_STORED"}],
+            "base_url":"http://localhost:11434/v1","model":"synthetic-context","temperature":null,"max_tokens":null,"reasoning_mode":"default","reasoning_encoding":"none","region":region});
+        let plan = doc
+            .command(json!({"op":"ai_preview","request":request,"region_history_id":id}))
+            .unwrap();
+        let body = plan["parts"][0]["wire_body"].as_str().unwrap();
+        assert!(body.contains("HISTORY_ANSWER_0"));
+        for i in 1..4 {
+            assert!(!body.contains(&format!("HISTORY_ANSWER_{i}")));
+        }
+        assert!(!body.contains("FORGED_UI_CONTEXT"));
+        let mut changed = request.clone();
+        changed["region"]["text"] = json!("CHANGED_CAPTURE_TEXT");
+        assert!(
+            doc.command(json!({"op":"ai_preview","request":changed,"region_history_id":id}))
+                .unwrap_err()
+                .contains("region changed")
+        );
+        assert_eq!(fs::read(&path).unwrap(), cached);
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        drop(doc);
+        entry.attachment.rect[1][0] = 1e100;
+        history.put(entry).unwrap();
+        let oversized = history.encode().unwrap();
+        fs::write(&path, &oversized).unwrap();
+        let doc = fixture.open();
+        let state = doc.command(json!({"op":"region_list"})).unwrap();
+        assert_eq!(
+            doc.command(json!({"op":"region_get","id":id})).unwrap()["can_reopen"],
+            false
+        );
+        assert!(
+            doc.command(
+                json!({"op":"region_reopen","id":id,"expected_history_revision":state["revision"]})
+            )
+            .unwrap_err()
+            .contains("outside the page bounds")
+        );
+        assert_eq!(fs::read(&path).unwrap(), oversized);
+    }
+    #[test]
+    fn saved_region_reopens_frozen_bytes_and_refuses_stale_geometry_without_writing() {
+        let fixture = Fixture::new("text-page.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        let id = saved_region(&doc);
+        let history = fs::read(region_path(&fixture.path)).unwrap();
+        let state = doc.command(json!({"op":"region_list"})).unwrap();
+        let entry = doc.command(json!({"op":"region_get","id":id})).unwrap();
+        assert_eq!(entry["can_reopen"], true);
+        let reopened = doc
+            .command(
+                json!({"op":"region_reopen","id":id,"expected_history_revision":state["revision"]}),
+            )
+            .unwrap();
+        assert_eq!(reopened["history_id"], id);
+        assert_eq!(reopened["image_png"], entry["attachment"]["png"]);
+        assert_eq!(reopened["text"], entry["attachment"]["text"]);
+        assert_eq!(reopened["question"], entry["draftQuestion"]);
+        assert_eq!(reopened["completed_turn_count"], 0);
+        assert_eq!(fs::read(region_path(&fixture.path)).unwrap(), history);
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        assert!(
+            doc.command(json!({"op":"region_reopen","id":id,"expected_history_revision":"stale"}))
+                .unwrap_err()
+                .contains("changed")
+        );
+        doc.command(json!({"op":"page_stage","operation":{"InsertBlank":{"index":0}}}))
+            .unwrap();
+        let state = doc.command(json!({"op":"region_list"})).unwrap();
+        assert!(
+            doc.command(
+                json!({"op":"region_reopen","id":id,"expected_history_revision":state["revision"]})
+            )
+            .is_err()
+        );
+        let stale = doc.command(json!({"op":"region_get","id":id})).unwrap();
+        assert_eq!(stale["can_reopen"], false);
+        assert_eq!(stale["attachment"], entry["attachment"]);
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
     }
     #[test]
     fn region_thumbnails_read_one_reviewed_attachment_without_rewriting_history() {

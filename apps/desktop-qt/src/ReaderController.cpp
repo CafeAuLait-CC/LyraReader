@@ -413,9 +413,10 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         if (parseError.error != QJsonParseError::NoError || !json.isObject())
             result.error = QStringLiteral("The document service returned an invalid response.");
         else result.result = json.object().value(QStringLiteral("result")).toVariant();
-        if(result.error.isEmpty() && operation==QStringLiteral("region_get")) {
+        if(result.error.isEmpty() && (operation==QStringLiteral("region_get") || operation==QStringLiteral("region_reopen"))) {
             auto detail=result.result.toMap();
-            detail.insert(QStringLiteral("image_url"),QUrl(QStringLiteral("data:image/png;base64,")+detail.value(QStringLiteral("attachment")).toMap().value(QStringLiteral("png")).toString()));
+            const auto png=operation==QStringLiteral("region_get") ? detail.value(QStringLiteral("attachment")).toMap().value(QStringLiteral("png")) : detail.value(QStringLiteral("image_png"));
+            detail.insert(QStringLiteral("image_url"),QUrl(QStringLiteral("data:image/png;base64,")+png.toString()));
             result.result=detail;
         }
         if(result.error.isEmpty() && operation==QStringLiteral("region_thumbnail")) {
@@ -436,7 +437,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
             result.source=NativeRasterSource::prepare(document,false,&result.error);
         return result;
     };
-    const bool regionWrite=operation.startsWith(QStringLiteral("region_")) && operation!=QStringLiteral("region_get") && operation!=QStringLiteral("region_list") && operation!=QStringLiteral("region_thumbnail");
+    const bool regionWrite=operation.startsWith(QStringLiteral("region_")) && operation!=QStringLiteral("region_get") && operation!=QStringLiteral("region_list") && operation!=QStringLiteral("region_thumbnail") && operation!=QStringLiteral("region_reopen");
     if(mutation || regionWrite || eraseControl || operation==QStringLiteral("ai_start") || operation==QStringLiteral("ai_cancel") || operation==QStringLiteral("knowledge_start") || operation==QStringLiteral("knowledge_cancel")){
         auto promise=std::make_shared<QPromise<CommandResult>>();promise->start();watcher->setFuture(promise->future());
         m_mutations->append([task,promise]{try{promise->addResult(task());}catch(...){promise->addResult(CommandResult{{},QStringLiteral("The command worker stopped unexpectedly.")});}promise->finish();});

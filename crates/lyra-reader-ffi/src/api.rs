@@ -1771,21 +1771,14 @@ impl Default for IndexRuntime {
 }
 
 impl LyraReaderDocument {
-    fn rasterize_region_bitmap(
+    /// Validate a 100% page-local, top-left view rectangle without allocating or rasterizing.
+    /// Shared by frozen-region restoration and the bitmap reader.
+    pub fn validate_view_region(
         &self,
         page: u32,
-        scale: f64,
         region: (f64, f64, f64, f64),
-        transparent_background: bool,
-        annotations: bool,
-    ) -> Result<PageBitmap, LyraReaderFfiError> {
+    ) -> Result<(), LyraReaderFfiError> {
         let (x_pt, y_pt, width_pt, height_pt) = region;
-        if !(scale.is_finite() && scale > 0.0) {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                severity: ErrorSeverity::Document,
-                message: format!("scale must be positive and finite, got {scale}"),
-            });
-        }
         if page >= self.backend.page_count() {
             return Err(LyraReaderFfiError::InvalidArgument {
                 severity: ErrorSeverity::Document,
@@ -1827,6 +1820,26 @@ impl LyraReaderDocument {
                 ),
             });
         }
+
+        Ok(())
+    }
+
+    fn rasterize_region_bitmap(
+        &self,
+        page: u32,
+        scale: f64,
+        region: (f64, f64, f64, f64),
+        transparent_background: bool,
+        annotations: bool,
+    ) -> Result<PageBitmap, LyraReaderFfiError> {
+        let (x_pt, y_pt, width_pt, height_pt) = region;
+        if !(scale.is_finite() && scale > 0.0) {
+            return Err(LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Document,
+                message: format!("scale must be positive and finite, got {scale}"),
+            });
+        }
+        self.validate_view_region(page, region)?;
 
         // A caller can request an arbitrary region, so apply the same pixel and edge limits as a
         // whole-page bitmap before asking PDFium to allocate it.

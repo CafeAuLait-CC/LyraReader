@@ -26,6 +26,7 @@ void ReaderController::initAi() {
     connect(this,&ReaderController::commandFinished,this,&ReaderController::handleAiCommand);
 }
 void ReaderController::resetAi() {
+    m_aiRegionRestoreId=0;m_regionContinuationPending=false;m_regionContinuationSettings.clear();
     clearAiRegionPaper();
     resetDocumentReading();
     ++m_aiRegionEpoch;RasterJobs::cancel(m_aiRegionJob);m_aiRegionJob.reset();m_aiRegion.clear();emit aiRegionChanged();
@@ -34,6 +35,7 @@ void ReaderController::resetAi() {
     m_aiTimer.stop();m_aiPreviewId=0;m_aiStartId=0;m_aiPollId=0;m_aiState.clear();emit aiStateChanged();
 }
 void ReaderController::cancelAiRegionCapture() {
+    m_aiRegionRestoreId=0;m_regionContinuationPending=false;m_regionContinuationSettings.clear();
     clearAiRegionPaper();
     ++m_aiRegionEpoch;RasterJobs::cancel(m_aiRegionJob);m_aiRegionJob.reset();
     if(m_aiRegion.value(QStringLiteral("loading")).toBool()){m_aiRegion.clear();emit aiRegionChanged();}
@@ -107,6 +109,15 @@ bool ReaderController::captureAiRegion(int page,const QVariantMap &rect,double z
         return result;
     }));
     return true;
+}
+quint64 ReaderController::reopenAiRegion(const QString &id,const QString &revision) {
+    if(!m_document || !m_source || m_loading || m_pendingCommands || m_aiState.value(QStringLiteral("running")).toBool() || hasUnsavedReadingNotes())return 0;
+    if(m_aiRegion.contains(QStringLiteral("image_png")) && !m_aiRegion.value(QStringLiteral("saved")).toBool() && m_aiRegion.value(QStringLiteral("history_id")).toString()!=id) {
+        setError(tr("Save the current region to Reading notes before opening another conversation."));return 0;
+    }
+    m_aiRegionRestoreEpoch=m_aiRegionEpoch;
+    m_aiRegionRestoreId=submit(QStringLiteral("region_reopen"),{{QStringLiteral("id"),id},{QStringLiteral("expected_history_revision"),revision}});
+    return m_aiRegionRestoreId;
 }
 void ReaderController::clearAiRegionPaper() {
     ++m_aiRegionPaperEpoch;m_aiRegionPaperSpec.clear();
@@ -200,7 +211,15 @@ void ReaderController::setAiRegionQuestion(const QString &text) {
     emit aiRegionChanged();
 }
 void ReaderController::prepareAiRegion(const QVariantMap &settings) {
-    if(!m_aiRegion.contains(QStringLiteral("image_png")) || m_aiRegion.value(QStringLiteral("loading")).toBool())return;
+    if(!m_aiRegion.contains(QStringLiteral("image_png")) || m_aiRegion.value(QStringLiteral("loading")).toBool() || m_pendingCommands || m_aiState.value(QStringLiteral("running")).toBool())return;
+    const auto previous=m_aiState.value(QStringLiteral("results")).toMap().value(QStringLiteral("region")).toMap();
+    if(!m_aiRegion.value(QStringLiteral("saved")).toBool() && !previous.value(QStringLiteral("turn_id")).toString().isEmpty()) {
+        invalidateAiPlan();m_regionContinuationPending=true;m_regionContinuationSettings=settings;
+        m_regionContinuationQuestion=m_aiRegion.value(QStringLiteral("question")).toString();m_regionContinuationEpoch=m_aiRegionEpoch;
+        m_aiState.insert(QStringLiteral("status"),tr("Saving the previous turn before preparing the next question…"));emit aiStateChanged();
+        if(!saveAiRegionNote()){m_regionContinuationPending=false;m_regionContinuationSettings.clear();}
+        return;
+    }
     QVariantMap region;
     for(const auto *key:{"page","x_pt","y_pt","width_pt","height_pt","text","image_png","image_width_px","image_height_px"})region.insert(QLatin1String(key),m_aiRegion.value(QLatin1String(key)));
     region.insert(QStringLiteral("send_image"),settings.value(QStringLiteral("imageInput"),false));
@@ -214,6 +233,7 @@ void ReaderController::prepareAiRegion(const QVariantMap &settings) {
         {QStringLiteral("reasoning_mode"),settings.value(QStringLiteral("reasoningMode"),QStringLiteral("default"))},{QStringLiteral("reasoning_encoding"),settings.value(QStringLiteral("reasoningEncoding"),QStringLiteral("none"))}});
 }
 void ReaderController::setAiInput(const QString &key,const QVariant &value) {
+    m_regionContinuationPending=false;m_regionContinuationSettings.clear();
     auto input=m_aiState.value(QStringLiteral("input")).toMap();
     if(key==QStringLiteral("view")) {
         const auto view=value.toString();
@@ -244,7 +264,8 @@ void ReaderController::setAiInput(const QString &key,const QVariant &value) {
     emit aiStateChanged();
 }
 void ReaderController::invalidateAiPlan() {
-    const bool hadPreview=m_aiPreviewId || m_aiState.contains(QStringLiteral("plan"));
+    const bool hadPreview=m_aiPreviewId || m_aiState.contains(QStringLiteral("plan")) || m_regionContinuationPending;
+    m_regionContinuationPending=false;m_regionContinuationSettings.clear();
     m_aiPreviewId=0;m_aiState.remove(QStringLiteral("plan"));
     if(hadPreview){
         if(!m_aiState.value(QStringLiteral("running")).toBool())m_aiState.insert(QStringLiteral("status"),tr("Preview the updated request before sending."));
@@ -284,7 +305,9 @@ void ReaderController::prepareAi(const QVariantMap &request) {
     m_aiState.insert(QStringLiteral("statusView"),m_aiState.value(QStringLiteral("previewView")));
     m_aiState.remove(QStringLiteral("plan"));m_aiState.insert(QStringLiteral("status"),tr("Preparing request locally…"));
     m_aiPlanGeneration=m_generation;emit aiStateChanged();
-    m_aiPreviewId=submit(QStringLiteral("ai_preview"),{{QStringLiteral("request"),input}});
+    QVariantMap preview{{QStringLiteral("request"),input}};
+    if(input.value(QStringLiteral("action")).toString()==QStringLiteral("RegionQuestion") && m_aiRegion.value(QStringLiteral("persisted")).toBool())preview.insert(QStringLiteral("region_history_id"),m_aiRegion.value(QStringLiteral("history_id")));
+    m_aiPreviewId=submit(QStringLiteral("ai_preview"),preview);
 }
 bool ReaderController::startAi(const QString &key,const QVariantMap &expectedPlan) {
     const auto plan=m_aiState.value(QStringLiteral("plan")).toMap();
@@ -360,7 +383,7 @@ quint64 ReaderController::saveAiRegionNote() {
     const auto result=m_aiState.value(QStringLiteral("results")).toMap().value(QStringLiteral("region")).toMap();
     if(!result.value(QStringLiteral("turn_id")).toString().isEmpty()) {
         QVariantMap turn{{QStringLiteral("id"),result.value(QStringLiteral("turn_id"))},{QStringLiteral("question"),result.value(QStringLiteral("question"))},{QStringLiteral("answer"),result.value(QStringLiteral("output"),QString{})},{QStringLiteral("state"),result.value(QStringLiteral("state"))}};
-        if(result.value(QStringLiteral("state")).toString()==QStringLiteral("failed"))turn.insert(QStringLiteral("error"),result.value(QStringLiteral("status")));
+        if(result.value(QStringLiteral("state")).toString()==QStringLiteral("failed") && (!result.value(QStringLiteral("restored")).toBool() || !result.value(QStringLiteral("status")).isNull()))turn.insert(QStringLiteral("error"),result.value(QStringLiteral("status")));
         args.insert(QStringLiteral("turn"),turn);
     }
     const bool exists=m_aiRegion.value(QStringLiteral("persisted")).toBool();
@@ -370,6 +393,23 @@ quint64 ReaderController::saveAiRegionNote() {
 }
 void ReaderController::handleAiCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error) {
     if(operation.startsWith(QStringLiteral("knowledge_"))){handleDocumentReadingCommand(id,operation,result,error);return;}
+    if(operation==QStringLiteral("region_reopen")) {
+        if(id!=m_aiRegionRestoreId)return;m_aiRegionRestoreId=0;
+        if(!error.isEmpty() || m_aiRegionRestoreEpoch!=m_aiRegionEpoch)return;
+        auto capture=result.toMap();
+        // Reopening the same active card must not replace newer local typing with its cache.
+        if(m_aiRegion.value(QStringLiteral("history_id"))==capture.value(QStringLiteral("history_id")) && m_aiRegion.contains(QStringLiteral("image_png")))return;
+        const auto latest=capture.take(QStringLiteral("latest_turn")).toMap();const auto image=capture.take(QStringLiteral("image_url")).toUrl();clearAiRegion();
+        capture.insert(QStringLiteral("restored"),true);m_aiRegion=capture;
+        m_aiRegionImage=image;
+        if(!latest.isEmpty()) {
+            auto response=latest;response.insert(QStringLiteral("restored"),true);response.insert(QStringLiteral("generation"),m_generation);
+            response.insert(QStringLiteral("responsePlan"),QVariantMap{{QStringLiteral("action"),QStringLiteral("RegionQuestion")},{QStringLiteral("source_pages"),latest.value(QStringLiteral("source_pages"))}});
+            auto results=m_aiState.value(QStringLiteral("results")).toMap();results.insert(QStringLiteral("region"),response);m_aiState.insert(QStringLiteral("results"),results);
+        }
+        m_aiState.insert(QStringLiteral("statusView"),QStringLiteral("region"));m_aiState.insert(QStringLiteral("status"),tr("Saved conversation reopened. Preview a question to continue."));
+        emit aiRegionImageChanged();emit aiRegionChanged();emit aiStateChanged();return;
+    }
     // Exports report their own outcome; they do not replace the loaded history or drafts.
     if(operation==QStringLiteral("region_export_markdown") || operation==QStringLiteral("region_thumbnail"))return;
     if(operation.startsWith(QStringLiteral("region_")) && operation!=QStringLiteral("region_get")) {
@@ -383,8 +423,15 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
             m_aiRegionSaveId=0;m_regionSaveError=error;emit regionNoteDraftChanged();
             if(error.isEmpty() && result.toMap().value(QStringLiteral("saved_id"))==m_aiRegion.value(QStringLiteral("history_id"))) {
                 m_aiRegion.insert(QStringLiteral("persisted"),true);m_aiRegion.insert(QStringLiteral("saved"),m_aiRegion.value(QStringLiteral("question")).toString()==m_aiRegionSaveDraft && m_aiState.value(QStringLiteral("results")).toMap().value(QStringLiteral("region")).toMap().value(QStringLiteral("turn_id")).toString()==m_aiRegionSaveTurn);
+                m_aiRegion.insert(QStringLiteral("completed_turn_count"),result.toMap().value(QStringLiteral("saved_completed_turn_count")));
             }
             emit aiRegionChanged();
+            if(m_regionContinuationPending) {
+                const auto settings=m_regionContinuationSettings;const bool current=m_regionContinuationEpoch==m_aiRegionEpoch && m_regionContinuationQuestion==m_aiRegion.value(QStringLiteral("question")).toString();
+                m_regionContinuationPending=false;m_regionContinuationSettings.clear();
+                if(error.isEmpty() && current && m_aiRegion.value(QStringLiteral("saved")).toBool())prepareAiRegion(settings);
+                else {m_aiState.insert(QStringLiteral("status"),error.isEmpty()?tr("The question changed. Preview it again before sending."):error);emit aiStateChanged();}
+            }
         }
         return;
     }

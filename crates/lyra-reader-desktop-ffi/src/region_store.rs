@@ -4,6 +4,7 @@ use crate::document::DesktopDocument;
 use crate::document_cache::{DocumentCache, atomic_write, read_optional};
 use fs2::FileExt;
 use lyra_reader_ai::region_history::{AnswerState, Attachment, Entry, History, Turn};
+use lyra_reader_ffi::api::{AiActionRecord, AiConversationTurnRecord, AiPlanRequestRecord};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -156,6 +157,74 @@ fn number(r: &Value, k: &str) -> Result<f64, String> {
         .ok_or_else(|| format!("Invalid capture {k}"))
 }
 impl DesktopDocument {
+    /// Use the stored snapshot and completed context at the same boundary as request planning.
+    pub(super) fn enrich_region_history(
+        &self,
+        request: &mut AiPlanRequestRecord,
+        id: Option<&str>,
+        sha: &str,
+    ) -> Result<(), String> {
+        let Some(id) = id else {
+            return Ok(());
+        };
+        if request.action != AiActionRecord::RegionQuestion {
+            return Err("Saved region context only belongs to a region question".into());
+        }
+        let _edits = self
+            .edits
+            .lock()
+            .map_err(|_| "Page-edit state is unavailable")?;
+        let marks = self
+            .marks
+            .lock()
+            .map_err(|_| "Annotation state is unavailable")?;
+        let mut store = self
+            .regions
+            .lock()
+            .map_err(|_| "Reading-note state is unavailable")?;
+        store.load(marks.cache_location()?)?;
+        if store.history.writes_blocked || store.error.is_some() {
+            return Err("Reading notes are protected. Keep the saved capture and resolve the cache warning before continuing".into());
+        }
+        let entry = store.history.get(id)?;
+        let active = self.active()?;
+        if active.document_identity().sha256 != sha {
+            return Err("The document changed while preparing the saved conversation".into());
+        }
+        entry.validate_reopen(active.page_count(), sha)?;
+        let region = request
+            .region
+            .as_ref()
+            .ok_or("The saved region capture is missing")?;
+        let [[x, y], [width, height]] = entry.attachment.rect;
+        active
+            .validate_view_region(entry.attachment.page, (x, y, width, height))
+            .map_err(|e| e.to_string())?;
+        if region.page != entry.attachment.page
+            || region.x_pt != x
+            || region.y_pt != y
+            || region.width_pt != width
+            || region.height_pt != height
+            || region.text != entry.attachment.text
+        {
+            return Err("The region changed. Reopen its saved capture before continuing".into());
+        }
+        if let Some(image) = region.image_png.as_deref() {
+            let saved = lyra_reader_edit::records::base64_decode(&entry.attachment.png)
+                .ok_or("The saved region picture is unavailable")?;
+            if image != saved {
+                return Err("The region picture changed. Reopen its saved capture".into());
+            }
+        }
+        request.history = entry
+            .completed_turns()
+            .map(|turn| AiConversationTurnRecord {
+                question: turn.question.into(),
+                answer: turn.answer.into(),
+            })
+            .collect();
+        Ok(())
+    }
     pub(super) fn region_command(&self, op: &str, r: &Value) -> Result<Value, String> {
         let _edits = self
             .edits
@@ -194,6 +263,36 @@ impl DesktopDocument {
                 "png":entry.attachment.png,"width":entry.attachment.pixel_width,
                 "height":entry.attachment.pixel_height}));
         }
+        if op == "region_reopen" {
+            if store.history.writes_blocked || store.error.is_some() {
+                return Err(
+                    "Reading notes are protected. Resolve the cache warning before continuing"
+                        .into(),
+                );
+            }
+            if field(r, "expected_history_revision")? != store.revision() {
+                return Err("Reading notes changed. Choose the conversation again".into());
+            }
+            let entry = store.history.get(field(r, "id")?)?;
+            entry.validate_reopen(active.page_count(), &identity.sha256)?;
+            let a = &entry.attachment;
+            let [[x, y], [width, height]] = a.rect;
+            active
+                .validate_view_region(a.page, (x, y, width, height))
+                .map_err(|e| e.to_string())?;
+            let latest=entry.turns.last().map(|turn|json!({"turn_id":turn.id,"question":turn.question,
+                "output":turn.answer,"state":turn.state,"status":turn.error,
+                "source_pages":entry.navigable_sources(entry.turns.len()-1,active.page_count(),&identity.sha256)}))
+                .or_else(||(!entry.question.is_empty()).then(||json!({"turn_id":entry.id,"question":entry.question,
+                    "output":entry.answer,"state":entry.state,"status":entry.error,"source_pages":[]})));
+            return Ok(json!({"history_id":entry.id,"persisted":true,"saved":true,
+                "question":entry.draft_question.as_deref().unwrap_or(""),"page":a.page,
+                "x_pt":x,"y_pt":y,"width_pt":width,"height_pt":height,
+                "text":a.text,"text_truncated":a.text_truncated,"image_png":a.png,
+                "image_width_px":a.pixel_width,"image_height_px":a.pixel_height,
+                "capture_scale":a.capture_scale,"source_sha256":identity.sha256,
+                "latest_turn":latest,"completed_turn_count":entry.completed_turns().count()}));
+        }
         if op == "region_get" {
             let entry = store
                 .history
@@ -202,6 +301,17 @@ impl DesktopDocument {
                 .find(|e| e.id == r["id"])
                 .ok_or("This region is unavailable")?;
             let mut value = serde_json::to_value(&entry).map_err(|e| e.to_string())?;
+            let [[x, y], [width, height]] = entry.attachment.rect;
+            let reopen_error = entry
+                .validate_reopen(active.page_count(), &identity.sha256)
+                .and_then(|()| {
+                    active
+                        .validate_view_region(entry.attachment.page, (x, y, width, height))
+                        .map_err(|e| e.to_string())
+                })
+                .err();
+            value["can_reopen"] = json!(reopen_error.is_none());
+            value["reopen_error"] = json!(reopen_error);
             value["locationInvalidated"] = json!(
                 entry.location_invalidated == Some(true)
                     || entry
@@ -353,6 +463,7 @@ impl DesktopDocument {
                 "region_create" | "region_snapshot" => {
                     entry.draft_question = Some(field(r, "draft")?.into());
                     if let Some(turn) = r.get("turn").filter(|t| !t.is_null()) {
+                        entry.materialize_legacy_turn();
                         let turn_id = field(turn, "id")?.to_owned();
                         let state: AnswerState = serde_json::from_value(turn["state"].clone())
                             .map_err(|e| e.to_string())?;
@@ -406,6 +517,10 @@ impl DesktopDocument {
         let mut state = store.history.summaries(key, &identity.sha256)?;
         state["revision"] = json!(store.revision());
         state["saved_id"] = json!(id);
+        if op != "region_delete" {
+            state["saved_completed_turn_count"] =
+                json!(store.history.get(&id)?.completed_turns().count());
+        }
         if op == "region_note" {
             state["saved_note"] = r["text"].clone();
         }

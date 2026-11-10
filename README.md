@@ -95,8 +95,11 @@ question draft and completed or partial answer in the application cache; the Not
 snapshots, shows bounded capture thumbnails and edits local knowledge notes without sending a request.
 Historical source buttons use only pages actually sent for that turn and the same PDF revision;
 answer-written page markers remain plain text. Saved notes export to a new Markdown file with
-their original PNG captures, preserving existing exports and the PDF. Saving is currently explicit;
-automatic region persistence, reopening multiple cards and Interleaf layout remain work in progress.
+their original PNG captures, preserving existing exports and the PDF. Continue conversation reopens
+the frozen capture in the single active card and uses completed turns as bounded request context.
+Preparing a follow-up saves the previous turn before previewing; new requests still require Send.
+Saving the current conversation remains explicit; timed persistence and remaining Interleaf lifecycle
+work are in progress.
 Unfinished knowledge-note drafts and failed snapshot saves keep the document open until resolved.
 Legacy answer page markers stay plain text. Actual HTTP attempts have a bounded local metadata audit
 trail, including retries. Settings and the AI panel open a metadata-only viewer, available without a

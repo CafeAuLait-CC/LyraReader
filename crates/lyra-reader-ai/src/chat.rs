@@ -2527,10 +2527,9 @@ fn document_chat_system_prompt() -> String {
 /// Returning the number dropped lets the plan explain the truncation instead of silently losing
 /// the conversation.
 fn bounded_history(history: &[ConversationTurn]) -> (Vec<ConversationTurn>, usize) {
-    let mut turns: Vec<ConversationTurn> = history
+    let mut turns: Vec<&ConversationTurn> = history
         .iter()
         .filter(|turn| !turn.question.trim().is_empty() && !turn.answer.trim().is_empty())
-        .cloned()
         .collect();
     let original = turns.len();
     if turns.len() > MAX_CHAT_HISTORY_TURNS {
@@ -2544,6 +2543,8 @@ fn bounded_history(history: &[ConversationTurn]) -> (Vec<ConversationTurn>, usiz
         let removed = turns.remove(0);
         total -= removed.question.chars().count() + removed.answer.chars().count();
     }
+    // Select borrowed records before cloning, so discarded cached answers are not duplicated.
+    let mut turns: Vec<ConversationTurn> = turns.into_iter().cloned().collect();
     if total > MAX_CHAT_HISTORY_CHARS {
         let turn = &mut turns[0];
         let question_chars = turn.question.chars().count();

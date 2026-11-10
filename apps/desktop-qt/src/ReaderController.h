@@ -87,6 +87,7 @@ public:
     Q_INVOKABLE bool isSavingRegionNote()const{return m_regionNoteSaveId!=0;}
     QVariantMap regionHistory()const{return m_regionHistory;}
     Q_INVOKABLE quint64 saveAiRegionNote();
+    Q_INVOKABLE quint64 reopenAiRegion(const QString &id,const QString &revision);
     QUrl aiRegionImage()const{return m_aiRegionImage;}
     Q_INVOKABLE bool captureAiRegion(int page,const QVariantMap &rect,double zoom);
     Q_INVOKABLE void cancelAiRegionCapture();
@@ -212,6 +213,10 @@ private:
     quint64 m_regionNoteSaveId=0;
     quint64 m_aiRegionSaveId=0;
     QString m_aiRegionSaveDraft,m_aiRegionSaveTurn;
+    quint64 m_aiRegionRestoreId=0,m_aiRegionRestoreEpoch=0,m_regionContinuationEpoch=0;
+    QVariantMap m_regionContinuationSettings;
+    QString m_regionContinuationQuestion;
+    bool m_regionContinuationPending=false;
     QUrl m_aiRegionImage;
     quint64 m_aiRegionEpoch=0;
     RasterJobs::Handle m_aiRegionJob;

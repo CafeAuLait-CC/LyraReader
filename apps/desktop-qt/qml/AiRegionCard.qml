@@ -179,6 +179,7 @@ Item {
             Label {text:qsTr("Ask about this area");font.bold:true;Layout.fillWidth:true}
             ToolButton {objectName:"closeAiRegionCard";text:qsTr("Close");onClicked:card.closeAnimated()}
         }
+        Label {visible:!!card.attachment.restored;text:qsTr("Saved conversation · %1 completed turns. Preview includes the recent context.").arg(card.attachment.completed_turn_count || 0);wrapMode:Text.Wrap;Layout.fillWidth:true;color:card.app.colors.textSecondary}
         BusyIndicator {running:!!card.attachment.loading;visible:running;Layout.alignment:Qt.AlignHCenter}
         ScrollView {
             Layout.fillWidth:true;Layout.fillHeight:true;contentWidth:availableWidth;clip:true

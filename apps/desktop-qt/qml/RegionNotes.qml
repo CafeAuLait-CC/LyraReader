@@ -11,6 +11,8 @@ Pane {
     property var owner:null
     property var detail:null
     property var readId:0
+    property var reopenId:0
+    property var continueContext:null
     property string selectedId:""
     property int turnIndex:0
     readonly property var history:owner ? owner.regionHistory : ({})
@@ -39,7 +41,7 @@ Pane {
     function deactivate() {
         let focused=app.activeFocusItem;let ownedFocus=false;
         while(focused){if(focused===notes){ownedFocus=true;break;}focused=focused.parent;}
-        exportFile.close();exportContext=null;remove.close();detail=null;readId=0;owner=null;
+        continueReveal.stop();continueContext=null;exportFile.close();exportContext=null;remove.close();detail=null;readId=0;reopenId=0;owner=null;
         if(ownedFocus)app.focusReadingView();closed();
     }
     onActiveChanged:if(active)activate();else deactivate()
@@ -50,6 +52,20 @@ Pane {
     Keys.onShortcutOverride:function(event){if(event.key===Qt.Key_Escape)event.accepted=true;}
     Keys.onEscapePressed:function(event){close();event.accepted=true;}
     function load(id){if(owner.regionNoteDraft.id && owner.regionNoteDraft.id!==id){app.operationStatus=qsTr("Save or discard the current reading note before selecting another area.");return;}selectedId=id;detail=null;readError="";readId=owner.submit("region_get",{id:id});}
+    function continueConversation() {
+        if(!owner || !detail || !detail.can_reopen || owner.pendingCommands || owner.hasUnsavedReadingNotes || history.writes_blocked)return;
+        continueReveal.stop();readError="";continueContext={reader:owner,generation:owner.documentGeneration,id:selectedId};reopenId=owner.reopenAiRegion(selectedId,history.revision);
+        if(!reopenId)readError=qsTr("Save the current region or reading-note draft before continuing another conversation.");
+    }
+    // The command signal also updates the controller. Reveal only after all its consumers settle.
+    Timer {id:continueReveal;interval:0;onTriggered:notes.finishContinue()}
+    function finishContinue() {
+        if(reopenId)return;
+        const context=continueContext;continueContext=null;
+        if(!context)return;
+        if(context.reader===owner && owner===app.currentReader && context.generation===owner.documentGeneration && context.id===selectedId && owner.aiRegion.history_id===context.id){close();app.openRegionTool();}
+        else if(owner)readError=qsTr("The document or region changed. Choose the saved conversation again.");
+    }
     function followSource(page) {
         if(!owner || owner!==app.currentReader || ownerGeneration!==owner.documentGeneration || !Number.isInteger(page) || page<1 || page>owner.pageCount || verifiedPages.indexOf(page)<0) {
             app.operationStatus=qsTr("This earlier source is unavailable for the current document revision.");return;
@@ -83,6 +99,12 @@ Pane {
         target:notes.owner
         function onDocumentReset(){notes.close();}
         function onCommandFinished(id,op,result,error){
+            if(id===notes.reopenId) {
+                notes.reopenId=0;
+                if(error){notes.continueContext=null;notes.readError=error;return;}
+                continueReveal.restart();
+                return;
+            }
             if(id===notes.readId){notes.readId=0;notes.readError=error;if(!error){notes.detail=result;notes.turnIndex=0;noteText.text=notes.owner.regionNoteDraft.id===result.id ? notes.owner.regionNoteDraft.text : result.knowledgeNote || "";}}
             if(op==="region_note" && !error && notes.detail && result.saved_id===notes.selectedId){var updated=notes.detail;updated.knowledgeNote=result.saved_note;notes.detail=updated;}
             if(op==="region_delete" && !error && result.saved_id===notes.selectedId){notes.detail=null;notes.selectedId="";}
@@ -186,6 +208,7 @@ Pane {
                     onClicked:{notes.app.navigate(notes.detail.attachment.page,0);notes.app.focusReadingView();}
                 }
                 Label {text:notes.detail && notes.detail.locationInvalidated ? qsTr("The document revision changed. This saved capture remains readable; its old location is unavailable.") : qsTr("Saved capture in original colours. PDF edits do not change this snapshot.");wrapMode:Text.Wrap;Layout.fillWidth:true;color:notes.app.colors.textSecondary}
+                Label {text:notes.detail ? notes.detail.reopen_error || "" : "";visible:text.length>0;wrapMode:Text.Wrap;Layout.fillWidth:true;color:notes.app.colors.textSecondary}
                 Item {
                     Layout.fillWidth:true;Layout.preferredHeight:160
                     PdfCrop {
@@ -239,6 +262,7 @@ Pane {
                 Button {objectName:"deleteRegionKnowledgeNote";text:qsTr("Delete saved region…");enabled:notes.owner && !notes.owner.hasUnsavedReadingNotes && !notes.owner.pendingCommands && !notes.history.writes_blocked && !notes.history.error;onClicked:remove.open()}
             }
         }
+        Button {objectName:"continueRegionConversation";visible:!!notes.detail;Layout.fillWidth:true;text:qsTr("Continue conversation");enabled:notes.detail && !!notes.detail.can_reopen && notes.owner && !notes.owner.pendingCommands && !notes.owner.hasUnsavedReadingNotes && !notes.history.writes_blocked;onClicked:notes.continueConversation()}
     }
     FileDialog {
         id:exportFile;objectName:"readingNotesExportDialog"

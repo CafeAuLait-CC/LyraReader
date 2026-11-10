@@ -109,6 +109,35 @@ impl Entry {
                 .display_turns()
                 .any(|turn| !turn.answer.trim().is_empty())
     }
+    /// Completed exchanges are eligible request context; partial/error records remain readable.
+    pub fn completed_turns(&self) -> impl Iterator<Item = DisplayTurn<'_>> {
+        self.display_turns()
+            .filter(|turn| turn.state == AnswerState::Finished && !turn.answer.is_empty())
+    }
+    pub fn validate_reopen(&self, page_count: u32, sha: &str) -> Result<(), String> {
+        if self.location_invalidated == Some(true) || self.capture_sha256.as_deref() != Some(sha) {
+            return Err("The saved region's document revision is unavailable. Its capture remains in Reading notes; select a new region to continue".into());
+        }
+        if self.attachment.page >= page_count {
+            return Err("The saved region's original page is unavailable. Its conversation was kept in Reading notes".into());
+        }
+        Ok(())
+    }
+    /// Materialize the old top-level exchange before appending another turn.
+    /// Its identity/time and missing provenance survive the explicit migration.
+    pub fn materialize_legacy_turn(&mut self) {
+        if self.turns.is_empty() && !self.question.is_empty() {
+            self.turns.push(Turn {
+                id: self.id.clone(),
+                question: self.question.clone(),
+                answer: self.answer.clone(),
+                state: self.state,
+                error: self.error.clone(),
+                created_at: self.created_at,
+                source_pages: None,
+            });
+        }
+    }
     pub fn validate(&self) -> Result<(), String> {
         if normalize_uuid(&self.id).is_none()
             || !self.created_at.is_finite()
@@ -585,6 +614,54 @@ mod tests {
             .next()
             .unwrap()
             .clone()
+    }
+    #[test]
+    fn legacy_materialization_keeps_the_original_exchange_date_identity_and_missing_proof() {
+        let mut entry = sample();
+        entry.question = "LEGACY_QUESTION".into();
+        entry.answer = "LEGACY_ANSWER".into();
+        entry.state = AnswerState::Finished;
+        entry.materialize_legacy_turn();
+        assert_eq!(entry.turns.len(), 1);
+        assert_eq!(entry.turns[0].id, entry.id);
+        assert_eq!(entry.turns[0].created_at, entry.created_at);
+        assert_eq!(entry.turns[0].question, "LEGACY_QUESTION");
+        assert_eq!(entry.turns[0].answer, "LEGACY_ANSWER");
+        assert!(entry.turns[0].source_pages.is_none());
+        entry.materialize_legacy_turn();
+        assert_eq!(entry.turns.len(), 1);
+    }
+    #[test]
+    fn reopening_requires_a_known_revision_and_context_excludes_unfinished_turns() {
+        let mut entry = sample();
+        let sha = "a".repeat(64);
+        assert!(entry.validate_reopen(1, &sha).is_err());
+        entry.capture_sha256 = Some(sha.clone());
+        assert!(entry.validate_reopen(1, &sha).is_ok());
+        assert!(entry.validate_reopen(0, &sha).is_err());
+        entry.location_invalidated = Some(true);
+        assert!(entry.validate_reopen(1, &sha).is_err());
+        entry.location_invalidated = None;
+        entry.turns = [
+            AnswerState::Finished,
+            AnswerState::Cancelled,
+            AnswerState::Failed,
+            AnswerState::Empty,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, state)| Turn {
+            id: format!("00000000-0000-4000-8000-{:012}", i),
+            question: format!("question {i}"),
+            answer: format!("answer {i}"),
+            state,
+            error: None,
+            created_at: i as f64,
+            source_pages: None,
+        })
+        .collect();
+        let completed: Vec<_> = entry.completed_turns().map(|t| t.answer).collect();
+        assert_eq!(completed, ["answer 0"]);
     }
     #[test]
     fn source_navigation_needs_sent_turn_pages_and_the_same_capture_revision() {
