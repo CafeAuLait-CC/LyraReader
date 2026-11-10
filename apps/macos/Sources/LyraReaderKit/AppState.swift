@@ -587,6 +587,9 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
         didSet { refreshTranslationPaperColors() }
     }
     private var canvasTiles: [CanvasPage] = []
+    /// Display-only pixels from the visible revision, never entries in the new render cache.
+    /// Each page is retired atomically once its replacement covers the viewport.
+    private var revisionCanvasFallbacks: [Int: [CanvasPage]] = [:]
     /// The canvas drawing this window's page list, registered by ``PDFCanvasView``.
     ///
     /// Weak, because the window owns the view. ``reloadVisiblePages()`` tells it that the commit
@@ -2521,13 +2524,35 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// The note currently expanded beside its glyph in the document.
     @Published public private(set) var openDocumentNoteID: String?
 
+    /// Cached and adopted notes use the same read-first paper as file-owned notes.
+    @Published public private(set) var openOwnNoteID: UUID?
+
+    public var openOwnNote: Annotation? {
+        annotations.first { $0.id == openOwnNoteID }
+    }
+
+    package var openNoteSource: AnnotationSource? {
+        if let id = openOwnNote?.id { return .own(id) }
+        if let id = openDocumentNote?.id { return .document(id) }
+        return nil
+    }
+
+    package var openNoteAnchor: CGRect? {
+        if let note = openOwnNote {
+            let rect = note.shapeRect ?? ownInlineNoteMarkers.first { $0.id == note.id.uuidString }?.rect
+            return anchorViewRect(page: note.page, region: rect)
+        }
+        return openDocumentNote.flatMap { documentNoteAnchor($0) }
+    }
+
     public var openDocumentNote: DocumentAnnotation? {
         documentAnnotations.first { $0.visible && $0.id == openDocumentNoteID }
     }
 
     public func closeDocumentNote() {
-        guard openDocumentNoteID != nil else { return }
+        guard openDocumentNoteID != nil || openOwnNoteID != nil else { return }
         openDocumentNoteID = nil
+        openOwnNoteID = nil
         refreshSelectionOverlay()
     }
 
@@ -3108,6 +3133,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var annotationRecordSlots: [AnnotationRecords.Slot]
         var selectedDocumentAnnotationID: String?
         var openDocumentNoteID: String?
+        var openOwnNoteID: UUID?
         var annotationTextures: [AnnotationTextureKey: PageImage]
         var noteGlyphTextures: [NoteGlyphKey: PageImage]
         var placedGlyphTextures: [PlacedGlyphKey: PageImage]
@@ -3216,6 +3242,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     private func invalidateTiles() {
+        revisionCanvasFallbacks = [:]
         tileCache.removeAll()
         tilesInFlight.removeAll()
         wantedTiles.removeAll()
@@ -4025,7 +4052,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
     }
 
-    private func resetDocumentState() {
+    private func resetDocumentState(keepingCanvas: Bool = false) {
         cancelRegionPaperMotions()
         // The perf trace's close records describe the state the document still has, so they run
         // before any of it is cleared; the first open (no document yet) emits nothing.
@@ -4068,9 +4095,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         tileRasterMilliseconds = 0
         pageRasterCount = 0
         pageRasterMilliseconds = 0
-        canvasPages = []
-        canvasTiles = []
-        visiblePagePlacements = []
+        if !keepingCanvas {
+            canvasPages = []
+            canvasTiles = []
+            visiblePagePlacements = []
+        }
         textPages = [:]
         textPagesInFlight = []
         linkCache = [:]
@@ -4183,6 +4212,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         redoStack = []
         selectedDocumentAnnotationID = nil
         openDocumentNoteID = nil
+        openOwnNoteID = nil
         noteGlyphTextures = [:]
         hoveredNoteKey = nil
         pendingNoteToggleID = nil
@@ -4194,9 +4224,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // with the other glyph caches: a tab switch is a document change, `StampGlyphKey`
         // carries no document identity, and the regenerated bitmap is pixel-identical.
         stampGlyphTextures = [:]
-        scrollYPt = 0
-        contentHeightPt = 0
-        contentWidthPt = 0
+        if !keepingCanvas {
+            scrollYPt = 0
+            contentHeightPt = 0
+            contentWidthPt = 0
+        }
         // The next document starts still, with no pointer or drag left over from the old one:
         // both would otherwise keep the fresh indicator visible for a document nobody touched.
         scrollIdleTask?.cancel()
@@ -5300,17 +5332,39 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         if selectDocumentAnnotation(id) {
             if let own = annotations.first(where: { $0.fileIdentity == id }) { jump(to: own) }
+            else { jump(toDocumentAnnotation: annotation) }
         } else { jump(toDocumentAnnotation: annotation) }
     }
 
     package func openPassageNote(_ source: AnnotationSource) {
+        guard commitTextEditing() else { return }
         jump(to: source)
         switch source {
         case .document(let id):
-            selectedDocumentAnnotationID = id
-            openDocumentNoteID = id
-            refreshSelectionOverlay()
+            if let note = documentAnnotations.first(where: { $0.id == id }) { showDocumentNote(note) }
+        case .own(let id): readAnnotationNote(id)
+        }
+    }
+
+    /// Opening a paper is navigation; only an explicit click in its body starts an edit.
+    public func readAnnotationNote(_ id: UUID) {
+        guard let note = annotations.first(where: { $0.id == id }),
+              note.kind == .stickyNote || note.kind.isTextMarkup,
+              commitTextEditing() else { return }
+        clearSelection()
+        selectedDocumentAnnotationID = nil
+        selectedAnnotationID = id
+        openDocumentNoteID = nil
+        openOwnNoteID = id
+        refreshSelectionOverlay()
+    }
+
+    package func editOpenNote() {
+        switch openNoteSource {
         case .own(let id): beginEditingAnnotation(id)
+        case .document(let id):
+            if let adopted = adoptDocumentAnnotation(id) { beginEditingAnnotation(adopted) }
+        case nil: break
         }
     }
 
@@ -6096,7 +6150,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     private func openOwnNoteID(atContentPoint point: CGPoint) -> UUID? {
-        guard let id = editingAnnotationID, let note = annotations.first(where: { $0.id == id }),
+        guard let id = openOwnNoteID ?? editingAnnotationID, let note = annotations.first(where: { $0.id == id }),
               let hit = pagePoint(atContentPoint: point), note.page == hit.page else { return nil }
         let rect = note.kind == .stickyNote ? note.shapeRect
             : ownInlineNoteMarkers.first(where: { $0.id == id.uuidString })?.rect
@@ -6120,17 +6174,20 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// note at the page point the pointer names.
     @discardableResult
     public func placeOrOpenStickyNote(atContentPoint point: CGPoint) -> Bool {
-        if openOwnNoteID(atContentPoint: point) != nil { _ = commitTextEditing(); return true }
+        if openOwnNoteID(atContentPoint: point) != nil {
+            guard commitTextEditing() else { return true }
+            closeDocumentNote()
+            return true
+        }
         if dismissOpenDocumentNote(atContentPoint: point) { return true }
         if let hit = placedTextHit(atContentPoint: point),
            let annotation = annotations.first(where: { $0.id == hit.id }),
            annotation.kind == .stickyNote {
             selectedAnnotationID = annotation.id
-            beginEditingAnnotation(annotation.id)
+            readAnnotationNote(annotation.id)
             return true
         }
-        // A note that belongs to the PDF is read-only; opening its paper is better than placing
-        // a cached note on top of it.
+        // Read an existing file-owned note instead of placing another icon on top of it.
         if openDocumentNote(at: point) { return true }
         guard let pageHit = pagePoint(atContentPoint: point) else { return false }
         return placeStickyNote(page: pageHit.page, at: pageHit.point)
@@ -6357,7 +6414,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         editingOriginalText = ""
         editingUndoDepth = 0
         editingTextSelectAll = false
-        reloadVisiblePages()
+        refreshSelectionOverlay()
         return written
     }
 
@@ -6396,7 +6453,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         undoStack = Array(undoStack.prefix(max(0, wasCreated ? depth - 1 : depth)))
         redoStack.removeAll()
         hasPendingAnnotationWrite = false
-        reloadVisiblePages()
+        refreshSelectionOverlay()
     }
 
     /// Opens the editor for a text box on a double-click anywhere inside it, even when the box
@@ -6411,14 +6468,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             beginEditingAnnotation(annotation.id)
             return true
         }
-        // A note or text box the PDF carries is adopted on the double-click that asks to edit
-        // it, then edited through the same editor as the reader's own.
+        // A text box enters its editor on double-click. Note icons keep the read-first
+        // interaction; only clicking the expanded paper's body adopts a note for editing.
         for document in documentAnnotations.reversed()
         where document.kind == "freeText" || document.kind == "text" {
             guard document.page == pageHit.page,
                   let box = document.boxes.first,
                   CGRect(x: box.xPt, y: box.yPt, width: box.widthPt, height: box.heightPt)
                     .contains(pageHit.point) else { continue }
+            if document.drawing == .noteIcon {
+                showDocumentNote(document)
+                return true
+            }
             guard Self.documentAnnotationEditability(document) == .editable,
                   let id = adoptDocumentAnnotation(document.id),
                   let adopted = annotations.first(where: { $0.id == id }) else { return false }
@@ -7553,12 +7614,13 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Selects an annotation the PDF carries, adopting it first when it is editable.
     ///
     /// This is the click-selection replacement for the old refusal: a file-owned highlight,
-    /// underline, strikeout or text box becomes a normal selected mark, and a sticky note opens
-    /// its editor. A kind with no editable model still states the one reason, from
-    /// `documentAnnotationEditability`.
+    /// underline, strikeout or text box becomes a normal selected mark. A sticky note opens
+    /// its paper for reading without adoption. A kind with no editable model still states
+    /// the reason from `documentAnnotationEditability`.
     @discardableResult
     public func selectDocumentAnnotation(_ documentID: String) -> Bool {
         if let existing = annotations.first(where: { $0.fileIdentity == documentID }) {
+            if existing.kind == .stickyNote { readAnnotationNote(existing.id); return true }
             selectedAnnotationID = existing.id
             selectedDocumentAnnotationID = nil
             refreshSelectionOverlay()
@@ -7569,17 +7631,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return false
         }
         let document = documentAnnotations[index]
+        if document.drawing == .noteIcon {
+            showDocumentNote(document)
+            return true
+        }
         if let reason = Self.documentAnnotationUnsupportedReason(document) {
             selectedDocumentAnnotationID = documentID
             markSelectionRefusalNotice = reason
             statusMessage = reason
             return false
         }
-        guard let id = adoptDocumentAnnotation(documentID) else { return false }
-        if document.kind == "text", let adopted = annotations.first(where: { $0.id == id }) {
-            beginEditingAnnotation(adopted.id)
-        }
-        return true
+        return adoptDocumentAnnotation(documentID) != nil
     }
 
     /// Deletes an annotation the PDF carries. The removal is pending until the next save, and
@@ -7669,6 +7731,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             editingTextSelectAll = false
         }
         if selectedAnnotationID == id { selectedAnnotationID = nil }
+        if openOwnNoteID == id { closeDocumentNote() }
         let removed = annotations[index]
         var updated = annotations
         updated.remove(at: index)
@@ -7680,7 +7743,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         undoStack.append(.removed(removed))
         redoStack.removeAll()
-        reloadVisiblePages()
+        refreshSelectionOverlay()
         statusMessage = removed.isFileOwned
             ? "Deleted a file annotation · the PDF is unchanged until you save"
             : "Deleted annotation"
@@ -12103,7 +12166,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             bookmarks: payload.bookmarks,
             slots: payload.slots,
             currentPage: payload.currentPage,
-            selection: payload.selection
+            selection: payload.selection,
+            preservingViewport: contentEditEnabled
         )) != nil else {
             lastError = "Could not reopen the revision for \(redo ? "redo" : "undo")"
             return
@@ -12408,7 +12472,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         bookmarks newBookmarks: [Bookmark],
         slots newSlots: [AnnotationRecords.Slot],
         currentPage newCurrentPage: Int,
-        selection newSelection: Set<Int>
+        selection newSelection: Set<Int>,
+        preservingViewport: Bool = false
     ) throws {
         flushPendingWrites()
         guard !hasPendingAnnotationWrite else {
@@ -12420,8 +12485,35 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         let previousDocumentURL = document?.url
         let translationURL = translationCacheDocumentURL
-        resetDocumentState()
+        let previousScroll = scrollYPt
+        let previousPageCount = document?.pageCount
+        let previousFrames = visiblePagePlacements
+        let viewport = visibleContentRect(viewportHeight: viewportHeightContentPt)
+        let hadTears = regionGapTotalPt > 0
         var loaded = try engine.openDocument(at: url)
+        // Revisions keep the visible pixels until complete replacement pages arrive. A
+        // different page layout must start from its own geometry, never stale tile positions.
+        let revisedFrames = engine.visiblePages(scrollYPt: previousScroll,
+            viewportHeightPt: viewportHeightContentPt, gapPt: pageGapPt,
+            marginPt: 0, layout: layoutMode)
+        let keepCanvas = preservingViewport && newCurrentPage == currentPage
+            && !hadTears && previousPageCount == loaded.pageCount
+            && !previousFrames.isEmpty && !revisedFrames.isEmpty
+            && revisedFrames.allSatisfy { revised in
+                previousFrames.contains { $0 == revised }
+            }
+        let visiblePages = Set(revisedFrames.filter {
+            CGRect(x: $0.leftPt, y: $0.topPt, width: $0.widthPt, height: $0.heightPt).intersects(viewport)
+        }.map(\.index))
+        let retained: [(Int, CanvasPage)] = keepCanvas ? canvasTiles.compactMap { quad in
+            let page = quad.placement.index >= 0 ? quad.placement.index >> 24
+                : PlacementIndex.pageRasterPage(quad.placement.index)
+            guard let page, visiblePages.contains(page) else { return nil }
+            return (page, quad)
+        } : []
+        let fallbacks = Dictionary(grouping: retained, by: { $0.0 }).mapValues { $0.map { $0.1 } }
+        resetDocumentState(keepingCanvas: keepCanvas)
+        revisionCanvasFallbacks = fallbacks
         loaded.title = title
         document = loaded
         // The working revision is not a new document for translation-cache purposes. The caller
@@ -12438,8 +12530,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         pageSelection = newSelection
         pageSelectionAnchor = newSelection.first
         currentPage = min(max(1, newCurrentPage), max(loaded.pageCount, 1))
-        invalidateTiles()
-        scrollYPt = displayPageTop(currentPage - 1)
+        scrollYPt = keepCanvas ? clampedScrollOffset(previousScroll) : displayPageTop(currentPage - 1)
         reloadVisiblePages()
         _ = writeAnnotationRecords(
             annotations: newAnnotations,
@@ -12532,7 +12623,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             bookmarks: marks, updates: changes.updates, deletions: changes.deletions)
         let oldScroll = scrollYPt
         try loadPageEditRevision(at: next, title: session.title, annotationRecordsURL: session.annotationRecordsURL,
-            annotations: [], bookmarks: [], slots: [], currentPage: currentPage, selection: pageSelection)
+            annotations: [], bookmarks: [], slots: [], currentPage: currentPage, selection: pageSelection,
+            preservingViewport: true)
         session.revisionURL = next
         pendingFileDeletions = []
         erasedInkStrokeIDs = []
@@ -12880,6 +12972,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         if editingAnnotationID != nil, !commitTextEditing() { return }
         markSelectionRefusalNotice = nil
         if wasClick, closingOwnNote != nil {
+            closeDocumentNote()
             clearSelection()
             moveOriginalAnnotation = nil; moveStartPagePoint = nil
             resizeOriginalAnnotation = nil; resizeStartPagePoint = nil; resizeHandle = nil
@@ -12975,7 +13068,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             if wasClick {
                 selectedAnnotationID = original.id
                 if original.kind == .stickyNote {
-                    beginEditingAnnotation(original.id)
+                    readAnnotationNote(original.id)
                 }
             }
             return
@@ -12999,6 +13092,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     private func showDocumentNote(_ annotation: DocumentAnnotation) {
+        guard commitTextEditing() else { return }
+        clearSelection()
+        clearAnnotationSelection()
+        openOwnNoteID = nil
         selectedDocumentAnnotationID = annotation.id
         openDocumentNoteID = annotation.id
         refreshSelectionOverlay()
@@ -13015,7 +13112,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         for marker in ownInlineNoteMarkers.reversed() where marker.page == hit.page {
             guard noteHitRect(marker.rect).contains(hit.point),
                   annotations.indices.contains(marker.annotationIndex) else { continue }
-            beginEditingAnnotation(annotations[marker.annotationIndex].id)
+            readAnnotationNote(annotations[marker.annotationIndex].id)
             return true
         }
         for marker in inlineNoteMarkers.reversed() where marker.page == hit.page {
@@ -13047,8 +13144,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 guard hit.contains(local) else { continue }
 
                 // A single click opens the file's own note paper, exactly as before: reading
-                // somebody's note must not silently rewrite it. A double-click (see
-                // `beginEditingTextBox`) or the sidebar adopts it for editing.
+                // somebody's note must not silently rewrite it. Clicking the paper's body
+                // explicitly adopts it for editing.
                 showDocumentNote(annotation)
                 FileHandle.standardError.write(
                     Data("lyra-reader-annot: opened note \(annotation.id) (\(annotation.drawing.rawValue)) on page \(annotation.page + 1)\n".utf8)
@@ -14540,6 +14637,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             annotationRecordSlots: annotationRecordSlots,
             selectedDocumentAnnotationID: selectedDocumentAnnotationID,
             openDocumentNoteID: openDocumentNoteID,
+            openOwnNoteID: openOwnNoteID,
             annotationTextures: annotationTextures,
             noteGlyphTextures: noteGlyphTextures,
             placedGlyphTextures: placedGlyphTextures,
@@ -14681,6 +14779,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         annotationRecordSlots = state.annotationRecordSlots
         selectedDocumentAnnotationID = state.selectedDocumentAnnotationID
         openDocumentNoteID = state.openDocumentNoteID
+        openOwnNoteID = state.openOwnNoteID
         annotationTextures = state.annotationTextures
         noteGlyphTextures = state.noteGlyphTextures
         placedGlyphTextures = state.placedGlyphTextures
@@ -15456,6 +15555,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // is about to be committed. This is the point where the startup gate releases the
         // document-wide index scans that were held behind the visible page.
         var anyOnScreenPageSharp = false
+        var revisedPagesReady = Set<Int>()
 
         for span in band {
             let placement = span.placement
@@ -15491,8 +15591,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     if let perfOnScreen, perfOnScreen.contains(placement.index), pageSharp {
                         perfSharpSources?[placement.index] = "page-raster"
                     }
-                    if pageSharp, onScreenPageIndices.contains(placement.index) {
-                        anyOnScreenPageSharp = true
+                    if pageSharp {
+                        revisedPagesReady.insert(placement.index)
+                        if onScreenPageIndices.contains(placement.index) { anyOnScreenPageSharp = true }
                     }
                     continue
                 }
@@ -15604,8 +15705,28 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 perfSharpSources?[placement.index] = "tile"
                 perfContentSources?[placement.index] = "tile"
             }
-            if complete, onScreenPageIndices.contains(placement.index) {
-                anyOnScreenPageSharp = true
+            if complete {
+                revisedPagesReady.insert(placement.index)
+                if onScreenPageIndices.contains(placement.index) { anyOnScreenPageSharp = true }
+            }
+        }
+        // Keep each old page intact while its new raster/tiles are incomplete, rather than
+        // publishing a blank or a mixture of old and edited page content. Failed renders retire
+        // old pixels too, so a failed redaction never masquerades as the resulting page.
+        revisionCanvasFallbacks = revisionCanvasFallbacks.filter { page, _ in
+            onScreenPageIndices.contains(page) && !revisedPagesReady.contains(page)
+                && !failedPreviewPages.contains(page) && !failedTiles.contains { $0.page == page }
+        }
+        if !revisionCanvasFallbacks.isEmpty {
+            pages.removeAll { quad in
+                let page = quad.placement.index >= 0 ? quad.placement.index >> 24
+                    : PlacementIndex.pageRasterPage(quad.placement.index)
+                return page.map { revisionCanvasFallbacks[$0] != nil } ?? false
+            }
+            for page in revisionCanvasFallbacks.keys.sorted() {
+                pages.append(contentsOf: revisionCanvasFallbacks[page] ?? [])
+                perfContentSources?[page] = "previous-revision"
+                perfSharpSources?.removeValue(forKey: page)
             }
         }
         visibleTileKeysByPage = visibleKeysByPage
@@ -15914,9 +16035,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// Updates overlays without reloading tiles or scheduling document analysis during a drag.
     private func refreshSelectionOverlay() {
+        guard !isChangingDocumentState else { return }
         var pages = canvasTiles
         appendSelectionHighlights(to: &pages)
         canvasPages = applyPageTears(to: pages)
+        invalidateCanvasForModelCommit()
     }
 
     /// Adds continuous line rectangles for selection and annotations.
@@ -16358,7 +16481,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func placedGlyphTexture(for annotation: Annotation, index: Int) -> PageImage? {
         guard let box = annotation.shapeRect, box.width > 0, box.height > 0 else { return nil }
         let scale = NoteGlyph.scale(zoom: zoomFactor, deviceScale: deviceScale)
-        let visualState = noteState(key: "own:" + annotation.id.uuidString, active: editingAnnotationID == annotation.id)
+        let visualState = noteState(key: "own:" + annotation.id.uuidString, active: editingAnnotationID == annotation.id || openOwnNoteID == annotation.id)
         let key = PlacedGlyphKey(
             index: index,
             kind: annotation.kind.rawValue,
@@ -16486,7 +16609,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     private func ownInlineGlyph(annotation: Annotation, index: Int, size: CGSize) -> PageImage? {
         let scale = NoteGlyph.scale(zoom: zoomFactor, deviceScale: deviceScale)
-        let visualState = noteState(key: "own:" + annotation.id.uuidString, active: editingAnnotationID == annotation.id)
+        let visualState = noteState(key: "own:" + annotation.id.uuidString, active: editingAnnotationID == annotation.id || openOwnNoteID == annotation.id)
         let key = PlacedGlyphKey(index: index, kind: "inline-comment", color: annotation.color,
             text: "", fontSize: 0, boxPt: size, scale: scale, appearance: NSApplication.shared.effectiveAppearance.name.rawValue,
             noteState: visualState, paper: notePaperAppearance)
@@ -18075,7 +18198,7 @@ extension AppState {
             try loadPageEditRevision(
                 at: destination, title: session.title, annotationRecordsURL: session.annotationRecordsURL,
                 annotations: annotations, bookmarks: bookmarks, slots: annotationRecordSlots,
-                currentPage: currentPage, selection: pageSelection)
+                currentPage: currentPage, selection: pageSelection, preservingViewport: true)
             // The edit may have changed one block's words or reflowed it. Entries on this
             // page are re-checked individually; translations on every other page survive.
             await inPlaceTranslation.restoreAfterPageEdit(

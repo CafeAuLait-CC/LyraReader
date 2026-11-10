@@ -3,8 +3,8 @@ import SwiftUI
 
 /// The editor for an editable note or text box.
 ///
-/// A PDF's own notes keep the read-only `DocumentNoteOverlay`; this is the editable counterpart
-/// for entries in the annotation cache. A sticky note opens a paper beside its icon, the way a reader
+/// Notes open in `DocumentNoteOverlay` for reading and enter this editor on a body click.
+/// Editing a PDF's own note first adopts it into the annotation cache. A sticky note opens a paper beside its icon, the way a reader
 /// expects after clicking a note icon. A text box opens **over its own box**, at the size the
 /// text is drawn at, so typing shows the line breaks and size the page will show.
 ///
@@ -36,6 +36,7 @@ package struct PlacedTextEditorOverlay: View {
                             TextEditor(text: $text)
                                 .focused($focused).font(.system(size: 13))
                                 .scrollContentBackground(.hidden)
+                                .background(SidebarScrollTheme(trackColor: LyraReaderTheme.noteBgColor))
                                 .background(LyraReaderTheme.noteBg).foregroundStyle(LyraReaderTheme.noteFg)
                                 .padding(6)
                                 .onExitCommand { state.cancelTextEditing() }
