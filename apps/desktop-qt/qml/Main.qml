@@ -2309,12 +2309,15 @@ ApplicationWindow {
             }
         }
     }
+    FileDialogNavigation {id:fileDialogNavigation}
     FileDialog {
         id: fileDialog
         objectName: "documentOpenDialog"
         title: qsTr("Open a PDF")
         nameFilters: [qsTr("PDF documents (*.pdf)"), qsTr("All files (*)")]
         fileMode: FileDialog.OpenFiles
+        onCurrentFolderChanged: fileDialogNavigation.track(fileDialog,root)
+        onVisibleChanged: fileDialogNavigation.track(visible ? fileDialog : null,root)
         onAccepted: {
             if (root.session)
                 root.session.openFiles(selectedFiles);

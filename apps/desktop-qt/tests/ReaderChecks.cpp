@@ -1,6 +1,7 @@
 #include "DisplayCalibration.h"
 #include "AuditController.h"
 #include "NavigationController.h"
+#include "FileDialogNavigation.h"
 #include "AuxiliaryWindowPolicy.h"
 #include "ReaderController.h"
 #include "PageItem.h"
@@ -39,6 +40,7 @@
 #include <QJSValue>
 #include <QUrlQuery>
 #include <QInputMethodEvent>
+#include <QQmlExpression>
 #include <QProcess>
 #include <QQuickStyle>
 #include <QQuickWindow>
@@ -73,6 +75,7 @@ static void registerReaderTypes() {
     qmlRegisterUncreatableType<ReaderController>("LyraReader",1,0,"ReaderController","Created by host");
     qmlRegisterType<AuditController>("LyraReader",1,0,"AuditController");
     qmlRegisterType<NavigationController>("LyraReader",1,0,"NavigationController");
+    qmlRegisterType<FileDialogNavigation>("LyraReader",1,0,"FileDialogNavigation");
     qmlRegisterType<DisplayCalibration>("LyraReader",1,0,"DisplayCalibration");
     qmlRegisterType<AuxiliaryWindowPolicy>("LyraReader",1,0,"AuxiliaryWindowPolicy");
     qmlRegisterType<PageItem>("LyraReader",1,0,"PdfPage");
@@ -597,6 +600,32 @@ private slots:
         QTRY_VERIFY(QGuiApplication::focusWindow()!=window);QVERIFY(!window->property("readerKeyboardEnabled").toBool());
         auto *dialog=QGuiApplication::focusWindow();if(!dialog)QSKIP("The platform file picker is outside this process; real keyboard acceptance remains required.");
         QTest::keyClick(dialog,Qt::Key_Escape);QTRY_VERIFY(!picker->property("visible").toBool());window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);QVERIFY(window->property("readerKeyboardEnabled").toBool());
+    }
+    void filePickerKeepsKeyboardSelectionValidAfterEnteringASmallerFolder() {
+        QTemporaryDir scratch,empty;QVERIFY(scratch.isValid() && empty.isValid());QDir directory(scratch.path());
+        for(int i=0;i<90;++i)QVERIFY(directory.mkdir(QString("directory-%1").arg(i,3,10,QChar('0'))));
+        const auto child=directory.filePath("directory-080");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",child+"/first.pdf"));QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",child+"/second.pdf"));
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *picker=view.window->findChild<QObject *>("documentOpenDialog");QVERIFY(picker);QVERIFY(picker->setProperty("currentFolder",QUrl::fromLocalFile(empty.path())));
+        QQmlExpression fallback(qmlContext(picker),picker,QStringLiteral("FileDialog.DontUseNativeDialog"));const auto options=fallback.evaluate();QVERIFY2(!fallback.hasError(),qPrintable(fallback.error().toString()));QVERIFY(picker->setProperty("options",options));
+        const auto closePicker=qScopeGuard([&]{picker->setProperty("visible",false);});QVERIFY(QMetaObject::invokeMethod(view.window,"openDialog"));QTRY_VERIFY(picker->property("visible").toBool());QTRY_VERIFY(QGuiApplication::focusWindow()!=view.window);
+        QPointer<QQuickWindow> dialog;QPointer<QQuickItem> list;
+        const auto locate=[&]{for(auto *window:QGuiApplication::allWindows())if(auto *quick=qobject_cast<QQuickWindow *>(window))if(quick->isVisible())if(auto *found=visualItem(quick->contentItem(),"fileDialogListView"))if(found->isVisible() && found->window()){list=found;dialog=found->window();return true;}return false;};
+        QTRY_VERIFY_WITH_TIMEOUT(locate(),5000);
+        QTRY_COMPARE_WITH_TIMEOUT(list->property("count").toInt(),0,5000);
+        // Follow the actual location editor path; do not inject a private delegate state.
+        dialog->requestActivate();QTRY_COMPARE_WITH_TIMEOUT(QGuiApplication::focusWindow(),dialog.data(),5000);QTest::keyClick(dialog,Qt::Key_L,Qt::ControlModifier);QTRY_VERIFY_WITH_TIMEOUT(dialog->activeFocusItem() && dialog->activeFocusItem()->property("selectedText").isValid(),3000);QInputMethodEvent location;location.setCommitString(scratch.path());QCoreApplication::sendEvent(dialog->activeFocusItem(),&location);QCOMPARE(dialog->activeFocusItem()->property("text").toString(),scratch.path());QTest::keyClick(dialog,Qt::Key_Return);
+        QTRY_COMPARE_WITH_TIMEOUT(picker->property("currentFolder").toUrl(),QUrl::fromLocalFile(scratch.path()),5000);QTRY_COMPARE_WITH_TIMEOUT(list->property("count").toInt(),90,5000);QTRY_COMPARE_WITH_TIMEOUT(list->property("currentIndex").toInt(),0,3000);
+        QTRY_VERIFY(visualItem(dialog->contentItem(),"fileDialogDelegate0"));
+        const auto focusInList=[&]{for(auto *item=dialog->activeFocusItem();item;item=item->parentItem())if(item==list)return true;return false;};
+        const auto filterFocused=[&]{for(auto *item=dialog->activeFocusItem();item;item=item->parentItem())if(item->inherits("QQuickComboBox"))return true;return false;};
+        // Qt's fallback links backward Tab from the filter to its current file delegate.
+        for(int step=0;step<32 && !filterFocused();++step)QTest::keyClick(dialog,Qt::Key_Tab);
+        QVERIFY(filterFocused());QTest::keyClick(dialog,Qt::Key_Backtab,Qt::ShiftModifier);QVERIFY2(focusInList(),"Backward Tab from the filter must reach the nonempty file view");
+        for(int i=0;i<82 && list->property("currentIndex").toInt()!=80;++i)QTest::keyClick(dialog,Qt::Key_Down);
+        QCOMPARE(list->property("currentIndex").toInt(),80);QTest::keyClick(dialog,Qt::Key_Return);
+        QTRY_COMPARE_WITH_TIMEOUT(picker->property("currentFolder").toUrl(),QUrl::fromLocalFile(child),5000);QTRY_COMPARE_WITH_TIMEOUT(list->property("count").toInt(),2,5000);QTRY_COMPARE_WITH_TIMEOUT(list->property("currentIndex").toInt(),0,5000);
+        QTest::keyClick(dialog,Qt::Key_Down);QTRY_COMPARE(list->property("currentIndex").toInt(),1);QTest::qWait(20);QCOMPARE(list->property("currentIndex").toInt(),1);
+        QTest::keyClick(dialog,Qt::Key_Up);QTest::keyClick(dialog,Qt::Key_Return);QTRY_VERIFY(!picker->property("visible").toBool());QTRY_COMPARE_WITH_TIMEOUT(view.workspace.activeReader()->pageCount(),1,10000);QCOMPARE(view.workspace.activeReader()->fileUrl(),QUrl::fromLocalFile(child+"/first.pdf"));
     }
     void navigationKeysBelongToTheFocusedReaderInsteadOfTransientAncestors() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/navigation-keys.pdf";
