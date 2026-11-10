@@ -17,6 +17,7 @@ class CropItem:public QQuickItem {
     Q_PROPERTY(QSize pixelSize READ pixelSize NOTIFY statusChanged)
     Q_PROPERTY(QString paperAppearance READ paperAppearance WRITE setPaperAppearance NOTIFY paperAppearanceChanged)
     Q_PROPERTY(bool resourceActive READ resourceActive WRITE setResourceActive NOTIFY resourceActiveChanged)
+    Q_PROPERTY(bool rasterDemandPaused READ rasterDemandPaused WRITE setRasterDemandPaused NOTIFY rasterDemandPausedChanged)
     Q_PROPERTY(PageItem *paperMap READ paperMap WRITE setPaperMap NOTIFY paperGeometryChanged)
     Q_PROPERTY(QRectF paperRect READ paperRect WRITE setPaperRect NOTIFY paperGeometryChanged)
     Q_PROPERTY(double paperZoom READ paperZoom WRITE setPaperZoom NOTIFY paperGeometryChanged)
@@ -31,9 +32,11 @@ public:
     QSize pixelSize()const{return m_image.pixels.size();}
     QString paperAppearance()const{return m_paper;}
     bool resourceActive()const{return m_resourceActive;}
+    bool rasterDemandPaused()const{return m_rasterDemandPaused;}
     void setSource(const QUrl &source);
     void setPaperAppearance(const QString &paper);
     void setResourceActive(bool active);
+    void setRasterDemandPaused(bool paused);
     // Page-owned artwork: source bounds and displayed parent origin are points, before zoom.
     // The page is borrowed only during scene sync; geometry changes never invalidate pixels.
     PageItem *paperMap()const;
@@ -48,6 +51,7 @@ public:
 signals:
     void sourceChanged();void statusChanged();void paperAppearanceChanged();void resourceActiveChanged();
     void paperGeometryChanged();
+    void rasterDemandPausedChanged();
 protected:
     QSGNode *updatePaintNode(QSGNode *,UpdatePaintNodeData *)override;
     void itemChange(ItemChange,const ItemChangeData &)override;
@@ -65,6 +69,7 @@ private:
     qint64 m_target=0;
     int m_status=0;
     bool m_resourceActive=true;
+    bool m_rasterDemandPaused=false,m_deferredRequest=false;
     bool m_visibilityPending=false,m_lastActive=false;
     QMetaObject::Connection m_visibilityConnection;
     QPointer<PageItem> m_paperMap;

@@ -4,6 +4,8 @@
 #include <QFutureWatcher>
 #include <QUuid>
 #include <QtConcurrentRun>
+#include <cmath>
+#include <limits>
 
 namespace {
 QString aiView(const QString &action) {
@@ -24,6 +26,7 @@ void ReaderController::initAi() {
     connect(this,&ReaderController::commandFinished,this,&ReaderController::handleAiCommand);
 }
 void ReaderController::resetAi() {
+    clearAiRegionPaper();
     resetDocumentReading();
     ++m_aiRegionEpoch;RasterJobs::cancel(m_aiRegionJob);m_aiRegionJob.reset();m_aiRegion.clear();emit aiRegionChanged();
     m_aiRegionImage=QUrl{};emit aiRegionImageChanged();
@@ -31,6 +34,7 @@ void ReaderController::resetAi() {
     m_aiTimer.stop();m_aiPreviewId=0;m_aiStartId=0;m_aiPollId=0;m_aiState.clear();emit aiStateChanged();
 }
 void ReaderController::cancelAiRegionCapture() {
+    clearAiRegionPaper();
     ++m_aiRegionEpoch;RasterJobs::cancel(m_aiRegionJob);m_aiRegionJob.reset();
     if(m_aiRegion.value(QStringLiteral("loading")).toBool()){m_aiRegion.clear();emit aiRegionChanged();}
 }
@@ -53,6 +57,16 @@ void ReaderController::clearAiRegion() {
 bool ReaderController::captureAiRegion(int page,const QVariantMap &rect,double zoom) {
     if(!m_document || !m_source || m_loading || m_pendingCommands || m_aiState.value(QStringLiteral("running")).toBool())return false;
     clearAiRegion();
+    // Snapshot only already indexed boxes on this page. Placement must not finish a
+    // document-wide figure scan or consult a later, mutable tab state from the worker.
+    const auto figures=m_data.value(QStringLiteral("figures")).toList();
+    const auto geometryLimit=lyra_reader_desktop_paper_geometry_limit();
+    const auto glyphs=m_textPages.value(QString::number(page)).toMap().value(QStringLiteral("chars"));
+    const auto glyphCount=std::size_t(glyphs.toList().size());
+    if(glyphCount>geometryLimit) {
+        m_aiRegion={{QStringLiteral("error"),tr("The page contains too much text geometry to place this area safely.")}};
+        emit aiRegionChanged();return false;
+    }
     // Capture and PNG conversion hold at most two four-megapixel buffers. The shared Rust
     // guard checks exact geometry before PDFium allocates; this is the global admission lease.
     auto reservation=RenderBudget::reserve(RenderBudget::Kind::Resident,32LL*1024*1024);
@@ -71,16 +85,113 @@ bool ReaderController::captureAiRegion(int page,const QVariantMap &rect,double z
         if(!result.error.isEmpty())m_aiRegion={{QStringLiteral("error"),result.error}};
         emit aiRegionChanged();
     });
-    watcher->setFuture(QtConcurrent::run(RasterJobs::pool(),[source,ticket,reservation,page,rect,zoom] {
+    watcher->setFuture(QtConcurrent::run(RasterJobs::pool(),[source,ticket,reservation,page,rect,zoom,figures,glyphs,glyphCount,geometryLimit] {
         RasterJobs::Run run(ticket);Captured result;
         if(ticket->cancelled)return result;
-        result.data=source->query({{QStringLiteral("op"),QStringLiteral("capture_region")},{QStringLiteral("page"),page},{QStringLiteral("rect"),rect},{QStringLiteral("zoom"),zoom}},&result.error).toMap();
+        QVariantList indexedRegions;
+        for(const auto &value:figures) {
+            const auto figure=value.toMap();
+            if(figure.value(QStringLiteral("page")).toInt()!=page)continue;
+            if(std::size_t(indexedRegions.size())>=geometryLimit-glyphCount) {
+                result.error=tr("The page contains too much figure geometry to place this area safely.");
+                return result;
+            }
+            indexedRegions.append(figure);
+        }
+        QVariantMap request{{QStringLiteral("op"),QStringLiteral("capture_region")},{QStringLiteral("page"),page},{QStringLiteral("rect"),rect},{QStringLiteral("zoom"),zoom},{QStringLiteral("indexed_regions"),indexedRegions}};
+        if(glyphs.isValid())request.insert(QStringLiteral("glyphs"),glyphs);
+        result.data=source->query(request,&result.error).toMap();
         // URL construction can scan several MiB. Do it once on this worker, never in a
         // QML binding that is re-evaluated on every question keystroke or streaming poll.
         if(result.error.isEmpty())result.image=QUrl(QStringLiteral("data:image/png;base64,")+result.data.value(QStringLiteral("image_png")).toString());
         return result;
     }));
     return true;
+}
+void ReaderController::clearAiRegionPaper() {
+    ++m_aiRegionPaperEpoch;m_aiRegionPaperSpec.clear();
+    if(m_aiRegionPaperCancel)m_aiRegionPaperCancel->store(true);
+    if(m_aiRegionPaper.isEmpty())return;
+    m_aiRegionPaper.clear();emit aiRegionPaperChanged();
+}
+double ReaderController::unshiftedPaperScroll(double displayY,double reveal) const {
+    return mapPaperScroll(displayY,false,reveal);
+}
+double ReaderController::shiftedPaperScroll(double sourceY,double reveal) const {
+    return mapPaperScroll(sourceY,true,reveal);
+}
+double ReaderController::mapPaperScroll(double value,bool shifted,double reveal) const {
+    if(!std::isfinite(reveal) || reveal<0 || reveal>1)return std::numeric_limits<double>::quiet_NaN();
+    const auto map=shifted ? lyra_reader_desktop_paper_shifted_scroll : lyra_reader_desktop_paper_unshifted_scroll;
+    if(m_aiRegionPaper.isEmpty())return map(value,0,0);
+    bool topOk=false,gapOk=false;
+    const auto top=m_aiRegionPaper.value(QStringLiteral("gap_top")).toDouble(&topOk);
+    const auto gap=m_aiRegionPaper.value(QStringLiteral("card")).toMap().value(QStringLiteral("gap_pt")).toDouble(&gapOk);
+    // A first pending or failed plan has no valid display rows. Decline persistence until
+    // the shell has a real map, rather than storing conversation coordinates as PDF points.
+    if(!topOk || !gapOk)return std::numeric_limits<double>::quiet_NaN();
+    return map(value,top,gap*reveal);
+}
+void ReaderController::configureAiRegionPaper(const QString &mode,double pageGap,double cardGap) {
+    if(!m_source || m_loading || !m_aiRegion.contains(QStringLiteral("image_png"))) {clearAiRegionPaper();return;}
+    const auto cardId=m_aiRegion.value(QStringLiteral("history_id")).toString();
+    if(cardId.isEmpty()){clearAiRegionPaper();return;}
+    if(!std::isfinite(cardGap) || cardGap<0 || !std::isfinite(pageGap)) {
+        ++m_aiRegionPaperEpoch;
+        if(m_aiRegionPaperCancel)m_aiRegionPaperCancel->store(true);
+        m_aiRegionPaperSpec.clear();m_aiRegionPaper={{QStringLiteral("error"),tr("The inserted area layout is invalid.")}};
+        emit aiRegionPaperChanged();return;
+    }
+    const auto plan=m_aiRegion.value(QStringLiteral("paper_plan")).toMap();
+    const QVariantMap card{{QStringLiteral("page"),m_aiRegion.value(QStringLiteral("page"))},
+        {QStringLiteral("split_pt"),plan.value(QStringLiteral("split_pt"))},{QStringLiteral("gap_pt"),cardGap}};
+    const QVariantMap request{{QStringLiteral("op"),QStringLiteral("layout")},
+        {QStringLiteral("mode"),mode},{QStringLiteral("gap"),pageGap},{QStringLiteral("paper_card"),card}};
+    if(request==m_aiRegionPaperSpec && (m_aiRegionPaperInFlight || !m_aiRegionPaper.contains(QStringLiteral("error"))))return;
+    ++m_aiRegionPaperEpoch;
+    m_aiRegionPaperSpec=request;
+    if(m_aiRegionPaperCancel)m_aiRegionPaperCancel->store(true);
+    const bool wasLoading=m_aiRegionPaper.value(QStringLiteral("loading")).toBool();
+    m_aiRegionPaper.insert(QStringLiteral("loading"),true);if(!wasLoading)emit aiRegionPaperChanged();
+    startAiRegionPaperPlan();
+}
+void ReaderController::startAiRegionPaperPlan() {
+    // One active snapshot per reader, plus the latest replaceable request. Epoch rejection
+    // alone would still enqueue a document-sized allocation for every resize/zoom event.
+    if(m_aiRegionPaperInFlight || m_aiRegionPaperSpec.isEmpty() || !m_source)return;
+    m_aiRegionPaperInFlight=true;
+    const auto request=m_aiRegionPaperSpec;const auto epoch=m_aiRegionPaperEpoch;
+    const auto card=request.value(QStringLiteral("paper_card")).toMap();
+    const auto cardId=m_aiRegion.value(QStringLiteral("history_id")).toString();
+    const auto source=m_source;const auto generation=m_generation;const auto captureEpoch=m_aiRegionEpoch;
+    const auto cancelled=std::make_shared<std::atomic_bool>(false);m_aiRegionPaperCancel=cancelled;
+    struct Planned {QVariantMap value;QString error;bool cancelled=false;};
+    auto *watcher=new QFutureWatcher<Planned>(this);
+    connect(watcher,&QFutureWatcher<Planned>::finished,this,[this,watcher,source,generation,captureEpoch,epoch,cardId,card,cancelled] {
+        const auto outcome=watcher->result();watcher->deleteLater();
+        m_aiRegionPaperInFlight=false;m_aiRegionPaperCancel.reset();
+        if(!outcome.cancelled && !cancelled->load() && epoch==m_aiRegionPaperEpoch && captureEpoch==m_aiRegionEpoch && generation==m_generation
+                && source==m_source && cardId==m_aiRegion.value(QStringLiteral("history_id")).toString()) {
+            if(!outcome.error.isEmpty())m_aiRegionPaper={{QStringLiteral("error"),outcome.error}};
+            else {
+                m_aiRegionPaper=outcome.value;m_aiRegionPaper.insert(QStringLiteral("id"),cardId);
+                m_aiRegionPaper.insert(QStringLiteral("card"),card);
+                m_aiRegionPaper.insert(QStringLiteral("source_sha256"),m_aiRegion.value(QStringLiteral("source_sha256")));
+            }
+            emit aiRegionPaperChanged();
+        }
+        if(epoch!=m_aiRegionPaperEpoch)startAiRegionPaperPlan();
+    });
+    watcher->setFuture(QtConcurrent::run([source,request,cancelled] {
+        Planned outcome;if(cancelled->load()){outcome.cancelled=true;return outcome;}
+        const auto packet=source->query(request,&outcome.error).toMap();
+        if(cancelled->load()){outcome.cancelled=true;return outcome;}
+        if(outcome.error.isEmpty()) {
+            outcome.value=packet.value(QStringLiteral("paper")).toMap();
+            if(outcome.value.isEmpty())outcome.error=tr("The renderer did not return the inserted area layout.");
+        }
+        return outcome;
+    }));
 }
 void ReaderController::setAiRegionQuestion(const QString &text) {
     if(m_aiRegion.value(QStringLiteral("question")).toString()==text)return;

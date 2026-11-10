@@ -3,7 +3,7 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import LyraReader 1.0
 
-Popup {
+Item {
     id:card
     objectName:"aiRegionCard"
     required property var app
@@ -15,32 +15,176 @@ Popup {
     readonly property bool previewReady:!!plan && !state.planSent
     onPreviewReadyChanged:if(!previewReady && payload && payload.visible)payload.close()
     readonly property var result:state.responseView==="region" ? ({output:state.output,reasoning:state.reasoning,usage:state.usage,responsePlan:state.responsePlan,generation:owner.documentGeneration}) : ((state.results || {}).region || {})
-    parent:Overlay.overlay
-    x:(app.width-width)/2;y:Math.max(12,(app.height-height)/2)
-    width:Math.min(560,app.width-24);height:Math.min(result.output || result.reasoning ? 740 : 560,app.height-48)
-    padding:12;focus:true;modal:false
-    closePolicy:Popup.CloseOnEscape
-    background:Rectangle {color:card.app.colors.panelBg;border.color:card.app.colors.separator;radius:8}
-    onAboutToShow:owner=app.currentReader
-    onClosed:{payload.close();if(owner && app.currentReader===owner)app.focusReadingView();}
+    parent:app.documentCanvas
+    property bool opened:false
+    visible:opened
+    z:6
+    property int ownerGeneration:-1
+    property bool needsReveal:false
+    readonly property var paper:owner ? owner.aiRegionPaper : ({})
+    readonly property var frame:app.documentCanvas ? app.documentCanvas.regionCardFrame(owner,app.documentCanvas.placementEpoch) : null
+    readonly property bool located:!!paper.rows
+    x:frame ? frame.x : 12
+    y:frame ? frame.y : located ? -height-1 : Math.max(12,((app.documentCanvas ? app.documentCanvas.height : app.height)-height)/2)
+    width:frame ? frame.width : Math.min(560,(app.documentCanvas ? app.documentCanvas.width : app.width)-24)
+    readonly property real fullHeight:Math.max(44,Math.min(result.output || result.reasoning ? 740 : 560,(app.documentCanvas ? app.documentCanvas.height : app.height)-24))
+    property real revealProgress:1
+    property bool closing:false
+    readonly property bool motionActive:opened && (needsReveal || reveal.running || closing)
+    readonly property bool canAnimate:!app.reduceMotion && app.visible
+    onCanAnimateChanged:if(!canAnimate && motionActive)completeMotion(app.visible)
+    property var motionAnchor:null
+    property real motionGapBottom:NaN
+    property int motionInteraction:-1
+    height:fullHeight*revealProgress
+    clip:true;focus:true
+    NumberAnimation {
+        id:reveal;objectName:"paperRevealMotion";target:card;property:"revealProgress";duration:220;easing.type:Easing.InOutCubic
+        onFinished:card.completeMotion(true)
+    }
+    function completeMotion(revealCard) {
+        const wasClosing=closing;reveal.stop();revealProgress=wasClosing ? 0 : 1;
+        if(wasClosing){closeCard(true);return;}
+        needsReveal=false;
+        if(revealCard && owner===app.currentReader && ownerGeneration===owner.documentGeneration) {
+            app.documentCanvas.showRegionCard(owner);
+            if(questionEditor.visible)questionEditor.forceActiveFocus();
+        }
+    }
+    function closeAnimated() {
+        if(!opened || closing)return;
+        if(!canAnimate || !located){close();return;}
+        reveal.stop();closing=true;needsReveal=false;
+        motionAnchor=app.documentCanvas.viewportAnchor(0);motionInteraction=app.documentCanvas.interactionEpoch;
+        const frame=app.documentCanvas.regionCardFrame(owner);
+        motionGapBottom=frame && frame.y<0 && frame.y+frame.height>0 ? frame.y+frame.height : NaN;
+        payload.close();reveal.to=0;reveal.start();
+    }
+    onRevealProgressChanged: {
+        // Bindings must publish the interpolated row sizes before clamping its scroll.
+        Qt.callLater(card.applyMotionFrame);
+    }
+    function applyMotionFrame() {
+        if(!opened || owner!==app.currentReader || !located)return;
+        app.documentCanvas.view.forceLayout();
+        if(motionInteraction!==app.documentCanvas.interactionEpoch)return;
+        if(needsReveal)app.documentCanvas.showRegionCard(owner);
+        else if(closing && Number.isFinite(motionGapBottom)) {
+            const frame=app.documentCanvas.regionCardFrame(owner);
+            if(frame)app.documentCanvas.restorePaperViewAnchor({owner:owner,id:paper.id,
+                interaction:motionInteraction,offsetY:0,viewY:Math.min(0,motionGapBottom-frame.height)});
+        } else if(closing && motionAnchor)app.documentCanvas.restoreViewportAnchor(motionAnchor,0);
+    }
+    signal closed()
+    function open() {
+        if(opened && owner!==app.currentReader)closeCard(false);
+        const wasOpened=opened;
+        reveal.stop();closing=false;
+        app.overviewVisible=false;app.textViewVisible=false;
+        owner=app.currentReader;ownerGeneration=owner.documentGeneration;
+        const immediateError=!!owner.aiRegion.error;
+        revealProgress=wasOpened || !canAnimate || immediateError ? 1 : 0;
+        opened=true;needsReveal=!immediateError;forceActiveFocus();requestPaper();
+        if(paper.rows && !paper.loading) {
+            layoutApply.restart();
+        }
+    }
+    function close(){closeCard(true);}
+    function closeCard(preserve) {
+        if(!opened)return;
+        const current=owner===app.currentReader && ownerGeneration===owner.documentGeneration;
+        const anchor=preserve && current ? app.documentCanvas.viewportAnchor(0) : null;
+        opened=false;needsReveal=false;closing=false;reveal.stop();layoutSettle.stop();layoutApply.stop();payload.close();
+        if(owner)owner.clearAiRegionPaper();
+        if(anchor && current)app.documentCanvas.restoreViewportAnchor(anchor,0);
+        if(current)app.focusReadingView();
+        closed();
+    }
+    property var pendingAnchor:null
+    property int pendingInteraction:-1
+    property bool pendingFocused:false
+    Timer {id:layoutSettle;interval:0;onTriggered:card.configurePaperNow();}
+    function requestPaper(){if(opened)layoutSettle.restart();}
+    function configurePaperNow() {
+        if(!opened || owner!==app.currentReader || owner.pendingCommands)return;
+        if(!attachment.image_png){if(!attachment.loading && !attachment.error)closeCard(false);return;}
+        const config=owner.layoutConfiguration;
+        if(!config.mode || !Number.isFinite(config.gap))return;
+        pendingAnchor=needsReveal ? null : app.documentCanvas.viewportAnchor(0);
+        pendingInteraction=app.documentCanvas.interactionEpoch;
+        const frame=app.documentCanvas.regionCardFrame(owner);
+        // Retained keyboard focus must not drag an explicit page navigation back to
+        // an offscreen conversation when a delayed zoom/content replan completes.
+        pendingFocused=focusedWithin() && !!frame && frame.y<app.documentCanvas.height
+                && frame.y+height>0;
+        owner.configureAiRegionPaper(config.mode,config.gap,fullHeight/app.zoom);
+    }
+    Timer {id:layoutApply;interval:0;onTriggered:card.settlePaper();}
+    function focusedWithin() {
+        let item=app.activeFocusItem;
+        while(item){if(item===card)return true;item=item.parent;}
+        return false;
+    }
+    function settlePaper() {
+        if(!opened || owner!==app.currentReader || !paper.rows || paper.loading)return;
+        const keptZoom=app.documentCanvas.finishPaperZoom(owner);
+        if(!keptZoom && !needsReveal && pendingAnchor && pendingInteraction===app.documentCanvas.interactionEpoch)
+            app.documentCanvas.restoreViewportAnchor(pendingAnchor,0);
+        if(needsReveal) {
+            if(reveal.running)return;
+            motionInteraction=app.documentCanvas.interactionEpoch;
+            if(canAnimate && revealProgress<1){reveal.to=1;reveal.start();}
+            else completeMotion(true);
+        } else if(!keptZoom && pendingFocused && pendingInteraction===app.documentCanvas.interactionEpoch && focusedWithin())
+            app.documentCanvas.showRegionCard(owner);
+        app.schedulePositionSave();
+    }
+    onAttachmentChanged: {
+        if(opened && owner && owner.documentGeneration!==ownerGeneration)closeCard(false);
+        else if(opened && attachment.error){reveal.stop();closing=false;needsReveal=false;revealProgress=1;}
+        else requestPaper();
+    }
+    onFullHeightChanged:requestPaper()
+    onPaperChanged:if(opened && paper.error){reveal.stop();closing=false;needsReveal=false;revealProgress=1;}
+    Connections {
+        target:card.owner
+        function onAiRegionPaperChanged(){layoutApply.restart();}
+        function onCommandsChanged(){card.requestPaper();}
+    }
+    Connections {
+        target:card.app
+        function onZoomChanged(){card.requestPaper();}
+    }
+    Connections {
+        target:card.app.documentCanvas
+        function onInteractionEpochChanged(){if(reveal.running)card.completeMotion(false);}
+    }
+    Keys.onShortcutOverride:function(event){if(event.key===Qt.Key_Escape)event.accepted=true;}
+    Keys.onEscapePressed:function(event){closeAnimated();event.accepted=true;}
     function prepare(){if(owner===app.currentReader)owner.prepareAiRegion(app.aiSettings);}
     function follow(link,plan) {
         if(owner!==app.currentReader || plan.generation!==owner.documentGeneration)return;
         const match=/^p\.(\d+)$/.exec(link);
         if(match && (plan.source_pages || []).indexOf(Number(match[1]))>=0){app.navigate(Number(match[1])-1);close();}
     }
+    Pane {
+        objectName:"aiRegionBody"
+        width:card.width;height:card.fullHeight;padding:12
+        opacity:.65+.35*card.revealProgress
+        enabled:!card.closing
+        background:Rectangle {color:card.app.colors.panelBg;border.color:card.app.colors.separator;radius:8}
     contentItem:ColumnLayout {
         spacing:8
         RowLayout {
             Label {text:qsTr("Ask about this area");font.bold:true;Layout.fillWidth:true}
-            ToolButton {objectName:"closeAiRegionCard";text:qsTr("Close");onClicked:card.close()}
+            ToolButton {objectName:"closeAiRegionCard";text:qsTr("Close");onClicked:card.closeAnimated()}
         }
         BusyIndicator {running:!!card.attachment.loading;visible:running;Layout.alignment:Qt.AlignHCenter}
         ScrollView {
             Layout.fillWidth:true;Layout.fillHeight:true;contentWidth:availableWidth;clip:true
             ColumnLayout {
                 width:parent.width;spacing:8
-                Label {text:card.attachment.error || "";textFormat:Text.PlainText;visible:text.length>0;wrapMode:Text.Wrap;Layout.fillWidth:true;color:card.app.colors.warningFg}
+                Label {text:card.attachment.error || card.paper.error || "";textFormat:Text.PlainText;visible:text.length>0;wrapMode:Text.Wrap;Layout.fillWidth:true;color:card.app.colors.warningFg}
                 Item {
                     visible:!!card.attachment.image_png
                     Layout.fillWidth:true;Layout.preferredHeight:Math.min(180,width*(card.attachment.image_height_px || 1)/(card.attachment.image_width_px || 1))
@@ -50,6 +194,9 @@ Popup {
                         width:Math.min(parent.width,parent.height*(card.attachment.image_width_px || 1)/(card.attachment.image_height_px || 1))
                         height:width*(card.attachment.image_height_px || 1)/(card.attachment.image_width_px || 1)
                         source:card.owner ? card.owner.aiRegionImage : ""
+                        // Decode the initial capture once, then defer budget-driven
+                        // redecodes until paper geometry has stopped moving.
+                        rasterDemandPaused:card.motionActive && status===1
                         Accessible.role:Accessible.Graphic
                         Accessible.name:qsTr("Captured region from page %1").arg((card.attachment.page || 0)+1)
                         Accessible.description:qsTr("Original colour preview. Use Captured text to read the available text layer.")
@@ -77,7 +224,7 @@ Popup {
             visible:!!card.attachment.image_png
             Layout.fillWidth:true;Layout.preferredHeight:80;Layout.maximumHeight:80;contentWidth:availableWidth;clip:true
             TextArea {
-                objectName:"aiRegionQuestion"
+                id:questionEditor;objectName:"aiRegionQuestion"
                 width:composer.availableWidth;text:card.attachment.question || ""
                 readOnly:card.running
                 wrapMode:TextEdit.Wrap;textFormat:TextEdit.PlainText
@@ -116,8 +263,9 @@ Popup {
         RowLayout {
             Button {objectName:"newAiRegion";text:qsTr("New area");enabled:!card.running && !card.attachment.loading;onClicked:card.app.armRegion()}
             Button {objectName:"stopAiRegion";visible:card.running && card.state.responseView==="region";text:qsTr("Stop response");onClicked:card.owner.cancelAi()}
-            Button {objectName:"clearAiRegion";text:qsTr("Clear area");enabled:!card.running;onClicked:{card.owner.clearAiRegion();card.close();}}
+            Button {objectName:"clearAiRegion";text:qsTr("Clear area");enabled:!card.running;onClicked:{const reader=card.owner;card.close();reader.clearAiRegion();}}
         }
+    }
     }
     Dialog {
         id:payload;objectName:"aiRegionPayload"

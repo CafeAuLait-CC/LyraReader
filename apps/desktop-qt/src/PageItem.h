@@ -19,6 +19,7 @@ class PageItem : public QQuickItem {
     Q_PROPERTY(bool backdropVisible READ backdropVisible NOTIFY refinementChanged)
     Q_PROPERTY(int loadedTileCount READ loadedTileCount NOTIFY refinementChanged)
     Q_PROPERTY(bool resourceActive READ resourceActive WRITE setResourceActive NOTIFY resourceActiveChanged)
+    Q_PROPERTY(bool rasterDemandPaused READ rasterDemandPaused WRITE setRasterDemandPaused NOTIFY rasterDemandPausedChanged)
     Q_PROPERTY(bool texturesReady READ texturesReady NOTIFY texturesReadyChanged)
     Q_PROPERTY(QString paperGeometryError READ paperGeometryError NOTIFY paperGeometryChanged)
     Q_PROPERTY(bool paperGeometryActive READ paperGeometryActive NOTIFY paperGeometryChanged)
@@ -37,6 +38,7 @@ public:
     int loadedTileCount() const {return int(m_tileImages.size());}
     bool embeddedAnnotations() const {return m_embedded;}
     bool resourceActive()const{return m_resourceActive;}
+    bool rasterDemandPaused()const{return m_rasterDemandPaused;}
     bool texturesReady()const{return m_texturesReady;}
     QString paperGeometryError()const{return m_paperError;}
     bool paperGeometryActive()const{return m_paperLayout.has_value();}
@@ -46,11 +48,13 @@ public:
     // One atomic geometry update. It does not change source pixels, raster demand or zoom.
     Q_INVOKABLE bool configurePaper(double originalHeightPt,double splitPt,double gapPt);
     Q_INVOKABLE void clearPaperGeometry();
+    Q_INVOKABLE QVariantMap paperViewport(const QRectF &displayRegion,qulonglong revision) const;
     Q_INVOKABLE QVariantMap paperEraserSegments(const QPointF &from,const QPointF &to)const;
     Q_INVOKABLE QVariantMap paperPoint(const QPointF &display)const;
     Q_INVOKABLE QVariantMap paperRegion(const QRectF &source,qulonglong revision)const;
     Q_INVOKABLE QVariantMap paperAxisY(double y,bool toDisplay,qulonglong revision)const;
     void setResourceActive(bool active);
+    void setRasterDemandPaused(bool paused);
     bool tilesEnabled() const {return m_tilesEnabled;}
     QRectF visibleRegion() const {return m_visibleRegion;}
     void setController(ReaderController *controller);
@@ -65,6 +69,7 @@ signals:
     void paperAppearanceChanged();void embeddedAnnotationsChanged();void tilesEnabledChanged();
     void visibleRegionChanged();void refinementChanged();
     void resourceActiveChanged();
+    void rasterDemandPausedChanged();
     void texturesReadyChanged();
     void paperGeometryChanged();
 protected:
@@ -91,6 +96,7 @@ private:
     QHash<QString,ResidentImage> m_tileImages,m_previousImages;
     QRectF m_visibleRegion;
     QString m_paperAppearance=QStringLiteral("original");
+    bool m_rasterDemandPaused=false;
     bool m_embedded=false,m_tilesEnabled=false,m_refined=false,m_demandCurrent=false;
     bool m_resourceActive=true;
     bool m_usingBackdrop=false;

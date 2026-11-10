@@ -40,6 +40,7 @@ bool PageItem::demandVisible()const {
     return m_visibleRegion.intersects(QRectF(0,0,page.value("width").toDouble(),page.value("height").toDouble()));
 }
 void PageItem::syncBudget() {
+    if(m_rasterDemandPaused)return;
     RenderBudget::instance()->setClient(this,demandVisible()?(m_tilesEnabled?16:1):0);
     const auto previous=m_targetBytes;m_targetBytes=RenderBudget::instance()->targetBytes(this);
     if(!m_targetBytes){if(loaded())resetImages();m_requestTimer.stop();return;}
@@ -56,6 +57,12 @@ void PageItem::setResourceActive(bool active) {
     if(m_resourceActive==active)return;m_resourceActive=active;
     syncBudget();if(!demandVisible()){resetImages();m_requestTimer.stop();}else m_requestTimer.start();
     emit resourceActiveChanged();
+}
+void PageItem::setRasterDemandPaused(bool paused) {
+    if(m_rasterDemandPaused==paused)return;
+    m_rasterDemandPaused=paused;
+    if(paused)m_requestTimer.stop();else {syncBudget();m_requestTimer.start();}
+    emit rasterDemandPausedChanged();
 }
 void PageItem::resetImages() {
     if(m_controller)m_controller->clearRasterDemand(quintptr(this));
@@ -90,6 +97,26 @@ bool PageItem::configurePaper(double height,double split,double gap) {
 void PageItem::clearPaperGeometry() {
     if(!m_paperLayout && m_paperError.isEmpty())return;
     ++m_paperEpoch;m_paperLayout.reset();m_paperError.clear();update();emit paperGeometryChanged();
+}
+QVariantMap PageItem::paperViewport(const QRectF &region,qulonglong revision)const {
+    if(!m_controller || m_controller->loading() || m_page<0 || m_page>=m_controller->pageCount() || revision!=m_paperEpoch)
+        return {{QStringLiteral("error"),tr("The page layout changed. Try again.")}};
+    if(!std::isfinite(region.x()) || !std::isfinite(region.y()) || !std::isfinite(region.width())
+            || !std::isfinite(region.height()) || !std::isfinite(region.right()) || !std::isfinite(region.bottom())
+            || region.width()<0 || region.height()<0)
+        return {{QStringLiteral("error"),tr("The paper viewport is invalid.")}};
+    const auto height=m_controller->pages().at(m_page).toMap().value(QStringLiteral("height")).toDouble();
+    const auto layout=m_paperLayout.value_or(LyraReaderPaperLayout{height,0,0,0,0});
+    LyraReaderPaperBand band{};LyraReaderBuffer error{};
+    if(!lyra_reader_desktop_paper_band(layout,region.y(),region.bottom(),&band,&error)) {
+        const auto message=QString::fromUtf8(reinterpret_cast<const char *>(error.data),qsizetype(error.len));
+        lyra_reader_desktop_buffer_free(error);return {{QStringLiteral("error"),message}};
+    }
+    if(band.present>1 || band.reserved || !std::isfinite(band.top) || !std::isfinite(band.bottom)
+            || band.top<0 || band.bottom<band.top || band.bottom>height)
+        return {{QStringLiteral("error"),tr("The paper mapper returned an invalid viewport.")}};
+    if(!band.present || region.width()==0)return {{QStringLiteral("hit"),false}};
+    return {{QStringLiteral("hit"),true},{QStringLiteral("rect"),QRectF(region.x(),band.top,region.width(),band.bottom-band.top)}};
 }
 QVariantMap PageItem::paperAxisY(double y,bool toDisplay,qulonglong revision)const {
     if(!m_controller || m_controller->loading() || m_page<0 || m_page>=m_controller->pageCount() || revision!=m_paperEpoch)return {{QStringLiteral("error"),tr("The page layout changed. Try again.")}};
@@ -150,7 +177,11 @@ void PageItem::setPaperAppearance(const QString &appearance) {if(m_paperAppearan
 void PageItem::setEmbeddedAnnotations(bool enabled) {if(m_embedded==enabled)return;m_embedded=enabled;resetImages();m_requestTimer.start();emit embeddedAnnotationsChanged();}
 void PageItem::setTilesEnabled(bool enabled) {if(m_tilesEnabled==enabled)return;m_tilesEnabled=enabled;m_demandCurrent=false;setRefined(false);m_requestTimer.start();emit tilesEnabledChanged();}
 void PageItem::setVisibleRegion(const QRectF &region) {
-    if(m_visibleRegion==region)return;m_visibleRegion=region;m_demandCurrent=false;setRefined(false);syncBudget();
+    if(m_visibleRegion==region)return;m_visibleRegion=region;m_demandCurrent=false;setRefined(false);
+    // Geometry-only paper motion retains the current pixels and demand until the
+    // final source band is known. Previously queued work may still finish normally.
+    if(m_rasterDemandPaused){update();emit visibleRegionChanged();return;}
+    syncBudget();
     if(!demandVisible()){resetImages();m_requestTimer.stop();}else {refresh();m_requestTimer.start(16);}emit visibleRegionChanged();
 }
 double PageItem::effectiveScale() const {
@@ -206,6 +237,7 @@ void PageItem::refresh() {
     update();emit refinementChanged();if(wasLoaded!=loaded())emit loadedChanged();
 }
 void PageItem::request() {
+    if(m_rasterDemandPaused)return;
     syncBudget();if(!demandVisible())return;
     if(needsTiles()) {
         const auto plan=m_controller->requestTilesForSurface(quintptr(this),m_page,effectiveScale(),m_targetBytes,m_visibleRegion,QSet<QString>(m_tileImages.keyBegin(),m_tileImages.keyEnd()));

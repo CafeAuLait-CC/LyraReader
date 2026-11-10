@@ -18,6 +18,7 @@ ApplicationWindow {
     function open() {
         if(visible){requestActivate();return;}
         appearance.currentIndex=["light","dark","system"].indexOf(app.appearance);
+        reduceMotion.checked=app.reduceMotion;
         paper.currentIndex=["original","warm","night"].indexOf(app.paperAppearance);
         gap.value=app.pageGap;baseUrl.text=app.aiSettings.baseUrl || "http://localhost:11434/v1";
         modelName.text=app.aiSettings.model || "";
@@ -32,6 +33,7 @@ ApplicationWindow {
     function openAudit(){open();if(visible)auditDialog.open();}
     function save() {
         app.appearance = ["light", "dark", "system"][appearance.currentIndex];
+        app.reduceMotion=reduceMotion.checked;
         app.paperAppearance = ["original", "warm", "night"][paper.currentIndex];
         app.pageGap = gap.value;
         app.setPageLayout(app.layoutMode);
@@ -78,6 +80,10 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     model: [qsTr("Light"), qsTr("Dark"), qsTr("Follow System")]
                     currentIndex: ["light", "dark", "system"].indexOf(app.appearance)
+                }
+                CheckBox {
+                    id:reduceMotion;objectName:"settingsReduceMotion"
+                    text:qsTr("Reduce motion");Layout.fillWidth:true
                 }
                 ComboBox {
                     id: paper

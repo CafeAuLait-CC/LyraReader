@@ -10,6 +10,20 @@ fn rect(y: f64, height: f64) -> Rect {
     Rect::new(100.0, y, 220.0, height)
 }
 
+#[test]
+fn fractional_viewports_never_demand_rows_outside_the_original_paper() {
+    for height in [842.123456789, 720.75, 500.1, 300.3] {
+        for split in [0.02, 20.1, height / 3.0, height - 0.02] {
+            for gap in [0.1, 80.25, 180.3, 1200.5] {
+                let paper = PaperLayout::new(height, Some(split), gap).unwrap();
+                let (top, bottom) = paper.paper_band(-100.0, height + gap + 100.0).unwrap();
+                assert_eq!(top, 0.0);
+                assert_eq!(bottom, height, "height {height} split {split} gap {gap}");
+            }
+        }
+    }
+}
+
 fn lines() -> Vec<Rect> {
     [100.0, 300.0, 500.0, 700.0, 1100.0]
         .into_iter()

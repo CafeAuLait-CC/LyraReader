@@ -14,6 +14,7 @@ pub mod ink;
 pub mod layout;
 pub mod navigation;
 pub mod paper;
+pub mod paper_document;
 pub mod viewport;
 
 pub use command::{Anchor, Command, Event, Layout, Zoom};

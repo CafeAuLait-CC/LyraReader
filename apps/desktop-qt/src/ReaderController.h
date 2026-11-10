@@ -26,6 +26,7 @@ class ReaderController : public QObject {
     Q_OBJECT
     Q_PROPERTY(QVariantList pages READ pages NOTIFY documentChanged)
     Q_PROPERTY(QVariantList layoutRows READ layoutRows NOTIFY documentChanged)
+    Q_PROPERTY(QVariantMap layoutConfiguration READ layoutConfiguration NOTIFY documentChanged)
     Q_PROPERTY(int pageCount READ pageCount NOTIFY documentChanged)
     Q_PROPERTY(double documentWidth READ documentWidth NOTIFY documentChanged)
     Q_PROPERTY(double documentHeight READ documentHeight NOTIFY documentChanged)
@@ -33,6 +34,7 @@ class ReaderController : public QObject {
     Q_PROPERTY(QVariantMap aiState READ aiState NOTIFY aiStateChanged)
     Q_PROPERTY(QVariantMap documentReading READ documentReading NOTIFY documentReadingChanged)
     Q_PROPERTY(QVariantMap aiRegion READ aiRegion NOTIFY aiRegionChanged)
+    Q_PROPERTY(QVariantMap aiRegionPaper READ aiRegionPaper NOTIFY aiRegionPaperChanged)
     Q_PROPERTY(QVariantMap regionNoteDraft READ regionNoteDraft NOTIFY regionNoteDraftChanged)
     Q_PROPERTY(bool hasUnsavedReadingNotes READ hasUnsavedReadingNotes NOTIFY regionNoteDraftChanged)
     Q_PROPERTY(QVariantMap regionHistory READ regionHistory NOTIFY regionHistoryChanged)
@@ -59,6 +61,7 @@ public:
     ~ReaderController() override;
     QVariantList pages() const { return m_pages; }
     QVariantList layoutRows() const { return m_layoutRows; }
+    QVariantMap layoutConfiguration() const { return m_layoutConfiguration; }
     int pageCount() const { return int(m_pages.size()); }
     double documentWidth() const { return m_documentWidth; }
     double documentHeight() const { return m_documentHeight; }
@@ -71,6 +74,11 @@ public:
     Q_INVOKABLE void invalidateDocumentReadingPreview();
     Q_INVOKABLE void dismissDocumentReadingChoice();
     QVariantMap aiRegion()const{return m_aiRegion;}
+    QVariantMap aiRegionPaper()const{return m_aiRegionPaper;}
+    Q_INVOKABLE void configureAiRegionPaper(const QString &mode,double pageGap,double cardGap);
+    Q_INVOKABLE void clearAiRegionPaper();
+    Q_INVOKABLE double unshiftedPaperScroll(double displayY,double reveal=1.0) const;
+    Q_INVOKABLE double shiftedPaperScroll(double sourceY,double reveal=1.0) const;
     QVariantMap regionNoteDraft()const{return m_regionNoteDraft;}
     bool hasUnsavedReadingNotes()const{return !m_regionNoteDraft.isEmpty() || !m_regionSaveError.isEmpty();}
     Q_INVOKABLE bool setRegionNoteDraft(const QString &id,const QString &text);
@@ -112,6 +120,7 @@ public:
     std::shared_ptr<NativeRasterSource> renderSource()const{return m_source;}
     bool passwordRequired() const { return m_passwordRequired; }
     qulonglong completedRasters() const { return m_completed; }
+    qulonglong tilePlanBatches()const{return m_tilePlanBatches;}
     qulonglong discardedRasters() const { return m_discarded; }
     int pendingRasters() const { return int(m_requests.size()) + (m_rendering ? 1 : 0); }
     Q_INVOKABLE void openFile(const QUrl &url, const QString &password = {});
@@ -163,6 +172,7 @@ signals:
     void aiStateChanged();
     void documentReadingChanged();
     void aiRegionChanged();
+    void aiRegionPaperChanged();
     void aiRegionImageChanged();
     void regionHistoryChanged();
     void regionNoteDraftChanged();
@@ -190,6 +200,13 @@ private:
     QTimer m_aiTimer;
     QVariantMap m_aiState;
     QVariantMap m_aiRegion;
+    QVariantMap m_aiRegionPaper,m_aiRegionPaperSpec;
+    QVariantMap m_layoutConfiguration;
+    double mapPaperScroll(double value,bool shifted,double reveal) const;
+    quint64 m_aiRegionPaperEpoch=0;
+    bool m_aiRegionPaperInFlight=false;
+    std::shared_ptr<std::atomic_bool> m_aiRegionPaperCancel;
+    void startAiRegionPaperPlan();
     QVariantMap m_regionHistory,m_regionNoteDraft,m_regionNoteSaveSnapshot;
     QString m_regionSaveError;
     quint64 m_regionNoteSaveId=0;
@@ -236,6 +253,7 @@ private:
     bool m_rasterRetryQueued=false;
     quint64 m_generation = 0;
     qulonglong m_completed = 0, m_discarded = 0;
+    qulonglong m_tilePlanBatches=0;
     // Whole pages and bounded tiles share the process-wide 96 MiB CPU LRU.
     QSet<QString> m_pending, m_failed;
     QList<Request> m_requests;

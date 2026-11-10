@@ -2,13 +2,17 @@
 #include <cstddef>
 #include <cstdint>
 
-inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 8;
+inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 9;
 
 // Owned Rust allocations: free each Buffer exactly once using buffer_free.
 // Output buffers must be zero initialized; calls do not free previous contents.
 // All document operations may block and must run on a worker, not the UI thread.
 extern "C" {
 std::uint32_t lyra_reader_desktop_abi_version();
+std::size_t lyra_reader_desktop_paper_geometry_limit();
+// Invalid input returns NaN; a scroll inside conversation space stores the source cut.
+double lyra_reader_desktop_paper_unshifted_scroll(double display_y,double gap_top,double gap);
+double lyra_reader_desktop_paper_shifted_scroll(double source_y,double gap_top,double gap);
 struct LyraReaderDesktopDocument;
 struct LyraReaderRenderSource;
 struct LyraReaderDesktopHistory;
@@ -26,6 +30,9 @@ struct LyraReaderPaperQuadPair {std::uint32_t count,reserved;LyraReaderPaperQuad
 struct LyraReaderPaperPoint {double x,y;};
 struct LyraReaderPaperHit {std::uint32_t present,reserved;LyraReaderPaperPoint point;};
 struct LyraReaderPaperAxis {std::uint32_t present,reserved;double y;};
+struct LyraReaderPaperBand {std::uint32_t present,reserved;double top,bottom;};
+bool lyra_reader_desktop_paper_band(LyraReaderPaperLayout layout,double top,double bottom,
+    LyraReaderPaperBand *output,LyraReaderBuffer *error);
 // Pure unclamped anchor map: direction 0=source to display, 1=inverse (absent in gap).
 bool lyra_reader_desktop_paper_axis(LyraReaderPaperLayout layout,double y,std::uint32_t direction,
     LyraReaderPaperAxis *output,LyraReaderBuffer *error);

@@ -54,6 +54,7 @@ struct OpenResult {
     std::shared_ptr<LyraReaderDesktopDocument> document;
     std::shared_ptr<NativeRasterSource> source;
     QVariantList pages,rows;
+    QVariantMap layoutConfiguration;
     double width = 0;
     double height = 0;
     QVariantMap signature;
@@ -83,7 +84,7 @@ bool ReaderController::hasUnsavedChanges()const {
     return marks.value(QStringLiteral("page_pending")).toBool() ||
         (!localOnly && marks.value(QStringLiteral("pdf_dirty")).toBool()) || !m_noteDrafts.isEmpty() || hasEditDrafts();
 }
-ReaderController::~ReaderController(){m_indexCancellation->store(true);RasterJobs::cancel(m_aiRegionJob);clearRasterCache();NativeImageProvider::unregisterSource(m_contentSourceKey);}
+ReaderController::~ReaderController(){m_indexCancellation->store(true);if(m_aiRegionPaperCancel)m_aiRegionPaperCancel->store(true);RasterJobs::cancel(m_aiRegionJob);clearRasterCache();NativeImageProvider::unregisterSource(m_contentSourceKey);}
 void ReaderController::clearRasterCache(){RasterJobs::cancel(m_activeRaster);RasterCache::clearPrefix(m_cachePrefix);m_tileDemand.clear();m_pageDemand.clear();m_manualDemand.clear();}
 int ReaderController::cpuCacheKiB(){return RasterCache::costKiB();}
 
@@ -114,7 +115,7 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
     m_lastUrl = url;
     const auto generation = ++m_generation;
     resetAi();m_document.reset();setRasterSource({});
-    m_pages.clear();m_layoutRows.clear();
+    m_pages.clear();m_layoutRows.clear();m_layoutConfiguration.clear();
     clearRasterCache();
     m_pending.clear();
     m_failed.clear();
@@ -146,7 +147,7 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
             return;
         }
         m_document = std::move(result.document);setRasterSource(std::move(result.source));
-        m_pages = std::move(result.pages);m_layoutRows=std::move(result.rows);
+        m_pages = std::move(result.pages);m_layoutRows=std::move(result.rows);m_layoutConfiguration=std::move(result.layoutConfiguration);
         m_data.insert(QStringLiteral("signature_status"),result.signature);emit dataChanged();
         m_data.insert(QStringLiteral("recovery"),result.recovery);
         m_data.insert(QStringLiteral("xfa_status"),result.xfa);
@@ -184,6 +185,7 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
         const auto object = json.object();
         result.pages = object.value(QStringLiteral("pages")).toArray().toVariantList();
         result.rows = object.value(QStringLiteral("rows")).toArray().toVariantList();
+        result.layoutConfiguration={{QStringLiteral("mode"),object.value(QStringLiteral("mode")).toVariant()},{QStringLiteral("gap"),object.value(QStringLiteral("gap")).toVariant()}};
         result.width = object.value(QStringLiteral("width")).toDouble();
         result.height = object.value(QStringLiteral("height")).toDouble();
         result.signature = object.value(QStringLiteral("signature_status")).toObject().toVariantMap();
@@ -207,7 +209,7 @@ bool ReaderController::openSnapshot(const std::shared_ptr<NativeRasterSource> &s
 void ReaderController::closeSnapshot() {
     if(!m_snapshotMode)return;
     ++m_generation;clearRasterCache();m_requests.clear();m_pending.clear();m_failed.clear();
-    setRasterSource({});m_pages.clear();m_layoutRows.clear();m_textPages.clear();m_textPending.clear();m_data.clear();
+    setRasterSource({});m_pages.clear();m_layoutRows.clear();m_layoutConfiguration.clear();m_textPages.clear();m_textPending.clear();m_data.clear();
     m_documentWidth=0;m_documentHeight=0;m_loading=false;
     emit documentReset();emit documentChanged();emit textPagesChanged();emit dataChanged();emit loadingChanged();
 }
@@ -228,7 +230,7 @@ quint64 ReaderController::submitSnapshot(quint64 id,const QString &operation,con
         const bool opening=m_loading && operation==QStringLiteral("layout");
         if(!result.error.isEmpty())setError(result.error);
         else if(operation==QStringLiteral("layout")) {
-            const auto layout=result.result.toMap();m_pages=layout.value(QStringLiteral("pages")).toList();m_layoutRows=layout.value(QStringLiteral("rows")).toList();
+            const auto layout=result.result.toMap();m_pages=layout.value(QStringLiteral("pages")).toList();m_layoutRows=layout.value(QStringLiteral("rows")).toList();m_layoutConfiguration={{QStringLiteral("mode"),layout.value(QStringLiteral("mode"))},{QStringLiteral("gap"),layout.value(QStringLiteral("gap"))}};
             m_documentWidth=layout.value(QStringLiteral("width")).toDouble();m_documentHeight=layout.value(QStringLiteral("height")).toDouble();emit documentChanged();
         }else if(operation==QStringLiteral("text")) {
             const auto page=arguments.value(QStringLiteral("page")).toInt();m_textPages.insert(QString::number(page),result.result);emit textPagesChanged();
@@ -346,7 +348,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
             const auto info=revision.value(QStringLiteral("info")).toMap();
             const bool reloadForms=m_data.contains(QStringLiteral("forms"));
             ++m_generation;resetAi();clearRasterCache();m_pending.clear();m_failed.clear();m_requests.clear();m_textPages.clear();m_textPending.clear();
-            m_pages=info.value(QStringLiteral("pages")).toList();m_layoutRows=info.value(QStringLiteral("rows")).toList();m_documentWidth=info.value(QStringLiteral("width")).toDouble();m_documentHeight=info.value(QStringLiteral("height")).toDouble();
+            m_pages=info.value(QStringLiteral("pages")).toList();m_layoutRows=info.value(QStringLiteral("rows")).toList();m_layoutConfiguration={{QStringLiteral("mode"),info.value(QStringLiteral("mode"))},{QStringLiteral("gap"),info.value(QStringLiteral("gap"))}};m_documentWidth=info.value(QStringLiteral("width")).toDouble();m_documentHeight=info.value(QStringLiteral("height")).toDouble();
             m_data.clear();m_data.insert(QStringLiteral("marks"),revision.value(QStringLiteral("marks")));m_data.insert(QStringLiteral("signature_status"),info.value(QStringLiteral("signature_status")));
             m_data.insert(QStringLiteral("xfa_status"),info.value(QStringLiteral("xfa_status")));
             m_data.insert(QStringLiteral("document_revision"),info.value(QStringLiteral("revision")));
@@ -364,6 +366,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
             const auto layout = outcome.result.toMap();
             m_pages = layout.value(QStringLiteral("pages")).toList();
             m_layoutRows = layout.value(QStringLiteral("rows")).toList();
+            m_layoutConfiguration={{QStringLiteral("mode"),layout.value(QStringLiteral("mode"))},{QStringLiteral("gap"),layout.value(QStringLiteral("gap"))}};
             m_documentWidth = layout.value(QStringLiteral("width")).toDouble();
             m_documentHeight = layout.value(QStringLiteral("height")).toDouble();
             emit documentChanged();
@@ -446,6 +449,7 @@ void ReaderController::requestText(int page) {
 }
 
 void ReaderController::setLayout(const QString &mode, double gap) {
+    clearAiRegionPaper();
     submit(QStringLiteral("layout"), {{QStringLiteral("mode"),mode},{QStringLiteral("gap"),gap}});
 }
 
@@ -517,6 +521,7 @@ TilePlanResult ReaderController::requestPlannedTiles(quintptr consumer,int page,
     auto request=density;request.page=std::uint32_t(page);request.width=dimensions.value("width").toDouble();request.height=dimensions.value("height").toDouble();request.visible={visible.x(),visible.y(),visible.width(),visible.height()};
     LyraReaderTilePlanBatch output{};LyraReaderBuffer error{};
     const auto release=qScopeGuard([&]{lyra_reader_desktop_tile_plan_free(output);});
+    ++m_tilePlanBatches;
     if(!lyra_reader_desktop_plan_tiles(&request,1,&output,&error)) {
         const auto message=takeError(error);clearTileDemand(consumer);setError(message);return {};
     }

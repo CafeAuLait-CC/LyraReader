@@ -253,6 +253,36 @@ impl PaperLayout {
         (paper_y.is_finite() && y.is_finite()).then_some(y)
     }
 
+    /// Translate the shared local map without treating accumulated row points as paper Y.
+    pub fn display_y_at_origin(self, paper_y: f64, origin: f64) -> Option<f64> {
+        let y = origin + self.display_y(paper_y)?;
+        (origin.is_finite() && y.is_finite()).then_some(y)
+    }
+
+    /// Classify gap edges before subtracting a potentially large row origin. Otherwise a
+    /// source anchor exactly at the lower cut can round just inside the gap on the inverse.
+    /// The existing local contract remains unchanged; this is its translated counterpart.
+    pub fn paper_y_at_origin(self, display_y: f64, origin: f64) -> Option<f64> {
+        if !origin.is_finite() || !display_y.is_finite() {
+            return None;
+        }
+        let local = display_y - origin;
+        if !local.is_finite() || local < -0.001 {
+            return None;
+        }
+        if let Some(split) = self.split_pt {
+            let lower = self.display_y_at_origin(split, origin)?;
+            if display_y >= lower {
+                let y = split + (display_y - lower);
+                return y.is_finite().then_some(y);
+            }
+            if display_y >= origin + split {
+                return None;
+            }
+        }
+        Some(local)
+    }
+
     /// Inverse anchor map, with no point in the gap. The shell separately checks the owning
     /// page's lower bound for pointer hits; positive extrapolated anchors remain reversible.
     /// The historical 0.001-point tolerance at the upper paper edge is retained.
@@ -282,8 +312,26 @@ impl PaperLayout {
             let low = top.max(segment.display_top_pt);
             let high = bottom.min(segment.display_top_pt + segment.height_pt);
             if low < high {
-                let a = low - segment.display_top_pt + segment.source_top_pt;
-                let b = high - segment.display_top_pt + segment.source_top_pt;
+                let source_bottom = if segment.source_top_pt == 0.0 {
+                    self.split_pt.unwrap_or(self.height_pt)
+                } else {
+                    self.height_pt
+                };
+                // This operation explicitly clips to source paper. Anchor a complete segment
+                // to its original endpoints: subtracting a fractional gap can otherwise put
+                // its final row one ULP outside the page (or omit the last ULP of coverage).
+                let a = if low == segment.display_top_pt {
+                    segment.source_top_pt
+                } else {
+                    (low - segment.display_top_pt + segment.source_top_pt)
+                        .clamp(segment.source_top_pt, source_bottom)
+                };
+                let b = if high == segment.display_top_pt + segment.height_pt {
+                    source_bottom
+                } else {
+                    (high - segment.display_top_pt + segment.source_top_pt)
+                        .clamp(segment.source_top_pt, source_bottom)
+                };
                 band = Some(match band {
                     None => (a, b),
                     Some((old_a, old_b)) => (old_a.min(a), old_b.max(b)),

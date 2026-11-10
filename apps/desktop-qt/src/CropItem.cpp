@@ -15,7 +15,10 @@ CropItem::CropItem(QQuickItem *parent):QQuickItem(parent) {
     connect(&m_timer,&QTimer::timeout,this,&CropItem::request);
     connect(RenderBudget::instance(),&RenderBudget::targetsChanged,this,[this] {
         const auto previous=m_target;syncBudget();
-        if(previous!=m_target && active()){invalidate();m_timer.start();}
+        if(previous!=m_target && active()) {
+            if(m_rasterDemandPaused)m_deferredRequest=true;
+            else {invalidate();m_timer.start();}
+        }
     });
 }
 CropItem::~CropItem(){for(const auto &c:m_paperConnections)QObject::disconnect(c);RasterJobs::cancel(m_job);RenderBudget::instance()->setClient(this,0);}
@@ -57,12 +60,22 @@ void CropItem::setSource(const QUrl &source) {
 }
 void CropItem::setPaperAppearance(const QString &paper){if(m_paper==paper)return;m_paper=paper;emit paperAppearanceChanged();update();}
 void CropItem::setResourceActive(bool value){if(m_resourceActive==value)return;m_resourceActive=value;scheduleVisibilityUpdate();emit resourceActiveChanged();}
+void CropItem::setRasterDemandPaused(bool paused) {
+    if(m_rasterDemandPaused==paused)return;m_rasterDemandPaused=paused;
+    if(paused){m_deferredRequest=m_deferredRequest || m_timer.isActive();m_timer.stop();}
+    else {
+        const bool retry=m_deferredRequest;m_deferredRequest=false;
+        if(active() && (retry || m_image.isNull())){if(retry)invalidate();m_timer.start();}
+    }
+    emit rasterDemandPausedChanged();
+}
 void CropItem::itemChange(ItemChange change,const ItemChangeData &data) {
     QQuickItem::itemChange(change,data);
     if(change==ItemSceneChange){QObject::disconnect(m_visibilityConnection);if(window())m_visibilityConnection=connect(window(),&QWindow::visibilityChanged,this,&CropItem::visibilityUpdated);}
     if(change==ItemVisibleHasChanged || change==ItemSceneChange)scheduleVisibilityUpdate();
 }
 void CropItem::request() {
+    if(m_rasterDemandPaused){m_deferredRequest=true;return;}
     syncBudget();if(!active() || m_job)return;
     auto ticket=RasterJobs::enqueue();if(!ticket){m_timer.start(200);return;}m_job=ticket;
     const auto epoch=m_epoch;const auto url=m_source;const auto bytes=qMax<qint64>(4096,m_target/2);setStatus(2);

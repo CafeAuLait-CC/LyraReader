@@ -27,10 +27,65 @@ use std::{
     ptr, slice,
 };
 
-/// Version of the Qt boundary, including the mandatory authoritative layout-row packet.
+/// Version of the Qt boundary, including the shared paper-geometry admission limit.
 #[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_desktop_abi_version() -> u32 {
-    8
+    9
+}
+
+/// Maximum caller-supplied glyph/figure boxes before paper placement allocates snapshots.
+#[unsafe(no_mangle)]
+pub extern "C" fn lyra_reader_desktop_paper_geometry_limit() -> usize {
+    lyra_reader_session::paper::MAX_PAPER_GEOMETRY_ITEMS
+}
+
+/// Pure row-scroll mapping. NaN reports invalid input; it is never a legitimate offset.
+#[unsafe(no_mangle)]
+pub extern "C" fn lyra_reader_desktop_paper_unshifted_scroll(
+    display_y: f64,
+    gap_top: f64,
+    gap: f64,
+) -> f64 {
+    lyra_reader_session::paper_document::unshifted_paper_scroll_y(display_y, gap_top, gap)
+        .unwrap_or(f64::NAN)
+}
+
+/// Pure source-scroll restoration; an invalid or overflowing result is NaN.
+#[unsafe(no_mangle)]
+pub extern "C" fn lyra_reader_desktop_paper_shifted_scroll(
+    source_y: f64,
+    gap_top: f64,
+    gap: f64,
+) -> f64 {
+    lyra_reader_session::paper_document::shifted_paper_scroll_y(source_y, gap_top, gap)
+        .unwrap_or(f64::NAN)
+}
+
+/// # Safety
+/// Output is a live aligned writable Band, distinct from an empty writable error Buffer.
+/// Inputs are scalar values. Invalid calls leave output untouched; a gap has present=0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_paper_band(
+    layout: paper::Layout,
+    top: f64,
+    bottom: f64,
+    output: *mut paper::Band,
+    error: *mut Buffer,
+) -> bool {
+    // SAFETY: caller-owned distinct output/error slots; output null/alignment is checked
+    // before writing. The pure map retains no pointer, PDF or scene-graph resources.
+    unsafe {
+        run(error, || {
+            if output.is_null()
+                || !(output as usize).is_multiple_of(std::mem::align_of::<paper::Band>())
+            {
+                return Err("Paper viewport output is null or misaligned".into());
+            }
+            output.write(paper::band(layout, top, bottom)?);
+            Ok(())
+        })
+        .is_some()
+    }
 }
 
 /// # Safety
@@ -746,6 +801,132 @@ mod tests {
     use super::*;
 
     #[test]
+    fn paper_scroll_packet_keeps_gap_offsets_out_of_persistent_reading_state() {
+        for source in [0.0, 100.0, 469.75, 470.0, 470.25, 900.0] {
+            let display = lyra_reader_desktop_paper_shifted_scroll(source, 470.0, 100.0);
+            assert_eq!(
+                lyra_reader_desktop_paper_unshifted_scroll(display, 470.0, 100.0),
+                source
+            );
+        }
+        assert_eq!(
+            lyra_reader_desktop_paper_shifted_scroll(470.0, 470.0, 100.0),
+            470.0
+        );
+        assert!(lyra_reader_desktop_paper_shifted_scroll(f64::MAX, 0.0, f64::MAX).is_nan());
+        for (display, expected) in [
+            (100.0, 100.0),
+            (470.0, 470.0),
+            (520.0, 470.0),
+            (570.0, 470.0),
+            (600.0, 500.0),
+        ] {
+            assert_eq!(
+                lyra_reader_desktop_paper_unshifted_scroll(display, 470.0, 100.0),
+                expected
+            );
+        }
+        assert_eq!(
+            lyra_reader_desktop_paper_unshifted_scroll(10000.0, 0.0, 0.0),
+            10000.0
+        );
+        for (display, top, gap) in [
+            (f64::NAN, 0.0, 0.0),
+            (-1.0, 0.0, 0.0),
+            (0.0, -1.0, 0.0),
+            (0.0, 0.0, -1.0),
+            (0.0, f64::INFINITY, 0.0),
+            (0.0, f64::MAX, f64::MAX),
+        ] {
+            assert!(lyra_reader_desktop_paper_unshifted_scroll(display, top, gap).is_nan());
+        }
+    }
+
+    #[test]
+    fn paper_viewport_packet_is_empty_in_the_gap_and_preserves_failed_outputs() {
+        let layout = paper::Layout {
+            height: 100.0,
+            split: 30.0,
+            gap: 80.0,
+            has_split: 1,
+            reserved: 0,
+        };
+        let mut output = paper::Band {
+            present: 99,
+            reserved: 98,
+            top: 97.0,
+            bottom: 96.0,
+        };
+        let mut error = Buffer {
+            data: ptr::null_mut(),
+            len: 0,
+        };
+        // SAFETY: distinct live aligned output/error slots; null output is deliberately
+        // passed only to the entry point that rejects it before writing.
+        unsafe {
+            for (top, bottom) in [(f64::NAN, 10.0), (20.0, 10.0), (0.0, f64::INFINITY)] {
+                assert!(!lyra_reader_desktop_paper_band(
+                    layout,
+                    top,
+                    bottom,
+                    &mut output,
+                    &mut error
+                ));
+                assert_eq!(
+                    (output.present, output.reserved, output.top, output.bottom),
+                    (99, 98, 97.0, 96.0)
+                );
+                assert!(!error.data.is_null());
+                lyra_reader_desktop_buffer_free(error);
+                error = Buffer {
+                    data: ptr::null_mut(),
+                    len: 0,
+                };
+            }
+            assert!(!lyra_reader_desktop_paper_band(
+                layout,
+                20.0,
+                140.0,
+                ptr::null_mut(),
+                &mut error
+            ));
+            lyra_reader_desktop_buffer_free(error);
+            error = Buffer {
+                data: ptr::null_mut(),
+                len: 0,
+            };
+            assert!(lyra_reader_desktop_paper_band(
+                layout,
+                20.0,
+                140.0,
+                &mut output,
+                &mut error
+            ));
+            assert_eq!((output.present, output.top, output.bottom), (1, 20.0, 60.0));
+            assert!(lyra_reader_desktop_paper_band(
+                layout,
+                31.0,
+                109.0,
+                &mut output,
+                &mut error
+            ));
+            assert_eq!(
+                (output.present, output.reserved, output.top, output.bottom),
+                (0, 0, 0.0, 0.0)
+            );
+            assert!(lyra_reader_desktop_paper_band(
+                layout,
+                110.0,
+                120.0,
+                &mut output,
+                &mut error
+            ));
+            assert_eq!((output.present, output.top, output.bottom), (1, 30.0, 40.0));
+            assert!(error.data.is_null());
+        }
+    }
+
+    #[test]
     fn paper_axis_packet_retains_shared_extrapolation_and_gap_contracts() {
         let layout = paper::tests::layout();
         let mut out = paper::Axis {
@@ -1222,7 +1403,11 @@ mod tests {
 
     #[test]
     fn image_byte_boundary_rejects_null_handles_and_reports_its_version() {
-        assert_eq!(lyra_reader_desktop_abi_version(), 8);
+        assert_eq!(lyra_reader_desktop_abi_version(), 9);
+        assert_eq!(
+            lyra_reader_desktop_paper_geometry_limit(),
+            lyra_reader_session::paper::MAX_PAPER_GEOMETRY_ITEMS
+        );
         let mut error = Buffer {
             data: ptr::null_mut(),
             len: 0,

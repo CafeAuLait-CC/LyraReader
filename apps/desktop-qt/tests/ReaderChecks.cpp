@@ -141,14 +141,44 @@ static bool settleReaderViewport(QQuickWindow *window) {
     return false;
 }
 
+// Wait for the native layout and its clipping bounds before injecting a pointer.
+// A fully enabled control can still lie outside an unfolding or newly resized card.
+static bool settleRegionControl(QQuickWindow *window,QQuickItem *card,QQuickItem *control,ReaderController *reader) {
+    QElapsedTimer timer;timer.start();QRectF previous;int stable=0;
+    while(timer.elapsed()<5000) {
+        QTest::qWait(40);const auto rect=control->mapRectToScene(QRectF(0,0,control->width(),control->height()));
+        auto *viewport=card->parentItem();
+        const bool inside=viewport && control->isVisible() && control->isEnabled()
+            && card->contains(control->mapToItem(card,QPointF(0,0))) && card->contains(control->mapToItem(card,QPointF(control->width(),control->height())))
+            && viewport->contains(control->mapToItem(viewport,QPointF(0,0))) && viewport->contains(control->mapToItem(viewport,QPointF(control->width(),control->height())));
+        if(inside && window->isVisible() && !card->property("motionActive").toBool() && !reader->aiRegionPaper().value("loading").toBool()
+                && qAbs(rect.x()-previous.x())<.01 && qAbs(rect.y()-previous.y())<.01 && rect.size()==previous.size())++stable;else stable=0;
+        if(stable>=3)return true;previous=rect;
+    }
+    return false;
+}
+
+static bool settleRasterWork(ReaderController *reader) {
+    QElapsedTimer elapsed;elapsed.start();int idleMs=0;
+    while(elapsed.elapsed()<5000) {
+        QTest::qWait(20);const auto jobs=RasterJobs::statistics();
+        if(reader->pendingRasters()==0 && jobs.value("queued").toInt()==0 && jobs.value("running").toInt()==0)idleMs+=20;else idleMs=0;
+        // Span both the surface debounce and delayed budget retry. Work planned before
+        // motion is allowed to finish; it must not be counted as a new geometry demand.
+        if(idleMs>=240)return true;
+    }
+    return false;
+}
+
 class ReaderChecks : public QObject {
     Q_OBJECT
 public:
     QString root;
+    QString graphicsBackend;
 private slots:
     void initTestCase() {
         QCOMPARE(lyra_reader_desktop_abi_version(),LYRA_READER_DESKTOP_ABI_VERSION);
-        qInfo() << "Qt test platform:" << QGuiApplication::platformName();
+        qInfo() << "Qt test platform:" << QGuiApplication::platformName() << "requested graphics:" << graphicsBackend;
         if (qEnvironmentVariableIsSet("LYRA_READER_REQUIRE_NATIVE_QT")) {
             QVERIFY(QGuiApplication::platformName() == "wayland" || QGuiApplication::platformName() == "xcb");
         }
@@ -228,6 +258,7 @@ private slots:
     }
     void settingsAreIndependentTransientWindowsWithSafeReopenAndOwnerLifetime() {
         WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        const auto oldMotion=window->property("reduceMotion");auto restoreMotion=qScopeGuard([&]{window->setProperty("reduceMotion",oldMotion);});
         auto *settings=window->findChild<QQuickWindow *>("settingsWindow");QVERIFY(settings);QVERIFY(!settings->isVisible());bool preparedAtFirstShow=false;
         connect(settings,&QWindow::visibleChanged,this,[&](bool shown){if(shown)preparedAtFirstShow=settings->transientParent()==window && settings->type()==Qt::Dialog && settings->modality()==Qt::NonModal;});
         workspace.setPreference("auxiliarySettingsGeometry",QVariantMap{{"width",1e300},{"height",-10},{"x",-1e300},{"y",1e300}});
@@ -235,10 +266,11 @@ private slots:
         const auto available=settings->screen()->availableGeometry();QVERIFY(settings->width()<=available.width());QVERIFY(settings->height()<=available.height());QVERIFY(!(settings->flags() & Qt::WindowStaysOnTopHint));
         if(qEnvironmentVariableIsSet("LYRA_READER_CHECK_AUX_OBSERVE"))QTest::qWait(1800);
         if(qEnvironmentVariableIsSet("LYRA_READER_CHECK_AUX_SNAPSHOT")){QTest::qWait(80);QVERIFY(settings->grabWindow().save(qEnvironmentVariable("LYRA_READER_CHECK_AUX_SNAPSHOT")));}
-        auto *url=settings->findChild<QObject *>("settingsBaseUrl");auto *key=settings->findChild<QObject *>("settingsApiKey");QVERIFY(url && key);url->setProperty("text","http://127.0.0.1:1/cancelled");key->setProperty("text","synthetic-local-draft");QVERIFY(settings->close());QTRY_VERIFY(!settings->isVisible());QVERIFY(key->property("text").toString().isEmpty());
+        auto *motion=settings->findChild<QObject *>("settingsReduceMotion");QVERIFY(motion);QCOMPARE(motion->property("checked").toBool(),oldMotion.toBool());motion->setProperty("checked",!oldMotion.toBool());
+        auto *url=settings->findChild<QObject *>("settingsBaseUrl");auto *key=settings->findChild<QObject *>("settingsApiKey");QVERIFY(url && key);url->setProperty("text","http://127.0.0.1:1/cancelled");key->setProperty("text","synthetic-local-draft");QVERIFY(settings->close());QTRY_VERIFY(!settings->isVisible());QVERIFY(key->property("text").toString().isEmpty());QCOMPARE(window->property("reduceMotion"),oldMotion);
         QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));QTRY_VERIFY(settings->isVisible());QVERIFY(url->property("text").toString()!="http://127.0.0.1:1/cancelled");
         const auto newSize=QSize(qMax(settings->minimumWidth(),settings->width()-40),qMax(settings->minimumHeight(),settings->height()-30));settings->resize(newSize);QTRY_COMPARE(settings->size(),newSize);QVERIFY(settings->close());
-        QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));QTRY_VERIFY(settings->isVisible());QCOMPARE(settings->size(),newSize);url->setProperty("text","http://127.0.0.1:1/saved");QVERIFY(QMetaObject::invokeMethod(settings,"save"));QTRY_VERIFY(!settings->isVisible());QCOMPARE(workspace.preference("ai").toMap().value("baseUrl").toString(),QString("http://127.0.0.1:1/saved"));
+        QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));QTRY_VERIFY(settings->isVisible());QCOMPARE(settings->size(),newSize);QCOMPARE(motion->property("checked").toBool(),oldMotion.toBool());motion->setProperty("checked",!oldMotion.toBool());url->setProperty("text","http://127.0.0.1:1/saved");QVERIFY(QMetaObject::invokeMethod(settings,"save"));QTRY_VERIFY(!settings->isVisible());QCOMPARE(workspace.preference("ai").toMap().value("baseUrl").toString(),QString("http://127.0.0.1:1/saved"));QCOMPARE(workspace.preference("reduceMotion").toBool(),!oldMotion.toBool());
         QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));QTRY_VERIFY(settings->isVisible());window->hide();QTRY_VERIFY(!settings->isVisible());
     }
     void displayCalibrationValidatesPhysicalMetrics() {
@@ -809,8 +841,12 @@ private slots:
         QVERIFY(window);
         reader.openFile(QUrl::fromLocalFile(QCoreApplication::applicationDirPath() + "/fixtures/qt-nine-pages.pdf"));
         QTRY_VERIFY_WITH_TIMEOUT(reader.completedRasters() > 0, 10000);
-        if (qEnvironmentVariable("QSG_RHI_BACKEND") == "vulkan")
-            QCOMPARE(window->rendererInterface()->graphicsApi(), QSGRendererInterface::Vulkan);
+        QTRY_VERIFY_WITH_TIMEOUT(window->isSceneGraphInitialized(),10000);
+        qInfo()<<"Qt test actual graphics:"<<window->rendererInterface()->graphicsApi();
+        if(graphicsBackend=="vulkan" || (graphicsBackend.isEmpty() && qEnvironmentVariable("QSG_RHI_BACKEND")=="vulkan"))
+            QCOMPARE(window->rendererInterface()->graphicsApi(),QSGRendererInterface::Vulkan);
+        else if(graphicsBackend=="opengl")QCOMPARE(window->rendererInterface()->graphicsApi(),QSGRendererInterface::OpenGL);
+        else if(graphicsBackend=="software")QCOMPARE(window->rendererInterface()->graphicsApi(),QSGRendererInterface::Software);
         QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
         QTest::qWait(100); // Finish the initial asynchronous layout before testing anchored zoom.
         const auto before = reader.completedRasters();
@@ -1713,18 +1749,38 @@ private slots:
         window->setProperty("fitting",false);QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,1.0),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
         window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","region-audit-synthetic-model"},{"imageInput",false}});
         QVERIFY(QMetaObject::invokeMethod(window,"armRegion",Q_ARG(QVariant,false)));QTRY_VERIFY(window->property("regionSelecting").toBool());QVERIFY(settleReaderViewport(window));
+        reader->requestText(0);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto sourcePages=reader->pages(),sourceRows=reader->layoutRows();
         auto *page=visualItem(window->contentItem(),"pdfPage0");QVERIFY(page);
         const auto start=page->mapToScene(QPointF(60,55)*window->property("zoom").toDouble()).toPoint(),end=page->mapToScene(QPointF(480,235)*window->property("zoom").toDouble()).toPoint();
         QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,start);QTest::mouseMove(window,end,30);QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,end);
         QTRY_VERIFY_WITH_TIMEOUT(!reader->aiRegion().value("image_png").toString().isEmpty(),15000);
         QVERIFY2(reader->aiRegion().value("error").toString().isEmpty(),qPrintable(reader->aiRegion().value("error").toString()));QVERIFY(!window->property("regionSelecting").toBool());
         const auto attachment=reader->aiRegion();QCOMPARE(attachment.value("capture_scale").toDouble(),2.0);QVERIFY(attachment.value("text").toString().contains("quick brown fox"));
+        const auto paperPlan=attachment.value("paper_plan").toMap();QVERIFY(paperPlan.contains("split_pt"));QVERIFY(paperPlan.contains("fallback"));QVERIFY(paperPlan.value("warning").isNull());
         const auto png=QByteArray::fromBase64(attachment.value("image_png").toByteArray());const auto picture=QImage::fromData(png);QVERIFY(!picture.isNull());QCOMPARE(picture.size(),QSize(attachment.value("image_width_px").toInt(),attachment.value("image_height_px").toInt()));
         const double pointerTolerance=1.01/window->property("zoom").toDouble();
         QVERIFY(std::abs(attachment.value("width_pt").toDouble()-420)<pointerTolerance);QVERIFY(std::abs(attachment.value("height_pt").toDouble()-180)<pointerTolerance);
         QVERIFY(std::abs(picture.width()-840)<=std::ceil(pointerTolerance*2));QVERIFY(std::abs(picture.height()-360)<=std::ceil(pointerTolerance*2));
         if(qEnvironmentVariableIsSet("LYRA_READER_REGION_DARK_NARROW")){window->setProperty("appearance","dark");window->resize(700,600);QTest::qWait(100);}
         auto *card=window->findChild<QObject *>("aiRegionCard");QVERIFY(card);QTRY_VERIFY(card->property("visible").toBool());auto *crop=window->findChild<QObject *>("aiRegionImage");QVERIFY(crop);QTRY_COMPARE_WITH_TIMEOUT(crop->property("status").toInt(),1,10000);
+        QTRY_VERIFY_WITH_TIMEOUT(reader->aiRegionPaper().contains("rows") && !reader->aiRegionPaper().value("loading").toBool(),10000);
+        auto *paperCard=qobject_cast<QQuickItem *>(card);QVERIFY(paperCard);QCOMPARE(paperCard->parentItem()->objectName(),QString("documentCanvas"));
+        QCOMPARE(reader->pages(),sourcePages);QCOMPARE(reader->layoutRows(),sourceRows);QCOMPARE(visualItem(window->contentItem(),"pdfPage0"),page);
+        QTRY_VERIFY(!card->property("motionActive").toBool() && paperCard->y()>=-1 && paperCard->y()+paperCard->height()<=paperCard->parentItem()->height()+1);
+        auto *canvas=paperCard->parentItem();const auto gapTop=reader->aiRegionPaper().value("gap_top").toDouble();
+        QVERIFY(QMetaObject::invokeMethod(canvas,"positionAnchor",Q_ARG(QVariant,QVariantMap({{"page",0},{"y",gapTop+80}})),Q_ARG(QVariant,0)));
+        QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));
+        const auto saved=workspace.viewState(reader);QCOMPARE(saved.value("viewportAnchor").toMap().value("y").toDouble(),gapTop);
+        QCOMPARE(saved.value("offset").toDouble()/window->property("zoom").toDouble(),gapTop);
+        QVERIFY(QMetaObject::invokeMethod(card,"close"));QVERIFY(reader->aiRegionPaper().isEmpty());
+        QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));
+        const auto list=window->findChild<QQuickItem *>("pageList");QVERIFY(list);
+        const auto expectedClosed=reader->clampScroll(gapTop*window->property("zoom").toDouble(),reader->documentHeight()*window->property("zoom").toDouble(),list->height());
+        QVERIFY(qAbs(workspace.viewState(reader).value("offset").toDouble()-expectedClosed)<.01);
+        QVERIFY(QMetaObject::invokeMethod(card,"open"));QTRY_VERIFY_WITH_TIMEOUT(reader->aiRegionPaper().contains("rows") && !reader->aiRegionPaper().value("loading").toBool(),10000);
+        QTRY_VERIFY(!card->property("motionActive").toBool() && paperCard->y()>=-1 && paperCard->y()+paperCard->height()<=canvas->height()+1);
+        const auto paperSnapshot=qEnvironmentVariable("LYRA_READER_REGION_PAPER_SNAPSHOT");if(!paperSnapshot.isEmpty()){QTest::qWait(100);QVERIFY(window->grabWindow().save(paperSnapshot));}
         QVERIFY2(qAbs(crop->property("width").toDouble()/crop->property("height").toDouble()-double(picture.width())/picture.height())<.001,"The captured area must keep its pixel aspect ratio in the bounded preview");
         window->setProperty("paperAppearance","night");QCOMPARE(reader->aiRegion().value("image_png"),attachment.value("image_png"));QCOMPARE(crop->property("paperAppearance").toString(),QString("original"));
         QSignalSpy imageChanges(reader,&ReaderController::aiRegionImageChanged);const auto imageUrl=reader->aiRegionImage();
@@ -1733,12 +1789,12 @@ private slots:
         const auto textPlan=reader->aiState().value("plan").toMap();const auto textBody=textPlan.value("parts").toList().first().toMap().value("wire_body").toString();QVERIFY(!textBody.contains("data:image/png"));QVERIFY(textBody.contains("quick brown fox"));
         window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","region-audit-synthetic-model"},{"imageInput",true}});QVERIFY(!reader->startAi("local",textPlan));
         QVERIFY(QMetaObject::invokeMethod(card,"prepare"));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("plan").toMap().isEmpty(),10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
-        const auto plan=reader->aiState().value("plan").toMap();const auto body=plan.value("parts").toList().first().toMap().value("wire_body").toString();QVERIFY(body.contains("data:image/png;base64,"+attachment.value("image_png").toString()));QCOMPARE(server.requests.size(),0);
+        const auto plan=reader->aiState().value("plan").toMap();const auto body=plan.value("parts").toList().first().toMap().value("wire_body").toString();QVERIFY(body.contains("data:image/png;base64,"+attachment.value("image_png").toString()));QVERIFY(!body.contains("paper_plan"));QCOMPARE(server.requests.size(),0);
         auto *payload=window->findChild<QObject *>("aiRegionPayload"),*displayedPayload=window->findChild<QObject *>("aiRegionDisplayedPayload");QVERIFY(payload && displayedPayload);QVERIFY(displayedPayload->property("text").toString().isEmpty());
         QVERIFY(QMetaObject::invokeMethod(payload,"open"));QTRY_VERIFY(payload->property("visible").toBool());QVERIFY(displayedPayload->property("text").toString().contains("Captured PNG bytes"));QVERIFY(!displayedPayload->property("text").toString().contains(attachment.value("image_png").toString()));QCOMPARE(payload->property("snapshot").toMap().value("parts").toList().first().toMap().value("wire_body").toString(),body);
         QVERIFY(QMetaObject::invokeMethod(payload,"close"));QTRY_VERIFY(!payload->property("visible").toBool());QVERIFY(displayedPayload->property("text").toString().isEmpty());
         const auto snapshots=qEnvironmentVariable("LYRA_READER_REGION_SNAPSHOT");if(!snapshots.isEmpty()){QTest::qWait(100);QVERIFY(window->grabWindow().save(snapshots));}
-        auto *send=window->findChild<QQuickItem *>("sendAiRegion");QVERIFY(send && send->isEnabled());QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,send->mapToScene(QPointF(send->width()/2,send->height()/2)).toPoint());
+        auto *send=window->findChild<QQuickItem *>("sendAiRegion");QVERIFY(send && send->isEnabled());QVERIFY(settleRegionControl(window,paperCard,send,reader));QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,send->mapToScene(QPointF(send->width()/2,send->height()/2)).toPoint());
         QTRY_COMPARE_WITH_TIMEOUT(server.requests.size(),2,10000);const auto raw=server.requests.first();QCOMPARE(raw.mid(raw.indexOf("\r\n\r\n")+4),body.toUtf8());
         auto fallback=QJsonDocument::fromJson(body.toUtf8()).object();fallback.remove("stream_options");const auto retry=server.requests[1];QCOMPARE(QJsonDocument::fromJson(retry.mid(retry.indexOf("\r\n\r\n")+4)).object(),fallback);
         QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QVERIFY(reader->aiState().value("output").toString().contains("Synthetic area answer"));
@@ -1753,8 +1809,8 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QCOMPARE(auditRows().size(),initialAuditCount+2);
         QCOMPARE(auditRows().at(initialAuditCount).value("http_status").toInt(),400);QCOMPARE(auditRows().at(initialAuditCount).value("outcome").toString(),QString("failed"));QCOMPARE(auditRows().last().value("outcome").toString(),QString("sent"));
         reader->setAiRegionQuestion("Second synthetic area question never logged");QVERIFY(QMetaObject::invokeMethod(card,"prepare"));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("plan").toMap().isEmpty(),10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
-        QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,send->mapToScene(QPointF(send->width()/2,send->height()/2)).toPoint());QTRY_COMPARE_WITH_TIMEOUT(server.requests.size(),3,10000);QTRY_VERIFY(reader->aiState().value("output").toString().contains("partial area answer"));
-        auto *stop=window->findChild<QQuickItem *>("stopAiRegion");QVERIFY(stop && stop->isVisible());QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,stop->mapToScene(QPointF(stop->width()/2,stop->height()/2)).toPoint());QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(settleRegionControl(window,paperCard,send,reader));QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,send->mapToScene(QPointF(send->width()/2,send->height()/2)).toPoint());QTRY_COMPARE_WITH_TIMEOUT(server.requests.size(),3,10000);QTRY_VERIFY(reader->aiState().value("output").toString().contains("partial area answer"));
+        auto *stop=window->findChild<QQuickItem *>("stopAiRegion");QVERIFY(stop && stop->isVisible());QTRY_COMPARE_WITH_TIMEOUT(reader->aiRegionPaper().value("card").toMap().value("gap_pt").toDouble()*window->property("zoom").toDouble(),paperCard->height(),10000);QTRY_VERIFY(paperCard->parentItem()->contains(stop->mapToItem(paperCard->parentItem(),QPointF(0,0))) && paperCard->parentItem()->contains(stop->mapToItem(paperCard->parentItem(),QPointF(stop->width(),stop->height()))));QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,stop->mapToScene(QPointF(stop->width()/2,stop->height()/2)).toPoint());QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
         QCOMPARE(auditRows().size(),initialAuditCount+3);QCOMPARE(auditRows().last().value("outcome").toString(),QString("cancelled"));
         QFile audit(auditPath);QVERIFY(audit.open(QIODevice::ReadOnly));const auto auditBytes=audit.readAll();QVERIFY(!auditBytes.contains("quick brown fox"));QVERIFY(!auditBytes.contains("Second synthetic"));QVERIFY(!auditBytes.contains(attachment.value("image_png").toByteArray()));QVERIFY(!auditBytes.contains("area.pdf"));
         audit.close();const auto restoreAudit=qScopeGuard([&]{QSaveFile restored(auditPath);if(restored.open(QIODevice::WriteOnly)){restored.write(auditBytes);restored.commit();}});
@@ -1769,8 +1825,213 @@ private slots:
 
         QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",220},{"height",440}},1));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiRegion().value("image_png").toString().isEmpty(),10000);QTRY_COMPARE_WITH_TIMEOUT(crop->property("status").toInt(),1,10000);QVERIFY(qAbs(crop->property("width").toDouble()/crop->property("height").toDouble()-.5)<.001);
         window->setProperty("textViewVisible",true);auto *readable=visualItem(window->contentItem(),"accessiblePageText");QVERIFY(readable);QTRY_VERIFY(readable->isVisible());
-        QVERIFY(QMetaObject::invokeMethod(card,"close"));QTRY_VERIFY(readable->hasActiveFocus());QCOMPARE(server.requests.size(),3);
+        QVERIFY(QMetaObject::invokeMethod(card,"close"));QTRY_VERIFY(readable->hasActiveFocus());QVERIFY(reader->aiRegionPaper().isEmpty());QVERIFY(!card->property("opened").toBool());QCOMPARE(server.requests.size(),3);
         QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),original);
+    }
+    void regionPaperUnfoldClipsNativeTextAndHoldsRasterDemand_data() {
+        QTest::addColumn<double>("zoom");QTest::newRow("page")<<1.0;QTest::newRow("tiles")<<3.0;
+    }
+    void regionPaperUnfoldClipsNativeTextAndHoldsRasterDemand() {
+        QFETCH(double,zoom);
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("paper-unfold.pdf");
+        {QPdfWriter writer(path);writer.setResolution(72);writer.setPageSize(QPageSize(QSizeF(595,842),QPageSize::Point));writer.setPageMargins(QMarginsF(0,0,0,0),QPageLayout::Point);
+            QPainter paint(&writer);QVERIFY(paint.isActive());paint.setPen(Qt::black);
+            for(int i=0;i<3;++i){if(i)QVERIFY(writer.newPage());paint.drawText(QPointF(60,90),QString("PUBLIC_MOTION_PAGE_%1").arg(i+1));paint.drawText(QPointF(60,260),QString("PUBLIC_BELOW_CUT_%1").arg(i+1));}QVERIFY(paint.end());}
+        QFile file(path);QVERIFY(file.open(QIODevice::ReadOnly));const auto original=file.readAll();file.close();
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;const auto previousMotion=window->property("reduceMotion");auto restoreMotion=qScopeGuard([&]{window->setProperty("reduceMotion",previousMotion);});window->setProperty("reduceMotion",false);
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==3 && !reader->loading() && reader->pendingCommands()==0 && !window->property("positionRestoring").toBool());
+        window->setProperty("secondaryRow","lyra");QVERIFY(settleReaderViewport(window));
+        QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,zoom),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+        reader->requestText(0);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",420},{"height",180}},1));
+        QTRY_VERIFY_WITH_TIMEOUT(reader->aiRegion().contains("image_png"),10000);
+        auto *page=qobject_cast<PageItem *>(visualItem(window->contentItem(),"pdfPage0"));QVERIFY(page);
+        QTRY_VERIFY_WITH_TIMEOUT(page->refined(),10000);QCOMPARE(page->rasterScale(),zoom);
+        QVERIFY(settleRasterWork(reader));if(zoom>1)QVERIFY(page->loadedTileCount()>0);
+        const auto enqueued=[] {const auto stats=RasterJobs::statistics();return stats.value("completed").toLongLong()+stats.value("running").toLongLong()+stats.value("queued").toLongLong();};
+        auto *card=window->findChild<QQuickItem *>("aiRegionCard");auto *body=window->findChild<QQuickItem *>("aiRegionBody");auto *question=window->findChild<QQuickItem *>("aiRegionQuestion");QVERIFY(card && body && question);
+        const auto font=question->property("font");
+        window->setProperty("secondaryRow","lyra");QVERIFY(QMetaObject::invokeMethod(card,"open"));
+        QTRY_VERIFY_WITH_TIMEOUT(reader->aiRegionPaper().contains("rows") && card->property("motionActive").toBool(),10000);
+        QTRY_VERIFY_WITH_TIMEOUT(card->property("revealProgress").toDouble()>0,10000);
+        auto *crop=window->findChild<QObject *>("aiRegionImage");QVERIFY(crop);
+        QTRY_COMPARE_WITH_TIMEOUT(crop->property("status").toInt(),1,10000);
+        // A single PNG decode belongs to opening the card, not to its geometry frames.
+        auto *animation=window->findChild<QObject *>("paperRevealMotion");QVERIFY(animation);QCOMPARE(animation->property("duration").toInt(),220);
+        QVERIFY(QMetaObject::invokeMethod(animation,"pause"));QVERIFY(card->property("motionActive").toBool());
+        const auto before=enqueued();const auto plans=reader->tilePlanBatches();
+        // Hold representative geometry frames longer than the normal demand debounce.
+        // A stalled/slow animation must not accidentally schedule PDF work either.
+        for(const double progress:{.25,.5,.75}) {
+            card->setProperty("revealProgress",progress);QTest::qWait(60);
+            QVERIFY(page->rasterDemandPaused());QCOMPARE(enqueued(),before);QCOMPARE(reader->tilePlanBatches(),plans);
+            QCOMPARE(question->property("font"),font);QCOMPARE(body->height(),card->property("fullHeight").toDouble());
+            QVERIFY(qAbs(card->height()-body->height()*progress)<.01);
+            if(progress==.5) {
+                QObject otherSurface;auto dropSurface=qScopeGuard([&]{RenderBudget::instance()->setClient(&otherSurface,0);});
+                RenderBudget::instance()->setClient(&otherSurface,20);QTest::qWait(90);
+                QCOMPARE(enqueued(),before);QCOMPARE(reader->tilePlanBatches(),plans);
+                RenderBudget::instance()->setClient(&otherSurface,0);QTest::qWait(90);
+                QCOMPARE(enqueued(),before);QCOMPARE(reader->tilePlanBatches(),plans);
+            }
+            QVERIFY2(card->y()>=-.01 && card->y()+card->height()<=card->parentItem()->height()+.01,"The revealed native card must remain inside the viewport.");
+            const auto evidence=qEnvironmentVariable("LYRA_READER_REVEAL_EVIDENCE_DIR");
+            if(!evidence.isEmpty()){QVERIFY(QDir().mkpath(evidence));QVERIFY(window->grabWindow().save(evidence+QString("/unfold-z%1-p%2.png").arg(int(zoom*100)).arg(int(progress*100))));}
+        }
+        QVERIFY(QMetaObject::invokeMethod(animation,"resume"));
+        int openingFrames=0;const auto sourcePages=reader->pages();QElapsedTimer limit;limit.start();
+        while(card->property("motionActive").toBool() && limit.elapsed()<3000) {
+            const double progress=card->property("revealProgress").toDouble();
+            if(progress>0 && progress<1) {
+                ++openingFrames;QVERIFY(card->clip());QVERIFY(page->rasterDemandPaused());
+                QVERIFY(qAbs(card->height()-body->height()*progress)<.01);QCOMPARE(question->property("font"),font);
+                QCOMPARE(body->height(),card->property("fullHeight").toDouble());QCOMPARE(enqueued(),before);QCOMPARE(reader->tilePlanBatches(),plans);
+                QVERIFY(page->paperLayout());QVERIFY(qAbs(page->paperLayout()->gap-reader->aiRegionPaper().value("card").toMap().value("gap_pt").toDouble()*progress)<.01);
+            }
+            QTest::qWait(16);
+        }
+        QVERIFY(openingFrames>=2);QVERIFY(!card->property("motionActive").toBool());QVERIFY(!page->rasterDemandPaused());
+        QCOMPARE(card->height(),body->height());QCOMPARE(reader->pages(),sourcePages);
+        QVERIFY(settleRasterWork(reader));
+        const auto gapTop=reader->aiRegionPaper().value("gap_top").toDouble();
+        QVERIFY(QMetaObject::invokeMethod(card->parentItem(),"positionAnchor",Q_ARG(QVariant,QVariantMap({{"page",0},{"y",gapTop+80/zoom}})),Q_ARG(QVariant,0)));
+        QTRY_VERIFY(qAbs(card->y()+80)<1.01);QVERIFY(settleRasterWork(reader));
+        const auto closingBottom=card->y()+card->height();const auto closingBefore=enqueued();const auto closingPlans=reader->tilePlanBatches();
+        QVERIFY(QMetaObject::invokeMethod(card,"closeAnimated"));QVERIFY(QMetaObject::invokeMethod(animation,"pause"));
+        // Read settled geometry rather than the interval between animation publication
+        // and the queued scroll adjustment, which can span separate native callbacks.
+        for(const double progress:{.99,.9,.75,.5,.25}) {
+            card->setProperty("revealProgress",progress);QTest::qWait(60);
+            const auto endBound=gapTop*zoom+card->parentItem()->height()-(reader->documentHeight()*zoom+card->height());
+            const auto expectedY=qMax(qMin(0.0,closingBottom-card->height()),endBound);
+            QVERIFY2(qAbs(card->y()-expectedY)<1.01,qPrintable(QString("Closing gap anchor moved %1 -> %2").arg(expectedY).arg(card->y())));
+            QCOMPARE(enqueued(),closingBefore);QCOMPARE(reader->tilePlanBatches(),closingPlans);
+        }
+        QVERIFY(QMetaObject::invokeMethod(animation,"resume"));int closingFrames=0;limit.restart();
+        while(card->property("opened").toBool() && limit.elapsed()<3000) {
+            const double progress=card->property("revealProgress").toDouble();
+            if(progress>0 && progress<1) {
+                ++closingFrames;QVERIFY(page->rasterDemandPaused());QCOMPARE(enqueued(),closingBefore);QCOMPARE(reader->tilePlanBatches(),closingPlans);
+                QCOMPARE(body->height(),card->property("fullHeight").toDouble());QCOMPARE(question->property("font"),font);
+                QVERIFY(qAbs(card->height()-body->height()*progress)<.01);
+            }
+            QTest::qWait(16);
+        }
+        QVERIFY(closingFrames>=2);QVERIFY(!card->property("opened").toBool());QVERIFY(reader->aiRegionPaper().isEmpty());QVERIFY(!page->rasterDemandPaused());
+        window->setProperty("reduceMotion",true);QVERIFY(QMetaObject::invokeMethod(card,"open"));
+        QTRY_VERIFY_WITH_TIMEOUT(reader->aiRegionPaper().contains("rows") && !card->property("needsReveal").toBool(),10000);
+        QCOMPARE(card->property("revealProgress").toDouble(),1.0);QVERIFY(!card->property("motionActive").toBool());QCOMPARE(card->height(),body->height());
+        QVERIFY(QMetaObject::invokeMethod(card,"closeAnimated"));QVERIFY(!card->property("opened").toBool());QVERIFY(reader->aiRegionPaper().isEmpty());
+        reader->clearAiRegion();QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),original);
+    }
+    void regionPaperMotionsFinishOnReopenNavigationAndDocumentChanges() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("motion-cancel.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;const auto oldMotion=window->property("reduceMotion");auto restore=qScopeGuard([&]{window->setProperty("reduceMotion",oldMotion);});window->setProperty("reduceMotion",false);
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && reader->pendingCommands()==0 && !window->property("positionRestoring").toBool());
+        window->setProperty("secondaryRow","lyra");QVERIFY(settleReaderViewport(window));
+        reader->requestText(0);QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",420},{"height",180}},1));QTRY_VERIFY_WITH_TIMEOUT(reader->aiRegion().contains("image_png"),10000);
+        auto *card=window->findChild<QQuickItem *>("aiRegionCard");QVERIFY(card);window->setProperty("secondaryRow","lyra");
+        const auto openMoving=[&] {return QMetaObject::invokeMethod(card,"open");};
+        QVERIFY(openMoving());QTRY_VERIFY(card->property("revealProgress").toDouble()>0 && card->property("revealProgress").toDouble()<1);
+        view.workspace.newTab();QVERIFY(!card->property("opened").toBool());QVERIFY(reader->aiRegionPaper().isEmpty());QTest::qWait(260);QVERIFY(!card->property("opened").toBool());QVERIFY(view.workspace.activeReader()!=reader);
+        view.workspace.selectTab(0);QTRY_COMPARE(window->property("currentReader").value<QObject *>(),reader);QVERIFY(openMoving());
+        QTRY_VERIFY(card->property("revealProgress").toDouble()>0 && card->property("revealProgress").toDouble()<1);
+        window->setProperty("reduceMotion",true);QVERIFY(!card->property("motionActive").toBool());QCOMPARE(card->property("revealProgress").toDouble(),1.0);
+        QVERIFY(QMetaObject::invokeMethod(card,"close"));window->setProperty("reduceMotion",false);QVERIFY(openMoving());
+        QTRY_VERIFY(card->property("revealProgress").toDouble()>0 && card->property("revealProgress").toDouble()<1);
+        QVERIFY(QMetaObject::invokeMethod(card,"closeAnimated"));QVERIFY(card->property("closing").toBool());QVERIFY(openMoving());
+        QTRY_VERIFY(!card->property("motionActive").toBool());QTest::qWait(260);QVERIFY(card->property("opened").toBool());QVERIFY(!card->property("closing").toBool());
+        QVERIFY(QMetaObject::invokeMethod(card,"close"));QVERIFY(openMoving());QTRY_VERIFY(card->property("motionActive").toBool() && reader->aiRegionPaper().contains("rows"));
+        QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,0),Q_ARG(QVariant,100)));QVERIFY(!card->property("motionActive").toBool());QCOMPARE(card->property("revealProgress").toDouble(),1.0);
+        QVERIFY(QMetaObject::invokeMethod(card,"close"));QVERIFY(openMoving());QTRY_VERIFY(card->property("motionActive").toBool() && reader->aiRegionPaper().contains("rows"));
+        window->hide();QVERIFY(!card->property("motionActive").toBool());window->show();QVERIFY(QMetaObject::invokeMethod(card,"close"));QVERIFY(openMoving());
+        QTRY_VERIFY(card->property("motionActive").toBool() && reader->aiRegionPaper().contains("rows"));reader->openFile(QUrl::fromLocalFile(path));
+        QTRY_VERIFY(!reader->loading() && reader->pendingCommands()==0);QVERIFY(!card->property("opened").toBool());QVERIFY(reader->aiRegionPaper().isEmpty());QTest::qWait(260);QVERIFY(reader->aiRegionPaper().isEmpty());
+        QTRY_COMPARE(reader->pendingRasters(),0);QVERIFY(QMetaObject::invokeMethod(window,"armRegion",Q_ARG(QVariant,false)));
+        const auto used=RenderBudget::statistics().value("residentBytes").toLongLong();
+        auto pressure=RenderBudget::reserve(RenderBudget::Kind::Resident,RenderBudget::residentLimit-used);QVERIFY(pressure);
+        QVERIFY(QMetaObject::invokeMethod(window,"finishRegionSelection",Q_ARG(QVariant,0),Q_ARG(QVariant,QVariantMap({{"x",60},{"y",55},{"width",420},{"height",180}}))));
+        QVERIFY(reader->aiRegion().contains("error"));QVERIFY(!reader->aiRegion().contains("image_png"));
+        QTRY_VERIFY(card->property("opened").toBool() && card->height()>0 && !card->property("motionActive").toBool());
+        QVERIFY(QMetaObject::invokeMethod(card,"close"));pressure.reset();reader->clearAiRegion();
+    }
+    void regionPaperKeepsUnequalRowsDraftsAndDistantReadingAnchors_data() {
+        QTest::addColumn<QString>("mode");QTest::addColumn<int>("ownerPage");QTest::addColumn<bool>("foot");
+        QTest::newRow("continuous-tear")<<QString("Continuous")<<7<<false;
+        QTest::newRow("facing-left-tear")<<QString("Facing")<<7<<false;
+        QTest::newRow("facing-right-tear")<<QString("Facing")<<8<<false;
+        QTest::newRow("facing-left-foot")<<QString("Facing")<<7<<true;
+        QTest::newRow("facing-right-foot")<<QString("Facing")<<8<<true;
+        QTest::newRow("last-page-foot")<<QString("Continuous")<<11<<true;
+    }
+    void regionPaperKeepsUnequalRowsDraftsAndDistantReadingAnchors() {
+        QFETCH(QString,mode);QFETCH(int,ownerPage);QFETCH(bool,foot);
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("paper-navigation.pdf");
+        {QPdfWriter pdf(path);pdf.setResolution(72);pdf.setPageMargins(QMarginsF(0,0,0,0));
+            QPainter painter;for(int page=0;page<12;++page){
+                const auto height=page%3==0?640:page%3==1?760:900;
+                pdf.setPageSize(QPageSize(QSizeF(400+50*(page%3),height),QPageSize::Point));
+                if(page)QVERIFY(pdf.newPage());else QVERIFY(painter.begin(&pdf));
+                painter.fillRect(QRectF(0,0,500,height),Qt::white);painter.setPen(Qt::black);painter.setFont(QFont("DejaVu Sans",13));
+                painter.drawText(QPointF(40,90),QString("PUBLIC_PAPER_PAGE_%1").arg(page+1));
+                painter.fillRect(QRectF(40,300,220,100),QColor("#88611B"));
+                painter.drawText(QPointF(40,height-50),QString("PUBLIC_BOTTOM_%1").arg(page+1));
+            }QVERIFY(painter.end());}
+        QFile file(path);QVERIFY(file.open(QIODevice::ReadOnly));const auto original=file.readAll();file.close();
+        MockChatServer server;QVERIFY(server.listen());NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==12 && !reader->loading() && reader->pendingCommands()==0 && !window->property("positionRestoring").toBool());
+        QVERIFY(QMetaObject::invokeMethod(window,"setPageLayout",Q_ARG(QVariant,mode)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,1.0),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+        const auto navigate=[&](int page,double y){return QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,page),Q_ARG(QVariant,y));};
+        QVERIFY(navigate(ownerPage,0));QTRY_VERIFY(visualItem(window->contentItem(),"pdfPage"+QString::number(ownerPage)));
+        reader->requestText(ownerPage);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto sourcePages=reader->pages(),sourceRows=reader->layoutRows();QPointer<QQuickItem> originalPage=visualItem(window->contentItem(),"pdfPage"+QString::number(ownerPage));
+        window->setProperty("secondaryRow","lyra");window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","public-paper-model"}});
+        const QVariantMap rect{{"x",40},{"y",foot?300:70},{"width",220},{"height",foot?100:70}};
+        QVERIFY(reader->captureAiRegion(ownerPage,rect,1));QTRY_VERIFY_WITH_TIMEOUT(reader->aiRegion().contains("image_png"),10000);
+        auto *card=window->findChild<QObject *>("aiRegionCard");QVERIFY(card);QVERIFY(QMetaObject::invokeMethod(card,"open"));
+        QTRY_VERIFY_WITH_TIMEOUT(reader->aiRegionPaper().contains("rows") && !reader->aiRegionPaper().value("loading").toBool() && !card->property("needsReveal").toBool(),10000);
+        const auto plan=reader->aiRegionPaper();const auto geometry=plan.value("card").toMap();QCOMPARE(geometry.value("split_pt").isNull(),foot);
+        QCOMPARE(reader->pages(),sourcePages);QCOMPARE(reader->layoutRows(),sourceRows);QVERIFY(originalPage);QCOMPARE(visualItem(window->contentItem(),"pdfPage"+QString::number(ownerPage)),originalPage.data());
+        if(mode=="Facing") {
+            const int mate=ownerPage%2?ownerPage+1:ownerPage-1;const auto source=sourcePages[mate].toMap();
+            QVERIFY(source.value("height")!=sourcePages[ownerPage].toMap().value("height"));
+            auto *item=visualItem(window->contentItem(),"pdfPage"+QString::number(mate));QVERIFY(item);
+            QCOMPARE(item->height(),source.value("height").toDouble()*window->property("zoom").toDouble());
+        }
+        QPointer<QQuickItem> question=window->findChild<QQuickItem *>("aiRegionQuestion");QVERIFY(question);question->forceActiveFocus();for(const char letter:QByteArray("draft retained"))QTest::keyClick(window,letter);
+        QTRY_COMPARE(reader->aiRegion().value("question").toString(),QString("draft retained"));const auto captureId=reader->aiRegion().value("history_id");
+        QVERIFY(navigate(0,0));QTest::qWait(80);QVERIFY(card->property("opened").toBool());QVERIFY(question);QCOMPARE(question->property("text").toString(),QString("draft retained"));
+        QVERIFY(navigate(ownerPage,0));QVERIFY(QMetaObject::invokeMethod(card,"open"));QTRY_VERIFY(!card->property("needsReveal").toBool());QVERIFY(question);QCOMPARE(reader->aiRegion().value("history_id"),captureId);
+        auto *paperCard=qobject_cast<QQuickItem *>(card);QVERIFY(paperCard);auto *canvas=paperCard->parentItem();
+        canvas->forceActiveFocus();QTRY_VERIFY(!question->hasActiveFocus());QTest::qWait(30);
+        const auto currentPlan=reader->aiRegionPaper();const auto ownerRow=currentPlan.value("card_row").toInt();const auto gapLocal=currentPlan.value("gap_top").toDouble()-currentPlan.value("rows").toList()[ownerRow].toMap().value("top").toDouble();
+        QVERIFY(QMetaObject::invokeMethod(canvas,"positionAnchor",Q_ARG(QVariant,QVariantMap({{"page",ownerPage},{"y",gapLocal+90}})),Q_ARG(QVariant,0)));
+        const double cardPoint=200;
+        QTRY_VERIFY_WITH_TIMEOUT(paperCard->y()+cardPoint>0 && paperCard->y()+cardPoint<canvas->height(),3000);
+        const double viewY=paperCard->y()+cardPoint;
+        for(const double zoom:{1.35,.9,1.0}) {
+            if(zoom==.9){question->forceActiveFocus();QTRY_VERIFY(question->hasActiveFocus());}
+            QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,zoom),Q_ARG(QVariant,paperCard->x()+paperCard->width()*.4),Q_ARG(QVariant,viewY)));
+            QTRY_VERIFY_WITH_TIMEOUT(!reader->aiRegionPaper().value("loading").toBool() && qAbs(reader->aiRegionPaper().value("card").toMap().value("gap_pt").toDouble()*window->property("zoom").toDouble()-paperCard->height())<.01,10000);
+            QTRY_VERIFY2_WITH_TIMEOUT(qAbs(paperCard->y()+cardPoint-viewY)<.1,qPrintable(QString("zoom=%1 expectedY=%2 actualY=%3 height=%4").arg(zoom).arg(viewY).arg(paperCard->y()+cardPoint).arg(paperCard->height())),3000);
+            QVERIFY(question);QCOMPARE(question->property("text").toString(),QString("draft retained"));
+        }
+        const int destination=ownerPage<10?10:2;
+        QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,1.15),Q_ARG(QVariant,paperCard->x()+paperCard->width()*.4),Q_ARG(QVariant,viewY)));
+        QVERIFY(navigate(destination,80));QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));const auto navigated=view.workspace.viewState(reader);
+        QTRY_VERIFY_WITH_TIMEOUT(!reader->aiRegionPaper().value("loading").toBool() && qAbs(reader->aiRegionPaper().value("card").toMap().value("gap_pt").toDouble()*window->property("zoom").toDouble()-paperCard->height())<.01,10000);
+        QTest::qWait(30);QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));const auto before=view.workspace.viewState(reader);
+        QCOMPARE(before.value("viewportAnchor").toMap().value("page"),navigated.value("viewportAnchor").toMap().value("page"));
+        // ListView rounds recreated row origins to view pixels at fractional zoom.
+        QVERIFY2(qAbs(before.value("viewportAnchor").toMap().value("y").toDouble()-navigated.value("viewportAnchor").toMap().value("y").toDouble())<1.01/window->property("zoom").toDouble(),qPrintable(QString("navigation anchor moved %1 -> %2").arg(navigated.value("viewportAnchor").toMap().value("y").toDouble()).arg(before.value("viewportAnchor").toMap().value("y").toDouble())));
+        QVERIFY(QMetaObject::invokeMethod(card,"close"));QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));const auto after=view.workspace.viewState(reader);
+        QVERIFY2(qAbs(before.value("offset").toDouble()-after.value("offset").toDouble())<1.01,qPrintable(QString("source offset moved %1 -> %2").arg(before.value("offset").toDouble()).arg(after.value("offset").toDouble())));
+        QCOMPARE(reader->pages(),sourcePages);QCOMPARE(reader->layoutRows(),sourceRows);QCOMPARE(server.requests.size(),0);
+        reader->clearAiRegion();QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),original);
     }
     void savedRegionNotesRetainCapturesLateDraftsAndKnowledgeAcrossReopen() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/reading-notes.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
@@ -1840,6 +2101,60 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QTRY_COMPARE_WITH_TIMEOUT(RasterJobs::statistics().value("queued").toInt(),0,10000);QTest::qWait(80);QVERIFY(reader.aiRegion().isEmpty());
         QTRY_COMPARE_WITH_TIMEOUT(RenderBudget::statistics().value("residentBytes").toLongLong(),before,10000);
         QVERIFY(reader.captureAiRegion(0,{{"x",0},{"y",0},{"width",1000000},{"height",1000000}},1));QTRY_VERIFY_WITH_TIMEOUT(reader.aiRegion().contains("error"),10000);QVERIFY(!reader.aiRegion().contains("image_png"));
+    }
+    void regionPaperStateKeepsSourceRowsAndRejectsLatePlans() {
+        QTemporaryDir temp;QVERIFY(temp.isValid());const auto path=temp.filePath("region-paper.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        QFile file(path);QVERIFY(file.open(QIODevice::ReadOnly));const auto bytes=file.readAll();file.close();
+        ReaderController reader;reader.openFile(QUrl::fromLocalFile(path));
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        reader.requestText(0);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QVERIFY(reader.textPages().contains("0"));
+        const auto pages=reader.pages(),rows=reader.layoutRows();const auto height=reader.documentHeight();
+        QVERIFY(reader.captureAiRegion(0,{{"x",60},{"y",55},{"width",420},{"height",180}},1));
+        QTRY_VERIFY_WITH_TIMEOUT(reader.aiRegion().contains("image_png"),10000);
+        const auto capturePng=reader.aiRegion().value("image_png");
+        const auto rasterCount=reader.completedRasters();
+        const auto id=reader.aiRegion().value("history_id");const auto sha=reader.aiRegion().value("source_sha256");
+        const auto split=reader.aiRegion().value("paper_plan").toMap().value("split_pt");QVERIFY(!split.isNull());QVERIFY(split.toDouble()>=235);
+        reader.configureAiRegionPaper("Continuous",std::numeric_limits<double>::quiet_NaN(),50);QVERIFY(reader.aiRegionPaper().contains("error"));
+        reader.configureAiRegionPaper("Continuous",12.75,-1);QVERIFY(reader.aiRegionPaper().contains("error"));
+        reader.configureAiRegionPaper("Continuous",12.75,150.25);
+        reader.configureAiRegionPaper("Continuous",12.75,150.25); // A repeated in-flight request must not invalidate itself.
+        QTRY_VERIFY_WITH_TIMEOUT(reader.aiRegionPaper().contains("rows") && !reader.aiRegionPaper().value("loading").toBool(),10000);
+        QCOMPARE(reader.aiRegionPaper().value("height").toDouble(),height+150.25);
+        QCOMPARE(reader.aiRegionPaper().value("id"),id);QCOMPARE(reader.aiRegionPaper().value("source_sha256"),sha);
+        const auto gapTop=reader.aiRegionPaper().value("gap_top").toDouble();
+        QCOMPARE(reader.unshiftedPaperScroll(gapTop+50),gapTop);
+        QCOMPARE(reader.unshiftedPaperScroll(gapTop+150.25+20),gapTop+20);
+        QCOMPARE(reader.unshiftedPaperScroll(gapTop+75.125+20,.5),gapTop+20);
+        QCOMPARE(reader.shiftedPaperScroll(gapTop+20,.5),gapTop+95.125);
+        QCOMPARE(reader.shiftedPaperScroll(gapTop+20,0),gapTop+20);
+        QVERIFY(std::isnan(reader.unshiftedPaperScroll(gapTop,-.1)));
+        QVERIFY(std::isnan(reader.shiftedPaperScroll(gapTop,1.1)));
+        QVERIFY(std::isnan(reader.shiftedPaperScroll(gapTop,qQNaN())));
+        QVERIFY(std::isnan(reader.unshiftedPaperScroll(-1)));
+        QCOMPARE(reader.pages(),pages);QCOMPARE(reader.layoutRows(),rows);QCOMPARE(reader.documentHeight(),height);
+        QCOMPARE(reader.aiRegion().value("image_png"),capturePng);QCOMPARE(reader.completedRasters(),rasterCount);
+        QTRY_COMPARE_WITH_TIMEOUT(reader.findChildren<QFutureWatcherBase *>().size(),0,10000);
+        auto *pool=QThreadPool::globalInstance();const auto oldLimit=pool->maxThreadCount();pool->setMaxThreadCount(1);
+        QSemaphore entered,release;auto held=QtConcurrent::run([&]{entered.release();release.acquire();});
+        auto restore=qScopeGuard([&]{release.release();pool->setMaxThreadCount(oldLimit);held.waitForFinished();});
+        QVERIFY(entered.tryAcquire(1,3000));
+        for(int gap=75;gap<139;++gap)reader.configureAiRegionPaper("Continuous",12.75,gap);
+        QCOMPARE(reader.findChildren<QFutureWatcherBase *>().size(),1); // One active job and one replaceable pending spec.
+        release.release();pool->setMaxThreadCount(oldLimit);held.waitForFinished();restore.dismiss();
+        QTRY_COMPARE_WITH_TIMEOUT(reader.aiRegionPaper().value("height").toDouble(),height+138,10000);
+        reader.configureAiRegionPaper("Facing",18,75);reader.configureAiRegionPaper("Continuous",12.75,25);
+        QVERIFY(QThreadPool::globalInstance()->waitForDone(10000));QCoreApplication::processEvents();
+        QTRY_COMPARE(reader.aiRegionPaper().value("height").toDouble(),height+25);
+        reader.configureAiRegionPaper("Continuous",12.75,95);reader.clearAiRegionPaper();
+        QVERIFY(QThreadPool::globalInstance()->waitForDone(10000));QCoreApplication::processEvents();QVERIFY(reader.aiRegionPaper().isEmpty());
+        reader.configureAiRegionPaper("Continuous",12.75,95);reader.setLayout("Facing",18);
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QVERIFY(QThreadPool::globalInstance()->waitForDone(10000));QCoreApplication::processEvents();QVERIFY(reader.aiRegionPaper().isEmpty());QVERIFY(reader.aiRegion().contains("image_png"));
+        reader.configureAiRegionPaper("Facing",18,95);reader.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));
+        QTRY_VERIFY_WITH_TIMEOUT(!reader.loading(),10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QVERIFY(QThreadPool::globalInstance()->waitForDone(10000));QCoreApplication::processEvents();QVERIFY(reader.aiRegionPaper().isEmpty());QVERIFY(reader.aiRegion().isEmpty());
+        QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),bytes);
     }
     void aiPreviewStreamingCancellationAndTabsUseTheRealLocalTransport() {
         MockChatServer server;QVERIFY2(server.listen(),"Loopback HTTP is required for this GUI check; no external service is contacted");
@@ -1989,7 +2304,7 @@ private slots:
             if(exposed)window->requestActivate();
             if(!exposed || !QTest::qWaitForWindowActive(window,2500)) {
                 QVERIFY(publish({{"schema",2},{"phase","preflight"},{"qt",qVersion()},{"platform",QGuiApplication::platformName()},
-                    {"requestedBackend",qEnvironmentVariable("QSG_RHI_BACKEND")},{"windowActive",window->isActive()},{"windowExposed",window->isExposed()},
+                    {"requestedBackend",graphicsBackend.isEmpty()?qEnvironmentVariable("QSG_RHI_BACKEND"):graphicsBackend},{"windowActive",window->isActive()},{"windowExposed",window->isExposed()},
                     {"interactivePresentationMeasured",false},{"inputBurstsAttempted",false},{"reason",exposed ? "Native window could not obtain keyboard focus; no interactive timing was attempted." : "Native window was not exposed within the preflight timeout; no interactive timing was attempted."}}));
                 QSKIP("Native window was not exposed or active; input bursts were not attempted. Diagnostic JSON was saved.");
             }
@@ -2043,7 +2358,7 @@ private slots:
             if(!focusMaintained || (native && trial>=2 && inputIntervals.isEmpty()))break;
         }
         sampler.stop();
-        QVariantMap report{{"schema",2},{"phase","bursts"},{"qt",qVersion()},{"platform",QGuiApplication::platformName()},{"graphicsApi",int(window->rendererInterface()->graphicsApi())},{"requestedBackend",qEnvironmentVariable("QSG_RHI_BACKEND")},
+        QVariantMap report{{"schema",2},{"phase","bursts"},{"qt",qVersion()},{"platform",QGuiApplication::platformName()},{"graphicsApi",int(window->rendererInterface()->graphicsApi())},{"requestedBackend",graphicsBackend.isEmpty()?qEnvironmentVariable("QSG_RHI_BACKEND"):graphicsBackend},
             {"architecture",QSysInfo::currentCpuArchitecture()},{"fixture",QFileInfo(input).fileName()},{"pages",reader.pageCount()},{"pageIndex",pageIndex},{"windowWidth",window->width()},{"windowHeight",window->height()},{"devicePixelRatio",window->effectiveDevicePixelRatio()},
             {"pdfOpenToTexturedFrameQueueMs",openMs},{"lastInputToTexturedFrameQueueMs",Performance::distribution(refinement)},{"lastInputToVisibleTextureFrameQueueMs",Performance::distribution(visibleRefinement)},{"synchronousZoomApplyMs",Performance::distribution(zoomApply)},{"synchronousPanNavigateApplyMs",Performance::distribution(navigationApply)},{"requestedSixteenMsEventPumpMs",Performance::distribution(eventPump)},{"duringInputFrameQueueIntervalsMs",Performance::distribution(inputIntervals)},
             {"trialsRequested",trials},{"trialsCompleted",refinement.size()},{"inputsPerBurst",12},{"targetInputIntervalMs",16},{"actualInputIntervalsMs",Performance::distribution(inputPacing)},{"inputBurstDurationMs",Performance::distribution(burstDurations)},{"percentileMethod","lower order statistic"},
@@ -2160,8 +2475,25 @@ private slots:
         LyraReaderTilePlanBatch empty{};LyraReaderBuffer error{};const auto retire=qScopeGuard([&]{lyra_reader_desktop_tile_plan_free(empty);lyra_reader_desktop_buffer_free(error);});
         QVERIFY(lyra_reader_desktop_plan_tiles(nullptr,0,&empty,&error));QCOMPARE(empty.len,std::size_t(0));QVERIFY(empty.plans==nullptr);QVERIFY(error.data==nullptr);
     }
+    void paperViewportMapsDisplayDemandWithoutDemandingConversationRows() {
+        ReaderController reader;reader.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        PageItem page;page.setController(&reader);page.setPageIndex(0);
+        const auto height=reader.pages().first().toMap().value("height").toDouble();
+        QVERIFY(page.configurePaper(height,200,80));const auto epoch=page.paperGeometryRevision();
+        auto mapped=page.paperViewport(QRectF(10,190,120,100),epoch);QVERIFY(mapped.value("hit").toBool());QCOMPARE(mapped.value("rect").toRectF(),QRectF(10,190,120,20));
+        mapped=page.paperViewport(QRectF(10,205,120,70),epoch);QVERIFY(!mapped.value("hit").toBool());QVERIFY(!mapped.contains("error"));
+        mapped=page.paperViewport(QRectF(10,280,120,20),epoch);QCOMPARE(mapped.value("rect").toRectF(),QRectF(10,200,120,20));
+        mapped=page.paperViewport(QRectF(10,-10,120,20),epoch);QCOMPARE(mapped.value("rect").toRectF(),QRectF(10,0,120,10));
+        QVERIFY(page.paperViewport(QRectF(0,qQNaN(),1,1),epoch).contains("error"));
+        QVERIFY(page.paperViewport(QRectF(0,0,-1,1),epoch).contains("error"));
+        QVERIFY(page.configurePaper(height,200,90));QVERIFY(page.paperViewport(QRectF(0,0,100,100),epoch).contains("error"));
+        page.clearPaperGeometry();mapped=page.paperViewport(QRectF(10,190,120,100),page.paperGeometryRevision());QCOMPARE(mapped.value("rect").toRectF(),QRectF(10,190,120,100));
+        QCOMPARE(reader.completedRasters(),qulonglong(0));QCOMPARE(reader.pendingRasters(),0);
+    }
     void nativePaperBatchPreservesPacketShapesAndRejectsPartialOutput() {
         static_assert(sizeof(LyraReaderPaperAxis)==16);
+        static_assert(sizeof(LyraReaderPaperBand)==24 && offsetof(LyraReaderPaperBand,top)==8);
         static_assert(sizeof(LyraReaderPaperRegion)==104);
         static_assert(sizeof(LyraReaderPaperSegments)==72 && sizeof(LyraReaderPaperPoint)==16);
         PageItem unowned;unowned.setSize(QSizeF(160,240));QVERIFY(unowned.paperEraserSegments(QPointF(10,10),QPointF(20,20)).contains("error"));
@@ -3623,6 +3955,7 @@ int main(int argc, char **argv) {
     QTemporaryDir documentCacheDirectory;
     if(!documentCacheDirectory.isValid())return 2;
     qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",documentCacheDirectory.path().toUtf8());
+    qputenv("LYRA_READER_INDEX_CACHE","disabled");
     QCoreApplication::setAttribute(Qt::AA_DontUseNativeDialogs);
     QApplication application(argc, argv);
     application.setQuitOnLastWindowClosed(false);
@@ -3640,7 +3973,15 @@ int main(int argc, char **argv) {
     checks.root = QDir(QString::fromLocal8Bit(argv[1])).absolutePath();
     // Remove the fixture root; preserve QTest's optional function/filter arguments.
     QList<char *> testArguments{argv[0]};
-    for(int i=2;i<argc;++i)testArguments.append(argv[i]);
+    for(int i=2;i<argc;++i) {
+        if(QByteArray(argv[i])!="--graphics"){testArguments.append(argv[i]);continue;}
+        if(!checks.graphicsBackend.isEmpty() || i+1>=argc){qCritical("Specify --graphics once, followed by auto, vulkan, opengl or software.");return 2;}
+        checks.graphicsBackend=QString::fromLocal8Bit(argv[++i]);
+        if(checks.graphicsBackend=="vulkan")QQuickWindow::setGraphicsApi(QSGRendererInterface::Vulkan);
+        else if(checks.graphicsBackend=="opengl")QQuickWindow::setGraphicsApi(QSGRendererInterface::OpenGL);
+        else if(checks.graphicsBackend=="software")QQuickWindow::setSceneGraphBackend(QStringLiteral("software"));
+        else if(checks.graphicsBackend!="auto"){qCritical("Unknown graphics backend. Use auto, vulkan, opengl or software.");return 2;}
+    }
     return QTest::qExec(&checks,int(testArguments.size()),testArguments.data());
 }
 #include "ReaderChecks.moc"

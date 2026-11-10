@@ -48,6 +48,37 @@ pub struct Axis {
     pub y: f64,
 }
 const _: () = assert!(std::mem::size_of::<Axis>() == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Band {
+    pub present: u32,
+    pub reserved: u32,
+    pub top: f64,
+    pub bottom: f64,
+}
+const _: () = assert!(std::mem::size_of::<Band>() == 24);
+
+pub fn band(layout: Layout, top: f64, bottom: f64) -> Result<Band, String> {
+    if !top.is_finite() || !bottom.is_finite() || bottom < top {
+        return Err("The paper viewport is invalid".into());
+    }
+    let mapped = PaperLayout::try_from(layout)?.paper_band(top, bottom);
+    Ok(match mapped {
+        Some((top, bottom)) => Band {
+            present: 1,
+            reserved: 0,
+            top,
+            bottom,
+        },
+        None => Band {
+            present: 0,
+            reserved: 0,
+            top: 0.0,
+            bottom: 0.0,
+        },
+    })
+}
 pub fn axis(layout: Layout, y: f64, direction: u32) -> Result<Axis, String> {
     if !y.is_finite() {
         return Err("Paper anchor is not finite".into());

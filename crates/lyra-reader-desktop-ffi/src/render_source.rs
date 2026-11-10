@@ -194,6 +194,8 @@ impl RenderSource {
                 )
             }
             "capture_region" => {
+                let geometry = crate::region::paper_geometry(&request)?;
+                let page = page()?;
                 let number = |key: &str| {
                     request["rect"][key]
                         .as_f64()
@@ -201,7 +203,8 @@ impl RenderSource {
                 };
                 crate::region::capture(
                     &self.engine,
-                    page()?,
+                    page,
+                    self.layout.placement(page).map(|page| page.height_pt),
                     Rect::new(
                         number("x")?,
                         number("y")?,
@@ -209,6 +212,8 @@ impl RenderSource {
                         number("height")?,
                     ),
                     request["zoom"].as_f64().ok_or("Missing region zoom")?,
+                    &geometry.indexed_regions,
+                    geometry.glyphs.as_deref(),
                 )
             }
             "info" => value(

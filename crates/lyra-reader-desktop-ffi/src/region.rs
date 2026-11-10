@@ -4,6 +4,7 @@ use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
 use lyra_reader_core::Rect;
 use lyra_reader_ffi::api::{AiPlanRequestRecord, AiRegionTextRecord, LyraReaderDocument};
 use lyra_reader_runtime::region::{self, MAXIMUM_PNG_BYTES};
+use lyra_reader_session::paper::{MAX_PAPER_GEOMETRY_ITEMS, TearFallback, plan_tear};
 use serde_json::{Value, json};
 use std::io::{self, Cursor, Write};
 
@@ -35,8 +36,11 @@ impl Write for BoundedPng {
 pub fn capture(
     document: &LyraReaderDocument,
     page: u32,
+    page_height: Option<f64>,
     rect: Rect,
     zoom: f64,
+    indexed_regions: &[Rect],
+    glyphs: Option<&[Rect]>,
 ) -> Result<Value, String> {
     let spec = region::capture_size(rect, zoom).map_err(|e| e.to_string())?;
     let bitmap = document
@@ -114,11 +118,131 @@ pub fn capture(
             ExtendedColorType::Rgba8,
         )
         .map_err(|e| e.to_string())?;
+    let paper_plan = placement(
+        page_height,
+        rect,
+        indexed_regions,
+        glyphs,
+        !text.text.trim().is_empty(),
+    );
     Ok(
         json!({"page":page,"x_pt":rect.origin.x,"y_pt":rect.origin.y,"width_pt":rect.size.width,"height_pt":rect.size.height,
         "source_sha256":document.document_identity().sha256,"text":text.text,"text_truncated":text.truncated,"text_warning":text_warning,"image_png":STANDARD.encode(&png.0),
-        "image_width_px":bitmap.width_px,"image_height_px":bitmap.height_px,"capture_scale":spec.scale}),
+        "image_width_px":bitmap.width_px,"image_height_px":bitmap.height_px,"capture_scale":spec.scale,"paper_plan":paper_plan}),
     )
+}
+
+/// Placement consumes only the caller's current page snapshot. Missing glyph geometry is
+/// an explicit row-foot fallback, never a reason to extract text again or finish an index.
+fn placement(
+    page_height: Option<f64>,
+    selection: Rect,
+    indexed_regions: &[Rect],
+    glyphs: Option<&[Rect]>,
+    selection_has_text: bool,
+) -> Value {
+    let Some(glyphs) = glyphs else {
+        return json!({"split_pt":null,"fallback":"unavailable_page_text","warning":null});
+    };
+    match page_height {
+        Some(height) => {
+            let plan = plan_tear(
+                height,
+                selection,
+                glyphs,
+                indexed_regions,
+                selection_has_text,
+            );
+            let fallback = plan.fallback.map(|reason| match reason {
+                TearFallback::UnknownPageGeometry => "unknown_page_geometry",
+                TearFallback::InvalidSelection => "invalid_selection",
+                TearFallback::InvalidContentGeometry => "invalid_content_geometry",
+                TearFallback::GeometryLimit => "geometry_limit",
+                TearFallback::UnindexedArtwork => "unindexed_artwork",
+            });
+            json!({"split_pt":plan.split_pt,"fallback":fallback,"warning":null})
+        }
+        None => json!({"split_pt":null,"fallback":"unknown_page_geometry","warning":null}),
+    }
+}
+
+pub struct PaperGeometry {
+    pub indexed_regions: Vec<Rect>,
+    pub glyphs: Option<Vec<Rect>>,
+}
+
+pub fn paper_geometry(request: &Value) -> Result<PaperGeometry, String> {
+    let count = |key: &str| -> Result<usize, String> {
+        match request.get(key) {
+            None => Ok(0),
+            Some(value) => value
+                .as_array()
+                .map(Vec::len)
+                .ok_or_else(|| format!("Invalid {key} geometry array")),
+        }
+    };
+    if count("glyphs")?
+        .checked_add(count("indexed_regions")?)
+        .is_none_or(|count| count > MAX_PAPER_GEOMETRY_ITEMS)
+    {
+        return Err("The paper geometry limit was exceeded".into());
+    }
+    Ok(PaperGeometry {
+        indexed_regions: indexed_regions(request)?,
+        glyphs: glyphs(request)?,
+    })
+}
+
+fn indexed_regions(request: &Value) -> Result<Vec<Rect>, String> {
+    let Some(value) = request.get("indexed_regions") else {
+        return Ok(Vec::new());
+    };
+    geometry_array(value)
+}
+
+fn glyphs(request: &Value) -> Result<Option<Vec<Rect>>, String> {
+    request.get("glyphs").map(geometry_array).transpose()
+}
+
+fn geometry_array(value: &Value) -> Result<Vec<Rect>, String> {
+    let regions = value.as_array().ok_or("Paper geometry must be an array")?;
+    if regions.len() > MAX_PAPER_GEOMETRY_ITEMS {
+        return Err("The paper geometry limit was exceeded".into());
+    }
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(regions.len())
+        .map_err(|_| "Paper geometry could not be allocated")?;
+    for region in regions {
+        let number = |key: &str| {
+            region[key]
+                .as_f64()
+                .ok_or_else(|| format!("Invalid paper region {key}"))
+        };
+        let rect = Rect::new(
+            number("x_pt")?,
+            number("y_pt")?,
+            number("width_pt")?,
+            number("height_pt")?,
+        );
+        if ![
+            rect.min_x(),
+            rect.min_y(),
+            rect.size.width,
+            rect.size.height,
+            rect.max_x(),
+            rect.max_y(),
+        ]
+        .iter()
+        .all(|value| value.is_finite())
+            || rect.size.width < 0.0
+            || rect.size.height < 0.0
+        {
+            return Err("Invalid paper region geometry".into());
+        }
+        result.push(rect);
+    }
+    Ok(result)
 }
 
 /// Decode bytes once, without materializing millions of JSON numeric values.
@@ -170,6 +294,34 @@ pub fn request(mut value: Value) -> Result<AiPlanRequestRecord, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn indexed_geometry_is_bounded_and_rejects_malformed_values_before_capture() {
+        assert!(indexed_regions(&json!({})).unwrap().is_empty());
+        let valid = json!({"indexed_regions":[{"x_pt":1,"y_pt":2,"width_pt":3,"height_pt":4}]});
+        assert_eq!(
+            indexed_regions(&valid).unwrap(),
+            [Rect::new(1.0, 2.0, 3.0, 4.0)]
+        );
+        for invalid in [
+            json!({"indexed_regions":null}),
+            json!({"indexed_regions":[{}]}),
+            json!({"indexed_regions":[{"x_pt":1e308,"y_pt":0,"width_pt":1e308,"height_pt":4}]}),
+            json!({"indexed_regions":[{"x_pt":1,"y_pt":2,"width_pt":-3,"height_pt":4}]}),
+        ] {
+            assert!(indexed_regions(&invalid).is_err());
+        }
+        let oversized = json!({"indexed_regions":vec![Value::Null;MAX_PAPER_GEOMETRY_ITEMS+1]});
+        assert!(indexed_regions(&oversized).unwrap_err().contains("limit"));
+        // Invalid elements intentionally prove that total-count rejection precedes decoding.
+        let combined =
+            json!({"glyphs":vec![Value::Null;MAX_PAPER_GEOMETRY_ITEMS],"indexed_regions":[null]});
+        assert!(paper_geometry(&combined).err().unwrap().contains("limit"));
+        assert!(paper_geometry(&json!({})).unwrap().glyphs.is_none());
+        assert_eq!(
+            paper_geometry(&json!({"glyphs":[]})).unwrap().glyphs,
+            Some(Vec::new())
+        );
+    }
     #[test]
     fn encoded_output_stops_at_the_bound_without_growing_the_buffer() {
         let mut sink = BoundedPng(vec![0; MAXIMUM_PNG_BYTES - 1]);

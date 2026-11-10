@@ -47,7 +47,11 @@ ApplicationWindow {
     }
     readonly property var colors: theme
     readonly property var pageList: canvas.view
+    readonly property var documentCanvas:canvas
+    readonly property var regionPaper:aiRegionCard
     property string appearance: session ? session.preference("appearance", "light") : "light"
+    property bool reduceMotion:session ? !!session.preference("reduceMotion",false) : false
+    onReduceMotionChanged:if(session)session.setPreference("reduceMotion",reduceMotion)
     property string sidebarTab: "thumbnails"
     property bool aiPanelVisible: false
     // Transient ancestors can stay active; only the focused reader owns its shortcuts.
@@ -74,7 +78,7 @@ ApplicationWindow {
     function finishRegionSelection(page,rect) {
         if(!regionSelecting)return;
         cancelRegionSelection();
-        if(currentReader.captureAiRegion(page,rect,zoom) || currentReader.aiRegion.error)aiRegionCard.open();
+        if(currentReader.captureAiRegion(page,rect,zoom) || currentReader.aiRegion.error){operationStatus="";aiRegionCard.open();}
         else operationStatus=qsTr("The document is busy or changed. Select the area again when it is ready.");
     }
     AiRegionCard {id:aiRegionCard;app:root}
@@ -213,8 +217,8 @@ ApplicationWindow {
     property bool overviewVisible: false
     property bool textViewVisible: false
     readonly property real textViewZoom: accessibleTextView.textSize / 16
-    onOverviewVisibleChanged: if (overviewVisible)
-        textViewVisible = false
+    onOverviewVisibleChanged: if(overviewVisible) {aiRegionCard.close();textViewVisible=false;}
+    onTextViewVisibleChanged:if(textViewVisible)aiRegionCard.close()
     function setTextViewEnabled(show) {
         if(placedTextController.deferAction(function(){root.setTextViewEnabled(show);}))return;
         if(show && placedTextController.waitingForCreation)placedTextController.suppressPendingEditor();
@@ -362,6 +366,7 @@ ApplicationWindow {
     }
     function saveReadingPosition() {
         positionTimer.stop();
+        if(canvas.paperPlanning)return;
         if (session && currentReader.pageCount > 0 && !positionRestoring) {
             const state = {
                 page: currentPage,
@@ -711,6 +716,7 @@ ApplicationWindow {
         overviewVisible = false;
     }
     function setPageLayout(mode) {
+        aiRegionCard.close();
         pendingLayoutPosition=null;
         if(currentReader.pageCount>0 && !positionRestoring)
             pendingLayoutPosition={reader:currentReader,epoch:positionRestoreEpoch,
@@ -932,7 +938,7 @@ ApplicationWindow {
         // These canvas helpers force the current virtualized layout synchronously.
         // No deferred callback can later restore this location into another tab/document.
         canvas.changeZoom(location.zoomPercent/100*calibrationFactor,0,0);
-        if(location.anchor)canvas.navigate(location.anchor.page,location.anchor.y);
+        if(location.anchor)canvas.restoreViewportAnchor(location.anchor,0);
         else canvas.restoreDocumentOffset(location.offsetPt*zoom);
         canvas.restoreDocumentX(location.xPt);
         currentPage=location.page;
@@ -1949,6 +1955,7 @@ ApplicationWindow {
             if(placedTextController.waitingForCreation)placedTextController.cancelPendingCreation();
             if(placedTextController.current){placedTextController.finish(true);return;}
             if(contentController.inlineEditing && contentController.textDraft){contentController.discard();return;}
+            if(aiRegionCard.visible){aiRegionCard.close();return;}
             root.cancelTabReorder();
             root.cancelRegionSelection();
             if (root.previewController && root.previewController.visible)
@@ -2377,7 +2384,7 @@ ApplicationWindow {
         }
         function onActiveReaderAboutToChange() {
             root.currentReader.cancelIndexQueries();
-            root.currentReader.cancelAiRegionCapture();root.cancelRegionSelection();aiRegionCard.close();
+            aiRegionCard.close();root.currentReader.cancelAiRegionCapture();root.cancelRegionSelection();
             if(placedTextController.waitingForCreation)placedTextController.suppressPendingEditor();
             dialogs.flushAnnotation();
             dialogs.annotationDialog.close();
@@ -2389,7 +2396,7 @@ ApplicationWindow {
         function onDocumentReset() {
             root.clearNavigation();
             root.pendingLayoutPosition=null;
-            root.cancelRegionSelection();aiRegionCard.close();
+            root.cancelRegionSelection();aiRegionCard.closeCard(false);
             documentReadingPopup.close();
             root.cancelErase();
             ++root.positionRestoreEpoch;
@@ -2517,7 +2524,7 @@ ApplicationWindow {
                             return;
                         root.navigate(state.page || 0, state.y || 0);
                         if (state.viewportAnchor)
-                            canvas.navigate(state.viewportAnchor.page, state.viewportAnchor.y);
+                            canvas.restoreViewportAnchor(state.viewportAnchor,0);
                         else if (state.offset !== undefined)
                             canvas.restoreDocumentOffset(state.offset);
                         if (state.documentX !== undefined)

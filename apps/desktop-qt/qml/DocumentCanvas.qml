@@ -4,6 +4,7 @@ import LyraReader 1.0
 
 Item {
     id: canvas
+    objectName:"documentCanvas"
     required property var app
     property alias view: pageList
     // Rust owns row grouping, unequal facing heights and the last-row gap. The shell only
@@ -12,8 +13,64 @@ Item {
         return {top:row.top,bottom:row.bottom,height:row.height,
             pages:app.currentReader.pages.slice(row.first,row.first+row.count)};
     })
+    readonly property var paperState:app.currentReader.aiRegionPaper
+    readonly property bool paperActive:!!paperState.rows && !paperState.error
+    readonly property bool paperPlanning:!!paperState.loading
+    readonly property real paperProgress:paperActive && app.regionPaper.owner===app.currentReader
+            && app.regionPaper.opened ? app.regionPaper.revealProgress : 1
+    readonly property bool paperMotionActive:paperActive && app.regionPaper.owner===app.currentReader
+            && app.regionPaper.motionActive
+    // Animate between the two Rust-produced endpoint layouts. This is a native view
+    // interpolation, not another row grouping or paper-placement implementation.
+    function paperMetric(source,target){return source+(target-source)*paperProgress;}
+    property int interactionEpoch:0
+    // Conversation text stays in view pixels. This pointer anchor exists only until
+    // the asynchronous gap replan settles; persisted reading anchors stay in PDF space.
+    property var pendingPaperZoom:null
+    onPaperActiveChanged:if(!paperActive)pendingPaperZoom=null
+    function restorePaperViewAnchor(anchor) {
+        if(!anchor || anchor.owner!==app.currentReader || !paperActive
+                || anchor.id!==paperState.id || anchor.interaction!==interactionEpoch)return false;
+        pageList.forceLayout();
+        const frame=regionCardFrame(anchor.owner);
+        if(!frame)return false;
+        const prior=positioning;positioning=true;
+        pageList.contentY=clampY(pageList.contentY+frame.y+anchor.offsetY-anchor.viewY);
+        positioning=prior;
+        return true;
+    }
+    function finishPaperZoom(owner) {
+        const anchor=pendingPaperZoom;
+        if(!anchor || anchor.owner!==owner)return false;
+        pendingPaperZoom=null;
+        return restorePaperViewAnchor(anchor);
+    }
+    function displayRowTop(index){return paperActive ? paperMetric(rows[index].top,paperState.rows[index].top) : rows[index].top;}
+    function regionCardFrame(owner,epoch) {
+        if(!owner || owner!==app.currentReader || !paperActive)return null;
+        const index=paperState.card_row;const item=pageList.itemAtIndex(index);
+        const page=owner.pages[paperState.card.page];
+        if(!item || !page)return null;
+        const width=Math.min(Math.max(320,page.width*app.zoom-24),Math.max(240,Math.min(canvas.width-24,760)));
+        const centre=(pageList.contentWidth-owner.documentWidth*app.zoom)/2+(page.left+page.width/2)*app.zoom-pageList.contentX;
+        return {x:Math.min(Math.max(12,centre-width/2),Math.max(12,canvas.width-width-12)),
+            y:item.y+(paperState.gap_top-displayRowTop(index))*app.zoom-pageList.contentY,
+            width:width,height:paperState.card.gap_pt*app.zoom*paperProgress,page:paperState.card.page};
+    }
+    function showRegionCard(owner) {
+        if(owner!==app.currentReader || !paperActive)return;
+        positioning=true;
+        if(!pageList.itemAtIndex(paperState.card_row))pageList.positionViewAtIndex(paperState.card_row,ListView.Beginning);
+        pageList.forceLayout();
+        const frame=regionCardFrame(owner);
+        if(frame && frame.y<0)pageList.contentY=clampY(pageList.contentY+frame.y);
+        else if(frame && frame.y+frame.height>height)
+            pageList.contentY=clampY(pageList.contentY+frame.y+frame.height-height);
+        positioning=false;app.updateCurrentPage();
+    }
     property bool positioning: false
     property int placementEpoch: 0
+    function refreshPlacement(){++placementEpoch;}
     property real observedHeight: 0
     property bool pendingHeightChange: false
     property var resizeReader: null
@@ -122,10 +179,10 @@ Item {
                 page: app.currentPage,
                 y: 0
             };
-        return {
-            page: rows[row].pages[0].index,
-            y: (point - item.y) / app.zoom
-        };
+        const display=displayRowTop(row)+(point-item.y)/app.zoom;
+        const source=paperActive ? app.currentReader.unshiftedPaperScroll(display,paperProgress) : display;
+        if(!Number.isFinite(source))return null;
+        return {page:rows[row].pages[0].index,y:source-rows[row].top};
     }
     function positionAnchor(anchor, viewY) {
         const row = pageRows[anchor.page];
@@ -140,13 +197,30 @@ Item {
         if (item)
             pageList.contentY = clampY(item.y + anchor.y * app.zoom - (viewY || 0));
     }
+    function restoreViewportAnchor(anchor,viewY) {
+        if(!anchor)return;
+        const row=pageRows[anchor.page];if(row===undefined)return;
+        const source=rows[row].top+anchor.y;
+        const display=paperActive ? app.currentReader.shiftedPaperScroll(source,paperProgress) : source;
+        if(!Number.isFinite(display))return;
+        const prior=positioning;positioning=true;
+        positionAnchor({page:anchor.page,y:display-displayRowTop(row)},viewY || 0);
+        positioning=prior;
+    }
     function navigate(page, y) {
-        positioning = true;
-        positionAnchor({
-            page: page,
-            y: y || 0
-        }, 0);
-        positioning = false;
+        ++interactionEpoch;positioning=true;
+        const row=pageRows[page];
+        if(row===undefined){positioning=false;return;}
+        pageList.positionViewAtIndex(row,ListView.Beginning);pageList.forceLayout();
+        const frame=pageFrame(page,placementEpoch);
+        let target=y || 0;
+        if(frame && frame.paperMap) {
+            const mapped=frame.paperMap.paperAxisY(target,true,frame.paperMap.paperGeometryRevision);
+            if(mapped.error || !mapped.hit){positioning=false;return;}
+            target=mapped.y;
+        }
+        positionAnchor({page:page,y:target},0);
+        positioning=false;
     }
     function restoreDocumentOffset(offset) {
         const y = offset / app.zoom;
@@ -154,7 +228,7 @@ Item {
         while (row + 1 < rows.length && rows[row + 1].top <= y)
             ++row;
         if (rows.length)
-            navigate(rows[row].pages[0].index, y - rows[row].top);
+            restoreViewportAnchor({page:rows[row].pages[0].index,y:y-rows[row].top},0);
     }
     function documentOffset(anchor) {
         const row = anchor ? pageRows[anchor.page] : undefined;
@@ -162,7 +236,16 @@ Item {
     }
     function pageOffset(page) {
         const item = pageList.itemAtIndex(pageRows[page]);
-        return item ? Math.max(0, (pageList.contentY - item.y) / app.zoom) : 0;
+        if(!item)return 0;
+        const local=(pageList.contentY-item.y)/app.zoom;
+        const frame=pageFrame(page,placementEpoch);const card=regionCardFrame(app.currentReader);
+        if(card && card.page===page && card.y<=0 && card.y+card.height>0)
+            return app.currentReader.unshiftedPaperScroll(displayRowTop(pageRows[page])+local,paperProgress)-rows[pageRows[page]].top;
+        if(frame && frame.paperMap) {
+            const point=frame.paperMap.paperAxisY(local,false,frame.paperMap.paperGeometryRevision);
+            if(point.hit)return Math.max(0,point.y);
+        }
+        return Math.max(0,local);
     }
     function documentX() {
         return (pageList.contentX - (pageList.contentWidth - app.currentReader.documentWidth * app.zoom) / 2) / app.zoom;
@@ -180,6 +263,13 @@ Item {
             pageList.contentX = Math.max(0, Math.min(pageList.contentWidth - pageList.width, left - 24));
     }
     function changeZoom(value, anchorX, anchorY) {
+        ++interactionEpoch;
+        const cardFrame=regionCardFrame(app.currentReader);
+        const card=app.regionPaper;
+        pendingPaperZoom=cardFrame && card && card.opened && anchorX>=cardFrame.x
+                && anchorX<cardFrame.x+cardFrame.width && anchorY>=cardFrame.y
+                && anchorY<cardFrame.y+card.height ? {owner:app.currentReader,id:paperState.id,
+                    interaction:interactionEpoch,viewY:anchorY,offsetY:anchorY-cardFrame.y} : null;
         const anchor = viewportAnchor(anchorY);
         const old = app.zoom;
         const oldLeft = (pageList.contentWidth - app.currentReader.documentWidth * old) / 2;
@@ -187,8 +277,9 @@ Item {
         positioning = true;
         app.zoom = Math.max(0.25 * app.calibrationFactor, Math.min(4 * app.calibrationFactor, value));
         pageList.forceLayout();
-        if (anchor)
-            positionAnchor(anchor, anchorY);
+        if (!restorePaperViewAnchor(pendingPaperZoom) && anchor)
+            restoreViewportAnchor(anchor, anchorY);
+        if(app.zoom===old)pendingPaperZoom=null;
         const newLeft = (pageList.contentWidth - app.currentReader.documentWidth * app.zoom) / 2;
         pageList.contentX = Math.max(0, Math.min(pageList.contentWidth - pageList.width, pointX * app.zoom + newLeft - anchorX));
         positioning = false;
@@ -196,7 +287,9 @@ Item {
         app.schedulePositionSave();
     }
     function pageAtOffset() {
-        const anchor = viewportAnchor(Math.min(pageList.height / 3, 180));
+        const sample=Math.min(pageList.height/3,180);const card=regionCardFrame(app.currentReader);
+        if(card && sample>=card.y && sample<card.y+card.height)return card.page;
+        const anchor = viewportAnchor(sample);
         if (!anchor)
             return 0;
         const row = rows[pageRows[anchor.page]];
@@ -226,6 +319,7 @@ Item {
             minimumSize: 0.04
         }
         ScrollBar.horizontal: ScrollBar {}
+        onMovementStarted:++canvas.interactionEpoch
         onContentYChanged: {
             app.updateCurrentPage();
             app.schedulePositionSave();
@@ -237,8 +331,13 @@ Item {
             objectName: "pdfCanvasRow"
             property alias pageSheets: sheetRepeater
             required property var modelData
+            required property int index
+            // Repeater completion precedes ListView's row registration. Refresh once
+            // that registration has settled so overlays can find a recreated row.
+            Component.onCompleted:Qt.callLater(canvas.refreshPlacement)
+            readonly property var displayGeometry:canvas.paperActive ? canvas.paperState.rows[index] : modelData
             width: pageList.contentWidth
-            height: modelData.height * app.zoom
+            height: (canvas.paperActive ? canvas.paperMetric(modelData.height,displayGeometry.height) : modelData.height) * app.zoom
             Repeater {
                 id: sheetRepeater
                 onItemAdded: function(index,item){++canvas.placementEpoch;}
@@ -247,8 +346,25 @@ Item {
                     id: sheet
                     property alias paperMap: pdfPage
                     required property var modelData
+                    readonly property var displayGeometry:canvas.paperActive ? canvas.paperState.pages[modelData.index] : modelData
+                    function syncPaper() {
+                        if(!pdfPage || pdfPage.pageIndex!==modelData.index)return;
+                        const card=canvas.paperState.card;
+                        if(canvas.paperActive && card.page===modelData.index && Number.isFinite(card.split_pt) && card.gap_pt>0)
+                            pdfPage.configurePaper(modelData.height,card.split_pt,card.gap_pt*canvas.paperProgress);
+                        else pdfPage.clearPaperGeometry();
+                    }
+                    function sourceViewport() {
+                        const viewport=Qt.rect((pageList.contentX-rowItem.x-sheet.x)/app.zoom,(pageList.contentY-rowItem.y-sheet.y)/app.zoom,pageList.width/app.zoom,pageList.height/app.zoom);
+                        if(!canvas.paperActive)return viewport;
+                        const mapped=pdfPage.paperViewport(viewport,pdfPage.paperGeometryRevision);
+                        return mapped.hit ? mapped.rect : Qt.rect(0,0,0,0);
+                    }
+                    onDisplayGeometryChanged:syncPaper()
+                    Connections {target:canvas;function onPaperProgressChanged(){sheet.syncPaper();}}
+                    Component.onCompleted:syncPaper()
                     width: modelData.width * app.zoom
-                    height: modelData.height * app.zoom
+                    height: (canvas.paperActive ? canvas.paperMetric(modelData.height,displayGeometry.height) : modelData.height) * app.zoom
                     x: (pageList.contentWidth - app.currentReader.documentWidth * app.zoom) / 2 + modelData.left * app.zoom
                     color: app.currentReader.paperBackground(app.paperAppearance)
                     PdfPage {
@@ -260,7 +376,8 @@ Item {
                         pageIndex: sheet.modelData.index
                         rasterScale: app.zoom
                         tilesEnabled: true
-                        visibleRegion: Qt.rect((pageList.contentX - rowItem.x - sheet.x) / app.zoom, (pageList.contentY - rowItem.y - sheet.y) / app.zoom, pageList.width / app.zoom, pageList.height / app.zoom)
+                        rasterDemandPaused:canvas.paperMotionActive
+                        visibleRegion:sheet.sourceViewport()
                         Accessible.role: Accessible.Graphic
                         Accessible.name: qsTr("PDF page %1").arg(sheet.modelData.index + 1)
                     }
@@ -291,7 +408,7 @@ Item {
                     BusyIndicator {
                         anchors.centerIn: parent
                         running: !pdfPage.loaded
-                        visible: running
+                        visible: running && (!canvas.paperActive || (pdfPage.visibleRegion.width>0 && pdfPage.visibleRegion.height>0))
                         width: 34
                         height: 34
                     }

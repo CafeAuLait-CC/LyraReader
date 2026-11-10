@@ -3,6 +3,7 @@
 use lyra_reader_core::Size;
 use lyra_reader_ffi::api::*;
 use lyra_reader_runtime::{MAX_PAGE_BYTES, PAGE_GAP_PT, bounded_raster_scale};
+use lyra_reader_session::paper_document::{PaperCard, PaperDocumentLayout};
 use lyra_reader_session::{DocumentLayout, LayoutMode};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -57,7 +58,33 @@ fn layout_rows(layout: &DocumentLayout) -> Result<Value, String> {
     Ok(Value::Array(rows))
 }
 
+fn layout_mode_name(mode: LayoutMode) -> &'static str {
+    match mode {
+        LayoutMode::Continuous => "Continuous",
+        LayoutMode::Facing => "Facing",
+    }
+}
+
 pub(super) fn layout_value(source_layout: &DocumentLayout, r: &Value) -> Result<Value, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Card {
+        page: u32,
+        split_pt: Option<f64>,
+        gap_pt: f64,
+    }
+    let card = r
+        .get("paper_card")
+        .filter(|card| !card.is_null())
+        .map(|card| {
+            // Reject oversized display snapshots and malformed input before building any rows.
+            if source_layout.page_count() > lyra_reader_session::paper::MAX_PAPER_GEOMETRY_ITEMS {
+                return Err("The inserted paper snapshot exceeds its geometry limit".into());
+            }
+            serde::Deserialize::deserialize(card)
+                .map_err(|e| format!("Invalid inserted paper: {e}"))
+        })
+        .transpose()?;
     let gap = r.get("gap").and_then(Value::as_f64).unwrap_or(PAGE_GAP_PT);
     if !gap.is_finite() || !(0.0..=200.0).contains(&gap) {
         return Err("Invalid page gap".into());
@@ -82,6 +109,41 @@ pub(super) fn layout_value(source_layout: &DocumentLayout, r: &Value) -> Result<
     })).collect::<Vec<_>>(), "width":layout.content_width_pt(),"height":layout.content_height_pt(),"gap":gap});
     // The literal above is an object; move the bounded array without serializing it twice.
     value["rows"] = rows;
+    value["mode"] = json!(layout_mode_name(mode));
+    if let Some(card) = card {
+        // Display geometry never replaces source placements used by PDF writes or bookmarks.
+        let card: Card = card;
+        let display = PaperDocumentLayout::new(
+            &layout,
+            Some(PaperCard {
+                page: card.page,
+                split_pt: card.split_pt,
+                gap_pt: card.gap_pt,
+            }),
+        )
+        .map_err(|e| e.to_string())?;
+        let mut display_rows = Vec::new();
+        display_rows
+            .try_reserve_exact(display.rows().len())
+            .map_err(|_| "The inserted row snapshot could not be allocated")?;
+        for row in display.rows() {
+            display_rows.push(
+                json!({"top":row.display_top_pt,"height":row.display_height_pt,
+                "first":row.source.first_page,"count":row.source.page_count}),
+            );
+        }
+        let mut display_pages = Vec::new();
+        display_pages
+            .try_reserve_exact(layout.page_count())
+            .map_err(|_| "The inserted page snapshot could not be allocated")?;
+        for page in layout.placements() {
+            display_pages.push(json!({"index":page.index,
+                "top":display.page_top_pt(page.index).ok_or("The inserted page is unavailable")?,
+                "height":display.page_height_pt(page.index).ok_or("The inserted page is unavailable")?}));
+        }
+        value["paper"] = json!({"rows":display_rows,"pages":display_pages,
+            "height":display.content_height_pt(),"gap_top":display.gap_top_pt(),"card_row":display.card_row()});
+    }
     Ok(value)
 }
 
@@ -183,6 +245,7 @@ impl DesktopDocument {
         });
         // This object is constructed here; indexing cannot depend on a file-supplied type.
         value["rows"] = rows;
+        value["mode"] = json!(layout_mode_name(layout.mode()));
         Ok(value)
     }
 
@@ -631,6 +694,63 @@ impl DesktopDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inserted_paper_packet_keeps_source_pages_and_facing_partners_unchanged() {
+        let source = DocumentLayout::new(
+            [
+                (100.0, 300.0),
+                (100.0, 500.0),
+                (100.0, 700.0),
+                (100.0, 400.0),
+            ],
+            20.0,
+        );
+        let baseline = layout_value(&source, &json!({"mode":"Facing","gap":20})).unwrap();
+        let request =
+            json!({"mode":"Facing","gap":20,"paper_card":{"page":1,"split_pt":250,"gap_pt":100}});
+        let opened = layout_value(&source, &request).unwrap();
+        for key in ["pages", "rows", "width", "height", "gap"] {
+            assert_eq!(opened[key], baseline[key]);
+        }
+        assert_eq!(
+            opened["paper"]["rows"][1],
+            json!({"top":320.0,"height":820.0,"first":1,"count":2})
+        );
+        assert_eq!(
+            opened["paper"]["pages"][1],
+            json!({"index":1,"top":320.0,"height":600.0})
+        );
+        assert_eq!(
+            opened["paper"]["pages"][2],
+            json!({"index":2,"top":320.0,"height":700.0})
+        );
+        assert_eq!(opened["paper"]["pages"][3]["top"], 1140.0);
+        assert_eq!(opened["paper"]["gap_top"], 570.0);
+        let foot = layout_value(
+            &source,
+            &json!({"mode":"Facing","gap":20,"paper_card":{"page":1,"split_pt":null,"gap_pt":100}}),
+        )
+        .unwrap();
+        assert_eq!(foot["paper"]["gap_top"], 1020.0);
+        assert_eq!(foot["paper"]["pages"][1]["height"], 500.0);
+        assert_eq!(
+            layout_value(
+                &source,
+                &json!({"mode":"Facing","gap":20,"paper_card":null})
+            )
+            .unwrap(),
+            baseline
+        );
+        for card in [
+            json!({"page":20,"gap_pt":30}),
+            json!({"page":1,"gap_pt":-1}),
+            json!({"page":1,"split_pt":501,"gap_pt":30}),
+            json!({"page":1,"gap_pt":30,"guessed":true}),
+        ] {
+            assert!(layout_value(&source, &json!({"paper_card":card})).is_err());
+        }
+    }
 
     #[test]
     fn oversized_row_snapshot_is_rejected_before_serialization() {
@@ -2402,6 +2522,22 @@ mod tests {
         let request = json!({"op":"capture_region","page":0,"zoom":1.0,"rect":{"x":0,"y":0,"width":595,"height":842}});
         let before = source.query(request.clone()).unwrap();
         assert!(before["text"].as_str().unwrap().contains("Frozen area"));
+        assert!(before["paper_plan"].is_object());
+        assert!(before["paper_plan"]["split_pt"].is_null()); // Full-page region belongs at the row foot.
+        assert!(before["paper_plan"]["warning"].is_null());
+        let glyphs =
+            serde_json::to_value(doc.active().unwrap().text_page(0).unwrap().chars).unwrap();
+        let text_request = json!({"op":"capture_region","page":0,"zoom":1,"rect":{"x":0,"y":0,"width":595,"height":100},"glyphs":glyphs});
+        let text_region = source.query(text_request.clone()).unwrap();
+        assert!(!text_region["text"].as_str().unwrap().trim().is_empty());
+        assert_eq!(text_region["paper_plan"]["split_pt"], 100.0);
+        let mut indexed_request = text_request.clone();
+        indexed_request["indexed_regions"] =
+            json!([{"x_pt":0,"y_pt":95,"width_pt":595,"height_pt":110}]);
+        let indexed = source.query(indexed_request).unwrap();
+        assert_eq!(indexed["image_png"], text_region["image_png"]);
+        assert_ne!(indexed["paper_plan"]["split_pt"], 100.0); // Never cut the already indexed figure.
+        assert!(source.query(json!({"op":"capture_region","page":0,"zoom":1,"rect":{"x":0,"y":0,"width":595,"height":100},"indexed_regions":[{}]})).is_err());
         assert_eq!(
             (
                 before["image_width_px"].as_u64(),
