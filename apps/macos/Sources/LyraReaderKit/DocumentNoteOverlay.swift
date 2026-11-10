@@ -7,13 +7,14 @@ struct DocumentNoteOverlay: View {
 
     var body: some View {
         GeometryReader { geometry in
-            if let note = state.openDocumentNote,
-               let anchor = state.documentNoteAnchor(note),
+            if let source = state.openNoteSource,
+               let anchor = state.openNoteAnchor,
                anchor.intersects(CGRect(origin: .zero, size: geometry.size)) {
                 let frame = DocumentNoteLayout.frame(anchor: anchor, viewport: geometry.size)
                 VStack(spacing: 0) {
                     HStack {
-                        Text(note.author.flatMap { $0.isEmpty ? nil : $0 } ?? "Note")
+                        Text(state.openDocumentNote?.author.flatMap { $0.isEmpty ? nil : $0 }
+                             ?? (state.openOwnNote?.kind == .stickyNote ? "Sticky Note" : "Note"))
                             .font(.headline).lineLimit(1)
                         Spacer()
                         Button { state.closeDocumentNote() } label: {
@@ -24,7 +25,8 @@ struct DocumentNoteOverlay: View {
                     }
                     .padding(12)
                     Divider()
-                    NotePaperText(text: note.contents ?? "")
+                    NotePaperText(text: state.openOwnNote?.note ?? state.openDocumentNote?.contents ?? "",
+                                  onEdit: { state.editOpenNote() })
                         .padding(8)
                 }
                 .foregroundStyle(LyraReaderTheme.noteFg)
@@ -35,10 +37,10 @@ struct DocumentNoteOverlay: View {
                 .shadow(color: .black.opacity(0.2), radius: 6, y: 3)
                 .transition(ReaderMotion.paperTransition)
                 .position(x: frame.midX, y: frame.midY)
-                .id(note.id)
+                .id(source)
             }
         }
-        .animation(ReaderMotion.paperAnimation, value: state.openDocumentNoteID)
+        .animation(ReaderMotion.paperAnimation, value: state.openNoteSource)
     }
 }
 
@@ -59,14 +61,19 @@ public enum DocumentNoteLayout {
 /// This native scroll view consumes wheel input over the paper without scrolling the PDF.
 struct NotePaperText: NSViewRepresentable {
     let text: String
+    var onEdit: (() -> Void)?
 
     func makeNSView(context: Context) -> NSScrollView {
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = false
         scroll.scrollerStyle = .legacy
-        scroll.drawsBackground = false
-        let body = NSTextView(frame: scroll.contentView.bounds)
+        scroll.drawsBackground = true
+        scroll.backgroundColor = LyraReaderTheme.noteBgColor
+        scroll.contentView.drawsBackground = false
+        LyraReaderSidebarScroller.install(on: scroll, trackColor: LyraReaderTheme.noteBgColor)
+        let body = NoteTextView(frame: scroll.contentView.bounds)
+        body.onEdit = onEdit
         body.isEditable = false
         body.isSelectable = true
         body.drawsBackground = false
@@ -84,8 +91,21 @@ struct NotePaperText: NSViewRepresentable {
     }
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
-        guard let body = scroll.documentView as? NSTextView, body.string != text else { return }
+        guard let body = scroll.documentView as? NoteTextView else { return }
+        body.onEdit = onEdit
+        body.textColor = LyraReaderTheme.noteTextColor
+        guard body.string != text else { return }
         body.string = text
         body.scrollToBeginningOfDocument(nil)
+    }
+}
+
+/// A body click explicitly starts editing while wheel events keep scrolling the paper.
+private final class NoteTextView: NSTextView {
+    var onEdit: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        guard let onEdit else { super.mouseDown(with: event); return }
+        onEdit()
     }
 }

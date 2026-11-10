@@ -556,6 +556,7 @@ public struct ReaderWindow: View {
             FormOverlay(state: state)
             DocumentNoteOverlay(state: state)
             PlacedTextEditorOverlay(state: state)
+                .id(state.editingAnnotationID)
 
             if let hint = opener.dropHint {
                 FileDropOverlay(hint: hint)

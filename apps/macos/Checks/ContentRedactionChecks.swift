@@ -1,8 +1,9 @@
 import AppKit
+import Combine
 import Foundation
 import enum LyraReaderBindings.ContentCommandRecord
 import struct LyraReaderBindings.ContentBoxRecord
-import LyraReaderKit
+@testable import LyraReaderKit
 
 extension ReaderChecks {
     /// T3.12 redaction through the one remaining path: the Edit workspace.
@@ -66,6 +67,17 @@ extension ReaderChecks {
             return rect.insetBy(dx: -1, dy: -1)
         }
 
+        try await eventually("the redaction fixture has visible page pixels", {
+            state.canvasPages.contains { $0.placement.index >= 0 || PlacementIndex.pageRasterPage($0.placement.index) != nil }
+        })
+        var blankRevisionFrames = 0
+        let continuity = state.$canvasPages.sink { pages in
+            if !pages.contains(where: { $0.placement.index >= 0 || PlacementIndex.pageRasterPage($0.placement.index) != nil }) {
+                blankRevisionFrames += 1
+            }
+        }
+        defer { continuity.cancel() }
+
         // ── Blackout: the covered word goes, its neighbours stay, the source is untouched ──
         let brown = wordRect("brown")
         // `Redact…` already armed Blackout; clicking the active tool again would turn it off,
@@ -121,6 +133,8 @@ extension ReaderChecks {
                 "the erase leaves white paper, not a black mark (\(erasedPixel))")
 
         // ── A stale command fails and writes no revision ───────────────────────────────
+        require(blankRevisionFrames == 0, "Blackout and Erase replace revisions without blank PDF frames")
+        continuity.cancel()
         let stale = ContentCommandRecord.redact(
             revision: "not-the-current-revision",
             bounds: ContentBoxRecord(

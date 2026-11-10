@@ -101,8 +101,10 @@ extension ReaderChecks {
         let placement = state.canvasPageFrames.first { $0.index == 0 }!
         require(state.openInlineNote(at: CGPoint(x: placement.leftPt + marker.rect.midX,
                                                  y: placement.topPt + marker.rect.midY))
-                    && state.editingAnnotationID == id,
-                "clicking the selection note label reopens its editable paper")
+                    && state.openOwnNoteID == id && state.editingAnnotationID == nil,
+                "clicking the selection note label reopens its reading paper")
+        state.editOpenNote()
+        require(state.editingAnnotationID == id, "clicking the selection note paper enters its editor")
         state.cancelTextEditing()
         let copy = scratch.appendingPathComponent("saved.pdf")
         let savedNote = await state.saveAnnotatedCopy(to: copy)

@@ -3,10 +3,20 @@ import SwiftUI
 
 /// Styles only scroll views inside this panel, without changing the user's scrollbar preference.
 struct SidebarScrollTheme: NSViewRepresentable {
-    func makeNSView(context: Context) -> Probe { Probe() }
-    func updateNSView(_ view: Probe, context: Context) { view.scheduleUpdate() }
+    var trackColor: NSColor = LyraReaderTheme.sidebarColor
+
+    func makeNSView(context: Context) -> Probe {
+        let view = Probe()
+        view.trackColor = trackColor
+        return view
+    }
+    func updateNSView(_ view: Probe, context: Context) {
+        view.trackColor = trackColor
+        view.scheduleUpdate()
+    }
 
     final class Probe: NSView {
+        var trackColor: NSColor = LyraReaderTheme.sidebarColor
         private var updatePending = false
         override func hitTest(_ point: NSPoint) -> NSView? { nil }
         override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); scheduleUpdate() }
@@ -34,7 +44,7 @@ struct SidebarScrollTheme: NSViewRepresentable {
             if let scroll = view as? NSScrollView {
                 let frame = convert(scroll.bounds, from: scroll)
                 if bounds.insetBy(dx: -1, dy: -1).contains(CGPoint(x: frame.midX, y: frame.midY)) {
-                    LyraReaderSidebarScroller.install(on: scroll)
+                    LyraReaderSidebarScroller.install(on: scroll, trackColor: trackColor)
                 }
             }
             for child in view.subviews { styleScrollViews(in: child) }
@@ -45,11 +55,13 @@ struct SidebarScrollTheme: NSViewRepresentable {
 /// Native scrolling, tracking and accessibility, with the palette's track and thumb colors.
 package final class LyraReaderSidebarScroller: NSScroller {
     package var transparentTrack = false { didSet { needsDisplay = true } }
+    package var trackColor: NSColor = LyraReaderTheme.sidebarColor { didSet { needsDisplay = true } }
     private var hovered = false
     private var hoverTracking: NSTrackingArea?
     override package class var isCompatibleWithOverlayScrollers: Bool { true }
 
-    package static func install(on scroll: NSScrollView) {
+    package static func install(on scroll: NSScrollView,
+                                trackColor: NSColor = LyraReaderTheme.sidebarColor) {
         if !(scroll.verticalScroller is LyraReaderSidebarScroller) {
             let old = scroll.verticalScroller
             let replacement = LyraReaderSidebarScroller(frame: old?.frame
@@ -66,13 +78,14 @@ package final class LyraReaderSidebarScroller: NSScroller {
             scroll.verticalScroller = replacement
             scroll.reflectScrolledClipView(scroll.contentView)
         }
+        (scroll.verticalScroller as? LyraReaderSidebarScroller)?.trackColor = trackColor
         scroll.verticalScroller?.needsDisplay = true
     }
 
     override package func drawKnobSlot(in slotRect: NSRect, highlight flag: Bool) {
         // Overlay tracks reveal the panel underneath; legacy tracks occupy their own gutter.
         if scrollerStyle == .legacy && !transparentTrack {
-            LyraReaderTheme.sidebarColor.setFill()
+            trackColor.setFill()
             bounds.fill()
         }
     }
