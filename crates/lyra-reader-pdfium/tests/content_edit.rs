@@ -1,6 +1,6 @@
 use lopdf::{Document, Object, Stream, dictionary};
 use lyra_reader_pdfium::content_edit::{
-    ContentBox, ContentCommand, content_image, edit_content, inspect_content,
+    ContentBox, ContentCommand, content_drag_preview, content_image, edit_content, inspect_content,
 };
 use std::path::{Path, PathBuf};
 
@@ -512,6 +512,40 @@ fn nested_graphic_label_moves_without_moving_the_other_instance() {
     assert_eq!(labels.len(), 2, "{snapshot:?}");
     let label = labels[0];
     assert!(!label.can_edit_text);
+    let preview = content_drag_preview(
+        &source,
+        &label.id,
+        &snapshot.revision,
+        &lyra_reader_core::RasterRequest::tile(
+            lyra_reader_core::PageIndex(0),
+            1.0,
+            (0.0, 0.0),
+            (612.0, 792.0),
+        ),
+    )
+    .unwrap();
+    // Each form instance remains independent even when its content stream is shared.
+    let dark = |image: &lyra_reader_core::RasterTile, bounds: ContentBox, alpha_only: bool| {
+        let top = (792.0 - bounds.y - bounds.height).floor() as usize;
+        let bottom = (792.0 - bounds.y).ceil() as usize;
+        (top..bottom)
+            .flat_map(|y| {
+                (bounds.x.floor() as usize..(bounds.x + bounds.width).ceil() as usize)
+                    .map(move |x| (y * 612 + x) * 4)
+            })
+            .filter(|&offset| {
+                if alpha_only {
+                    image.pixels[offset + 3] > 0
+                } else {
+                    image.pixels[offset] < 200
+                }
+            })
+            .count()
+    };
+    assert_eq!(dark(&preview.background, label.bounds, false), 0);
+    assert!(dark(&preview.background, labels[1].bounds, false) > 10);
+    assert!(dark(&preview.foreground, label.bounds, true) > 10);
+    assert_eq!(dark(&preview.foreground, labels[1].bounds, true), 0);
     let destination = source.with_file_name("moved.pdf");
     let bounds = ContentBox {
         x: label.bounds.x + 50.0,
@@ -698,6 +732,31 @@ fn rotated_cropped_pages_insert_upright_text_and_keep_the_frame_on_reedit() {
         assert!(
             (item.bounds.width - bounds.width).abs() < 0.01,
             "the text frame must survive reopening"
+        );
+        let crop = geometry.page_to_view(1.0).apply_rect(Rect::new(
+            item.bounds.x,
+            item.bounds.y,
+            item.bounds.width,
+            item.bounds.height,
+        ));
+        let request = lyra_reader_core::RasterRequest::tile(
+            lyra_reader_core::PageIndex(0),
+            2.0,
+            (crop.origin.x, crop.origin.y),
+            (crop.size.width, crop.size.height),
+        );
+        let preview = content_drag_preview(&first, &item.id, &snapshot.revision, &request).unwrap();
+        assert!(
+            preview
+                .foreground
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|pixel| pixel[3] > 100)
+                .count()
+                > 20,
+            "the rotated/cropped drag appearance must contain its upright text: rotation {value}"
         );
         let second = source.with_file_name("replaced.pdf");
         let _ = std::fs::remove_file(&second);
@@ -1096,4 +1155,93 @@ fn erase_tj_after_another_show_keeps_operator_local_character_indices() {
             && text.contains("Right"),
         "{text}"
     );
+}
+
+#[test]
+fn live_drag_pixels_isolate_text_and_preserve_coloured_paper_without_writes() {
+    use lyra_reader_core::{DocumentBackend, PageIndex, RasterRequest};
+    let source = fixture(
+        "drag-colour",
+        b"q 0.8 0.9 1 rg 0 0 612 792 re f Q BT /F1 18 Tf 72 700 Td (Move me) Tj ET",
+    );
+    let bytes = std::fs::read(&source).unwrap();
+    let page = inspect_content(&source, 0).unwrap();
+    let item = page
+        .items
+        .iter()
+        .find(|item| item.text == "Move me")
+        .unwrap();
+    let backend = lyra_reader_pdfium::PdfiumBackend::open(&source, None).unwrap();
+    let geometry = backend.page_info(PageIndex(0)).unwrap().geometry;
+    let rect = geometry
+        .page_to_view(1.0)
+        .apply_rect(lyra_reader_core::Rect::new(
+            item.bounds.x - 2.0,
+            item.bounds.y - 2.0,
+            item.bounds.width + 4.0,
+            item.bounds.height + 4.0,
+        ));
+    let request = RasterRequest::tile(
+        PageIndex(0),
+        2.0,
+        (rect.origin.x, rect.origin.y),
+        (rect.size.width, rect.size.height),
+    );
+    let original = backend.rasterize(&request).unwrap();
+    let preview = content_drag_preview(&source, &item.id, &page.revision, &request).unwrap();
+    assert!(
+        preview
+            .foreground
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| p[3] == 0)
+    );
+    assert!(
+        preview
+            .foreground
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| p[3] > 100)
+    );
+    for pixel in preview.background.pixels.as_chunks::<4>().0 {
+        assert!(
+            pixel[0] > 250
+                && (225..=235).contains(&pixel[1])
+                && (199..=209).contains(&pixel[2])
+                && pixel[3] == 255,
+            "{pixel:?}"
+        );
+    }
+    for ((original, foreground), background) in original
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(preview.foreground.pixels.as_chunks::<4>().0)
+        .zip(preview.background.pixels.as_chunks::<4>().0)
+    {
+        for channel in 0..3 {
+            let alpha = u16::from(foreground[3]);
+            let composed = (u16::from(foreground[channel]) * alpha
+                + u16::from(background[channel]) * (255 - alpha)
+                + 127)
+                / 255;
+            assert!(
+                composed.abs_diff(u16::from(original[channel])) <= 3,
+                "isolated appearance must reconstruct the original: {original:?}, {foreground:?}, {background:?}"
+            );
+        }
+    }
+    assert_eq!(std::fs::read(&source).unwrap(), bytes);
+    assert_eq!(inspect_content(&source, 0).unwrap().revision, page.revision);
+    assert!(content_drag_preview(&source, &item.id, "stale", &request).is_err());
+    let invalid = RasterRequest {
+        scale: f64::INFINITY,
+        ..request
+    };
+    assert!(content_drag_preview(&source, &item.id, &page.revision, &invalid).is_err());
 }

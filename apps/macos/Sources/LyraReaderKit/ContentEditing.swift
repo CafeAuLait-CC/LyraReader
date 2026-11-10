@@ -25,6 +25,13 @@ public struct PDFContentPage: Codable, Equatable, Sendable {
   public var revision: String, page: Int, items: [PDFContentItem]
 }
 
+/// Display-only source patch and isolated object pixels, both in page-local view points.
+public struct ContentDragPreview: Sendable {
+  public let bounds: CGRect
+  public let background: PageImage
+  public let foreground: PageImage
+}
+
 public extension ContentBoxRecord {
   init(_ rect: CGRect) {
     self.init(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height)
@@ -179,6 +186,79 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
   private var guides: [CGFloat] = []
   private var horizontalGuides: [CGFloat] = []
   private var resizeCorner: Int?
+  private struct DragIdentity: Equatable {
+    let url: URL?
+    let revision: String
+    let page: Int
+    let item: String
+    let scale: CGFloat
+    let scroll: CGFloat
+  }
+  private var appearanceIdentity: DragIdentity?
+  private var gestureIdentity: DragIdentity?
+  private var gestureTool: String?
+  private var committedPreview: (identity: DragIdentity, frame: CGRect)?
+  private var dragAppearance: ContentDragPreview?
+  private var dragAppearanceTask: Task<Void, Never>?
+
+  private func identity(for item: PDFContentItem) -> DragIdentity? {
+    guard let state, let page = state.contentEditPage else { return nil }
+    // The inspected page can be the visible lower page while the HUD still names the upper
+    // page. Actual viewport movement, not that label, invalidates a held drag.
+    return DragIdentity(url: state.document?.url, revision: page.revision, page: page.page,
+      item: item.id, scale: state.zoomFactor * (window?.backingScaleFactor ?? 2), scroll: state.scrollYPt)
+  }
+
+  private func prepareDragAppearance(for item: PDFContentItem, immediate: Bool = false) {
+    guard item.kind != "link", let state, let key = identity(for: item),
+          let page = state.canvasPageFrames.first(where: { $0.index == key.page }) else { return }
+    if appearanceIdentity == key, dragAppearance != nil || !immediate { return }
+    dragAppearanceTask?.cancel()
+    appearanceIdentity = key
+    dragAppearance = nil
+    let region = item.bounds.rect.insetBy(dx: -2, dy: -2).intersection(
+      CGRect(x: 0, y: 0, width: page.widthPt, height: page.heightPt))
+    guard !region.isNull, !region.isEmpty else { return }
+    dragAppearanceTask = Task { @MainActor [weak self, weak state] in
+      guard let self, let state else { return }
+      do {
+        if !immediate { try await Task.sleep(for: .milliseconds(120)) }
+        try Task.checkCancellation()
+        let pixels = try await state.engine.contentDragPreview(page: key.page, target: key.item,
+          revision: key.revision, bounds: region, scale: key.scale)
+        guard !Task.isCancelled, self.appearanceIdentity == key,
+              self.identity(for: item) == key else { return }
+        self.dragAppearance = pixels
+        if self.gestureIdentity == key { self.updateDragAppearance() }
+      } catch {
+        guard !Task.isCancelled, self.appearanceIdentity == key,
+              self.identity(for: item) == key else { return }
+        self.appearanceIdentity = nil
+        // A preview failure does not discard the move or change the document.
+        state.statusMessage = "Could not preview this object: \(error.localizedDescription)"
+      }
+    }
+  }
+
+  private func updateDragAppearance() {
+    guard let state, let item = state.selectedContentItem,
+          let key = gestureIdentity, identity(for: item) == key,
+          let pixels = dragAppearance, appearanceIdentity == key,
+          resizeCorner == nil, let preview, let destination = local(preview) else { return }
+    state.showContentDrag(pixels, page: key.page,
+      delta: CGPoint(x: destination.minX - item.bounds.x, y: destination.minY - item.bounds.y))
+  }
+
+  private func cancelDrag() {
+    origin = nil; original = nil; preview = nil; resizeCorner = nil
+    gestureIdentity = nil; gestureTool = nil
+    wasSelected = false
+    committedPreview = nil
+    guides = []; horizontalGuides = []
+    state?.clearContentDrag()
+    needsDisplay = true
+  }
+
   override var isFlipped: Bool { true }
   override var acceptsFirstResponder: Bool { true }
   override func updateTrackingAreas() {
@@ -233,7 +313,9 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
     updateHover(at: point)
   }
   private func updateHover(at point: CGPoint) {
-    hover = hit(point)?.id
+    let item = state?.contentEditTool == "select" ? hit(point) : nil
+    hover = item?.id
+    if let item { prepareDragAppearance(for: item) }
     if showsMoveCursor {
       NSCursor.openHand.set()
     } else {
@@ -243,6 +325,22 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
   }
   /// Scrolling can replace the inspected page while the pointer stays still.
   func synchronizePointer() {
+    if let committed = committedPreview,
+       state?.contentCommandInFlight != true
+        || state?.selectedContentItem.flatMap({ identity(for: $0) }) != committed.identity {
+      committedPreview = nil
+    }
+    if let gesture = gestureIdentity,
+       state?.selectedContentItem.flatMap({ identity(for: $0) }) != gesture
+        || state?.contentEditTool != gestureTool {
+      origin = nil; original = nil; preview = nil; resizeCorner = nil
+      gestureIdentity = nil; gestureTool = nil
+      wasSelected = false
+      guides = []; horizontalGuides = []
+      DispatchQueue.main.async { [weak self] in
+        if self?.gestureIdentity == nil { self?.state?.clearContentDrag() }
+      }
+    }
     guard let window else { return }
     let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
     if bounds.contains(point) { updateHover(at: point) }
@@ -260,6 +358,7 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
     guard let state, !state.pageEditBusy, !state.contentEditLoading, !state.contentCommandInFlight,
       state.contentTextRecovery == nil
     else { return }
+    cancelDrag()
     let contentPoint = CanvasGeometry.contentPoint(viewX: point.x, viewYTop: point.y,
       scrollYPt: state.scrollYPt, zoom: state.zoomFactor,
       contentOffsetX: max(0, (bounds.width - state.contentWidthPt * state.zoomFactor) / 2))
@@ -326,6 +425,9 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
       needsDisplay = true
       return
     }
+    gestureIdentity = identity(for: item)
+    gestureTool = state.contentEditTool
+    prepareDragAppearance(for: item, immediate: true)
     wasSelected = state.contentEditSelection == item.id
     state.contentEditSelection = item.id
     origin = point
@@ -378,6 +480,7 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
       }
     }
     preview = rect
+    updateDragAppearance()
     NSCursor.closedHand.set()
     needsDisplay = true
   }
@@ -386,6 +489,8 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
       origin = nil
       original = nil
       preview = nil
+      gestureIdentity = nil
+      gestureTool = nil
       resizeCorner = nil
       guides = []
       horizontalGuides = []
@@ -403,14 +508,20 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
       }
       return
     }
-    guard let state, let selected = state.selectedContentItem else { return }
+    guard origin != nil, let state, let selected = state.selectedContentItem else { return }
     if let preview, let original,
       resizeCorner != nil || hypot(preview.minX - original.minX, preview.minY - original.minY) > 2,
       let rect = local(preview)
     {
+      guard gestureIdentity == identity(for: selected) || resizeCorner != nil else {
+        state.clearContentDrag()
+        return
+      }
+      if let key = gestureIdentity { committedPreview = (key, preview) }
       state.transformContent(selected, to: rect)
       return
     }
+    state.clearContentDrag()
     if wasSelected && selected.can_edit_text {
       beginText(selected, at: convert(event.locationInWindow, from: nil))
     }
@@ -454,11 +565,15 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
             .foregroundColor: NSColor.white,
           ])
       }
-      guard item.id == hover || item.id == state.contentEditSelection, let base = frame(item) else {
+      guard (state.contentEditTool == "select" && item.id == hover)
+                || item.id == state.contentEditSelection, let base = frame(item) else {
         continue
       }
       let selected = item.id == state.contentEditSelection
-      let r = selected ? preview ?? base : base
+      let held = committedPreview.flatMap { pending in
+        state.contentCommandInFlight && identity(for: item) == pending.identity ? pending.frame : nil
+      }
+      let r = selected ? preview ?? held ?? base : base
       NSColor.controlAccentColor.setStroke()
       let path = NSBezierPath(rect: r)
       path.lineWidth = 1
@@ -587,6 +702,7 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
       return
     }
     if event.keyCode == 53 {
+      if origin != nil { cancelDrag(); return }
       commitText()
       // Escape first returns an armed content tool to the implicit pointer state; only a
       // second Escape (with no tool armed) leaves the Edit workspace.
@@ -605,6 +721,7 @@ final class ContentEditorView: NSView, NSTextViewDelegate {
       super.scrollWheel(with: event)
       return
     }
+    if origin != nil { cancelDrag() }
     let delta = wheelMotion.delta(scrollingDeltaY: event.scrollingDeltaY,
       precise: event.hasPreciseScrollingDeltas, timestamp: event.timestamp)
     if event.hasPreciseScrollingDeltas {

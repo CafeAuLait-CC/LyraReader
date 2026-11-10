@@ -1967,6 +1967,8 @@ public protocol PDFEngine: AnyObject {
     func pageRotations() async throws -> [Int]
     func contentObjects(page: Int) async throws -> PDFContentPage
     func contentImagePNG(page: Int, target: String, revision: String) async throws -> Data
+    func contentDragPreview(page: Int, target: String, revision: String,
+                            bounds: CGRect, scale: CGFloat) async throws -> ContentDragPreview
     func applyContentEdit(page: Int, command: ContentCommandRecord, to destination: URL) async throws
     /// The 0-based pages a redaction would have to replace with a raster image, computed without
     /// writing anything. Non-empty means the Edit workspace must ask before staging.
@@ -2088,6 +2090,11 @@ public extension PDFEngine {
     }
     func contentImagePNG(page: Int, target: String, revision: String) async throws -> Data {
         throw NSError(domain:"LyraReader",code:2,userInfo:[NSLocalizedDescriptionKey:"This engine cannot export images"])
+    }
+    func contentDragPreview(page: Int, target: String, revision: String,
+                            bounds: CGRect, scale: CGFloat) async throws -> ContentDragPreview {
+        throw NSError(domain: "LyraReader", code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot preview page objects"])
     }
     func contentObjects(page: Int) async throws -> PDFContentPage {
         throw NSError(domain:"LyraReader",code:2,userInfo:[NSLocalizedDescriptionKey:"This engine cannot inspect page content"])
@@ -3403,6 +3410,28 @@ public final class RustEngine: PDFEngine {
             }
         }
         return try JSONDecoder().decode(PDFContentPage.self,from:Data(json.utf8))
+    }
+
+    public func contentDragPreview(page: Int, target: String, revision: String,
+                                   bounds: CGRect, scale: CGFloat) async throws -> ContentDragPreview {
+        guard let document else { throw NSError(domain: "LyraReader", code: 1) }
+        generation += 2
+        let firstGeneration = generation - 1
+        let record: ContentDragPreviewRecord = try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do { continuation.resume(returning: try document.contentDragPreview(
+                    page: UInt32(page), target: target, revision: revision,
+                    bounds: ContentBoxRecord(bounds), scale: Double(scale))) }
+                catch { continuation.resume(throwing: error) }
+            }
+        }
+        func image(_ bitmap: PageBitmap, generation: UInt64) -> PageImage {
+            PageImage(pixelWidth: Int(bitmap.widthPx), pixelHeight: Int(bitmap.heightPx),
+                pointSize: bounds.size, bgra: bitmap.pixels, generation: generation)
+        }
+        return ContentDragPreview(bounds: bounds,
+            background: image(record.background, generation: firstGeneration),
+            foreground: image(record.foreground, generation: firstGeneration + 1))
     }
 
     public func contentImagePNG(page:Int,target:String,revision:String) async throws -> Data {

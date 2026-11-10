@@ -61,9 +61,15 @@ extension ReaderChecks {
         windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
     }
     let p = point(first)
-    state.selectContentTool("text")
+    state.selectContentTool("select")
     view.mouseMoved(with: event(.mouseMoved, p))
     require(view.hoveredContentID == first.id, "Edit hover identifies the complete text block")
+    for tool in ["text", "image", "link", "erase", "blackout"] {
+      state.selectContentTool(tool)
+      view.mouseMoved(with: event(.mouseMoved, p))
+      require(view.hoveredContentID == nil, "the \(tool) tool suppresses the implicit edit hover frame")
+    }
+    state.selectContentTool("text")
     view.mouseDown(with: event(.leftMouseDown, p))
     view.mouseUp(with: event(.leftMouseUp, p))
     require(
@@ -78,16 +84,33 @@ extension ReaderChecks {
     let moved = CGPoint(x: p.x + 20 * state.zoomFactor, y: p.y + 12 * state.zoomFactor)
     view.mouseDown(with: event(.leftMouseDown, p))
     view.mouseDragged(with: event(.leftMouseDragged, moved))
+    try await eventually("PDF text pixels follow the held pointer before mouse-up") {
+      state.canvasPages.contains { $0.placement.index == PlacementIndex.contentDragForeground }
+    }
+    let live = state.canvasPages.first { $0.placement.index == PlacementIndex.contentDragForeground }!
+    let stationary = state.canvasPages.first { $0.placement.index == PlacementIndex.contentDragBackground }!
+    require(abs(live.placement.leftPt - stationary.placement.leftPt - 20) < 0.5
+              && abs(live.placement.topPt - stationary.placement.topPt) > 6,
+            "live text pixels follow the drag in both directions, including alignment snapping")
+    require(live.image.bgra.enumerated().contains { $0.offset % 4 == 3 && $0.element > 0 },
+            "the moving preview contains visible glyph pixels")
+    require(state.pageEditPendingOperations.isEmpty, "pointer samples do not stage PDF revisions")
     view.mouseUp(with: event(.leftMouseUp, moved))
     try await eventually("drag stages and reopens a content revision") {
       state.pageEditPendingOperations.count == 1 && !state.contentEditLoading && !state.pageEditBusy
     }
     require(blankRevisionFrames == 0, "moving page content never publishes a blank PDF frame")
+    try await eventually("the committed page replaces its temporary drag textures") {
+      !state.canvasPages.contains { $0.placement.index == PlacementIndex.contentDragForeground }
+    }
     guard let block = state.contentEditPage?.items.first(where: { $0.text == first.text }) else {
       fatalError("Moved text missing: \(state.lastError ?? "")")
     }
     require(
       abs(block.bounds.x - first.bounds.x - 20) < 0.5, "drag uses page points at the current zoom")
+    require(abs(block.bounds.x - first.bounds.x - live.placement.leftPt + stationary.placement.leftPt) < 0.5
+              && abs(block.bounds.y - first.bounds.y - live.placement.topPt + stationary.placement.topPt) < 0.5,
+            "mouse-up preserves the preview's exact snapped text position")
     let q = point(block)
     view.mouseDown(with: event(.leftMouseDown, q))
     view.mouseUp(with: event(.leftMouseUp, q))

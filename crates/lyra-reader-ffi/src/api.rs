@@ -1238,6 +1238,13 @@ pub struct PageBitmap {
     pub pixels: Vec<u8>,
 }
 
+/// Two bounded region bitmaps, in the same page-local rectangle.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ContentDragPreviewRecord {
+    pub background: PageBitmap,
+    pub foreground: PageBitmap,
+}
+
 /// Where a metadata field came from, as the panel shows it.
 ///
 /// `Absent` is the only correct source of an empty field: "no value" is not a guess.
@@ -2108,69 +2115,19 @@ impl LyraReaderDocument {
         height_pt: f64,
         transparent_background: bool,
     ) -> Result<PageBitmap, LyraReaderFfiError> {
-        if !(scale.is_finite() && scale > 0.0) {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                severity: ErrorSeverity::Document,
-                message: format!("scale must be positive and finite, got {scale}"),
-            });
-        }
-        let page_count = self.backend.page_count();
-        lyra_reader_core::checked_page_index(page, page_count, |page| {
-            LyraReaderFfiError::InvalidArgument {
-                severity: ErrorSeverity::Document,
-                message: lyra_reader_core::page_out_of_range_message(page, page_count),
-            }
-        })?;
-        if !(x_pt.is_finite()
-            && y_pt.is_finite()
-            && width_pt.is_finite()
-            && height_pt.is_finite()
-            && width_pt > 0.0
-            && height_pt > 0.0
-            && (x_pt + width_pt).is_finite()
-            && (y_pt + height_pt).is_finite())
-        {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                severity: ErrorSeverity::Document,
-                message: format!(
-                    "region ({x_pt}, {y_pt}, {width_pt}×{height_pt}) must be finite with positive dimensions"
-                ),
-            });
-        }
-        let geometry = self.backend.page_info(PageIndex(page))?.geometry;
-        let page_size = geometry.view_size(1.0);
-        let tolerance = 1e-6;
-        if x_pt < -tolerance
-            || y_pt < -tolerance
-            || x_pt + width_pt > page_size.width + tolerance
-            || y_pt + height_pt > page_size.height + tolerance
-        {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                severity: ErrorSeverity::Document,
-                message: format!(
-                    "region ({x_pt}, {y_pt}, {width_pt}×{height_pt}) is outside the page bounds ({}, {})",
-                    page_size.width, page_size.height
-                ),
-            });
-        }
-
-        // A caller can request an arbitrary region, so apply the same pixel and edge limits as a
-        // whole-page bitmap before asking PDFium to allocate it.
-        let scale = clamp_scale((width_pt, height_pt), scale);
-        if !(scale.is_finite() && scale > 0.0 && (scale as f32) > 0.0) {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                severity: ErrorSeverity::Document,
-                message: "region dimensions exceed the renderer's supported range".to_string(),
-            });
-        }
-        let mut request =
-            RasterRequest::tile(PageIndex(page), scale, (x_pt, y_pt), (width_pt, height_pt));
-        if transparent_background {
-            // A zero-alpha clear: the page background stays clear, the content PDFium draws
-            // supplies the coverage alpha. The RGB of a fully clear pixel is irrelevant to
-            // alpha-over, which weights it by zero.
-            request.background = [0, 0, 0, 0];
-        }
+        let request = region_raster_request(
+            self,
+            page,
+            scale,
+            ContentBoxRecord {
+                x: x_pt,
+                y: y_pt,
+                width: width_pt,
+                height: height_pt,
+            },
+            transparent_background,
+        )?;
+        let scale = request.scale;
         let tile = self.backend.rasterize(&request)?;
 
         Ok(PageBitmap {
@@ -2958,6 +2915,37 @@ impl LyraReaderDocument {
         serde_json::to_string(&snapshot).map_err(|e| LyraReaderFfiError::InvalidArgument {
             severity: ErrorSeverity::Document,
             message: e.to_string(),
+        })
+    }
+
+    /// Transient pixels for a live drag; only the detached render copy changes.
+    pub fn content_drag_preview(
+        &self,
+        page: u32,
+        target: String,
+        revision: String,
+        bounds: ContentBoxRecord,
+        scale: f64,
+    ) -> Result<ContentDragPreviewRecord, LyraReaderFfiError> {
+        let request = region_raster_request(self, page, scale, bounds, false)?;
+        let preview = lyra_reader_pdfium::content_edit::content_drag_preview(
+            Path::new(&self.path),
+            &target,
+            &revision,
+            &request,
+        )?;
+        let bitmap = |tile: lyra_reader_core::RasterTile| PageBitmap {
+            width_px: tile.size.width as u32,
+            height_px: tile.size.height as u32,
+            stride: tile.stride as u32,
+            width_pt: bounds.width,
+            height_pt: bounds.height,
+            scale_used: request.scale,
+            pixels: tile.pixels,
+        };
+        Ok(ContentDragPreviewRecord {
+            background: bitmap(preview.background),
+            foreground: bitmap(preview.foreground),
         })
     }
 
@@ -6108,6 +6096,85 @@ fn clamp_scale(page_size_pt: (f64, f64), requested: f64) -> f64 {
     }
 
     scale
+}
+
+fn region_raster_request(
+    document: &LyraReaderDocument,
+    page: u32,
+    scale: f64,
+    bounds: ContentBoxRecord,
+    transparent_background: bool,
+) -> Result<RasterRequest, LyraReaderFfiError> {
+    let ContentBoxRecord {
+        x: x_pt,
+        y: y_pt,
+        width: width_pt,
+        height: height_pt,
+    } = bounds;
+    if !(scale.is_finite() && scale > 0.0) {
+        return Err(LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
+            message: format!("scale must be positive and finite, got {scale}"),
+        });
+    }
+    let page_count = document.backend.page_count();
+    lyra_reader_core::checked_page_index(page, page_count, |page| {
+        LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
+            message: lyra_reader_core::page_out_of_range_message(page, page_count),
+        }
+    })?;
+    if !(x_pt.is_finite()
+        && y_pt.is_finite()
+        && width_pt.is_finite()
+        && height_pt.is_finite()
+        && width_pt > 0.0
+        && height_pt > 0.0
+        && (x_pt + width_pt).is_finite()
+        && (y_pt + height_pt).is_finite())
+    {
+        return Err(LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
+            message: format!(
+                "region ({x_pt}, {y_pt}, {width_pt}×{height_pt}) must be finite with positive dimensions"
+            ),
+        });
+    }
+    let geometry = document.backend.page_info(PageIndex(page))?.geometry;
+    let page_size = geometry.view_size(1.0);
+    let tolerance = 1e-6;
+    if x_pt < -tolerance
+        || y_pt < -tolerance
+        || x_pt + width_pt > page_size.width + tolerance
+        || y_pt + height_pt > page_size.height + tolerance
+    {
+        return Err(LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
+            message: format!(
+                "region ({x_pt}, {y_pt}, {width_pt}×{height_pt}) is outside the page bounds ({}, {})",
+                page_size.width, page_size.height
+            ),
+        });
+    }
+
+    // A caller can request an arbitrary region, so apply the same pixel and edge limits as a
+    // whole-page bitmap before asking PDFium to allocate it.
+    let scale = clamp_scale((width_pt, height_pt), scale);
+    if !(scale.is_finite() && scale > 0.0 && (scale as f32) > 0.0) {
+        return Err(LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
+            message: "region dimensions exceed the renderer's supported range".to_string(),
+        });
+    }
+    let mut request =
+        RasterRequest::tile(PageIndex(page), scale, (x_pt, y_pt), (width_pt, height_pt));
+    if transparent_background {
+        // A zero-alpha clear: the page background stays clear, the content PDFium draws
+        // supplies the coverage alpha. The RGB of a fully clear pixel is irrelevant to
+        // alpha-over, which weights it by zero.
+        request.background = [0, 0, 0, 0];
+    }
+    Ok(request)
 }
 
 /// One link: a clickable box plus where it leads.

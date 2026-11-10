@@ -12,22 +12,16 @@ struct DocumentNoteOverlay: View {
                anchor.intersects(CGRect(origin: .zero, size: geometry.size)) {
                 let frame = DocumentNoteLayout.frame(anchor: anchor, viewport: geometry.size)
                 VStack(spacing: 0) {
-                    HStack {
-                        Text(state.openDocumentNote?.author.flatMap { $0.isEmpty ? nil : $0 }
-                             ?? (state.openOwnNote?.kind == .stickyNote ? "Sticky Note" : "Note"))
-                            .font(.headline).lineLimit(1)
-                        Spacer()
-                        Button { state.closeDocumentNote() } label: {
-                            Image(systemName: "xmark")
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Close note")
-                    }
-                    .padding(12)
-                    Divider()
                     NotePaperText(text: state.openOwnNote?.note ?? state.openDocumentNote?.contents ?? "",
                                   onEdit: { state.editOpenNote() })
                         .padding(8)
+                        .padding(.top, 14)
+                }
+                .overlay(alignment: .topTrailing) {
+                    Button { state.closeDocumentNote() } label: { Image(systemName: "xmark") }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Close note")
+                        .padding(6)
                 }
                 .foregroundStyle(LyraReaderTheme.noteFg)
                 .frame(width: frame.width, height: frame.height)
