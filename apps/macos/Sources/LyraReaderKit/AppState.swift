@@ -12587,6 +12587,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         pageEditSession = nil
         pageEditPendingOperations = []
         pageEditIsApplied = false
+        // An empty failed session can end without reopening the original. Restore its records
+        // target before deleting the directory, so later annotation edits cannot write into it.
+        if let session, annotationsURL == session.annotationRecordsURL {
+            annotationsURL = session.originalRecordsURL
+        }
         if let revisionURL = session?.revisionURL, revisionURL != session?.originalURL {
             engine.closeDocument(at: revisionURL)
         }
