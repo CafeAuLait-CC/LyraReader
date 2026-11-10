@@ -46,14 +46,14 @@ Item {
             enabled:app.currentReader.pageCount>0 && !app.currentReader.loading && (!!app.currentReader.aiRegion.image_png || !app.currentReader.aiState.running)
             onClicked:app.openRegionTool()
         }
-        LyraToolButton {objectName:"lyraReadingNotes";symbol:"note";text:qsTr("Notes");Accessible.name:qsTr("Reading notes");display:AbstractButton.TextBesideIcon;enabled:app.currentReader.pageCount>0;onClicked:app.openRegionNotes()}
+        LyraToolButton {objectName:"lyraReadingNotes";symbol:"note";text:qsTr("Notes");Accessible.name:qsTr("Reading notes");display:AbstractButton.TextBesideIcon;selected:app.aiPanelVisible && app.aiPanelMode==="notes";enabled:app.currentReader.pageCount>0;onClicked:app.openRegionNotes()}
         Repeater {
             model:[{key:"summary",title:qsTr("Summary")},{key:"translation",title:qsTr("Translate")},{key:"chat",title:qsTr("Chat")}]
             LyraToolButton {
                 required property var modelData
                 objectName:"lyraWorkspace"+modelData.key
                 symbol:"ai";text:modelData.title;display:AbstractButton.TextBesideIcon
-                selected:app.aiPanelVisible && ((app.currentReader.aiState.input || {}).view || "summary")===modelData.key
+                selected:app.aiPanelVisible && app.aiPanelMode!=="notes" && ((app.currentReader.aiState.input || {}).view || "summary")===modelData.key
                 onClicked:app.openAiWorkspace(modelData.key)
             }
         }

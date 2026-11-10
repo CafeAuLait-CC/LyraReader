@@ -53,6 +53,7 @@ ApplicationWindow {
     property bool reduceMotion:session ? !!session.preference("reduceMotion",false) : false
     onReduceMotionChanged:if(session)session.setPreference("reduceMotion",reduceMotion)
     property string sidebarTab: "thumbnails"
+    property string aiPanelMode:"assistant"
     property bool aiPanelVisible: false
     // Transient ancestors can stay active; only the focused reader owns its shortcuts.
     readonly property bool readerKeyboardEnabled: navigationController.keyboardFocus && (!dialogs.settingsDialog || !dialogs.settingsDialog.visible || !dialogs.settingsDialog.active)
@@ -84,8 +85,7 @@ ApplicationWindow {
     AiRegionCard {id:aiRegionCard;app:root}
     DocumentReading {id:documentReadingPopup;app:root}
     function openDocumentReading(){aiRegionCard.close();regionNotes.close();documentReadingPopup.open();}
-    RegionNotes {id:regionNotes;app:root}
-    function openRegionNotes(){aiRegionCard.close();regionNotes.open();}
+    function openRegionNotes(){if(currentReader.pageCount>0){aiRegionCard.close();showAiPanelMode(true,"notes");}}
     function focusReadingView() {
         if(currentReader.pageCount>0) {
             const target=overviewVisible ? overviewContent.focusTarget : textViewVisible ? accessibleTextView.focusTarget : pageList;
@@ -108,12 +108,15 @@ ApplicationWindow {
         currentReader.setAiInput("view",value);
         showAiPanel(true);
     }
-    function showAiPanel(show) {
-        if (placedTextController.deferAction(function(){root.showAiPanel(show);})) return;
-        if (show && secondaryRow==="edit" && contentController.deferAction({kind:"assistant",value:true})) return;
+    function showAiPanel(show) {showAiPanelMode(show,"assistant");}
+    function showAiPanelMode(show,mode) {
+        const panelMode=mode==="notes" ? "notes" : "assistant";
+        if (placedTextController.deferAction(function(){root.showAiPanelMode(show,panelMode);})) return;
+        if (show && secondaryRow==="edit" && contentController.deferAction({kind:"assistant",value:true,mode:panelMode})) return;
         if (show) {
             if (secondaryRow==="edit" || secondaryRow==="fill") setSecondaryRow("",true);
             overviewVisible=false;
+            aiPanelMode=panelMode;
         }
         aiPanelVisible = show;
         if (show && width < 1200) searchVisible = false;
@@ -1956,6 +1959,7 @@ ApplicationWindow {
             if(placedTextController.current){placedTextController.finish(true);return;}
             if(contentController.inlineEditing && contentController.textDraft){contentController.discard();return;}
             if(aiRegionCard.visible){aiRegionCard.close();return;}
+            if(regionNotes.active){regionNotes.close();return;}
             root.cancelTabReorder();
             root.cancelRegionSelection();
             if (root.previewController && root.previewController.visible)
@@ -2191,17 +2195,18 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         Layout.leftMargin: 14
                         Layout.rightMargin: 8
-                        Label { text: aiContent.workspaceTitle; color: theme.textPrimary; font.weight: Font.DemiBold; Layout.fillWidth: true }
+                        Label { text: root.aiPanelMode==="notes" ? qsTr("Reading notes") : aiContent.workspaceTitle; color: theme.textPrimary; font.weight: Font.DemiBold; Layout.fillWidth: true }
                         LyraToolButton { symbol: "settings"; text: qsTr("AI settings"); onClicked: root.showSettings() }
                         LyraToolButton {
                             objectName: "closeAiPanel"
                             symbol: "close"
-                            text: qsTr("Close AI panel (Ctrl+Shift+A)")
+                            text: root.aiPanelMode==="notes" ? qsTr("Close reading notes") : qsTr("Close AI panel (Ctrl+Shift+A)")
                             onClicked: root.showAiPanel(false)
                         }
                     }
                     Rectangle { Layout.fillWidth: true; height: 1; color: theme.separator }
-                    AiPanel { id: aiContent; app: root; Layout.fillWidth: true; Layout.fillHeight: true }
+                    AiPanel { id: aiContent; app: root; visible:root.aiPanelMode!=="notes"; Layout.fillWidth: true; Layout.fillHeight: true }
+                    RegionNotes {id:regionNotes;app:root;Layout.fillWidth:true;Layout.fillHeight:true}
                 }
                 Rectangle {
                     width: 1; height: parent.height; color: theme.separator
@@ -2384,7 +2389,7 @@ ApplicationWindow {
         }
         function onActiveReaderAboutToChange() {
             root.currentReader.cancelIndexQueries();
-            aiRegionCard.close();root.currentReader.cancelAiRegionCapture();root.cancelRegionSelection();
+            regionNotes.close();aiRegionCard.close();root.currentReader.cancelAiRegionCapture();root.cancelRegionSelection();
             if(placedTextController.waitingForCreation)placedTextController.suppressPendingEditor();
             dialogs.flushAnnotation();
             dialogs.annotationDialog.close();
@@ -2397,6 +2402,7 @@ ApplicationWindow {
             root.clearNavigation();
             root.pendingLayoutPosition=null;
             root.cancelRegionSelection();aiRegionCard.closeCard(false);
+            if(root.aiPanelMode==="notes")root.aiPanelVisible=false;
             documentReadingPopup.close();
             root.cancelErase();
             ++root.positionRestoreEpoch;

@@ -391,7 +391,37 @@ impl History {
         Ok(output.into_bytes())
     }
     pub fn summaries(&self, key: &str, sha: &str) -> Result<Value, String> {
-        let entries=self.migrated_entries(key)?.into_iter().map(|e|json!({"id":e.id,"page":e.attachment.page,"number":e.region_number,"created_at":e.created_at,"question":e.question.chars().take(160).collect::<String>(),"draft":e.draft_question.as_deref().unwrap_or("").chars().take(160).collect::<String>(),"state":e.state,"turns":e.turns.len(),"has_note":!e.knowledge_note.is_empty(),"location_invalidated":e.location_invalidated==Some(true) || e.capture_sha256.as_deref().is_some_and(|s|s!=sha)})).collect::<Vec<_>>();
+        // Sort the presentation view only. Raw slots keep their original order and bytes.
+        // Stable equal-date ordering also treats positive and negative zero alike.
+        let mut entries = self.migrated_entries(key)?;
+        entries.sort_by(|a, b| {
+            if a.created_at == b.created_at {
+                std::cmp::Ordering::Equal
+            } else {
+                b.created_at.total_cmp(&a.created_at)
+            }
+        });
+        let entries = entries.into_iter().map(|e| {
+            // Legacy single-turn records have no turns array, matching the producer's allTurns.
+            let turns = if e.turns.is_empty() {
+                usize::from(!e.question.is_empty())
+            } else {
+                e.turns.len()
+            };
+            json!({
+                "id": e.id,
+                "page": e.attachment.page,
+                "number": e.region_number,
+                "created_at": e.created_at,
+                "question": e.question.chars().take(160).collect::<String>(),
+                "draft": e.draft_question.as_deref().unwrap_or("").chars().take(160).collect::<String>(),
+                "state": e.state,
+                "turns": turns,
+                "has_note": !e.knowledge_note.is_empty(),
+                "location_invalidated": e.location_invalidated == Some(true)
+                    || e.capture_sha256.as_deref().is_some_and(|s| s != sha)
+            })
+        }).collect::<Vec<_>>();
         Ok(
             json!({"entries":entries,"foreign_count":self.foreign_count(),"warnings":self.warnings,"writes_blocked":self.writes_blocked}),
         )
@@ -602,6 +632,33 @@ mod tests {
                 .unwrap()
                 .writes_blocked
         );
+    }
+    #[test]
+    fn summary_view_is_newest_first_with_stable_ties_and_legacy_turn_counts() {
+        let mut history = History::default();
+        for (index, time) in [10.0, 30.0, 30.0, -0.0, 0.0].into_iter().enumerate() {
+            let mut entry = sample();
+            entry.id = format!("00000000-1111-4222-8333-{:012}", index + 1);
+            entry.created_at = time;
+            entry.turns.clear();
+            entry.question = if index == 0 {
+                String::new()
+            } else {
+                "Legacy question".into()
+            };
+            history.put(entry).unwrap();
+        }
+        let bytes = history.encode().unwrap();
+        let view = history.summaries("current-key", &"a".repeat(64)).unwrap();
+        let entries = view["entries"].as_array().unwrap();
+        let ids: Vec<_> = entries.iter().map(|v| v["id"].as_str().unwrap()).collect();
+        assert_eq!(
+            ids,
+            [2, 3, 1, 4, 5].map(|i| format!("00000000-1111-4222-8333-{i:012}"))
+        );
+        assert_eq!(entries[0]["turns"], 1);
+        assert_eq!(entries[2]["turns"], 0);
+        assert_eq!(history.encode().unwrap(), bytes);
     }
     #[test]
     fn malicious_attachment_geometry_and_lengths_are_rejected_before_decode_or_allocation() {

@@ -153,7 +153,7 @@ Item {
         else if (next.kind==="tabClose") app.requestCloseTab(app.readerIndex(next.reader));
         else if (next.kind==="windowClose") app.close();
         else if (next.kind==="overview") app.showOverview(true);
-        else if (next.kind==="assistant") app.showAiPanel(next.value);
+        else if (next.kind==="assistant") app.showAiPanelMode(next.value,next.mode);
         else if (next.kind==="region") app.armRegion(true);
         else if (next.kind==="search") app.focusSearch();
         else if (next.kind==="textView") app.setTextViewEnabled(next.value);
