@@ -371,7 +371,7 @@ quint64 ReaderController::saveAiRegionNote() {
 void ReaderController::handleAiCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error) {
     if(operation.startsWith(QStringLiteral("knowledge_"))){handleDocumentReadingCommand(id,operation,result,error);return;}
     // Exports report their own outcome; they do not replace the loaded history or drafts.
-    if(operation==QStringLiteral("region_export_markdown"))return;
+    if(operation==QStringLiteral("region_export_markdown") || operation==QStringLiteral("region_thumbnail"))return;
     if(operation.startsWith(QStringLiteral("region_")) && operation!=QStringLiteral("region_get")) {
         if(error.isEmpty())m_regionHistory=result.toMap();else m_regionHistory.insert(QStringLiteral("error"),error);
         emit regionHistoryChanged();

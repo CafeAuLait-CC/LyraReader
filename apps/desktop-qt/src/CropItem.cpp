@@ -56,7 +56,7 @@ void CropItem::setSource(const QUrl &source) {
     if(m_source==source)return;
     auto withoutPaper=[](QUrl value){QUrlQuery query(value);query.removeAllQueryItems(QStringLiteral("paper"));value.setQuery(query);return value;};
     const bool changed=withoutPaper(source)!=withoutPaper(m_source);m_source=source;emit sourceChanged();
-    if(changed){invalidate();m_image={};m_error.clear();setStatus(source.isEmpty()?0:2);syncBudget();m_timer.start();update();}
+    if(changed){invalidate();m_image={};m_error.clear();setStatus(source.isEmpty()?0:2);m_lastActive=active();syncBudget();m_timer.start();update();}
 }
 void CropItem::setPaperAppearance(const QString &paper){if(m_paper==paper)return;m_paper=paper;emit paperAppearanceChanged();update();}
 void CropItem::setResourceActive(bool value){if(m_resourceActive==value)return;m_resourceActive=value;scheduleVisibilityUpdate();emit resourceActiveChanged();}

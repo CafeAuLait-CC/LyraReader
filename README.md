@@ -92,7 +92,10 @@ drafts and results; switching views or reopening the drawer sends nothing. Chat 
 composer and collapsed source passages. Select & Ask captures a bounded area in its original colours
 and requires a request preview before sending. Save to Reading notes keeps its frozen image, text,
 question draft and completed or partial answer in the application cache; the Notes view reads these
-snapshots and edits local knowledge notes without sending a request. Saving is currently explicit;
+snapshots, shows bounded capture thumbnails and edits local knowledge notes without sending a request.
+Historical source buttons use only pages actually sent for that turn and the same PDF revision;
+answer-written page markers remain plain text. Saved notes export to a new Markdown file with
+their original PNG captures, preserving existing exports and the PDF. Saving is currently explicit;
 automatic region persistence, reopening multiple cards and Interleaf layout remain work in progress.
 Unfinished knowledge-note drafts and failed snapshot saves keep the document open until resolved.
 Legacy answer page markers stay plain text. Actual HTTP attempts have a bounded local metadata audit

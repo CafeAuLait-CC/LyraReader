@@ -8,6 +8,7 @@
 #include <QElapsedTimer>
 #include <QFileInfo>
 #include <QFile>
+#include <QBuffer>
 #include <QFutureWatcher>
 #include <QJsonDocument>
 #include <QJsonArray>
@@ -341,7 +342,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         if(document!=m_document || (!mutation && generation!=m_generation))return;
         if((operation==QStringLiteral("marks") || operation==QStringLiteral("content_objects")) && mutationSequence!=m_mutationSequence)return;
         if(latestOnly && m_latestRead.value(operation)!=id)return;
-        if (!outcome.error.isEmpty() && operation!=QStringLiteral("split_plan") && !operation.startsWith(QStringLiteral("ai_")) && !operation.startsWith(QStringLiteral("knowledge_"))) setError(outcome.error);
+        if (!outcome.error.isEmpty() && operation!=QStringLiteral("split_plan") && operation!=QStringLiteral("region_thumbnail") && !operation.startsWith(QStringLiteral("ai_")) && !operation.startsWith(QStringLiteral("knowledge_"))) setError(outcome.error);
         else if (operation==QStringLiteral("content_stage") || operation==QStringLiteral("page_stage") || operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo") || operation==QStringLiteral("page_discard") || operation==QStringLiteral("page_apply") || operation==QStringLiteral("document_save") || operation==QStringLiteral("document_discard")) {
             setRasterSource(outcome.source);
             const auto revision=outcome.result.toMap();
@@ -417,11 +418,25 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
             detail.insert(QStringLiteral("image_url"),QUrl(QStringLiteral("data:image/png;base64,")+detail.value(QStringLiteral("attachment")).toMap().value(QStringLiteral("png")).toString()));
             result.result=detail;
         }
+        if(result.error.isEmpty() && operation==QStringLiteral("region_thumbnail")) {
+            const auto capture=result.result.toMap();
+            // Decode off the GUI thread under the existing temporary-pixel admission budget.
+            auto reservation=RenderBudget::reserve(RenderBudget::Kind::Resident,RenderBudget::maximumJobBytes);
+            if(!reservation)result.error=QStringLiteral("Preview memory is busy. Reopen Reading notes to try again.");
+            else {
+                const auto url=QUrl(QStringLiteral("data:image/png;base64,")+capture.value(QStringLiteral("png")).toString());
+                const auto image=NativeImageProvider::rawImage(url,64*1024,&result.error);
+                QByteArray png;QBuffer buffer(&png);
+                if(image.isNull() || !buffer.open(QIODevice::WriteOnly) || !image.save(&buffer,"PNG"))result.error=QStringLiteral("The saved capture thumbnail could not be decoded.");
+                else result.result=QVariantMap{{QStringLiteral("id"),capture.value(QStringLiteral("id"))},{QStringLiteral("revision"),capture.value(QStringLiteral("revision"))},{QStringLiteral("width"),image.width()},{QStringLiteral("height"),image.height()},{QStringLiteral("image_url"),QUrl(QStringLiteral("data:image/png;base64,")+QString::fromLatin1(png.toBase64()))}};
+            }
+            if(!result.error.isEmpty())result.result=QVariantMap{};
+        }
         if(result.error.isEmpty() && (operation==QStringLiteral("content_stage") || operation==QStringLiteral("page_stage") || operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo") || operation==QStringLiteral("page_discard") || operation==QStringLiteral("page_apply") || operation==QStringLiteral("document_save") || operation==QStringLiteral("document_discard")))
             result.source=NativeRasterSource::prepare(document,false,&result.error);
         return result;
     };
-    const bool regionWrite=operation.startsWith(QStringLiteral("region_")) && operation!=QStringLiteral("region_get") && operation!=QStringLiteral("region_list");
+    const bool regionWrite=operation.startsWith(QStringLiteral("region_")) && operation!=QStringLiteral("region_get") && operation!=QStringLiteral("region_list") && operation!=QStringLiteral("region_thumbnail");
     if(mutation || regionWrite || eraseControl || operation==QStringLiteral("ai_start") || operation==QStringLiteral("ai_cancel") || operation==QStringLiteral("knowledge_start") || operation==QStringLiteral("knowledge_cancel")){
         auto promise=std::make_shared<QPromise<CommandResult>>();promise->start();watcher->setFuture(promise->future());
         m_mutations->append([task,promise]{try{promise->addResult(task());}catch(...){promise->addResult(CommandResult{{},QStringLiteral("The command worker stopped unexpectedly.")});}promise->finish();});

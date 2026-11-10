@@ -42,6 +42,7 @@
 #include <QProcess>
 #include <QQuickStyle>
 #include <QQuickWindow>
+#include <QRegularExpression>
 #include <QQmlProperty>
 #include <QSGRendererInterface>
 #include <QSettings>
@@ -1826,6 +1827,14 @@ private slots:
         QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",220},{"height",440}},1));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiRegion().value("image_png").toString().isEmpty(),10000);QTRY_COMPARE_WITH_TIMEOUT(crop->property("status").toInt(),1,10000);QVERIFY(qAbs(crop->property("width").toDouble()/crop->property("height").toDouble()-.5)<.001);
         window->setProperty("textViewVisible",true);auto *readable=visualItem(window->contentItem(),"accessiblePageText");QVERIFY(readable);QTRY_VERIFY(readable->isVisible());
         QVERIFY(QMetaObject::invokeMethod(card,"close"));QTRY_VERIFY(readable->hasActiveFocus());QVERIFY(reader->aiRegionPaper().isEmpty());QVERIFY(!card->property("opened").toBool());QCOMPARE(server.requests.size(),3);
+        QVERIFY(QMetaObject::invokeMethod(window,"openRegionNotes"));auto *savedNotes=window->findChild<QObject *>("regionNotes");QVERIFY(savedNotes);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(savedNotes,"load",Q_ARG(QVariant,savedRegionId)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QTRY_VERIFY(visualItem(window->contentItem(),"regionNoteSource1"));auto *sentPage=visualItem(window->contentItem(),"regionNoteSource1");QTRY_VERIFY(sentPage->isVisible());QVERIFY(sentPage->isEnabled());
+        const auto beforeSource=window->property("currentPage");QVERIFY(QMetaObject::invokeMethod(savedNotes,"followSource",Q_ARG(QVariant,99)));QCOMPARE(window->property("currentPage"),beforeSource);QVERIFY(window->property("operationStatus").toString().contains("unavailable"));
+        window->setProperty("operationStatus",QString{});QVERIFY(QMetaObject::invokeMethod(sentPage,"clicked"));QCOMPARE(window->property("currentPage").toInt(),0);QVERIFY(window->property("operationStatus").toString().isEmpty());
+        const auto generation=savedNotes->property("ownerGeneration");savedNotes->setProperty("ownerGeneration",generation.toInt()-1);QVERIFY(QMetaObject::invokeMethod(savedNotes,"followSource",Q_ARG(QVariant,1)));QVERIFY(window->property("operationStatus").toString().contains("unavailable"));savedNotes->setProperty("ownerGeneration",generation);
+        savedNotes->setProperty("turnIndex",1);QTRY_VERIFY(!visualItem(window->contentItem(),"regionNoteSource1"));QVERIFY(QMetaObject::invokeMethod(savedNotes,"followSource",Q_ARG(QVariant,1)));QVERIFY(window->property("operationStatus").toString().contains("unavailable"));
+        QVERIFY(QMetaObject::invokeMethod(savedNotes,"close"));QCOMPARE(server.requests.size(),3);
         QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),original);
     }
     void regionPaperUnfoldClipsNativeTextAndHoldsRasterDemand_data() {
@@ -2034,6 +2043,7 @@ private slots:
         reader->clearAiRegion();QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),original);
     }
     void savedRegionNotesRetainCapturesLateDraftsAndKnowledgeAcrossReopen() {
+        QTest::failOnWarning(QRegularExpression(QStringLiteral(".*exception occurred during delayed function evaluation.*")));
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/reading-notes.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
         MockChatServer sentinel;QVERIFY(sentinel.listen());
         NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;window->setProperty("aiSettings",QVariantMap{{"baseUrl",sentinel.baseUrl()},{"model","notes-no-send"}});view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
@@ -2048,10 +2058,18 @@ private slots:
         auto *notesItem=qobject_cast<QQuickItem *>(notes);auto *dock=visualItem(window->contentItem(),"aiDock");auto *notesList=visualItem(window->contentItem(),"regionNotesList");QVERIFY(notesItem && dock && notesList);
         bool insideDock=false;for(auto *item=notesItem;item;item=item->parentItem())if(item==dock)insideDock=true;QVERIFY(insideDock);
         QTRY_VERIFY(notesItem->width()>240 && notesItem->width()<=dock->width());QTRY_VERIFY(notesItem->height()>300);QTRY_VERIFY(notesList->hasActiveFocus());
+        auto *thumbnail=qobject_cast<CropItem *>(visualItem(window->contentItem(),"regionNoteThumbnail1"));QVERIFY2(thumbnail,"Saved list rows must show a bounded frozen capture thumbnail");QTRY_COMPARE_WITH_TIMEOUT(thumbnail->status(),1,10000);QVERIFY(!thumbnail->pixelSize().isEmpty());QVERIFY(qint64(thumbnail->pixelSize().width())*thumbnail->pixelSize().height()*4<=64*1024);QCOMPARE(sentinel.requests.size(),0);
+        const auto historyBeforeThumbnailFailure=reader->regionHistory();QSignalSpy thumbnailFailures(reader,&ReaderController::commandFinished);const auto staleThumbnail=reader->submit("region_thumbnail",{{"id",id},{"expected_history_revision","obsolete-layout-fixture"}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);bool thumbnailRefused=false;for(const auto &row:thumbnailFailures)if(row[0].toULongLong()==staleThumbnail){thumbnailRefused=row[3].toString().contains("changed");}QVERIFY(thumbnailRefused);QCOMPARE(reader->regionHistory(),historyBeforeThumbnailFailure);QVERIFY2(reader->error().isEmpty(),"A retired thumbnail request must report to its owner without replacing document-wide errors");
         // Native key activation must reach a real list row, rather than calling load directly.
         QTRY_VERIFY(notesList->property("count").toInt()==1);QTest::keyClick(window,Qt::Key_Return);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
         const auto toMap=[](const QVariant &v){return v.metaType()==QMetaType::fromType<QJSValue>() ? v.value<QJSValue>().toVariant().toMap():v.toMap();};
         QTRY_COMPARE_WITH_TIMEOUT(toMap(notes->property("detail")).value("draftQuestion").toString(),QString("Late draft is retained"),10000);QCOMPARE(toMap(notes->property("detail")).value("attachment").toMap().value("png").toString(),png);
+        QTRY_COMPARE_WITH_TIMEOUT(thumbnail->status(),0,10000);QVERIFY(!visualItem(window->contentItem(),"regionNoteSource1"));
+        // Stress only the presentation with the storage source-count limit. These synthetic
+        // pages are not provenance and the actual one-page reader must refuse their targets.
+        auto *sourceStrip=visualItem(window->contentItem(),"regionNoteSources");QVERIFY(sourceStrip);const auto originalDetail=toMap(notes->property("detail"));auto layoutFixture=originalDetail;QVariantList manySources;for(int page=1;page<=4096;++page)manySources.append(page);layoutFixture.insert("verified_source_pages",QVariantList{QVariant::fromValue(manySources)});notes->setProperty("detail",layoutFixture);
+        QTRY_COMPARE(sourceStrip->property("count").toInt(),4096);std::function<int(QQuickItem *)> sourceControls=[&](QQuickItem *item){bool number=false;item->objectName().mid(QStringLiteral("regionNoteSource").size()).toInt(&number);int count=number && item->objectName().startsWith("regionNoteSource") ? 1 : 0;for(auto *child:item->childItems())count+=sourceControls(child);return count;};QTRY_VERIFY(sourceControls(sourceStrip)>0);QVERIFY(sourceControls(sourceStrip)<32);
+        sourceStrip->setProperty("currentIndex",4095);QTRY_VERIFY(visualItem(window->contentItem(),"regionNoteSource4096"));QVERIFY(sourceControls(sourceStrip)<32);const auto beforeJump=window->property("currentPage");QVERIFY(QMetaObject::invokeMethod(notes,"followSource",Q_ARG(QVariant,4096)));QCOMPARE(window->property("currentPage"),beforeJump);QVERIFY(window->property("operationStatus").toString().contains("unavailable"));notes->setProperty("detail",originalDetail);QTRY_COMPARE(sourceStrip->property("count").toInt(),0);window->setProperty("operationStatus",QString{});
         auto *crop=window->findChild<QObject *>("regionNoteImage");QVERIFY(crop);QTRY_COMPARE_WITH_TIMEOUT(crop->property("status").toInt(),1,10000);QVERIFY(qAbs(crop->property("width").toDouble()/crop->property("height").toDouble()-420.0/180.0)<.001);
         auto *exportNotes=window->findChild<QObject *>("exportRegionNotes");QVERIFY(exportNotes);QVERIFY(!exportNotes->property("enabled").toBool());
         auto *text=window->findChild<QObject *>("regionKnowledgeNote");auto *save=window->findChild<QObject *>("saveRegionKnowledgeNote");QVERIFY(text && save);text->setProperty("text","A synthetic local knowledge note α/β");auto *noteEditor=qobject_cast<QQuickItem *>(text);auto *saveButton=qobject_cast<QQuickItem *>(save);QVERIFY(noteEditor && saveButton);noteEditor->forceActiveFocus();QTest::keyClick(window,Qt::Key_End,Qt::ControlModifier);QTest::keyClick(window,Qt::Key_Return);QCOMPARE(text->property("text").toString(),QString("A synthetic local knowledge note α/β\n"));QTest::keyClick(window,Qt::Key_Backspace);QTest::keyClick(window,Qt::Key_Tab);QVERIFY2(saveButton->hasActiveFocus(),"Tab must leave the reading-note editor for its Save button, without inserting a tab");QCOMPARE(text->property("text").toString(),QString("A synthetic local knowledge note α/β"));QTest::keyClick(window,Qt::Key_Space);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));

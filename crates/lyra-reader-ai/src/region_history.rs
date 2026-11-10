@@ -202,6 +202,25 @@ impl Entry {
             .and_then(|t| t.source_pages.as_deref())
             .unwrap_or(&[])
     }
+    /// One-based pages actually sent for this turn, valid only for the captured revision.
+    /// An answer's page markers and an older capture without a fingerprint prove nothing.
+    pub fn navigable_sources(&self, turn: usize, page_count: u32, sha: &str) -> Vec<u32> {
+        if self.location_invalidated == Some(true)
+            || self.capture_sha256.as_deref() != Some(sha)
+            || self.attachment.page >= page_count
+        {
+            return Vec::new();
+        }
+        let mut pages: Vec<_> = self
+            .verified_sources(turn)
+            .iter()
+            .copied()
+            .filter(|page| *page > 0 && *page <= page_count)
+            .collect();
+        pages.sort_unstable();
+        pages.dedup();
+        pages
+    }
 }
 
 #[derive(Clone)]
@@ -566,6 +585,33 @@ mod tests {
             .next()
             .unwrap()
             .clone()
+    }
+    #[test]
+    fn source_navigation_needs_sent_turn_pages_and_the_same_capture_revision() {
+        let mut entry = sample();
+        entry.capture_sha256 = Some("a".repeat(64));
+        entry.turns = vec![Turn {
+            id: entry.id.clone(),
+            question: "Synthetic question".into(),
+            answer: "Unverified marker [p.99]".into(),
+            state: AnswerState::Finished,
+            error: None,
+            created_at: 0.0,
+            source_pages: Some(vec![2, 1, 2, 3, 0, u32::MAX]),
+        }];
+        let sha = "a".repeat(64);
+        assert_eq!(entry.navigable_sources(0, 2, &sha), [1, 2]);
+        assert!(entry.navigable_sources(1, 2, &sha).is_empty());
+        assert!(entry.navigable_sources(0, 2, &"b".repeat(64)).is_empty());
+        assert!(entry.navigable_sources(0, 0, &sha).is_empty());
+        entry.location_invalidated = Some(true);
+        assert!(entry.navigable_sources(0, 2, &sha).is_empty());
+        entry.location_invalidated = None;
+        entry.capture_sha256 = None;
+        assert!(entry.navigable_sources(0, 2, &sha).is_empty());
+        entry.capture_sha256 = Some(sha.clone());
+        entry.turns[0].source_pages = None;
+        assert!(entry.navigable_sources(0, 2, &sha).is_empty());
     }
     #[test]
     fn legacy_rectangle_date_and_unverified_sources_survive_without_reencoding() {

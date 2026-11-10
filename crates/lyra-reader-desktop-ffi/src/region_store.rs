@@ -184,6 +184,16 @@ impl DesktopDocument {
             state["revision"] = json!(store.revision());
             return Ok(state);
         }
+        if op == "region_thumbnail" {
+            if field(r, "expected_history_revision")? != store.revision() {
+                return Err("Reading notes changed. Refresh the saved captures".into());
+            }
+            // Borrow just one validated attachment; a virtual list must not clone every PNG.
+            let entry = store.history.get(field(r, "id")?)?;
+            return Ok(json!({"id":entry.id,"revision":store.revision(),
+                "png":entry.attachment.png,"width":entry.attachment.pixel_width,
+                "height":entry.attachment.pixel_height}));
+        }
         if op == "region_get" {
             let entry = store
                 .history
@@ -198,6 +208,15 @@ impl DesktopDocument {
                         .capture_sha256
                         .as_deref()
                         .is_some_and(|s| s != identity.sha256)
+            );
+            value["verified_source_pages"] = json!(
+                (0..entry.turns.len())
+                    .map(|turn| entry.navigable_sources(
+                        turn,
+                        active.page_count(),
+                        &identity.sha256
+                    ))
+                    .collect::<Vec<_>>()
             );
             return Ok(value);
         }

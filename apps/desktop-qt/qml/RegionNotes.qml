@@ -16,6 +16,7 @@ Pane {
     readonly property var history:owner ? owner.regionHistory : ({})
     readonly property var turns:detail ? detail.turns || [] : []
     readonly property var turn:turns.length ? turns[Math.min(turnIndex,turns.length-1)] : detail && detail.question ? detail : null
+    readonly property var verifiedPages:detail && !detail.locationInvalidated ? (detail.verified_source_pages || [])[turnIndex] || [] : []
     function stateLabel(state){return state==="finished" ? qsTr("Completed") : state==="cancelled" ? qsTr("Stopped") : state==="failed" ? qsTr("Failed") : qsTr("No answer yet");}
     readonly property bool active:app.aiPanelVisible && app.aiPanelMode==="notes" && app.currentReader.pageCount>0
     property string readError:""
@@ -49,6 +50,12 @@ Pane {
     Keys.onShortcutOverride:function(event){if(event.key===Qt.Key_Escape)event.accepted=true;}
     Keys.onEscapePressed:function(event){close();event.accepted=true;}
     function load(id){if(owner.regionNoteDraft.id && owner.regionNoteDraft.id!==id){app.operationStatus=qsTr("Save or discard the current reading note before selecting another area.");return;}selectedId=id;detail=null;readError="";readId=owner.submit("region_get",{id:id});}
+    function followSource(page) {
+        if(!owner || owner!==app.currentReader || ownerGeneration!==owner.documentGeneration || !Number.isInteger(page) || page<1 || page>owner.pageCount || verifiedPages.indexOf(page)<0) {
+            app.operationStatus=qsTr("This earlier source is unavailable for the current document revision.");return;
+        }
+        app.navigate(page-1,0);app.focusReadingView();
+    }
     function clearExportPresentation(){exportReader=null;exportId=0;}
     function beginExport() {
         if(!canExport)return;
@@ -110,11 +117,57 @@ Pane {
                 objectName:"regionNoteRow"+modelData.number
                 text:qsTr("Region %1 · page %2").arg(modelData.number).arg(modelData.page+1)
                 implicitHeight:Math.max(86,contentItem.implicitHeight+20)
-                contentItem:ColumnLayout {
-                    spacing:4
-                    Label {text:row.text;textFormat:Text.PlainText;font.bold:true;Layout.fillWidth:true;color:row.highlighted ? notes.app.colors.selectedFg : notes.app.colors.accent}
-                    Label {text:modelData.question || modelData.draft || qsTr("New region");textFormat:Text.PlainText;wrapMode:Text.Wrap;maximumLineCount:2;elide:Text.ElideRight;Layout.fillWidth:true;color:notes.app.colors.textPrimary}
-                    Label {text:qsTr("%1 turns · %2").arg(modelData.turns).arg(modelData.has_note ? qsTr("Reading note") : notes.stateLabel(modelData.state));textFormat:Text.PlainText;Layout.fillWidth:true;color:notes.app.colors.textSecondary;font.pixelSize:11}
+                property var thumbnail:null
+                property string thumbnailError:""
+                property var thumbnailId:0
+                property var thumbnailOwner:null
+                property string thumbnailRevision:""
+                property int thumbnailGeneration:-1
+                readonly property bool inViewport:list.visible && notes.active && y+height>list.contentY && y<list.contentY+list.height
+                function refreshThumbnail() {
+                    if(!inViewport || !notes.owner || !notes.history.revision || notes.history.error || thumbnailId)return;
+                    if(thumbnail && thumbnailRevision===notes.history.revision)return;
+                    thumbnail=null;thumbnailError="";thumbnailOwner=notes.owner;thumbnailGeneration=thumbnailOwner.documentGeneration;thumbnailRevision=notes.history.revision;
+                    thumbnailId=thumbnailOwner.submit("region_thumbnail",{id:modelData.id,expected_history_revision:thumbnailRevision});
+                }
+                Timer {id:thumbnailRefresh;interval:0;onTriggered:row.refreshThumbnail()}
+                onInViewportChanged:if(inViewport)thumbnailRefresh.restart()
+                onModelDataChanged:thumbnailRefresh.restart()
+                Component.onCompleted:thumbnailRefresh.restart()
+                Connections {target:notes;function onHistoryChanged(){thumbnailRefresh.restart();}}
+                Connections {
+                    target:row.thumbnailOwner
+                    function onCommandFinished(id,op,result,error) {
+                        if(id!==row.thumbnailId || op!=="region_thumbnail")return;
+                        row.thumbnailId=0;
+                        if(row.thumbnailOwner!==notes.owner || row.thumbnailGeneration!==notes.ownerGeneration || row.thumbnailRevision!==notes.history.revision || (!error && result.id!==row.modelData.id)) {thumbnailRefresh.restart();return;}
+                        row.thumbnailError=error;if(!error)row.thumbnail=result;
+                    }
+                }
+                contentItem:RowLayout {
+                    spacing:10
+                    Rectangle {
+                        Layout.preferredWidth:52;Layout.preferredHeight:42;Layout.alignment:Qt.AlignTop
+                        radius:4;color:notes.app.colors.canvasBg
+                        PdfCrop {
+                            objectName:"regionNoteThumbnail"+row.modelData.number
+                            anchors.centerIn:parent
+                            width:row.thumbnail ? Math.min(52,42*row.thumbnail.width/row.thumbnail.height) : 52
+                            height:row.thumbnail ? width*row.thumbnail.height/row.thumbnail.width : 42
+                            source:row.thumbnail ? row.thumbnail.image_url : ""
+                            resourceActive:row.inViewport
+                            Accessible.role:Accessible.Graphic;Accessible.name:qsTr("Saved capture for region %1").arg(row.modelData.number)
+                            Accessible.description:row.thumbnailError
+                        }
+                        Label {anchors.fill:parent;text:row.thumbnailError ? qsTr("No preview") : "…";visible:!row.thumbnail;wrapMode:Text.Wrap;horizontalAlignment:Text.AlignHCenter;verticalAlignment:Text.AlignVCenter;color:notes.app.colors.textSecondary;font.pixelSize:10}
+                        ToolTip.visible:row.hovered && !!row.thumbnailError;ToolTip.text:row.thumbnailError
+                    }
+                    ColumnLayout {
+                        spacing:4;Layout.fillWidth:true
+                        Label {text:row.text;textFormat:Text.PlainText;font.bold:true;Layout.fillWidth:true;color:row.highlighted ? notes.app.colors.selectedFg : notes.app.colors.accent}
+                        Label {text:row.modelData.question || row.modelData.draft || qsTr("New region");textFormat:Text.PlainText;wrapMode:Text.Wrap;maximumLineCount:2;elide:Text.ElideRight;Layout.fillWidth:true;color:notes.app.colors.textPrimary}
+                        Label {text:qsTr("%1 turns · %2").arg(row.modelData.turns).arg(row.modelData.has_note ? qsTr("Reading note") : notes.stateLabel(row.modelData.state));textFormat:Text.PlainText;Layout.fillWidth:true;color:notes.app.colors.textSecondary;font.pixelSize:11}
+                    }
                 }
                 background:Rectangle {radius:6;color:parent.highlighted ? notes.app.colors.selectedBg : parent.down ? notes.app.colors.pressedBg : parent.hovered ? notes.app.colors.hoverBg : notes.app.colors.raisedBg;border.width:list.activeFocus && list.currentIndex===row.index ? 2 : 1;border.color:list.activeFocus && list.currentIndex===row.index ? notes.app.colors.focusRing : notes.app.colors.separator}
                 highlighted:notes.selectedId===modelData.id
@@ -150,7 +203,19 @@ Pane {
                 Label {text:notes.turn ? qsTr("%1 · %2").arg(notes.stateLabel(notes.turn.state)).arg(notes.turn.question.slice(0,120000)) : "";wrapMode:Text.Wrap;Layout.fillWidth:true;textFormat:Text.PlainText}
                 TextArea {objectName:"regionNoteAnswer";visible:!!notes.turn;Layout.fillWidth:true;readOnly:true;selectByMouse:true;wrapMode:TextEdit.Wrap;textFormat:TextEdit.PlainText;text:notes.turn ? notes.turn.answer.slice(0,120000) : "";Accessible.name:qsTr("Saved answer")}
                 Label {visible:!!notes.turn && notes.turn.answer.length>120000;text:qsTr("Long answer preview limited to 120,000 characters. Copy answer keeps the complete text.");wrapMode:Text.Wrap;Layout.fillWidth:true;color:notes.app.colors.textSecondary}
-                Label {visible:!!notes.turn;text:qsTr("Historical page markers are shown as text; they do not create verified navigation links.");wrapMode:Text.Wrap;Layout.fillWidth:true;color:notes.app.colors.textSecondary}
+                Label {visible:!!notes.turn;text:notes.verifiedPages.length ? qsTr("Pages sent with this turn. Answer page markers remain plain text.") : qsTr("No verified source pages for this turn. Answer page markers remain plain text.");wrapMode:Text.Wrap;Layout.fillWidth:true;color:notes.app.colors.textSecondary}
+                ListView {
+                    id:sourcePages
+                    objectName:"regionNoteSources";visible:notes.verifiedPages.length>0
+                    Layout.fillWidth:true;Layout.preferredHeight:currentItem ? currentItem.implicitHeight+8 : 40
+                    model:notes.verifiedPages;orientation:ListView.Horizontal;clip:true;spacing:4
+                    activeFocusOnTab:true;keyNavigationEnabled:true
+                    Accessible.role:Accessible.List;Accessible.name:qsTr("Pages sent with this conversation turn")
+                    Keys.onReturnPressed:if(currentItem)currentItem.clicked()
+                    Keys.onEnterPressed:if(currentItem)currentItem.clicked()
+                    ScrollBar.horizontal:ScrollBar{}
+                    delegate:Button {required property int modelData;objectName:"regionNoteSource"+modelData;text:qsTr("Page %1").arg(modelData);enabled:notes.owner===notes.app.currentReader && notes.ownerGeneration===notes.owner.documentGeneration;onClicked:notes.followSource(modelData)}
+                }
                 Button {text:qsTr("Copy answer");visible:!!notes.turn;enabled:!!notes.turn && !!notes.app.session;onClicked:notes.app.session.copyText(notes.turn.answer)}
                 Label {text:qsTr("Knowledge note");font.bold:true}
                 TextArea {

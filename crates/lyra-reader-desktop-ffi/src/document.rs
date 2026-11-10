@@ -941,6 +941,38 @@ mod tests {
             .join("region-conversations-v1.json")
     }
     #[test]
+    fn region_thumbnails_read_one_reviewed_attachment_without_rewriting_history() {
+        let fixture = Fixture::new("text-page.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        let id = saved_region(&doc);
+        let history = fs::read(region_path(&fixture.path)).unwrap();
+        let state = doc.command(json!({"op":"region_list"})).unwrap();
+        let image = doc
+            .command(json!({"op":"region_thumbnail","id":id,
+            "expected_history_revision":state["revision"]}))
+            .unwrap();
+        let entry = doc.command(json!({"op":"region_get","id":id})).unwrap();
+        assert_eq!(image["png"], entry["attachment"]["png"]);
+        assert_eq!(image["width"], entry["attachment"]["pixelWidth"]);
+        assert_eq!(image["id"], id);
+        assert_eq!(image["revision"], state["revision"]);
+        assert!(image.get("attachment").is_none());
+        assert!(image.get("turns").is_none());
+        assert_eq!(fs::read(region_path(&fixture.path)).unwrap(), history);
+        doc.command(json!({"op":"region_note","id":id,"text":"New local note"}))
+            .unwrap();
+        let saved = fs::read(region_path(&fixture.path)).unwrap();
+        assert!(
+            doc.command(json!({"op":"region_thumbnail","id":id,
+            "expected_history_revision":state["revision"]}))
+                .unwrap_err()
+                .contains("changed")
+        );
+        assert_eq!(fs::read(region_path(&fixture.path)).unwrap(), saved);
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+    }
+    #[test]
     fn region_export_uses_the_reviewed_saved_snapshot_and_never_rewrites_source_or_cache() {
         let fixture = Fixture::new("text-page.pdf");
         let original = fs::read(&fixture.path).unwrap();
