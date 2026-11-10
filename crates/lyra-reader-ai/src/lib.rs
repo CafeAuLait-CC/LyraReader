@@ -12,6 +12,7 @@ pub mod knowledge;
 pub mod mock;
 pub mod openai;
 pub mod provider;
+pub mod region_export;
 pub mod region_history;
 pub mod sections;
 

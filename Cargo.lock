@@ -907,6 +907,7 @@ dependencies = [
 name = "lyra-reader-ai"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "lyra-reader-core",
  "lyra-reader-edit",
  "rcgen",

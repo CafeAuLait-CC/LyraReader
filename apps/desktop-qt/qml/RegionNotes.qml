@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Dialogs
 import LyraReader 1.0
 
 Pane {
@@ -19,6 +20,10 @@ Pane {
     readonly property bool active:app.aiPanelVisible && app.aiPanelMode==="notes" && app.currentReader.pageCount>0
     property string readError:""
     property int ownerGeneration:-1
+    property var exportContext:null
+    property var exportReader:null
+    property var exportId:0
+    readonly property bool canExport:owner && !owner.pendingCommands && !owner.hasUnsavedReadingNotes && !exportId && !history.error && (history.entries || []).some(e=>e.has_answer)
     visible:active;enabled:active;focus:active;padding:10
     background:Rectangle {color:notes.app.colors.sidebarBg}
     signal closed()
@@ -33,14 +38,40 @@ Pane {
     function deactivate() {
         let focused=app.activeFocusItem;let ownedFocus=false;
         while(focused){if(focused===notes){ownedFocus=true;break;}focused=focused.parent;}
-        remove.close();detail=null;readId=0;owner=null;
+        exportFile.close();exportContext=null;remove.close();detail=null;readId=0;owner=null;
         if(ownedFocus)app.focusReadingView();closed();
     }
     onActiveChanged:if(active)activate();else deactivate()
-    Connections {target:notes.app;function onCurrentReaderChanged(){notes.close();}}
+    Connections {
+        target:notes.app
+        function onCurrentReaderChanged(){notes.close();if(notes.exportReader!==notes.app.currentReader)notes.clearExportPresentation();}
+    }
     Keys.onShortcutOverride:function(event){if(event.key===Qt.Key_Escape)event.accepted=true;}
     Keys.onEscapePressed:function(event){close();event.accepted=true;}
     function load(id){if(owner.regionNoteDraft.id && owner.regionNoteDraft.id!==id){app.operationStatus=qsTr("Save or discard the current reading note before selecting another area.");return;}selectedId=id;detail=null;readError="";readId=owner.submit("region_get",{id:id});}
+    function clearExportPresentation(){exportReader=null;exportId=0;}
+    function beginExport() {
+        if(!canExport)return;
+        exportContext={reader:owner,generation:owner.documentGeneration,revision:history.revision};
+        exportFile.open();
+    }
+    function exportTo(url) {
+        const context=exportContext;exportContext=null;
+        if(!context || !context.reader || context.reader!==owner || owner!==app.currentReader || context.generation!==owner.documentGeneration || owner.hasUnsavedReadingNotes) {
+            app.operationStatus=qsTr("The document or reading-note draft changed. Choose the export again.");return;
+        }
+        exportReader=context.reader;app.operationStatus=qsTr("Exporting saved reading notes…");
+        exportId=exportReader.submit("region_export_markdown",{destination:app.session.localPath(url),expected_history_revision:context.revision});
+    }
+    Connections {
+        target:notes.exportReader
+        function onDocumentReset(){notes.clearExportPresentation();}
+        function onCommandFinished(id,op,result,error) {
+            if(id!==notes.exportId)return;
+            notes.clearExportPresentation();
+            notes.app.operationStatus=error || result.warning || qsTr("Exported %1 original region pictures with Markdown. Omitted %2 unanswered conversations; %3 unsupported records were kept in the cache.").arg(result.image_count).arg(result.omitted_count).arg(result.unavailable_count);
+        }
+    }
     Connections {
         target:notes.owner
         function onDocumentReset(){notes.close();}
@@ -56,6 +87,7 @@ Pane {
             Layout.fillWidth:true
             Button {objectName:"regionNotesBack";text:qsTr("All notes");visible:!!notes.detail;enabled:notes.owner && !notes.owner.hasUnsavedReadingNotes && !notes.owner.pendingCommands;onClicked:{notes.detail=null;notes.selectedId="";list.forceActiveFocus();}}
             Label {text:qsTr("Saved locally");color:notes.app.colors.textSecondary;Layout.fillWidth:true}
+            LyraToolButton {objectName:"exportRegionNotes";symbol:"export";text:qsTr("Export Reading notes as Markdown and pictures (new file)");enabled:notes.canExport;onClicked:notes.beginExport()}
             LyraToolButton {objectName:"regionNotesNewArea";symbol:"plus";text:qsTr("Select a new region");enabled:notes.owner && !notes.owner.hasUnsavedReadingNotes && !notes.owner.pendingCommands && !notes.owner.aiState.running;onClicked:{notes.close();notes.app.armRegion(false);}}
         }
         Label {text:qsTr("Local captures and conversations. Opening notes sends no request.");wrapMode:Text.Wrap;Layout.fillWidth:true;color:notes.app.colors.textSecondary}
@@ -121,13 +153,34 @@ Pane {
                 Label {visible:!!notes.turn;text:qsTr("Historical page markers are shown as text; they do not create verified navigation links.");wrapMode:Text.Wrap;Layout.fillWidth:true;color:notes.app.colors.textSecondary}
                 Button {text:qsTr("Copy answer");visible:!!notes.turn;enabled:!!notes.turn && !!notes.app.session;onClicked:notes.app.session.copyText(notes.turn.answer)}
                 Label {text:qsTr("Knowledge note");font.bold:true}
-                TextArea {id:noteText;objectName:"regionKnowledgeNote";readOnly:!!notes.history.writes_blocked;selectByMouse:true;Layout.fillWidth:true;wrapMode:TextEdit.Wrap;textFormat:TextEdit.PlainText;placeholderText:qsTr("Keep your own reading note…");Accessible.name:qsTr("Knowledge note");onTextChanged:if(notes.detail && notes.owner){if(text!==(notes.detail.knowledgeNote || "") || notes.owner.isSavingRegionNote())notes.owner.setRegionNoteDraft(notes.selectedId,text);else if(notes.owner.regionNoteDraft.id===notes.selectedId)notes.owner.discardRegionNoteDraft();}}
+                TextArea {
+                    id:noteText;objectName:"regionKnowledgeNote"
+                    readOnly:!!notes.history.writes_blocked;selectByMouse:true
+                    Layout.fillWidth:true;wrapMode:TextEdit.Wrap;textFormat:TextEdit.PlainText
+                    placeholderText:qsTr("Keep your own reading note…");Accessible.name:qsTr("Knowledge note")
+                    Keys.priority:Keys.BeforeItem
+                    Keys.onPressed:function(event) {
+                        if((event.key!==Qt.Key_Tab && event.key!==Qt.Key_Backtab) || (event.modifiers & (Qt.ControlModifier|Qt.AltModifier|Qt.MetaModifier)))return;
+                        const forward=event.key!==Qt.Key_Backtab && !(event.modifiers & Qt.ShiftModifier);
+                        const next=nextItemInFocusChain(forward);
+                        if(next && next!==noteText)next.forceActiveFocus(forward ? Qt.TabFocusReason : Qt.BacktabFocusReason);
+                        event.accepted=true;
+                    }
+                    onTextChanged:if(notes.detail && notes.owner){if(text!==(notes.detail.knowledgeNote || "") || notes.owner.isSavingRegionNote())notes.owner.setRegionNoteDraft(notes.selectedId,text);else if(notes.owner.regionNoteDraft.id===notes.selectedId)notes.owner.discardRegionNoteDraft();}
+                }
                 Button {objectName:"saveRegionKnowledgeNote";text:qsTr("Save knowledge note");enabled:notes.owner && !!notes.owner.regionNoteDraft.id && !notes.owner.pendingCommands && !notes.history.writes_blocked;onClicked:notes.owner.saveRegionNoteDraft()}
                 Label {visible:notes.owner && notes.owner.regionNoteDraft.id===notes.selectedId;text:qsTr("Unsaved reading note. Save or discard it before closing this document.");Layout.fillWidth:true;wrapMode:Text.Wrap;color:notes.app.colors.warningFg}
                 Button {objectName:"discardRegionNoteDraft";text:qsTr("Discard note draft");visible:notes.owner && notes.owner.regionNoteDraft.id===notes.selectedId;enabled:notes.owner && !notes.owner.pendingCommands;onClicked:{notes.owner.discardRegionNoteDraft();noteText.text=notes.detail.knowledgeNote || "";}}
                 Button {objectName:"deleteRegionKnowledgeNote";text:qsTr("Delete saved region…");enabled:notes.owner && !notes.owner.hasUnsavedReadingNotes && !notes.owner.pendingCommands && !notes.history.writes_blocked && !notes.history.error;onClicked:remove.open()}
             }
         }
+    }
+    FileDialog {
+        id:exportFile;objectName:"readingNotesExportDialog"
+        title:qsTr("Export Reading Notes to a New File")
+        fileMode:FileDialog.SaveFile;nameFilters:[qsTr("Markdown (*.md)")];defaultSuffix:"md"
+        onAccepted:notes.exportTo(selectedFile)
+        onRejected:notes.exportContext=null
     }
     Dialog {
         id:remove;objectName:"deleteRegionNoteConfirmation";title:qsTr("Delete saved region?");modal:true

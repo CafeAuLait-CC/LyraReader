@@ -5,6 +5,7 @@ use crate::document_cache::{DocumentCache, atomic_write, read_optional};
 use fs2::FileExt;
 use lyra_reader_ai::region_history::{AnswerState, Attachment, Entry, History, Turn};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::PathBuf,
@@ -71,6 +72,12 @@ pub(super) struct RegionStore {
     error: Option<String>,
 }
 impl RegionStore {
+    fn revision(&self) -> String {
+        Sha256::digest(self.baseline.as_deref().unwrap_or(b""))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
     fn load(&mut self, cache: &DocumentCache) -> Result<(), String> {
         let path = cache.directory.join(FILE);
         if self.path.as_ref() == Some(&path) {
@@ -174,6 +181,7 @@ impl DesktopDocument {
         if op == "region_list" {
             let mut state = store.history.summaries(key, &identity.sha256)?;
             state["error"] = json!(store.error);
+            state["revision"] = json!(store.revision());
             return Ok(state);
         }
         if op == "region_get" {
@@ -192,6 +200,66 @@ impl DesktopDocument {
                         .is_some_and(|s| s != identity.sha256)
             );
             return Ok(value);
+        }
+        if op == "region_export_markdown" {
+            if let Some(error) = &store.error {
+                return Err(error.clone());
+            }
+            if field(r, "expected_history_revision")? != store.revision() {
+                return Err("Reading notes changed. Open the export dialog again to review the current snapshot".into());
+            }
+            let history_path = store.path.as_ref().ok_or("Reading notes are not loaded")?;
+            let mut options = fs::OpenOptions::new();
+            options.create(true).truncate(false).read(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let lock = options
+                .open(cache.directory.join(".region-conversations.lock"))
+                .map_err(|e| e.to_string())?;
+            FileExt::try_lock_shared(&lock).map_err(|e| {
+                format!("Another window is saving reading notes. Try exporting again: {e}")
+            })?;
+            let verify = || {
+                if read_optional(history_path)? != store.baseline {
+                    Err("Reading notes changed outside this window. Reopen before exporting; existing data was kept".into())
+                } else {
+                    Ok(())
+                }
+            };
+            verify()?;
+            let destination = std::path::Path::new(field(r, "destination")?);
+            let stem = destination
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or("Invalid export filename")?;
+            let folder = lyra_reader_ai::region_export::image_folder(stem)?;
+            let file = self
+                .original_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or("The source filename cannot be represented in Markdown")?;
+            let title = self
+                .original_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or("The source title cannot be represented in Markdown")?;
+            let document = lyra_reader_ai::region_export::render(
+                title,
+                file,
+                &store.history.migrated_entries(key)?,
+                store.history.foreign_count(),
+                now(),
+                &folder,
+            )?;
+            let count = document.images.len();
+            let omitted = document.omitted;
+            let warning = crate::region_export::publish(destination, &folder, document, verify)?;
+            return Ok(
+                json!({"image_count":count,"omitted_count":omitted,"unavailable_count":store.history.foreign_count(),"warning":warning}),
+            );
         }
         marks.validate_source()?;
         if let Some(error) = &store.error {
@@ -317,6 +385,7 @@ impl DesktopDocument {
         }
         store.persist(cache, next)?;
         let mut state = store.history.summaries(key, &identity.sha256)?;
+        state["revision"] = json!(store.revision());
         state["saved_id"] = json!(id);
         if op == "region_note" {
             state["saved_note"] = r["text"].clone();

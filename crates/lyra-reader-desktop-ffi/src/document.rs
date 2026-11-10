@@ -941,6 +941,49 @@ mod tests {
             .join("region-conversations-v1.json")
     }
     #[test]
+    fn region_export_uses_the_reviewed_saved_snapshot_and_never_rewrites_source_or_cache() {
+        let fixture = Fixture::new("text-page.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        let id = saved_region(&doc);
+        let initial = doc.command(json!({"op":"region_list"})).unwrap();
+        assert_eq!(initial["entries"][0]["has_answer"], false);
+        let destination = fixture.directory.join("notes.md");
+        assert!(doc.command(json!({"op":"region_export_markdown","destination":destination,"expected_history_revision":initial["revision"]})).unwrap_err().contains("no saved region conversations"));
+        doc.command(json!({"op":"region_note","id":id,"text":"A synthetic note α/β"}))
+            .unwrap();
+        let snapshot = doc.command(json!({"op":"region_list"})).unwrap();
+        assert_eq!(snapshot["entries"][0]["has_answer"], true);
+        let history = fs::read(region_path(&fixture.path)).unwrap();
+        assert!(doc.command(json!({"op":"region_export_markdown","destination":destination,"expected_history_revision":initial["revision"]})).unwrap_err().contains("changed"));
+        assert!(!destination.exists());
+        assert!(!fixture.directory.join("notes-images").exists());
+        let outcome=doc.command(json!({"op":"region_export_markdown","destination":destination,"expected_history_revision":snapshot["revision"]})).unwrap();
+        assert_eq!(outcome["image_count"], 1);
+        assert_eq!(outcome["omitted_count"], 0);
+        let markdown = fs::read_to_string(&destination).unwrap();
+        assert!(markdown.contains("A synthetic note α/β"));
+        assert!(!markdown.contains("data:image"));
+        let entry = doc.command(json!({"op":"region_get","id":id})).unwrap();
+        let image =
+            lyra_reader_edit::records::base64_decode(entry["attachment"]["png"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(
+            fs::read(fixture.directory.join("notes-images/region-01.png")).unwrap(),
+            image
+        );
+        assert_eq!(fs::read(region_path(&fixture.path)).unwrap(), history);
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        assert!(doc.command(json!({"op":"region_export_markdown","destination":destination,"expected_history_revision":snapshot["revision"]})).is_err());
+        assert_eq!(fs::read_to_string(destination).unwrap(), markdown);
+        let mut external = history.clone();
+        external.push(b' ');
+        fs::write(region_path(&fixture.path), &external).unwrap();
+        assert!(doc.command(json!({"op":"region_export_markdown","destination":fixture.directory.join("external.md"),"expected_history_revision":snapshot["revision"]})).unwrap_err().contains("outside this window"));
+        assert!(!fixture.directory.join("external.md").exists());
+        assert_eq!(fs::read(region_path(&fixture.path)).unwrap(), external);
+    }
+    #[test]
     fn region_history_reopens_without_raster_or_pdf_writes_and_retains_saved_drafts() {
         let fixture = Fixture::new("text-page.pdf");
         let original = fs::read(&fixture.path).unwrap();

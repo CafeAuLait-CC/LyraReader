@@ -15,6 +15,7 @@ mod navigation;
 mod pages;
 mod paper;
 mod region;
+mod region_export;
 mod region_store;
 mod render_source;
 mod saving;

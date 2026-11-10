@@ -17,6 +17,7 @@ serde = { version = "1", features = ["derive"] }
 # extended grapheme clusters, not Unicode scalars.
 unicode-segmentation = { workspace = true }
 serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 # The layered summary cache is keyed by a hash of exactly the page text a request sends, so
 # editing one section invalidates that section and nothing else. SHA-256 is already in the
 # workspace through the document layer; using the same digest keeps the key stable.

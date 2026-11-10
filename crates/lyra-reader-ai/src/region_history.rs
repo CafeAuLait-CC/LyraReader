@@ -82,7 +82,33 @@ pub struct Entry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_sha256: Option<String>,
 }
+pub struct DisplayTurn<'a> {
+    pub question: &'a str,
+    pub answer: &'a str,
+    pub state: AnswerState,
+}
 impl Entry {
+    /// The legacy producer stored one turn in the top-level fields, without a turns array.
+    pub fn display_turns(&self) -> impl Iterator<Item = DisplayTurn<'_>> {
+        let legacy = (self.turns.is_empty() && !self.question.is_empty()).then_some(DisplayTurn {
+            question: &self.question,
+            answer: &self.answer,
+            state: self.state,
+        });
+        legacy
+            .into_iter()
+            .chain(self.turns.iter().map(|turn| DisplayTurn {
+                question: &turn.question,
+                answer: &turn.answer,
+                state: turn.state,
+            }))
+    }
+    pub fn has_answer(&self) -> bool {
+        !self.knowledge_note.is_empty()
+            || self
+                .display_turns()
+                .any(|turn| !turn.answer.trim().is_empty())
+    }
     pub fn validate(&self) -> Result<(), String> {
         if normalize_uuid(&self.id).is_none()
             || !self.created_at.is_finite()
@@ -403,11 +429,7 @@ impl History {
         });
         let entries = entries.into_iter().map(|e| {
             // Legacy single-turn records have no turns array, matching the producer's allTurns.
-            let turns = if e.turns.is_empty() {
-                usize::from(!e.question.is_empty())
-            } else {
-                e.turns.len()
-            };
+            let turns = e.display_turns().count();
             json!({
                 "id": e.id,
                 "page": e.attachment.page,
@@ -418,6 +440,7 @@ impl History {
                 "state": e.state,
                 "turns": turns,
                 "has_note": !e.knowledge_note.is_empty(),
+                "has_answer": e.has_answer(),
                 "location_invalidated": e.location_invalidated == Some(true)
                     || e.capture_sha256.as_deref().is_some_and(|s| s != sha)
             })
