@@ -278,23 +278,26 @@ public struct TextPage: Sendable {
     public let text: String
     public let hasUnicodeMapError: Bool
     private let selectionLines: [SelectionLine]
+    private let selectionExcludedIndices: Set<Int>
     private let rust: TextPageRust?
 
-    public init(page: Int, chars: [TextChar], text: String, hasUnicodeMapError: Bool) {
+    public init(page: Int, chars: [TextChar], text: String, hasUnicodeMapError: Bool,
+                selectionExcludedIndices: [Int] = []) {
         self.init(
             page: page, chars: chars, text: text, hasUnicodeMapError: hasUnicodeMapError,
-            rust: nil)
+            rust: nil, selectionExcludedIndices: selectionExcludedIndices)
     }
 
     init(
         page: Int, chars: [TextChar], text: String, hasUnicodeMapError: Bool,
-        rust: TextPageRust?
+        rust: TextPageRust?, selectionExcludedIndices: [Int] = []
     ) {
         self.page = page
         self.chars = chars
         self.text = text
         self.hasUnicodeMapError = hasUnicodeMapError
-        self.selectionLines = SelectionLine.build(chars)
+        self.selectionExcludedIndices = Set(selectionExcludedIndices)
+        self.selectionLines = SelectionLine.build(chars, excluding: self.selectionExcludedIndices)
         self.rust = rust
     }
 
@@ -386,10 +389,11 @@ private struct SelectionLine: Sendable {
     var bounds: CGRect
     var stops: [(index: Int, rect: CGRect)]
 
-    static func build(_ chars: [TextChar]) -> [SelectionLine] {
+    static func build(_ chars: [TextChar], excluding excluded: Set<Int> = []) -> [SelectionLine] {
         var lines: [SelectionLine] = []
         var current: SelectionLine?
         for (index, char) in chars.enumerated() {
+            if excluded.contains(index) { continue }
             if char.unicode == 10 || char.unicode == 13 {
                 if let current { lines.append(current) }
                 current = nil
@@ -406,7 +410,7 @@ private struct SelectionLine: Sendable {
                     if let previous = line.stops.last, previous.index + 1 < index {
                         let gaps = (previous.index + 1)..<index
                         let width = max(0, rect.minX - previous.rect.maxX) / CGFloat(gaps.count)
-                        for (offset, gapIndex) in gaps.enumerated() where Unicode.Scalar(chars[gapIndex].unicode).map({ CharacterSet.whitespaces.contains($0) }) == true {
+                        for (offset, gapIndex) in gaps.enumerated() where !excluded.contains(gapIndex) && Unicode.Scalar(chars[gapIndex].unicode).map({ CharacterSet.whitespaces.contains($0) }) == true {
                             line.stops.append((gapIndex, CGRect(x: previous.rect.maxX + CGFloat(offset) * width,
                                 y: line.bounds.minY, width: width, height: line.bounds.height)))
                         }
@@ -2759,7 +2763,8 @@ public final class RustEngine: PDFEngine {
                             },
                             text: extracted.text,
                             hasUnicodeMapError: extracted.hasUnicodeMapError,
-                            rust: rust
+                            rust: rust,
+                            selectionExcludedIndices: extracted.selectionExcludedIndices.map(Int.init)
                         )
                     )
                 } catch {
@@ -4715,7 +4720,9 @@ extension TextPage {
         guard !chars.isEmpty else { return "" }
         let clamped = range.clamped(to: 0...(chars.count - 1))
         guard !clamped.isEmpty else { return "" }
-        let scalars = chars[clamped].compactMap { Unicode.Scalar($0.unicode) }
+        let scalars = chars[clamped].enumerated().compactMap { offset, character in
+            selectionExcludedIndices.contains(clamped.lowerBound + offset) ? nil : Unicode.Scalar(character.unicode)
+        }
         return String(String.UnicodeScalarView(scalars))
     }
 

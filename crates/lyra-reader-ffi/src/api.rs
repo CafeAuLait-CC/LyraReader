@@ -2157,8 +2157,9 @@ impl LyraReaderDocument {
     pub fn text_page(&self, page: u32) -> Result<TextPage, LyraReaderFfiError> {
         let model = self.extract_text_page(page)?;
         let selection = Arc::new(lyra_reader_text::SelectionTextPage::new(model.clone()));
+        let record = text_page_record(page, &model, selection.layout().excluded_indices().to_vec());
         self.retain_selection_text_page(page, selection);
-        Ok(text_page_record(page, &model))
+        Ok(record)
     }
 
     /// Line-aware hit test (Swift `TextPage.characterIndex`), served from the page cache.
@@ -8116,6 +8117,8 @@ pub struct TextPage {
     pub text: String,
     /// The Unicode mapping has errors, which makes search unreliable.
     pub has_unicode_map_error: bool,
+    /// Original character indices of manuscript line numbers, excluded only from selection.
+    pub selection_excluded_indices: Vec<u32>,
 }
 
 /// One closed character range into a page's text layer.
@@ -8126,7 +8129,11 @@ pub struct TextRange {
 }
 
 /// Convert the Rust text model into the FFI record.
-fn text_page_record(page: u32, model: &lyra_reader_text::TextPage) -> TextPage {
+fn text_page_record(
+    page: u32,
+    model: &lyra_reader_text::TextPage,
+    selection_excluded_indices: Vec<u32>,
+) -> TextPage {
     TextPage {
         page,
         chars: model
@@ -8142,6 +8149,7 @@ fn text_page_record(page: u32, model: &lyra_reader_text::TextPage) -> TextPage {
             .collect(),
         text: model.text.clone(),
         has_unicode_map_error: model.has_unicode_map_error,
+        selection_excluded_indices,
     }
 }
 

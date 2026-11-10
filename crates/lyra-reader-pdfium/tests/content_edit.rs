@@ -33,6 +33,103 @@ fn write_pdf(path: &Path, content: &[u8]) {
 }
 
 #[test]
+fn edits_preserve_text_state_across_content_stream_boundaries() {
+    let source = fixture("split-text-state", b"");
+    let mut document = Document::load(&source).unwrap();
+    let page_id = document.get_pages()[&1];
+    // Contents is one logical program: BT, the font and relative text position remain active
+    // across streams. Regenerating only a dirty stream loses the state its neighbours inherit.
+    let streams = [
+        b"BT /F1 12 Tf 72 700 Td (Move this line) Tj ".as_slice(),
+        b"0 -120 Td (Untouched middle) Tj 0.2 0.3 0.8 rg ",
+        b"0 -120 Td (Untouched bottom) Tj ET",
+    ]
+    .map(|bytes| {
+        Object::Reference(document.add_object(Stream::new(dictionary! {}, bytes.to_vec())))
+    });
+    document
+        .get_dictionary_mut(page_id)
+        .unwrap()
+        .set("Contents", streams.to_vec());
+    document.save(&source).unwrap();
+    let original = std::fs::read(&source).unwrap();
+    let page = inspect_content(&source, 0).unwrap();
+    let target = page
+        .items
+        .iter()
+        .find(|item| item.text == "Move this line")
+        .unwrap();
+    let mut moved = target.bounds;
+    moved.x += 18.0;
+    let commands = [
+        ContentCommand::Transform {
+            revision: page.revision.clone(),
+            target: target.id.clone(),
+            bounds: moved,
+            rotation: 0.0,
+        },
+        ContentCommand::ReplaceText {
+            revision: page.revision.clone(),
+            target: target.id.clone(),
+            bounds: target.bounds,
+            text: "New text".into(),
+            font: "Original".into(),
+            size: 12.0,
+            colour: [0, 0, 0, 255],
+            alignment: 0,
+        },
+        ContentCommand::Delete {
+            revision: page.revision.clone(),
+            target: target.id.clone(),
+        },
+        ContentCommand::InsertText {
+            revision: page.revision.clone(),
+            bounds: ContentBox {
+                x: 350.0,
+                y: 700.0,
+                width: 140.0,
+                height: 20.0,
+            },
+            text: "Inserted text".into(),
+            font: "Helvetica".into(),
+            size: 12.0,
+            colour: [0, 0, 0, 255],
+            alignment: 0,
+        },
+    ];
+    for (index, command) in commands.iter().enumerate() {
+        let destination = source.with_file_name(format!("edit-{index}.pdf"));
+        edit_content(&source, &destination, 0, command).unwrap();
+        let edited = inspect_content(&destination, 0).unwrap();
+        match command {
+            ContentCommand::Transform { bounds, .. } => {
+                let after = edited
+                    .items
+                    .iter()
+                    .find(|item| item.text == target.text)
+                    .unwrap();
+                assert!((after.bounds.x - bounds.x).abs() < 0.01);
+                assert!((after.bounds.y - bounds.y).abs() < 0.01);
+            }
+            ContentCommand::ReplaceText { text, .. } | ContentCommand::InsertText { text, .. } => {
+                assert!(edited.items.iter().any(|item| &item.text == text));
+            }
+            ContentCommand::Delete { .. } => {
+                assert!(!edited.items.iter().any(|item| item.text == target.text));
+            }
+            _ => unreachable!("this check only constructs text edits"),
+        }
+        for text in ["Untouched middle", "Untouched bottom"] {
+            let before = page.items.iter().find(|item| item.text == text).unwrap();
+            let after = edited.items.iter().find(|item| item.text == text).unwrap();
+            assert_eq!(before.bounds, after.bounds);
+            assert_eq!(before.colour, after.colour);
+        }
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+    }
+}
+
+#[test]
 fn kerning_paragraph_replaces_real_content_and_survives_reopen() {
     let source = fixture("replace", b"BT /F1 12 Tf 72 700 Td [(Hello) -120 ( world)] TJ 0 -15 Td (Second line.) Tj ET BT /F1 12 Tf 72 500 Td (Unaffected neighbour) Tj ET");
     let before = std::fs::read(&source).unwrap();

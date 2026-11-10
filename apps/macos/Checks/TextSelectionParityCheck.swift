@@ -270,6 +270,34 @@ extension ReaderChecks {
                 "a rejected page does not extract")
         }
 
+        // A source-ordered range can contain margin counters between every two body lines.
+        // Rust supplies the same exclusions to the prepared cache and Swift's miss fallback.
+        do {
+            let source = fixtures.appendingPathComponent("two-column-line-numbers.pdf")
+            let engine = LyraReaderBindings.LyraReaderEngine()
+            let document = try engine.openDocument(path: source.path, password: nil)
+            let record = try document.textPage(page: 0)
+            let local = localTextPage(record)
+            require(record.selectionExcludedIndices.count == 60,
+                    "both interleaved line-number gutters are recognized")
+            let upper = record.chars.count - 1
+            let copied = local.string(in: 0...upper)
+            let cached = try document.textRangeString(page: 0, start: 0, end: UInt32(upper))
+            require(copied == cached && !copied.contains("001") && !copied.contains("020")
+                    && copied.contains("42") && copied.contains("[12]"),
+                    "Rust selection and Swift fallback copy prose without margin counters and keep inline numbers")
+            require(local.selectionRects(in: 0...upper).allSatisfy { $0.minX >= 59 && $0.maxX < 565 },
+                    "selection highlights do not cover either gutter")
+            require(record.text.contains("001") && record.text.contains("020")
+                    && local.chars.count == record.chars.count,
+                    "raw text and original character indices remain complete")
+            let wrapper = try RustEngine()
+            _ = try wrapper.openDocument(at: source)
+            let live = try await wrapper.textPage(0)
+            require(live.string(in: 0...upper) == copied && live.selectionRects(in: 0...upper) == local.selectionRects(in: 0...upper),
+                    "the production loading path uses the same exclusions for text and highlights")
+        }
+
         let diagnosticEngine = LyraReaderBindings.LyraReaderEngine()
         let diagnosticDocument = try diagnosticEngine.openDocument(
             path: multipage.path, password: nil)
@@ -294,7 +322,8 @@ extension ReaderChecks {
                     widthPt: CGFloat($0.widthPt), heightPt: CGFloat($0.heightPt))
             },
             text: record.text,
-            hasUnicodeMapError: record.hasUnicodeMapError)
+            hasUnicodeMapError: record.hasUnicodeMapError,
+            selectionExcludedIndices: record.selectionExcludedIndices.map(Int.init))
     }
 
     @MainActor private static func textPoint(

@@ -21,6 +21,7 @@ mod bibliography_tests;
 mod equations;
 mod figures;
 mod fragments;
+mod line_numbers;
 mod navigation;
 mod numbered;
 mod paren;
