@@ -2482,6 +2482,63 @@ mod tests {
         );
     }
     #[test]
+    fn failed_first_content_edit_restores_original_cache_targets_and_keeps_marks() {
+        let fixture = Fixture::new("text-page.pdf");
+        let original_pdf = fs::read(&fixture.path).unwrap();
+        let cache = cache_path(&fixture.path);
+        let foreign = r#"{ "kind":"future-cache-kind", "number":1.0000, "text":"a\/b" }"#;
+        fs::write(&cache, format!("[{foreign}]\n")).unwrap();
+        let doc = fixture.open();
+        let created = doc.command(json!({"op":"mark_create","entry":{"kind":"square","page":0,"version":1,
+            "rect":{"x":20,"y":20,"width":30,"height":30},"strokeWidth":2,"color":"#1B7F3BFF","note":"Before the rejected first edit"}})).unwrap();
+        let id = created["selected_id"].clone();
+        doc.command(
+            json!({"op":"bookmark_create","page":0,"title":"Keep the original bookmark","yPt":12}),
+        )
+        .unwrap();
+        let before = fs::read(&cache).unwrap();
+        let identity_path = cache.with_file_name("source.json");
+        let identity = fs::read(&identity_path).unwrap();
+        let snapshot = doc
+            .command(json!({"op":"content_objects","page":0}))
+            .unwrap();
+        assert!(
+            doc.command(json!({"op":"content_stage","page":0,"command":{"Delete":{
+            "revision":snapshot["revision"],"target":"missing-first-content-target"}}}))
+                .is_err()
+        );
+        assert!(!cache.with_file_name("session.json").exists());
+        assert_eq!(cache_path(&fixture.path), cache);
+        assert_eq!(fs::read(&cache).unwrap(), before);
+        assert_eq!(fs::read(&identity_path).unwrap(), identity);
+        let after = doc.command(json!({"op":"marks"})).unwrap();
+        assert_eq!(after["page_session_active"], false);
+        assert_eq!(after["page_pending"], false);
+        assert_eq!(after["preserved"], 1);
+        assert_eq!(after["annotations"].as_array().unwrap().len(), 1);
+        assert_eq!(after["bookmarks"].as_array().unwrap().len(), 1);
+        assert_eq!(after["annotations"][0]["id"], id);
+        // A subsequent annotation edit must persist at the original DocumentId cache,
+        // rather than a retired transaction directory which disappears on close.
+        doc.command(
+            json!({"op":"mark_update","id":id,"patch":{"note":"After the rejected first edit"}}),
+        )
+        .unwrap();
+        assert!(fs::read_to_string(&cache).unwrap().contains(foreign));
+        assert_eq!(fs::read(&fixture.path).unwrap(), original_pdf);
+        drop(doc);
+        let reopened = fixture.open();
+        let saved = reopened.command(json!({"op":"marks"})).unwrap();
+        assert_eq!(
+            saved["annotations"][0]["note"],
+            "After the rejected first edit"
+        );
+        assert_eq!(saved["annotations"][0]["id"], id);
+        assert_eq!(saved["bookmarks"].as_array().unwrap().len(), 1);
+        assert_eq!(saved["preserved"], 1);
+        assert_eq!(saved["page_session_active"], false);
+    }
+    #[test]
     fn stale_content_commands_create_no_session_and_failed_edits_keep_redo() {
         let fixture = Fixture::new("text-page.pdf");
         let doc = fixture.open();
