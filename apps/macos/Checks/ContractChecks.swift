@@ -107,7 +107,7 @@ extension ReaderChecks {
                     let resolved = resolveZoom(policy: policy(
                         .fitPage,
                         page: CGSize(width: 1, height: height),
-                        viewport: CGSize(width: 1, height: viewport),
+                        viewport: CGSize(width: 100_000, height: viewport),
                         calibration: calibration))
                     require(resolved.map(Int.init) == expected,
                             "fit page \(height) into \(viewport) @\(calibration): "

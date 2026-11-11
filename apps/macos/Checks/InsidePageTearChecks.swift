@@ -295,6 +295,8 @@ extension ReaderChecks {
         for fullPage in [true, false] {
             let (state, _) = makeTearState(preferFullPageRasters: fullPage)
             state.setViewportSize(CGSize(width: 900, height: 1800))
+            // This geometry check deliberately shows the following page at actual size.
+            state.zoomActual()
             state.reloadVisiblePages()
             func nextPageTop() -> CGFloat? {
                 state.canvasPages.filter {

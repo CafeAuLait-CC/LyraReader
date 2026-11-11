@@ -12,22 +12,7 @@ private final class ViewportFullscreenTransition {
     var exited = false
 }
 
-/// The user-visible resize policy (`feat/viewport-fit-on-resize`).
-///
-/// A real viewport-height change (window resize or fullscreen) means two different things:
-///
-/// * a **single-page** document whose page is shorter than the new viewport adopts **Fit Page**,
-///   so the page does not float above a band of blank canvas;
-/// * a **multi-page** document never changes its percentage. Only the scroll range is tightened:
-///   the first page's top edge sits at the viewport top at offset 0, and the clamp puts the last
-///   page's bottom edge at the viewport bottom at the maximum offset. A document shorter than
-///   the viewport stays top-aligned instead of being centred.
-///
-/// The decision is `lyra-reader-session`'s (through the FFI); these checks drive the shell's real
-/// `setViewportSize` path, which is what the canvas calls after layout. A second scenario drives
-/// the same path through a real `ReaderWindow`, a real `NSWindow` frame resize and a real
-/// fullscreen transition, so the AppKit-layout → callback → policy wiring is covered, not just
-/// the state method.
+/// Fits undersized pages in documents of any length, through state and real-window events.
 extension ReaderChecks {
     /// Deterministic policy scenarios, plus the real-window resize/fullscreen scenario.
     ///
@@ -48,134 +33,161 @@ extension ReaderChecks {
 
         try await singlePageResizeChecks(fixture: singlePage)
         try await multiPageResizeChecks(fixture: multipage)
-        try await windowResizeChecks(singlePage: singlePage, multipage: multipage)
+        try fittedTabChecks(singlePage: singlePage, multipage: multipage)
+        try await windowResizeChecks(multipage: multipage)
     }
 
-    /// A4 at 100% is 842 pt tall. With calibration 1 (the uncalibrated check convention) the
-    /// fixture page is shorter than a 900 pt viewport but taller than a 500 pt one, so the two
-    /// heights give the blank→fit and filled→unchanged cases without guessing at screen density.
+    /// Assert the actual drawing transform, including first/last page clamps and adjacent paper.
+    @MainActor
+    private static func requireFittedPage(_ state: AppState, page: Int, viewport: CGSize) {
+        let frames = state.canvasPageFrames
+        guard let frame = frames.first(where: { $0.index == page }) else {
+            fatalError("FAIL: fitted page has no canvas frame")
+        }
+        let top = (frame.topPt - state.scrollYPt) * state.zoomFactor
+        let bottom = top + frame.heightPt * state.zoomFactor
+        require(top >= AppState.zoomPresetInsetPt - 0.1, "Fit Page leaves space above the paper (\(top))")
+        require(viewport.height - bottom >= AppState.zoomPresetInsetPt - 0.1,
+                "Fit Page leaves space below the paper (\(viewport.height - bottom))")
+        require(abs(top - (viewport.height - bottom)) < 0.5, "Fit Page balances the vertical space")
+        require(frame.widthPt * state.zoomFactor <= viewport.width - 2 * AppState.zoomPresetInsetPt + 0.5,
+                "Fit Page includes the complete width")
+        require(state.currentPage == page + 1, "the leading blank belongs to fitted page \(page + 1), got \(state.currentPage)")
+        for other in frames where abs(other.topPt - frame.topPt) > 0.5 {
+            let otherTop = (other.topPt - state.scrollYPt) * state.zoomFactor
+            let otherBottom = otherTop + other.heightPt * state.zoomFactor
+            require(otherBottom <= 0.5 || otherTop >= viewport.height - 0.5,
+                    "Fit Page excludes adjacent paper slivers (page \(other.index), \(otherTop)...\(otherBottom))")
+        }
+    }
+
     @MainActor
     private static func singlePageResizeChecks(fixture: URL) async throws {
         let state = AppState(engine: try RustEngine())
         state.setViewportSize(CGSize(width: 700, height: 500))
-        guard state.newTab(url: fixture), let document = state.document else {
-            fatalError("FAIL: viewport fit could not open the single-page fixture")
-        }
-        require(document.pageCount == 1, "viewport fit: single-page fixture has one page")
-        let pageHeight = document.firstPageSize.height
-        require(abs(pageHeight - 842) < 0.5, "viewport fit: single-page fixture is A4 (\(pageHeight) pt)")
-
-        // 500 → 900 is the vertical change a resize/fullscreen transition reports. Fit Page is
-        // (900 − 2 × 8) / 842 × 100 = 104.988… → 104 (floor, as for the Fit Page command).
-        state.setViewportSize(CGSize(width: 760, height: 900))
-        require(state.zoomPercent == 104,
-                "viewport fit: a blank single page adopts Fit Page on a taller viewport (got \(state.zoomPercent)%)")
-        require(state.scrollYPt == 0, "viewport fit: the fitted single page is top-aligned")
-        let shownPageHeight = pageHeight * state.zoomFactor
-        require(shownPageHeight <= CGFloat(900 - 2 * 8) + 0.5,
-                "viewport fit: Fit Page keeps the page inside the preset inset (\(shownPageHeight) pt of 900)")
-        // Flooring can leave at most one percentage step of extra blank below the inset.
-        require(shownPageHeight > CGFloat(900 - 2 * 8) - pageHeight / 100 - 0.5,
-                "viewport fit: the adopted percentage is the floored fit, not an arbitrary zoom")
-
-        // A manual zoom-out below the fit is stable until the next real viewport change; that
-        // change asks the policy again and re-fits. 94 < (901 − 16) / 842 × 100 = 105.106… → 105.
+        require(state.newTab(url: fixture), "single-page fit fixture opens")
+        let viewport = CGSize(width: 760, height: 900)
+        state.setViewportSize(viewport)
+        require(state.zoomPercent == 104, "single-page resize adopts the floored fit")
+        requireFittedPage(state, page: 0, viewport: viewport)
+        // The fitted blank above the first page is content-space padding, not a negative scroll
+        // origin. A negative `scrollYPt` would put the scrollbar and the saved position out of
+        // range, so the first page is the case that proves the sign.
+        require(state.scrollYPt >= 0, "Fit Page keeps the offset non-negative on the first page")
+        state.setViewportSize(CGSize(width: 760, height: 899.4))
+        requireFittedPage(state, page: 0, viewport: CGSize(width: 760, height: 899.4))
+        require(state.scrollYPt >= 0, "a height nudge keeps the fitted offset non-negative")
+        let offset = state.scrollYPt
+        state.zoomFitPage()
+        require(abs(state.scrollYPt - offset) < 0.01, "explicit Fit Page and resize agree")
         state.zoomOut()
-        require(state.zoomPercent == 94, "viewport fit: manual zoom-out reaches 94% (got \(state.zoomPercent)%)")
+        require(state.zoomPercent == 94, "manual zoom-out remains available")
         state.setViewportSize(CGSize(width: 760, height: 901))
-        require(state.zoomPercent == 105,
-                "viewport fit: manual zoom-out + resize re-applies Fit Page (got \(state.zoomPercent)%)")
-        require(state.scrollYPt == 0, "viewport fit: the re-fitted page is top-aligned")
-
-        // At the fit value the preset's own 16 pt of blank is intentional; another resize must
-        // not shrink the reader to the same value. 105 is still the fit at 902 pt.
-        state.setViewportSize(CGSize(width: 760, height: 902))
-        require(state.zoomPercent == 105,
-                "viewport fit: a resize at the fit value keeps the percentage (got \(state.zoomPercent)%)")
-
-        // A zoom above the fit is never pulled back down by a resize.
-        state.zoomIn() // 115
-        state.setViewportSize(CGSize(width: 760, height: 903))
-        require(state.zoomPercent == 115,
-                "viewport fit: a zoom above the fit is not shrunk on resize (got \(state.zoomPercent)%)")
-
-        // A width-only viewport change is what the sidebar and inspector produce. It must not
-        // re-fit even though it goes through the same `setViewportSize` entry point.
-        let beforePanelZoom = state.zoomPercent
-        let beforePanelScroll = state.scrollYPt
-        state.setViewportSize(CGSize(width: 1000, height: 903), canvasWidth: 800)
-        require(state.zoomPercent == beforePanelZoom && state.scrollYPt == beforePanelScroll,
-                "viewport fit: sidebar/inspector width-only changes do not re-fit or scroll")
-
-        // Exiting fullscreen shrinks the viewport: a fitted page is above the new fit (57% at
-        // 500 pt), so the percentage stays. The fitted page still clamps into the new range.
-        state.setViewportSize(CGSize(width: 1000, height: 500))
-        require(state.zoomPercent == 115,
-                "viewport fit: shrinking the viewport does not zoom a page that is already above the fit")
-        require(state.scrollYPt >= 0, "viewport fit: a shrunk single page never scrolls above its top")
-
-        // A virtual CI display can report a low logical density (38 ppi, factor 0.5278), which
-        // makes the same A4 page much shorter in view points. The policy must use the calibrated
-        // page size: (582 − 16) / (842 × 0.5278) × 100 = 127.3… → 127, not the 67% an
-        // uncalibrated readout would give.
-        state.setDisplayCalibration(DisplayCalibration(factor: 0.5278))
-        state.setViewportSize(CGSize(width: 700, height: 582))
-        require(state.zoomPercent == 127,
-                "viewport fit: the resize fit divides by the display calibration "
-                    + "(got \(state.zoomPercent)%, want 127%)")
-        require(state.scrollYPt == 0, "viewport fit: the calibrated fit is top-aligned")
+        require(state.zoomPercent == 105, "a later height change re-fits")
+        state.zoomIn()
+        state.setViewportSize(CGSize(width: 760, height: 850))
+        require(state.zoomPercent == 115, "an above-fit zoom survives shrinking")
     }
 
     @MainActor
     private static func multiPageResizeChecks(fixture: URL) async throws {
         let state = AppState(engine: try RustEngine())
         state.setViewportSize(CGSize(width: 700, height: 500))
-        guard state.newTab(url: fixture), let document = state.document else {
-            fatalError("FAIL: viewport fit could not open the multi-page fixture")
+        require(state.newTab(url: fixture), "multi-page fit fixture opens")
+        let viewport = CGSize(width: 760, height: 900)
+        for page in 0..<3 {
+            state.zoomActual()
+            state.gotoPage(page)
+            state.zoomFitPage()
+            requireFittedPage(state, page: page, viewport: CGSize(width: 700, height: 500))
+            require(state.scrollYPt >= 0, "Fit Page keeps page \(page + 1)'s offset non-negative")
+            let offset = state.scrollYPt
+            let percent = state.zoomPercent
+            state.zoomFitPage()
+            require(state.zoomPercent == percent && abs(state.scrollYPt - offset) < 0.01,
+                    "Fit Page is idempotent on page \(page + 1)")
         }
-        require(document.pageCount == 3, "viewport fit: multi-page fixture has three pages")
-        require(state.zoomPercent == 100, "viewport fit: multi-page document opens at 100%")
-        // Three A4 pages with the default 12 pt gap: 3 × 842 + 2 × 12 = 2550 pt.
+        // The previous implementation explicitly kept 25% for multi-page documents.
+        state.zoomActual()
+        state.gotoPage(1)
+        while state.zoomPercent > AppState.minimumZoomPercent { state.zoomOut() }
+        state.setViewportSize(viewport)
+        require(state.zoomPercent == 104, "multi-page resize replaces undersized zoom")
+        // Zooming out can change the current page before the resize; the fit must keep that page.
+        requireFittedPage(state, page: state.currentPage - 1, viewport: viewport)
+        require(state.scrollYPt >= 0, "a multi-page resize keeps the fitted offset non-negative")
+        let fitted = state.zoomPercent
+        state.zoomOut()
+        state.setViewportSize(CGSize(width: 800, height: 900))
+        require(state.zoomPercent == fitted - 10, "width-only panel movement leaves manual zoom alone")
+        state.setViewportSize(CGSize(width: 800, height: 901))
+        require(state.zoomPercent == 105, "a subsequent height change re-fits a multi-page document")
+        requireFittedPage(state, page: state.currentPage - 1, viewport: CGSize(width: 800, height: 901))
+        // A zero preferred page gap must not reintroduce neighboring paper.
+        state.setPageGap(0)
+        for page in 0..<3 {
+            state.gotoPage(page)
+            state.zoomFitPage()
+            requireFittedPage(state, page: page, viewport: CGSize(width: 800, height: 901))
+        }
+        state.gotoPage(1)
+        state.zoomFitPage()
+        let fittedScroll = state.scrollYPt
+        state.setPageGap(state.pageGapPt)
+        state.setLayoutMode(state.layoutMode)
+        require(abs(state.scrollYPt - fittedScroll) < 0.01, "unchanged preferences preserve fitted spacing")
+        requireFittedPage(state, page: 1, viewport: CGSize(width: 800, height: 901))
+        let anchorViewY: CGFloat = 300
+        let oldFrame = state.canvasPageFrames.first { $0.index == 1 }!
+        let localY = anchorViewY / state.zoomFactor + state.scrollYPt - oldFrame.topPt
+        require(state.zoomByPinch(0.1, anchorViewY: anchorViewY), "pinch zoom leaves Fit Page")
+        let newFrame = state.canvasPageFrames.first { $0.index == 1 }!
+        let newLocalY = anchorViewY / state.zoomFactor + state.scrollYPt - newFrame.topPt
+        require(abs(localY - newLocalY) < 0.5, "leaving fitted spacing preserves the point under the pointer")
+        state.setLayoutMode(.facing)
+        state.gotoPage(1)
+        state.zoomFitPage()
+        requireFittedPage(state, page: 1, viewport: CGSize(width: 800, height: 901))
+        let row = state.canvasPageFrames.filter { $0.index == 1 || $0.index == 2 }
+        let width = (row.map { $0.leftPt + $0.widthPt }.max() ?? 0) - (row.map(\.leftPt).min() ?? 0)
+        require(width * state.zoomFactor <= 800 - 2 * AppState.zoomPresetInsetPt + 0.5,
+                "the full facing spread fits horizontally")
+    }
+
+    @MainActor
+    private static func fittedTabChecks(singlePage: URL, multipage: URL) throws {
+        let state = AppState(engine: try RustEngine())
+        let viewport = CGSize(width: 800, height: 900)
+        state.setViewportSize(viewport)
+        require(state.newTab(url: multipage), "fitted tab opens")
+        state.gotoPage(1)
+        state.zoomFitPage()
+        requireFittedPage(state, page: 1, viewport: viewport)
+        state.jumpFromPreview(to: 2)
+        require(state.goBack(), "Back returns from a fitted-page jump")
+        requireFittedPage(state, page: 1, viewport: viewport)
+        state.scroll(toFraction: 0)
+        requireFittedPage(state, page: 0, viewport: viewport)
+        require(state.scrollYPt >= 0, "the fitted top of the document is offset zero or more")
+        state.scroll(toFraction: 1)
+        requireFittedPage(state, page: 2, viewport: viewport)
+        require(state.scrollYPt >= 0, "the fitted end of the document is offset zero or more")
+        require(state.flushPendingPositionSave(), "fitted reading position saves")
+        let key = "readingPosition:" + multipage.path
+        let saved = UserDefaults.standard.double(forKey: key)
+        let expected = state.engine.pageTopPt(2, gapPt: state.pageGapPt)
+        require(abs(saved - expected) < 0.5, "saved position excludes temporary fitted-row gaps")
+        defer { UserDefaults.standard.removeObject(forKey: key) }
+        require(state.newTab(url: singlePage), "a second tab opens after Fit Page")
+        state.selectTab(0)
+        requireFittedPage(state, page: 2, viewport: viewport)
+        state.selectTab(1)
+        state.zoomOut()
+        let manual = state.zoomPercent
+        state.selectTab(0)
+        require(state.zoomPercent == manual, "returning to a fitted tab keeps the current manual zoom")
         require(abs(state.contentHeightPt - 2550) < 0.5,
-                "viewport fit: multi-page content height is 2550 pt (got \(state.contentHeightPt))")
-
-        // At the bottom, growing the viewport must keep 100% and move the offset to the new
-        // maximum: last page bottom at the viewport bottom.
-        state.gotoPage(2)
-        state.scroll(byScreenPoints: 100_000)
-        require(abs(state.scrollYPt - 2050) < 0.5,
-                "viewport fit: multi-page reaches the 500 pt viewport bottom (got \(state.scrollYPt))")
-        state.setViewportSize(CGSize(width: 760, height: 900))
-        require(state.zoomPercent == 100,
-                "viewport fit: multi-page keeps its percentage on a taller viewport (got \(state.zoomPercent)%)")
-        require(abs(state.scrollYPt - 1650) < 0.5,
-                "viewport fit: multi-page clamps to the new bottom, last page at the viewport bottom "
-                    + "(got \(state.scrollYPt), want 1650)")
-        require(state.scrollYPt <= max(0, state.contentHeightPt - 900) + 0.5,
-                "viewport fit: multi-page never leaves scrollable blank after the last page")
-
-        // At the top, growing the viewport must leave offset 0: first page top at viewport top.
-        state.gotoPage(0)
-        state.setViewportSize(CGSize(width: 800, height: 1000))
-        require(state.zoomPercent == 100 && state.scrollYPt == 0,
-                "viewport fit: multi-page stays top-aligned at the first page top "
-                    + "(zoom \(state.zoomPercent)%, offset \(state.scrollYPt))")
-
-        // Content shorter than the viewport: offset 0, blank only after the last page, never a
-        // centred document.
-        state.setViewportSize(CGSize(width: 800, height: 3000))
-        require(state.zoomPercent == 100, "viewport fit: a short multi-page document keeps 100%")
-        require(state.scrollYPt == 0,
-                "viewport fit: a short multi-page document is top-aligned, not centred (got \(state.scrollYPt))")
-
-        // The blank case that re-fits a one-page document must still not touch a multi-page one.
-        for _ in 0..<8 { state.zoomOut() } // 100 → 25
-        require(state.zoomPercent == 25, "viewport fit: multi-page manual zoom-out reaches 25%")
-        state.setViewportSize(CGSize(width: 800, height: 3200))
-        require(state.zoomPercent == 25,
-                "viewport fit: multi-page keeps 25% even with blank below the last page")
-        require(state.scrollYPt == 0,
-                "viewport fit: the short multi-page document stays top-aligned at 25%")
+                "a fitted tab discards spacing calculated at a different zoom")
     }
 
     /// Real AppKit layout → `HorizontalDocumentViewport.onViewport` → `AppState.setViewportSize`.
@@ -185,7 +197,7 @@ extension ReaderChecks {
     /// window server drives. A runner that refuses the fullscreen transition falls back to the
     /// resize half with a NOTE, rather than failing on an unavailable window-server feature.
     @MainActor
-    private static func windowResizeChecks(singlePage: URL, multipage: URL) async throws {
+    private static func windowResizeChecks(multipage: URL) async throws {
         _ = NSApplication.shared
         // The check runner is a command-line process, so its default activation policy is
         // `.prohibited`, and AppKit refuses fullscreen for such an application. The shipping app
@@ -217,13 +229,19 @@ extension ReaderChecks {
         var canvas: MetalCanvasView?
         try await eventually("viewport fit: the window canvas attaches", {
             canvas = firstCanvas(in: host)
-            return canvas?.bounds.height ?? 0 > 100
+            return (canvas?.hasAttachedSurface == true) && (canvas?.bounds.height ?? 0) > 100
         })
         guard let canvas else { fatalError("FAIL: viewport fit found no canvas") }
 
+        // The CI runner's 38 ppi virtual display scales a page to 0.5278×, a geometry a
+        // developer's 1.5× display never reaches. Pin that factor after the canvas has reported
+        // the real screen so the resize path below is the same hard case on every machine; a
+        // later screen notification is a no-op because the canvas already reported that screen.
+        state.setDisplayCalibration(DisplayCalibration(factor: 0.5278))
+
         // The document opens at the settled canvas height, where a 842 pt page does not blank.
-        guard state.open(url: singlePage) else {
-            fatalError("FAIL: viewport fit could not open \(singlePage.lastPathComponent) in a window")
+        guard state.open(url: multipage) else {
+            fatalError("FAIL: viewport fit could not open \(multipage.lastPathComponent) in a window")
         }
         try await Task.sleep(for: .milliseconds(250))
         // The canvas reports the real display calibration. On a 38 ppi virtual CI display the
@@ -258,11 +276,13 @@ extension ReaderChecks {
         let canvasHeight = canvas.bounds.height
         let pageHeight = state.document?.firstPageSize.height ?? 0
         let shownPageHeight = pageHeight * state.zoomFactor
-        require(state.scrollYPt == 0, "viewport fit: window resize leaves the fitted page top-aligned")
+        requireFittedPage(state, page: state.currentPage - 1, viewport: canvas.bounds.size)
         require(shownPageHeight <= canvasHeight - 2 * 8 + 2,
                 "viewport fit: window resize fits the page into the canvas (\(shownPageHeight) pt of \(canvasHeight))")
-        require(shownPageHeight > canvasHeight - 2 * 8 - pageHeight / 100 - 2,
-                "viewport fit: window resize adopts the floored fit for the real canvas height")
+        // A fitted first page must not park the offset above the document origin. On the CI
+        // runner the grow can be clamped by a small screen, so the subsequent shrink may not
+        // change the viewport at all; this assertion catches the fitted state itself.
+        require(state.scrollYPt >= 0, "viewport fit: fitted window offset stays non-negative")
 
         // Shrinking back to a real window size must keep the percentage (the fit is now lower).
         window.setContentSize(CGSize(width: 900, height: 700))
@@ -277,6 +297,7 @@ extension ReaderChecks {
         // so the transition can be attempted; on a runner that refuses fullscreen the check
         // falls back to the resize evidence above and states the gap instead of failing on an
         // unavailable window-server feature.
+        while state.zoomPercent > AppState.minimumZoomPercent { state.zoomOut() }
         let preFullscreenZoom = state.zoomPercent
         let transition = ViewportFullscreenTransition()
         let center = NotificationCenter.default
@@ -311,7 +332,7 @@ extension ReaderChecks {
         require(fullscreenZoom > preFullscreenZoom,
                 "viewport fit: entering fullscreen re-fits a page that leaves blank space "
                     + "(zoom \(fullscreenZoom)%, was \(preFullscreenZoom)%, canvas \(canvas.bounds.size))")
-        require(state.scrollYPt == 0, "viewport fit: the fullscreen-fit page is top-aligned")
+        requireFittedPage(state, page: state.currentPage - 1, viewport: canvas.bounds.size)
         let fullscreenPageHeight = pageHeight * state.zoomFactor
         require(fullscreenPageHeight <= canvas.bounds.height - 2 * 8 + 2,
                 "viewport fit: entering fullscreen fits the page (\(fullscreenPageHeight) pt of \(canvas.bounds.height))")
@@ -338,11 +359,13 @@ extension ReaderChecks {
         }
         require(many.pageCount == 3, "viewport fit: window multi-page fixture has three pages")
         state.zoomActual()
+        for _ in 0..<15 { state.zoomIn() }
+        let manyZoom = state.zoomPercent
         state.gotoPage(0)
         window.setContentSize(CGSize(width: 900, height: 1000))
         window.contentView?.layoutSubtreeIfNeeded()
         try await Task.sleep(for: .milliseconds(400))
-        require(state.zoomPercent == 100, "viewport fit: the multi-page window keeps 100% through a resize")
+        require(state.zoomPercent == manyZoom, "viewport fit: the multi-page window keeps an above-fit zoom through a resize")
         require(state.scrollYPt == 0, "viewport fit: the multi-page window is top-aligned after a resize")
         try await holdForScreenshot("multi-top")
         state.gotoPage(2)
