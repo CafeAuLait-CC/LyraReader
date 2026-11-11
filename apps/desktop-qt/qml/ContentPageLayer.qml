@@ -174,4 +174,9 @@ Item {
         Keys.onPressed:function(event){if(event.key===Qt.Key_F2 && editor.tool==="select" && selected && selected.kind==="text"){editor.editText(selected,layer.page);event.accepted=true;}}
         Keys.onDeletePressed: editor.remove()
     }
+    ContentResizeHandles {
+        anchors.fill:parent;z:2
+        app:layer.app;page:layer.page;editor:layer.editor;paperMap:layer.paperMap;focusTarget:pointer
+    }
+
 }

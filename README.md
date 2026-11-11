@@ -85,7 +85,9 @@ Dragging an already selected object previews its real pixels over a separately m
 One bounded bitmap pair is prepared from the pinned working revision; pointer motion only moves
 scene geometry. Escape, navigation and document changes cancel the preview. Successful moves retain
 it until the updated page is ready, with undo and Save using the existing transaction. Magnetic
-alignment guides and on-canvas corner resizing are still being ported.
+alignment guides are still being ported. Text and bitmap objects have four native corner handles;
+Escape cancels a resize, and undo and Save use the same shared transaction. External Form groups
+and links keep their existing geometry fields; their corner handles remain pending verification.
 Redact → Blackout/Erase removes
 PDF content and asks explicitly before a fallback replaces an entire page with an image. Fill & Sign
 places text, dates, vector checkmarks/crosses, stamps, drawn vector signatures and typed or imported
