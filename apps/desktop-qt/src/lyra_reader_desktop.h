@@ -2,11 +2,11 @@
 #include <cstddef>
 #include <cstdint>
 
-inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 10;
+inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 11;
 
 // Owned Rust allocations: free each Buffer exactly once using buffer_free.
 // Output buffers must be zero initialized; calls do not free previous contents.
-// All document operations may block and must run on a worker, not the UI thread.
+// Document operations run on a worker, except the explicitly cache-only selection calls.
 extern "C" {
 std::uint32_t lyra_reader_desktop_abi_version();
 std::size_t lyra_reader_desktop_paper_geometry_limit();
@@ -103,6 +103,14 @@ void lyra_reader_desktop_buffer_free(LyraReaderBuffer buffer);
 // Document may be null only for the global audit_records and audit_clear operations.
 bool lyra_reader_desktop_command(const LyraReaderDesktopDocument *document,
     const std::uint8_t *request, std::size_t request_len, LyraReaderBuffer *output, LyraReaderBuffer *error);
+// These synchronous calls only query prepared text; NotPrepared is distinct from Error.
+// Ready owns a UTF-8 buffer; a miss/error leaves output untouched. Endpoints may be reversed.
+enum class LyraReaderSelectionStatus : std::uint32_t { Error=0, NotPrepared=1, Ready=2 };
+LyraReaderSelectionStatus lyra_reader_desktop_selection_text(const LyraReaderDesktopDocument *,
+    std::uint32_t page,std::uint32_t start,std::uint32_t end,LyraReaderBuffer *output,LyraReaderBuffer *error);
+std::size_t lyra_reader_desktop_selection_copy_limit();
+bool lyra_reader_desktop_selection_copy_text(const std::uint8_t *text,std::size_t text_len,
+    LyraReaderBuffer *output,LyraReaderBuffer *error);
 double lyra_reader_desktop_zoom_offset(double offset, double anchor, double old_zoom, double new_zoom);
 // Pure shared policy: zero means no fit/no change, never a valid percentage.
 std::uint32_t lyra_reader_desktop_fit_percent(bool fit_page, double page_width, double page_height,

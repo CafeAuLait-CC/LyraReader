@@ -38,7 +38,7 @@ public:
     Q_INVOKABLE QVariantMap viewState(ReaderController *reader) const;
     Q_INVOKABLE void saveViewState(ReaderController *reader, const QVariantMap &state);
     Q_INVOKABLE void clearRecentDocuments();
-    Q_INVOKABLE void copyText(const QString &text);
+    Q_INVOKABLE virtual void copyText(const QString &text);
     Q_INVOKABLE void openExternal(const QUrl &url);
     Q_INVOKABLE QVariant preference(const QString &key, const QVariant &fallback = {}) const;
     Q_INVOKABLE void setPreference(const QString &key, const QVariant &value);

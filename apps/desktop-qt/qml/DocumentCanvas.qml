@@ -41,14 +41,35 @@ Item {
     // Conversation text stays in view pixels. This pointer anchor exists only until
     // the asynchronous gap replan settles; persisted reading anchors stay in PDF space.
     property var pendingPaperZoom:null
+    property var settlingPaperZoom:null
+    property int paperZoomFrames:0
+    function stopPaperZoomSettlement(){settlingPaperZoom=null;paperZoomFrames=0;paperZoomDeadline.stop();}
+    function paperZoomSettlementCurrent(anchor) {
+        const card=app.regionPaper;
+        return !!anchor && card && card.opened && !card.motionActive && anchor.owner===app.currentReader
+            && anchor.id===paperState.id && anchor.interaction===interactionEpoch
+            && Math.abs(anchor.zoom-app.zoom)<1e-9 && Math.abs(anchor.height-card.fullHeight)<.01;
+    }
+    function settlePaperZoom(frame) {
+        const anchor=settlingPaperZoom;
+        if(!anchor)return;
+        if(!paperZoomSettlementCurrent(anchor) || !restorePaperViewAnchor(anchor)){stopPaperZoomSettlement();return;}
+        if(frame && ++paperZoomFrames>=2)stopPaperZoomSettlement();
+    }
+    // A late ListView virtual-origin correction can follow the plan's first layout.
+    // Track two queued scene frames, with a bounded event-loop fallback for hidden
+    // surfaces. No document query, raster or animation is created by this correction.
+    Timer {id:paperZoomDeadline;interval:100;onTriggered:{canvas.settlePaperZoom(false);canvas.stopPaperZoomSettlement();}}
+    Connections {target:app;enabled:!!canvas.settlingPaperZoom;function onFrameSwapped(){canvas.settlePaperZoom(true);}}
+
     // A fixed-pixel conversation keeps the fitted blank below it when a pointer
     // zoom removes document fitting. This bounded view-only tail is not a PDF gap
     // or a persisted reading coordinate, and explicit navigation retires it.
     property real paperTailPixels:0
     property string paperTailId:""
     readonly property real paperTail:paperActive && paperTailId===paperState.id ? paperTailPixels : 0
-    onPaperActiveChanged:if(!paperActive){pendingPaperZoom=null;paperTailPixels=0;paperTailId="";}
-    Connections {target:app;function onCurrentReaderChanged(){canvas.paperTailPixels=0;canvas.paperTailId="";}}
+    onPaperActiveChanged:if(!paperActive){pendingPaperZoom=null;paperTailPixels=0;paperTailId="";stopPaperZoomSettlement();}
+    Connections {target:app;function onCurrentReaderChanged(){canvas.paperTailPixels=0;canvas.paperTailId="";canvas.stopPaperZoomSettlement();}}
     function restorePaperViewAnchor(anchor) {
         if(!anchor || anchor.owner!==app.currentReader || !paperActive
                 || anchor.id!==paperState.id || anchor.interaction!==interactionEpoch)return false;
@@ -62,9 +83,14 @@ Item {
     }
     function finishPaperZoom(owner) {
         const anchor=pendingPaperZoom;
-        if(!anchor || anchor.owner!==owner)return false;
-        pendingPaperZoom=null;
-        return restorePaperViewAnchor(anchor);
+        if(!anchor || anchor.owner!==owner)
+            return settlingPaperZoom && settlingPaperZoom.owner===owner && paperZoomSettlementCurrent(settlingPaperZoom) ? restorePaperViewAnchor(settlingPaperZoom) : false;
+        pendingPaperZoom=null;stopPaperZoomSettlement();
+        if(!restorePaperViewAnchor(anchor))return false;
+        settlingPaperZoom=Object.assign({},anchor,{zoom:app.zoom,height:app.regionPaper.fullHeight});
+        paperZoomDeadline.restart();
+        Qt.callLater(function(){canvas.settlePaperZoom(false);});
+        return true;
     }
     function displayRowTop(index){return paperActive ? paperMetric(rows[index].top,paperState.rows[index].top) : rows[index].top;}
     function regionCardFrame(owner,epoch) {
@@ -243,7 +269,7 @@ Item {
         positioning=prior;
     }
     function navigate(page, y) {
-        ++interactionEpoch;positioning=true;paperTailPixels=0;paperTailId="";
+        stopPaperZoomSettlement();++interactionEpoch;positioning=true;paperTailPixels=0;paperTailId="";
         const row=pageRows[page];
         if(row===undefined){positioning=false;return;}
         pageList.positionViewAtIndex(row,ListView.Beginning);pageList.forceLayout();
@@ -298,7 +324,7 @@ Item {
             pageList.contentX = Math.max(0, Math.min(pageList.contentWidth - pageList.width, left - 24));
     }
     function changeZoom(value, anchorX, anchorY) {
-        ++interactionEpoch;
+        stopPaperZoomSettlement();++interactionEpoch;
         const cardFrame=regionCardFrame(app.currentReader);
         const card=app.regionPaper;
         pendingPaperZoom=cardFrame && card && card.opened && anchorX>=cardFrame.x

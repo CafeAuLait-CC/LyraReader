@@ -57,6 +57,10 @@ Back/Forward uses the shared twenty-entry history in each direction and restores
 page anchor, horizontal position and fractional calibrated percentage. Only preview jumps record
 an entry; document/revision or tab changes clear the ephemeral history. Alt+Left/Alt+Right belong
 to the focused reader, including when another transient reader window is active.
+Canvas selections omit conservatively recognized manuscript line counters without changing raw page
+text or original character indices. Explicit Copy joins discretionary word breaks while preserving
+ordinary hyphens and paragraph boundaries. New markup freezes its selected geometry; historical
+annotations keep their existing geometry.
 The five exclusive secondary rows are Annotate, Edit, Fill & Sign, Export and Lyra. Annotate
 uses three groups for markup, drawing and placement, with menus for shapes, stamps and signatures.
 Ordinary text boxes edit directly on the page, including adopted PDF FreeText. Control+Return

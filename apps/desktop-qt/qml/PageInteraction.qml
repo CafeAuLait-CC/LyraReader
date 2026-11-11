@@ -13,7 +13,7 @@ Item {
         chars: [],
         text: ""
     }
-    readonly property var selectedRects: app.selection && app.selection.page === page ? Logic.quads(textPage.chars, app.selection.start, app.selection.end) : []
+    readonly property var selectedRects: app.selection && app.selection.page === page ? Logic.quads(textPage.chars, app.selection.start, app.selection.end,textPage.selection_excluded_indices) : []
     readonly property var searchRects: app.activeSearchHit && app.activeSearchHit.page === page ? Logic.quads(textPage.chars, app.activeSearchHit.start, app.activeSearchHit.end - 1) : []
     Component.onCompleted: app.currentReader.requestText(page)
     Repeater {
@@ -234,7 +234,7 @@ Item {
                 app.beginErase(page, p);
                 return;
             }
-            start = Logic.nearestCharacter(annotationLayer.textPage.chars, p.x, p.y);
+            start = Logic.nearestCharacter(annotationLayer.textPage.chars, p.x, p.y,annotationLayer.textPage.selection_excluded_indices);
             if (gestureTool === "stamp" || gestureTool === "signature") {
                 app.selection = null;
                 start = -1;
@@ -296,7 +296,7 @@ Item {
                 previousPoint = p;
                 return;
             }
-            const end = Logic.nearestCharacter(annotationLayer.textPage.chars, p.x, p.y);
+            const end = Logic.nearestCharacter(annotationLayer.textPage.chars, p.x, p.y,annotationLayer.textPage.selection_excluded_indices);
             if (gestureTool === "stamp" || gestureTool === "signature")
                 return;
             if (start >= 0 && end >= 0)
@@ -372,12 +372,14 @@ Item {
                 return;
             }
             const chars = annotationLayer.textPage.chars;
-            const at = Logic.nearestCharacter(chars, p.x, p.y);
+            const at = Logic.nearestCharacter(chars, p.x, p.y,annotationLayer.textPage.selection_excluded_indices);
             if (at < 0)
                 return;
             let first = at, last = at;
             const word = function (i) {
-                return i >= 0 && i < chars.length && !/\s/.test(String.fromCodePoint(chars[i].unicode || 32));
+                if(i<0 || i>=chars.length || (annotationLayer.textPage.selection_excluded_indices || []).indexOf(i)>=0)return false;
+                const u=chars[i].unicode;
+                return Number.isInteger(u) && u>0 && u<=0x10ffff && !(u>=0xd800 && u<=0xdfff) && !/\s/.test(String.fromCodePoint(u));
             };
             while (word(first - 1))
                 --first;

@@ -19,6 +19,7 @@ mod region_export;
 mod region_store;
 mod render_source;
 mod saving;
+mod selection;
 mod session;
 mod tile_plan;
 use document::DesktopDocument as Document;
@@ -28,10 +29,10 @@ use std::{
     ptr, slice,
 };
 
-/// Version of the Qt boundary, including both axes of the shared viewport-fit policy.
+/// Version of the Qt boundary, including cache-only selection and clipboard adapters.
 #[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_desktop_abi_version() -> u32 {
-    10
+    11
 }
 
 /// Maximum caller-supplied glyph/figure boxes before paper placement allocates snapshots.
@@ -1441,7 +1442,7 @@ mod tests {
 
     #[test]
     fn image_byte_boundary_rejects_null_handles_and_reports_its_version() {
-        assert_eq!(lyra_reader_desktop_abi_version(), 10);
+        assert_eq!(lyra_reader_desktop_abi_version(), 11);
         assert_eq!(
             lyra_reader_desktop_paper_geometry_limit(),
             lyra_reader_session::paper::MAX_PAPER_GEOMETRY_ITEMS

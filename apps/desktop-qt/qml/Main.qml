@@ -774,15 +774,27 @@ ApplicationWindow {
         searchIndex = (searchIndex + delta + searchResults.length) % searchResults.length;
         navigate(activeSearchHit.page);
     }
+    function selectedTextResult() {
+        if (!selection)return {text:""};
+        const text=currentReader.textPages[selection.page.toString()];
+        if(!text)return {error:qsTr("The page text is still loading. Try the selection again.")};
+        const cached=currentReader.selectionText(selection.page,selection.start,selection.end);
+        if(cached.error!==undefined)return cached;
+        return {text:cached.ready ? cached.text : Logic.selectedText(text.chars,selection.start,selection.end,text.selection_excluded_indices)};
+    }
     function selectedText() {
-        if (!selection)
-            return "";
-        const text = currentReader.textPages[selection.page.toString()];
-        return text ? Logic.selectedText(text.chars, selection.start, selection.end) : "";
+        const result=selectedTextResult();
+        if(result.error!==undefined){operationStatus=result.error;return "";}
+        return result.text;
     }
     function copySelection() {
-        if (session && selection)
-            session.copyText(selectedText());
+        if(!session || !selection)return;
+        const raw=selectedTextResult();
+        if(raw.error!==undefined){operationStatus=raw.error;return;}
+        if(!raw.text.length){operationStatus=qsTr("The selection contains no selectable text.");return;}
+        const copied=currentReader.normalizedCopiedText(raw.text);
+        if(copied.error!==undefined){operationStatus=copied.error;return;}
+        session.copyText(copied.text);operationStatus=qsTr("Selection copied.");
     }
     function selectionFinished() {
         if (["highlight", "underline", "strikeout"].indexOf(annotationTool) >= 0)
@@ -1232,7 +1244,7 @@ ApplicationWindow {
         const text = currentReader.textPages[selection.page.toString()];
         if (!text)
             return;
-        for (const rect of Logic.quads(text.chars, selection.start, selection.end))
+        for (const rect of Logic.quads(text.chars, selection.start, selection.end,text.selection_excluded_indices))
             addRedaction(selection.page, rect);
         selection = null;
     }
@@ -1241,19 +1253,18 @@ ApplicationWindow {
     }
     function markSelection(kind) {
         if (blockXfaWrite()) return;
-        if (!selection)
-            return;
-        currentReader.submit("mark_create", {
-            entry: {
-                kind: kind,
-                page: selection.page,
-                start: Math.min(selection.start, selection.end),
-                end: Math.max(selection.start, selection.end),
-                color: brushColor + Logic.hex(brushOpacity * 255),
-                note: ""
-            }
-        });
-        selection = null;
+        if (!selection)return;
+        const entry={kind:kind,page:selection.page,start:Math.min(selection.start,selection.end),
+            end:Math.max(selection.start,selection.end),color:brushColor+Logic.hex(brushOpacity*255),note:""};
+        const text=currentReader.textPages[selection.page.toString()];
+        if(text && (text.selection_excluded_indices || []).length) {
+            // Freeze new selection geometry; existing cached ranges and PDF-owned
+            // annotation appearances are not reinterpreted by a newer recognizer.
+            entry.quads=Logic.quads(text.chars,selection.start,selection.end,text.selection_excluded_indices);
+            if(!entry.quads.length){operationStatus=qsTr("The selection contains no selectable text.");return;}
+        }
+        currentReader.submit("mark_create",{entry:entry});
+        selection=null;
     }
     function updateSelectedAnnotation(patch) {
         const selected=selectedAnnotation;

@@ -1,9 +1,11 @@
 .pragma library
 
-function nearestCharacter(chars, x, y) {
+function nearestCharacter(chars, x, y, excluded) {
+    const omitted=new Set(excluded || [])
     let best = -1, distance = Infinity
     for (let i = 0; i < chars.length; ++i) {
         const c = chars[i]
+        if (omitted.has(i)) continue
         if (!(c.width_pt > 0 && c.height_pt > 0)) continue
         const dx = Math.max(c.x_pt - x, 0, x - c.x_pt - c.width_pt)
         const dy = Math.max(c.y_pt - y, 0, y - c.y_pt - c.height_pt)
@@ -12,9 +14,11 @@ function nearestCharacter(chars, x, y) {
     }
     return best
 }
-function quads(chars, start, end) {
+function quads(chars, start, end, excluded) {
+    const omitted=new Set(excluded || [])
     const result = []
     for (let i = Math.max(0, Math.min(start, end)); i <= Math.max(start, end) && i < chars.length; ++i) {
+        if (omitted.has(i)) continue
         const c = chars[i]
         if (!(c.width_pt > 0 && c.height_pt > 0)) continue
         let q = result[result.length - 1]
@@ -27,13 +31,15 @@ function quads(chars, start, end) {
     }
     return result
 }
-function selectedText(chars, start, end) {
-    let result = ""
+function selectedText(chars, start, end, excluded) {
+    // Rust supplies the original indices to omit; do not compact the source character array.
+    const omitted=new Set(excluded || []), result=[]
     for (let i = Math.max(0, Math.min(start,end)); i <= Math.max(start,end) && i < chars.length; ++i) {
         const u = chars[i].unicode
-        if (u > 0 && u <= 0x10ffff) result += String.fromCodePoint(u)
+        if (!omitted.has(i) && Number.isInteger(u) && u >= 0 && u <= 0x10ffff && !(u >= 0xd800 && u <= 0xdfff))
+            result.push(String.fromCodePoint(u))
     }
-    return result
+    return result.join("")
 }
 function contains(rect, x, y) {
     return x >= rect.x_pt && y >= rect.y_pt && x <= rect.x_pt + rect.width_pt && y <= rect.y_pt + rect.height_pt

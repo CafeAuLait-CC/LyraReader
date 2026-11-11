@@ -473,6 +473,24 @@ QVariantMap ReaderController::signatureImage(const QUrl &url) const {
     if(size.isEmpty())return {{"error",tr("Choose a PNG or JPEG up to 8192 pixels per side and 16 megapixels.")}};
     return {{"image",QString::fromLatin1(bytes.toBase64())},{"width",size.width()},{"height",size.height()}};
 }
+QVariantMap ReaderController::selectionText(int page,int start,int end) const {
+    if(!m_document)return {{QStringLiteral("ready"),false}};
+    if(page<0 || start<0 || end<0)return {{QStringLiteral("error"),QStringLiteral("The selection indices are invalid")}};
+    LyraReaderBuffer out{},error{};
+    const auto status=lyra_reader_desktop_selection_text(m_document.get(),uint(page),uint(start),uint(end),&out,&error);
+    if(status==LyraReaderSelectionStatus::Error)return {{QStringLiteral("error"),takeError(error)}};
+    if(status==LyraReaderSelectionStatus::NotPrepared)return {{QStringLiteral("ready"),false}};
+    return {{QStringLiteral("ready"),true},{QStringLiteral("text"),takeError(out)}};
+}
+QVariantMap ReaderController::normalizedCopiedText(const QString &text) const {
+    // At most three UTF-8 bytes per UTF-16 unit; bound the conversion before allocating.
+    if(quint64(text.size())>lyra_reader_desktop_selection_copy_limit()/3)
+        return {{QStringLiteral("error"),QStringLiteral("The copied selection exceeds the native clipboard size limit")}};
+    const auto utf8=text.toUtf8();LyraReaderBuffer out{},error{};
+    if(!lyra_reader_desktop_selection_copy_text(reinterpret_cast<const std::uint8_t *>(utf8.constData()),std::size_t(utf8.size()),&out,&error))
+        return {{QStringLiteral("error"),takeError(error)}};
+    return {{QStringLiteral("text"),takeError(out)}};
+}
 void ReaderController::requestText(int page) {
     if (page < 0 || page >= pageCount() || m_textPages.contains(QString::number(page)) || m_textPending.contains(page)) return;
     m_textPending.insert(page);

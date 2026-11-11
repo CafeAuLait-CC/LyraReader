@@ -59,6 +59,14 @@
 #include <cmath>
 #include <cstdlib>
 
+// Exercise the production copy command without reading or replacing a user's clipboard.
+class RecordingClipboardWorkspace final : public WorkspaceController {
+public:
+    QString copied;
+    int copies=0;
+    void copyText(const QString &text) override {copied=text;++copies;}
+};
+
 class FakeCredentialStore final : public CredentialStore {
 public:
     struct Request { VaultOperation operation; QString key,secret; Completion complete; };
@@ -206,6 +214,63 @@ private slots:
             QVERIFY(QGuiApplication::platformName() == "wayland" || QGuiApplication::platformName() == "xcb");
         }
         registerReaderTypes();
+    }
+    void copiedSelectionsExcludeMarginCountersWithoutChangingRawText_data() {
+        QTest::addColumn<QString>("fixture");QTest::newRow("counters")<<QString("two-column-line-numbers.pdf");
+        QTest::newRow("discretionary")<<QString("selection-discretionary-hyphens.pdf");
+    }
+    void copiedSelectionsExcludeMarginCountersWithoutChangingRawText() {
+        QFETCH(QString,fixture);QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("selection.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/"+fixture,path));QFile source(path);QVERIFY(source.open(QIODevice::ReadOnly));const auto before=source.readAll();source.close();
+        RecordingClipboardWorkspace workspace;QQmlApplicationEngine engine;
+        engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.rootContext()->setContextProperty("workspace",&workspace);
+        engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(settleReaderViewport(window));
+        reader->requestText(0);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTRY_VERIFY(reader->textPages().contains("0"));
+        const auto page=reader->textPages().value("0").toMap();const auto chars=page.value("chars").toList();QVERIFY(!chars.isEmpty());QCOMPARE(page.value("selection_excluded_indices").toList().size(),60);
+        QVERIFY(page.value("text").toString().contains("001"));QVERIFY(page.value("text").toString().contains("020"));
+        const int last=int(chars.size())-1;
+        const auto cached=reader->selectionText(0,last,0);QVERIFY(cached.value("ready").toBool());QVERIFY(!cached.contains("error"));
+        const QString raw=cached.value("text").toString();QVERIFY(!raw.contains("001") && !raw.contains("020"));if(!fixture.startsWith("selection-discretionary"))QVERIFY(raw.contains("42") && raw.contains("[12]"));
+        auto selectAll=[&]{return window->setProperty("selection",QVariantMap{{"page",0},{"start",last},{"end",0}});};
+        QVERIFY(selectAll());QVariant selected;QVERIFY(QMetaObject::invokeMethod(window,"selectedText",Q_RETURN_ARG(QVariant,selected)));QCOMPARE(selected.toString(),raw);
+        QVERIFY(QMetaObject::invokeMethod(window,"copySelection"));QCOMPARE(workspace.copies,1);
+        const auto copied=workspace.copied;QVERIFY(!copied.contains(QChar(2)) && !copied.contains(QChar(0xad)));
+        if(fixture.startsWith("selection-discretionary")){QVERIFY(raw.contains(QChar(2)));QVERIFY(copied.contains("conditioning") && copied.contains("ordinary"));QVERIFY(copied.contains("fine-grained") && copied.contains("Time-Aware"));}
+        QVERIFY(QMetaObject::invokeMethod(window,"selectedText",Q_RETURN_ARG(QVariant,selected)));QCOMPARE(selected.toString(),raw);QCOMPARE(reader->textPages().value("0").toMap().value("text"),page.value("text"));
+        // Missing text and a counter-only empty range must not erase a prior copy.
+        QVERIFY(window->setProperty("selection",QVariantMap{{"page",999},{"start",0},{"end",1}}));
+        QVERIFY(QMetaObject::invokeMethod(window,"copySelection"));QCOMPARE(workspace.copies,1);QCOMPARE(workspace.copied,copied);
+        const int excluded=page.value("selection_excluded_indices").toList().first().toInt();
+        QVERIFY(window->setProperty("selection",QVariantMap{{"page",0},{"start",excluded},{"end",excluded}}));
+        QVERIFY(QMetaObject::invokeMethod(window,"copySelection"));QCOMPARE(workspace.copies,1);QCOMPARE(workspace.copied,copied);QVERIFY(selectAll());
+        // A frozen reader has no editable-document handle. Its loaded text fallback
+        // must use the same original-index exclusions as the prepared shared cache.
+        const auto frozen=reader->renderSource();QVERIFY(frozen);workspace.newTab();auto *snapshot=workspace.activeReader();QVERIFY(snapshot!=reader);
+        QVERIFY(snapshot->openSnapshot(frozen,QUrl::fromLocalFile(path),"Frozen selection"));QTRY_COMPARE_WITH_TIMEOUT(snapshot->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(snapshot->pendingCommands(),0,10000);QVERIFY(settleReaderViewport(window));
+        snapshot->requestText(0);QTRY_COMPARE_WITH_TIMEOUT(snapshot->pendingCommands(),0,10000);QTRY_VERIFY(snapshot->textPages().contains("0"));QVERIFY(!snapshot->selectionText(0,0,last).value("ready").toBool());
+        QVERIFY(selectAll());QVERIFY(QMetaObject::invokeMethod(window,"selectedText",Q_RETURN_ARG(QVariant,selected)));QCOMPARE(selected.toString(),raw);
+        QVERIFY(QMetaObject::invokeMethod(window,"copySelection"));QCOMPARE(workspace.copies,2);QCOMPARE(workspace.copied,copied);
+        workspace.selectTab(0);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(settleReaderViewport(window));QVERIFY(selectAll());
+        QVERIFY(QMetaObject::invokeMethod(window,"markSelection",Q_ARG(QVariant,"highlight")));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto marks=reader->data().value("marks").toMap().value("annotations").toList();QCOMPARE(marks.size(),1);
+        const auto quads=marks.first().toMap().value("quads").toList();QVERIFY(!quads.isEmpty());
+        for(const auto &q:quads){const auto box=q.toMap();QVERIFY(box.value("x_pt").toDouble()>=59);QVERIFY(box.value("x_pt").toDouble()+box.value("width_pt").toDouble()<565);}
+        QVERIFY(QMetaObject::invokeMethod(window,"saveDocument",Q_ARG(QVariant,false)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTRY_VERIFY_WITH_TIMEOUT(!reader->hasUnsavedChanges(),10000);QVERIFY(settleReaderViewport(window));
+        ReaderController reopened;reopened.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reopened.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reopened.pendingCommands(),0,10000);
+        reopened.submit("annotations");reopened.requestText(0);QTRY_COMPARE_WITH_TIMEOUT(reopened.pendingCommands(),0,10000);const auto fileMarks=reopened.data().value("annotations").toList();QCOMPARE(fileMarks.size(),1);
+        const auto savedQuads=fileMarks.first().toMap().value("quads").toList();QVERIFY(!savedQuads.isEmpty());
+        for(const auto &q:savedQuads){const auto box=q.toMap();QVERIFY(box.value("x_pt").toDouble()>=59);QVERIFY(box.value("x_pt").toDouble()+box.value("width_pt").toDouble()<565);}
+        QVERIFY(reopened.textPages().value("0").toMap().value("text").toString().contains("001"));
+        QFile original(root+"/tests/fixtures/"+fixture);QVERIFY(original.open(QIODevice::ReadOnly));QCOMPARE(original.readAll(),before);
+    }
+    void selectionFallbackKeepsUnicodeScalarsAndOriginalIndices() {
+        QFile script(":/qml/ReaderLogic.js");QVERIFY(script.open(QIODevice::ReadOnly));auto code=script.readAll();code=code.mid(code.indexOf('\n')+1);QJSEngine engine;QVERIFY(!engine.evaluate(QString::fromUtf8(code)).isError());
+        const auto chars=engine.evaluate("[{unicode:0,x_pt:60,y_pt:20,width_pt:1,height_pt:10},{unicode:49,x_pt:10,y_pt:20,width_pt:4,height_pt:10},{unicode:65,x_pt:64,y_pt:20,width_pt:4,height_pt:10},{unicode:55296},{unicode:128512},{unicode:1114112}]");
+        auto selected=engine.globalObject().property("selectedText").call({chars,0,5,engine.evaluate("[1]")});QVERIFY(!selected.isError());
+        QString expected(QChar(0));expected+="A";expected+=QString::fromUtf8("😀");QCOMPARE(selected.toString(),expected);
+        auto hit=engine.globalObject().property("nearestCharacter").call({chars,10,20,engine.evaluate("[1]")});QVERIFY(!hit.isError());QVERIFY(hit.toInt()!=1);
+        const auto quads=engine.globalObject().property("quads").call({chars,0,5,engine.evaluate("[1]")}).toVariant().toList();QVERIFY(!quads.isEmpty());for(const auto &q:quads)QVERIFY(q.toMap().value("x").toDouble()>=60);
     }
     void snapshotRastersIncludePdfAnnotationsWithoutATextureOverlay() {
         ReaderController original;original.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/annotated.pdf"));QTRY_COMPARE_WITH_TIMEOUT(original.pageCount(),2,10000);QTRY_COMPARE_WITH_TIMEOUT(original.pendingCommands(),0,10000);QString error;const auto source=NativeRasterSource::prepare(original.documentHandle(),false,&error);QVERIFY2(source,qPrintable(error));ReaderController frozen;QVERIFY(frozen.openSnapshot(source,original.fileUrl(),"Synthetic snapshot"));QTRY_COMPARE_WITH_TIMEOUT(frozen.pageCount(),2,10000);frozen.requestPage(0,1);QTRY_VERIFY_WITH_TIMEOUT(!frozen.cachedPage(0,1).isNull(),10000);const auto page=frozen.pages().first().toMap();const QRectF region(0,0,page.value("width").toDouble(),page.value("height").toDouble());const auto marked=source->crop(0,region,1,true,false,&error),bare=source->crop(0,region,1,false,false,&error);QVERIFY2(error.isEmpty(),qPrintable(error));QCOMPARE(frozen.cachedPage(0,1),marked);QVERIFY(marked!=bare);
@@ -2141,6 +2206,7 @@ private slots:
         QTest::newRow("facing-left-tear")<<QString("Facing")<<7<<false;
         QTest::newRow("facing-right-tear")<<QString("Facing")<<8<<false;
         QTest::newRow("facing-left-foot")<<QString("Facing")<<7<<true;
+        QTest::newRow("facing-left-foot-late-layout")<<QString("Facing")<<7<<true;
         QTest::newRow("facing-right-foot")<<QString("Facing")<<8<<true;
         QTest::newRow("last-page-foot")<<QString("Continuous")<<11<<true;
         QTest::newRow("last-page-foot-tall")<<QString("Continuous")<<11<<true;
@@ -2193,13 +2259,25 @@ private slots:
         const double cardPoint=200;
         QTRY_VERIFY_WITH_TIMEOUT(paperCard->y()+cardPoint>0 && paperCard->y()+cardPoint<canvas->height(),3000);
         const double viewY=paperCard->y()+cardPoint;
+        const bool lateLayout=QByteArray(QTest::currentDataTag()).endsWith("-late-layout");
+        auto nudges=std::make_shared<int>(0);QPointer<QQuickItem> list=visualItem(window->contentItem(),"pageList");QVERIFY(list);
+        if(lateLayout)connect(reader,&ReaderController::aiRegionPaperChanged,window,[reader,window,list,nudges]{
+            if(*nudges || reader->aiRegionPaper().value("loading").toBool())return;
+            *nudges=1;
+            // Simulate a queued virtual-origin adjustment after the first plan restore.
+            // Both callbacks are owned by this test window and never alter source rows.
+            QTimer::singleShot(0,window,[window,list,nudges]{QTimer::singleShot(0,window,[list,nudges]{
+                if(list){list->setProperty("contentY",list->property("contentY").toDouble()+2.375);*nudges=2;}
+            });});
+        });
         const auto fitting=reader->fitPresentation();
         const double expectedTail=foot && ownerPage==reader->pageCount()-1 ? fitting.value("inset").toDouble()*window->property("zoom").toDouble() : 0;
         for(const double zoom:{1.35,.9,1.0}) {
             if(zoom==.9){question->forceActiveFocus();QTRY_VERIFY(question->hasActiveFocus());}
             QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,zoom),Q_ARG(QVariant,paperCard->x()+paperCard->width()*.4),Q_ARG(QVariant,viewY)));
             QTRY_VERIFY_WITH_TIMEOUT(!reader->aiRegionPaper().value("loading").toBool() && qAbs(reader->aiRegionPaper().value("card").toMap().value("gap_pt").toDouble()*window->property("zoom").toDouble()-paperCard->height())<.01,10000);
-            QTRY_VERIFY2_WITH_TIMEOUT(qAbs(paperCard->y()+cardPoint-viewY)<.1,qPrintable(QString("zoom=%1 expectedY=%2 actualY=%3 height=%4").arg(zoom).arg(viewY).arg(paperCard->y()+cardPoint).arg(paperCard->height())),3000);
+            if(lateLayout)QTRY_COMPARE_WITH_TIMEOUT(*nudges,2,3000);
+            QTRY_VERIFY2_WITH_TIMEOUT(qAbs(paperCard->y()+cardPoint-viewY)<.1,qPrintable(QString("zoom=%1 expectedY=%2 actualY=%3 height=%4 contentY=%5 originY=%6 pixelAligned=%7").arg(zoom).arg(viewY).arg(paperCard->y()+cardPoint).arg(paperCard->height()).arg(list->property("contentY").toDouble()).arg(list->property("originY").toDouble()).arg(list->property("pixelAligned").toBool())),3000);
             QVERIFY(question);QCOMPARE(question->property("text").toString(),QString("draft retained"));
             QVERIFY(canvas->property("paperTailPixels").toDouble()>=0 && canvas->property("paperTailPixels").toDouble()<=canvas->height());
             QVERIFY(std::abs(canvas->property("paperTailPixels").toDouble()-expectedTail)<.01);
