@@ -31,10 +31,92 @@ extension ReaderChecks {
         try FileManager.default.copyItem(at: source, to: singlePage)
         try FileManager.default.copyItem(at: multipageSource, to: multipage)
 
+        try ordinaryEdgeChecks(singlePage: singlePage, multipage: multipage)
         try await singlePageResizeChecks(fixture: singlePage)
         try await multiPageResizeChecks(fixture: multipage)
         try fittedTabChecks(singlePage: singlePage, multipage: multipage)
         try await windowResizeChecks(multipage: multipage)
+    }
+
+    /// The document edges keep the preset inset in view points at every ordinary zoom.
+    @MainActor
+    private static func requireDocumentEdges(_ state: AppState, viewport: CGSize) {
+        state.scroll(toFraction: 0)
+        guard let first = state.canvasPageFrames.first(where: { $0.index == 0 }) else {
+            fatalError("FAIL: document top has no first-page frame")
+        }
+        let top = (first.topPt - state.scrollYPt) * state.zoomFactor
+        require(abs(top - AppState.zoomPresetInsetPt) < 0.1,
+                "ordinary document top leaves the screen-space inset (\(top))")
+        require(state.scrollYPt == 0 && state.scrollFraction == 0,
+                "ordinary top padding is content with a zero scroll origin")
+        state.scrollByWheelStep(-1_000_000)
+        require(state.scrollYPt == 0, "wheel scrolling stops at the padded top")
+        state.scroll(toFraction: 1)
+        guard let last = state.canvasPageFrames.first(where: { $0.index == (state.document?.pageCount ?? 1) - 1 }) else {
+            fatalError("FAIL: document bottom has no last-page frame")
+        }
+        let bottom = viewport.height - (last.topPt + last.heightPt - state.scrollYPt) * state.zoomFactor
+        require(bottom >= AppState.zoomPresetInsetPt - 0.1,
+                "ordinary document bottom retains at least the inset (\(bottom))")
+        if state.hasScrollableContent {
+            require(abs(bottom - AppState.zoomPresetInsetPt) < 0.1 && abs(state.scrollFraction - 1) < 1e-9,
+                    "the scrollbar reaches the padded document bottom exactly")
+        }
+        let parked = state.scrollYPt
+        state.scrollByWheelStep(1_000_000)
+        require(abs(state.scrollYPt - parked) < 0.01, "wheel scrolling stops at the padded bottom")
+        state.gotoPage(0)
+        require(state.scrollYPt == 0, "Go to first page preserves the top inset")
+        state.scroll(toFraction: 1)
+    }
+
+    @MainActor
+    private static func ordinaryEdgeChecks(singlePage: URL, multipage: URL) throws {
+        for height: CGFloat in [500, 1350] {
+            for density: CGFloat in [380, 720, 1080] {
+                let viewport = CGSize(width: 800, height: height)
+                let calibration = DisplayCalibration.resolve(logicalWidthPt: density, physicalWidthMm: 254)
+                for mode: ReaderLayoutMode in [.continuous, .facing] {
+                    let state = AppState(engine: try RustEngine())
+                    state.setViewportSize(viewport)
+                    state.setDisplayCalibration(calibration)
+                    require(state.newTab(url: multipage), "ordinary edge fixture opens")
+                    state.setLayoutMode(mode)
+                    for zoom in [25, 100, 250] {
+                        state.zoomActual()
+                        while state.zoomPercent > zoom { state.zoomOut() }
+                        while state.zoomPercent < zoom { state.zoomIn() }
+                        requireDocumentEdges(state, viewport: viewport)
+                    }
+                    state.zoomFitWidth()
+                    requireDocumentEdges(state, viewport: viewport)
+                }
+            }
+            let single = AppState(engine: try RustEngine())
+            single.setViewportSize(CGSize(width: 800, height: height))
+            require(single.open(url: singlePage), "ordinary single-page fixture opens")
+            single.zoomActual()
+            requireDocumentEdges(single, viewport: CGSize(width: 800, height: height))
+        }
+
+        let state = AppState(engine: try RustEngine())
+        state.setViewportSize(CGSize(width: 800, height: 500))
+        require(state.open(url: multipage), "ordinary saved-position fixture opens")
+        state.zoomActual()
+        state.gotoPage(1)
+        state.scroll(byScreenPoints: 123)
+        let canonical = state.scrollYPt - AppState.zoomPresetInsetPt / state.zoomFactor
+        require(state.flushPendingPositionSave(), "ordinary position saves")
+        let key = "readingPosition:" + multipage.path
+        require(abs(UserDefaults.standard.double(forKey: key) - canonical) < 0.1,
+                "saved ordinary position excludes view-dependent edge padding")
+        let restored = AppState(engine: try RustEngine())
+        restored.setViewportSize(CGSize(width: 800, height: 500))
+        restored.setDisplayCalibration(DisplayCalibration.resolve(logicalWidthPt: 1080, physicalWidthMm: 254))
+        require(restored.open(url: multipage), "ordinary saved position reopens at another display density")
+        require(abs(restored.scrollYPt - AppState.zoomPresetInsetPt / restored.zoomFactor - canonical) < 0.1,
+                "restored position keeps the same paper point across display densities")
     }
 
     /// Assert the actual drawing transform, including first/last page clamps and adjacent paper.
@@ -186,8 +268,8 @@ extension ReaderChecks {
         let manual = state.zoomPercent
         state.selectTab(0)
         require(state.zoomPercent == manual, "returning to a fitted tab keeps the current manual zoom")
-        require(abs(state.contentHeightPt - 2550) < 0.5,
-                "a fitted tab discards spacing calculated at a different zoom")
+        require(abs(state.contentHeightPt - 2550 - 2 * AppState.zoomPresetInsetPt / state.zoomFactor) < 0.5,
+                "a fitted tab restores ordinary edge padding at the current zoom")
     }
 
     /// Real AppKit layout → `HorizontalDocumentViewport.onViewport` → `AppState.setViewportSize`.
@@ -390,8 +472,9 @@ extension ReaderChecks {
         // `scrollYPt` is in content points; the canvas height is in view points.
         let expectedBottom = max(0, state.contentHeightPt - canvas.bounds.height / state.zoomFactor)
         require(abs(state.scrollYPt - expectedBottom) < 0.5,
-                "viewport fit: the multi-page window puts the last page at the canvas bottom "
+                "viewport fit: the multi-page window reaches the padded canvas bottom "
                     + "(offset \(state.scrollYPt), want \(expectedBottom), canvas \(canvas.bounds.size))")
+        requireDocumentEdges(state, viewport: canvas.bounds.size)
         try await holdForScreenshot("multi-bottom")
     }
 

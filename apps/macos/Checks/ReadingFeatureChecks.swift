@@ -57,7 +57,7 @@ extension ReaderChecks {
 
         state.gotoPage(0)
         state.scroll(byScreenPoints: 240)
-        let firstPosition = state.scrollYPt
+        let firstPosition = state.scrollYPt - state.canvasPageFrames.first { $0.index == 0 }!.topPt
         require(state.addBookmarkAtCurrentPage(name: "  Introduction  "), "a bookmark is added")
         require(state.bookmarks.count == 1, "the bookmark appears in the sidebar's list")
         let first = state.bookmarks[0]
@@ -147,8 +147,8 @@ extension ReaderChecks {
         require(state.layoutMode == .facing, "the display mode is switchable")
         require(abs(state.contentWidthPt - (2 * 595 + 12)) < 0.01,
                 "facing content is two page columns wide plus the gap")
-        require(abs(state.contentHeightPt - (842 + 12 + 842)) < 0.01,
-                "facing content is a cover row plus one spread row")
+        require(abs(state.contentHeightPt - (842 + 12 + 842) - 2 * AppState.zoomPresetInsetPt / state.zoomFactor) < 0.01,
+                "facing content includes the cover, spread and document-edge padding")
 
         state.gotoPage(0)
         require(state.pagePlacement(at: CGPoint(x: 650, y: 100))?.index == 0,
@@ -211,8 +211,9 @@ extension ReaderChecks {
         let afterContentY = CanvasGeometry.contentY(
             viewY: anchorViewY, scrollYPt: state.scrollYPt, zoom: state.zoomFactor
         )
-        let centerViewAfter = (centerContentY - state.scrollYPt) * state.zoomFactor
-        require(abs(beforeContentY - afterContentY) < 0.05,
+        let newTop = state.canvasPageFrames.first { $0.index == 1 }!.topPt
+        let centerViewAfter = (newTop + (left?.heightPt ?? 0) / 2 - state.scrollYPt) * state.zoomFactor
+        require(abs((beforeContentY - (left?.topPt ?? 0)) - (afterContentY - newTop)) < 0.05,
                 "the page centre stays under the pointer through a facing-page zoom")
         require(abs(centerViewBefore - anchorViewY) < 0.05
                     && abs(centerViewAfter - anchorViewY) < 0.05,
@@ -263,12 +264,12 @@ extension ReaderChecks {
         state.gotoPage(0)
         _ = state.contentHeightPt
         state.setLayoutMode(.facing)
-        require(abs(state.contentHeightPt - (842 + 12 + 842)) < 0.01,
+        require(abs(state.contentHeightPt - (842 + 12 + 842) - 2 * AppState.zoomPresetInsetPt / state.zoomFactor) < 0.01,
                 "switching to facing changes the content height without a reopen")
 
         state.setPageGap(30)
         require(abs(state.pageGapPt - 30) < 0.01, "the gap is accepted")
-        require(abs(state.contentHeightPt - (842 + 30 + 842)) < 0.01,
+        require(abs(state.contentHeightPt - (842 + 30 + 842) - 2 * AppState.zoomPresetInsetPt / state.zoomFactor) < 0.01,
                 "the new gap changes the vertical layout immediately")
         require(abs(state.contentWidthPt - (2 * 595 + 30)) < 0.01,
                 "the new gap changes the horizontal layout immediately")
@@ -277,7 +278,7 @@ extension ReaderChecks {
         require(abs(state.pageGapPt - 48) < 0.01, "the gap clamps at its upper bound")
         state.setPageGap(-10)
         require(abs(state.pageGapPt - 0) < 0.01, "the gap clamps at its lower bound")
-        require(abs(state.contentHeightPt - (842 + 842)) < 0.01,
+        require(abs(state.contentHeightPt - (842 + 842) - 2 * AppState.zoomPresetInsetPt / state.zoomFactor) < 0.01,
                 "a zero gap packs the facing rows together")
 
         // Scroll-indicator geometry reads the content height, so it has to follow the layout.

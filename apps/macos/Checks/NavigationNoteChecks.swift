@@ -13,8 +13,7 @@ extension ReaderChecks {
                 "contents links carry the direct navigation policy from Rust")
         for link in links {
             state.gotoPage(0)
-            let page = engine.visiblePages(scrollYPt: 0, viewportHeightPt: 600,
-                                           gapPt: state.pageGapPt, marginPt: 0).first!
+            let page = state.canvasPageFrames.first!
             let point = CGPoint(x: page.leftPt + link.xPt + link.widthPt / 2,
                                 y: page.topPt + link.yPt + link.heightPt / 2)
             try await eventually("the contents link becomes clickable", { state.link(at: point) != nil })

@@ -199,8 +199,7 @@ extension ReaderChecks {
                 "entries this version cannot draw are preserved, not rejected")
         let text = try await futureEngine.textPage(known.page)
         let expectedRects = text.selectionRects(in: known.start...known.end)
-        let placement = futureEngine.visiblePages(scrollYPt: futureState.scrollYPt,
-            viewportHeightPt: 500, gapPt: futureState.pageGapPt, marginPt: 0)
+        let placement = futureState.canvasPageFrames
             .first { $0.index == known.page }!
         // Multiply folds opacity into the tint rather than replacing the source glyphs.
         let expectedColor = Data(known.color.baked(opacity: 1).bgra)
@@ -304,7 +303,7 @@ extension ReaderChecks {
         let keyBeforeOpen = "readingPosition:" + typing.path
         UserDefaults.standard.removeObject(forKey: keyBeforeOpen)
         typingState.scroll(toFraction: 0.4) // debounced: only in memory until a flush point
-        let switchPosition = typingState.scrollYPt
+        let switchPosition = typingState.scrollYPt - AppState.zoomPresetInsetPt / typingState.zoomFactor
         require(switchPosition > 0, "the document scrolled before the switch")
         require(UserDefaults.standard.object(forKey: keyBeforeOpen) == nil,
                 "the scrolled position is still only in memory")
@@ -325,7 +324,7 @@ extension ReaderChecks {
         require(typingState.annotations.first?.note == timed + "!!",
                 "the note flushed at the switch is on disk")
         require(abs(UserDefaults.standard.double(forKey: keyBeforeOpen) - Double(switchPosition)) < 0.5,
-                "the flushed position is the one the document had")
+                "the flushed position is the paper point the document had, without edge padding")
 
         // Closing the (active) tab flushes too.
         typingState.updateNote(timed + "!!?", for: noteAnnotation.id)

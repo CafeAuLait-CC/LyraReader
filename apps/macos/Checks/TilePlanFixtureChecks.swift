@@ -75,7 +75,7 @@ import LyraReaderKit
 
 extension ReaderChecks {
     private static let tilePlanFixtureDirectory = "tests/fixtures/tile-plan"
-    private static let tilePlanFixtureFile = "plans.json"
+    private static let tilePlanFixtureFile = "plans-with-edge-padding.json"
 
     /// The scripted viewport updates whose plans are frozen.
     private enum TilePlanScenario: String, CaseIterable {
@@ -99,20 +99,16 @@ extension ReaderChecks {
         print("Captured \(data.count) bytes of tile-plan fixtures")
     }
 
-    /// The tile-plan equivalence check (audit C5).
-    ///
-    /// `tests/fixtures/tile-plan/plans.json` was captured from the shell's own scheduler before
-    /// the decision moved to `lyra-reader-render`. It freezes, for every scripted viewport
-    /// update: the LOD, the chosen prefetch ring, every page's band rows and columns, the pinned
-    /// set and the raster submission order with each tile's prefetch flag. The check rebuilds
-    /// the same scenarios through the current code and requires the bytes to match exactly; a
-    /// re-capture must reproduce the frozen bytes.
+    /// The original zero-inset scheduler freeze remains in `plans.json` for the Rust migration
+    /// audit. Ordinary paper-edge padding intentionally changes the viewport's relation to the
+    /// page bands, so `plans-with-edge-padding.json` freezes the same scripts with that layout.
+    /// The current check compares every LOD, ring, band, pinned tile and submission exactly.
     @MainActor static func tilePlanFixtureChecks(root: URL) async throws {
         let directory = root.appendingPathComponent(tilePlanFixtureDirectory)
         let golden = try Data(contentsOf: directory.appendingPathComponent(tilePlanFixtureFile))
         let actual = try fixtureBytes(try await tilePlanFixtureObject(url: root))
         require(actual == golden,
-                "the tile plan matches its pre-change freeze"
+                "the tile plan matches the paper-edge-padding freeze"
                 + (actual == golden ? "" : " (\(actual.count) vs \(golden.count) bytes)"))
         print("Tile-plan equivalence check passed")
     }
