@@ -41,11 +41,7 @@ pub enum ZoomRequest {
     Step { percent: u32, delta: i32 },
     /// Fit the page's width into the viewport width, leaving the preset inset per side.
     FitWidth,
-    /// Fit the page's height into the viewport height, leaving the preset inset per side.
-    ///
-    /// This is the shipping "Fit Page" preset: it fits the height only, because width is what
-    /// Fit Width is for and the page remains vertically scrollable when it is smaller than
-    /// the window.
+    /// Fit the entire page or spread into both viewport axes, leaving the preset inset.
     FitPage,
 }
 
@@ -121,7 +117,13 @@ pub fn resolve_zoom_percent(
             Some(stepped.clamp(i64::from(MIN_ZOOM_PERCENT), i64::from(MAX_ZOOM_PERCENT)) as u32)
         }
         ZoomRequest::FitWidth => fit_percent(page.width, viewport.width, calibration),
-        ZoomRequest::FitPage => fit_percent(page.height, viewport.height, calibration),
+        ZoomRequest::FitPage => Some(
+            fit_percent(page.height, viewport.height, calibration)?.min(fit_percent(
+                page.width,
+                viewport.width,
+                calibration,
+            )?),
+        ),
     }
 }
 
@@ -159,46 +161,71 @@ pub fn clamp_scroll(offset: f64, content_height: f64, viewport_height: f64) -> f
 
 /// The Fit Page percentage a real viewport-height change should adopt, when it should adopt one.
 ///
-/// **Scope.** Only a single-page document changes its zoom on a resize or a fullscreen
-/// transition. A multi-page document keeps the reader's percentage: re-fitting the current page
-/// of a 200-page paper on every window drag would throw away the reading position, and the scroll
-/// range already becomes tight via [`clamp_scroll`] (top edge at the viewport top, last page's
-/// bottom at the viewport bottom). A facing spread is a multi-page document too — its row count
-/// is smaller than its page count, but the percentage still belongs to the reader.
-///
-/// **When.** The current percentage must be *below* the fit value. That means the page at the
-/// current zoom is shorter than the viewport minus the preset inset, which is exactly the case
-/// where re-fitting removes blank space. At or above the fit value the function returns `None`:
-/// shrinking to the fit would only add the preset's own blank (the fit leaves 8 pt per side) and
-/// would override a zoom the reader chose. A manual zoom-out after an automatic fit is therefore
-/// stable until the next real viewport change, which asks this function again.
-///
-/// The fit arithmetic is [`resolve_zoom_percent`]'s (8 pt inset per side, 25–400 clamp, floor);
-/// this function must not grow a second formula.
+/// Any nonempty document participates. Fit the current page or spread, retaining a zoom
+/// already at or above the fit. A manual zoom-out remains stable until the next height change.
+/// The percentage comes from the same policy as the explicit Fit Page command.
 pub fn fit_page_on_viewport_change(
     page_count: u32,
     current_percent: u32,
-    page_height_pt: f64,
-    viewport_height_pt: f64,
+    page: Size,
+    viewport: Size,
     calibration: f64,
 ) -> Option<u32> {
-    if page_count != 1 {
+    if page_count == 0 {
         return None;
     }
-    // FitPage reads the height axis; the width values are unused but must be finite for
-    // `fit_percent`'s shared validation, so pass the same height on both axes.
-    let fit = resolve_zoom_percent(
-        ZoomRequest::FitPage,
-        Size::new(page_height_pt, page_height_pt),
-        Size::new(viewport_height_pt, viewport_height_pt),
-        calibration,
-    )?;
+    let fit = resolve_zoom_percent(ZoomRequest::FitPage, page, viewport, calibration)?;
     (current_percent < fit).then_some(fit)
+}
+
+/// Content-space spacing for a fitted page. The inter-row gap includes the rounding remainder,
+/// so adjacent paper cannot peek into the blank above or below the fitted row.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FitPageSpacing {
+    pub inset_pt: f64,
+    pub gap_pt: f64,
+}
+
+pub fn fit_page_spacing(
+    page_height_pt: f64,
+    viewport_height_pt: f64,
+    zoom: f64,
+    preferred_gap_pt: f64,
+) -> Option<FitPageSpacing> {
+    if ![page_height_pt, viewport_height_pt, zoom]
+        .iter()
+        .all(|v| v.is_finite() && *v > 0.0)
+        || !preferred_gap_pt.is_finite()
+        || preferred_gap_pt < 0.0
+    {
+        return None;
+    }
+    let blank = (viewport_height_pt / zoom - page_height_pt).max(0.0);
+    Some(FitPageSpacing {
+        inset_pt: blank / 2.0,
+        gap_pt: preferred_gap_pt.max(blank),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fit_page_on_viewport_change(
+        count: u32,
+        current: u32,
+        height: f64,
+        viewport: f64,
+        calibration: f64,
+    ) -> Option<u32> {
+        super::fit_page_on_viewport_change(
+            count,
+            current,
+            Size::new(1.0, height),
+            Size::new(100_000.0, viewport),
+            calibration,
+        )
+    }
 
     fn a4() -> Size {
         Size::new(595.0, 842.0)
@@ -341,31 +368,61 @@ mod tests {
     }
 
     #[test]
-    fn a_multi_page_document_never_changes_zoom_on_a_viewport_change() {
-        // The same blank geometry that fits a one-page document (viewport 900) must not touch
-        // a three-page paper, and a facing spread (two pages per row) is still multi-page.
-        for page_count in [2, 3, 200] {
+    fn every_nonempty_document_can_refit_its_current_row() {
+        for count in [1, 2, 3, 200] {
             assert_eq!(
-                fit_page_on_viewport_change(page_count, 100, 842.0, 900.0, 1.0),
-                None
+                fit_page_on_viewport_change(count, 25, 842.0, 900.0, 1.0),
+                Some(104)
             );
             assert_eq!(
-                fit_page_on_viewport_change(page_count, 50, 842.0, 2000.0, 1.0),
+                fit_page_on_viewport_change(count, 104, 842.0, 900.0, 1.0),
                 None
             );
         }
-        assert_eq!(fit_page_on_viewport_change(2, 100, 842.0, 900.0, 1.5), None);
+        assert_eq!(fit_page_on_viewport_change(0, 25, 842.0, 900.0, 1.0), None);
     }
 
     #[test]
-    fn a_facing_spread_keeps_its_percent() {
-        // Facing layout puts two pages in a row, but the document still has a page count; the
-        // policy only ever participates for page_count == 1. A cover/verso pair is not a
-        // single-page document even though the row looks like one tall page.
-        assert_eq!(fit_page_on_viewport_change(2, 100, 842.0, 900.0, 1.0), None);
-        assert_eq!(fit_page_on_viewport_change(2, 50, 842.0, 2000.0, 1.0), None);
-        // No document (page_count 0) is not a single page either.
-        assert_eq!(fit_page_on_viewport_change(0, 100, 842.0, 900.0, 1.0), None);
+    fn fit_page_respects_width_and_calibrated_spread_geometry() {
+        let page = Size::new(1202.0, 842.0);
+        let viewport = Size::new(700.0, 900.0);
+        assert_eq!(
+            super::fit_page_on_viewport_change(200, 25, page, viewport, 1.0),
+            Some(56)
+        );
+        assert_eq!(
+            super::fit_page_on_viewport_change(200, 56, page, viewport, 1.0),
+            None
+        );
+        assert_eq!(
+            resolve_zoom_percent(ZoomRequest::FitPage, page, viewport, 1.5),
+            Some(37)
+        );
+    }
+
+    #[test]
+    fn fit_spacing_centres_paper_and_excludes_adjacent_rows() {
+        for height in [200.0, 842.0, 1500.0] {
+            for viewport in [500.0, 900.0, 1500.0] {
+                let percent = resolve_zoom_percent(
+                    ZoomRequest::FitPage,
+                    Size::new(1.0, height),
+                    Size::new(10_000.0, viewport),
+                    1.0,
+                )
+                .unwrap();
+                let zoom = f64::from(percent) / 100.0;
+                let spacing = fit_page_spacing(height, viewport, zoom, 0.0).unwrap();
+                let top = spacing.inset_pt * zoom;
+                let bottom = top + height * zoom;
+                assert!((top - (viewport - bottom)).abs() < 1e-8);
+                assert!(top + 1e-8 >= ZOOM_PRESET_INSET_PT);
+                assert!(bottom + spacing.gap_pt * zoom >= viewport);
+                assert!(top - spacing.gap_pt * zoom <= 0.0);
+            }
+        }
+        assert!(fit_page_spacing(842.0, 900.0, 0.0, 12.0).is_none());
+        assert!(fit_page_spacing(f64::NAN, 900.0, 1.0, 12.0).is_none());
     }
 
     #[test]
@@ -426,8 +483,8 @@ mod tests {
         for viewport_height in [200.0, 500.0, 800.0, 900.0, 1200.0, 4000.0] {
             let preset = resolve_zoom_percent(
                 ZoomRequest::FitPage,
-                Size::new(595.0, 842.0),
-                Size::new(1000.0, viewport_height),
+                Size::new(1.0, 842.0),
+                Size::new(100_000.0, viewport_height),
                 1.0,
             )
             .unwrap();

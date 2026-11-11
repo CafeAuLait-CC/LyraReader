@@ -153,7 +153,8 @@ extension ReaderChecks {
                 "the faded indicator is still grabbable: interaction does not follow the animation")
         require(!state.showsScrollIndicator, "and it is still not drawn while idle")
 
-        state.setViewportSize(CGSize(width: 700, height: 3_000))
+        // Keep the zoom above the width-limited fit so this isolates a whole-document scroller.
+        state.setViewportSize(CGSize(width: 600, height: 3_000))
         require(!state.hasScrollableContent && !state.scrollIndicatorIsInteractive
                 && !state.showsScrollIndicator,
                 "a viewport tall enough for the whole document has no indicator and no hit area")

@@ -623,9 +623,9 @@ extension AppState {
             .reduce(0) { $0 + regionGapHeightPt($1) }
     }
 
-    /// Page top with the region gaps applied. With no cards this is exactly the engine's value.
+    /// Page top with the region-card and fitted-row gaps applied.
     func displayPageTop(_ page: Int) -> CGFloat {
-        let engineTop = engine.pageTopPt(page, gapPt: pageGapPt, layout: layoutMode)
+        let engineTop = engine.pageTopPt(page, gapPt: pageGapPt, layout: layoutMode) + fittedPageShift(page)
         guard !regionCards.isEmpty else { return engineTop }
         return engineTop + regionShift(beforeRow: regionRow(forPage: page))
     }
@@ -645,7 +645,7 @@ extension AppState {
             return displayPageTop(card.attachment.page) + split
         }
         let row = regionRow(forPage: card.attachment.page)
-        var top = regionEngineRowBottom(row: row) + regionShift(beforeRow: row)
+        var top = regionEngineRowBottom(row: row) + regionShift(beforeRow: row) + fittedPageShift(card.attachment.page)
         for earlier in regionCards {
             guard earlier.id != card.id else { break }
             guard regionRow(forPage: earlier.attachment.page) == row else { continue }
@@ -664,7 +664,7 @@ extension AppState {
         viewportHeightPt height: CGFloat,
         marginPt margin: CGFloat
     ) -> [PagePlacement] {
-        guard !regionCards.isEmpty else {
+        guard !regionCards.isEmpty || fittedPageExtraGapPt > 0 else {
             return engine.visiblePages(
                 scrollYPt: scroll,
                 viewportHeightPt: height,
@@ -673,18 +673,38 @@ extension AppState {
                 layout: layoutMode
             )
         }
-        let totalGap = regionGapTotalPt
-        let raw = engine.visiblePages(
-            scrollYPt: max(0, scroll - totalGap),
-            viewportHeightPt: height + totalGap,
-            gapPt: pageGapPt,
-            marginPt: margin,
-            layout: layoutMode
-        )
+        let raw: [PagePlacement]
+        if fittedPageExtraGapPt > 0, let document {
+            // Invert the monotonic row tops instead of widening the query by every fitted gap
+            // in a long document. Only a viewport-sized band plus one row reaches the engine.
+            let rowCount = regionRow(forPage: document.pageCount - 1) + 1
+            var low = 0
+            var high = rowCount
+            while low < high {
+                let mid = (low + high) / 2
+                if displayPageTop(regionFirstPage(inRow: mid)) <= scroll - margin {
+                    low = mid + 1
+                } else {
+                    high = mid
+                }
+            }
+            let row = max(0, low - 1)
+            let first = regionFirstPage(inRow: row)
+            let baseTop = engine.pageTopPt(first, gapPt: pageGapPt, layout: layoutMode)
+            let rowHeight = regionEngineRowBottom(row: row) - baseTop
+            raw = engine.visiblePages(scrollYPt: baseTop,
+                viewportHeightPt: height + 2 * margin + rowHeight + pageGapPt + regionGapTotalPt,
+                gapPt: pageGapPt, marginPt: 0, layout: layoutMode)
+        } else {
+            let totalGap = regionGapTotalPt
+            raw = engine.visiblePages(
+                scrollYPt: max(0, scroll - totalGap), viewportHeightPt: height + totalGap,
+                gapPt: pageGapPt, marginPt: margin, layout: layoutMode)
+        }
         let top = scroll - margin
         let bottom = scroll + height + margin
         return raw.compactMap { placement in
-            let shift = regionShift(beforeRow: regionRow(forPage: placement.index))
+            let shift = regionShift(beforeRow: regionRow(forPage: placement.index)) + fittedPageShift(placement.index)
             let shifted = PagePlacement(
                 index: placement.index,
                 topPt: placement.topPt + shift,
@@ -730,11 +750,13 @@ extension AppState {
     /// positions use this, so quitting with a card open does not make the next launch jump down
     /// by the card's height (history is session-only and the gap will not be there).
     func regionUnshiftedScrollYPt(_ y: CGFloat) -> CGFloat {
-        guard !regionCards.isEmpty else { return y }
-        var result = y
+        guard !regionCards.isEmpty || fittedPageInsetPt > 0 || fittedPageExtraGapPt > 0 else { return y }
+        let page = regionCurrentPage(at: y + fittedPageInsetPt)
+        let position = fittedPageInsetPt > 0 ? max(y, displayPageTop(page)) : y
+        var result = position - fittedPageShift(page)
         for card in regionCards {
             guard let top = regionGapTop(for: card) else { continue }
-            if y >= top { result -= min(regionGapHeightPt(card), y - top) }
+            if position >= top { result -= min(regionGapHeightPt(card), position - top) }
         }
         return max(0, result)
     }
