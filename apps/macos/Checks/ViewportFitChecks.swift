@@ -259,9 +259,24 @@ extension ReaderChecks {
                 "viewport fit: window document can be zoomed out to the minimum "
                     + "(got \(initialZoom)%, took \(zoomOutSteps) steps)")
 
-        // A real frame resize. The grown window leaves a ~853 pt canvas here (less on a small
-        // display); Fit Page is always above the 25% the reader chose.
-        window.setContentSize(CGSize(width: 900, height: 1000))
+        // A real frame resize. A CI display can clamp the window's height, and a size that is
+        // already clamped to the screen changes nothing — the fitted percentage would then keep
+        // the 25% chosen above and the assertion below would fail on the runner while passing on
+        // a developer display. Shrink first to a size well below the screen limit, then grow to
+        // the largest size the screen allows, so the height always increases by a real amount.
+        let visible = window.screen?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let maxWidth = max(600, min(900, visible.width - 40))
+        let maxHeight = max(420, min(1000, visible.height - 40))
+        let smallHeight = max(300, maxHeight - 240)
+        let canvasBeforeShrink = canvas.bounds.height
+        window.setContentSize(CGSize(width: maxWidth, height: smallHeight))
+        window.contentView?.layoutSubtreeIfNeeded()
+        var settle = 0
+        while canvas.bounds.height >= canvasBeforeShrink && settle < 40 {
+            try await Task.sleep(for: .milliseconds(25))
+            settle += 1
+        }
+        window.setContentSize(CGSize(width: maxWidth, height: maxHeight))
         window.contentView?.layoutSubtreeIfNeeded()
         var resizeWait = 0
         while state.zoomPercent <= initialZoom && resizeWait < 200 {
@@ -284,8 +299,9 @@ extension ReaderChecks {
         // change the viewport at all; this assertion catches the fitted state itself.
         require(state.scrollYPt >= 0, "viewport fit: fitted window offset stays non-negative")
 
-        // Shrinking back to a real window size must keep the percentage (the fit is now lower).
-        window.setContentSize(CGSize(width: 900, height: 700))
+        // Shrinking back to the smaller real window size must keep the percentage (the fit is
+        // now lower than the grown fit).
+        window.setContentSize(CGSize(width: maxWidth, height: smallHeight))
         window.contentView?.layoutSubtreeIfNeeded()
         try await Task.sleep(for: .milliseconds(300))
         require(state.zoomPercent == grownZoom,
