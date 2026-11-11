@@ -4,6 +4,7 @@ import LyraReader 1.0
 
 Item {
     id: layer
+    objectName:"contentPageLayer"+page
     required property var app
     required property int page
     property var paperMap: null
@@ -12,6 +13,33 @@ Item {
     readonly property var selected: editor.selected
     readonly property bool ready: editor.model.page===page && editor.model.revision.length>0
     readonly property var shown: editor.gesture || (selected && ready ? selected.bounds : null)
+    property var hoverItem:null
+    property var hoverOwner:null
+    property var hoverGeneration:null
+    property string hoverRevision:""
+    property real hoverZoom:0
+    readonly property var hovered:visible && app.secondaryRow==="edit" && editor.tool==="select" && pointer.containsMouse && ready
+        && hoverOwner===app.currentReader && hoverGeneration===app.currentReader.documentGeneration
+        && hoverRevision===editor.model.revision && hoverZoom===app.zoom ? hoverItem : null
+    readonly property bool showsHover:!!hovered && (!selected || selected.id!==hovered.id)
+    function clearHover(){hoverItem=null;hoverOwner=null;hoverGeneration=null;hoverRevision="";}
+    onVisibleChanged:if(!visible)clearHover()
+    Connections {target:layer.editor;function onToolChanged(){layer.clearHover();} function onModelChanged(){layer.clearHover();}}
+    Connections {target:layer.app;function onCurrentReaderChanged(){layer.clearHover();} function onZoomChanged(){layer.clearHover();}}
+    Connections {target:layer.app.pageList;function onContentYChanged(){layer.clearHover();} function onContentXChanged(){layer.clearHover();}}
+    Rectangle {
+        objectName:"contentHoverFrame"+layer.page
+        visible:layer.showsHover && !layer.paperActive
+        x:layer.hovered ? layer.hovered.bounds.x*app.zoom : 0;y:layer.hovered ? layer.hovered.bounds.y*app.zoom : 0
+        width:layer.hovered ? layer.hovered.bounds.width*app.zoom : 0;height:layer.hovered ? layer.hovered.bounds.height*app.zoom : 0
+        color:"transparent";border.width:1;border.color:app.colors.focusRing
+    }
+    PdfAnnotations {
+        objectName:"paperContentHoverFrame"+layer.page
+        anchors.fill:parent;visible:layer.paperActive && layer.showsHover
+        paperMap:layer.paperMap;zoom:app.zoom
+        annotations:visible ? [{id:"ui-content-hover",kind:"square",rect:layer.hovered.bounds,color:app.colors.focusRing,strokeWidth:1/app.zoom}] : []
+    }
     Rectangle {
         visible: !!layer.shown && !layer.paperActive
         x: layer.shown ? layer.shown.x*app.zoom : 0
@@ -31,10 +59,20 @@ Item {
         annotations: visible ? [{id:"ui-content-frame",kind:"square",rect:layer.shown,color:app.colors.focusRing,strokeWidth:2/app.zoom}] : []
     }
     MouseArea {
+        id:pointer
         anchors.fill: parent
         objectName: "contentPointer"+layer.page
         enabled: !app.contentEditor.pending
-        cursorShape: editor.tool==="select" ? Qt.ArrowCursor : Qt.CrossCursor
+        hoverEnabled:editor.tool==="select"
+        cursorShape:editor.tool!=="select" ? Qt.CrossCursor : dragging && !!editor.gesture ? Qt.ClosedHandCursor : layer.hovered && selected && layer.hovered.id===selected.id ? Qt.OpenHandCursor : Qt.ArrowCursor
+        function updateHover(mouse) {
+            if(pressed || editor.tool!=="select" || !layer.ready){layer.clearHover();return;}
+            const p=position(mouse);
+            layer.hoverItem=p ? at(p.x,p.y) : null;layer.hoverOwner=app.currentReader;
+            layer.hoverGeneration=app.currentReader.documentGeneration;layer.hoverRevision=editor.model.revision;layer.hoverZoom=app.zoom;
+        }
+        onEntered:updateHover({x:mouseX,y:mouseY})
+        onExited:layer.clearHover()
         acceptedButtons: Qt.LeftButton
         activeFocusOnTab: true
         Accessible.role: Accessible.Canvas
@@ -58,10 +96,12 @@ Item {
         }
         function at(x,y) {
             if (!layer.ready) return null;
-            const hits=editor.model.items.filter(function(item){const r=item.bounds;
-                return x>=r.x && x<=r.x+r.width && y>=r.y && y<=r.y+r.height;});
-            hits.sort(function(a,b){return a.bounds.width*a.bounds.height-b.bounds.width*b.bounds.height;});
-            return hits[0] || null;
+            let closest=null,area=Infinity;
+            for(const item of editor.model.items) {
+                const r=item.bounds,size=r.width*r.height;
+                if(x>=r.x && x<=r.x+r.width && y>=r.y && y<=r.y+r.height && size<area){closest=item;area=size;}
+            }
+            return closest;
         }
         function area(x,y) {
             const size=app.currentReader.pages[layer.page];
@@ -70,7 +110,7 @@ Item {
                 height:Math.max(1,Math.min(size.height,Math.max(start.y,y))-top)};
         }
         onPressed: function(mouse) {
-            began=false;dragging=false;
+            began=false;dragging=false;layer.clearHover();
             const p=position(mouse);if(!p)return;
             forceActiveFocus();
             app.currentPage=layer.page;
@@ -80,6 +120,7 @@ Item {
             start=p;hit=at(start.x,start.y);
         }
         onPositionChanged: function(mouse) {
+            if(!pressed){updateHover(mouse);return;}
             if (!pressed || !began || !layer.ready || editor.hasDraft || !currentGesture() || pressRevision!==editor.model.revision) return;
             const p=position(mouse);if(!p)return;
             const x=p.x,y=p.y;
@@ -117,6 +158,8 @@ Item {
             if (editor.inlineEditing) {editor.discard();return;}
             editor.gesture=null;editor.selected=null;editor.tool="select";
         }
+        Keys.onReturnPressed:if(editor.tool==="select" && selected && selected.kind==="text")editor.editText(selected,layer.page)
+        Keys.onPressed:function(event){if(event.key===Qt.Key_F2 && editor.tool==="select" && selected && selected.kind==="text"){editor.editText(selected,layer.page);event.accepted=true;}}
         Keys.onDeletePressed: editor.remove()
     }
 }

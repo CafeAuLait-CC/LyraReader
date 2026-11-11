@@ -82,10 +82,12 @@ Item {
     }
     function submit(command,page,allowRaster) {
         if (pending || app.blockXfaWrite() || owner.pendingCommands>0) return;
+        const ticket={reader:owner,command:command,page:page};
+        // A newly staged transform is not a recovery draft until its result fails.
+        // Publish that ownership before store() can notify the inspector binding.
+        pending=ticket;
         if (!hasDraft) store(command,page,"");
         app.pendingPage=app.currentPage;app.pendingPageSelection=app.selectedPages.slice();
-        const ticket={reader:owner,command:command,page:page};
-        pending=ticket;
         ticket.id=owner.submit("content_stage",{page:page,command:command,allow_raster:!!allowRaster,
             current_page:app.currentPage,selected_pages:app.selectedPages});
     }

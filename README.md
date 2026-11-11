@@ -75,6 +75,9 @@ and scrollbar colours stay independent of PDF zoom. Right-click an annotation fo
 exposes eight direct actions, including flattened copies and form values with a verified
 original-file backup. Flattening uses the saved PDF revision; save pending annotation/form drafts
 first to include them. Links and sticky notes are kept, and the result remains editable.
+With no Edit tool armed, selecting or moving text keeps the inspector closed until the caret opens;
+failed or retained drafts still expose recovery controls. Only this selection state offers hover
+outlines. Leaving Lyra closes its drawer while retaining the selected workspace and question draft.
 The Edit row stages actual text/object/link edits through the shared typed commands and recoverable transaction;
 failed or superseded text drafts remain available to copy or retry. Long drafts use a bounded
 scrolling editor, and position/size fields keep their labels and page-point units visible.

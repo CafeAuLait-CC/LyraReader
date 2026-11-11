@@ -142,9 +142,13 @@ ApplicationWindow {
     onFillDateFormatChanged: if (fillTool === "date") refreshFillDate()
     property string fillImageSize: "medium"
     property color fillColor: theme.documentInk
-    readonly property bool editInspectorVisible: currentReader.pageCount>0 && secondaryRow==="edit" && (contentController.tool!=="select" || !!contentController.selected || contentController.hasDraft)
+    readonly property bool editInspectorVisible: currentReader.pageCount>0 && secondaryRow==="edit" && (contentController.tool!=="select" || contentController.inlineEditing || (contentController.hasDraft && !contentController.pending) || (!!contentController.selected && contentController.selected.kind!=="text"))
     readonly property bool fillInspectorVisible: currentReader.pageCount>0 && secondaryRow==="fill" && fillTool.length>0
+    property string previousSecondaryRow:""
     onSecondaryRowChanged: {
+        const leftLyra=previousSecondaryRow==="lyra" && secondaryRow!=="lyra";
+        previousSecondaryRow=secondaryRow;
+        if(leftLyra)aiPanelVisible=false;
         if(secondaryRow!=="lyra"){cancelRegionSelection();aiRegionCard.close();}
         annotationToolsVisible=secondaryRow==="annotate";
         if (secondaryRow!=="fill") {clearFillTool();formToolActive=false;}
