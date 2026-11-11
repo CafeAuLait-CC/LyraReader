@@ -33,6 +33,16 @@ Item {
     readonly property bool tooLong:savedText.length>textLimit
     readonly property bool canEdit:!!entry && app.annotationNoteKind(entry) && app.canModifyPdf && !tooLong && !Logic.annotationUnsupportedReason(entry).length
     readonly property var frame:entry ? app.documentCanvas.pageFrame(entry.page,app.documentCanvas.placementEpoch) : null
+    property int returnBodyEpoch:-1
+    function restoreReadingFocus() {
+        const expectedEpoch=returnBodyEpoch;returnBodyEpoch=-1;
+        if(expectedEpoch<0)return;
+        Qt.callLater(function(){if(paper.epoch===expectedEpoch && paper.current && !paper.editing && !paper.revealPending && body.visible)body.forceActiveFocus();});
+    }
+    function finishEditing(cancel) {
+        if(!editing)return;
+        returnBodyEpoch=epoch;body.forceActiveFocus();editor.finish(cancel);
+    }
     function handlesAdoption(source,id){return adoptionOwner===source && adoptionRequest===id;}
     function display(source,annotation) {
         if(!source || !annotation)return;
@@ -110,6 +120,9 @@ Item {
     }
     Connections {
         target:paper.editor
+        // Wait for the acknowledged end; cancellation leaves edit mode before its
+        // shared transaction closes and transfers focus back to the canvas.
+        function onActiveChanged(){if(!paper.editor.active)paper.restoreReadingFocus();}
         function onEntryChanged(){if(paper.editor.entry && paper.editor.owner && paper.editor.current && paper.editor.noteOnly)paper.display(paper.editor.owner,paper.editor.entry);}
         function onFocusSerialChanged(){if(paper.editor.entry && paper.editor.owner && paper.editor.current && paper.editor.noteOnly)paper.display(paper.editor.owner,paper.editor.entry);if(paper.editing)Qt.callLater(function(){if(paper.editing){body.forceActiveFocus();body.cursorPosition=body.length;}});}
     }
@@ -133,36 +146,45 @@ Item {
             onWheel:function(event){event.accepted=true;}
         }
         ColumnLayout {
-            anchors.fill:parent;anchors.margins:10;spacing:6
-            RowLayout {
-                Layout.fillWidth:true
-                Label {text:paper.entry ? String(paper.entry.author || qsTr("Note on page %1").arg(paper.entry.page+1)).slice(0,160) : "";color:app.colors.noteFg;font.bold:true;elide:Text.ElideRight;Layout.fillWidth:true;textFormat:Text.PlainText}
-                Button {objectName:"editReadingNote";text:qsTr("Edit");visible:!paper.editing;enabled:paper.canEdit && !paper.adopting;onClicked:paper.edit()}
-                ToolButton {objectName:"closeReadingNote";text:qsTr("Close");onClicked:paper.close()}
-            }
+            anchors.fill:parent;anchors.margins:10;anchors.topMargin:paper.editing ? 10 : 30;spacing:6
             ScrollView {
                 id:scroll;objectName:"annotationNoteScroll";Layout.fillWidth:true;Layout.fillHeight:true;clip:true;contentWidth:availableWidth
                 TextArea {
                     id:body;objectName:"annotationNoteBody";width:scroll.availableWidth
                     text:paper.editing ? paper.editor.text : paper.savedText.slice(0,paper.textLimit)
                     readOnly:!paper.editing || paper.editor.closing;selectByMouse:true;wrapMode:TextEdit.Wrap;textFormat:TextEdit.PlainText
-                    font.pixelSize:13;color:app.colors.noteFg;selectionColor:app.colors.selectedBg;selectedTextColor:app.colors.selectedFg
+                    font.pixelSize:13;rightPadding:14;color:app.colors.noteFg;selectionColor:app.colors.selectedBg;selectedTextColor:app.colors.selectedFg
                     background:Rectangle {color:app.colors.noteBg}
                     onTextChanged:if(paper.editing && activeFocus && !readOnly)paper.editor.change(text)
                     TapHandler {acceptedButtons:Qt.LeftButton;onTapped:if(body.readOnly)paper.edit();}
-                    Accessible.name:paper.editing ? qsTr("Edit note; Control+Return finishes, Escape cancels") : qsTr("Read note; activate Edit to change it")
+                    Accessible.name:paper.editing ? qsTr("Edit note; Control+Return finishes, Escape cancels") : qsTr("Read note")
+                    Accessible.description:!paper.canEdit ? qsTr("Read only") : !paper.editing ? qsTr("Click the body or press Return or F2 to edit this note") : ""
                     Keys.onShortcutOverride:function(event){if(event.key===Qt.Key_Escape)event.accepted=true;}
-                    Keys.onEscapePressed:function(event){if(paper.editing)paper.editor.finish(true);else paper.close();event.accepted=true;}
-                    Keys.onPressed:function(event){if(paper.editing && (event.modifiers & Qt.ControlModifier) && (event.key===Qt.Key_Return || event.key===Qt.Key_Enter)){paper.editor.finish(false);event.accepted=true;}}
+                    Keys.onEscapePressed:function(event){if(paper.editing)paper.finishEditing(true);else paper.close();event.accepted=true;}
+                    Keys.onPressed:function(event){
+                        if(paper.editing && (event.modifiers & Qt.ControlModifier) && (event.key===Qt.Key_Return || event.key===Qt.Key_Enter)){paper.finishEditing(false);event.accepted=true;}
+                        else if(!paper.editing && (event.key===Qt.Key_F2 || event.key===Qt.Key_Return || event.key===Qt.Key_Enter)){paper.edit();event.accepted=true;}
+                    }
                 }
                 ScrollBar.vertical:ScrollBar {
-                    id:bar;objectName:"annotationNoteScrollBar"
+                    id:bar;objectName:"annotationNoteScrollBar";policy:ScrollBar.AlwaysOn
                     parent:scroll;x:scroll.mirrored ? 0 : scroll.width-width;y:scroll.topPadding;height:scroll.availableHeight
                     background:Rectangle {color:app.colors.noteBg}
                     contentItem:Rectangle {implicitWidth:10;implicitHeight:28;radius:4;color:app.colors.noteFg;opacity:bar.pressed || bar.active ? 1 : .85}
                 }
             }
-            Label {visible:text.length>0;Layout.fillWidth:true;wrapMode:Text.Wrap;textFormat:Text.PlainText;color:app.colors.noteFg;text:paper.error || (paper.editor.current && paper.editor.noteOnly && paper.editor.error || "") || (paper.tooLong ? qsTr("Showing the first %1 characters. Export annotations to read the complete note.").arg(paper.textLimit) : !paper.canEdit ? Logic.annotationUnsupportedReason(paper.entry) || qsTr("Read only") : paper.editing ? "" : qsTr("Click the note body to edit. Reading does not change the PDF."))}
+            Label {visible:text.length>0;Layout.fillWidth:true;wrapMode:Text.Wrap;textFormat:Text.PlainText;color:app.colors.noteFg;text:paper.error || (paper.editor.current && paper.editor.noteOnly && paper.editor.error || "") || (paper.tooLong ? qsTr("Showing the first %1 characters. Export annotations to read the complete note.").arg(paper.textLimit) : !paper.canEdit ? Logic.annotationUnsupportedReason(paper.entry) || qsTr("Read only") : "")}
+            RowLayout {
+                objectName:"annotationNoteActions";visible:paper.editing;Layout.fillWidth:true;spacing:8
+                Item {Layout.fillWidth:true}
+                Button {objectName:"cancelReadingNote";text:qsTr("Cancel");flat:true;font.pixelSize:11;palette.buttonText:app.colors.noteFg;enabled:!paper.editor.closing;onClicked:paper.finishEditing(true)}
+                Button {objectName:"doneReadingNote";text:qsTr("Done");flat:true;font.pixelSize:11;font.bold:true;palette.buttonText:app.colors.noteFg;enabled:!paper.editor.closing;onClicked:paper.finishEditing(false)}
+            }
+        }
+        LyraToolButton {
+            objectName:"closeReadingNote";anchors.top:parent.top;anchors.right:parent.right;anchors.margins:6
+            visible:!paper.editing;width:28;height:28;symbol:"close";text:qsTr("Close note");icon.color:app.colors.noteFg
+            onClicked:paper.close()
         }
     }
 }
