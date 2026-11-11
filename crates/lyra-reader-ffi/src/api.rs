@@ -778,15 +778,14 @@ impl LyraReaderEngine {
 
 /// Which fit preset a zoom request asks for.
 ///
-/// `FitPage` is the shipping macOS "Fit Page": it fits the page's **height** only. Width is
-/// `FitWidth`'s job, and a page shorter than the window stays vertically scrollable.
+/// `FitPage` fits the entire page or facing row into both viewport axes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum ZoomModeRecord {
     /// A toolbar/pointer step from `percent` by `delta`, clamped to the reader's range.
     Percent,
     /// Fit the page width into the viewport width, leaving the preset inset per side.
     FitWidth,
-    /// Fit the page height into the viewport height, leaving the preset inset per side.
+    /// Fit the entire page or facing row, leaving the preset inset per side.
     FitPage,
 }
 
@@ -802,11 +801,11 @@ pub struct ZoomPolicyRecord {
     pub percent: u32,
     /// Step in whole percent, for `Percent` (may be negative).
     pub delta: i32,
-    /// Page (or facing-row) width at 100%, for `FitWidth`.
+    /// Page (or facing-row) width at 100%, for either fit preset.
     pub page_width_pt: f64,
     /// Page (or facing-row) height at 100%, for `FitPage`.
     pub page_height_pt: f64,
-    /// Viewport width, for `FitWidth`.
+    /// Viewport width, for either fit preset.
     pub viewport_width_pt: f64,
     /// Viewport height, for `FitPage`.
     pub viewport_height_pt: f64,
@@ -848,25 +847,42 @@ pub fn clamp_scroll(offset_pt: f64, content_height_pt: f64, viewport_height_pt: 
 /// The Fit Page percentage a viewport-height change (resize/fullscreen) should adopt.
 ///
 /// `Some(percent)` means the shell must apply that percentage; `None` means keep the current
-/// zoom. Only a single-page document participates, and only while `current_percent` is below the
-/// fit — a reader already at or above the fit is never shrunk. Multi-page documents always
-/// return `None`; their viewport change only tightens the scroll range. See
-/// `lyra_reader_session::fit_page_on_viewport_change`.
+/// zoom. Any nonempty document participates; the current page or spread must fit both axes.
 #[uniffi::export]
-pub fn fit_page_on_viewport_change(
-    page_count: u32,
-    current_percent: u32,
-    page_height_pt: f64,
-    viewport_height_pt: f64,
-    calibration: f64,
-) -> Option<u32> {
+pub fn fit_page_on_viewport_change(page_count: u32, policy: ZoomPolicyRecord) -> Option<u32> {
     lyra_reader_session::fit_page_on_viewport_change(
         page_count,
-        current_percent,
+        policy.percent,
+        lyra_reader_core::Size::new(policy.page_width_pt, policy.page_height_pt),
+        lyra_reader_core::Size::new(policy.viewport_width_pt, policy.viewport_height_pt),
+        policy.calibration,
+    )
+}
+
+/// Content-space padding and row gap for the fitted page's presentation.
+#[derive(Clone, Copy, Debug, uniffi::Record)]
+pub struct FitPageSpacingRecord {
+    pub inset_pt: f64,
+    pub gap_pt: f64,
+}
+
+#[uniffi::export]
+pub fn fit_page_spacing(
+    page_height_pt: f64,
+    viewport_height_pt: f64,
+    zoom: f64,
+    preferred_gap_pt: f64,
+) -> Option<FitPageSpacingRecord> {
+    lyra_reader_session::fit_page_spacing(
         page_height_pt,
         viewport_height_pt,
-        calibration,
+        zoom,
+        preferred_gap_pt,
     )
+    .map(|spacing| FitPageSpacingRecord {
+        inset_pt: spacing.inset_pt,
+        gap_pt: spacing.gap_pt,
+    })
 }
 
 /// Lowest offered zoom percentage; the shell reads it instead of hard-coding 25.
