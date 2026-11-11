@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
+mod drag_preview;
+pub use drag_preview::{ContentDragPreview, content_drag_preview};
 mod flat;
 mod layout;
 mod links;
@@ -721,10 +723,14 @@ fn build_revision(
             return Ok(output);
         }
     }
+    // PDF contents arrays are one continuous program. PDFium regenerates dirty streams
+    // independently, which can discard text/graphics state inherited by an untouched stream.
+    // Give the edited page one stream before loading it; object order and operators stay intact.
+    let bytes = joined_page_contents(bytes, index)?;
     let pdfium = pdfium_instance()?;
     let _guard = crate::backend::lock_pdfium()?;
     let mut doc = pdfium
-        .load_pdf_from_byte_slice(bytes, None)
+        .load_pdf_from_byte_slice(&bytes, None)
         .map_err(pdf_error)?;
     let mut page = doc
         .pages()
@@ -970,6 +976,27 @@ fn build_revision(
     page.regenerate_content().map_err(pdf_error)?;
     drop(page);
     doc.save_to_bytes().map_err(pdf_error)
+}
+
+fn joined_page_contents(bytes: &[u8], index: u32) -> Result<std::borrow::Cow<'_, [u8]>> {
+    let mut document = lopdf::Document::load_mem(bytes).map_err(pdf_error)?;
+    let page = document
+        .get_pages()
+        .get(&(index + 1))
+        .copied()
+        .ok_or_else(|| failure("The requested page does not exist."))?;
+    if document.get_page_contents(page).len() <= 1 {
+        return Ok(std::borrow::Cow::Borrowed(bytes));
+    }
+    let contents = document.get_page_content(page);
+    let stream = document.add_object(lopdf::Stream::new(lopdf::Dictionary::new(), contents));
+    document
+        .get_dictionary_mut(page)
+        .map_err(pdf_error)?
+        .set("Contents", stream);
+    let mut output = Vec::new();
+    document.save_to(&mut output).map_err(pdf_error)?;
+    Ok(std::borrow::Cow::Owned(output))
 }
 
 fn pdf_matrix(t: Transform2D) -> PdfMatrix {

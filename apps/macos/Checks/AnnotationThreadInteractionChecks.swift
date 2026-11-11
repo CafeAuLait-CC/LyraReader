@@ -33,7 +33,13 @@ extension ReaderChecks {
             }
         }
         verifyThread(state, adopted: false)
+        let writesBeforeReading = state.annotationWriteCount
         state.activateDocumentAnnotationRow(parentID)
+        require(state.openDocumentNoteID == parentID && state.editingAnnotationID == nil
+                && state.annotations.isEmpty && !state.hasUnsavedDocumentChanges
+                && state.annotationWriteCount == writesBeforeReading,
+                "sidebar note reading neither adopts nor dirties the PDF")
+        state.editOpenNote()
         let own = state.annotations.first { $0.fileIdentity == parentID }!
         require(state.annotationSidebarSelected(.own(own.id)), "the selected editable parent is highlighted in the sidebar")
         verifyThread(state, adopted: true)
@@ -119,14 +125,101 @@ extension ReaderChecks {
         require(reader.openDocumentNoteID == nil && reader.selection == nil,
                 "a second click closes the same PDF note and clears stale PDF selection")
         reader.activateDocumentAnnotationRow(parentID)
+        require(reader.openDocumentNoteID == parentID && reader.editingAnnotationID == nil,
+                "sidebar and canvas both open file notes for reading")
+        reader.editOpenNote()
         let edited = reader.annotations.first { $0.fileIdentity == parentID }!
         reader.updateEditingText("Draft preserved by the second click")
         try await clickNote()
         require(reader.editingAnnotationID == nil, "a second click closes an adopted sticky-note editor")
         try await clickNote()
-        require(reader.editingAnnotationID == edited.id && reader.editingAnnotation?.note == "Draft preserved by the second click",
-                "another click reopens the same sticky note with its draft intact")
+        require(reader.openOwnNoteID == edited.id && reader.editingAnnotationID == nil
+                && reader.openOwnNote?.note == "Draft preserved by the second click",
+                "another icon click reopens the adopted note for reading with its draft intact")
         require(reader.commitTextEditing(), "the final note draft commits")
+        require(reader.placeStickyNote(page: 1, at: CGPoint(x: 200, y: 250)), "a second note is placed")
+        let secondID = reader.editingAnnotationID!
+        let secondText = "Second note — different location and contents.\n"
+            + (1...24).map { "Line \($0): 独立的便签内容与滚动区域。" }.joined(separator: "\n")
+        reader.updateEditingText(secondText)
+        require(reader.commitTextEditing(), "the second note draft commits")
+        func textView(in view: NSView, matching text: String, editable: Bool) -> NSTextView? {
+            if let body = view as? NSTextView, body.isEditable == editable, body.string == text { return body }
+            return view.subviews.lazy.compactMap { textView(in: $0, matching: text, editable: editable) }.first
+        }
+        let firstText = "Draft preserved by the second click"
+        let savedNotes = reader.annotations
+        let writes = reader.annotationWriteCount
+        for id in [edited.id, secondID, edited.id, secondID] {
+            reader.openPassageNote(.own(id))
+            let expected = id == edited.id ? firstText : secondText
+            try await eventually("switching sidebar notes replaces the live paper text", {
+                host.layoutSubtreeIfNeeded()
+                return reader.openOwnNoteID == id && reader.editingAnnotationID == nil
+                    && textView(in: host, matching: expected, editable: false) != nil
+            })
+        }
+        require(reader.annotations == savedNotes && reader.annotationWriteCount == writes,
+                "repeated reading and switching never mutates or writes note contents")
+        let body = textView(in: host, matching: secondText, editable: false)!
+        require((body.enclosingScrollView?.bounds.height ?? 0) > 180,
+                "the reading paper uses its height for note content rather than a title bar")
+        let scroller = body.enclosingScrollView?.verticalScroller as? LyraReaderSidebarScroller
+        require(scroller?.trackColor == LyraReaderTheme.noteBgColor,
+                "the note's legacy scrollbar track uses the note paper color")
+        if let directory = ProcessInfo.processInfo.environment["LYRA_READER_CHECK_SNAPSHOT_DIR"],
+           let scroll = body.enclosingScrollView {
+            // Capture after the paper's reveal, rather than a partially masked transition.
+            try await Task.sleep(for: .milliseconds(350))
+            host.layoutSubtreeIfNeeded()
+            let folder = URL(fileURLWithPath: directory)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let bitmap = scroll.bitmapImageRepForCachingDisplay(in: scroll.bounds)!
+            scroll.cacheDisplay(in: scroll.bounds, to: bitmap)
+            try bitmap.representation(using: .png, properties: [:])!
+                .write(to: folder.appendingPathComponent("note-reading-scrollbar.png"))
+        }
+        let scrollRect = host.convert(body.enclosingScrollView!.bounds, from: body.enclosingScrollView!)
+        var paperRect = scrollRect.insetBy(dx: -8, dy: -8)
+        if host.isFlipped { paperRect.origin.y -= 14 }
+        paperRect.size.height += 14
+        func capturePaper(_ name: String) throws {
+            guard let directory = ProcessInfo.processInfo.environment["LYRA_READER_CHECK_SNAPSHOT_DIR"] else { return }
+            let bitmap = host.bitmapImageRepForCachingDisplay(in: paperRect)!
+            host.cacheDisplay(in: paperRect, to: bitmap)
+            try bitmap.representation(using: .png, properties: [:])!
+                .write(to: URL(fileURLWithPath: directory).appendingPathComponent(name + ".png"))
+        }
+        try capturePaper("note-headerless-reading")
+        let click = NSEvent.mouseEvent(with: .leftMouseDown, location: body.convert(CGPoint(x: 8, y: 8), to: nil),
+            modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil,
+            eventNumber: 0, clickCount: 1, pressure: 1)!
+        body.mouseDown(with: click)
+        try await eventually("a paper body click opens the current note editor", {
+            reader.editingAnnotationID == secondID && textView(in: host, matching: secondText, editable: true) != nil
+        })
+        try await eventually("the editor scrollbar track also uses the note paper color", {
+            guard let editor = textView(in: host, matching: secondText, editable: true),
+                  let scroller = editor.enclosingScrollView?.verticalScroller as? LyraReaderSidebarScroller
+            else { return false }
+            return scroller.trackColor == LyraReaderTheme.noteBgColor
+        })
+        if ProcessInfo.processInfo.environment["LYRA_READER_CHECK_SNAPSHOT_DIR"] != nil {
+            try await Task.sleep(for: .milliseconds(350))
+            host.layoutSubtreeIfNeeded()
+            try capturePaper("note-headerless-editing")
+        }
+        reader.beginEditingAnnotation(edited.id)
+        try await eventually("switching directly between editors loads the first note", {
+            textView(in: host, matching: firstText, editable: true) != nil
+        })
+        reader.beginEditingAnnotation(secondID)
+        try await eventually("switching directly back loads the second note", {
+            textView(in: host, matching: secondText, editable: true) != nil
+        })
+        require(reader.annotations == savedNotes && reader.annotationWriteCount == writes,
+                "editor initialization cannot copy an earlier note into a later note")
+        require(reader.commitTextEditing(), "the unmodified note editor closes")
         let final = try Data(contentsOf: file)
         require(final == original, "thread presentation and navigation leave the source PDF unchanged")
 
@@ -140,6 +233,9 @@ extension ReaderChecks {
             let reply = sampleState.documentAnnotations.first { $0.page == 4 && $0.isReply }!
             let parent = sampleState.documentAnnotations.first { $0.id == reply.parentID }!
             sampleState.activateDocumentAnnotationRow(parent.id)
+            require(sampleState.openDocumentNoteID == parent.id && !sampleState.hasUnsavedDocumentChanges,
+                    "the private review note first opens for reading")
+            sampleState.editOpenNote()
             let adopted = sampleState.annotations.first { $0.fileIdentity == parent.id }!
             require(sampleState.annotationSidebarSelected(.own(adopted.id)), "the private review parent row highlights after adoption")
             let page = sampleState.annotationSidebarPages.first { $0.id == 4 }!

@@ -7,11 +7,11 @@ extension ReaderChecks {
         _ = NSApplication.shared
         let color = AnnotationColor(red: 255, green: 0, blue: 255, alpha: 255)
         func render(_ state: NoteGlyph.State = .normal, _ paper: PaperAppearance = .original,
-                    inline: Bool = false, size: CGFloat = 24) -> PageImage {
+                    inline: Bool = false, size: CGFloat = 24, tint: AnnotationColor? = nil) -> PageImage {
             let box = CGSize(width: size, height: size)
             let image = inline
-                ? NoteGlyph.inlineComment(color: color, boxPt: box, scale: 2, generation: 1, state: state, paper: paper)
-                : NoteGlyph.noteIcon(color: color, boxPt: box, scale: 2, generation: 1, state: state, paper: paper)
+                ? NoteGlyph.inlineComment(color: tint ?? color, boxPt: box, scale: 2, generation: 1, state: state, paper: paper)
+                : NoteGlyph.noteIcon(color: tint ?? color, boxPt: box, scale: 2, generation: 1, state: state, paper: paper)
             return image!
         }
         func cgImage(_ image: PageImage) -> CGImage {
@@ -50,6 +50,29 @@ extension ReaderChecks {
                 "the upper-right margin is transparent, with no unread indicator")
         require(render(inline: true).bgra != normal.bgra,
                 "inline text comments remain distinguishable from ordinary sticky notes")
+        let orange = AnnotationColor(red: 255, green: 128, blue: 0, alpha: 102)
+        for paper in [PaperAppearance.original, .warm, .night] {
+            for state in [NoteGlyph.State.normal, .hovered, .active] {
+                let pinkIcon = render(state, paper, inline: true)
+                let orangeIcon = render(state, paper, inline: true, tint: orange)
+                require(pinkIcon.bgra != orangeIcon.bgra,
+                        "inline note colours follow their highlights in every paper and interaction state")
+                require(render(state, paper).bgra == render(state, paper, tint: orange).bgra,
+                        "ordinary stickers keep their supplied palette regardless of highlight colour")
+                let alpha = stride(from: 3, to: pinkIcon.bgra.count, by: 4)
+                require(alpha.allSatisfy { pinkIcon.bgra[$0] == orangeIcon.bgra[$0] },
+                        "highlight colours preserve the folded-paper silhouette")
+                let palette = LyraReaderTheme.noteIconColors(state: state, darkPaper: paper == .night,
+                                                             highlight: orange)
+                require(palette.fold.redComponent < palette.paper.redComponent
+                        && palette.fold.greenComponent < palette.paper.greenComponent
+                        && palette.fold.blueComponent <= palette.paper.blueComponent,
+                        "the lower-right fold is slightly darker than the tinted paper")
+            }
+        }
+        let opaqueOrange = AnnotationColor(red: 255, green: 128, blue: 0, alpha: 255)
+        require(render(inline: true, tint: orange).bgra == render(inline: true, tint: opaqueOrange).bgra,
+                "translucent highlights still have opaque, identifiable note markers")
         let savedAppearance = NSApp.appearance
         NSApp.appearance = NSAppearance(named: .darkAqua)
         require(render().bgra == normal.bgra, "dark window chrome keeps the default icon on original white paper")
@@ -60,7 +83,8 @@ extension ReaderChecks {
             let folder = URL(fileURLWithPath: directory)
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             for (name, image) in [("hover", hovered), ("active", active), ("night", dark),
-                                  ("inline", render(inline: true)), ("16", render(size: 16))] {
+                                  ("inline", render(inline: true)), ("inline-orange", render(inline: true, tint: orange)),
+                                  ("16", render(size: 16))] {
                 let png = NSBitmapImageRep(cgImage: cgImage(image)).representation(using: .png, properties: [:])!
                 try png.write(to: folder.appendingPathComponent("note-icon-\(name).png"))
             }

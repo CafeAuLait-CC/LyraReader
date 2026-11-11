@@ -680,6 +680,9 @@ extension ReaderChecks {
             claim(PlacementIndex.aiSource(index), "AI source-highlight box \(index)")
         }
 
+        claim(PlacementIndex.contentDragBackground, "content drag background")
+        claim(PlacementIndex.contentDragForeground, "content drag foreground")
+
         // …and the ends of every block, which is where two blocks would meet if a capacity grew
         // past what the layout allows: the last page raster, the last selection box, the last
         // cached annotation, the last loaded annotation's last box, and the last note glyph. The
@@ -694,9 +697,9 @@ extension ReaderChecks {
         claim(PlacementIndex.ownNote(PlacementIndex.block - 1), "the last reader placed-text glyph")
         claim(PlacementIndex.aiSource(PlacementIndex.block - 1), "the last AI source-highlight box")
 
-        require(owner.count == 4_096 * 6 + 4_096 * 64 + 7,
+        require(owner.count == 4_096 * 6 + 4_096 * 64 + 7 + 2,
                 "page rasters, the selection, this reader's annotations, loaded annotations, "
-                    + "reader placed-text glyphs, note glyphs and the AI source highlight never share a placement index (\(owner.count) distinct indices, "
+                    + "reader placed-text glyphs, note glyphs, the AI source highlight and drag textures never share a placement index (\(owner.count) distinct indices, "
                     + "including the ends of each block)")
     }
 

@@ -67,11 +67,13 @@ enum NoteGlyph {
     @MainActor static func inlineComment(color: AnnotationColor, boxPt: CGSize, scale: CGFloat,
                                         generation: UInt64, state: State = .normal,
                                         paper: PaperAppearance = .original) -> PageImage? {
-        commentBadge(boxPt: boxPt, scale: scale, generation: generation, inline: true, state: state, paper: paper)
+        commentBadge(boxPt: boxPt, scale: scale, generation: generation, inline: true, state: state,
+                     paper: paper, highlight: color)
     }
 
     @MainActor private static func commentBadge(boxPt: CGSize, scale: CGFloat, generation: UInt64,
-                                               inline: Bool, state: State, paper: PaperAppearance) -> PageImage? {
+                                               inline: Bool, state: State, paper: PaperAppearance,
+                                               highlight: AnnotationColor? = nil) -> PageImage? {
         guard let (width, height) = pixelSize(boxPt, scale: scale),
               let context = context(width: width, height: height) else { return nil }
         let side = CGFloat(min(width, height))
@@ -80,7 +82,7 @@ enum NoteGlyph {
         // SVG uses top-down coordinates; the bitmap context's drawing axis points upward.
         context.translateBy(x: 0, y: 24)
         context.scaleBy(x: 1, y: -1)
-        let colors = LyraReaderTheme.noteIconColors(state: state, darkPaper: paper == .night)
+        let colors = LyraReaderTheme.noteIconColors(state: state, darkPaper: paper == .night, highlight: highlight)
         let outline = CGMutablePath()
         outline.move(to: CGPoint(x: 6.5, y: 3.75))
         outline.addLine(to: CGPoint(x: 17.5, y: 3.75))

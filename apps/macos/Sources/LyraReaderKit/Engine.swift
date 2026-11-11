@@ -278,23 +278,26 @@ public struct TextPage: Sendable {
     public let text: String
     public let hasUnicodeMapError: Bool
     private let selectionLines: [SelectionLine]
+    private let selectionExcludedIndices: Set<Int>
     private let rust: TextPageRust?
 
-    public init(page: Int, chars: [TextChar], text: String, hasUnicodeMapError: Bool) {
+    public init(page: Int, chars: [TextChar], text: String, hasUnicodeMapError: Bool,
+                selectionExcludedIndices: [Int] = []) {
         self.init(
             page: page, chars: chars, text: text, hasUnicodeMapError: hasUnicodeMapError,
-            rust: nil)
+            rust: nil, selectionExcludedIndices: selectionExcludedIndices)
     }
 
     init(
         page: Int, chars: [TextChar], text: String, hasUnicodeMapError: Bool,
-        rust: TextPageRust?
+        rust: TextPageRust?, selectionExcludedIndices: [Int] = []
     ) {
         self.page = page
         self.chars = chars
         self.text = text
         self.hasUnicodeMapError = hasUnicodeMapError
-        self.selectionLines = SelectionLine.build(chars)
+        self.selectionExcludedIndices = Set(selectionExcludedIndices)
+        self.selectionLines = SelectionLine.build(chars, excluding: self.selectionExcludedIndices)
         self.rust = rust
     }
 
@@ -386,10 +389,11 @@ private struct SelectionLine: Sendable {
     var bounds: CGRect
     var stops: [(index: Int, rect: CGRect)]
 
-    static func build(_ chars: [TextChar]) -> [SelectionLine] {
+    static func build(_ chars: [TextChar], excluding excluded: Set<Int> = []) -> [SelectionLine] {
         var lines: [SelectionLine] = []
         var current: SelectionLine?
         for (index, char) in chars.enumerated() {
+            if excluded.contains(index) { continue }
             if char.unicode == 10 || char.unicode == 13 {
                 if let current { lines.append(current) }
                 current = nil
@@ -406,7 +410,7 @@ private struct SelectionLine: Sendable {
                     if let previous = line.stops.last, previous.index + 1 < index {
                         let gaps = (previous.index + 1)..<index
                         let width = max(0, rect.minX - previous.rect.maxX) / CGFloat(gaps.count)
-                        for (offset, gapIndex) in gaps.enumerated() where Unicode.Scalar(chars[gapIndex].unicode).map({ CharacterSet.whitespaces.contains($0) }) == true {
+                        for (offset, gapIndex) in gaps.enumerated() where !excluded.contains(gapIndex) && Unicode.Scalar(chars[gapIndex].unicode).map({ CharacterSet.whitespaces.contains($0) }) == true {
                             line.stops.append((gapIndex, CGRect(x: previous.rect.maxX + CGFloat(offset) * width,
                                 y: line.bounds.minY, width: width, height: line.bounds.height)))
                         }
@@ -1967,6 +1971,8 @@ public protocol PDFEngine: AnyObject {
     func pageRotations() async throws -> [Int]
     func contentObjects(page: Int) async throws -> PDFContentPage
     func contentImagePNG(page: Int, target: String, revision: String) async throws -> Data
+    func contentDragPreview(page: Int, target: String, revision: String,
+                            bounds: CGRect, scale: CGFloat) async throws -> ContentDragPreview
     func applyContentEdit(page: Int, command: ContentCommandRecord, to destination: URL) async throws
     /// The 0-based pages a redaction would have to replace with a raster image, computed without
     /// writing anything. Non-empty means the Edit workspace must ask before staging.
@@ -2088,6 +2094,11 @@ public extension PDFEngine {
     }
     func contentImagePNG(page: Int, target: String, revision: String) async throws -> Data {
         throw NSError(domain:"LyraReader",code:2,userInfo:[NSLocalizedDescriptionKey:"This engine cannot export images"])
+    }
+    func contentDragPreview(page: Int, target: String, revision: String,
+                            bounds: CGRect, scale: CGFloat) async throws -> ContentDragPreview {
+        throw NSError(domain: "LyraReader", code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "This engine cannot preview page objects"])
     }
     func contentObjects(page: Int) async throws -> PDFContentPage {
         throw NSError(domain:"LyraReader",code:2,userInfo:[NSLocalizedDescriptionKey:"This engine cannot inspect page content"])
@@ -2752,7 +2763,8 @@ public final class RustEngine: PDFEngine {
                             },
                             text: extracted.text,
                             hasUnicodeMapError: extracted.hasUnicodeMapError,
-                            rust: rust
+                            rust: rust,
+                            selectionExcludedIndices: extracted.selectionExcludedIndices.map(Int.init)
                         )
                     )
                 } catch {
@@ -3403,6 +3415,28 @@ public final class RustEngine: PDFEngine {
             }
         }
         return try JSONDecoder().decode(PDFContentPage.self,from:Data(json.utf8))
+    }
+
+    public func contentDragPreview(page: Int, target: String, revision: String,
+                                   bounds: CGRect, scale: CGFloat) async throws -> ContentDragPreview {
+        guard let document else { throw NSError(domain: "LyraReader", code: 1) }
+        generation += 2
+        let firstGeneration = generation - 1
+        let record: ContentDragPreviewRecord = try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do { continuation.resume(returning: try document.contentDragPreview(
+                    page: UInt32(page), target: target, revision: revision,
+                    bounds: ContentBoxRecord(bounds), scale: Double(scale))) }
+                catch { continuation.resume(throwing: error) }
+            }
+        }
+        func image(_ bitmap: PageBitmap, generation: UInt64) -> PageImage {
+            PageImage(pixelWidth: Int(bitmap.widthPx), pixelHeight: Int(bitmap.heightPx),
+                pointSize: bounds.size, bgra: bitmap.pixels, generation: generation)
+        }
+        return ContentDragPreview(bounds: bounds,
+            background: image(record.background, generation: firstGeneration),
+            foreground: image(record.foreground, generation: firstGeneration + 1))
     }
 
     public func contentImagePNG(page:Int,target:String,revision:String) async throws -> Data {
@@ -4662,6 +4696,11 @@ public final class MockEngine: PDFEngine {
 // PDF glyph boxes describe ink, not a text selection. Join adjacent glyphs on each
 // line so spaces and the gaps between letters are included, without bridging columns.
 extension TextPage {
+    /// Resolve the original range first, then join discretionary PDF word breaks for copying.
+    public func copyText(in range: ClosedRange<Int>) -> String {
+        selectionCopyText(text: string(in: range))
+    }
+
     /// The text those characters spell, with the same Unicode-scalar mapping the engine uses.
     /// Empty when the range is empty or contains no decodable scalar.
     ///
@@ -4686,7 +4725,9 @@ extension TextPage {
         guard !chars.isEmpty else { return "" }
         let clamped = range.clamped(to: 0...(chars.count - 1))
         guard !clamped.isEmpty else { return "" }
-        let scalars = chars[clamped].compactMap { Unicode.Scalar($0.unicode) }
+        let scalars = chars[clamped].enumerated().compactMap { offset, character in
+            selectionExcludedIndices.contains(clamped.lowerBound + offset) ? nil : Unicode.Scalar(character.unicode)
+        }
         return String(String.UnicodeScalarView(scalars))
     }
 

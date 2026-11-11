@@ -117,6 +117,7 @@ public enum TabRowLayout {
     private var frameObservers: [NSObjectProtocol] = []
     private var observedViews: [NSView] = []
     private var appearanceObservation: NSKeyValueObservation?
+    private var resizeObserver: NSObjectProtocol?
 
     public init(window: NSWindow) {
         self.window = window
@@ -138,11 +139,21 @@ public enum TabRowLayout {
                 self?.scheduleAlignment()
             }
         }
+        // Frame notifications arrive inside AppKit's close → miniaturize → zoom layout.
+        // Its last write can therefore undo the synchronous repair of the green button.
+        // didResize is the end of that tick: repair all three before it is displayed, without
+        // waiting for the main queue (which can lag behind the live-resize tracking loop).
+        resizeObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didResizeNotification, object: window, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.alignButtons() }
+        }
         scheduleAlignment()
     }
 
     isolated deinit {
         appearanceObservation?.invalidate()
+        if let resizeObserver { NotificationCenter.default.removeObserver(resizeObserver) }
         frameObservers.forEach(NotificationCenter.default.removeObserver)
     }
 

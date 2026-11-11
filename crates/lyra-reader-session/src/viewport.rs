@@ -157,6 +157,45 @@ pub fn clamp_scroll(offset: f64, content_height: f64, viewport_height: f64) -> f
     offset.clamp(0.0, maximum)
 }
 
+/// The Fit Page percentage a real viewport-height change should adopt, when it should adopt one.
+///
+/// **Scope.** Only a single-page document changes its zoom on a resize or a fullscreen
+/// transition. A multi-page document keeps the reader's percentage: re-fitting the current page
+/// of a 200-page paper on every window drag would throw away the reading position, and the scroll
+/// range already becomes tight via [`clamp_scroll`] (top edge at the viewport top, last page's
+/// bottom at the viewport bottom). A facing spread is a multi-page document too — its row count
+/// is smaller than its page count, but the percentage still belongs to the reader.
+///
+/// **When.** The current percentage must be *below* the fit value. That means the page at the
+/// current zoom is shorter than the viewport minus the preset inset, which is exactly the case
+/// where re-fitting removes blank space. At or above the fit value the function returns `None`:
+/// shrinking to the fit would only add the preset's own blank (the fit leaves 8 pt per side) and
+/// would override a zoom the reader chose. A manual zoom-out after an automatic fit is therefore
+/// stable until the next real viewport change, which asks this function again.
+///
+/// The fit arithmetic is [`resolve_zoom_percent`]'s (8 pt inset per side, 25–400 clamp, floor);
+/// this function must not grow a second formula.
+pub fn fit_page_on_viewport_change(
+    page_count: u32,
+    current_percent: u32,
+    page_height_pt: f64,
+    viewport_height_pt: f64,
+    calibration: f64,
+) -> Option<u32> {
+    if page_count != 1 {
+        return None;
+    }
+    // FitPage reads the height axis; the width values are unused but must be finite for
+    // `fit_percent`'s shared validation, so pass the same height on both axes.
+    let fit = resolve_zoom_percent(
+        ZoomRequest::FitPage,
+        Size::new(page_height_pt, page_height_pt),
+        Size::new(viewport_height_pt, viewport_height_pt),
+        calibration,
+    )?;
+    (current_percent < fit).then_some(fit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +314,138 @@ mod tests {
         assert_eq!(clamp_scroll(9999.0, 1000.0, 300.0), 700.0);
         assert_eq!(clamp_scroll(9999.0, 200.0, 300.0), 0.0);
         assert_eq!(clamp_scroll(120.0, 0.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn a_blank_single_page_adopts_the_fit_page_percent() {
+        // A4 at 100% is 842 pt tall inside a 900 pt viewport: 58 pt of blank below it.
+        // The fit is (900 - 16) / 842 × 100 = 104.988… → 104.
+        assert_eq!(
+            fit_page_on_viewport_change(1, 100, 842.0, 900.0, 1.0),
+            Some(104)
+        );
+        // A taller-than-viewport page at the same percentage leaves no blank and must stay.
+        assert_eq!(fit_page_on_viewport_change(1, 100, 842.0, 800.0, 1.0), None);
+    }
+
+    #[test]
+    fn a_filled_or_zoomed_single_page_keeps_its_percent() {
+        // 93 is exactly the fit for an 800 pt viewport; at the fit value the preset's 16 pt of
+        // blank is intentional and is not a reason to shrink to the same value again.
+        assert_eq!(fit_page_on_viewport_change(1, 93, 842.0, 800.0, 1.0), None);
+        assert_eq!(fit_page_on_viewport_change(1, 104, 842.0, 900.0, 1.0), None);
+        assert_eq!(fit_page_on_viewport_change(1, 250, 842.0, 900.0, 1.0), None);
+        // 100 > 99 (the fit for 850 pt) even though 842 < 850: the reader is above the fit
+        // value, and the second rule ("already at or above the fit") wins over the 8 pt edge.
+        assert_eq!(fit_page_on_viewport_change(1, 100, 842.0, 850.0, 1.0), None);
+    }
+
+    #[test]
+    fn a_multi_page_document_never_changes_zoom_on_a_viewport_change() {
+        // The same blank geometry that fits a one-page document (viewport 900) must not touch
+        // a three-page paper, and a facing spread (two pages per row) is still multi-page.
+        for page_count in [2, 3, 200] {
+            assert_eq!(
+                fit_page_on_viewport_change(page_count, 100, 842.0, 900.0, 1.0),
+                None
+            );
+            assert_eq!(
+                fit_page_on_viewport_change(page_count, 50, 842.0, 2000.0, 1.0),
+                None
+            );
+        }
+        assert_eq!(fit_page_on_viewport_change(2, 100, 842.0, 900.0, 1.5), None);
+    }
+
+    #[test]
+    fn a_facing_spread_keeps_its_percent() {
+        // Facing layout puts two pages in a row, but the document still has a page count; the
+        // policy only ever participates for page_count == 1. A cover/verso pair is not a
+        // single-page document even though the row looks like one tall page.
+        assert_eq!(fit_page_on_viewport_change(2, 100, 842.0, 900.0, 1.0), None);
+        assert_eq!(fit_page_on_viewport_change(2, 50, 842.0, 2000.0, 1.0), None);
+        // No document (page_count 0) is not a single page either.
+        assert_eq!(fit_page_on_viewport_change(0, 100, 842.0, 900.0, 1.0), None);
+    }
+
+    #[test]
+    fn the_resize_fit_uses_the_display_calibration() {
+        // A 38 ppi virtual display reports factor 0.5278: the 842 pt A4 page is only 444.4 view
+        // points tall at 100%, so a 582 pt viewport fits it at (582 - 16) / (842 × 0.5278) × 100
+        // = 127.3… → 127. The same viewport on the 72 ppi convention would only fit at 67%, and
+        // a 100% reader is already above that.
+        assert_eq!(
+            fit_page_on_viewport_change(1, 100, 842.0, 582.0, 0.5278),
+            Some(127)
+        );
+        assert_eq!(
+            fit_page_on_viewport_change(1, 127, 842.0, 582.0, 0.5278),
+            None
+        );
+        assert_eq!(fit_page_on_viewport_change(1, 100, 842.0, 582.0, 1.0), None);
+    }
+
+    #[test]
+    fn the_resize_fit_uses_the_min_and_max_clamps() {
+        // 884 / (10 × 1) × 100 is far past 400: the preset clamps to 400, so a 399% reader is
+        // below the fit and adopts it, while 400% is at the fit and stays.
+        assert_eq!(
+            fit_page_on_viewport_change(1, 399, 10.0, 1000.0, 1.0),
+            Some(MAX_ZOOM_PERCENT)
+        );
+        assert_eq!(fit_page_on_viewport_change(1, 400, 10.0, 1000.0, 1.0), None);
+        // A page taller than any percentage can fit clamps to 25; 24 is below it.
+        assert_eq!(
+            fit_page_on_viewport_change(1, 24, 100_000.0, 900.0, 1.0),
+            Some(MIN_ZOOM_PERCENT)
+        );
+        assert_eq!(
+            fit_page_on_viewport_change(1, 25, 100_000.0, 900.0, 1.0),
+            None
+        );
+    }
+
+    #[test]
+    fn the_resize_fit_returns_none_for_invalid_geometry() {
+        let no = |page_height: f64, viewport_height: f64, calibration: f64| {
+            fit_page_on_viewport_change(1, 50, page_height, viewport_height, calibration)
+        };
+        assert_eq!(no(0.0, 900.0, 1.0), None);
+        assert_eq!(no(f64::NAN, 900.0, 1.0), None);
+        assert_eq!(no(f64::INFINITY, 900.0, 1.0), None);
+        assert_eq!(no(-842.0, 900.0, 1.0), None);
+        assert_eq!(no(842.0, 16.0, 1.0), None);
+        assert_eq!(no(842.0, 0.0, 1.0), None);
+        assert_eq!(no(842.0, f64::NAN, 1.0), None);
+        assert_eq!(no(842.0, 900.0, 0.0), None);
+        assert_eq!(no(842.0, 900.0, f64::NAN), None);
+    }
+
+    #[test]
+    fn the_resize_fit_does_not_duplicate_the_preset_formula() {
+        for viewport_height in [200.0, 500.0, 800.0, 900.0, 1200.0, 4000.0] {
+            let preset = resolve_zoom_percent(
+                ZoomRequest::FitPage,
+                Size::new(595.0, 842.0),
+                Size::new(1000.0, viewport_height),
+                1.0,
+            )
+            .unwrap();
+            // One percent below the preset is always below the fit; the function must return
+            // exactly the preset value, not a recomputed approximation of it.
+            if preset > MIN_ZOOM_PERCENT {
+                assert_eq!(
+                    fit_page_on_viewport_change(1, preset - 1, 842.0, viewport_height, 1.0),
+                    Some(preset),
+                    "viewport {viewport_height}"
+                );
+            }
+            assert_eq!(
+                fit_page_on_viewport_change(1, preset, 842.0, viewport_height, 1.0),
+                None,
+                "viewport {viewport_height}"
+            );
+        }
     }
 
     #[test]

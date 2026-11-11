@@ -236,6 +236,10 @@ public enum PlacementIndex {
     /// it can coexist with a selection without sharing a texture cache slot.
     public static func aiSource(_ index: Int) -> Int { -8 * block + index }
 
+    /// The stationary source patch and moving object of a content drag.
+    public static let contentDragBackground = -9 * block
+    public static let contentDragForeground = -9 * block + 1
+
     /// Whether `index` names one box of the transient AI source highlight.
     public static func isAISource(_ index: Int) -> Bool {
         index >= -8 * block && index < -7 * block

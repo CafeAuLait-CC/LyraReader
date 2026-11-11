@@ -14,7 +14,8 @@ public enum LyraReaderTheme {
     }
 
     /// Paper-bound note markers use the supplied icon palette, independent of window appearance.
-    static func noteIconColors(state: NoteGlyph.State, darkPaper: Bool) -> (paper: NSColor, fold: NSColor, ink: NSColor) {
+    static func noteIconColors(state: NoteGlyph.State, darkPaper: Bool,
+                               highlight: AnnotationColor? = nil) -> (paper: NSColor, fold: NSColor, ink: NSColor) {
         let colors: (UInt32, UInt32, UInt32)
         if darkPaper {
             switch state {
@@ -33,7 +34,21 @@ public enum LyraReaderTheme {
             NSColor(srgbRed: CGFloat((hex >> 16) & 255) / 255,
                     green: CGFloat((hex >> 8) & 255) / 255, blue: CGFloat(hex & 255) / 255, alpha: 1)
         }
-        return (color(colors.0), color(colors.1), color(colors.2))
+        let base = (paper: color(colors.0), fold: color(colors.1), ink: color(colors.2))
+        guard let highlight else { return base }
+        // Keep the paper artwork and its interaction states, with an opaque pastel tint from
+        // the attached markup. Highlight opacity belongs to the text, not to this badge.
+        let amount: CGFloat = darkPaper ? 0.28 : 0.4
+        // A neutral light base keeps pale pink/blue highlights from inheriting the ordinary
+        // sticker's yellow cast. Its brightness still follows the existing hover/open palette.
+        let neutral = max(base.paper.redComponent, base.paper.greenComponent, base.paper.blueComponent)
+        let paper = NSColor(
+            srgbRed: (darkPaper ? base.paper.redComponent : neutral) * (1 - amount) + CGFloat(highlight.red) / 255 * amount,
+            green: (darkPaper ? base.paper.greenComponent : neutral) * (1 - amount) + CGFloat(highlight.green) / 255 * amount,
+            blue: (darkPaper ? base.paper.blueComponent : neutral) * (1 - amount) + CGFloat(highlight.blue) / 255 * amount, alpha: 1)
+        let fold = NSColor(srgbRed: paper.redComponent * 0.86,
+                           green: paper.greenComponent * 0.86, blue: paper.blueComponent * 0.86, alpha: 1)
+        return (paper, fold, base.ink)
     }
 
     public static let windowBg = Color(nsColor: adaptive(0xFAFAFA, 0x201F1D))

@@ -3,8 +3,8 @@ import SwiftUI
 
 /// The editor for an editable note or text box.
 ///
-/// A PDF's own notes keep the read-only `DocumentNoteOverlay`; this is the editable counterpart
-/// for entries in the annotation cache. A sticky note opens a paper beside its icon, the way a reader
+/// Notes open in `DocumentNoteOverlay` for reading and enter this editor on a body click.
+/// Editing a PDF's own note first adopts it into the annotation cache. A sticky note opens a paper beside its icon, the way a reader
 /// expects after clicking a note icon. A text box opens **over its own box**, at the size the
 /// text is drawn at, so typing shows the line breaks and size the page will show.
 ///
@@ -30,15 +30,15 @@ package struct PlacedTextEditorOverlay: View {
                 Group {
                     if isNote {
                         VStack(spacing: 0) {
-                            header(for: annotation)
-                            Divider()
                             if !missingGlyphs.isEmpty { appearanceWarning }
                             TextEditor(text: $text)
                                 .focused($focused).font(.system(size: 13))
                                 .scrollContentBackground(.hidden)
+                                .background(SidebarScrollTheme(trackColor: LyraReaderTheme.noteBgColor))
                                 .background(LyraReaderTheme.noteBg).foregroundStyle(LyraReaderTheme.noteFg)
                                 .padding(6)
                                 .onExitCommand { state.cancelTextEditing() }
+                            editingActions
                         }
                         .background(LyraReaderTheme.noteBg)
                         .clipShape(RoundedRectangle(cornerRadius: 6))
@@ -126,12 +126,8 @@ package struct PlacedTextEditorOverlay: View {
         missingGlyphs = coverage.missing
     }
 
-    private func header(for annotation: AppState.Annotation) -> some View {
+    private var editingActions: some View {
         HStack(spacing: 8) {
-            Image(systemName: annotation.kind == .textBox ? "textbox" : "text.bubble")
-                .font(.system(size: 11))
-            Text(annotation.kind == .stickyNote ? "Sticky Note" : "Note")
-                .font(.system(size: 11, weight: .semibold))
             Spacer()
             Button("Cancel") { state.cancelTextEditing() }
                 .buttonStyle(.plain)

@@ -1,5 +1,5 @@
 import AppKit
-import LyraReaderKit
+@testable import LyraReaderKit
 import CoreGraphics
 import Foundation
 
@@ -168,7 +168,7 @@ extension ReaderChecks {
         state.undo()
         require(state.annotations.contains(where: { $0.id == noteID }), "deleting a note is undoable")
 
-        // Clicking a note icon opens the editable paper, not the PDF's read-only note overlay.
+        // Explicit editing remains undoable after reading the note.
         state.beginEditingAnnotation(noteID)
         require(state.editingAnnotationID == noteID && state.openDocumentNoteID == nil,
                 "the note opens in the editable editor, not the read-only paper")
@@ -208,6 +208,36 @@ extension ReaderChecks {
                 "the text box's font size is part of the entry")
         require(textRecords.contains("\"version\" : \(AppState.Annotation.placedTextVersion)"),
                 "the text box is versioned like the note")
+
+        try await eventually("the text-box regression observes real PDF raster pixels", {
+            state.canvasPages.contains {
+                $0.placement.index >= 0 || PlacementIndex.pageRasterPage($0.placement.index) != nil
+            }
+        })
+        let reloadsBeforeMoves = state.viewportReloadCount
+        let rasterGenerations = state.canvasPages.filter {
+            $0.placement.index >= 0 || PlacementIndex.pageRasterPage($0.placement.index) != nil
+        }.map(\.image.generation)
+        for _ in 0..<8 {
+            state.selectAnnotation(boxID)
+            let current = state.annotations.first { $0.id == boxID }!.shapeRect!
+            let start = contentPoint(state, page: 0, point: CGPoint(x: current.midX, y: current.midY))
+            let end = CGPoint(x: start.x + 3, y: start.y + 2)
+            state.beginSelection(at: start)
+            state.extendSelection(to: end)
+            state.endPointerInteraction(at: end, wasClick: false)
+        }
+        state.removeAnnotation(boxID)
+        require(state.viewportReloadCount == reloadsBeforeMoves,
+                "repeated text-box moves and deletion update overlays without rebuilding the PDF viewport")
+        require(state.canvasPages.filter {
+            $0.placement.index >= 0 || PlacementIndex.pageRasterPage($0.placement.index) != nil
+        }.map(\.image.generation) == rasterGenerations,
+                "text-box moves and deletion retain every underlying page raster")
+        state.undo()
+        for _ in 0..<8 { state.undo() }
+        require(state.annotations.first(where: { $0.id == boxID })?.shapeRect == box,
+                "all repeated text-box moves remain independently undoable")
 
         let boxReader = AppState(engine: try RustEngine())
         boxReader.setViewportSize(CGSize(width: 700, height: 500))
@@ -297,6 +327,10 @@ extension ReaderChecks {
         let inside = contentPoint(state, page: 0,
                                   point: CGPoint(x: coverRect.midX, y: coverRect.midY))
         state.extendSelection(to: CGPoint(x: inside.x + 15, y: inside.y + 9))
+        let movingText = state.canvasPages.first { $0.placement.index == PlacementIndex.ownNote(state.annotations.firstIndex { $0.id == coverID }!) }!
+        let pageFrame = state.canvasPageFrames.first { $0.index == 0 }!
+        require(abs(movingText.placement.leftPt - pageFrame.leftPt - coverRect.minX - 15) < 0.01,
+                "annotation text glyphs follow the pointer before mouse-up")
         state.endPointerInteraction(at: CGPoint(x: inside.x + 15, y: inside.y + 9),
                                     wasClick: false)
         require(state.annotations.first(where: { $0.id == coverID })?.shapeRect?.minX ==
@@ -515,7 +549,10 @@ extension ReaderChecks {
                     "a single click reads the note without adopting or rewriting it")
             externalState.closeDocumentNote()
             require(externalState.beginEditingTextBox(atContentPoint: point),
-                    "a double-click opens the same note in the editable editor")
+                    "a double-click keeps the same note in its reading paper")
+            require(externalState.editingAnnotationID == nil && externalState.openDocumentNoteID == externalNote.id,
+                    "double-clicking a note icon does not adopt it")
+            externalState.editOpenNote()
             guard let adoptedID = externalState.selectedAnnotationID,
                   let adopted = externalState.annotations.first(where: { $0.id == adoptedID })
             else {
@@ -525,7 +562,7 @@ extension ReaderChecks {
             require(adopted.fileIdentity == externalNote.id,
                     "the editable note carries the file's own identity")
             require(externalState.editingAnnotationID == adoptedID,
-                    "the double-click opens the editable paper")
+                    "clicking the paper body opens the editable note")
             require(!externalState.documentAnnotations.contains(where: {
                 $0.id == externalNote.id
             }), "the PDF copy is hidden while the adopted note is open")

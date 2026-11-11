@@ -4,6 +4,7 @@ import SwiftUI
 
 extension ReaderChecks {
     @MainActor static func annotationEditingChecks(root: URL) async throws {
+        try await annotationPassageGeometryChecks(root: root)
         let source = "🙂 Generating human motion with diffusion\nmodels poses several challenges. We compare diffusion models again."
         let scalars = Array(source.unicodeScalars)
         let chars = scalars.enumerated().map { index, scalar in
@@ -100,8 +101,10 @@ extension ReaderChecks {
         let placement = state.canvasPageFrames.first { $0.index == 0 }!
         require(state.openInlineNote(at: CGPoint(x: placement.leftPt + marker.rect.midX,
                                                  y: placement.topPt + marker.rect.midY))
-                    && state.editingAnnotationID == id,
-                "clicking the selection note label reopens its editable paper")
+                    && state.openOwnNoteID == id && state.editingAnnotationID == nil,
+                "clicking the selection note label reopens its reading paper")
+        state.editOpenNote()
+        require(state.editingAnnotationID == id, "clicking the selection note paper enters its editor")
         state.cancelTextEditing()
         let copy = scratch.appendingPathComponent("saved.pdf")
         let savedNote = await state.saveAnnotatedCopy(to: copy)

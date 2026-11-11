@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 import PDFKit
 import SwiftUI
@@ -21,6 +22,16 @@ extension ReaderChecks {
     try await eventually("content fixture opens and lays out") {
       state.document?.url == source && !state.canvasPageFrames.isEmpty
     }
+    try await eventually("the content fixture has visible page pixels") {
+      state.canvasPages.contains { $0.placement.index >= 0 || PlacementIndex.pageRasterPage($0.placement.index) != nil }
+    }
+    var blankRevisionFrames = 0
+    let continuity = state.$canvasPages.sink { pages in
+      if !pages.contains(where: { $0.placement.index >= 0 || PlacementIndex.pageRasterPage($0.placement.index) != nil }) {
+        blankRevisionFrames += 1
+      }
+    }
+    defer { continuity.cancel() }
     state.toggleContentEditing()
     await state.reloadContentObjects()
     guard let first = state.contentEditPage?.items.first(where: { $0.can_edit_text }) else {
@@ -50,9 +61,15 @@ extension ReaderChecks {
         windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
     }
     let p = point(first)
-    state.selectContentTool("text")
+    state.selectContentTool("select")
     view.mouseMoved(with: event(.mouseMoved, p))
     require(view.hoveredContentID == first.id, "Edit hover identifies the complete text block")
+    for tool in ["text", "image", "link", "erase", "blackout"] {
+      state.selectContentTool(tool)
+      view.mouseMoved(with: event(.mouseMoved, p))
+      require(view.hoveredContentID == nil, "the \(tool) tool suppresses the implicit edit hover frame")
+    }
+    state.selectContentTool("text")
     view.mouseDown(with: event(.leftMouseDown, p))
     view.mouseUp(with: event(.leftMouseUp, p))
     require(
@@ -67,15 +84,35 @@ extension ReaderChecks {
     let moved = CGPoint(x: p.x + 20 * state.zoomFactor, y: p.y + 12 * state.zoomFactor)
     view.mouseDown(with: event(.leftMouseDown, p))
     view.mouseDragged(with: event(.leftMouseDragged, moved))
+    require(!state.contentEditInspectorVisible && state.secondaryInspectorWidth == 0,
+            "dragging selected text keeps the property inspector closed")
+    try await eventually("PDF text pixels follow the held pointer before mouse-up") {
+      state.canvasPages.contains { $0.placement.index == PlacementIndex.contentDragForeground }
+    }
+    let live = state.canvasPages.first { $0.placement.index == PlacementIndex.contentDragForeground }!
+    let stationary = state.canvasPages.first { $0.placement.index == PlacementIndex.contentDragBackground }!
+    require(abs(live.placement.leftPt - stationary.placement.leftPt - 20) < 0.5
+              && abs(live.placement.topPt - stationary.placement.topPt) > 6,
+            "live text pixels follow the drag in both directions, including alignment snapping")
+    require(live.image.bgra.enumerated().contains { $0.offset % 4 == 3 && $0.element > 0 },
+            "the moving preview contains visible glyph pixels")
+    require(state.pageEditPendingOperations.isEmpty, "pointer samples do not stage PDF revisions")
     view.mouseUp(with: event(.leftMouseUp, moved))
     try await eventually("drag stages and reopens a content revision") {
       state.pageEditPendingOperations.count == 1 && !state.contentEditLoading && !state.pageEditBusy
+    }
+    require(blankRevisionFrames == 0, "moving page content never publishes a blank PDF frame")
+    try await eventually("the committed page replaces its temporary drag textures") {
+      !state.canvasPages.contains { $0.placement.index == PlacementIndex.contentDragForeground }
     }
     guard let block = state.contentEditPage?.items.first(where: { $0.text == first.text }) else {
       fatalError("Moved text missing: \(state.lastError ?? "")")
     }
     require(
       abs(block.bounds.x - first.bounds.x - 20) < 0.5, "drag uses page points at the current zoom")
+    require(abs(block.bounds.x - first.bounds.x - live.placement.leftPt + stationary.placement.leftPt) < 0.5
+              && abs(block.bounds.y - first.bounds.y - live.placement.topPt + stationary.placement.topPt) < 0.5,
+            "mouse-up preserves the preview's exact snapped text position")
     let q = point(block)
     view.mouseDown(with: event(.leftMouseDown, q))
     view.mouseUp(with: event(.leftMouseUp, q))
@@ -88,6 +125,8 @@ extension ReaderChecks {
       editor.selectedRange().length == 0,
       "second click places a caret instead of selecting all text")
     editor.string = "Edited"
+    require(state.contentEditInspectorVisible,
+            "entering a native text caret opens the text property inspector")
     view.mouseDown(with: event(.leftMouseDown, CGPoint(x: 5, y: 5)))
     try await eventually("typing changes actual page content in a new revision") {
       state.pageEditPendingOperations.count == 2 && !state.contentEditLoading && !state.pageEditBusy
@@ -108,6 +147,7 @@ extension ReaderChecks {
       state.pageEditPendingOperations.count == 2 && !state.pageEditBusy
     }
     await state.reloadContentObjects()
+    require(blankRevisionFrames == 0, "content editing, undo and redo retain continuous page pixels")
     guard let edited = state.contentEditPage?.items.first(where: { $0.text == "Edited" }) else {
       fatalError("Edited block missing")
     }
@@ -237,6 +277,7 @@ extension ReaderChecks {
       !state.tabs.contains(where: { $0.url == saved }), "explicit Discard closes the edited tab")
     let discardedSource = try Data(contentsOf: source)
     require(discardedSource == original, "discard never modifies the source PDF")
+    try await contentImageContinuityChecks(scratch: scratch)
     for factor in [38.0 / 72.0, 1.0, 108.5 / 72.0] {
       try await hostedContentEditingChecks(root: root, source: source, calibrationFactor: factor)
     }
@@ -245,6 +286,62 @@ extension ReaderChecks {
 }
 
 extension ReaderChecks {
+  @MainActor private static func contentImageContinuityChecks(scratch: URL) async throws {
+    let file = scratch.appendingPathComponent("image-continuity.pdf")
+    var media = CGRect(x: 0, y: 0, width: 600, height: 800)
+    let context = CGContext(file as CFURL, mediaBox: &media, nil)!
+    let pixels = Data(Array(repeating: [UInt8(220), 50, 30, 255], count: 64).flatMap { $0 })
+    let image = CGImage(width: 8, height: 8, bitsPerComponent: 8, bitsPerPixel: 32,
+      bytesPerRow: 32, space: CGColorSpaceCreateDeviceRGB(),
+      bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+      provider: CGDataProvider(data: pixels as CFData)!, decode: nil, shouldInterpolate: false,
+      intent: .defaultIntent)!
+    context.beginPDFPage(nil)
+    context.draw(image, in: CGRect(x: 80, y: 480, width: 100, height: 60))
+    context.endPDFPage()
+    context.closePDF()
+    let source = try Data(contentsOf: file)
+    let state = AppState(engine: try RustEngine())
+    state.setViewportSize(CGSize(width: 700, height: 400))
+    state.newTab(url: file)
+    state.scroll(toFraction: 0.25)
+    state.toggleContentEditing()
+    await state.reloadContentObjects()
+    try await eventually("the image fixture has page pixels and editable image objects") {
+      state.contentEditPage?.items.contains { $0.kind == "image" } == true
+        && state.canvasPages.contains { $0.placement.index >= 0 || PlacementIndex.pageRasterPage($0.placement.index) != nil }
+    }
+    let scroll = state.scrollYPt
+    var blankFrames = 0
+    let continuity = state.$canvasPages.sink { pages in
+      if !pages.contains(where: { $0.placement.index >= 0 || PlacementIndex.pageRasterPage($0.placement.index) != nil }) {
+        blankFrames += 1
+      }
+    }
+    defer { continuity.cancel() }
+    for number in 1...4 {
+      let oldGenerations = Set(state.canvasPages.map(\.image.generation))
+      let item = state.contentEditPage!.items.first { $0.kind == "image" }!
+      state.transformContent(item, to: item.bounds.rect.offsetBy(dx: 7, dy: 5))
+      try await eventually("moving an image replaces its visible revision completely") {
+        let pages = state.canvasPages.filter {
+          $0.placement.index >= 0 || PlacementIndex.pageRasterPage($0.placement.index) != nil
+        }
+        return state.pageEditPendingOperations.count == number && !state.contentCommandInFlight
+          && !pages.isEmpty && pages.allSatisfy { !oldGenerations.contains($0.image.generation) }
+      }
+      let moved = state.contentEditPage!.items.first { $0.kind == "image" }!
+      require(abs(moved.bounds.x - item.bounds.x - 7) < 0.5
+              && abs(moved.bounds.y - item.bounds.y - 5) < 0.5,
+              "each image move reaches the PDF objects and the replacement canvas")
+      require(abs(state.scrollYPt - scroll) < 0.01,
+              "content revision replacement preserves the exact reading position")
+    }
+    require(blankFrames == 0, "repeated image moves never publish a blank PDF frame")
+    let unchanged = try Data(contentsOf: file)
+    require(unchanged == source, "image continuity retains the staged-save contract")
+  }
+
   @MainActor static func hostedContentEditingChecks(
     root: URL, source: URL, calibrationFactor: CGFloat
   ) async throws {
@@ -314,6 +411,8 @@ extension ReaderChecks {
     view.mouseDown(with: event(.leftMouseDown))
     view.mouseUp(with: event(.leftMouseUp))
     require(state.contentEditSelection == item.id, "hosted first click selects the paragraph")
+    require(!state.contentEditInspectorVisible && state.secondaryInspectorWidth == 0,
+            "hosted text selection keeps the canvas width and inspector closed")
     host.layoutSubtreeIfNeeded()
     if let directory = ProcessInfo.processInfo.environment["LYRA_CONTENT_EVIDENCE"] {
       // Wait for the secondary-row reveal and selection properties before capturing chrome.
@@ -337,6 +436,19 @@ extension ReaderChecks {
     require(
       !contentTextViews(view).isEmpty,
       "hosted second click opens a native text caret")
+    require(state.contentEditInspectorVisible,
+            "hosted caret editing opens the text inspector")
+    try await eventually("the caret's inspector finishes changing the canvas width") {
+      host.layoutSubtreeIfNeeded()
+      let expectedWidth = host.bounds.width - ReaderChrome.scrollIndicatorLaneWidthPt
+        - ReaderEditingPanelTransition<ContentEditInspector>.width
+      return abs(state.canvasViewportWidthPt - expectedWidth) < 0.5
+    }
+    guard let caret = contentTextViews(view).first?.enclosingScrollView,
+          let expected = state.viewRect(local: item.bounds.rect, onPage: 0)?.insetBy(dx: -2, dy: -3)
+    else { fatalError("Hosted text caret geometry is missing") }
+    require(abs(caret.frame.minX - expected.minX) < 0.5 && abs(caret.frame.minY - expected.minY) < 0.5,
+            "the native caret remains aligned with PDF text after its inspector opens")
     if ProcessInfo.processInfo.environment["LYRA_CONTENT_UI_PAUSE"] != nil {
       try await Task.sleep(for: .seconds(55))
     }

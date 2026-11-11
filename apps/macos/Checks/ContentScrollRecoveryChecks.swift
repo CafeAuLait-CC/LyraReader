@@ -9,6 +9,7 @@ extension ReaderChecks {
         state.setViewportSize(CGSize(width: 800, height: 600))
         require(state.open(url: root.appendingPathComponent("tests/fixtures/text-page.pdf")),
                 "content scroll fixture opens")
+        state.gotoPage(0)
         state.contentEditEnabled = true
         let first = Task { @MainActor in await state.reloadContentObjects() }
         try await eventually("first inspection is in flight", { engine.waiting[0] != nil })
@@ -46,6 +47,64 @@ extension ReaderChecks {
                 "empty space with no selection never becomes a move hand")
         view.mouseExited(with: event)
         require(!view.showsMoveCursor, "leaving the paper clears move hover")
+        try await contentDragCancellationChecks(root: root)
+
+    }
+}
+
+extension ReaderChecks {
+    @MainActor private static func contentDragCancellationChecks(root: URL) async throws {
+        for cancelByPage in [false, true] {
+            let engine = ContentScrollEngine()
+            let state = AppState(engine: engine)
+            state.setViewportSize(CGSize(width: 800, height: 600))
+            state.newTab(url: root.appendingPathComponent("tests/fixtures/text-page.pdf"))
+            state.gotoPage(0)
+            state.contentEditEnabled = true
+            let item = PDFContentItem(id: "moving-text", kind: "text",
+                bounds: PDFContentBox(CGRect(x: 100, y: 100, width: 200, height: 30)),
+                text: "Moving text", font: "Helvetica", size: 12, colour: [0, 0, 0, 255],
+                can_edit_text: true, reason: nil, paths: [[0]], link_page: nil, link_uri: nil)
+            let load = Task { @MainActor in await state.reloadContentObjects() }
+            try await eventually("the controlled drag page begins loading", { engine.waiting[0] != nil })
+            engine.complete(0, items: [item])
+            await load.value
+            let view = ContentEditorView(frame: CGRect(x: 0, y: 0, width: 800, height: 600))
+            let window = NSWindow(contentRect: view.bounds, styleMask: [.borderless], backing: .buffered, defer: false)
+            window.contentView = view
+            view.state = state
+            defer { window.contentView = nil; window.orderOut(nil) }
+            func mouse(_ type: NSEvent.EventType, _ point: CGPoint) -> NSEvent {
+                NSEvent.mouseEvent(with: type, location: view.convert(point, to: nil), modifierFlags: [], timestamp: 0,
+                    windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
+            }
+            let source = state.viewRect(local: item.bounds.rect, onPage: 0)!
+            let point = CGPoint(x: source.midX, y: source.midY)
+            state.contentEditSelection = item.id
+            view.mouseDown(with: mouse(.leftMouseDown, point))
+            view.mouseDragged(with: mouse(.leftMouseDragged, CGPoint(x: point.x + 30, y: point.y + 15)))
+            try await eventually("one preview request starts for the held drag", { engine.previewWaiting != nil })
+            for step in 1...12 {
+                view.mouseDragged(with: mouse(.leftMouseDragged, CGPoint(x: point.x + CGFloat(step * 4), y: point.y + 15)))
+            }
+            require(engine.previewRequests == 1, "pointer events reuse one preview request")
+            if cancelByPage {
+                state.gotoPage(1)
+                view.synchronizePointer()
+            } else {
+                view.keyDown(with: NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                    windowNumber: window.windowNumber, context: nil, characters: "\u{1b}",
+                    charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: 53)!)
+            }
+            view.mouseUp(with: mouse(.leftMouseUp, CGPoint(x: point.x + 48, y: point.y + 15)))
+            require(!state.contentTextEditing, "releasing a cancelled drag cannot start a text editor")
+            engine.completePreview()
+            // Let the resumed main-actor task consume the deliberately late result.
+            try await Task.sleep(for: .milliseconds(75))
+            require(!state.canvasPages.contains { $0.placement.index == PlacementIndex.contentDragForeground },
+                    "a late preview cannot resurrect a drag after \(cancelByPage ? "page navigation" : "Escape")")
+            require(state.pageEditPendingOperations.isEmpty, "cancelling a preview stages no PDF edit")
+        }
     }
 }
 
@@ -53,12 +112,27 @@ extension ReaderChecks {
 @MainActor private final class ContentScrollEngine: PDFEngine {
     let version = "content scroll regression"
     var waiting: [Int: CheckedContinuation<PDFContentPage, Error>] = [:]
+    var previewWaiting: CheckedContinuation<ContentDragPreview, Error>?
+    var previewBounds = CGRect.zero
+    var previewRequests = 0
+    func contentDragPreview(page: Int, target: String, revision: String,
+                            bounds: CGRect, scale: CGFloat) async throws -> ContentDragPreview {
+        previewRequests += 1
+        previewBounds = bounds
+        return try await withCheckedThrowingContinuation { previewWaiting = $0 }
+    }
+    func completePreview() {
+        let image = PageImage(pixelWidth: 1, pixelHeight: 1, pointSize: previewBounds.size,
+                              bgra: Data([0, 0, 0, 255]), generation: 1)
+        previewWaiting?.resume(returning: ContentDragPreview(bounds: previewBounds, background: image, foreground: image))
+        previewWaiting = nil
+    }
     func contentObjects(page: Int) async throws -> PDFContentPage {
         try await withCheckedThrowingContinuation { waiting[page] = $0 }
     }
-    func complete(_ page: Int) {
+    func complete(_ page: Int, items: [PDFContentItem] = []) {
         waiting.removeValue(forKey: page)?.resume(returning:
-            PDFContentPage(revision: "revision", page: page, items: []))
+            PDFContentPage(revision: "revision", page: page, items: items))
     }
     func openDocument(at url: URL) throws -> LoadedDocument {
         LoadedDocument(title: "Scroll", pageCount: 3, url: url,
