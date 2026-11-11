@@ -29,8 +29,7 @@ extension ReaderChecks {
             let center = max(0, (size.width - state.contentWidthPt * scale) / 2)
             let viewport = CGRect(x: -center / scale, y: state.scrollYPt,
                                   width: size.width / scale, height: size.height / scale)
-            let placements = engine.visiblePages(scrollYPt: state.scrollYPt,
-                viewportHeightPt: viewport.height, gapPt: state.pageGapPt, marginPt: 0)
+            let placements = state.canvasPageFrames
             let area = placements.reduce(CGFloat(0)) { sum, p in
                 let r = viewport.intersection(CGRect(x: p.leftPt, y: p.topPt, width: p.widthPt, height: p.heightPt))
                 return sum + (r.isNull ? 0 : r.width * r.height)

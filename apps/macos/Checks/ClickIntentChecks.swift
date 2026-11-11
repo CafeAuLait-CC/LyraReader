@@ -59,10 +59,8 @@ extension ReaderChecks {
         }
 
         /// The center of `box` (page-local points) in the content space the click is reported in.
-        func contentPoint(_ box: CGRect, page: Int, in state: AppState, using probe: PDFEngine) throws -> CGPoint {
-            guard let placement = probe.visiblePages(scrollYPt: state.scrollYPt,
-                                                     viewportHeightPt: viewport.height,
-                                                     gapPt: state.pageGapPt, marginPt: 0)
+        func contentPoint(_ box: CGRect, page: Int, in state: AppState) throws -> CGPoint {
+            guard let placement = state.canvasPageFrames
                 .first(where: { $0.index == page }) else {
                 fatalError("FAIL: page \(page + 1) is on screen after the jump")
             }
@@ -85,7 +83,7 @@ extension ReaderChecks {
             let state = try coldState(citationsURL, at: page)
             click(state, at: try contentPoint(CGRect(x: citation.xPt, y: citation.yPt,
                                                      width: citation.widthPt, height: citation.heightPt),
-                                              page: page, in: state, using: probe))
+                                              page: page, in: state))
             try await eventually("a click that beats the citation fetch still opens its reference", {
                 state.referencePreview?.kind == .reference
             })
@@ -111,7 +109,7 @@ extension ReaderChecks {
             let state = try coldState(mentionsURL, at: page)
             click(state, at: try contentPoint(CGRect(x: mention.xPt, y: mention.yPt,
                                                      width: mention.widthPt, height: mention.heightPt),
-                                              page: page, in: state, using: probe))
+                                              page: page, in: state))
             try await eventually("a click that beats the \(kind.lowercased()) mention fetch opens its caption", {
                 state.referencePreview != nil
             })
@@ -140,8 +138,7 @@ extension ReaderChecks {
             fatalError("FAIL: the fixture carries a citation to click")
         }
         state.scroll(byScreenPoints: max(0, citation.yPt - 120))
-        let placement = engine.visiblePages(scrollYPt: state.scrollYPt, viewportHeightPt: 500,
-                                            gapPt: state.pageGapPt, marginPt: 0)[0]
+        let placement = state.canvasPageFrames[0]
         func viewPoint(_ xPt: CGFloat, _ yPt: CGFloat) -> CGPoint {
             // Content points → view coordinates (bottom-left origin): the canvas has no surface
             // here, so it is not horizontally offset and the zoom is 1.

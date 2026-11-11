@@ -359,7 +359,7 @@ extension ReaderChecks {
         require(abs(bottom.sourceTopPt - 190) < 0.001 && abs(bottom.heightPt - 1010) < 0.001,
                 "the bottom segment shows exactly the content below the split")
         let gapTop = state.regionGapTop(for: card.id)!
-        require(abs(gapTop - 190) < 0.001, "the card's gap starts at the tear")
+        require(abs(gapTop - page0Before.topPt - 190) < 0.001, "the card's gap starts at the tear")
         require(abs(bottom.topPt - (gapTop + 300)) < 0.001,
                 "the bottom segment starts after the card's gap")
         require(abs(page1Before.topPt + 300 - state.canvasPageFrames.first { $0.index == 1 }!.topPt) < 0.001,
@@ -379,7 +379,7 @@ extension ReaderChecks {
         require(quads[0].image.generation == quads[1].image.generation,
                 "both segments reuse the same raster generation (no second render)")
         require(abs(quads[0].placement.heightPt - 190) < 0.001
-                && abs(quads[1].placement.topPt - (190 + 300)) < 0.001
+                && abs(quads[1].placement.topPt - (page0Before.topPt + 190 + 300)) < 0.001
                 && abs(quads[1].placement.heightPt - 1010) < 0.001,
                 "the two quads' destinations are the two segments, with the gap between them")
         let chrome = PageChromeGeometry.rectangles(
@@ -574,26 +574,27 @@ extension ReaderChecks {
                                       measuredViewHeight: 300)
         require(card.tearSplitPt == 190, "mapping fixture tears at 190")
 
-        let above = state.pagePoint(atContentPoint: CGPoint(x: 50, y: 100))
+        let pageTop = state.canvasPageFrames.first { $0.index == 0 }!.topPt
+        let above = state.pagePoint(atContentPoint: CGPoint(x: 50, y: pageTop + 100))
         require(above?.page == 0 && above?.point == CGPoint(x: 50, y: 100),
                 "a point above the tear maps to its page Y")
-        let belowContent = CGPoint(x: 50, y: 900 + 300)
+        let belowContent = CGPoint(x: 50, y: pageTop + 900 + 300)
         let below = state.pagePoint(atContentPoint: belowContent)
         require(below?.page == 0 && below?.point == CGPoint(x: 50, y: 900),
                 "a point below the tear subtracts the gap and names the same page Y it had before the tear")
-        require(state.pagePoint(atContentPoint: CGPoint(x: 50, y: 190 + 100)) == nil,
+        require(state.pagePoint(atContentPoint: CGPoint(x: 50, y: pageTop + 190 + 100)) == nil,
                 "a point in the card's gap belongs to no page, like a gap between pages")
-        require(state.pageIndex(at: CGPoint(x: 50, y: 190 + 100)) == nil,
+        require(state.pageIndex(at: CGPoint(x: 50, y: pageTop + 190 + 100)) == nil,
                 "page hit testing skips the gap")
         require(state.pageIndex(at: belowContent) == 0,
                 "page hit testing finds the page below the tear")
-        require(state.contentY(forPageLocalY: 100, onPage: 0) == 100,
+        require(state.contentY(forPageLocalY: 100, onPage: 0) == pageTop + 100,
                 "page Y above the split maps to the page's content Y")
-        require(state.contentY(forPageLocalY: 900, onPage: 0) == 1200,
+        require(state.contentY(forPageLocalY: 900, onPage: 0) == pageTop + 1200,
                 "page Y below the split adds the gap")
-        require(state.pageLocalY(forContentY: 1200, onPage: 0) == 900,
+        require(state.pageLocalY(forContentY: pageTop + 1200, onPage: 0) == 900,
                 "content Y below the gap maps back to the page Y")
-        require(state.pageLocalY(forContentY: 190 + 100, onPage: 0) == nil,
+        require(state.pageLocalY(forContentY: pageTop + 190 + 100, onPage: 0) == nil,
                 "content Y inside the gap has no page Y")
 
         let segment = state.pagePlacement(at: belowContent)
@@ -601,9 +602,9 @@ extension ReaderChecks {
                 "the bottom segment is a real placement with its page-local source offset")
         let rects = state.viewRects(local: CGRect(x: 10, y: 100, width: 100, height: 500), onPage: 0)
         require(rects.count == 2, "a page rectangle spanning the tear becomes two view rectangles")
-        require(abs(rects[0].minY - 100) < 0.001 && abs(rects[0].height - 90) < 0.001,
+        require(abs(rects[0].minY - (pageTop + 100)) < 0.001 && abs(rects[0].height - 90) < 0.001,
                 "the upper piece of the rectangle is above the tear")
-        require(abs(rects[1].minY - (190 + 300)) < 0.001 && abs(rects[1].height - 410) < 0.001,
+        require(abs(rects[1].minY - (pageTop + 190 + 300)) < 0.001 && abs(rects[1].height - 410) < 0.001,
                 "the lower piece starts after the gap and keeps the page-local offsets")
 
         state.reloadVisiblePages()
@@ -625,8 +626,9 @@ extension ReaderChecks {
     private static func tearSelectionChecks() async throws {
         let (state, _) = makeTearState()
         try await eventually("the synthetic text layer loads") { state.hasTextLayer(0) }
-        state.beginSelection(at: CGPoint(x: 150, y: 305))
-        state.extendSelection(to: CGPoint(x: 150, y: 505))
+        let paperTop = state.canvasPageFrames.first { $0.index == 0 }!.topPt
+        state.beginSelection(at: CGPoint(x: 150, y: paperTop + 305))
+        state.extendSelection(to: CGPoint(x: 150, y: paperTop + 505))
         guard let before = state.selection else {
             fatalError("FAIL: the fixture selection spans two text lines")
         }
@@ -653,7 +655,7 @@ extension ReaderChecks {
                 "the tear neither drops nor duplicates a selection quad (\(quads.count) vs \(expectedRects.count))")
         let quadTops = quads.map(\.placement.topPt).sorted()
         for rect in expectedRects {
-            let expectedTop = rect.minY + (rect.minY >= 340 ? 300 : 0)
+            let expectedTop = paperTop + rect.minY + (rect.minY >= 340 ? 300 : 0)
             require(quadTops.contains(where: { abs($0 - expectedTop) < 0.6 }),
                     "a selection quad on the \(rect.minY >= 340 ? "bottom" : "top") side is at its page position plus the gap when needed (expected \(expectedTop), got \(quadTops))")
         }
@@ -748,6 +750,7 @@ extension ReaderChecks {
     private static func tearFailureChecks() async throws {
         // A selection with less than a card's height below it never cuts the page.
         let (state, _) = makeTearState()
+        let paperTop = state.canvasPageFrames.first { $0.index == 0 }!.topPt
         let nearFoot = try await openCard(state, rect: CGRect(x: 100, y: 1000, width: 220, height: 100),
                                           measuredViewHeight: 300)
         require(nearFoot.tearSplitPt == nil,
@@ -757,10 +760,10 @@ extension ReaderChecks {
         require(state.pageSegments(forPage: 0).count == 1,
                 "a page-foot fallback leaves the page whole")
         let gapTop = state.regionGapTop(for: nearFoot.id)!
-        require(abs(gapTop - 1200) < 0.001,
+        require(abs(gapTop - paperTop - 1200) < 0.001,
                 "the fallback gap starts at the page foot, as before")
         let page1 = state.canvasPageFrames.first { $0.index == 1 }!
-        require(abs(page1.topPt - (1200 + state.pageGapPt + state.regionGapHeightPt(nearFoot))) < 0.001,
+        require(abs(page1.topPt - (paperTop + 1200 + state.pageGapPt + state.regionGapHeightPt(nearFoot))) < 0.001,
                 "the page below starts after the fallback gap")
         state.closeRegionCard(id: nearFoot.id, keepHistory: false)
 
@@ -791,7 +794,9 @@ extension ReaderChecks {
         require(tall.tearFallbackReason == nil, "growth does not create a fallback")
         require(tallState.pageSegments(forPage: 0).count == 2, "both paper segments remain")
         require(abs(tallState.regionGapHeightPt(tall) - 1400) < 0.001, "the inserted gap follows measured height")
-        require(abs(tallState.regionGapTop(for: tall.id)! - 190) < 0.001, "the gap stays at the original cut")
+        let tallTop = tallState.canvasPageFrames.first { $0.index == 0 }!.topPt
+        require(abs(tallState.regionGapTop(for: tall.id)! - tallTop - 190) < 0.001,
+                "the gap stays at the original page-local cut")
         tallState.closeRegionCard(id: tall.id, keepHistory: false)
     }
 
@@ -849,7 +854,8 @@ extension ReaderChecks {
         require(state.addInkAnnotation(page: 0, points: [belowPoint,
                                                          CGPoint(x: belowPoint.x + 30, y: belowPoint.y)]),
                 "an annotation below the tear is added")
-        require(state.geometryAnnotationHit(atContentPoint: CGPoint(x: 55, y: abovePoint.y))?.page == 0,
+        let aboveContentY = state.contentY(forPageLocalY: abovePoint.y, onPage: 0)!
+        require(state.geometryAnnotationHit(atContentPoint: CGPoint(x: 55, y: aboveContentY))?.page == 0,
                 "the annotation above the tear is hit at its page Y")
         let belowContentY = state.contentY(forPageLocalY: belowPoint.y, onPage: 0)!
         require(state.geometryAnnotationHit(atContentPoint: CGPoint(x: 55, y: belowContentY))?.page == 0,

@@ -24,8 +24,7 @@ extension ReaderChecks {
         })
         // The red frame is a genuine /Dest link; the frame must not replace its hit target.
         guard let target = try await engine.links(0).first(where: { $0.page == 0 }),
-              let placement = engine.visiblePages(scrollYPt: state.scrollYPt, viewportHeightPt: 800,
-                                                  gapPt: state.pageGapPt, marginPt: 0).first else {
+              let placement = state.canvasPageFrames.first else {
             fatalError("FAIL: the framed internal link retains its destination")
         }
         let point = CGPoint(x: placement.leftPt + target.xPt + target.widthPt / 2,
