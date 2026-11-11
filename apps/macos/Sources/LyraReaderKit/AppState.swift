@@ -647,13 +647,21 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     /// Gap between pages, in points. Set through `setPageGap` so it is clamped and the layout
     /// is rebuilt immediately; read by the engine on every layout query.
     @Published public private(set) var pageGapPt: CGFloat = ReadingLayoutPreferences.defaultGapPt
-    /// Fit Page adds temporary row spacing without changing the saved page-gap preference.
+    /// Fit Page adds temporary row spacing and balanced top/bottom padding without changing the
+    /// saved page-gap preference. The padding is **content**, not a negative scroll origin: the
+    /// first page's top moves down by `fittedPageInsetPt` in content space, so every scroll
+    /// offset the reader can hold stays at or above zero like the ordinary layout. Presenting
+    /// the same blank by subtracting from an unshifted offset would make `scrollYPt` negative,
+    /// which the scrollbar, saved positions and tab snapshots all treat as out of range.
     private var fittedPageSpacing: FitPageSpacingRecord?
     var fittedPageExtraGapPt: CGFloat { fittedPageSpacing.map { max(0, CGFloat($0.gapPt) - pageGapPt) } ?? 0 }
-    var fittedPageGapTotalPt: CGFloat {
+    /// Temporary space the fitted presentation adds to the content height: both paper insets
+    /// plus every inter-row gap (the rounding remainder included).
+    var fittedPageSpaceTotalPt: CGFloat {
+        guard fittedPageSpacing != nil else { return 0 }
         let count = document?.pageCount ?? 0
         let rows = count > 0 ? regionRow(forPage: count - 1) + 1 : 0
-        return CGFloat(max(0, rows - 1)) * fittedPageExtraGapPt
+        return 2 * fittedPageInsetPt + CGFloat(max(0, rows - 1)) * fittedPageExtraGapPt
     }
     func fittedPageShift(_ page: Int) -> CGFloat {
         CGFloat(regionRow(forPage: page)) * fittedPageExtraGapPt
@@ -4046,7 +4054,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             noticeInterruptedSave(at: url)
             if let restoringTabScroll {
                 contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode)
-                    + regionGapTotalPt + fittedPageGapTotalPt
+                    + regionGapTotalPt + fittedPageSpaceTotalPt
                 contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt, layout: layoutMode)
                 scrollYPt = min(max(0, restoringTabScroll),
                                 max(0, contentHeightPt - viewportHeightContentPt))
@@ -4468,13 +4476,15 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     private func rebuildContentDimensions() {
-        contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode) + regionGapTotalPt + fittedPageGapTotalPt
+        contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode) + regionGapTotalPt + fittedPageSpaceTotalPt
         contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt, layout: layoutMode)
     }
 
     /// Restore ordinary continuous spacing, retaining the same page-local reading position.
     private func clearFitPageSpacing() {
         guard fittedPageSpacing != nil else { return }
+        // The viewport top may sit in the fitted blank above the row; that blank belongs to the
+        // row, so ask for the page at the row top rather than at the blank itself.
         let page = regionCurrentPage(at: scrollYPt + fittedPageInsetPt)
         let offset = scrollYPt - displayPageTop(page)
         fittedPageSpacing = nil
@@ -4570,11 +4580,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// The scroll offset clamped to the document (shared by every path that sets it).
     private func clampedScrollOffset(_ value: CGFloat) -> CGFloat {
+        // `contentHeightPt` already contains the fitted paper insets and row gaps (see
+        // `fittedPageSpaceTotalPt`), so the clamp is the ordinary 0…(content − viewport) range.
+        // There is no fitted special case here and therefore no way to return a negative offset.
         CGFloat(clampScroll(
-            offsetPt: Double(value + fittedPageInsetPt),
-            contentHeightPt: Double(contentHeightPt + 2 * fittedPageInsetPt),
+            offsetPt: Double(value),
+            contentHeightPt: Double(contentHeightPt),
             viewportHeightPt: Double(viewportHeightContentPt)
-        )) - fittedPageInsetPt
+        ))
     }
 
     /// Actual physical size: 100% of the calibrated scale (⌘0).
@@ -12937,22 +12950,21 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// 0…1 position of the viewport inside the content (drives the scroll indicator).
     public var scrollFraction: Double {
-        let scrollable = max(contentHeightPt + 2 * fittedPageInsetPt - viewportHeightContentPt, 0)
+        let scrollable = max(contentHeightPt - viewportHeightContentPt, 0)
         guard scrollable > 0 else { return 0 }
-        return Double(min(max((scrollYPt + fittedPageInsetPt) / scrollable, 0), 1))
+        return Double(min(max(scrollYPt / scrollable, 0), 1))
     }
 
     /// 0…1 share of the content the viewport covers (the indicator's thumb length).
     public var viewportFraction: Double {
-        let height = contentHeightPt + 2 * fittedPageInsetPt
-        guard height > 0 else { return 1 }
-        return Double(min(max(viewportHeightContentPt / height, 0.02), 1))
+        guard contentHeightPt > 0 else { return 1 }
+        return Double(min(max(viewportHeightContentPt / contentHeightPt, 0.02), 1))
     }
 
     /// Whether the document is longer than the viewport: there is something to scroll, so there
     /// is a scroller to show and to grab.
     public var hasScrollableContent: Bool {
-        contentHeightPt + 2 * fittedPageInsetPt > viewportHeightContentPt + 0.01
+        contentHeightPt > viewportHeightContentPt + 0.01
     }
 
     /// Whether the indicator accepts pointer input.
@@ -15093,8 +15105,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func scroll(toFraction fraction: Double) {
         guard document != nil else { return }
         cancelScrollGlide()
-        let scrollable = max(contentHeightPt + 2 * fittedPageInsetPt - viewportHeightContentPt, 0)
-        let next = CGFloat(min(max(fraction, 0), 1)) * scrollable - fittedPageInsetPt
+        let scrollable = max(contentHeightPt - viewportHeightContentPt, 0)
+        let next = CGFloat(min(max(fraction, 0), 1)) * scrollable
         beginScrollActivity()
         guard abs(next - scrollYPt) > 0.01 else { return }
         let previousOffset = scrollYPt
@@ -15333,7 +15345,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return
         }
         contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode)
-            + regionGapTotalPt + fittedPageGapTotalPt
+            + regionGapTotalPt + fittedPageSpaceTotalPt
         contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt, layout: layoutMode)
         let top = displayPageTop(anchor.page)
         scrollYPt = clampedScrollOffset(top + anchor.offsetY)
@@ -15401,7 +15413,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 blend: quad.blend, source: quad.source)
         }
         visiblePagePlacements = visible
-        contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode) + regionGapTotalPt + fittedPageGapTotalPt
+        contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode) + regionGapTotalPt + fittedPageSpaceTotalPt
         var pages = canvasTiles
         appendSelectionHighlights(to: &pages)
         canvasPages = applyPageTears(to: pages)
@@ -15450,7 +15462,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
 
         contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode)
-            + regionGapTotalPt + fittedPageGapTotalPt
+            + regionGapTotalPt + fittedPageSpaceTotalPt
         contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt, layout: layoutMode)
 
         let viewportHeight = viewportHeightContentPt

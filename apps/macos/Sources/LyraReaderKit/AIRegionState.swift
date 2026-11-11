@@ -623,9 +623,14 @@ extension AppState {
             .reduce(0) { $0 + regionGapHeightPt($1) }
     }
 
-    /// Page top with the region-card and fitted-row gaps applied.
+    /// Page top with the region-card gaps and the fitted presentation's content-space padding.
+    ///
+    /// The fitted inset is a real offset in content space: the first row starts below it, and
+    /// the last row ends above the bottom inset. `scrollYPt` therefore keeps the ordinary
+    /// `0…(content − viewport)` range and can never become negative to show that padding.
     func displayPageTop(_ page: Int) -> CGFloat {
-        let engineTop = engine.pageTopPt(page, gapPt: pageGapPt, layout: layoutMode) + fittedPageShift(page)
+        let engineTop = engine.pageTopPt(page, gapPt: pageGapPt, layout: layoutMode)
+            + fittedPageInsetPt + fittedPageShift(page)
         guard !regionCards.isEmpty else { return engineTop }
         return engineTop + regionShift(beforeRow: regionRow(forPage: page))
     }
@@ -645,7 +650,8 @@ extension AppState {
             return displayPageTop(card.attachment.page) + split
         }
         let row = regionRow(forPage: card.attachment.page)
-        var top = regionEngineRowBottom(row: row) + regionShift(beforeRow: row) + fittedPageShift(card.attachment.page)
+        var top = regionEngineRowBottom(row: row) + regionShift(beforeRow: row)
+            + fittedPageInsetPt + fittedPageShift(card.attachment.page)
         for earlier in regionCards {
             guard earlier.id != card.id else { break }
             guard regionRow(forPage: earlier.attachment.page) == row else { continue }
@@ -664,7 +670,7 @@ extension AppState {
         viewportHeightPt height: CGFloat,
         marginPt margin: CGFloat
     ) -> [PagePlacement] {
-        guard !regionCards.isEmpty || fittedPageExtraGapPt > 0 else {
+        guard !regionCards.isEmpty || fittedPageInsetPt > 0 || fittedPageExtraGapPt > 0 else {
             return engine.visiblePages(
                 scrollYPt: scroll,
                 viewportHeightPt: height,
@@ -674,7 +680,7 @@ extension AppState {
             )
         }
         let raw: [PagePlacement]
-        if fittedPageExtraGapPt > 0, let document {
+        if fittedPageInsetPt > 0 || fittedPageExtraGapPt > 0, let document {
             // Invert the monotonic row tops instead of widening the query by every fitted gap
             // in a long document. Only a viewport-sized band plus one row reaches the engine.
             let rowCount = regionRow(forPage: document.pageCount - 1) + 1
@@ -704,7 +710,8 @@ extension AppState {
         let top = scroll - margin
         let bottom = scroll + height + margin
         return raw.compactMap { placement in
-            let shift = regionShift(beforeRow: regionRow(forPage: placement.index)) + fittedPageShift(placement.index)
+            let shift = regionShift(beforeRow: regionRow(forPage: placement.index))
+                + fittedPageInsetPt + fittedPageShift(placement.index)
             let shifted = PagePlacement(
                 index: placement.index,
                 topPt: placement.topPt + shift,
@@ -752,7 +759,10 @@ extension AppState {
     func regionUnshiftedScrollYPt(_ y: CGFloat) -> CGFloat {
         guard !regionCards.isEmpty || fittedPageInsetPt > 0 || fittedPageExtraGapPt > 0 else { return y }
         let page = regionCurrentPage(at: y + fittedPageInsetPt)
-        let position = fittedPageInsetPt > 0 ? max(y, displayPageTop(page)) : y
+        // The fitted presentation centres the row: the viewport top can sit in the paper inset
+        // above the page, so the unshifted position is the page's engine top, not that blank.
+        let position = (fittedPageInsetPt > 0 || fittedPageExtraGapPt > 0)
+            ? max(y, displayPageTop(page) - fittedPageInsetPt) : y
         var result = position - fittedPageShift(page)
         for card in regionCards {
             guard let top = regionGapTop(for: card) else { continue }
@@ -775,7 +785,7 @@ extension AppState {
             return
         }
         let base = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode)
-        contentHeightPt = base + regionGapTotalPt
+        contentHeightPt = base + regionGapTotalPt + fittedPageSpaceTotalPt
         if !preservingScroll {
             scrollYPt = regionClampScroll(scrollYPt)
         }

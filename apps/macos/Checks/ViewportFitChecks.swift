@@ -70,8 +70,13 @@ extension ReaderChecks {
         state.setViewportSize(viewport)
         require(state.zoomPercent == 104, "single-page resize adopts the floored fit")
         requireFittedPage(state, page: 0, viewport: viewport)
+        // The fitted blank above the first page is content-space padding, not a negative scroll
+        // origin. A negative `scrollYPt` would put the scrollbar and the saved position out of
+        // range, so the first page is the case that proves the sign.
+        require(state.scrollYPt >= 0, "Fit Page keeps the offset non-negative on the first page")
         state.setViewportSize(CGSize(width: 760, height: 899.4))
         requireFittedPage(state, page: 0, viewport: CGSize(width: 760, height: 899.4))
+        require(state.scrollYPt >= 0, "a height nudge keeps the fitted offset non-negative")
         let offset = state.scrollYPt
         state.zoomFitPage()
         require(abs(state.scrollYPt - offset) < 0.01, "explicit Fit Page and resize agree")
@@ -95,6 +100,7 @@ extension ReaderChecks {
             state.gotoPage(page)
             state.zoomFitPage()
             requireFittedPage(state, page: page, viewport: CGSize(width: 700, height: 500))
+            require(state.scrollYPt >= 0, "Fit Page keeps page \(page + 1)'s offset non-negative")
             let offset = state.scrollYPt
             let percent = state.zoomPercent
             state.zoomFitPage()
@@ -109,6 +115,7 @@ extension ReaderChecks {
         require(state.zoomPercent == 104, "multi-page resize replaces undersized zoom")
         // Zooming out can change the current page before the resize; the fit must keep that page.
         requireFittedPage(state, page: state.currentPage - 1, viewport: viewport)
+        require(state.scrollYPt >= 0, "a multi-page resize keeps the fitted offset non-negative")
         let fitted = state.zoomPercent
         state.zoomOut()
         state.setViewportSize(CGSize(width: 800, height: 900))
@@ -161,8 +168,10 @@ extension ReaderChecks {
         requireFittedPage(state, page: 1, viewport: viewport)
         state.scroll(toFraction: 0)
         requireFittedPage(state, page: 0, viewport: viewport)
+        require(state.scrollYPt >= 0, "the fitted top of the document is offset zero or more")
         state.scroll(toFraction: 1)
         requireFittedPage(state, page: 2, viewport: viewport)
+        require(state.scrollYPt >= 0, "the fitted end of the document is offset zero or more")
         require(state.flushPendingPositionSave(), "fitted reading position saves")
         let key = "readingPosition:" + multipage.path
         let saved = UserDefaults.standard.double(forKey: key)
@@ -220,9 +229,15 @@ extension ReaderChecks {
         var canvas: MetalCanvasView?
         try await eventually("viewport fit: the window canvas attaches", {
             canvas = firstCanvas(in: host)
-            return canvas?.bounds.height ?? 0 > 100
+            return (canvas?.hasAttachedSurface == true) && (canvas?.bounds.height ?? 0) > 100
         })
         guard let canvas else { fatalError("FAIL: viewport fit found no canvas") }
+
+        // The CI runner's 38 ppi virtual display scales a page to 0.5278×, a geometry a
+        // developer's 1.5× display never reaches. Pin that factor after the canvas has reported
+        // the real screen so the resize path below is the same hard case on every machine; a
+        // later screen notification is a no-op because the canvas already reported that screen.
+        state.setDisplayCalibration(DisplayCalibration(factor: 0.5278))
 
         // The document opens at the settled canvas height, where a 842 pt page does not blank.
         guard state.open(url: multipage) else {
@@ -264,6 +279,10 @@ extension ReaderChecks {
         requireFittedPage(state, page: state.currentPage - 1, viewport: canvas.bounds.size)
         require(shownPageHeight <= canvasHeight - 2 * 8 + 2,
                 "viewport fit: window resize fits the page into the canvas (\(shownPageHeight) pt of \(canvasHeight))")
+        // A fitted first page must not park the offset above the document origin. On the CI
+        // runner the grow can be clamped by a small screen, so the subsequent shrink may not
+        // change the viewport at all; this assertion catches the fitted state itself.
+        require(state.scrollYPt >= 0, "viewport fit: fitted window offset stays non-negative")
 
         // Shrinking back to a real window size must keep the percentage (the fit is now lower).
         window.setContentSize(CGSize(width: 900, height: 700))

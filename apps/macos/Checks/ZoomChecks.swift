@@ -293,8 +293,18 @@ extension ReaderChecks {
         let singleHeight = 792 * single.zoomFactor
         require(singleHeight <= viewport.height,
                 "on a single-page document Fit Page leaves nothing to scroll (\(singleHeight) pt)")
-        require(abs(-single.scrollYPt * single.zoomFactor - (viewport.height - singleHeight) / 2) < 0.5,
-                "a single fitted page has balanced vertical margins")
+        // The balanced margin is the page's view-space top, not the sign of a content offset:
+        // the fitted inset is content-space padding, so the offset itself stays at zero.
+        let singleFrame = single.canvasPageFrames.first { $0.index == 0 }
+        let singleTop = ((singleFrame?.topPt ?? 0) - single.scrollYPt) * single.zoomFactor
+        let singleBottom = viewport.height - singleTop - singleHeight
+        require(single.scrollYPt >= 0,
+                "a single fitted page keeps the scroll offset non-negative (\(single.scrollYPt))")
+        require(singleTop >= inset - 0.1 && abs(singleTop - singleBottom) < 0.5,
+                "a single fitted page has balanced vertical margins "
+                    + "(top \(singleTop) pt, bottom \(singleBottom) pt, "
+                    + "scroll \(single.scrollYPt), pages \(single.canvasPageFrames.map(\.index)), "
+                    + "content \(single.contentHeightPt), zoom \(single.zoomPercent))")
     }
 
     /// Moving the window to another screen or changing the display mode keeps the percentage and
