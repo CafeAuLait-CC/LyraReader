@@ -183,6 +183,13 @@ enum PaperVisualCapture {
             var diagnostic = "no canvas"
             do {
               try await wait("visible current PDF frame after layout and canvas replacement") {
+                guard NSApplication.shared.isActive && window.isKeyWindow else {
+                    window.makeKeyAndOrderFront(nil)
+                    NSApplication.shared.activate(ignoringOtherApps: true)
+                    samples = 0
+                    diagnostic = "active=\(NSApplication.shared.isActive) key=\(window.isKeyWindow)"
+                    return false
+                }
                 window.contentView?.layoutSubtreeIfNeeded()
                 guard let content = window.contentView, let canvas = self.canvas(in: content),
                       canvas === state.attachedCanvas, canvas.window === window else { return false }
