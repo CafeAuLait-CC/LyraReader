@@ -97,8 +97,7 @@ extension ReaderChecks {
             let links = try await engine.base.links(0).sorted { $0.yPt < $1.yPt }
             require(links.count >= 2, "the fixture includes a plain link as well as indexed targets")
             func point(_ link: DocumentLink) -> CGPoint {
-                let placement = engine.visiblePages(scrollYPt: state.scrollYPt, viewportHeightPt: 500,
-                                                     gapPt: state.pageGapPt, marginPt: 0).first!
+                let placement = state.canvasPageFrames.first!
                 return CGPoint(x: placement.leftPt + link.xPt + link.widthPt / 2,
                                y: placement.topPt + link.yPt + link.heightPt / 2)
             }
@@ -108,8 +107,7 @@ extension ReaderChecks {
             if table {
                 let label = scenario.hasPrefix("table6") ? "6" : "1"
                 let mention = try await engine.base.captionMentions(page: 0).first { $0.label == label }!
-                let placement = engine.visiblePages(scrollYPt: 0, viewportHeightPt: 500,
-                                                     gapPt: state.pageGapPt, marginPt: 0).first!
+                let placement = state.canvasPageFrames.first!
                 target = CGPoint(x: placement.leftPt + mention.xPt + mention.widthPt / 2,
                                  y: placement.topPt + mention.yPt + mention.heightPt / 2)
             }

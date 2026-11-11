@@ -38,8 +38,7 @@ extension ReaderChecks {
         let mentions = try await engine.captionMentions(page: 0)
         require(Set(mentions.map(\.label)) == Set(["1.1", "A.4", "A.38", "A.39"]),
                 "chapter, appendix, and parenthesized equation mentions keep their full labels")
-        let placement = engine.visiblePages(scrollYPt: 0, viewportHeightPt: 500,
-                                             gapPt: state.pageGapPt, marginPt: 0).first!
+        let placement = state.canvasPageFrames.first!
         try await eventually("the fixture's source links load", {
             state.link(at: CGPoint(x: placement.leftPt + 120, y: placement.topPt + 112)) != nil
         })

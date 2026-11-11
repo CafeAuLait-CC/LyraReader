@@ -8,8 +8,10 @@ import CoreGraphics
 /// * **view space** — the canvas's own coordinate space with the origin at its **top-left**.
 ///   AppKit's is bottom-left; `MetalCanvasView` flips exactly once, at the event boundary, so
 ///   everything below the view's `bounds` uses this one.
-/// * **content space** — PDF points with the origin at the top-left of the first page, Y growing
-///   downwards. `PagePlacement` and `AppState.scrollYPt` live here.
+/// * **content space** — PDF-point units with the origin at the scrollable layout's top-left,
+///   Y growing downwards. Presented `PagePlacement`s include the paper-edge padding;
+///   `AppState.scrollYPt` lives in this space. Page-local PDF coordinates start at the paper
+///   itself and are translated by the presented placement.
 ///
 /// The `zoom` every function takes is `AppState.zoomFactor`, not the bare percentage: it already
 /// includes the display calibration, so at 100% one PDF point occupies `calibration × backing`

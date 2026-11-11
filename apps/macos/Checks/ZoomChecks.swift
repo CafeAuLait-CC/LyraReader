@@ -346,15 +346,18 @@ extension ReaderChecks {
         // Pointer-anchored zoom must still hold the content point under the pointer when the
         // factor includes calibration: the arithmetic uses `zoomFactor`, not the percentage.
         let anchorViewY: CGFloat = 180
+        let anchorPage = state.currentPage - 1
         let contentBefore = CanvasGeometry.contentY(
             viewY: anchorViewY, scrollYPt: state.scrollYPt, zoom: state.zoomFactor)
+            - state.canvasPageFrames.first { $0.index == anchorPage }!.topPt
         let zoomBefore = state.zoomPercent
         require(state.zoomByPinch(0.1, anchorViewY: anchorViewY), "a pinch zooms on a calibrated screen")
         require(state.zoomPercent == zoomBefore + 10, "the pinch still moves the percentage by 10")
         let contentAfter = CanvasGeometry.contentY(
             viewY: anchorViewY, scrollYPt: state.scrollYPt, zoom: state.zoomFactor)
+            - state.canvasPageFrames.first { $0.index == anchorPage }!.topPt
         require(abs(contentAfter - contentBefore) < 0.5,
-                "the content point under the pointer is preserved with calibration applied "
+                "the paper point under the pointer is preserved with calibration applied "
                     + "(\(contentBefore) → \(contentAfter) pt)")
     }
 
@@ -450,15 +453,15 @@ extension ReaderChecks {
         state.setDisplayCalibration(calibration)
         state.open(url: scratch)
         state.gotoPage(0)
-        guard let placement = state.canvasPageFrames.first(where: { $0.index == 0 }) else {
-            require(false, "the annotation fixture page has a placement")
-            return
-        }
         let aim = CGPoint(x: 120, y: 240)
         var stored: [CGPoint] = []
         for percent in [100, 150] {
             state.zoomPercent = percent
             state.reloadVisiblePages()
+            guard let placement = state.canvasPageFrames.first(where: { $0.index == 0 }) else {
+                require(false, "the annotation fixture page has a placement")
+                return
+            }
             let zoom = state.zoomFactor
             let offsetX = CanvasGeometry.contentOffsetX(
                 viewportWidthPt: viewport.width,

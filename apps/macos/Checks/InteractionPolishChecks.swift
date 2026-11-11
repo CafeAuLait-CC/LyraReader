@@ -110,6 +110,11 @@ extension ReaderChecks {
         require(anchor > 100 && anchor < 400,
                 "the synthesized pointer lands inside the canvas (view y \(anchor))")
 
+        func paperYAtPointer() -> CGFloat {
+            CanvasGeometry.contentY(viewY: anchor, scrollYPt: state.scrollYPt, zoom: state.zoomFactor)
+                - AppState.zoomPresetInsetPt / state.zoomFactor
+        }
+
         // ── A plain wheel notch scrolls, and must not zoom ────────────────────────────────
         let zoomBeforePlain = state.zoomPercent
         let scrollBeforePlain = state.scrollYPt
@@ -124,9 +129,7 @@ extension ReaderChecks {
 
         // ── Ctrl + the same notch zooms, anchored at the pointer ──────────────────────────
         let pagesBefore = state.canvasPages.map(\.placement.index)
-        let contentYBefore = CanvasGeometry.contentY(
-            viewY: anchor, scrollYPt: state.scrollYPt, zoom: state.zoomFactor
-        )
+        let contentYBefore = paperYAtPointer()
         let zoomBefore = state.zoomPercent
         let scrollBefore = state.scrollYPt
         view.scrollWheel(with: control)
@@ -134,46 +137,35 @@ extension ReaderChecks {
                 "Ctrl+scroll zooms (was \(zoomBefore)%, now \(state.zoomPercent)%)")
         require(state.scrollYPt != scrollBefore,
                 "the zoom moves the scroll offset to hold the anchor")
-        let contentYAfter = CanvasGeometry.contentY(
-            viewY: anchor, scrollYPt: state.scrollYPt, zoom: state.zoomFactor
-        )
+        let contentYAfter = paperYAtPointer()
         require(abs(contentYAfter - contentYBefore) < 0.5,
-                "the content point under the pointer is preserved "
+                "the paper point under the pointer is preserved "
                 + "(\(contentYBefore) → \(contentYAfter) pt)")
         require(pagesBefore == state.canvasPages.map(\.placement.index),
                 "the zoom keeps the same pages in the band (no page churn, no cleared canvas)")
 
         // ── ⌘+scroll is the same zoom, for the Accessibility conflict case ────────────────
         let zoomBeforeCommand = state.zoomPercent
-        let contentYBeforeCommand = CanvasGeometry.contentY(
-            viewY: anchor, scrollYPt: state.scrollYPt, zoom: state.zoomFactor
-        )
+        let contentYBeforeCommand = paperYAtPointer()
         view.scrollWheel(with: command)
         require(state.zoomPercent > zoomBeforeCommand, "⌘+scroll zooms as well")
-        require(abs(CanvasGeometry.contentY(viewY: anchor, scrollYPt: state.scrollYPt,
-                                            zoom: state.zoomFactor) - contentYBeforeCommand) < 0.5,
+        require(abs(paperYAtPointer() - contentYBeforeCommand) < 0.5,
                 "⌘+scroll is anchored at the pointer too")
 
         // ── Pinch zooms through the same anchored path ────────────────────────────────────
         let zoomBeforePinch = state.zoomPercent
-        let contentYBeforePinch = CanvasGeometry.contentY(
-            viewY: anchor, scrollYPt: state.scrollYPt, zoom: state.zoomFactor
-        )
+        let contentYBeforePinch = paperYAtPointer()
         require(state.zoomByPinch(0.1, anchorViewY: anchor), "a pinch step zooms")
         require(state.zoomPercent == zoomBeforePinch + 10, "a 0.1 pinch is ten percent")
-        require(abs(CanvasGeometry.contentY(viewY: anchor, scrollYPt: state.scrollYPt,
-                                            zoom: state.zoomFactor) - contentYBeforePinch) < 0.5,
+        require(abs(paperYAtPointer() - contentYBeforePinch) < 0.5,
                 "pinch keeps the pointer anchored as well")
 
         // ── Zooming out is anchored too ───────────────────────────────────────────────────
         let zoomBeforeOut = state.zoomPercent
-        let contentYBeforeOut = CanvasGeometry.contentY(
-            viewY: anchor, scrollYPt: state.scrollYPt, zoom: state.zoomFactor
-        )
+        let contentYBeforeOut = paperYAtPointer()
         view.scrollWheel(with: controlOut)
         require(state.zoomPercent < zoomBeforeOut, "Ctrl+scrolling the other way zooms out")
-        require(abs(CanvasGeometry.contentY(viewY: anchor, scrollYPt: state.scrollYPt,
-                                            zoom: state.zoomFactor) - contentYBeforeOut) < 0.5,
+        require(abs(paperYAtPointer() - contentYBeforeOut) < 0.5,
                 "zooming out is anchored at the pointer as well")
 
         // ── A trackpad's precise deltas accumulate instead of being dropped ───────────────

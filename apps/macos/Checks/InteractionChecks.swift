@@ -165,8 +165,7 @@ extension ReaderChecks {
                 "zooming back reuses the previous cached LOD")
 
         let text = try await engine.textPage(0)
-        let placement = engine.visiblePages(scrollYPt: 0, viewportHeightPt: 500,
-                                            gapPt: state.pageGapPt, marginPt: 0)[0]
+        let placement = state.canvasPageFrames[0]
         func point(_ index: Int) -> CGPoint {
             let char = text.chars[index]
             return CGPoint(x: placement.leftPt + char.xPt + char.widthPt / 2,
