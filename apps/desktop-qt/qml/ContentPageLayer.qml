@@ -24,6 +24,10 @@ Item {
     readonly property bool showsHover:!!hovered && (!selected || selected.id!==hovered.id)
     function clearHover(){hoverItem=null;hoverOwner=null;hoverGeneration=null;hoverRevision="";}
     onVisibleChanged:if(!visible)clearHover()
+    Connections {
+        target:layer.app
+        function onCancelContentGesture(){pointer.began=false;pointer.dragging=false;layer.editor.gesture=null;}
+    }
     Connections {target:layer.editor;function onToolChanged(){layer.clearHover();} function onModelChanged(){layer.clearHover();}}
     Connections {target:layer.app;function onCurrentReaderChanged(){layer.clearHover();} function onZoomChanged(){layer.clearHover();}}
     Connections {target:layer.app.pageList;function onContentYChanged(){layer.clearHover();} function onContentXChanged(){layer.clearHover();}}
@@ -82,9 +86,13 @@ Item {
         property bool dragging: false
         property bool began: false
         property string pressRevision: ""
+        property string pressTool:""
+        property real pressZoom:0
+        property point pressScroll
+        property size pressViewport
         property var pressOwner: null
         property var pressGeneration: null
-        function currentGesture() {return !!pressOwner && pressOwner===app.currentReader && pressGeneration===app.currentReader.documentGeneration;}
+        function currentGesture() {return !!pressOwner && pressOwner===app.currentReader && pressGeneration===app.currentReader.documentGeneration && pressTool===editor.tool && app.secondaryRow==="edit" && pressZoom===app.zoom && pressScroll.x===app.pageList.contentX && pressScroll.y===app.pageList.contentY && pressViewport.width===app.documentCanvas.width && pressViewport.height===app.documentCanvas.height;}
         function position(mouse) {
             if(layer.paperActive) {
                 if(layer.paperMap.controller!==app.currentReader)return null;
@@ -110,12 +118,12 @@ Item {
                 height:Math.max(1,Math.min(size.height,Math.max(start.y,y))-top)};
         }
         onPressed: function(mouse) {
-            began=false;dragging=false;layer.clearHover();
+            began=false;dragging=false;layer.clearHover();app.documentCanvas.dragPreview.cancel();
             const p=position(mouse);if(!p)return;
             forceActiveFocus();
             app.currentPage=layer.page;
             pressOwner=app.currentReader;pressGeneration=app.currentReader.documentGeneration;
-            began=layer.ready;pressRevision=editor.model.revision;
+            began=layer.ready;pressRevision=editor.model.revision;pressTool=editor.tool;pressZoom=app.zoom;pressScroll=Qt.point(app.pageList.contentX,app.pageList.contentY);pressViewport=Qt.size(app.documentCanvas.width,app.documentCanvas.height);
             if (!layer.ready) {editor.reload();return;}
             start=p;hit=at(start.x,start.y);
         }
@@ -125,23 +133,25 @@ Item {
             const p=position(mouse);if(!p)return;
             const x=p.x,y=p.y;
             if (Math.abs(x-start.x)+Math.abs(y-start.y)<3) return;
-            dragging=true;
+            const first=!dragging;dragging=true;
             if (["erase","blackout","link"].indexOf(editor.tool)>=0) editor.gesture=area(x,y);
             else if (hit && selected && hit.id===selected.id) {
                 const size=app.currentReader.pages[layer.page],r=hit.bounds;
+                if(first && editor.tool==="select" && hit.kind!=="link")app.documentCanvas.dragPreview.prepare(layer.page,hit.id,editor.model.revision,Qt.rect(r.x,r.y,r.width,r.height));
                 editor.gesture={x:Math.max(0,Math.min(size.width-r.width,r.x+x-start.x)),
                     y:Math.max(0,Math.min(size.height-r.height,r.y+y-start.y)),width:r.width,height:r.height};
+                if(app.documentCanvas.dragPreview.active)app.documentCanvas.dragPreview.offset=Qt.point(editor.gesture.x-r.x,editor.gesture.y-r.y);
             }
         }
         onReleased: function(mouse) {
-            if (!began || !layer.ready || !currentGesture() || pressRevision!==editor.model.revision) return;
-            began=false;
+            if (!began || !layer.ready || !currentGesture() || pressRevision!==editor.model.revision){began=false;dragging=false;editor.gesture=null;app.documentCanvas.dragPreview.cancel();return;}
+            const moved=dragging;began=false;
             const p=position(mouse);
-            if(!p){editor.gesture=null;dragging=false;hit=null;return;}
+            if(!p){editor.gesture=null;dragging=false;hit=null;app.documentCanvas.dragPreview.cancel();return;}
             const x=p.x,y=p.y;
             if (dragging && ["erase","blackout"].indexOf(editor.tool)>=0) editor.redact(area(x,y),layer.page);
             else if (dragging && editor.tool==="link") {editor.selected=null;editor.gesture=area(x,y);}
-            else if (dragging && editor.gesture && hit) {const bounds=editor.gesture;editor.gesture=null;editor.applyGeometry(hit,bounds);}
+            else if (dragging && editor.gesture && hit) {const bounds=editor.gesture;editor.gesture=null;editor.applyGeometry(hit,bounds);if(editor.pending)app.documentCanvas.dragPreview.hold(editor.pending.id);else app.documentCanvas.dragPreview.cancel();}
             else if (hit) editor.select(hit,layer.page);
             else if (editor.tool==="text") {
                 const size=app.currentReader.pages[layer.page];
@@ -150,10 +160,12 @@ Item {
                 const size=app.currentReader.pages[layer.page];
                 editor.chooseImage({x:Math.max(0,Math.min(x,size.width-150)),y:Math.max(0,Math.min(y,size.height-100)),width:Math.min(150,size.width),height:Math.min(100,size.height)},null);
             } else editor.selected=null;
+            if(!moved)app.documentCanvas.dragPreview.cancel();
         }
         onDoubleClicked: function(mouse) {const p=position(mouse);if(!p)return;const item=at(p.x,p.y);if(item && item.kind==="text")editor.editText(item,layer.page);}
-        onCanceled: {if(currentGesture())editor.gesture=null;dragging=false;began=false;}
+        onCanceled: {if(began)app.documentCanvas.dragPreview.cancel();if(currentGesture())editor.gesture=null;dragging=false;began=false;}
         Keys.onEscapePressed: {
+            app.documentCanvas.dragPreview.cancel();
             began=false;dragging=false;
             if (editor.inlineEditing) {editor.discard();return;}
             editor.gesture=null;editor.selected=null;editor.tool="select";

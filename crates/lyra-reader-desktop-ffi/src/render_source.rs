@@ -116,7 +116,7 @@ impl RenderSource {
             .map(Mutex::new)
             .map_err(|e| format!("The image preview source is unavailable: {e}"))
     }
-    pub fn image_png(&self, page: u32, target: &str, revision: &str) -> Result<Vec<u8>, String> {
+    fn image_bytes(&self) -> Result<Vec<u8>, String> {
         let source = self.image_file.as_ref().map_err(Clone::clone)?;
         let mut source = source
             .lock()
@@ -146,7 +146,47 @@ impl RenderSource {
             return Err("The image preview source changed while it was read".into());
         }
         drop(source);
-        lyra_reader_pdfium::content_edit::content_image_from_bytes(&bytes, page, target, revision)
+        Ok(bytes)
+    }
+    pub fn image_png(&self, page: u32, target: &str, revision: &str) -> Result<Vec<u8>, String> {
+        lyra_reader_pdfium::content_edit::content_image_from_bytes(
+            &self.image_bytes()?,
+            page,
+            target,
+            revision,
+        )
+        .map_err(|e| e.to_string())
+    }
+    pub fn drag_preview(
+        &self,
+        page: u32,
+        target: &str,
+        revision: &str,
+        bounds: ContentBoxRecord,
+        scale: f64,
+    ) -> Result<ContentDragPreviewRecord, String> {
+        // The shared renderer is path-based. A private, bounded copy from the pinned
+        // descriptor keeps atomic Save from redirecting this gesture to newer bytes.
+        // It lives only for this worker call; pointer updates never enter this path.
+        let bytes = self.image_bytes()?;
+        let path = std::env::temp_dir().join(format!("LyraReaderDrag-{}", crate::marks::uuid()?));
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&path).map_err(|e| e.to_string())?;
+        let directory = OwnedDirectory(path);
+        let pdf = directory.0.join("source.pdf");
+        fs::write(&pdf, &bytes).map_err(|e| e.to_string())?;
+        drop(bytes);
+        // Locals drop in reverse order: close the PDF before removing its private file.
+        let engine = LyraReaderEngine::new()
+            .open_document(pdf.to_string_lossy().into_owned(), None)
+            .map_err(|e| e.to_string())?;
+        engine
+            .content_drag_preview(page, target.into(), revision.into(), bounds, scale)
             .map_err(|e| e.to_string())
     }
     pub fn query(&self, request: Value) -> Result<Value, String> {

@@ -8,6 +8,21 @@ Item {
     required property var app
     property alias view: pageList
     property alias annotationNotePaper: annotationPaper
+    property alias dragPreview:contentDrag
+    readonly property var dragFrame:contentDrag.page>=0 ? pageFrame(contentDrag.page,placementEpoch) : null
+    ContentDragPreview {
+        id:contentDrag;objectName:"contentDragPreview"
+        parent:canvas.dragFrame && canvas.dragFrame.dragHost ? canvas.dragFrame.dragHost : canvas
+        anchors.fill:parent;visible:active && !!canvas.dragFrame
+        controller:app.currentReader;paperMap:canvas.dragFrame ? canvas.dragFrame.paperMap : null
+        zoom:app.zoom;paperAppearance:app.paperAppearance
+        Component.onCompleted:attachOwner(canvas)
+        onStateChanged:if(error.length)app.operationStatus=qsTr("Object preview unavailable. You can still move the object.")
+    }
+    onWidthChanged:if(contentDrag.active)contentDrag.cancel()
+    onHeightChanged:if(contentDrag.active)contentDrag.cancel()
+    Connections {target:canvas.app;function onSecondaryRowChanged(){if(canvas.app.secondaryRow!=="edit")contentDrag.cancel();}}
+    Connections {target:pageList;function onMovementStarted(){contentDrag.cancel();}function onContentYChanged(){if(contentDrag.active && !contentDrag.holding)contentDrag.cancel();}function onContentXChanged(){if(contentDrag.active && !contentDrag.holding)contentDrag.cancel();}}
     // Rust owns row grouping, unequal facing heights and the last-row gap. The shell only
     // attaches the corresponding existing page objects for its visual Repeater.
     readonly property var rows: app.currentReader.layoutRows.map(function(row) {
@@ -142,7 +157,7 @@ Item {
             const sheet=item.pageSheets.itemAt(index);
             if(sheet && sheet.modelData.index===page)
                 return {x:item.x+sheet.x-pageList.contentX,y:item.y+sheet.y-pageList.contentY,
-                    width:sheet.width,height:sheet.height,paperMap:sheet.paperMap};
+                    width:sheet.width,height:sheet.height,paperMap:sheet.paperMap,dragHost:sheet.dragHost};
         }
         return null;
     }
@@ -269,6 +284,7 @@ Item {
         positioning=prior;
     }
     function navigate(page, y) {
+        if(contentDrag.active && (!app.positionRestoring || contentDrag.page!==page))contentDrag.cancel();
         stopPaperZoomSettlement();++interactionEpoch;positioning=true;paperTailPixels=0;paperTailId="";
         const row=pageRows[page];
         if(row===undefined){positioning=false;return;}
@@ -324,6 +340,7 @@ Item {
             pageList.contentX = Math.max(0, Math.min(pageList.contentWidth - pageList.width, left - 24));
     }
     function changeZoom(value, anchorX, anchorY) {
+        if(contentDrag.active)contentDrag.cancel();
         stopPaperZoomSettlement();++interactionEpoch;
         const cardFrame=regionCardFrame(app.currentReader);
         const card=app.regionPaper;
@@ -411,6 +428,7 @@ Item {
                 delegate: Rectangle {
                     id: sheet
                     property alias paperMap: pdfPage
+                    property alias dragHost: objectDragHost
                     required property var modelData
                     readonly property var displayGeometry:canvas.paperActive ? canvas.paperState.pages[modelData.index] : modelData
                     function syncPaper() {
@@ -448,6 +466,7 @@ Item {
                         Accessible.role: Accessible.Graphic
                         Accessible.name: qsTr("PDF page %1").arg(sheet.modelData.index + 1)
                     }
+                    Item {id:objectDragHost;anchors.fill:parent;clip:true}
                     AnnotationsLayer {
                         anchors.fill: parent
                         app: canvas.app

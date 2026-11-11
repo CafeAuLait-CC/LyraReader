@@ -33,6 +33,7 @@ add_custom_target(lyra_reader_build
     VERBATIM)
 add_dependencies(lyra_reader_rust lyra_reader_build)
 add_library(lyrareader_shell STATIC src/QuitCoordinator.cpp src/QuitCoordinator.h src/SignatureArtwork.cpp src/SignatureArtwork.h src/DisplayCalibration.cpp src/DisplayCalibration.h src/AuxiliaryWindowPolicy.cpp src/AuxiliaryWindowPolicy.h src/ReaderController.cpp src/ReaderController.h src/ReaderAi.cpp src/PageItem.cpp src/PageItem.h src/CropItem.cpp src/CropItem.h src/WorkspaceController.cpp src/WorkspaceController.h src/CredentialStore.cpp src/CredentialStore.h src/AnnotationOverlay.cpp src/AnnotationOverlay.h src/PaperAppearance.cpp src/PaperAppearance.h src/PdfPrintJob.cpp src/PdfPrintJob.h src/RasterCache.cpp src/RasterCache.h src/RasterJobs.cpp src/RasterJobs.h src/RenderBudget.cpp src/RenderBudget.h src/BudgetedTexture.cpp src/BudgetedTexture.h src/NativeRaster.cpp src/NativeRaster.h src/PreviewController.cpp src/PreviewController.h)
+target_sources(lyrareader_shell PRIVATE src/ContentDragItem.cpp src/ContentDragItem.h)
 target_include_directories(lyrareader_shell PUBLIC src)
 target_sources(lyrareader_shell PRIVATE src/ReaderDocumentReading.cpp src/ReaderRegionPersistence.cpp)
 target_sources(lyrareader_shell PRIVATE src/FileDialogNavigation.cpp src/FileDialogNavigation.h)

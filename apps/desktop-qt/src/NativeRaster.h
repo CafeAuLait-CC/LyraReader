@@ -20,6 +20,8 @@ public:
     QVariantMap indexStatistics()const;
     QImage crop(int page, const QRectF &region, double scale, bool annotated, bool transparent,
                 QString *error, double *actualScale = nullptr) const;
+    struct DragImages {QImage background,foreground;};
+    DragImages dragPreview(int page,const QString &target,const QString &revision,const QRectF &region,double scale,QString *error)const;
     QImage contentImage(int page,const QString &target,const QString &revision,const QSize &bounds,
                         qint64 maximumBytes,QString *error)const;
 private:

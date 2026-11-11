@@ -5,6 +5,7 @@
 #include "AuxiliaryWindowPolicy.h"
 #include "PageItem.h"
 #include "CropItem.h"
+#include "ContentDragItem.h"
 #include "ReaderController.h"
 #include "WorkspaceController.h"
 #include "QuitCoordinator.h"
@@ -77,6 +78,7 @@ int main(int argc, char **argv) {
     qmlRegisterType<AuxiliaryWindowPolicy>("LyraReader",1,0,"AuxiliaryWindowPolicy");
     qmlRegisterType<PageItem>("LyraReader", 1, 0, "PdfPage");
     qmlRegisterType<CropItem>("LyraReader",1,0,"PdfCrop");
+    qmlRegisterType<ContentDragItem>("LyraReader",1,0,"ContentDragPreview");
     qmlRegisterType<AnnotationOverlay>("LyraReader",1,0,"PdfAnnotations");
     std::function<QQuickWindow *(const QUrl &,int,double)> createWindow;
     createWindow = [&](const QUrl &url,int page,double y) -> QQuickWindow * {

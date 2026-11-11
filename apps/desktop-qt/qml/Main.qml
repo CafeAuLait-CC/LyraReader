@@ -9,6 +9,7 @@ import "ReaderLogic.js" as Logic
 
 ApplicationWindow {
     id: root
+    signal cancelContentGesture()
     objectName: "readerWindow"
     visible: true
     width: 1200
@@ -1985,6 +1986,7 @@ ApplicationWindow {
         enabled: root.readerKeyboardEnabled
         sequence: "Escape"
         onActivated: {
+            if(documentCanvas.dragPreview.active || secondaryRow==="edit"){documentCanvas.dragPreview.cancel();cancelContentGesture();}
             if(placedTextController.waitingForCreation)placedTextController.cancelPendingCreation();
             if(placedTextController.current){placedTextController.finish(true);return;}
             if(contentController.inlineEditing && contentController.textDraft){contentController.discard();return;}

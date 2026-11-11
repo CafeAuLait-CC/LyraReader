@@ -2,7 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 
-inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 11;
+inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 12;
 
 // Owned Rust allocations: free each Buffer exactly once using buffer_free.
 // Output buffers must be zero initialized; calls do not free previous contents.
@@ -111,6 +111,13 @@ LyraReaderSelectionStatus lyra_reader_desktop_selection_text(const LyraReaderDes
 std::size_t lyra_reader_desktop_selection_copy_limit();
 bool lyra_reader_desktop_selection_copy_text(const std::uint8_t *text,std::size_t text_len,
     LyraReaderBuffer *output,LyraReaderBuffer *error);
+// One detached, immutable crop pair; all dimensions are checked before allocating.
+// Each output owns pixels freed once with buffer_free. Null/aliased/misaligned outputs fail.
+std::size_t lyra_reader_desktop_drag_pair_limit();
+bool lyra_reader_desktop_drag_preview(const LyraReaderRenderSource *,std::uint32_t page,
+    const std::uint8_t *target,std::size_t target_len,const std::uint8_t *revision,std::size_t revision_len,
+    double x,double y,double width,double height,double scale,
+    LyraReaderBitmap *background,LyraReaderBitmap *foreground,LyraReaderBuffer *error);
 double lyra_reader_desktop_zoom_offset(double offset, double anchor, double old_zoom, double new_zoom);
 // Pure shared policy: zero means no fit/no change, never a valid percentage.
 std::uint32_t lyra_reader_desktop_fit_percent(bool fit_page, double page_width, double page_height,

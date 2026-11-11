@@ -8,6 +8,7 @@ mod content;
 mod document;
 mod document_cache;
 mod draft_store;
+mod drag_preview;
 mod exports;
 mod knowledge;
 mod marks;
@@ -32,7 +33,7 @@ use std::{
 /// Version of the Qt boundary, including cache-only selection and clipboard adapters.
 #[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_desktop_abi_version() -> u32 {
-    11
+    12
 }
 
 /// Maximum caller-supplied glyph/figure boxes before paper placement allocates snapshots.
@@ -1442,7 +1443,7 @@ mod tests {
 
     #[test]
     fn image_byte_boundary_rejects_null_handles_and_reports_its_version() {
-        assert_eq!(lyra_reader_desktop_abi_version(), 11);
+        assert_eq!(lyra_reader_desktop_abi_version(), 12);
         assert_eq!(
             lyra_reader_desktop_paper_geometry_limit(),
             lyra_reader_session::paper::MAX_PAPER_GEOMETRY_ITEMS

@@ -128,6 +128,16 @@ QImage NativeRasterSource::crop(int page,const QRectF &region,double scale,bool 
     auto *pixels=new LyraReaderBuffer(bitmap.pixels);
     return QImage(pixels->data,int(bitmap.width),int(bitmap.height),int(bitmap.stride),QImage::Format_ARGB32,releasePixels,pixels);
 }
+NativeRasterSource::DragImages NativeRasterSource::dragPreview(int page,const QString &target,const QString &revision,const QRectF &region,double scale,QString *error)const {
+    if(page<0 || target.size()>4096 || revision.size()>128){*error=QStringLiteral("Invalid object preview identity.");return {};}
+    const auto id=target.toUtf8(),version=revision.toUtf8();LyraReaderBitmap bg{},fg{};LyraReaderBuffer failure{};
+    if(!lyra_reader_desktop_drag_preview(m_source.get(),std::uint32_t(page),reinterpret_cast<const std::uint8_t *>(id.constData()),std::size_t(id.size()),reinterpret_cast<const std::uint8_t *>(version.constData()),std::size_t(version.size()),region.x(),region.y(),region.width(),region.height(),scale,&bg,&fg,&failure)){*error=takeError(failure);return {};}
+    const auto cleanup=qScopeGuard([&]{lyra_reader_desktop_buffer_free(bg.pixels);lyra_reader_desktop_buffer_free(fg.pixels);});
+    const auto valid=[](const LyraReaderBitmap &b){return b.pixels.data && b.width>0 && b.height>0 && b.width<=8192 && b.height<=8192 && b.stride>=std::uint64_t(b.width)*4 && b.pixels.len==std::uint64_t(b.stride)*b.height && b.pixels.len<=lyra_reader_desktop_drag_pair_limit()/2;};
+    if(!valid(bg) || !valid(fg) || bg.width!=fg.width || bg.height!=fg.height || bg.stride!=fg.stride){*error=QStringLiteral("Invalid object preview pixels.");return {};}
+    const auto take=[](LyraReaderBitmap &b){auto *pixels=new LyraReaderBuffer(b.pixels);b.pixels={};return QImage(pixels->data,int(b.width),int(b.height),int(b.stride),QImage::Format_ARGB32,releasePixels,pixels);};
+    return {take(bg),take(fg)};
+}
 QImage NativeRasterSource::contentImage(int page,const QString &target,const QString &revision,
                                       const QSize &bounds,qint64 maximumBytes,QString *error)const {
     if(page<0 || bounds.isEmpty() || bounds.width()>2048 || bounds.height()>2048 || maximumBytes<4){*error=QStringLiteral("Invalid image preview dimensions.");return {};}
