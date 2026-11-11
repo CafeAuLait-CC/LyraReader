@@ -270,6 +270,74 @@ extension ReaderChecks {
                 "a rejected page does not extract")
         }
 
+        // A source-ordered range can contain margin counters between every two body lines.
+        // Rust supplies the same exclusions to the prepared cache and Swift's miss fallback.
+        do {
+            let source = fixtures.appendingPathComponent("two-column-line-numbers.pdf")
+            let engine = LyraReaderBindings.LyraReaderEngine()
+            let document = try engine.openDocument(path: source.path, password: nil)
+            let record = try document.textPage(page: 0)
+            let local = localTextPage(record)
+            require(record.selectionExcludedIndices.count == 60,
+                    "both interleaved line-number gutters are recognized")
+            let upper = record.chars.count - 1
+            let copied = local.string(in: 0...upper)
+            let cached = try document.textRangeString(page: 0, start: 0, end: UInt32(upper))
+            require(copied == cached && !copied.contains("001") && !copied.contains("020")
+                    && copied.contains("42") && copied.contains("[12]"),
+                    "Rust selection and Swift fallback copy prose without margin counters and keep inline numbers")
+            require(local.selectionRects(in: 0...upper).allSatisfy { $0.minX >= 59 && $0.maxX < 565 },
+                    "selection highlights do not cover either gutter")
+            require(record.text.contains("001") && record.text.contains("020")
+                    && local.chars.count == record.chars.count,
+                    "raw text and original character indices remain complete")
+            let wrapper = try RustEngine()
+            _ = try wrapper.openDocument(at: source)
+            let live = try await wrapper.textPage(0)
+            require(live.string(in: 0...upper) == copied && live.selectionRects(in: 0...upper) == local.selectionRects(in: 0...upper),
+                    "the production loading path uses the same exclusions for text and highlights")
+        }
+
+        do {
+            let source = fixtures.appendingPathComponent("selection-discretionary-hyphens.pdf")
+            let wrapper = try RustEngine()
+            let state = AppState(engine: wrapper)
+            state.setViewportSize(CGSize(width: 1000, height: 800))
+            state.newTab(url: source)
+            let page = try await wrapper.textPage(0)
+            let range = 0...(page.chars.count - 1)
+            let raw = page.string(in: range)
+            require(raw.contains("\u{2}"), "the PDF fixture produces real discretionary hyphen markers")
+            let copied = page.copyText(in: range)
+            require(!copied.contains("\u{2}") && copied.contains("conditioning") && copied.contains("ordinary")
+                    && !copied.contains("con ditioning") && !copied.contains("ordi nary")
+                    && copied.contains("fine-grained") && copied.contains("Time-Aware"),
+                    "copy joins wrapped words while preserving actual hyphens")
+            require(page.string(in: range) == raw,
+                    "copy normalization leaves raw text and character indices unchanged")
+            let rects = page.selectionRects(in: range)
+            let first = try required(rects.first, "the copy fixture has first-line geometry")
+            let last = try required(rects.last, "the copy fixture has last-line geometry")
+            try await eventually("the canvas text can be selected for copying") {
+                guard let placement = state.canvasPageFrames.first(where: { $0.index == 0 }) else { return false }
+                state.beginSelection(at: CGPoint(x: placement.leftPt + first.minX + 1,
+                    y: placement.topPt + first.midY))
+                return state.selection != nil
+            }
+            let placement = state.canvasPageFrames.first { $0.index == 0 }!
+            let end = CGPoint(x: placement.leftPt + last.maxX - 1, y: placement.topPt + last.midY)
+            state.extendSelection(to: end)
+            state.endPointerInteraction(at: end, wasClick: false)
+            let pasteboard = NSPasteboard.withUniqueName()
+            defer { pasteboard.releaseGlobally() }
+            state.copySelection(to: pasteboard)
+            let clipboard = pasteboard.string(forType: .string) ?? ""
+            require(clipboard.contains("conditioning") && clipboard.contains("ordinary")
+                    && !clipboard.contains("\u{2}") && !clipboard.contains("001")
+                    && clipboard.contains("fine-grained"),
+                    "the canvas copy action writes cleaned text without line numbers to the pasteboard")
+        }
+
         let diagnosticEngine = LyraReaderBindings.LyraReaderEngine()
         let diagnosticDocument = try diagnosticEngine.openDocument(
             path: multipage.path, password: nil)
@@ -294,7 +362,8 @@ extension ReaderChecks {
                     widthPt: CGFloat($0.widthPt), heightPt: CGFloat($0.heightPt))
             },
             text: record.text,
-            hasUnicodeMapError: record.hasUnicodeMapError)
+            hasUnicodeMapError: record.hasUnicodeMapError,
+            selectionExcludedIndices: record.selectionExcludedIndices.map(Int.init))
     }
 
     @MainActor private static func textPoint(

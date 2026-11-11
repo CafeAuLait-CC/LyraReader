@@ -16,11 +16,34 @@ extension ReaderChecks {
         window.contentView = host
         window.orderFrontRegardless()
         defer { window.orderOut(nil) }
+        func firstCanvas(in view: NSView) -> MetalCanvasView? {
+            if let canvas = view as? MetalCanvasView { return canvas }
+            return view.subviews.lazy.compactMap { firstCanvas(in: $0) }.first
+        }
+        try await eventually("the note reader canvas attaches",
+                             { firstCanvas(in: host)?.hasAttachedSurface == true })
+        try await eventually("the note canvas viewport reaches the reader",
+                             { state.canvasViewportWidthPt > 0 })
+        // Pin the CI runner's 38 ppi virtual-display geometry (factor 0.5278) after the canvas
+        // reported its real screen. A developer display is 1.5× and would otherwise never open
+        // the note on the fit path this check must keep independent of the PDF position.
+        state.setDisplayCalibration(DisplayCalibration(factor: 0.5278))
         state.open(url: url)
         try await eventually("note fixture is loaded in the reader", { !state.documentNotes.isEmpty })
+        // At this calibration the page is smaller than the canvas, so the reader's fit path is
+        // the one that runs on CI. Fit explicitly so the scenario is the same on every display:
+        // a fitted first page must keep `scrollYPt` non-negative, and scrolling the note paper
+        // must not move that PDF offset at all.
+        state.zoomFitPage()
+        require(state.zoomPercent > 100,
+                "the low-density note fixture takes the Fit Page path (\(state.zoomPercent)%)")
+        require(state.scrollYPt >= 0,
+                "Fit Page keeps the offset non-negative on the note page")
         guard let note = state.documentNotes.first, let box = note.boxes.first,
-              let placement = engine.visiblePages(scrollYPt: state.scrollYPt, viewportHeightPt: 700,
-                                                    gapPt: state.pageGapPt, marginPt: 0).first(where: { $0.index == note.page })
+              let placement = state.canvasPageFrames.first(where: { $0.index == note.page })
+                ?? engine.visiblePages(scrollYPt: state.scrollYPt, viewportHeightPt: 700,
+                                       gapPt: state.pageGapPt, marginPt: 0)
+                    .first(where: { $0.index == note.page })
         else { fatalError("FAIL: the note has a visible placement") }
         let point = CGPoint(x: placement.leftPt + box.xPt + box.widthPt / 2,
                             y: placement.topPt + box.yPt + box.heightPt / 2)

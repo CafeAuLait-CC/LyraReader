@@ -823,15 +823,14 @@ impl LyraReaderEngine {
 
 /// Which fit preset a zoom request asks for.
 ///
-/// `FitPage` is the shipping macOS "Fit Page": it fits the page's **height** only. Width is
-/// `FitWidth`'s job, and a page shorter than the window stays vertically scrollable.
+/// `FitPage` fits the entire page or facing row into both viewport axes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum ZoomModeRecord {
     /// A toolbar/pointer step from `percent` by `delta`, clamped to the reader's range.
     Percent,
     /// Fit the page width into the viewport width, leaving the preset inset per side.
     FitWidth,
-    /// Fit the page height into the viewport height, leaving the preset inset per side.
+    /// Fit the entire page or facing row, leaving the preset inset per side.
     FitPage,
 }
 
@@ -847,11 +846,11 @@ pub struct ZoomPolicyRecord {
     pub percent: u32,
     /// Step in whole percent, for `Percent` (may be negative).
     pub delta: i32,
-    /// Page (or facing-row) width at 100%, for `FitWidth`.
+    /// Page (or facing-row) width at 100%, for either fit preset.
     pub page_width_pt: f64,
     /// Page (or facing-row) height at 100%, for `FitPage`.
     pub page_height_pt: f64,
-    /// Viewport width, for `FitWidth`.
+    /// Viewport width, for either fit preset.
     pub viewport_width_pt: f64,
     /// Viewport height, for `FitPage`.
     pub viewport_height_pt: f64,
@@ -893,25 +892,42 @@ pub fn clamp_scroll(offset_pt: f64, content_height_pt: f64, viewport_height_pt: 
 /// The Fit Page percentage a viewport-height change (resize/fullscreen) should adopt.
 ///
 /// `Some(percent)` means the shell must apply that percentage; `None` means keep the current
-/// zoom. Only a single-page document participates, and only while `current_percent` is below the
-/// fit — a reader already at or above the fit is never shrunk. Multi-page documents always
-/// return `None`; their viewport change only tightens the scroll range. See
-/// `lyra_reader_session::fit_page_on_viewport_change`.
+/// zoom. Any nonempty document participates; the current page or spread must fit both axes.
 #[uniffi::export]
-pub fn fit_page_on_viewport_change(
-    page_count: u32,
-    current_percent: u32,
-    page_height_pt: f64,
-    viewport_height_pt: f64,
-    calibration: f64,
-) -> Option<u32> {
+pub fn fit_page_on_viewport_change(page_count: u32, policy: ZoomPolicyRecord) -> Option<u32> {
     lyra_reader_session::fit_page_on_viewport_change(
         page_count,
-        current_percent,
+        policy.percent,
+        lyra_reader_core::Size::new(policy.page_width_pt, policy.page_height_pt),
+        lyra_reader_core::Size::new(policy.viewport_width_pt, policy.viewport_height_pt),
+        policy.calibration,
+    )
+}
+
+/// Content-space padding and row gap for the fitted page's presentation.
+#[derive(Clone, Copy, Debug, uniffi::Record)]
+pub struct FitPageSpacingRecord {
+    pub inset_pt: f64,
+    pub gap_pt: f64,
+}
+
+#[uniffi::export]
+pub fn fit_page_spacing(
+    page_height_pt: f64,
+    viewport_height_pt: f64,
+    zoom: f64,
+    preferred_gap_pt: f64,
+) -> Option<FitPageSpacingRecord> {
+    lyra_reader_session::fit_page_spacing(
         page_height_pt,
         viewport_height_pt,
-        calibration,
+        zoom,
+        preferred_gap_pt,
     )
+    .map(|spacing| FitPageSpacingRecord {
+        inset_pt: spacing.inset_pt,
+        gap_pt: spacing.gap_pt,
+    })
 }
 
 /// Lowest offered zoom percentage; the shell reads it instead of hard-coding 25.
@@ -1191,6 +1207,12 @@ pub fn plan_tiles(request: TilePlanRequestRecord) -> Option<TilePlanRecord> {
     })
 }
 
+/// Join discretionary word breaks after extracting a selection, without changing PDF indices.
+#[uniffi::export]
+pub fn selection_copy_text(text: String) -> String {
+    lyra_reader_text::normalize_copied_text(&text)
+}
+
 /// `Page 3`, `Pages 1-3`, `Pages 1, 3, 5` (1-based, sorted and de-duplicated).
 #[uniffi::export]
 pub fn page_label(pages: Vec<u32>) -> String {
@@ -1283,6 +1305,13 @@ pub struct PageBitmap {
     /// a sane memory budget until tiles land (T1.5).
     pub scale_used: f64,
     pub pixels: Vec<u8>,
+}
+
+/// Two bounded region bitmaps, in the same page-local rectangle.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ContentDragPreviewRecord {
+    pub background: PageBitmap,
+    pub foreground: PageBitmap,
 }
 
 /// Where a metadata field came from, as the panel shows it.
@@ -1833,32 +1862,20 @@ impl LyraReaderDocument {
         annotations: bool,
     ) -> Result<PageBitmap, LyraReaderFfiError> {
         let (x_pt, y_pt, width_pt, height_pt) = region;
-        if !(scale.is_finite() && scale > 0.0) {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                severity: ErrorSeverity::Document,
-                message: format!("scale must be positive and finite, got {scale}"),
-            });
-        }
-        self.validate_view_region(page, region)?;
-
-        // A caller can request an arbitrary region, so apply the same pixel and edge limits as a
-        // whole-page bitmap before asking PDFium to allocate it.
-        let scale = clamp_scale((width_pt, height_pt), scale);
-        if !(scale.is_finite() && scale > 0.0 && (scale as f32) > 0.0) {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                severity: ErrorSeverity::Document,
-                message: "region dimensions exceed the renderer's supported range".to_string(),
-            });
-        }
-        let mut request =
-            RasterRequest::tile(PageIndex(page), scale, (x_pt, y_pt), (width_pt, height_pt));
+        let mut request = region_raster_request(
+            self,
+            page,
+            scale,
+            ContentBoxRecord {
+                x: x_pt,
+                y: y_pt,
+                width: width_pt,
+                height: height_pt,
+            },
+            transparent_background,
+        )?;
         request.flags.annotations = annotations;
-        if transparent_background {
-            // A zero-alpha clear: the page background stays clear, the content PDFium draws
-            // supplies the coverage alpha. The RGB of a fully clear pixel is irrelevant to
-            // alpha-over, which weights it by zero.
-            request.background = [0, 0, 0, 0];
-        }
+        let scale = request.scale;
         let tile = self.backend.rasterize(&request)?;
 
         Ok(PageBitmap {
@@ -2307,8 +2324,9 @@ impl LyraReaderDocument {
     pub fn text_page(&self, page: u32) -> Result<TextPage, LyraReaderFfiError> {
         let model = self.extract_text_page(page)?;
         let selection = Arc::new(lyra_reader_text::SelectionTextPage::new(model.clone()));
+        let record = text_page_record(page, &model, selection.layout().excluded_indices().to_vec());
         self.retain_selection_text_page(page, selection);
-        Ok(text_page_record(page, &model))
+        Ok(record)
     }
 
     /// Line-aware hit test (Swift `TextPage.characterIndex`), served from the page cache.
@@ -3065,6 +3083,37 @@ impl LyraReaderDocument {
         serde_json::to_string(&snapshot).map_err(|e| LyraReaderFfiError::InvalidArgument {
             severity: ErrorSeverity::Document,
             message: e.to_string(),
+        })
+    }
+
+    /// Transient pixels for a live drag; only the detached render copy changes.
+    pub fn content_drag_preview(
+        &self,
+        page: u32,
+        target: String,
+        revision: String,
+        bounds: ContentBoxRecord,
+        scale: f64,
+    ) -> Result<ContentDragPreviewRecord, LyraReaderFfiError> {
+        let request = region_raster_request(self, page, scale, bounds, false)?;
+        let preview = lyra_reader_pdfium::content_edit::content_drag_preview(
+            Path::new(&self.path),
+            &target,
+            &revision,
+            &request,
+        )?;
+        let bitmap = |tile: lyra_reader_core::RasterTile| PageBitmap {
+            width_px: tile.size.width as u32,
+            height_px: tile.size.height as u32,
+            stride: tile.stride as u32,
+            width_pt: bounds.width,
+            height_pt: bounds.height,
+            scale_used: request.scale,
+            pixels: tile.pixels,
+        };
+        Ok(ContentDragPreviewRecord {
+            background: bitmap(preview.background),
+            foreground: bitmap(preview.foreground),
         })
     }
 
@@ -6253,6 +6302,47 @@ fn clamp_scale(page_size_pt: (f64, f64), requested: f64) -> f64 {
     scale
 }
 
+fn region_raster_request(
+    document: &LyraReaderDocument,
+    page: u32,
+    scale: f64,
+    bounds: ContentBoxRecord,
+    transparent_background: bool,
+) -> Result<RasterRequest, LyraReaderFfiError> {
+    let ContentBoxRecord {
+        x: x_pt,
+        y: y_pt,
+        width: width_pt,
+        height: height_pt,
+    } = bounds;
+    if !(scale.is_finite() && scale > 0.0) {
+        return Err(LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
+            message: format!("scale must be positive and finite, got {scale}"),
+        });
+    }
+    document.validate_view_region(page, (x_pt, y_pt, width_pt, height_pt))?;
+
+    // A caller can request an arbitrary region, so apply the same pixel and edge limits as a
+    // whole-page bitmap before asking PDFium to allocate it.
+    let scale = clamp_scale((width_pt, height_pt), scale);
+    if !(scale.is_finite() && scale > 0.0 && (scale as f32) > 0.0) {
+        return Err(LyraReaderFfiError::InvalidArgument {
+            severity: ErrorSeverity::Document,
+            message: "region dimensions exceed the renderer's supported range".to_string(),
+        });
+    }
+    let mut request =
+        RasterRequest::tile(PageIndex(page), scale, (x_pt, y_pt), (width_pt, height_pt));
+    if transparent_background {
+        // A zero-alpha clear: the page background stays clear, the content PDFium draws
+        // supplies the coverage alpha. The RGB of a fully clear pixel is irrelevant to
+        // alpha-over, which weights it by zero.
+        request.background = [0, 0, 0, 0];
+    }
+    Ok(request)
+}
+
 /// One link: a clickable box plus where it leads.
 #[derive(Debug, Clone, uniffi::Record)]
 #[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
@@ -8251,6 +8341,8 @@ pub struct TextPage {
     pub text: String,
     /// The Unicode mapping has errors, which makes search unreliable.
     pub has_unicode_map_error: bool,
+    /// Original character indices of manuscript line numbers, excluded only from selection.
+    pub selection_excluded_indices: Vec<u32>,
 }
 
 /// One closed character range into a page's text layer.
@@ -8261,7 +8353,11 @@ pub struct TextRange {
 }
 
 /// Convert the Rust text model into the FFI record.
-fn text_page_record(page: u32, model: &lyra_reader_text::TextPage) -> TextPage {
+fn text_page_record(
+    page: u32,
+    model: &lyra_reader_text::TextPage,
+    selection_excluded_indices: Vec<u32>,
+) -> TextPage {
     TextPage {
         page,
         chars: model
@@ -8277,6 +8373,7 @@ fn text_page_record(page: u32, model: &lyra_reader_text::TextPage) -> TextPage {
             .collect(),
         text: model.text.clone(),
         has_unicode_map_error: model.has_unicode_map_error,
+        selection_excluded_indices,
     }
 }
 

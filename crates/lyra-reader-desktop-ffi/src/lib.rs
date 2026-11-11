@@ -28,10 +28,10 @@ use std::{
     ptr, slice,
 };
 
-/// Version of the Qt boundary, including the shared paper-geometry admission limit.
+/// Version of the Qt boundary, including both axes of the shared viewport-fit policy.
 #[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_desktop_abi_version() -> u32 {
-    9
+    10
 }
 
 /// Maximum caller-supplied glyph/figure boxes before paper placement allocates snapshots.
@@ -656,23 +656,52 @@ pub extern "C" fn lyra_reader_desktop_fit_percent(
     .unwrap_or(0) // Explicit optional-result sentinel, never a valid percentage.
 }
 
-/// Zero means retain the current percentage; the single-page decision lives in session.
+/// Zero means retain the current percentage; the page/spread decision lives in session.
 #[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_desktop_viewport_fit(
     page_count: u32,
     current_percent: u32,
+    page_width: f64,
     page_height: f64,
+    viewport_width: f64,
     viewport_height: f64,
     calibration: f64,
 ) -> u32 {
     lyra_reader_session::fit_page_on_viewport_change(
         page_count,
         current_percent,
-        page_height,
-        viewport_height,
+        lyra_reader_core::Size::new(page_width, page_height),
+        lyra_reader_core::Size::new(viewport_width, viewport_height),
         calibration,
     )
     .unwrap_or(0) // A no-change result is not replaced with a new zoom.
+}
+
+/// Native projection of shared content-space Fit Page spacing. NaN fields mean invalid input.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct NativeFitPageSpacing {
+    pub inset_pt: f64,
+    pub gap_pt: f64,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lyra_reader_desktop_fit_page_spacing(
+    page_height: f64,
+    viewport_height: f64,
+    zoom: f64,
+    preferred_gap: f64,
+) -> NativeFitPageSpacing {
+    match lyra_reader_session::fit_page_spacing(page_height, viewport_height, zoom, preferred_gap) {
+        Some(spacing) => NativeFitPageSpacing {
+            inset_pt: spacing.inset_pt,
+            gap_pt: spacing.gap_pt,
+        },
+        None => NativeFitPageSpacing {
+            inset_pt: f64::NAN,
+            gap_pt: f64::NAN,
+        },
+    }
 }
 
 /// NaN means the shell's transient layout has no usable range; keep its previous offset.
@@ -1369,19 +1398,19 @@ mod tests {
             104
         );
         assert_eq!(
-            lyra_reader_desktop_viewport_fit(1, 100, 842.0, 900.0, 1.0),
+            lyra_reader_desktop_viewport_fit(1, 100, 595.0, 842.0, 900.0, 900.0, 1.0),
             104
         );
         assert_eq!(
-            lyra_reader_desktop_viewport_fit(1, 104, 842.0, 900.0, 1.0),
+            lyra_reader_desktop_viewport_fit(1, 104, 595.0, 842.0, 900.0, 900.0, 1.0),
             0
         );
         assert_eq!(
-            lyra_reader_desktop_viewport_fit(2, 25, 842.0, 900.0, 1.0),
-            0
+            lyra_reader_desktop_viewport_fit(2, 25, 595.0, 842.0, 900.0, 900.0, 1.0),
+            104
         );
         assert_eq!(
-            lyra_reader_desktop_viewport_fit(1, 100, 842.0, 582.0, 0.5278),
+            lyra_reader_desktop_viewport_fit(1, 100, 595.0, 842.0, 700.0, 582.0, 0.5278),
             127
         );
         assert_eq!(
@@ -1391,6 +1420,14 @@ mod tests {
         assert_eq!(
             lyra_reader_desktop_fit_percent(true, 595.0, 842.0, 900.0, f64::NAN, 1.0),
             0
+        );
+        let spacing = lyra_reader_desktop_fit_page_spacing(842.0, 900.0, 1.04, 0.0);
+        assert!((spacing.inset_pt * 2.0 + 842.0 - 900.0 / 1.04).abs() < 1e-10);
+        assert_eq!(spacing.gap_pt, spacing.inset_pt * 2.0);
+        assert!(
+            lyra_reader_desktop_fit_page_spacing(842.0, 900.0, 0.0, 0.0)
+                .inset_pt
+                .is_nan()
         );
         assert_eq!(lyra_reader_desktop_clamp_scroll(-5.0, 1000.0, 300.0), 0.0);
         assert_eq!(
@@ -1404,7 +1441,7 @@ mod tests {
 
     #[test]
     fn image_byte_boundary_rejects_null_handles_and_reports_its_version() {
-        assert_eq!(lyra_reader_desktop_abi_version(), 9);
+        assert_eq!(lyra_reader_desktop_abi_version(), 10);
         assert_eq!(
             lyra_reader_desktop_paper_geometry_limit(),
             lyra_reader_session::paper::MAX_PAPER_GEOMETRY_ITEMS

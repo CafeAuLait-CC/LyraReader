@@ -2,7 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 
-inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 9;
+inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 10;
 
 // Owned Rust allocations: free each Buffer exactly once using buffer_free.
 // Output buffers must be zero initialized; calls do not free previous contents.
@@ -108,7 +108,10 @@ double lyra_reader_desktop_zoom_offset(double offset, double anchor, double old_
 std::uint32_t lyra_reader_desktop_fit_percent(bool fit_page, double page_width, double page_height,
     double viewport_width, double viewport_height, double calibration);
 std::uint32_t lyra_reader_desktop_viewport_fit(std::uint32_t page_count, std::uint32_t current_percent,
-    double page_height, double viewport_height, double calibration);
+    double page_width, double page_height, double viewport_width, double viewport_height, double calibration);
 // NaN means no usable transient layout range; retain the previous offset.
+struct LyraReaderFitPageSpacing { double inset_pt; double gap_pt; };
+LyraReaderFitPageSpacing lyra_reader_desktop_fit_page_spacing(double page_height, double viewport_height,
+    double zoom, double preferred_gap);
 double lyra_reader_desktop_clamp_scroll(double offset, double content_height, double viewport_height);
 }

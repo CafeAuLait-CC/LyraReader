@@ -25,6 +25,7 @@ struct TilePlanResult {QList<TileSpec> tiles;bool accepted=false;};
 class ReaderController : public QObject {
     Q_OBJECT
     Q_PROPERTY(QVariantList pages READ pages NOTIFY documentChanged)
+    Q_PROPERTY(QVariantMap fitPresentation READ fitPresentation NOTIFY fitPresentationChanged)
     Q_PROPERTY(QVariantList layoutRows READ layoutRows NOTIFY documentChanged)
     Q_PROPERTY(QVariantMap layoutConfiguration READ layoutConfiguration NOTIFY documentChanged)
     Q_PROPERTY(int pageCount READ pageCount NOTIFY documentChanged)
@@ -62,6 +63,7 @@ public:
     explicit ReaderController(QObject *parent = nullptr);
     ~ReaderController() override;
     QVariantList pages() const { return m_pages; }
+    QVariantMap fitPresentation() const { return m_fitPresentation; }
     QVariantList layoutRows() const { return m_layoutRows; }
     QVariantMap layoutConfiguration() const { return m_layoutConfiguration; }
     int pageCount() const { return int(m_pages.size()); }
@@ -139,7 +141,9 @@ public:
     Q_INVOKABLE void setLayout(const QString &mode, double gap);
     Q_INVOKABLE double zoomOffset(double offset, double anchor, double oldZoom, double newZoom) const;
     Q_INVOKABLE uint fitPercent(bool fitPage,double pageWidth,double pageHeight,double viewportWidth,double viewportHeight,double calibration) const;
-    Q_INVOKABLE uint viewportFitPercent(uint currentPercent,double pageHeight,double viewportHeight,double calibration) const;
+    Q_INVOKABLE uint viewportFitPercent(uint currentPercent,double pageWidth,double pageHeight,double viewportWidth,double viewportHeight,double calibration) const;
+    Q_INVOKABLE bool configureFitPageSpacing(double pageHeight,double viewportHeight,double zoom,double preferredGap);
+    Q_INVOKABLE void clearFitPageSpacing();
     Q_INVOKABLE double clampScroll(double offset,double contentHeight,double viewportHeight) const;
     Q_INVOKABLE void cancelIndexQueries();
     Q_INVOKABLE QVariantMap signatureImage(const QUrl &url) const;
@@ -164,6 +168,7 @@ public:
     static QString rasterKey(int page, double scale,bool embedded=false);
 signals:
     void documentChanged();
+    void fitPresentationChanged();
     void documentReset();
     void loadingChanged();
     void errorChanged();
@@ -224,6 +229,7 @@ private:
     QVariantMap m_aiRegion;
     QVariantMap m_aiRegionPaper,m_aiRegionPaperSpec;
     QVariantMap m_layoutConfiguration;
+    QVariantMap m_fitPresentation;
     double mapPaperScroll(double value,bool shifted,double reveal) const;
     quint64 m_aiRegionPaperEpoch=0;
     bool m_aiRegionPaperInFlight=false;

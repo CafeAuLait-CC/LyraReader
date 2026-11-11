@@ -162,6 +162,8 @@ extension ReaderChecks {
         require(reader.annotations == savedNotes && reader.annotationWriteCount == writes,
                 "repeated reading and switching never mutates or writes note contents")
         let body = textView(in: host, matching: secondText, editable: false)!
+        require((body.enclosingScrollView?.bounds.height ?? 0) > 180,
+                "the reading paper uses its height for note content rather than a title bar")
         let scroller = body.enclosingScrollView?.verticalScroller as? LyraReaderSidebarScroller
         require(scroller?.trackColor == LyraReaderTheme.noteBgColor,
                 "the note's legacy scrollbar track uses the note paper color")
@@ -177,6 +179,18 @@ extension ReaderChecks {
             try bitmap.representation(using: .png, properties: [:])!
                 .write(to: folder.appendingPathComponent("note-reading-scrollbar.png"))
         }
+        let scrollRect = host.convert(body.enclosingScrollView!.bounds, from: body.enclosingScrollView!)
+        var paperRect = scrollRect.insetBy(dx: -8, dy: -8)
+        if host.isFlipped { paperRect.origin.y -= 14 }
+        paperRect.size.height += 14
+        func capturePaper(_ name: String) throws {
+            guard let directory = ProcessInfo.processInfo.environment["LYRA_READER_CHECK_SNAPSHOT_DIR"] else { return }
+            let bitmap = host.bitmapImageRepForCachingDisplay(in: paperRect)!
+            host.cacheDisplay(in: paperRect, to: bitmap)
+            try bitmap.representation(using: .png, properties: [:])!
+                .write(to: URL(fileURLWithPath: directory).appendingPathComponent(name + ".png"))
+        }
+        try capturePaper("note-headerless-reading")
         let click = NSEvent.mouseEvent(with: .leftMouseDown, location: body.convert(CGPoint(x: 8, y: 8), to: nil),
             modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil,
             eventNumber: 0, clickCount: 1, pressure: 1)!
@@ -190,6 +204,11 @@ extension ReaderChecks {
             else { return false }
             return scroller.trackColor == LyraReaderTheme.noteBgColor
         })
+        if ProcessInfo.processInfo.environment["LYRA_READER_CHECK_SNAPSHOT_DIR"] != nil {
+            try await Task.sleep(for: .milliseconds(350))
+            host.layoutSubtreeIfNeeded()
+            try capturePaper("note-headerless-editing")
+        }
         reader.beginEditingAnnotation(edited.id)
         try await eventually("switching directly between editors loads the first note", {
             textView(in: host, matching: firstText, editable: true) != nil

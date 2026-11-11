@@ -48,9 +48,11 @@ are collected before writing; a failed resolution keeps every window open and re
 already completed. Reading positions survive an aborted Save All attempt. Several newer macOS
 features are still being ported. XFA documents keep local reading bookmarks; PDF editing and
 derivative exports are refused, including forms selected as merge inputs.
-Reader resizes preserve the chosen percentage in multi-page documents, including facing spreads.
-A real viewport-height change can enlarge a single page below Fit Page; it never shrinks a chosen
-zoom. Width-only panel movement leaves the percentage unchanged, and fit presets use the shared policy.
+A real viewport-height change can enlarge the current page or facing spread below Fit Page;
+it never shrinks a chosen zoom. Width-only panel movement leaves the percentage unchanged.
+Fit Page uses shared two-axis sizing and balanced temporary spacing, without adjacent-row slivers.
+Saved reading positions keep canonical page coordinates; temporary spacing stays out of the PDF
+and persisted view state, while retained tabs and Back/Forward keep their fitted presentation.
 Back/Forward uses the shared twenty-entry history in each direction and restores the selection,
 page anchor, horizontal position and fractional calibrated percentage. Only preview jumps record
 an entry; document/revision or tab changes clear the ephemeral history. Alt+Left/Alt+Right belong

@@ -680,9 +680,9 @@ ApplicationWindow {
             ? qsTr("100% · Uncalibrated display: ") + displayCalibration.fallbackReason
             : qsTr("Actual Size · 100%");
     }
-    function applyFit(preset) {
+    function applyFit(preset, targetPage) {
         if (currentReader.pageCount === 0) return false;
-        const page = currentPage;
+        const page = targetPage===undefined ? currentPage : targetPage;
         const row = canvas.rows[canvas.pageRows[page]];
         if (!row || !row.pages.length) return false;
         const left = Math.min.apply(null, row.pages.map(p => p.left));
@@ -696,9 +696,13 @@ ApplicationWindow {
         changeZoom(percent / 100 * calibrationFactor, pageList.width / 2, 0);
         const rowCenter = (pageList.contentWidth - currentReader.documentWidth * zoom) / 2 + (left + right) / 2 * zoom;
         pageList.contentX = Math.max(0, Math.min(pageList.contentWidth - pageList.width, rowCenter - pageList.width / 2));
-        if (preset === "page") navigate(page, 0);
+        if (preset === "page") {
+            if(!canvas.configureFit(page))return false;
+            pageList.forceLayout();
+            navigate(page, 0);
+        }
         // Persist the resolved percentage. Legacy fitting records are resolved once
-        // on restore; panel movement and later window resizes never reactivate a preset.
+        // on restore. Width-only panel movement never reactivates a preset.
         fitting = false;
         return true;
     }
@@ -933,6 +937,7 @@ ApplicationWindow {
             zoomPercent: zoomPercent,
             fitting: fitting,
             fitPreset: fitPreset,
+            fittedPage: canvas.fitActive,
             selection: selection
         };
     }
@@ -942,6 +947,7 @@ ApplicationWindow {
         // These canvas helpers force the current virtualized layout synchronously.
         // No deferred callback can later restore this location into another tab/document.
         canvas.changeZoom(location.zoomPercent/100*calibrationFactor,0,0);
+        if(location.fittedPage)canvas.configureFit(location.page);
         if(location.anchor)canvas.restoreViewportAnchor(location.anchor,0);
         else canvas.restoreDocumentOffset(location.offsetPt*zoom);
         canvas.restoreDocumentX(location.xPt);

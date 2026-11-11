@@ -51,6 +51,19 @@ QString takeError(LyraReaderBuffer &buffer) {
     buffer = {};
     return message;
 }
+// A save/revision publishes a temporary Continuous layout before the shell restores
+// its retained layout. Only intrinsic page sizes invalidate fitted presentation here.
+bool samePageSizes(const QVariantList &before,const QVariantList &after) {
+    if(before.size()!=after.size())return false;
+    for(qsizetype i=0;i<before.size();++i) {
+        const auto a=before[i].toMap(),b=after[i].toMap();
+        for(const auto &key:{QStringLiteral("width"),QStringLiteral("height")}) {
+            bool aOk=false,bOk=false;const double x=a.value(key).toDouble(&aOk),y=b.value(key).toDouble(&bOk);
+            if(!aOk || !bOk || !std::isfinite(x) || x<=0 || x!=y)return false;
+        }
+    }
+    return true;
+}
 struct OpenResult {
     std::shared_ptr<LyraReaderDesktopDocument> document;
     std::shared_ptr<NativeRasterSource> source;
@@ -116,6 +129,7 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
     m_lastUrl = url;
     const auto generation = ++m_generation;
     resetAi();m_document.reset();setRasterSource({});
+    clearFitPageSpacing();
     m_pages.clear();m_layoutRows.clear();m_layoutConfiguration.clear();
     clearRasterCache();
     m_pending.clear();
@@ -349,6 +363,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
             const auto info=revision.value(QStringLiteral("info")).toMap();
             const bool reloadForms=m_data.contains(QStringLiteral("forms"));
             ++m_generation;resetAi();clearRasterCache();m_pending.clear();m_failed.clear();m_requests.clear();m_textPages.clear();m_textPending.clear();
+            if(!samePageSizes(m_pages,info.value(QStringLiteral("pages")).toList()))clearFitPageSpacing();
             m_pages=info.value(QStringLiteral("pages")).toList();m_layoutRows=info.value(QStringLiteral("rows")).toList();m_layoutConfiguration={{QStringLiteral("mode"),info.value(QStringLiteral("mode"))},{QStringLiteral("gap"),info.value(QStringLiteral("gap"))}};m_documentWidth=info.value(QStringLiteral("width")).toDouble();m_documentHeight=info.value(QStringLiteral("height")).toDouble();
             m_data.clear();m_data.insert(QStringLiteral("marks"),revision.value(QStringLiteral("marks")));m_data.insert(QStringLiteral("signature_status"),info.value(QStringLiteral("signature_status")));
             m_data.insert(QStringLiteral("xfa_status"),info.value(QStringLiteral("xfa_status")));
@@ -465,6 +480,8 @@ void ReaderController::requestText(int page) {
 }
 
 void ReaderController::setLayout(const QString &mode, double gap) {
+    if(!m_fitPresentation.isEmpty() && (m_fitPresentation.value(QStringLiteral("mode")).toString()!=mode
+            || m_fitPresentation.value(QStringLiteral("preferredGap")).toDouble()!=gap))clearFitPageSpacing();
     clearAiRegionPaper();
     submit(QStringLiteral("layout"), {{QStringLiteral("mode"),mode},{QStringLiteral("gap"),gap}});
 }
@@ -475,8 +492,21 @@ double ReaderController::zoomOffset(double offset, double anchor, double oldZoom
 uint ReaderController::fitPercent(bool fitPage,double pageWidth,double pageHeight,double viewportWidth,double viewportHeight,double calibration) const {
     return lyra_reader_desktop_fit_percent(fitPage,pageWidth,pageHeight,viewportWidth,viewportHeight,calibration);
 }
-uint ReaderController::viewportFitPercent(uint currentPercent,double pageHeight,double viewportHeight,double calibration) const {
-    return lyra_reader_desktop_viewport_fit(uint(pageCount()),currentPercent,pageHeight,viewportHeight,calibration);
+uint ReaderController::viewportFitPercent(uint currentPercent,double pageWidth,double pageHeight,double viewportWidth,double viewportHeight,double calibration) const {
+    return lyra_reader_desktop_viewport_fit(uint(pageCount()),currentPercent,pageWidth,pageHeight,viewportWidth,viewportHeight,calibration);
+}
+bool ReaderController::configureFitPageSpacing(double pageHeight,double viewportHeight,double zoom,double preferredGap) {
+    const auto spacing=lyra_reader_desktop_fit_page_spacing(pageHeight,viewportHeight,zoom,preferredGap);
+    if(!std::isfinite(spacing.inset_pt) || !std::isfinite(spacing.gap_pt))return false;
+    const QVariantMap next{{QStringLiteral("inset"),spacing.inset_pt},{QStringLiteral("gap"),spacing.gap_pt},
+        {QStringLiteral("preferredGap"),preferredGap},{QStringLiteral("zoom"),zoom},
+        {QStringLiteral("mode"),m_layoutConfiguration.value(QStringLiteral("mode"))}};
+    if(next!=m_fitPresentation){m_fitPresentation=next;emit fitPresentationChanged();}
+    return true;
+}
+void ReaderController::clearFitPageSpacing() {
+    if(m_fitPresentation.isEmpty())return;
+    m_fitPresentation.clear();emit fitPresentationChanged();
 }
 double ReaderController::clampScroll(double offset,double contentHeight,double viewportHeight) const {
     return lyra_reader_desktop_clamp_scroll(offset,contentHeight,viewportHeight);

@@ -30,8 +30,6 @@ package struct PlacedTextEditorOverlay: View {
                 Group {
                     if isNote {
                         VStack(spacing: 0) {
-                            header(for: annotation)
-                            Divider()
                             if !missingGlyphs.isEmpty { appearanceWarning }
                             TextEditor(text: $text)
                                 .focused($focused).font(.system(size: 13))
@@ -40,6 +38,7 @@ package struct PlacedTextEditorOverlay: View {
                                 .background(LyraReaderTheme.noteBg).foregroundStyle(LyraReaderTheme.noteFg)
                                 .padding(6)
                                 .onExitCommand { state.cancelTextEditing() }
+                            editingActions
                         }
                         .background(LyraReaderTheme.noteBg)
                         .clipShape(RoundedRectangle(cornerRadius: 6))
@@ -127,12 +126,8 @@ package struct PlacedTextEditorOverlay: View {
         missingGlyphs = coverage.missing
     }
 
-    private func header(for annotation: AppState.Annotation) -> some View {
+    private var editingActions: some View {
         HStack(spacing: 8) {
-            Image(systemName: annotation.kind == .textBox ? "textbox" : "text.bubble")
-                .font(.system(size: 11))
-            Text(annotation.kind == .stickyNote ? "Sticky Note" : "Note")
-                .font(.system(size: 11, weight: .semibold))
             Spacer()
             Button("Cancel") { state.cancelTextEditing() }
                 .buttonStyle(.plain)

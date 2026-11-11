@@ -27,6 +27,8 @@ struct Location {
     zoom_percent: f64,
     fitting: bool,
     fit_preset: Preset,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    fitted_page: bool,
     selection: Option<Selection>,
 }
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -141,6 +143,21 @@ mod tests {
                 .query(json!({"op":"back","location":location(0)}))
                 .unwrap()["target"]
                 .is_null()
+        );
+    }
+    #[test]
+    fn fitted_presentation_intent_is_retained_without_persisting_viewport_padding() {
+        let history = History::new();
+        let mut fitted = location(4);
+        fitted["fittedPage"] = json!(true);
+        history
+            .query(json!({"op":"record","location":fitted}))
+            .unwrap();
+        assert_eq!(
+            history
+                .query(json!({"op":"back","location":location(9)}))
+                .unwrap()["target"],
+            fitted
         );
     }
     #[test]

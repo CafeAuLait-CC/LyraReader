@@ -291,7 +291,9 @@ extension ReaderChecks {
         guard let remembered = state.backHistory.last else {
             fatalError("FAIL: missing second mirrored history entry")
         }
-        state.setViewportSize(CGSize(width: 700, height: 2200))
+        // Keep the current zoom above the width-limited fit so this case isolates history
+        // clamping; undersized multi-page zooms now intentionally re-fit on height changes.
+        state.setViewportSize(CGSize(width: 600, height: 2200))
         let expected = CGFloat(LyraReaderBindings.clampScroll(
             offsetPt: Double(remembered.scrollYPt),
             contentHeightPt: Double(state.contentHeightPt),

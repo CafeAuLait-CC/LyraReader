@@ -221,7 +221,7 @@ extension ReaderChecks {
     }
 
     /// Fit Width fills the viewport's width, leaves the stated inset, keeps the current page and
-    /// is idempotent. Fit Page does the same for the page height and centres neither edge.
+    /// is idempotent. Fit Page includes both axes and balances the vertical space.
     @MainActor private static func fitPresetChecks(url: URL, calibration: DisplayCalibration) {
         let inset = AppState.zoomPresetInsetPt
         let viewport = CGSize(width: 900, height: 700)
@@ -293,7 +293,18 @@ extension ReaderChecks {
         let singleHeight = 792 * single.zoomFactor
         require(singleHeight <= viewport.height,
                 "on a single-page document Fit Page leaves nothing to scroll (\(singleHeight) pt)")
-        require(single.scrollYPt == 0, "a single page fitted to the height starts at its top")
+        // The balanced margin is the page's view-space top, not the sign of a content offset:
+        // the fitted inset is content-space padding, so the offset itself stays at zero.
+        let singleFrame = single.canvasPageFrames.first { $0.index == 0 }
+        let singleTop = ((singleFrame?.topPt ?? 0) - single.scrollYPt) * single.zoomFactor
+        let singleBottom = viewport.height - singleTop - singleHeight
+        require(single.scrollYPt >= 0,
+                "a single fitted page keeps the scroll offset non-negative (\(single.scrollYPt))")
+        require(singleTop >= inset - 0.1 && abs(singleTop - singleBottom) < 0.5,
+                "a single fitted page has balanced vertical margins "
+                    + "(top \(singleTop) pt, bottom \(singleBottom) pt, "
+                    + "scroll \(single.scrollYPt), pages \(single.canvasPageFrames.map(\.index)), "
+                    + "content \(single.contentHeightPt), zoom \(single.zoomPercent))")
     }
 
     /// Moving the window to another screen or changing the display mode keeps the percentage and
@@ -401,8 +412,8 @@ extension ReaderChecks {
         let pageHeight = 842 * state.zoomFactor
         require(pageHeight <= availableHeight + 0.5,
                 "facing Fit Page fits one row's height (\(pageHeight) of \(availableHeight) pt)")
-        require(pageHeight >= availableHeight * 0.98,
-                "facing Fit Page fills the height within 2%")
+        require(state.contentWidthPt * state.zoomFactor <= availableWidth + 0.5,
+                "facing Fit Page includes both pages horizontally")
         require(state.currentPage == 2, "facing Fit Page keeps the current page")
         require(state.statusMessage.contains("Fit page · \(state.zoomPercent)%"),
                 "facing Fit Page shows its percentage (\(state.statusMessage))")

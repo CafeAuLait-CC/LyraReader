@@ -464,7 +464,10 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     @Published public var aiToolsVisible: Bool = false {
         didSet {
             if aiToolsVisible { closeOtherSecondaryRows(except: .lyra) }
-            else { cancelRegionSelection() }
+            else {
+                cancelRegionSelection()
+                if oldValue { deactivateSecondaryRowTool(.lyra) }
+            }
         }
     }
     /// 100% means actual physical size, scaled by the current screen's calibration.
@@ -548,6 +551,7 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
                 blurFormField()
                 cancelRegionSelection(reason: "Region selection cancelled: Edit PDF took the pointer.")
             } else {
+                clearContentDrag()
                 // Leaving Edit leaves its tool too. Reopening the row starts in the implicit
                 // pointer state, so the inspector (which follows an armed tool) stays closed.
                 if rasterRedactionPrompt != nil {
@@ -590,6 +594,25 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     /// Display-only pixels from the visible revision, never entries in the new render cache.
     /// Each page is retired atomically once its replacement covers the viewport.
     private var revisionCanvasFallbacks: [Int: [CanvasPage]] = [:]
+    private struct LiveContentDrag {
+        var pixels: ContentDragPreview
+        var page: Int
+        var delta: CGPoint
+        var retiringEpoch: UInt64?
+    }
+    private var liveContentDrag: LiveContentDrag?
+
+    package func showContentDrag(_ pixels: ContentDragPreview, page: Int, delta: CGPoint) {
+        liveContentDrag = LiveContentDrag(pixels: pixels, page: page, delta: delta)
+        refreshSelectionOverlay()
+    }
+
+    package func clearContentDrag() {
+        guard liveContentDrag != nil else { return }
+        liveContentDrag = nil
+        refreshSelectionOverlay()
+    }
+
     /// The canvas drawing this window's page list, registered by ``PDFCanvasView``.
     ///
     /// Weak, because the window owns the view. ``reloadVisiblePages()`` tells it that the commit
@@ -624,6 +647,27 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     /// Gap between pages, in points. Set through `setPageGap` so it is clamped and the layout
     /// is rebuilt immediately; read by the engine on every layout query.
     @Published public private(set) var pageGapPt: CGFloat = ReadingLayoutPreferences.defaultGapPt
+    /// Fit Page adds temporary row spacing and balanced top/bottom padding without changing the
+    /// saved page-gap preference. The padding is **content**, not a negative scroll origin: the
+    /// first page's top moves down by `fittedPageInsetPt` in content space, so every scroll
+    /// offset the reader can hold stays at or above zero like the ordinary layout. Presenting
+    /// the same blank by subtracting from an unshifted offset would make `scrollYPt` negative,
+    /// which the scrollbar, saved positions and tab snapshots all treat as out of range.
+    private var fittedPageSpacing: FitPageSpacingRecord?
+    var fittedPageExtraGapPt: CGFloat { fittedPageSpacing.map { max(0, CGFloat($0.gapPt) - pageGapPt) } ?? 0 }
+    /// Temporary space the fitted presentation adds to the content height: both paper insets
+    /// plus every inter-row gap (the rounding remainder included).
+    var fittedPageSpaceTotalPt: CGFloat {
+        guard fittedPageSpacing != nil else { return 0 }
+        let count = document?.pageCount ?? 0
+        let rows = count > 0 ? regionRow(forPage: count - 1) + 1 : 0
+        return 2 * fittedPageInsetPt + CGFloat(max(0, rows - 1)) * fittedPageExtraGapPt
+    }
+    func fittedPageShift(_ page: Int) -> CGFloat {
+        CGFloat(regionRow(forPage: page)) * fittedPageExtraGapPt
+    }
+    var fittedPageInsetPt: CGFloat { fittedPageSpacing.map { CGFloat($0.insetPt) } ?? 0 }
+
     /// How pages are arranged horizontally (continuous or facing spreads).
     @Published public private(set) var layoutMode: ReaderLayoutMode = .continuous
     /// The gap range the Settings slider and the checks share.
@@ -2247,8 +2291,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     private func currentReaderLocation() -> ReaderLocation {
-        ReaderLocation(page: max(0, currentPage - 1), scrollYPt: scrollYPt,
-                       selection: selection)
+        let page = max(0, currentPage - 1)
+        return ReaderLocation(page: page, scrollYPt: scrollYPt - fittedPageShift(page),
+                              selection: selection)
     }
 
     private func currentReaderLocationRecord() -> ReaderLocationRecord {
@@ -2295,7 +2340,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         cancelScrollGlide()
         // Clamp only if the content shrank since (a window resize or a layout change); on the
         // ordinary path this is exactly the remembered number.
-        scrollYPt = clampedScrollOffset(location.scrollYPt)
+        scrollYPt = clampedScrollOffset(location.scrollYPt + fittedPageShift(location.page))
         selection = location.selection
         selectionAnchor = nil
         reloadVisiblePages()
@@ -3050,6 +3095,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var scrollYPt: CGFloat
         var contentHeightPt: CGFloat
         var contentWidthPt: CGFloat
+        var fittedPageSpacing: FitPageSpacingRecord?
+        var fittedPageZoomFactor: CGFloat
+        var fittedPageViewportHeightPt: CGFloat
         var statusMessage: String
         var pageSelection: Set<Int>
         var pageSelectionAnchor: Int?
@@ -4006,7 +4054,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             noticeInterruptedSave(at: url)
             if let restoringTabScroll {
                 contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode)
-                    + regionGapTotalPt
+                    + regionGapTotalPt + fittedPageSpaceTotalPt
                 contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt, layout: layoutMode)
                 scrollYPt = min(max(0, restoringTabScroll),
                                 max(0, contentHeightPt - viewportHeightContentPt))
@@ -4064,6 +4112,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         isChangingDocumentState = true
         defer { isChangingDocumentState = wasChanging }
         contentLoadToken = UUID()
+        liveContentDrag = nil
         contentEditPage = nil
         contentEditSelection = nil
         contentLinkDraft = nil
@@ -4224,6 +4273,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         // with the other glyph caches: a tab switch is a document change, `StampGlyphKey`
         // carries no document identity, and the regenerated bitmap is pixel-identical.
         stampGlyphTextures = [:]
+        fittedPageSpacing = nil
         if !keepingCanvas {
             scrollYPt = 0
             contentHeightPt = 0
@@ -4243,12 +4293,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     public func zoomIn() {
+        clearFitPageSpacing()
         zoomPercent = resolvedZoomPercent(mode: .percent, percent: zoomPercent, delta: 10)
             ?? zoomPercent
         reloadVisiblePages()
     }
 
     public func zoomOut() {
+        clearFitPageSpacing()
         zoomPercent = resolvedZoomPercent(mode: .percent, percent: zoomPercent, delta: -10)
             ?? zoomPercent
         reloadVisiblePages()
@@ -4355,27 +4407,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Flooring is deliberate: a fit that rounds up would leave a sliver of the page outside the
     /// viewport (there is no horizontal scrolling to reach it, and the vertical one would show a
     /// scrollbar for a page that was supposed to fit).
-    private func fitZoomPercent(_ mode: LyraReaderBindings.ZoomModeRecord,
-                                fittingContentPt contentPt: CGFloat,
-                                intoViewportPt viewportPt: CGFloat) -> Int? {
-        switch mode {
-        case .fitWidth:
-            return resolvedZoomPercent(
-                mode: .fitWidth,
-                percent: 100,
-                page: CGSize(width: contentPt, height: 1),
-                viewport: CGSize(width: viewportPt, height: 1)
-            )
-        case .fitPage:
-            return resolvedZoomPercent(
-                mode: .fitPage,
-                percent: 100,
-                page: CGSize(width: 1, height: contentPt),
-                viewport: CGSize(width: 1, height: viewportPt)
-            )
-        case .percent:
-            return nil
-        }
+    private func fitWidthZoomPercent(fittingContentPt contentPt: CGFloat,
+                                     intoViewportPt viewportPt: CGFloat) -> Int? {
+        resolvedZoomPercent(mode: .fitWidth, percent: 100,
+            page: CGSize(width: contentPt, height: 1),
+            viewport: CGSize(width: viewportPt, height: 1))
     }
 
     private enum ZoomPresetAnchor {
@@ -4384,13 +4420,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         /// The offset is in content points, so the reader keeps looking at the same part of the
         /// page; only the amount of content visible at the same window size changes.
         case viewportTop
-        /// Put the current page's top at the viewport top (Fit Page).
-        ///
-        /// The fit already leaves `zoomPresetInsetPt` per side in the *scale*, so the page is
-        /// smaller than the viewport. It is top-aligned rather than centred because the current
-        /// page is defined by the content point at the viewport top: scrolling even into the gap
-        /// above a page would report the previous page while the fitted page fills the screen.
-        case pageTop(page: Int)
+        /// Centre the current page or spread vertically with room on both sides.
+        case pageTop(page: Int, heightPt: CGFloat)
     }
 
     /// Applies a preset percentage through the ordinary zoom path and re-anchors the scroll.
@@ -4402,12 +4433,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard document != nil else { return }
         cancelScrollGlide()
         pointerZoomRemainder = 0
+        clearFitPageSpacing()
         zoomPercent = percent
         switch anchor {
         case .viewportTop:
             scrollYPt = clampedScrollOffset(scrollYPt)
-        case .pageTop(let page):
-            scrollYPt = clampedScrollOffset(displayPageTop(page))
+        case .pageTop(let page, let height):
+            fittedPageSpacing = fitPageSpacing(
+                pageHeightPt: Double(height), viewportHeightPt: Double(viewportSizePt.height),
+                zoom: Double(zoomFactor), preferredGapPt: Double(pageGapPt))
+            rebuildContentDimensions()
+            scrollYPt = clampedScrollOffset(displayPageTop(page) - fittedPageInsetPt)
         }
         reloadVisiblePages()
         schedulePositionSave()
@@ -4420,7 +4456,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// the content point at the viewport top is kept.
     public func zoomFitWidth() {
         guard let geometry = pageFitGeometry(),
-              let target = fitZoomPercent(.fitWidth,
+              let target = fitWidthZoomPercent(
                                           fittingContentPt: geometry.widthToFitPt,
                                           intoViewportPt: viewportSizePt.width)
         else { return }
@@ -4428,20 +4464,32 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         statusMessage = "Fit width · \(zoomPercent)%"
     }
 
-    /// Fits the current page — the current spread row in facing mode — to the viewport **height**,
-    /// leaving ``zoomPresetInsetPt`` on each side. Other pages remain reachable by scrolling;
-    /// width is the job of ``zoomFitWidth``.
-    ///
-    /// Idempotent for the same reason as ``zoomFitWidth``: the current page's top is the anchor,
-    /// and the target is recomputed from the page geometry and the viewport.
+    /// Fits the entire current page or spread, with balanced vertical space and no adjacent sliver.
     public func zoomFitPage() {
         guard let geometry = pageFitGeometry(),
-              let target = fitZoomPercent(.fitPage,
-                                          fittingContentPt: geometry.pageHeightPt,
-                                          intoViewportPt: viewportSizePt.height)
+              let target = resolvedZoomPercent(mode: .fitPage, percent: zoomPercent,
+                  page: CGSize(width: geometry.widthToFitPt, height: geometry.pageHeightPt),
+                  viewport: viewportSizePt)
         else { return }
-        applyZoomPreset(target, anchoring: .pageTop(page: geometry.page))
+        applyZoomPreset(target, anchoring: .pageTop(page: geometry.page, heightPt: geometry.pageHeightPt))
         statusMessage = "Fit page · \(zoomPercent)%"
+    }
+
+    private func rebuildContentDimensions() {
+        contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode) + regionGapTotalPt + fittedPageSpaceTotalPt
+        contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt, layout: layoutMode)
+    }
+
+    /// Restore ordinary continuous spacing, retaining the same page-local reading position.
+    private func clearFitPageSpacing() {
+        guard fittedPageSpacing != nil else { return }
+        // The viewport top may sit in the fitted blank above the row; that blank belongs to the
+        // row, so ask for the page at the row top rather than at the blank itself.
+        let page = regionCurrentPage(at: scrollYPt + fittedPageInsetPt)
+        let offset = scrollYPt - displayPageTop(page)
+        fittedPageSpacing = nil
+        rebuildContentDimensions()
+        scrollYPt = clampedScrollOffset(displayPageTop(page) + max(0, offset))
     }
 
     /// How much zoom one screen point of a Ctrl/⌘+scroll asks for, in percent.
@@ -4506,9 +4554,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
         let oldZoom = zoomFactor
         let previousScrollYPt = scrollYPt
-        let anchorContentY = CanvasGeometry.contentY(
-            viewY: anchorViewY, scrollYPt: scrollYPt, zoom: oldZoom
-        )
+        let oldAnchorY = CanvasGeometry.contentY(
+            viewY: anchorViewY, scrollYPt: scrollYPt, zoom: oldZoom)
+        let anchorPage = regionCurrentPage(at: oldAnchorY)
+        let pageLocalY = oldAnchorY - displayPageTop(anchorPage)
+        clearFitPageSpacing()
+        let anchorContentY = displayPageTop(anchorPage) + pageLocalY
         zoomPercent = target
         // The anchored offset replaces the old one outright; a glide still in flight would pull
         // it back toward where the wheel was heading before the zoom.
@@ -4529,6 +4580,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// The scroll offset clamped to the document (shared by every path that sets it).
     private func clampedScrollOffset(_ value: CGFloat) -> CGFloat {
+        // `contentHeightPt` already contains the fitted paper insets and row gaps (see
+        // `fittedPageSpaceTotalPt`), so the clamp is the ordinary 0…(content − viewport) range.
+        // There is no fitted special case here and therefore no way to return a negative offset.
         CGFloat(clampScroll(
             offsetPt: Double(value),
             contentHeightPt: Double(contentHeightPt),
@@ -4543,6 +4597,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// points wide, which is its real 8.5 inches on that panel.
     public func zoomActual() {
         guard document != nil else { return }
+        clearFitPageSpacing()
         cancelScrollGlide()
         pointerZoomRemainder = 0
         zoomPercent = 100
@@ -4629,37 +4684,25 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             // the band once; doing it again here would double the visible-set work.
             return
         }
-        // A multi-page document keeps its percentage. A taller viewport can still leave the
-        // offset past the last page, so the range is tightened with the same clamp every scroll
-        // path uses: 0 when the content is shorter than the viewport (top alignment), otherwise
-        // the last page's bottom at the viewport bottom. One rebuild publishes the new band.
+        // Keep an above-fit percentage, but discard padding calculated for the old viewport.
+        clearFitPageSpacing()
         scrollYPt = clampedScrollOffset(scrollYPt)
         reloadVisiblePages()
     }
 
-    /// Re-applies Fit Page when a real viewport-height change left a one-page document's page
-    /// shorter than the viewport.
-    ///
-    /// Returns whether a fit was applied; the caller then skips its own clamp/reload because
-    /// ``applyZoomPreset`` already performed both against the new viewport. The decision itself
-    /// is ``LyraReaderBindings/fitPageOnViewportChange(pageCount:currentPercent:pageHeightPt:viewportHeightPt:calibration:)``
-    /// in `lyra-reader-session`, so the preset's inset/floor/clamp arithmetic is not duplicated
-    /// here. A multi-page document (a facing spread included) always returns nil from that
-    /// policy, so its percentage survives resize and fullscreen.
+    /// Re-fit an undersized current page or spread after a real height change.
     private func applyFitPageOnViewportChange() -> Bool {
-        guard let document, document.pageCount == 1,
-              let geometry = pageFitGeometry(),
-              let target = fitPageOnViewportChange(
-                  pageCount: UInt32(clamping: document.pageCount),
-                  currentPercent: UInt32(clamping: zoomPercent),
-                  pageHeightPt: Double(geometry.pageHeightPt),
-                  viewportHeightPt: Double(viewportSizePt.height),
-                  calibration: Double(displayCalibration.factor)
-              )
-        else { return false }
-        // The single page is the whole document, so top-anchoring lands the scroll at 0: the
-        // page's top edge at the viewport top is the top of the document.
-        applyZoomPreset(Int(target), anchoring: .pageTop(page: geometry.page))
+        guard let document, let geometry = pageFitGeometry() else { return false }
+        let policy = ZoomPolicyRecord(mode: .fitPage, percent: UInt32(clamping: zoomPercent), delta: 0,
+            pageWidthPt: Double(geometry.widthToFitPt), pageHeightPt: Double(geometry.pageHeightPt),
+            viewportWidthPt: Double(viewportSizePt.width), viewportHeightPt: Double(viewportSizePt.height),
+            calibration: Double(displayCalibration.factor))
+        let requested = fitPageOnViewportChange(pageCount: UInt32(clamping: document.pageCount), policy: policy)
+        // Live resize can end between integer zoom steps. Keep updating the padding even when
+        // the percentage is already the fit, rather than discarding it on the final layout tick.
+        let maintainsFit = fittedPageSpacing != nil && resolveZoom(policy: policy) == UInt32(zoomPercent)
+        guard let target = requested ?? (maintainsFit ? UInt32(zoomPercent) : nil) else { return false }
+        applyZoomPreset(Int(target), anchoring: .pageTop(page: geometry.page, heightPt: geometry.pageHeightPt))
         statusMessage = "Fit page · \(zoomPercent)%"
         return true
     }
@@ -8478,11 +8521,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         document != nil && fillAndSignVisible && armedFillSignTool != nil
     }
 
-    /// The Edit inspector is visible while Edit is open *and* a content tool is armed (or a page
-    /// object is selected with the implicit pointer). Opening Edit alone does not open it.
+    /// Selecting or dragging text keeps the viewport stable. Its properties appear when the
+    /// caret opens; armed tools, selected graphics and recoverable drafts retain their options.
     public var contentEditInspectorVisible: Bool {
         document != nil && contentEditEnabled
-            && (contentEditTool != "select" || contentEditSelection != nil)
+            && (contentEditTool != "select" || contentTextEditing || contentTextRecovery != nil
+                || selectedContentItem.map { $0.kind != "text" } == true)
     }
 
     /// Width the right-hand inspector column takes from the canvas. There is one inspector slot
@@ -12486,6 +12530,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let previousDocumentURL = document?.url
         let translationURL = translationCacheDocumentURL
         let previousScroll = scrollYPt
+        let drag = preservingViewport ? liveContentDrag : nil
         let previousPageCount = document?.pageCount
         let previousFrames = visiblePagePlacements
         let viewport = visibleContentRect(viewportHeight: viewportHeightContentPt)
@@ -12514,6 +12559,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let fallbacks = Dictionary(grouping: retained, by: { $0.0 }).mapValues { $0.map { $0.1 } }
         resetDocumentState(keepingCanvas: keepCanvas)
         revisionCanvasFallbacks = fallbacks
+        if keepCanvas, var drag {
+            drag.retiringEpoch = renderEpoch
+            liveContentDrag = drag
+        }
         loaded.title = title
         document = loaded
         // The working revision is not a new document for translation-cache purposes. The caller
@@ -12561,6 +12610,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         pageEditSession = nil
         pageEditPendingOperations = []
         pageEditIsApplied = false
+        // An empty failed session can end without reopening the original. Restore its records
+        // target before deleting the directory, so later annotation edits cannot write into it.
+        if let session, annotationsURL == session.annotationRecordsURL {
+            annotationsURL = session.originalRecordsURL
+        }
         if let revisionURL = session?.revisionURL, revisionURL != session?.originalURL {
             engine.closeDocument(at: revisionURL)
         }
@@ -12910,7 +12964,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Whether the document is longer than the viewport: there is something to scroll, so there
     /// is a scroller to show and to grab.
     public var hasScrollableContent: Bool {
-        contentHeightPt > viewportHeightContentPt
+        contentHeightPt > viewportHeightContentPt + 0.01
     }
 
     /// Whether the indicator accepts pointer input.
@@ -14559,6 +14613,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             scrollYPt: scrollYPt,
             contentHeightPt: contentHeightPt,
             contentWidthPt: contentWidthPt,
+            fittedPageSpacing: fittedPageSpacing,
+            fittedPageZoomFactor: zoomFactor,
+            fittedPageViewportHeightPt: viewportSizePt.height,
             statusMessage: statusMessage,
             pageSelection: pageSelection,
             pageSelectionAnchor: pageSelectionAnchor,
@@ -14682,6 +14739,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         scrollYPt = state.scrollYPt
         contentHeightPt = state.contentHeightPt
         contentWidthPt = state.contentWidthPt
+        fittedPageSpacing = state.fittedPageSpacing
         statusMessage = state.statusMessage
         pageSelection = state.pageSelection
         pageSelectionAnchor = state.pageSelectionAnchor
@@ -14810,6 +14868,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         isScrolling = false
         isScrollIndicatorHovered = false
         isDraggingScrollIndicator = false
+        if abs(state.fittedPageZoomFactor - zoomFactor) > 1e-9
+            || abs(state.fittedPageViewportHeightPt - viewportSizePt.height) > 0.5 {
+            clearFitPageSpacing()
+        }
     }
 
     /// Loads whatever a restored snapshot did not have yet. A completed empty result keeps its
@@ -15158,7 +15220,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func gotoPage(_ page: Int) {
         guard document != nil else { return }
         cancelScrollGlide()
-        scrollYPt = displayPageTop(max(0, page))
+        let top = displayPageTop(max(0, page))
+        scrollYPt = fittedPageSpacing == nil ? top : clampedScrollOffset(top - fittedPageInsetPt)
         reloadVisiblePages()
         schedulePositionSave()
     }
@@ -15184,6 +15247,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// throw the reader to a different paragraph.
     public func setLayoutMode(_ mode: ReaderLayoutMode) {
         guard mode != layoutMode else { return }
+        clearFitPageSpacing()
         let anchor = readingLayoutAnchor()
         layoutMode = mode
         if Self.usesStoredReadingLayoutPreferences {
@@ -15203,6 +15267,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     public func setPageGap(_ value: CGFloat) {
         let clamped = ReadingLayoutPreferences.clampGap(value)
         guard abs(clamped - pageGapPt) > 0.0001 else { return }
+        clearFitPageSpacing()
         let anchor = readingLayoutAnchor()
         pageGapPt = clamped
         if Self.usesStoredReadingLayoutPreferences {
@@ -15218,6 +15283,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let mode = ReadingLayoutPreferences.layoutMode()
         let gap = ReadingLayoutPreferences.gapPt()
         guard mode != layoutMode || abs(gap - pageGapPt) > 0.0001 else { return }
+        clearFitPageSpacing()
         let anchor = readingLayoutAnchor()
         layoutMode = mode
         pageGapPt = gap
@@ -15236,7 +15302,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// 100% zoom is still one ⌘+ away.
     private func fitSpreadToViewportIfNeeded() {
         guard layoutMode == .facing, contentWidthPt > 0, viewportSizePt.width > 0 else { return }
-        guard let fitPercent = fitZoomPercent(.fitWidth,
+        guard let fitPercent = fitWidthZoomPercent(
                                               fittingContentPt: contentWidthPt,
                                               intoViewportPt: viewportSizePt.width)
         else { return }
@@ -15262,7 +15328,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     private func readingLayoutAnchor() -> ReadingLayoutAnchor {
         guard document != nil else { return ReadingLayoutAnchor(page: 0, offsetY: 0) }
-        let page = regionCurrentPage(at: scrollYPt)
+        let page = regionCurrentPage(at: scrollYPt + fittedPageInsetPt)
         let top = displayPageTop(page)
         return ReadingLayoutAnchor(page: page, offsetY: max(0, scrollYPt - top))
     }
@@ -15279,7 +15345,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return
         }
         contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode)
-            + regionGapTotalPt
+            + regionGapTotalPt + fittedPageSpaceTotalPt
         contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt, layout: layoutMode)
         let top = displayPageTop(anchor.page)
         scrollYPt = clampedScrollOffset(top + anchor.offsetY)
@@ -15311,6 +15377,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard calibration.factor.isFinite, calibration.factor > 0 else { return }
         let factorChanged = abs(calibration.factor - displayCalibration.factor) > 1e-9
         guard factorChanged || calibration != displayCalibration else { return }
+        if factorChanged { clearFitPageSpacing() }
         displayCalibration = calibration
         // A different screen with the same density changes nothing on screen; only adopt its
         // description. A real factor change re-lays out the open document.
@@ -15346,7 +15413,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 blend: quad.blend, source: quad.source)
         }
         visiblePagePlacements = visible
-        contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode) + regionGapTotalPt
+        contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode) + regionGapTotalPt + fittedPageSpaceTotalPt
         var pages = canvasTiles
         appendSelectionHighlights(to: &pages)
         canvasPages = applyPageTears(to: pages)
@@ -15395,7 +15462,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
 
         contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode)
-            + regionGapTotalPt
+            + regionGapTotalPt + fittedPageSpaceTotalPt
         contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt, layout: layoutMode)
 
         let viewportHeight = viewportHeightContentPt
@@ -15710,6 +15777,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 if onScreenPageIndices.contains(placement.index) { anyOnScreenPageSharp = true }
             }
         }
+        if let drag = liveContentDrag, drag.retiringEpoch == renderEpoch,
+           revisedPagesReady.contains(drag.page) || failedPreviewPages.contains(drag.page)
+                || failedTiles.contains(where: { $0.page == drag.page }) {
+            liveContentDrag = nil
+        }
         // Keep each old page intact while its new raster/tiles are incomplete, rather than
         // publishing a blank or a mixture of old and edited page content. Failed renders retire
         // old pixels too, so a failed redaction never masquerades as the resulting page.
@@ -15769,14 +15841,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         if let perfOnScreen, let perfSharpSources {
             finishPerfViewport(pages: pages, sharpSources: perfSharpSources,
                                contentSources: perfContentSources ?? [:], onScreen: perfOnScreen,
-                               anchorPage: regionCurrentPage(at: scrollYPt),
+                               anchorPage: regionCurrentPage(at: scrollYPt + fittedPageInsetPt),
                                bandPages: visible.map(\.index),
                                path: usesScreenPageRasters ? "page-raster" : "tile", lod: lod,
                                viewport: viewport, visibleMisses: bandReport.visibleMisses,
                                queuedTiles: queuedTiles.count, wanted: wanted.count)
         }
         if isRestoringDocument && !pages.isEmpty { isRestoringDocument = false }
-        currentPage = regionCurrentPage(at: scrollYPt) + 1
+        currentPage = regionCurrentPage(at: scrollYPt + fittedPageInsetPt) + 1
         reportTileCacheStats(
             wanted: wanted.count, scheduled: pendingTiles.count, band: bandReport,
             ringVh: ringVh, lod: lod, tilePt: tilePt, pages: pages.count
@@ -16047,6 +16119,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     /// Everything translucent — the selection and every highlight — is drawn by the same
     /// textured-quad pipeline as the pages, so annotation rendering needs no new GPU path.
     private func appendSelectionHighlights(to pages: inout [CanvasPage]) {
+        if let drag = liveContentDrag,
+           let placement = visiblePagePlacements.first(where: { $0.index == drag.page }) {
+            for (index, image, delta) in [
+                (PlacementIndex.contentDragBackground, drag.pixels.background, CGPoint.zero),
+                (PlacementIndex.contentDragForeground, drag.pixels.foreground, drag.delta)
+            ] {
+                let region = drag.pixels.bounds.offsetBy(dx: delta.x, dy: delta.y)
+                pages.append(CanvasPage(placement: PagePlacement(index: index,
+                    topPt: placement.topPt + region.minY, leftPt: placement.leftPt + region.minX,
+                    widthPt: region.width, heightPt: region.height), image: image))
+            }
+        }
         if let highlight = aiSourceHighlight,
            let placement = visiblePagePlacements.first(where: { $0.index == highlight.page }) {
             let image: PageImage = switch highlight.phase {
@@ -16971,18 +17055,18 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     /// Copies the selected characters (⌘C from the canvas).
-    public func copySelection() {
+    public func copySelection(to pasteboard: NSPasteboard = .general) {
         guard let selection, let textPage = textPages[selection.page] else { return }
         let range = selection.range.clamped(to: 0...(textPage.chars.count - 1))
         guard !range.isEmpty else { return }
 
         // One range→string entry point (Rust for engine-loaded pages, the same Swift rule for
         // synthetic ones); decoding scalars here would be the second copy this task removed.
-        let string = textPage.string(in: range)
+        let string = textPage.copyText(in: range)
         guard !string.isEmpty else { return }
 
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(string, forType: .string)
+        pasteboard.clearContents()
+        pasteboard.setString(string, forType: .string)
         statusMessage = "Copied \(string.count) characters"
     }
 
@@ -17293,7 +17377,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func configurePagePreviews(visible: [PagePlacement], band: [BandSpan], viewport: CGRect,
                                        viewportHeight: CGFloat, screenScale: CGFloat) {
         desiredPreviewScale = usesScreenPageRasters ? screenScale : 1
-        let current = regionCurrentPage(at: scrollYPt)
+        let current = regionCurrentPage(at: scrollYPt + fittedPageInsetPt)
         let bandPages = Set(band.map(\.placement.index))
         let candidates: [PagePlacement]
         let budget: Int
@@ -17442,6 +17526,7 @@ extension AppState {
         if deferContentTransition({ [weak self] in self?.selectContentTool(tool) }) { return }
         // One click arms a content tool; a second click on the same one returns the pointer to
         // its implicit selection state, which is why the Edit row needs no Select button.
+        clearContentDrag()
         contentEditTool = (tool != "select" && contentEditTool == tool) ? "select" : tool
         contentEditSelection = nil
         contentLinkDraft = nil
@@ -17636,7 +17721,7 @@ extension AppState {
     /// to another row, opening page overview or closing the document must all leave the page in
     /// the implicit pointer state rather than keep applying a tool whose control is gone.
     ///
-    /// Export and Lyra own no persistent page tool, so they have nothing to clear.
+    /// Export has no persistent page tool; Lyra owns the assistant drawer.
     private func deactivateSecondaryRowTool(_ row: SecondaryRow) {
         switch row {
         case .annotations:
@@ -17647,7 +17732,9 @@ extension AppState {
             contentLinkDraft = nil
         case .fillAndSign:
             clearFillSignTool()
-        case .export, .lyra:
+        case .lyra:
+            rightPanelVisible = false
+        case .export:
             break
         }
     }
@@ -17947,6 +18034,7 @@ extension AppState {
     private func preserveContentFailure(
         _ command: ContentCommandRecord, _ message: String, page: Int? = nil, url: URL? = nil
     ) {
+        clearContentDrag()
         if let payload = command.replaceTextPayload {
             contentRecoveryCommand = (
                 command, page ?? contentEditPage?.page ?? currentPage - 1, url ?? document?.url
@@ -18243,6 +18331,7 @@ extension AppState {
             await reloadContentObjects()
             return true
         } catch {
+            clearContentDrag()
             pageEditSession?.transaction.cancelPrepared()
             // The edit did not land, so the blocks and their cached translations are still
             // the ones on screen. Restore them rather than making a failed command discard

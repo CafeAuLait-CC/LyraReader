@@ -14,6 +14,19 @@ Item {
         return {top:row.top,bottom:row.bottom,height:row.height,
             pages:app.currentReader.pages.slice(row.first,row.first+row.count)};
     })
+    // Fit spacing is presentation-only and owned by this retained Reader. Canonical
+    // Rust page/row coordinates, cached reading locations and PDF geometry stay unchanged.
+    readonly property var fitState:app.currentReader.fitPresentation
+    readonly property bool fitActive:fitState.zoom!==undefined && Math.abs(fitState.zoom-app.zoom)<1e-9
+    readonly property real fitInset:fitActive ? fitState.inset : 0
+    readonly property real fitExtraGap:fitActive ? fitState.gap-fitState.preferredGap : 0
+    function rowLeading(index){return index===0 ? fitInset*app.zoom : 0;}
+    function configureFit(page) {
+        const row=rows[pageRows[page]];
+        if(!row)return false;
+        return app.currentReader.configureFitPageSpacing(row.bottom-row.top,pageList.height,app.zoom,
+            app.currentReader.layoutConfiguration.gap);
+    }
     readonly property var paperState:app.currentReader.aiRegionPaper
     readonly property bool paperActive:!!paperState.rows && !paperState.error
     readonly property bool paperPlanning:!!paperState.loading
@@ -28,7 +41,14 @@ Item {
     // Conversation text stays in view pixels. This pointer anchor exists only until
     // the asynchronous gap replan settles; persisted reading anchors stay in PDF space.
     property var pendingPaperZoom:null
-    onPaperActiveChanged:if(!paperActive)pendingPaperZoom=null
+    // A fixed-pixel conversation keeps the fitted blank below it when a pointer
+    // zoom removes document fitting. This bounded view-only tail is not a PDF gap
+    // or a persisted reading coordinate, and explicit navigation retires it.
+    property real paperTailPixels:0
+    property string paperTailId:""
+    readonly property real paperTail:paperActive && paperTailId===paperState.id ? paperTailPixels : 0
+    onPaperActiveChanged:if(!paperActive){pendingPaperZoom=null;paperTailPixels=0;paperTailId="";}
+    Connections {target:app;function onCurrentReaderChanged(){canvas.paperTailPixels=0;canvas.paperTailId="";}}
     function restorePaperViewAnchor(anchor) {
         if(!anchor || anchor.owner!==app.currentReader || !paperActive
                 || anchor.id!==paperState.id || anchor.interaction!==interactionEpoch)return false;
@@ -55,7 +75,7 @@ Item {
         const width=Math.min(Math.max(320,page.width*app.zoom-24),Math.max(240,Math.min(canvas.width-24,760)));
         const centre=(pageList.contentWidth-owner.documentWidth*app.zoom)/2+(page.left+page.width/2)*app.zoom-pageList.contentX;
         return {x:Math.min(Math.max(12,centre-width/2),Math.max(12,canvas.width-width-12)),
-            y:item.y+(paperState.gap_top-displayRowTop(index))*app.zoom-pageList.contentY,
+            y:item.y+rowLeading(index)+(paperState.gap_top-displayRowTop(index))*app.zoom-pageList.contentY,
             width:width,height:paperState.card.gap_pt*app.zoom*paperProgress,page:paperState.card.page};
     }
     function showRegionCard(owner) {
@@ -77,6 +97,7 @@ Item {
     property var resizeReader: null
     property int resizeEpoch: -1
     property var resizeRevision: null
+    property int resizePage:0
     clip: true
     readonly property var pageRows: {
         const result = {};
@@ -138,6 +159,7 @@ Item {
         if(!app || app.positionRestoring || !app.currentReader || app.currentReader.loading || !rows.length
                 || app.textViewVisible || app.overviewVisible) return;
         if(resizeReader!==app.currentReader || resizeEpoch!==app.positionRestoreEpoch)pendingHeightChange=false;
+        if(heightChanged && !pendingHeightChange)resizePage=app.currentPage;
         pendingHeightChange=pendingHeightChange || heightChanged;
         resizeReader=app.currentReader;resizeEpoch=app.positionRestoreEpoch;
         resizeRevision=app.currentReader.data.document_revision;
@@ -150,13 +172,23 @@ Item {
                 || app.textViewVisible || app.overviewVisible || !rows.length)return;
         pageList.forceLayout();
         if(changed) {
-            const page=app.currentReader.pages[0];
+            const row=rows[pageRows[resizePage]];
+            if(!row || !row.pages.length)return;
+            const left=Math.min.apply(null,row.pages.map(p=>p.left));
+            const right=Math.max.apply(null,row.pages.map(p=>p.left+p.width));
             // A fractional pinch percentage rounds down only at the integer policy boundary;
             // a returned integer still strictly exceeds the actual current percentage.
-            const target=app.currentReader.viewportFitPercent(Math.floor(app.zoomPercent),page.height,pageList.height,app.calibrationFactor);
-            if(target>0 && app.applyFit("page")) {
+            const target=app.currentReader.viewportFitPercent(Math.floor(app.zoomPercent),right-left,row.bottom-row.top,pageList.width-48,pageList.height,app.calibrationFactor);
+            const maintained=fitActive && app.currentReader.fitPercent(true,right-left,row.bottom-row.top,
+                pageList.width-48,pageList.height,app.calibrationFactor)===app.zoomPercent;
+            if((target>0 || maintained) && app.applyFit("page",resizePage)) {
                 app.operationStatus=qsTr("Fit page · %1%").arg(app.zoomPercent);
                 return;
+            }
+            if(fitActive) {
+                const anchor=viewportAnchor(0);
+                app.currentReader.clearFitPageSpacing();pageList.forceLayout();
+                restoreViewportAnchor(anchor,0);
             }
         }
         pageList.contentY=clampY(pageList.contentY);
@@ -171,7 +203,9 @@ Item {
         if (!rows.length)
             return null;
         const point = pageList.contentY + (viewY || 0);
-        let row = pageList.indexAt(pageList.contentX + pageList.width / 2, point);
+        // In fitted blank space probe toward the paper, while retaining the original
+        // coordinate for the canonical anchor. Each gap is at least twice the inset.
+        let row = pageList.indexAt(pageList.contentX + pageList.width / 2, point+(fitActive ? fitInset*app.zoom+.01 : 0));
         if (row < 0)
             row = point < pageList.originY ? 0 : rows.length - 1;
         const item = pageList.itemAtIndex(row);
@@ -180,10 +214,10 @@ Item {
                 page: app.currentPage,
                 y: 0
             };
-        const display=displayRowTop(row)+(point-item.y)/app.zoom;
+        const display=displayRowTop(row)+(point-item.y-rowLeading(row))/app.zoom;
         const source=paperActive ? app.currentReader.unshiftedPaperScroll(display,paperProgress) : display;
         if(!Number.isFinite(source))return null;
-        return {page:rows[row].pages[0].index,y:source-rows[row].top};
+        return {page:rows[row].pages[0].index,y:fitActive ? Math.max(0,Math.min(rows[row].bottom-rows[row].top,source-rows[row].top)) : source-rows[row].top};
     }
     function positionAnchor(anchor, viewY) {
         const row = pageRows[anchor.page];
@@ -196,7 +230,7 @@ Item {
         }
         const item = pageList.itemAtIndex(row);
         if (item)
-            pageList.contentY = clampY(item.y + anchor.y * app.zoom - (viewY || 0));
+            pageList.contentY = clampY(item.y + rowLeading(row) + anchor.y * app.zoom - (viewY || 0));
     }
     function restoreViewportAnchor(anchor,viewY) {
         if(!anchor)return;
@@ -205,11 +239,11 @@ Item {
         const display=paperActive ? app.currentReader.shiftedPaperScroll(source,paperProgress) : source;
         if(!Number.isFinite(display))return;
         const prior=positioning;positioning=true;
-        positionAnchor({page:anchor.page,y:display-displayRowTop(row)},viewY || 0);
+        positionAnchor({page:anchor.page,y:display-displayRowTop(row)},viewY || (anchor.y===0 ? fitInset*app.zoom : 0));
         positioning=prior;
     }
     function navigate(page, y) {
-        ++interactionEpoch;positioning=true;
+        ++interactionEpoch;positioning=true;paperTailPixels=0;paperTailId="";
         const row=pageRows[page];
         if(row===undefined){positioning=false;return;}
         pageList.positionViewAtIndex(row,ListView.Beginning);pageList.forceLayout();
@@ -220,7 +254,7 @@ Item {
             if(mapped.error || !mapped.hit){positioning=false;return;}
             target=mapped.y;
         }
-        positionAnchor({page:page,y:target},0);
+        positionAnchor({page:page,y:target},target===0 ? fitInset*app.zoom : 0);
         positioning=false;
     }
     function restoreDocumentOffset(offset) {
@@ -238,7 +272,7 @@ Item {
     function pageOffset(page) {
         const item = pageList.itemAtIndex(pageRows[page]);
         if(!item)return 0;
-        const local=(pageList.contentY-item.y)/app.zoom;
+        const local=(pageList.contentY-item.y-rowLeading(pageRows[page]))/app.zoom;
         const frame=pageFrame(page,placementEpoch);const card=regionCardFrame(app.currentReader);
         if(card && card.page===page && card.y<=0 && card.y+card.height>0)
             return app.currentReader.unshiftedPaperScroll(displayRowTop(pageRows[page])+local,paperProgress)-rows[pageRows[page]].top;
@@ -273,6 +307,10 @@ Item {
                     interaction:interactionEpoch,viewY:anchorY,offsetY:anchorY-cardFrame.y} : null;
         const anchor = viewportAnchor(anchorY);
         const old = app.zoom;
+        if(pendingPaperZoom && fitActive && paperState.card_row===rows.length-1 && paperState.card.split_pt===null) {
+            paperTailPixels=Math.min(pageList.height,fitInset*old);paperTailId=paperState.id;
+        } else if(!pendingPaperZoom){paperTailPixels=0;paperTailId="";}
+        app.currentReader.clearFitPageSpacing();
         const oldLeft = (pageList.contentWidth - app.currentReader.documentWidth * old) / 2;
         const pointX = (pageList.contentX + anchorX - oldLeft) / old;
         positioning = true;
@@ -339,6 +377,7 @@ Item {
             readonly property var displayGeometry:canvas.paperActive ? canvas.paperState.rows[index] : modelData
             width: pageList.contentWidth
             height: (canvas.paperActive ? canvas.paperMetric(modelData.height,displayGeometry.height) : modelData.height) * app.zoom
+                +canvas.rowLeading(index)+(index===canvas.rows.length-1 ? canvas.fitInset*app.zoom+canvas.paperTail : canvas.fitExtraGap*app.zoom)
             Repeater {
                 id: sheetRepeater
                 onItemAdded: function(index,item){++canvas.placementEpoch;}
@@ -366,6 +405,7 @@ Item {
                     Component.onCompleted:syncPaper()
                     width: modelData.width * app.zoom
                     height: (canvas.paperActive ? canvas.paperMetric(modelData.height,displayGeometry.height) : modelData.height) * app.zoom
+                    y:canvas.rowLeading(rowItem.index)
                     x: (pageList.contentWidth - app.currentReader.documentWidth * app.zoom) / 2 + modelData.left * app.zoom
                     color: app.currentReader.paperBackground(app.paperAppearance)
                     PdfPage {
