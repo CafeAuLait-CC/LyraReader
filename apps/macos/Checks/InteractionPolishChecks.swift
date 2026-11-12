@@ -203,7 +203,7 @@ extension ReaderChecks {
         // ── Limits ────────────────────────────────────────────────────────────────────────
         require(PreviewPanelGeometry.clampSize(CGSize(width: 10, height: 10), onScreen: screen)
                     == PreviewPanelGeometry.minimumSize,
-                "a resize below the minimum is clamped up to 320×240")
+                "a resize below the minimum is clamped up to 320×120")
         require(PreviewPanelGeometry.clampSize(CGSize(width: 5000, height: 5000), onScreen: screen)
                     == PreviewPanelGeometry.maximumSize(onScreen: screen),
                 "a resize above the maximum is clamped to 80% of the screen")
@@ -255,7 +255,7 @@ extension ReaderChecks {
         require(PreviewPanelGeometry.resizedByBottomRight(
             start, by: CGVector(dx: -5000, dy: 5000), onScreen: screen).size
                     == PreviewPanelGeometry.minimumSize,
-                "dragging the corner past the minimum stops at 320×240")
+                "dragging the corner past the minimum stops at 320×120")
         require(PreviewPanelGeometry.resizedByBottomRight(
             start, by: CGVector(dx: 5000, dy: -5000), onScreen: screen).size
                     == PreviewPanelGeometry.maximumSize(onScreen: screen),
@@ -356,8 +356,27 @@ extension ReaderChecks {
                                    entries: [entries[1]])
         controller.sync(state: state, canvasOnScreen: canvas, canvasHeightPt: canvas.height,
                         screen: screen)
-        require(controller.panel?.frame != moved && controller.panel?.frame.height == PreviewPanelGeometry.minimumSize.height,
+        require(controller.panel?.frame != moved && controller.panel!.frame.height < 160,
                 "a short new preview automatically shrinks after a manually resized long preview")
+
+        let shortFrame = controller.panel!.frame
+        require(shortFrame.height >= controller.model.fullContentHeight(panelWidthPt: shortFrame.width),
+                "a short citation has room for both header rows, heading and full body")
+        controller.panel!.applyUserFrame(CGRect(x: 60, y: 90, width: 600, height: 360))
+        let manual = controller.panel!.frame
+        for _ in 0..<3 { controller.sync(state: state, screen: screen) }
+        require(controller.panel!.frame == manual && controller.userAdjustedFrame,
+                "ordinary state synchronization preserves the user's manual citation size")
+        state.openReferencePreview(page: 0, title: "[1,2,3]", from: "page 1", kind: .reference,
+            entries: (1...3).map { .init(label: "\($0)", text: "Author. A useful synthetic title. 2026.") })
+        controller.sync(state: state, screen: screen)
+        require(controller.panel!.frame.height > shortFrame.height,
+                "three citations grow the card beyond a single short entry")
+        state.openReferencePreview(page: 0, title: "long", from: "page 1", kind: .reference,
+            entries: [.init(label: "1", text: String(repeating: "Long wrapped citation body. ", count: 600))])
+        controller.sync(state: state, screen: screen)
+        require(controller.panel!.frame.height == PreviewPanelGeometry.maximumSize(onScreen: screen).height,
+                "over-screen citation text stops at the screen ceiling and remains scrollable")
 
         // A frame dragged clean off the screen comes back.
         controller.panel?.applyUserFrame(CGRect(x: 9000, y: 9000, width: 520, height: 320))
@@ -383,8 +402,8 @@ extension ReaderChecks {
         if let hosted = firstCanvasView(controller.panel?.contentView) {
             require(hosted.hasAttachedSurface || hosted.submittedFrameCount > 0,
                     "the figure preview's canvas attaches a Metal surface inside the panel")
-            require(hosted.canvasClearColor === LyraReaderTheme.raisedBgColor,
-                    "the figure preview clears to the panel colour behind transparent paper")
+            require(hosted.canvasClearColor === LyraReaderTheme.originalPaperColor,
+                    "the figure preview clears to original paper behind transparent content")
         } else {
             print("NOTE: the panel's canvas had not materialised in this environment; "
                   + "the second surface inside the panel is unverified here")

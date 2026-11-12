@@ -413,3 +413,71 @@ extension ReaderChecks {
               + "(\(cropAlpha.clear) clear / \(cropAlpha.solid) opaque pixels)")
     }
 }
+
+/// Completes raster requests in a chosen order, without relying on scheduler timing.
+@MainActor private final class SuspendedPreviewEngine: PreviewEngine {
+    struct Request {
+        let scale: CGFloat
+        let continuation: CheckedContinuation<PageImage, Error>
+    }
+    var requests: [Request] = []
+    var completedRequests = 0
+    override func rasterizeRegion(page: Int, scale: CGFloat, xPt: CGFloat, yPt: CGFloat,
+                                  widthPt: CGFloat, heightPt: CGFloat,
+                                  transparentBackground: Bool) async throws -> PageImage {
+        let image: PageImage = try await withCheckedThrowingContinuation { continuation in
+            requests.append(Request(scale: scale, continuation: continuation))
+        }
+        completedRequests += 1
+        return image
+    }
+    func finish(_ index: Int) {
+        requests[index].continuation.resume(returning: PageImage(
+            pixelWidth: 1, pixelHeight: 1, pointSize: CGSize(width: 300, height: 200),
+            bgra: Data([255, 0, 255, 255]), generation: UInt64(index + 100)))
+    }
+}
+
+extension ReaderChecks {
+    @MainActor static func previewResizeEpochChecks(url: URL) async throws {
+        let engine = SuspendedPreviewEngine()
+        let state = AppState(engine: engine)
+        require(state.open(url: url), "controlled preview fixture opens")
+        state.openReferencePreview(page: 0, title: "Figure", from: "page 1", kind: .figure,
+                                   region: CGRect(x: 0, y: 0, width: 300, height: 200))
+        try await eventually("first raster is suspended", { engine.requests.count == 1 })
+        state.setReferencePreviewViewport(CGSize(width: 540, height: 200))
+        try await eventually("first resize is suspended", { engine.requests.count == 2 })
+        state.setReferencePreviewViewport(CGSize(width: 580, height: 200))
+        try await eventually("final resize is suspended", { engine.requests.count == 3 })
+        require(engine.requests[0].scale < engine.requests[1].scale
+                    && engine.requests[1].scale < engine.requests[2].scale,
+                "each raster uses its requested viewport scale")
+        engine.finish(2)
+        try await eventually("the latest resize wins first", {
+            state.referencePreviewPages.first?.image.generation == 102
+        })
+        engine.finish(0)
+        engine.finish(1)
+        try await eventually("both stale raster requests complete", { engine.completedRequests == 3 })
+        await Task.yield()
+        require(state.referencePreviewPages.first?.image.generation == 102
+                    && abs(state.referencePreviewZoom - 580.0 / 300) < 1e-9,
+                "older raster completions cannot restore a stale resize or image")
+        state.setReferencePreviewViewport(CGSize(width: 580.5, height: 200))
+        require(abs(state.referencePreviewZoom - 580.5 / 300) < 1e-9 && engine.requests.count == 3,
+                "fractional viewport changes fit exactly without another raster")
+        state.setReferencePreviewViewport(CGSize(width: CGFloat.infinity, height: 200))
+        require(state.referencePreviewZoom.isFinite && engine.requests.count == 3,
+                "invalid viewport geometry cannot poison the preview")
+        state.setReferencePreviewViewport(CGSize(width: 620, height: 200))
+        try await eventually("closing raster is suspended", { engine.requests.count == 4 })
+        state.closeReferencePreview()
+        engine.finish(3)
+        try await eventually("the closed preview's raster completes", { engine.completedRequests == 4 })
+        await Task.yield()
+        require(state.referencePreview == nil && state.referencePreviewPages.isEmpty
+                    && !state.referencePreviewLoading,
+                "closing rejects the final in-flight resize")
+    }
+}
