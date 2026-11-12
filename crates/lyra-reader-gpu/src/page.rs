@@ -146,7 +146,9 @@ fn fs_page(in: VertexOutput) -> @location(0) vec4<f32> {
         // Lyra text-secondary (#C8BFAF), in linear sRGB. Neutral source ink is carried by
         // coverage over the existing card: black is soft ink, white is clear. Saturated plot
         // colours retain their source channels instead of undergoing a whole-image inversion.
-        let chroma = max(max(colour.r, colour.g), colour.b) - min(min(colour.r, colour.g), colour.b);
+        let maximum = max(max(colour.r, colour.g), colour.b);
+        // Judge neutrality relative to intensity: a very dark red/blue is still chromatic.
+        let chroma = (maximum - min(min(colour.r, colour.g), colour.b)) / max(maximum, 0.000001);
         let neutral = 1.0 - smoothstep(0.0, 0.02, chroma);
         let lightness = dot(colour.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
         let ink = vec4<f32>(vec3<f32>(0.577580440, 0.520995573, 0.428690497), colour.a * (1.0-lightness));
@@ -1020,15 +1022,17 @@ mod tests {
             255, 255, 0, 255, // cyan plot
             0, 0, 0, 128, // antialiased black edge
             204, 204, 204, 255, // light gray rule
+            0, 0, 16, 255, // dark but chromatic red
+            16, 0, 0, 255, // dark but chromatic blue
         ];
-        let texture = context.upload_page_texture(7, 1, &source).unwrap();
+        let texture = context.upload_page_texture(9, 1, &source).unwrap();
         let draws = [
-            (background, [0.0, 0.0, 7.0, 1.0], QuadBlend::Interface),
-            (texture, [0.0, 0.0, 7.0, 1.0], QuadBlend::Normal),
+            (background, [0.0, 0.0, 9.0, 1.0], QuadBlend::Interface),
+            (texture, [0.0, 0.0, 9.0, 1.0], QuadBlend::Normal),
         ];
-        let original = context.offscreen_probe_layers(&draws, 7, 1).unwrap();
+        let original = context.offscreen_probe_layers(&draws, 9, 1).unwrap();
         let dark = context
-            .offscreen_probe_layers_with_appearance(&draws, 7, 1, PaperAppearance::DarkFigure)
+            .offscreen_probe_layers_with_appearance(&draws, 9, 1, PaperAppearance::DarkFigure)
             .unwrap();
         for (actual, expected) in [
             (&dark[0..3], [200_u8, 191, 175]),
@@ -1044,6 +1048,11 @@ mod tests {
             &dark[12..20],
             &original[12..20],
             "chromatic plot pixels keep their colours"
+        );
+        assert_eq!(
+            &dark[28..36],
+            &original[28..36],
+            "very dark plot colours remain chromatic"
         );
         fn luminance(rgb: &[u8]) -> f64 {
             rgb.iter()
@@ -1073,7 +1082,7 @@ mod tests {
             "light gray table rules remain distinguishable"
         );
         assert_eq!(
-            context.offscreen_probe_layers(&draws, 7, 1).unwrap(),
+            context.offscreen_probe_layers(&draws, 9, 1).unwrap(),
             original,
             "switching to light appearance restores the untouched source texture"
         );
