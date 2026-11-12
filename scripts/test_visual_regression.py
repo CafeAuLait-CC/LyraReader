@@ -101,6 +101,54 @@ class BaselineIntegrityTests(unittest.TestCase):
                 visual.terminate_own_capture(self.directory)
             kill.assert_not_called()
 
+    def test_unknown_suite_is_not_an_unvalidated_capture_set(self):
+        self.report['suite'] = 'unknown'
+        self.write_report()
+        with self.assertRaisesRegex(ValueError, 'Unsupported capture suite'):
+            visual.load_capture(self.directory)
+
+    def test_reader_suite_requires_its_complete_distinct_set(self):
+        self.report['suite'] = 'reader-shell'
+        self.report['captures'] = []
+        for sid in visual.CAPTURE_SUITES['reader-shell']:
+            name = sid + '.png'
+            (self.directory / name).write_bytes(b'synthetic reader image bytes')
+            self.report['captures'].append({'id': sid, 'file': name})
+        self.write_report()
+        visual.load_capture(self.directory)
+        self.report['captures'][-1] = {'id': '11-fullscreen-restored', 'file': '11-fullscreen-restored.png'}
+        self.write_report()
+        with self.assertRaisesRegex(ValueError, 'Missing, duplicated'):
+            visual.load_capture(self.directory)
+
+    def test_cross_suite_comparison_cannot_reuse_a_paper_baseline(self):
+        reader = self.directory / 'reader'
+        reader.mkdir()
+        captures = []
+        for sid in visual.CAPTURE_SUITES['reader-shell']:
+            name = sid + '.png'
+            (reader / name).write_bytes(b'reader pixels')
+            captures.append({'id': sid, 'file': name})
+        visual.write_json(reader / 'capture.json', {
+            'schema_version': 1, 'suite': 'reader-shell', 'status': 'candidate', 'captures': captures,
+        })
+        args = argparse.Namespace(baseline=self.directory, actual=reader, output=self.directory / 'diff',
+                                  allow_unreviewed=True, channel_tolerance=0)
+        with patch.object(visual, 'compile_comparer') as compile_comparer:
+            with self.assertRaisesRegex(ValueError, 'Capture suites differ'):
+                visual.compare_runs(args)
+            compile_comparer.assert_not_called()
+
+
+class CommittedPaperBaselineTests(unittest.TestCase):
+    def test_adopted_baselines_retain_their_reviewed_images_and_manifest(self):
+        root = visual.ROOT / 'tests/visual-baselines/paper/macos-15.7.9-2560x1440-2x'
+        for theme in ['en-light', 'en-dark']:
+            with self.subTest(theme=theme):
+                directory = root / theme
+                report = visual.load_capture(directory)
+                visual.verify_approval(directory, report)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -124,13 +124,15 @@ The developer commands that are not needed to build and run — headless test ho
 reference-raster comparisons, the CLI inspection commands and the measurement recipes — are documented in the
 design notes rather than here.
 
-## Paper visual regression
+## Native visual regression
 
 The debug bundle supports opt-in capture of its own native window on macOS 14.4 or later.
 Keep the desktop awake and idle while capture controls its own window and full-screen Space.
 The launcher creates a separate bundle identity and scratch caches.
-It records 11 checkpoints for paper scale, native edges, sidebar changes, resizing, zoom round trips,
-and full-screen entry/exit. The source PDF is generated from synthetic content.
+The default `paper` suite records 16 checkpoints for paper scale, native edges, sidebar changes,
+resizing, zoom round trips, full-screen entry/exit, Fit Page on a one/three-page fixture, and the
+document end. It checks the ordinary 8 pt document-edge padding and balanced fitted padding.
+The PDFs are generated from synthetic content.
 
 ```bash
 ./scripts/build-rust.sh --debug
@@ -138,6 +140,7 @@ and full-screen entry/exit. The source PDF is generated from synthetic content.
 python3 scripts/check-visual.py self-test
 python3 -m unittest discover -s scripts -p test_visual_regression.py
 python3 scripts/check-visual.py capture --output build/visual-en-light --language en --appearance light
+python3 scripts/check-visual.py capture --suite reader-shell --output build/visual-reader-light --appearance light
 ```
 
 Open the output's `index.html` to review native-size PNGs and environment details. Repeat with
@@ -150,6 +153,12 @@ Display mode points, backing framebuffer pixels and each window's backing scale 
 the framebuffer dimensions do not assert the panel's physical resolution. The flows drive production
 state and native window actions; they do not cover pointer gesture delivery.
 
+The `reader-shell` suite records 10 checkpoints: empty Home, one/three/eight tabs, the first tab
+selected, a narrow window and its restoration, closing the active tab, retaining the last tab,
+and returning Home. Its eight synthetic documents have per-document registration colors; the
+checks verify the active document, tab count and actual rendered pixels. Home requires zero page
+quads and an isolated empty recent-document list. These images remain review candidates.
+
 ```bash
 python3 scripts/check-visual.py compare --baseline BASELINE --actual ACTUAL --output build/visual-diff
 ```
@@ -161,9 +170,17 @@ to its SHA-256 digest. Create that approval only after reviewing the images. Cha
 or manifest invalidates it. `--allow-unreviewed` is available solely for developer repeatability checks
 and marks the result as **not a regression gate**. No image baselines are accepted automatically.
 
-CI runs the comparer and approval regressions. Its manual **Capture unreviewed visual candidates**
-input additionally collects en/light and en/dark candidates as artifacts; reviewed image baselines
-are required before enabling a PR image-comparison gate. Chinese visual checks are deferred until
+The first paper batch is provisionally adopted under
+`tests/visual-baselines/paper/macos-15.7.9-2560x1440-2x/en-light` and `en-dark`: 32 original PNGs,
+sanitized capture manifests and hash-bound approvals. They cover the recorded macOS build,
+2560×1440 logical display, 5120×2880 backing framebuffer and backing scale 2; other environments
+require separate reviewed baselines. Use the matching directory as `BASELINE` above. Paper and
+reader-shell captures cannot share a baseline or an incomplete checkpoint set.
+
+CI verifies the adopted baseline bytes and runs the comparer/approval regressions. Its manual
+**Capture unreviewed visual candidates** input additionally collects paper and reader-shell
+en/light and en/dark candidates as artifacts. Pixel comparison requires a controlled matching
+desktop; this does not enable a cross-environment PR screenshot gate. Chinese visual checks are deferred until
 Chinese localization is implemented. Existing zh-Hans preference captures show English fallback
 and are not accepted as evidence of Chinese UI coverage.
 

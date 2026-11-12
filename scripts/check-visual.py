@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture unreviewed paper candidates, or compare against an explicitly approved baseline.
+"""Capture native visual candidates, or compare against an explicitly approved baseline.
 
 macOS 14.4+, Command Line Tools, and a logged-in, awake desktop are required for capture.
 Only the isolated debug application's own window is captured. No third-party Python packages.
@@ -28,7 +28,24 @@ EXPECTED_CAPTURES = [
     '01-default-100', '02-fixed-100', '03-sidebar-open', '04-sidebar-restored',
     '05-resize-small', '06-resize-restored', '07-fit-width', '08-zoom-in',
     '09-zoom-restored', '10-fullscreen', '11-fullscreen-restored',
+    '12-fit-page-window', '13-fit-page-first', '14-fit-page-middle',
+    '15-fit-page-last', '16-document-end-100',
 ]
+CAPTURE_SUITES = {
+    'paper': EXPECTED_CAPTURES,
+    'reader-shell': [
+        '01-home-empty', '02-one-tab', '03-three-tabs', '04-eight-tabs',
+        '05-first-tab-active', '06-narrow-eight-tabs', '07-window-restored',
+        '08-close-active-tab', '09-last-tab', '10-return-home',
+    ],
+}
+
+
+def expected_captures(report: dict) -> list[str]:
+    suite = report.get('suite', 'paper')
+    if not isinstance(suite, str) or suite not in CAPTURE_SUITES:
+        raise ValueError('Unsupported capture suite')
+    return CAPTURE_SUITES[suite]
 
 
 def digest(path: Path) -> str:
@@ -43,7 +60,8 @@ def command(arguments: list[str], **kwargs: object) -> str:
     return subprocess.run(arguments, check=True, text=True, capture_output=True, **kwargs).stdout.strip()
 
 
-def fixture(path: Path) -> None:
+def fixture(path: Path, title: str = 'LyraReader paper alignment probe', identity: str | None = None,
+            pages: int = 1) -> None:
     """Reuse the repository's PDF writer; registration patches have known PDF-space centers."""
     writer = runpy.run_path(str(ROOT / 'scripts/make-fixtures.py'))['build_pdf']
     content = [
@@ -54,7 +72,7 @@ def fixture(path: Path) -> None:
         '0 0.2 1 rg 570 756 18 12 re f',
         '0 0.7 0.2 rg 24 24 18 12 re f',
         '1 0.6 0 rg 570 24 18 12 re f',
-        '0 0 0 rg BT /F1 18 Tf 60 754 Td (LyraReader paper alignment probe) Tj ET',
+        f'0 0 0 rg BT /F1 18 Tf 60 754 Td ({title}) Tj ET',
         'BT /F1 11 Tf 60 732 Td (Synthetic fixture - no private document content) Tj ET',
     ]
     for y in range(80, 710, 30):
@@ -62,7 +80,18 @@ def fixture(path: Path) -> None:
                     f'0.15 0.15 0.15 rg BT /F1 10 Tf 32 {y + 5} Td (PDF y = {y}) Tj ET']
     for x in range(60, 600, 60):
         content += [f'0.8 0.8 0.8 RG 0.3 w {x} 48 m {x} 708 l S']
-    path.write_bytes(writer([('\n'.join(content), 0)], page_sizes=[(612, 792)]))
+    colors = {'magenta': '1 0 1', 'cyan': '0 1 1', 'yellow': '1 1 0'}
+    streams = []
+    for index in range(pages):
+        page = list(content)
+        color = identity
+        if pages > 1:
+            page = [line.replace(title, f'{title} - page {index + 1}') for line in page]
+            color = ['magenta', 'cyan', 'yellow'][index % 3]
+        if color is not None:
+            page.append(f'{colors[color]} rg 300 696 12 12 re f')
+        streams.append(('\n'.join(page), 0))
+    path.write_bytes(writer(streams, page_sizes=[(612, 792)] * pages))
 
 
 def compile_comparer(directory: Path) -> Path:
@@ -74,6 +103,7 @@ def compile_comparer(directory: Path) -> Path:
 def render_report(directory: Path, report: dict, comparisons: list[dict] | None = None) -> None:
     """A local review artifact; images keep native pixels and are scaled only for viewing."""
     status = report.get('status', 'failed')
+    title = 'LyraReader reader shell review' if report.get('suite') == 'reader-shell' else 'LyraReader paper visual review'
     parts = ['<!doctype html><html lang="en"><meta charset="utf-8">',
              '<meta name="viewport" content="width=device-width, initial-scale=1">',
              '<title>LyraReader visual review</title>',
@@ -81,7 +111,7 @@ def render_report(directory: Path, report: dict, comparisons: list[dict] | None 
              'img{max-width:100%;height:auto}figure{margin:24px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere}',
              '.pair{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:20px}',
              'figcaption{font-weight:600;margin-bottom:8px}a{color:#725014}</style>',
-             '<h1>LyraReader paper visual review</h1>',
+             '<h1>' + title + '</h1>',
              f'<p>Status: <strong>{html.escape(status)}</strong>. Candidates are unreviewed; capture success is not baseline approval.</p>',
              '<pre>' + html.escape(json.dumps(report.get('environment', {}), indent=2, ensure_ascii=False)) + '</pre>']
     if report.get('error'):
@@ -133,8 +163,20 @@ def capture(args: argparse.Namespace) -> int:
     args.created_output = True
     scratch = output / 'scratch'
     scratch.mkdir()
-    fixture_path = output / 'paper-alignment.pdf'
-    fixture(fixture_path)
+    suite = args.suite
+    if suite == 'paper':
+        fixture_path = output / 'paper-alignment.pdf'
+        fixture(fixture_path)
+        multipage = output / 'paper-multipage.pdf'
+        fixture(multipage, pages=3)
+        fixtures = [fixture_path, multipage]
+    else:
+        fixtures = []
+        for index, letter in enumerate('abcdefgh'):
+            path = output / f'reader-{letter}.pdf'
+            fixture(path, title=f'Reader tab {letter.upper()}', identity=['magenta', 'cyan', 'yellow'][index % 3])
+            fixtures.append(path)
+        fixture_path = fixtures[0]
     app = scratch / 'LyraReaderVisual.app'
     source = (args.app or ROOT / 'build/LyraReader.app').resolve()
     if not (source / 'Contents/MacOS/LyraReader').is_file():
@@ -161,8 +203,12 @@ def capture(args: argparse.Namespace) -> int:
         'pdfium_sha256': digest(source / 'Contents/Frameworks/libpdfium.dylib'),
         'baseline_status': 'unreviewed',
     }
+    if len(fixtures) > 1:
+        hashes = {path.name: digest(path) for path in fixtures}
+        metadata['fixtures_sha256'] = hashes
+        metadata['fixture_sha256'] = hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()
     write_json(output / 'run.json', metadata)
-    request = {'fixture': str(fixture_path), 'output': str(output),
+    request = {'fixture': str(fixture_path), 'output': str(output), 'suite': suite,
                'language': args.language, 'appearance': args.appearance}
     if args.mutation:
         request['mutation'] = args.mutation
@@ -192,7 +238,7 @@ def capture(args: argparse.Namespace) -> int:
     if report['status'] != 'candidate':
         print(f'FAIL: {report.get("error", "capture failed")}; report: {output / "index.html"}', file=sys.stderr)
         return 1
-    if [item['id'] for item in report['captures']] != EXPECTED_CAPTURES:
+    if report.get('suite', 'paper') != suite or [item['id'] for item in report['captures']] != expected_captures(report):
         raise ValueError('Incomplete or unexpected capture set')
     # Only the random domain and bundle created by this run are eligible for cleanup.
     subprocess.run(['defaults', 'delete', info['CFBundleIdentifier']], stdout=subprocess.DEVNULL,
@@ -207,7 +253,7 @@ def load_capture(directory: Path) -> dict:
     if report.get('schema_version') != 1 or report.get('status') != 'candidate':
         raise ValueError('A failed or unsupported capture cannot be a comparison input')
     captures = report.get('captures', [])
-    if [item['id'] for item in captures] != EXPECTED_CAPTURES:
+    if [item['id'] for item in captures] != expected_captures(report):
         raise ValueError('Missing, duplicated, or unexpected captures')
     for item in captures:
         if item['file'] != item['id'] + '.png' or not (directory / item['file']).is_file():
@@ -232,6 +278,8 @@ def compare_runs(args: argparse.Namespace) -> int:
     actual_dir = args.actual.resolve()
     reference = load_capture(reference_dir)
     actual = load_capture(actual_dir)
+    if reference.get('suite', 'paper') != actual.get('suite', 'paper'):
+        raise ValueError('Capture suites differ; each suite requires its own baseline')
     if not args.allow_unreviewed:
         verify_approval(reference_dir, reference)
     # Different valid environments require separate baselines, rather than a looser threshold.
@@ -263,7 +311,8 @@ def compare_runs(args: argparse.Namespace) -> int:
             record['error'] = result.stderr.strip()
         failed |= result.returncode != 0
         comparisons.append(record)
-    report = {'schema_version': 1, 'status': 'different' if failed else 'matching',
+    report = {'schema_version': 1, 'suite': actual.get('suite', 'paper'),
+              'status': 'different' if failed else 'matching',
               'regression_gate': not args.allow_unreviewed, 'environment': actual['environment'], 'comparisons': comparisons}
     write_json(output / 'comparison.json', report)
     render_report(output, report, comparisons)
@@ -280,6 +329,7 @@ def main() -> int:
     record.add_argument('--app', type=Path)
     record.add_argument('--language', choices=['en', 'zh-Hans'], default='en')
     record.add_argument('--appearance', choices=['light', 'dark'], default='light')
+    record.add_argument('--suite', choices=CAPTURE_SUITES, default='paper')
     record.add_argument('--mutation', choices=['scale', 'chrome'])
     check = sub.add_parser('compare', help='Compare against a reviewed, hash-bound baseline')
     check.add_argument('--baseline', type=Path, required=True)

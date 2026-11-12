@@ -1,0 +1,26 @@
+{
+  "approved": true,
+  "capture_manifest_sha256": "153aa24fdbf97764833eabeb21a9c274fbaea94147d998afec9d77949e731928",
+  "provisional": true,
+  "review_basis": "User-delegated first-batch review against merged #239 and #241 after visual and repeatability verification.",
+  "review_date": "2026-11-11",
+  "schema_version": 1,
+  "sha256": {
+    "01-default-100.png": "651fe9a8f4d59df67652fe880e17c55bbfda6efdfbe9a4c168b1b6e0822d83ae",
+    "02-fixed-100.png": "651fe9a8f4d59df67652fe880e17c55bbfda6efdfbe9a4c168b1b6e0822d83ae",
+    "03-sidebar-open.png": "9145cfd6222125482a8ff3b9523b5b74ab8595321d5704c5213d64aa01bb8f8f",
+    "04-sidebar-restored.png": "651fe9a8f4d59df67652fe880e17c55bbfda6efdfbe9a4c168b1b6e0822d83ae",
+    "05-resize-small.png": "0fc482e4e00b6b8a366e2a31cfd872cb3a3a52571fc11c46d141ea289f493f18",
+    "06-resize-restored.png": "beabfcd699e4c30b4c2ea64005059ff2186283e3a654430746ee67b5052635f1",
+    "07-fit-width.png": "ecbfbd3d5f4a369133209464a09f58957b2f3717fc57b3eb098a7184dbd2da93",
+    "08-zoom-in.png": "a1da8b87dc4b885428db2390d22f808773fd9aca9ff6388fcb3cc06bc9946660",
+    "09-zoom-restored.png": "beabfcd699e4c30b4c2ea64005059ff2186283e3a654430746ee67b5052635f1",
+    "10-fullscreen.png": "5f522a0327e8450e38bf2544b9e51104aee39fe32a95e372bf272cf4d57acce3",
+    "11-fullscreen-restored.png": "4dc9d0a1b8746b6e7387ac78c7cf73e0c74f5c0e51e2dc75dad1812fabfe709b",
+    "12-fit-page-window.png": "492016eb9508f65a6e94243863bb05ac84ec10e05f749d03c4de2eaea7ffa9da",
+    "13-fit-page-first.png": "8e06f6234bc3b99be07a27f8d9bb0a01df9a26121d8689b4ebdb226be11d023e",
+    "14-fit-page-middle.png": "4b4e6e6f48dd3c9aa54cba61c8f77f5f66540d03158ef7cf36fbfc61f2f22a5b",
+    "15-fit-page-last.png": "9adcbd8b39262b1997e7cc9036e298d549f42117057ed813712e84ce41da1183",
+    "16-document-end-100.png": "d1774a60fdccf0b9de60588fd9d34ec6e85a0ad7148e531bc3ad9262da1e43a8"
+  }
+}

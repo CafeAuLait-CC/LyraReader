@@ -17,6 +17,7 @@ enum PaperVisualCapture {
         let output: URL
         let language: String
         let appearance: String
+        let suite: String
         let mutation: String?
     }
 
@@ -50,11 +51,15 @@ enum PaperVisualCapture {
                 throw CaptureError("Invalid language, appearance, fixture, or output directory")
             }
             let mutation = request["mutation"]
+            let suite = request["suite"] ?? "paper"
+            guard ["paper", "reader-shell"].contains(suite), mutation == nil || suite == "paper" else {
+                throw CaptureError("Unsupported capture suite or mutation")
+            }
             guard mutation == nil || ["scale", "chrome"].contains(mutation) else {
                 throw CaptureError("Visual mutation must be scale or chrome")
             }
             options = Options(fixture: fixture, output: output, language: language,
-                              appearance: appearance, mutation: mutation)
+                              appearance: appearance, suite: suite, mutation: mutation)
             try Data(String(ProcessInfo.processInfo.processIdentifier).utf8)
                 .write(to: output.appendingPathComponent("capture.pid"), options: .atomic)
             // LaunchServices can inherit launchd hooks rather than the launcher's environment.
@@ -65,6 +70,8 @@ enum PaperVisualCapture {
             UserDefaults.standard.setVolatileDomain([
                 "AppleLanguages": [language], "AppleLocale": language == "en" ? "en_US" : "zh_CN",
                 ReadingAppearanceStore.preferenceKey: "original",
+                // Keep the real Home view deterministic and prevent fallback to private system recents.
+                "lyrareader.recentDocuments": Data("[]".utf8),
                 "lyrareader.didMigratePreferences": true
             ], forName: UserDefaults.argumentDomain)
             AppState.recordsRecentDocuments = false
@@ -163,8 +170,15 @@ enum PaperVisualCapture {
 
         init(options: Options) { self.options = options }
 
-        func wait(_ description: String, until condition: () -> Bool) async throws {
-            for _ in 0..<800 {
+        func focus(window: NSWindow) {
+            window.makeKeyAndOrderFront(nil)
+            window.orderFrontRegardless()
+            NSRunningApplication.current.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+            NSApplication.shared.activate(ignoringOtherApps: true)
+        }
+
+        func wait(_ description: String, attempts: Int = 800, until condition: () -> Bool) async throws {
+            for _ in 0..<attempts {
                 if condition() { return }
                 try await Task.sleep(for: .milliseconds(25))
             }
@@ -182,10 +196,9 @@ enum PaperVisualCapture {
             var settledCanvas: MetalCanvasView?
             var diagnostic = "no canvas"
             do {
-              try await wait("visible current PDF frame after layout and canvas replacement") {
+              try await wait("visible current PDF frame after layout and canvas replacement", attempts: 2400) {
                 guard NSApplication.shared.isActive && window.isKeyWindow else {
-                    window.makeKeyAndOrderFront(nil)
-                    NSApplication.shared.activate(ignoringOtherApps: true)
+                    self.focus(window: window)
                     samples = 0
                     diagnostic = "active=\(NSApplication.shared.isActive) key=\(window.isKeyWindow)"
                     return false
@@ -297,9 +310,11 @@ enum PaperVisualCapture {
             return bytes
         }
 
-        func snapshot(_ id: String, state: AppState, window: NSWindow) async throws {
-            window.makeKeyAndOrderFront(nil)
-            NSApplication.shared.activate(ignoringOtherApps: true)
+        enum PaperExpectation { case none, topEdge, bottomEdge, fitted }
+
+        func snapshot(_ id: String, state: AppState, window: NSWindow, identity: String? = nil,
+                      expectation: PaperExpectation = .none, requiredMarker: String = "red") async throws {
+            focus(window: window)
             let liveCanvas: MetalCanvasView
             do { liveCanvas = try await settle(state: state, window: window) }
             catch {
@@ -310,8 +325,22 @@ enum PaperVisualCapture {
                 throw error
             }
             let canvas = liveCanvas
-            guard let paper = canvas.pageChromeRectangles.first,
+            let visiblePapers = canvas.pageChromeRectangles.filter { $0.intersects(canvas.bounds) }
+            guard let paper = visiblePapers.first,
                   let layer = canvas.layer as? CAMetalLayer else { throw CaptureError("Missing native paper chrome") }
+            let top = paper.minY, bottom = canvas.bounds.height - paper.maxY
+            switch expectation {
+            case .none: break
+            case .topEdge:
+                guard abs(top - 8) <= 0.5 else { throw CaptureError("Document top padding differs in \(id): \(top)") }
+            case .bottomEdge:
+                guard abs(bottom - 8) <= 0.5 else { throw CaptureError("Document bottom padding differs in \(id): \(bottom)") }
+            case .fitted:
+                guard visiblePapers.count == 1, top >= 7.5, bottom >= 7.5, abs(top - bottom) <= 0.5,
+                      paper.minX >= 7.5, canvas.bounds.width - paper.maxX >= 7.5 else {
+                    throw CaptureError("Fit Page padding or neighboring paper differs in \(id): top=\(top) bottom=\(bottom)")
+                }
+            }
             let scale = window.backingScaleFactor
             guard abs(layer.contentsScale - scale) < 0.0001 else {
                 throw CaptureError("Drawable-to-point scale does not match the window")
@@ -344,8 +373,7 @@ enum PaperVisualCapture {
             // or a presentation timestamp that the OS may not provide for full-screen windows.
             for _ in 0..<80 {
                 guard NSApplication.shared.isActive && window.isKeyWindow else {
-                    window.makeKeyAndOrderFront(nil)
-                    NSApplication.shared.activate(ignoringOtherApps: true)
+                    focus(window: window)
                     stableSamples = 0
                     previousPixels = nil
                     try await Task.sleep(for: .milliseconds(100))
@@ -357,16 +385,18 @@ enum PaperVisualCapture {
                 canvasLeft = screenBounds.minX - capturedWindowFrame.minX
                 canvasTop = primary.frame.maxY - screenBounds.maxY - capturedWindowFrame.minY
                 markerChecks = []
-                for (name, sourceX, sourceY) in [("red", CGFloat(33), CGFloat(30)),
+                var sources = [("red", CGFloat(33), CGFloat(30)),
                     ("blue", CGFloat(579), CGFloat(30)), ("green", CGFloat(33), CGFloat(762)),
-                    ("orange", CGFloat(579), CGFloat(762))] {
+                    ("orange", CGFloat(579), CGFloat(762))]
+                if let identity { sources.append((identity, 306, 90)) }
+                for (name, sourceX, sourceY) in sources {
                     let point = CGPoint(x: canvasLeft + paper.minX + sourceX * state.zoomFactor,
                                         y: canvasTop + paper.minY + sourceY * state.zoomFactor)
                     let x = Int((point.x * scale).rounded())
                     let y = Int((point.y * scale).rounded())
                     let visible = CGRect(x: canvasLeft, y: canvasTop, width: bounds.width, height: bounds.height).contains(point)
                         && x >= 0 && x < image.width && y >= 0 && y < image.height
-                    if name == "red" { mx = x; my = y }
+                    if name == requiredMarker { mx = x; my = y }
                     guard visible else { continue }
                     let offset = (y * image.width + x) * 4
                     let r = Int(pixels[offset]), g = Int(pixels[offset + 1]), b = Int(pixels[offset + 2])
@@ -375,11 +405,14 @@ enum PaperVisualCapture {
                     case "red": matches = r > 180 && g < 90 && b < 90
                     case "blue": matches = b > 180 && r < 90 && g < 140
                     case "green": matches = g > 120 && r < 100 && b < 140
+                    case "magenta": matches = r > 180 && b > 180 && g < 90
+                    case "cyan": matches = g > 180 && b > 180 && r < 90
+                    case "yellow": matches = r > 180 && g > 180 && b < 90
                     default: matches = r > 180 && g >= 100 && g < 220 && b < 100
                     }
                     markerChecks.append(["name": name, "pixel": [x, y], "rgb": [r, g, b], "match": matches])
                 }
-                markerVisible = markerChecks.contains { $0["name"] as? String == "red" }
+                markerVisible = markerChecks.contains { $0["name"] as? String == requiredMarker }
                     && markerChecks.allSatisfy { $0["match"] as? Bool == true }
                 let mutationVisible = beforeMutation.map { $0 != pixels } ?? true
                 stableSamples = markerVisible && mutationVisible && previousPixels == pixels ? stableSamples + 1 : 0
@@ -394,6 +427,7 @@ enum PaperVisualCapture {
             captures.append([
                 "id": id, "file": "\(id).png", "pixel_width": image.width, "pixel_height": image.height,
                 "window_points": [window.frame.width, window.frame.height],
+                "tab_count": state.tabs.count, "active_tab_index": state.activeTabIndex as Any? ?? NSNull(),
                 "active_application": NSApplication.shared.isActive, "key_window": window.isKeyWindow,
                 "canvas_points": [canvasLeft, canvasTop, bounds.width, bounds.height],
                 "canvas_window_points": [bounds.minX, bounds.minY, bounds.width, bounds.height],
@@ -403,6 +437,8 @@ enum PaperVisualCapture {
                 "captured_content_rect_points": [capturedContentRect.minX, capturedContentRect.minY,
                     capturedContentRect.width, capturedContentRect.height],
                 "paper_points": [paper.minX, paper.minY, paper.width, paper.height],
+                "paper_margins_points": [paper.minX, top, canvas.bounds.width - paper.maxX, bottom],
+                "visible_paper_count": visiblePapers.count, "page_index": state.currentPage - 1,
                 "backing_scale": scale, "layer_scale": layer.contentsScale,
                 "layer_drawable_size": [layer.drawableSize.width, layer.drawableSize.height],
                 "submitted_drawable_size": [canvas.lastAttemptDrawableSize.width, canvas.lastAttemptDrawableSize.height],
@@ -415,7 +451,8 @@ enum PaperVisualCapture {
                 "metal_presentation_timestamp_available": frames.contains(
                     canvas.visualSubmittedFrameIndex, surface: canvas.presentationSurfaceID),
                 "verification": "current-window-compositor-pixels",
-                "marker_pixel": [mx, my], "registration_markers": markerChecks, "fullscreen": window.styleMask.contains(.fullScreen)
+                "marker_pixel": [mx, my], "required_registration_marker": requiredMarker,
+                "registration_markers": markerChecks, "fullscreen": window.styleMask.contains(.fullScreen)
             ])
             guard markerVisible else { throw CaptureError("GPU registration marker is missing or misaligned in \(id)") }
             guard stableSamples >= 3 else { throw CaptureError("Window compositor pixels did not stabilize in \(id)") }
@@ -475,6 +512,104 @@ enum PaperVisualCapture {
             guard changed >= 20 else { throw CaptureError("Capture did not include the native paper chrome") }
         }
 
+        func homeSnapshot(_ id: String, state: AppState, window: NSWindow) async throws {
+            focus(window: window)
+            try await wait("empty production reader home", attempts: 2400) {
+                guard NSApplication.shared.isActive && window.isKeyWindow else {
+                    self.focus(window: window)
+                    return false
+                }
+                window.contentView?.layoutSubtreeIfNeeded()
+                guard let content = window.contentView, let canvas = self.canvas(in: content) else { return false }
+                return state.document == nil && state.tabs.isEmpty && state.canvasPages.isEmpty
+                    && canvas.lastSubmittedQuadCount == 0 && window.occlusionState.contains(.visible)
+            }
+            guard RecentDocumentStore.shared.entries.isEmpty else {
+                throw CaptureError("Home capture must not contain recent documents")
+            }
+            var previous: [UInt8]?
+            var stable = 0
+            for _ in 0..<80 {
+                guard NSApplication.shared.isActive && window.isKeyWindow else {
+                    focus(window: window)
+                    stable = 0
+                    previous = nil
+                    try await Task.sleep(for: .milliseconds(100))
+                    continue
+                }
+                let image = try await screenshot(window: window)
+                let pixels = try rgba(image)
+                stable = previous == pixels ? stable + 1 : 0
+                previous = pixels
+                if stable >= 3 {
+                    guard state.document == nil && state.tabs.isEmpty else {
+                        throw CaptureError("Home changed while capturing")
+                    }
+                    var colors = Set<Int>()
+                    for offset in stride(from: 0, to: pixels.count, by: 4 * 997) {
+                        colors.insert(Int(pixels[offset]) << 16 | Int(pixels[offset + 1]) << 8 | Int(pixels[offset + 2]))
+                    }
+                    guard colors.count >= 16 else { throw CaptureError("Home image is blank or uniform") }
+                    try write(image, name: "\(id).png")
+                    captures.append([
+                        "id": id, "file": "\(id).png", "pixel_width": image.width, "pixel_height": image.height,
+                        "window_points": [window.frame.width, window.frame.height],
+                        "backing_scale": window.backingScaleFactor, "calibration": state.displayCalibration.factor,
+                        "zoom_percent": state.zoomPercent, "tab_count": 0,
+                        "active_application": NSApplication.shared.isActive, "key_window": window.isKeyWindow,
+                        "verification": "stable-native-home-with-zero-page-quads"
+                    ])
+                    return
+                }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            throw CaptureError("Home compositor pixels did not stabilize")
+        }
+
+        func captureReaderShell(state: AppState, window: NSWindow) async throws {
+            try await homeSnapshot("01-home-empty", state: state, window: window)
+            let names = Array("abcdefgh").map { "reader-\($0).pdf" }
+            let colors = ["magenta", "cyan", "yellow"]
+            func open(_ index: Int) throws {
+                let url = options.fixture.deletingLastPathComponent().appendingPathComponent(names[index])
+                guard state.openDocumentInTab(url) else { throw CaptureError("Cannot open reader fixture") }
+                state.zoomActual()
+                state.scroll(toFraction: 0)
+            }
+            func shot(_ id: String, active: Int, count: Int, source: Int) async throws {
+                func correctDocument() -> Bool {
+                    state.activeTabIndex == active && state.tabs.count == count
+                        && state.document?.url?.lastPathComponent == names[source]
+                }
+                guard correctDocument() else { throw CaptureError("Wrong tab or document before \(id)") }
+                try await snapshot(id, state: state, window: window, identity: colors[source % colors.count])
+                guard correctDocument() else { throw CaptureError("Tab changed while capturing \(id)") }
+            }
+            try open(0)
+            try await shot("02-one-tab", active: 0, count: 1, source: 0)
+            try open(1)
+            try open(2)
+            try await shot("03-three-tabs", active: 2, count: 3, source: 2)
+            for index in 3..<8 { try open(index) }
+            try await shot("04-eight-tabs", active: 7, count: 8, source: 7)
+            state.selectTab(0)
+            try await shot("05-first-tab-active", active: 0, count: 8, source: 0)
+            window.setContentSize(CGSize(width: 960, height: 640))
+            try await shot("06-narrow-eight-tabs", active: 0, count: 8, source: 0)
+            window.setContentSize(CGSize(width: 1200, height: 800))
+            try await shot("07-window-restored", active: 0, count: 8, source: 0)
+            state.closeTab(0)
+            try await shot("08-close-active-tab", active: 0, count: 7, source: 1)
+            while state.tabs.count > 1 {
+                let count = state.tabs.count
+                state.closeTab(count - 1)
+                guard state.tabs.count == count - 1 else { throw CaptureError("Fixture tab refused to close") }
+            }
+            try await shot("09-last-tab", active: 0, count: 1, source: 1)
+            state.closeTab(0)
+            try await homeSnapshot("10-return-home", state: state, window: window)
+        }
+
         func fullScreen(window: NSWindow, entering: Bool) async throws {
             fullScreenTransitionCompleted = false
             let name = entering ? NSWindow.didEnterFullScreenNotification : NSWindow.didExitFullScreenNotification
@@ -504,7 +639,6 @@ enum PaperVisualCapture {
             window.makeKeyAndOrderFront(nil)
             window.orderFrontRegardless()
             NSApplication.shared.activate(ignoringOtherApps: true)
-            guard state.open(url: options.fixture) else { throw CaptureError("Cannot open synthetic visual fixture") }
             environment = [
                 "os": ProcessInfo.processInfo.operatingSystemVersionString,
                 "language": options.language, "appearance": options.appearance,
@@ -528,39 +662,65 @@ enum PaperVisualCapture {
                 environment["display_mode_points"] = [mode.width, mode.height]
                 environment["display_backing_pixels"] = [mode.pixelWidth, mode.pixelHeight]
             }
+            if options.suite == "reader-shell" {
+                try await captureReaderShell(state: state, window: window)
+                return
+            }
+            guard state.open(url: options.fixture) else { throw CaptureError("Cannot open synthetic visual fixture") }
             state.zoomActual()
             state.scroll(toFraction: 0)
-            try await snapshot("01-default-100", state: state, window: window)
+            try await snapshot("01-default-100", state: state, window: window, expectation: .topEdge)
             window.setContentSize(CGSize(width: 1200, height: 800))
-            try await snapshot("02-fixed-100", state: state, window: window)
+            try await snapshot("02-fixed-100", state: state, window: window, expectation: .topEdge)
             state.sidebarVisible = true
-            try await snapshot("03-sidebar-open", state: state, window: window)
+            try await snapshot("03-sidebar-open", state: state, window: window, expectation: .topEdge)
             state.sidebarVisible = false
-            try await snapshot("04-sidebar-restored", state: state, window: window)
+            try await snapshot("04-sidebar-restored", state: state, window: window, expectation: .topEdge)
             window.setContentSize(CGSize(width: 960, height: 640))
-            try await snapshot("05-resize-small", state: state, window: window)
+            try await snapshot("05-resize-small", state: state, window: window, expectation: .topEdge)
             window.setContentSize(CGSize(width: 1200, height: 800))
-            try await snapshot("06-resize-restored", state: state, window: window)
+            try await snapshot("06-resize-restored", state: state, window: window, expectation: .topEdge)
             state.zoomFitWidth()
             state.scroll(toFraction: 0)
-            try await snapshot("07-fit-width", state: state, window: window)
+            try await snapshot("07-fit-width", state: state, window: window, expectation: .topEdge)
             state.zoomIn()
             state.zoomIn()
             state.scroll(toFraction: 0)
-            try await snapshot("08-zoom-in", state: state, window: window)
+            try await snapshot("08-zoom-in", state: state, window: window, expectation: .topEdge)
             state.zoomActual()
             state.scroll(toFraction: 0)
-            try await snapshot("09-zoom-restored", state: state, window: window)
+            try await snapshot("09-zoom-restored", state: state, window: window, expectation: .topEdge)
             try await fullScreen(window: window, entering: true)
-            try await snapshot("10-fullscreen", state: state, window: window)
+            try await snapshot("10-fullscreen", state: state, window: window, expectation: .fitted)
             try await fullScreen(window: window, entering: false)
-            try await snapshot("11-fullscreen-restored", state: state, window: window)
+            try await snapshot("11-fullscreen-restored", state: state, window: window, expectation: .topEdge)
+            state.zoomFitPage()
+            try await snapshot("12-fit-page-window", state: state, window: window, expectation: .fitted)
+            let multipage = options.fixture.deletingLastPathComponent().appendingPathComponent("paper-multipage.pdf")
+            guard state.open(url: multipage), state.document?.pageCount == 3 else {
+                throw CaptureError("Cannot open three-page visual fixture")
+            }
+            // A zero preferred gap exercises the fitted spacing that excludes neighboring paper.
+            state.setPageGap(0)
+            for (page, id, identity) in [(0, "13-fit-page-first", "magenta"),
+                                       (1, "14-fit-page-middle", "cyan"),
+                                       (2, "15-fit-page-last", "yellow")] {
+                state.gotoPage(page)
+                state.zoomFitPage()
+                try await snapshot(id, state: state, window: window, identity: identity, expectation: .fitted)
+                guard state.currentPage == page + 1 else { throw CaptureError("Wrong fitted page in \(id)") }
+            }
+            state.zoomActual()
+            state.scroll(toFraction: 1)
+            try await snapshot("16-document-end-100", state: state, window: window,
+                               expectation: .bottomEdge, requiredMarker: "green")
             try await nativeChromeProbe(state: state, window: window)
         }
 
         func writeManifest(error: String?) throws {
             var report: [String: Any] = [
                 "schema_version": 1, "status": error == nil ? "candidate" : "failed",
+                "suite": options.suite,
                 "environment": environment, "captures": captures,
                 "mutation": options.mutation as Any? ?? NSNull()
             ]
