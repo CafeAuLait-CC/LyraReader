@@ -45,6 +45,8 @@ pub enum PaperAppearance {
     Night = 2,
     /// Neutral scientific foreground becomes warm gray-gold; chromatic pixels stay original.
     DarkFigure = 3,
+    /// Match PDFium's encoded-sRGB edge compositing on the light preview surface.
+    LightFigure = 4,
 }
 
 impl PaperAppearance {
@@ -63,6 +65,8 @@ impl PaperAppearance {
             3.0
         } else if self == Self::DarkFigure {
             4.0
+        } else if self == Self::LightFigure {
+            5.0
         } else {
             self as u8 as f32
         }
@@ -71,11 +75,11 @@ impl PaperAppearance {
 
 /// Uniform block layout: `dest` + `surface` + paper mode + source UV rectangle.
 ///
-/// 48 bytes: four `f32` destination, two `f32` surface size, one `f32` paper mode, one
-/// `f32` padding, and four `f32` source rectangle (`u0, v0, u1, v1`). The source rectangle is
+/// 64 bytes: destination, surface size, paper mode, padding, source UV rectangle and linear
+/// surface background. The source rectangle is
 /// what lets one uploaded page texture serve both pieces of a torn page without a second
 /// rasterisation or a CPU pixel copy.
-const UNIFORM_BYTES: u64 = 48;
+const UNIFORM_BYTES: u64 = 64;
 
 /// The shader that draws a textured quad in *pixel* coordinates.
 ///
@@ -92,6 +96,7 @@ struct Uniforms {
     _padding: f32,
     // Normalized source rectangle: u0, v0, u1, v1. (0,0,1,1) is the whole texture.
     source: vec4<f32>,
+    background: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -139,9 +144,26 @@ fn paper_colour(rgb: vec3<f32>) -> vec3<f32> {
     return rgb;
 }
 
+fn srgb_encode(rgb: vec3<f32>) -> vec3<f32> {
+    return select(rgb * 12.92, 1.055 * pow(max(rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - 0.055,
+                  rgb > vec3<f32>(0.0031308));
+}
+
+fn srgb_decode(rgb: vec3<f32>) -> vec3<f32> {
+    return select(rgb / 12.92, pow((rgb + 0.055) / 1.055, vec3<f32>(2.4)), rgb > vec3<f32>(0.04045));
+}
+
 @fragment
 fn fs_page(in: VertexOutput) -> @location(0) vec4<f32> {
     let colour = textureSample(page_texture, page_sampler, in.uv);
+    if uniforms.paper_mode == 5.0 {
+        // PDFium composites coverage in encoded sRGB on opaque paper. Ordinary GPU alpha-over
+        // instead blends in linear light, making transparent glyph edges much paler. Resolve
+        // against this crop surface in PDFium's space, then return linear RGB to the sRGB target.
+        // Only the displayed crop is resolved; uploaded pixels keep their original alpha.
+        let resolved = mix(srgb_encode(uniforms.background.rgb), srgb_encode(colour.rgb), colour.a);
+        return vec4<f32>(srgb_decode(resolved), 1.0);
+    }
     if uniforms.paper_mode == 4.0 {
         // Lyra text-secondary (#C8BFAF), in linear sRGB. Neutral source ink is carried by
         // coverage over the existing card: black is soft ink, white is clear. Saturated plot
@@ -585,7 +607,7 @@ impl GpuContext {
         let mut bind_groups = Vec::with_capacity(draws.len());
         let mut uniform_buffers = Vec::with_capacity(draws.len());
         for (texture_id, rect, source, blend) in draws {
-            let uniforms: [f32; 12] = [
+            let uniforms: [f32; 16] = [
                 rect[0],
                 rect[1],
                 rect[2],
@@ -598,6 +620,10 @@ impl GpuContext {
                 source[1],
                 source[2],
                 source[3],
+                clear[0] as f32,
+                clear[1] as f32,
+                clear[2] as f32,
+                clear[3] as f32,
             ];
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("lyra-reader-page-uniforms"),
@@ -747,6 +773,17 @@ impl GpuContext {
         height: u32,
         appearance: PaperAppearance,
     ) -> Result<Vec<u8>> {
+        self.probe_layers_with_background(draws, width, height, appearance, [0.0, 0.0, 0.0, 1.0])
+    }
+
+    fn probe_layers_with_background(
+        &mut self,
+        draws: &[TexturedQuad],
+        width: u32,
+        height: u32,
+        appearance: PaperAppearance,
+        clear: [f64; 4],
+    ) -> Result<Vec<u8>> {
         if width == 0 || height == 0 {
             return Err(LyraReaderError::new(
                 ErrorCode::InvalidArgument,
@@ -784,7 +821,7 @@ impl GpuContext {
         let mut uniform_buffers = Vec::with_capacity(draws.len());
         let mut bind_groups = Vec::with_capacity(draws.len());
         for (texture_id, rect, source, blend) in draws {
-            let uniforms: [f32; 12] = [
+            let uniforms: [f32; 16] = [
                 rect[0],
                 rect[1],
                 rect[2],
@@ -797,6 +834,10 @@ impl GpuContext {
                 source[1],
                 source[2],
                 source[3],
+                clear[0] as f32,
+                clear[1] as f32,
+                clear[2] as f32,
+                clear[3] as f32,
             ];
             let uniform_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("page-probe-uniforms"),
@@ -860,7 +901,12 @@ impl GpuContext {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: clear[0],
+                        g: clear[1],
+                        b: clear[2],
+                        a: clear[3],
+                    }),
                     store: wgpu::StoreOp::Store,
                 },
             };
@@ -989,6 +1035,7 @@ mod tests {
             PaperAppearance::Warm,
             PaperAppearance::Night,
             PaperAppearance::DarkFigure,
+            PaperAppearance::LightFigure,
         ] {
             let actual = context
                 .offscreen_probe_layers_with_appearance(&draws, 2, 1, appearance)
@@ -1000,6 +1047,89 @@ mod tests {
                 "{appearance:?}: {actual:?}"
             );
         }
+    }
+
+    #[test]
+    fn light_figure_edges_match_pdfium_compositing_without_changing_source_pixels() {
+        let mut context = match GpuContext::new(false) {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("skipping: {error}");
+                return;
+            }
+        };
+        let source = [
+            0, 0, 0, 64, 0, 0, 0, 128, 0, 0, 0, 192, // black glyph edges
+            128, 128, 128, 255, // opaque gray rule
+            0, 0, 255, 128, 255, 0, 0, 64, // translucent red/blue plot marks
+            21, 89, 170, 0, // irrelevant colour in a clear pixel
+            0, 0, 0, 255, 255, 255, 255, 255, // solid black and painted white
+        ];
+        let texture = context.upload_page_texture(9, 1, &source).unwrap();
+        let draws = [(
+            texture,
+            [0.0, 0.0, 9.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+            QuadBlend::Normal,
+        )];
+        let original = context
+            .offscreen_probe_layers_with_uv_and_appearance(&draws, 9, 1, PaperAppearance::Original)
+            .unwrap();
+        for background in [[255_u8, 255, 255], [255, 253, 250]] {
+            let linear = |c: u8| {
+                let c = f64::from(c) / 255.0;
+                if c <= 0.04045 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            let clear = [
+                linear(background[0]),
+                linear(background[1]),
+                linear(background[2]),
+                1.0,
+            ];
+            let actual = context
+                .probe_layers_with_background(&draws, 9, 1, PaperAppearance::LightFigure, clear)
+                .unwrap();
+            for (index, pixel) in source.as_chunks::<4>().0.iter().enumerate() {
+                let alpha = u32::from(pixel[3]);
+                for (channel, source_channel) in
+                    [pixel[2], pixel[1], pixel[0]].into_iter().enumerate()
+                {
+                    // This is PDFium's encoded-channel coverage contract, also pinned by the
+                    // PDF backend's transparent-versus-opaque text-page regression.
+                    let expected = ((u32::from(source_channel) * alpha
+                        + u32::from(background[channel]) * (255 - alpha)
+                        + 127)
+                        / 255) as u8;
+                    assert!(
+                        actual[index * 4 + channel].abs_diff(expected) <= 1,
+                        "pixel {index}, channel {channel}: {:?} vs {expected}",
+                        &actual[index * 4..index * 4 + 4]
+                    );
+                }
+                assert_eq!(actual[index * 4 + 3], 255);
+            }
+            // The former linear-alpha path makes this same edge about 187 instead of 127.
+            assert!(
+                actual[4] < 130,
+                "half-covered black keeps the opaque page's visual weight"
+            );
+        }
+        assert_eq!(
+            context
+                .offscreen_probe_layers_with_uv_and_appearance(
+                    &draws,
+                    9,
+                    1,
+                    PaperAppearance::Original,
+                )
+                .unwrap(),
+            original,
+            "display correction never rewrites the uploaded source"
+        );
     }
 
     #[test]

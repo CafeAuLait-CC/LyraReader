@@ -145,8 +145,8 @@ extension ReaderChecks {
                 require(view.paperAppearance == .original,
                         "scientific colours remain original under \(theme) / \(mode)")
                 let dark = view.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-                require(view.adaptsFigureInkToAppearance && view.renderingAppearanceCode == (dark ? 3 : 0),
-                        "only dark scientific crops enable neutral-ink adaptation")
+                require(view.adaptsFigureInkToAppearance && view.renderingAppearanceCode == (dark ? 3 : 4),
+                        "scientific crops select dark ink or light edge compositing")
                 require((view.layer as? CAMetalLayer)?.colorspace?.name == CGColorSpace.sRGB,
                         "the native crop layer declares its source sRGB colour space")
                 var background = NSColor.black
@@ -197,7 +197,7 @@ extension ReaderChecks {
             try await eventually("theme switch updates the existing figure surface", {
                 panels.panel?.contentView?.layoutSubtreeIfNeeded()
                 guard let view = canvas(panels.panel?.contentView) else { return false }
-                return view.renderingAppearanceCode == (theme == .darkAqua ? 3 : 0)
+                return view.renderingAppearanceCode == (theme == .darkAqua ? 3 : 4)
             })
             require(state.referencePreviewPages[0].image.generation == source.generation
                         && state.referencePreviewPages[0].image.bgra == source.bgra,

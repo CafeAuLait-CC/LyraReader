@@ -50,8 +50,9 @@ separate features with their own documented limits.
   on write; forms; document properties (Info and XMP); redaction that removes the covered content; printing
   (a page torn open by a region card still prints as the original page).
 - **Papers**: clickable citations (author–year, bracketed, superscript and bare parenthetical numerals),
-  figure/table/algorithm previews with transparent crops (dark previews use soft warm gray-gold neutral ink
-  while retaining chart colours), metadata recognition with BibTeX export.
+  figure/table/algorithm previews with transparent crops (light previews match the original page's edge
+  compositing; dark previews use soft warm gray-gold neutral ink while retaining chart colours),
+  metadata recognition with BibTeX export.
 - **Assist**: an optional assistant in its own right-hand panel — document chat with retrieval across the whole
   file and citation chips that jump to the verified source and flash it; region questions, where a drag opens the
   answer in a card set into a real tear in the page (the page's pixels are clipped into two pieces, never

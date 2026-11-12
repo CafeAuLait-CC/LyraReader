@@ -483,8 +483,9 @@ public final class MetalCanvasView: NSView {
         }
     }
 
-    /// Only floating scientific crops opt in; the reader and whole-page previews retain their
-    /// selected paper profile. Appearance changes redraw the same uploaded texture.
+    /// Only floating scientific crops opt in: light crops match PDFium edge coverage and dark
+    /// crops lift neutral ink. The reader and whole-page previews retain their selected paper
+    /// profile. Appearance changes redraw the same uploaded texture.
     public var adaptsFigureInkToAppearance = false {
         didSet {
             guard oldValue != adaptsFigureInkToAppearance else { return }
@@ -502,8 +503,9 @@ public final class MetalCanvasView: NSView {
     }
 
     package var renderingAppearanceCode: UInt8 {
-        if adaptsFigureInkToAppearance,
-           effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua { return 3 }
+        if adaptsFigureInkToAppearance {
+            return effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? 3 : 4
+        }
         return paperAppearance.code
     }
 
