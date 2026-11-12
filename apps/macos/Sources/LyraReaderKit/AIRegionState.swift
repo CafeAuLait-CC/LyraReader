@@ -623,14 +623,14 @@ extension AppState {
             .reduce(0) { $0 + regionGapHeightPt($1) }
     }
 
-    /// Page top with the region-card gaps and the fitted presentation's content-space padding.
+    /// Page top with region-card gaps and the document's content-space edge padding.
     ///
-    /// The fitted inset is a real offset in content space: the first row starts below it, and
+    /// The paper inset is a real offset in content space: the first row starts below it, and
     /// the last row ends above the bottom inset. `scrollYPt` therefore keeps the ordinary
     /// `0…(content − viewport)` range and can never become negative to show that padding.
     func displayPageTop(_ page: Int) -> CGFloat {
         let engineTop = engine.pageTopPt(page, gapPt: pageGapPt, layout: layoutMode)
-            + fittedPageInsetPt + fittedPageShift(page)
+            + documentInsetPt + fittedPageShift(page)
         guard !regionCards.isEmpty else { return engineTop }
         return engineTop + regionShift(beforeRow: regionRow(forPage: page))
     }
@@ -651,7 +651,7 @@ extension AppState {
         }
         let row = regionRow(forPage: card.attachment.page)
         var top = regionEngineRowBottom(row: row) + regionShift(beforeRow: row)
-            + fittedPageInsetPt + fittedPageShift(card.attachment.page)
+            + documentInsetPt + fittedPageShift(card.attachment.page)
         for earlier in regionCards {
             guard earlier.id != card.id else { break }
             guard regionRow(forPage: earlier.attachment.page) == row else { continue }
@@ -670,7 +670,7 @@ extension AppState {
         viewportHeightPt height: CGFloat,
         marginPt margin: CGFloat
     ) -> [PagePlacement] {
-        guard !regionCards.isEmpty || fittedPageInsetPt > 0 || fittedPageExtraGapPt > 0 else {
+        guard !regionCards.isEmpty || documentInsetPt > 0 || fittedPageExtraGapPt > 0 else {
             return engine.visiblePages(
                 scrollYPt: scroll,
                 viewportHeightPt: height,
@@ -680,7 +680,7 @@ extension AppState {
             )
         }
         let raw: [PagePlacement]
-        if fittedPageInsetPt > 0 || fittedPageExtraGapPt > 0, let document {
+        if fittedPageExtraGapPt > 0, let document {
             // Invert the monotonic row tops instead of widening the query by every fitted gap
             // in a long document. Only a viewport-sized band plus one row reaches the engine.
             let rowCount = regionRow(forPage: document.pageCount - 1) + 1
@@ -702,7 +702,9 @@ extension AppState {
                 viewportHeightPt: height + 2 * margin + rowHeight + pageGapPt + regionGapTotalPt,
                 gapPt: pageGapPt, marginPt: 0, layout: layoutMode)
         } else {
-            let totalGap = regionGapTotalPt
+            // Ordinary padding is a uniform translation; retain the engine's direct band
+            // query instead of performing a row search on every normal scroll update.
+            let totalGap = regionGapTotalPt + documentInsetPt
             raw = engine.visiblePages(
                 scrollYPt: max(0, scroll - totalGap), viewportHeightPt: height + totalGap,
                 gapPt: pageGapPt, marginPt: margin, layout: layoutMode)
@@ -711,7 +713,7 @@ extension AppState {
         let bottom = scroll + height + margin
         return raw.compactMap { placement in
             let shift = regionShift(beforeRow: regionRow(forPage: placement.index))
-                + fittedPageInsetPt + fittedPageShift(placement.index)
+                + documentInsetPt + fittedPageShift(placement.index)
             let shifted = PagePlacement(
                 index: placement.index,
                 topPt: placement.topPt + shift,
@@ -757,13 +759,12 @@ extension AppState {
     /// positions use this, so quitting with a card open does not make the next launch jump down
     /// by the card's height (history is session-only and the gap will not be there).
     func regionUnshiftedScrollYPt(_ y: CGFloat) -> CGFloat {
-        guard !regionCards.isEmpty || fittedPageInsetPt > 0 || fittedPageExtraGapPt > 0 else { return y }
-        let page = regionCurrentPage(at: y + fittedPageInsetPt)
-        // The fitted presentation centres the row: the viewport top can sit in the paper inset
-        // above the page, so the unshifted position is the page's engine top, not that blank.
-        let position = (fittedPageInsetPt > 0 || fittedPageExtraGapPt > 0)
-            ? max(y, displayPageTop(page) - fittedPageInsetPt) : y
-        var result = position - fittedPageShift(page)
+        guard !regionCards.isEmpty || documentInsetPt > 0 || fittedPageExtraGapPt > 0 else { return y }
+        let page = regionCurrentPage(at: y + documentInsetPt)
+        // A viewport in leading padding still names the paper's top. Store paper coordinates
+        // so ordinary edge padding and temporary fitted spacing cannot shift a restored position.
+        let position = max(y, displayPageTop(page))
+        var result = position - documentInsetPt - fittedPageShift(page)
         for card in regionCards {
             guard let top = regionGapTop(for: card) else { continue }
             if position >= top { result -= min(regionGapHeightPt(card), position - top) }
@@ -785,7 +786,7 @@ extension AppState {
             return
         }
         let base = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode)
-        contentHeightPt = base + regionGapTotalPt + fittedPageSpaceTotalPt
+        contentHeightPt = base + regionGapTotalPt + presentationSpaceTotalPt
         if !preservingScroll {
             scrollYPt = regionClampScroll(scrollYPt)
         }

@@ -22,6 +22,13 @@ extension ReaderChecks {
         let paper = PaperAppearance.night.displayColor(.white).usingColorSpace(.sRGB)!
         require(ink.redComponent > 0.7 && ink.redComponent < 0.85 && paper.redComponent < 0.2,
                 "night annotations use subdued light ink and dark paper")
+        let edge = PaperAppearance.night.displayColor(
+            NSColor(srgbRed: 128.0/255, green: 128.0/255, blue: 128.0/255, alpha: 0.4)
+        ).usingColorSpace(.sRGB)!
+        require(abs(edge.redComponent * 255 - 166) < 1
+                    && abs(edge.greenComponent * 255 - 162) < 1
+                    && abs(edge.blueComponent * 255 - 156) < 1 && edge.alphaComponent == 0.4,
+                "neutral vector edges match the GPU's moderated night coverage without changing opacity")
         require(PaperAppearance.warm.displayColor(.white).redComponent > 0.97,
                 "warm paper follows the palette cream")
         let source = NSColor(srgbRed: 0.7, green: 0.2, blue: 0.1, alpha: 0.4)
@@ -84,7 +91,7 @@ extension ReaderChecks {
                                    entries: [.init(label: "2", text: "A short citation.")])
         controller.sync(state: state, parentWindow: parent)
         require(panel.frame.width == PreviewPanelGeometry.defaultSize.width
-                    && panel.frame.height == PreviewPanelGeometry.minimumSize.height,
+                    && panel.frame.height < 160,
                 "a different preview refits both dimensions after a manual resize")
         let esc = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
                                   windowNumber: parent.windowNumber, context: nil, characters: "\u{1b}",

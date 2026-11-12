@@ -647,26 +647,25 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
     /// Gap between pages, in points. Set through `setPageGap` so it is clamped and the layout
     /// is rebuilt immediately; read by the engine on every layout query.
     @Published public private(set) var pageGapPt: CGFloat = ReadingLayoutPreferences.defaultGapPt
-    /// Fit Page adds temporary row spacing and balanced top/bottom padding without changing the
-    /// saved page-gap preference. The padding is **content**, not a negative scroll origin: the
-    /// first page's top moves down by `fittedPageInsetPt` in content space, so every scroll
-    /// offset the reader can hold stays at or above zero like the ordinary layout. Presenting
-    /// the same blank by subtracting from an unshifted offset would make `scrollYPt` negative,
-    /// which the scrollbar, saved positions and tab snapshots all treat as out of range.
+    /// Paper padding is real content, keeping every scroll offset non-negative. Ordinary
+    /// reading keeps the preset's screen-space inset at either document edge; Fit Page can
+    /// enlarge it to balance the spare height and adds temporary spacing between rows.
     private var fittedPageSpacing: FitPageSpacingRecord?
     var fittedPageExtraGapPt: CGFloat { fittedPageSpacing.map { max(0, CGFloat($0.gapPt) - pageGapPt) } ?? 0 }
-    /// Temporary space the fitted presentation adds to the content height: both paper insets
-    /// plus every inter-row gap (the rounding remainder included).
-    var fittedPageSpaceTotalPt: CGFloat {
-        guard fittedPageSpacing != nil else { return 0 }
-        let count = document?.pageCount ?? 0
-        let rows = count > 0 ? regionRow(forPage: count - 1) + 1 : 0
-        return 2 * fittedPageInsetPt + CGFloat(max(0, rows - 1)) * fittedPageExtraGapPt
+    var presentationSpaceTotalPt: CGFloat {
+        guard let document, document.pageCount > 0 else { return 0 }
+        let rows = regionRow(forPage: document.pageCount - 1) + 1
+        return 2 * documentInsetPt + CGFloat(max(0, rows - 1)) * fittedPageExtraGapPt
     }
     func fittedPageShift(_ page: Int) -> CGFloat {
         CGFloat(regionRow(forPage: page)) * fittedPageExtraGapPt
     }
-    var fittedPageInsetPt: CGFloat { fittedPageSpacing.map { CGFloat($0.insetPt) } ?? 0 }
+    var documentInsetPt: CGFloat {
+        guard let document, document.pageCount > 0 else { return 0 }
+        // The policy's inset is in view points; placements and scroll offsets use PDF points.
+        return max(fittedPageSpacing.map { CGFloat($0.insetPt) } ?? 0,
+                   Self.zoomPresetInsetPt / max(zoomFactor, 0.01))
+    }
 
     /// How pages are arranged horizontally (continuous or facing spreads).
     @Published public private(set) var layoutMode: ReaderLayoutMode = .continuous
@@ -1978,7 +1977,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var referencePreviewLoading = false
 
     public func setReferencePreviewViewport(_ size: CGSize) {
-        guard size.width > 0, size.height > 0 else { return }
+        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else { return }
         let widthChanged = abs(referencePreviewWidthPt - size.width) > 1
         referencePreviewWidthPt = size.width
         referencePreviewHeightPt = size.height
@@ -1989,6 +1988,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                                  sectionTitle: preview.sectionTitle,
                                  sectionReference: preview.sectionReference)
         } else {
+            // Sub-point layout changes need no new raster, but must still fit the live bounds.
+            if let image = referencePreviewPages.first?.image {
+                referencePreviewZoom = size.width / max(image.pointSize.width, 1)
+            }
             scrollReferencePreview(by: 0)
         }
     }
@@ -2100,8 +2103,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     yPt: region.minY,
                     widthPt: region.width,
                     heightPt: region.height,
-                    // A figure/table crop is shown on the panel's own colour, so its white
-                    // page margin must be transparent. A whole-page preview keeps its paper.
+                    // Keep crop pixels independent of their display background. The preview
+                    // surface supplies original paper; whole-page previews retain their paper.
                     transparentBackground: kind == .figure
                 )
             } else {
@@ -4054,10 +4057,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             noticeInterruptedSave(at: url)
             if let restoringTabScroll {
                 contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode)
-                    + regionGapTotalPt + fittedPageSpaceTotalPt
+                    + regionGapTotalPt + presentationSpaceTotalPt
                 contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt, layout: layoutMode)
-                scrollYPt = min(max(0, restoringTabScroll),
-                                max(0, contentHeightPt - viewportHeightContentPt))
+                scrollYPt = restoredReadingOffset(restoringTabScroll)
                 reloadVisiblePages()
             } else {
                 reloadVisiblePages()
@@ -4296,6 +4298,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         clearFitPageSpacing()
         zoomPercent = resolvedZoomPercent(mode: .percent, percent: zoomPercent, delta: 10)
             ?? zoomPercent
+        rebuildContentDimensions()
+        scrollYPt = clampedScrollOffset(scrollYPt)
         reloadVisiblePages()
     }
 
@@ -4303,6 +4307,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         clearFitPageSpacing()
         zoomPercent = resolvedZoomPercent(mode: .percent, percent: zoomPercent, delta: -10)
             ?? zoomPercent
+        rebuildContentDimensions()
+        scrollYPt = clampedScrollOffset(scrollYPt)
         reloadVisiblePages()
     }
 
@@ -4358,13 +4364,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard let document, document.pageCount > 0 else { return nil }
         let page = min(max(0, currentPage - 1), document.pageCount - 1)
         let placement = visiblePagePlacements.first { $0.index == page }
-            ?? engine.visiblePages(
-                scrollYPt: scrollYPt,
-                viewportHeightPt: viewportHeightContentPt,
-                gapPt: pageGapPt,
-                marginPt: 0,
-                layout: layoutMode
-            ).first { $0.index == page }
+            ?? regionVisiblePages(scrollYPt: scrollYPt, viewportHeightPt: viewportHeightContentPt,
+                                  marginPt: 0).first { $0.index == page }
         let fallback = document.firstPageSize
         let pageHeight = placement?.heightPt ?? fallback.height
         guard pageHeight > 0, pageHeight.isFinite else { return nil }
@@ -4437,13 +4438,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         zoomPercent = percent
         switch anchor {
         case .viewportTop:
+            rebuildContentDimensions()
             scrollYPt = clampedScrollOffset(scrollYPt)
         case .pageTop(let page, let height):
             fittedPageSpacing = fitPageSpacing(
                 pageHeightPt: Double(height), viewportHeightPt: Double(viewportSizePt.height),
                 zoom: Double(zoomFactor), preferredGapPt: Double(pageGapPt))
             rebuildContentDimensions()
-            scrollYPt = clampedScrollOffset(displayPageTop(page) - fittedPageInsetPt)
+            scrollYPt = clampedScrollOffset(displayPageTop(page) - documentInsetPt)
         }
         reloadVisiblePages()
         schedulePositionSave()
@@ -4476,7 +4478,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     }
 
     private func rebuildContentDimensions() {
-        contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode) + regionGapTotalPt + fittedPageSpaceTotalPt
+        guard document != nil else {
+            contentHeightPt = 0
+            contentWidthPt = 0
+            return
+        }
+        contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode) + regionGapTotalPt + presentationSpaceTotalPt
         contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt, layout: layoutMode)
     }
 
@@ -4485,11 +4492,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard fittedPageSpacing != nil else { return }
         // The viewport top may sit in the fitted blank above the row; that blank belongs to the
         // row, so ask for the page at the row top rather than at the blank itself.
-        let page = regionCurrentPage(at: scrollYPt + fittedPageInsetPt)
+        let page = regionCurrentPage(at: scrollYPt + documentInsetPt)
         let offset = scrollYPt - displayPageTop(page)
         fittedPageSpacing = nil
         rebuildContentDimensions()
-        scrollYPt = clampedScrollOffset(displayPageTop(page) + max(0, offset))
+        scrollYPt = clampedScrollOffset(displayPageTop(page) + max(-documentInsetPt, offset))
     }
 
     /// How much zoom one screen point of a Ctrl/⌘+scroll asks for, in percent.
@@ -4559,8 +4566,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let anchorPage = regionCurrentPage(at: oldAnchorY)
         let pageLocalY = oldAnchorY - displayPageTop(anchorPage)
         clearFitPageSpacing()
-        let anchorContentY = displayPageTop(anchorPage) + pageLocalY
         zoomPercent = target
+        rebuildContentDimensions()
+        let anchorContentY = displayPageTop(anchorPage) + pageLocalY
         // The anchored offset replaces the old one outright; a glide still in flight would pull
         // it back toward where the wheel was heading before the zoom.
         cancelScrollGlide()
@@ -4580,8 +4588,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     /// The scroll offset clamped to the document (shared by every path that sets it).
     private func clampedScrollOffset(_ value: CGFloat) -> CGFloat {
-        // `contentHeightPt` already contains the fitted paper insets and row gaps (see
-        // `fittedPageSpaceTotalPt`), so the clamp is the ordinary 0…(content − viewport) range.
+        // `contentHeightPt` already contains the paper insets and any fitted row gaps (see
+        // `presentationSpaceTotalPt`), so the clamp is the ordinary 0…(content − viewport) range.
         // There is no fitted special case here and therefore no way to return a negative offset.
         CGFloat(clampScroll(
             offsetPt: Double(value),
@@ -4601,6 +4609,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         cancelScrollGlide()
         pointerZoomRemainder = 0
         zoomPercent = 100
+        rebuildContentDimensions()
         scrollYPt = clampedScrollOffset(scrollYPt)
         reloadVisiblePages()
         statusMessage = "Actual size · 100%"
@@ -12538,9 +12547,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         var loaded = try engine.openDocument(at: url)
         // Revisions keep the visible pixels until complete replacement pages arrive. A
         // different page layout must start from its own geometry, never stale tile positions.
-        let revisedFrames = engine.visiblePages(scrollYPt: previousScroll,
-            viewportHeightPt: viewportHeightContentPt, gapPt: pageGapPt,
-            marginPt: 0, layout: layoutMode)
+        // Compare displayed frames on both sides, including ordinary edge padding. Comparing
+        // padded frames with raw engine coordinates would discard valid pixels on every edit.
+        let revisedFrames = previousPageCount == loaded.pageCount
+            ? regionVisiblePages(scrollYPt: previousScroll, viewportHeightPt: viewportHeightContentPt,
+                                 marginPt: 0) : []
         let keepCanvas = preservingViewport && newCurrentPage == currentPage
             && !hadTears && previousPageCount == loaded.pageCount
             && !previousFrames.isEmpty && !revisedFrames.isEmpty
@@ -12557,7 +12568,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return (page, quad)
         } : []
         let fallbacks = Dictionary(grouping: retained, by: { $0.0 }).mapValues { $0.map { $0.1 } }
+        let retainedSpacing = keepCanvas ? fittedPageSpacing : nil
         resetDocumentState(keepingCanvas: keepCanvas)
+        fittedPageSpacing = retainedSpacing
         revisionCanvasFallbacks = fallbacks
         if keepCanvas, var drag {
             drag.retiringEpoch = renderEpoch
@@ -14575,7 +14588,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func restoreActiveTabPosition() {
         guard let index = activeTabIndex, tabs.indices.contains(index) else { return }
         let saved = tabs[index].scrollYPt
-        scrollYPt = min(saved, max(0, contentHeightPt - viewportHeightContentPt))
+        scrollYPt = restoredReadingOffset(saved)
         reloadVisiblePages()
     }
 
@@ -15049,8 +15062,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard let saved = UserDefaults.standard.object(forKey: Self.positionKey(for: url)) as? Double
         else { return }
 
-        let maxOffset = max(0, contentHeightPt - viewportHeightContentPt)
-        let clamped = min(max(0, CGFloat(saved)), maxOffset)
+        let clamped = restoredReadingOffset(CGFloat(saved))
         guard clamped > 0 else { return }
 
         scrollYPt = clamped
@@ -15058,6 +15070,11 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         FileHandle.standardError.write(
             Data("lyra-reader-position: restored \(Int(clamped)) pt of \(Int(contentHeightPt)) pt\n".utf8)
         )
+    }
+
+    /// Persisted positions are paper coordinates, independent of screen density and padding.
+    private func restoredReadingOffset(_ saved: CGFloat) -> CGFloat {
+        saved <= 0 ? 0 : clampedScrollOffset(saved + documentInsetPt)
     }
 
     private func schedulePositionSave() {
@@ -15221,7 +15238,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard document != nil else { return }
         cancelScrollGlide()
         let top = displayPageTop(max(0, page))
-        scrollYPt = fittedPageSpacing == nil ? top : clampedScrollOffset(top - fittedPageInsetPt)
+        scrollYPt = fittedPageSpacing == nil
+            ? (page == 0 ? 0 : top) : clampedScrollOffset(top - documentInsetPt)
         reloadVisiblePages()
         schedulePositionSave()
     }
@@ -15314,6 +15332,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         pointerZoomRemainder = 0
         let centreContentY = scrollYPt + viewportHeightContentPt / 2
         zoomPercent = target
+        rebuildContentDimensions()
         let fittedViewport = viewportSizePt.height / zoomFactor
         scrollYPt = clampedScrollOffset(centreContentY - fittedViewport / 2)
         reloadVisiblePages()
@@ -15328,9 +15347,9 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
 
     private func readingLayoutAnchor() -> ReadingLayoutAnchor {
         guard document != nil else { return ReadingLayoutAnchor(page: 0, offsetY: 0) }
-        let page = regionCurrentPage(at: scrollYPt + fittedPageInsetPt)
+        let page = regionCurrentPage(at: scrollYPt + documentInsetPt)
         let top = displayPageTop(page)
-        return ReadingLayoutAnchor(page: page, offsetY: max(0, scrollYPt - top))
+        return ReadingLayoutAnchor(page: page, offsetY: max(-documentInsetPt, scrollYPt - top))
     }
 
     /// Rebuilds the scroll geometry after `layoutMode` or `pageGapPt` changed and restores the
@@ -15345,7 +15364,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             return
         }
         contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode)
-            + regionGapTotalPt + fittedPageSpaceTotalPt
+            + regionGapTotalPt + presentationSpaceTotalPt
         contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt, layout: layoutMode)
         let top = displayPageTop(anchor.page)
         scrollYPt = clampedScrollOffset(top + anchor.offsetY)
@@ -15384,6 +15403,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard factorChanged, document != nil else { return }
         cancelScrollGlide()
         let previousScroll = scrollYPt
+        rebuildContentDimensions()
         scrollYPt = clampedScrollOffset(scrollYPt)
         reloadVisiblePages()
         if abs(scrollYPt - previousScroll) > 0.01 { schedulePositionSave() }
@@ -15413,7 +15433,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                 blend: quad.blend, source: quad.source)
         }
         visiblePagePlacements = visible
-        contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode) + regionGapTotalPt + fittedPageSpaceTotalPt
+        contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode) + regionGapTotalPt + presentationSpaceTotalPt
         var pages = canvasTiles
         appendSelectionHighlights(to: &pages)
         canvasPages = applyPageTears(to: pages)
@@ -15462,7 +15482,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
 
         contentHeightPt = engine.contentHeightPt(gapPt: pageGapPt, layout: layoutMode)
-            + regionGapTotalPt + fittedPageSpaceTotalPt
+            + regionGapTotalPt + presentationSpaceTotalPt
         contentWidthPt = engine.contentWidthPt(gapPt: pageGapPt, layout: layoutMode)
 
         let viewportHeight = viewportHeightContentPt
@@ -15841,14 +15861,14 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         if let perfOnScreen, let perfSharpSources {
             finishPerfViewport(pages: pages, sharpSources: perfSharpSources,
                                contentSources: perfContentSources ?? [:], onScreen: perfOnScreen,
-                               anchorPage: regionCurrentPage(at: scrollYPt + fittedPageInsetPt),
+                               anchorPage: regionCurrentPage(at: scrollYPt + documentInsetPt),
                                bandPages: visible.map(\.index),
                                path: usesScreenPageRasters ? "page-raster" : "tile", lod: lod,
                                viewport: viewport, visibleMisses: bandReport.visibleMisses,
                                queuedTiles: queuedTiles.count, wanted: wanted.count)
         }
         if isRestoringDocument && !pages.isEmpty { isRestoringDocument = false }
-        currentPage = regionCurrentPage(at: scrollYPt + fittedPageInsetPt) + 1
+        currentPage = regionCurrentPage(at: scrollYPt + documentInsetPt) + 1
         reportTileCacheStats(
             wanted: wanted.count, scheduled: pendingTiles.count, band: bandReport,
             ringVh: ringVh, lod: lod, tilePt: tilePt, pages: pages.count
@@ -17377,7 +17397,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     private func configurePagePreviews(visible: [PagePlacement], band: [BandSpan], viewport: CGRect,
                                        viewportHeight: CGFloat, screenScale: CGFloat) {
         desiredPreviewScale = usesScreenPageRasters ? screenScale : 1
-        let current = regionCurrentPage(at: scrollYPt + fittedPageInsetPt)
+        let current = regionCurrentPage(at: scrollYPt + documentInsetPt)
         let bandPages = Set(band.map(\.placement.index))
         let candidates: [PagePlacement]
         let budget: Int

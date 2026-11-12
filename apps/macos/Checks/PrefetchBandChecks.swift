@@ -77,8 +77,7 @@ extension ReaderChecks {
             guard let lod = state.pinnedTiles.first?.lod else { return TileKey(page: -1, lod: 0, x: 0, y: 0) }
             let tilePt = 512 / CGFloat(1 << Int(lod))
             let rect = visibleRect()
-            let pages = engine.visiblePages(scrollYPt: state.scrollYPt, viewportHeightPt: rect.height,
-                                            gapPt: state.pageGapPt, marginPt: 0)
+            let pages = state.canvasPageFrames
             for placement in pages {
                 let columns = max(1, Int(ceil(placement.widthPt / tilePt)))
                 let rows = max(1, Int(ceil(placement.heightPt / tilePt)))

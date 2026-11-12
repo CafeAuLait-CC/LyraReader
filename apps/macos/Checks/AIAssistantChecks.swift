@@ -540,13 +540,7 @@ extension ReaderChecks {
                     "\(label): a gutter run outside the selection is not in the selected text")
         }
 
-        guard let placement = engine.visiblePages(
-            scrollYPt: state.scrollYPt,
-            viewportHeightPt: 500,
-            gapPt: state.pageGapPt,
-            marginPt: 0,
-            layout: state.layoutMode
-        ).first(where: { $0.index == 0 }) else {
+        guard let placement = state.canvasPageFrames.first(where: { $0.index == 0 }) else {
             fatalError("\(label): page 1 is not visible for the selection reproduction")
         }
         func point(at index: Int) -> CGPoint {

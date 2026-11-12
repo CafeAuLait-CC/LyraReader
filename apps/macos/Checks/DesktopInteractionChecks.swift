@@ -32,10 +32,7 @@ extension ReaderChecks {
         require(state.open(url: a), "the canvas-menu fixture opens")
 
         guard let text = try? await engine.textPage(0),
-              let placement = engine.visiblePages(
-                scrollYPt: 0, viewportHeightPt: 800, gapPt: state.pageGapPt,
-                marginPt: 0, layout: state.layoutMode
-              ).first(where: { $0.index == 0 })
+              let placement = state.canvasPageFrames.first(where: { $0.index == 0 })
         else { fatalError("FAIL: the canvas-menu fixture has no first page") }
         guard let index = text.chars.firstIndex(where: {
             $0.unicode != 32 && $0.widthPt > 1 && $0.heightPt > 1
@@ -151,10 +148,7 @@ extension ReaderChecks {
         require(state.open(url: path), "the link fixture opens")
 
         let links = try await engine.links(0)
-        guard let placement = engine.visiblePages(
-                scrollYPt: 0, viewportHeightPt: 800, gapPt: state.pageGapPt,
-                marginPt: 0, layout: state.layoutMode
-            ).first(where: { $0.index == 0 }),
+        guard let placement = state.canvasPageFrames.first(where: { $0.index == 0 }),
             let link = links.first
         else { fatalError("FAIL: the link fixture has no link on page 1") }
 

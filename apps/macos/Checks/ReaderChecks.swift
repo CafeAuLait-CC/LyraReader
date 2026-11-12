@@ -424,6 +424,21 @@ struct ReaderChecks {
             try await linkBorderCanvasChecks(url: fastRoot.appendingPathComponent("tests/fixtures/link-borders.pdf"))
             return
         }
+        if CommandLine.arguments.contains("--check-preview-paper") {
+            try await previewPaperChecks(root: fastRoot)
+            return
+        }
+        if CommandLine.arguments.contains("--check-preview-lifecycle") {
+            try await previewLifecycleChecks(root: fastRoot)
+            return
+        }
+        if CommandLine.arguments.contains("--check-preview-repairs") {
+            try await previewPanelSessionChecks(url: fastRoot.appendingPathComponent("tests/fixtures/multipage.pdf"))
+            try await previewResizeEpochChecks(url: fastRoot.appendingPathComponent("tests/fixtures/multipage.pdf"))
+            try await previewPaperChecks(root: fastRoot)
+            try await previewLifecycleChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-hosted-preview") {
             let root = checkRoot(CommandLine.arguments.dropFirst(2).first)
             try await hostedPreviewChecks(root: root)
@@ -1151,6 +1166,15 @@ struct ReaderChecks {
             }),
             ("placement-index", {
                 placementIndexChecks()
+            }),
+            ("preview-resize-epoch", {
+                try await previewResizeEpochChecks(url: b)
+            }),
+            ("preview-paper", {
+                try await previewPaperChecks(root: root)
+            }),
+            ("preview-lifecycle", {
+                try await previewLifecycleChecks(root: root)
             }),
             ("hosted-preview", {
                 try await hostedPreviewChecks(root: root)
