@@ -43,6 +43,8 @@ pub enum PaperAppearance {
     Original = 0,
     Warm = 1,
     Night = 2,
+    /// Neutral scientific foreground becomes warm gray-gold; chromatic pixels stay original.
+    DarkFigure = 3,
 }
 
 impl PaperAppearance {
@@ -59,6 +61,8 @@ impl PaperAppearance {
             0.0
         } else if self == Self::Night && blend == QuadBlend::Multiply {
             3.0
+        } else if self == Self::DarkFigure {
+            4.0
         } else {
             self as u8 as f32
         }
@@ -138,6 +142,16 @@ fn paper_colour(rgb: vec3<f32>) -> vec3<f32> {
 @fragment
 fn fs_page(in: VertexOutput) -> @location(0) vec4<f32> {
     let colour = textureSample(page_texture, page_sampler, in.uv);
+    if uniforms.paper_mode == 4.0 {
+        // Lyra text-secondary (#C8BFAF), in linear sRGB. Neutral source ink is carried by
+        // coverage over the existing card: black is soft ink, white is clear. Saturated plot
+        // colours retain their source channels instead of undergoing a whole-image inversion.
+        let chroma = max(max(colour.r, colour.g), colour.b) - min(min(colour.r, colour.g), colour.b);
+        let neutral = 1.0 - smoothstep(0.0, 0.02, chroma);
+        let lightness = dot(colour.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let ink = vec4<f32>(vec3<f32>(0.577580440, 0.520995573, 0.428690497), colour.a * (1.0-lightness));
+        return mix(colour, ink, neutral);
+    }
     if uniforms.paper_mode == 3.0 {
         // For night ink A and source page x, f(x)=A+(B-A)x. A multiply coefficient c
         // becomes f(cx)=c*f(x)+(1-c)*A: alpha-over toward the ink keeps glyphs intact
@@ -972,6 +986,7 @@ mod tests {
             PaperAppearance::Original,
             PaperAppearance::Warm,
             PaperAppearance::Night,
+            PaperAppearance::DarkFigure,
         ] {
             let actual = context
                 .offscreen_probe_layers_with_appearance(&draws, 2, 1, appearance)
@@ -983,6 +998,85 @@ mod tests {
                 "{appearance:?}: {actual:?}"
             );
         }
+    }
+
+    #[test]
+    fn dark_figure_ink_is_soft_transparent_and_preserves_plot_colours() {
+        let mut context = match GpuContext::new(false) {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("skipping: {error}");
+                return;
+            }
+        };
+        let background = context
+            .upload_page_texture(1, 1, &[41, 48, 52, 255])
+            .unwrap();
+        let source = [
+            0, 0, 0, 255, // black ink
+            255, 255, 255, 255, // painted white paper
+            0, 0, 0, 0, // unpainted paper
+            255, 0, 255, 255, // magenta plot
+            255, 255, 0, 255, // cyan plot
+            0, 0, 0, 128, // antialiased black edge
+            204, 204, 204, 255, // light gray rule
+        ];
+        let texture = context.upload_page_texture(7, 1, &source).unwrap();
+        let draws = [
+            (background, [0.0, 0.0, 7.0, 1.0], QuadBlend::Interface),
+            (texture, [0.0, 0.0, 7.0, 1.0], QuadBlend::Normal),
+        ];
+        let original = context.offscreen_probe_layers(&draws, 7, 1).unwrap();
+        let dark = context
+            .offscreen_probe_layers_with_appearance(&draws, 7, 1, PaperAppearance::DarkFigure)
+            .unwrap();
+        for (actual, expected) in [
+            (&dark[0..3], [200_u8, 191, 175]),
+            (&dark[4..7], [52, 48, 41]),
+            (&dark[8..11], [52, 48, 41]),
+        ] {
+            assert!(
+                actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 1),
+                "{actual:?}"
+            );
+        }
+        assert_eq!(
+            &dark[12..20],
+            &original[12..20],
+            "chromatic plot pixels keep their colours"
+        );
+        fn luminance(rgb: &[u8]) -> f64 {
+            rgb.iter()
+                .zip([0.2126, 0.7152, 0.0722])
+                .map(|(c, weight)| {
+                    let c = f64::from(*c) / 255.0;
+                    weight
+                        * if c <= 0.04045 {
+                            c / 12.92
+                        } else {
+                            ((c + 0.055) / 1.055).powf(2.4)
+                        }
+                })
+                .sum()
+        }
+        let paper = luminance(&[52, 48, 41]);
+        assert!(
+            (luminance(&dark[0..3]) + 0.05) / (paper + 0.05) >= 7.0,
+            "small text has contrast headroom without pure white"
+        );
+        assert!(
+            dark[20] > 52 && dark[20] < 200,
+            "antialias coverage is retained"
+        );
+        assert!(
+            (luminance(&dark[24..27]) + 0.05) / (paper + 0.05) >= 3.0,
+            "light gray table rules remain distinguishable"
+        );
+        assert_eq!(
+            context.offscreen_probe_layers(&draws, 7, 1).unwrap(),
+            original,
+            "switching to light appearance restores the untouched source texture"
+        );
     }
 
     #[test]

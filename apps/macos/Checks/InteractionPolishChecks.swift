@@ -402,8 +402,8 @@ extension ReaderChecks {
         if let hosted = firstCanvasView(controller.panel?.contentView) {
             require(hosted.hasAttachedSurface || hosted.submittedFrameCount > 0,
                     "the figure preview's canvas attaches a Metal surface inside the panel")
-            require(hosted.canvasClearColor === LyraReaderTheme.originalPaperColor,
-                    "the figure preview clears to original paper behind transparent content")
+            require(hosted.canvasClearColor === LyraReaderTheme.raisedBgColor,
+                    "the figure preview blends transparent paper into its card")
         } else {
             print("NOTE: the panel's canvas had not materialised in this environment; "
                   + "the second surface inside the panel is unverified here")

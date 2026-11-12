@@ -50,6 +50,7 @@ typedef struct LyraReaderFrameStats {
 } LyraReaderFrameStats;
 
 /* ABI version; checked by the host at startup. */
+enum { LYRA_READER_ABI_VERSION = 3 };
 uint32_t lyra_reader_abi_version(void);
 
 /* Creates the wgpu instance/adapter/device. flags: bit0 = validation layers. */
@@ -155,7 +156,7 @@ int32_t lyra_reader_surface_draw_pages_on_background(uint64_t surface_id,
                                        double red, double green, double blue,
                                        LyraReaderFrameStats *stats);
 
-/* Display-only profile: 0 original, 1 warm, 2 grayscale night. */
+/* ABI 3 display-only profile: 0 original, 1 warm, 2 grayscale night, 3 dark figure ink. */
 int32_t lyra_reader_surface_draw_pages_with_appearance(uint64_t surface_id,
                                        const uint64_t *texture_ids,
                                        const float *rects,

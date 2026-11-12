@@ -66,8 +66,9 @@ pub fn document_index_cache_path(document: &std::path::Path) -> std::path::PathB
 /// 2 added the `blend_modes` array to [`lyra_reader_surface_draw_pages`]: a page quad and a
 /// PDF highlight quad are composited differently (see [`QuadBlend`]), so the call needed to say
 /// which is which. Version 1 callers would have every quad drawn alpha-over — the shell and the
-/// library ship together, and `lyra_reader_abi_version` is checked at startup.
-pub const ABI_VERSION: u32 = 2;
+/// library ship together. Version 3 adds the dark scientific-foreground display profile (3)
+/// to the appearance draw entry points; earlier libraries reject that profile.
+pub const ABI_VERSION: u32 = 3;
 
 /// Blend mode values in the `blend_modes` array of [`lyra_reader_surface_draw_pages`].
 ///
@@ -497,7 +498,7 @@ pub unsafe extern "C" fn lyra_reader_surface_draw_pages_on_background(
     }
 }
 
-/// Draws with a display-only paper profile: 0 original, 1 warm, 2 grayscale night.
+/// Draws with a display-only profile: 0 original, 1 warm, 2 grayscale night, 3 dark figure ink.
 ///
 /// # Safety
 /// Same array and stats contract as [`lyra_reader_surface_draw_pages`].
@@ -598,6 +599,7 @@ unsafe fn draw_pages(
         0 => lyra_reader_gpu::PaperAppearance::Original,
         1 => lyra_reader_gpu::PaperAppearance::Warm,
         2 => lyra_reader_gpu::PaperAppearance::Night,
+        3 => lyra_reader_gpu::PaperAppearance::DarkFigure,
         _ => return code::ERR_INVALID_ARGUMENT,
     };
     if [red, green, blue]
