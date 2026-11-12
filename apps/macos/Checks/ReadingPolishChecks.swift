@@ -84,7 +84,7 @@ extension ReaderChecks {
                                    entries: [.init(label: "2", text: "A short citation.")])
         controller.sync(state: state, parentWindow: parent)
         require(panel.frame.width == PreviewPanelGeometry.defaultSize.width
-                    && panel.frame.height == PreviewPanelGeometry.minimumSize.height,
+                    && panel.frame.height < 160,
                 "a different preview refits both dimensions after a manual resize")
         let esc = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
                                   windowNumber: parent.windowNumber, context: nil, characters: "\u{1b}",

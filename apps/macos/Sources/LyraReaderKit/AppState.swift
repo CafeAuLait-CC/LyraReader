@@ -1977,7 +1977,7 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     @Published public private(set) var referencePreviewLoading = false
 
     public func setReferencePreviewViewport(_ size: CGSize) {
-        guard size.width > 0, size.height > 0 else { return }
+        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else { return }
         let widthChanged = abs(referencePreviewWidthPt - size.width) > 1
         referencePreviewWidthPt = size.width
         referencePreviewHeightPt = size.height
@@ -1988,6 +1988,10 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                                  sectionTitle: preview.sectionTitle,
                                  sectionReference: preview.sectionReference)
         } else {
+            // Sub-point layout changes need no new raster, but must still fit the live bounds.
+            if let image = referencePreviewPages.first?.image {
+                referencePreviewZoom = size.width / max(image.pointSize.width, 1)
+            }
             scrollReferencePreview(by: 0)
         }
     }
@@ -2099,8 +2103,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
                     yPt: region.minY,
                     widthPt: region.width,
                     heightPt: region.height,
-                    // A figure/table crop is shown on the panel's own colour, so its white
-                    // page margin must be transparent. A whole-page preview keeps its paper.
+                    // Keep crop pixels independent of their display background. The preview
+                    // surface supplies original paper; whole-page previews retain their paper.
                     transparentBackground: kind == .figure
                 )
             } else {
