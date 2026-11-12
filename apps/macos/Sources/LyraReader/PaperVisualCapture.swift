@@ -1,6 +1,7 @@
 #if DEBUG
 import AppKit
 import CoreGraphics
+import CoreVideo
 import ImageIO
 import LyraReaderKit
 import Metal
@@ -52,7 +53,7 @@ enum PaperVisualCapture {
             }
             let mutation = request["mutation"]
             let suite = request["suite"] ?? "paper"
-            guard ["paper", "reader-shell"].contains(suite), mutation == nil || suite == "paper" else {
+            guard ["paper", "reader-shell", "toolbar-inspectors"].contains(suite), mutation == nil || suite == "paper" else {
                 throw CaptureError("Unsupported capture suite or mutation")
             }
             guard mutation == nil || ["scale", "chrome"].contains(mutation) else {
@@ -80,6 +81,12 @@ enum PaperVisualCapture {
             AppState.usesStoredSidebarTab = false
             AppState.usesStoredSidePanelPreferences = false
             ReaderMotion.reduceMotionOverride = true
+            if suite == "toolbar-inspectors" {
+                guard let utc = TimeZone(secondsFromGMT: 0) else {
+                    throw CaptureError("UTC is unavailable for the date preview fixture")
+                }
+                FillSignDateFormat.previewClockOverride = (Date(timeIntervalSince1970: 946_728_000), utc)
+            }
             for (key, directory) in [
                 ("LYRA_READER_DOCUMENT_CACHE_DIR", "Documents"),
                 ("LYRA_READER_INDEX_CACHE_DIR", "Indexes"),
@@ -163,6 +170,7 @@ enum PaperVisualCapture {
         let options: Options
         let frames = PresentedFrames()
         var captures: [[String: Any]] = []
+        var deferredCaptures: [[String: Any]] = []
         var environment: [String: Any] = [:]
         var fullScreenTransitionCompleted = false
         var capturedWindowFrame = CGRect.zero
@@ -244,7 +252,8 @@ enum PaperVisualCapture {
             guard let number = window.screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
             else { throw CaptureError("Own window has no display") }
             let result = try await Self.captureOwnWindow(windowID: CGWindowID(window.windowNumber),
-                scale: window.backingScaleFactor, displayID: CGDirectDisplayID(number.uint32Value))
+                scale: window.backingScaleFactor, displayID: CGDirectDisplayID(number.uint32Value),
+                sRGB: options.suite == "toolbar-inspectors")
             capturedWindowFrame = result.frame
             capturedContentRect = result.contentRect
             return result.image
@@ -252,7 +261,8 @@ enum PaperVisualCapture {
 
         // Keep ScreenCaptureKit's non-Sendable snapshot/filter objects on its nonisolated
         // async executor. Only immutable CGImage pixels cross back to the main actor.
-        nonisolated static func captureOwnWindow(windowID: CGWindowID, scale: CGFloat, displayID: CGDirectDisplayID) async throws -> WindowImage {
+        nonisolated static func captureOwnWindow(windowID: CGWindowID, scale: CGFloat,
+            displayID: CGDirectDisplayID, sRGB: Bool) async throws -> WindowImage {
             let available = try await SCShareableContent.currentProcess
             guard let ownWindow = available.windows.first(where: {
                 $0.windowID == windowID
@@ -279,6 +289,12 @@ enum PaperVisualCapture {
                 y: ownWindow.frame.minY - display.frame.minY, width: ownWindow.frame.width, height: ownWindow.frame.height)
             configuration.captureResolution = .best
             configuration.scalesToFit = false
+            if sRGB {
+                // Request the comparison space from WindowServer instead of converting the
+                // display's color space after its pixels have already been quantized.
+                configuration.colorSpaceName = CGColorSpace.sRGB
+                configuration.pixelFormat = kCVPixelFormatType_32BGRA
+            }
             let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
             guard image.width == width, image.height == height else {
                 throw CaptureError("System capture changed the requested native pixel dimensions")
@@ -356,6 +372,9 @@ enum PaperVisualCapture {
             CATransaction.commit()
             CATransaction.flush()
             let bounds = canvas.convert(canvas.bounds, to: nil)
+            // Inspectors clip an anchored drawing surface rather than shrink it. A fixture
+            // marker behind that clip is not visible PDF content and must not be read as UI.
+            let visibleCanvas = canvas.visibleRect.intersection(canvas.bounds)
             guard let primary = NSScreen.screens.first else { throw CaptureError("No primary screen coordinate origin") }
             let screenBounds = window.convertToScreen(bounds)
             var capturedImage: CGImage?
@@ -394,7 +413,9 @@ enum PaperVisualCapture {
                                         y: canvasTop + paper.minY + sourceY * state.zoomFactor)
                     let x = Int((point.x * scale).rounded())
                     let y = Int((point.y * scale).rounded())
-                    let visible = CGRect(x: canvasLeft, y: canvasTop, width: bounds.width, height: bounds.height).contains(point)
+                    let localPoint = CGPoint(x: paper.minX + sourceX * state.zoomFactor,
+                                             y: paper.minY + sourceY * state.zoomFactor)
+                    let visible = visibleCanvas.contains(localPoint)
                         && x >= 0 && x < image.width && y >= 0 && y < image.height
                     if name == requiredMarker { mx = x; my = y }
                     guard visible else { continue }
@@ -431,6 +452,8 @@ enum PaperVisualCapture {
                 "active_application": NSApplication.shared.isActive, "key_window": window.isKeyWindow,
                 "canvas_points": [canvasLeft, canvasTop, bounds.width, bounds.height],
                 "canvas_window_points": [bounds.minX, bounds.minY, bounds.width, bounds.height],
+                "visible_canvas_local_points": [visibleCanvas.minX, visibleCanvas.minY,
+                    visibleCanvas.width, visibleCanvas.height],
                 "window_frame_points": [window.frame.minX, window.frame.minY, window.frame.width, window.frame.height],
                 "captured_window_frame_points": [capturedWindowFrame.minX, capturedWindowFrame.minY,
                     capturedWindowFrame.width, capturedWindowFrame.height],
@@ -610,6 +633,149 @@ enum PaperVisualCapture {
             try await homeSnapshot("10-return-home", state: state, window: window)
         }
 
+        func chromeRect(_ kind: ReaderChromeMarkerView.Kind, window: NSWindow) -> CGRect? {
+            func find(_ view: NSView) -> ReaderChromeMarkerView? {
+                if let marker = view as? ReaderChromeMarkerView, marker.kind == kind { return marker }
+                return view.subviews.lazy.compactMap { find($0) }.first
+            }
+            guard let host = window.contentView, let marker = find(host) else { return nil }
+            return host.convert(marker.bounds, from: marker)
+        }
+
+        enum Inspector { case none, edit, fill }
+
+        func toolbarChrome(state: AppState, window: NSWindow, row: SecondaryRow?,
+                           inspector: Inspector) async throws -> [String: Any] {
+            let rows = row.map { [$0] } ?? []
+            guard state.openSecondaryRows == rows, !state.rightPanelVisible,
+                  !state.performancePanelVisible, !state.searchSidebarVisible,
+                  state.contentEditInspectorVisible == (inspector == .edit),
+                  state.fillSignInspectorVisible == (inspector == .fill) else {
+                throw CaptureError("Toolbar or inspector ownership differs for \(rows)")
+            }
+            let expectedHeight = row == nil ? CGFloat.zero : ReaderChrome.secondaryToolbarHeightPt
+            let expectedEdit = inspector == .edit ? ReaderChrome.editingPanelWidthPt : 0
+            let expectedFill = inspector == .fill ? ReaderChrome.editingPanelWidthPt : 0
+            let expectedLeading = state.sidebarVisible && state.document != nil ? ReaderChrome.sidebarTotalWidthPt : 0
+            var measured: [String: Any] = [:]
+            do {
+                try await wait("secondary row and inspector native geometry") {
+                    window.contentView?.layoutSubtreeIfNeeded()
+                    guard let host = window.contentView,
+                          let slot = self.chromeRect(.secondaryRowSlot, window: window),
+                          let edit = self.chromeRect(.editingInspectorSlot, window: window),
+                          let fill = self.chromeRect(.fillSignInspectorSlot, window: window) else { return false }
+                    measured = ["open_rows": state.openSecondaryRows.map(\.rawValue),
+                        "row_slot_points": [slot.minX, slot.minY, slot.width, slot.height],
+                        "edit_inspector_width": edit.width, "fill_inspector_width": fill.width,
+                        "assistant_visible": state.rightPanelVisible,
+                        "annotation_tool": String(describing: state.annotationTool),
+                        "content_tool": state.contentEditTool,
+                        "fill_tool": state.armedFillSignTool?.rawValue as Any? ?? NSNull()]
+                    guard abs(slot.height - expectedHeight) < 0.5,
+                          abs(edit.width - expectedEdit) < 0.5,
+                          abs(fill.width - expectedFill) < 0.5 else { return false }
+                    if row != nil {
+                        guard let toolbar = self.chromeRect(.secondaryToolbar, window: window),
+                              abs(toolbar.height - ReaderChrome.secondaryToolbarHeightPt) < 0.5,
+                              abs(toolbar.minX - expectedLeading) < 0.5,
+                              abs(toolbar.maxX - (host.bounds.maxX - expectedEdit - expectedFill)) < 0.5
+                        else { return false }
+                        measured["row_content_points"] = [toolbar.minX, toolbar.minY, toolbar.width, toolbar.height]
+                    }
+                    return true
+                }
+            } catch { throw CaptureError("\(error); chrome=\(measured)") }
+            return measured
+        }
+
+        func captureToolbarInspectors(state: AppState, window: NSWindow) async throws {
+            environment["date_preview_clock"] = "2000-01-01T12:00:00Z; UTC"
+            environment["capture_color_space"] = "sRGB; 8-bit BGRA; SDR"
+            window.setContentSize(CGSize(width: 1200, height: 800))
+            guard state.openDocumentInTab(options.fixture) else { throw CaptureError("Cannot open toolbar fixture") }
+            state.zoomActual()
+            state.scroll(toFraction: 0)
+            func shot(_ id: String, row: SecondaryRow? = nil, inspector: Inspector = .none,
+                      annotation: AnnotationTool = .select, content: String = "select",
+                      fill: FillSignTool? = nil) async throws {
+                guard state.annotationTool == annotation, state.contentEditTool == content,
+                      state.armedFillSignTool == fill else { throw CaptureError("Wrong armed tool before \(id)") }
+                _ = try await toolbarChrome(state: state, window: window, row: row, inspector: inspector)
+                try await snapshot(id, state: state, window: window)
+                let chrome = try await toolbarChrome(state: state, window: window, row: row, inspector: inspector)
+                guard state.annotationTool == annotation, state.contentEditTool == content,
+                      state.armedFillSignTool == fill, !captures.isEmpty else {
+                    throw CaptureError("Tool changed while capturing \(id)")
+                }
+                captures[captures.count - 1]["tool_chrome"] = chrome
+            }
+            try await shot("01-document-idle")
+            state.toggleAnnotationTools()
+            try await shot("02-annotate-row", row: .annotations)
+            state.toggleAnnotationTool(.highlight)
+            try await shot("03-highlight-armed", row: .annotations, annotation: .highlight)
+            state.toggleAnnotationTool(.note)
+            try await shot("04-note-armed", row: .annotations, annotation: .note)
+            state.toggleAnnotationTool(.note)
+            try await shot("05-annotate-disarmed", row: .annotations)
+            state.toggleContentEditing()
+            try await shot("06-edit-row", row: .contentEdit)
+            state.selectContentTool("text")
+            try await shot("07-edit-text-inspector", row: .contentEdit, inspector: .edit, content: "text")
+            state.selectContentTool("link")
+            try await shot("08-edit-link-inspector", row: .contentEdit, inspector: .edit, content: "link")
+            guard state.cancelContentTool() else { throw CaptureError("Edit tool did not clear") }
+            try await shot("09-edit-tool-cleared", row: .contentEdit)
+            state.toggleFillAndSign()
+            try await shot("10-fill-sign-row", row: .fillAndSign)
+            let tools: [(FillSignTool, String, AnnotationTool)] = [
+                (.text, "11-fill-text-inspector", .textBox), (.signature, "12-signature-inspector", .select),
+                (.date, "13-date-inspector", .select), (.checkmark, "14-checkmark-inspector", .select),
+                (.cross, "15-cross-inspector", .select), (.stamp, "16-stamp-inspector", .stamp),
+                (.image, "17-image-inspector", .select)
+            ]
+            for (tool, id, annotation) in tools {
+                state.selectFillSignTool(tool)
+                try await shot(id, row: .fillAndSign, inspector: .fill, annotation: annotation, fill: tool)
+            }
+            state.clearFillSignTool()
+            try await shot("18-fill-tool-cleared", row: .fillAndSign)
+            state.toggleExport()
+            try await shot("reference-export-row", row: .export)
+            guard var reference = captures.popLast() else { throw CaptureError("Export reference is missing") }
+            reference["deferred_reason"] = "Export subtools are not finalized; geometry is checked, appearance is not a baseline."
+            deferredCaptures.append(reference)
+            state.toggleAITools()
+            try await shot("19-lyra-row", row: .lyra)
+            // Exercise the actual assistant drawer without freezing its unfinished contents.
+            state.toggleRightPanel()
+            _ = try await settle(state: state, window: window)
+            guard state.rightPanelVisible else { throw CaptureError("Assistant did not open before Edit") }
+            state.toggleContentEditing()
+            state.selectContentTool("text")
+            try await shot("20-edit-after-assistant", row: .contentEdit, inspector: .edit, content: "text")
+            state.toggleRightPanel()
+            _ = try await settle(state: state, window: window)
+            guard state.rightPanelVisible else { throw CaptureError("Assistant did not open before Fill & Sign") }
+            state.toggleFillAndSign()
+            state.selectFillSignTool(.signature)
+            try await shot("21-fill-after-assistant", row: .fillAndSign, inspector: .fill, fill: .signature)
+            state.sidebarVisible = true
+            try await shot("22-sidebar-with-inspector", row: .fillAndSign, inspector: .fill, fill: .signature)
+            window.setContentSize(CGSize(width: 960, height: 640))
+            try await shot("23-narrow-with-inspector", row: .fillAndSign, inspector: .fill, fill: .signature)
+            window.setContentSize(CGSize(width: 1200, height: 800))
+            state.sidebarVisible = false
+            try await shot("24-inspector-window-restored", row: .fillAndSign, inspector: .fill, fill: .signature)
+            state.toggleFillAndSign()
+            try await shot("25-rows-closed-restored")
+            state.closeTab(0)
+            try await homeSnapshot("26-home-no-document", state: state, window: window)
+            let chrome = try await toolbarChrome(state: state, window: window, row: nil, inspector: .none)
+            captures[captures.count - 1]["tool_chrome"] = chrome
+        }
+
         func fullScreen(window: NSWindow, entering: Bool) async throws {
             fullScreenTransitionCompleted = false
             let name = entering ? NSWindow.didEnterFullScreenNotification : NSWindow.didExitFullScreenNotification
@@ -664,6 +830,10 @@ enum PaperVisualCapture {
             }
             if options.suite == "reader-shell" {
                 try await captureReaderShell(state: state, window: window)
+                return
+            }
+            if options.suite == "toolbar-inspectors" {
+                try await captureToolbarInspectors(state: state, window: window)
                 return
             }
             guard state.open(url: options.fixture) else { throw CaptureError("Cannot open synthetic visual fixture") }
@@ -725,6 +895,7 @@ enum PaperVisualCapture {
                 "mutation": options.mutation as Any? ?? NSNull()
             ]
             if let error { report["error"] = error }
+            if !deferredCaptures.isEmpty { report["deferred_captures"] = deferredCaptures }
             let bytes = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
             try bytes.write(to: options.output.appendingPathComponent("capture.json"), options: .atomic)
         }

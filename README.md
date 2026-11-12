@@ -141,6 +141,7 @@ python3 scripts/check-visual.py self-test
 python3 -m unittest discover -s scripts -p test_visual_regression.py
 python3 scripts/check-visual.py capture --output build/visual-en-light --language en --appearance light
 python3 scripts/check-visual.py capture --suite reader-shell --output build/visual-reader-light --appearance light
+python3 scripts/check-visual.py capture --suite toolbar-inspectors --output build/visual-tools-light --appearance light
 ```
 
 Open the output's `index.html` to review native-size PNGs and environment details. Repeat with
@@ -158,6 +159,15 @@ selected, a narrow window and its restoration, closing the active tab, retaining
 and returning Home. Its eight synthetic documents have per-document registration colors; the
 checks verify the active document, tab count and actual rendered pixels. Home requires zero page
 quads and an isolated empty recent-document list. Reviewed baselines are listed below.
+
+The `toolbar-inspectors` suite records 26 checkpoints covering tool rows, armed/cleared tools,
+all seven Fill & Sign inspectors, Edit text/link inspectors, assistant/inspector exclusion,
+sidebar and narrow-window combinations, and closing back to Home. Native chrome probes assert
+the 46 pt row and the exclusive 292 pt inspector column. The date preview uses a fixed UTC clock
+only in the isolated debug capture process; placed dates and ordinary launches keep their usual clock.
+Export's unfinished subtool list is saved separately as a deferred reference, outside the
+checkpoint catalogue. These new images require visual review before baseline adoption.
+Review repeatability results before choosing a per-channel tolerance; comparison defaults to zero.
 
 ```bash
 python3 scripts/check-visual.py compare --baseline BASELINE --actual ACTUAL --output build/visual-diff
@@ -177,11 +187,11 @@ sanitized capture manifests and hash-bound approvals. They cover the recorded ma
 reader-shell batch adds 20 original PNGs and hash-bound approvals under
 `tests/visual-baselines/reader-shell/macos-15.7.9-2560x1440-2x/en-light` and `en-dark`.
 Other environments require separate reviewed baselines. Use the matching directory as `BASELINE`
-above. Paper and reader-shell captures cannot share a baseline or an incomplete checkpoint set.
+above. Each suite requires its own baseline and complete checkpoint set.
 
 CI verifies the adopted baseline bytes and runs the comparer/approval regressions. Its manual
-**Capture unreviewed visual candidates** input additionally collects paper and reader-shell
-en/light and en/dark candidates as artifacts. Pixel comparison requires a controlled matching
+**Capture unreviewed visual candidates** input additionally collects English light/dark candidates
+from all three suites as artifacts. Pixel comparison requires a controlled matching
 desktop; this does not enable a cross-environment PR screenshot gate. Chinese visual checks are deferred until
 Chinese localization is implemented. Existing zh-Hans preference captures show English fallback
 and are not accepted as evidence of Chinese UI coverage.

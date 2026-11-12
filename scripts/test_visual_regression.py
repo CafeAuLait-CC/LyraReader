@@ -107,19 +107,46 @@ class BaselineIntegrityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Unsupported capture suite'):
             visual.load_capture(self.directory)
 
-    def test_reader_suite_requires_its_complete_distinct_set(self):
-        self.report['suite'] = 'reader-shell'
+    def test_additional_suites_require_their_complete_distinct_sets(self):
+        for suite in ['reader-shell', 'toolbar-inspectors']:
+            with self.subTest(suite=suite):
+                self.report['suite'] = suite
+                self.report['captures'] = []
+                for sid in visual.CAPTURE_SUITES[suite]:
+                    name = sid + '.png'
+                    (self.directory / name).write_bytes(b'synthetic native image bytes')
+                    self.report['captures'].append({'id': sid, 'file': name})
+                self.write_report()
+                visual.load_capture(self.directory)
+                self.report['captures'][-1] = {'id': '11-fullscreen-restored', 'file': '11-fullscreen-restored.png'}
+                self.write_report()
+                with self.assertRaisesRegex(ValueError, 'Missing, duplicated'):
+                    visual.load_capture(self.directory)
+
+    def test_toolbar_comparison_rejects_a_different_date_preview_clock(self):
+        self.report['suite'] = 'toolbar-inspectors'
+        self.report['environment'] = json.loads((visual.ROOT / 'tests/visual-baselines/paper'
+            / 'macos-15.7.9-2560x1440-2x/en-light/capture.json').read_text())['environment']
+        self.report['environment']['date_preview_clock'] = '2000-01-01T12:00:00Z; UTC'
+        self.report['environment']['capture_color_space'] = 'sRGB; 8-bit BGRA; SDR'
         self.report['captures'] = []
-        for sid in visual.CAPTURE_SUITES['reader-shell']:
+        actual = self.directory / 'actual'
+        actual.mkdir()
+        for sid in visual.CAPTURE_SUITES['toolbar-inspectors']:
             name = sid + '.png'
-            (self.directory / name).write_bytes(b'synthetic reader image bytes')
+            for folder in [self.directory, actual]:
+                (folder / name).write_bytes(b'synthetic toolbar image bytes')
             self.report['captures'].append({'id': sid, 'file': name})
         self.write_report()
-        visual.load_capture(self.directory)
-        self.report['captures'][-1] = {'id': '11-fullscreen-restored', 'file': '11-fullscreen-restored.png'}
-        self.write_report()
-        with self.assertRaisesRegex(ValueError, 'Missing, duplicated'):
-            visual.load_capture(self.directory)
+        changed = json.loads(json.dumps(self.report))
+        changed['environment']['date_preview_clock'] = '2000-01-02T12:00:00Z; UTC'
+        visual.write_json(actual / 'capture.json', changed)
+        args = argparse.Namespace(baseline=self.directory, actual=actual, output=self.directory / 'diff',
+                                  allow_unreviewed=True, channel_tolerance=0)
+        with patch.object(visual, 'compile_comparer') as compile_comparer:
+            with self.assertRaisesRegex(ValueError, 'date_preview_clock'):
+                visual.compare_runs(args)
+            compile_comparer.assert_not_called()
 
     def test_cross_suite_comparison_cannot_reuse_a_paper_baseline(self):
         reader = self.directory / 'reader'

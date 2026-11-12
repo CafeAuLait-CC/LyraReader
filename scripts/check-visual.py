@@ -38,6 +38,17 @@ CAPTURE_SUITES = {
         '05-first-tab-active', '06-narrow-eight-tabs', '07-window-restored',
         '08-close-active-tab', '09-last-tab', '10-return-home',
     ],
+    'toolbar-inspectors': [
+        '01-document-idle', '02-annotate-row', '03-highlight-armed', '04-note-armed',
+        '05-annotate-disarmed', '06-edit-row', '07-edit-text-inspector',
+        '08-edit-link-inspector', '09-edit-tool-cleared', '10-fill-sign-row',
+        '11-fill-text-inspector', '12-signature-inspector', '13-date-inspector',
+        '14-checkmark-inspector', '15-cross-inspector', '16-stamp-inspector',
+        '17-image-inspector', '18-fill-tool-cleared', '19-lyra-row',
+        '20-edit-after-assistant', '21-fill-after-assistant',
+        '22-sidebar-with-inspector', '23-narrow-with-inspector',
+        '24-inspector-window-restored', '25-rows-closed-restored', '26-home-no-document',
+    ],
 }
 
 
@@ -103,7 +114,9 @@ def compile_comparer(directory: Path) -> Path:
 def render_report(directory: Path, report: dict, comparisons: list[dict] | None = None) -> None:
     """A local review artifact; images keep native pixels and are scaled only for viewing."""
     status = report.get('status', 'failed')
-    title = 'LyraReader reader shell review' if report.get('suite') == 'reader-shell' else 'LyraReader paper visual review'
+    title = {'reader-shell': 'LyraReader reader shell review',
+             'toolbar-inspectors': 'LyraReader toolbar and inspector review'}.get(
+                 report.get('suite'), 'LyraReader paper visual review')
     parts = ['<!doctype html><html lang="en"><meta charset="utf-8">',
              '<meta name="viewport" content="width=device-width, initial-scale=1">',
              '<title>LyraReader visual review</title>',
@@ -116,11 +129,12 @@ def render_report(directory: Path, report: dict, comparisons: list[dict] | None 
              '<pre>' + html.escape(json.dumps(report.get('environment', {}), indent=2, ensure_ascii=False)) + '</pre>']
     if report.get('error'):
         parts.append('<p>' + html.escape(str(report['error'])) + '</p>')
-    for capture in report.get('captures', []):
+    for capture in report.get('captures', []) + report.get('deferred_captures', []):
         name = capture['file']
         if Path(name).name != name:
             raise ValueError('Capture filename must be a basename')
-        parts.append(f'<figure><figcaption>{html.escape(capture["id"])}</figcaption>'
+        label = capture['id'] + (' (deferred reference)' if capture.get('deferred_reason') else '')
+        parts.append(f'<figure><figcaption>{html.escape(label)}</figcaption>'
                      f'<a href="{html.escape(name, quote=True)}"><img src="{html.escape(name, quote=True)}" '
                      f'alt="{html.escape(capture["id"], quote=True)}"></a></figure>')
     for comparison in comparisons or []:
@@ -170,6 +184,10 @@ def capture(args: argparse.Namespace) -> int:
         multipage = output / 'paper-multipage.pdf'
         fixture(multipage, pages=3)
         fixtures = [fixture_path, multipage]
+    elif suite == 'toolbar-inspectors':
+        fixture_path = output / 'toolbar-inspectors.pdf'
+        fixture(fixture_path, title='LyraReader toolbar and inspector probe')
+        fixtures = [fixture_path]
     else:
         fixtures = []
         for index, letter in enumerate('abcdefgh'):
@@ -285,6 +303,8 @@ def compare_runs(args: argparse.Namespace) -> int:
     # Different valid environments require separate baselines, rather than a looser threshold.
     keys = ['os', 'os_build', 'language', 'appearance', 'locale', 'system_font', 'gpu',
             'capture', 'screen_points', 'display_mode_points', 'display_backing_pixels', 'hardware_model', 'swift', 'pdfium_sha256', 'fixture_sha256']
+    if reference.get('suite') == 'toolbar-inspectors':
+        keys.extend(['date_preview_clock', 'capture_color_space'])
     for key in keys:
         if key not in reference['environment'] or reference['environment'][key] != actual['environment'].get(key):
             raise ValueError(f'Baseline environment differs or is missing: {key}')
