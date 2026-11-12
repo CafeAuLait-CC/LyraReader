@@ -1061,9 +1061,9 @@ struct ReferencePreviewPanelContent: View {
     /// A figure, table or plain page destination: the rendered region, because the picture is the
     /// point.
     private func imageBody(_ preview: AppState.ReferencePreview) -> some View {
-        // Scientific figures keep their source colours on original paper, independently of
-        // the UI theme and the reader's optional paper conversion. The raster stays transparent;
-        // only this surface's display background changes. Whole pages follow reading appearance.
+        // Transparent crops blend into the card in both themes. The GPU lifts neutral ink in
+        // dark appearance while preserving chromatic content and the source texture. Whole-page
+        // previews continue to follow the reader's paper conversion.
         let crop = preview.kind == .figure
         return ZStack {
             PDFCanvasView(
@@ -1072,7 +1072,8 @@ struct ReferencePreviewPanelContent: View {
                 zoom: state.referencePreviewZoom,
                 contentWidthPt: state.referencePreviewPages.first?.placement.widthPt ?? 0,
                 paperAppearance: crop ? .original : appearance.mode,
-                canvasClearColor: crop ? LyraReaderTheme.originalPaperColor : nil,
+                adaptsFigureInkToAppearance: crop,
+                canvasClearColor: crop ? LyraReaderTheme.raisedBgColor : nil,
                 onFrame: { stats in state.updateGpuStatus(stats, label: "preview") },
                 onFailure: { message in state.reportGpuFailure(message) },
                 onViewportSize: { size in onViewportSize(preview, size) },
@@ -1088,7 +1089,7 @@ struct ReferencePreviewPanelContent: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(crop ? LyraReaderTheme.originalPaper : LyraReaderTheme.canvasBg)
+        .background(crop ? LyraReaderTheme.raisedBg : LyraReaderTheme.canvasBg)
         .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 

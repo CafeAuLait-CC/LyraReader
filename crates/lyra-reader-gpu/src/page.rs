@@ -43,6 +43,10 @@ pub enum PaperAppearance {
     Original = 0,
     Warm = 1,
     Night = 2,
+    /// Neutral scientific foreground becomes warm gray-gold; chromatic pixels stay original.
+    DarkFigure = 3,
+    /// Match PDFium's encoded-sRGB edge compositing on the light preview surface.
+    LightFigure = 4,
 }
 
 impl PaperAppearance {
@@ -59,6 +63,10 @@ impl PaperAppearance {
             0.0
         } else if self == Self::Night && blend == QuadBlend::Multiply {
             3.0
+        } else if self == Self::DarkFigure {
+            4.0
+        } else if self == Self::LightFigure {
+            5.0
         } else {
             self as u8 as f32
         }
@@ -67,11 +75,11 @@ impl PaperAppearance {
 
 /// Uniform block layout: `dest` + `surface` + paper mode + source UV rectangle.
 ///
-/// 48 bytes: four `f32` destination, two `f32` surface size, one `f32` paper mode, one
-/// `f32` padding, and four `f32` source rectangle (`u0, v0, u1, v1`). The source rectangle is
+/// 64 bytes: destination, surface size, paper mode, padding, source UV rectangle and linear
+/// surface background. The source rectangle is
 /// what lets one uploaded page texture serve both pieces of a torn page without a second
 /// rasterisation or a CPU pixel copy.
-const UNIFORM_BYTES: u64 = 48;
+const UNIFORM_BYTES: u64 = 64;
 
 /// The shader that draws a textured quad in *pixel* coordinates.
 ///
@@ -88,6 +96,7 @@ struct Uniforms {
     _padding: f32,
     // Normalized source rectangle: u0, v0, u1, v1. (0,0,1,1) is the whole texture.
     source: vec4<f32>,
+    background: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -129,19 +138,58 @@ fn paper_colour(rgb: vec3<f32>) -> vec3<f32> {
         return mix(vec3<f32>(0.029556834, 0.024157632, 0.018500220), vec3<f32>(0.973445290, 0.930110858, 0.846873232), rgb);
     }
     if uniforms.paper_mode == 2.0 {
-        let lightness = dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let linear_lightness = dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        // Opaque PDFium glyph edges carry coverage in encoded sRGB, not linear intensity.
+        // A source gray of 0.5 is half-covered ink, not 78% ink after inversion. Move halfway
+        // toward that coverage: a full correction makes pale gray rules too faint. Chromatic
+        // content keeps its existing night tone, and the paper/solid-ink endpoints stay fixed.
+        let encoded_lightness = dot(srgb_encode(rgb), vec3<f32>(0.2126, 0.7152, 0.0722));
+        let lightness = mix(linear_lightness, encoded_lightness, 0.5 * neutral_amount(rgb));
         return mix(vec3<f32>(0.584078418, 0.558340390, 0.508881321), vec3<f32>(0.017641954, 0.015996293, 0.012983032), vec3<f32>(lightness));
     }
     return rgb;
 }
 
+fn srgb_encode(rgb: vec3<f32>) -> vec3<f32> {
+    return select(rgb * 12.92, 1.055 * pow(max(rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - 0.055,
+                  rgb > vec3<f32>(0.0031308));
+}
+
+fn srgb_decode(rgb: vec3<f32>) -> vec3<f32> {
+    return select(rgb / 12.92, pow((rgb + 0.055) / 1.055, vec3<f32>(2.4)), rgb > vec3<f32>(0.04045));
+}
+
+fn neutral_amount(rgb: vec3<f32>) -> f32 {
+    let maximum = max(max(rgb.r, rgb.g), rgb.b);
+    let chroma = (maximum - min(min(rgb.r, rgb.g), rgb.b)) / max(maximum, 0.000001);
+    return 1.0 - smoothstep(0.0, 0.02, chroma);
+}
+
 @fragment
 fn fs_page(in: VertexOutput) -> @location(0) vec4<f32> {
     let colour = textureSample(page_texture, page_sampler, in.uv);
+    if uniforms.paper_mode == 5.0 {
+        // PDFium composites coverage in encoded sRGB on opaque paper. Ordinary GPU alpha-over
+        // instead blends in linear light, making transparent glyph edges much paler. Resolve
+        // against this crop surface in PDFium's space, then return linear RGB to the sRGB target.
+        // Only the displayed crop is resolved; uploaded pixels keep their original alpha.
+        let resolved = mix(srgb_encode(uniforms.background.rgb), srgb_encode(colour.rgb), colour.a);
+        return vec4<f32>(srgb_decode(resolved), 1.0);
+    }
+    if uniforms.paper_mode == 4.0 {
+        // Lyra text-secondary (#C8BFAF), in linear sRGB. Neutral source ink is carried by
+        // coverage over the existing card: black is soft ink, white is clear. Saturated plot
+        // colours retain their source channels instead of undergoing a whole-image inversion.
+        // Judge neutrality relative to intensity: a very dark red/blue is still chromatic.
+        let neutral = neutral_amount(colour.rgb);
+        let lightness = dot(colour.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let ink = vec4<f32>(vec3<f32>(0.577580440, 0.520995573, 0.428690497), colour.a * (1.0-lightness));
+        return mix(colour, ink, neutral);
+    }
     if uniforms.paper_mode == 3.0 {
-        // For night ink A and source page x, f(x)=A+(B-A)x. A multiply coefficient c
-        // becomes f(cx)=c*f(x)+(1-c)*A: alpha-over toward the ink keeps glyphs intact
-        // and lifts the dark paper to a visible gray. Transparent tint pixels stay clear.
+        // Keep the existing night highlight treatment: alpha-over toward the ink preserves
+        // solid glyphs and lifts dark paper to visible gray. This overlay does not rerun the
+        // page's neutral-edge transfer; transparent tint pixels stay clear.
         let coefficient = dot(colour.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
         return vec4<f32>(vec3<f32>(0.584078418, 0.558340390, 0.508881321), (1.0-coefficient)*colour.a);
     }
@@ -569,7 +617,7 @@ impl GpuContext {
         let mut bind_groups = Vec::with_capacity(draws.len());
         let mut uniform_buffers = Vec::with_capacity(draws.len());
         for (texture_id, rect, source, blend) in draws {
-            let uniforms: [f32; 12] = [
+            let uniforms: [f32; 16] = [
                 rect[0],
                 rect[1],
                 rect[2],
@@ -582,6 +630,10 @@ impl GpuContext {
                 source[1],
                 source[2],
                 source[3],
+                clear[0] as f32,
+                clear[1] as f32,
+                clear[2] as f32,
+                clear[3] as f32,
             ];
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("lyra-reader-page-uniforms"),
@@ -731,6 +783,17 @@ impl GpuContext {
         height: u32,
         appearance: PaperAppearance,
     ) -> Result<Vec<u8>> {
+        self.probe_layers_with_background(draws, width, height, appearance, [0.0, 0.0, 0.0, 1.0])
+    }
+
+    fn probe_layers_with_background(
+        &mut self,
+        draws: &[TexturedQuad],
+        width: u32,
+        height: u32,
+        appearance: PaperAppearance,
+        clear: [f64; 4],
+    ) -> Result<Vec<u8>> {
         if width == 0 || height == 0 {
             return Err(LyraReaderError::new(
                 ErrorCode::InvalidArgument,
@@ -768,7 +831,7 @@ impl GpuContext {
         let mut uniform_buffers = Vec::with_capacity(draws.len());
         let mut bind_groups = Vec::with_capacity(draws.len());
         for (texture_id, rect, source, blend) in draws {
-            let uniforms: [f32; 12] = [
+            let uniforms: [f32; 16] = [
                 rect[0],
                 rect[1],
                 rect[2],
@@ -781,6 +844,10 @@ impl GpuContext {
                 source[1],
                 source[2],
                 source[3],
+                clear[0] as f32,
+                clear[1] as f32,
+                clear[2] as f32,
+                clear[3] as f32,
             ];
             let uniform_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("page-probe-uniforms"),
@@ -844,7 +911,12 @@ impl GpuContext {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: clear[0],
+                        g: clear[1],
+                        b: clear[2],
+                        a: clear[3],
+                    }),
                     store: wgpu::StoreOp::Store,
                 },
             };
@@ -972,6 +1044,8 @@ mod tests {
             PaperAppearance::Original,
             PaperAppearance::Warm,
             PaperAppearance::Night,
+            PaperAppearance::DarkFigure,
+            PaperAppearance::LightFigure,
         ] {
             let actual = context
                 .offscreen_probe_layers_with_appearance(&draws, 2, 1, appearance)
@@ -983,6 +1057,175 @@ mod tests {
                 "{appearance:?}: {actual:?}"
             );
         }
+    }
+
+    #[test]
+    fn light_figure_edges_match_pdfium_compositing_without_changing_source_pixels() {
+        let mut context = match GpuContext::new(false) {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("skipping: {error}");
+                return;
+            }
+        };
+        let source = [
+            0, 0, 0, 64, 0, 0, 0, 128, 0, 0, 0, 192, // black glyph edges
+            128, 128, 128, 255, // opaque gray rule
+            0, 0, 255, 128, 255, 0, 0, 64, // translucent red/blue plot marks
+            21, 89, 170, 0, // irrelevant colour in a clear pixel
+            0, 0, 0, 255, 255, 255, 255, 255, // solid black and painted white
+        ];
+        let texture = context.upload_page_texture(9, 1, &source).unwrap();
+        let draws = [(
+            texture,
+            [0.0, 0.0, 9.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+            QuadBlend::Normal,
+        )];
+        let original = context
+            .offscreen_probe_layers_with_uv_and_appearance(&draws, 9, 1, PaperAppearance::Original)
+            .unwrap();
+        for background in [[255_u8, 255, 255], [255, 253, 250]] {
+            let linear = |c: u8| {
+                let c = f64::from(c) / 255.0;
+                if c <= 0.04045 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            let clear = [
+                linear(background[0]),
+                linear(background[1]),
+                linear(background[2]),
+                1.0,
+            ];
+            let actual = context
+                .probe_layers_with_background(&draws, 9, 1, PaperAppearance::LightFigure, clear)
+                .unwrap();
+            for (index, pixel) in source.as_chunks::<4>().0.iter().enumerate() {
+                let alpha = u32::from(pixel[3]);
+                for (channel, source_channel) in
+                    [pixel[2], pixel[1], pixel[0]].into_iter().enumerate()
+                {
+                    // This is PDFium's encoded-channel coverage contract, also pinned by the
+                    // PDF backend's transparent-versus-opaque text-page regression.
+                    let expected = ((u32::from(source_channel) * alpha
+                        + u32::from(background[channel]) * (255 - alpha)
+                        + 127)
+                        / 255) as u8;
+                    assert!(
+                        actual[index * 4 + channel].abs_diff(expected) <= 1,
+                        "pixel {index}, channel {channel}: {:?} vs {expected}",
+                        &actual[index * 4..index * 4 + 4]
+                    );
+                }
+                assert_eq!(actual[index * 4 + 3], 255);
+            }
+            // The former linear-alpha path makes this same edge about 187 instead of 127.
+            assert!(
+                actual[4] < 130,
+                "half-covered black keeps the opaque page's visual weight"
+            );
+        }
+        assert_eq!(
+            context
+                .offscreen_probe_layers_with_uv_and_appearance(
+                    &draws,
+                    9,
+                    1,
+                    PaperAppearance::Original,
+                )
+                .unwrap(),
+            original,
+            "display correction never rewrites the uploaded source"
+        );
+    }
+
+    #[test]
+    fn dark_figure_ink_is_soft_transparent_and_preserves_plot_colours() {
+        let mut context = match GpuContext::new(false) {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("skipping: {error}");
+                return;
+            }
+        };
+        let background = context
+            .upload_page_texture(1, 1, &[41, 48, 52, 255])
+            .unwrap();
+        let source = [
+            0, 0, 0, 255, // black ink
+            255, 255, 255, 255, // painted white paper
+            0, 0, 0, 0, // unpainted paper
+            255, 0, 255, 255, // magenta plot
+            255, 255, 0, 255, // cyan plot
+            0, 0, 0, 128, // antialiased black edge
+            204, 204, 204, 255, // light gray rule
+            0, 0, 16, 255, // dark but chromatic red
+            16, 0, 0, 255, // dark but chromatic blue
+        ];
+        let texture = context.upload_page_texture(9, 1, &source).unwrap();
+        let draws = [
+            (background, [0.0, 0.0, 9.0, 1.0], QuadBlend::Interface),
+            (texture, [0.0, 0.0, 9.0, 1.0], QuadBlend::Normal),
+        ];
+        let original = context.offscreen_probe_layers(&draws, 9, 1).unwrap();
+        let dark = context
+            .offscreen_probe_layers_with_appearance(&draws, 9, 1, PaperAppearance::DarkFigure)
+            .unwrap();
+        for (actual, expected) in [
+            (&dark[0..3], [200_u8, 191, 175]),
+            (&dark[4..7], [52, 48, 41]),
+            (&dark[8..11], [52, 48, 41]),
+        ] {
+            assert!(
+                actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 1),
+                "{actual:?}"
+            );
+        }
+        assert_eq!(
+            &dark[12..20],
+            &original[12..20],
+            "chromatic plot pixels keep their colours"
+        );
+        assert_eq!(
+            &dark[28..36],
+            &original[28..36],
+            "very dark plot colours remain chromatic"
+        );
+        fn luminance(rgb: &[u8]) -> f64 {
+            rgb.iter()
+                .zip([0.2126, 0.7152, 0.0722])
+                .map(|(c, weight)| {
+                    let c = f64::from(*c) / 255.0;
+                    weight
+                        * if c <= 0.04045 {
+                            c / 12.92
+                        } else {
+                            ((c + 0.055) / 1.055).powf(2.4)
+                        }
+                })
+                .sum()
+        }
+        let paper = luminance(&[52, 48, 41]);
+        assert!(
+            (luminance(&dark[0..3]) + 0.05) / (paper + 0.05) >= 7.0,
+            "small text has contrast headroom without pure white"
+        );
+        assert!(
+            dark[20] > 52 && dark[20] < 200,
+            "antialias coverage is retained"
+        );
+        assert!(
+            (luminance(&dark[24..27]) + 0.05) / (paper + 0.05) >= 3.0,
+            "light gray table rules remain distinguishable"
+        );
+        assert_eq!(
+            context.offscreen_probe_layers(&draws, 9, 1).unwrap(),
+            original,
+            "switching to light appearance restores the untouched source texture"
+        );
     }
 
     #[test]
@@ -1037,21 +1280,102 @@ mod tests {
     }
 
     #[test]
+    fn night_neutral_edges_reduce_bloom_without_eroding_faint_rules() {
+        let mut context = match GpuContext::new(false) {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("skipping: {error}");
+                return;
+            }
+        };
+        let source = [
+            0, 0, 0, 255, 64, 64, 64, 255, 128, 128, 128, 255, 192, 192, 192, 255, 204, 204, 204,
+            255, 255, 255, 255, 255, 0, 0, 255, 255, 0, 255, 0, 255, 16, 0, 0, 255,
+        ];
+        let texture = context.upload_page_texture(9, 1, &source).unwrap();
+        let draws = [(texture, [0.0, 0.0, 9.0, 1.0], QuadBlend::Normal)];
+        let original = context.offscreen_probe_layers(&draws, 9, 1).unwrap();
+        let night = context
+            .offscreen_probe_layers_with_appearance(&draws, 9, 1, PaperAppearance::Night)
+            .unwrap();
+        let expected = [
+            [201_u8, 197, 189],
+            [187, 183, 176],
+            [166, 162, 156],
+            [130, 127, 121],
+            [120, 117, 112],
+            [36, 34, 30],
+            // Chromatic source tones retain the preceding night conversion.
+            [181, 177, 170],
+            [117, 114, 109],
+            [201, 197, 189],
+        ];
+        for (index, rgb) in expected.iter().enumerate() {
+            for channel in 0..3 {
+                assert!(
+                    night[index * 4 + channel].abs_diff(rgb[channel]) <= 1,
+                    "night pixel {index}: {:?} vs {rgb:?}",
+                    &night[index * 4..index * 4 + 4]
+                );
+            }
+        }
+        assert!(
+            night[..24]
+                .as_chunks::<4>()
+                .0
+                .windows(2)
+                .all(|pair| pair[0][0] > pair[1][0]),
+            "edge tones stay ordered instead of clipping away fine coverage"
+        );
+        let luminance = |rgb: &[u8]| -> f64 {
+            rgb.iter()
+                .zip([0.2126, 0.7152, 0.0722])
+                .map(|(c, weight)| {
+                    let c = f64::from(*c) / 255.0;
+                    weight
+                        * if c <= 0.04045 {
+                            c / 12.92
+                        } else {
+                            ((c + 0.055) / 1.055).powf(2.4)
+                        }
+                })
+                .sum()
+        };
+        assert!(
+            (luminance(&night[16..19]) + 0.05) / (luminance(&night[20..23]) + 0.05) >= 3.0,
+            "the faint gray rule retains contrast headroom after the optical correction"
+        );
+        assert_eq!(
+            context.offscreen_probe_layers(&draws, 9, 1).unwrap(),
+            original,
+            "night coverage correction is display-only"
+        );
+    }
+
+    #[test]
     fn night_multiply_highlights_lift_paper_without_dimming_ink() {
         let Ok(mut context) = GpuContext::new(false) else {
             return;
         };
         let page = context
-            .upload_page_texture(2, 1, &[0, 0, 0, 255, 255, 255, 255, 255])
+            .upload_page_texture(
+                3,
+                1,
+                &[0, 0, 0, 255, 128, 128, 128, 255, 255, 255, 255, 255],
+            )
             .unwrap();
         let tint = context
-            .upload_page_texture(2, 1, &[0, 255, 255, 255, 0, 255, 255, 255])
+            .upload_page_texture(
+                3,
+                1,
+                &[0, 255, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255],
+            )
             .unwrap();
-        let rect = [0.0, 0.0, 2.0, 1.0];
+        let rect = [0.0, 0.0, 3.0, 1.0];
         let plain = context
             .offscreen_probe_layers_with_appearance(
                 &[(page, rect, QuadBlend::Normal)],
-                2,
+                3,
                 1,
                 PaperAppearance::Night,
             )
@@ -1062,7 +1386,7 @@ mod tests {
                     (page, rect, QuadBlend::Normal),
                     (tint, rect, QuadBlend::Multiply),
                 ],
-                2,
+                3,
                 1,
                 PaperAppearance::Night,
             )
@@ -1073,12 +1397,16 @@ mod tests {
                 "night ink must remain intact"
             );
             assert!(
-                marked[4 + channel] > plain[4 + channel] + 15,
+                marked[8 + channel] > plain[8 + channel] + 15,
                 "gray highlight must be visible on dark paper"
+            );
+            assert!(
+                marked[4 + channel] >= plain[4 + channel] && marked[4 + channel] < marked[channel],
+                "a highlighted antialiased edge stays between the paper and solid ink"
             );
         }
         assert!(
-            marked[4] < marked[0],
+            marked[8] < marked[0],
             "highlight background remains darker than the ink"
         );
     }
