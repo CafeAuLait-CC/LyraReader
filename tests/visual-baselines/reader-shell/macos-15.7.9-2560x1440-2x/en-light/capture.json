@@ -1,0 +1,719 @@
+{
+  "captures": [
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "file": "01-home-empty.png",
+      "id": "01-home-empty",
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "tab_count": 0,
+      "verification": "stable-native-home-with-zero-page-quads",
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "02-one-tab.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "02-one-tab",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            0,
+            51,
+            255
+          ]
+        },
+        {
+          "match": true,
+          "name": "magenta",
+          "pixel": [
+            1187,
+            467
+          ],
+          "rgb": [
+            255,
+            0,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 2,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "03-three-tabs.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "03-three-tabs",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            0,
+            51,
+            255
+          ]
+        },
+        {
+          "match": true,
+          "name": "yellow",
+          "pixel": [
+            1187,
+            467
+          ],
+          "rgb": [
+            255,
+            255,
+            0
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 3,
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 7,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "04-eight-tabs.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "04-eight-tabs",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            0,
+            51,
+            255
+          ]
+        },
+        {
+          "match": true,
+          "name": "cyan",
+          "pixel": [
+            1187,
+            467
+          ],
+          "rgb": [
+            0,
+            255,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 8,
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "05-first-tab-active.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "05-first-tab-active",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            0,
+            51,
+            255
+          ]
+        },
+        {
+          "match": true,
+          "name": "magenta",
+          "pixel": [
+            1187,
+            467
+          ],
+          "rgb": [
+            255,
+            0,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 8,
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        947,
+        550
+      ],
+      "file": "06-narrow-eight-tabs.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "06-narrow-eight-tabs",
+      "page_index": 0,
+      "paper_margins_points": [
+        12.374993074597228,
+        8,
+        12.374993074597228,
+        -651.5000179245717
+      ],
+      "paper_points": [
+        12.374993074597228,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1280,
+      "pixel_width": 1920,
+      "registration_markers": [
+        {
+          "match": true,
+          "name": "red",
+          "pixel": [
+            124,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            1770,
+            286
+          ],
+          "rgb": [
+            0,
+            51,
+            255
+          ]
+        },
+        {
+          "match": true,
+          "name": "magenta",
+          "pixel": [
+            947,
+            467
+          ],
+          "rgb": [
+            255,
+            0,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 8,
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        960,
+        640
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "07-window-restored.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "07-window-restored",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            0,
+            51,
+            255
+          ]
+        },
+        {
+          "match": true,
+          "name": "magenta",
+          "pixel": [
+            1187,
+            467
+          ],
+          "rgb": [
+            255,
+            0,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 8,
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "08-close-active-tab.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "08-close-active-tab",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            0,
+            51,
+            255
+          ]
+        },
+        {
+          "match": true,
+          "name": "cyan",
+          "pixel": [
+            1187,
+            467
+          ],
+          "rgb": [
+            0,
+            255,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 7,
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "09-last-tab.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "09-last-tab",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            0,
+            51,
+            255
+          ]
+        },
+        {
+          "match": true,
+          "name": "cyan",
+          "pixel": [
+            1187,
+            467
+          ],
+          "rgb": [
+            0,
+            255,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "file": "10-return-home.png",
+      "id": "10-return-home",
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "tab_count": 0,
+      "verification": "stable-native-home-with-zero-page-quads",
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    }
+  ],
+  "environment": {
+    "appearance": "light",
+    "capture": "ScreenCaptureKit.currentProcess.ownWindowInDisplay",
+    "display_backing_pixels": [
+      5120,
+      2880
+    ],
+    "display_mode_points": [
+      2560,
+      1440
+    ],
+    "fixture_sha256": "96581341cc51cdf14a38d809030933f23a7b3261c3780353ad9f49f170444535",
+    "fixtures_sha256": {
+      "reader-a.pdf": "6a3d0b4c5f24cbce90f13352bfeb30df50ff12cc155f8d5f2005237d1299429d",
+      "reader-b.pdf": "61d09514b4d88c57123f21cced1bc0e709f5a2814c83c756599e8740115a5eff",
+      "reader-c.pdf": "a6b91920ee6aac5426fe3dc8ee6a70d86942ab20f3dd5f2a86de52d23f8dd653",
+      "reader-d.pdf": "25cd53fb31f416b034fe647816b657fa4ec15928e7a24f9d6faab04646844b9b",
+      "reader-e.pdf": "9ed7c58ce8ec595c66cadac3f5f3f453342d21e27fb6e80a1a0b2728adca9c4d",
+      "reader-f.pdf": "bea8f1b5b8a7c50cba77b6ac89d0a5c5cfc63dbe7944f358137d27fb28a2c1f8",
+      "reader-g.pdf": "6f43f1674f2b90150bb2625eba32a4c4ae10f6938e2cd1c962360285f1e06130",
+      "reader-h.pdf": "77f3dc3f0ec0d2361818e35cc602942bb18a1698050c398592e494d9c5396055"
+    },
+    "gpu": "Apple M4 Pro",
+    "hardware_model": "Mac16,11",
+    "language": "en",
+    "locale": "en_US",
+    "os": "Version 15.7.9 (Build 24G830)",
+    "os_build": "24G830",
+    "pdfium_sha256": "713947839b0402a1215cb160845a6217f46580ee8f8de5c63f524ee6b5496a65",
+    "screen_points": [
+      2560,
+      1440
+    ],
+    "swift": "Apple Swift version 6.2.4 (swiftlang-6.2.4.1.4 clang-1700.6.4.2)\nTarget: arm64-apple-macosx15.0",
+    "system_font": ".AppleSystemUIFont"
+  },
+  "provenance": {
+    "content": "Repository-generated synthetic PDFs and native application UI",
+    "fixture_generator": "scripts/check-visual.py",
+    "reviewed_capture_manifest_sha256": "ce7f0d351737e3bfd5d0d5c48043f706992bc8c5a82b906c1a73e2ed76cfe353",
+    "upstream_revision": "eb89a996f7a766904af5accd54d89acc9e10eecb"
+  },
+  "schema_version": 1,
+  "status": "candidate",
+  "suite": "reader-shell"
+}

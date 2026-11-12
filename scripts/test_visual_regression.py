@@ -140,14 +140,15 @@ class BaselineIntegrityTests(unittest.TestCase):
             compile_comparer.assert_not_called()
 
 
-class CommittedPaperBaselineTests(unittest.TestCase):
+class CommittedVisualBaselineTests(unittest.TestCase):
     def test_adopted_baselines_retain_their_reviewed_images_and_manifest(self):
-        root = visual.ROOT / 'tests/visual-baselines/paper/macos-15.7.9-2560x1440-2x'
-        for theme in ['en-light', 'en-dark']:
-            with self.subTest(theme=theme):
-                directory = root / theme
-                report = visual.load_capture(directory)
-                visual.verify_approval(directory, report)
+        root = visual.ROOT / 'tests/visual-baselines'
+        for suite in ['paper', 'reader-shell']:
+            for theme in ['en-light', 'en-dark']:
+                with self.subTest(suite=suite, theme=theme):
+                    directory = root / suite / 'macos-15.7.9-2560x1440-2x' / theme
+                    report = visual.load_capture(directory)
+                    visual.verify_approval(directory, report)
 
 
 if __name__ == '__main__':

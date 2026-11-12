@@ -157,7 +157,7 @@ The `reader-shell` suite records 10 checkpoints: empty Home, one/three/eight tab
 selected, a narrow window and its restoration, closing the active tab, retaining the last tab,
 and returning Home. Its eight synthetic documents have per-document registration colors; the
 checks verify the active document, tab count and actual rendered pixels. Home requires zero page
-quads and an isolated empty recent-document list. These images remain review candidates.
+quads and an isolated empty recent-document list. Reviewed baselines are listed below.
 
 ```bash
 python3 scripts/check-visual.py compare --baseline BASELINE --actual ACTUAL --output build/visual-diff
@@ -173,9 +173,11 @@ and marks the result as **not a regression gate**. No image baselines are accept
 The first paper batch is provisionally adopted under
 `tests/visual-baselines/paper/macos-15.7.9-2560x1440-2x/en-light` and `en-dark`: 32 original PNGs,
 sanitized capture manifests and hash-bound approvals. They cover the recorded macOS build,
-2560×1440 logical display, 5120×2880 backing framebuffer and backing scale 2; other environments
-require separate reviewed baselines. Use the matching directory as `BASELINE` above. Paper and
-reader-shell captures cannot share a baseline or an incomplete checkpoint set.
+2560×1440 logical display, 5120×2880 backing framebuffer and backing scale 2. The user-approved
+reader-shell batch adds 20 original PNGs and hash-bound approvals under
+`tests/visual-baselines/reader-shell/macos-15.7.9-2560x1440-2x/en-light` and `en-dark`.
+Other environments require separate reviewed baselines. Use the matching directory as `BASELINE`
+above. Paper and reader-shell captures cannot share a baseline or an incomplete checkpoint set.
 
 CI verifies the adopted baseline bytes and runs the comparer/approval regressions. Its manual
 **Capture unreviewed visual candidates** input additionally collects paper and reader-shell
