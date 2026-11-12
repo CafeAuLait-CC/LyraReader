@@ -390,7 +390,7 @@ def compare_runs(args: argparse.Namespace) -> int:
     if reference.get('suite') == 'toolbar-inspectors':
         keys.extend(['date_preview_clock', 'capture_color_space'])
     if reference.get('suite') == 'search-previews':
-        keys.append('capture_color_space')
+        keys.extend(['capture_color_space', 'preview_shadow_policy'])
     for key in keys:
         if key not in reference['environment'] or reference['environment'][key] != actual['environment'].get(key):
             raise ValueError(f'Baseline environment differs or is missing: {key}')

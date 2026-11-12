@@ -177,6 +177,7 @@ enum PaperVisualCapture {
         var capturedWindowFrame = CGRect.zero
         var capturedContentRect = CGRect.zero
         var capturedOverlayFrames: [CGRect] = []
+        nonisolated static let previewShadowOutset: CGFloat = 48
 
         init(options: Options) { self.options = options }
 
@@ -256,7 +257,7 @@ enum PaperVisualCapture {
             return settledCanvas
         }
 
-        func screenshot(window: NSWindow) async throws -> CGImage {
+        func screenshot(window: NSWindow, previewShadows: Bool = true) async throws -> CGImage {
             guard let number = window.screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
             else { throw CaptureError("Own window has no display") }
             let result = try await Self.captureOwnWindow(windowID: CGWindowID(window.windowNumber),
@@ -264,7 +265,7 @@ enum PaperVisualCapture {
                 sRGB: ["toolbar-inspectors", "search-previews"].contains(options.suite),
                 overlayIDs: options.suite == "search-previews" ? (window.childWindows ?? []).filter {
                     $0 is ReferencePreviewPanel && $0.isVisible
-                }.map { CGWindowID($0.windowNumber) } : [])
+                }.map { CGWindowID($0.windowNumber) } : [], previewShadows: previewShadows)
             capturedWindowFrame = result.frame
             capturedContentRect = result.contentRect
             capturedOverlayFrames = result.overlayFrames
@@ -274,7 +275,8 @@ enum PaperVisualCapture {
         // Keep ScreenCaptureKit's non-Sendable snapshot/filter objects on its nonisolated
         // async executor. Only immutable CGImage pixels cross back to the main actor.
         nonisolated static func captureOwnWindow(windowID: CGWindowID, scale: CGFloat,
-            displayID: CGDirectDisplayID, sRGB: Bool, overlayIDs: [CGWindowID]) async throws -> WindowImage {
+            displayID: CGDirectDisplayID, sRGB: Bool, overlayIDs: [CGWindowID],
+            previewShadows: Bool) async throws -> WindowImage {
             let available = try await SCShareableContent.currentProcess
             guard let ownWindow = available.windows.first(where: {
                 $0.windowID == windowID
@@ -297,8 +299,12 @@ enum PaperVisualCapture {
             // Desktop, Dock, menu bar and every other application's windows are excluded.
             let filter = SCContentFilter(display: display, including: [ownWindow] + overlays)
             filter.includeMenuBar = false
+            // Include the native preview shadow outside its frame, even when the panel
+            // extends beyond the reader. Sampling remains clipped to this display.
             let captureFrame = overlays.isEmpty ? ownWindow.frame
-                : overlays.reduce(ownWindow.frame) { $0.union($1.frame) }.integral
+                : overlays.reduce(ownWindow.frame) {
+                    $0.union($1.frame.insetBy(dx: -Self.previewShadowOutset, dy: -Self.previewShadowOutset))
+                }.integral.intersection(display.frame)
             let width = Int((captureFrame.width * scale).rounded())
             let height = Int((captureFrame.height * scale).rounded())
             guard width > 0, height > 0, width <= 16384, height <= 16384,
@@ -307,8 +313,11 @@ enum PaperVisualCapture {
             configuration.width = width
             configuration.height = height
             configuration.showsCursor = false
-            configuration.ignoreShadowsSingleWindow = true
-            configuration.ignoreShadowsDisplay = true
+            let suppressFraming = overlays.isEmpty || !previewShadows
+            configuration.ignoreShadowsSingleWindow = suppressFraming
+            configuration.ignoreShadowsDisplay = suppressFraming
+            // The one preview is explicitly included above; do not implicitly add other children.
+            if !overlays.isEmpty { configuration.includeChildWindows = false }
             configuration.sourceRect = CGRect(x: captureFrame.minX - display.frame.minX,
                 y: captureFrame.minY - display.frame.minY, width: captureFrame.width, height: captureFrame.height)
             configuration.captureResolution = .best
@@ -445,7 +454,8 @@ enum PaperVisualCapture {
                     let localPoint = CGPoint(x: paper.minX + sourceX * state.zoomFactor,
                                              y: paper.minY + sourceY * state.zoomFactor)
                     let visible = visibleCanvas.contains(localPoint)
-                        && !capturedOverlayFrames.contains { $0.contains(CGPoint(
+                        && !capturedOverlayFrames.contains { $0.insetBy(
+                            dx: -Self.previewShadowOutset, dy: -Self.previewShadowOutset).contains(CGPoint(
                             x: point.x + capturedWindowFrame.minX, y: point.y + capturedWindowFrame.minY)) }
                         && x >= 0 && x < image.width && y >= 0 && y < image.height
                     if name == requiredMarker { mx = x; my = y }
@@ -888,9 +898,55 @@ enum PaperVisualCapture {
                         canvas.visualSubmittedFrameIndex, surface: canvas.presentationSurfaceID)]
         }
 
+        func verifyPreviewShadow(_ id: String, window: NSWindow,
+                                 panels: ReferencePreviewPanelController) async throws {
+            guard let panel = panels.panel else { throw CaptureError("Shadow probe is missing its preview") }
+            guard panel.hasShadow else { throw CaptureError("Production preview disabled its native shadow") }
+            let enabled = try await screenshot(window: window)
+            let frame = capturedWindowFrame
+            guard capturedOverlayFrames.count == 1, let panelFrame = capturedOverlayFrames.first else {
+                throw CaptureError("Shadow probe requires exactly one owned preview")
+            }
+            let suppressed = try await screenshot(window: window, previewShadows: false)
+            guard capturedWindowFrame == frame, enabled.width == suppressed.width,
+                  enabled.height == suppressed.height else { throw CaptureError("Shadow probe changed geometry") }
+            let on = try rgba(enabled), off = try rgba(suppressed)
+            let scale = window.backingScaleFactor
+            let outer = panelFrame.insetBy(dx: -Self.previewShadowOutset, dy: -Self.previewShadowOutset)
+            let left = max(0, Int(((outer.minX - frame.minX) * scale).rounded(.up)))
+            let top = max(0, Int(((outer.minY - frame.minY) * scale).rounded(.up)))
+            let right = min(enabled.width, Int(((outer.maxX - frame.minX) * scale).rounded(.down)))
+            let bottom = min(enabled.height, Int(((outer.maxY - frame.minY) * scale).rounded(.down)))
+            guard right > left, bottom > top else { throw CaptureError("Shadow ring is outside the capture") }
+            var changed = 0
+            var maximum = 0
+            for y in top..<bottom {
+                for x in left..<right {
+                    let point = CGPoint(x: frame.minX + (CGFloat(x) + 0.5) / scale,
+                                        y: frame.minY + (CGFloat(y) + 0.5) / scale)
+                    guard !panelFrame.contains(point) else { continue }
+                    let offset = (y * enabled.width + x) * 4
+                    var difference = 0
+                    for channel in 0..<4 {
+                        difference = max(difference, abs(Int(on[offset + channel]) - Int(off[offset + channel])))
+                    }
+                    maximum = max(maximum, difference)
+                    if difference > 2 { changed += 1 }
+                }
+            }
+            try write(enabled, name: "probe-\(id)-shadow-on.png")
+            try write(suppressed, name: "probe-\(id)-shadow-off.png")
+            let evidence: [String: Any] = ["shadow_ring_changed_pixels": changed,
+                "maximum_channel_difference": maximum, "panel_has_shadow": panel.hasShadow,
+                "same_window_and_geometry": true, "suppressed_only_in_capture_configuration": true]
+            captures[captures.count - 1]["native_preview_shadow_probe"] = evidence
+            guard changed > 128 else { throw CaptureError("Native preview shadow is missing from captured pixels: \(evidence)") }
+        }
+
         func captureSearchPreviews(state: AppState, window: NSWindow,
                                    panels: ReferencePreviewPanelController) async throws {
             environment["capture_color_space"] = "sRGB; 8-bit BGRA; SDR"
+            environment["preview_shadow_policy"] = "native framing; explicit window allowlist; 48pt preview outset; display clipped"
             environment["capture"] = "ScreenCaptureKit.currentProcess.readerAndOwnedPreviewInDisplay"
             environment["interaction_driver"] = "production AppState actions; native preview frame and Escape events"
             window.setContentSize(CGSize(width: 1200, height: 800))
@@ -1016,6 +1072,7 @@ enum PaperVisualCapture {
                 throw CaptureError("Single citation resolved to the wrong entry")
             }
             try await shot("16-citation-single")
+            try await verifyPreviewShadow("citation", window: window, panels: panels)
             try preserved()
             _ = state.openCitation(at: try point(group.xPt + group.widthPt / 2, group.yPt + group.heightPt / 2))
             try await wait("grouped citation resolution") { state.referencePreview?.entries.count == 3 }
@@ -1053,6 +1110,7 @@ enum PaperVisualCapture {
             _ = state.openFigureMention(at: try point(figure.xPt + figure.widthPt / 2, figure.yPt + figure.heightPt / 2))
             try await wait("figure resolution") { state.referencePreview?.title == "Figure 1" }
             try await shot("21-figure-preview", raster: "figure")
+            try await verifyPreviewShadow("figure", window: window, panels: panels)
             try preserved()
             _ = state.openFigureMention(at: try point(table.xPt + table.widthPt / 2, table.yPt + table.heightPt / 2))
             try await wait("table replaces figure") { state.referencePreview?.title == "Table 1" }

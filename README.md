@@ -182,6 +182,10 @@ pixels, crop bounds, reader position, navigation history and panel cleanup. Thes
 separate review; the toolbar suite's tolerance does not apply to them automatically.
 This suite temporarily parks the pointer outside its windows to avoid accidental hover states
 and restores it when capture ends.
+Preview captures retain native window framing and shadows, with a 48 pt outset clipped to the
+display. Same-window shadow-on/off probes verify actual pixels outside the panel frame; the
+shadow-suppressed images are diagnostics, separate from the checkpoint catalogue. Environment
+matching includes this shadow policy so earlier suppressed-framing captures cannot be mixed in.
 
 ```bash
 python3 scripts/check-visual.py compare --baseline BASELINE --actual ACTUAL --output build/visual-diff
