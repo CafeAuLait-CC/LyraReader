@@ -138,7 +138,13 @@ fn paper_colour(rgb: vec3<f32>) -> vec3<f32> {
         return mix(vec3<f32>(0.029556834, 0.024157632, 0.018500220), vec3<f32>(0.973445290, 0.930110858, 0.846873232), rgb);
     }
     if uniforms.paper_mode == 2.0 {
-        let lightness = dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let linear_lightness = dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        // Opaque PDFium glyph edges carry coverage in encoded sRGB, not linear intensity.
+        // A source gray of 0.5 is half-covered ink, not 78% ink after inversion. Move halfway
+        // toward that coverage: a full correction makes pale gray rules too faint. Chromatic
+        // content keeps its existing night tone, and the paper/solid-ink endpoints stay fixed.
+        let encoded_lightness = dot(srgb_encode(rgb), vec3<f32>(0.2126, 0.7152, 0.0722));
+        let lightness = mix(linear_lightness, encoded_lightness, 0.5 * neutral_amount(rgb));
         return mix(vec3<f32>(0.584078418, 0.558340390, 0.508881321), vec3<f32>(0.017641954, 0.015996293, 0.012983032), vec3<f32>(lightness));
     }
     return rgb;
@@ -151,6 +157,12 @@ fn srgb_encode(rgb: vec3<f32>) -> vec3<f32> {
 
 fn srgb_decode(rgb: vec3<f32>) -> vec3<f32> {
     return select(rgb / 12.92, pow((rgb + 0.055) / 1.055, vec3<f32>(2.4)), rgb > vec3<f32>(0.04045));
+}
+
+fn neutral_amount(rgb: vec3<f32>) -> f32 {
+    let maximum = max(max(rgb.r, rgb.g), rgb.b);
+    let chroma = (maximum - min(min(rgb.r, rgb.g), rgb.b)) / max(maximum, 0.000001);
+    return 1.0 - smoothstep(0.0, 0.02, chroma);
 }
 
 @fragment
@@ -168,18 +180,16 @@ fn fs_page(in: VertexOutput) -> @location(0) vec4<f32> {
         // Lyra text-secondary (#C8BFAF), in linear sRGB. Neutral source ink is carried by
         // coverage over the existing card: black is soft ink, white is clear. Saturated plot
         // colours retain their source channels instead of undergoing a whole-image inversion.
-        let maximum = max(max(colour.r, colour.g), colour.b);
         // Judge neutrality relative to intensity: a very dark red/blue is still chromatic.
-        let chroma = (maximum - min(min(colour.r, colour.g), colour.b)) / max(maximum, 0.000001);
-        let neutral = 1.0 - smoothstep(0.0, 0.02, chroma);
+        let neutral = neutral_amount(colour.rgb);
         let lightness = dot(colour.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
         let ink = vec4<f32>(vec3<f32>(0.577580440, 0.520995573, 0.428690497), colour.a * (1.0-lightness));
         return mix(colour, ink, neutral);
     }
     if uniforms.paper_mode == 3.0 {
-        // For night ink A and source page x, f(x)=A+(B-A)x. A multiply coefficient c
-        // becomes f(cx)=c*f(x)+(1-c)*A: alpha-over toward the ink keeps glyphs intact
-        // and lifts the dark paper to a visible gray. Transparent tint pixels stay clear.
+        // Keep the existing night highlight treatment: alpha-over toward the ink preserves
+        // solid glyphs and lifts dark paper to visible gray. This overlay does not rerun the
+        // page's neutral-edge transfer; transparent tint pixels stay clear.
         let coefficient = dot(colour.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
         return vec4<f32>(vec3<f32>(0.584078418, 0.558340390, 0.508881321), (1.0-coefficient)*colour.a);
     }
@@ -1270,21 +1280,102 @@ mod tests {
     }
 
     #[test]
+    fn night_neutral_edges_reduce_bloom_without_eroding_faint_rules() {
+        let mut context = match GpuContext::new(false) {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("skipping: {error}");
+                return;
+            }
+        };
+        let source = [
+            0, 0, 0, 255, 64, 64, 64, 255, 128, 128, 128, 255, 192, 192, 192, 255, 204, 204, 204,
+            255, 255, 255, 255, 255, 0, 0, 255, 255, 0, 255, 0, 255, 16, 0, 0, 255,
+        ];
+        let texture = context.upload_page_texture(9, 1, &source).unwrap();
+        let draws = [(texture, [0.0, 0.0, 9.0, 1.0], QuadBlend::Normal)];
+        let original = context.offscreen_probe_layers(&draws, 9, 1).unwrap();
+        let night = context
+            .offscreen_probe_layers_with_appearance(&draws, 9, 1, PaperAppearance::Night)
+            .unwrap();
+        let expected = [
+            [201_u8, 197, 189],
+            [187, 183, 176],
+            [166, 162, 156],
+            [130, 127, 121],
+            [120, 117, 112],
+            [36, 34, 30],
+            // Chromatic source tones retain the preceding night conversion.
+            [181, 177, 170],
+            [117, 114, 109],
+            [201, 197, 189],
+        ];
+        for (index, rgb) in expected.iter().enumerate() {
+            for channel in 0..3 {
+                assert!(
+                    night[index * 4 + channel].abs_diff(rgb[channel]) <= 1,
+                    "night pixel {index}: {:?} vs {rgb:?}",
+                    &night[index * 4..index * 4 + 4]
+                );
+            }
+        }
+        assert!(
+            night[..24]
+                .as_chunks::<4>()
+                .0
+                .windows(2)
+                .all(|pair| pair[0][0] > pair[1][0]),
+            "edge tones stay ordered instead of clipping away fine coverage"
+        );
+        let luminance = |rgb: &[u8]| -> f64 {
+            rgb.iter()
+                .zip([0.2126, 0.7152, 0.0722])
+                .map(|(c, weight)| {
+                    let c = f64::from(*c) / 255.0;
+                    weight
+                        * if c <= 0.04045 {
+                            c / 12.92
+                        } else {
+                            ((c + 0.055) / 1.055).powf(2.4)
+                        }
+                })
+                .sum()
+        };
+        assert!(
+            (luminance(&night[16..19]) + 0.05) / (luminance(&night[20..23]) + 0.05) >= 3.0,
+            "the faint gray rule retains contrast headroom after the optical correction"
+        );
+        assert_eq!(
+            context.offscreen_probe_layers(&draws, 9, 1).unwrap(),
+            original,
+            "night coverage correction is display-only"
+        );
+    }
+
+    #[test]
     fn night_multiply_highlights_lift_paper_without_dimming_ink() {
         let Ok(mut context) = GpuContext::new(false) else {
             return;
         };
         let page = context
-            .upload_page_texture(2, 1, &[0, 0, 0, 255, 255, 255, 255, 255])
+            .upload_page_texture(
+                3,
+                1,
+                &[0, 0, 0, 255, 128, 128, 128, 255, 255, 255, 255, 255],
+            )
             .unwrap();
         let tint = context
-            .upload_page_texture(2, 1, &[0, 255, 255, 255, 0, 255, 255, 255])
+            .upload_page_texture(
+                3,
+                1,
+                &[0, 255, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255],
+            )
             .unwrap();
-        let rect = [0.0, 0.0, 2.0, 1.0];
+        let rect = [0.0, 0.0, 3.0, 1.0];
         let plain = context
             .offscreen_probe_layers_with_appearance(
                 &[(page, rect, QuadBlend::Normal)],
-                2,
+                3,
                 1,
                 PaperAppearance::Night,
             )
@@ -1295,7 +1386,7 @@ mod tests {
                     (page, rect, QuadBlend::Normal),
                     (tint, rect, QuadBlend::Multiply),
                 ],
-                2,
+                3,
                 1,
                 PaperAppearance::Night,
             )
@@ -1306,12 +1397,16 @@ mod tests {
                 "night ink must remain intact"
             );
             assert!(
-                marked[4 + channel] > plain[4 + channel] + 15,
+                marked[8 + channel] > plain[8 + channel] + 15,
                 "gray highlight must be visible on dark paper"
+            );
+            assert!(
+                marked[4 + channel] >= plain[4 + channel] && marked[4 + channel] < marked[channel],
+                "a highlighted antialiased edge stays between the paper and solid ink"
             );
         }
         assert!(
-            marked[4] < marked[0],
+            marked[8] < marked[0],
             "highlight background remains darker than the ink"
         );
     }

@@ -20,10 +20,23 @@ public enum PaperAppearance: String, CaseIterable, Identifiable, Sendable {
         guard self != .original, let rgb = color.usingColorSpace(.sRGB) else { return color }
         func linear(_ c: CGFloat) -> CGFloat { c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4) }
         func srgb(_ c: CGFloat) -> CGFloat { c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1 / 2.4) - 0.055 }
-        let channels = [rgb.redComponent, rgb.greenComponent, rgb.blueComponent].map(linear)
+        let encoded = [rgb.redComponent, rgb.greenComponent, rgb.blueComponent]
+        let channels = encoded.map(linear)
         let paper = (self == .warm ? [252.0, 247.0, 237.0] : [36.0, 34.0, 30.0]).map { linear($0 / 255) }
         let ink = (self == .warm ? [48.0, 43.0, 37.0] : [201.0, 197.0, 189.0]).map { linear($0 / 255) }
-        let lightness = channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722
+        var lightness = channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722
+        if self == .night {
+            // Match the GPU's neutral coverage transfer in page.rs; coloured annotations keep
+            // their existing night luminance. This affects display, never the stored colour.
+            let maximum = max(channels[0], max(channels[1], channels[2]))
+            let minimum = min(channels[0], min(channels[1], channels[2]))
+            let chroma = (maximum - minimum) / max(maximum, 0.000001)
+            let t = min(1, max(0, chroma / 0.02))
+            let neutral = 1 - t * t * (3 - 2 * t)
+            let encodedLightness = encoded[0] * 0.2126 + encoded[1] * 0.7152 + encoded[2] * 0.0722
+            // A half-strength correction reduces edge bloom while retaining pale gray rules.
+            lightness += (encodedLightness - lightness) * neutral * 0.5
+        }
         let values = (0..<3).map { i in srgb(ink[i] + (paper[i] - ink[i]) * (self == .night ? lightness : channels[i])) }
         return NSColor(srgbRed: values[0], green: values[1], blue: values[2], alpha: rgb.alphaComponent)
     }
