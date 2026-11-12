@@ -841,7 +841,12 @@ enum PaperVisualCapture {
                 if raster {
                     guard state.referencePreviewPages.count == 1, let canvas = self.canvas(in: content),
                           canvas.hasAttachedSurface, let quads = canvas.lastSubmittedQuadCount, quads > 0,
-                          canvas.visualSubmittedFrameIndex > 0 else { return false }
+                          canvas.visualSubmittedFrameIndex > 0,
+                          canvas.visualSubmittedViewportSize == canvas.bounds.size,
+                          abs(canvas.visualSubmittedZoom - state.referencePreviewZoom) < 1e-9,
+                          abs(canvas.visualSubmittedScrollYPt - state.referencePreviewScrollYPt) < 1e-9,
+                          let page = state.referencePreviewPages.first,
+                          abs(page.placement.widthPt * state.referencePreviewZoom - canvas.bounds.width) <= 1 else { return false }
                 } else {
                     guard state.referencePreviewPages.isEmpty, self.canvas(in: content) == nil,
                           panels.model.entries.map(\.citationEntry) == preview.entries else { return false }
@@ -871,7 +876,7 @@ enum PaperVisualCapture {
             let bottom = min(image.height, Int(((primary.frame.maxY - screen.minY - capturedWindowFrame.minY) * scale).rounded(.down)))
             guard right > left, bottom > top else { throw CaptureError("Preview canvas is outside the capture") }
             let pixels = try rgba(image)
-            var counts = ["magenta": 0, "cyan": 0, "red": 0, "blue": 0]
+            var counts = ["magenta": 0, "cyan": 0, "red": 0, "blue": 0, "paper": 0, "ink": 0]
             for y in top..<bottom {
                 for x in left..<right {
                     let offset = (y * image.width + x) * 4
@@ -880,6 +885,8 @@ enum PaperVisualCapture {
                     if g > 180 && b > 180 && r < 90 { counts["cyan", default: 0] += 1 }
                     if r > 180 && g < 90 && b < 90 { counts["red", default: 0] += 1 }
                     if b > 180 && r < 90 && g < 140 { counts["blue", default: 0] += 1 }
+                    if r >= 245 && g >= 245 && b >= 245 { counts["paper", default: 0] += 1 }
+                    if r < 80 && g < 80 && b < 80 { counts["ink", default: 0] += 1 }
                 }
             }
             let correct: Bool
@@ -891,8 +898,16 @@ enum PaperVisualCapture {
             default: throw CaptureError("Unknown preview raster expectation")
             }
             guard correct else { throw CaptureError("Wrong or missing \(expected) preview pixels in \(id): \(counts)") }
+            if expected == "figure" || expected == "table" {
+                guard counts["paper", default: 0] > (right - left) * (bottom - top) / 4,
+                      counts["ink", default: 0] > 20 else {
+                    throw CaptureError("Original paper or dark figure/table ink is missing in \(id): \(counts)")
+                }
+            }
             return ["expected": expected, "canvas_pixel_rect": [left, top, right - left, bottom - top],
                     "color_pixel_counts": counts, "surface": canvas.presentationSurfaceID,
+                    "submitted_zoom": canvas.visualSubmittedZoom,
+                    "submitted_viewport_points": [canvas.visualSubmittedViewportSize.width, canvas.visualSubmittedViewportSize.height],
                     "frame_index": canvas.visualSubmittedFrameIndex,
                     "metal_presentation_timestamp_available": frames.contains(
                         canvas.visualSubmittedFrameIndex, surface: canvas.presentationSurfaceID)]
@@ -1073,6 +1088,9 @@ enum PaperVisualCapture {
             }
             try await shot("16-citation-single")
             try await verifyPreviewShadow("citation", window: window, panels: panels)
+            guard let singleSize = panels.panel?.frame.size, singleSize.height < 180 else {
+                throw CaptureError("A short citation did not shrink to its content")
+            }
             try preserved()
             _ = state.openCitation(at: try point(group.xPt + group.widthPt / 2, group.yPt + group.heightPt / 2))
             try await wait("grouped citation resolution") { state.referencePreview?.entries.count == 3 }
@@ -1080,6 +1098,9 @@ enum PaperVisualCapture {
                 throw CaptureError("Wrapped bibliography entry was truncated")
             }
             try await shot("17-citation-group")
+            guard let groupSize = panels.panel?.frame.size, groupSize.height > singleSize.height else {
+                throw CaptureError("Grouped citation size did not follow its longer content")
+            }
             weak var escapedPanel: ReferencePreviewPanel?
             do {
                 // Release the closed panel before the next preview. Retaining its hosting view
@@ -1102,11 +1123,13 @@ enum PaperVisualCapture {
             try await wait("Escape closes and detaches preview") {
                 state.referencePreview == nil && panels.panel == nil
                     && escapedPanel?.isVisible != true && escapedPanel?.parent == nil
+                    && escapedPanel?.contentView == nil
             }
             try await shot("20-preview-escape")
             // AppKit may retain an ordered-out NSWindow. Record object lifetime separately
             // from the observable close/detach contract instead of assuming immediate deinit.
             captures[captures.count - 1]["closed_preview_object_released"] = escapedPanel == nil
+            captures[captures.count - 1]["closed_preview_host_unmounted"] = escapedPanel?.contentView == nil
             _ = state.openFigureMention(at: try point(figure.xPt + figure.widthPt / 2, figure.yPt + figure.heightPt / 2))
             try await wait("figure resolution") { state.referencePreview?.title == "Figure 1" }
             try await shot("21-figure-preview", raster: "figure")

@@ -180,6 +180,8 @@ Capture includes only the process-owned reader and its one attached preview pane
 the image bounds expand to their union when necessary. Checks verify resolved text, actual preview
 pixels, crop bounds, reader position, navigation history and panel cleanup. These candidates need
 separate review; the toolbar suite's tolerance does not apply to them automatically.
+Capture also checks compact single-entry sizing against grouped citations, submitted viewport/zoom
+agreement, original-paper and ink pixels in figure/table previews, and closed-host unmounting.
 This suite temporarily parks the pointer outside its windows to avoid accidental hover states
 and restores it when capture ends.
 Preview captures retain native window framing and shadows, with a 48 pt outset clipped to the
