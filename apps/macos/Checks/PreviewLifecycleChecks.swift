@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import LyraReaderKit
+import QuartzCore
 import SwiftUI
 
 extension ReaderChecks {
@@ -93,6 +94,8 @@ extension ReaderChecks {
                     panels.panel!.applyUserFrame(CGRect(x: 150, y: 180, width: width, height: 360))
                 }
                 let resized = try await ready()
+                require((resized.layer as? CAMetalLayer)?.colorspace?.name == CGColorSpace.sRGB,
+                        "resizing the crop surface preserves its explicit sRGB declaration")
                 let expected = resized.bounds.width / region.width
                 require(abs(state.referencePreviewZoom - expected) < 0.001,
                         "rapid resize fits the final live bounds without right-edge clipping")
@@ -104,8 +107,8 @@ extension ReaderChecks {
         }
     }
 
-    /// Sample the real transparent raster against the actual hosted canvas background. A dark
-    /// raised-bg or a night conversion makes these original black rules and tones fail.
+    /// Verify native profile selection and unchanged transparent source bytes. Actual dark ink
+    /// coverage and colour are also checked by the GPU offscreen regression and native captures.
     @MainActor static func previewPaperChecks(root: URL) async throws {
         let state = AppState(engine: try RustEngine())
         require(state.open(url: root.appendingPathComponent("tests/fixtures/alpha-crop.pdf")),
@@ -141,7 +144,15 @@ extension ReaderChecks {
                 let view = canvas(panels.panel?.contentView)!
                 require(view.paperAppearance == .original,
                         "scientific colours remain original under \(theme) / \(mode)")
-                let background = view.canvasClearColor!.usingColorSpace(.sRGB)!
+                let dark = view.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+                require(view.adaptsFigureInkToAppearance && view.renderingAppearanceCode == (dark ? 3 : 4),
+                        "scientific crops select dark ink or light edge compositing")
+                require((view.layer as? CAMetalLayer)?.colorspace?.name == CGColorSpace.sRGB,
+                        "the native crop layer declares its source sRGB colour space")
+                var background = NSColor.black
+                view.effectiveAppearance.performAsCurrentDrawingAppearance {
+                    background = view.canvasClearColor!.usingColorSpace(.sRGB)!
+                }
                 let image = state.referencePreviewPages[0].image
                 let scale = CGFloat(image.pixelWidth) / image.pointSize.width
                 func sample(_ x: CGFloat, _ y: CGFloat) -> [CGFloat] {
@@ -155,8 +166,11 @@ extension ReaderChecks {
                         return [red, green, blue]
                     }
                 }
-                require(sample(560, 100).allSatisfy { $0 > 0.99 },
-                        "unpainted paper displays white independently of the dark UI")
+                let expectedBackground: [CGFloat] = dark
+                    ? [52.0 / 255, 48.0 / 255, 41.0 / 255]
+                    : [1, 253.0 / 255, 250.0 / 255]
+                require(zip(sample(560, 100), expectedBackground).allSatisfy { abs($0.0 - $0.1) < 0.001 },
+                        "transparent paper blends into the original light or dark card")
                 let samples: [(CGFloat, CGFloat, CGFloat)] = [
                     (132, 112, 242.0 / 255), (132, 212, 204.0 / 255),
                     (300, 212, 128.0 / 255), (468, 212, 0)
@@ -168,6 +182,26 @@ extension ReaderChecks {
                 state.closeReferencePreview()
                 try await eventually("paper check unmounts the figure", { panels.panel == nil })
             }
+        }
+        appearance.mode = .original
+        state.openReferencePreview(page: 0, title: "Live theme switch", from: "page 1",
+            kind: .figure, region: CGRect(x: 0, y: 0, width: 595, height: 400))
+        try await eventually("theme-switch crop is ready", {
+            !state.referencePreviewLoading && !state.referencePreviewPages.isEmpty
+                && canvas(panels.panel?.contentView) != nil
+        })
+        let source = state.referencePreviewPages[0].image
+        for theme in [NSAppearance.Name.darkAqua, .aqua, .darkAqua] {
+            window.appearance = NSAppearance(named: theme)
+            panels.sync(state: state, parentWindow: window)
+            try await eventually("theme switch updates the existing figure surface", {
+                panels.panel?.contentView?.layoutSubtreeIfNeeded()
+                guard let view = canvas(panels.panel?.contentView) else { return false }
+                return view.renderingAppearanceCode == (theme == .darkAqua ? 3 : 4)
+            })
+            require(state.referencePreviewPages[0].image.generation == source.generation
+                        && state.referencePreviewPages[0].image.bgra == source.bgra,
+                    "theme switching reuses untouched source pixels")
         }
     }
 }

@@ -483,6 +483,32 @@ public final class MetalCanvasView: NSView {
         }
     }
 
+    /// Only floating scientific crops opt in: light crops match PDFium edge coverage and dark
+    /// crops lift neutral ink. The reader and whole-page previews retain their selected paper
+    /// profile. Appearance changes redraw the same uploaded texture.
+    public var adaptsFigureInkToAppearance = false {
+        didSet {
+            guard oldValue != adaptsFigureInkToAppearance else { return }
+            // Crop colours and their card clear are specified in sRGB, like the uploaded
+            // textures. An untagged layer lets the compositor reinterpret their midtones.
+            syncFigureColorSpace()
+            markNeedsRender()
+        }
+    }
+
+    private func syncFigureColorSpace() {
+        guard let metalLayer = layer as? CAMetalLayer else { return }
+        metalLayer.colorspace = adaptsFigureInkToAppearance
+            ? CGColorSpace(name: CGColorSpace.sRGB) : nil
+    }
+
+    package var renderingAppearanceCode: UInt8 {
+        if adaptsFigureInkToAppearance {
+            return effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? 3 : 4
+        }
+        return paperAppearance.code
+    }
+
     /// The colour the GPU clears to behind transparent texture pixels.
     ///
     /// `nil` keeps the reader canvas colour. The floating preview sets its own card colour for
@@ -1630,6 +1656,10 @@ public final class MetalCanvasView: NSView {
             resizeSurfaceIfNeeded()
             return
         }
+        guard lyra_reader_abi_version() == UInt32(LYRA_READER_ABI_VERSION) else {
+            report("The rendering library does not match this application. Rebuild the Rust library and Swift bindings together.")
+            return
+        }
         guard let metalLayer = layer as? CAMetalLayer else {
             report("backing layer is not a CAMetalLayer")
             return
@@ -1656,6 +1686,8 @@ public final class MetalCanvasView: NSView {
         }
 
         surfaceId = newSurfaceId
+        // wgpu configures the native layer and resets its colour space during attach/resize.
+        syncFigureColorSpace()
         configuredPixelSize = CGSize(width: width, height: height)
         configuredScale = backingScale()
         reportDeviceScale()
@@ -1686,6 +1718,7 @@ public final class MetalCanvasView: NSView {
         }
         configuredPixelSize = pixels
         configuredScale = backingScale()
+        syncFigureColorSpace()
         markNeedsRender()
         return true
     }
@@ -2037,7 +2070,7 @@ public final class MetalCanvasView: NSView {
                             sourceRects.baseAddress,
                             modes.baseAddress,
                             textureIds.count,
-                            clear[0], clear[1], clear[2], paperAppearance.code,
+                            clear[0], clear[1], clear[2], renderingAppearanceCode,
                             &stats
                         )
                     }
@@ -2252,6 +2285,7 @@ public struct PDFCanvasView: NSViewRepresentable {
     private let zoom: CGFloat
     private let contentWidthPt: CGFloat
     private let paperAppearance: PaperAppearance
+    private let adaptsFigureInkToAppearance: Bool
     private let canvasClearColor: NSColor?
     private let annotationMarks: [CanvasAnnotationMark]
     private let annotationPageFrames: [PagePlacement]
@@ -2325,6 +2359,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         zoom: CGFloat = 1.0,
         contentWidthPt: CGFloat = 0,
         paperAppearance: PaperAppearance = .original,
+        adaptsFigureInkToAppearance: Bool = false,
         canvasClearColor: NSColor? = nil,
         annotationMarks: [CanvasAnnotationMark] = [],
         annotationPageFrames: [PagePlacement] = [],
@@ -2388,6 +2423,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         self.zoom = zoom
         self.contentWidthPt = contentWidthPt
         self.paperAppearance = paperAppearance
+        self.adaptsFigureInkToAppearance = adaptsFigureInkToAppearance
         self.canvasClearColor = canvasClearColor
         self.annotationMarks = annotationMarks
         self.annotationPageFrames = annotationPageFrames
@@ -2490,6 +2526,7 @@ public struct PDFCanvasView: NSViewRepresentable {
         view.scrollYPt = commit?.scrollYPt ?? scrollYPt
         view.contentWidthPt = commit?.contentWidthPt ?? contentWidthPt
         view.paperAppearance = paperAppearance
+        view.adaptsFigureInkToAppearance = adaptsFigureInkToAppearance
         view.canvasClearColor = canvasClearColor
         view.annotationMarks = commit?.annotationMarks ?? annotationMarks
         view.annotationPageFrames = commit?.pageFrames ?? annotationPageFrames
