@@ -18,6 +18,7 @@ enum PaperVisualCapture {
         let output: URL
         let language: String
         let appearance: String
+        let paperMode: PaperAppearance
         let suite: String
         let mutation: String?
     }
@@ -46,6 +47,9 @@ enum PaperVisualCapture {
             let output = URL(fileURLWithPath: try argument("output")).standardizedFileURL
             let language = try argument("language")
             let appearance = try argument("appearance")
+            guard let paperMode = PaperAppearance(rawValue: request["paper_mode"] ?? "original") else {
+                throw CaptureError("Invalid paper mode")
+            }
             guard ["en", "zh-Hans"].contains(language), ["light", "dark"].contains(appearance),
                   FileManager.default.fileExists(atPath: fixture.path),
                   FileManager.default.fileExists(atPath: output.path) else {
@@ -60,7 +64,7 @@ enum PaperVisualCapture {
                 throw CaptureError("Visual mutation must be scale or chrome")
             }
             options = Options(fixture: fixture, output: output, language: language,
-                              appearance: appearance, suite: suite, mutation: mutation)
+                              appearance: appearance, paperMode: paperMode, suite: suite, mutation: mutation)
             try Data(String(ProcessInfo.processInfo.processIdentifier).utf8)
                 .write(to: output.appendingPathComponent("capture.pid"), options: .atomic)
             // LaunchServices can inherit launchd hooks rather than the launcher's environment.
@@ -70,7 +74,7 @@ enum PaperVisualCapture {
             }
             UserDefaults.standard.setVolatileDomain([
                 "AppleLanguages": [language], "AppleLocale": language == "en" ? "en_US" : "zh_CN",
-                ReadingAppearanceStore.preferenceKey: "original",
+                ReadingAppearanceStore.preferenceKey: paperMode.rawValue,
                 // Keep the real Home view deterministic and prevent fallback to private system recents.
                 "lyrareader.recentDocuments": Data("[]".utf8),
                 "lyrareader.didMigratePreferences": true
@@ -362,6 +366,55 @@ enum PaperVisualCapture {
 
         enum PaperExpectation { case none, topEdge, bottomEdge, fitted }
 
+        func markerRGB(_ name: String, mode: PaperAppearance) throws -> [Int] {
+            let source: [String: [CGFloat]] = [
+                "red": [1, 0, 0], "blue": [0, 0.2, 1], "green": [0, 0.7, 0.2],
+                "orange": [1, 0.6, 0], "magenta": [1, 0, 1], "cyan": [0, 1, 1],
+                "yellow": [1, 1, 0], "purple": [0.6, 0.1, 1], "white": [1, 1, 1], "black": [0, 0, 0]
+            ]
+            guard let rgb = source[name], var converted = mode.displayColor(NSColor(
+                srgbRed: rgb[0], green: rgb[1], blue: rgb[2], alpha: 1)).usingColorSpace(.sRGB) else {
+                throw CaptureError("Unknown registration colour: \(name)")
+            }
+            if mode == .night, ["toolbar-inspectors", "search-previews"].contains(options.suite) {
+                // These suites explicitly request sRGB from ScreenCaptureKit. The untagged
+                // reader/page-preview layer is interpreted in the display profile first;
+                // colour-tagged figure crops keep their sRGB profile and original colour probes.
+                guard let screen = NSScreen.screens.first,
+                      let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+                      let displaySpace = NSColorSpace(cgColorSpace: CGDisplayCopyColorSpace(CGDirectDisplayID(number.uint32Value))) else {
+                    throw CaptureError("Display colour profile is unavailable for registration")
+                }
+                let components = [converted.redComponent, converted.greenComponent, converted.blueComponent, CGFloat(1)]
+                guard let screenRGB = NSColor(colorSpace: displaySpace, components: components, count: 4).usingColorSpace(.sRGB) else {
+                    throw CaptureError("Cannot convert the display registration colour to sRGB")
+                }
+                converted = screenRGB
+            }
+            return [converted.redComponent, converted.greenComponent, converted.blueComponent]
+                .map { Int(($0 * 255).rounded()) }
+        }
+
+        func markerMatches(_ name: String, rgb: [Int], mode: PaperAppearance) throws -> Bool {
+            if mode == .night {
+                let expected = try markerRGB(name, mode: mode)
+                return zip(rgb, expected).allSatisfy { abs($0 - $1) <= 8 }
+            }
+            // Preserve the original registration bands: untagged reader surfaces undergo the
+            // display's native colour conversion. These are identity probes, not golden tolerances.
+            let r = rgb[0], g = rgb[1], b = rgb[2]
+            switch name {
+            case "red": return r > 180 && g < 90 && b < 90
+            case "blue": return b > 180 && r < 90 && g < 140
+            case "green": return g > 120 && r < 100 && b < 140
+            case "magenta": return r > 180 && b > 180 && g < 90
+            case "cyan": return g > 180 && b > 180 && r < 90
+            case "yellow": return r > 180 && g > 180 && b < 90
+            case "purple": return r > 100 && r < 180 && g < 70 && b > 180
+            default: return r > 180 && g >= 100 && g < 220 && b < 100
+            }
+        }
+
         func snapshot(_ id: String, state: AppState, window: NSWindow, identity: String? = nil,
                       expectation: PaperExpectation = .none, requiredMarker: String = "red",
                       keyWindow: NSWindow? = nil) async throws {
@@ -376,6 +429,9 @@ enum PaperVisualCapture {
                 throw error
             }
             let canvas = liveCanvas
+            guard canvas.paperAppearance == options.paperMode else {
+                throw CaptureError("The production canvas did not apply the requested paper mode")
+            }
             let visiblePapers = canvas.pageChromeRectangles.filter { $0.intersects(canvas.bounds) }
             guard let paper = visiblePapers.first,
                   let layer = canvas.layer as? CAMetalLayer else { throw CaptureError("Missing native paper chrome") }
@@ -462,18 +518,12 @@ enum PaperVisualCapture {
                     guard visible else { continue }
                     let offset = (y * image.width + x) * 4
                     let r = Int(pixels[offset]), g = Int(pixels[offset + 1]), b = Int(pixels[offset + 2])
-                    let matches: Bool
-                    switch name {
-                    case "red": matches = r > 180 && g < 90 && b < 90
-                    case "blue": matches = b > 180 && r < 90 && g < 140
-                    case "green": matches = g > 120 && r < 100 && b < 140
-                    case "magenta": matches = r > 180 && b > 180 && g < 90
-                    case "cyan": matches = g > 180 && b > 180 && r < 90
-                    case "yellow": matches = r > 180 && g > 180 && b < 90
-                    case "purple": matches = r > 100 && r < 180 && g < 70 && b > 180
-                    default: matches = r > 180 && g >= 100 && g < 220 && b < 100
-                    }
-                    markerChecks.append(["name": name, "pixel": [x, y], "rgb": [r, g, b], "match": matches])
+                    let expected = try markerRGB(name, mode: options.paperMode)
+                    // Registration probes tolerate native colour conversion, independently of
+                    // the unchanged, user-reviewed whole-image comparison policy.
+                    let matches = try markerMatches(name, rgb: [r, g, b], mode: options.paperMode)
+                    markerChecks.append(["name": name, "pixel": [x, y], "rgb": [r, g, b],
+                                         "expected_rgb": expected, "match": matches])
                 }
                 if options.suite == "search-previews",
                    !markerChecks.contains(where: { $0["name"] as? String == requiredMarker }),
@@ -877,16 +927,36 @@ enum PaperVisualCapture {
             guard right > left, bottom > top else { throw CaptureError("Preview canvas is outside the capture") }
             let pixels = try rgba(image)
             var counts = ["magenta": 0, "cyan": 0, "red": 0, "blue": 0, "paper": 0, "ink": 0]
+            let crop = expected == "figure" || expected == "table"
+            let dark = panel.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            var background: NSColor?
+            panel.effectiveAppearance.performAsCurrentDrawingAppearance {
+                background = LyraReaderTheme.raisedBgColor.usingColorSpace(.sRGB)
+            }
+            guard let background else { throw CaptureError("Preview card colour is unavailable") }
+            let paperRGB = crop
+                ? [background.redComponent, background.greenComponent, background.blueComponent].map { Int(($0 * 255).rounded()) }
+                : try markerRGB("white", mode: options.paperMode)
+            let inkRGB = crop ? (dark ? [200, 191, 175] : [0, 0, 0]) : try markerRGB("black", mode: options.paperMode)
+            let markers = try Dictionary(uniqueKeysWithValues: ["magenta", "cyan", "red", "blue"].map {
+                ($0, try markerRGB($0, mode: crop ? .original : options.paperMode))
+            })
             for y in top..<bottom {
                 for x in left..<right {
                     let offset = (y * image.width + x) * 4
-                    let r = pixels[offset], g = pixels[offset + 1], b = pixels[offset + 2]
-                    if r > 180 && b > 180 && g < 90 { counts["magenta", default: 0] += 1 }
-                    if g > 180 && b > 180 && r < 90 { counts["cyan", default: 0] += 1 }
-                    if r > 180 && g < 90 && b < 90 { counts["red", default: 0] += 1 }
-                    if b > 180 && r < 90 && g < 140 { counts["blue", default: 0] += 1 }
-                    if r >= 245 && g >= 245 && b >= 245 { counts["paper", default: 0] += 1 }
-                    if r < 80 && g < 80 && b < 80 { counts["ink", default: 0] += 1 }
+                    let r = Int(pixels[offset]), g = Int(pixels[offset + 1]), b = Int(pixels[offset + 2])
+                    if !crop && options.paperMode == .night {
+                        for (name, mapped) in markers where abs(r-mapped[0]) <= 8 && abs(g-mapped[1]) <= 8 && abs(b-mapped[2]) <= 8 {
+                            counts[name, default: 0] += 1
+                        }
+                    } else {
+                        if r > 180 && b > 180 && g < 90 { counts["magenta", default: 0] += 1 }
+                        if g > 180 && b > 180 && r < 90 { counts["cyan", default: 0] += 1 }
+                        if r > 180 && g < 90 && b < 90 { counts["red", default: 0] += 1 }
+                        if b > 180 && r < 90 && g < 140 { counts["blue", default: 0] += 1 }
+                    }
+                    if abs(r-paperRGB[0]) <= 6 && abs(g-paperRGB[1]) <= 6 && abs(b-paperRGB[2]) <= 6 { counts["paper", default: 0] += 1 }
+                    if abs(r-inkRGB[0]) <= 14 && abs(g-inkRGB[1]) <= 14 && abs(b-inkRGB[2]) <= 14 { counts["ink", default: 0] += 1 }
                 }
             }
             let correct: Bool
@@ -901,11 +971,13 @@ enum PaperVisualCapture {
             if expected == "figure" || expected == "table" {
                 guard counts["paper", default: 0] > (right - left) * (bottom - top) / 4,
                       counts["ink", default: 0] > 20 else {
-                    throw CaptureError("Original paper or dark figure/table ink is missing in \(id): \(counts)")
+                    throw CaptureError("The themed figure/table card or ink is missing in \(id): \(counts)")
                 }
             }
             return ["expected": expected, "canvas_pixel_rect": [left, top, right - left, bottom - top],
-                    "color_pixel_counts": counts, "surface": canvas.presentationSurfaceID,
+                    "color_pixel_counts": counts, "expected_background_rgb": paperRGB, "expected_ink_rgb": inkRGB,
+                    "paper_mode": options.paperMode.rawValue, "crop_adapts_to_appearance": crop,
+                    "surface": canvas.presentationSurfaceID,
                     "submitted_zoom": canvas.visualSubmittedZoom,
                     "submitted_viewport_points": [canvas.visualSubmittedViewportSize.width, canvas.visualSubmittedViewportSize.height],
                     "frame_index": canvas.visualSubmittedFrameIndex,
@@ -1210,6 +1282,8 @@ enum PaperVisualCapture {
             environment = [
                 "os": ProcessInfo.processInfo.operatingSystemVersionString,
                 "language": options.language, "appearance": options.appearance,
+                "paper_mode": options.paperMode.rawValue,
+                "paper_mode_source": "isolated production ReadingAppearanceStore preference; View > Paper Appearance",
                 "locale": Locale.current.identifier,
                 "system_font": NSFont.systemFont(ofSize: 14).fontName,
                 "gpu": (canvas.layer as? CAMetalLayer)?.device?.name ?? "unavailable",

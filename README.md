@@ -149,7 +149,10 @@ python3 scripts/check-visual.py capture --suite search-previews --output build/v
 ```
 
 Open the output's `index.html` to review native-size PNGs and environment details. Repeat with
-`--appearance dark` for the second English profile. Each output directory must be new. Capture failure,
+`--appearance dark` for dark interface chrome with original document colours. Use
+`--appearance dark --paper-mode night` for the production Night Reading preference, or
+`--appearance light --paper-mode warm` for Warm Paper. The paper mode is recorded separately;
+the original-colour default preserves existing approvals. Each output directory must be new. Capture failure,
 missing GPU content, and unstable compositor pixels fail explicitly; an unreviewed candidate is not
 an accepted baseline. `--mutation scale` and `--mutation chrome` deliberately produce failing runs
 for diagnostic use. Capture waits for registered GPU content and stable native compositor pixels;
@@ -184,7 +187,8 @@ the image bounds expand to their union when necessary. Checks verify resolved te
 pixels, crop bounds, reader position, navigation history and panel cleanup. These candidates need
 separate review; the toolbar suite's tolerance does not apply to them automatically.
 Capture also checks compact single-entry sizing against grouped citations, submitted viewport/zoom
-agreement, original-paper and ink pixels in figure/table previews, and closed-host unmounting.
+agreement, theme-adapted card/ink and preserved colour probes in figure/table previews, and
+closed-host unmounting. Whole-page previews follow the selected paper mode.
 This suite temporarily parks the pointer outside its windows to avoid accidental hover states
 and restores it when capture ends.
 Preview captures retain native window framing and shadows, with a 48 pt outset clipped to the
@@ -217,11 +221,16 @@ The toolbar/inspector profiles add 52 user-approved PNGs under
 `tests/visual-baselines/toolbar-inspectors/macos-15.7.9-2560x1440-2x/en-light` and `en-dark`, with an
 explicitly reviewed one-level per-channel tolerance. Export references are deferred.
 The paper and reader-shell approvals retain zero tolerance.
+All six adopted profiles explicitly used Original Colours, including the dark interface profiles.
+They do not cover Night Reading's dark paper. Captures without a `paper_mode` field are treated as
+that historical original-colour mode; comparisons reject different paper modes. Night Reading
+candidates require separate user review and are never adopted by relabelling the white-paper images.
 Other environments require separate reviewed baselines. Use the matching directory as `BASELINE`
 above. Each suite requires its own baseline and complete checkpoint set.
 
 CI verifies the adopted baseline bytes and runs the comparer/approval regressions. Its manual
-**Capture unreviewed visual candidates** input additionally collects English light/dark candidates
+**Capture unreviewed visual candidates** input additionally collects English original-colour
+light/dark and dark Night Reading candidates
 from all four suites as artifacts. Pixel comparison requires a controlled matching
 desktop; this does not enable a cross-environment PR screenshot gate. Chinese visual checks are deferred until
 Chinese localization is implemented. Existing zh-Hans preference captures show English fallback

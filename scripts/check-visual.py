@@ -300,7 +300,7 @@ def capture(args: argparse.Namespace) -> int:
         metadata['fixture_sha256'] = hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()
     write_json(output / 'run.json', metadata)
     request = {'fixture': str(fixture_path), 'output': str(output), 'suite': suite,
-               'language': args.language, 'appearance': args.appearance}
+               'language': args.language, 'appearance': args.appearance, 'paper_mode': args.paper_mode}
     if args.mutation:
         request['mutation'] = args.mutation
     write_json(output / 'request.json', request)
@@ -394,6 +394,12 @@ def compare_runs(args: argparse.Namespace) -> int:
     for key in keys:
         if key not in reference['environment'] or reference['environment'][key] != actual['environment'].get(key):
             raise ValueError(f'Baseline environment differs or is missing: {key}')
+    # Captures predating this field explicitly forced Original Colours. Preserve their signed
+    # approvals without ever treating those white pages as coverage for Night Reading.
+    reference_paper = reference['environment'].get('paper_mode', 'original')
+    actual_paper = actual['environment'].get('paper_mode', 'original')
+    if reference_paper not in ['original', 'warm', 'night'] or reference_paper != actual_paper:
+        raise ValueError('Baseline environment differs or is invalid: paper_mode')
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     comparer = compile_comparer(output)
@@ -436,6 +442,8 @@ def main() -> int:
     record.add_argument('--app', type=Path)
     record.add_argument('--language', choices=['en', 'zh-Hans'], default='en')
     record.add_argument('--appearance', choices=['light', 'dark'], default='light')
+    record.add_argument('--paper-mode', choices=['original', 'warm', 'night'], default='original',
+                        help='Production Paper Appearance preference; Night Reading also selects dark reader chrome')
     record.add_argument('--suite', choices=CAPTURE_SUITES, default='paper')
     record.add_argument('--mutation', choices=['scale', 'chrome'])
     check = sub.add_parser('compare', help='Compare against a reviewed, hash-bound baseline')

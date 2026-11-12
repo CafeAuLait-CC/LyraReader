@@ -241,6 +241,33 @@ class BaselineIntegrityTests(unittest.TestCase):
     def test_legacy_approvals_retain_zero_tolerance(self):
         self.assert_comparison_policy(self.comparison_args(), 0)
 
+    def test_legacy_original_paper_approval_accepts_explicit_original_mode(self):
+        args = self.comparison_args()
+        actual = json.loads((args.actual / 'capture.json').read_text())
+        actual['environment']['paper_mode'] = 'original'
+        visual.write_json(args.actual / 'capture.json', actual)
+        self.assert_comparison_policy(args, 0)
+
+    def test_original_paper_cannot_pass_as_night_reading(self):
+        args = self.comparison_args()
+        actual = json.loads((args.actual / 'capture.json').read_text())
+        actual['environment']['paper_mode'] = 'night'
+        visual.write_json(args.actual / 'capture.json', actual)
+        with patch.object(visual, 'compile_comparer') as compile_comparer:
+            with self.assertRaisesRegex(ValueError, 'paper_mode'):
+                visual.compare_runs(args)
+            compile_comparer.assert_not_called()
+
+    def test_night_reading_cannot_compare_against_a_missing_paper_mode(self):
+        args = self.comparison_args()
+        self.report['environment']['paper_mode'] = 'night'
+        self.write_report()
+        self.approve()
+        with patch.object(visual, 'compile_comparer') as compile_comparer:
+            with self.assertRaisesRegex(ValueError, 'paper_mode'):
+                visual.compare_runs(args)
+            compile_comparer.assert_not_called()
+
     def test_invalid_reviewed_tolerances_are_rejected(self):
         self.approve()
         path = self.directory / 'approval.json'
