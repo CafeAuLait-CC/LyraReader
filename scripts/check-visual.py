@@ -49,6 +49,16 @@ CAPTURE_SUITES = {
         '22-sidebar-with-inspector', '23-narrow-with-inspector',
         '24-inspector-window-restored', '25-rows-closed-restored', '26-home-no-document',
     ],
+    'search-previews': [
+        '01-document-idle', '02-search-no-results', '03-search-first-hit', '04-search-next-hit',
+        '05-search-next-page', '06-search-last-hit', '07-search-wrap-first', '08-search-wrap-last',
+        '09-search-replaced-query', '10-search-restored-query', '11-search-results-hidden',
+        '12-search-results-restored', '13-search-both-sidebars', '14-search-narrow-window',
+        '15-search-cleared', '16-citation-single', '17-citation-group', '18-preview-resized',
+        '19-preview-moved', '20-preview-escape', '21-figure-preview', '22-table-replaces-figure',
+        '23-preview-page-jump', '24-reader-back', '25-whole-page-preview',
+        '26-preview-with-search', '27-preview-closed', '28-home-no-document',
+    ],
 }
 
 
@@ -111,10 +121,69 @@ def compile_comparer(directory: Path) -> Path:
     return binary
 
 
+def navigation_fixture(path: Path) -> None:
+    """Synthetic text/index targets and asymmetric GPU probes, using the shared PDF writer."""
+    helpers = runpy.run_path(str(ROOT / 'scripts/make-fixtures.py'))
+    escape = helpers['escape_pdf_string']
+
+    def text(x: int, y: int, size: int, value: str) -> str:
+        return f'0 0 0 rg BT /F1 {size} Tf {x} {y} Td ({escape(value)}) Tj ET'
+
+    def page(index: int) -> list[str]:
+        color = ['1 0 1', '0 1 1', '1 1 0', '0.6 0.1 1'][index]
+        return [
+            '1 0 0 rg 24 806 18 12 re f', '0 0.2 1 rg 570 806 18 12 re f',
+            '0 0.7 0.2 rg 24 24 18 12 re f', '1 0.6 0 rg 570 24 18 12 re f',
+            f'{color} rg 300 746 12 12 re f',
+            text(60, 804, 17, f'Search and preview probe - page {index + 1}'),
+            text(60, 782, 10, 'Synthetic local content - no private documents or network'),
+        ]
+
+    first = page(0) + [text(60, y, 12, value) for y, value in [
+        (650, 'quartzneedle alpha - first deterministic match'),
+        (625, 'quartzneedle beta - second deterministic match'),
+        (590, 'One citation [1] introduces the baseline.'),
+        (560, 'A grouped citation [1,2,3] names all works.'),
+        (530, 'The diagram is described in Figure 1.'),
+        (500, 'Table 1 lists the measurement settings.'),
+        (470, 'Section 2 contains the synthetic results.'),
+        (390, 'Opening a preview must preserve this reading position.'),
+    ]]
+    second = page(1) + [text(60, 650, 12, 'quartzneedle gamma - third deterministic match'),
+        text(60, 625, 12, 'quartzneedle delta - fourth deterministic match'),
+        text(60, 590, 17, '2 Synthetic results'),
+        '0.2 0.2 0.2 RG 1 w 90 430 420 130 re S',
+        '1 0 1 rg 120 450 150 80 re f', '0 1 1 rg 310 450 150 55 re f',
+        text(90, 410, 11, 'Figure 1: Synthetic magenta and cyan bars.'),
+    ]
+    table = page(2) + [text(72, 710, 11, 'Table 1: Quantitative comparison of synthetic baseline methods and results.'),
+        '0 G 0 g 0.7 w',
+        '72 690 m 523 690 l S', '72 670 m 523 670 l S', '72 610 m 523 610 l S']
+    for y, name, value in [(677, 'Parameter', 'Value'), (653, 'Window width', '1200 pt'),
+                            (635, 'Backing scale', '2'), (617, 'Colour space', 'sRGB')]:
+        table += [text(77, y, 11, name), text(473, y, 11, value)]
+    table.append('0 1 1 rg BT /F1 11 Tf 370 635 Td (cyan probe) Tj ET')
+    third = page(3) + [text(60, 690, 17, 'References'),
+        text(60, 650, 12, 'quartzneedle epsilon - fifth deterministic match'),
+        text(60, 625, 12, 'quartzneedle zeta - sixth deterministic match')]
+    for y, value in [
+        (570, '[1] Vega, A.: Deterministic visual baselines. 2024.'),
+        (530, '[2] Aster, B.: A long synthetic reference about native document'),
+        (514, 'interfaces, stable navigation, and visible regression checks.'),
+        (498, 'Journal of Synthetic Fixtures 12(3), 100-120, 2025.'),
+        (458, '[3] Nova, C.: Local previews and accurate rendering. 2023.'),
+    ]:
+        third.append(text(60, y, 11, value))
+    path.write_bytes(helpers['build_pdf']([('\n'.join(p), 0) for p in [first, second, table, third]],
+        page_sizes=[(595, 842)] * 4, outline=[{'title': '2 Synthetic results', 'page': 1}],
+        info={'Title': 'Synthetic navigation study', 'Author': 'LyraReader fixture', 'Subject': 'Visual regression fixture'}))
+
+
 def render_report(directory: Path, report: dict, comparisons: list[dict] | None = None) -> None:
     """A local review artifact; images keep native pixels and are scaled only for viewing."""
     status = report.get('status', 'failed')
     title = {'reader-shell': 'LyraReader reader shell review',
+             'search-previews': 'LyraReader search and preview review',
              'toolbar-inspectors': 'LyraReader toolbar and inspector review'}.get(
                  report.get('suite'), 'LyraReader paper visual review')
     parts = ['<!doctype html><html lang="en"><meta charset="utf-8">',
@@ -187,6 +256,10 @@ def capture(args: argparse.Namespace) -> int:
     elif suite == 'toolbar-inspectors':
         fixture_path = output / 'toolbar-inspectors.pdf'
         fixture(fixture_path, title='LyraReader toolbar and inspector probe')
+        fixtures = [fixture_path]
+    elif suite == 'search-previews':
+        fixture_path = output / 'search-previews.pdf'
+        navigation_fixture(fixture_path)
         fixtures = [fixture_path]
     else:
         fixtures = []
@@ -316,6 +389,8 @@ def compare_runs(args: argparse.Namespace) -> int:
             'capture', 'screen_points', 'display_mode_points', 'display_backing_pixels', 'hardware_model', 'swift', 'pdfium_sha256', 'fixture_sha256']
     if reference.get('suite') == 'toolbar-inspectors':
         keys.extend(['date_preview_clock', 'capture_color_space'])
+    if reference.get('suite') == 'search-previews':
+        keys.append('capture_color_space')
     for key in keys:
         if key not in reference['environment'] or reference['environment'][key] != actual['environment'].get(key):
             raise ValueError(f'Baseline environment differs or is missing: {key}')

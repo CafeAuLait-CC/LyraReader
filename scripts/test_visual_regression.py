@@ -108,7 +108,7 @@ class BaselineIntegrityTests(unittest.TestCase):
             visual.load_capture(self.directory)
 
     def test_additional_suites_require_their_complete_distinct_sets(self):
-        for suite in ['reader-shell', 'toolbar-inspectors']:
+        for suite in ['reader-shell', 'toolbar-inspectors', 'search-previews']:
             with self.subTest(suite=suite):
                 self.report['suite'] = suite
                 self.report['captures'] = []
@@ -163,6 +163,30 @@ class BaselineIntegrityTests(unittest.TestCase):
                                   allow_unreviewed=True, channel_tolerance=0)
         with patch.object(visual, 'compile_comparer') as compile_comparer:
             with self.assertRaisesRegex(ValueError, 'Capture suites differ'):
+                visual.compare_runs(args)
+            compile_comparer.assert_not_called()
+
+    def test_search_comparison_rejects_a_different_capture_color_space(self):
+        self.report['suite'] = 'search-previews'
+        self.report['environment'] = json.loads((visual.ROOT / 'tests/visual-baselines/paper'
+            / 'macos-15.7.9-2560x1440-2x/en-light/capture.json').read_text())['environment']
+        self.report['environment']['capture_color_space'] = 'sRGB; 8-bit BGRA; SDR'
+        self.report['captures'] = []
+        actual = self.directory / 'actual'
+        actual.mkdir()
+        for sid in visual.CAPTURE_SUITES['search-previews']:
+            name = sid + '.png'
+            for folder in [self.directory, actual]:
+                (folder / name).write_bytes(b'synthetic search image bytes')
+            self.report['captures'].append({'id': sid, 'file': name})
+        self.write_report()
+        changed = json.loads(json.dumps(self.report))
+        changed['environment']['capture_color_space'] = 'display native'
+        visual.write_json(actual / 'capture.json', changed)
+        args = argparse.Namespace(baseline=self.directory, actual=actual, output=self.directory / 'diff',
+                                  allow_unreviewed=True, channel_tolerance=0)
+        with patch.object(visual, 'compile_comparer') as compile_comparer:
+            with self.assertRaisesRegex(ValueError, 'capture_color_space'):
                 visual.compare_runs(args)
             compile_comparer.assert_not_called()
 

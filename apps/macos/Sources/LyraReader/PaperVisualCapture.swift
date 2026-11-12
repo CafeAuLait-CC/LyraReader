@@ -53,7 +53,7 @@ enum PaperVisualCapture {
             }
             let mutation = request["mutation"]
             let suite = request["suite"] ?? "paper"
-            guard ["paper", "reader-shell", "toolbar-inspectors"].contains(suite), mutation == nil || suite == "paper" else {
+            guard ["paper", "reader-shell", "toolbar-inspectors", "search-previews"].contains(suite), mutation == nil || suite == "paper" else {
                 throw CaptureError("Unsupported capture suite or mutation")
             }
             guard mutation == nil || ["scale", "chrome"].contains(mutation) else {
@@ -135,6 +135,7 @@ enum PaperVisualCapture {
         let image: CGImage
         let frame: CGRect
         let contentRect: CGRect
+        let overlayFrames: [CGRect]
     }
 
     /// Metal invokes the sink off the main actor. Every access to the one stored frame index
@@ -175,6 +176,7 @@ enum PaperVisualCapture {
         var fullScreenTransitionCompleted = false
         var capturedWindowFrame = CGRect.zero
         var capturedContentRect = CGRect.zero
+        var capturedOverlayFrames: [CGRect] = []
 
         init(options: Options) { self.options = options }
 
@@ -183,6 +185,12 @@ enum PaperVisualCapture {
             window.orderFrontRegardless()
             NSRunningApplication.current.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
             NSApplication.shared.activate(ignoringOtherApps: true)
+            if window is ReferencePreviewPanel { window.makeKeyAndOrderFront(nil) }
+        }
+
+        func ownsKeyWindow(_ window: NSWindow) -> Bool {
+            window.isKeyWindow || (options.suite == "search-previews"
+                && (window.childWindows ?? []).contains { $0 is ReferencePreviewPanel && $0.isVisible && $0.isKeyWindow })
         }
 
         func wait(_ description: String, attempts: Int = 800, until condition: () -> Bool) async throws {
@@ -205,7 +213,7 @@ enum PaperVisualCapture {
             var diagnostic = "no canvas"
             do {
               try await wait("visible current PDF frame after layout and canvas replacement", attempts: 2400) {
-                guard NSApplication.shared.isActive && window.isKeyWindow else {
+                guard NSApplication.shared.isActive && self.ownsKeyWindow(window) else {
                     self.focus(window: window)
                     samples = 0
                     diagnostic = "active=\(NSApplication.shared.isActive) key=\(window.isKeyWindow)"
@@ -217,7 +225,7 @@ enum PaperVisualCapture {
                 let work = state.scheduledTileWork
                 let signature = "\(canvas.presentationSurfaceID)/\(window.frame)/\(canvas.bounds)/\(canvas.frameAttemptCount)/"
                     + "\(state.zoomFactor)/\(state.scrollYPt)/\(state.pageRasterCount)/\(state.tileRasterCount)"
-                let ready = NSApplication.shared.isActive && window.isKeyWindow
+                let ready = NSApplication.shared.isActive && self.ownsKeyWindow(window)
                     && window.occlusionState.contains(.visible) && canvas.hasAttachedSurface
                     && !state.canvasPages.isEmpty && !state.isScrolling && !state.isDraggingScrollIndicator
                     && work.queued == 0 && work.inFlight == 0
@@ -253,16 +261,20 @@ enum PaperVisualCapture {
             else { throw CaptureError("Own window has no display") }
             let result = try await Self.captureOwnWindow(windowID: CGWindowID(window.windowNumber),
                 scale: window.backingScaleFactor, displayID: CGDirectDisplayID(number.uint32Value),
-                sRGB: options.suite == "toolbar-inspectors")
+                sRGB: ["toolbar-inspectors", "search-previews"].contains(options.suite),
+                overlayIDs: options.suite == "search-previews" ? (window.childWindows ?? []).filter {
+                    $0 is ReferencePreviewPanel && $0.isVisible
+                }.map { CGWindowID($0.windowNumber) } : [])
             capturedWindowFrame = result.frame
             capturedContentRect = result.contentRect
+            capturedOverlayFrames = result.overlayFrames
             return result.image
         }
 
         // Keep ScreenCaptureKit's non-Sendable snapshot/filter objects on its nonisolated
         // async executor. Only immutable CGImage pixels cross back to the main actor.
         nonisolated static func captureOwnWindow(windowID: CGWindowID, scale: CGFloat,
-            displayID: CGDirectDisplayID, sRGB: Bool) async throws -> WindowImage {
+            displayID: CGDirectDisplayID, sRGB: Bool, overlayIDs: [CGWindowID]) async throws -> WindowImage {
             let available = try await SCShareableContent.currentProcess
             guard let ownWindow = available.windows.first(where: {
                 $0.windowID == windowID
@@ -271,12 +283,24 @@ enum PaperVisualCapture {
             guard let display = available.displays.first(where: { $0.displayID == displayID }) else {
                 throw CaptureError("Own window display is unavailable to the capture process")
             }
-            // Include exactly this process-owned window. Desktop, Dock, menu bar and every
-            // other application's windows are excluded before the display is sampled.
-            let filter = SCContentFilter(display: display, including: [ownWindow])
+            guard overlayIDs.count <= 1, !overlayIDs.contains(windowID) else {
+                throw CaptureError("Unexpected preview window allowlist")
+            }
+            var overlays: [SCWindow] = []
+            for id in overlayIDs {
+                guard let overlay = available.windows.first(where: {
+                    $0.windowID == id && $0.owningApplication?.processID == ProcessInfo.processInfo.processIdentifier
+                }) else { throw CaptureError("The process-owned preview is unavailable for capture") }
+                overlays.append(overlay)
+            }
+            // An explicit allowlist contains only this reader and its one owned preview.
+            // Desktop, Dock, menu bar and every other application's windows are excluded.
+            let filter = SCContentFilter(display: display, including: [ownWindow] + overlays)
             filter.includeMenuBar = false
-            let width = Int((ownWindow.frame.width * scale).rounded())
-            let height = Int((ownWindow.frame.height * scale).rounded())
+            let captureFrame = overlays.isEmpty ? ownWindow.frame
+                : overlays.reduce(ownWindow.frame) { $0.union($1.frame) }.integral
+            let width = Int((captureFrame.width * scale).rounded())
+            let height = Int((captureFrame.height * scale).rounded())
             guard width > 0, height > 0, width <= 16384, height <= 16384,
                   width <= 32_000_000 / height else { throw CaptureError("Capture dimensions exceed the limit") }
             let configuration = SCStreamConfiguration()
@@ -285,8 +309,8 @@ enum PaperVisualCapture {
             configuration.showsCursor = false
             configuration.ignoreShadowsSingleWindow = true
             configuration.ignoreShadowsDisplay = true
-            configuration.sourceRect = CGRect(x: ownWindow.frame.minX - display.frame.minX,
-                y: ownWindow.frame.minY - display.frame.minY, width: ownWindow.frame.width, height: ownWindow.frame.height)
+            configuration.sourceRect = CGRect(x: captureFrame.minX - display.frame.minX,
+                y: captureFrame.minY - display.frame.minY, width: captureFrame.width, height: captureFrame.height)
             configuration.captureResolution = .best
             configuration.scalesToFit = false
             if sRGB {
@@ -299,7 +323,8 @@ enum PaperVisualCapture {
             guard image.width == width, image.height == height else {
                 throw CaptureError("System capture changed the requested native pixel dimensions")
             }
-            return WindowImage(image: image, frame: ownWindow.frame, contentRect: filter.contentRect)
+            return WindowImage(image: image, frame: captureFrame, contentRect: filter.contentRect,
+                               overlayFrames: overlays.map(\.frame))
         }
 
         func write(_ image: CGImage, name: String) throws {
@@ -329,8 +354,9 @@ enum PaperVisualCapture {
         enum PaperExpectation { case none, topEdge, bottomEdge, fitted }
 
         func snapshot(_ id: String, state: AppState, window: NSWindow, identity: String? = nil,
-                      expectation: PaperExpectation = .none, requiredMarker: String = "red") async throws {
-            focus(window: window)
+                      expectation: PaperExpectation = .none, requiredMarker: String = "red",
+                      keyWindow: NSWindow? = nil) async throws {
+            focus(window: keyWindow ?? window)
             let liveCanvas: MetalCanvasView
             do { liveCanvas = try await settle(state: state, window: window) }
             catch {
@@ -387,12 +413,13 @@ enum PaperVisualCapture {
             var canvasTop: CGFloat = 0
             var previousPixels: [UInt8]?
             var stableSamples = 0
+            var visibleRequiredMarker = requiredMarker
             // A successful GPU submission can precede the compositor's updated window image.
             // Wait for known fixture pixels at the current transform, rather than a fixed sleep
             // or a presentation timestamp that the OS may not provide for full-screen windows.
             for _ in 0..<80 {
-                guard NSApplication.shared.isActive && window.isKeyWindow else {
-                    focus(window: window)
+                guard NSApplication.shared.isActive && ownsKeyWindow(window) else {
+                    focus(window: keyWindow ?? window)
                     stableSamples = 0
                     previousPixels = nil
                     try await Task.sleep(for: .milliseconds(100))
@@ -404,9 +431,11 @@ enum PaperVisualCapture {
                 canvasLeft = screenBounds.minX - capturedWindowFrame.minX
                 canvasTop = primary.frame.maxY - screenBounds.maxY - capturedWindowFrame.minY
                 markerChecks = []
+                let bottomMarkerY = options.suite == "search-previews"
+                    ? paper.height / state.zoomFactor - 30 : 762
                 var sources = [("red", CGFloat(33), CGFloat(30)),
-                    ("blue", CGFloat(579), CGFloat(30)), ("green", CGFloat(33), CGFloat(762)),
-                    ("orange", CGFloat(579), CGFloat(762))]
+                    ("blue", CGFloat(579), CGFloat(30)), ("green", CGFloat(33), bottomMarkerY),
+                    ("orange", CGFloat(579), bottomMarkerY)]
                 if let identity { sources.append((identity, 306, 90)) }
                 for (name, sourceX, sourceY) in sources {
                     let point = CGPoint(x: canvasLeft + paper.minX + sourceX * state.zoomFactor,
@@ -416,6 +445,8 @@ enum PaperVisualCapture {
                     let localPoint = CGPoint(x: paper.minX + sourceX * state.zoomFactor,
                                              y: paper.minY + sourceY * state.zoomFactor)
                     let visible = visibleCanvas.contains(localPoint)
+                        && !capturedOverlayFrames.contains { $0.contains(CGPoint(
+                            x: point.x + capturedWindowFrame.minX, y: point.y + capturedWindowFrame.minY)) }
                         && x >= 0 && x < image.width && y >= 0 && y < image.height
                     if name == requiredMarker { mx = x; my = y }
                     guard visible else { continue }
@@ -429,11 +460,20 @@ enum PaperVisualCapture {
                     case "magenta": matches = r > 180 && b > 180 && g < 90
                     case "cyan": matches = g > 180 && b > 180 && r < 90
                     case "yellow": matches = r > 180 && g > 180 && b < 90
+                    case "purple": matches = r > 100 && r < 180 && g < 70 && b > 180
                     default: matches = r > 180 && g >= 100 && g < 220 && b < 100
                     }
                     markerChecks.append(["name": name, "pixel": [x, y], "rgb": [r, g, b], "match": matches])
                 }
-                markerVisible = markerChecks.contains { $0["name"] as? String == requiredMarker }
+                if options.suite == "search-previews",
+                   !markerChecks.contains(where: { $0["name"] as? String == requiredMarker }),
+                   let alternate = markerChecks.first,
+                   let name = alternate["name"] as? String,
+                   let pixel = alternate["pixel"] as? [Int], pixel.count == 2 {
+                    visibleRequiredMarker = name
+                    mx = pixel[0]; my = pixel[1]
+                } else { visibleRequiredMarker = requiredMarker }
+                markerVisible = markerChecks.contains { $0["name"] as? String == visibleRequiredMarker }
                     && markerChecks.allSatisfy { $0["match"] as? Bool == true }
                 let mutationVisible = beforeMutation.map { $0 != pixels } ?? true
                 stableSamples = markerVisible && mutationVisible && previousPixels == pixels ? stableSamples + 1 : 0
@@ -474,7 +514,8 @@ enum PaperVisualCapture {
                 "metal_presentation_timestamp_available": frames.contains(
                     canvas.visualSubmittedFrameIndex, surface: canvas.presentationSurfaceID),
                 "verification": "current-window-compositor-pixels",
-                "marker_pixel": [mx, my], "required_registration_marker": requiredMarker,
+                "marker_pixel": [mx, my], "required_registration_marker": visibleRequiredMarker,
+                "captured_preview_frames_screen_points": capturedOverlayFrames.map { [$0.minX, $0.minY, $0.width, $0.height] },
                 "registration_markers": markerChecks, "fullscreen": window.styleMask.contains(.fullScreen)
             ])
             guard markerVisible else { throw CaptureError("GPU registration marker is missing or misaligned in \(id)") }
@@ -776,6 +817,268 @@ enum PaperVisualCapture {
             captures[captures.count - 1]["tool_chrome"] = chrome
         }
 
+        func previewReady(state: AppState, window: NSWindow,
+                          panels: ReferencePreviewPanelController) async throws -> ReferencePreviewPanel {
+            var previous = ""
+            var stable = 0
+            try await wait("owned preview content and layout") {
+                guard let preview = state.referencePreview, !state.referencePreviewLoading,
+                      state.referencePreviewError == nil, let panel = panels.panel,
+                      panel.isVisible, panel.parent === window, let content = panel.contentView,
+                      let screen = panel.screen else { return false }
+                content.layoutSubtreeIfNeeded()
+                let raster = preview.kind == .figure || preview.kind == .page
+                if raster {
+                    guard state.referencePreviewPages.count == 1, let canvas = self.canvas(in: content),
+                          canvas.hasAttachedSurface, let quads = canvas.lastSubmittedQuadCount, quads > 0,
+                          canvas.visualSubmittedFrameIndex > 0 else { return false }
+                } else {
+                    guard state.referencePreviewPages.isEmpty, self.canvas(in: content) == nil,
+                          panels.model.entries.map(\.citationEntry) == preview.entries else { return false }
+                }
+                guard screen.visibleFrame.insetBy(dx: 11, dy: 11).contains(panel.frame) else { return false }
+                let signature = "\(panel.frame)/\(state.referencePreviewPages.count)/\(panels.model.entries)"
+                stable = signature == previous ? stable + 1 : 0
+                previous = signature
+                return stable >= 3
+            }
+            guard let panel = panels.panel else { throw CaptureError("Preview disappeared after layout") }
+            return panel
+        }
+
+        func verifyPreviewPixels(_ id: String, panel: NSWindow, expected: String) throws -> [String: Any] {
+            guard let content = panel.contentView, let canvas = canvas(in: content),
+                  let primary = NSScreen.screens.first,
+                  let source = CGImageSourceCreateWithURL(options.output.appendingPathComponent("\(id).png") as CFURL, nil),
+                  let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+                throw CaptureError("Preview raster verification is missing its canvas or capture")
+            }
+            let screen = panel.convertToScreen(canvas.convert(canvas.visibleRect, to: nil))
+            let scale = panel.backingScaleFactor
+            let left = max(0, Int(((screen.minX - capturedWindowFrame.minX) * scale).rounded(.up)))
+            let top = max(0, Int(((primary.frame.maxY - screen.maxY - capturedWindowFrame.minY) * scale).rounded(.up)))
+            let right = min(image.width, Int(((screen.maxX - capturedWindowFrame.minX) * scale).rounded(.down)))
+            let bottom = min(image.height, Int(((primary.frame.maxY - screen.minY - capturedWindowFrame.minY) * scale).rounded(.down)))
+            guard right > left, bottom > top else { throw CaptureError("Preview canvas is outside the capture") }
+            let pixels = try rgba(image)
+            var counts = ["magenta": 0, "cyan": 0, "red": 0, "blue": 0]
+            for y in top..<bottom {
+                for x in left..<right {
+                    let offset = (y * image.width + x) * 4
+                    let r = pixels[offset], g = pixels[offset + 1], b = pixels[offset + 2]
+                    if r > 180 && b > 180 && g < 90 { counts["magenta", default: 0] += 1 }
+                    if g > 180 && b > 180 && r < 90 { counts["cyan", default: 0] += 1 }
+                    if r > 180 && g < 90 && b < 90 { counts["red", default: 0] += 1 }
+                    if b > 180 && r < 90 && g < 140 { counts["blue", default: 0] += 1 }
+                }
+            }
+            let correct: Bool
+            switch expected {
+            case "figure": correct = counts["magenta", default: 0] > 100 && counts["cyan", default: 0] > 100
+            case "table": correct = counts["cyan", default: 0] > 20 && counts["magenta", default: 0] == 0
+            case "page": correct = counts["magenta", default: 0] > 100 && counts["red", default: 0] > 20
+                && counts["blue", default: 0] > 20
+            default: throw CaptureError("Unknown preview raster expectation")
+            }
+            guard correct else { throw CaptureError("Wrong or missing \(expected) preview pixels in \(id): \(counts)") }
+            return ["expected": expected, "canvas_pixel_rect": [left, top, right - left, bottom - top],
+                    "color_pixel_counts": counts, "surface": canvas.presentationSurfaceID,
+                    "frame_index": canvas.visualSubmittedFrameIndex,
+                    "metal_presentation_timestamp_available": frames.contains(
+                        canvas.visualSubmittedFrameIndex, surface: canvas.presentationSurfaceID)]
+        }
+
+        func captureSearchPreviews(state: AppState, window: NSWindow,
+                                   panels: ReferencePreviewPanelController) async throws {
+            environment["capture_color_space"] = "sRGB; 8-bit BGRA; SDR"
+            environment["capture"] = "ScreenCaptureKit.currentProcess.readerAndOwnedPreviewInDisplay"
+            environment["interaction_driver"] = "production AppState actions; native preview frame and Escape events"
+            window.setContentSize(CGSize(width: 1200, height: 800))
+            guard state.openDocumentInTab(options.fixture) else { throw CaptureError("Cannot open search fixture") }
+            state.zoomActual()
+            state.scroll(toFraction: 0)
+            let colors = ["magenta", "cyan", "yellow", "purple"]
+            func shot(_ id: String, hit: Int? = nil, count: Int = 0, raster: String? = nil) async throws {
+                try await wait("search completion before \(id)") { !state.isSearching }
+                func checkSearch() throws {
+                    guard state.searchHits.count == count, state.currentHitIndex == hit else {
+                        throw CaptureError("Search result or active match differs in \(id)")
+                    }
+                    if let hit {
+                        guard state.searchHits.indices.contains(hit) else { throw CaptureError("Invalid search match") }
+                        let result = state.searchHits[hit]
+                        guard result.end > result.start, state.selection?.page == result.page,
+                              state.selection?.range == result.start...(result.end - 1) else {
+                            throw CaptureError("Search selection differs in \(id)")
+                        }
+                    }
+                }
+                try checkSearch()
+                let panel = state.referencePreview == nil ? nil : try await previewReady(state: state, window: window, panels: panels)
+                if panel == nil {
+                    try await wait("closed preview cleanup") { panels.panel == nil }
+                }
+                let page = state.currentPage - 1
+                guard colors.indices.contains(page) else { throw CaptureError("Unexpected fixture page") }
+                try await snapshot(id, state: state, window: window, identity: colors[page], keyWindow: panel)
+                try checkSearch()
+                guard capturedOverlayFrames.count == (panel == nil ? 0 : 1) else {
+                    throw CaptureError("Preview was omitted or leaked into \(id)")
+                }
+                var metadata: [String: Any] = [
+                    "query": state.searchQuery, "hit_count": count, "current_hit_index": hit as Any? ?? NSNull(),
+                    "hit_pages": state.searchHits.map(\.page), "results_visible": state.searchSidebarVisible,
+                    "sidebar_visible": state.sidebarVisible, "scroll_y_points": state.scrollYPt,
+                    "can_go_back": state.canGoBack, "can_go_forward": state.canGoForward
+                ]
+                if let selection = state.selection {
+                    metadata["selection"] = [selection.page, selection.range.lowerBound, selection.range.upperBound]
+                }
+                if let preview = state.referencePreview, let panel {
+                    metadata["preview"] = ["kind": String(describing: preview.kind), "title": preview.title,
+                        "page": preview.page, "entries": preview.entries.map { ["label": $0.label, "text": $0.text] },
+                        "region_points": preview.region.map { [$0.minX, $0.minY, $0.width, $0.height] } ?? [],
+                        "zoom": state.referencePreviewZoom,
+                        "frame_screen_points": [panel.frame.minX, panel.frame.minY, panel.frame.width, panel.frame.height],
+                        "key_window": panel.isKeyWindow]
+                    if let raster { metadata["preview_pixels"] = try verifyPreviewPixels(id, panel: panel, expected: raster) }
+                }
+                captures[captures.count - 1]["search_preview"] = metadata
+            }
+            func search(_ query: String) async throws {
+                state.searchQuery = query
+                state.runSearch()
+                try await wait("search request") { !state.isSearching }
+            }
+            try await shot("01-document-idle")
+            try await search("absentneedle")
+            try await shot("02-search-no-results")
+            try await search("quartzneedle")
+            guard state.searchHits.map(\.page) == [0, 0, 1, 1, 3, 3] else {
+                throw CaptureError("Synthetic search corpus has changed")
+            }
+            try await shot("03-search-first-hit", hit: 0, count: 6)
+            state.findNext()
+            try await shot("04-search-next-hit", hit: 1, count: 6)
+            state.findNext()
+            try await shot("05-search-next-page", hit: 2, count: 6)
+            state.showSearchHit(5)
+            try await shot("06-search-last-hit", hit: 5, count: 6)
+            state.findNext()
+            try await shot("07-search-wrap-first", hit: 0, count: 6)
+            state.findPrevious()
+            try await shot("08-search-wrap-last", hit: 5, count: 6)
+            try await search("quartzneedle gamma")
+            try await shot("09-search-replaced-query", hit: 0, count: 1)
+            try await search("quartzneedle")
+            try await shot("10-search-restored-query", hit: 0, count: 6)
+            state.searchSidebarVisible = false
+            try await shot("11-search-results-hidden", hit: 0, count: 6)
+            state.searchSidebarVisible = true
+            try await shot("12-search-results-restored", hit: 0, count: 6)
+            state.sidebarVisible = true
+            try await shot("13-search-both-sidebars", hit: 0, count: 6)
+            window.setContentSize(CGSize(width: 960, height: 640))
+            try await shot("14-search-narrow-window", hit: 0, count: 6)
+            window.setContentSize(CGSize(width: 1200, height: 800))
+            state.sidebarVisible = false
+            state.clearSearch()
+            state.gotoPage(0)
+            try await shot("15-search-cleared")
+
+            // Read actual Rust hit boxes independently; production handlers still resolve the
+            // target and populate the real panel. No entry, crop or raster is injected by the driver.
+            let probe = try RustEngine()
+            _ = try probe.openDocument(at: options.fixture)
+            let citations = try await probe.citations(0)
+            let mentions = try await probe.captionMentions(page: 0)
+            guard let single = citations.first(where: { $0.labels.count == 1 }),
+                  let group = citations.first(where: { $0.labels.count == 3 }),
+                  let figure = mentions.first(where: { $0.kind == "Figure" }),
+                  let table = mentions.first(where: { $0.kind == "Table" }) else {
+                throw CaptureError("Synthetic citation or caption hit boxes are missing")
+            }
+            func point(_ x: CGFloat, _ y: CGFloat) throws -> CGPoint {
+                guard let page = state.canvasPageFrames.first(where: { $0.index == 0 }) else {
+                    throw CaptureError("Source page placement is missing")
+                }
+                return CGPoint(x: page.leftPt + x, y: page.topPt + y)
+            }
+            let originScroll = state.scrollYPt
+            func preserved() throws {
+                guard state.currentPage == 1, abs(state.scrollYPt - originScroll) < 0.01 else {
+                    throw CaptureError("Preview changed the reader's source position")
+                }
+            }
+            _ = state.openCitation(at: try point(single.xPt + single.widthPt / 2, single.yPt + single.heightPt / 2))
+            try await wait("single citation resolution") { state.referencePreview?.entries.count == 1 }
+            guard state.referencePreview?.entries.first?.text.contains("Deterministic visual baselines") == true else {
+                throw CaptureError("Single citation resolved to the wrong entry")
+            }
+            try await shot("16-citation-single")
+            try preserved()
+            _ = state.openCitation(at: try point(group.xPt + group.widthPt / 2, group.yPt + group.heightPt / 2))
+            try await wait("grouped citation resolution") { state.referencePreview?.entries.count == 3 }
+            guard state.referencePreview?.entries[1].text.contains("100-120, 2025") == true else {
+                throw CaptureError("Wrapped bibliography entry was truncated")
+            }
+            try await shot("17-citation-group")
+            weak var escapedPanel: ReferencePreviewPanel?
+            do {
+                // Release the closed panel before the next preview. Retaining its hosting view
+                // would let an offscreen observer report a competing viewport to the same state.
+                let panel = try await previewReady(state: state, window: window, panels: panels)
+                escapedPanel = panel
+                panel.applyUserFrame(CGRect(x: panel.frame.minX, y: panel.frame.maxY - 360, width: 600, height: 360))
+                try await shot("18-preview-resized")
+                panel.applyUserFrame(panel.frame.offsetBy(dx: 90, dy: 45))
+                try await shot("19-preview-moved")
+                try preserved()
+                guard let escape = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panel.windowNumber,
+                    context: nil, characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: 53) else {
+                    throw CaptureError("Cannot construct preview Escape event")
+                }
+                panel.keyDown(with: escape)
+            }
+            focus(window: window)
+            try await wait("Escape closes and detaches preview") {
+                state.referencePreview == nil && panels.panel == nil
+                    && escapedPanel?.isVisible != true && escapedPanel?.parent == nil
+            }
+            try await shot("20-preview-escape")
+            // AppKit may retain an ordered-out NSWindow. Record object lifetime separately
+            // from the observable close/detach contract instead of assuming immediate deinit.
+            captures[captures.count - 1]["closed_preview_object_released"] = escapedPanel == nil
+            _ = state.openFigureMention(at: try point(figure.xPt + figure.widthPt / 2, figure.yPt + figure.heightPt / 2))
+            try await wait("figure resolution") { state.referencePreview?.title == "Figure 1" }
+            try await shot("21-figure-preview", raster: "figure")
+            try preserved()
+            _ = state.openFigureMention(at: try point(table.xPt + table.widthPt / 2, table.yPt + table.heightPt / 2))
+            try await wait("table replaces figure") { state.referencePreview?.title == "Table 1" }
+            guard state.referencePreview?.page == 2, let region = state.referencePreview?.region,
+                  region.width < 500, region.height < 200 else { throw CaptureError("Table crop fell back to the whole page") }
+            try await shot("22-table-replaces-figure", raster: "table")
+            try preserved()
+            state.jumpFromPreview(to: 2)
+            guard state.canGoBack else { throw CaptureError("Preview jump did not record history") }
+            try await shot("23-preview-page-jump", raster: "table")
+            guard state.currentPage == 3, state.goBack() else { throw CaptureError("Preview jump or Back failed") }
+            try await shot("24-reader-back", raster: "table")
+            try preserved()
+            guard state.openReferencePreview(page: 1, title: "Page 2", from: "p. 1", kind: .page,
+                anchor: CGRect(x: 220, y: 270, width: 50, height: 14)) else { throw CaptureError("Page preview failed to open") }
+            try await shot("25-whole-page-preview", raster: "page")
+            try preserved()
+            try await search("quartzneedle")
+            try await shot("26-preview-with-search", hit: 0, count: 6, raster: "page")
+            state.closeReferencePreview()
+            try await shot("27-preview-closed", hit: 0, count: 6)
+            state.clearSearch()
+            state.closeTab(0)
+            try await homeSnapshot("28-home-no-document", state: state, window: window)
+        }
+
         func fullScreen(window: NSWindow, entering: Bool) async throws {
             fullScreenTransitionCompleted = false
             let name = entering ? NSWindow.didEnterFullScreenNotification : NSWindow.didExitFullScreenNotification
@@ -793,6 +1096,24 @@ enum PaperVisualCapture {
         }
 
         func capture(registry: ReaderWindowRegistry) async throws {
+            // A stationary pointer can enter a toolbar button as the test window opens.
+            // Move it off this suite's windows, then restore it even on capture failure.
+            var originalPointer: CGPoint?
+            if options.suite == "search-previews" {
+                guard let pointer = CGEvent(source: nil)?.location,
+                      CGWarpMouseCursorPosition(CGPoint(x: 8, y: 8)) == .success else {
+                    throw CaptureError("Cannot keep the pointer outside visual capture windows")
+                }
+                originalPointer = pointer
+            }
+            defer {
+                if let originalPointer {
+                    let result = CGWarpMouseCursorPosition(originalPointer)
+                    if result != .success {
+                        FileHandle.standardError.write(Data("visual-capture: pointer restoration failed: \(result.rawValue)\n".utf8))
+                    }
+                }
+            }
             PerfTrace.setCapture { [frames] line in frames.append(line) }
             try await wait("production reader window") { registry.sessions.first?.window?.contentView != nil }
             guard let session = registry.sessions.first, let window = session.window,
@@ -834,6 +1155,10 @@ enum PaperVisualCapture {
             }
             if options.suite == "toolbar-inspectors" {
                 try await captureToolbarInspectors(state: state, window: window)
+                return
+            }
+            if options.suite == "search-previews" {
+                try await captureSearchPreviews(state: state, window: window, panels: session.previewPanels)
                 return
             }
             guard state.open(url: options.fixture) else { throw CaptureError("Cannot open synthetic visual fixture") }

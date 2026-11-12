@@ -318,6 +318,8 @@ jobs:
           python3 scripts/check-visual.py capture --suite reader-shell --output build/visual-candidates/reader-en-dark --language en --appearance dark
           python3 scripts/check-visual.py capture --suite toolbar-inspectors --output build/visual-candidates/tools-en-light --language en --appearance light
           python3 scripts/check-visual.py capture --suite toolbar-inspectors --output build/visual-candidates/tools-en-dark --language en --appearance dark
+          python3 scripts/check-visual.py capture --suite search-previews --output build/visual-candidates/search-en-light --language en --appearance light
+          python3 scripts/check-visual.py capture --suite search-previews --output build/visual-candidates/search-en-dark --language en --appearance dark
 
       - name: Preserve unreviewed visual candidates and failures
         if: always() && github.event_name == 'workflow_dispatch' && inputs.capture_visual_candidates

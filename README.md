@@ -126,7 +126,7 @@ design notes rather than here.
 
 ## Native visual regression
 
-The debug bundle supports opt-in capture of its own native window on macOS 14.4 or later.
+The debug bundle supports opt-in capture of its native reader and owned preview on macOS 14.4 or later.
 Keep the desktop awake and idle while capture controls its own window and full-screen Space.
 The launcher creates a separate bundle identity and scratch caches.
 The default `paper` suite records 16 checkpoints for paper scale, native edges, sidebar changes,
@@ -142,6 +142,7 @@ python3 -m unittest discover -s scripts -p test_visual_regression.py
 python3 scripts/check-visual.py capture --output build/visual-en-light --language en --appearance light
 python3 scripts/check-visual.py capture --suite reader-shell --output build/visual-reader-light --appearance light
 python3 scripts/check-visual.py capture --suite toolbar-inspectors --output build/visual-tools-light --appearance light
+python3 scripts/check-visual.py capture --suite search-previews --output build/visual-search-light --appearance light
 ```
 
 Open the output's `index.html` to review native-size PNGs and environment details. Repeat with
@@ -169,6 +170,18 @@ Export's unfinished subtool list is saved separately as a deferred reference, ou
 checkpoint catalogue. Each captured profile requires visual review before baseline adoption.
 Review repeatability results before choosing a per-channel tolerance. Unreviewed comparisons default
 to zero; adopted profiles use their reviewed policy.
+
+The `search-previews` suite records 28 checkpoints covering empty results, match selection,
+cross-page navigation and wrapping, replacement queries, sidebar/window combinations and clearing;
+single/grouped citations, wrapped entries, preview resizing/moving, Escape, figure/table replacement,
+page jumps and Back, whole-page previews, search coexistence and closing to Home. Its four-page
+synthetic PDF provides six search matches, three references and distinct figure/table raster probes.
+Capture includes only the process-owned reader and its one attached preview panel, at native scale;
+the image bounds expand to their union when necessary. Checks verify resolved text, actual preview
+pixels, crop bounds, reader position, navigation history and panel cleanup. These candidates need
+separate review; the toolbar suite's tolerance does not apply to them automatically.
+This suite temporarily parks the pointer outside its windows to avoid accidental hover states
+and restores it when capture ends.
 
 ```bash
 python3 scripts/check-visual.py compare --baseline BASELINE --actual ACTUAL --output build/visual-diff
@@ -200,7 +213,7 @@ above. Each suite requires its own baseline and complete checkpoint set.
 
 CI verifies the adopted baseline bytes and runs the comparer/approval regressions. Its manual
 **Capture unreviewed visual candidates** input additionally collects English light/dark candidates
-from all three suites as artifacts. Pixel comparison requires a controlled matching
+from all four suites as artifacts. Pixel comparison requires a controlled matching
 desktop; this does not enable a cross-environment PR screenshot gate. Chinese visual checks are deferred until
 Chinese localization is implemented. Existing zh-Hans preference captures show English fallback
 and are not accepted as evidence of Chinese UI coverage.
