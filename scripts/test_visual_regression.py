@@ -166,12 +166,73 @@ class BaselineIntegrityTests(unittest.TestCase):
                 visual.compare_runs(args)
             compile_comparer.assert_not_called()
 
+    def comparison_args(self, requested=None, reviewed=None):
+        self.report['environment'] = json.loads((visual.ROOT / 'tests/visual-baselines/paper'
+            / 'macos-15.7.9-2560x1440-2x/en-light/capture.json').read_text())['environment']
+        for row in self.report['captures']:
+            row.update(pixel_width=1, pixel_height=1, backing_scale=1, calibration=1, zoom_percent=100)
+        self.write_report()
+        self.approve()
+        if reviewed is not None:
+            path = self.directory / 'approval.json'
+            approval = json.loads(path.read_text())
+            approval['channel_tolerance'] = reviewed
+            visual.write_json(path, approval)
+        actual = self.directory / 'actual'
+        actual.mkdir()
+        visual.write_json(actual / 'capture.json', self.report)
+        for row in self.report['captures']:
+            (actual / row['file']).write_bytes((self.directory / row['file']).read_bytes())
+        return argparse.Namespace(baseline=self.directory, actual=actual, output=self.directory / 'diff',
+                                  allow_unreviewed=False, channel_tolerance=requested)
+
+    def assert_comparison_policy(self, args, expected):
+        with patch.object(visual, 'compile_comparer', return_value=self.directory / 'mock-comparer'), \
+                patch.object(visual.subprocess, 'run') as compare:
+            compare.return_value.returncode = 0
+            compare.return_value.stdout = json.dumps({'match': True, 'changed_pixels': 0})
+            self.assertEqual(visual.compare_runs(args), 0)
+            self.assertTrue(compare.call_args_list)
+            self.assertTrue(all(call.args[0][-1] == str(expected) for call in compare.call_args_list))
+        report = json.loads((args.output / 'comparison.json').read_text())
+        self.assertEqual(report['channel_tolerance'], expected)
+        self.assertTrue(report['regression_gate'])
+
+    def test_gate_uses_the_reviewed_tolerance_when_unspecified(self):
+        self.assert_comparison_policy(self.comparison_args(reviewed=1), 1)
+
+    def test_gate_allows_an_explicit_stricter_tolerance(self):
+        self.assert_comparison_policy(self.comparison_args(requested=0, reviewed=1), 0)
+
+    def test_gate_cannot_widen_the_reviewed_tolerance(self):
+        args = self.comparison_args(requested=2, reviewed=1)
+        with patch.object(visual, 'compile_comparer') as compile_comparer:
+            with self.assertRaisesRegex(ValueError, 'exceeds the reviewed'):
+                visual.compare_runs(args)
+            compile_comparer.assert_not_called()
+
+    def test_legacy_approvals_retain_zero_tolerance(self):
+        self.assert_comparison_policy(self.comparison_args(), 0)
+
+    def test_invalid_reviewed_tolerances_are_rejected(self):
+        self.approve()
+        path = self.directory / 'approval.json'
+        approval = json.loads(path.read_text())
+        for invalid in [True, -1, 17, '1', None]:
+            with self.subTest(tolerance=invalid):
+                approval['channel_tolerance'] = invalid
+                visual.write_json(path, approval)
+                with self.assertRaisesRegex(ValueError, 'comparison tolerance'):
+                    visual.verify_approval(self.directory, self.report)
+
 
 class CommittedVisualBaselineTests(unittest.TestCase):
     def test_adopted_baselines_retain_their_reviewed_images_and_manifest(self):
         root = visual.ROOT / 'tests/visual-baselines'
-        for suite in ['paper', 'reader-shell']:
-            for theme in ['en-light', 'en-dark']:
+        profiles = {'paper': ['en-light', 'en-dark'], 'reader-shell': ['en-light', 'en-dark'],
+                    'toolbar-inspectors': ['en-light', 'en-dark']}
+        for suite, themes in profiles.items():
+            for theme in themes:
                 with self.subTest(suite=suite, theme=theme):
                     directory = root / suite / 'macos-15.7.9-2560x1440-2x' / theme
                     report = visual.load_capture(directory)

@@ -166,19 +166,24 @@ sidebar and narrow-window combinations, and closing back to Home. Native chrome 
 the 46 pt row and the exclusive 292 pt inspector column. The date preview uses a fixed UTC clock
 only in the isolated debug capture process; placed dates and ordinary launches keep their usual clock.
 Export's unfinished subtool list is saved separately as a deferred reference, outside the
-checkpoint catalogue. These new images require visual review before baseline adoption.
-Review repeatability results before choosing a per-channel tolerance; comparison defaults to zero.
+checkpoint catalogue. Each captured profile requires visual review before baseline adoption.
+Review repeatability results before choosing a per-channel tolerance. Unreviewed comparisons default
+to zero; adopted profiles use their reviewed policy.
 
 ```bash
 python3 scripts/check-visual.py compare --baseline BASELINE --actual ACTUAL --output build/visual-diff
 ```
 
-Comparison never rescales images and defaults to exact sRGB pixels. It requires matching environments
+Comparison never rescales images and uses exact sRGB pixels unless a reviewed baseline explicitly
+approves a per-channel tolerance. It requires matching environments
 and an explicit `approval.json` in the baseline directory: `schema_version: 1`, `approved: true`,
 `capture_manifest_sha256` for `capture.json`, and a `sha256` object mapping every checkpoint PNG filename
 to its SHA-256 digest. Create that approval only after reviewing the images. Changing an approved image
 or manifest invalidates it. `--allow-unreviewed` is available solely for developer repeatability checks
 and marks the result as **not a regression gate**. No image baselines are accepted automatically.
+An optional integer `channel_tolerance` in the approval records the reviewed comparison policy;
+omitting it keeps zero tolerance. An explicit `--channel-tolerance` may be stricter than that policy
+but cannot widen it for a regression gate. Unreviewed comparisons still default to zero.
 
 The first paper batch is provisionally adopted under
 `tests/visual-baselines/paper/macos-15.7.9-2560x1440-2x/en-light` and `en-dark`: 32 original PNGs,
@@ -186,6 +191,10 @@ sanitized capture manifests and hash-bound approvals. They cover the recorded ma
 2560×1440 logical display, 5120×2880 backing framebuffer and backing scale 2. The user-approved
 reader-shell batch adds 20 original PNGs and hash-bound approvals under
 `tests/visual-baselines/reader-shell/macos-15.7.9-2560x1440-2x/en-light` and `en-dark`.
+The toolbar/inspector profiles add 52 user-approved PNGs under
+`tests/visual-baselines/toolbar-inspectors/macos-15.7.9-2560x1440-2x/en-light` and `en-dark`, with an
+explicitly reviewed one-level per-channel tolerance. Export references are deferred.
+The paper and reader-shell approvals retain zero tolerance.
 Other environments require separate reviewed baselines. Use the matching directory as `BASELINE`
 above. Each suite requires its own baseline and complete checkpoint set.
 

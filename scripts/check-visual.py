@@ -279,7 +279,7 @@ def load_capture(directory: Path) -> dict:
     return report
 
 
-def verify_approval(directory: Path, report: dict) -> None:
+def verify_approval(directory: Path, report: dict) -> dict:
     path = directory / 'approval.json'
     if not path.is_file():
         raise ValueError('Baseline has no explicit approval.json; candidates are not automatically accepted')
@@ -289,6 +289,10 @@ def verify_approval(directory: Path, report: dict) -> None:
             or approval.get('capture_manifest_sha256') != digest(directory / 'capture.json') \
             or approval.get('sha256') != expected:
         raise ValueError('Baseline approval is absent or does not match the image bytes')
+    tolerance = approval.get('channel_tolerance', 0)
+    if type(tolerance) is not int or not 0 <= tolerance <= 16:
+        raise ValueError('Baseline comparison tolerance must be an integer in 0...16')
+    return approval
 
 
 def compare_runs(args: argparse.Namespace) -> int:
@@ -298,8 +302,15 @@ def compare_runs(args: argparse.Namespace) -> int:
     actual = load_capture(actual_dir)
     if reference.get('suite', 'paper') != actual.get('suite', 'paper'):
         raise ValueError('Capture suites differ; each suite requires its own baseline')
-    if not args.allow_unreviewed:
-        verify_approval(reference_dir, reference)
+    approval = None if args.allow_unreviewed else verify_approval(reference_dir, reference)
+    reviewed_tolerance = approval.get('channel_tolerance', 0) if approval is not None else None
+    tolerance = args.channel_tolerance
+    if tolerance is None:
+        tolerance = reviewed_tolerance if reviewed_tolerance is not None else 0
+    if type(tolerance) is not int or not 0 <= tolerance <= 16:
+        raise ValueError('Comparison tolerance must be an integer in 0...16')
+    if reviewed_tolerance is not None and tolerance > reviewed_tolerance:
+        raise ValueError('Requested tolerance exceeds the reviewed baseline policy')
     # Different valid environments require separate baselines, rather than a looser threshold.
     keys = ['os', 'os_build', 'language', 'appearance', 'locale', 'system_font', 'gpu',
             'capture', 'screen_points', 'display_mode_points', 'display_backing_pixels', 'hardware_model', 'swift', 'pdfium_sha256', 'fixture_sha256']
@@ -322,7 +333,7 @@ def compare_runs(args: argparse.Namespace) -> int:
         shutil.copyfile(reference_dir / before['file'], output / reference_name)
         shutil.copyfile(actual_dir / after['file'], output / actual_name)
         result = subprocess.run([str(comparer), str(output / reference_name), str(output / actual_name),
-                                 str(output / difference_name), str(args.channel_tolerance)], text=True, capture_output=True)
+                                 str(output / difference_name), str(tolerance)], text=True, capture_output=True)
         record = {'id': sid, 'reference': reference_name, 'actual': actual_name}
         if result.returncode in [0, 1]:
             record.update(json.loads(result.stdout))
@@ -333,6 +344,7 @@ def compare_runs(args: argparse.Namespace) -> int:
         comparisons.append(record)
     report = {'schema_version': 1, 'suite': actual.get('suite', 'paper'),
               'status': 'different' if failed else 'matching',
+              'channel_tolerance': tolerance, 'reviewed_channel_tolerance': reviewed_tolerance,
               'regression_gate': not args.allow_unreviewed, 'environment': actual['environment'], 'comparisons': comparisons}
     write_json(output / 'comparison.json', report)
     render_report(output, report, comparisons)
@@ -355,7 +367,8 @@ def main() -> int:
     check.add_argument('--baseline', type=Path, required=True)
     check.add_argument('--actual', type=Path, required=True)
     check.add_argument('--output', type=Path, required=True)
-    check.add_argument('--channel-tolerance', type=int, choices=range(17), default=0)
+    check.add_argument('--channel-tolerance', type=int, choices=range(17), default=None,
+                       help='Use the reviewed baseline policy when omitted; unreviewed/legacy runs default to zero')
     check.add_argument('--allow-unreviewed', action='store_true', help='Developer repeatability probe only; not a regression gate')
     sub.add_parser('self-test', help='Exercise image comparison without launching an application')
     args = parser.parse_args()
