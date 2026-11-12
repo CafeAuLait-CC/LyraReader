@@ -4,6 +4,10 @@ import SwiftUI
 /// Native semantic colors from docs/Lyra-Palette (sRGB). PDF pixels keep their source colors.
 @MainActor
 public enum LyraReaderTheme {
+    /// Unpainted original PDF paper, independent of the interface's light/dark surfaces.
+    public static let originalPaperColor = NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
+    public static let originalPaper = Color(nsColor: originalPaperColor)
+
     private static func adaptive(_ light: UInt32, _ dark: UInt32) -> NSColor {
         NSColor(name: nil) { @Sendable appearance in
             let hex = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light

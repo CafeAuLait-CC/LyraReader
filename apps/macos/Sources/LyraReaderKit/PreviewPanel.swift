@@ -12,9 +12,9 @@ import SwiftUI
 public enum PreviewPanelGeometry {
     /// A readable citation column; the height is fitted to each preview.
     public static let defaultSize = CGSize(width: 520, height: 360)
-    /// 320×240 pt: small enough to tuck into a corner, large enough for a reference to stay
-    /// readable.
-    public static let minimumSize = CGSize(width: 320, height: 240)
+    /// The two header rows and a short citation fit in 120 pt. Longer content determines its
+    /// own height; using the image preview's old 240 pt floor left short references half empty.
+    public static let minimumSize = CGSize(width: 320, height: 120)
     /// The documented ceiling: 80% of the screen it opens on.
     public static let maximumScreenFraction: CGFloat = 0.8
     /// Inset from the screen edge, and the horizontal inset the spec asks for.
@@ -172,8 +172,8 @@ public enum ReferencePreviewLayout {
     public static let headingFontSize: CGFloat = ReferencePreviewTypography.titleFontSize
     public static let headingWeight: ReferencePreviewTextWeight = ReferencePreviewTypography.titleWeight
     public static let entrySpacingPt: CGFloat = 12
-    /// Card padding plus the scroll indicator's lane.
-    public static let textInsetPt: CGFloat = 30
+    /// Card padding, scroll indicator, entry copy menu and the spacing beside it.
+    public static let textInsetPt: CGFloat = 52
 
     public static func textColumnWidth(panelWidthPt: CGFloat) -> CGFloat {
         max(80, panelWidthPt - textInsetPt)
@@ -337,13 +337,14 @@ public final class ReferencePreviewModel: ObservableObject {
     /// Full citation text, with a title heading; large bibliographies scroll at the screen limit.
     public func fullContentHeight(panelWidthPt: CGFloat) -> CGFloat {
         let width = ReferencePreviewLayout.textColumnWidth(panelWidthPt: panelWidthPt)
-        return 80 + entries.reduce(CGFloat(0)) { total, entry in
+        let spacing = CGFloat(max(0, entries.count - 1)) * ReferencePreviewLayout.entrySpacingPt
+        return 80 + spacing + entries.reduce(CGFloat(0)) { total, entry in
             total + ReferencePreviewLayout.textHeight(
                 entry.heading, widthPt: width,
                 fontSize: ReferencePreviewLayout.headingFontSize,
                 weight: ReferencePreviewLayout.headingWeight
             )
-                + ReferencePreviewLayout.textHeight(entry.text, widthPt: width) + 16
+                + ReferencePreviewLayout.textHeight(entry.text, widthPt: width) + 4
         }
     }
 }
@@ -632,6 +633,10 @@ public final class ReferencePreviewPanelController {
         panel.onUserFrameChange = nil
         panel.onCancel = nil
         panel.onGoBack = nil
+        // AppKit may retain an ordered-out panel. Unmount its observed SwiftUI content now so
+        // a closed citation cannot grow a new Metal canvas when a later figure opens.
+        hosting?.removeFromSuperview()
+        panel.contentView = nil
         self.panel = nil
         hosting = nil
         grip = nil
@@ -664,7 +669,14 @@ public final class ReferencePreviewPanelController {
         }
         panel.onGoBack = { [weak state] in state?.goBack() }
         let hosting = NSHostingView(rootView: ReferencePreviewPanelContent(
-            state: state, model: model
+            state: state, model: model,
+            onViewportSize: { [weak self, weak state, weak panel] preview, size in
+                // Layout can outlive the view that requested it, including a replaced body in
+                // this same panel. Only the current owner and current content may set the fit.
+                guard let self, let panel, self.panel === panel,
+                      let state, state.referencePreview == preview else { return }
+                state.setReferencePreviewViewport(size)
+            }
         ))
         hosting.autoresizingMask = [.width, .height]
         let container = NSView(frame: CGRect(origin: .zero, size: PreviewPanelGeometry.defaultSize))
@@ -829,6 +841,7 @@ public enum ReferencePreviewHeaderLayout {
 struct ReferencePreviewPanelContent: View {
     @ObservedObject var state: AppState
     @ObservedObject var model: ReferencePreviewModel
+    let onViewportSize: (AppState.ReferencePreview, CGSize) -> Void
     @ObservedObject private var appearance = ReadingAppearanceStore.shared
 
     var body: some View {
@@ -1048,10 +1061,9 @@ struct ReferencePreviewPanelContent: View {
     /// A figure, table or plain page destination: the rendered region, because the picture is the
     /// point.
     private func imageBody(_ preview: AppState.ReferencePreview) -> some View {
-        // A figure/table crop is rasterized with a transparent page background, so the canvas
-        // must clear to the panel's own colour. Clearing to the reader-canvas grey instead would
-        // put the white-card problem back as a grey card, and in the dark theme as a near-black
-        // one. A whole-page preview keeps the canvas colour: there the paper is the subject.
+        // Scientific figures keep their source colours on original paper, independently of
+        // the UI theme and the reader's optional paper conversion. The raster stays transparent;
+        // only this surface's display background changes. Whole pages follow reading appearance.
         let crop = preview.kind == .figure
         return ZStack {
             PDFCanvasView(
@@ -1059,11 +1071,11 @@ struct ReferencePreviewPanelContent: View {
                 scrollYPt: state.referencePreviewScrollYPt,
                 zoom: state.referencePreviewZoom,
                 contentWidthPt: state.referencePreviewPages.first?.placement.widthPt ?? 0,
-                paperAppearance: appearance.mode,
-                canvasClearColor: crop ? LyraReaderTheme.raisedBgColor : nil,
+                paperAppearance: crop ? .original : appearance.mode,
+                canvasClearColor: crop ? LyraReaderTheme.originalPaperColor : nil,
                 onFrame: { stats in state.updateGpuStatus(stats, label: "preview") },
                 onFailure: { message in state.reportGpuFailure(message) },
-                onViewportSize: { size in state.setReferencePreviewViewport(size) },
+                onViewportSize: { size in onViewportSize(preview, size) },
                 onScroll: { delta in state.scrollReferencePreview(by: delta) },
                 interactionSnapshot: {
                     (state.referencePreviewPages, state.referencePreviewScrollYPt,
@@ -1076,7 +1088,7 @@ struct ReferencePreviewPanelContent: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(crop ? LyraReaderTheme.raisedBg : LyraReaderTheme.canvasBg)
+        .background(crop ? LyraReaderTheme.originalPaper : LyraReaderTheme.canvasBg)
         .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
