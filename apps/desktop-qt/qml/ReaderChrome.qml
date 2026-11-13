@@ -5,6 +5,7 @@ import QtQuick.Layouts
 ColumnLayout {
     id: chrome
     required property var app
+    readonly property bool menuOpen: viewMenu.visible || zoomMenu.visible || moreMenu.visible
     spacing: 0
     property int tabDragCancelEpoch:0
     implicitHeight: 90
@@ -238,12 +239,17 @@ ColumnLayout {
                 onClicked: app.showOverview()
             }
             LyraToolButton {
+                id: viewMenuButton
+                objectName: "viewMenuButton"
                 symbol: "view"
                 text: qsTr("View settings")
                 onClicked: viewMenu.popup(0, height)
             }
             Menu {
                 id: viewMenu
+                objectName: "viewSettingsMenu"
+                parent: viewMenuButton
+                focus: true
                 MenuItem {
                     text: qsTr("Read Page Text (Ctrl+Shift+R)")
                     checkable: true
@@ -290,6 +296,8 @@ ColumnLayout {
                 onClicked: app.zoomBy(1 / 1.2)
             }
             ToolButton {
+                id: zoomMenuButton
+                objectName: "zoomMenuButton"
                 text: Math.round((app.textViewVisible ? app.textViewZoom * 100 : app.zoomPercent)) + (app.textViewVisible ? "%" : "% ▾")
                 Layout.preferredWidth: 72
                 Layout.minimumWidth: 72
@@ -298,6 +306,9 @@ ColumnLayout {
             }
             Menu {
                 id: zoomMenu
+                objectName: "zoomPresetMenu"
+                parent: zoomMenuButton
+                focus: true
                 MenuItem {
                     text: qsTr("Actual Size (100%)")
                     onTriggered: {
@@ -368,6 +379,7 @@ ColumnLayout {
                 onClicked: app.toggleSecondaryRow("lyra")
             }
             LyraToolButton {
+                id: moreCommandsButton
                 objectName: "moreCommands"
                 symbol: "more"
                 text: qsTr("More commands")
@@ -376,6 +388,8 @@ ColumnLayout {
             Menu {
                 id: moreMenu
                 objectName: "moreCommandsMenu"
+                parent: moreCommandsButton
+                focus: true
                 MenuItem {
                     text: qsTr("Fill & Sign")
                     enabled: app.canModifyPdf

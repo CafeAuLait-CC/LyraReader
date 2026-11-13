@@ -59,7 +59,9 @@ ApplicationWindow {
     property bool aiPanelVisible: false
     // Transient ancestors can stay active; only the focused reader owns its shortcuts.
     readonly property bool readerKeyboardEnabled: navigationController.keyboardFocus && (!dialogs.settingsDialog || !dialogs.settingsDialog.visible || !dialogs.settingsDialog.active)
-    readonly property bool readerPageNavigationEnabled: readerKeyboardEnabled && !textViewVisible
+    // Action equivalents keep their menu hints; direct reader keys yield to popup navigation.
+    readonly property bool documentKeysEnabled: readerKeyboardEnabled && !readerChrome.menuOpen && !mainFileMenu.visible && !mainViewMenu.visible
+    readonly property bool readerPageNavigationEnabled: documentKeysEnabled && !textViewVisible
         && !(activeFocusItem && typeof activeFocusItem.selectedText !== "undefined")
     property bool regionSelecting: false
     property var regionDraft: null
@@ -1019,12 +1021,12 @@ ApplicationWindow {
     }
     Shortcut {
         sequence: "Alt+Left"
-        enabled: root.readerKeyboardEnabled && navigationController.keyboardFocus && root.canGoBack
+        enabled: root.documentKeysEnabled && navigationController.keyboardFocus && root.canGoBack
         onActivated: root.goBack()
     }
     Shortcut {
         sequence:"Alt+Right"
-        enabled:root.readerKeyboardEnabled && navigationController.keyboardFocus && root.canGoForward
+        enabled:root.documentKeysEnabled && navigationController.keyboardFocus && root.canGoForward
         onActivated:root.goForward()
     }
     function showSelectionMenu(item, page, x, y, paperPoint) {
@@ -1917,7 +1919,7 @@ ApplicationWindow {
         onActivated: root.navigate(currentReader.pageCount - 1)
     }
     Shortcut {
-        enabled: root.readerKeyboardEnabled
+        enabled: root.documentKeysEnabled
         sequence: "Ctrl+L"
         onActivated: {
             pageNumber.forceActiveFocus();
@@ -1925,38 +1927,38 @@ ApplicationWindow {
         }
     }
     Shortcut {
-        enabled: root.readerKeyboardEnabled
+        enabled: root.documentKeysEnabled
         sequence: "Ctrl+B"
         onActivated: root.sidebarVisible = !root.sidebarVisible
     }
     Shortcut {
-        enabled: root.readerKeyboardEnabled
+        enabled: root.documentKeysEnabled
         sequence: "F11"
         onActivated: root.visibility = root.visibility === Window.FullScreen ? Window.Windowed : Window.FullScreen
     }
     Shortcut {
         sequences: [StandardKey.Copy]
-        enabled: root.readerKeyboardEnabled && (!!root.selection && root.activeFocusItem && root.activeFocusItem.objectName === "pdfPointer")
+        enabled: root.documentKeysEnabled && (!!root.selection && root.activeFocusItem && root.activeFocusItem.objectName === "pdfPointer")
         onActivated: root.copySelection()
     }
     Shortcut {
-        enabled: root.readerKeyboardEnabled
+        enabled: root.documentKeysEnabled
         sequences: [StandardKey.Find]
         onActivated: root.focusSearch()
     }
     Shortcut {
-        enabled: root.readerKeyboardEnabled
+        enabled: root.documentKeysEnabled
         sequence: "Ctrl+D"
         onActivated: root.addBookmark()
     }
     Shortcut {
-        enabled: root.readerKeyboardEnabled
+        enabled: root.documentKeysEnabled
         sequence: "Ctrl+W"
         onActivated: if (root.session)
             root.requestCloseTab(root.session.activeIndex)
     }
     Shortcut {
-        enabled: root.readerKeyboardEnabled
+        enabled: root.documentKeysEnabled
         sequence: "Ctrl+Tab"
         onActivated: if (root.session)
             root.selectReaderTab((root.session.activeIndex + 1) % root.session.tabs.length)
@@ -1974,16 +1976,16 @@ ApplicationWindow {
 
     Shortcut {
         sequences: [StandardKey.Undo]
-        enabled: root.readerKeyboardEnabled && (!(root.activeFocusItem && typeof root.activeFocusItem.selectedText !== "undefined"))
+        enabled: root.documentKeysEnabled && (!(root.activeFocusItem && typeof root.activeFocusItem.selectedText !== "undefined"))
         onActivated: root.undo()
     }
     Shortcut {
         sequences: [StandardKey.Redo]
-        enabled: root.readerKeyboardEnabled && (!(root.activeFocusItem && typeof root.activeFocusItem.selectedText !== "undefined"))
+        enabled: root.documentKeysEnabled && (!(root.activeFocusItem && typeof root.activeFocusItem.selectedText !== "undefined"))
         onActivated: root.redo()
     }
     Shortcut {
-        enabled: root.readerKeyboardEnabled
+        enabled: root.documentKeysEnabled
         sequence: "Escape"
         onActivated: {
             if(documentCanvas.dragPreview.active || secondaryRow==="edit"){documentCanvas.dragPreview.cancel();cancelContentGesture();}
@@ -2010,6 +2012,7 @@ ApplicationWindow {
             color: theme.titlebarBg
         }
         Menu {
+            id: mainFileMenu
             title: qsTr("&File")
             MenuItem {
                 action: openAction
@@ -2022,6 +2025,7 @@ ApplicationWindow {
             }
         }
         Menu {
+            id: mainViewMenu
             title: qsTr("&View")
             MenuItem {
                 action: readPageTextAction
@@ -2082,6 +2086,7 @@ ApplicationWindow {
         }
     }
     header: ReaderChrome {
+        id: readerChrome
         app: root
     }
 

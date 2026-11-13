@@ -58,6 +58,8 @@ Back/Forward uses the shared twenty-entry history in each direction and restores
 page anchor, horizontal position and fractional calibrated percentage. Only preview jumps record
 an entry; document/revision or tab changes clear the ephemeral history. Alt+Left/Alt+Right belong
 to the focused reader, including when another transient reader window is active.
+Toolbar menus stay attached to their buttons and take arrow, Return and Escape input;
+direct document navigation waits until the menu closes.
 Canvas selections omit conservatively recognized manuscript line counters without changing raw page
 text or original character indices. Explicit Copy joins discretionary word breaks while preserving
 ordinary hyphens and paragraph boundaries. New markup freezes its selected geometry; historical

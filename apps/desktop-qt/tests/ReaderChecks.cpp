@@ -511,6 +511,46 @@ private slots:
             QCOMPARE(window->property("zoomPercent").toDouble(),300.0);
         }
     }
+    void toolbarMenusAnchorAndOwnTheirKeyboard_data() {
+        QTest::addColumn<QString>("buttonName");QTest::addColumn<QString>("menuName");QTest::addColumn<QString>("theme");QTest::addColumn<int>("width");
+        for(const auto &kind:{QString("more"),QString("view"),QString("zoom")})for(const auto &theme:{QString("light"),QString("dark")}) {
+            const auto button=kind=="more"?QString("moreCommands"):kind=="view"?QString("viewMenuButton"):QString("zoomMenuButton");
+            const auto menu=kind=="more"?QString("moreCommandsMenu"):kind=="view"?QString("viewSettingsMenu"):QString("zoomPresetMenu");
+            QTest::newRow(qPrintable(kind+"-"+theme))<<button<<menu<<theme<<(theme=="dark"?700:1100);
+        }
+    }
+    void toolbarMenusAnchorAndOwnTheirKeyboard() {
+        QFETCH(QString,buttonName);QFETCH(QString,menuName);QFETCH(QString,theme);QFETCH(int,width);
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("toolbar-menus.pdf");QVERIFY(QFile::copy(QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;window->resize(width,700);window->setProperty("appearance",theme);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==9 && !reader->loading() && !reader->pendingCommands());QVERIFY(settleReaderViewport(window));
+        QVERIFY(QMetaObject::invokeMethod(window,"actualSize"));QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,2),Q_ARG(QVariant,0)));QVERIFY(settleReaderViewport(window));
+        auto *button=visualItem(window->contentItem(),buttonName);auto *menu=window->findChild<QObject *>(menuName);QVERIFY(button && menu);
+        window->requestActivate();button->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(button->hasActiveFocus());
+        QTest::keyClick(window,Qt::Key_Space);QTRY_VERIFY(menu->property("visible").toBool());QTest::qWait(40);
+        auto *body=menu->property("contentItem").value<QQuickItem *>();QVERIFY(body);
+        const auto actual=body->mapToGlobal(QPointF(-menu->property("leftPadding").toDouble(),-menu->property("topPadding").toDouble()));const auto expected=button->mapToGlobal(QPointF(0,button->height()));
+        qInfo()<<"Toolbar popup anchor"<<buttonName<<actual<<expected<<"window"<<window->size();
+        QVERIFY2(QLineF(actual,expected).length()<2,"The menu must open below its own toolbar button");
+        QTRY_VERIFY(menu->property("activeFocus").toBool());
+        const auto page=window->property("currentPage");QTest::keyClick(window,Qt::Key_End,Qt::ControlModifier);QTest::qWait(40);QCOMPARE(window->property("currentPage"),page);
+        QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!menu->property("visible").toBool());QTRY_VERIFY(button->hasActiveFocus());
+        QTest::keyClick(window,Qt::Key_End,Qt::ControlModifier);QTRY_COMPARE(window->property("currentPage").toInt(),8);
+        if(buttonName=="moreCommands") {
+            button->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Space);QTRY_VERIFY(menu->property("visible").toBool());
+            bool selectedSettings=false;
+            for(int step=0;step<menu->property("count").toInt()+2;++step) {
+                const auto *item=body->property("currentItem").value<QQuickItem *>();
+                qInfo()<<"Toolbar keyboard selection"<<menu->property("currentIndex")<<(item?item->property("text"):QVariant());
+                if(item && item->property("text").toString()==QString::fromUtf8("Settings…")){selectedSettings=true;break;}
+                QTest::keyClick(window,Qt::Key_Down);QTest::qWait(5);
+            }
+            QVERIFY2(selectedSettings,"Arrow navigation must reach the actual Settings command");QTest::keyClick(window,Qt::Key_Return);
+            QQuickWindow *settings=nullptr;QTRY_VERIFY((settings=window->findChild<QQuickWindow *>("settingsWindow")) && settings->isVisible());
+            QTRY_COMPARE(QGuiApplication::focusWindow(),settings);QTest::keyClick(settings,Qt::Key_Escape);QTRY_VERIFY(!settings->isVisible());QTRY_COMPARE(QGuiApplication::focusWindow(),window);
+        }
+        QVERIFY(!reader->hasUnsavedChanges());
+    }
     void ordinaryDocumentEdgesUseSharedSpacingAndCanonicalAnchors_data() {
         QTest::addColumn<QString>("layout");QTest::addColumn<double>("percent");
         for(const auto &layout:{QString("Continuous"),QString("Facing")})
