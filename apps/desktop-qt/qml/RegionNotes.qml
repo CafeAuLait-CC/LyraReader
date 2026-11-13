@@ -8,6 +8,7 @@ Pane {
     id:notes
     objectName:"regionNotes"
     required property var app
+    readonly property bool tabTransferDialogVisible: exportFile.visible || remove.visible
     property var owner:null
     property var detail:null
     property var readId:0

@@ -403,8 +403,28 @@ ApplicationWindow {
     property bool closeApproved: false
     property int closingTab: -2
     property var pendingCloseReader: null
+    function tabTransferUiBlockReason() {
+        // Popups added by inspectors must be protected too. The invoking File menu
+        // may still be open during Action.triggered; its own panel is harmless.
+        const overlay=Overlay.overlay;
+        const menuPanel=mainFileMenu.contentItem ? mainFileMenu.contentItem.parent : null;
+        if(overlay)for(let i=0;i<overlay.children.length;++i) {
+            const panel=overlay.children[i];
+            if(panel.visible && panel.children.length && panel!==menuPanel)
+                return qsTr("Close the open dialog or panel before moving this tab. Its input stays here.");
+        }
+        if (closeApproved || closeOperation || closingTab!==-2 || pendingDocumentSave || printRequested || pendingAiReader || pendingAiPlan)
+            return qsTr("Finish or cancel the pending window operation before moving this tab.");
+        if (fileDialog.visible || passwordDialog.visible || dialogs.tabTransferDialogVisible || aiContent.tabTransferDialogVisible || contentController.tabTransferDialogVisible || fillTools.tabTransferDialogVisible || pageExports.visible || pageExports.tabTransferDialogVisible || regionNotes.tabTransferDialogVisible || redactionReview.visible || documentReadingPopup.visible || aiRegionCard.visible || regionNotes.visible)
+            return qsTr("Close the open dialog or panel before moving this tab. Its input stays here.");
+        if (placedTextController.active || placedTextController.waitingForCreation || contentController.inlineEditing || contentController.gesture || contentController.pending || contentController.transition || contentController.imageRequest || contentController.imageExportRequest || contentController.rasterRequest || annotationDraft || redactionDraft || eraseDraft.length || eraserToken.length || regionSelecting || readerChrome.tabDragActive || fillTool.length || annotationTool!=="select" || (activeFocusItem && activeFocusItem.inputMethodComposing))
+            return qsTr("Finish or cancel the active edit or tool before moving this tab.");
+        if (currentReader.pageCount>0 && (positionRestoring || pendingLayoutPosition || canvas.paperPlanning))
+            return qsTr("Wait for the reading position to settle before moving this tab.");
+        return "";
+    }
     function prepareForQuit() {
-        if (closeOperation || pendingDocumentSave || dialogs.closePromptVisible || dialogs.saveDialog.visible) return false;
+        if ((session && session.tabTransferInProgress) || closeOperation || pendingDocumentSave || dialogs.closePromptVisible || dialogs.saveDialog.visible) return false;
         const tabs=session?session.tabs:[{reader:currentReader}];
         tabs.forEach(tab=>tab.reader.flushAiRegionNote());
         if(tabs.some(tab=>tab.reader.hasUnsavedReadingNotes && !tab.reader.regionPersistencePending)){readingNotesBlockClose(-1);return false;}
@@ -569,6 +589,7 @@ ApplicationWindow {
     }
     onClosing: function (event) {
         if (closeApproved) return;
+        if (session && session.tabTransferInProgress) {event.accepted=false;return;}
         if (session && session.quitCoordinator.busy) {event.accepted=false;return;}
         if (secondaryRow==="edit" && contentController.deferAction({kind:"windowClose"})) {event.accepted=false;return;}
         cancelErase();
@@ -1919,6 +1940,13 @@ ApplicationWindow {
         onTriggered: root.showSettings()
     }
     Action {
+        id: detachTabAction
+        objectName: "moveTabToNewWindowAction"
+        text: qsTr("Move Tab to New Window")
+        enabled: !!root.session && currentReader.pageCount>0 && !root.session.tabTransferInProgress
+        onTriggered: root.session.detachActiveTab()
+    }
+    Action {
         id: zoomIn
         text: qsTr("Zoom In")
         shortcut: root.readerKeyboardEnabled ? StandardKey.ZoomIn : ""
@@ -2073,6 +2101,7 @@ ApplicationWindow {
         }
         Menu {
             id: mainFileMenu
+            objectName: "fileMenu"
             title: qsTr("&File")
             MenuItem {
                 action: openAction
@@ -2084,6 +2113,7 @@ ApplicationWindow {
                 objectName: "settingsMenuItem"
                 action: settingsAction
             }
+            MenuItem { action: detachTabAction }
             MenuSeparator {}
             MenuItem {
                 action: quitAction
@@ -2492,6 +2522,7 @@ ApplicationWindow {
         function onCloseTabRequested(index) {
             root.requestCloseTab(index);
         }
+        function onTabTransferFailed(reason) {root.operationStatus=reason;}
         function onActiveReaderAboutToChange() {
             root.currentReader.cancelIndexQueries();root.currentReader.flushAiRegionNote();
             regionNotes.close();aiRegionCard.close();root.currentReader.cancelAiRegionCapture();root.cancelRegionSelection();

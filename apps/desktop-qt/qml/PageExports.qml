@@ -7,6 +7,7 @@ Dialog {
     id: exportsDialog
     objectName: "pageExports"
     required property var app
+    readonly property bool tabTransferDialogVisible: appendPicker.visible || mergeDestination.visible || folderPicker.visible
     property var owner: null
     property bool merging: false
     property var additions: []

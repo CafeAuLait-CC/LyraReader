@@ -1,5 +1,6 @@
 #include "QuitCoordinator.h"
 #include "WorkspaceController.h"
+#include "LocalFileIdentity.h"
 #include <QCoreApplication>
 #include <QEvent>
 #include <QFileInfo>
@@ -9,7 +10,6 @@
 #include <QQuickItem>
 #include <QSet>
 #include <QJSValue>
-#include <filesystem>
 #include <algorithm>
 #include <vector>
 #include <QFutureWatcher>
@@ -17,23 +17,6 @@
 #include <QtConcurrentRun>
 #include <utility>
 
-namespace {
-bool sameFile(const QUrl &one,const QUrl &two) {
-    if(!one.isLocalFile() || !two.isLocalFile() || one.toLocalFile().isEmpty() || two.toLocalFile().isEmpty())return false;
-    const auto a=QFileInfo(one.toLocalFile()),b=QFileInfo(two.toLocalFile());
-    auto key=[](const QFileInfo &f){const auto canonical=f.canonicalFilePath();return canonical.isEmpty() ? QFileInfo(f.absolutePath()).canonicalFilePath()+QLatin1Char('/')+f.fileName() : canonical;};
-    if(key(a)==key(b))return true;
-    std::error_code error;
-    auto path=[](const QString &s){
-#ifdef Q_OS_WIN
-        return std::filesystem::path(s.toStdWString());
-#else
-        return std::filesystem::path(s.toStdString());
-#endif
-    };
-    return std::filesystem::equivalent(path(a.absoluteFilePath()),path(b.absoluteFilePath()),error) && !error;
-}
-}
 QuitCoordinator::QuitCoordinator(QObject *parent):QObject(parent) {
     m_timer.setInterval(30);
     connect(&m_timer,&QTimer::timeout,this,&QuitCoordinator::advance);
@@ -129,7 +112,7 @@ void QuitCoordinator::decide(const QString &decision) {
             const auto error=data.value(QStringLiteral("marks")).toMap().value(QStringLiteral("error")).toString();
             if(!error.isEmpty()){abort(error);return;}
             if(document.reader->aiState().value(QStringLiteral("running")).toBool()){abort(tr("Stop the active AI request before saving and quitting."));return;}
-            for(int j=0;j<i;++j)if(sameFile(document.source,m_documents[j].source)){abort(tr("The same PDF has unsaved changes in more than one tab or window. Save or discard one copy first. Nothing was saved."));return;}
+            for(int j=0;j<i;++j)if(sameLocalFile(document.source,m_documents[j].source)){abort(tr("The same PDF has unsaved changes in more than one tab or window. Save or discard one copy first. Nothing was saved."));return;}
         }
         askNextCopy();
     } else {
@@ -162,9 +145,9 @@ bool QuitCoordinator::preflightCopies() {
         if(!document.copy)continue;
         for(const auto &window:m_windows)if(window.workspace)for(const auto &tab:window.workspace->tabs()) {
             auto *reader=tab.toMap().value(QStringLiteral("reader")).value<ReaderController *>();
-            if(reader && (sameFile(document.destination,reader->fileUrl()) || sameFile(document.destination,QUrl::fromLocalFile(reader->data().value(QStringLiteral("document_revision")).toString())))) {abort(tr("A copy cannot overwrite any open original or working PDF. Nothing was saved."));return false;}
+            if(reader && (sameLocalFile(document.destination,reader->fileUrl()) || sameLocalFile(document.destination,QUrl::fromLocalFile(reader->data().value(QStringLiteral("document_revision")).toString())))) {abort(tr("A copy cannot overwrite any open original or working PDF. Nothing was saved."));return false;}
         }
-        for(int j=0;j<i;++j)if(m_documents[j].copy && sameFile(document.destination,m_documents[j].destination)){abort(tr("Two copies cannot use the same destination. Nothing was saved."));return false;}
+        for(int j=0;j<i;++j)if(m_documents[j].copy && sameLocalFile(document.destination,m_documents[j].destination)){abort(tr("Two copies cannot use the same destination. Nothing was saved."));return false;}
     }
     return true;
 }

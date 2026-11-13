@@ -18,6 +18,7 @@ Item {
     property int closeIndex: -1
     property var closeReader: null
     readonly property bool closePromptVisible: closeConfirmation.visible
+    readonly property bool tabTransferDialogVisible: closeConfirmation.visible || flattenNotice.visible || replaceConfirmation.visible || sidecarRecovery.visible || bookmarkEditor.visible || deletePages.visible || discardPages.visible || save.visible || settings.visible || information.visible || forms.visible || annotation.visible || annotationColor.visible || credential.visible
     function confirmClose(index) {
         closeIndex = index;
         closeReader=app.closeTarget(index);

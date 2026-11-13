@@ -2,6 +2,7 @@
 #include <QObject>
 #include <QString>
 #include <QList>
+#include <QSet>
 #include <functional>
 #include <memory>
 
@@ -12,6 +13,7 @@ class CredentialStore : public QObject {
 public:
     explicit CredentialStore(QObject *parent=nullptr);
     ~CredentialStore() override;
+    bool busy()const{return !m_pending.isEmpty();}
     Q_INVOKABLE quint64 read(const QString &account);
     Q_INVOKABLE quint64 write(const QString &account,const QString &secret);
     Q_INVOKABLE quint64 remove(const QString &account);
@@ -28,6 +30,7 @@ private:
     static void invalidateAccount(const QString &key);
     void selectAccount(const QString &key);
     quint64 m_sequence=0;
+    QSet<quint64> m_pending;
     quint64 m_epoch=0;
     QString m_account,m_secret;
     std::shared_ptr<PendingRead> m_read;

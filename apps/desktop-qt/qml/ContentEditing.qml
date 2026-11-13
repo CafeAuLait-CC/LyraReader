@@ -15,6 +15,7 @@ Item {
     property var rasterRequest: null
     property var imageRequest: null
     property var imageExportRequest:null
+    readonly property bool tabTransferDialogVisible: rasterConfirmation.visible || imageExportPicker.visible || imagePicker.visible
     readonly property var owner: app.currentReader
     readonly property var model: owner.data.content_objects || ({revision:"",page:-1,items:[]})
     readonly property var draft: owner.editDrafts.content || ({})

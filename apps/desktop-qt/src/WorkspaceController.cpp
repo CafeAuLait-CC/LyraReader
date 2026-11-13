@@ -1,12 +1,14 @@
 #include "WorkspaceController.h"
 #include "PdfPrintJob.h"
+#include "LocalFileIdentity.h"
 #include <QPrinter>
 #include <QPrintDialog>
 #include <QPointer>
-#include <filesystem>
 #include <QFileInfo>
 #include <QSettings>
 #include <QJSValue>
+#include <QQmlEngine>
+#include <QScopeGuard>
 #include <QClipboard>
 #include <QGuiApplication>
 #include <QWindow>
@@ -37,7 +39,8 @@ QString positionKey(const ReaderController *reader) {
 }
 }
 
-WorkspaceController::WorkspaceController(QObject *parent) : QObject(parent) {
+WorkspaceController::WorkspaceController(QObject *parent,CredentialStore *credentials) : QObject(parent),m_credentials(credentials ? credentials : new CredentialStore(this)) {
+    m_credentials->setParent(this);
     connect(m_preview,&PreviewController::externalRequested,this,&WorkspaceController::openExternal);
     QSettings settings;
     m_recent = normalizedRecents(settings.value(QStringLiteral("reader/recentDocuments")).toList());
@@ -55,13 +58,19 @@ void WorkspaceController::publishRecents(const QVariantList &entries) {
         workspace->m_recent=entries;emit workspace->recentDocumentsChanged();
     }
 }
-ReaderController *WorkspaceController::appendTab() {
+void WorkspaceController::connectReader(ReaderController *reader) {
+    m_readerConnections.insert(reader,{
+        connect(reader,&ReaderController::documentChanged,this,&WorkspaceController::tabsChanged),
+        connect(reader,&ReaderController::loadingChanged,this,&WorkspaceController::tabsChanged),
+        connect(reader,&ReaderController::openFinished,this,[this,reader](bool success){if(success)remember(reader);})
+    });
+}
+ReaderController *WorkspaceController::appendTab(bool notify) {
     auto *reader = new ReaderController(this);
+    QQmlEngine::setObjectOwnership(reader,QQmlEngine::CppOwnership);
     m_tabs.append(reader);
-    connect(reader, &ReaderController::documentChanged, this, &WorkspaceController::tabsChanged);
-    connect(reader, &ReaderController::loadingChanged, this, &WorkspaceController::tabsChanged);
-    connect(reader, &ReaderController::openFinished, this, [this,reader](bool success) { if (success) remember(reader); });
-    emit tabsChanged();
+    connectReader(reader);
+    if(notify)emit tabsChanged();
     return reader;
 }
 QVariantList WorkspaceController::tabs() const {
@@ -74,13 +83,14 @@ QVariantList WorkspaceController::tabs() const {
 }
 ReaderController *WorkspaceController::activeReader() const { return m_tabs.value(m_activeIndex); }
 void WorkspaceController::selectTab(int index) {
-    if (index < 0 || index >= m_tabs.size() || index == m_activeIndex) return;
+    if (m_tabTransfer || index < 0 || index >= m_tabs.size() || index == m_activeIndex) return;
     m_preview->close();
     emit activeReaderAboutToChange();
     m_activeIndex = index;
     emit activeReaderChanged();
 }
 bool WorkspaceController::moveTab(ReaderController *reader,ReaderController *before) {
+    if(m_tabTransfer)return false;
     auto destination=[&]() {
         const auto source=m_tabs.indexOf(reader),gap=before ? m_tabs.indexOf(before) : m_tabs.size();
         if(source<0 || gap<0)return qsizetype(-1);
@@ -100,9 +110,124 @@ bool WorkspaceController::moveTab(ReaderController *reader,ReaderController *bef
     if(guard)emit activeReaderChanged();
     return true;
 }
+QString WorkspaceController::tabTransferBlockReason()const {
+    const auto *reader=activeReader();
+    if(quitCoordinator()->busy())return tr("Finish or cancel quitting before moving a tab.");
+    if(m_credentials->busy())return tr("Wait for the credential operation to finish before moving a tab.");
+    if(m_printJobs)return tr("Wait for printing to finish before moving a tab.");
+    if(!reader || !reader->pageCount() || reader->fileUrl().isEmpty())return tr("Open a PDF before moving this tab.");
+    if(reader->loading() || reader->pendingCommands() || reader->regionPersistencePending())return tr("Wait for the document operation to finish before moving this tab.");
+    if(reader->hasUnsavedChanges() || reader->hasUnsavedReadingNotes())return tr("Save or review the unsaved changes before moving this tab. Nothing was moved.");
+    const auto readingPhase=reader->documentReading().value(QStringLiteral("phase")).toString();
+    if(reader->aiState().value(QStringLiteral("running")).toBool() || QStringList{QStringLiteral("preparing"),QStringLiteral("starting"),QStringLiteral("reading"),QStringLiteral("stopping")}.contains(readingPhase))
+        return tr("Stop the active AI request before moving this tab.");
+    for(const auto *other:m_tabs)if(other!=reader && sameLocalFile(other->fileUrl(),reader->fileUrl()))
+        return tr("The same PDF is open in another tab here. Close that copy before moving this tab.");
+    return {};
+}
+void WorkspaceController::detachActiveTab() {
+    if(m_tabTransfer)return;
+    emit detachActiveTabRequested();
+}
+QString WorkspaceController::transferActiveTabTo(WorkspaceController *target,QPointer<ReaderController> *emptySource) {
+    if(emptySource)*emptySource=nullptr;
+    const auto unavailable=tr("The reader windows changed while preparing the move. The tab was not moved.");
+    if(!target || target==this || m_tabTransfer || target->m_tabTransfer)return unavailable;
+    QPointer<WorkspaceController> source(this),destination(target);
+    QPointer<ReaderController> reader(activeReader()),placeholder(target->activeReader());
+    const auto sourceTabs=m_tabs,targetTabs=target->m_tabs;
+    const auto document=reader ? reader->documentHandle() : nullptr;
+    const auto generation=reader ? reader->documentGeneration() : 0;
+    const auto revision=reader ? reader->editRevision() : 0;
+    const auto unchanged=[&] {
+        return source && destination && reader && placeholder && source->m_tabs==sourceTabs && destination->m_tabs==targetTabs && source->activeReader()==reader && destination->activeReader()==placeholder &&
+            reader->documentHandle()==document && reader->documentGeneration()==generation && reader->editRevision()==revision &&
+            targetTabs.size()==1 && !placeholder->pageCount() && placeholder->fileUrl().isEmpty() && !placeholder->loading() && !placeholder->pendingCommands() && !placeholder->hasUnsavedChanges() && !placeholder->hasUnsavedReadingNotes();
+    };
+    QVariantMap sourceAiSettings,targetAiSettings;
+    auto windowReason=[&](WorkspaceController *workspace) {
+        for(auto *window:QGuiApplication::topLevelWindows())if(window->objectName()==QStringLiteral("readerWindow") && window->property("session").value<WorkspaceController *>()==workspace) {
+            if(workspace==source && !window->isVisible())return unavailable;
+            for(auto *child:QGuiApplication::topLevelWindows())if(child!=window && child->isVisible() && (child->flags() & Qt::WindowType_Mask)==Qt::Dialog) {
+                QSet<QWindow *> seen;
+                for(auto *parent=child->transientParent();parent && !seen.contains(parent);parent=parent->transientParent()) {
+                    if(parent==window)return tr("Close the child window before moving this tab. Its input stays here.");
+                    seen.insert(parent);
+                }
+            }
+            QVariant reason;
+            if(!QMetaObject::invokeMethod(window,"tabTransferUiBlockReason",Q_RETURN_ARG(QVariant,reason)))return tr("This reader window cannot prepare a tab move.");
+            const auto value=window->property("aiSettings");
+            const auto settings=(value.metaType()==QMetaType::fromType<QJSValue>() ? value.value<QJSValue>().toVariant() : value).toMap();
+            if(workspace==source)sourceAiSettings=settings;else targetAiSettings=settings;
+            return reason.toString();
+        }
+        return tr("A reader window is no longer available.");
+    };
+    const auto validate=[&]() -> QString {
+        if(!unchanged())return unavailable;
+        if(destination->m_credentials->busy())return tr("Wait for the new window's credential operation to finish before moving this tab.");
+        if(destination->m_printJobs)return tr("Wait for printing in the new window to finish before moving this tab.");
+        auto error=source->tabTransferBlockReason();
+        if(!error.isEmpty())return error;
+        error=windowReason(source);
+        if(!unchanged())return unavailable;
+        if(!error.isEmpty())return error;
+        error=windowReason(destination);
+        if(!unchanged())return unavailable;
+        if(!error.isEmpty())return error;
+        const auto ai=reader->aiState();
+        const bool prepared=(!ai.value(QStringLiteral("plan")).toMap().isEmpty() && !ai.value(QStringLiteral("planSent")).toBool()) || reader->documentReading().value(QStringLiteral("phase")).toString()==QStringLiteral("preview");
+        if(prepared && sourceAiSettings!=targetAiSettings)
+            return tr("The windows use different AI settings. Update Settings before moving a prepared request. Nothing was moved.");
+        return {};
+    };
+    if(const auto error=validate();!error.isEmpty())return error;
+    m_tabTransfer=target->m_tabTransfer=true;
+    const auto release=qScopeGuard([source,destination]{
+        if(source)source->m_tabTransfer=false;
+        if(destination)destination->m_tabTransfer=false;
+        if(source)emit source->tabTransferStateChanged();
+        if(destination)emit destination->tabTransferStateChanged();
+    });
+    emit tabTransferStateChanged();
+    if(!unchanged())return unavailable;
+    emit target->tabTransferStateChanged();
+    if(const auto error=validate();!error.isEmpty())return error;
+    emit activeReaderAboutToChange();
+    if(const auto error=validate();!error.isEmpty())return error;
+    emit target->activeReaderAboutToChange();
+    if(const auto error=validate();!error.isEmpty())return error;
+    m_preview->close();
+    if(!unchanged())return unavailable;
+    target->m_preview->close();
+    if(const auto error=validate();!error.isEmpty())return error;
+
+    // Commit ownership and both lists before emitting any model notification. The
+    // Reader (Rust document, immutable sources, workers, history and AI state) stays
+    // alive; no open/reset/generation bump or second PDF writer is introduced.
+    const auto oldIndex=m_activeIndex;
+    for(const auto &connection:m_readerConnections.take(reader))QObject::disconnect(connection);
+    for(const auto &connection:target->m_readerConnections.take(placeholder))QObject::disconnect(connection);
+    const auto view=m_views.take(reader);
+    m_tabs.removeAt(oldIndex);
+    if(m_tabs.isEmpty()){auto *blank=appendTab(false);if(emptySource)*emptySource=blank;}
+    m_activeIndex=qBound(0,oldIndex,int(m_tabs.size())-1);
+    target->m_views.remove(placeholder);
+    target->m_tabs={reader};target->m_activeIndex=0;
+    target->m_views.insert(reader,view);
+    reader->setParent(target);
+    target->connectReader(reader);
+    placeholder->deleteLater();
+    emit tabsChanged();
+    if(source)emit source->activeReaderChanged();
+    if(destination)emit destination->tabsChanged();
+    if(destination)emit destination->activeReaderChanged();
+    return {};
+}
 void WorkspaceController::openFiles(const QList<QUrl> &urls) { for (const auto &url : urls) openFile(url); }
 void WorkspaceController::openFile(const QUrl &url) {
-    if (!url.isLocalFile()) return;
+    if (m_tabTransfer || !url.isLocalFile()) return;
     const auto path = QFileInfo(url.toLocalFile()).absoluteFilePath();
     for (int i = 0; i < m_tabs.size(); ++i) {
         if (m_tabs.at(i)->fileUrl().toLocalFile() == path) { selectTab(i); return; }
@@ -119,11 +244,12 @@ void WorkspaceController::requestQuit() {
 }
 
 void WorkspaceController::newTab() {
+    if(m_tabTransfer)return;
     appendTab();
     selectTab(int(m_tabs.size()) - 1);
 }
 void WorkspaceController::closeTab(int index, bool discardPending) {
-    if (index < 0 || index >= m_tabs.size()) return;
+    if (m_tabTransfer || index < 0 || index >= m_tabs.size()) return;
     auto *candidate=m_tabs.at(index);
     candidate->flushAiRegionNote();
     const auto marks=candidate->data().value(QStringLiteral("marks")).toMap();
@@ -135,6 +261,7 @@ void WorkspaceController::closeTab(int index, bool discardPending) {
     if(candidate==activeReader())m_preview->close();
     emit activeReaderAboutToChange();
     auto *reader = m_tabs.takeAt(index);
+    m_readerConnections.remove(reader);
     m_views.remove(reader);
     reader->deleteLater(); // Outstanding workers own their Rust handles independently.
     if (m_tabs.isEmpty()) appendTab();
@@ -209,26 +336,42 @@ QString WorkspaceController::writeTextFile(const QUrl &url,const QString &text) 
 
 void WorkspaceController::printDocument(ReaderController *reader,int currentPage) {
     if(!reader || !reader->pageCount())return;
+    if(m_tabTransfer){emit printFinished(tr("Wait for the tab move to finish before printing."));return;}
     if(reader->pendingCommands()>0){emit printFinished(tr("Wait for the document operation to finish before printing."));return;}
     const auto document=reader->documentHandle();
     const auto pages=reader->pages();
-    const auto original=reader->fileUrl().toLocalFile();
+    const auto revision=reader->editRevision();
+    const QPointer<WorkspaceController> owner(this);
+    const QPointer<ReaderController> readerGuard(reader);
     auto printer=std::make_shared<QPrinter>(QPrinter::HighResolution);
     printer->setDocName(reader->title());
     QPrintDialog dialog(printer.get());
     dialog.setMinMax(1,int(pages.size()));
     dialog.setOption(QAbstractPrintDialog::PrintPageRange,true);
     dialog.setOption(QAbstractPrintDialog::PrintCurrentPage,true);
-    if(dialog.exec()!=QDialog::Accepted)return;
+    ++m_printJobs;
+    const auto result=dialog.exec();
+    if(!owner)return;
+    --owner->m_printJobs;
+    if(result!=QDialog::Accepted)return;
+    if(!readerGuard || readerGuard->documentHandle()!=document || readerGuard->editRevision()!=revision) {
+        emit owner->printFinished(tr("The document changed while the print dialog was open. Open Print again."));return;
+    }
+    owner->printDocumentToDevice(readerGuard,printer,currentPage);
+}
+void WorkspaceController::printDocumentToDevice(ReaderController *reader,const std::shared_ptr<QPrinter> &printer,int currentPage,bool showProgress) {
+    if(!reader || !printer || !m_tabs.contains(reader) || !reader->pageCount())return;
+    if(m_tabTransfer){emit printFinished(tr("Wait for the tab move to finish before printing."));return;}
+    if(reader->pendingCommands()>0){emit printFinished(tr("Wait for the document operation to finish before printing."));return;}
     if(!printer->outputFileName().isEmpty()) {
-        const auto destination=QFileInfo(printer->outputFileName());
-        std::error_code error;
-        if(destination.absoluteFilePath()==QFileInfo(original).absoluteFilePath() ||
-            std::filesystem::equivalent(std::filesystem::u8path(original.toUtf8().constData()),
-                std::filesystem::u8path(destination.absoluteFilePath().toUtf8().constData()),error)) {
+        const auto destination=QUrl::fromLocalFile(printer->outputFileName());
+        if(sameLocalFile(destination,reader->fileUrl()) || sameLocalFile(destination,QUrl::fromLocalFile(reader->data().value(QStringLiteral("document_revision")).toString()))) {
             emit printFinished(tr("Printing cannot overwrite the original PDF. Choose another destination."));return;
         }
     }
     const auto owner=QPointer<WorkspaceController>(this);
-    PdfPrintJob::start(document,pages,printer,currentPage,[owner](const QString &error){if(owner)emit owner->printFinished(error);});
+    ++m_printJobs;
+    PdfPrintJob::start(reader->documentHandle(),reader->pages(),printer,currentPage,[owner](const QString &error){
+        if(owner){--owner->m_printJobs;emit owner->printFinished(error);}
+    },showProgress);
 }

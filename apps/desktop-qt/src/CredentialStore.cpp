@@ -13,7 +13,12 @@ QString accountKey(const QString &account) {
     return QString::fromLatin1(QCryptographicHash::hash(url.toEncoded(),QCryptographicHash::Sha256).toHex());
 }
 }
-CredentialStore::CredentialStore(QObject *parent):QObject(parent){stores().append(this);}
+CredentialStore::CredentialStore(QObject *parent):QObject(parent){
+    stores().append(this);
+    // Retire each logical request before its UI listeners run. Invalidating the
+    // session does not cancel an outstanding vault write or a queued cache hit.
+    connect(this,&CredentialStore::finished,this,[this](quint64 id,const QString &,const QString &,const QString &){m_pending.remove(id);});
+}
 CredentialStore::~CredentialStore(){stores().removeAll(this);}
 void CredentialStore::clearSession() {
     ++m_epoch;m_account.clear();m_secret.clear();m_read.reset();
@@ -27,6 +32,7 @@ void CredentialStore::invalidateAccount(const QString &key) {
 }
 quint64 CredentialStore::read(const QString &account) {
     const auto id=++m_sequence;
+    m_pending.insert(id);
     const auto key=accountKey(account);selectAccount(key);
     const auto epoch=m_epoch;
     if(!m_secret.isEmpty()) {
@@ -55,7 +61,7 @@ quint64 CredentialStore::read(const QString &account) {
     return id;
 }
 quint64 CredentialStore::write(const QString &account,const QString &secret) {
-    const auto id=++m_sequence;const auto key=accountKey(account);invalidateAccount(key);selectAccount(key);
+    const auto id=++m_sequence;m_pending.insert(id);const auto key=accountKey(account);invalidateAccount(key);selectAccount(key);
     const auto epoch=m_epoch;const QPointer<CredentialStore> guard(this);
     startVault(VaultOperation::Write,key,secret,[guard,id,key,epoch,secret](QString,QString error) {
         if(!guard)return;
@@ -67,7 +73,7 @@ quint64 CredentialStore::write(const QString &account,const QString &secret) {
     return id;
 }
 quint64 CredentialStore::remove(const QString &account) {
-    const auto id=++m_sequence;const auto key=accountKey(account);invalidateAccount(key);
+    const auto id=++m_sequence;m_pending.insert(id);const auto key=accountKey(account);invalidateAccount(key);
     const QPointer<CredentialStore> guard(this);
     startVault(VaultOperation::Remove,key,{},[guard,id,key](QString,QString error) {
         if(!guard)return;

@@ -8,6 +8,7 @@
 #include "ContentDragItem.h"
 #include "ReaderController.h"
 #include "WorkspaceController.h"
+#include "ReaderWindowFactory.h"
 #include "QuitCoordinator.h"
 #include "AnnotationOverlay.h"
 #include "NativeRaster.h"
@@ -22,7 +23,6 @@
 #include <QSGRendererInterface>
 #include <QStandardPaths>
 #include <QTimer>
-#include <functional>
 
 static const char *graphicsName(QSGRendererInterface::GraphicsApi api) {
     switch (api) {
@@ -80,32 +80,14 @@ int main(int argc, char **argv) {
     qmlRegisterType<CropItem>("LyraReader",1,0,"PdfCrop");
     qmlRegisterType<ContentDragItem>("LyraReader",1,0,"ContentDragPreview");
     qmlRegisterType<AnnotationOverlay>("LyraReader",1,0,"PdfAnnotations");
-    std::function<QQuickWindow *(const QUrl &,int,double)> createWindow;
-    createWindow = [&](const QUrl &url,int page,double y) -> QQuickWindow * {
-        auto *engine = new QQmlApplicationEngine(&application);
-        engine->addImageProvider(QStringLiteral("lyrapreview"),new NativeImageProvider);
-        auto *workspace = new WorkspaceController(engine);
-        engine->rootContext()->setContextProperty(QStringLiteral("workspace"),workspace);
-        engine->rootContext()->setContextProperty(QStringLiteral("reader"),workspace->activeReader());
-        engine->load(QUrl(QStringLiteral("qrc:/qml/Main.qml")));
-        if (engine->rootObjects().isEmpty()) { delete engine; return nullptr; }
-        auto *created = qobject_cast<QQuickWindow *>(engine->rootObjects().first());
-        if (!created) { delete engine; return nullptr; }
-        created->setPersistentSceneGraph(false);
-        created->setProperty("requestedPage",page);
-        created->setProperty("requestedY",y);
-        QObject::connect(workspace,&WorkspaceController::newWindowRequested,&application,[&](const QUrl &file,int targetPage,double targetY) {createWindow(file,targetPage,targetY);});
-        QObject::connect(created,&QQuickWindow::closing,engine,[engine,created] {
-            QTimer::singleShot(0,engine,[engine,created] { if(!created->isVisible())engine->deleteLater(); });
-        });
+    ReaderWindowFactory windows;
+    QObject::connect(&windows,&ReaderWindowFactory::windowCreated,&application,[](QQuickWindow *created) {
         QObject::connect(created,&QQuickWindow::sceneGraphInitialized,created,[created] {
             qInfo()<<"lyra-reader-qt-backend:"<<QGuiApplication::platformName()
                    <<"graphicsApi="<<graphicsName(created->rendererInterface()->graphicsApi());
         },Qt::DirectConnection);
-        if (!url.isEmpty()) workspace->openFile(url);
-        return created;
-    };
-    auto *window=createWindow({},-1,0);
+    });
+    auto *window=windows.createWindow();
     if (!window) return 1;
     const auto files = parser.positionalArguments();
     if (!files.isEmpty()) {
@@ -136,8 +118,6 @@ int main(int argc, char **argv) {
         });
     }
     const int result=application.exec();
-    // Destroy QML windows and their platform/theme connections while QApplication
-    // services are still alive, rather than in QObject's later child cleanup.
-    qDeleteAll(application.findChildren<QQmlApplicationEngine *>(QString{},Qt::FindDirectChildrenOnly));
+    // The window factory destroys its QML engines before QApplication services.
     return result;
 }

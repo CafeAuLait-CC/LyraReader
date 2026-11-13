@@ -4,6 +4,7 @@
 #include "PreviewController.h"
 #include <QVariantList>
 #include "QuitCoordinator.h"
+class QPrinter;
 
 // Native window session. Tabs retain their own document, raster cache and view state.
 class WorkspaceController : public QObject {
@@ -15,8 +16,10 @@ class WorkspaceController : public QObject {
     Q_PROPERTY(PreviewController *preview READ preview CONSTANT)
     Q_PROPERTY(CredentialStore *credentials READ credentials CONSTANT)
     Q_PROPERTY(QuitCoordinator *quitCoordinator READ quitCoordinator CONSTANT)
+    Q_PROPERTY(bool tabTransferInProgress READ tabTransferInProgress NOTIFY tabTransferStateChanged)
 public:
-    explicit WorkspaceController(QObject *parent = nullptr);
+    // Takes ownership of an optional platform vault adapter.
+    explicit WorkspaceController(QObject *parent=nullptr,CredentialStore *credentials=nullptr);
     ~WorkspaceController() override;
     QVariantList tabs() const;
     ReaderController *activeReader() const;
@@ -27,10 +30,15 @@ public:
     QuitCoordinator *quitCoordinator()const;
     static QList<WorkspaceController *> allWorkspaces();
     Q_INVOKABLE void printDocument(ReaderController *reader, int currentPage = 0);
+    void printDocumentToDevice(ReaderController *reader,const std::shared_ptr<QPrinter> &printer,int currentPage=0,bool showProgress=true);
     Q_INVOKABLE void openFiles(const QList<QUrl> &urls);
     Q_INVOKABLE void openFile(const QUrl &url);
     Q_INVOKABLE void selectTab(int index);
     Q_INVOKABLE bool moveTab(ReaderController *reader, ReaderController *before);
+    Q_INVOKABLE void detachActiveTab();
+    bool tabTransferInProgress()const{return m_tabTransfer;}
+    QString tabTransferBlockReason()const;
+    QString transferActiveTabTo(WorkspaceController *target,QPointer<ReaderController> *emptySource=nullptr);
     Q_INVOKABLE void closeTab(int index, bool discardPending = false);
     Q_INVOKABLE void newTab();
     Q_INVOKABLE void requestQuit();
@@ -52,14 +60,21 @@ signals:
     void activeReaderAboutToChange();
     void recentDocumentsChanged();
     void newWindowRequested(const QUrl &url, int page, double y);
+    void detachActiveTabRequested();
+    void tabTransferFailed(const QString &reason);
+    void tabTransferStateChanged();
 private:
-    ReaderController *appendTab();
+    ReaderController *appendTab(bool notify=true);
+    void connectReader(ReaderController *reader);
     void remember(ReaderController *reader);
     static void publishRecents(const QVariantList &entries);
     QList<ReaderController *> m_tabs;
     QHash<ReaderController *, QVariantMap> m_views;
+    QHash<ReaderController *, QList<QMetaObject::Connection>> m_readerConnections;
+    bool m_tabTransfer=false;
+    int m_printJobs=0;
     QVariantList m_recent;
     int m_activeIndex = 0;
     PreviewController *m_preview = new PreviewController(this);
-    CredentialStore *m_credentials = new CredentialStore(this);
+    CredentialStore *m_credentials=nullptr;
 };

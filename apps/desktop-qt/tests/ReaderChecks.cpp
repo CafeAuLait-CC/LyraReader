@@ -20,6 +20,7 @@
 #include <QSysInfo>
 #include <QUuid>
 #include <QPrinter>
+#include <QPrintDialog>
 #include <QPainter>
 #include <QPdfWriter>
 #include <QScopeGuard>
@@ -29,6 +30,7 @@
 #include "RasterCache.h"
 #include "AnnotationOverlay.h"
 #include "WorkspaceController.h"
+#include "ReaderWindowFactory.h"
 #include <QApplication>
 #include <QClipboard>
 #include <QBuffer>
@@ -330,6 +332,229 @@ private slots:
         QCOMPARE(lifetime.lock(),reader->renderSource());reader->openFile(reader->fileUrl());
         QTRY_VERIFY_WITH_TIMEOUT(!reader->loading() && reader->pageCount()==2 && reader->pendingCommands()==0,10000);
         QTRY_VERIFY_WITH_TIMEOUT(lifetime.expired(),10000);
+    }
+    void movingAnActiveTabKeepsItsReaderAcrossEnginesAndClosesOnlyTheEmptySource_data() {
+        QTest::addColumn<QString>("layout");QTest::newRow("Continuous")<<QString("Continuous");QTest::newRow("Facing")<<QString("Facing");
+    }
+    void movingAnActiveTabKeepsItsReaderAcrossEnginesAndClosesOnlyTheEmptySource() {
+        QFETCH(QString,layout);
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("move-nine-pages.pdf");
+        QVERIFY(QFile::copy(QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf",path));
+        const auto residentBefore=RenderBudget::statistics().value("residentBytes").toLongLong(),textureBefore=RenderBudget::statistics().value("textureBytes").toLongLong();
+        ReaderWindowFactory windows;QList<QPointer<QQuickWindow>> created;
+        connect(&windows,&ReaderWindowFactory::windowCreated,this,[&](QQuickWindow *window){created.append(window);});
+        QPointer<QQuickWindow> source(windows.createWindow());QVERIFY(source);
+        auto *workspace=source->property("session").value<WorkspaceController *>();QVERIFY(workspace);
+        QPointer<WorkspaceController> oldWorkspace(workspace);workspace->openFile(QUrl::fromLocalFile(path));
+        QPointer<ReaderController> reader(workspace->activeReader());
+        QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()==9 && !reader->loading() && !reader->pendingCommands(),15000);
+        QVERIFY(settleReaderViewport(source));source->setProperty("pageGap",38);QVERIFY(QMetaObject::invokeMethod(source,"setPageLayout",Q_ARG(QVariant,layout)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(settleReaderViewport(source));QCOMPARE(reader->layoutConfiguration().value("mode").toString(),layout);source->setProperty("fitting",false);source->setProperty("zoom",1.37);
+        QVERIFY(QMetaObject::invokeMethod(source,"navigate",Q_ARG(QVariant,5),Q_ARG(QVariant,170)));
+        QVERIFY(settleReaderViewport(source));QVERIFY(QMetaObject::invokeMethod(source,"saveReadingPosition"));
+        const auto position=workspace->viewState(reader);QVERIFY(position.contains("viewportAnchor"));const auto oldWidth=visualItem(source->contentItem(),"pageList")->width();
+        const auto handle=reader->documentHandle();const auto generation=reader->documentGeneration();const auto revision=reader->editRevision();
+        auto immutable=reader->renderSource();QVERIFY(immutable);QSignalSpy opened(reader,&ReaderController::openFinished),reset(reader,&ReaderController::documentReset);
+        auto *action=source->findChild<QObject *>("moveTabToNewWindowAction");QVERIFY(action);QVERIFY(action->property("enabled").toBool());
+        QVERIFY(QMetaObject::invokeMethod(action,"trigger"));
+        QCOMPARE(created.size(),2);QPointer<QQuickWindow> target(created.last());QVERIFY(target && target!=source);
+        auto *destination=target->property("session").value<WorkspaceController *>();QVERIFY(destination);
+        QCOMPARE(destination->activeReader(),reader.data());QCOMPARE(reader->parent(),destination);QCOMPARE(QQmlEngine::objectOwnership(reader),QQmlEngine::CppOwnership);
+        QTRY_VERIFY_WITH_TIMEOUT(source.isNull() && oldWorkspace.isNull(),10000);QVERIFY(reader);
+        QCOMPARE(reader->documentHandle(),handle);QCOMPARE(reader->documentGeneration(),generation);QCOMPARE(reader->editRevision(),revision);
+        QCOMPARE(reader->renderSource(),immutable);QCOMPARE(opened.count(),0);QCOMPARE(reset.count(),0);
+        QVERIFY(target->isVisible());QVERIFY(!target->transientParent());QCOMPARE(target->flags() & Qt::WindowType_Mask,Qt::Window);
+        QVERIFY(settleReaderViewport(target));QCOMPARE(target->property("layoutMode").toString(),layout);QCOMPARE(target->property("pageGap").toDouble(),38.0);QCOMPARE(target->property("fitting").toBool(),false);QVERIFY(std::abs(target->property("zoom").toDouble()-1.37)<1e-9);
+        QVERIFY(QMetaObject::invokeMethod(target,"saveReadingPosition"));const auto restored=destination->viewState(reader);
+        const auto anchor=position.value("viewportAnchor").toMap(),actual=restored.value("viewportAnchor").toMap();
+        QCOMPARE(actual.value("page"),anchor.value("page"));QVERIFY2(std::abs(actual.value("y").toDouble()-anchor.value("y").toDouble())<2,qPrintable(QString::fromUtf8(QJsonDocument::fromVariant(restored).toJson())));
+        if(visualItem(target->contentItem(),"pageList")->width()==oldWidth)QVERIFY(std::abs(restored.value("documentX").toDouble()-position.value("documentX").toDouble())<2);
+        QString error;QVERIFY(!immutable->crop(5,QRectF(0,0,120,80),.5,false,false,&error).isNull());QVERIFY2(error.isEmpty(),qPrintable(error));
+        reader->requestText(5);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(!reader->textPages().value("5").toMap().value("text").toString().isEmpty());
+        const auto shot=qEnvironmentVariable("LYRA_READER_TAB_MOVE_SNAPSHOT");if(!shot.isEmpty()){const QFileInfo file(shot);QVERIFY(target->grabWindow().save(file.path()+"/"+file.completeBaseName()+"-"+layout+".png"));}
+        QVERIFY(target->close());QTRY_VERIFY_WITH_TIMEOUT(target.isNull() && reader.isNull(),10000);
+        QVERIFY(!immutable->crop(0,QRectF(0,0,80,80),.5,false,false,&error).isNull());QVERIFY(error.isEmpty());
+        QTRY_VERIFY_WITH_TIMEOUT(RenderBudget::statistics().value("residentBytes").toLongLong()<=residentBefore,10000);
+        QTRY_VERIFY_WITH_TIMEOUT(RenderBudget::statistics().value("textureBytes").toLongLong()<=textureBefore,10000);
+    }
+    void movingOneOfSeveralTabsRewiresNotificationsAndPreservesUndoHistory() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());ReaderWindowFactory windows;
+        auto *source=windows.createWindow();auto *target=windows.createWindow({},-1,0,false);QVERIFY(source && target);
+        auto *origin=source->property("session").value<WorkspaceController *>(),*destination=target->property("session").value<WorkspaceController *>();
+        QList<ReaderController *> readers;for(const auto &name:{"first","second"}) {
+            const auto path=scratch.filePath(QString(name)+".pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));origin->openFile(QUrl::fromLocalFile(path));readers.append(origin->activeReader());
+            QTRY_VERIFY_WITH_TIMEOUT(readers.last()->pageCount()==1 && !readers.last()->loading() && !readers.last()->pendingCommands(),10000);
+        }
+        auto *reader=readers.last();reader->submit("page_stage",{{"operation",QVariantMap{{"Rotate",QVariantMap{{"pages",QVariantList{0}},{"quarter_turns",1}}}}}});
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);reader->submit("page_undo");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY(!reader->hasUnsavedChanges());
+        QVERIFY(settleReaderViewport(source));const auto handle=reader->documentHandle();const auto marks=reader->data().value("marks").toMap();
+        QCOMPARE(origin->transferActiveTabTo(destination),QString{});target->show();QCOMPARE(origin->tabs().size(),1);QCOMPARE(origin->activeReader(),readers.first());QVERIFY(source->isVisible());
+        QCOMPARE(destination->activeReader(),reader);QCOMPARE(reader->documentHandle(),handle);QCOMPARE(reader->data().value("marks").toMap(),marks);
+        QSignalSpy sourceChanges(origin,&WorkspaceController::tabsChanged),targetChanges(destination,&WorkspaceController::tabsChanged);
+        // The production open-finished connection must also remember only at the new owner.
+        emit reader->documentChanged();QCOMPARE(sourceChanges.count(),0);QCOMPARE(targetChanges.count(),1);
+        reader->submit("page_redo");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY(reader->hasUnsavedChanges());QVERIFY(reader->pages().first().toMap().value("width").toDouble()>reader->pages().first().toMap().value("height").toDouble());
+        reader->submit("page_undo");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY(!reader->hasUnsavedChanges());
+        QPointer<QQuickWindow> old(source);QVERIFY(source->close());QTRY_VERIFY(old.isNull());reader->requestText(0);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(!reader->textPages().value("0").toMap().isEmpty());
+    }
+    void tabMovesRefuseDraftsWindowDialogsAndLateCredentialIntentWithoutWriting() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("move-protected.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        const auto original=[&]{QFile f(path);if(!f.open(QIODevice::ReadOnly))return QByteArray{};return f.readAll();}();QVERIFY(!original.isEmpty());
+        ReaderWindowFactory windows;auto *source=windows.createWindow();auto *target=windows.createWindow({},-1,0,false);QVERIFY(source && target);
+        auto *origin=source->property("session").value<WorkspaceController *>(),*destination=target->property("session").value<WorkspaceController *>();origin->openFile(QUrl::fromLocalFile(path));auto *reader=origin->activeReader();
+        QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands(),10000);QVERIFY(settleReaderViewport(source));
+        const auto handle=reader->documentHandle();const auto generation=reader->documentGeneration();
+        for(const auto &key:{"forms","content"}){const QVariantMap draft{{"synthetic","kept"}};reader->setEditDraft(key,draft);QVERIFY(!origin->transferActiveTabTo(destination).isEmpty());QCOMPARE(reader->editDrafts().value(key).toMap(),draft);QCOMPARE(origin->activeReader(),reader);QCOMPARE(destination->activeReader()->pageCount(),0);reader->setEditDraft(key,{});}
+        reader->setNoteDraft("synthetic-note","retained note");QVERIFY(!origin->transferActiveTabTo(destination).isEmpty());QCOMPARE(reader->noteDrafts().value("synthetic-note").toString(),QString("retained note"));reader->clearNoteDraft("synthetic-note");
+        for(const auto &property:{"pendingAiReader","pendingDocumentSave","annotationDraft","pendingSignatureImage"}) {
+            // Armed artwork is protected through its tool, rather than an orphaned image value.
+            if(QByteArray(property)=="pendingSignatureImage"){source->setProperty("fillTool","signature");source->setProperty(property,QVariantMap{{"synthetic",true}});}
+            else source->setProperty(property,QByteArray(property)=="pendingAiReader" ? QVariant::fromValue(reader) : QVariant(QVariantMap{{"synthetic",true}}));
+            QVERIFY2(!origin->transferActiveTabTo(destination).isEmpty(),property);QCOMPARE(reader->parent(),origin);QCOMPARE(reader->documentHandle(),handle);QCOMPARE(reader->documentGeneration(),generation);
+            source->setProperty(property,QVariant::fromValue(nullptr));source->setProperty("fillTool","");
+        }
+        QVERIFY(QMetaObject::invokeMethod(source,"showSettings"));auto *settings=source->findChild<QQuickWindow *>("settingsWindow");QVERIFY(settings);QTRY_VERIFY(settings->isVisible());
+        QVERIFY(!origin->transferActiveTabTo(destination).isEmpty());QVERIFY(settings->isVisible());QVERIFY(settings->close());QTRY_VERIFY(!settings->isVisible());
+        source->setProperty("annotationTool","select");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(settleReaderViewport(source));
+        reader->submit("bookmark_create",{{"page",0},{"title","Do not move this draft"},{"yPt",20}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(reader->hasUnsavedChanges());
+        QSignalSpy failures(origin,&WorkspaceController::tabTransferFailed),opened(&windows,&ReaderWindowFactory::windowCreated);origin->detachActiveTab();QCOMPARE(failures.count(),1);QCOMPARE(opened.count(),0);QVERIFY(source->isVisible());
+        QFile file(path);QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),original);QCOMPARE(origin->activeReader(),reader);
+    }
+    void tabMovesWaitForVaultWritesAndQueuedCacheHitsWithoutAccessingTheSystemVault() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("vault-move.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        auto *vault=new FakeCredentialStore;WorkspaceController origin(nullptr,vault);QQmlApplicationEngine engine;
+        engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&origin);engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *source=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(source);
+        ReaderWindowFactory windows;auto *target=windows.createWindow({},-1,0,false);QVERIFY(target);auto *destination=target->property("session").value<WorkspaceController *>();
+        origin.openFile(QUrl::fromLocalFile(path));auto *reader=origin.activeReader();QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands(),10000);QVERIFY(settleReaderViewport(source));
+        const QString account="https://tab-move-vault.invalid/v1";
+        vault->write(account,"synthetic-only");QVERIFY(vault->busy());vault->clearSession();QVERIFY(vault->busy());QVERIFY(origin.transferActiveTabTo(destination).contains("credential"));QCOMPARE(reader->parent(),&origin);vault->reply(0);QVERIFY(!vault->busy());
+        vault->read(account);vault->read(account);QCOMPARE(vault->requests.size(),2);QVERIFY(vault->busy());vault->reply(1,"synthetic-only");QVERIFY(!vault->busy());
+        vault->read(account);QCOMPARE(vault->requests.size(),2);QVERIFY(vault->busy());QVERIFY(origin.transferActiveTabTo(destination).contains("credential"));QCOMPARE(reader->parent(),&origin);QTRY_VERIFY(!vault->busy());
+        vault->remove(account);QVERIFY(vault->busy());QVERIFY(origin.transferActiveTabTo(destination).contains("credential"));vault->reply(2);QVERIFY(!vault->busy());
+        QCOMPARE(origin.transferActiveTabTo(destination),QString{});QCOMPARE(destination->activeReader(),reader);
+    }
+    void tabMovesWaitForTheirPrintJobAndKeepTheOriginalPdfUntouched() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("print-before-move.pdf"),output=scratch.filePath("printed.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        QFile original(path);QVERIFY(original.open(QIODevice::ReadOnly));const auto bytes=original.readAll();original.close();
+        ReaderWindowFactory windows;auto *source=windows.createWindow();auto *target=windows.createWindow({},-1,0,false);QVERIFY(source && target);
+        auto *origin=source->property("session").value<WorkspaceController *>(),*destination=target->property("session").value<WorkspaceController *>();origin->openFile(QUrl::fromLocalFile(path));auto *reader=origin->activeReader();
+        QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands(),10000);QVERIFY(settleReaderViewport(source));
+        auto printer=std::make_shared<QPrinter>(QPrinter::HighResolution);printer->setOutputFormat(QPrinter::PdfFormat);printer->setOutputFileName(output);
+        QSignalSpy finished(origin,&WorkspaceController::printFinished);origin->printDocumentToDevice(reader,printer,0,false);
+        QVERIFY(origin->transferActiveTabTo(destination).contains("printing"));QCOMPARE(reader->parent(),origin);QVERIFY(source->isVisible());
+        QTRY_COMPARE_WITH_TIMEOUT(finished.count(),1,20000);QVERIFY2(finished.first().first().toString().isEmpty(),qPrintable(finished.first().first().toString()));QVERIFY(QFileInfo(output).size()>0);
+        QTimer rejector;rejector.setSingleShot(true);bool sawPrintDialog=false;QString moveDuringDialog;
+        connect(&rejector,&QTimer::timeout,&rejector,[&]{for(auto *widget:QApplication::topLevelWidgets())if(auto *dialog=qobject_cast<QPrintDialog *>(widget)){sawPrintDialog=true;moveDuringDialog=origin->transferActiveTabTo(destination);dialog->reject();}});
+        rejector.start(0);origin->printDocument(reader);rejector.stop();QVERIFY(sawPrintDialog);QVERIFY2(moveDuringDialog.contains("printing"),qPrintable(moveDuringDialog));QCOMPARE(reader->parent(),origin);
+        printer->setOutputFileName(path);origin->printDocumentToDevice(reader,printer,0,false);QCOMPARE(finished.count(),2);QVERIFY(finished.last().first().toString().contains("cannot overwrite"));
+        QVERIFY(original.open(QIODevice::ReadOnly));QCOMPARE(original.readAll(),bytes);original.close();
+        ReaderController printed;printed.openFile(QUrl::fromLocalFile(output));QTRY_VERIFY_WITH_TIMEOUT(printed.pageCount()==1 && !printed.loading() && !printed.pendingCommands(),10000);
+        QCOMPARE(origin->transferActiveTabTo(destination),QString{});QCOMPARE(destination->activeReader(),reader);
+    }
+    void tabMoveKeepsAiStateAfterPendingVaultAndRunningRequestsAreRefused() {
+        MockChatServer server;QVERIFY(server.listen());server.responses.append({{MockChatServer::delta({{"content","Completed answer stays with the same reader"}}),QByteArray("data: [DONE]\n\n")},300});
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("move-ai.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        ReaderWindowFactory windows;QPointer<QQuickWindow> source(windows.createWindow());auto *target=windows.createWindow({},-1,0,false);QVERIFY(source && target);
+        auto *origin=source->property("session").value<WorkspaceController *>(),*destination=target->property("session").value<WorkspaceController *>();origin->openFile(QUrl::fromLocalFile(path));auto *reader=origin->activeReader();
+        QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands(),10000);QVERIFY(settleReaderViewport(source));
+        source->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","move-mock"}});reader->setAiInput("action",0);reader->setAiInput("question","Unsent question is retained");
+        auto *panel=source->findChild<QObject *>("aiPanel");QVERIFY(panel);QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));
+        QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("plan").toMap().isEmpty() && !reader->pendingCommands(),10000);const auto plan=reader->aiState().value("plan").toMap();
+        source->setProperty("credentialReadId",123);source->setProperty("pendingAiReader",QVariant::fromValue(reader));source->setProperty("pendingAiPlan",plan);
+        QVERIFY(!origin->transferActiveTabTo(destination).isEmpty());QCOMPARE(reader->parent(),origin);QCOMPARE(server.requests.size(),0);
+        // Exercise the production window-level completion connection without reading
+        // a system credential. A refused move leaves this intent at its source.
+        emit origin->credentials()->finished(123,"read","local",{});
+        QTRY_COMPARE_WITH_TIMEOUT(server.requests.size(),1,10000);QTRY_VERIFY(reader->aiState().value("running").toBool());QVERIFY(!origin->transferActiveTabTo(destination).isEmpty());QCOMPARE(reader->parent(),origin);
+        QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool() && !reader->pendingCommands(),10000);QVERIFY(reader->aiState().value("output").toString().contains("Completed answer"));
+        QCOMPARE(server.requests.first().mid(server.requests.first().indexOf("\r\n\r\n")+4),plan.value("parts").toList().first().toMap().value("wire_body").toString().toUtf8());
+        QVERIFY(settleReaderViewport(source));const auto state=reader->aiState();const auto generation=reader->documentGeneration();
+        QCOMPARE(origin->transferActiveTabTo(destination),QString{});target->show();QVERIFY(source->close());QTRY_VERIFY(source.isNull());QVERIFY(settleReaderViewport(target));
+        QCOMPARE(reader->aiState(),state);QCOMPARE(reader->documentGeneration(),generation);QCOMPARE(reader->aiState().value("input").toMap().value("question").toString(),QString("Unsent question is retained"));
+        QTest::qWait(200);QCOMPARE(server.requests.size(),1);QCOMPARE(destination->activeReader(),reader);
+    }
+    void preparedRequestsKeepTheirWindowSettingsAndNeverSendDuringATabMove_data() {
+        QTest::addColumn<bool>("knowledge");QTest::newRow("assistant")<<false;QTest::newRow("document-reading")<<true;
+    }
+    void preparedRequestsKeepTheirWindowSettingsAndNeverSendDuringATabMove() {
+        QFETCH(bool,knowledge);MockChatServer sourceServer,targetServer;QVERIFY(sourceServer.listen());QVERIFY(targetServer.listen());
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("prepared-move.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        ReaderWindowFactory windows;QPointer<QQuickWindow> source(windows.createWindow());auto *target=windows.createWindow({},-1,0,false);QVERIFY(source && target);
+        auto *origin=source->property("session").value<WorkspaceController *>(),*destination=target->property("session").value<WorkspaceController *>();origin->openFile(QUrl::fromLocalFile(path));auto *reader=origin->activeReader();
+        QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands(),10000);QVERIFY(settleReaderViewport(source));
+        const QVariantMap sourceSettings{{"baseUrl",sourceServer.baseUrl()},{"model","source-mock"}},targetSettings{{"baseUrl",targetServer.baseUrl()},{"model","target-mock"}};
+        source->setProperty("aiSettings",sourceSettings);target->setProperty("aiSettings",targetSettings);
+        if(knowledge) {
+            QVERIFY(QMetaObject::invokeMethod(source,"openDocumentReading"));auto *popup=source->findChild<QObject *>("documentReadingPopup");QVERIFY(popup);QTRY_VERIFY(popup->property("visible").toBool());QVERIFY(QMetaObject::invokeMethod(popup,"prepare"));
+            QTRY_VERIFY_WITH_TIMEOUT(reader->documentReading().value("phase").toString()=="preview" && !reader->pendingCommands(),10000);QVERIFY(QMetaObject::invokeMethod(popup,"close"));QTRY_VERIFY(!popup->property("visible").toBool());
+        } else {
+            reader->setAiInput("action",0);reader->setAiInput("question","Retain this unsent draft");auto *panel=source->findChild<QObject *>("aiPanel");QVERIFY(panel);QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY_WITH_TIMEOUT(reader->aiState().contains("plan") && !reader->pendingCommands(),10000);
+        }
+        QVERIFY(settleReaderViewport(source));const auto state=knowledge ? reader->documentReading() : reader->aiState();const auto handle=reader->documentHandle();
+        QSignalSpy failed(origin,&WorkspaceController::tabTransferFailed);origin->detachActiveTab();QCOMPARE(failed.count(),1);QVERIFY(failed.first().first().toString().contains("different AI settings"));QCOMPARE(reader->parent(),origin);QVERIFY(source->isVisible());QCOMPARE(knowledge ? reader->documentReading() : reader->aiState(),state);QTRY_COMPARE(WorkspaceController::allWorkspaces().size(),2);
+        // Updating the destination is an explicit settings change, not a hidden
+        // transport wrapper or a fresh HTTP request during the move.
+        target->setProperty("aiSettings",sourceSettings);QCOMPARE(origin->transferActiveTabTo(destination),QString{});QCOMPARE(reader->documentHandle(),handle);QCOMPARE(knowledge ? reader->documentReading() : reader->aiState(),state);
+        target->show();QVERIFY(source->close());QTRY_VERIFY(source.isNull());QTest::qWait(150);QCOMPARE(sourceServer.requests.size(),0);QCOMPARE(targetServer.requests.size(),0);QCOMPARE(destination->activeReader(),reader);
+    }
+    void tabMovesRevalidateReentrantChangesAndDestruction() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("move-reentrant.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        for(const auto &change:{"draft","target-destroy","source-destroy","new-tab"}) {
+            ReaderWindowFactory windows;QPointer<QQuickWindow> source(windows.createWindow()),target(windows.createWindow({},-1,0,false));QVERIFY(source && target);
+            QPointer<WorkspaceController> origin(source->property("session").value<WorkspaceController *>()),destination(target->property("session").value<WorkspaceController *>());
+            origin->openFile(QUrl::fromLocalFile(path));QPointer<ReaderController> reader(origin->activeReader());QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands(),10000);QVERIFY(settleReaderViewport(source));
+            const auto connection=connect(origin,&WorkspaceController::activeReaderAboutToChange,this,[&]{
+                if(QByteArray(change)=="draft")reader->setEditDraft("forms",QVariantMap{{"changed","during callback"}});
+                else if(QByteArray(change)=="target-destroy")delete qmlEngine(target);
+                else if(QByteArray(change)=="source-destroy")delete qmlEngine(source);
+                else {origin->newTab();origin->selectTab(0);origin->closeTab(0);origin->detachActiveTab();}
+            });
+            const auto error=origin->transferActiveTabTo(destination);QObject::disconnect(connection);
+            if(QByteArray(change)=="source-destroy"){QVERIFY(!error.isEmpty());QVERIFY(!origin && !source && !reader);QVERIFY(destination && !destination->activeReader()->pageCount());}
+            else if(QByteArray(change)=="target-destroy"){QVERIFY(!error.isEmpty());QVERIFY(!destination && !target);QCOMPARE(origin->activeReader(),reader.data());QCOMPARE(reader->parent(),origin.data());}
+            else if(QByteArray(change)=="draft"){QVERIFY(!error.isEmpty());QCOMPARE(origin->activeReader(),reader.data());QCOMPARE(reader->editDrafts().value("forms").toMap().value("changed").toString(),QString("during callback"));}
+            else {QVERIFY2(error.isEmpty(),qPrintable(error));QCOMPARE(destination->activeReader(),reader.data());QCOMPARE(origin->tabs().size(),1);QVERIFY(origin->activeReader()!=reader);}
+            if(origin)QVERIFY(!origin->tabTransferInProgress());if(destination)QVERIFY(!destination->tabTransferInProgress());
+        }
+    }
+    void tabMoveFactoryRechecksTheRequestedTabBeforeClosingTheSource() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("move-intent.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        for(const bool destroy:{false,true}) {
+            ReaderWindowFactory windows;QPointer<QQuickWindow> source(windows.createWindow());QVERIFY(source);auto *origin=source->property("session").value<WorkspaceController *>();origin->openFile(QUrl::fromLocalFile(path));auto *reader=origin->activeReader();
+            QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands(),10000);QVERIFY(settleReaderViewport(source));QSignalSpy failure(origin,&WorkspaceController::tabTransferFailed);
+            connect(&windows,&ReaderWindowFactory::windowCreated,this,[&](QQuickWindow *window){if(destroy)delete qmlEngine(window);else origin->newTab();});origin->detachActiveTab();
+            QCOMPARE(failure.count(),1);QVERIFY(source->isVisible());QCOMPARE(reader->parent(),origin);QVERIFY(origin->tabs().first().toMap().value("reader").value<ReaderController *>()==reader);
+            QTRY_COMPARE_WITH_TIMEOUT(WorkspaceController::allWorkspaces().size(),1,10000);
+        }
+    }
+    void aTabMoveDoesNotCloseANewBlankTabCreatedByACompletionListener() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("move-completion.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        ReaderWindowFactory windows;QList<QPointer<QQuickWindow>> created;connect(&windows,&ReaderWindowFactory::windowCreated,this,[&](QQuickWindow *window){created.append(window);});
+        QPointer<QQuickWindow> source(windows.createWindow());QVERIFY(source);auto *origin=source->property("session").value<WorkspaceController *>();origin->openFile(QUrl::fromLocalFile(path));auto *reader=origin->activeReader();QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands(),10000);QVERIFY(settleReaderViewport(source));
+        bool reentered=false;QPointer<ReaderController> newBlank;
+        connect(origin,&WorkspaceController::tabTransferStateChanged,this,[&]{if(!origin->tabTransferInProgress() && origin->activeReader()!=reader && !reentered){reentered=true;origin->newTab();newBlank=origin->activeReader();origin->closeTab(0);}});
+        origin->detachActiveTab();QVERIFY(reentered);QCOMPARE(created.size(),2);QVERIFY(source && source->isVisible());QVERIFY(newBlank && newBlank!=reader);QCOMPARE(origin->tabs().size(),1);QCOMPARE(origin->activeReader(),newBlank.data());
+        auto *target=created.last().data();QVERIFY(target && target->isVisible());auto *destination=target->property("session").value<WorkspaceController *>();QCOMPARE(destination->activeReader(),reader);QCOMPARE(reader->parent(),destination);
+    }
+    void tabMovesKeepUnlistedPopupInputButAllowTheInvokingFileMenu() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("popup-move.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        ReaderWindowFactory windows;auto *source=windows.createWindow();auto *target=windows.createWindow({},-1,0,false);QVERIFY(source && target);auto *origin=source->property("session").value<WorkspaceController *>(),*destination=target->property("session").value<WorkspaceController *>();
+        origin->openFile(QUrl::fromLocalFile(path));auto *reader=origin->activeReader();QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands(),10000);QVERIFY(settleReaderViewport(source));
+        QQmlComponent component(qmlEngine(source));component.setData("import QtQuick; import QtQuick.Controls; Popup { width:240; height:100; modal:true; contentItem:TextField { text:'Unconfirmed popup input' } }",QUrl());
+        QScopedPointer<QObject> popup(component.createWithInitialProperties({{"parent",QVariant::fromValue(source->contentItem())}}));QVERIFY2(popup,qPrintable(component.errorString()));
+        QVERIFY(QMetaObject::invokeMethod(popup.data(),"open"));QTRY_VERIFY(popup->property("visible").toBool());QVERIFY(!origin->transferActiveTabTo(destination).isEmpty());QCOMPARE(reader->parent(),origin);
+        auto *input=popup->property("contentItem").value<QQuickItem *>();QVERIFY(input);QCOMPARE(input->property("text").toString(),QString("Unconfirmed popup input"));
+        QVERIFY(QMetaObject::invokeMethod(popup.data(),"close"));QTRY_VERIFY(!popup->property("visible").toBool());popup.reset();
+        auto *menu=source->findChild<QObject *>("fileMenu");QVERIFY(menu);QVERIFY(QMetaObject::invokeMethod(menu,"open"));QTRY_VERIFY(menu->property("visible").toBool());
+        const auto error=origin->transferActiveTabTo(destination);QVERIFY2(error.isEmpty(),qPrintable(error));QCOMPARE(destination->activeReader(),reader);
+    }
+    void tabMovesRefuseDuplicatePhysicalFilesAndAnActiveQuit() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("original.pdf"),alias=scratch.filePath("alias.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));QVERIFY(QFile::link(path,alias));
+        ReaderWindowFactory windows;auto *source=windows.createWindow();auto *target=windows.createWindow({},-1,0,false);QVERIFY(source && target);auto *origin=source->property("session").value<WorkspaceController *>(),*destination=target->property("session").value<WorkspaceController *>();
+        origin->openFile(QUrl::fromLocalFile(path));QTRY_VERIFY_WITH_TIMEOUT(origin->activeReader()->pageCount()==1 && !origin->activeReader()->loading() && !origin->activeReader()->pendingCommands(),10000);
+        origin->openFile(QUrl::fromLocalFile(alias));auto *reader=origin->activeReader();QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands(),10000);QVERIFY(settleReaderViewport(source));
+        const auto reason=origin->transferActiveTabTo(destination);QVERIFY(reason.contains("same PDF"));QCOMPARE(origin->tabs().size(),2);QCOMPARE(reader->parent(),origin);
+        origin->closeTab(0);QVERIFY(settleReaderViewport(source));reader->submit("bookmark_create",{{"page",0},{"title","Quit review"},{"yPt",20}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        auto *quit=origin->quitCoordinator();origin->requestQuit();QTRY_COMPARE_WITH_TIMEOUT(quit->phase(),QString("prompt"),10000);QVERIFY(origin->transferActiveTabTo(destination).contains("quitting"));QCOMPARE(reader->parent(),origin);quit->cancel();QVERIFY(!quit->busy());
     }
     void nativeTabsReorderAfterHalfTheirWidthAndKeepReaderOwnership() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
@@ -2847,7 +3072,10 @@ private slots:
         }
     }
     void foldedNoteGlyphsHaveCompleteOpaqueArtworkAndBoundedTextures() {
-        NativeCorpus::Viewer view;QVERIFY(view.window);QQmlComponent component(&view.engine);
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.window->requestActivate();QTRY_VERIFY(view.window->isExposed());QTRY_COMPARE(QGuiApplication::focusWindow(),view.window);
+        QSize previous;int stable=0;QElapsedTimer configuration;configuration.start();
+        while(configuration.elapsed()<3000 && stable<4){QTest::qWait(30);const auto size=view.window->size();if(size==previous)++stable;else stable=0;previous=size;}
+        QVERIFY(stable>=4);QQmlComponent component(&view.engine);
         component.setData(R"(import QtQuick
             Item {
                 width:64;height:64
@@ -2867,7 +3095,15 @@ private slots:
         auto normal=capture();QVERIFY(!normal.isNull());QCOMPARE(sample(normal,2,2).alpha(),0);QCOMPARE(sample(normal,19,19).alpha(),0);
         const auto paper=sample(normal,6,14);QVERIFY2(qAbs(paper.red()-245)<2 && qAbs(paper.green()-236)<2 && qAbs(paper.blue()-215)<2,qPrintable(paper.name()));QCOMPARE(paper.alpha(),255);
         const auto ink=sample(normal,10,8.25);QVERIFY(ink.red()<paper.red()-30);
-        QTest::mouseMove(view.window,badge->mapToScene(QPointF(32,32)).toPoint());QTRY_VERIFY(badge->property("hovered").toBool());auto hovered=capture();QVERIFY(sample(hovered,6,14)!=paper);QTest::mouseMove(view.window,QPoint(view.window->width()-20,view.window->height()-20));QTRY_VERIFY(!badge->property("hovered").toBool());
+        QSignalSpy painted(canvas,SIGNAL(painted()));QVERIFY(painted.isValid());
+        QTest::mouseMove(view.window,badge->mapToScene(QPointF(32,32)).toPoint());QTRY_VERIFY(badge->property("hovered").toBool());
+        // Canvas painting and the grab's texture upload are separate queued work.
+        // Require an actual hover repaint, not just the old pixels after 80 ms.
+        QTRY_VERIFY_WITH_TIMEOUT(painted.count()>0 && badge->property("hovered").toBool(),3000);
+        QImage hovered;const auto hoverFrame=[&]{hovered=capture();return !hovered.isNull() && badge->property("hovered").toBool() && sample(hovered,6,14)!=paper;};
+        QTRY_VERIFY2_WITH_TIMEOUT(hoverFrame(),qPrintable(QString("hover=%1 paint=%2 actual=%3 normal=%4 window=%5").arg(badge->property("hovered").toBool()).arg(painted.count()).arg(hovered.isNull()?QString("no image"):sample(hovered,6,14).name(QColor::HexArgb)).arg(paper.name(QColor::HexArgb)).arg(view.window->isExposed())),3000);
+        qInfo()<<"Note hover frame"<<badge->property("hovered")<<"paints"<<painted.count()<<sample(hovered,6,14)<<"normal"<<paper;
+        QTest::mouseMove(view.window,QPoint(view.window->width()-20,view.window->height()-20));QTRY_VERIFY(!badge->property("hovered").toBool());
         const auto windowRect=canvas->property("canvasWindow").toRectF();const auto canvasSize=canvas->property("canvasSize").toSizeF();QCOMPARE(windowRect.size(),canvasSize);
         auto *theme=object->property("theme").value<QObject *>();QVERIFY(theme);theme->setProperty("dark",true);QCOMPARE(capture(),normal);
         badge->setProperty("active",true);auto active=capture();QVERIFY(sample(active,6,14)!=paper);

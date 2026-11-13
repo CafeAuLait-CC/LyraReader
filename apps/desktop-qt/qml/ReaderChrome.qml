@@ -6,6 +6,7 @@ ColumnLayout {
     id: chrome
     required property var app
     readonly property bool menuOpen: viewMenu.visible || zoomMenu.visible || moreMenu.visible
+    readonly property bool tabDragActive: !!tabStrip.tabDrag
     spacing: 0
     property int tabDragCancelEpoch:0
     implicitHeight: 90

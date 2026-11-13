@@ -5,6 +5,7 @@ import QtQuick.Dialogs
 
 ToolBar {
     id: tools
+    readonly property bool tabTransferDialogVisible: typedSignature.visible || drawnSignature.visible || imagePicker.visible
     required property var app
     implicitHeight:46
     background:Rectangle {color:app.colors.panelBg}

@@ -160,7 +160,12 @@ prefetch and drawer-retention defaults over the same grid primitives.
 A byte-bounded revisit cache retains reduced page images after sharp sources leave the working
 set. Unloaded pages already use the selected reading-mode paper colour.
 Tabs reorder after half a tab width of travel, retain their reader state, and support
-Alt+Shift+Left/Right; cross-window drag and tear-off remain work in progress.
+Alt+Shift+Left/Right. File → Move Tab to New Window hands a clean active tab to a new ordinary
+reader window, preserving its document, undo history and reading position. Pending edits, dialogs,
+vault operations, printing and running AI requests block the move without saving or discarding anything.
+Prepared AI requests also require matching window settings, and moving never sends a request.
+The empty source window closes after a successful handoff; moving to an existing window,
+cross-window drag and tear-off remain work in progress.
 Inline citation previews size to their measured text and preserve a manual resize until the content
 changes. Image previews fit fractional viewport widths without rerasterising subpoint changes.
 Scientific crops use the interface theme: dark neutral ink becomes soft warm gray-gold while chart

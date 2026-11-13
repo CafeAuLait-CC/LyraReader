@@ -6,6 +6,7 @@ Pane {
     id: aiPanel
     objectName: "aiPanel"
     required property var app
+    readonly property bool tabTransferDialogVisible: payload.visible
     readonly property var owner: app.currentReader
     readonly property var viewState: owner.aiState
     readonly property var input: viewState.input || ({})
