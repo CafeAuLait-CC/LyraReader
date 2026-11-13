@@ -1496,7 +1496,7 @@ ApplicationWindow {
             currentReader.submit("marks_undo");
         else if (markState.can_page_undo) {
             pendingPage = currentPage;
-            currentReader.submit("page_undo", {current_page: currentPage, selected_pages: selectedPages});
+            currentReader.submit("page_undo", {current_page: currentPage, selected_pages: selectedPages, preserve_viewport: secondaryRow==="edit"});
         }
     }
     function redo() {
@@ -1506,7 +1506,7 @@ ApplicationWindow {
             currentReader.submit("marks_redo");
         else if (markState.can_page_redo) {
             pendingPage = currentPage;
-            currentReader.submit("page_redo", {current_page: currentPage, selected_pages: selectedPages});
+            currentReader.submit("page_redo", {current_page: currentPage, selected_pages: selectedPages, preserve_viewport: secondaryRow==="edit"});
         }
     }
     property bool printRequested: false

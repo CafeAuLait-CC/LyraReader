@@ -2706,6 +2706,120 @@ private slots:
         reader->openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));
         QTRY_VERIFY(reader->pageCount()==1 && !reader->loading());QVERIFY(window->property("selectedSidebarAnnotationID").toString().isEmpty());
     }
+    void sameLayoutContentRevisionsKeepAWholePageUntilReplacementIsReady_data() {
+        QTest::addColumn<QString>("layout");QTest::addColumn<QString>("edit");
+        for(const auto &layout:QStringList{"Continuous","Facing"})for(const auto &edit:QStringList{"delete","image","blackout","erase"})QTest::newRow(qPrintable(layout+"-"+edit))<<layout<<edit;
+    }
+    void sameLayoutContentRevisionsKeepAWholePageUntilReplacementIsReady() {
+        QFETCH(QString,layout);QFETCH(QString,edit);
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("revision-continuity.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        if(layout=="Facing") {QPdfWriter pdf(path);pdf.setResolution(72);pdf.setPageSize(QPageSize(QSizeF(500,600),QPageSize::Point));pdf.setPageMargins(QMarginsF(0,0,0,0));QPainter painter(&pdf);QVERIFY(painter.isActive());painter.setFont(QFont("DejaVu Sans",16));painter.drawText(QPointF(72,100),"LyraReader fixture title");QVERIFY(pdf.newPage());painter.drawText(QPointF(72,100),"Second facing page");QVERIFY(painter.end());}
+        QFile originalFile(path);QVERIFY(originalFile.open(QIODevice::ReadOnly));const auto originalBytes=originalFile.readAll();originalFile.close();
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;window->resize(1100,850);if(qEnvironmentVariableIsSet("LYRA_READER_REVISION_DARK_NARROW")){window->setProperty("appearance","dark");window->setProperty("paperAppearance","night");}view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==(layout=="Facing"?2:1) && !reader->loading() && !reader->pendingCommands());QVERIFY(settleReaderViewport(window));
+        QVERIFY(QMetaObject::invokeMethod(window,"setPageLayout",Q_ARG(QVariant,layout)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(settleReaderViewport(window));
+        QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,3.25),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QVERIFY(settleReaderViewport(window));
+        QPointer<PageItem> page=qobject_cast<PageItem *>(visualItem(window->contentItem(),"pdfPage0"));QVERIFY(page);
+        QTRY_VERIFY_WITH_TIMEOUT(page->refined() && page->texturesReady(),15000);QVERIFY(settleRasterWork(reader));QVERIFY(page->loadedTileCount()>1);
+        const auto capture=[&]{auto grab=page->grabToImage(QSize(300,400));if(!grab)return QImage{};QSignalSpy ready(grab.data(),&QQuickItemGrabResult::ready);if(ready.isEmpty() && !ready.wait(3000))return QImage{};return grab->image();};
+        const auto saveImage=[&](const QImage &image,const QString &phase){const auto folder=qEnvironmentVariable("LYRA_READER_REVISION_SNAPSHOT_DIR");if(folder.isEmpty())return true;return QDir().mkpath(folder) && image.save(QDir(folder).filePath(layout.toLower()+"-"+edit+"-"+phase+".png"));};
+        const auto before=capture();QVERIFY(!before.isNull());QVERIFY(saveImage(before,"before"));reader->submit("content_objects",{{"page",0}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto objects=reader->data().value("content_objects").toMap();QVariantMap title;for(const auto &v:objects.value("items").toList())if((layout=="Facing" && v.toMap().value("kind")=="text") || v.toMap().value("text").toString().contains("LyraReader fixture")){title=v.toMap();break;}QVERIFY2(!title.isEmpty(),qPrintable(QString::fromUtf8(QJsonDocument::fromVariant(objects).toJson(QJsonDocument::Compact))));
+        std::vector<std::unique_ptr<HeldRasterAdmission>> blocked;
+        const auto hold=[&]{for(int i=0;i<RasterJobs::maximumQueued;++i){auto slot=std::make_unique<HeldRasterAdmission>();if(!slot->ticket)return false;blocked.push_back(std::move(slot));}return true;};
+        QVERIFY(hold());const auto generation=reader->documentGeneration();const auto originalPages=reader->pages(),originalRows=reader->layoutRows();
+        QVariantMap command{{"Delete",QVariantMap{{"revision",objects.value("revision")},{"target",title.value("id")}}}};
+        if(edit=="image") {const auto image=scratch.filePath("continuity-colors.png");QImage pixels(8,8,QImage::Format_RGBA8888);pixels.fill(Qt::red);QVERIFY(pixels.save(image));command={{"InsertImage",QVariantMap{{"revision",objects.value("revision")},{"bounds",QVariantMap{{"x",72},{"y",65},{"width",220},{"height",80}}},{"image_path",image}}}};}
+        else if(edit=="blackout" || edit=="erase")command={{"Redact",QVariantMap{{"revision",objects.value("revision")},{"bounds",title.value("bounds")},{"blackout",edit=="blackout"}}}};
+        bool allowRaster=false;
+        if(edit=="blackout" || edit=="erase") {reader->submit("content_redaction_preflight",{{"page",0},{"command",command}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));allowRaster=!reader->data().value("content_redaction_preflight").toList().isEmpty();}
+        reader->submit("content_stage",{{"page",0},{"command",command},{"allow_raster",allowRaster}});
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QVERIFY(reader->documentGeneration()!=generation);
+        QCOMPARE(reader->pages(),originalPages);QCOMPARE(reader->layoutRows(),originalRows);QCOMPARE(qobject_cast<PageItem *>(visualItem(window->contentItem(),"pdfPage0")),page.data());QVERIFY(page->loaded());QVERIFY(page->revisionFallbackActive());QVERIFY(!page->refined());QVERIFY(!page->texturesReady());
+        QCOMPARE(capture(),before);
+        bool heldPartial=false;
+        const auto partial=[&]{if(!heldPartial){heldPartial=hold();}};
+        const auto tile=connect(reader,&ReaderController::tileReady,window,[&](int p){if(p==0)partial();});const auto base=connect(reader,&ReaderController::pageReady,window,[&](int p,double){if(p==0)partial();});
+        blocked.clear();QTRY_VERIFY_WITH_TIMEOUT(heldPartial,10000);QVERIFY(!page->refined());QCOMPARE(capture(),before);QVERIFY(saveImage(capture(),"partial"));
+        disconnect(tile);disconnect(base);blocked.clear();
+        QTRY_VERIFY_WITH_TIMEOUT(page->refined() && page->texturesReady(),15000);const auto after=capture();QVERIFY(!after.isNull());QVERIFY(after!=before);QTRY_VERIFY(!page->revisionFallbackActive());QVERIFY(saveImage(after,"after"));
+        // Exercise the actual row policy and shared transaction undo/redo, not a parallel history.
+        QVERIFY(QMetaObject::invokeMethod(window,"setSecondaryRow",Q_ARG(QVariant,"edit"),Q_ARG(QVariant,false)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(settleRasterWork(reader));QVERIFY(hold());const auto editedGeneration=reader->documentGeneration();
+        QVERIFY(QMetaObject::invokeMethod(window,"undo"));QTRY_VERIFY_WITH_TIMEOUT(reader->documentGeneration()!=editedGeneration && !reader->pendingCommands(),15000);
+        QVERIFY(page->revisionFallbackActive());QCOMPARE(capture(),after);blocked.clear();
+        QTRY_VERIFY_WITH_TIMEOUT(page->refined() && page->texturesReady() && !page->revisionFallbackActive(),15000);const auto undone=capture();QVERIFY(undone!=after);
+        QVERIFY(settleRasterWork(reader));QVERIFY(hold());const auto undoneGeneration=reader->documentGeneration();
+        QVERIFY(QMetaObject::invokeMethod(window,"redo"));QTRY_VERIFY_WITH_TIMEOUT(reader->documentGeneration()!=undoneGeneration && !reader->pendingCommands(),15000);
+        QVERIFY(page->revisionFallbackActive());QCOMPARE(capture(),undone);blocked.clear();
+        QTRY_VERIFY_WITH_TIMEOUT(page->refined() && page->texturesReady() && !page->revisionFallbackActive(),15000);QVERIFY(capture()!=undone);
+        QCOMPARE(window->property("layoutMode").toString(),layout);
+        QVERIFY(originalFile.open(QIODevice::ReadOnly));QCOMPARE(originalFile.readAll(),originalBytes);originalFile.close();
+        QVERIFY(QMetaObject::invokeMethod(window,"saveDocument",Q_ARG(QVariant,false)));QTRY_VERIFY_WITH_TIMEOUT(!reader->pendingCommands() && !reader->hasUnsavedChanges(),15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
+        QVERIFY(originalFile.open(QIODevice::ReadOnly));QVERIFY(originalFile.readAll()!=originalBytes);originalFile.close();reader->openFile(QUrl::fromLocalFile(path));QTRY_VERIFY_WITH_TIMEOUT(!reader->loading() && !reader->pendingCommands(),15000);QVERIFY(settleReaderViewport(window));
+        page=qobject_cast<PageItem *>(visualItem(window->contentItem(),"pdfPage0"));QVERIFY(page);QTRY_VERIFY_WITH_TIMEOUT(page->refined() && page->texturesReady(),15000);QVERIFY(capture()!=before);
+    }
+    void revisionFallbackRetiresForFailuresPressureAndIdentityChanges_data() {
+        QTest::addColumn<QString>("action");
+        for(const auto &a:QStringList{"failure","resident-pressure","texture-pressure","hide","replace-url","rotation","paper","policy","reprime","second-edit","undo-pending"})QTest::newRow(qPrintable(a))<<a;
+    }
+    void revisionFallbackRetiresForFailuresPressureAndIdentityChanges() {
+        QFETCH(QString,action);QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("revision-lifetime.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;if(qEnvironmentVariableIsSet("LYRA_READER_REVISION_DARK_NARROW")){window->resize(700,600);window->setProperty("appearance","dark");window->setProperty("paperAppearance","night");}view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());QVERIFY(settleReaderViewport(window));
+        QPointer<PageItem> page=qobject_cast<PageItem *>(visualItem(window->contentItem(),"pdfPage0"));QVERIFY(page);QTRY_VERIFY_WITH_TIMEOUT(page->refined() && page->texturesReady(),15000);QVERIFY(settleRasterWork(reader));
+        const auto capture=[&]{auto grab=page->grabToImage(QSize(300,400));if(!grab)return QImage{};QSignalSpy ready(grab.data(),&QQuickItemGrabResult::ready);if(ready.isEmpty() && !ready.wait(3000))return QImage{};return grab->image();};
+        if(action=="reprime"){emit reader->rasterPressure(0);page->update();QVERIFY(!capture().isNull());}
+        const auto before=capture();QVERIFY(!before.isNull());reader->submit("content_objects",{{"page",0}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto objects=reader->data().value("content_objects").toMap();QVariantMap title;for(const auto &v:objects.value("items").toList())if(v.toMap().value("text").toString().contains("LyraReader fixture")){title=v.toMap();break;}QVERIFY(!title.isEmpty());
+        std::vector<std::unique_ptr<HeldRasterAdmission>> blocked;for(int i=0;i<RasterJobs::maximumQueued;++i){auto slot=std::make_unique<HeldRasterAdmission>();QVERIFY(slot->ticket);blocked.push_back(std::move(slot));}
+        if(action=="policy")page->setRevisionContinuityAllowed(false);
+        const auto generation=reader->documentGeneration();reader->submit("content_stage",{{"page",0},{"command",QVariantMap{{"Delete",QVariantMap{{"revision",objects.value("revision")},{"target",title.value("id")}}}}}});
+        QTRY_VERIFY_WITH_TIMEOUT(reader->documentGeneration()!=generation && !reader->pendingCommands(),15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QVERIFY(page);
+        if(action=="policy"){QVERIFY(!page->revisionFallbackActive());QVERIFY(!page->loaded());page->setRevisionContinuityAllowed(true);}
+        else {
+            QVERIFY(page->revisionFallbackActive());QCOMPARE(capture(),before);
+            if(action=="failure") {
+                // This injects the controller's page-specific failure notification, not a
+                // physical driver failure. A different page must not retire this snapshot.
+                emit reader->rasterFailed(1);QVERIFY(page->revisionFallbackActive());emit reader->rasterFailed(0);QVERIFY(!page->revisionFallbackActive());QVERIFY(!page->loaded());QVERIFY(capture()!=before);
+            }else if(action=="resident-pressure" || action=="texture-pressure") {
+                const bool texture=action=="texture-pressure";const auto stats=RenderBudget::statistics();const auto key=texture?QString("textureBytes"):QString("residentBytes");const auto limit=texture?RenderBudget::textureLimit:RenderBudget::residentLimit;
+                auto reserve=RenderBudget::reserve(texture?RenderBudget::Kind::Texture:RenderBudget::Kind::Resident,limit-stats.value(key).toLongLong()-1);QVERIFY(reserve);QSignalSpy pressure(reader,&ReaderController::rasterPressure);
+                blocked.clear();QTRY_VERIFY_WITH_TIMEOUT(!page->revisionFallbackActive(),15000);
+                if(texture)QVERIFY(RenderBudget::statistics().value("textureDenied").toLongLong()>stats.value("textureDenied").toLongLong());else QVERIFY(!pressure.isEmpty());
+                QVERIFY(RenderBudget::statistics().value(key).toLongLong()<=limit);QVERIFY(capture()!=before);reserve.reset();
+            }else if(action=="hide") {page->setResourceActive(false);QVERIFY(!page->revisionFallbackActive());QVERIFY(!page->loaded());page->setResourceActive(true);}
+            else if(action=="replace-url") {reader->openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));QTRY_VERIFY(reader->pageCount()==3 && !reader->loading());QVERIFY(!page || !page->revisionFallbackActive());}
+            else if(action=="rotation") {const auto g=reader->documentGeneration();reader->submit("page_stage",{{"operation",QVariantMap{{"Rotate",QVariantMap{{"pages",QVariantList{0}},{"quarter_turns",1}}}}}});QTRY_VERIFY_WITH_TIMEOUT(reader->documentGeneration()!=g && !reader->pendingCommands(),15000);QVERIFY(!page || !page->revisionFallbackActive());}
+            else if(action=="paper") {QVERIFY(page->configurePaper(reader->pages().first().toMap().value("height").toDouble(),20,40));QVERIFY(!page->revisionFallbackActive());page->clearPaperGeometry();}
+            else if(action=="second-edit" || action=="undo-pending") {
+                const auto g=reader->documentGeneration();
+                if(action=="second-edit") {
+                    reader->submit("content_objects",{{"page",0}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);const auto next=reader->data().value("content_objects").toMap();const auto items=next.value("items").toList();QVERIFY(!items.isEmpty());
+                    reader->submit("content_stage",{{"page",0},{"command",QVariantMap{{"Delete",QVariantMap{{"revision",next.value("revision")},{"target",items.first().toMap().value("id")}}}}}});
+                }else reader->submit("page_undo",{{"current_page",0},{"preserve_viewport",true}});
+                QTRY_VERIFY_WITH_TIMEOUT(reader->documentGeneration()!=g && !reader->pendingCommands(),15000);QVERIFY(page && page->revisionFallbackActive());QCOMPARE(capture(),before);
+            }
+        }
+        blocked.clear();auto *current=qobject_cast<PageItem *>(visualItem(window->contentItem(),"pdfPage0"));QVERIFY(current);QTRY_VERIFY_WITH_TIMEOUT(current->refined() && current->texturesReady() && !current->revisionFallbackActive(),15000);
+        // Hiding the final surface must release every previous-revision lease as well.
+        current->setResourceActive(false);QVERIFY(!current->loaded());QVERIFY(!current->revisionFallbackActive());
+    }
+    void closingDuringARevisionReleasesTheOldSceneAndPixelLeases() {
+        const auto resident=RenderBudget::statistics().value("residentBytes").toLongLong(),texture=RenderBudget::statistics().value("textureBytes").toLongLong();
+        for(int round=0;round<3;++round) {
+            {
+                QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("close-revision.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+                NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());QVERIFY(settleReaderViewport(view.window));
+                auto *page=qobject_cast<PageItem *>(visualItem(view.window->contentItem(),"pdfPage0"));QVERIFY(page);QTRY_VERIFY_WITH_TIMEOUT(page->refined() && page->texturesReady(),15000);QVERIFY(settleRasterWork(reader));reader->submit("content_objects",{{"page",0}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);const auto objects=reader->data().value("content_objects").toMap(),first=objects.value("items").toList().first().toMap();
+                std::vector<std::unique_ptr<HeldRasterAdmission>> held;for(int i=0;i<RasterJobs::maximumQueued;++i){auto ticket=std::make_unique<HeldRasterAdmission>();QVERIFY(ticket->ticket);held.push_back(std::move(ticket));}
+                const auto generation=reader->documentGeneration();reader->submit("content_stage",{{"page",0},{"command",QVariantMap{{"Delete",QVariantMap{{"revision",objects.value("revision")},{"target",first.value("id")}}}}}});QTRY_VERIFY_WITH_TIMEOUT(reader->documentGeneration()!=generation && !reader->pendingCommands(),15000);QVERIFY(page->revisionFallbackActive());
+            }
+            QTRY_VERIFY_WITH_TIMEOUT(RenderBudget::statistics().value("residentBytes").toLongLong()<=resident,10000);
+            QTRY_VERIFY_WITH_TIMEOUT(RenderBudget::statistics().value("textureBytes").toLongLong()<=texture,10000);
+        }
+    }
     void foldedNoteGlyphsHaveCompleteOpaqueArtworkAndBoundedTextures() {
         NativeCorpus::Viewer view;QVERIFY(view.window);QQmlComponent component(&view.engine);
         component.setData(R"(import QtQuick

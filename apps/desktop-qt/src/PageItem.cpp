@@ -15,6 +15,9 @@ class PageScene final:public QSGTransformNode {
 public:
     QHash<QString,BudgetedTexture *> images;
     QStringList order;
+    quint64 sourceEpoch=0,acceptedDemandEpoch=0;
+    PageScene *staging=nullptr;
+    ~PageScene()override{delete staging;}
 };
 }
 
@@ -46,6 +49,7 @@ void PageItem::syncBudget() {
     if(!m_targetBytes){if(loaded())resetImages();m_requestTimer.stop();return;}
     if(previous==m_targetBytes)return;
     if(m_targetBytes<previous) {
+        if(!m_revisionFrame)clearAcceptedFrame();
         m_previousTiles.clear();m_previousImages.clear();m_tiles.clear();m_tileImages.clear();m_level=-1000;
         if(m_image.pixels.sizeInBytes()>m_targetBytes/2)m_image={};
         update();
@@ -64,7 +68,35 @@ void PageItem::setRasterDemandPaused(bool paused) {
     if(paused)m_requestTimer.stop();else {syncBudget();m_requestTimer.start();}
     emit rasterDemandPausedChanged();
 }
-void PageItem::resetImages() {
+void PageItem::prepareRevision(bool preserveViewport) {
+    std::shared_ptr<const RevisionFrame> frame;
+    if(preserveViewport && m_revisionContinuityAllowed && demandVisible() && !m_embedded && !m_paperLayout) {
+        std::lock_guard lock(m_frameMutex);frame=m_acceptedFrame;
+    }
+    m_revisionFrame=std::move(frame);m_preserveNextReset=bool(m_revisionFrame);
+    emit revisionFallbackChanged();
+}
+void PageItem::setRevisionContinuityAllowed(bool allowed) {
+    if(m_revisionContinuityAllowed==allowed)return;
+    m_revisionContinuityAllowed=allowed;if(!allowed)retireRevision();
+    emit revisionContinuityAllowedChanged();
+}
+void PageItem::retireRevision() {
+    if(!m_revisionFrame)return;
+    m_revisionFrame.reset();
+    {std::lock_guard lock(m_frameMutex);if(m_acceptedFrame && m_acceptedFrame->sourceEpoch!=m_sourceEpoch)m_acceptedFrame.reset();}
+    update();emit revisionFallbackChanged();emit loadedChanged();
+}
+void PageItem::clearAcceptedFrame() {
+    std::lock_guard lock(m_frameMutex);m_acceptedFrame.reset();
+}
+void PageItem::resetImages(bool keepRevision) {
+    ++m_sourceEpoch;m_preserveNextReset=false;
+    if(!keepRevision) {
+        m_revisionFrame.reset();
+        clearAcceptedFrame();
+        emit revisionFallbackChanged();
+    }
     if(m_controller)m_controller->clearRasterDemand(quintptr(this));
     m_image={};m_usingBackdrop=false;m_tiles.clear();m_tileImages.clear();m_previousTiles.clear();m_previousImages.clear();m_level=-1000;m_demandCurrent=false;
     setRefined(false);update();emit loadedChanged();emit refinementChanged();
@@ -76,7 +108,10 @@ void PageItem::setController(ReaderController *controller) {
     if(controller) {
         m_connections.append(connect(controller,&ReaderController::pageReady,this,[this](int page,double){if(page==m_page)refresh();}));
         m_connections.append(connect(controller,&ReaderController::tileReady,this,[this](int page){if(page==m_page)refresh();}));
-        m_connections.append(connect(controller,&ReaderController::documentReset,this,&PageItem::resetImages));
+        m_connections.append(connect(controller,&ReaderController::revisionAboutToChange,this,&PageItem::prepareRevision));
+        m_connections.append(connect(controller,&ReaderController::documentReset,this,[this]{resetImages(m_preserveNextReset);}));
+        m_connections.append(connect(controller,&ReaderController::rasterFailed,this,[this](int page){if(page==m_page)retireRevision();}));
+        m_connections.append(connect(controller,&ReaderController::rasterPressure,this,[this](int page){if(page==m_page){clearAcceptedFrame();retireRevision();}}));
         m_connections.append(connect(controller,&ReaderController::documentReset,this,&PageItem::clearPaperGeometry));
         m_connections.append(connect(controller,&ReaderController::documentChanged,this,[this]{m_requestTimer.start();}));
     }
@@ -92,7 +127,7 @@ bool PageItem::configurePaper(double height,double split,double gap) {
         lyra_reader_desktop_buffer_free(error);emit paperGeometryChanged();return false;
     }
     if(m_paperLayout && m_paperLayout->height==height && m_paperLayout->split==split && m_paperLayout->gap==gap && m_paperError.isEmpty())return true;
-    ++m_paperEpoch;m_paperLayout=layout;m_paperError.clear();update();emit paperGeometryChanged();return true;
+    retireRevision();++m_paperEpoch;m_paperLayout=layout;m_paperError.clear();update();emit paperGeometryChanged();return true;
 }
 void PageItem::clearPaperGeometry() {
     if(!m_paperLayout && m_paperError.isEmpty())return;
@@ -243,7 +278,7 @@ void PageItem::request() {
         const auto plan=m_controller->requestTilesForSurface(quintptr(this),m_page,effectiveScale(),m_targetBytes,m_visibleRegion,QSet<QString>(m_tileImages.keyBegin(),m_tileImages.keyEnd()));
         // A rejected plan is not an empty, completed demand. Keep any old image
         // available while the Reader reports the failure, without claiming refinement.
-        if(!plan.accepted){m_demandCurrent=false;setRefined(false);refresh();return;}
+        if(!plan.accepted){retireRevision();m_demandCurrent=false;setRefined(false);refresh();return;}
         const auto &next=plan.tiles;
         const int level=next.isEmpty()?m_level:next.first().level;
         if(level!=m_level) {
@@ -275,12 +310,16 @@ void PageItem::itemChange(ItemChange change,const ItemChangeData &data) {
         if(!qFuzzyCompare(device,m_lastDeviceScale)){m_lastDeviceScale=device;m_demandCurrent=false;setRefined(false);m_requestTimer.start();}
     }
 }
-QSGNode *PageItem::updatePaintNode(QSGNode *old,UpdatePaintNodeData *) {
+QSGNode *PageItem::paintFrame(QSGNode *old,bool previous,bool &blocked) {
+    const auto &image=previous?m_revisionFrame->image:m_image;
+    const auto &currentTiles=previous?m_revisionFrame->tiles:m_tiles;
+    const auto &currentImages=previous?m_revisionFrame->images:m_tileImages;
     auto *root=static_cast<PageScene *>(old);
     if(!loaded() || width()<=0 || height()<=0){delete root;return nullptr;}
     if(!root)root=new PageScene;
+    root->sourceEpoch=previous?m_revisionFrame->sourceEpoch:m_sourceEpoch;
     const int appearance=PaperAppearance::mode(m_paperAppearance);
-    QStringList order;bool orderChanged=false,blocked=false;
+    QStringList order;bool orderChanged=false;
     const auto append=[&](const QString &key,const ResidentImage &image,const PaperAppearance::Quad *quads,int count) {
         if(image.isNull())return;
         auto *node=root->images.value(key);
@@ -299,7 +338,7 @@ QSGNode *PageItem::updatePaintNode(QSGNode *old,UpdatePaintNodeData *) {
         const PaperAppearance::Quad quad{logical,source};append(key,image,&quad,1);
     };
     const QRectF paper= m_paperLayout ? QRectF(0,0,width()/m_scale,m_paperLayout->height) : QRectF(0,0,width()/m_scale,height()/m_scale);
-    collect(QStringLiteral("base"),m_image,paper,QRectF(0,0,1,1));
+    collect(QStringLiteral("base"),image,paper,QRectF(0,0,1,1));
     const auto tiles=[&](const QList<TileSpec> &specs,const QHash<QString,ResidentImage> &images) {
         for(const auto &tile:specs) {
             if(!tile.target.intersects(m_visibleRegion))continue;
@@ -308,7 +347,7 @@ QSGNode *PageItem::updatePaintNode(QSGNode *old,UpdatePaintNodeData *) {
             collect(tile.key,image,tile.target,texture);
         }
     };
-    tiles(m_previousTiles,m_previousImages);tiles(m_tiles,m_tileImages);
+    if(!previous)tiles(m_previousTiles,m_previousImages);tiles(currentTiles,currentImages);
     QVector<LyraReaderPaperQuadPair> mapped;
     if(m_paperLayout) {
         QVector<LyraReaderPaperQuad> requests;requests.reserve(draws.size());
@@ -319,7 +358,7 @@ QSGNode *PageItem::updatePaintNode(QSGNode *old,UpdatePaintNodeData *) {
             const auto message=QString::fromUtf8(reinterpret_cast<const char *>(error.data),qsizetype(error.len));lyra_reader_desktop_buffer_free(error);
             const auto epoch=m_paperEpoch;
             QMetaObject::invokeMethod(this,[this,epoch,message]{if(epoch==m_paperEpoch && message!=m_paperError){m_paperError=message;emit paperGeometryChanged();}},Qt::QueuedConnection);
-            delete root;return nullptr;
+            blocked=true;delete root;return nullptr;
         }
     }
     for(qsizetype i=0;i<draws.size();++i) {
@@ -333,8 +372,50 @@ QSGNode *PageItem::updatePaintNode(QSGNode *old,UpdatePaintNodeData *) {
         if(!order.contains(it.key())){root->removeChildNode(it.value());delete it.value();it=root->images.erase(it);}else ++it;
     }
     if(orderChanged || root->order!=order){for(const auto &key:order){auto *node=root->images.value(key);root->removeChildNode(node);root->appendChildNode(node);}root->order=order;}
-    const auto epoch=m_textureEpoch;const bool ready=m_refined && !blocked;
-    QMetaObject::invokeMethod(this,[this,epoch,ready]{if(epoch==m_textureEpoch && m_texturesReady!=ready){m_texturesReady=ready;emit texturesReadyChanged();}},Qt::QueuedConnection);
-    if(blocked)QMetaObject::invokeMethod(this,[this]{m_requestTimer.start(200);},Qt::QueuedConnection);
+    return root;
+}
+QSGNode *PageItem::updatePaintNode(QSGNode *old,UpdatePaintNodeData *) {
+    auto *root=static_cast<PageScene *>(old);
+    if(!loaded() || width()<=0 || height()<=0){delete root;return nullptr;}
+    bool blocked=false,ready=false;
+    if(m_revisionFrame) {
+        // Draw one complete previous revision, never a mixture with new partial tiles.
+        if(root && root->sourceEpoch!=m_revisionFrame->sourceEpoch){delete root;root=nullptr;}
+        root=static_cast<PageScene *>(paintFrame(root,true,blocked));
+        if(root && m_refined && (!m_image.isNull() || !m_tileImages.isEmpty())) {
+            auto *next=root->staging;root->staging=nullptr;
+            if(next && next->sourceEpoch!=m_sourceEpoch){delete next;next=nullptr;}
+            bool nextBlocked=false;
+            next=static_cast<PageScene *>(paintFrame(next,false,nextBlocked));
+            if(next && !nextBlocked) {delete root;root=next;ready=true;}
+            else {root->staging=next;blocked=true;}
+        }
+    }else {
+        if(root && root->sourceEpoch!=m_sourceEpoch) {
+            // Admission pressure may retire an old page. Reuse its partial staging
+            // group, but never leave an old texture under a new source's stable key.
+            auto *next=root->staging;root->staging=nullptr;delete root;root=next;
+            if(root && root->sourceEpoch!=m_sourceEpoch){delete root;root=nullptr;}
+        }
+        root=static_cast<PageScene *>(paintFrame(root,false,blocked));ready=m_refined && !blocked;
+    }
+    ready=ready && root && (!m_image.isNull() || !m_tileImages.isEmpty());
+    if(ready) {
+        std::lock_guard lock(m_frameMutex);
+        if(!m_acceptedFrame || root->acceptedDemandEpoch!=m_textureEpoch) {
+            auto frame=std::make_shared<RevisionFrame>();frame->image=m_image;frame->tiles=m_tiles;frame->images=m_tileImages;frame->sourceEpoch=m_sourceEpoch;
+            m_acceptedFrame=std::move(frame);root->acceptedDemandEpoch=m_textureEpoch;
+        }
+    }
+    const auto epoch=m_textureEpoch,source=m_sourceEpoch;
+    QMetaObject::invokeMethod(this,[this,epoch,source,ready,blocked] {
+        if(source!=m_sourceEpoch)return;
+        // Hard texture admission limits can make two complete revisions impossible.
+        // Release the old one and retry; pressure is not a refined or successful page.
+        if(blocked)clearAcceptedFrame();
+        if(ready || blocked)retireRevision();
+        if(epoch==m_textureEpoch && m_texturesReady!=ready){m_texturesReady=ready;emit texturesReadyChanged();}
+        if(blocked)m_requestTimer.start(200);
+    },Qt::QueuedConnection);
     return root;
 }

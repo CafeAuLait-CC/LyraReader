@@ -358,13 +358,19 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         if(latestOnly && m_latestRead.value(operation)!=id)return;
         if (!outcome.error.isEmpty() && operation!=QStringLiteral("split_plan") && operation!=QStringLiteral("region_thumbnail") && !operation.startsWith(QStringLiteral("ai_")) && !operation.startsWith(QStringLiteral("knowledge_"))) setError(outcome.error);
         else if (operation==QStringLiteral("content_stage") || operation==QStringLiteral("page_stage") || operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo") || operation==QStringLiteral("page_discard") || operation==QStringLiteral("page_apply") || operation==QStringLiteral("document_save") || operation==QStringLiteral("document_discard")) {
-            setRasterSource(outcome.source);
             const auto revision=outcome.result.toMap();
             const auto info=revision.value(QStringLiteral("info")).toMap();
+            // This is a shell viewport policy, not a second transaction history.
+            // Undo/redo opt in only while the content-editing row owns the viewport.
+            const bool contentRevision=operation==QStringLiteral("content_stage") ||
+                ((operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo")) && arguments.value(QStringLiteral("preserve_viewport")).toBool());
+            const bool keepLayout=contentRevision && !m_layoutRows.isEmpty() && samePageSizes(m_pages,info.value(QStringLiteral("pages")).toList());
+            emit revisionAboutToChange(keepLayout);
+            setRasterSource(outcome.source);
             const bool reloadForms=m_data.contains(QStringLiteral("forms"));
             ++m_generation;resetAi();clearRasterCache();m_pending.clear();m_failed.clear();m_requests.clear();m_textPages.clear();m_textPending.clear();
             if(!samePageSizes(m_pages,info.value(QStringLiteral("pages")).toList()))clearFitPageSpacing();
-            m_pages=info.value(QStringLiteral("pages")).toList();m_layoutRows=info.value(QStringLiteral("rows")).toList();m_layoutConfiguration={{QStringLiteral("mode"),info.value(QStringLiteral("mode"))},{QStringLiteral("gap"),info.value(QStringLiteral("gap"))}};m_documentWidth=info.value(QStringLiteral("width")).toDouble();m_documentHeight=info.value(QStringLiteral("height")).toDouble();
+            if(!keepLayout){m_pages=info.value(QStringLiteral("pages")).toList();m_layoutRows=info.value(QStringLiteral("rows")).toList();m_layoutConfiguration={{QStringLiteral("mode"),info.value(QStringLiteral("mode"))},{QStringLiteral("gap"),info.value(QStringLiteral("gap"))}};m_documentWidth=info.value(QStringLiteral("width")).toDouble();m_documentHeight=info.value(QStringLiteral("height")).toDouble();}
             m_data.clear();m_data.insert(QStringLiteral("marks"),revision.value(QStringLiteral("marks")));m_data.insert(QStringLiteral("signature_status"),info.value(QStringLiteral("signature_status")));
             m_data.insert(QStringLiteral("xfa_status"),info.value(QStringLiteral("xfa_status")));
             m_data.insert(QStringLiteral("document_revision"),info.value(QStringLiteral("revision")));
@@ -650,6 +656,7 @@ void ReaderController::startNextRaster() {
         if(generation!=m_generation || result.cancelled){++m_discarded;if(generation==m_generation)m_pending.remove(request.key);}
         else if(result.pressure) {
             m_pending.remove(request.key);
+            emit rasterPressure(request.page);
             QTimer::singleShot(100,this,[this,request,generation] {
                 if(generation!=m_generation)return;
                 bool wanted=!request.tile && (m_manualDemand.contains(request.key) || m_pageDemand.values().contains(request.key));
@@ -659,7 +666,7 @@ void ReaderController::startNextRaster() {
         }else {
             m_pending.remove(request.key);
             m_manualDemand.remove(request.key);
-            if(result.image.isNull()){m_failed.insert(request.key);setError(result.error);}
+            if(result.image.isNull()){m_failed.insert(request.key);setError(result.error);emit rasterFailed(request.page);}
             else {
                 RasterCache::put(m_cachePrefix+request.key,result.image.pixels);++m_completed;
                 if(!result.backdrop.isNull())RasterCache::putBackdrop(backdropKey(request.page),result.backdrop);

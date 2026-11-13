@@ -471,6 +471,7 @@ Item {
                         rasterScale: app.zoom
                         tilesEnabled: true
                         rasterDemandPaused:canvas.paperMotionActive
+                        revisionContinuityAllowed:!canvas.paperActive
                         visibleRegion:sheet.sourceViewport()
                         Accessible.role: Accessible.Graphic
                         Accessible.name: qsTr("PDF page %1").arg(sheet.modelData.index + 1)

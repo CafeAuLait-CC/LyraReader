@@ -92,7 +92,9 @@ scrolling editor, and position/size fields keep their labels and page-point unit
 Dragging an already selected object previews its real pixels over a separately masked page region.
 One bounded bitmap pair is prepared from the pinned working revision; pointer motion only moves
 scene geometry. Escape, navigation and document changes cancel the preview. Successful moves retain
-it until the updated page is ready, with undo and Save using the existing transaction. Nearby edges
+it until the updated page is ready, with undo and Save using the existing transaction. Same-layout
+content revisions retain each complete visible page until its replacement scene is ready. New partial
+tiles do not mix with that page; render failures and admission pressure release the fallback. Nearby edges
 snap within four logical pixels, with guides from the current object snapshot; hold Shift at drag
 start for free placement. Text and bitmap objects have four native corner handles;
 Escape cancels a resize, and undo and Save use the same shared transaction. External Form groups

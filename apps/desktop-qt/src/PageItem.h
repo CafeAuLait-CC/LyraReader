@@ -4,6 +4,7 @@
 #include <QQuickItem>
 #include <QPointer>
 #include <QTimer>
+#include <mutex>
 
 class PageItem : public QQuickItem {
     Q_OBJECT
@@ -21,6 +22,8 @@ class PageItem : public QQuickItem {
     Q_PROPERTY(bool resourceActive READ resourceActive WRITE setResourceActive NOTIFY resourceActiveChanged)
     Q_PROPERTY(bool rasterDemandPaused READ rasterDemandPaused WRITE setRasterDemandPaused NOTIFY rasterDemandPausedChanged)
     Q_PROPERTY(bool texturesReady READ texturesReady NOTIFY texturesReadyChanged)
+    Q_PROPERTY(bool revisionFallbackActive READ revisionFallbackActive NOTIFY revisionFallbackChanged)
+    Q_PROPERTY(bool revisionContinuityAllowed READ revisionContinuityAllowed WRITE setRevisionContinuityAllowed NOTIFY revisionContinuityAllowedChanged)
     Q_PROPERTY(QString paperGeometryError READ paperGeometryError NOTIFY paperGeometryChanged)
     Q_PROPERTY(bool paperGeometryActive READ paperGeometryActive NOTIFY paperGeometryChanged)
     Q_PROPERTY(qulonglong paperGeometryRevision READ paperGeometryRevision NOTIFY paperGeometryChanged)
@@ -32,7 +35,7 @@ public:
     int pageIndex() const {return m_page;}
     double rasterScale() const {return m_scale;}
     QString paperAppearance() const {return m_paperAppearance;}
-    bool loaded() const {return !m_image.isNull() || !m_tileImages.isEmpty();}
+    bool loaded() const {return !m_image.isNull() || !m_tileImages.isEmpty() || bool(m_revisionFrame);}
     bool refined() const {return m_refined;}
     bool backdropVisible()const{return m_usingBackdrop && !m_refined && !m_image.isNull();}
     int loadedTileCount() const {return int(m_tileImages.size());}
@@ -40,6 +43,9 @@ public:
     bool resourceActive()const{return m_resourceActive;}
     bool rasterDemandPaused()const{return m_rasterDemandPaused;}
     bool texturesReady()const{return m_texturesReady;}
+    bool revisionFallbackActive()const{return bool(m_revisionFrame);}
+    bool revisionContinuityAllowed()const{return m_revisionContinuityAllowed;}
+    void setRevisionContinuityAllowed(bool allowed);
     QString paperGeometryError()const{return m_paperError;}
     bool paperGeometryActive()const{return m_paperLayout.has_value();}
     qulonglong paperGeometryRevision()const{return m_paperEpoch;}
@@ -71,6 +77,8 @@ signals:
     void resourceActiveChanged();
     void rasterDemandPausedChanged();
     void texturesReadyChanged();
+    void revisionFallbackChanged();
+    void revisionContinuityAllowedChanged();
     void paperGeometryChanged();
 protected:
     QSGNode *updatePaintNode(QSGNode *node,UpdatePaintNodeData *) override;
@@ -79,7 +87,11 @@ private:
     double effectiveScale() const;
     double fallbackScale() const;
     bool needsTiles() const;
-    void resetImages();
+    void resetImages(bool keepRevision=false);
+    void prepareRevision(bool preserveViewport);
+    void retireRevision();
+    void clearAcceptedFrame();
+    QSGNode *paintFrame(QSGNode *node,bool previous,bool &blocked);
     void request();
     void refresh();
     void setRefined(bool value);
@@ -103,6 +115,19 @@ private:
     qint64 m_targetBytes=0;
     bool m_texturesReady=false;
     quint64 m_textureEpoch=0;
+    struct RevisionFrame {
+        ResidentImage image;
+        QList<TileSpec> tiles;
+        QHash<QString,ResidentImage> images;
+        quint64 sourceEpoch=0;
+    };
+    // The render thread publishes only complete scene-node groups. The mutex protects
+    // the snapshot pointer, never PDFium work or texture creation. Pixel leases are shared.
+    std::mutex m_frameMutex;
+    std::shared_ptr<const RevisionFrame> m_acceptedFrame,m_revisionFrame;
+    quint64 m_sourceEpoch=1;
+    bool m_preserveNextReset=false;
+    bool m_revisionContinuityAllowed=true;
     QTimer m_requestTimer;
     std::optional<LyraReaderPaperLayout> m_paperLayout;
     QString m_paperError;

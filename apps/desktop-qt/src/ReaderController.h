@@ -175,12 +175,15 @@ signals:
     void documentChanged();
     void fitPresentationChanged();
     void documentReset();
+    void revisionAboutToChange(bool preserveViewport);
     void loadingChanged();
     void errorChanged();
     void passwordRequiredChanged();
     void statisticsChanged();
     void pageReady(int page, double scale);
     void tileReady(int page);
+    void rasterFailed(int page);
+    void rasterPressure(int page);
     void openFinished(bool success);
     void commandFinished(quint64 id, const QString &operation, const QVariant &result, const QString &error);
     void dataChanged();
