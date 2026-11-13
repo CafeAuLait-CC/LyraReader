@@ -32,6 +32,15 @@ struct PageView {
     warning: Option<String>,
 }
 impl PageEdits {
+    pub(super) fn quit_state(&self) -> Result<Option<DocumentTransactionStateRecord>, String> {
+        self.control
+            .as_ref()
+            .map(|control| {
+                control.check()?;
+                control.handle.snapshot().map_err(|e| e.to_string())
+            })
+            .transpose()
+    }
     pub fn has_session(&self) -> bool {
         self.control.is_some()
     }
@@ -180,7 +189,7 @@ impl PageEdits {
             directory,
             Arc::clone(&control),
             owner,
-        )));
+        )?));
         self.control = Some(control);
         self.adopt(&state);
         Ok(state)
@@ -215,7 +224,7 @@ impl PageEdits {
             directory,
             Arc::clone(&control),
             owner,
-        )));
+        )?));
         self.control = Some(control);
         self.adopt(&state);
         Ok(Some(state))
@@ -564,7 +573,7 @@ impl DesktopDocument {
                 restored.seed_bookmarks(&next)?;
                 (next, restored)
             }
-            "document_discard" => {
+            "document_discard" | "quit_discard" => {
                 let root = marks.cache_root().map(Path::to_path_buf);
                 let next = LyraReaderEngine::new()
                     .open_document(
@@ -573,13 +582,30 @@ impl DesktopDocument {
                     )
                     .map_err(|e| e.to_string())?;
                 let original = edits.original.as_ref().unwrap_or(&marks).clone();
-                let discarded = original.discard_known(&next)?;
-                if let Err(error) = edits.retire() {
-                    if let Err(rollback) = discarded.rollback_discard(&original) {
-                        marks.recovery_notice(rollback.clone());
-                        return Err(format!("{error}. {rollback}"));
+                if op == "quit_discard" {
+                    // The quit was already resolved durably. Retire recovery first:
+                    // after interruption only the unchanged original cache remains.
+                    // consume() recognizes that exact missing-session transition.
+                    let _owner = if edits.has_session() {
+                        None
+                    } else {
+                        Some(SessionOwner::acquire(
+                            &original.cache_location()?.directory.join("session.json"),
+                        )?)
+                    };
+                    edits.retire()?;
+                    #[cfg(test)]
+                    crate::quit::test_checkpoint("retired");
+                    original.discard_known(&next)?;
+                } else {
+                    let discarded = original.discard_known(&next)?;
+                    if let Err(error) = edits.retire() {
+                        if let Err(rollback) = discarded.rollback_discard(&original) {
+                            marks.recovery_notice(rollback.clone());
+                            return Err(format!("{error}. {rollback}"));
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
                 }
                 *self
                     .recovery_status

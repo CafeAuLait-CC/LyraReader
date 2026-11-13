@@ -15,6 +15,7 @@ mod marks;
 mod navigation;
 mod pages;
 mod paper;
+mod quit;
 mod region;
 mod region_export;
 mod region_store;
@@ -33,7 +34,82 @@ use std::{
 /// Version of the Qt boundary, including cache-only selection and clipboard adapters.
 #[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_desktop_abi_version() -> u32 {
-    13
+    14
+}
+
+/// Persist one resolved quit without deleting any draft. Resolution: 0=save, 1=discard.
+/// # Safety
+/// Documents addresses count aligned, initialized pointers, each non-null and alive for
+/// this entire worker call. Count is 1..=256. Output/error are distinct empty writable
+/// Buffers; the caller frees them once. No QObject or UI thread state crosses this ABI.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_resolve_quit(
+    documents: *const *const Document,
+    count: usize,
+    resolution: u32,
+    output: *mut Buffer,
+    error: *mut Buffer,
+) -> bool {
+    // SAFETY: pointer arrays and output ownership are the caller's documented contract.
+    unsafe {
+        run(error, || {
+            if documents.is_null() || count == 0 || count > quit::MAX_DOCUMENTS || output.is_null()
+            {
+                return Err("Invalid quit document batch or output".into());
+            }
+            let documents = slice::from_raw_parts(documents, count)
+                .iter()
+                .map(|document| {
+                    document
+                        .as_ref()
+                        .ok_or_else(|| "Null quit document".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let receipt = quit::resolve(&documents, resolution)?;
+            output.write(Buffer::owned(
+                serde_json::to_vec(&receipt).map_err(|e| e.to_string())?,
+            ));
+            Ok(())
+        })
+    }
+    .is_some()
+}
+
+/// Acknowledge the final UI epoch check. Bounded in-memory operation; no I/O.
+/// # Safety
+/// Receipt addresses length readable bytes. Error is an empty writable Buffer
+/// freed once by the caller. This may run on the UI thread after resolve_quit returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_activate_quit(
+    receipt: *const u8,
+    length: usize,
+    error: *mut Buffer,
+) -> bool {
+    // SAFETY: documented readable slice and exclusive writable error buffer.
+    unsafe { run(error, || quit::activate(bytes(receipt, length)?)) }.is_some()
+}
+
+/// Cancel this exact quit receipt if the caller's UI epoch changed before closing.
+/// # Safety
+/// Document is non-null and alive throughout the worker call. Receipt addresses length
+/// readable bytes. Error is an empty writable Buffer, freed once by the caller.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_cancel_quit(
+    document: *const Document,
+    receipt: *const u8,
+    length: usize,
+    error: *mut Buffer,
+) -> bool {
+    // SAFETY: documented live handle, request slice and exclusive writable error buffer.
+    unsafe {
+        run(error, || {
+            quit::cancel(
+                document.as_ref().ok_or("Null quit document")?,
+                bytes(receipt, length)?,
+            )
+        })
+    }
+    .is_some()
 }
 
 /// Maximum caller-supplied glyph/figure boxes before paper placement allocates snapshots.
@@ -1449,7 +1525,7 @@ mod tests {
 
     #[test]
     fn image_byte_boundary_rejects_null_handles_and_reports_its_version() {
-        assert_eq!(lyra_reader_desktop_abi_version(), 13);
+        assert_eq!(lyra_reader_desktop_abi_version(), 14);
         assert_eq!(
             lyra_reader_desktop_zoom_preset_inset_pt(),
             lyra_reader_session::ZOOM_PRESET_INSET_PT

@@ -121,10 +121,18 @@ static int quitRecoveryChild(int argc,char **argv) {
     reader->submit("page_stage",{{"operation",QVariantMap{{"Rotate",QVariantMap{{"pages",QVariantList{1}},{"quarter_turns",1}}}}}});
     if(!wait([&]{return reader->pendingCommands()==0 && reader->data().value("marks").toMap().value("page_pending").toBool();}))return 6;
     if(mode=="crash")std::_Exit(9);
-    if(mode!="save" && mode!="discard")return 7;
-    auto *quit=view.workspace.quitCoordinator();bool accepted=false;QObject::connect(quit,&QuitCoordinator::accepted,&application,[&]{accepted=true;});
+    const auto decision=mode=="discard-event"?QString("discard"):mode;
+    if(decision!="save" && decision!="discard")return 7;
+    auto *quit=view.workspace.quitCoordinator();int accepted=0;QObject::connect(quit,&QuitCoordinator::accepted,&application,[&]{++accepted;});
+    if(mode=="discard-event")application.installEventFilter(quit);
     view.workspace.requestQuit();if(!wait([&]{return quit->phase()=="prompt";}))return 8;
-    quit->decide(mode);if(!wait([&]{return !quit->busy();}) || !accepted || view.window->isVisible()){qWarning()<<quit->message();return 10;}
+    quit->decide(decision);if(!wait([&]{return !quit->busy();}) || accepted!=1 || view.window->isVisible()){qWarning()<<quit->message();return 10;}
+    if(mode=="discard-event") {
+        QCoreApplication::processEvents(QEventLoop::AllEvents,50);
+        QEvent event(QEvent::Quit);QCoreApplication::sendEvent(&application,&event);
+        QCoreApplication::processEvents(QEventLoop::AllEvents,50);
+        if(quit->busy() || accepted!=1 || view.window->isVisible()){qWarning()<<"Accepted quit restarted the closed editors"<<quit->phase()<<accepted;return 11;}
+    }
     std::_Exit(9);
 }
 
@@ -4707,11 +4715,14 @@ private slots:
         QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",firstPath));QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",secondPath));
         auto bytes=[](const QString &path){QFile file(path);return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray{};};
         const auto firstBytes=bytes(firstPath),secondBytes=bytes(secondPath);QVERIFY(!firstBytes.isEmpty() && !secondBytes.isEmpty());
+        std::weak_ptr<LyraReaderDesktopDocument> documentA,documentB;
+        {
         NativeCorpus::Viewer first,second,clean;QVERIFY(first.window && second.window && clean.window);
         if(qEnvironmentVariableIsSet("LYRA_READER_QUIT_DARK_NARROW")){first.window->setProperty("appearance","dark");first.window->resize(640,480);}
         first.workspace.openFile(QUrl::fromLocalFile(firstPath));second.workspace.openFile(QUrl::fromLocalFile(secondPath));
         auto *a=first.workspace.activeReader(),*b=second.workspace.activeReader();
         QTRY_COMPARE_WITH_TIMEOUT(a->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(b->pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(a->pendingCommands()+b->pendingCommands(),0,10000);
+        documentA=a->documentHandle();documentB=b->documentHandle();
         a->submit("bookmark_create",{{"page",0},{"title","Discarded bookmark"},{"yPt",20}});
         b->submit("page_stage",{{"operation",QVariantMap{{"Rotate",QVariantMap{{"pages",QVariantList{1}},{"quarter_turns",1}}}}}});
         auto *quit=first.workspace.quitCoordinator();QSignalSpy accepted(quit,&QuitCoordinator::accepted);
@@ -4726,9 +4737,14 @@ private slots:
         QVERIFY(a->hasUnsavedChanges() && b->hasUnsavedChanges());QCOMPARE(bytes(firstPath),firstBytes);QCOMPARE(bytes(secondPath),secondBytes);
         first.workspace.requestQuit();QTRY_COMPARE(quit->phase(),QString("prompt"));QTRY_VERIFY(dialog->property("opened").toBool());QVERIFY(clickDialogButton(first.window,dialog,"Discard All Changes"));
         QTRY_COMPARE_WITH_TIMEOUT(accepted.count(),1,15000);QVERIFY(!first.window->isVisible() && !second.window->isVisible() && !clean.window->isVisible());
-        QCOMPARE(bytes(firstPath),firstBytes);QCOMPARE(bytes(secondPath),secondBytes);QVERIFY(!a->hasUnsavedChanges() && !b->hasUnsavedChanges());
+        QCOMPARE(bytes(firstPath),firstBytes);QCOMPARE(bytes(secondPath),secondBytes);QVERIFY(a->hasUnsavedChanges() && b->hasUnsavedChanges());
+        }
+        // Simulate the next launch after the closed editor objects and their
+        // outstanding workers have released the editable document handles.
+        QTRY_VERIFY(documentA.expired() && documentB.expired());
         ReaderController reopenedA,reopenedB;reopenedA.openFile(QUrl::fromLocalFile(firstPath));reopenedB.openFile(QUrl::fromLocalFile(secondPath));
         QTRY_COMPARE_WITH_TIMEOUT(reopenedA.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reopenedB.pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(reopenedA.pendingCommands()+reopenedB.pendingCommands(),0,10000);
+        QVERIFY(reopenedA.data().value("marks").toMap().value("error").isNull());QVERIFY(reopenedB.data().value("marks").toMap().value("error").isNull());
         QVERIFY(!reopenedA.hasUnsavedChanges() && !reopenedB.hasUnsavedChanges());QVERIFY(reopenedA.data().value("marks").toMap().value("bookmarks").toList().isEmpty());QVERIFY(!reopenedB.data().value("marks").toMap().value("page_session_active").toBool());
     }
     void quitSavesInactiveTabsAndCollectsAllCopyDestinationsBeforeWriting() {
@@ -4746,6 +4762,31 @@ private slots:
         QTRY_COMPARE_WITH_TIMEOUT(accepted.count(),1,20000);QVERIFY(!view.window->isVisible());QCOMPARE(bytes(signedPath),signedBytes);QVERIFY(bytes(path)!=original);QVERIFY(QFile::exists(copyPath));
         ReaderController reopened,copy;reopened.openFile(QUrl::fromLocalFile(signedPath));copy.openFile(QUrl::fromLocalFile(copyPath));QTRY_COMPARE_WITH_TIMEOUT(reopened.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(copy.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reopened.pendingCommands()+copy.pendingCommands(),0,10000);QVERIFY(!reopened.hasUnsavedChanges());QVERIFY(reopened.data().value("marks").toMap().value("bookmarks").toList().isEmpty());QVERIFY(!copy.data().value("signature_status").toMap().value("signed").toBool());QCOMPARE(copy.data().value("marks").toMap().value("bookmarks").toList().first().toMap().value("title").toString(),QString("Copy saved"));
     }
+    void quitDiscardFailureKeepsEveryDocumentDraftAndRecoveryBytes() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto one=scratch.filePath("quit-discard-one.pdf"),two=scratch.filePath("quit-discard-two.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",one));QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",two));
+        NativeCorpus::Viewer first,second;QVERIFY(first.window && second.window);first.workspace.openFile(QUrl::fromLocalFile(one));second.workspace.openFile(QUrl::fromLocalFile(two));auto *a=first.workspace.activeReader(),*b=second.workspace.activeReader();QTRY_COMPARE(a->pageCount()+b->pageCount(),2);QTRY_COMPARE(a->pendingCommands()+b->pendingCommands(),0);
+        for(auto *reader:{a,b})reader->submit("bookmark_create",{{"page",0},{"title","Keep the entire quit batch"},{"yPt",20}});QTRY_COMPARE(a->pendingCommands()+b->pendingCommands(),0);QVERIFY(a->hasUnsavedChanges() && b->hasUnsavedChanges());
+        const auto read=[](const QString &path){QFile f(path);return f.open(QIODevice::ReadOnly)?f.readAll():QByteArray();};
+        const auto aPath=a->data().value("marks").toMap().value("path").toString(),bPath=b->data().value("marks").toMap().value("path").toString();const auto aPending=QFileInfo(aPath).dir().filePath("changes.json"),bPending=QFileInfo(bPath).dir().filePath("changes.json");
+        const auto aRecords=read(aPath),aState=read(aPending),bRecords=read(bPath),bState=read(bPending);QVERIFY(!aRecords.isEmpty() && !aState.isEmpty() && !bState.isEmpty());const auto pdfOne=read(one),pdfTwo=read(two);
+        const auto external=bState+" \n";QFile changed(bPending);QVERIFY(changed.open(QIODevice::WriteOnly));QCOMPARE(changed.write(external),external.size());changed.close();
+        auto *quit=first.workspace.quitCoordinator();const auto cleanup=qScopeGuard([&]{quit->cancel();});QSignalSpy accepted(quit,&QuitCoordinator::accepted);first.workspace.requestQuit();QTRY_COMPARE(quit->phase(),QString("prompt"));quit->decide("discard");QTRY_VERIFY_WITH_TIMEOUT(!quit->busy(),15000);
+        QCOMPARE(accepted.count(),0);QVERIFY(first.window->isVisible() && second.window->isVisible());QVERIFY2(a->hasUnsavedChanges(),"A later discard failure must not retire an earlier document draft");QVERIFY(b->hasUnsavedChanges());QCOMPARE(read(aPath),aRecords);QCOMPARE(read(aPending),aState);QCOMPARE(read(bPath),bRecords);QCOMPARE(read(bPending),external);QCOMPARE(read(one),pdfOne);QCOMPARE(read(two),pdfTwo);
+    }
+    void quitLateDraftCancelsTheExactCommittedBatchAndPreservesRecovery() {
+        QTemporaryDir scratch;const auto path=scratch.filePath("quit-late-receipt.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
+        reader->submit("bookmark_create",{{"page",0},{"title","Recover after cancelled decision"},{"yPt",20}});QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(reader->hasUnsavedChanges());
+        auto *quit=view.workspace.quitCoordinator();bool injected=false;const auto late=connect(quit,&QuitCoordinator::changed,&view.workspace,[&]{if(quit->phase()=="recording" && !injected){injected=true;reader->setNoteDraft("late","Keep this later draft");}});
+        const auto cleanup=qScopeGuard([&]{disconnect(late);quit->cancel();});QSignalSpy accepted(quit,&QuitCoordinator::accepted);view.workspace.requestQuit();QTRY_COMPARE(quit->phase(),QString("prompt"));quit->decide("discard");QTRY_VERIFY_WITH_TIMEOUT(!quit->busy(),15000);QVERIFY(injected);QCOMPARE(accepted.count(),0);QVERIFY(view.window->isVisible());QVERIFY(quit->message().contains("New changes"));QCOMPARE(reader->noteDrafts().value("late").toString(),QString("Keep this later draft"));
+        ReaderController recovered;recovered.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE(recovered.pageCount(),1);QTRY_COMPARE(recovered.pendingCommands(),0);QVERIFY(recovered.hasUnsavedChanges());QCOMPARE(recovered.data().value("marks").toMap().value("bookmarks").toList().size(),1);
+    }
+    void quitNewWorkspaceDuringRecordingCancelsWithoutClosingReaders() {
+        QTemporaryDir scratch;const auto path=scratch.filePath("quit-new-workspace.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);reader->submit("bookmark_create",{{"page",0},{"title","Retain while another reader is created"},{"yPt",20}});QTRY_COMPARE(reader->pendingCommands(),0);
+        auto *quit=view.workspace.quitCoordinator();std::unique_ptr<WorkspaceController> lateWorkspace;
+        const auto late=connect(quit,&QuitCoordinator::changed,&view.workspace,[&]{if(quit->phase()=="recording" && !lateWorkspace)lateWorkspace=std::make_unique<WorkspaceController>();});
+        const auto cleanup=qScopeGuard([&]{disconnect(late);quit->cancel();});QSignalSpy accepted(quit,&QuitCoordinator::accepted);view.workspace.requestQuit();QTRY_COMPARE(quit->phase(),QString("prompt"));quit->decide("discard");QTRY_VERIFY_WITH_TIMEOUT(!quit->busy(),15000);QVERIFY(lateWorkspace);QCOMPARE(accepted.count(),0);QVERIFY(view.window->isVisible());QVERIFY(reader->hasUnsavedChanges());
+        ReaderController recovered;recovered.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE(recovered.pageCount(),1);QTRY_COMPARE(recovered.pendingCommands(),0);QVERIFY(recovered.hasUnsavedChanges());
+    }
     void quitPreflightsDraftsAndReportsPartialSuccessWithoutClosingWindows() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto one=scratch.path()+"/quit-one.pdf",two=scratch.path()+"/quit-two.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",one));QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",two));
         NativeCorpus::Viewer first,second;QVERIFY(first.window && second.window);first.workspace.openFile(QUrl::fromLocalFile(one));second.workspace.openFile(QUrl::fromLocalFile(two));auto *a=first.workspace.activeReader(),*b=second.workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(a->pageCount()+b->pageCount(),4,10000);QTRY_COMPARE_WITH_TIMEOUT(a->pendingCommands()+b->pendingCommands(),0,10000);
@@ -4761,12 +4802,12 @@ private slots:
     }
     void quitResolutionAndCrashRecoverySurviveARealProcessBoundary() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});
-        for(const QString mode:{"crash","discard","save"}) {
+        for(const QString mode:{"crash","discard","discard-event","save"}) {
             const auto path=scratch.path()+"/"+mode+".pdf",cache=scratch.path()+"/"+mode+"-cache";QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",path));QFile file(path);QVERIFY(file.open(QIODevice::ReadOnly));const auto before=file.readAll();file.close();
             QProcess child;auto env=QProcessEnvironment::systemEnvironment();env.insert("QT_QPA_PLATFORM","offscreen");env.insert("QT_QUICK_BACKEND","software");env.remove("LYRA_READER_REQUIRE_NATIVE_QT");child.setProcessEnvironment(env);child.start(QCoreApplication::applicationFilePath(),{"--quit-recovery-child",mode,path,cache});QVERIFY(child.waitForStarted(5000));QVERIFY(child.waitForFinished(45000));QVERIFY2(child.exitCode()==9,child.readAllStandardError().constData());
             qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",cache.toUtf8());ReaderController reopened;reopened.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reopened.pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(reopened.pendingCommands(),0,10000);QVERIFY2(reopened.error().isEmpty(),qPrintable(reopened.error()));const auto marks=reopened.data().value("marks").toMap();
             QCOMPARE(reopened.hasUnsavedChanges(),mode=="crash");QCOMPARE(marks.value("page_session_active").toBool(),mode=="crash");
-            if(mode=="discard")QVERIFY(marks.value("bookmarks").toList().isEmpty());else QCOMPARE(marks.value("bookmarks").toList().first().toMap().value("title").toString(),QString("Process-boundary bookmark"));
+            if(mode.startsWith("discard"))QVERIFY(marks.value("bookmarks").toList().isEmpty());else QCOMPARE(marks.value("bookmarks").toList().first().toMap().value("title").toString(),QString("Process-boundary bookmark"));
             QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll()==before,mode!="save");file.close();
         }
     }

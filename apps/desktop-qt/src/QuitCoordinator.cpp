@@ -10,6 +10,12 @@
 #include <QSet>
 #include <QJSValue>
 #include <filesystem>
+#include <algorithm>
+#include <vector>
+#include <QFutureWatcher>
+#include <QJsonDocument>
+#include <QtConcurrentRun>
+#include <utility>
 
 namespace {
 bool sameFile(const QUrl &one,const QUrl &two) {
@@ -44,7 +50,15 @@ QVariantList QuitCoordinator::documents()const {
     return result;
 }
 bool QuitCoordinator::eventFilter(QObject *object,QEvent *event) {
-    if(object==QCoreApplication::instance() && event->type()==QEvent::Quit && !m_accepting) {
+    if(object==QCoreApplication::instance() && event->type()==QEvent::Quit) {
+        if(m_accepting) {
+            // The accepted application's queued Quit may arrive after the close
+            // callbacks. Closed readers deliberately still own their recovery data.
+            const auto windows=QGuiApplication::topLevelWindows();
+            const bool newReader=std::any_of(windows.cbegin(),windows.cend(),[](QWindow *window){return window->objectName()==QStringLiteral("readerWindow") && window->isVisible();});
+            if(!newReader)return false;
+            m_accepting=false;
+        }
         const auto all=WorkspaceController::allWorkspaces();
         WorkspaceController *owner=nullptr;QSet<QWindow *> seen;
         for(auto *window=QGuiApplication::focusWindow();window && !seen.contains(window);window=window->transientParent()) {
@@ -57,7 +71,8 @@ bool QuitCoordinator::eventFilter(QObject *object,QEvent *event) {
 }
 void QuitCoordinator::request(WorkspaceController *owner) {
     if(busy() || !owner)return;
-    ++m_epoch;m_owner=owner;m_windows.clear();m_documents.clear();m_completed=0;m_index=0;m_copyIndex=0;
+    m_accepting=false;
+    ++m_epoch;m_owner=owner;m_windows.clear();m_documents.clear();m_completed=0;m_index=0;m_copyIndex=0;m_resolved=false;m_receipt.clear();m_receiptDocument.reset();m_resolutionAborted=false;m_resolutionError.clear();
     m_message=tr("Waiting for pending document changes…");m_phase=QStringLiteral("preparing");
     for(auto *workspace:WorkspaceController::allWorkspaces()) {
         QWindow *window=nullptr;
@@ -118,8 +133,7 @@ void QuitCoordinator::decide(const QString &decision) {
         }
         askNextCopy();
     } else {
-        for(const auto &window:m_windows)if(window.window)QMetaObject::invokeMethod(window.window,"prepareDiscardForQuit");
-        m_phase=QStringLiteral("discarding");m_message=tr("Discarding document drafts…");emit changed();advance();
+        m_phase=QStringLiteral("discarding");m_message=tr("Recording the resolved quit…");emit changed();recordResolution();
     }
 }
 void QuitCoordinator::askNextCopy() {
@@ -188,8 +202,7 @@ void QuitCoordinator::finishCommand(quint64 id,const QString &operation,const QV
     for(const auto &key:{"cache_cleanup_error","sidecar_error","sidecar_cleanup_error","recovery_warning"})if(!report.value(QLatin1String(key)).toString().isEmpty()){abort(tr("The PDF operation completed, but its draft needs attention: %1").arg(report.value(QLatin1String(key)).toString()));return;}
     auto &document=m_documents[m_index];
     // These are the only draft changes the matching Rust command may resolve.
-    if(operation==QStringLiteral("document_discard")){document.notes.clear();document.drafts.clear();}
-    else if(operation==QStringLiteral("document_save"))document.drafts.remove(QStringLiteral("forms"));
+    if(operation==QStringLiteral("document_save"))document.drafts.remove(QStringLiteral("forms"));
     m_draining=true;QMetaObject::invokeMethod(this,&QuitCoordinator::advance,Qt::QueuedConnection);
 }
 void QuitCoordinator::advance() {
@@ -202,7 +215,7 @@ void QuitCoordinator::advance() {
         for(const auto &window:m_windows)if(window.workspace)for(const auto &tab:window.workspace->tabs()){auto *reader=tab.toMap().value(QStringLiteral("reader")).value<ReaderController *>();if(reader && (reader->loading() || reader->pendingCommands()>0 || reader->regionPersistencePending()))return;}
         collect();return;
     }
-    if(m_phase!=QStringLiteral("saving") && m_phase!=QStringLiteral("discarding") && m_phase!=QStringLiteral("retiring"))return;
+    if(m_phase!=QStringLiteral("saving"))return;
     if(m_command) {
         if(!m_draining)return;
         auto &document=m_documents[m_index];if(document.reader && document.reader->pendingCommands()>0)return;
@@ -210,15 +223,36 @@ void QuitCoordinator::advance() {
         if(m_operation!=QStringLiteral("save_document_copy") && document.reader->hasUnsavedChanges()){abort(tr("Changes remain unsaved. All reader windows stay open."));return;}
         m_command=0;m_draining=false;++m_index;
     }
-    if(m_index==m_documents.size()) {
-        if(m_phase==QStringLiteral("saving")) {
-            m_phase=QStringLiteral("retiring");m_message=tr("Retiring drafts saved to copies…");m_index=0;emit changed();
-        } else {finish();return;}
-    }
-    while(m_phase==QStringLiteral("retiring") && m_index<m_documents.size() && !m_documents[m_index].copy)++m_index;
-    if(m_index==m_documents.size()){finish();return;}
+    if(m_index==m_documents.size()){recordResolution();return;}
     auto &document=m_documents[m_index];
-    startCommand(document,m_phase!=QStringLiteral("saving") ? QStringLiteral("document_discard") : document.copy ? QStringLiteral("save_document_copy") : QStringLiteral("document_save"));
+    startCommand(document,document.copy ? QStringLiteral("save_document_copy") : QStringLiteral("document_save"));
+}
+void QuitCoordinator::recordResolution() {
+    for(const auto &document:m_documents)if(!unchanged(document) || document.reader->pendingCommands()>0){abort(tr("New changes remain unsaved. All reader windows stay open."));return;}
+    if(m_documents.isEmpty()){finish();return;}
+    std::vector<std::shared_ptr<LyraReaderDesktopDocument>> documents;
+    for(const auto &document:m_documents)documents.push_back(document.handle);
+    const auto epoch=m_epoch;const auto resolution=m_decision==QStringLiteral("save") ? 0u : 1u;
+    m_recording=true;m_phase=QStringLiteral("recording");m_message=tr("Recording the resolved quit…");emit changed();
+    struct Result {QByteArray receipt;QString error;};
+    auto *watcher=new QFutureWatcher<Result>(this);
+    connect(watcher,&QFutureWatcher<Result>::finished,this,[this,watcher,documents,epoch] {
+        const auto result=watcher->result();watcher->deleteLater();
+        m_recording=false;
+        if(epoch!=m_epoch)return;
+        if(!result.error.isEmpty()){abort(m_resolutionAborted?m_resolutionError:result.error);return;}
+        m_receipt=result.receipt;m_receiptDocument=documents.front();m_resolved=true;
+        if(m_resolutionAborted){abort(m_resolutionError);return;}
+        const auto warning=QJsonDocument::fromJson(m_receipt).toVariant().toMap().value(QStringLiteral("warning")).toString();
+        if(!warning.isEmpty()){abort(tr("The quit decision was committed, but its durability could not be confirmed: %1").arg(warning));return;}
+        finish();
+    });
+    watcher->setFuture(QtConcurrent::run([documents,resolution] {
+        std::vector<const LyraReaderDesktopDocument *> handles;for(const auto &document:documents)handles.push_back(document.get());
+        LyraReaderBuffer output{},error{};const auto ok=lyra_reader_desktop_resolve_quit(handles.data(),handles.size(),resolution,&output,&error);
+        Result result;if(ok)result.receipt=QByteArray(reinterpret_cast<const char *>(output.data),qsizetype(output.len));else result.error=QString::fromUtf8(reinterpret_cast<const char *>(error.data),qsizetype(error.len));
+        lyra_reader_desktop_buffer_free(output);lyra_reader_desktop_buffer_free(error);return result;
+    }));
 }
 void QuitCoordinator::cancel() {
     if(m_phase==QStringLiteral("preparing") || m_phase==QStringLiteral("prompt") || m_phase==QStringLiteral("copy"))abort({});
@@ -227,20 +261,50 @@ void QuitCoordinator::restoreWindows() {
     for(const auto &window:m_windows)if(auto *quick=qobject_cast<QQuickWindow *>(window.window.data()))quick->contentItem()->setEnabled(window.enabled);
 }
 void QuitCoordinator::abort(const QString &error) {
-    m_timer.stop();for(const auto &connection:m_connections)disconnect(connection);m_connections.clear();restoreWindows();
-    const auto detail=error.isEmpty() ? QString{} : m_completed>0 ? tr("%1 Earlier successful saves or discards remain completed; unresolved drafts and all reader windows stay open.").arg(error) : error;
+    if(m_phase==QStringLiteral("cancelling"))return;
+    if(m_recording){m_timer.stop();m_resolutionAborted=true;m_resolutionError=error;return;}
+    m_timer.stop();for(const auto &connection:m_connections)disconnect(connection);m_connections.clear();
+    if(!m_receipt.isEmpty()) {
+        const auto receipt=std::exchange(m_receipt,{});const auto document=std::move(m_receiptDocument);m_resolved=false;m_phase=QStringLiteral("cancelling");
+        auto *watcher=new QFutureWatcher<QString>(this);
+        connect(watcher,&QFutureWatcher<QString>::finished,this,[this,watcher,error] {
+            const auto cancellation=watcher->result();watcher->deleteLater();m_phase=QStringLiteral("recording");
+            abort(cancellation.isEmpty()?error:tr("%1 The quit receipt could not be cancelled: %2. The stored decision may still resolve the earlier drafts on reopen. Keep these windows open and back up recovery data before closing.").arg(error,cancellation));
+        });
+        watcher->setFuture(QtConcurrent::run([document,receipt] {
+            LyraReaderBuffer failure{};const auto ok=lyra_reader_desktop_cancel_quit(document.get(),reinterpret_cast<const std::uint8_t *>(receipt.constData()),std::size_t(receipt.size()),&failure);
+            const auto message=ok?QString{}:QString::fromUtf8(reinterpret_cast<const char *>(failure.data),qsizetype(failure.len));lyra_reader_desktop_buffer_free(failure);return message;
+        }));return;
+    }
+    restoreWindows();
+    const auto detail=error.isEmpty() ? QString{} : m_completed>0 ? tr("%1 Earlier successful saves remain completed; unresolved drafts and all reader windows stay open.").arg(error) : error;
     ++m_epoch;m_phase=QStringLiteral("idle");m_message=detail;m_command=0;m_draining=false;m_windows.clear();m_documents.clear();emit changed();emit finished(false,detail);
 }
 void QuitCoordinator::finish() {
     // No window disappears until all documents, including late drafts, are resolved.
+    const auto all=WorkspaceController::allWorkspaces();
+    if(all.size()!=m_windows.size()){abort(tr("The reader windows changed while resolving the quit. Try again."));return;}
     for(const auto &window:m_windows) {
-        if(!window.window || !window.workspace || window.workspace->tabs().size()!=window.readers.size()){abort(tr("The reader tabs changed while resolving the quit."));return;}
+        if(!window.window || !window.workspace || !all.contains(window.workspace) || window.workspace->tabs().size()!=window.readers.size()){abort(tr("The reader tabs changed while resolving the quit."));return;}
         for(const auto &tab:window.workspace->tabs())if(!window.readers.contains(tab.toMap().value(QStringLiteral("reader")).value<ReaderController *>())){abort(tr("The reader tabs changed while resolving the quit."));return;}
     }
-    for(const auto &window:m_windows)for(const auto &tab:window.workspace->tabs()){auto *reader=tab.toMap().value(QStringLiteral("reader")).value<ReaderController *>();if(reader && (reader->hasUnsavedChanges() || reader->hasUnsavedReadingNotes() || reader->pendingCommands()>0)){abort(tr("New changes remain unsaved. All reader windows stay open."));return;}}
+    for(const auto &document:m_documents)if(!unchanged(document)){abort(tr("New changes remain unsaved. All reader windows stay open."));return;}
+    for(const auto &window:m_windows)for(const auto &tab:window.workspace->tabs()) {
+        auto *reader=tab.toMap().value(QStringLiteral("reader")).value<ReaderController *>();if(!reader)continue;
+        const bool resolved=m_resolved && std::any_of(m_documents.cbegin(),m_documents.cend(),[&](const Document &document){return document.reader==reader;});
+        if((reader->hasUnsavedChanges() && !resolved) || reader->hasUnsavedReadingNotes() || reader->pendingCommands()>0){abort(tr("New changes remain unsaved. All reader windows stay open."));return;}
+    }
+    if(m_resolved) {
+        LyraReaderBuffer failure{};
+        const auto ok=lyra_reader_desktop_activate_quit(reinterpret_cast<const std::uint8_t *>(m_receipt.constData()),std::size_t(m_receipt.size()),&failure);
+        const auto error=ok?QString{}:QString::fromUtf8(reinterpret_cast<const char *>(failure.data),qsizetype(failure.len));lyra_reader_desktop_buffer_free(failure);
+        if(!ok){abort(error);return;}
+    }
+    // Only an accepted batch may abandon UI drafts. Failed/cancelled batches keep them.
+    for(const auto &window:m_windows)if(window.window)QMetaObject::invokeMethod(window.window,"prepareDiscardForQuit");
+    m_receipt.clear();m_receiptDocument.reset();m_resolved=false;
     m_timer.stop();m_accepting=true;restoreWindows();
     for(const auto &window:m_windows)if(window.window)window.window->setProperty("closeApproved",true);
     for(const auto &window:m_windows)if(window.window)window.window->close();
     ++m_epoch;m_phase=QStringLiteral("idle");m_windows.clear();m_documents.clear();m_command=0;emit changed();emit finished(true,{});emit accepted();
-    QMetaObject::invokeMethod(this,[this]{m_accepting=false;},Qt::QueuedConnection);
 }

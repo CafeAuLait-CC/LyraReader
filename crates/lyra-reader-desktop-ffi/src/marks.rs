@@ -245,6 +245,44 @@ impl Marks {
             pending: self.pending_baseline.clone(),
         }
     }
+    pub(super) fn check_quit_draft(&self) -> Result<crate::draft_store::Pair, String> {
+        self.validate_source()?;
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
+        let pair = crate::draft_store::read(&self.path)?;
+        if let Some(context) = &self.session {
+            // During page editing the shared transaction manifest owns the marks;
+            // the original records/state before-images belong to edits.original.
+            context.control.check()?;
+        } else if pair != self.cache_pair() {
+            return Err("The annotation cache or pending state changed outside this window. The quit was cancelled; all drafts were kept.".into());
+        }
+        Ok(pair)
+    }
+    pub(super) fn hide_resolved_draft(&mut self, document: &LyraReaderDocument, error: String) {
+        // Cleanup failed after a confirmed quit. Keep every recovery byte, but show the
+        // original PDF read-only rather than revive work the reader explicitly resolved.
+        self.entries
+            .retain(|entry| matches!(entry, Entry::Opaque(_)));
+        self.deletions.clear();
+        self.hidden_ink.clear();
+        self.transient_ink.clear();
+        self.embedded_bookmarks.clear();
+        self.erase = None;
+        self.text_edit = None;
+        self.undo.clear();
+        self.redo.clear();
+        self.session = None;
+        self.owns_recovery = false;
+        self.pending = PendingState::new(false, None);
+        self.page_count = document.page_count();
+        if let Err(bookmarks) = self.seed_bookmarks(document) {
+            self.error = Some(format!("{error}. {bookmarks}"));
+        } else {
+            self.error = Some(error);
+        }
+    }
     pub fn discard_known(&self, document: &LyraReaderDocument) -> Result<Self, String> {
         if self.session.is_some() {
             return Err("Discard the page transaction through its original cache".into());

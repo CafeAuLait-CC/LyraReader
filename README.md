@@ -44,8 +44,10 @@ Save, Discard or Cancel, with pending form edits reviewed first. Failed writes k
 Discard clears known drafts while preserving foreign cache records. Pending ink deletions and
 their replacement strokes recover together after an interrupted process. Quit collects unsaved
 tabs across every reader window, with Save All, Discard All Changes and Cancel. Copy destinations
-are collected before writing; a failed resolution keeps every window open and reports operations
-already completed. Reading positions survive an aborted Save All attempt. Several newer macOS
+are collected before writing. Discard All records one batch decision without deleting any draft;
+the next open verifies the source and recovery fingerprints before retiring resolved work. Failed
+preparations keep every window and draft. Save All reports earlier PDF writes if a later save fails.
+Reading positions survive an aborted Save All attempt. Several newer macOS
 features are still being ported. XFA documents keep local reading bookmarks; PDF editing and
 derivative exports are refused, including forms selected as merge inputs.
 A real viewport-height change can enlarge the current page or facing spread below Fit Page;

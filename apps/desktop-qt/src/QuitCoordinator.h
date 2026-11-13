@@ -60,6 +60,7 @@ private:
     void finishCommand(quint64,const QString &,const QVariant &,const QString &);
     void abort(const QString &error);
     void finish();
+    void recordResolution();
     void restoreWindows();
     QPointer<WorkspaceController> m_owner;
     QList<Window> m_windows;
@@ -69,6 +70,9 @@ private:
     int m_index=0,m_copyIndex=0,m_completed=0;
     quint64 m_command=0;
     quint64 m_epoch=0;
-    bool m_draining=false,m_accepting=false;
+    bool m_draining=false,m_accepting=false,m_resolved=false,m_recording=false,m_resolutionAborted=false;
+    QString m_resolutionError;
+    QByteArray m_receipt;
+    std::shared_ptr<LyraReaderDesktopDocument> m_receiptDocument;
     QList<QMetaObject::Connection> m_connections;
 };

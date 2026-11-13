@@ -2,7 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 
-inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 13;
+inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 14;
 
 // Owned Rust allocations: free each Buffer exactly once using buffer_free.
 // Output buffers must be zero initialized; calls do not free previous contents.
@@ -81,6 +81,16 @@ bool lyra_reader_desktop_history_command(const LyraReaderDesktopHistory *history
 LyraReaderDesktopDocument *lyra_reader_desktop_open(const std::uint8_t *path, std::size_t path_len,
     const std::uint8_t *password, std::size_t password_len, LyraReaderBuffer *error);
 void lyra_reader_desktop_close(LyraReaderDesktopDocument *document);
+// Worker-only batch decision; all handles stay alive through the call. Resolution
+// 0=save, 1=discard. No draft is deleted. The owned JSON receipt can cancel this
+// exact decision if the UI epoch changes; error/output start empty and are freed once.
+bool lyra_reader_desktop_resolve_quit(const LyraReaderDesktopDocument *const *documents,
+    std::size_t count,std::uint32_t resolution,LyraReaderBuffer *output,LyraReaderBuffer *error);
+// Final bounded in-memory UI acknowledgement, with no I/O or PDFium operation.
+bool lyra_reader_desktop_activate_quit(const std::uint8_t *receipt,std::size_t length,LyraReaderBuffer *error);
+bool lyra_reader_desktop_cancel_quit(const LyraReaderDesktopDocument *document,
+    const std::uint8_t *receipt,std::size_t length,LyraReaderBuffer *error);
+
 bool lyra_reader_desktop_info(const LyraReaderDesktopDocument *document, LyraReaderBuffer *output, LyraReaderBuffer *error);
 bool lyra_reader_desktop_render(const LyraReaderDesktopDocument *document, std::uint32_t page, double scale,
     LyraReaderBitmap *output, LyraReaderBuffer *error);

@@ -195,11 +195,13 @@ impl DesktopDocument {
             mark_state.error = Some(error);
         }
         let marks = Mutex::new(mark_state);
+        let original = Arc::clone(&engine);
+        let original_layout = DocumentLayout::new(sizes, PAGE_GAP_PT);
         let document = Self {
             original_signature: engine.signature_status(),
             original_xfa: engine.xfa_status(),
             engine: RwLock::new(engine),
-            layout: RwLock::new(DocumentLayout::new(sizes, PAGE_GAP_PT)),
+            layout: RwLock::new(original_layout.clone()),
             edits: Mutex::new(crate::pages::PageEdits::default()),
             original_path: path.to_path_buf(),
             recovery_status: Mutex::new(Value::Null),
@@ -217,6 +219,34 @@ impl DesktopDocument {
             if let Ok(mut status) = document.recovery_status.lock() {
                 *status = json!({"error":error});
             }
+        }
+        if let Err(error) = crate::quit::consume(&document) {
+            let reason = format!(
+                "The resolved quit could not be cleaned up. Recovery files were kept; reopen to retry. {error}"
+            );
+            *document
+                .engine
+                .write()
+                .map_err(|_| "Document state is unavailable")? = Arc::clone(&original);
+            *document
+                .layout
+                .write()
+                .map_err(|_| "Document layout is unavailable")? = original_layout;
+            *document
+                .edits
+                .lock()
+                .map_err(|_| "Page-edit state is unavailable")? =
+                crate::pages::PageEdits::default();
+            document
+                .marks
+                .lock()
+                .map_err(|_| "Annotation state is unavailable")?
+                .hide_resolved_draft(&original, reason.clone());
+            *document
+                .recovery_status
+                .lock()
+                .map_err(|_| "Recovery state is unavailable")? =
+                json!({"error":reason,"resolved_quit_cleanup_pending":true});
         }
         Ok(document)
     }

@@ -113,6 +113,8 @@ pub(super) fn write(
                 next.pending.as_deref().ok_or("Missing pending state")?,
             )?;
         }
+        #[cfg(test)]
+        crate::quit::test_checkpoint("pending");
         if next.records != expected.records {
             atomic_write(
                 path,
@@ -121,6 +123,8 @@ pub(super) fn write(
                     .ok_or("Missing annotation records")?,
             )?;
         }
+        #[cfg(test)]
+        crate::quit::test_checkpoint("records");
         Ok::<_, String>(())
     })();
     if let Err(error) = changed {

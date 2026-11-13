@@ -6,7 +6,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc, LazyLock, Mutex,
+        Arc, LazyLock, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -16,6 +16,12 @@ static OWNERS: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(|| Mutex::new(H
 pub(super) struct SessionOwner(PathBuf);
 impl SessionOwner {
     pub fn acquire(path: &Path) -> Result<Self, String> {
+        let path = path
+            .parent()
+            .ok_or("Missing session owner directory")?
+            .canonicalize()
+            .map_err(|e| e.to_string())?
+            .join(path.file_name().ok_or("Missing session owner filename")?);
         let mut owners = lock(&OWNERS).map_err(|e| e.to_string())?;
         if !owners.insert(path.to_path_buf()) {
             return Err("This PDF is being edited in another window. Save or close that editing session first.".into());
@@ -98,46 +104,137 @@ impl SessionControl {
     }
 }
 
+// File leases belong to the directory, independently of the editable transaction.
+// Reopening recovery in this process must see leases retained by an older preview.
+static FILES: LazyLock<Mutex<HashMap<PathBuf, Weak<SessionFiles>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+struct SessionFiles {
+    path: PathBuf,
+    cleanup: AtomicBool,
+    retirement: Mutex<Option<Arc<SessionControl>>>,
+    revisions: Mutex<HashMap<PathBuf, usize>>,
+}
+impl SessionFiles {
+    fn new(path: PathBuf, temporary: bool) -> Self {
+        Self {
+            path,
+            cleanup: AtomicBool::new(temporary),
+            retirement: Mutex::new(None),
+            revisions: Mutex::new(HashMap::new()),
+        }
+    }
+    fn recoverable(path: &Path) -> Result<Arc<Self>, String> {
+        let path = path.canonicalize().map_err(|e| e.to_string())?;
+        let mut files = lock(&FILES).map_err(|e| e.to_string())?;
+        files.retain(|_, value| value.strong_count() > 0);
+        if let Some(existing) = files.get(&path).and_then(Weak::upgrade) {
+            return Ok(existing);
+        }
+        let state = Arc::new(Self::new(path.to_path_buf(), false));
+        files.insert(path.to_path_buf(), Arc::downgrade(&state));
+        Ok(state)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    #[test]
+    fn directory_aliases_share_the_file_lease_registry() {
+        let root = std::env::temp_dir().join(format!(
+            "lyra-reader-lease-alias-{}",
+            crate::marks::uuid().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let real = root.join("session-test");
+        fs::create_dir(&real).unwrap();
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let first = SessionFiles::recoverable(&real).unwrap();
+        let second = SessionFiles::recoverable(&alias).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        drop(first);
+        drop(second);
+        // Only this test's unique synthetic directory is disposable.
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+impl Drop for SessionFiles {
+    fn drop(&mut self) {
+        if !self.cleanup.load(Ordering::Acquire) {
+            return;
+        }
+        // A poisoned lease table must keep every file rather than guess at ownership.
+        if self.revisions.is_poisoned() {
+            eprintln!("lyra-reader-session: poisoned file leases; files were kept");
+            return;
+        }
+        match self.retirement.get_mut() {
+            Ok(Some(control)) => {
+                if let Err(e) = control.handle.close(true) {
+                    eprintln!("lyra-reader-session: retired cleanup failed; files were kept: {e}");
+                }
+            }
+            Ok(None) => {
+                // Only a native-owned temporary or validated retired directory is disposable here.
+                let _ = fs::remove_dir_all(&self.path);
+            }
+            Err(e) => {
+                eprintln!("lyra-reader-session: retirement state unavailable; files were kept: {e}")
+            }
+        }
+    }
+}
 pub(super) struct SessionDirectory {
     pub path: PathBuf,
     control: Option<Arc<SessionControl>>,
     owner: Mutex<Option<SessionOwner>>,
-    cleanup: AtomicBool,
-    revisions: Mutex<HashMap<PathBuf, usize>>,
+    files: Arc<SessionFiles>,
 }
 impl SessionDirectory {
+    // Caller proved this is a retired session-* child of the document cache and
+    // holds its editor registration. Existing immutable leases still delay removal.
+    pub(super) fn retire_detached(path: &Path) -> Result<(), String> {
+        let files = SessionFiles::recoverable(path)?;
+        files.cleanup.store(true, Ordering::Release);
+        Ok(())
+    }
     pub fn temporary(path: PathBuf) -> Self {
+        let files = Arc::new(SessionFiles::new(path.clone(), true));
         Self {
             path,
             control: None,
             owner: Mutex::new(None),
-            cleanup: AtomicBool::new(true),
-            revisions: Mutex::new(HashMap::new()),
+            files,
         }
     }
-    pub fn recoverable(path: PathBuf, control: Arc<SessionControl>, owner: SessionOwner) -> Self {
-        Self {
+    pub fn recoverable(
+        path: PathBuf,
+        control: Arc<SessionControl>,
+        owner: SessionOwner,
+    ) -> Result<Self, String> {
+        let files = SessionFiles::recoverable(&path)?;
+        Ok(Self {
             path,
             control: Some(control),
             owner: Mutex::new(Some(owner)),
-            cleanup: AtomicBool::new(false),
-            revisions: Mutex::new(HashMap::new()),
-        }
+            files,
+        })
     }
     pub fn lease(self: &Arc<Self>, path: &Path) -> Result<RevisionLease, String> {
-        let mut revisions = lock(&self.revisions).map_err(|e| e.to_string())?;
+        let mut revisions = lock(&self.files.revisions).map_err(|e| e.to_string())?;
         let count = revisions.entry(path.to_path_buf()).or_insert(0);
         *count = count
             .checked_add(1)
             .ok_or("Revision lease count overflowed")?;
         Ok(RevisionLease {
-            directory: Arc::clone(self),
+            files: Arc::clone(&self.files),
             path: path.to_path_buf(),
         })
     }
     pub fn collect_garbage(&self) -> Result<(), String> {
         if let Some(control) = &self.control {
-            let protected = lock(&self.revisions)
+            let protected = lock(&self.files.revisions)
                 .map_err(|e| e.to_string())?
                 .keys()
                 .map(|p| {
@@ -150,39 +247,27 @@ impl SessionDirectory {
         Ok(())
     }
     pub fn retire(&self) -> Result<(), String> {
+        let mut owner = lock(&self.owner).map_err(|e| e.to_string())?;
         if let Some(control) = &self.control {
+            // Acquire the fallible registry lock before retiring the public manifest.
+            let mut retirement = lock(&self.files.retirement).map_err(|e| e.to_string())?;
             control.mutate(|handle| handle.retire_recovery())?;
+            *retirement = Some(Arc::clone(control));
         }
-        self.cleanup.store(true, Ordering::Release);
-        // The public manifest is retired. A new session may start while immutable
-        // render snapshots keep this directory and its retired transaction alive.
-        lock(&self.owner).map_err(|e| e.to_string())?.take();
+        self.files.cleanup.store(true, Ordering::Release);
+        // No preview owns this editor registration. Its independent file lease only
+        // postpones cleanup, including across a restored editor of this same session.
+        owner.take();
         Ok(())
     }
 }
-impl Drop for SessionDirectory {
-    fn drop(&mut self) {
-        if !self.cleanup.load(Ordering::Acquire) {
-            return;
-        }
-        if let Some(control) = &self.control {
-            if let Err(e) = control.handle.close(true) {
-                eprintln!("lyra-reader-session: retired cleanup failed; files were kept: {e}");
-            }
-        } else {
-            // Only a temporary directory created by this shell is disposable here.
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-}
-
 pub(super) struct RevisionLease {
-    directory: Arc<SessionDirectory>,
+    files: Arc<SessionFiles>,
     path: PathBuf,
 }
 impl Drop for RevisionLease {
     fn drop(&mut self) {
-        match lock(&self.directory.revisions) {
+        match lock(&self.files.revisions) {
             Ok(mut revisions) => {
                 if let Some(count) = revisions.get_mut(&self.path) {
                     *count -= 1;

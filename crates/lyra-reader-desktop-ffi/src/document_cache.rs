@@ -77,7 +77,7 @@ fn canonical_path(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
-fn legacy_key(path: &Path) -> String {
+pub(super) fn legacy_key(path: &Path) -> String {
     Sha256::digest(path.to_string_lossy().as_bytes())
         .iter()
         .map(|b| format!("{b:02x}"))
