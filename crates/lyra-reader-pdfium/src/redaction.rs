@@ -1575,9 +1575,10 @@ fn rewrite_content(
 
     // Restore the initial page graphics state, including CTM, clipping and opacity.
     // An identity `cm` multiplies the existing CTM; it does not reset it. Paths are
-    // not saved by q/Q, so discard an unfinished source path before adding the mark.
-    output.push(Operation::new("Q", vec![]));
+    // not saved by q/Q: finish a pending clip inside the source state, then restore
+    // the page state. Reversing n/Q would apply the old clip to the new mark.
     output.push(Operation::new("n", vec![]));
+    output.push(Operation::new("Q", vec![]));
     let mut bytes = Content { operations: output }.encode().map_err(|error| {
         LyraReaderError::new(
             ErrorCode::Internal,
@@ -2927,7 +2928,7 @@ mod tests {
         let mut content = document.get_page_content(page);
         // The text has already been painted. A valid trailing CTM must not move
         // the new mark; multiplying it by an identity matrix cannot reset it.
-        content.extend_from_slice(b"\n100 100 120 30 re\n2 0 0 2 0 0 cm\n");
+        content.extend_from_slice(b"\n100 100 120 30 re W\n2 0 0 2 0 0 cm\n");
         document
             .change_page_content(page, content)
             .expect("replace content");
