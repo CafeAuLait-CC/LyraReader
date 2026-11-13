@@ -96,9 +96,9 @@ it until the updated page is ready, with undo and Save using the existing transa
 content revisions retain each complete visible page until its replacement scene is ready. New partial
 tiles do not mix with that page; render failures and admission pressure release the fallback. Nearby edges
 snap within four logical pixels, with guides from the current object snapshot; hold Shift at drag
-start for free placement. Text and bitmap objects have four native corner handles;
-Escape cancels a resize, and undo and Save use the same shared transaction. External Form groups
-and links keep their existing geometry fields; their corner handles remain pending verification.
+start for free placement. Text, bitmap, graphic and link objects have four native corner handles;
+Escape cancels a resize, and undo and Save use the same shared transaction. Editable text keeps its original size and reflows within a resized frame. Thin objects choose the
+nearest displayed corner when hit areas overlap; link corners work in the Link tool as well.
 Redact → Blackout/Erase removes
 PDF content and asks explicitly before a fallback replaces an entire page with an image. Fill & Sign
 places text, dates, vector checkmarks/crosses, stamps, drawn vector signatures and typed or imported

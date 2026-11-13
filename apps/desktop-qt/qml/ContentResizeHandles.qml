@@ -1,7 +1,7 @@
 import QtQuick
 
-// Native gesture chrome only. The existing typed Transform owns PDF geometry,
-// validation, revision checks, undo, recovery and Save.
+// Native gesture chrome only. The editor chooses the existing typed content
+// command; Rust owns geometry, text layout, validation, undo, recovery and Save.
 Item {
     id: handles
     objectName:"contentResizeHandles"+page
@@ -11,9 +11,10 @@ Item {
     property var paperMap: null
     property var focusTarget: null
     readonly property var shown: editor.gesture || (editor.selected ? editor.selected.bounds : null)
-    visible: app.canModifyPdf && app.secondaryRow==="edit" && editor.tool==="select"
+    visible: app.canModifyPdf && app.secondaryRow==="edit"
         && editor.model.page===page && !!editor.selected
-        && (editor.selected.kind==="text" || editor.selected.kind==="image")
+        && (editor.tool==="select" || (editor.tool==="link" && editor.selected.kind==="link"))
+        && ["text","image","graphic","link"].indexOf(editor.selected.kind)>=0
         && !editor.hasDraft && !editor.pending
     property var base: null
     property var patch: null
@@ -22,10 +23,23 @@ Item {
     property var editPaper: null
     property var editPaperRevision: null
     property string editRevision: ""
+    property string editTool: ""
     property real editZoom: 0
     property point editScroll
     property size editViewport
     property int corner: -1
+    // x/y and grip centres are logical view pixels. Thin objects can have
+    // overlapping hit rectangles, so the receiving MouseArea is not the corner.
+    function nearestCorner(x,y,fallback) {
+        let chosen=fallback,distance=Number.POSITIVE_INFINITY;
+        for(let i=0;i<4;++i) {
+            const item=grips.itemAt(i);if(!item || !item.visible)continue;
+            const dx=x-item.x-item.width/2,dy=y-item.y-item.height/2;
+            const next=dx*dx+dy*dy;
+            if(next<distance){distance=next;chosen=i;}
+        }
+        return chosen;
+    }
 
     function current() {
         return !!base && editOwner===app.currentReader && editGeneration===editOwner.documentGeneration
@@ -33,7 +47,7 @@ Item {
             && paperMap===editPaper && (editPaperRevision===null
                 ? (!paperMap || !paperMap.paperGeometryActive)
                 : !!paperMap && paperMap.paperGeometryActive && paperMap.paperGeometryRevision===editPaperRevision)
-            && !!editor.selected && base.id===editor.selected.id && editor.tool==="select"
+            && !!editor.selected && base.id===editor.selected.id && editor.tool===editTool
             && app.secondaryRow==="edit" && editZoom===app.zoom
             && editScroll.x===app.pageList.contentX && editScroll.y===app.pageList.contentY
             && editViewport.width===app.documentCanvas.width && editViewport.height===app.documentCanvas.height;
@@ -43,7 +57,7 @@ Item {
         if(!visible || editor.owner.pendingCommands)return false;
         app.documentCanvas.dragPreview.cancel();
         base=editor.selected;corner=index;editOwner=app.currentReader;
-        editGeneration=editOwner.documentGeneration;editRevision=editor.model.revision;
+        editGeneration=editOwner.documentGeneration;editRevision=editor.model.revision;editTool=editor.tool;
         editPaper=paperMap;editPaperRevision=paperMap && paperMap.paperGeometryActive ? paperMap.paperGeometryRevision : null;
         editZoom=app.zoom;editScroll=Qt.point(app.pageList.contentX,app.pageList.contentY);
         editViewport=Qt.size(app.documentCanvas.width,app.documentCanvas.height);
@@ -80,7 +94,7 @@ Item {
     }
     function cancel() {
         if(patch && editor.gesture===patch)editor.gesture=null;
-        base=null;patch=null;editOwner=null;editGeneration=null;editPaper=null;editPaperRevision=null;editRevision="";corner=-1;
+        base=null;patch=null;editOwner=null;editGeneration=null;editPaper=null;editPaperRevision=null;editRevision="";editTool="";corner=-1;
     }
     onVisibleChanged:if(!visible)cancel()
     onPaperMapChanged:if(base)cancel()
@@ -97,6 +111,7 @@ Item {
     Connections {target:handles.editor;function onModelChanged(){if(handles.base && !handles.current())handles.cancel();}function onSelectedChanged(){if(handles.base && !handles.current())handles.cancel();}function onToolChanged(){handles.cancel();}}
     Connections {target:handles.editor.owner;function onDocumentChanged(){if(handles.base && (!handles.current() || handles.editOwner.loading))handles.cancel();}}
     Repeater {
+        id:grips
         model:handles.visible ? 4 : 0
         Rectangle {
             id:grip
@@ -115,10 +130,13 @@ Item {
             Accessible.name:qsTr("PDF content resize corner %1").arg(index+1)
             MouseArea {
                 anchors.fill:parent;anchors.margins:-4
+                hoverEnabled:true
+                property int hitCorner:grip.index
                 preventStealing:pressed
-                cursorShape:grip.index===0 || grip.index===3 ? Qt.SizeFDiagCursor : Qt.SizeBDiagCursor
-                onPressed:{forceActiveFocus();handles.begin(grip.index);}
-                onPositionChanged:function(mouse){if(pressed){const p=mapToItem(handles,mouse.x,mouse.y);handles.resizeAt(p.x,p.y);}}
+                cursorShape:hitCorner===0 || hitCorner===3 ? Qt.SizeFDiagCursor : Qt.SizeBDiagCursor
+                onPressed:function(mouse){const p=mapToItem(handles,mouse.x,mouse.y);hitCorner=handles.nearestCorner(p.x,p.y,grip.index);forceActiveFocus();handles.begin(hitCorner);}
+                onPositionChanged:function(mouse){const p=mapToItem(handles,mouse.x,mouse.y);if(pressed)handles.resizeAt(p.x,p.y);else hitCorner=handles.nearestCorner(p.x,p.y,grip.index);}
+                onExited:if(!pressed)hitCorner=grip.index
                 onReleased:function(mouse){const p=mapToItem(handles,mouse.x,mouse.y);handles.finish(p.x,p.y);}
                 onCanceled:handles.cancel()
                 Keys.onEscapePressed:handles.cancel()

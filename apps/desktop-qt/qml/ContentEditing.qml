@@ -97,7 +97,14 @@ Item {
     }
     function applyGeometry(item,bounds) {
         if (hasDraft || !item) return;
-        submit({Transform:{revision:model.revision,target:item.id,bounds:bounds,rotation:0}},model.page,false);
+        // The content row resizes an editable text frame without stretching its
+        // glyphs. The existing Rust writer owns fitting and line layout.
+        const reflow=item.can_edit_text && (Math.abs(bounds.width-item.bounds.width)>.1
+            || Math.abs(bounds.height-item.bounds.height)>.1);
+        const command=reflow ? {ReplaceText:{revision:model.revision,target:item.id,text:item.text,
+            bounds:bounds,font:"Original",size:item.size,colour:item.colour,alignment:0}}
+            : {Transform:{revision:model.revision,target:item.id,bounds:bounds,rotation:0}};
+        submit(command,model.page,false);
     }
     function remove() {
         if (hasDraft || !selected) return;
