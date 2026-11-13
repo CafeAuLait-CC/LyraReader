@@ -2132,8 +2132,10 @@ ApplicationWindow {
                         required property var modelData
                         objectName: "moveTabDestination"
                         text: modelData.title
-                        contentItem: Text {text:destinationItem.text;textFormat:Text.PlainText;font:destinationItem.font;color:destinationItem.highlighted ? destinationItem.palette.highlightedText : destinationItem.palette.windowText;elide:Text.ElideRight;verticalAlignment:Text.AlignVCenter}
-                        ToolTip.text: modelData.detail
+                        readonly property string destinationDescription: text+"\n"+modelData.detail
+                        Accessible.description: destinationDescription
+                        contentItem: Text {text:destinationItem.text;textFormat:Text.PlainText;font:destinationItem.font;color:destinationItem.highlighted ? destinationItem.palette.highlightedText : destinationItem.palette.windowText;elide:Text.ElideMiddle;verticalAlignment:Text.AlignVCenter}
+                        ToolTip.text: destinationDescription
                         ToolTip.visible: hovered
                         onTriggered: root.session.moveActiveTabToWindow(modelData.windowId,moveWindowMenu.sourceReader,moveWindowMenu.sourceGeneration)
                     }

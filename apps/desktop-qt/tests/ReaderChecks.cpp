@@ -396,6 +396,20 @@ private slots:
         auto *entry=source->findChildren<QObject *>("moveTabDestination").first();QVERIFY(QMetaObject::invokeMethod(entry,"triggered"));QTRY_VERIFY_WITH_TIMEOUT(source.isNull(),10000);
         QCOMPARE(created.size(),2);QVERIFY(target->isVisible());QCOMPARE(destination->tabs().size(),2);QCOMPARE(destination->activeReader(),reader);QCOMPARE(reader->parent(),destination);QCOMPARE(destination->tabs()[0].toMap().value("reader").value<ReaderController *>(),old);
     }
+    void longDestinationLabelsKeepTheirWindowNumberAndCompleteDescription_data() {
+        QTest::addColumn<QString>("theme");QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
+    }
+    void longDestinationLabelsKeepTheirWindowNumberAndCompleteDescription() {
+        QFETCH(QString,theme);QTemporaryDir scratch;QVERIFY(scratch.isValid());ReaderWindowFactory windows;auto *source=windows.createWindow();QVERIFY(source);source->setProperty("appearance",theme);source->resize(700,600);auto *origin=source->property("session").value<WorkspaceController *>();
+        const auto incoming=scratch.filePath("incoming.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",incoming));origin->openFile(QUrl::fromLocalFile(incoming));QTRY_VERIFY_WITH_TIMEOUT(origin->activeReader()->pageCount()==1 && !origin->activeReader()->pendingCommands(),10000);QVERIFY(settleReaderViewport(source));
+        const auto name=QString("identical-")+QString(80,QLatin1Char('w'))+".pdf";
+        for(const auto &folder:{"first-target","second-target"}){QVERIFY(QDir(scratch.path()).mkdir(folder));const auto file=scratch.filePath(QString(folder)+"/"+name);QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",file));auto *target=windows.createWindow();QVERIFY(target);auto *owner=target->property("session").value<WorkspaceController *>();owner->openFile(QUrl::fromLocalFile(file));QTRY_VERIFY_WITH_TIMEOUT(owner->activeReader()->pageCount()==1 && !owner->activeReader()->pendingCommands(),10000);}
+        const auto targets=origin->tabTransferTargets();QCOMPARE(targets.size(),2);QVERIFY(targets[0].toMap().value("windowId")!=targets[1].toMap().value("windowId"));
+        for(const auto &target:targets){const auto label=target.toMap().value("title").toString();QVERIFY2(label.startsWith("Window "),qPrintable(label));QVERIFY(label.contains(name));QVERIFY(label.contains("-target"));}
+        source->requestActivate();QTRY_VERIFY(QGuiApplication::focusWindow()==source);auto *fileMenu=source->findChild<QObject *>("fileMenu"),*menu=source->findChild<QObject *>("moveTabToWindowMenu");QVERIFY(fileMenu && menu);QVERIFY(QMetaObject::invokeMethod(fileMenu,"open"));QTRY_VERIFY(fileMenu->property("visible").toBool());QVERIFY(QMetaObject::invokeMethod(menu,"open"));QTRY_VERIFY(menu->property("visible").toBool());QTRY_COMPARE(source->findChildren<QObject *>("moveTabDestination").size(),2);
+        for(auto *entry:source->findChildren<QObject *>("moveTabDestination")){auto *label=entry->property("contentItem").value<QQuickItem *>();QVERIFY(label);QCOMPARE(label->property("textFormat").toInt(),int(Qt::PlainText));QCOMPARE(label->property("elide").toInt(),int(Qt::ElideMiddle));QTRY_VERIFY(label->property("truncated").toBool());QCOMPARE(entry->property("destinationDescription").toString(),entry->property("text").toString()+"\n1 tab");}
+        QVERIFY(menu->property("width").toDouble()<=source->width()-20);QTest::qWait(30);const auto shot=qEnvironmentVariable("LYRA_READER_DESTINATION_MENU_SNAPSHOT");if(!shot.isEmpty())QVERIFY(source->grabWindow().save(shot+"-"+theme+".png"));
+    }
     void movingAnActiveTabKeepsItsReaderAcrossEnginesAndClosesOnlyTheEmptySource_data() {
         QTest::addColumn<QString>("layout");QTest::newRow("Continuous")<<QString("Continuous");QTest::newRow("Facing")<<QString("Facing");
     }

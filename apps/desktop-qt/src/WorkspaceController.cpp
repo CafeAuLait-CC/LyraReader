@@ -65,7 +65,7 @@ QVariantList WorkspaceController::tabTransferTargets()const {
         const auto *reader=candidate->activeReader();const QFileInfo file(reader ? reader->fileUrl().toLocalFile() : QString{});
         const auto title=reader && reader->pageCount() ? reader->title() : tr("Empty reader");
         const auto folder=reader && !reader->fileUrl().isEmpty() ? file.dir().dirName() : QString{};
-        const auto label=folder.isEmpty() ? tr("%1 · Window %2").arg(title).arg(number) : tr("%1 — %2 · Window %3").arg(title,folder).arg(number);
+        const auto label=folder.isEmpty() ? tr("Window %2 · %1").arg(title).arg(number) : tr("Window %3 · %1 — %2").arg(title,folder).arg(number);
         result.append(QVariantMap{{QStringLiteral("windowId"),candidate->windowTransferId()},{QStringLiteral("title"),label},{QStringLiteral("detail"),(candidate->m_tabs.size()==1 ? tr("1 tab") : tr("%1 tabs").arg(candidate->m_tabs.size()))}});
     }
     return result;
