@@ -142,11 +142,13 @@ Pane {
                 id: question
                 objectName: "aiQuestion"
                 width: composerScroll.availableWidth
-                text: aiPanel.input.question || ""
+                readonly property string modelText: aiPanel.input.question || ""
+                text: modelText
                 textFormat: TextEdit.PlainText; wrapMode: TextEdit.Wrap
                 placeholderText: aiPanel.workspace === "chat" ? qsTr("Ask about this document…") : qsTr("Question about selected text…")
                 Accessible.name: aiPanel.workspace === "chat" ? qsTr("Question about document") : qsTr("Question about selection")
-                onTextChanged: if (activeFocus) aiPanel.owner.setAiInput("question", text)
+                // Model rebinding must not enter the setter while switching readers.
+                onTextChanged: if (activeFocus && text !== modelText) aiPanel.owner.setAiInput("question", text)
                 Keys.onPressed: function(event) {
                     if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && (event.modifiers & Qt.ControlModifier) && preview.enabled) { aiPanel.prepare(); event.accepted = true; }
                 }

@@ -38,6 +38,7 @@
 #include <QDirIterator>
 #include <QSignalSpy>
 #include <QQmlApplicationEngine>
+#include <QQmlError>
 #include <QQmlContext>
 #include <QJSValue>
 #include <QUrlQuery>
@@ -159,6 +160,13 @@ static bool clickDialogButton(QQuickWindow *window,QObject *dialog,const QString
         return true;
     }
     return false;
+}
+
+static QStringList qmlBindingLoops(const QSignalSpy &warnings) {
+    QStringList result;
+    for(const auto &arguments:warnings)for(const auto &error:qvariant_cast<QList<QQmlError>>(arguments.first()))
+        if(error.description().contains("Binding loop"))result.append(error.toString());
+    return result;
 }
 
 // A native compositor can acknowledge a different initial size after engine data
@@ -2178,7 +2186,7 @@ private slots:
         QTest::keyClick(view.window,Qt::Key_Home,Qt::ControlModifier);QTRY_VERIFY(composer->mapRectToItem(viewport,composer->property("cursorRectangle").toRectF()).top()>=0);QVERIFY(composer->mapRectToItem(viewport,composer->property("cursorRectangle").toRectF()).bottom()<=viewport->height());QCOMPARE(reader->aiState().value("input").toMap().value("chatQuestion").toString(),draft);
     }
     void closingAiWithAComposerFocusedReturnsKeyboardUndoToTheDocument() {
-        QTemporaryDir scratch;const auto path=scratch.path()+"/ai-focus.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QTemporaryDir scratch;const auto path=scratch.path()+"/ai-focus.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));NativeCorpus::Viewer view;QVERIFY(view.window);QSignalSpy qmlWarnings(&view.engine,&QQmlEngine::warnings);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
         reader->submit("mark_create",{{"entry",QVariantMap{{"kind","square"},{"page",0},{"version",1},{"rect",QVariantMap{{"x",60},{"y",120},{"width",60},{"height",40}}},{"color","#90B79AFF"},{"note","Synthetic document undo"},{"strokeWidth",2}}}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QCOMPARE(reader->data().value("marks").toMap().value("annotations").toList().size(),1);
         QVERIFY(QMetaObject::invokeMethod(view.window,"openAiWorkspace",Q_ARG(QVariant,"chat")));auto *composer=visualItem(view.window->contentItem(),"aiQuestion");QVERIFY(composer);composer->forceActiveFocus();QTRY_VERIFY(composer->hasActiveFocus());for(const auto ch:QByteArray("Draft retained"))QTest::keyClick(view.window,ch);QCOMPARE(reader->aiState().value("input").toMap().value("chatQuestion").toString(),QString("Draft retained"));
         QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,false)));QVERIFY(!composer->hasActiveFocus());auto *canvas=visualItem(view.window->contentItem(),"pageList");QVERIFY(canvas && canvas->hasActiveFocus());QTest::keyClick(view.window,Qt::Key_Z,Qt::ControlModifier);QTRY_COMPARE_WITH_TIMEOUT(reader->data().value("marks").toMap().value("annotations").toList().size(),0,10000);QCOMPARE(reader->aiState().value("input").toMap().value("chatQuestion").toString(),QString("Draft retained"));
@@ -2186,6 +2194,8 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,true)));view.window->setProperty("textViewVisible",true);auto *text=visualItem(view.window->contentItem(),"accessiblePageText");QVERIFY(text);QTRY_VERIFY(text->isVisible());QTest::qWait(30);composer->forceActiveFocus();view.window->setProperty("aiPanelVisible",false);QTRY_VERIFY(text->hasActiveFocus());QVERIFY(!canvas->hasActiveFocus());
         view.window->setProperty("textViewVisible",false);QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,true)));QVERIFY(QMetaObject::invokeMethod(view.window,"showOverview",Q_ARG(QVariant,false)));auto *grid=visualItem(view.window->contentItem(),"pageOverview");QVERIFY(grid && grid->isVisible());composer->forceActiveFocus();view.window->setProperty("aiPanelVisible",false);QTRY_VERIFY(grid->hasActiveFocus());QVERIFY(!canvas->hasActiveFocus());
         QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,true)));composer->forceActiveFocus();view.workspace.newTab();QTRY_VERIFY(!composer->hasActiveFocus());QVERIFY(view.workspace.activeReader()->aiState().value("input").toMap().value("chatQuestion").toString().isEmpty());QCOMPARE(reader->aiState().value("input").toMap().value("chatQuestion").toString(),QString("Draft retained"));
+        const auto loops=qmlBindingLoops(qmlWarnings);QVERIFY2(loops.isEmpty(),qPrintable(loops.join("\n")));
+        QCOMPARE(view.workspace.activeReader()->aiState().value("input").toMap(),QVariantMap());
     }
     void auditViewerWorksWithoutAPdfAndClearsOnlyTheReviewedLocalSnapshot() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});const auto cache=scratch.path()+"/cache";qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",cache.toUtf8());
