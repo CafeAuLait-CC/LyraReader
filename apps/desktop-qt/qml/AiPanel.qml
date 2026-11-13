@@ -143,12 +143,21 @@ Pane {
                 objectName: "aiQuestion"
                 width: composerScroll.availableWidth
                 readonly property string modelText: aiPanel.input.question || ""
-                text: modelText
+                property bool applyingModel: false
+                function syncModelText() {
+                    if(text===modelText)return;
+                    applyingModel=true;
+                    text=modelText;
+                    applyingModel=false;
+                }
+                onModelTextChanged:syncModelText()
+                Component.onCompleted:syncModelText()
                 textFormat: TextEdit.PlainText; wrapMode: TextEdit.Wrap
                 placeholderText: aiPanel.workspace === "chat" ? qsTr("Ask about this document…") : qsTr("Question about selected text…")
                 Accessible.name: aiPanel.workspace === "chat" ? qsTr("Question about document") : qsTr("Question about selection")
-                // Model rebinding must not enter the setter while switching readers.
-                onTextChanged: if (activeFocus && text !== modelText) aiPanel.owner.setAiInput("question", text)
+                // TextEdit can normalize displayed line separators. Only real edits
+                // may replace the model's original text or invalidate its preview.
+                onTextChanged: if (activeFocus && !applyingModel) aiPanel.owner.setAiInput("question", text)
                 Keys.onPressed: function(event) {
                     if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && (event.modifiers & Qt.ControlModifier) && preview.enabled) { aiPanel.prepare(); event.accepted = true; }
                 }

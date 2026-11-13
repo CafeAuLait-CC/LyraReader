@@ -118,8 +118,14 @@ Item {
         modal: true
         title: qsTr("Export as Flattened Copy")
         standardButtons: Dialog.Ok | Dialog.Cancel
+        // This notice always has a title and buttons. Reserve their intrinsic
+        // chrome even while closed, before the overlay reparents the popup.
+        implicitHeight: topPadding + bottomPadding + flattenDescription.implicitHeight
+            + (header ? header.implicitHeight + spacing : 0)
+            + (footer ? footer.implicitHeight + spacing : 0)
         Label {
-            width: parent.width
+            id: flattenDescription
+            width: flattenNotice.availableWidth
             textFormat: Text.PlainText
             wrapMode: Text.Wrap
             text: qsTr("Paints saved annotations and form values into a new PDF. Pending annotation and form drafts are not included; save them first to include them. Links and sticky notes remain annotations, and unsupported fields are kept and reported. The original is unchanged. This is not tamper-proof: the painted content remains editable, and only a digital signature can detect later changes.")

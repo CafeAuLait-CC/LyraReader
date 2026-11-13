@@ -2073,14 +2073,45 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(reading,"prepare"));QTRY_COMPARE(reader->documentReading().value("phase").toString(),QString("preview"));QTRY_COMPARE(reader->pendingCommands(),0);state=reader->documentReading();QVERIFY(reader->startDocumentReading("local",state.value("plan").toMap(),state.value("token").toString()));QTRY_COMPARE(server.requests.size(),2);QTRY_COMPARE_WITH_TIMEOUT(server.activeConnections(),1,10000);reader->openFile(QUrl::fromLocalFile(path));QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);QTRY_COMPARE_WITH_TIMEOUT(server.activeConnections(),0,10000);QCOMPARE(reader->documentReading().value("phase").toString(),QString("idle"));QVERIFY(!reader->documentReading().value("ready").toBool());QVERIFY(reader->error().isEmpty());QVERIFY(!reading->property("visible").toBool());
         QDirIterator files(cache,{"document-knowledge-v1.json"},QDir::Files,QDirIterator::Subdirectories);QVERIFY(!files.hasNext());
     }
+    void documentReadingPopupKeyboardAndNarrowPayloadStayLocal_data() {
+        QTest::addColumn<QString>("theme");QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
+    }
     void documentReadingPopupKeyboardAndNarrowPayloadStayLocal() {
-        MockChatServer server;QVERIFY(server.listen());QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/reading-keyboard.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;auto *reader=view.workspace.activeReader();view.workspace.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
+        QFETCH(QString,theme);MockChatServer server;QVERIFY(server.listen());QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/reading-keyboard.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));NativeCorpus::Viewer view;QVERIFY(view.window);QSignalSpy qmlWarnings(&view.engine,&QQmlEngine::warnings);auto *window=view.window;window->setProperty("appearance",theme);auto *reader=view.workspace.activeReader();view.workspace.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
         window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic"}});const QVariantMap selection{{"page",0},{"start",0},{"end",3}};window->setProperty("selection",selection);
         auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);reader->setAiInput("action",3);QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(reader->aiState().value("plan").toMap().value("action").toString()=="TranslateSelection");QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(!reader->documentReading().value("choice_pending").toBool());
         reader->setAiInput("action",0);QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(reader->aiState().value("plan").toMap().value("action").toString()=="SummarizePage");QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(reader->documentReading().value("choice_pending").toBool());auto *skip=view.window->findChild<QObject *>("skipDocumentReadingChoice");QVERIFY(skip);QVERIFY(QMetaObject::invokeMethod(skip,"clicked"));QVERIFY(!reader->documentReading().value("choice_pending").toBool());QCOMPARE(server.requests.size(),0);
         QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(!reader->documentReading().value("choice_pending").toBool());window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);QTest::keyClick(window,Qt::Key_K,Qt::ControlModifier|Qt::ShiftModifier);auto *reading=window->findChild<QObject *>("documentReadingPopup");QVERIFY(reading);QTRY_VERIFY(reading->property("visible").toBool());QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!reading->property("visible").toBool());QCOMPARE(window->property("selection").toMap(),selection);QCOMPARE(server.requests.size(),0);
         QVERIFY(QMetaObject::invokeMethod(window,"openDocumentReading"));QVERIFY(QMetaObject::invokeMethod(reading,"prepare"));QTRY_COMPARE(reader->documentReading().value("phase").toString(),QString("preview"));QTRY_COMPARE(reader->pendingCommands(),0);auto *inspect=window->findChild<QObject *>("inspectDocumentReading");QVERIFY(inspect);QVERIFY(QMetaObject::invokeMethod(inspect,"clicked"));auto *payload=window->findChild<QObject *>("documentReadingPayload");QVERIFY(payload);QTRY_VERIFY(payload->property("visible").toBool());QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!payload->property("visible").toBool());QVERIFY(reading->property("visible").toBool());QCOMPARE(window->property("selection").toMap(),selection);
-        window->resize(380,600);QTest::qWait(100);QVERIFY(reading->property("width").toDouble()<=window->width()-20);QVERIFY(reading->property("height").toDouble()<=window->height()-40);const auto evidence=qEnvironmentVariable("LYRA_READER_AI_EVIDENCE_DIR");if(!evidence.isEmpty()){QVERIFY(QDir().mkpath(evidence));QVERIFY(window->grabWindow().save(evidence+"/reading-preview-light-narrow.png"));}QCOMPARE(server.requests.size(),0);reader->stopDocumentReading();QTRY_COMPARE(reader->pendingCommands(),0);
+        window->resize(380,600);QTest::qWait(100);QVERIFY(reading->property("width").toDouble()<=window->width()-20);QVERIFY(reading->property("height").toDouble()<=window->height()-40);const auto evidenceBase=qEnvironmentVariable("LYRA_READER_AI_EVIDENCE_DIR");const auto evidence=evidenceBase.isEmpty()?QString():evidenceBase+"/"+theme;if(!evidence.isEmpty()){QVERIFY(QDir().mkpath(evidence));QVERIFY(window->grabWindow().save(evidence+"/reading-preview-light-narrow.png"));}QCOMPARE(server.requests.size(),0);reader->stopDocumentReading();QTRY_COMPARE(reader->pendingCommands(),0);
+        auto *notice=window->findChild<QObject *>("flattenExportNotice");QVERIFY(notice);
+        QVariantList metrics;
+        const auto record=[&](const QString &phase) {
+            QVariantMap row{{"phase",phase},{"windowWidth",window->width()},{"windowHeight",window->height()}};
+            for(const auto *key:{"width","height","implicitWidth","implicitHeight","contentWidth","contentHeight","availableWidth","availableHeight","implicitContentWidth","implicitContentHeight","implicitHeaderHeight","implicitFooterHeight","implicitBackgroundHeight","topPadding","bottomPadding","topInset","bottomInset","spacing","visible"})row.insert(QString::fromLatin1(key),notice->property(key));
+            for(const auto *key:{"header","footer","contentItem"})if(auto *item=notice->property(key).value<QQuickItem *>()) {
+                QVariantMap sizes{{"type",QString::fromLatin1(item->metaObject()->className())},{"width",item->width()},{"height",item->height()},{"implicitWidth",item->implicitWidth()},{"implicitHeight",item->implicitHeight()},{"visible",item->isVisible()}};
+                QVariantList children;for(auto *child:item->childItems())children.append(QVariantMap{{"type",QString::fromLatin1(child->metaObject()->className())},{"x",child->x()},{"y",child->y()},{"width",child->width()},{"height",child->height()},{"implicitHeight",child->implicitHeight()}});sizes.insert("children",children);row.insert(QString::fromLatin1(key),sizes);
+            }
+            metrics.append(row);qInfo()<<"Flatten intrinsic metrics"<<QJsonDocument::fromVariant(row).toJson(QJsonDocument::Compact);
+        };
+        record("closed-after-reading-popup");
+        QVERIFY(QMetaObject::invokeMethod(reading,"close"));QTRY_VERIFY(!reading->property("visible").toBool());
+        QVERIFY(QMetaObject::invokeMethod(notice,"open"));QTRY_VERIFY(notice->property("visible").toBool());QTest::qWait(160);record("open-narrow");
+        auto *body=notice->property("contentItem").value<QQuickItem *>();auto *background=notice->property("background").value<QQuickItem *>();auto *header=notice->property("header").value<QQuickItem *>();auto *footer=notice->property("footer").value<QQuickItem *>();QVERIFY(body && background && header && footer);
+        const auto validateFrame=[&] {
+            const auto frame=background->mapRectToScene(background->boundingRect()).adjusted(-1,-1,1,1);
+            const auto content=body->mapRectToScene(body->childrenRect());const auto title=header->mapRectToScene(header->boundingRect()),buttons=footer->mapRectToScene(footer->boundingRect());
+            return frame.contains(content) && frame.contains(title) && frame.contains(buttons) && title.bottom()<=content.top()+1 && content.bottom()<=buttons.top()+1;
+        };
+        QVERIFY2(validateFrame(),"The complete paragraph, title and buttons must fit without overlap");
+        if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"/flatten-original-narrow.png"));
+        window->resize(1100,760);QVERIFY(settleReaderViewport(window));QTest::qWait(100);record("open-wide");QVERIFY(validateFrame());
+        if(!evidence.isEmpty()){QVERIFY(window->grabWindow().save(evidence+"/flatten-original-wide.png"));QFile output(evidence+"/flatten-metrics.json");QVERIFY(output.open(QIODevice::WriteOnly));QVERIFY(output.write(QJsonDocument::fromVariant(metrics).toJson())>0);}
+        QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!notice->property("visible").toBool());QCOMPARE(window->property("selection").toMap(),selection);
+        QVERIFY(!reader->hasUnsavedChanges());QCOMPARE(server.requests.size(),0);
+        const auto loops=qmlBindingLoops(qmlWarnings);QVERIFY2(loops.isEmpty(),qPrintable(loops.join("\n")));
+
     }
     void documentQuestionUsesRetrievedSourcesAndRejectsUnsentCitations() {
         MockChatServer server;QVERIFY(server.listen());server.responses.append({{MockChatServer::delta({{"content","Document answer [p.1], invented [p.99], invalid [p.0]."}}),MockChatServer::usage(),QByteArray("data: [DONE]\n\n")},20,200});
@@ -2184,6 +2215,26 @@ private slots:
         auto *composer=visualItem(view.window->contentItem(),"aiQuestion");QVERIFY(composer);auto *viewport=visualItem(view.window->contentItem(),"aiComposerScroll");QVERIFY(viewport && viewport->clip());QVERIFY(composer->height()>=viewport->property("availableHeight").toDouble());composer->forceActiveFocus();QString draft;for(int i=0;i<30;++i)draft+=QString("Synthetic question line %1 with wrapped text.\n").arg(i);composer->setProperty("text",draft);QTest::keyClick(view.window,Qt::Key_End,Qt::ControlModifier);QTest::qWait(80);QCOMPARE(reader->aiState().value("input").toMap().value("chatQuestion").toString(),draft);
         auto *flick=viewport->property("contentItem").value<QQuickItem *>();QVERIFY(flick);QVERIFY(flick->property("contentHeight").toDouble()>viewport->height());const auto cursor=composer->mapRectToItem(viewport,composer->property("cursorRectangle").toRectF());const auto image=qEnvironmentVariable("LYRA_READER_AI_COMPOSER_SNAPSHOT");if(!image.isEmpty())QVERIFY(view.window->grabWindow().save(image));QVERIFY2(cursor.top()>=0 && cursor.bottom()<=viewport->height(),qPrintable(QString("Caret %1..%2; viewport height %3").arg(cursor.top()).arg(cursor.bottom()).arg(viewport->height())));
         QTest::keyClick(view.window,Qt::Key_Home,Qt::ControlModifier);QTRY_VERIFY(composer->mapRectToItem(viewport,composer->property("cursorRectangle").toRectF()).top()>=0);QVERIFY(composer->mapRectToItem(viewport,composer->property("cursorRectangle").toRectF()).bottom()<=viewport->height());QCOMPARE(reader->aiState().value("input").toMap().value("chatQuestion").toString(),draft);
+    }
+    void aiComposerExternalTextStaysUnchangedUntilARealEdit_data() {
+        QTest::addColumn<QString>("value");
+        QTest::newRow("crlf")<<QStringLiteral("first\r\nsecond");
+        QTest::newRow("cr")<<QStringLiteral("first\rsecond");
+        QTest::newRow("paragraph")<<QStringLiteral("first\u2029second");
+        QTest::newRow("unicode-spaces")<<QString::fromUtf8("  合成问题 e\u0301\t  ");
+        QTest::newRow("nul")<<(QStringLiteral("before")+QChar(0)+QStringLiteral("after"));
+    }
+    void aiComposerExternalTextStaysUnchangedUntilARealEdit() {
+        QFETCH(QString,value);QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("external-question.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());
+        QSignalSpy warnings(&view.engine,&QQmlEngine::warnings);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"openAiWorkspace",Q_ARG(QVariant,"chat")));auto *composer=visualItem(view.window->contentItem(),"aiQuestion");QVERIFY(composer);composer->forceActiveFocus();QTRY_VERIFY(composer->hasActiveFocus());
+        QSignalSpy changed(reader,&ReaderController::aiStateChanged);reader->setAiInput("question",value);QTest::qWait(30);
+        QCOMPARE(reader->aiState().value("input").toMap().value("question").toString(),value);QCOMPARE(reader->aiState().value("input").toMap().value("chatQuestion").toString(),value);QCOMPARE(changed.size(),1);
+        const auto beforeTyping=composer->property("text").toString();composer->setProperty("cursorPosition",composer->property("length"));QTest::keyClick(view.window,Qt::Key_X);QTest::qWait(10);
+        const auto edited=composer->property("text").toString();QVERIFY(edited.endsWith('x'));QCOMPARE(reader->aiState().value("input").toMap().value("question").toString(),edited);
+        QTest::keyClick(view.window,Qt::Key_Z,Qt::ControlModifier);QCOMPARE(composer->property("text").toString(),beforeTyping);QCOMPARE(reader->aiState().value("input").toMap().value("question").toString(),beforeTyping);
+        const auto loops=qmlBindingLoops(warnings);QVERIFY2(loops.isEmpty(),qPrintable(loops.join("\n")));QVERIFY(!reader->hasUnsavedChanges());
     }
     void closingAiWithAComposerFocusedReturnsKeyboardUndoToTheDocument() {
         QTemporaryDir scratch;const auto path=scratch.path()+"/ai-focus.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));NativeCorpus::Viewer view;QVERIFY(view.window);QSignalSpy qmlWarnings(&view.engine,&QQmlEngine::warnings);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
