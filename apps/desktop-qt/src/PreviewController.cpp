@@ -167,7 +167,8 @@ void PreviewController::showEntry(int index) {
 void PreviewController::showFullPage() { imageRegion(m_model.value(QStringLiteral("page")).toInt(),{}); }
 void PreviewController::showText() {if(m_textModel.isEmpty())return;m_model=m_textModel;emit changed();}
 QVariantList PreviewController::imageSegments(double width,double deviceScale,const QString &paper) const {
-    if(!m_source || m_sourceKey.isEmpty() || !std::isfinite(width) || width<=0)return {};
+    if(!m_source || m_sourceKey.isEmpty() || !std::isfinite(width) || width<=0
+            || !std::isfinite(deviceScale) || deviceScale<=0)return {};
     QVariantList segments=m_model.value(QStringLiteral("fragments")).toList();
     if(segments.isEmpty()){auto one=m_model.value(QStringLiteral("region")).toMap();one.insert(QStringLiteral("page"),m_model.value(QStringLiteral("page")));segments.append(one);}
     QVariantList result;
@@ -180,6 +181,9 @@ QVariantList PreviewController::imageSegments(double width,double deviceScale,co
         add(QStringLiteral("x"),target.x());add(QStringLiteral("y"),target.y());add(QStringLiteral("w"),target.width());add(QStringLiteral("h"),target.height());
         const double pixels=std::ceil(width*qBound(1.0,deviceScale,4.0)/32.0)*32.0;
         add(QStringLiteral("scale"),qBound(.1,pixels/target.width(),16.0));query.addQueryItem(QStringLiteral("paper"),paper);url.setQuery(query);
+        if(m_model.value(QStringLiteral("kind"))==QStringLiteral("figure")) {
+            query.addQueryItem(QStringLiteral("transparent"),QStringLiteral("1"));url.setQuery(query);
+        }
         result.append(QVariantMap{{QStringLiteral("url"),url},{QStringLiteral("aspect"),target.height()/target.width()},{QStringLiteral("page"),page}});
     }
     return result;

@@ -14,9 +14,19 @@ Popup {
     property real preferredWidth: 520
     property real preferredHeight: 420
     property bool adjusted: false
+    property bool manuallySized: false
+    property string contentKey: ""
+    readonly property real liveImageWidth: Math.max(40, availableWidth - 24)
+    property real rasterWidth: 496
+    readonly property real naturalHeight: previewBody.implicitHeight + titlebar.height + footer.implicitHeight + 18
+    function updateRasterWidth() {
+        if (Number.isFinite(liveImageWidth) && liveImageWidth > 0 && Math.abs(liveImageWidth-rasterWidth) > 1)
+            rasterWidth = liveImageWidth;
+    }
+    onLiveImageWidthChanged: updateRasterWidth()
     parent: Overlay.overlay
-    width: Math.min(preferredWidth, app.width - 24)
-    height: Math.min(preferredHeight, app.height - 36)
+    width: Math.min(preferredWidth, app.width * .8, app.width - 24)
+    height: Math.min(Math.max(120, manuallySized ? preferredHeight : textPreview ? naturalHeight : 480), app.height * .8, app.height - 36)
     padding: 0
     modal: false
     dim: false
@@ -41,10 +51,15 @@ Popup {
                 panel.close();
                 return;
             }
+            const key = JSON.stringify(controller.model);
+            if (key !== panel.contentKey) {
+                panel.contentKey = key;
+                panel.manuallySized = false;
+            }
             if (!panel.visible) {
                 adjusted = false;
+                manuallySized = false;
                 preferredWidth = 520;
-                preferredHeight = panel.textPreview ? 360 : 480;
                 panel.positionNearAnchor();
                 panel.open();
             }
@@ -126,11 +141,9 @@ Popup {
             clip: true
             contentWidth: availableWidth
             ColumnLayout {
+                id: previewBody
                 width: scroll.availableWidth
                 spacing: 12
-                Item {
-                    height: 2
-                }
                 Label {
                     textFormat: Text.PlainText
                     visible: panel.preview.kind === "section"
@@ -174,10 +187,24 @@ Popup {
                         Layout.leftMargin: 16
                         Layout.rightMargin: 16
                         spacing: 4
-                        Button {
-                            text: qsTr("[%1] · page %2").arg(referenceEntry.modelData.label).arg(referenceEntry.modelData.page + 1)
-                            flat: true
-                            onClicked: controller.showEntry(referenceEntry.index)
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 4
+                            Button {
+                                text: qsTr("[%1] · page %2").arg(referenceEntry.modelData.label).arg(referenceEntry.modelData.page + 1)
+                                flat: true
+                                font.pixelSize: 11
+                                Layout.fillWidth: true
+                                contentItem: Label { objectName: "referenceEntryHeading" + referenceEntry.index; textFormat: Text.PlainText; text: parent.text; color: app.colors.textSecondary; elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter }
+                                onClicked: controller.showEntry(referenceEntry.index)
+                            }
+                            LyraToolButton {
+                                theme: app.colors
+                                symbol: "copy"
+                                text: qsTr("Copy reference text")
+                                onClicked: if (app.session)
+                                    app.session.copyText(referenceEntry.modelData.text)
+                            }
                         }
                         TextArea {
                             textFormat: TextEdit.PlainText
@@ -192,18 +219,12 @@ Popup {
                             padding: 0
                             Accessible.name: qsTr("Reference %1").arg(referenceEntry.modelData.label)
                         }
-                        Button {
-                            text: qsTr("Copy reference text")
-                            flat: true
-                            onClicked: if (app.session)
-                                app.session.copyText(referenceEntry.modelData.text)
-                        }
                     }
                 }
                 Repeater {
                     // Read the model explicitly: an invokable cannot expose its
                     // private C++ model reads to the QML dependency tracker.
-                    model: !panel.textPreview && controller && panel.preview.page !== undefined ? controller.imageSegments(Math.max(40, scroll.availableWidth - 24), Screen.devicePixelRatio, "original") : []
+                    model: panel.visible && !panel.textPreview && controller && controller.visible && panel.preview.page !== undefined ? controller.imageSegments(panel.rasterWidth, Screen.devicePixelRatio, "original") : []
                     ColumnLayout {
                         id: regionEntry
                         required property var modelData
@@ -211,21 +232,27 @@ Popup {
                         Layout.fillWidth: true
                         Layout.leftMargin: 12
                         Layout.rightMargin: 12
-                        PdfCrop {
+                        Item {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: panel.liveImageWidth * modelData.aspect
+                            PdfCrop {
                             id: crop
                             objectName: index === 0 ? "referencePreviewImage" : "referencePreviewImage" + index
-                            Layout.fillWidth: true
-                            Layout.preferredHeight: width * modelData.aspect
+                            width: panel.liveImageWidth
+                            height: width * modelData.aspect
                             source: modelData.url
                             Accessible.role: Accessible.Graphic
                             Accessible.name: qsTr("Preview of page %1").arg(modelData.page + 1)
                             Accessible.description: panel.preview.caption || qsTr("Use Text to read reference information.")
                             resourceActive: panel.visible && regionEntry.y + crop.y + crop.height > scroll.contentItem.contentY && regionEntry.y + crop.y < scroll.contentItem.contentY + scroll.availableHeight
-                            paperAppearance: app.paperAppearance
+                            // Scientific regions follow the interface theme, while full pages
+                            // retain the selected reading profile. Source URLs remain original.
+                            paperAppearance: panel.preview.kind === "figure" ? (app.colors.dark ? "dark-figure" : "original") : app.paperAppearance
                             BusyIndicator {
                                 anchors.centerIn: parent
                                 running: crop.status === Image.Loading
                                 visible: running
+                            }
                             }
                         }
                         Label {
@@ -258,6 +285,7 @@ Popup {
             color: app.colors.separator
         }
         RowLayout {
+            id: footer
             Layout.fillWidth: true
             Layout.margins: 8
             spacing: 4
@@ -319,10 +347,11 @@ Popup {
                 startWidth = panel.width;
                 startHeight = panel.height;
                 panel.adjusted = true;
+                panel.manuallySized = true;
             }
             onActiveTranslationChanged: if (active) {
                 panel.preferredWidth = Math.max(320, Math.min(app.width - panel.x - 12, startWidth + activeTranslation.x));
-                panel.preferredHeight = Math.max(220, Math.min(app.height - panel.y - 12, startHeight + activeTranslation.y));
+                panel.preferredHeight = Math.max(120, Math.min(app.height * .8, app.height - panel.y - 12, startHeight + activeTranslation.y));
             }
         }
     }

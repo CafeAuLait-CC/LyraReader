@@ -4,6 +4,7 @@
 #include <QSGMaterialShader>
 #include <QSGTextureMaterial>
 #include <array>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -14,11 +15,20 @@ const std::array<double, 256> &linearChannels() {
     static const auto values = [] { std::array<double, 256> v{}; for (int i=0; i<256; ++i) v[i]=linear(i/255.0); return v; }();
     return values;
 }
-std::array<double, 3> convert(double r, double g, double b, int mode) {
+double neutralAmount(double r,double g,double b) {
+    const double maximum=std::max(r,std::max(g,b)),minimum=std::min(r,std::min(g,b));
+    const double t=std::clamp((maximum-minimum)/std::max(maximum,0.000001)/.02,0.0,1.0);
+    return 1-t*t*(3-2*t);
+}
+double nightLightness(double r,double g,double b,double encodedR,double encodedG,double encodedB) {
+    const double linearLightness=r*.2126+g*.7152+b*.0722;
+    return linearLightness+(.2126*encodedR+.7152*encodedG+.0722*encodedB-linearLightness)*neutralAmount(r,g,b)*.5;
+}
+std::array<double, 3> convert(double r, double g, double b, int mode,bool correctNeutral=true) {
     const std::array<double, 3> channels{r,g,b};
     const std::array<double, 3> paper = mode == 1 ? std::array<double,3>{252,247,237} : std::array<double,3>{36,34,30};
     const std::array<double, 3> ink = mode == 1 ? std::array<double,3>{48,43,37} : std::array<double,3>{201,197,189};
-    const double lightness = r*.2126+g*.7152+b*.0722;
+    const double lightness = mode==2 && correctNeutral ? nightLightness(r,g,b,srgb(r),srgb(g),srgb(b)) : r*.2126+g*.7152+b*.0722;
     std::array<double,3> output{};
     for (int i=0; i<3; ++i) {
         const double low=linear(ink[i]/255.0), high=linear(paper[i]/255.0);
@@ -71,11 +81,32 @@ public:
 };
 }
 
-int PaperAppearance::mode(const QString &name) { return name==QStringLiteral("warm") ? 1 : name==QStringLiteral("night") ? 2 : 0; }
+int PaperAppearance::mode(const QString &name) { if(name==QStringLiteral("dark-figure"))return 3; return name==QStringLiteral("warm") ? 1 : name==QStringLiteral("night") ? 2 : 0; }
 QColor PaperAppearance::displayColor(const QColor &source,int mode) {
     if (!mode) return source;
-    const auto channels=convert(linear(source.redF()),linear(source.greenF()),linear(source.blueF()),mode);
+    const double r=linear(source.redF()),g=linear(source.greenF()),b=linear(source.blueF());
+    if(mode==3) {
+        const double neutral=neutralAmount(r,g,b),lightness=r*.2126+g*.7152+b*.0722;
+        // Match the shared GPU scientific-crop transfer. This changes display only.
+        return QColor::fromRgbF(srgb(r+(linear(200.0/255)-r)*neutral),
+            srgb(g+(linear(191.0/255)-g)*neutral),srgb(b+(linear(175.0/255)-b)*neutral),
+            source.alphaF()*(1-lightness*neutral));
+    }
+    const auto channels=convert(r,g,b,mode);
     return QColor::fromRgbF(channels[0],channels[1],channels[2],source.alphaF());
+}
+namespace {
+const std::array<QRgb,65536> &grayFigureColours() {
+    // Freeze the existing scalar colour conversion, including QColor's alpha rounding.
+    // One bounded 256 KiB table serves every software crop; uploaded source bytes stay raw.
+    static const auto values=[] {
+        std::array<QRgb,65536> result{};
+        for(int alpha=0;alpha<256;++alpha)for(int gray=0;gray<256;++gray)
+            result[alpha*256+gray]=PaperAppearance::displayColor(QColor(gray,gray,gray,alpha),3).rgba();
+        return result;
+    }();
+    return values;
+}
 }
 QImage PaperAppearance::displayImage(const QImage &source,int mode) {
     if(!mode) return source;
@@ -91,15 +122,21 @@ QImage PaperAppearance::displayImage(const QImage &source,int mode) {
     // Night mode is monochrome. A fine luminance LUT keeps the software fallback responsive.
     std::array<QRgb,4097> night{};
     if(mode==2) for(int i=0;i<=4096;++i) {
-        const auto c=convert(double(i)/4096,double(i)/4096,double(i)/4096,mode);
+        const auto c=convert(double(i)/4096,double(i)/4096,double(i)/4096,mode,false);
         night[i]=qRgb(qRound(c[0]*255),qRound(c[1]*255),qRound(c[2]*255));
     }
+    const auto *grayFigure=mode==3 ? &grayFigureColours() : nullptr;
     for(int y=0;y<result.height();++y) {
         auto *row=reinterpret_cast<QRgb *>(result.scanLine(y));
         for(int x=0;x<result.width();++x) {
             const QRgb p=row[x];
             if(mode==1) row[x]=qRgba(warm[0][qRed(p)],warm[1][qGreen(p)],warm[2][qBlue(p)],qAlpha(p));
-            else row[x]=(night[qBound(0,qRound((table[qRed(p)]*.2126+table[qGreen(p)]*.7152+table[qBlue(p)]*.0722)*4096),4096)]&0xffffffu)|(quint32(qAlpha(p))<<24);
+            else if(mode==2) row[x]=(night[qBound(0,qRound(nightLightness(table[qRed(p)],table[qGreen(p)],table[qBlue(p)],qRed(p)/255.0,qGreen(p)/255.0,qBlue(p)/255.0)*4096),4096)]&0xffffffu)|(quint32(qAlpha(p))<<24);
+            else if(mode==3 && qRed(p)==qGreen(p) && qRed(p)==qBlue(p))
+                row[x]=(*grayFigure)[qAlpha(p)*256+qRed(p)];
+            else if(mode==3 && neutralAmount(table[qRed(p)],table[qGreen(p)],table[qBlue(p)])==0)
+                row[x]=p; // Fully chromatic pixels are exactly unchanged by the transfer.
+            else row[x]=displayColor(QColor::fromRgba(p),mode).rgba();
         }
     }
     return result;

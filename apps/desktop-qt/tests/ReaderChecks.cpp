@@ -511,6 +511,212 @@ private slots:
             QCOMPARE(window->property("zoomPercent").toDouble(),300.0);
         }
     }
+    void ordinaryDocumentEdgesUseSharedSpacingAndCanonicalAnchors_data() {
+        QTest::addColumn<QString>("layout");QTest::addColumn<double>("percent");
+        for(const auto &layout:{QString("Continuous"),QString("Facing")})
+            for(double percent:{25.0,100.0,250.0})QTest::newRow(qPrintable(layout+QString::number(percent)))<<layout<<percent;
+    }
+    void ordinaryDocumentEdgesUseSharedSpacingAndCanonicalAnchors() {
+        QFETCH(QString,layout);QFETCH(double,percent);
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("edge-spacing.pdf");
+        QVERIFY(QFile::copy(QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),9,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(settleReaderViewport(window));
+        QVERIFY(QMetaObject::invokeMethod(window,"setPageLayout",Q_ARG(QVariant,layout)));
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(settleReaderViewport(window));
+        window->setProperty("fitting",false);
+        QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,percent/100*window->property("calibrationFactor").toDouble()),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+        QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+        QVERIFY(settleReaderViewport(window));
+        auto *list=visualItem(window->contentItem(),"pageList"),*canvas=visualItem(window->contentItem(),"documentCanvas");QVERIFY(list && canvas);
+        auto *first=visualItem(window->contentItem(),"pdfPage0");QVERIFY(first);
+        QTRY_VERIFY2(std::abs(first->mapToItem(list,QPointF()).y()-8)<.2,"Ordinary zoom must retain the shared eight-point screen inset");
+        QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));
+        const auto start=view.workspace.viewState(reader).value("viewportAnchor").toMap();
+        QCOMPARE(start.value("page").toInt(),0);QVERIFY(std::abs(start.value("y").toDouble())<.01);
+        QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,2),Q_ARG(QVariant,120.0)));
+        QVERIFY(settleReaderViewport(window));QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));
+        const auto saved=view.workspace.viewState(reader).value("viewportAnchor").toMap();
+        const double expected=reader->pages().at(2).toMap().value("top").toDouble()+120;
+        const auto savedPage=saved.value("page").toInt();
+        const double canonical=reader->pages().at(savedPage).toMap().value("top").toDouble()+saved.value("y").toDouble();
+        qInfo()<<"Ordinary edge anchor"<<percent<<layout<<saved<<"canonical"<<canonical<<"expected"<<expected<<"scroll"<<list->property("contentY")<<"origin"<<list->property("originY")<<"zoom"<<window->property("zoom");
+        // ListView pixel-aligns scroll at small zoom. Keep the existing one-device-pixel
+        // anchor contract instead of requiring a fraction of a screen pixel in PDF space.
+        QVERIFY(std::abs(canonical-expected)*window->property("zoom").toDouble()*window->effectiveDevicePixelRatio()<1);
+        view.workspace.newTab();view.workspace.selectTab(0);QVERIFY(settleReaderViewport(window));
+        QVariant anchor;QVERIFY(QMetaObject::invokeMethod(canvas,"viewportAnchor",Q_RETURN_ARG(QVariant,anchor),Q_ARG(QVariant,0)));
+        const auto restored=anchor.value<QJSValue>().toVariant().toMap();QCOMPARE(restored.value("page"),saved.value("page"));
+        const auto stableAnchor=[&](const QVariantMap &value){return std::abs(value.value("y").toDouble()-saved.value("y").toDouble())*window->property("zoom").toDouble()*window->effectiveDevicePixelRatio()<1;};
+        qInfo()<<"Restored canonical edge anchor"<<saved<<restored;
+        QVERIFY(stableAnchor(restored));
+        for(int repeat=0;repeat<10;++repeat) {
+            view.workspace.selectTab(1);view.workspace.selectTab(0);QVERIFY(settleReaderViewport(window));
+            QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));
+            const auto current=view.workspace.viewState(reader).value("viewportAnchor").toMap();
+            QCOMPARE(current.value("page"),saved.value("page"));QVERIFY2(stableAnchor(current),"Repeated tab restoration must not accumulate reading drift");
+        }
+        QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,8),Q_ARG(QVariant,0)));QVERIFY(settleReaderViewport(window));
+        list->setProperty("contentY",list->property("originY").toDouble()+std::max(0.0,list->property("contentHeight").toDouble()-list->height()));
+        QTest::qWait(30);auto *last=visualItem(window->contentItem(),"pdfPage8");QVERIFY(last);
+        const double trailing=list->height()-last->mapToItem(list,QPointF(0,last->height())).y();
+        QVERIFY2(trailing>=7.8,qPrintable(QString("Trailing inset: %1").arg(trailing)));
+        const auto directory=qEnvironmentVariable("LYRA_READER_CHECK_SNAPSHOTS");
+        if(!directory.isEmpty() && layout=="Continuous" && percent==100)QVERIFY(window->grabWindow().save(directory+"/ordinary-edge-spacing.png"));
+    }
+    void nightNeutralEdgesMatchTheSharedCoverageGolden() {
+        const std::array<int,6> levels{0,64,128,192,204,255};
+        const std::array<QColor,6> expected{QColor(201,197,189),QColor(187,183,176),QColor(166,162,156),QColor(130,127,121),QColor(120,117,112),QColor(36,34,30)};
+        QImage image(6,1,QImage::Format_ARGB32);
+        for(int i=0;i<6;++i) {
+            const auto source=QColor(levels[i],levels[i],levels[i],137);image.setPixelColor(i,0,source);
+            const auto actual=PaperAppearance::displayColor(source,2);
+            QVERIFY2(std::abs(actual.red()-expected[i].red())<=1 && std::abs(actual.green()-expected[i].green())<=1 && std::abs(actual.blue()-expected[i].blue())<=1,qPrintable(actual.name()+" expected "+expected[i].name()));
+            QCOMPARE(actual.alpha(),137);
+        }
+        const auto converted=PaperAppearance::displayImage(image,2);
+        for(int i=0;i<6;++i){const auto actual=converted.pixelColor(i,0);QVERIFY(std::abs(actual.red()-expected[i].red())<=1);QVERIFY(std::abs(actual.green()-expected[i].green())<=1);QVERIFY(std::abs(actual.blue()-expected[i].blue())<=1);QCOMPARE(actual.alpha(),137);}
+        QCOMPARE(image.pixelColor(2,0),QColor(128,128,128,137));
+    }
+    void scientificCpuFastPathsMatchGrayAlphaAndNearNeutralColours_data() {
+        QTest::addColumn<int>("format");QTest::newRow("straight")<<int(QImage::Format_ARGB32);QTest::newRow("premultiplied")<<int(QImage::Format_RGBA8888_Premultiplied);
+    }
+    void scientificCpuFastPathsMatchGrayAlphaAndNearNeutralColours() {
+        QFETCH(int,format);QImage source(256,768,QImage::Format_ARGB32);
+        for(int y=0;y<768;++y)for(int x=0;x<256;++x) {
+            const auto colour=y<256 ? QColor(x,x,x,y) : y<512 ? QColor(x,qBound(0,x+(y%9)-4,255),qBound(0,x+(y%13)-6,255),(x+y*19)%256) : QColor(x,(x+y)%256,(x*13+y*17)%256,y%256);
+            source.setPixelColor(x,y,colour);
+        }
+        const auto input=source.convertToFormat(QImage::Format(format));const auto original=QCryptographicHash::hash(QByteArray::fromRawData(reinterpret_cast<const char *>(input.constBits()),input.sizeInBytes()),QCryptographicHash::Sha256);
+        const auto normalized=input.convertToFormat(QImage::Format_ARGB32),output=PaperAppearance::displayImage(input,3);QCOMPARE(output.size(),input.size());
+        for(int y=0;y<input.height();++y)for(int x=0;x<input.width();++x) {
+            const auto expected=PaperAppearance::displayColor(normalized.pixelColor(x,y),3).rgba();
+            QVERIFY2(output.pixel(x,y)==expected,qPrintable(QString("CPU colour mismatch at %1,%2: %3 expected %4").arg(x).arg(y).arg(output.pixel(x,y),8,16).arg(expected,8,16)));
+        }
+        QCOMPARE(QCryptographicHash::hash(QByteArray::fromRawData(reinterpret_cast<const char *>(input.constBits()),input.sizeInBytes()),QCryptographicHash::Sha256),original);
+    }
+    void scientificCropColoursFollowThemeWithoutAnotherRaster() {
+        QImage source(88,8,QImage::Format_ARGB32);
+        const std::array<QColor,11> colours{QColor(0,0,0),QColor(64,64,64),QColor(128,128,128),QColor(192,192,192),QColor(255,255,255),QColor(255,0,0),QColor(0,0,16),QColor(16,0,0),QColor(0,0,0,128),QColor(255,0,0,128),QColor(128,64,0,64)};
+        for(int i=0;i<11;++i)for(int y=0;y<8;++y)for(int x=0;x<8;++x)source.setPixelColor(i*8+x,y,colours[i]);
+        QByteArray bytes;QBuffer buffer(&bytes);QVERIFY(buffer.open(QIODevice::WriteOnly));QVERIFY(source.save(&buffer,"PNG"));
+        const QUrl url("data:image/png;base64,"+QString::fromLatin1(bytes.toBase64()));
+        QQuickWindow window;window.resize(720,240);window.setColor(Qt::white);
+        auto *crop=new CropItem(window.contentItem());crop->setSize(window.size());
+        connect(&window,&QQuickWindow::widthChanged,crop,[&]{crop->setWidth(window.width());});
+        connect(&window,&QQuickWindow::heightChanged,crop,[&]{crop->setHeight(window.height());});
+        crop->setSource(url);window.show();QTRY_COMPARE_WITH_TIMEOUT(crop->status(),1,10000);QTest::qWait(120);
+        const auto sample=[&](int i){const auto frame=window.grabWindow();return frame.isNull()?QColor():frame.pixelColor(int((i+.5)*frame.width()/11),frame.height()/2);};
+        const auto light=sample(8);QVERIFY2(std::abs(light.red()-127)<=2,qPrintable(QString("Encoded alpha-over must match PDFium: %1").arg(light.name())));
+        for(int i:{8,9,10}) {
+            const auto c=sample(i),raw=colours[i];const double alpha=raw.alphaF();
+            QVERIFY(std::abs(c.red()-qRound(raw.red()*alpha+255*(1-alpha)))<=2);
+            QVERIFY(std::abs(c.green()-qRound(raw.green()*alpha+255*(1-alpha)))<=2);
+            QVERIFY(std::abs(c.blue()-qRound(raw.blue()*alpha+255*(1-alpha)))<=2);
+        }
+        const auto jobs=RasterJobs::statistics().value("completed");const auto pixels=crop->pixelSize();
+        window.setColor(QColor(40,37,31));crop->setPaperAppearance("dark-figure");QTest::qWait(120);
+        const auto black=sample(0),white=sample(4),blue=sample(6),red=sample(7);
+        QVERIFY2(std::abs(black.red()-200)<=2 && std::abs(black.green()-191)<=2 && std::abs(black.blue()-175)<=2,qPrintable("Dark neutral ink: "+black.name()));
+        QCOMPARE(white,QColor(40,37,31));QVERIFY(std::abs(blue.blue()-16)<=2 && blue.red()<3 && blue.green()<3);QVERIFY(std::abs(red.red()-16)<=2 && red.green()<3 && red.blue()<3);
+        const auto gray=sample(2);QVERIFY(gray.red()<black.red() && gray.red()>white.red());
+        const auto directory=qEnvironmentVariable("LYRA_READER_CHECK_SNAPSHOTS");if(!directory.isEmpty())QVERIFY(window.grabWindow().save(directory+"/scientific-crop-dark.png"));
+        crop->setPaperAppearance("night");QTest::qWait(120);
+        for(int i=0;i<4;++i) {
+            const std::array<QColor,4> expected{QColor(201,197,189),QColor(187,183,176),QColor(166,162,156),QColor(130,127,121)};
+            const auto c=sample(i);QVERIFY2(std::abs(c.red()-expected[i].red())<=2 && std::abs(c.green()-expected[i].green())<=2 && std::abs(c.blue()-expected[i].blue())<=2,qPrintable(c.name()+" expected "+expected[i].name()));
+        }
+        QCOMPARE(crop->source(),url);QCOMPARE(crop->pixelSize(),pixels);QCOMPARE(RasterJobs::statistics().value("completed"),jobs);
+        crop->setPaperAppearance("original");window.setColor(Qt::white);QTest::qWait(120);QVERIFY(std::abs(sample(8).red()-127)<=2);const auto saturated=sample(5);QVERIFY(std::abs(saturated.red()-255)<=1 && saturated.green()<=1 && saturated.blue()<=1);
+        QVERIFY(window.close());
+    }
+    void referencePreviewAutoSizingUsesBodyAndHonoursManualSize() {
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;
+        auto *panel=window->findChild<QObject *>("referencePreviewPanel");QVERIFY(panel);
+        QQmlComponent component(&view.engine);component.setData(R"(
+            import QtQuick
+            QtObject {
+                property var model: ({})
+                property bool visible: true
+                property bool pinned: false
+                property rect anchor: Qt.rect(20,20,10,10)
+                signal changed()
+                function imageSegments(width,dpr,paper) { return []; }
+            })",QUrl());
+        auto *controller=component.create();QVERIFY2(controller,qPrintable(component.errorString()));controller->setParent(&view.engine);
+        QVERIFY(QQmlProperty::write(panel,"controller",QVariant::fromValue(controller)));
+        const auto entry=[](int index,const QString &text){return QVariantMap{{"label",QString::number(index)},{"page",0},{"text",text}};};
+        const auto show=[&](const QVariantList &entries,const QString &title){controller->setProperty("model",QVariantMap{{"kind","reference"},{"title",title},{"page",0},{"entries",entries}});return QMetaObject::invokeMethod(controller,"changed");};
+        auto literal=entry(1,"A short citation.");literal.insert("label","<b>1</b>");
+        QVERIFY(show({literal},"One"));QTRY_VERIFY(panel->property("opened").toBool());QTest::qWait(50);
+        auto *heading=visualItem(window->contentItem(),"referenceEntryHeading0");QVERIFY(heading);QCOMPARE(heading->property("textFormat").toInt(),int(Qt::PlainText));QVERIFY(heading->property("text").toString().contains("<b>1</b>"));
+        const double shortHeight=panel->property("height").toDouble();QVERIFY2(shortHeight>=120 && shortHeight<200,qPrintable(QString("Short citation height %1").arg(shortHeight)));
+        QVERIFY(show({entry(1,"First entry."),entry(2,"Second entry."),entry(3,"Third entry.")},"Three"));QTest::qWait(60);
+        QVERIFY(panel->property("height").toDouble()>shortHeight+40);
+        panel->setProperty("preferredHeight",240);panel->setProperty("manuallySized",true);QTest::qWait(30);
+        const double manual=panel->property("height").toDouble();QVERIFY(QMetaObject::invokeMethod(controller,"changed"));QTest::qWait(30);QCOMPARE(panel->property("height").toDouble(),manual);
+        QVERIFY(show({entry(1,QString("Long citation body with preserved words. ").repeated(500))},"Long"));QTest::qWait(60);
+        QVERIFY(!panel->property("manuallySized").toBool());QVERIFY(panel->property("height").toDouble()<=window->height()*.8+.1);QVERIFY(panel->property("height").toDouble()>shortHeight);
+        const auto directory=qEnvironmentVariable("LYRA_READER_CHECK_SNAPSHOTS");if(!directory.isEmpty())QVERIFY(window->grabWindow().save(directory+"/preview-long-text.png"));
+        controller->setProperty("visible",false);QVERIFY(QMetaObject::invokeMethod(controller,"changed"));QTRY_VERIFY(!panel->property("visible").toBool());
+    }
+    void previewImageWidthKeepsSubpointLayoutAndRejectsStaleSources() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("preview-density.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/booktabs-bounds.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;window->setProperty("appearance","light");
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        auto *preview=view.workspace.preview();const double y=reader->pages().first().toMap().value("height").toDouble()-693.5;
+        preview->openAt(reader,0,125,y,320,200,1);QTRY_VERIFY_WITH_TIMEOUT(preview->visible(),10000);QCOMPARE(preview->model().value("kind").toString(),QString("figure"));
+        auto *panel=window->findChild<QObject *>("referencePreviewPanel");QVERIFY(panel);QTRY_VERIFY_WITH_TIMEOUT(view.cropReady(),10000);
+        auto *crop=visualItem(window->contentItem(),"referencePreviewImage");QVERIFY(crop);const auto before=crop->property("source").toUrl();
+        QVERIFY(preview->imageSegments(500,std::numeric_limits<double>::quiet_NaN(),"original").isEmpty());QVERIFY(preview->imageSegments(500,0,"original").isEmpty());
+        const double width=panel->property("preferredWidth").toDouble(),rasterWidth=panel->property("rasterWidth").toDouble(),actualWidth=crop->width();
+        panel->setProperty("preferredWidth",width+.5);QTest::qWait(120);
+        QCOMPARE(panel->property("rasterWidth").toDouble(),rasterWidth);QCOMPARE(crop->property("source").toUrl(),before);QVERIFY(std::abs(crop->width()-actualWidth-.5)<.1);
+        QPointer<QQuickItem> oldCrop=crop;
+        panel->setProperty("preferredWidth",width+70);QTRY_VERIFY(oldCrop.isNull());
+        QTRY_VERIFY(visualItem(window->contentItem(),"referencePreviewImage") && visualItem(window->contentItem(),"referencePreviewImage")->property("source").toUrl()!=before);
+        QTRY_VERIFY_WITH_TIMEOUT(view.cropReady(),10000);crop=visualItem(window->contentItem(),"referencePreviewImage");QVERIFY(crop);
+        const auto source=crop->property("source").toUrl();QCOMPARE(QUrlQuery(source).queryItemValue("transparent"),QString("1"));
+        QTest::qWait(150);const auto jobs=RasterJobs::statistics().value("completed");const auto size=crop->property("pixelSize");window->setProperty("appearance","dark");QTest::qWait(120);
+        QCOMPARE(crop->property("paperAppearance").toString(),QString("dark-figure"));QCOMPARE(crop->property("source").toUrl(),source);QCOMPARE(crop->property("pixelSize"),size);QCOMPARE(RasterJobs::statistics().value("completed"),jobs);
+        preview->close();QTRY_VERIFY(!panel->property("visible").toBool());QTRY_VERIFY(!visualItem(window->contentItem(),"referencePreviewImage"));
+        QVERIFY(preview->imageSegments(500,1,"original").isEmpty());
+        preview->openAt(reader,0,125,y,320,200,1);preview->close();preview->openAt(reader,0,125,y+15,320,200,1);
+        QTRY_VERIFY_WITH_TIMEOUT(preview->visible(),10000);QTRY_VERIFY_WITH_TIMEOUT(view.cropReady(),10000);
+        QVERIFY(preview->model().value("title").toString().contains("6"));
+        preview->showFullPage();QTRY_VERIFY_WITH_TIMEOUT(view.cropReady(),10000);crop=visualItem(window->contentItem(),"referencePreviewImage");QVERIFY(crop);QCOMPARE(crop->property("paperAppearance").toString(),window->property("paperAppearance").toString());
+        preview->close();QTRY_VERIFY(!panel->property("visible").toBool());
+    }
+    void cropReplacementsRejectQueuedPixelsAndReleaseClosedResources() {
+        QTRY_VERIFY_WITH_TIMEOUT(RasterJobs::statistics().value("queued").toInt()==0 && RasterJobs::statistics().value("running").toInt()==0,10000);
+        auto entered=std::make_shared<QSemaphore>(),release=std::make_shared<QSemaphore>();auto *pool=RasterJobs::pool();const int count=pool->maxThreadCount();
+        for(int i=0;i<count;++i)(void)QtConcurrent::run(pool,[entered,release]{entered->release();release->acquire();});
+        auto unblock=qScopeGuard([&]{release->release(count);pool->waitForDone(10000);});QTRY_COMPARE(entered->available(),count);
+        const auto url=[](const QSize &size,const QColor &color){QImage image(size,QImage::Format_ARGB32);image.fill(color);QByteArray bytes;QBuffer b(&bytes);if(!b.open(QIODevice::WriteOnly) || !image.save(&b,"PNG"))return QUrl{};return QUrl("data:image/png;base64,"+QString::fromLatin1(bytes.toBase64()));};
+        QQuickWindow window;window.resize(320,160);auto *crop=new CropItem(window.contentItem());crop->setSize(window.size());
+        const auto first=url({8,8},Qt::red),second=url({16,8},Qt::green),latest=url({24,8},Qt::blue);QVERIFY(!first.isEmpty() && !second.isEmpty() && !latest.isEmpty());
+        crop->setSource(first);window.show();QTRY_VERIFY(RasterJobs::statistics().value("queued").toInt()>=1);
+        crop->setSource(second);QTRY_VERIFY(RasterJobs::statistics().value("queued").toInt()>=2);
+        crop->setSource(latest);QTRY_VERIFY(RasterJobs::statistics().value("queued").toInt()>=3);
+        const auto cancelled=RasterJobs::statistics().value("cancelled").toLongLong();release->release(count);unblock.dismiss();
+        QTRY_COMPARE_WITH_TIMEOUT(crop->status(),1,10000);QCOMPARE(crop->source(),latest);QCOMPARE(crop->pixelSize(),QSize(24,8));
+        QTRY_VERIFY(RasterJobs::statistics().value("cancelled").toLongLong()>=cancelled+2);
+        window.hide();QTRY_COMPARE(crop->status(),0);QVERIFY(crop->pixelSize().isEmpty());
+        const auto completed=RasterJobs::statistics().value("completed");QTest::qWait(120);QCOMPARE(RasterJobs::statistics().value("completed"),completed);
+        window.show();QTRY_COMPARE_WITH_TIMEOUT(crop->status(),1,10000);QCOMPARE(crop->pixelSize(),QSize(24,8));QVERIFY(window.close());
+    }
+    void singlePageOrdinaryZoomKeepsBothDocumentEdges_data() {
+        QTest::addColumn<double>("percent");for(double percent:{25.0,100.0,250.0})QTest::newRow(qPrintable(QString::number(percent)))<<percent;
+    }
+    void singlePageOrdinaryZoomKeepsBothDocumentEdges() {
+        QFETCH(double,percent);QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("single-edges.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());QVERIFY(settleReaderViewport(window));window->setProperty("fitting",false);
+        QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,percent/100*window->property("calibrationFactor").toDouble()),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QVERIFY(settleReaderViewport(window));
+        auto *list=visualItem(window->contentItem(),"pageList"),*page=visualItem(window->contentItem(),"pdfPage0");QVERIFY(list && page);QTRY_VERIFY(std::abs(page->mapToItem(list,QPointF()).y()-8)<.2);
+        list->setProperty("contentY",list->property("originY").toDouble()+std::max(0.0,list->property("contentHeight").toDouble()-list->height()));QTest::qWait(30);QVERIFY(list->height()-page->mapToItem(list,QPointF(0,page->height())).y()>=7.8);
+    }
     void fittedPresentationSurvivesHistorySaveAndPointerZoom_data() {
         QTest::addColumn<QString>("layout");QTest::newRow("continuous")<<QString("Continuous");QTest::newRow("facing")<<QString("Facing");
     }
@@ -2014,7 +2220,8 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(card,"close"));QVERIFY(reader->aiRegionPaper().isEmpty());
         QVERIFY(QMetaObject::invokeMethod(window,"saveReadingPosition"));
         const auto list=window->findChild<QQuickItem *>("pageList");QVERIFY(list);
-        const auto expectedClosed=reader->clampScroll(gapTop*window->property("zoom").toDouble(),reader->documentHeight()*window->property("zoom").toDouble(),list->height());
+        const double edge=reader->zoomPresetInset(),zoom=window->property("zoom").toDouble();
+        const auto expectedClosed=std::max(0.0,reader->clampScroll(gapTop*zoom+edge,reader->documentHeight()*zoom+2*edge,list->height())-edge);
         QVERIFY(qAbs(workspace.viewState(reader).value("offset").toDouble()-expectedClosed)<.01);
         QVERIFY(QMetaObject::invokeMethod(card,"open"));QTRY_VERIFY_WITH_TIMEOUT(reader->aiRegionPaper().contains("rows") && !reader->aiRegionPaper().value("loading").toBool(),10000);
         QTRY_VERIFY(!card->property("motionActive").toBool() && paperCard->y()>=-1 && paperCard->y()+paperCard->height()<=canvas->height()+1);
@@ -3459,7 +3666,7 @@ private slots:
         const auto ink=[&](const QRectF &local){const auto image=window->grabWindow();if(image.isNull())return -1;const auto at=pointer->mapRectToScene(QRectF(local.topLeft()*viewZoom,local.size()*viewZoom));const double scale=double(image.width())/window->width();const QRect pixels(qFloor(at.x()*scale),qFloor(at.y()*scale),qCeil(at.width()*scale),qCeil(at.height()*scale));int n=0;for(int y=qMax(0,pixels.top());y<=qMin(image.height()-1,pixels.bottom());++y)for(int x=qMax(0,pixels.left());x<=qMin(image.width()-1,pixels.right());++x){const auto c=image.pixelColor(x,y);if(c.red()<90 && c.green()<90 && c.blue()<90)++n;}return n;};
         QTRY_VERIFY_WITH_TIMEOUT(ink(bounds.adjusted(1,1,-1,-1))<5,10000);QTRY_VERIFY_WITH_TIMEOUT(ink(bounds.translated(localDelta))>40,10000);const auto shot=window->grabWindow();const double pixelScale=double(shot.width())/window->width()*viewZoom;QVERIFY2(ink(bounds.translated(localDelta))<bounds.width()*bounds.height()*pixelScale*pixelScale*.8,"Transparent object pixels must not become a solid black rectangle");
         const auto snapshot=qEnvironmentVariable("LYRA_READER_DRAG_SNAPSHOT");if(!snapshot.isEmpty())QVERIFY(window->grabWindow().save(snapshot));
-        for(int i=1;i<=12;++i)QTest::mouseMove(window,start+delta+QPoint(i,0),10);QCOMPARE(drag->requests(),requests);QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,start+delta+QPoint(12,0));QTRY_VERIFY_WITH_TIMEOUT(!reader->pendingCommands() && reader->hasUnsavedChanges(),15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QTRY_VERIFY_WITH_TIMEOUT(!drag->active() && drag->residentBytes()==0,15000);
+        for(int i=1;i<=12;++i)QTest::mouseMove(window,start+delta+QPoint(i,0),10);QVERIFY2(pointer->property("pressed").toBool(),"The page Flickable must not steal an active object gesture");QCOMPARE(drag->requests(),requests);QMetaObject::invokeMethod(pointer,"currentGesture",Q_RETURN_ARG(QVariant,current));qInfo()<<"Drag release diagnostics"<<current<<"pressed"<<pointer->property("pressed")<<"scroll"<<window->findChild<QObject *>("pageList")->property("contentY")<<"active"<<drag->active();QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,start+delta+QPoint(12,0));qInfo()<<"Released drag"<<"active"<<drag->active()<<"pending"<<reader->pendingCommands()<<"error"<<reader->error();QTRY_VERIFY_WITH_TIMEOUT(!reader->pendingCommands() && reader->hasUnsavedChanges(),15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QTRY_VERIFY_WITH_TIMEOUT(!drag->active() && drag->residentBytes()==0,15000);
         reader->submit("content_objects",{{"page",0}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVariantMap moved;for(const auto &v:reader->data().value("content_objects").toMap().value("items").toList())if(v.toMap().value("text").toString().contains("LyraReader fixture")){moved=v.toMap();break;}QVERIFY(!moved.isEmpty());const auto mb=moved.value("bounds").toMap();QVERIFY(qAbs(mb.value("x").toDouble()-bounds.x()-12/viewZoom)<.1);QVERIFY(qAbs(mb.value("y").toDouble()-bounds.y()-localDelta.y())<.1);QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),original);file.close();
         QVERIFY(QMetaObject::invokeMethod(window,"undo"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);reader->submit("content_objects",{{"page",0}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QCOMPARE(reader->data().value("content_objects").toMap().value("revision"),model.value("revision"));
         QVERIFY(QMetaObject::invokeMethod(window,"redo"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(QMetaObject::invokeMethod(window,"saveDocument",Q_ARG(QVariant,false)));QTRY_VERIFY_WITH_TIMEOUT(!reader->pendingCommands() && !reader->hasUnsavedChanges(),15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));

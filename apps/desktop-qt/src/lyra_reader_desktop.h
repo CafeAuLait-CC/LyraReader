@@ -2,13 +2,14 @@
 #include <cstddef>
 #include <cstdint>
 
-inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 12;
+inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 13;
 
 // Owned Rust allocations: free each Buffer exactly once using buffer_free.
 // Output buffers must be zero initialized; calls do not free previous contents.
 // Document operations run on a worker, except the explicitly cache-only selection calls.
 extern "C" {
 std::uint32_t lyra_reader_desktop_abi_version();
+double lyra_reader_desktop_zoom_preset_inset_pt();
 std::size_t lyra_reader_desktop_paper_geometry_limit();
 // Invalid input returns NaN; a scroll inside conversation space stores the source cut.
 double lyra_reader_desktop_paper_unshifted_scroll(double display_y,double gap_top,double gap);

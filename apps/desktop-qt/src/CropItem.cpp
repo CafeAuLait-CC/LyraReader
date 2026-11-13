@@ -12,6 +12,9 @@ namespace {struct CropResult {ResidentImage image;bool pressure=false;QString er
 
 CropItem::CropItem(QQuickItem *parent):QQuickItem(parent) {
     setFlag(ItemHasContents,true);m_timer.setSingleShot(true);m_timer.setInterval(70);
+    // A C++ parent can attach the scene during base construction, before itemChange
+    // dispatches to this class. Observe that initial window as well as later reparenting.
+    if(window())m_visibilityConnection=connect(window(),&QWindow::visibilityChanged,this,&CropItem::visibilityUpdated);
     connect(&m_timer,&QTimer::timeout,this,&CropItem::request);
     connect(RenderBudget::instance(),&RenderBudget::targetsChanged,this,[this] {
         const auto previous=m_target;syncBudget();

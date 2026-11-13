@@ -33,7 +33,7 @@ use std::{
 /// Version of the Qt boundary, including cache-only selection and clipboard adapters.
 #[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_desktop_abi_version() -> u32 {
-    12
+    13
 }
 
 /// Maximum caller-supplied glyph/figure boxes before paper placement allocates snapshots.
@@ -633,6 +633,12 @@ pub extern "C" fn lyra_reader_desktop_zoom_offset(
         return 0.0;
     }
     lyra_reader_runtime::zoomed_offset(offset, anchor, old_zoom, new_zoom)
+}
+
+/// The shared screen-space edge inset; the shell divides by its current zoom for layout.
+#[unsafe(no_mangle)]
+pub extern "C" fn lyra_reader_desktop_zoom_preset_inset_pt() -> f64 {
+    lyra_reader_session::ZOOM_PRESET_INSET_PT
 }
 
 /// Pure shared zoom policy. Zero means no usable fit, outside the 25–400 percent range.
@@ -1443,7 +1449,11 @@ mod tests {
 
     #[test]
     fn image_byte_boundary_rejects_null_handles_and_reports_its_version() {
-        assert_eq!(lyra_reader_desktop_abi_version(), 12);
+        assert_eq!(lyra_reader_desktop_abi_version(), 13);
+        assert_eq!(
+            lyra_reader_desktop_zoom_preset_inset_pt(),
+            lyra_reader_session::ZOOM_PRESET_INSET_PT
+        );
         assert_eq!(
             lyra_reader_desktop_paper_geometry_limit(),
             lyra_reader_session::paper::MAX_PAPER_GEOMETRY_ITEMS

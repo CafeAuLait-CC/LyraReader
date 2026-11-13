@@ -25,6 +25,7 @@ struct TilePlanResult {QList<TileSpec> tiles;bool accepted=false;};
 class ReaderController : public QObject {
     Q_OBJECT
     Q_PROPERTY(QVariantList pages READ pages NOTIFY documentChanged)
+    Q_PROPERTY(double zoomPresetInset READ zoomPresetInset CONSTANT)
     Q_PROPERTY(QVariantMap fitPresentation READ fitPresentation NOTIFY fitPresentationChanged)
     Q_PROPERTY(QVariantList layoutRows READ layoutRows NOTIFY documentChanged)
     Q_PROPERTY(QVariantMap layoutConfiguration READ layoutConfiguration NOTIFY documentChanged)
@@ -63,6 +64,7 @@ public:
     explicit ReaderController(QObject *parent = nullptr);
     ~ReaderController() override;
     QVariantList pages() const { return m_pages; }
+    double zoomPresetInset() const { return lyra_reader_desktop_zoom_preset_inset_pt(); }
     QVariantMap fitPresentation() const { return m_fitPresentation; }
     QVariantList layoutRows() const { return m_layoutRows; }
     QVariantMap layoutConfiguration() const { return m_layoutConfiguration; }

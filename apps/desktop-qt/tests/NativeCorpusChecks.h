@@ -57,7 +57,7 @@ inline bool cropEvidence(Viewer &view,const QString &stem) {
 inline void coldNarrativeAndTablePreviews(const QString &root) {
     QTemporaryDir scratch;QVERIFY(scratch.isValid());
     for(const auto &name:{"narrative-citation.pdf","booktabs-bounds.pdf"})QVERIFY(QFile::copy(root+"/tests/fixtures/"+name,scratch.path()+"/"+name));
-    Viewer view;QVERIFY(view.window);view.window->setProperty("paperAppearance","original");auto *preview=view.workspace.preview();
+    Viewer view;QVERIFY(view.window);view.window->setProperty("appearance","light");view.window->setProperty("paperAppearance","original");auto *preview=view.workspace.preview();
     view.workspace.openFile(QUrl::fromLocalFile(scratch.path()+"/narrative-citation.pdf"));auto *reader=view.workspace.activeReader();
     QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),2,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
     // Actual year-only link bounds, before references/citations/figures were queried.
@@ -85,7 +85,7 @@ inline void realPapers(const QString &root) {
     if(!qEnvironmentVariableIsSet("LYRA_READER_CHECK_CORPUS"))QSKIP("Opt-in three-paper native corpus; fetch the locked 1512.03385, 1706.03762, 2303.08774 PDFs first");
     QFile lock(root+"/tests/eval/arxiv-lock.tsv");QVERIFY(lock.open(QIODevice::ReadOnly));QHash<QString,QByteArray> hashes;
     for(const auto &line:lock.readAll().split('\n')){const auto fields=line.simplified().split(' ');if(fields.size()>=3 && !fields[0].startsWith('#'))hashes.insert(QString::fromLatin1(fields[0]),fields[2]);}
-    QTemporaryDir scratch;QVERIFY(scratch.isValid());Viewer view;QVERIFY(view.window);view.window->setProperty("paperAppearance","original");QVariantList report;
+    QTemporaryDir scratch;QVERIFY(scratch.isValid());Viewer view;QVERIFY(view.window);view.window->setProperty("appearance","light");view.window->setProperty("paperAppearance","original");QVariantList report;
     for(const auto &id:{QString("1512.03385"),QString("1706.03762"),QString("2303.08774")}) {
         const auto input=root+"/eval-papers/"+id+".pdf";QFile file(input);QVERIFY2(file.open(QIODevice::ReadOnly),qPrintable(input));
         QCOMPARE(QCryptographicHash::hash(file.readAll(),QCryptographicHash::Sha256).toHex(),hashes.value(id));file.close();

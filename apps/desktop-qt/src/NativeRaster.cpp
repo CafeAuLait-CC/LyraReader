@@ -225,7 +225,9 @@ QImage NativeImageProvider::rawImage(const QUrl &url,qint64 maximumBytes,QString
     while(std::ceil(region.width()*scale)*std::ceil(region.height()*scale)*4>maximumBytes)scale*=.99;
     const auto annotations=query.queryItemValue(QStringLiteral("annotations"));
     if(query.hasQueryItem(QStringLiteral("annotations")) && annotations!=QStringLiteral("0") && annotations!=QStringLiteral("1")){*error=QStringLiteral("Invalid preview annotation flag.");return {};}
-    return source->crop(page,region,scale,annotations!=QStringLiteral("0"),false,error);
+    const auto transparent=query.queryItemValue(QStringLiteral("transparent"));
+    if(query.hasQueryItem(QStringLiteral("transparent")) && transparent!=QStringLiteral("0") && transparent!=QStringLiteral("1")){*error=QStringLiteral("Invalid preview transparency flag.");return {};}
+    return source->crop(page,region,scale,annotations!=QStringLiteral("0"),transparent==QStringLiteral("1"),error);
 }
 QImage NativeImageProvider::requestImage(const QString &id,QSize *size,const QSize &) {
     const QUrl url(QStringLiteral("image://lyrapreview/")+id);const QUrlQuery query(url);

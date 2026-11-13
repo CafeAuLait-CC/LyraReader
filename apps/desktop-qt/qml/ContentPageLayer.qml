@@ -78,6 +78,7 @@ Item {
         onEntered:updateHover({x:mouseX,y:mouseY})
         onExited:layer.clearHover()
         acceptedButtons: Qt.LeftButton
+        preventStealing: pressed
         activeFocusOnTab: true
         Accessible.role: Accessible.Canvas
         Accessible.name: qsTr("Edit PDF content on page %1").arg(layer.page+1)

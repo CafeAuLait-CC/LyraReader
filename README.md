@@ -51,6 +51,7 @@ derivative exports are refused, including forms selected as merge inputs.
 A real viewport-height change can enlarge the current page or facing spread below Fit Page;
 it never shrinks a chosen zoom. Width-only panel movement leaves the percentage unchanged.
 Fit Page uses shared two-axis sizing and balanced temporary spacing, without adjacent-row slivers.
+Ordinary zoom keeps the shared eight-point document-edge inset; saved anchors exclude that blank.
 Saved reading positions keep canonical page coordinates; temporary spacing stays out of the PDF
 and persisted view state, while retained tabs and Back/Forward keep their fitted presentation.
 Back/Forward uses the shared twenty-entry history in each direction and restores the selection,
@@ -150,6 +151,11 @@ A byte-bounded revisit cache retains reduced page images after sharp sources lea
 set. Unloaded pages already use the selected reading-mode paper colour.
 Tabs reorder after half a tab width of travel, retain their reader state, and support
 Alt+Shift+Left/Right; cross-window drag and tear-off remain work in progress.
+Inline citation previews size to their measured text and preserve a manual resize until the content
+changes. Image previews fit fractional viewport widths without rerasterising subpoint changes.
+Scientific crops use the interface theme: dark neutral ink becomes soft warm gray-gold while chart
+colours stay original. Full-page previews keep the selected paper profile. These display conversions,
+including moderated night-reading edges, leave raw rasters and exported content unchanged.
 Settings and detached PDF previews open as resizable native dialogs, with a transient owner and a
 bounded initial size. Both were observed floating on their first map on niri while the main reader
 remained tiled; other compositors still need acceptance. Detached previews hold an immutable working

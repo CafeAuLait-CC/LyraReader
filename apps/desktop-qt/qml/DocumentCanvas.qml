@@ -29,13 +29,14 @@ Item {
         return {top:row.top,bottom:row.bottom,height:row.height,
             pages:app.currentReader.pages.slice(row.first,row.first+row.count)};
     })
-    // Fit spacing is presentation-only and owned by this retained Reader. Canonical
+    // Edge and fit spacing are presentation-only and owned by this retained Reader. Canonical
     // Rust page/row coordinates, cached reading locations and PDF geometry stay unchanged.
     readonly property var fitState:app.currentReader.fitPresentation
     readonly property bool fitActive:fitState.zoom!==undefined && Math.abs(fitState.zoom-app.zoom)<1e-9
     readonly property real fitInset:fitActive ? fitState.inset : 0
     readonly property real fitExtraGap:fitActive ? fitState.gap-fitState.preferredGap : 0
-    function rowLeading(index){return index===0 ? fitInset*app.zoom : 0;}
+    readonly property real documentInset:Math.max(fitInset,app.currentReader.zoomPresetInset/app.zoom)
+    function rowLeading(index){return index===0 ? documentInset*app.zoom : 0;}
     function configureFit(page) {
         const row=rows[pageRows[page]];
         if(!row)return false;
@@ -240,7 +241,8 @@ Item {
     Timer {id:viewportSettle;interval:0;onTriggered:canvas.settleViewport()}
     // ListView may move its origin when earlier, uninstantiated rows change size.
     // Capture the actual row rather than interpreting contentY as a document offset.
-    function viewportAnchor(viewY) {
+    function viewportAnchor(viewY) { return readingAnchor(viewY,false); }
+    function readingAnchor(viewY,layoutAnchor) {
         if (!rows.length)
             return null;
         const point = pageList.contentY + (viewY || 0);
@@ -258,7 +260,11 @@ Item {
         const display=displayRowTop(row)+(point-item.y-rowLeading(row))/app.zoom;
         const source=paperActive ? app.currentReader.unshiftedPaperScroll(display,paperProgress) : display;
         if(!Number.isFinite(source))return null;
-        return {page:rows[row].pages[0].index,y:fitActive ? Math.max(0,Math.min(rows[row].bottom-rows[row].top,source-rows[row].top)) : source-rows[row].top};
+        const local=source-rows[row].top;
+        // Persist paper coordinates, never the first screen-space blank. Pointer zoom may
+        // retain that leading blank as a transient negative layout anchor.
+        return {page:rows[row].pages[0].index,y:fitActive ? Math.max(0,Math.min(rows[row].bottom-rows[row].top,local))
+            : row===0 ? Math.max(layoutAnchor ? -documentInset : 0,local) : local};
     }
     function positionAnchor(anchor, viewY) {
         const row = pageRows[anchor.page];
@@ -280,7 +286,7 @@ Item {
         const display=paperActive ? app.currentReader.shiftedPaperScroll(source,paperProgress) : source;
         if(!Number.isFinite(display))return;
         const prior=positioning;positioning=true;
-        positionAnchor({page:anchor.page,y:display-displayRowTop(row)},viewY || (anchor.y===0 ? fitInset*app.zoom : 0));
+        positionAnchor({page:anchor.page,y:display-displayRowTop(row)},viewY || (anchor.y===0 && (fitActive || row===0) ? documentInset*app.zoom : 0));
         positioning=prior;
     }
     function navigate(page, y) {
@@ -296,7 +302,7 @@ Item {
             if(mapped.error || !mapped.hit){positioning=false;return;}
             target=mapped.y;
         }
-        positionAnchor({page:page,y:target},target===0 ? fitInset*app.zoom : 0);
+        positionAnchor({page:page,y:target},target===0 && (fitActive || row===0) ? documentInset*app.zoom : 0);
         positioning=false;
     }
     function restoreDocumentOffset(offset) {
@@ -348,7 +354,7 @@ Item {
                 && anchorX<cardFrame.x+cardFrame.width && anchorY>=cardFrame.y
                 && anchorY<cardFrame.y+card.height ? {owner:app.currentReader,id:paperState.id,
                     interaction:interactionEpoch,viewY:anchorY,offsetY:anchorY-cardFrame.y} : null;
-        const anchor = viewportAnchor(anchorY);
+        const anchor = readingAnchor(anchorY,true);
         const old = app.zoom;
         if(pendingPaperZoom && fitActive && paperState.card_row===rows.length-1 && paperState.card.split_pt===null) {
             paperTailPixels=Math.min(pageList.height,fitInset*old);paperTailId=paperState.id;
@@ -420,7 +426,7 @@ Item {
             readonly property var displayGeometry:canvas.paperActive ? canvas.paperState.rows[index] : modelData
             width: pageList.contentWidth
             height: (canvas.paperActive ? canvas.paperMetric(modelData.height,displayGeometry.height) : modelData.height) * app.zoom
-                +canvas.rowLeading(index)+(index===canvas.rows.length-1 ? canvas.fitInset*app.zoom+canvas.paperTail : canvas.fitExtraGap*app.zoom)
+                +canvas.rowLeading(index)+(index===canvas.rows.length-1 ? canvas.documentInset*app.zoom+canvas.paperTail : canvas.fitExtraGap*app.zoom)
             Repeater {
                 id: sheetRepeater
                 onItemAdded: function(index,item){++canvas.placementEpoch;}
