@@ -225,6 +225,16 @@ All six adopted profiles explicitly used Original Colours, including the dark in
 They do not cover Night Reading's dark paper. Captures without a `paper_mode` field are treated as
 that historical original-colour mode; comparisons reject different paper modes. Night Reading
 candidates require separate user review and are never adopted by relabelling the white-paper images.
+The macOS 15.8.3 refresh adds nine explicitly approved profiles and 156 byte-for-byte copies of reviewed PNGs
+under each suite's `macos-15.8.3-2560x1440-2x` directory: `en-light-original`, `en-dark-original`
+and `en-dark-night`. Original-colour paper/reader profiles use zero tolerance and toolbar profiles
+use one level. Night Reading uses one level for paper and zero for reader/toolbar profiles, as
+explicitly selected in review. The older 104 assets remain intact; baseline integrity checks now
+cover 260 images across 15 profiles.
+All 84 search/preview appearances in the refresh were accepted with a one-level comparison policy.
+Those images are not adopted as a pixel gate: independent full-image repeats still match only
+18 of 28 checkpoints in each of the three profiles. The floating-window comparison needs further
+stabilization within that policy; appearance approval does not turn the remaining failures into passes.
 Other environments require separate reviewed baselines. Use the matching directory as `BASELINE`
 above. Each suite requires its own baseline and complete checkpoint set.
 

@@ -1,0 +1,30 @@
+{
+  "approved": true,
+  "capture_manifest_sha256": "29a35b75dde4b9e7c6d1393151615d9e5afb4b77ab59b4339c462fa795a41532",
+  "channel_tolerance": 0,
+  "provisional": false,
+  "review_basis": "User accepted all checkpoints, the macOS 15.8.3 environment and this profile-specific comparison policy in the hash-bound four-batch visual refresh review.",
+  "review_date": "2026-11-12",
+  "review_source_sha256": "97a4dbba4352d40619e14165596b149f290eddd417824a96e226959d8916eb25",
+  "reviewed_product_commit": "c81e97d07d66e25527fb1e0be25a1f90bd6d1ebe",
+  "schema_version": 1,
+  "sha256": {
+    "01-default-100.png": "c956124fa21ff769b92a80f0570f74b4f75d54fcb71bfc0e904dc399c9588922",
+    "02-fixed-100.png": "167a2fa6ecd6b3439af42a1a4f64b65d3063a88fd548782efe367c2940df8966",
+    "03-sidebar-open.png": "021227e2be5a0f07353e384ff65e177ad6c5d2f566cbb84c783d27673a28ffb4",
+    "04-sidebar-restored.png": "c956124fa21ff769b92a80f0570f74b4f75d54fcb71bfc0e904dc399c9588922",
+    "05-resize-small.png": "b2c49317f0783ebb6556bca9d4142ee7b353435a14bc153f6b07dd9a762f5e7a",
+    "06-resize-restored.png": "d6f2cb50cd223a7a2671bbea8afbd68df94feb1fed8e00e9d4fc12757b3ac398",
+    "07-fit-width.png": "2a0da8619a3132b2ec036c0e6556bcdc70f13d674ed2ed6331aee5169c6f91d2",
+    "08-zoom-in.png": "a0668db8fd7288bd9f1d64dcf36e5153702c540a3b896173cdd6b4cdf5309626",
+    "09-zoom-restored.png": "d6f2cb50cd223a7a2671bbea8afbd68df94feb1fed8e00e9d4fc12757b3ac398",
+    "10-fullscreen.png": "92266db3a89625b681ebc67d017415bfa77776426c309f017e68ab0179e763a9",
+    "11-fullscreen-restored.png": "bd648b49c95190edda39656223a70bf32ba4a0dada637e6ef77042b62c2ce2b3",
+    "12-fit-page-window.png": "61e9be346d9a313dc3993b8682fef21fd52d48258cccd2517ac18554afb9c151",
+    "13-fit-page-first.png": "96dc2f03441f8d9d542cf034f3ea401f2275d6a2120b93ae5b6fc864b0e9b482",
+    "14-fit-page-middle.png": "70ab8339c501b0a74ad4d225d25b8d07fef93a14b1d39cb9fe09db1cdde313be",
+    "15-fit-page-last.png": "894edbd6a148511cbe45ba2ee66daf5019acabeb73b49431de377dc990684b16",
+    "16-document-end-100.png": "af5a5a600db4fba92f9bcf87e8e417f4b5847223967a265b50aa079c46b59a30"
+  },
+  "source_capture_manifest_sha256": "0998a823996bcb33d2196f34f5194f79240c68597c7fe5eca0ebb80004b9852b"
+}

@@ -283,14 +283,28 @@ class BaselineIntegrityTests(unittest.TestCase):
 class CommittedVisualBaselineTests(unittest.TestCase):
     def test_adopted_baselines_retain_their_reviewed_images_and_manifest(self):
         root = visual.ROOT / 'tests/visual-baselines'
-        profiles = {'paper': ['en-light', 'en-dark'], 'reader-shell': ['en-light', 'en-dark'],
-                    'toolbar-inspectors': ['en-light', 'en-dark']}
-        for suite, themes in profiles.items():
-            for theme in themes:
-                with self.subTest(suite=suite, theme=theme):
-                    directory = root / suite / 'macos-15.7.9-2560x1440-2x' / theme
-                    report = visual.load_capture(directory)
-                    visual.verify_approval(directory, report)
+        environments = {
+            'macos-15.7.9-2560x1440-2x': ['en-light', 'en-dark'],
+            'macos-15.8.3-2560x1440-2x': ['en-light-original', 'en-dark-original', 'en-dark-night'],
+        }
+        expected = set()
+        total_images = 0
+        for environment, profiles in environments.items():
+            for suite in ['paper', 'reader-shell', 'toolbar-inspectors']:
+                for profile in profiles:
+                    directory = root / suite / environment / profile
+                    expected.add(directory / 'approval.json')
+                    with self.subTest(environment=environment, suite=suite, profile=profile):
+                        report = visual.load_capture(directory)
+                        approval = visual.verify_approval(directory, report)
+                        mode = 'night' if profile.endswith('-night') else 'original'
+                        self.assertEqual(report['environment'].get('paper_mode', 'original'), mode)
+                        tolerance = (1 if suite == 'paper' else 0) if mode == 'night' else (
+                            1 if suite == 'toolbar-inspectors' else 0)
+                        self.assertEqual(approval.get('channel_tolerance', 0), tolerance)
+                        total_images += len(report['captures'])
+        self.assertEqual(set(root.glob('*/*/*/approval.json')), expected)
+        self.assertEqual(total_images, 260)
 
 
 if __name__ == '__main__':
