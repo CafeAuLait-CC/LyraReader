@@ -1,0 +1,1451 @@
+{
+  "captures": [
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "01-default-100.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "01-default-100",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            0,
+            51,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "02-fixed-100.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "02-fixed-100",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            0,
+            51,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        251,
+        90,
+        936,
+        710
+      ],
+      "file": "03-sidebar-open.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "03-sidebar-open",
+      "page_index": 0,
+      "paper_margins_points": [
+        6.874993074597228,
+        8,
+        6.874993074597228,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        6.874993074597228,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            615,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2261,
+            286
+          ],
+          "rgb": [
+            0,
+            51,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "04-sidebar-restored.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "04-sidebar-restored",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            0,
+            51,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        947,
+        550
+      ],
+      "file": "05-resize-small.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "05-resize-small",
+      "page_index": 0,
+      "paper_margins_points": [
+        12.374993074597228,
+        8,
+        12.374993074597228,
+        -651.5000179245717
+      ],
+      "paper_points": [
+        12.374993074597228,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1280,
+      "pixel_width": 1920,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            124,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            1770,
+            286
+          ],
+          "rgb": [
+            0,
+            51,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        960,
+        640
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "06-resize-restored.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "06-resize-restored",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            0,
+            51,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "07-fit-width.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "07-fit-width",
+      "page_index": 0,
+      "paper_margins_points": [
+        12.482491273992537,
+        7.999999999999999,
+        12.482491273992537,
+        -801.8100225849605
+      ],
+      "paper_points": [
+        12.482491273992537,
+        7.999999999999999,
+        1162.035017452015,
+        1503.8100225849605
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            150,
+            310
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2224,
+            310
+          ],
+          "rgb": [
+            0,
+            51,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 126
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1346.5,
+        710
+      ],
+      "file": "08-zoom-in.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "08-zoom-in",
+      "page_index": 0,
+      "paper_margins_points": [
+        0.007489888912004972,
+        8,
+        0.007489888912004972,
+        -1040.510026169875
+      ],
+      "paper_points": [
+        0.007489888912004972,
+        8,
+        1346.485020222176,
+        1742.510026169875
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            145,
+            328
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 146
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "09-zoom-restored.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "09-zoom-restored",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            0,
+            51,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        2547,
+        1350
+      ],
+      "file": "10-fullscreen.png",
+      "fullscreen": true,
+      "gpu_marker_visible": true,
+      "id": "10-fullscreen",
+      "page_index": 0,
+      "paper_margins_points": [
+        761.6512423128029,
+        12.607490051862559,
+        761.6512423128029,
+        12.607490051862442
+      ],
+      "paper_points": [
+        761.6512423128029,
+        12.607490051862559,
+        1023.6975153743942,
+        1324.785019896275
+      ],
+      "pixel_height": 2880,
+      "pixel_width": 5120,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            1634,
+            306
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            3460,
+            306
+          ],
+          "rgb": [
+            0,
+            51,
+            255
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            179,
+            51
+          ],
+          "match": true,
+          "name": "green",
+          "pixel": [
+            1634,
+            2754
+          ],
+          "rgb": [
+            0,
+            179,
+            51
+          ]
+        },
+        {
+          "expected_rgb": [
+            255,
+            153,
+            0
+          ],
+          "match": true,
+          "name": "orange",
+          "pixel": [
+            3460,
+            2754
+          ],
+          "rgb": [
+            255,
+            153,
+            0
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        2560,
+        1440
+      ],
+      "zoom_percent": 111
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "11-fullscreen-restored.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "11-fullscreen-restored",
+      "page_index": 0,
+      "paper_margins_points": [
+        81.65124231280288,
+        8,
+        81.65124231280288,
+        -622.7850198962749
+      ],
+      "paper_points": [
+        81.65124231280288,
+        8,
+        1023.6975153743942,
+        1324.785019896275
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            274,
+            296
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2100,
+            296
+          ],
+          "rgb": [
+            0,
+            51,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 111
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "12-fit-page-window.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "12-fit-page-window",
+      "page_index": 0,
+      "paper_margins_points": [
+        326.0474959832664,
+        8.88499480187418,
+        326.04749598326634,
+        8.8849948018742
+      ],
+      "paper_points": [
+        326.0474959832664,
+        8.88499480187418,
+        534.9050080334672,
+        692.2300103962516
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            710,
+            250
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            1664,
+            250
+          ],
+          "rgb": [
+            0,
+            51,
+            255
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            179,
+            51
+          ],
+          "match": true,
+          "name": "green",
+          "pixel": [
+            710,
+            1530
+          ],
+          "rgb": [
+            0,
+            179,
+            51
+          ]
+        },
+        {
+          "expected_rgb": [
+            255,
+            153,
+            0
+          ],
+          "match": true,
+          "name": "orange",
+          "pixel": [
+            1664,
+            1530
+          ],
+          "rgb": [
+            255,
+            153,
+            0
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 58
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "13-fit-page-first.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "13-fit-page-first",
+      "page_index": 0,
+      "paper_margins_points": [
+        326.0474959832664,
+        8.88499480187418,
+        326.04749598326634,
+        8.8849948018742
+      ],
+      "paper_points": [
+        326.0474959832664,
+        8.88499480187418,
+        534.9050080334672,
+        692.2300103962516
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            710,
+            250
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            1664,
+            250
+          ],
+          "rgb": [
+            0,
+            51,
+            255
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            179,
+            51
+          ],
+          "match": true,
+          "name": "green",
+          "pixel": [
+            710,
+            1530
+          ],
+          "rgb": [
+            0,
+            179,
+            51
+          ]
+        },
+        {
+          "expected_rgb": [
+            255,
+            153,
+            0
+          ],
+          "match": true,
+          "name": "orange",
+          "pixel": [
+            1664,
+            1530
+          ],
+          "rgb": [
+            255,
+            153,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            255,
+            0,
+            255
+          ],
+          "match": true,
+          "name": "magenta",
+          "pixel": [
+            1187,
+            355
+          ],
+          "rgb": [
+            255,
+            0,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 58
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "14-fit-page-middle.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "14-fit-page-middle",
+      "page_index": 1,
+      "paper_margins_points": [
+        326.0474959832664,
+        8.88499480187418,
+        326.04749598326634,
+        8.8849948018742
+      ],
+      "paper_points": [
+        326.0474959832664,
+        8.88499480187418,
+        534.9050080334672,
+        692.2300103962516
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            710,
+            250
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            1664,
+            250
+          ],
+          "rgb": [
+            0,
+            51,
+            255
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            179,
+            51
+          ],
+          "match": true,
+          "name": "green",
+          "pixel": [
+            710,
+            1530
+          ],
+          "rgb": [
+            0,
+            179,
+            51
+          ]
+        },
+        {
+          "expected_rgb": [
+            255,
+            153,
+            0
+          ],
+          "match": true,
+          "name": "orange",
+          "pixel": [
+            1664,
+            1530
+          ],
+          "rgb": [
+            255,
+            153,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            255,
+            255
+          ],
+          "match": true,
+          "name": "cyan",
+          "pixel": [
+            1187,
+            355
+          ],
+          "rgb": [
+            0,
+            255,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 58
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "15-fit-page-last.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "15-fit-page-last",
+      "page_index": 2,
+      "paper_margins_points": [
+        326.0474959832664,
+        8.884994801874479,
+        326.04749598326634,
+        8.884994801873972
+      ],
+      "paper_points": [
+        326.0474959832664,
+        8.884994801874479,
+        534.9050080334672,
+        692.2300103962516
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            710,
+            250
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            1664,
+            250
+          ],
+          "rgb": [
+            0,
+            51,
+            255
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            179,
+            51
+          ],
+          "match": true,
+          "name": "green",
+          "pixel": [
+            710,
+            1530
+          ],
+          "rgb": [
+            0,
+            179,
+            51
+          ]
+        },
+        {
+          "expected_rgb": [
+            255,
+            153,
+            0
+          ],
+          "match": true,
+          "name": "orange",
+          "pixel": [
+            1664,
+            1530
+          ],
+          "rgb": [
+            255,
+            153,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            255,
+            255,
+            0
+          ],
+          "match": true,
+          "name": "yellow",
+          "pixel": [
+            1187,
+            355
+          ],
+          "rgb": [
+            255,
+            255,
+            0
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 58
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "16-document-end-100.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "16-document-end-100",
+      "page_index": 2,
+      "paper_margins_points": [
+        132.37499307459723,
+        -491.50001792457175,
+        132.3749930745971,
+        8
+      ],
+      "paper_points": [
+        132.37499307459723,
+        -491.50001792457175,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            0,
+            179,
+            51
+          ],
+          "match": true,
+          "name": "green",
+          "pixel": [
+            364,
+            1494
+          ],
+          "rgb": [
+            0,
+            179,
+            51
+          ]
+        },
+        {
+          "expected_rgb": [
+            255,
+            153,
+            0
+          ],
+          "match": true,
+          "name": "orange",
+          "pixel": [
+            2010,
+            1494
+          ],
+          "rgb": [
+            255,
+            153,
+            0
+          ]
+        }
+      ],
+      "required_registration_marker": "green",
+      "verification": "current-window-compositor-pixels",
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    }
+  ],
+  "environment": {
+    "appearance": "dark",
+    "capture": "ScreenCaptureKit.currentProcess.ownWindowInDisplay",
+    "display_backing_pixels": [
+      5120,
+      2880
+    ],
+    "display_mode_points": [
+      2560,
+      1440
+    ],
+    "fixture_sha256": "dd15ac5d2710bd1b07a0b5ec8560a8fcd8d08075c0344d75d8501c03481ba9a9",
+    "gpu": "Apple M4 Pro",
+    "hardware_model": "Mac16,11",
+    "language": "en",
+    "locale": "en_US",
+    "os": "Version 15.8.3 (Build 24H241)",
+    "os_build": "24H241",
+    "paper_mode": "original",
+    "pdfium_sha256": "713947839b0402a1215cb160845a6217f46580ee8f8de5c63f524ee6b5496a65",
+    "screen_points": [
+      2560,
+      1440
+    ],
+    "swift": "Apple Swift version 6.2.4 (swiftlang-6.2.4.1.4 clang-1700.6.4.2)\nTarget: arm64-apple-macosx15.0",
+    "system_font": ".AppleSystemUIFont"
+  },
+  "mutation": null,
+  "schema_version": 1,
+  "status": "candidate",
+  "suite": "paper"
+}

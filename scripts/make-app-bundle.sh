@@ -49,6 +49,9 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 cp "$BIN" "$APP/Contents/MacOS/LyraReader"
 cp apps/macos/Support/Info.plist "$APP/Contents/Info.plist"
+if [ "$CONFIG" = "debug" ]; then
+  /usr/libexec/PlistBuddy -c "Add :LyraReaderVisualCapture bool true" "$APP/Contents/Info.plist"
+fi
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 if [ -f "$ROOT/apps/macos/Support/AppIcon.icns" ]; then
