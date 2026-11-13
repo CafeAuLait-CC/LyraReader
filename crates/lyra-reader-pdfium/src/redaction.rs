@@ -1101,6 +1101,8 @@ fn parse_content(
             "Q" => {
                 if let Some(previous) = stack.pop() {
                     state = previous;
+                } else {
+                    supported = false;
                 }
             }
             "cm" => {
@@ -1257,7 +1259,9 @@ fn parse_content(
         removed_paints,
         removed_objects,
         removed_graphics,
-        supported,
+        // Isolating the rewritten stream requires balanced graphics-state saves.
+        // An incomplete stack uses the existing, explicitly confirmed raster path.
+        supported: supported && stack.is_empty(),
         crop,
     })
 }
@@ -1547,6 +1551,7 @@ fn rewrite_content(
         .map(|show| (show.index, show))
         .collect();
     let mut output: Vec<Operation> = Vec::with_capacity(parsed.operations.len() + rects.len() * 6);
+    output.push(Operation::new("q", vec![]));
 
     for (index, operation) in parsed.operations.iter().enumerate() {
         if parsed.removed_paints.contains(&index) {
@@ -1568,8 +1573,11 @@ fn rewrite_content(
         output.push(operation.clone());
     }
 
-    // The black mark: a new graphics state with an identity CTM, so a page whose stream leaves a
-    // transformed CTM behind still gets the rectangle where the reader drew it.
+    // Restore the initial page graphics state, including CTM, clipping and opacity.
+    // An identity `cm` multiplies the existing CTM; it does not reset it. Paths are
+    // not saved by q/Q, so discard an unfinished source path before adding the mark.
+    output.push(Operation::new("Q", vec![]));
+    output.push(Operation::new("n", vec![]));
     let mut bytes = Content { operations: output }.encode().map_err(|error| {
         LyraReaderError::new(
             ErrorCode::Internal,
@@ -1581,9 +1589,9 @@ fn rewrite_content(
         bytes.push(b'\n');
     }
     bytes.extend_from_slice(if fill == RedactionFill::Erase {
-        b"q\n1 0 0 1 0 0 cm\n1 1 1 rg\n1 1 1 RG\n"
+        b"q\n1 1 1 rg\n1 1 1 RG\n"
     } else {
-        b"q\n1 0 0 1 0 0 cm\n0 0 0 rg\n0 0 0 RG\n"
+        b"q\n0 0 0 rg\n0 0 0 RG\n"
     });
     for rect in rects {
         bytes.extend_from_slice(
@@ -2904,6 +2912,98 @@ mod tests {
             .expect("raster")
             .pixel_at(x, y)
             .expect("sample")
+    }
+
+    #[test]
+    fn redaction_fill_is_independent_of_the_streams_final_transform() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        let directory = scratch("redact-final-transform");
+        let source = copy_fixture(&directory, "text-page.pdf", "transformed.pdf");
+        let mut document = Document::load(&source).expect("fixture");
+        let page = *document.get_pages().values().next().expect("page");
+        let mut content = document.get_page_content(page);
+        // The text has already been painted. A valid trailing CTM must not move
+        // the new mark; multiplying it by an identity matrix cannot reset it.
+        content.extend_from_slice(b"\n100 100 120 30 re\n2 0 0 2 0 0 cm\n");
+        document
+            .change_page_content(page, content)
+            .expect("replace content");
+        document.save(&source).expect("save fixture");
+        let original = fs::read(&source).expect("source");
+        let rect = word_rect(&source, 0, "brown");
+        let destination = directory.join("redacted.pdf");
+        let report = stage_content_redaction(
+            &source,
+            &destination,
+            &[RedactionArea::new(0, rect)],
+            RedactionFill::Blackout,
+            &original,
+            false,
+        )
+        .expect("verified vector blackout at the original page coordinates");
+        assert!(report.verified);
+        assert!(!report.pages[0].rasterized);
+        assert!(!text_of(&destination, 0).contains("brown"));
+        assert_eq!(
+            pixel(&destination, 0, 110.0, 110.0),
+            pixel(&source, 0, 110.0, 110.0)
+        );
+        assert_eq!(fs::read(&source).expect("unchanged source"), original);
+    }
+
+    #[test]
+    fn unbalanced_graphics_state_requires_the_explicit_raster_path() {
+        if !crate::is_available() {
+            eprintln!("skipping: PDFium unavailable");
+            return;
+        }
+        for operator in [b"q".as_slice(), b"Q".as_slice()] {
+            let directory = scratch("redact-unbalanced-state");
+            let source = copy_fixture(&directory, "text-page.pdf", "unbalanced.pdf");
+            let mut document = Document::load(&source).expect("fixture");
+            let page = *document.get_pages().values().next().expect("page");
+            let mut content = document.get_page_content(page);
+            content.extend_from_slice(b"\n");
+            content.extend_from_slice(operator);
+            content.extend_from_slice(b"\n");
+            document
+                .change_page_content(page, content)
+                .expect("replace content");
+            document.save(&source).expect("save fixture");
+            let original = fs::read(&source).expect("source");
+            let areas = [RedactionArea::new(0, word_rect(&source, 0, "brown"))];
+            assert_eq!(
+                raster_pages_for_redaction(&source, &areas).expect("preflight"),
+                vec![0]
+            );
+            let destination = directory.join("redacted.pdf");
+            assert!(
+                stage_content_redaction(
+                    &source,
+                    &destination,
+                    &areas,
+                    RedactionFill::Blackout,
+                    &original,
+                    false
+                )
+                .is_err()
+            );
+            assert!(!destination.exists());
+            let report = stage_content_redaction(
+                &source,
+                &destination,
+                &areas,
+                RedactionFill::Blackout,
+                &original,
+                true,
+            )
+            .expect("explicitly confirmed raster");
+            assert!(report.verified && report.pages[0].rasterized);
+            assert_eq!(fs::read(&source).expect("unchanged source"), original);
+        }
     }
 
     #[test]
