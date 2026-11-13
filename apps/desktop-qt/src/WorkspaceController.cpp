@@ -5,6 +5,8 @@
 #include <QPrintDialog>
 #include <QPointer>
 #include <QFileInfo>
+#include <QDir>
+#include <QUuid>
 #include <QSettings>
 #include <QJSValue>
 #include <QQmlEngine>
@@ -39,7 +41,7 @@ QString positionKey(const ReaderController *reader) {
 }
 }
 
-WorkspaceController::WorkspaceController(QObject *parent,CredentialStore *credentials) : QObject(parent),m_credentials(credentials ? credentials : new CredentialStore(this)) {
+WorkspaceController::WorkspaceController(QObject *parent,CredentialStore *credentials) : QObject(parent),m_windowTransferId(QUuid::createUuid().toString(QUuid::WithoutBraces)),m_credentials(credentials ? credentials : new CredentialStore(this)) {
     m_credentials->setParent(this);
     connect(m_preview,&PreviewController::externalRequested,this,&WorkspaceController::openExternal);
     QSettings settings;
@@ -49,6 +51,35 @@ WorkspaceController::WorkspaceController(QObject *parent,CredentialStore *creden
 }
 WorkspaceController::~WorkspaceController() {workspaces().removeAll(this);}
 QList<WorkspaceController *> WorkspaceController::allWorkspaces(){return workspaces();}
+QWindow *WorkspaceController::readerWindow()const {
+    for(auto *window:QGuiApplication::topLevelWindows())
+        if(window->objectName()==QStringLiteral("readerWindow") && window->property("session").value<WorkspaceController *>()==this)return window;
+    return nullptr;
+}
+QVariantList WorkspaceController::tabTransferTargets()const {
+    QVariantList result;int number=0;
+    for(auto *candidate:workspaces()) {
+        auto *window=candidate->readerWindow();
+        if(!window || !window->isVisible())continue;
+        ++number;if(candidate==this)continue;
+        const auto *reader=candidate->activeReader();const QFileInfo file(reader ? reader->fileUrl().toLocalFile() : QString{});
+        const auto title=reader && reader->pageCount() ? reader->title() : tr("Empty reader");
+        const auto folder=reader && !reader->fileUrl().isEmpty() ? file.dir().dirName() : QString{};
+        const auto label=folder.isEmpty() ? tr("%1 · Window %2").arg(title).arg(number) : tr("%1 — %2 · Window %3").arg(title,folder).arg(number);
+        result.append(QVariantMap{{QStringLiteral("windowId"),candidate->windowTransferId()},{QStringLiteral("title"),label},{QStringLiteral("detail"),(candidate->m_tabs.size()==1 ? tr("1 tab") : tr("%1 tabs").arg(candidate->m_tabs.size()))}});
+    }
+    return result;
+}
+void WorkspaceController::moveActiveTabToWindow(const QString &targetId,ReaderController *expectedReader,qulonglong expectedGeneration) {
+    if(m_tabTransfer)return;
+    if(!expectedReader || expectedReader!=activeReader() || expectedReader->documentGeneration()!=expectedGeneration) {
+        emit tabTransferFailed(tr("The active tab changed while the window menu was open. Nothing was moved."));return;
+    }
+    for(auto *candidate:workspaces())if(candidate->windowTransferId()==targetId && candidate!=this) {
+        emit moveActiveTabToWindowRequested(candidate,expectedReader,expectedGeneration);return;
+    }
+    emit tabTransferFailed(tr("The selected reader window is no longer available. Nothing was moved."));
+}
 QuitCoordinator *WorkspaceController::quitCoordinator()const{return QuitCoordinator::instance();}
 void WorkspaceController::publishRecents(const QVariantList &entries) {
     // Signals can close another window; never keep an unguarded raw pointer across one.
@@ -115,14 +146,19 @@ QString WorkspaceController::tabTransferBlockReason()const {
     if(quitCoordinator()->busy())return tr("Finish or cancel quitting before moving a tab.");
     if(m_credentials->busy())return tr("Wait for the credential operation to finish before moving a tab.");
     if(m_printJobs)return tr("Wait for printing to finish before moving a tab.");
-    if(!reader || !reader->pageCount() || reader->fileUrl().isEmpty())return tr("Open a PDF before moving this tab.");
+    if(const auto error=readerTransferBlockReason(reader,false);!error.isEmpty())return error;
+    for(const auto *other:m_tabs)if(other!=reader && sameLocalFile(other->fileUrl(),reader->fileUrl()))
+        return tr("The same PDF is open in another tab here. Close that copy before moving this tab.");
+    return {};
+}
+QString WorkspaceController::readerTransferBlockReason(const ReaderController *reader,bool allowEmpty) {
+    if(!reader || ((!reader->pageCount() || reader->fileUrl().isEmpty()) && !(allowEmpty && !reader->pageCount() && reader->fileUrl().isEmpty() && !reader->loading())))
+        return tr("Open a PDF before moving this tab.");
     if(reader->loading() || reader->pendingCommands() || reader->regionPersistencePending())return tr("Wait for the document operation to finish before moving this tab.");
     if(reader->hasUnsavedChanges() || reader->hasUnsavedReadingNotes())return tr("Save or review the unsaved changes before moving this tab. Nothing was moved.");
     const auto readingPhase=reader->documentReading().value(QStringLiteral("phase")).toString();
     if(reader->aiState().value(QStringLiteral("running")).toBool() || QStringList{QStringLiteral("preparing"),QStringLiteral("starting"),QStringLiteral("reading"),QStringLiteral("stopping")}.contains(readingPhase))
         return tr("Stop the active AI request before moving this tab.");
-    for(const auto *other:m_tabs)if(other!=reader && sameLocalFile(other->fileUrl(),reader->fileUrl()))
-        return tr("The same PDF is open in another tab here. Close that copy before moving this tab.");
     return {};
 }
 void WorkspaceController::detachActiveTab() {
@@ -134,20 +170,24 @@ QString WorkspaceController::transferActiveTabTo(WorkspaceController *target,QPo
     const auto unavailable=tr("The reader windows changed while preparing the move. The tab was not moved.");
     if(!target || target==this || m_tabTransfer || target->m_tabTransfer)return unavailable;
     QPointer<WorkspaceController> source(this),destination(target);
-    QPointer<ReaderController> reader(activeReader()),placeholder(target->activeReader());
+    QPointer<ReaderController> reader(activeReader()),targetActive(target->activeReader());
     const auto sourceTabs=m_tabs,targetTabs=target->m_tabs;
     const auto document=reader ? reader->documentHandle() : nullptr;
     const auto generation=reader ? reader->documentGeneration() : 0;
     const auto revision=reader ? reader->editRevision() : 0;
+    const auto targetDocument=targetActive ? targetActive->documentHandle() : nullptr;
+    const auto targetGeneration=targetActive ? targetActive->documentGeneration() : 0;
+    const auto targetRevision=targetActive ? targetActive->editRevision() : 0;
+    const bool replaceEmpty=targetTabs.size()==1 && targetActive && !targetActive->pageCount() && targetActive->fileUrl().isEmpty() && targetActive->aiState().isEmpty();
     const auto unchanged=[&] {
-        return source && destination && reader && placeholder && source->m_tabs==sourceTabs && destination->m_tabs==targetTabs && source->activeReader()==reader && destination->activeReader()==placeholder &&
+        return source && destination && reader && targetActive && source->m_tabs==sourceTabs && destination->m_tabs==targetTabs && source->activeReader()==reader && destination->activeReader()==targetActive &&
             reader->documentHandle()==document && reader->documentGeneration()==generation && reader->editRevision()==revision &&
-            targetTabs.size()==1 && !placeholder->pageCount() && placeholder->fileUrl().isEmpty() && !placeholder->loading() && !placeholder->pendingCommands() && !placeholder->hasUnsavedChanges() && !placeholder->hasUnsavedReadingNotes();
+            targetActive->documentHandle()==targetDocument && targetActive->documentGeneration()==targetGeneration && targetActive->editRevision()==targetRevision && (!replaceEmpty || targetActive->aiState().isEmpty());
     };
     QVariantMap sourceAiSettings,targetAiSettings;
     auto windowReason=[&](WorkspaceController *workspace) {
-        for(auto *window:QGuiApplication::topLevelWindows())if(window->objectName()==QStringLiteral("readerWindow") && window->property("session").value<WorkspaceController *>()==workspace) {
-            if(workspace==source && !window->isVisible())return unavailable;
+        if(auto *window=workspace->readerWindow()) {
+            if(!window->isVisible() && (workspace==source || !replaceEmpty))return unavailable;
             for(auto *child:QGuiApplication::topLevelWindows())if(child!=window && child->isVisible() && (child->flags() & Qt::WindowType_Mask)==Qt::Dialog) {
                 QSet<QWindow *> seen;
                 for(auto *parent=child->transientParent();parent && !seen.contains(parent);parent=parent->transientParent()) {
@@ -166,10 +206,14 @@ QString WorkspaceController::transferActiveTabTo(WorkspaceController *target,QPo
     };
     const auto validate=[&]() -> QString {
         if(!unchanged())return unavailable;
-        if(destination->m_credentials->busy())return tr("Wait for the new window's credential operation to finish before moving this tab.");
-        if(destination->m_printJobs)return tr("Wait for printing in the new window to finish before moving this tab.");
+        if(destination->m_credentials->busy())return tr("Wait for the other window's credential operation to finish before moving this tab.");
+        if(destination->m_printJobs)return tr("Wait for printing in the other window to finish before moving this tab.");
         auto error=source->tabTransferBlockReason();
         if(!error.isEmpty())return error;
+        error=readerTransferBlockReason(targetActive,true);
+        if(!error.isEmpty())return tr("The other window is not ready: %1").arg(error);
+        for(auto *other:targetTabs)if(sameLocalFile(other->fileUrl(),reader->fileUrl()))
+            return tr("The other window already has this PDF open. Nothing was moved.");
         error=windowReason(source);
         if(!unchanged())return unavailable;
         if(!error.isEmpty())return error;
@@ -208,17 +252,17 @@ QString WorkspaceController::transferActiveTabTo(WorkspaceController *target,QPo
     // alive; no open/reset/generation bump or second PDF writer is introduced.
     const auto oldIndex=m_activeIndex;
     for(const auto &connection:m_readerConnections.take(reader))QObject::disconnect(connection);
-    for(const auto &connection:target->m_readerConnections.take(placeholder))QObject::disconnect(connection);
+    if(replaceEmpty)for(const auto &connection:target->m_readerConnections.take(targetActive))QObject::disconnect(connection);
     const auto view=m_views.take(reader);
     m_tabs.removeAt(oldIndex);
     if(m_tabs.isEmpty()){auto *blank=appendTab(false);if(emptySource)*emptySource=blank;}
     m_activeIndex=qBound(0,oldIndex,int(m_tabs.size())-1);
-    target->m_views.remove(placeholder);
-    target->m_tabs={reader};target->m_activeIndex=0;
+    if(replaceEmpty){target->m_views.remove(targetActive);target->m_tabs.clear();}
+    target->m_tabs.append(reader);target->m_activeIndex=int(target->m_tabs.size())-1;
     target->m_views.insert(reader,view);
     reader->setParent(target);
     target->connectReader(reader);
-    placeholder->deleteLater();
+    if(replaceEmpty)targetActive->deleteLater();
     emit tabsChanged();
     if(source)emit source->activeReaderChanged();
     if(destination)emit destination->tabsChanged();

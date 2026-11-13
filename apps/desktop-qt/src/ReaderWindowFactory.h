@@ -3,6 +3,7 @@
 #include <QUrl>
 class QQuickWindow;
 class WorkspaceController;
+class ReaderController;
 
 // Full reader windows have independent QML engines and remain ordinary top-levels.
 class ReaderWindowFactory : public QObject {
@@ -14,4 +15,5 @@ signals:
     void windowCreated(QQuickWindow *window);
 private:
     void detachActiveTab(WorkspaceController *source,QQuickWindow *sourceWindow);
+    void moveToWindow(WorkspaceController *source,QQuickWindow *sourceWindow,WorkspaceController *target,ReaderController *reader,qulonglong generation);
 };

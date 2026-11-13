@@ -6,6 +6,18 @@
 #include <QQuickWindow>
 #include <QTimer>
 
+namespace {
+void finishTransfer(QPointer<WorkspaceController> source,QPointer<QQuickWindow> oldWindow,
+                    QPointer<QQuickWindow> window,QPointer<ReaderController> emptySource) {
+    if(window){if(window->visibility()==QWindow::Minimized)window->showNormal();else window->show();}
+    if(window)window->raise();
+    if(window)window->requestActivate();
+    if(window && window->isVisible() && emptySource && source && oldWindow && source->tabs().size()==1 && source->activeReader()==emptySource && emptySource->fileUrl().isEmpty()) {
+        QVariant reason;
+        if(QMetaObject::invokeMethod(oldWindow,"tabTransferUiBlockReason",Q_RETURN_ARG(QVariant,reason)) && reason.toString().isEmpty() && oldWindow)oldWindow->close();
+    }
+}
+}
 QQuickWindow *ReaderWindowFactory::createWindow(const QUrl &url,int page,double y,bool visible) {
     auto *engine=new QQmlApplicationEngine(this);
     engine->addImageProvider(QStringLiteral("lyrapreview"),new NativeImageProvider);
@@ -19,7 +31,8 @@ QQuickWindow *ReaderWindowFactory::createWindow(const QUrl &url,int page,double 
     window->setProperty("requestedPage",page);
     window->setProperty("requestedY",y);
     connect(workspace,&WorkspaceController::newWindowRequested,this,[this](const QUrl &file,int targetPage,double targetY){createWindow(file,targetPage,targetY);});
-    connect(workspace,&WorkspaceController::detachActiveTabRequested,this,[this,workspace,window]{detachActiveTab(workspace,window);});
+    connect(workspace,&WorkspaceController::detachActiveTabRequested,this,[this,owner=QPointer<WorkspaceController>(workspace),window=QPointer<QQuickWindow>(window)]{if(owner && window)detachActiveTab(owner,window);});
+    connect(workspace,&WorkspaceController::moveActiveTabToWindowRequested,this,[this,owner=QPointer<WorkspaceController>(workspace),window=QPointer<QQuickWindow>(window)](WorkspaceController *target,ReaderController *reader,qulonglong generation){if(owner && window)moveToWindow(owner,window,target,reader,generation);});
     connect(window,&QQuickWindow::closing,engine,[engine,window]{
         QTimer::singleShot(0,engine,[engine,window]{if(!window->isVisible())engine->deleteLater();});
     });
@@ -53,11 +66,20 @@ void ReaderWindowFactory::detachActiveTab(WorkspaceController *source,QQuickWind
         if(origin)emit origin->tabTransferFailed(error);
         return;
     }
-    if(window)window->show();
-    if(window)window->raise();
-    if(window)window->requestActivate();
-    if(window && window->isVisible() && emptySource && origin && oldWindow && origin->tabs().size()==1 && origin->activeReader()==emptySource && emptySource->fileUrl().isEmpty()) {
-        QVariant reason;
-        if(QMetaObject::invokeMethod(oldWindow,"tabTransferUiBlockReason",Q_RETURN_ARG(QVariant,reason)) && reason.toString().isEmpty() && oldWindow)oldWindow->close();
+    finishTransfer(origin,oldWindow,window,emptySource);
+}
+void ReaderWindowFactory::moveToWindow(WorkspaceController *source,QQuickWindow *sourceWindow,WorkspaceController *target,ReaderController *reader,qulonglong generation) {
+    QPointer<WorkspaceController> origin(source);
+    QPointer<QQuickWindow> oldWindow(sourceWindow);
+    if(!WorkspaceController::allWorkspaces().contains(target) || target==source) {
+        emit source->tabTransferFailed(tr("The selected reader window is no longer available. Nothing was moved."));return;
     }
+    QPointer<QQuickWindow> window(qobject_cast<QQuickWindow *>(target->readerWindow()));
+    if(!reader || origin->activeReader()!=reader || reader->documentGeneration()!=generation || !window || !window->isVisible()) {
+        emit source->tabTransferFailed(tr("The selected tab or window changed. Nothing was moved."));return;
+    }
+    QPointer<ReaderController> emptySource;
+    const auto error=origin->transferActiveTabTo(target,&emptySource);
+    if(!error.isEmpty()){if(origin)emit origin->tabTransferFailed(error);return;}
+    finishTransfer(origin,oldWindow,window,emptySource);
 }

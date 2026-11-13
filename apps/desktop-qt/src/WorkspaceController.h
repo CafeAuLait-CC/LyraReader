@@ -29,6 +29,10 @@ public:
     CredentialStore *credentials() const { return m_credentials; }
     QuitCoordinator *quitCoordinator()const;
     static QList<WorkspaceController *> allWorkspaces();
+    QWindow *readerWindow()const;
+    QString windowTransferId()const{return m_windowTransferId;}
+    Q_INVOKABLE QVariantList tabTransferTargets()const;
+    Q_INVOKABLE void moveActiveTabToWindow(const QString &targetId,ReaderController *expectedReader,qulonglong expectedGeneration);
     Q_INVOKABLE void printDocument(ReaderController *reader, int currentPage = 0);
     void printDocumentToDevice(ReaderController *reader,const std::shared_ptr<QPrinter> &printer,int currentPage=0,bool showProgress=true);
     Q_INVOKABLE void openFiles(const QList<QUrl> &urls);
@@ -61,13 +65,16 @@ signals:
     void recentDocumentsChanged();
     void newWindowRequested(const QUrl &url, int page, double y);
     void detachActiveTabRequested();
+    void moveActiveTabToWindowRequested(WorkspaceController *target,ReaderController *reader,qulonglong generation);
     void tabTransferFailed(const QString &reason);
     void tabTransferStateChanged();
 private:
     ReaderController *appendTab(bool notify=true);
     void connectReader(ReaderController *reader);
+    static QString readerTransferBlockReason(const ReaderController *reader,bool allowEmpty);
     void remember(ReaderController *reader);
     static void publishRecents(const QVariantList &entries);
+    const QString m_windowTransferId;
     QList<ReaderController *> m_tabs;
     QHash<ReaderController *, QVariantMap> m_views;
     QHash<ReaderController *, QList<QMetaObject::Connection>> m_readerConnections;

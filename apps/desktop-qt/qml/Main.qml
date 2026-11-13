@@ -408,9 +408,10 @@ ApplicationWindow {
         // may still be open during Action.triggered; its own panel is harmless.
         const overlay=Overlay.overlay;
         const menuPanel=mainFileMenu.contentItem ? mainFileMenu.contentItem.parent : null;
+        const transferPanel=moveWindowMenu.contentItem ? moveWindowMenu.contentItem.parent : null;
         if(overlay)for(let i=0;i<overlay.children.length;++i) {
             const panel=overlay.children[i];
-            if(panel.visible && panel.children.length && panel!==menuPanel)
+            if(panel.visible && panel.children.length && panel!==menuPanel && panel!==transferPanel)
                 return qsTr("Close the open dialog or panel before moving this tab. Its input stays here.");
         }
         if (closeApproved || closeOperation || closingTab!==-2 || pendingDocumentSave || printRequested || pendingAiReader || pendingAiPlan)
@@ -2114,6 +2115,33 @@ ApplicationWindow {
                 action: settingsAction
             }
             MenuItem { action: detachTabAction }
+            Menu {
+                id: moveWindowMenu
+                objectName: "moveTabToWindowMenu"
+                title: qsTr("Move Tab to Window")
+                enabled: !!root.session && currentReader.pageCount>0 && !root.session.tabTransferInProgress
+                width: Math.min(420,Math.max(220,root.width-32))
+                property var destinations: []
+                property var sourceReader: null
+                property var sourceGeneration: null
+                onAboutToShow: {sourceReader=root.currentReader;sourceGeneration=sourceReader.documentGeneration;destinations=root.session.tabTransferTargets();}
+                Instantiator {
+                    model: moveWindowMenu.destinations
+                    delegate: MenuItem {
+                        id: destinationItem
+                        required property var modelData
+                        objectName: "moveTabDestination"
+                        text: modelData.title
+                        contentItem: Text {text:destinationItem.text;textFormat:Text.PlainText;font:destinationItem.font;color:destinationItem.highlighted ? destinationItem.palette.highlightedText : destinationItem.palette.windowText;elide:Text.ElideRight;verticalAlignment:Text.AlignVCenter}
+                        ToolTip.text: modelData.detail
+                        ToolTip.visible: hovered
+                        onTriggered: root.session.moveActiveTabToWindow(modelData.windowId,moveWindowMenu.sourceReader,moveWindowMenu.sourceGeneration)
+                    }
+                    onObjectAdded: function(index,object) {moveWindowMenu.insertItem(index,object);}
+                    onObjectRemoved: function(index,object) {moveWindowMenu.removeItem(object);}
+                }
+                MenuItem {text:qsTr("No other reader windows");enabled:false;visible:moveWindowMenu.destinations.length===0;height:visible ? implicitHeight : 0}
+            }
             MenuSeparator {}
             MenuItem {
                 action: quitAction
