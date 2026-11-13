@@ -23,10 +23,12 @@ Item {
         && hoverRevision===editor.model.revision && hoverZoom===app.zoom ? hoverItem : null
     readonly property bool showsHover:!!hovered && (!selected || selected.id!==hovered.id)
     function clearHover(){hoverItem=null;hoverOwner=null;hoverGeneration=null;hoverRevision="";}
-    onVisibleChanged:if(!visible)clearHover()
+    onVisibleChanged:if(!visible){clearHover();if(pointer)pointer.cancelGesture();}
+    onPaperMapChanged:if(pointer)pointer.cancelGesture()
+    onReadyChanged:if(!ready && pointer)pointer.cancelGesture()
     Connections {
         target:layer.app
-        function onCancelContentGesture(){pointer.began=false;pointer.dragging=false;layer.editor.gesture=null;}
+        function onCancelContentGesture(){pointer.cancelGesture();}
     }
     Connections {target:layer.editor;function onToolChanged(){layer.clearHover();} function onModelChanged(){layer.clearHover();}}
     Connections {target:layer.app;function onCurrentReaderChanged(){layer.clearHover();} function onZoomChanged(){layer.clearHover();}}
@@ -62,6 +64,19 @@ Item {
         zoom: app.zoom
         annotations: visible ? [{id:"ui-content-frame",kind:"square",rect:layer.shown,color:app.colors.focusRing,strokeWidth:2/app.zoom}] : []
     }
+    ContentAlignmentGuides {
+        id:alignment
+        objectName:"contentAlignmentGuides"+layer.page
+        anchors.fill:parent;z:1
+        app:layer.app;editor:layer.editor;page:layer.page;paperMap:layer.paperMap
+        onInvalidated:pointer.cancelGesture()
+    }
+    Connections {target:layer.paperMap;function onPaperGeometryChanged(){if(pointer.began && !pointer.currentGesture())pointer.cancelGesture();}}
+    Connections {target:layer.app;function onZoomChanged(){pointer.cancelGesture();}function onCurrentReaderChanged(){pointer.cancelGesture();}function onSecondaryRowChanged(){if(layer.app.secondaryRow!=="edit")pointer.cancelGesture();}}
+    Connections {target:layer.app.pageList;function onContentXChanged(){if(pointer.began)pointer.cancelGesture();}function onContentYChanged(){if(pointer.began)pointer.cancelGesture();}}
+    Connections {target:layer.app.documentCanvas;function onWidthChanged(){pointer.cancelGesture();}function onHeightChanged(){pointer.cancelGesture();}}
+    Connections {target:layer.editor;function onModelChanged(){if(pointer.began && (pointer.pressRevision!==layer.editor.model.revision || layer.editor.model.page!==layer.page))pointer.cancelGesture();}function onToolChanged(){pointer.cancelGesture();}function onHasDraftChanged(){if(pointer.began && layer.editor.hasDraft)pointer.cancelGesture();}function onSelectedChanged(){if(pointer.began && pointer.hit && (!layer.editor.selected || pointer.hit.id!==layer.editor.selected.id))pointer.cancelGesture();}}
+    Connections {target:pointer.pressOwner;function onDocumentChanged(){if(pointer.began && (pointer.pressOwner.loading || !pointer.currentGesture()))pointer.cancelGesture();}}
     MouseArea {
         id:pointer
         anchors.fill: parent
@@ -93,7 +108,21 @@ Item {
         property size pressViewport
         property var pressOwner: null
         property var pressGeneration: null
-        function currentGesture() {return !!pressOwner && pressOwner===app.currentReader && pressGeneration===app.currentReader.documentGeneration && pressTool===editor.tool && app.secondaryRow==="edit" && pressZoom===app.zoom && pressScroll.x===app.pageList.contentX && pressScroll.y===app.pageList.contentY && pressViewport.width===app.documentCanvas.width && pressViewport.height===app.documentCanvas.height;}
+        property var pressPaper: null
+        property var pressPaperRevision: null
+        property bool pressFreeMove: false
+        property var ownGesture: null
+        function currentGesture() {return !!pressOwner && pressOwner===app.currentReader && pressGeneration===app.currentReader.documentGeneration && pressTool===editor.tool && app.secondaryRow==="edit" && pressZoom===app.zoom && pressScroll.x===app.pageList.contentX && pressScroll.y===app.pageList.contentY && pressViewport.width===app.documentCanvas.width && pressViewport.height===app.documentCanvas.height && pressPaper===layer.paperMap
+            && (pressPaperRevision===null ? !layer.paperActive : layer.paperActive && layer.paperMap.paperGeometryRevision===pressPaperRevision);}
+        function showGesture(rect) {ownGesture=rect;editor.gesture=rect;}
+        function cancelGesture() {
+            const wasActive=began || dragging,patch=ownGesture;
+            began=false;dragging=false;ownGesture=null;hit=null;
+            if(patch && editor.gesture===patch)editor.gesture=null;
+            alignment.clear();
+            if(app.documentCanvas.contentPointerOwner===pointer)app.documentCanvas.contentPointerOwner=null;
+            if(wasActive)app.documentCanvas.dragPreview.cancel();
+        }
         function position(mouse) {
             if(layer.paperActive) {
                 if(layer.paperMap.controller!==app.currentReader)return null;
@@ -119,13 +148,20 @@ Item {
                 height:Math.max(1,Math.min(size.height,Math.max(start.y,y))-top)};
         }
         onPressed: function(mouse) {
-            began=false;dragging=false;layer.clearHover();app.documentCanvas.dragPreview.cancel();
-            const p=position(mouse);if(!p)return;
+            cancelGesture();layer.clearHover();app.documentCanvas.dragPreview.cancel();
+            // Suspending parent flicking can quantize its scroll position. Re-map
+            // the original press through stable canvas coordinates before capture.
+            const scene=mapToItem(app.documentCanvas,mouse.x,mouse.y);
+            app.documentCanvas.contentPointerOwner=pointer;
+            const local=mapFromItem(app.documentCanvas,scene.x,scene.y);
+            const p=position(local);if(!p){cancelGesture();return;}
             forceActiveFocus();
             app.currentPage=layer.page;
             pressOwner=app.currentReader;pressGeneration=app.currentReader.documentGeneration;
             began=layer.ready;pressRevision=editor.model.revision;pressTool=editor.tool;pressZoom=app.zoom;pressScroll=Qt.point(app.pageList.contentX,app.pageList.contentY);pressViewport=Qt.size(app.documentCanvas.width,app.documentCanvas.height);
-            if (!layer.ready) {editor.reload();return;}
+            pressPaper=layer.paperMap;pressPaperRevision=layer.paperActive ? layer.paperMap.paperGeometryRevision : null;
+            pressFreeMove=!!(mouse.modifiers & Qt.ShiftModifier);
+            if (!layer.ready) {cancelGesture();editor.reload();return;}
             start=p;hit=at(start.x,start.y);
         }
         onPositionChanged: function(mouse) {
@@ -135,24 +171,28 @@ Item {
             const x=p.x,y=p.y;
             if (Math.abs(x-start.x)+Math.abs(y-start.y)<3) return;
             const first=!dragging;dragging=true;
-            if (["erase","blackout","link"].indexOf(editor.tool)>=0) editor.gesture=area(x,y);
+            if (["erase","blackout","link"].indexOf(editor.tool)>=0) showGesture(area(x,y));
             else if (hit && selected && hit.id===selected.id) {
                 const size=app.currentReader.pages[layer.page],r=hit.bounds;
                 if(first && editor.tool==="select" && hit.kind!=="link")app.documentCanvas.dragPreview.prepare(layer.page,hit.id,editor.model.revision,Qt.rect(r.x,r.y,r.width,r.height));
-                editor.gesture={x:Math.max(0,Math.min(size.width-r.width,r.x+x-start.x)),
+                if(first && !pressFreeMove)alignment.prepare(editor.model.items);
+                let rect={x:Math.max(0,Math.min(size.width-r.width,r.x+x-start.x)),
                     y:Math.max(0,Math.min(size.height-r.height,r.y+y-start.y)),width:r.width,height:r.height};
+                if(pressFreeMove || (mouse.modifiers & Qt.ShiftModifier))alignment.showLines([],[]);
+                else {rect=alignment.adjust(rect);if(!rect)return;}
+                showGesture(rect);
                 if(app.documentCanvas.dragPreview.active)app.documentCanvas.dragPreview.offset=Qt.point(editor.gesture.x-r.x,editor.gesture.y-r.y);
             }
         }
         onReleased: function(mouse) {
-            if (!began || !layer.ready || !currentGesture() || pressRevision!==editor.model.revision){began=false;dragging=false;editor.gesture=null;app.documentCanvas.dragPreview.cancel();return;}
-            const moved=dragging;began=false;
+            if (!began || !layer.ready || !currentGesture() || pressRevision!==editor.model.revision){cancelGesture();return;}
+            const moved=dragging;began=false;dragging=false;alignment.clear();ownGesture=null;
             const p=position(mouse);
-            if(!p){editor.gesture=null;dragging=false;hit=null;app.documentCanvas.dragPreview.cancel();return;}
+            if(!p){editor.gesture=null;cancelGesture();app.documentCanvas.dragPreview.cancel();return;}
             const x=p.x,y=p.y;
-            if (dragging && ["erase","blackout"].indexOf(editor.tool)>=0) editor.redact(area(x,y),layer.page);
-            else if (dragging && editor.tool==="link") {editor.selected=null;editor.gesture=area(x,y);}
-            else if (dragging && editor.gesture && hit) {const bounds=editor.gesture;editor.gesture=null;editor.applyGeometry(hit,bounds);if(editor.pending)app.documentCanvas.dragPreview.hold(editor.pending.id);else app.documentCanvas.dragPreview.cancel();}
+            if (moved && ["erase","blackout"].indexOf(editor.tool)>=0) editor.redact(area(x,y),layer.page);
+            else if (moved && editor.tool==="link") {editor.selected=null;editor.gesture=area(x,y);}
+            else if (moved && editor.gesture && hit) {const bounds=editor.gesture;editor.gesture=null;editor.applyGeometry(hit,bounds);if(editor.pending)app.documentCanvas.dragPreview.hold(editor.pending.id);else app.documentCanvas.dragPreview.cancel();}
             else if (hit) editor.select(hit,layer.page);
             else if (editor.tool==="text") {
                 const size=app.currentReader.pages[layer.page];
@@ -162,12 +202,12 @@ Item {
                 editor.chooseImage({x:Math.max(0,Math.min(x,size.width-150)),y:Math.max(0,Math.min(y,size.height-100)),width:Math.min(150,size.width),height:Math.min(100,size.height)},null);
             } else editor.selected=null;
             if(!moved)app.documentCanvas.dragPreview.cancel();
+            if(app.documentCanvas.contentPointerOwner===pointer)app.documentCanvas.contentPointerOwner=null;
         }
         onDoubleClicked: function(mouse) {const p=position(mouse);if(!p)return;const item=at(p.x,p.y);if(item && item.kind==="text")editor.editText(item,layer.page);}
-        onCanceled: {if(began)app.documentCanvas.dragPreview.cancel();if(currentGesture())editor.gesture=null;dragging=false;began=false;}
+        onCanceled:cancelGesture()
         Keys.onEscapePressed: {
-            app.documentCanvas.dragPreview.cancel();
-            began=false;dragging=false;
+            cancelGesture();app.documentCanvas.dragPreview.cancel();
             if (editor.inlineEditing) {editor.discard();return;}
             editor.gesture=null;editor.selected=null;editor.tool="select";
         }

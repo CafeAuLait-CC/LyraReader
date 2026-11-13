@@ -323,3 +323,5 @@ Font License 1.1, shipped subsetted as `LyraReader Sans SC`), rcgen (tests only)
 used under Apple's licence for in-app use on Apple platforms only: they may not become an application icon or
 mark, may not be redistributed as an icon set, and a Linux or Windows shell must bring its own icons. The
 application icon is original artwork made for this project.
+
+On Linux, moving selected PDF content shows alignment guides and snaps nearby edges within four logical pixels. Hold Shift when starting a drag for free placement. Guides reuse the current object snapshot and keep the existing single-step undo and Save workflow.

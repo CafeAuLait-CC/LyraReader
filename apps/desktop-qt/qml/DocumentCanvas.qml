@@ -6,6 +6,8 @@ Item {
     id: canvas
     objectName:"documentCanvas"
     required property var app
+    // The native object gesture owns the pointer until release or cancellation.
+    property Item contentPointerOwner: null
     property alias view: pageList
     property alias annotationNotePaper: annotationPaper
     property alias dragPreview:contentDrag
@@ -402,6 +404,7 @@ Item {
         cacheBuffer: height / 2
         reuseItems: false
         boundsBehavior: Flickable.StopAtBounds
+        interactive: !canvas.contentPointerOwner
         flickableDirection: Flickable.AutoFlickIfNeeded
         ScrollBar.vertical: ScrollBar {
             minimumSize: 0.04
