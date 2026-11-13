@@ -71,6 +71,9 @@ uses three groups for markup, drawing and placement, with menus for shapes, stam
 Ordinary text boxes edit directly on the page, including adopted PDF FreeText. Control+Return
 commits one undoable edit; Escape restores the existing mark or removes a cancelled new box.
 Existing sticky notes and markup comments open in one anchored reading paper without adoption or writes.
+Folded-paper badges sit beside the full text line and retain their anchor after adoption. The
+280 by 220 logical-pixel reading paper moves left when there is insufficient room on its right.
+Reply rows navigate to their thread root, including adopted roots, while keeping the reply selected.
 The reading paper has a corner Close and no title bar. A body click, Return or F2 explicitly starts
 a note edit; a PDF-owned note is adopted at that point. Cancel and Done sit below the editing body
 and return focus after the edit is acknowledged.
@@ -89,8 +92,9 @@ scrolling editor, and position/size fields keep their labels and page-point unit
 Dragging an already selected object previews its real pixels over a separately masked page region.
 One bounded bitmap pair is prepared from the pinned working revision; pointer motion only moves
 scene geometry. Escape, navigation and document changes cancel the preview. Successful moves retain
-it until the updated page is ready, with undo and Save using the existing transaction. Magnetic
-alignment guides are still being ported. Text and bitmap objects have four native corner handles;
+it until the updated page is ready, with undo and Save using the existing transaction. Nearby edges
+snap within four logical pixels, with guides from the current object snapshot; hold Shift at drag
+start for free placement. Text and bitmap objects have four native corner handles;
 Escape cancels a resize, and undo and Save use the same shared transaction. External Form groups
 and links keep their existing geometry fields; their corner handles remain pending verification.
 Redact → Blackout/Erase removes
@@ -325,5 +329,3 @@ Font License 1.1, shipped subsetted as `LyraReader Sans SC`), rcgen (tests only)
 used under Apple's licence for in-app use on Apple platforms only: they may not become an application icon or
 mark, may not be redistributed as an icon set, and a Linux or Windows shell must bring its own icons. The
 application icon is original artwork made for this project.
-
-On Linux, moving selected PDF content shows alignment guides and snaps nearby edges within four logical pixels. Hold Shift when starting a drag for free placement. Guides reuse the current object snapshot and keep the existing single-step undo and Save workflow.

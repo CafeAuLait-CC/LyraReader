@@ -131,15 +131,21 @@ Item {
         id:geometry
         app:paper.app
         paperMap:paper.frame ? paper.frame.paperMap : null
-        sourceRect:paper.entry && paper.entry.rect ? Qt.rect(paper.entry.rect.x,paper.entry.rect.y,paper.entry.rect.width,paper.entry.rect.height) : Qt.rect(0,0,0,0)
+        sourceRect:{
+            const marker=paper.app.noteMarkerRect(paper.entry);
+            const r=marker || (paper.entry && paper.entry.rect);
+            return r ? Qt.rect(r.x,r.y,r.width,r.height) : Qt.rect(0,0,0,0);
+        }
     }
     readonly property rect anchor:frame && geometry.hit ? Qt.rect(frame.x+geometry.bounds.x*app.zoom,frame.y+geometry.bounds.y*app.zoom,geometry.bounds.width*app.zoom,geometry.bounds.height*app.zoom) : Qt.rect(0,0,0,0)
     Rectangle {
         id:panel;objectName:"annotationNotePaper"
         visible:paper.current && !paper.revealPending && !!paper.entry && !!paper.frame && geometry.hit && paper.anchor.x+paper.anchor.width>0 && paper.anchor.x<paper.width && paper.anchor.y+paper.anchor.height>0 && paper.anchor.y<paper.height
-        width:Math.min(360,Math.max(1,paper.width-24));height:Math.min(340,Math.max(1,paper.height-24))
-        x:Math.max(12,Math.min(paper.width-width-12,paper.anchor.x+paper.anchor.width+10))
-        y:Math.max(12,Math.min(paper.height-height-12,paper.anchor.y))
+        width:Math.min(280,Math.max(1,paper.width-16));height:Math.min(220,Math.max(1,paper.height-16))
+        readonly property real preferredX:paper.anchor.x+paper.anchor.width+8+width<=paper.width-8
+            ? paper.anchor.x+paper.anchor.width+8 : paper.anchor.x-width-8
+        x:Math.max(8,Math.min(paper.width-width-8,preferredX))
+        y:Math.max(8,Math.min(paper.height-height-8,paper.anchor.y))
         color:app.colors.noteBg;border.color:app.colors.noteFg;border.width:1;radius:6;clip:true
         MouseArea {
             anchors.fill:parent;acceptedButtons:Qt.AllButtons

@@ -4651,7 +4651,7 @@ impl LyraReaderDocument {
     /// This method never extracts. The only failure it can report is an out-of-range page,
     /// which is an InvalidArgument rather than "not prepared"; keeping real failures as `Err`
     /// is what lets the shell tell a missing page from a page it merely has not loaded yet.
-    fn prepared_selection_text_page(
+    pub fn prepared_selection_text_page(
         &self,
         page: u32,
     ) -> Result<Option<Arc<lyra_reader_text::SelectionTextPage>>, LyraReaderFfiError> {

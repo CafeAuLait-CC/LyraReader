@@ -47,6 +47,7 @@
 #include <QProcess>
 #include <QQuickStyle>
 #include <QQuickWindow>
+#include <QQuickItemGrabResult>
 #include <QRegularExpression>
 #include <QQmlProperty>
 #include <QSGRendererInterface>
@@ -2616,6 +2617,163 @@ private slots:
         QCOMPARE(reader->pages(),sourcePages);QCOMPARE(reader->layoutRows(),sourceRows);QCOMPARE(server.requests.size(),0);
         reader->clearAiRegion();QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),original);
     }
+    void offscreenNoteBadgesReleaseTheirPaintObjects() {
+        NativeCorpus::Viewer view;QVERIFY(view.window);QQmlComponent component(&view.engine);
+        component.setData(R"(import QtQuick
+            import LyraReader 1.0
+            Item {
+                width:700;height:700
+                property alias notes:notes
+                LyraReaderTheme { id:theme }
+                QtObject {
+                    id:reader
+                    property var textPages:({})
+                    property int documentGeneration:1
+                    signal noteMarkersReady(double request,int page,var markers,string error)
+                }
+                QtObject {
+                    id:fakeApp
+                    property var currentReader:reader
+                    property var placedTextEditor:null
+                    property var selectedAnnotation:null
+                    property var annotationDraft:null
+                    property var erasePreview:[]
+                    property var eraseDraft:[]
+                    property real zoom:1
+                    property string paperAppearance:"original"
+                    property var colors:theme
+                    property string annotationFont:"sans-serif"
+                    property var annotations:[{id:"near",page:0,kind:"stickyNote",rect:{x:20,y:20,width:24,height:24},visible:true},
+                        {id:"far",page:0,kind:"stickyNote",rect:{x:500,y:500,width:24,height:24},visible:true}]
+                }
+                AnnotationsLayer { id:notes;anchors.fill:parent;app:fakeApp;page:0;visibleRegion:Qt.rect(0,0,100,100) }
+            })",QUrl("qrc:/qml/NoteVisibilityCheck.qml"));
+        QScopedPointer<QObject> object(component.create());QVERIFY2(object,qPrintable(component.errorString()));auto *item=qobject_cast<QQuickItem *>(object.data());QVERIFY(item);item->setParentItem(view.window->contentItem());
+        auto *notes=object->property("notes").value<QObject *>();QVERIFY(notes);
+        QTRY_VERIFY(visualItem(item,"foldedNoteBadge_near"));QVERIFY(!visualItem(item,"foldedNoteBadge_far"));
+        notes->setProperty("visibleRegion",QRectF(0,0,700,700));QTRY_VERIFY(visualItem(item,"foldedNoteBadge_far"));
+        notes->setProperty("visibleRegion",QRectF(0,0,100,100));QTRY_VERIFY(!visualItem(item,"foldedNoteBadge_far"));QVERIFY(visualItem(item,"foldedNoteBadge_near"));
+    }
+    void readingANoteAndEnteringEditPreserveRawTextUntilInput() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/raw-note.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());
+        const auto raw=QString::fromUtf8("First\r\nSecond\rThird\u2029中文  ");
+        reader->submit("mark_create",{{"entry",QVariantMap{{"kind","stickyNote"},{"page",0},{"version",1},{"rect",QVariantMap{{"x",80},{"y",90},{"width",22},{"height",22}}},{"fontSize",14},{"color","#88611Bff"},{"note",raw}}}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto annotations=[&]{return reader->data().value("marks").toMap().value("annotations").toList();};QCOMPARE(annotations().size(),1);QCOMPARE(annotations()[0].toMap().value("note").toString(),raw);
+        const auto annotation=window->property("annotations").value<QJSValue>().toVariant().toList().first();QVERIFY(QMetaObject::invokeMethod(window,"selectAnnotation",Q_ARG(QVariant,annotation),Q_ARG(QVariant,false)));
+        auto *body=window->findChild<QQuickItem *>("annotationNoteBody");auto *editor=window->findChild<QObject *>("placedTextEditing");QVERIFY(body && editor);QTRY_VERIFY(body->isVisible() && body->property("readOnly").toBool());body->forceActiveFocus();QTest::keyClick(window,Qt::Key_Return);
+        QTRY_VERIFY_WITH_TIMEOUT(!body->property("readOnly").toBool(),10000);QTest::qWait(650);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QCOMPARE(annotations()[0].toMap().value("note").toString(),raw);QCOMPARE(editor->property("text").toString(),raw);
+        QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY_WITH_TIMEOUT(!editor->property("active").toBool(),10000);QCOMPARE(annotations()[0].toMap().value("note").toString(),raw);
+    }
+    void inlineNoteLookupsWarmEvictedVisibleTextAndDropOldSources() {
+        ReaderController reader;reader.openFile(QUrl::fromLocalFile(QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf"));QTRY_VERIFY(reader.pageCount()==9 && !reader.loading() && !reader.pendingCommands());
+        reader.requestText(0);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);const auto chars=reader.textPages().value("0").toMap().value("chars").toList();
+        QVariantMap first,last;for(const auto &v:chars){const auto c=v.toMap();if(c.value("width_pt").toDouble()<=0 || c.value("height_pt").toDouble()<=0)continue;if(first.isEmpty())first=c;else if(c.value("x_pt").toDouble()>first.value("x_pt").toDouble()+30 && qAbs(c.value("y_pt").toDouble()-first.value("y_pt").toDouble())<2){last=c;break;}}QVERIFY(!last.isEmpty());
+        const QVariantMap box{{"x",last.value("x_pt")},{"y",last.value("y_pt")},{"width",last.value("width_pt")},{"height",last.value("height_pt")}};
+        const QVariantList entries{QVariantMap{{"id","synthetic-comment"},{"boxes",QVariantList{box}}}};
+        QSignalSpy ready(&reader,&ReaderController::noteMarkersReady);reader.requestNoteMarkers(0,entries);QTRY_COMPARE_WITH_TIMEOUT(ready.size(),1,10000);QVERIFY(ready[0][3].toString().isEmpty());const auto baseline=ready[0][2].toList();QVERIFY(!baseline.isEmpty());
+        auto source=reader.renderSource();QString error;for(int page=1;page<9;++page)source->query({{"op","text"},{"page",page}},&error);QVERIFY(error.isEmpty());
+        const auto cold=source->query({{"op","note_markers"},{"page",0},{"entries",entries}},&error).toMap();QVERIFY(error.isEmpty());QVERIFY(!cold.value("prepared").toBool());
+        reader.requestNoteMarkers(0,entries);QTRY_COMPARE_WITH_TIMEOUT(ready.size(),2,10000);QVERIFY(ready[1][3].toString().isEmpty());QCOMPARE(ready[1][2].toList(),baseline);
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);QTRY_COMPARE_WITH_TIMEOUT(reader.findChildren<QFutureWatcherBase *>().size(),0,10000);ready.clear();
+        auto *pool=QThreadPool::globalInstance();const auto oldLimit=pool->maxThreadCount();pool->setMaxThreadCount(1);
+        QSemaphore entered,release;auto held=QtConcurrent::run([&]{entered.release();release.acquire();});auto restore=qScopeGuard([&]{release.release();pool->setMaxThreadCount(oldLimit);held.waitForFinished();});QVERIFY(entered.tryAcquire(1,3000));
+        reader.requestNoteMarkers(0,entries);reader.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));
+        release.release();pool->setMaxThreadCount(oldLimit);held.waitForFinished();restore.dismiss();
+        QTRY_VERIFY_WITH_TIMEOUT(reader.pageCount()==1 && !reader.loading() && !reader.pendingCommands(),10000);QCOMPARE(ready.size(),0);
+    }
+    void replySidebarRowsJumpToTheirRootAndRetainReplyIdentity() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/reply-roots.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/annotated-replies.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==2 && !reader->loading());QVERIFY(settleReaderViewport(window));
+        const auto rows=[&]{return window->property("annotationThreads").value<QJSValue>().toVariant().toMap().value("rows").toList();};
+        const auto row=[&](const QString &id){for(const auto &v:rows())if(v.toMap().value("annotation").toMap().value("id")==id)return v.toMap();return QVariantMap{};};
+        const auto cross=row("nm:reply-cross-page");QCOMPARE(cross.value("rootID").toString(),QString("nm:parent-highlight"));
+        QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,1),Q_ARG(QVariant,20)));QVERIFY(settleReaderViewport(window));
+        QVERIFY(QMetaObject::invokeMethod(window,"showSidebar",Q_ARG(QVariant,"annotations")));
+        QTRY_VERIFY_WITH_TIMEOUT(visualItem(window->contentItem(),"annotationThreadRow_nm:reply-cross-page"),10000);auto *item=visualItem(window->contentItem(),"annotationThreadRow_nm:reply-cross-page");
+        QVERIFY(QMetaObject::invokeMethod(item,"clicked"));QTRY_COMPARE(window->property("currentPage").toInt(),0);
+        QCOMPARE(window->property("selectedSidebarAnnotationID").toString(),QString("nm:reply-cross-page"));QVERIFY(!window->property("selectedAnnotation").value<QJSValue>().toVariant().isValid());
+        auto *paper=window->findChild<QObject *>("annotationNotePaperController");QVERIFY(paper);QVERIFY(!paper->property("opened").toBool());QVERIFY(item->property("highlighted").toBool());
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(reader->data().value("marks").toMap().value("annotations").toList().isEmpty());
+        reader->submit("file_adopt",{{"id","nm:parent-highlight"}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto adopted=reader->data().value("marks").toMap().value("annotations").toList().first().toMap();QCOMPARE(row("nm:reply-cross-page").value("rootID"),adopted.value("id"));
+        QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,1),Q_ARG(QVariant,20)));QVERIFY(settleReaderViewport(window));
+        QVERIFY(QMetaObject::invokeMethod(window,"activateAnnotationThreadRow",Q_ARG(QVariant,cross)));QTRY_COMPARE(window->property("currentPage").toInt(),0);
+        QVERIFY(QMetaObject::invokeMethod(window,"activateAnnotationThreadRow",Q_ARG(QVariant,row("nm:reply-two"))));QCOMPARE(window->property("selectedSidebarAnnotationID").toString(),QString("nm:reply-two"));QVERIFY(!paper->property("opened").toBool());
+        QVERIFY(QMetaObject::invokeMethod(window,"activateAnnotationThreadRow",Q_ARG(QVariant,row("nm:reply-to-hidden"))));QVERIFY(window->property("operationStatus").toString().contains("hidden"));
+        reader->openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));
+        QTRY_VERIFY(reader->pageCount()==1 && !reader->loading());QVERIFY(window->property("selectedSidebarAnnotationID").toString().isEmpty());
+    }
+    void foldedNoteGlyphsHaveCompleteOpaqueArtworkAndBoundedTextures() {
+        NativeCorpus::Viewer view;QVERIFY(view.window);QQmlComponent component(&view.engine);
+        component.setData(R"(import QtQuick
+            Item {
+                width:64;height:64
+                property alias badge:badge
+                property alias theme:theme
+                LyraReaderTheme { id:theme }
+                NoteBadge { id:badge;objectName:"testNoteBadge";anchors.fill:parent;colors:theme }
+            })",QUrl("qrc:/qml/NoteGlyphCheck.qml"));
+        QScopedPointer<QObject> object(component.create());QVERIFY2(object,qPrintable(component.errorString()));
+        auto *item=qobject_cast<QQuickItem *>(object.data());QVERIFY(item);item->setParentItem(view.window->contentItem());item->setPosition(QPointF(200,150));
+        QTest::mouseMove(view.window,QPoint(view.window->width()-20,view.window->height()-20));
+        auto *badge=visualItem(item,"testNoteBadge");QVERIFY(badge);auto *canvas=visualItem(badge,"noteBadgeCanvas");QVERIFY(canvas);
+        // A non-null image can precede the render thread's queued completion event.
+        // Keep the result alive until ready(), then read it on the GUI thread.
+        const auto capture=[&]{QTest::qWait(80);auto grab=badge->grabToImage();if(!grab)return QImage{};QSignalSpy ready(grab.data(),&QQuickItemGrabResult::ready);if(ready.isEmpty() && !ready.wait(3000))return QImage{};return grab->image();};
+        const auto sample=[](const QImage &image,double x,double y){return image.pixelColor(qFloor(x/24*image.width()),qFloor(y/24*image.height()));};
+        auto normal=capture();QVERIFY(!normal.isNull());QCOMPARE(sample(normal,2,2).alpha(),0);QCOMPARE(sample(normal,19,19).alpha(),0);
+        const auto paper=sample(normal,6,14);QVERIFY2(qAbs(paper.red()-245)<2 && qAbs(paper.green()-236)<2 && qAbs(paper.blue()-215)<2,qPrintable(paper.name()));QCOMPARE(paper.alpha(),255);
+        const auto ink=sample(normal,10,8.25);QVERIFY(ink.red()<paper.red()-30);
+        QTest::mouseMove(view.window,badge->mapToScene(QPointF(32,32)).toPoint());QTRY_VERIFY(badge->property("hovered").toBool());auto hovered=capture();QVERIFY(sample(hovered,6,14)!=paper);QTest::mouseMove(view.window,QPoint(view.window->width()-20,view.window->height()-20));QTRY_VERIFY(!badge->property("hovered").toBool());
+        const auto windowRect=canvas->property("canvasWindow").toRectF();const auto canvasSize=canvas->property("canvasSize").toSizeF();QCOMPARE(windowRect.size(),canvasSize);
+        auto *theme=object->property("theme").value<QObject *>();QVERIFY(theme);theme->setProperty("dark",true);QCOMPARE(capture(),normal);
+        badge->setProperty("active",true);auto active=capture();QVERIFY(sample(active,6,14)!=paper);
+        badge->setProperty("inlineComment",true);badge->setProperty("highlight",QColor::fromRgbF(.2,.4,1,.01));auto translucent=capture();QCOMPARE(sample(translucent,6,14).alpha(),255);
+        badge->setProperty("highlight",QColor::fromRgbF(.2,.4,1,1));QCOMPARE(capture(),translucent);
+        const auto dots=sample(translucent,8.375,9.875);QVERIFY(dots.red()<sample(translucent,6,14).red()-20);
+        badge->setProperty("nightPaper",true);auto night=capture();QVERIFY(sample(night,6,14).red()<120);QCOMPARE(sample(night,6,14).alpha(),255);
+        item->setWidth(2400);item->setHeight(2400);QCoreApplication::processEvents();QCOMPARE(canvas->property("canvasSize").toSizeF(),QSizeF(192,192));
+        item->setWidth(64);item->setHeight(64);
+    }
+    void inlineCommentsReuseFullLineAnchorsWithoutAdoptingOrMovingPdfBytes() {
+        QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/inline-comments.pdf";
+        QVERIFY(QFile::copy(root+"/tests/fixtures/annotated-replies.pdf",path));QFile pdf(path);QVERIFY(pdf.open(QIODevice::ReadOnly));const auto original=pdf.readAll();pdf.close();
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==2 && !reader->loading());QVERIFY(settleReaderViewport(window));reader->requestText(0);
+        const auto markers=[&]{return window->property("noteMarkerLayouts").value<QJSValue>().toVariant().toMap().value("0").toMap().value("markers").toList();};
+        const auto marker=[&](const QString &id){for(const auto &m:markers())if(m.toMap().value("id").toString()==id)return m.toMap().value("rect").toMap();return QVariantMap{};};
+        QTRY_VERIFY_WITH_TIMEOUT(!marker("nm:parent-highlight").isEmpty(),10000);const auto before=marker("nm:parent-highlight");
+        QCOMPARE(before.value("width").toDouble(),24.0);QVERIFY(visualItem(window->contentItem(),"inlineNoteBadge_nm:parent-highlight"));
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        auto *sheet=qobject_cast<PageItem *>(visualItem(window->contentItem(),"pdfPage0"));QVERIFY(sheet);
+        QTRY_VERIFY_WITH_TIMEOUT(sheet->refined() && sheet->texturesReady(),10000);
+        // Native mapping can still settle the first viewport and thumbnail demand.
+        // Fence that work, then count only this reader, not other provider instances.
+        QTest::qWait(250);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingRasters(),0,10000);
+        QTRY_VERIFY_WITH_TIMEOUT(sheet->refined() && sheet->texturesReady(),10000);
+        const auto jobs=reader->completedRasters();const auto globalJobs=RasterJobs::statistics().value("completed");
+        const double x=before.value("x").toDouble()+12,y=before.value("y").toDouble()+12;
+        QVariant hit;QVERIFY(QMetaObject::invokeMethod(window,"annotationAt",Q_RETURN_ARG(QVariant,hit),Q_ARG(QVariant,0),Q_ARG(QVariant,x),Q_ARG(QVariant,y),Q_ARG(QVariant,false)));QCOMPARE(hit.toMap().value("id").toString(),QString("nm:parent-highlight"));
+        QVERIFY(QMetaObject::invokeMethod(window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,x),Q_ARG(QVariant,y),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+        auto *paper=window->findChild<QObject *>("annotationNotePaperController");auto *body=window->findChild<QQuickItem *>("annotationNoteBody");QVERIFY(paper && body);
+        QTRY_VERIFY(body->isVisible());QVERIFY(body->property("readOnly").toBool());QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(reader->data().value("marks").toMap().value("annotations").toList().isEmpty());QTest::qWait(80);qInfo()<<"Note read raster counters"<<jobs<<reader->completedRasters()<<"global"<<globalJobs<<RasterJobs::statistics().value("completed");QCOMPARE(reader->completedRasters(),jobs);
+        const auto anchor=paper->property("anchor").toRectF();QVERIFY(qAbs(anchor.width()-24*window->property("zoom").toDouble())<.01);
+        const auto openShot=qEnvironmentVariable("LYRA_READER_INLINE_NOTE_OPEN_SNAPSHOT");if(!openShot.isEmpty())QVERIFY(window->grabWindow().save(openShot));
+        QVERIFY(QMetaObject::invokeMethod(paper,"close"));
+        auto *layer=window->property("noteMarkerLayouts").value<QJSValue>().toVariant().toMap().value("0").toMap().value("layer").value<QObject *>();QVERIFY(layer);
+        QVERIFY(QQmlProperty::write(layer,"page",1));QVERIFY(markers().isEmpty());
+        QVERIFY(QQmlProperty::write(layer,"page",0));QTRY_VERIFY_WITH_TIMEOUT(!marker("nm:parent-highlight").isEmpty(),10000);
+        reader->submit("file_adopt",{{"id","nm:parent-highlight"}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto owned=reader->data().value("marks").toMap().value("annotations").toList().first().toMap();const auto id=owned.value("id").toString();
+        QTRY_VERIFY_WITH_TIMEOUT(!marker(id).isEmpty(),10000);QCOMPARE(marker(id),before);
+        QVERIFY(pdf.open(QIODevice::ReadOnly));QCOMPARE(pdf.readAll(),original);
+        const auto shot=qEnvironmentVariable("LYRA_READER_INLINE_NOTES_SNAPSHOT");if(!shot.isEmpty())QVERIFY(window->grabWindow().save(shot));
+    }
     void noteReadingDoesNotWriteAndInlineEditorsKeepTheirOwnText() {
         QTest::failOnWarning(QRegularExpression(QStringLiteral(".*TypeError:.*")));
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/note-paper.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));QFile pdf(path);QVERIFY(pdf.open(QIODevice::ReadOnly));const auto original=pdf.readAll();pdf.close();
@@ -2637,6 +2795,8 @@ private slots:
 
         // The actual sidebar row reopens the first note in read mode without adopting it.
         QVERIFY(QMetaObject::invokeMethod(window,"showSidebar",Q_ARG(QVariant,"annotations")));QTRY_VERIFY_WITH_TIMEOUT(visualItem(window->contentItem(),"annotationThreadRow_"+ids[0]),10000);auto *row=visualItem(window->contentItem(),"annotationThreadRow_"+ids[0]);QVERIFY(row);QVERIFY(QMetaObject::invokeMethod(row,"clicked"));QTRY_COMPARE(body->property("text").toString(),texts[0]);QVERIFY(body->property("readOnly").toBool());QTRY_VERIFY_WITH_TIMEOUT(panel->isVisible(),10000);
+        QCOMPARE(panel->width(),280.0);QCOMPARE(panel->height(),220.0);
+        QVERIFY2(visualItem(window->contentItem(),"foldedNoteBadge_"+ids[0]),"Sticky notes use the shared folded-paper artwork");
         QTest::qWait(40);QTest::mouseMove(window,body->mapToScene(QPointF(12,12)).toPoint(),20);QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,body->mapToScene(QPointF(12,12)).toPoint());QTRY_VERIFY_WITH_TIMEOUT(!body->property("readOnly").toBool() && body->hasActiveFocus(),10000);QCOMPARE(body->property("text").toString(),texts[0]);QTest::keyClick(window,Qt::Key_End,Qt::ControlModifier);for(const char typed:QByteArray(" first-edit"))QTest::keyClick(window,typed);QTest::qWait(650);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);for(const char typed:QByteArray(" second-edit"))QTest::keyClick(window,typed);QTest::qWait(650);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTest::keyClick(window,Qt::Key_Return,Qt::ControlModifier);QTRY_VERIFY_WITH_TIMEOUT(!editing->property("active").toBool(),10000);QCOMPARE(values()[0].toMap().value("note").toString(),texts[0]+" first-edit second-edit");QCOMPARE(values()[1],initial[1]);
         reader->submit("marks_undo");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QCOMPARE(values(),initial);
         QVERIFY(QMetaObject::invokeMethod(window,"selectAnnotation",Q_ARG(QVariant,initial[1]),Q_ARG(QVariant,true)));body->forceActiveFocus();QTest::keyClick(window,Qt::Key_F2);QTRY_VERIFY_WITH_TIMEOUT(!body->property("readOnly").toBool() && body->hasActiveFocus(),10000);QTest::keyClick(window,Qt::Key_End,Qt::ControlModifier);for(const char typed:QByteArray(" CANCELLED_NOTE_DRAFT"))QTest::keyClick(window,typed);QTest::qWait(650);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY_WITH_TIMEOUT(!editing->property("active").toBool(),10000);QCOMPARE(values(),initial);QCOMPARE(body->property("text").toString(),texts[1]);

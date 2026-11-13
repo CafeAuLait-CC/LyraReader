@@ -56,6 +56,23 @@ QtObject {
     readonly property color bookmark: dark ? "#E7C07B" : "#9A6A19"
     readonly property color noteBg: dark ? "#463126" : "#FFF0E6"
     readonly property color noteFg: dark ? "#F3BD94" : "#8A4C26"
+    // Current macOS folded-note artwork tokens. Paper appearance owns these,
+    // independently of the window theme; source annotation opacity is not a badge alpha.
+    function noteIconColors(state, nightPaper, highlight) {
+        const table = nightPaper
+            ? [["#413B2E", "#534A35", "#C1AB7F"], ["#4A4231", "#60533B", "#D3BC8C"], ["#51452F", "#6D5938", "#E7C07B"]]
+            : [["#F5ECD7", "#E8DABE", "#857252"], ["#EFE0BC", "#DFCCA0", "#79613A"], ["#EBD7A6", "#D7BB7D", "#735423"]];
+        const values = table[state];
+        let paper = Qt.color(values[0]), fold = Qt.color(values[1]);
+        if (highlight !== null) {
+            const amount = nightPaper ? .28 : .4, neutral = Math.max(paper.r, paper.g, paper.b);
+            paper = Qt.rgba((nightPaper ? paper.r : neutral) * (1 - amount) + highlight.r * amount,
+                            (nightPaper ? paper.g : neutral) * (1 - amount) + highlight.g * amount,
+                            (nightPaper ? paper.b : neutral) * (1 - amount) + highlight.b * amount, 1);
+            fold = Qt.rgba(paper.r * .86, paper.g * .86, paper.b * .86, 1);
+        }
+        return {paper: paper, fold: fold, ink: Qt.color(values[2])};
+    }
     readonly property color successBg: dark ? "#243A2D" : "#E9F3ED"
     readonly property color successFg: dark ? "#96CBA9" : "#2F6F53"
     readonly property color warningBg: dark ? "#40351F" : "#FFF2D4"

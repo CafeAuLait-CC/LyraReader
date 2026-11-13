@@ -958,6 +958,7 @@ dependencies = [
  "lyra-reader-render",
  "lyra-reader-runtime",
  "lyra-reader-session",
+ "lyra-reader-text",
  "serde",
  "serde_json",
  "sha2",

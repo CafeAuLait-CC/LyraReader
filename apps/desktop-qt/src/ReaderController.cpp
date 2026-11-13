@@ -497,6 +497,32 @@ void ReaderController::requestText(int page) {
     submit(QStringLiteral("text"), {{QStringLiteral("page"),page}});
 }
 
+quint64 ReaderController::requestNoteMarkers(int page,const QVariantList &entries) {
+    const auto id=++m_commandSequence;const auto source=m_source;const auto generation=m_generation;
+    if(!source || page<0 || page>=pageCount())return id;
+    ++m_pendingCommands;emit commandsChanged();
+    auto *watcher=new QFutureWatcher<CommandResult>(this);
+    connect(watcher,&QFutureWatcher<CommandResult>::finished,this,[this,watcher,id,page,source,generation]{
+        const auto result=watcher->result();watcher->deleteLater();--m_pendingCommands;emit commandsChanged();
+        if(source!=m_source || generation!=m_generation)return;
+        emit noteMarkersReady(id,page,result.result.toMap().value(QStringLiteral("markers")).toList(),result.error);
+    });
+    const bool textWasLoaded=m_textPages.contains(QString::number(page));
+    watcher->setFuture(QtConcurrent::run([source,page,entries,textWasLoaded]{
+        const QVariantMap query{{QStringLiteral("op"),QStringLiteral("note_markers")},
+            {QStringLiteral("page"),page},{QStringLiteral("entries"),entries}};
+        CommandResult result;result.result=source->query(query,&result.error);
+        // The bounded engine cache may have evicted a page still held by the view.
+        // Warm only this live page, on the worker and on this same immutable source.
+        if(result.error.isEmpty() && textWasLoaded && !result.result.toMap().value(QStringLiteral("prepared")).toBool()) {
+            source->query({{QStringLiteral("op"),QStringLiteral("text")},{QStringLiteral("page"),page}},&result.error);
+            if(result.error.isEmpty())result.result=source->query(query,&result.error);
+        }
+        return result;
+    }));
+    return id;
+}
+
 void ReaderController::setLayout(const QString &mode, double gap) {
     if(!m_fitPresentation.isEmpty() && (m_fitPresentation.value(QStringLiteral("mode")).toString()!=mode
             || m_fitPresentation.value(QStringLiteral("preferredGap")).toDouble()!=gap))clearFitPageSpacing();

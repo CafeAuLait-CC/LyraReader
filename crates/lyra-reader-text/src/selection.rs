@@ -728,6 +728,13 @@ mod tests {
     #[test]
     fn interleaved_two_column_line_numbers_are_not_selection_stops_or_copied_text() {
         let chars = manuscript_numbers(7.0, false);
+        let layout = SelectionLayout::build(&chars);
+        let line = crate::note_line_bounds(&layout, Rect::new(90.0, 30.0, 10.0, 10.0)).unwrap();
+        assert_eq!(
+            line.min_x(),
+            60.0,
+            "A margin comment must anchor beside prose, not a manuscript line number"
+        );
         let raw_text: String = chars
             .iter()
             .filter_map(|c| char::from_u32(c.unicode))

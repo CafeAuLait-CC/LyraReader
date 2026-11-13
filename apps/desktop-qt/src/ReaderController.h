@@ -140,6 +140,7 @@ public:
     Q_INVOKABLE void dismissError();
     Q_INVOKABLE quint64 submit(const QString &operation, const QVariantMap &arguments = {});
     Q_INVOKABLE void requestText(int page);
+    Q_INVOKABLE quint64 requestNoteMarkers(int page, const QVariantList &entries);
     Q_INVOKABLE QVariantMap selectionText(int page,int start,int end) const;
     Q_INVOKABLE QVariantMap normalizedCopiedText(const QString &text) const;
     Q_INVOKABLE void setLayout(const QString &mode, double gap);
@@ -194,6 +195,7 @@ signals:
     void regionHistoryChanged();
     void regionNoteDraftChanged();
     void textPagesChanged();
+    void noteMarkersReady(quint64 request, int page, const QVariantList &markers, const QString &error);
     void commandsChanged();
 private:
     TilePlanResult requestPlannedTiles(quintptr consumer,int page,const LyraReaderTilePlanRequest &density,const QRectF &visible,const QSet<QString> &retained);

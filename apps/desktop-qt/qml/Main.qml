@@ -284,6 +284,50 @@ ApplicationWindow {
         return Logic.normalized(a, true);
     }))
     readonly property var annotationThreads: Logic.annotationThreads(annotations)
+    property var noteMarkerLayouts: ({})
+    property string selectedSidebarAnnotationID: ""
+    function activateAnnotationThreadRow(row) {
+        if(!row || !row.annotation)return;
+        const source=currentReader,generation=source.documentGeneration;
+        if(placedTextController.deferAction(function(){if(currentReader===source && source.documentGeneration===generation)root.activateAnnotationThreadRow(row);}))return;
+        const annotation=annotations.find(function(a){return a.id===row.annotation.id;});
+        if(!annotation)return;
+        if(!annotation.is_reply){selectAnnotation(annotation);return;}
+        const currentRow=annotationThreads.rows.find(function(r){return r.annotation.id===annotation.id;});
+        if(!currentRow)return;
+        dialogs.flushAnnotation();annotationNotePaper.close();dialogs.annotationDialog.close();
+        const target=annotations.find(function(a){return a.id===currentRow.rootID;}) || annotation;
+        selectedAnnotation=null;selection=null;selectedSidebarAnnotationID=annotation.id;
+        navigate(target.page,target.rect ? target.rect.y : 0);
+        if(currentRow.orphanReason)operationStatus=currentRow.orphanReason;
+    }
+    function publishNoteMarkers(layer, page, owner, generation, markers) {
+        if(owner!==currentReader || generation!==owner.documentGeneration)return;
+        const next=Object.assign({},noteMarkerLayouts);
+        next[page]={layer:layer,owner:owner,generation:generation,markers:markers};noteMarkerLayouts=next;
+    }
+    function forgetNoteMarkers(layer,page) {
+        if(!noteMarkerLayouts[page] || noteMarkerLayouts[page].layer!==layer)return;
+        const next=Object.assign({},noteMarkerLayouts);delete next[page];noteMarkerLayouts=next;
+    }
+    function pageNoteMarkers(page) {
+        const value=noteMarkerLayouts[page];
+        return value && value.layer && value.layer.page===page && value.owner===currentReader && value.generation===currentReader.documentGeneration ? value.markers : [];
+    }
+    function noteMarkerRect(annotation) {
+        if(!annotation)return null;
+        const value=pageNoteMarkers(annotation.page).find(function(m){return m.id===annotation.id;});
+        return value ? value.rect : null;
+    }
+    function noteMarkerAt(page,x,y) {
+        const marker=pageNoteMarkers(page).find(function(m){const r=m.rect;return x>=r.x && x<=r.x+r.width && y>=r.y && y<=r.y+r.height;});
+        return marker ? annotations.find(function(a){return a.id===marker.id;}) || null : null;
+    }
+    function openInlineNote(annotation) {
+        if(placedTextController.deferAction(function(){root.openInlineNote(annotation);}))return;
+        selectedSidebarAnnotationID=annotation.id;
+        dialogs.flushAnnotation();dialogs.annotationDialog.close();annotationNotePaper.openNote(annotation,true,false);
+    }
     property var annotationDraft: null
     property var redactionDraft: null
     property var eraseDraft: []
@@ -320,6 +364,8 @@ ApplicationWindow {
     onAppearanceChanged: if (session)
         session.setPreference("appearance", appearance)
     onCurrentReaderChanged: {
+        noteMarkerLayouts=({});
+        selectedSidebarAnnotationID="";
         pendingLayoutPosition=null;
         cancelRegionSelection();if(aiRegionCard)aiRegionCard.close();
         Qt.callLater(function(){contentController.reset();});
@@ -926,6 +972,8 @@ ApplicationWindow {
             annotationTool="select";
             placedTextController.expectCreation(currentReader,request,false);
         } else if (annotationTool === "select") {
+            const marker=noteMarkerAt(page,x,y);
+            if(marker){openInlineNote(marker);return;}
             const hit = annotationAt(page, x, y, false);
             if (hit)
                 selectAnnotation(hit, false);
@@ -1095,6 +1143,7 @@ ApplicationWindow {
     }
     function selectAnnotation(annotation, edit) {
         if(placedTextController.deferAction(function(){root.selectAnnotation(annotation,edit);}))return;
+        selectedSidebarAnnotationID=annotation ? annotation.id : "";
         dialogs.flushAnnotation();
         if(annotation && (annotation.kind==="stickyNote" || (edit!==false && (annotation.note || annotation.contents) && (annotationNoteKind(annotation) || annotation.drawing==="markup")))) {
             dialogs.annotationDialog.close();annotationNotePaper.openNote(annotation,edit===false,edit!==false);return;
@@ -1145,6 +1194,9 @@ ApplicationWindow {
         dialogs.openBookmark(bookmark, index);
     }
     function annotationAt(page, x, y, inkOnly) {
+        if(!inkOnly) {
+            const entry=noteMarkerAt(page,x,y);if(entry)return entry;
+        }
         const values = annotations.filter(function (a) {
             return a.page === page && (!inkOnly || a.kind === "ink");
         });
@@ -2449,6 +2501,7 @@ ApplicationWindow {
             root.positionRestoring = true;
             root.selection = null;
             root.selectedAnnotation = null;
+            root.selectedSidebarAnnotationID = "";
             root.annotationDraft = null;
             root.redactionDraft = null;
             root.metadataDraft = null;

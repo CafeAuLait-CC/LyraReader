@@ -9,8 +9,15 @@ Item {
     required property int page
     property real zoom: app.zoom
     property bool ownOnly: false
+    property bool inlineNotes: false
     property var paperMap: null
     property rect visibleRegion: Qt.rect(0, 0, width / zoom, height / zoom)
+    function inViewport(rect) {
+        return rect && [rect.x,rect.y,rect.width,rect.height,rect.x+rect.width,rect.y+rect.height].every(Number.isFinite)
+            && rect.width>0 && rect.height>0 && rect.x<visibleRegion.x+visibleRegion.width
+            && rect.x+rect.width>visibleRegion.x && rect.y<visibleRegion.y+visibleRegion.height
+            && rect.y+rect.height>visibleRegion.y;
+    }
     readonly property var marks: {
         const values = app.annotations.filter(function (a) {
             return a.page === page && a.visible && (!ownOnly || !a.foreign) && app.eraseDraft.indexOf(a.id) < 0;
@@ -18,6 +25,52 @@ Item {
         return values.map(function (a) {
             return app.annotationDraft && app.annotationDraft.id === a.id ? app.annotationDraft : a;
         }).concat(app.erasePreview.filter(function (a) { return a.page === page; }));
+    }
+    readonly property var markerOwner: app.currentReader
+    readonly property var markerTextPage: markerOwner.textPages[page.toString()]
+    readonly property var markerInputs: {
+        if(!inlineNotes)return [];
+        const editor=app.placedTextEditor;
+        const values=marks.filter(function(a){return ["highlight","underline","strikeout"].indexOf(a.kind)>=0 && !a.is_reply && (String(a.note || a.contents || "").trim().length || (editor && editor.current && editor.noteOnly && editor.entry && editor.entry.id===a.id));});
+        return values.filter(function(a){return a.foreign;}).concat(values.filter(function(a){return !a.foreign;}))
+            .map(function(a){return {id:a.id,boxes:a.quads || []};});
+    }
+    readonly property string markerKey: JSON.stringify(markerInputs)
+    property var noteMarkers: []
+    property double markerRequest: -1
+    property var markerGeneration: null
+    property string requestedMarkerKey: ""
+    property int markerPublishedPage: -1
+    function invalidateMarkers() {
+        if(markerPublishedPage>=0 && markerPublishedPage!==page)app.forgetNoteMarkers(annotationLayer,markerPublishedPage);
+        markerPublishedPage=inlineNotes ? page : -1;
+        markerRequest=-1;noteMarkers=[];
+        if(inlineNotes)app.publishNoteMarkers(annotationLayer,page,markerOwner,markerOwner.documentGeneration,[]);
+        markerTimer.restart();
+    }
+    function updateMarkers() {
+        if(!inlineNotes)return;
+        noteMarkers=[];app.publishNoteMarkers(annotationLayer,page,markerOwner,markerOwner.documentGeneration,[]);
+        markerGeneration=markerOwner.documentGeneration;
+        if(!markerInputs.length){markerRequest=-1;return;}
+        requestedMarkerKey=markerKey;
+        markerRequest=markerOwner.requestNoteMarkers(page,markerInputs);
+    }
+    onMarkerKeyChanged: invalidateMarkers()
+    onMarkerTextPageChanged: invalidateMarkers()
+    onMarkerOwnerChanged: invalidateMarkers()
+    onPageChanged: invalidateMarkers()
+    Component.onCompleted: markerTimer.restart()
+    Component.onDestruction: if(app && markerPublishedPage>=0)app.forgetNoteMarkers(annotationLayer,markerPublishedPage)
+    Timer {id:markerTimer;interval:0;onTriggered:annotationLayer.updateMarkers()}
+    Connections {
+        target:annotationLayer.markerOwner
+        function onNoteMarkersReady(request,page,markers,error) {
+            if(request!==annotationLayer.markerRequest || page!==annotationLayer.page || annotationLayer.requestedMarkerKey!==annotationLayer.markerKey || annotationLayer.markerGeneration!==annotationLayer.markerOwner.documentGeneration)return;
+            if(error.length){annotationLayer.app.operationStatus=error;return;}
+            annotationLayer.noteMarkers=markers;
+            annotationLayer.app.publishNoteMarkers(annotationLayer,page,annotationLayer.markerOwner,annotationLayer.markerGeneration,markers);
+        }
     }
     clip: true
     PdfAnnotations {
@@ -34,6 +87,43 @@ Item {
         zoom: annotationLayer.zoom
         paperAppearance: app.paperAppearance
         paperMap: annotationLayer.paperMap
+    }
+    Repeater {
+        model: annotationLayer.noteMarkers
+        Item {
+            id:inlineDelegate
+            required property var modelData
+            readonly property var annotation:annotationLayer.marks.find(function(a){return a.id===modelData.id;}) || null
+            readonly property bool torn:!!annotationLayer.paperMap && annotationLayer.paperMap.paperGeometryActive
+            visible:!!annotation && annotationLayer.inViewport(modelData.rect)
+            x:torn ? 0 : modelData.rect.x*annotationLayer.zoom
+            y:torn ? 0 : modelData.rect.y*annotationLayer.zoom
+            width:torn ? annotationLayer.width : modelData.rect.width*annotationLayer.zoom
+            height:torn ? annotationLayer.height : modelData.rect.height*annotationLayer.zoom
+            Component {
+                id:inlinePaint
+                NoteBadge {
+                    objectName:"inlineNoteBadge_"+inlineDelegate.modelData.id
+                    colors:annotationLayer.app.colors
+                    nightPaper:annotationLayer.app.paperAppearance==="night"
+                    inlineComment:true
+                    highlight:inlineDelegate.annotation ? Logic.color(inlineDelegate.annotation) : Qt.rgba(0,0,0,0)
+                    active:!!app.selectedAnnotation && app.selectedAnnotation.id===inlineDelegate.modelData.id
+                    Accessible.role:Accessible.Button
+                    Accessible.name:qsTr("Read comment on page %1: %2").arg(annotationLayer.page+1).arg(inlineDelegate.annotation ? inlineDelegate.annotation.note : "")
+                    Accessible.ignored:inlineDelegate.torn
+                    Accessible.onPressAction:if(inlineDelegate.annotation)app.openInlineNote(inlineDelegate.annotation)
+                }
+            }
+            Loader {anchors.fill:parent;active:!inlineDelegate.torn && inlineDelegate.visible;sourceComponent:inlinePaint}
+            PaperStaticRegion {
+                app:annotationLayer.app;paperMap:annotationLayer.paperMap
+                sourceRect:Qt.rect(inlineDelegate.modelData.rect.x,inlineDelegate.modelData.rect.y,24,24)
+                zoom:annotationLayer.zoom;paint:inlineDelegate.visible ? inlinePaint : null
+                accessibleName:qsTr("Read comment on page %1: %2").arg(annotationLayer.page+1).arg(inlineDelegate.annotation ? inlineDelegate.annotation.note : "")
+                onPressed:if(inlineDelegate.annotation)app.openInlineNote(inlineDelegate.annotation)
+            }
+        }
     }
     Repeater {
         model: app.annotations.filter(function (a) {
@@ -140,6 +230,7 @@ Item {
         Item {
             id: noteDelegate
             required property var modelData
+            visible:annotationLayer.inViewport(modelData.rect)
             readonly property bool torn: !!annotationLayer.paperMap && annotationLayer.paperMap.paperGeometryActive
             x: torn ? 0 : modelData.rect.x * annotationLayer.zoom
             y: torn ? 0 : modelData.rect.y * annotationLayer.zoom
@@ -148,20 +239,14 @@ Item {
             Component {
                 id: notePaint
                 Item {
-                    Rectangle {
+                    NoteBadge {
+                        objectName: "foldedNoteBadge_" + noteDelegate.modelData.id
                         visible: noteDelegate.modelData.kind === "stickyNote"
                         anchors.fill: parent
-                        radius: Math.min(3, parent.width / 6)
-                        color: app.colors.noteBg
-                        border.color: app.colors.noteFg
-                        Label {
-                            Accessible.ignored: noteDelegate.torn
-                            textFormat: Text.PlainText
-                            anchors.centerIn: parent
-                            text: "✎"
-                            font.pixelSize: Math.max(6, Math.min(18, parent.height * .7))
-                            color: app.colors.noteFg
-                        }
+                        colors: annotationLayer.app.colors
+                        nightPaper: annotationLayer.app.paperAppearance === "night"
+                        active: !!app.selectedAnnotation && app.selectedAnnotation.id === noteDelegate.modelData.id
+                        Accessible.ignored: noteDelegate.torn
                     }
                     Text {
                         objectName: "staticNoteText"
@@ -181,7 +266,7 @@ Item {
             }
             Loader {
                 anchors.fill: parent
-                active: !noteDelegate.torn
+                active: !noteDelegate.torn && noteDelegate.visible
                 sourceComponent: notePaint
             }
             PaperStaticRegion {
@@ -190,7 +275,7 @@ Item {
                 paperMap: annotationLayer.paperMap
                 sourceRect: Qt.rect(noteDelegate.modelData.rect.x,noteDelegate.modelData.rect.y,noteDelegate.modelData.rect.width,noteDelegate.modelData.rect.height)
                 zoom: annotationLayer.zoom
-                paint: notePaint
+                paint: noteDelegate.visible ? notePaint : null
                 accessibleName: noteDelegate.modelData.kind==="stickyNote" ? qsTr("Sticky note on page %1: %2").arg(annotationLayer.page+1).arg(noteDelegate.modelData.note || "") : qsTr("Text annotation on page %1: %2").arg(annotationLayer.page+1).arg(noteDelegate.modelData.note || "")
                 onPressed: app.selectAnnotation(noteDelegate.modelData,false)
             }

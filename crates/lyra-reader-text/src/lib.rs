@@ -23,6 +23,7 @@ mod figures;
 mod fragments;
 mod line_numbers;
 mod navigation;
+mod note_markers;
 mod numbered;
 mod paren;
 mod selection;
@@ -38,6 +39,9 @@ pub use figures::{
     caption_region_without_margin, find_caption_mentions,
 };
 pub use navigation::is_navigation_page;
+pub use note_markers::{
+    MAX_INLINE_NOTE_BOXES, MAX_INLINE_NOTE_MARKERS, inline_note_markers, note_line_bounds,
+};
 pub use paren::{ParenthesisedCandidate, inspect_parenthesised_citations};
 pub use selection::{
     MAX_REGION_TEXT_CHARS, SelectionLayout, SelectionLine, SelectionStop, SelectionTextPage,

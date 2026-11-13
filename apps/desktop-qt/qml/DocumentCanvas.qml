@@ -480,6 +480,7 @@ Item {
                         anchors.fill: parent
                         app: canvas.app
                         page: sheet.modelData.index
+                        inlineNotes: true
                         visibleRegion: pdfPage.visibleRegion
                         paperMap: pdfPage
                     }

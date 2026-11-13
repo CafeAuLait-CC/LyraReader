@@ -186,7 +186,7 @@ function annotationThreads(annotations) {
             const next=pending.pop()
             if(rendered.has(next.id))continue
             rendered.add(next.id)
-            groups.get(sectionPage).push({annotation:byID.get(next.id),depth:next.depth,sectionPage:sectionPage,sectionKey:String(sectionPage+1),orphanReason:next.depth===0 ? orphans.get(next.id) || "" : ""})
+            groups.get(sectionPage).push({annotation:byID.get(next.id),rootID:id,depth:next.depth,sectionPage:sectionPage,sectionKey:String(sectionPage+1),orphanReason:next.depth===0 ? orphans.get(next.id) || "" : ""})
             const descendants=children.get(next.id) || []
             for(let i=descendants.length-1;i>=0;--i)pending.push({id:descendants[i],depth:next.depth+1})
         }

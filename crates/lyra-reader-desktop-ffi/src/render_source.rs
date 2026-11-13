@@ -212,6 +212,9 @@ impl RenderSource {
             }
         };
         match request["op"].as_str().unwrap_or("") {
+            "note_markers" => {
+                crate::note_markers::query(&self.engine, page()?, &request["entries"])
+            }
             "references_scan_step" => {
                 let progress = self
                     .engine

@@ -268,6 +268,9 @@ Pane {
                     Accessible.onPressAction: if (enabled && visible)
                         clicked()
                     objectName: "annotationThreadRow_" + annotation.id
+                    highlighted:app.selectedSidebarAnnotationID===annotation.id
+                    Accessible.selectable:true
+                    Accessible.selected:highlighted
                     width: annotationList.width
                     leftPadding: 10 + Math.min(modelData.depth, 6) * 14
                     height: Math.max(68, annotationContent.implicitHeight + 20)
@@ -316,7 +319,7 @@ Pane {
                             color: app.colors.warningFg
                         }
                     }
-                    onClicked: app.selectAnnotation(annotation)
+                    onClicked: app.activateAnnotationThreadRow(modelData)
                 }
                 Label {
                     textFormat: Text.PlainText

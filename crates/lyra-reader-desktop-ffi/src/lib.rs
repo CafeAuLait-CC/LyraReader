@@ -13,6 +13,7 @@ mod exports;
 mod knowledge;
 mod marks;
 mod navigation;
+mod note_markers;
 mod pages;
 mod paper;
 mod quit;
