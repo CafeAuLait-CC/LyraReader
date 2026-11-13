@@ -366,6 +366,28 @@ private slots:
         QCOMPARE(AuxiliaryWindowPolicy::boundedSize({1,1},{0,0,100,90}),QSize(68,58));
         QVERIFY(AuxiliaryWindowPolicy::boundedSize({560,650},{}).isEmpty());
     }
+    void preferencesKeysOpenSettingsWithoutADocumentAndYieldToItsWindow() {
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;
+        auto *settings=window->findChild<QQuickWindow *>("settingsWindow");QVERIFY(settings);QVERIFY(!settings->isVisible());
+        const auto preferences=QKeySequence::fromString(QStringLiteral("Ctrl+,"),QKeySequence::PortableText);QVERIFY(!preferences.isEmpty());
+        qInfo()<<"Platform Preferences key"<<preferences.toString(QKeySequence::PortableText);
+        window->requestActivate();QVERIFY(QTest::qWaitForWindowActive(window,5000));QTRY_VERIFY(window->property("readerKeyboardEnabled").toBool());
+        QTest::keySequence(window,preferences);QTRY_VERIFY(settings->isVisible());
+        settings->requestActivate();QVERIFY(QTest::qWaitForWindowActive(settings,5000));QTRY_VERIFY(QGuiApplication::focusWindow()==settings);
+        QCOMPARE(view.workspace.activeReader()->pageCount(),0);QCOMPARE(view.workspace.tabs().size(),1);
+        auto *action=window->findChild<QObject *>("settingsAction"),*menu=window->findChild<QObject *>("settingsMenuItem");QVERIFY(action && menu);
+        QCOMPARE(menu->property("action").value<QObject *>(),action);
+        QTRY_VERIFY(!window->property("readerKeyboardEnabled").toBool());QVERIFY(action->property("shortcut").toString().isEmpty());
+        QSignalSpy triggered(action,SIGNAL(triggered(QObject*)));QVERIFY(triggered.isValid());
+        QTest::keySequence(settings,preferences);QTest::qWait(40);QVERIFY(triggered.isEmpty());QVERIFY(settings->isVisible());
+        QTest::keyClick(settings,Qt::Key_Escape);QTRY_VERIFY(!settings->isVisible());QTRY_VERIFY(window->isActive());
+        QTRY_VERIFY(window->property("readerKeyboardEnabled").toBool());
+        QTest::keySequence(window,preferences);QTRY_VERIFY(settings->isVisible());QCOMPARE(triggered.size(),1);
+        settings->requestActivate();QVERIFY(QTest::qWaitForWindowActive(settings,5000));QTRY_VERIFY(QGuiApplication::focusWindow()==settings);QTest::keyClick(settings,Qt::Key_Escape);QTRY_VERIFY(!settings->isVisible());
+        QTRY_VERIFY(window->isActive());QTRY_VERIFY(window->property("readerKeyboardEnabled").toBool());QVERIFY(QMetaObject::invokeMethod(action,"trigger"));QTRY_VERIFY(settings->isVisible());
+        QCOMPARE(triggered.size(),2);QVERIFY(settings->close());
+        QCOMPARE(view.workspace.activeReader()->pageCount(),0);QVERIFY(!view.workspace.activeReader()->hasUnsavedChanges());
+    }
     void settingsAreIndependentTransientWindowsWithSafeReopenAndOwnerLifetime() {
         WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
         const auto oldMotion=window->property("reduceMotion");auto restoreMotion=qScopeGuard([&]{window->setProperty("reduceMotion",oldMotion);});
@@ -2262,7 +2284,7 @@ private slots:
         MockChatServer sentinel;QVERIFY(sentinel.listen());NativeCorpus::Viewer view;QVERIFY(view.window);auto *main=view.window;main->setProperty("aiSettings",QVariantMap{{"baseUrl",sentinel.baseUrl()},{"model","audit-no-send-synthetic-model"}});
         auto *settings=main->findChild<QQuickWindow *>("settingsWindow");QVERIFY(settings);QVERIFY(QMetaObject::invokeMethod(settings,"open"));QTRY_VERIFY(settings->isVisible());
         // Window-scoped Escape shortcuts need the native activation acknowledgement.
-        settings->requestActivate();QVERIFY(QTest::qWaitForWindowActive(settings,5000));
+        settings->requestActivate();QVERIFY(QTest::qWaitForWindowActive(settings,5000));QTRY_VERIFY(QGuiApplication::focusWindow()==settings);
         auto *button=settings->findChild<QObject *>("openAuditTrail");QVERIFY(button);QVERIFY(QMetaObject::invokeMethod(button,"clicked"));auto *dialog=settings->findChild<QObject *>("auditDialog");auto *controller=settings->findChild<AuditController *>("auditController");QVERIFY(dialog && controller);QTRY_VERIFY(dialog->property("visible").toBool());QTRY_VERIFY_WITH_TIMEOUT(!controller->busy(),10000);
         QCOMPARE(view.workspace.activeReader()->pageCount(),0);QCOMPARE(controller->state().value("records").toList().size(),0);QVERIFY2(controller->error().isEmpty(),qPrintable(controller->error()));QVERIFY(!QDir(cache+"/Audit").exists());QCOMPARE(sentinel.requests.size(),0);
         QVERIFY(QDir().mkpath(cache+"/Audit"));const auto path=cache+"/Audit/ai-requests.jsonl";

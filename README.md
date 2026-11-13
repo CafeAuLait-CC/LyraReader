@@ -166,9 +166,10 @@ changes. Image previews fit fractional viewport widths without rerasterising sub
 Scientific crops use the interface theme: dark neutral ink becomes soft warm gray-gold while chart
 colours stay original. Full-page previews keep the selected paper profile. These display conversions,
 including moderated night-reading edges, leave raw rasters and exported content unchanged.
-Settings and detached PDF previews open as resizable native dialogs, with a transient owner and a
-bounded initial size. Both were observed floating on their first map on niri while the main reader
-remained tiled; other compositors still need acceptance. Detached previews hold an immutable working
+Ctrl+, and File → Settings open Settings even without a document; the shortcut yields to another
+window's keyboard focus. Settings and detached PDF previews open as resizable native dialogs,
+with a transient owner and a bounded initial size. Both were observed floating on their first map
+on niri while the main reader remained tiled; other compositors still need acceptance. Detached previews hold an immutable working
 revision, retain page navigation, tiled zoom and selectable page text after the source tab changes or
 closes, and release that revision when closed. Uncommitted annotation drafts are not added to this
 snapshot; PDF annotations already present in its working revision remain visible.

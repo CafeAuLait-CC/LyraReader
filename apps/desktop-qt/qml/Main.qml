@@ -1911,6 +1911,14 @@ ApplicationWindow {
             root.close()
     }
     Action {
+        id: settingsAction
+        objectName: "settingsAction"
+        text: qsTr("Settings…")
+        // Some Linux themes map Preferences to a dedicated hardware Settings key.
+        shortcut: root.readerKeyboardEnabled ? "Ctrl+," : ""
+        onTriggered: root.showSettings()
+    }
+    Action {
         id: zoomIn
         text: qsTr("Zoom In")
         shortcut: root.readerKeyboardEnabled ? StandardKey.ZoomIn : ""
@@ -2071,6 +2079,11 @@ ApplicationWindow {
             }
             MenuItem { action: saveDocumentAction }
             MenuItem { action: saveDocumentAsAction }
+            MenuSeparator {}
+            MenuItem {
+                objectName: "settingsMenuItem"
+                action: settingsAction
+            }
             MenuSeparator {}
             MenuItem {
                 action: quitAction
