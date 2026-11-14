@@ -121,7 +121,8 @@ changing endpoints or updating/removing a key invalidates that session. Persiste
 in the system vault. Document chat keeps bounded exchanges per open document, including cancelled
 partial answers; failures remain visible and are excluded from later requests. Historical citations
 use the passages actually sent for that exchange. Summary, translation and chat have separate
-drafts and results; switching views or reopening the drawer sends nothing. Chat has a bottom
+drafts and results; switching views or reopening the drawer sends nothing. Read-only answers and
+provider reasoning support keyboard selection and keep the caret visible during navigation. Chat has a bottom
 composer and collapsed source passages. Layers and coverage lists abstract, section and page units,
 checks text locally and shows the sampled source pages. Preview summary prepares one selected unit
 through the shared planner; Send, Stop and Retry use the assistant's normal preview and local audit

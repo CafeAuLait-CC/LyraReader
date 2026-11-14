@@ -183,6 +183,7 @@ Item {
         Label {visible:!!card.attachment.restored;text:qsTr("Saved conversation · %1 completed turns. Preview includes the recent context.").arg(card.attachment.completed_turn_count || 0);wrapMode:Text.Wrap;Layout.fillWidth:true;color:card.app.colors.textSecondary}
         BusyIndicator {running:!!card.attachment.loading;visible:running;Layout.alignment:Qt.AlignHCenter}
         ScrollView {
+            id: resultScroll
             Layout.fillWidth:true;Layout.fillHeight:true;contentWidth:availableWidth;clip:true
             ColumnLayout {
                 width:parent.width;spacing:8
@@ -218,7 +219,7 @@ Item {
                     text:card.app.aiSettings.imageInput ? qsTr("Image input is enabled. The captured PNG above will be included.") : qsTr("Text only. To send the captured PNG, enable region images for this model in Settings.")
                     color:card.app.colors.textSecondary;font.pixelSize:11
                 }
-                AiResult {app:card.app;value:card.result;answerName:"aiRegionAnswer";Layout.fillWidth:true;onCitation:function(link,plan){card.follow(link,plan);}}
+                AiResult {app:card.app;viewport:resultScroll.contentItem;value:card.result;answerName:"aiRegionAnswer";Layout.fillWidth:true;onCitation:function(link,plan){card.follow(link,plan);}}
             }
         }
         ScrollView {

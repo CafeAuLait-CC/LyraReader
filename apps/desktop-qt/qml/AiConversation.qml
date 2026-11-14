@@ -73,9 +73,12 @@ ScrollView {
                     color: app.colors.textSecondary; font.pixelSize: 11
                 }
                 AiResult {
-                    Layout.fillWidth: true; app: conversation.app; answerName: "aiHistoryAnswer" + index; showSources: true
+                    Layout.fillWidth: true; app: conversation.app; answerName: "aiHistoryAnswer" + index; showSources: true; viewport: conversation.contentItem
                     value: ({output: modelData.answer, reasoning: modelData.reasoning, generation: modelData.generation, responsePlan: {action: "DocumentChat", sources: modelData.sources || []}})
-                    onCitation: function(link, plan) { conversation.citation(link, plan); }
+                    onKeyboardNavigation: function(key) {
+                    if ([Qt.Key_Up, Qt.Key_PageUp, Qt.Key_Home].indexOf(key) >= 0) conversation.followTail = false;
+                }
+                onCitation: function(link, plan) { conversation.citation(link, plan); }
                 }
                 Rectangle { Layout.fillWidth: true; height: 1; color: app.colors.separator }
             }
@@ -88,8 +91,11 @@ ScrollView {
                 Label { id: activeQuestion; anchors.fill: parent; anchors.margins: 8; text: conversation.viewState.activeQuestion || ""; textFormat: Text.PlainText; wrapMode: Text.Wrap; color: app.colors.textPrimary }
             }
             AiResult {
-                Layout.fillWidth: true; app: conversation.app; answerName: "aiStreamingChatAnswer"; showSources: true
+                Layout.fillWidth: true; app: conversation.app; answerName: "aiStreamingChatAnswer"; showSources: true; viewport: conversation.contentItem
                 value: ({output: conversation.viewState.output, reasoning: conversation.viewState.reasoning, responsePlan: conversation.viewState.responsePlan, generation: app.currentReader.documentGeneration})
+                onKeyboardNavigation: function(key) {
+                    if ([Qt.Key_Up, Qt.Key_PageUp, Qt.Key_Home].indexOf(key) >= 0) conversation.followTail = false;
+                }
                 onCitation: function(link, plan) { conversation.citation(link, plan); }
             }
         }

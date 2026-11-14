@@ -151,13 +151,14 @@ Pane {
             onTextEdited: aiPanel.owner.setAiInput("language", text)
         }
         ScrollView {
+            id: responseScroll
             objectName: "aiResponseScroll"
             visible: aiPanel.workspace !== "chat"
             Layout.fillWidth: true; Layout.fillHeight: true; Layout.minimumHeight: 24
             contentWidth: availableWidth
             AiResult {
                 width: parent.width
-                app: aiPanel.app; value: aiPanel.result
+                app: aiPanel.app; value: aiPanel.result; viewport: responseScroll.contentItem
                 onCitation: function(link, responsePlan) { aiPanel.followHistoryLink(link, responsePlan); }
             }
         }
