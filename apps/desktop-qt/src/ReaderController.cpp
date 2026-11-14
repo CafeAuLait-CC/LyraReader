@@ -341,7 +341,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
     if(mutation)++m_mutationSequence;
     const auto mutationSequence=m_mutationSequence;
     const auto generation = m_generation;
-    const bool latestOnly=operation==QStringLiteral("search") || operation==QStringLiteral("bibtex") || operation==QStringLiteral("layout") || operation==QStringLiteral("ai_preview") || operation==QStringLiteral("split_plan") || operation==QStringLiteral("content_objects");
+    const bool latestOnly=operation==QStringLiteral("search") || operation==QStringLiteral("bibtex") || operation==QStringLiteral("layout") || operation==QStringLiteral("ai_preview") || operation==QStringLiteral("ai_summary_catalog") || operation==QStringLiteral("ai_summary_inspect") || operation==QStringLiteral("split_plan") || operation==QStringLiteral("content_objects");
     if(latestOnly)m_latestRead.insert(operation,id);
     ++m_pendingCommands;
     emit commandsChanged();

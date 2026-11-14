@@ -8819,6 +8819,7 @@ pub fn validate_ai_model(model: String) -> Result<String, LyraReaderFfiError> {
 
 /// One level of the layered summary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub enum AiSummaryLayerRecord {
     /// One paragraph for the whole document, from a bounded prefix of its pages.
     Abstract,
@@ -8847,6 +8848,7 @@ pub struct AiSummarySectionRecord {
 /// What the shell asks one layer to build. The outline lives in the shell's sidebar model, so
 /// the section ranges arrive here rather than being derived a second time.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AiSummaryUnitRequestRecord {
     pub kind: AiSummaryLayerRecord,
     /// 0-based position within the layer; the row identity for matching results.
@@ -8884,6 +8886,7 @@ pub struct AiSummaryRequestRecord {
 
 /// The text one unit sends and the hash the cache keys on, without prompts.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AiSummaryFingerprintRecord {
     pub index: u32,
     pub kind: AiSummaryLayerRecord,
@@ -8945,6 +8948,7 @@ pub struct AiSummaryPlanRecord {
 
 /// The bounds the panel states before anything is sent.
 #[derive(Debug, Clone, Copy, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Serialize, serde::Deserialize))]
 pub struct AiSummaryLimitsRecord {
     /// Per end of the document: the abstract reads up to this many pages from the beginning
     /// and the same number from the end.

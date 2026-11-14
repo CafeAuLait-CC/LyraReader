@@ -17,7 +17,7 @@ QString aiView(const QString &action) {
 }
 
 void ReaderController::initAi() {
-    initDocumentReading();initRegionPersistence();
+    initDocumentReading();initRegionPersistence();initSummaryCatalog();
     m_aiTimer.setInterval(60);
     connect(&m_aiTimer,&QTimer::timeout,this,[this]{
         if(!m_aiState.value(QStringLiteral("running")).toBool()){m_aiTimer.stop();return;}
@@ -26,6 +26,7 @@ void ReaderController::initAi() {
     connect(this,&ReaderController::commandFinished,this,&ReaderController::handleAiCommand);
 }
 void ReaderController::resetAi() {
+    resetSummaryCatalog();
     resetRegionPersistence();
     m_aiRegionRestoreId=0;m_regionContinuationPending=false;m_regionContinuationSettings.clear();
     clearAiRegionPaper();

@@ -24,6 +24,7 @@ mod render_source;
 mod saving;
 mod selection;
 mod session;
+mod summary;
 mod tile_plan;
 use document::DesktopDocument as Document;
 use std::{

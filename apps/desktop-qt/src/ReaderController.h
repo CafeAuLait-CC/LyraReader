@@ -34,6 +34,7 @@ class ReaderController : public QObject {
     Q_PROPERTY(double documentHeight READ documentHeight NOTIFY documentChanged)
     Q_PROPERTY(QUrl fileUrl READ fileUrl NOTIFY documentChanged)
     Q_PROPERTY(QVariantMap aiState READ aiState NOTIFY aiStateChanged)
+    Q_PROPERTY(QVariantMap summaryCatalog READ summaryCatalog NOTIFY summaryCatalogChanged)
     Q_PROPERTY(QVariantMap documentReading READ documentReading NOTIFY documentReadingChanged)
     Q_PROPERTY(QVariantMap aiRegion READ aiRegion NOTIFY aiRegionChanged)
     Q_PROPERTY(QVariantMap aiRegionPaper READ aiRegionPaper NOTIFY aiRegionPaperChanged)
@@ -73,6 +74,10 @@ public:
     double documentHeight() const { return m_documentHeight; }
     QUrl fileUrl() const { return m_lastUrl; }
     QVariantMap aiState()const{return m_aiState;}
+    QVariantMap summaryCatalog()const{return m_summaryCatalog;}
+    Q_INVOKABLE void setSummaryExpanded(bool expanded);
+    Q_INVOKABLE void loadSummaryCatalog(const QString &layer,int offset=0);
+    Q_INVOKABLE void inspectSummaryUnit(const QString &id);
     QVariantMap documentReading()const{auto state=m_documentReading;state.insert(QStringLiteral("choice_pending"),m_readingChoicePending);return state;}
     Q_INVOKABLE void prepareDocumentReading(const QVariantMap &request);
     Q_INVOKABLE bool startDocumentReading(const QString &key,const QVariantMap &plan,const QString &token);
@@ -191,6 +196,7 @@ signals:
     void unsavedChangesChanged();
     void editDraftsChanged();
     void aiStateChanged();
+    void summaryCatalogChanged();
     void documentReadingChanged();
     void aiRegionChanged();
     void aiRegionPaperChanged();
@@ -208,6 +214,12 @@ private:
     struct Request { int page; double scale; QString key; bool embedded=false; bool tile=false; QRectF region; int priority=0; };
     quint64 submitSnapshot(quint64 id,const QString &operation,const QVariantMap &arguments);
     void initAi();
+    void initSummaryCatalog();
+    void resetSummaryCatalog();
+    void handleSummaryCatalogCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error);
+    QVariantMap m_summaryCatalog;
+    quint64 m_summaryCatalogId=0,m_summaryInspectId=0,m_summaryActionEpoch=0;
+    QString m_summaryExpectedId;
     void initRegionPersistence();
     void resetRegionPersistence();
     void resetAiRegion();

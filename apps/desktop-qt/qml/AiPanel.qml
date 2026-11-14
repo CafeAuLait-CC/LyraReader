@@ -6,7 +6,7 @@ Pane {
     id: aiPanel
     objectName: "aiPanel"
     required property var app
-    readonly property bool tabTransferDialogVisible: payload.visible
+    readonly property bool tabTransferDialogVisible: payload.visible || summaryCatalog.popupVisible
     readonly property var owner: app.currentReader
     readonly property var viewState: owner.aiState
     readonly property var input: viewState.input || ({})
@@ -90,6 +90,13 @@ Pane {
             Layout.fillWidth:true
             Button {objectName:"openDocumentReading";text:aiPanel.owner.documentReading.choice_pending ? qsTr("Read document (optional)…") : qsTr("Document Reading…");Layout.fillWidth:true;enabled:!aiPanel.owner.snapshotReadOnly;onClicked:app.openDocumentReading()}
             ToolButton {objectName:"skipDocumentReadingChoice";text:qsTr("Skip");visible:!!aiPanel.owner.documentReading.choice_pending;Accessible.name:qsTr("Continue without document reading");onClicked:aiPanel.owner.dismissDocumentReadingChoice()}
+        }
+        SummaryCatalog {
+            id: summaryCatalog
+            objectName: "summaryCatalog"
+            app: aiPanel.app
+            visible: aiPanel.workspace === "summary"
+            Layout.fillWidth: true
         }
         ComboBox {
             objectName: "aiSummaryTarget"

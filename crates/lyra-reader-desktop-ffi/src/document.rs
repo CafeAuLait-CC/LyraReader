@@ -669,6 +669,8 @@ impl DesktopDocument {
                 build_ai_merge_plan(arg(&r, "request")?)
                     .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),
             ),
+            "ai_summary_catalog" => crate::summary::catalog(&d, arg(&r, "request")?),
+            "ai_summary_inspect" => crate::summary::inspect(&d, arg(&r, "request")?),
             "ai_endpoint" => value(inspect_ai_base_url(text(&r, "base_url")?)),
             "ai_start" => {
                 let plan: AiPlanRecord = arg(&r, "plan")?;
@@ -4309,5 +4311,119 @@ mod tests {
             reopened.command(json!({"op":"marks"})).unwrap()["bookmarks"][0]["page"],
             0
         );
+    }
+
+    #[test]
+    fn summary_catalog_is_local_paginated_and_reuses_outline_ranges() {
+        let fixture = Fixture::new("index-past-120.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        let before = doc.active().unwrap().text_page_cache_stats().loads;
+        let page = doc
+            .command(json!({"op":"ai_summary_catalog","request":{"layer":"Page","offset":0}}))
+            .unwrap();
+        assert_eq!(page["total"], 130);
+        assert_eq!(
+            page["rows"].as_array().unwrap().len(),
+            ai_summary_limits().max_requests_per_batch as usize
+        );
+        assert_eq!(page["rows"][0]["id"], "page:1");
+        assert_eq!(page["rows"][0]["link_page"], 0);
+        let last = doc
+            .command(json!({"op":"ai_summary_catalog","request":{"layer":"Page","offset":129}}))
+            .unwrap();
+        assert_eq!(last["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(last["rows"][0]["id"], "page:130");
+        assert_eq!(last["rows"][0]["page_span"], "Page 130 of 130");
+        assert!(last["next_offset"].is_null());
+        let abstract_row = doc
+            .command(json!({"op":"ai_summary_catalog","request":{"layer":"Abstract"}}))
+            .unwrap();
+        assert_eq!(abstract_row["total"], 1);
+        assert!(abstract_row["rows"][0]["link_page"].is_null());
+        let sections = doc
+            .command(json!({"op":"ai_summary_catalog","request":{"layer":"Section"}}))
+            .unwrap();
+        assert_eq!(sections["total"], 13);
+        assert_eq!(sections["rows"][0]["unit"]["page_end"], 10);
+        assert_eq!(doc.active().unwrap().text_page_cache_stats().loads, before);
+        assert!(doc.ai.lock().unwrap().is_none());
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+
+        let outlined_fixture = Fixture::new("outlined.pdf");
+        let outlined = outlined_fixture.open();
+        let active = outlined.active().unwrap();
+        let expected = ai_summary_sections(active.outline().unwrap(), active.page_count());
+        let rows = outlined
+            .command(json!({"op":"ai_summary_catalog","request":{"layer":"Section"}}))
+            .unwrap();
+        assert_eq!(rows["total"], expected.len());
+        for (row, section) in rows["rows"].as_array().unwrap().iter().zip(expected) {
+            assert_eq!(row["unit"]["title"], section.title);
+            assert_eq!(row["unit"]["page_start"], section.page_start);
+            assert_eq!(row["unit"]["page_end"], section.page_end);
+            assert_eq!(row["link_page"], section.link_page);
+        }
+    }
+
+    #[test]
+    fn summary_inspection_keeps_shared_dual_end_coverage_without_requests_or_writes() {
+        let fixture = Fixture::new("index-past-120.pdf");
+        let before = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        let coverage = doc
+            .command(json!({"op":"ai_summary_inspect","request":{"layer":"Abstract","index":0}}))
+            .unwrap();
+        assert_eq!(coverage["id"], "abstract");
+        let pages = coverage["fingerprint"]["pages"].as_array().unwrap();
+        assert_eq!(pages.len(), 24);
+        assert_eq!(pages[0], 1);
+        assert_eq!(pages[11], 12);
+        assert_eq!(pages[12], 119);
+        assert_eq!(pages[23], 130);
+        assert!(coverage["fingerprint"]["truncated"].as_bool().unwrap());
+        assert_eq!(
+            coverage["fingerprint"]["text_hash"].as_str().unwrap().len(),
+            64
+        );
+        assert!(!coverage.to_string().contains("request_body"));
+        assert!(!coverage.to_string().contains("messages"));
+        assert!(doc.ai.lock().unwrap().is_none());
+        assert_eq!(fs::read(&fixture.path).unwrap(), before);
+    }
+
+    #[test]
+    fn summary_catalog_and_inspection_reject_invalid_units_before_text_extraction() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let loads = doc.active().unwrap().text_page_cache_stats().loads;
+        for request in [
+            json!({"op":"ai_summary_catalog","request":{"layer":"page"}}),
+            json!({"op":"ai_summary_catalog","request":{"layer":"Page","offset":-1}}),
+            json!({"op":"ai_summary_catalog","request":{"layer":"Page","offset":1}}),
+            json!({"op":"ai_summary_catalog","request":{"layer":"Page","offset":2}}),
+            json!({"op":"ai_summary_catalog","request":{"layer":"Page","limit":4294967295u32}}),
+            json!({"op":"ai_summary_inspect","request":{"layer":"Abstract","index":1}}),
+            json!({"op":"ai_summary_inspect","request":{"layer":"Page","index":1}}),
+            json!({"op":"ai_summary_inspect","request":{"layer":"Page","index":-1}}),
+            json!({"op":"ai_summary_inspect","request":{"layer":"Page","index":0,"page_end":999}}),
+        ] {
+            assert!(doc.command(request).is_err());
+        }
+        assert_eq!(doc.active().unwrap().text_page_cache_stats().loads, loads);
+        assert!(doc.ai.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn summary_empty_text_is_reported_without_a_plan_or_provider_configuration() {
+        let fixture = Fixture::new("thin-lines.pdf");
+        let doc = fixture.open();
+        let coverage = doc
+            .command(json!({"op":"ai_summary_inspect","request":{"layer":"Page","index":0}}))
+            .unwrap();
+        assert_eq!(coverage["id"], "page:1");
+        assert_eq!(coverage["fingerprint"]["characters"], 0);
+        assert!(coverage["fingerprint"]["note"].is_null());
+        assert!(doc.ai.lock().unwrap().is_none());
     }
 }
