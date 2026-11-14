@@ -341,22 +341,27 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
     if(mutation)++m_mutationSequence;
     const auto mutationSequence=m_mutationSequence;
     const auto generation = m_generation;
-    const bool latestOnly=operation==QStringLiteral("search") || operation==QStringLiteral("bibtex") || operation==QStringLiteral("layout") || operation==QStringLiteral("ai_preview") || operation==QStringLiteral("ai_summary_catalog") || operation==QStringLiteral("ai_summary_inspect") || operation==QStringLiteral("split_plan") || operation==QStringLiteral("content_objects");
+    const bool latestOnly=operation==QStringLiteral("search") || operation==QStringLiteral("bibtex") || operation==QStringLiteral("layout") || operation==QStringLiteral("ai_preview") || operation==QStringLiteral("ai_summary_catalog") || operation==QStringLiteral("ai_summary_inspect") || operation==QStringLiteral("ai_summary_prepare") || operation==QStringLiteral("split_plan") || operation==QStringLiteral("content_objects");
     if(latestOnly)m_latestRead.insert(operation,id);
     ++m_pendingCommands;
-    emit commandsChanged();
+    QPointer<ReaderController> alive(this);emit commandsChanged();if(!alive)return 0;
     auto *watcher = new QFutureWatcher<CommandResult>(this);
     connect(watcher, &QFutureWatcher<CommandResult>::finished, this, [this,watcher,id,operation,arguments,generation,latestOnly,document,mutation,eraseControl,mutationSequence,draftKey,savedDraft,draftMatchesRequest,discardedNotes,discardedEdits] {
         const auto outcome = watcher->result();
         watcher->deleteLater();
+        // Direct notification listeners may close this reader or publish a newer revision.
+        QPointer<ReaderController> currentReader(this);
+        auto deliveryGeneration=m_generation;
+        const auto current=[&]{return currentReader && document==m_document && deliveryGeneration==m_generation;};
         --m_pendingCommands;
-        emit commandsChanged();
+        emit commandsChanged();if(!current())return;
         // A page revision invalidates raster/read results, but later queued mutations
         // still belong to this same document and must deliver their new state.
         if(document!=m_document || (!mutation && generation!=m_generation))return;
+        deliveryGeneration=m_generation;
         if((operation==QStringLiteral("marks") || operation==QStringLiteral("content_objects")) && mutationSequence!=m_mutationSequence)return;
         if(latestOnly && m_latestRead.value(operation)!=id)return;
-        if (!outcome.error.isEmpty() && operation!=QStringLiteral("split_plan") && operation!=QStringLiteral("region_thumbnail") && !operation.startsWith(QStringLiteral("ai_")) && !operation.startsWith(QStringLiteral("knowledge_"))) setError(outcome.error);
+        if (!outcome.error.isEmpty() && operation!=QStringLiteral("split_plan") && operation!=QStringLiteral("region_thumbnail") && !operation.startsWith(QStringLiteral("ai_")) && !operation.startsWith(QStringLiteral("knowledge_"))) {setError(outcome.error);if(!current())return;}
         else if (operation==QStringLiteral("content_stage") || operation==QStringLiteral("page_stage") || operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo") || operation==QStringLiteral("page_discard") || operation==QStringLiteral("page_apply") || operation==QStringLiteral("document_save") || operation==QStringLiteral("document_discard")) {
             const auto revision=outcome.result.toMap();
             const auto info=revision.value(QStringLiteral("info")).toMap();
@@ -365,10 +370,10 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
             const bool contentRevision=operation==QStringLiteral("content_stage") ||
                 ((operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo")) && arguments.value(QStringLiteral("preserve_viewport")).toBool());
             const bool keepLayout=contentRevision && !m_layoutRows.isEmpty() && samePageSizes(m_pages,info.value(QStringLiteral("pages")).toList());
-            emit revisionAboutToChange(keepLayout);
+            emit revisionAboutToChange(keepLayout);if(!current())return;
             setRasterSource(outcome.source);
             const bool reloadForms=m_data.contains(QStringLiteral("forms"));
-            ++m_generation;resetAi();clearRasterCache();m_pending.clear();m_failed.clear();m_requests.clear();m_textPages.clear();m_textPending.clear();
+            ++m_generation;deliveryGeneration=m_generation;resetAi();if(!current())return;clearRasterCache();m_pending.clear();m_failed.clear();m_requests.clear();m_textPages.clear();m_textPending.clear();
             if(!samePageSizes(m_pages,info.value(QStringLiteral("pages")).toList()))clearFitPageSpacing();
             if(!keepLayout){m_pages=info.value(QStringLiteral("pages")).toList();m_layoutRows=info.value(QStringLiteral("rows")).toList();m_layoutConfiguration={{QStringLiteral("mode"),info.value(QStringLiteral("mode"))},{QStringLiteral("gap"),info.value(QStringLiteral("gap"))}};m_documentWidth=info.value(QStringLiteral("width")).toDouble();m_documentHeight=info.value(QStringLiteral("height")).toDouble();}
             m_data.clear();m_data.insert(QStringLiteral("marks"),revision.value(QStringLiteral("marks")));m_data.insert(QStringLiteral("signature_status"),info.value(QStringLiteral("signature_status")));
@@ -376,14 +381,14 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
             m_data.insert(QStringLiteral("document_revision"),info.value(QStringLiteral("revision")));
             m_data.insert(QStringLiteral("annotation_rules"),info.value(QStringLiteral("annotation_rules")));
             m_data.insert(QStringLiteral("ai_history_limit"),info.value(QStringLiteral("ai_history_limit")));
-            emit documentReset();emit documentChanged();emit dataChanged();emit textPagesChanged();
-            submit(QStringLiteral("outline"));submit(QStringLiteral("metadata"));
-            if(reloadForms)submit(QStringLiteral("forms"));
+            emit documentReset();if(!current())return;emit documentChanged();if(!current())return;emit dataChanged();if(!current())return;emit textPagesChanged();if(!current())return;
+            submit(QStringLiteral("outline"));if(!current())return;submit(QStringLiteral("metadata"));if(!current())return;
+            if(reloadForms){submit(QStringLiteral("forms"));if(!current())return;}
         } else if (operation == QStringLiteral("text")) {
             const int page = arguments.value(QStringLiteral("page")).toInt();
             m_textPending.remove(page);
             m_textPages.insert(QString::number(page), outcome.result);
-            emit textPagesChanged();
+            emit textPagesChanged();if(!current())return;
         } else if (operation == QStringLiteral("layout")) {
             const auto layout = outcome.result.toMap();
             m_pages = layout.value(QStringLiteral("pages")).toList();
@@ -391,27 +396,27 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
             m_layoutConfiguration={{QStringLiteral("mode"),layout.value(QStringLiteral("mode"))},{QStringLiteral("gap"),layout.value(QStringLiteral("gap"))}};
             m_documentWidth = layout.value(QStringLiteral("width")).toDouble();
             m_documentHeight = layout.value(QStringLiteral("height")).toDouble();
-            emit documentChanged();
+            emit documentChanged();if(!current())return;
         } else if (!eraseControl && !operation.startsWith(QStringLiteral("region_")) && !operation.startsWith(QStringLiteral("knowledge_"))) {
             const bool marks=operation==QStringLiteral("ink_erase_commit") || operation==QStringLiteral("marks") || operation.startsWith(QStringLiteral("mark_")) || operation.startsWith(QStringLiteral("marks_")) || operation.startsWith(QStringLiteral("bookmark_")) || operation.startsWith(QStringLiteral("file_"));
             m_data.insert(marks ? QStringLiteral("marks") : operation, outcome.result);
-            emit dataChanged();
+            emit dataChanged();if(!current())return;
         }
         if (!outcome.error.isEmpty() && operation == QStringLiteral("text"))
             m_textPending.remove(arguments.value(QStringLiteral("page")).toInt());
         if(outcome.error.isEmpty() && draftMatchesRequest && m_editDrafts.value(draftKey)==savedDraft)
-            setEditDraft(draftKey,{});
+            {setEditDraft(draftKey,{});if(!current())return;}
         if(!outcome.error.isEmpty() && operation==QStringLiteral("content_stage") && draftMatchesRequest && m_editDrafts.value(draftKey)==savedDraft) {
-            auto preserved=savedDraft.toMap();preserved.insert(QStringLiteral("error"),outcome.error);setEditDraft(draftKey,preserved);
+            auto preserved=savedDraft.toMap();preserved.insert(QStringLiteral("error"),outcome.error);setEditDraft(draftKey,preserved);if(!current())return;
         }
         if(outcome.error.isEmpty() && operation==QStringLiteral("document_discard")) {
-            for(auto it=discardedNotes.cbegin();it!=discardedNotes.cend();++it)if(m_noteDrafts.value(it.key())==it.value())clearNoteDraft(it.key());
-            for(auto it=discardedEdits.cbegin();it!=discardedEdits.cend();++it)if(m_editDrafts.value(it.key())==it.value())setEditDraft(it.key(),{});
+            for(auto it=discardedNotes.cbegin();it!=discardedNotes.cend();++it)if(m_noteDrafts.value(it.key())==it.value()){clearNoteDraft(it.key());if(!current())return;}
+            for(auto it=discardedEdits.cbegin();it!=discardedEdits.cend();++it)if(m_editDrafts.value(it.key())==it.value()){setEditDraft(it.key(),{});if(!current())return;}
         }
         if(outcome.error.isEmpty() && (operation==QStringLiteral("mark_update") || operation==QStringLiteral("mark_text_update"))) {
             const auto annotationId=arguments.value(QStringLiteral("id")).toString();
             const auto patch=arguments.value(QStringLiteral("patch")).toMap();
-            if(patch.contains(QStringLiteral("note")) && m_noteDrafts.value(annotationId)==patch.value(QStringLiteral("note")))clearNoteDraft(annotationId);
+            if(patch.contains(QStringLiteral("note")) && m_noteDrafts.value(annotationId)==patch.value(QStringLiteral("note"))){clearNoteDraft(annotationId);if(!current())return;}
         }
         emit commandFinished(id, operation, outcome.result, outcome.error);
     });

@@ -669,6 +669,16 @@ impl DesktopDocument {
                 build_ai_merge_plan(arg(&r, "request")?)
                     .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),
             ),
+            "ai_summary_prepare" => {
+                let mut request = crate::region::request(r["request"].clone())?;
+                // Only completed, matching document knowledge may enrich this local preview.
+                // Questions, selections and chat history are never forwarded to a summary unit.
+                request.action = AiActionRecord::SummarizeDocument;
+                request.document_knowledge_text = None;
+                request.document_knowledge_pages.clear();
+                self.enrich_reading(&mut request, &d.document_identity().sha256)?;
+                crate::summary::prepare(&d, arg(&r, "unit")?, request)
+            }
             "ai_summary_catalog" => crate::summary::catalog(&d, arg(&r, "request")?),
             "ai_summary_inspect" => crate::summary::inspect(&d, arg(&r, "request")?),
             "ai_endpoint" => value(inspect_ai_base_url(text(&r, "base_url")?)),
@@ -4424,6 +4434,79 @@ mod tests {
         assert_eq!(coverage["id"], "page:1");
         assert_eq!(coverage["fingerprint"]["characters"], 0);
         assert!(coverage["fingerprint"]["note"].is_null());
+        assert!(doc.ai.lock().unwrap().is_none());
+    }
+    fn summary_settings() -> Value {
+        json!({"action":"SummarizeDocument","document_knowledge":false,"current_page":0,
+            "selection":null,"question":"UNSENT_QUESTION","language":null,"history":[],"region":null,
+            "base_url":"http://localhost:11434/v1","model":"synthetic-summary",
+            "temperature":null,"max_tokens":null,"reasoning_mode":"default","reasoning_encoding":"none",
+            "document_knowledge_text":"UNVERIFIED_PARTIAL_CONTEXT","document_knowledge_pages":[1]})
+    }
+
+    #[test]
+    fn summary_unit_previews_render_shared_page_section_and_dual_end_bodies_locally() {
+        let fixture = Fixture::new("index-past-120.pdf");
+        let before = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        for (layer, index, action, expected_id) in [
+            ("Abstract", 0, "SummarizeAbstract", "abstract"),
+            ("Section", 0, "SummarizeSection", "section:0"),
+            ("Page", 24, "SummarizePageLine", "page:25"),
+        ] {
+            let preview=doc.command(json!({"op":"ai_summary_prepare","unit":{"layer":layer,"index":index},"request":summary_settings()})).unwrap();
+            assert_eq!(preview["id"], expected_id);
+            let plan = &preview["plan"];
+            assert_eq!(plan["action"], action);
+            assert_eq!(plan["parts"].as_array().unwrap().len(), 1);
+            let body = plan["parts"][0]["wire_body"].as_str().unwrap();
+            assert!(serde_json::from_str::<Value>(body).is_ok());
+            assert!(!body.contains("UNSENT_QUESTION"));
+            assert!(!body.contains("UNVERIFIED_PARTIAL_CONTEXT"));
+            let pages = plan["source_pages"].as_array().unwrap();
+            if layer == "Abstract" {
+                assert_eq!(pages.len(), 24);
+                assert_eq!(pages[12], 119);
+                assert_eq!(pages[23], 130);
+            }
+            if layer == "Page" {
+                assert_eq!(pages, &vec![json!(25)]);
+                assert_eq!(preview["page_span"], "Page 25 of 130");
+            }
+            assert!(doc.ai.lock().unwrap().is_none());
+        }
+        assert_eq!(fs::read(&fixture.path).unwrap(), before);
+    }
+
+    #[test]
+    fn summary_unit_previews_reject_bad_rows_empty_text_and_bad_provider_without_sending() {
+        let fixture = Fixture::new("thin-lines.pdf");
+        let doc = fixture.open();
+        for unit in [
+            json!({"layer":"Page","index":1}),
+            json!({"layer":"Page","index":0,"page_end":2}),
+            json!({"layer":"Abstract","index":1}),
+        ] {
+            assert!(
+                doc.command(
+                    json!({"op":"ai_summary_prepare","unit":unit,"request":summary_settings()})
+                )
+                .is_err()
+            );
+        }
+        let empty=doc.command(json!({"op":"ai_summary_prepare","unit":{"layer":"Page","index":0},"request":summary_settings()}));
+        assert!(empty.is_err());
+        assert!(doc.ai.lock().unwrap().is_none());
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let mut bad = summary_settings();
+        bad["base_url"] = json!("not-a-url");
+        assert!(
+            doc.command(
+                json!({"op":"ai_summary_prepare","unit":{"layer":"Page","index":0},"request":bad})
+            )
+            .is_err()
+        );
         assert!(doc.ai.lock().unwrap().is_none());
     }
 }

@@ -12,6 +12,14 @@ ColumnLayout {
     signal citation(string link, var plan)
     spacing: 4
     readonly property var sent: value.responsePlan || ({})
+    Label {
+        objectName: result.answerName + "UnitTitle"
+        visible: !!result.value.unitTitle
+        text: result.value.unitTitle ? qsTr("Answer for: %1").arg(result.value.unitTitle) : ""
+        textFormat: Text.PlainText; wrapMode: Text.Wrap; maximumLineCount: 2; elide: Text.ElideRight
+        Accessible.description: text
+        Layout.fillWidth: true; font.bold: true; color: app.colors.textPrimary
+    }
     ToolButton {
         id: sources
         objectName: result.answerName + "Sources"

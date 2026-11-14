@@ -6,6 +6,7 @@ Item {
     id: root
     required property var app
     readonly property var owner: app.currentReader
+    signal previewUnit(string id)
     property var popupOwner: null
     readonly property var state: popupOwner ? popupOwner.summaryCatalog : ({})
     readonly property bool popupVisible: detail.visible
@@ -21,6 +22,14 @@ Item {
         detail.close();
         if (owner !== expectedOwner || !owner || owner.documentGeneration !== generation) return;
         app.navigate(row.link_page);
+    }
+    function previewSummary(row) {
+        if (!popupOwner || popupOwner !== owner || state.generation !== owner.documentGeneration) return;
+        const expectedOwner = popupOwner;
+        const generation = state.generation;
+        detail.close();
+        if (owner !== expectedOwner || !owner || owner.documentGeneration !== generation) return;
+        previewUnit(row.id);
     }
     LyraToolButton {
         id: entry
@@ -62,7 +71,7 @@ Item {
             anchors.fill: parent
             spacing: 8
             Label {
-                text: qsTr("Coverage checks use this PDF locally. Nothing is sent.")
+                text: qsTr("Coverage checks and previews use this PDF locally. Send is a separate action.")
                 textFormat: Text.PlainText; wrapMode: Text.Wrap
                 Layout.fillWidth: true; color: root.app.colors.textSecondary
             }
@@ -112,7 +121,8 @@ Item {
                     Label {
                         objectName: "summaryCatalogRowTitle"
                         text: row.modelData.unit.kind === "Abstract" ? qsTr("Abstract") : row.modelData.unit.title
-                        textFormat: Text.PlainText; wrapMode: Text.Wrap
+                        textFormat: Text.PlainText; wrapMode: Text.Wrap; maximumLineCount: 2; elide: Text.ElideRight
+                        Accessible.description: text
                         font.bold: true; Layout.fillWidth: true; color: root.app.colors.textPrimary
                     }
                     Label {
@@ -134,7 +144,9 @@ Item {
                         textFormat: Text.PlainText; wrapMode: Text.Wrap
                         Layout.fillWidth: true; color: root.app.colors.textSecondary
                     }
-                    RowLayout {
+                    GridLayout {
+                        Layout.fillWidth: true
+                        columns: row.width >= 400 ? 3 : 2
                         Button {
                             objectName: "inspectSummaryCatalogRow"
                             property string unitId: row.modelData.id
@@ -142,6 +154,14 @@ Item {
                             enabled: !root.state.loading && !root.state.inspecting
                             onClicked: root.popupOwner.inspectSummaryUnit(unitId)
                             Accessible.description: qsTr("Inspect this unit's text locally without sending a request")
+                        }
+                        Button {
+                            objectName: "previewSummaryCatalogRow"
+                            property string unitId: row.modelData.id
+                            text: qsTr("Preview summary")
+                            enabled: !root.state.loading && !root.state.inspecting && !root.popupOwner.aiState.running
+                            onClicked: root.previewSummary(row.modelData)
+                            Accessible.description: qsTr("Prepare one request locally; Send remains a separate action")
                         }
                         ToolButton {
                             objectName: "openSummaryCatalogSource"

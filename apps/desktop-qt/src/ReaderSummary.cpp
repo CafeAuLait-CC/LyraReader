@@ -7,7 +7,7 @@ void ReaderController::initSummaryCatalog() {
 
 void ReaderController::resetSummaryCatalog() {
     ++m_summaryActionEpoch;m_summaryCatalogId=0;m_summaryInspectId=0;m_summaryExpectedId.clear();
-    m_summaryCatalog.clear();emit summaryCatalogChanged();
+    m_summaryCatalog.clear();m_summaryUnitContext.clear();emit summaryCatalogChanged();
 }
 
 void ReaderController::setSummaryExpanded(bool expanded) {
@@ -79,4 +79,36 @@ void ReaderController::handleSummaryCatalogCommand(quint64 id,const QString &ope
         m_summaryExpectedId.clear();m_summaryCatalog.insert(QStringLiteral("coverage"),coverage);
         emit summaryCatalogChanged();
     }
+}
+
+
+void ReaderController::clearSummaryUnit() {
+    if(m_aiState.value(QStringLiteral("running")).toBool() || m_summaryUnitContext.isEmpty())return;
+    m_summaryUnitContext.clear();QPointer<ReaderController> alive(this);invalidateAiPlan();if(alive)emit summaryCatalogChanged();
+}
+
+void ReaderController::prepareSummaryUnit(const QString &id,const QVariantMap &settings) {
+    if(!m_document || m_loading || m_snapshotMode || m_aiState.value(QStringLiteral("running")).toBool())return;
+    QVariantMap row;
+    for(const auto &value:m_summaryCatalog.value(QStringLiteral("rows")).toList())
+        if(value.toMap().value(QStringLiteral("id")).toString()==id){row=value.toMap();break;}
+    if(row.isEmpty() && m_summaryUnitContext.value(QStringLiteral("id")).toString()==id
+        && m_summaryUnitContext.value(QStringLiteral("generation")).toULongLong()==m_generation)row=m_summaryUnitContext;
+    if(row.isEmpty()) {
+        QPointer<ReaderController> alive(this);const auto epoch=m_aiPreviewEpoch+1;const auto generation=m_generation;
+        invalidateAiPlan();if(!alive || epoch!=m_aiPreviewEpoch || generation!=m_generation)return;
+        m_aiState.insert(QStringLiteral("statusView"),QStringLiteral("summary"));
+        m_aiState.insert(QStringLiteral("status"),tr("This summary row is no longer available. Refresh the layer."));emit aiStateChanged();return;
+    }
+    const auto document=m_document;const auto generation=m_generation;QPointer<ReaderController> alive(this);
+    const auto epoch=++m_aiPreviewEpoch;m_aiPreviewId=0;m_aiState.remove(QStringLiteral("plan"));
+    row.insert(QStringLiteral("generation"),generation);m_summaryUnitContext=row;
+    auto input=m_aiState.value(QStringLiteral("input")).toMap();input.insert(QStringLiteral("view"),QStringLiteral("summary"));
+    m_aiState.insert(QStringLiteral("input"),input);emit summaryCatalogChanged();
+    if(!alive || document!=m_document || generation!=m_generation || epoch!=m_aiPreviewEpoch)return;
+    emit aiStateChanged();
+    if(!alive || document!=m_document || generation!=m_generation || epoch!=m_aiPreviewEpoch)return;
+    auto request=settings;request.insert(QStringLiteral("action"),QStringLiteral("SummarizeDocument"));
+    const auto unit=row.value(QStringLiteral("unit")).toMap();
+    prepareAi(request,{{QStringLiteral("layer"),unit.value(QStringLiteral("kind"))},{QStringLiteral("index"),unit.value(QStringLiteral("index"))}});
 }

@@ -122,7 +122,11 @@ in the system vault. Document chat keeps bounded exchanges per open document, in
 partial answers; failures remain visible and are excluded from later requests. Historical citations
 use the passages actually sent for that exchange. Summary, translation and chat have separate
 drafts and results; switching views or reopening the drawer sends nothing. Chat has a bottom
-composer and collapsed source passages. Select & Ask captures a bounded area in its original colours
+composer and collapsed source passages. Layers and coverage lists abstract, section and page units,
+checks text locally and shows the sampled source pages. Preview summary prepares one selected unit
+through the shared planner; Send, Stop and Retry use the assistant's normal preview and local audit
+trail. Unit summaries currently appear in the Summary result; batch generation and persistent
+per-unit caching are still pending. Select & Ask captures a bounded area in its original colours
 and requires a request preview before sending. Save to Reading notes keeps its frozen image, text,
 question draft and completed or partial answer in the application cache; the Notes view reads these
 snapshots, shows bounded capture thumbnails and edits local knowledge notes without sending a request.

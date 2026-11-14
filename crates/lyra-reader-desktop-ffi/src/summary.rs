@@ -1,6 +1,7 @@
 //! Local layered-summary catalog and coverage over the shared macOS production builders.
 //! Listing rows never extracts page text. Explicit inspection reads only one selected unit;
-//! neither operation builds a prompt, opens a provider connection, or writes a cache.
+//! neither operation builds a prompt, opens a provider connection, or writes a disk cache.
+//! Explicit single-unit preparation builds a preview over the same shared planner, not a send.
 use lyra_reader_ffi::api::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -239,6 +240,77 @@ pub(crate) fn inspect(
         id: row.id,
         fingerprint,
         page_span: span,
+    })
+    .map_err(|error| error.to_string())
+}
+
+pub(crate) fn prepare(
+    document: &LyraReaderDocument,
+    request: InspectRequest,
+    settings: AiPlanRequestRecord,
+) -> Result<Value, String> {
+    let units = Units::new(document, request.layer)?;
+    let row = units.row(request.index)?;
+    let mut prepared = document
+        .prepare_ai_summary(AiSummaryRequestRecord {
+            layer: request.layer,
+            units: vec![row.unit.clone()],
+            language: settings.language,
+            document_title: String::new(),
+            base_url: settings.base_url,
+            model: settings.model,
+            temperature: settings.temperature,
+            max_tokens: settings.max_tokens,
+            reasoning_mode: settings.reasoning_mode,
+            reasoning_encoding: settings.reasoning_encoding,
+            document_knowledge_text: settings.document_knowledge_text,
+            document_knowledge_pages: settings.document_knowledge_pages,
+        })
+        .map_err(|error| error.to_string())?;
+    if prepared.units.len() != 1 {
+        return Err("The summary planner returned an unexpected unit count.".into());
+    }
+    let unit = prepared
+        .units
+        .pop()
+        .ok_or("The prepared summary is unavailable.")?;
+    let plan = unit.plan.ok_or_else(|| {
+        unit.error
+            .unwrap_or_else(|| "This summary has no extractable text.".into())
+    })?;
+    let plan = render_ai_plan(plan, AiWireTransport::ChatCompletions)
+        .map_err(|error| error.to_string())?;
+    if plan.parts.len() != 1 {
+        return Err("A single summary unit must contain exactly one request.".into());
+    }
+    let kind = match request.layer {
+        AiSummaryLayerRecord::Abstract => "abstract",
+        AiSummaryLayerRecord::Section => "sections",
+        AiSummaryLayerRecord::Page => "pages",
+    };
+    let span = page_span_label(
+        kind.into(),
+        unit.pages,
+        unit.page_start,
+        unit.page_end,
+        unit.covered_page_end,
+        unit.truncated,
+        units.page_count,
+    );
+    #[derive(Serialize)]
+    struct Preview {
+        id: String,
+        title: String,
+        page_span: String,
+        note: Option<String>,
+        plan: AiPlanRecord,
+    }
+    serde_json::to_value(Preview {
+        id: row.id,
+        title: unit.title,
+        page_span: span,
+        note: unit.note,
+        plan,
     })
     .map_err(|error| error.to_string())
 }

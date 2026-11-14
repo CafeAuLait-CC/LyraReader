@@ -743,4 +743,60 @@ mod tests {
         join.join().unwrap();
         assert_eq!(response, Ok(true));
     }
+    #[test]
+    fn unit_summary_uses_only_completed_matching_document_reading_without_publishing_or_sending() {
+        let f = Fixture::new();
+        let mut settings = input();
+        settings["document_knowledge_text"] = json!("UNVERIFIED_UNIT_CONTEXT");
+        settings["document_knowledge_pages"] = json!([1]);
+        f.prepare();
+        {
+            let mut state = f.doc.knowledge.lock().unwrap();
+            state.phase = "reading";
+            state.job = Some(ReadingJob {
+                cancel: CancellationToken::new(),
+                progress: Arc::new(Mutex::new(Progress {
+                    result: Some(Ok("UNFINISHED_UNIT_READING".into())),
+                    ..Progress::default()
+                })),
+            });
+        }
+        let request =
+            json!({"op":"ai_summary_prepare","unit":{"layer":"Page","index":0},"request":settings});
+        let local = f.doc.command(request.clone()).unwrap();
+        let body = local["plan"]["parts"][0]["wire_body"].as_str().unwrap();
+        assert!(!body.contains("UNVERIFIED_UNIT_CONTEXT"));
+        assert!(!body.contains("UNFINISHED_UNIT_READING"));
+        f.doc.invalidate_reading().unwrap();
+        let bytes = f.record().encode(1).unwrap();
+        fs::write(f.file(), &bytes).unwrap();
+        f.doc.command(json!({"op":"knowledge_load"})).unwrap();
+        let complete = f.doc.command(request.clone()).unwrap();
+        assert!(
+            complete["plan"]["parts"][0]["wire_body"]
+                .as_str()
+                .unwrap()
+                .contains("SYNTHETIC_SHARED_READING")
+        );
+        assert_eq!(fs::read(f.file()).unwrap(), bytes);
+        assert_eq!(
+            f.doc.command(json!({"op":"ai_poll"})).unwrap(),
+            json!({"events":[],"finished":true})
+        );
+        f.doc
+            .knowledge
+            .lock()
+            .unwrap()
+            .record
+            .as_mut()
+            .unwrap()
+            .source_hash = "changed-source".into();
+        let stale = f.doc.command(request).unwrap();
+        assert!(
+            !stale["plan"]["parts"][0]["wire_body"]
+                .as_str()
+                .unwrap()
+                .contains("SYNTHETIC_SHARED_READING")
+        );
+    }
 }

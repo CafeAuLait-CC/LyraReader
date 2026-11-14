@@ -12,28 +12,37 @@ Pane {
     readonly property var input: viewState.input || ({})
     readonly property string workspace: input.view || "summary"
     readonly property int action: workspace === "chat" ? 4 : workspace === "translation" ? 3 : (input.summaryAction === undefined ? 1 : input.summaryAction)
+    readonly property var summaryUnit: owner.summaryUnitContext
+    readonly property bool unitMode: workspace === "summary" && !!summaryUnit.id
     readonly property string workspaceTitle: workspace === "chat" ? qsTr("Document chat") : workspace === "translation" ? qsTr("Translation") : qsTr("Summary")
     readonly property var plan: viewState.previewView === workspace ? viewState.plan || null : null
     readonly property bool previewReady: !!plan && !viewState.planSent
     readonly property bool running: !!viewState.running
-    readonly property var result: viewState.responseView === workspace ? ({output: viewState.output, reasoning: viewState.reasoning, usage: viewState.usage, responsePlan: viewState.responsePlan, generation: owner.documentGeneration}) : ((viewState.results || {})[workspace] || {})
+    readonly property var result: viewState.responseView === workspace ? ({unitTitle: viewState.unitTitle, output: viewState.output, reasoning: viewState.reasoning, usage: viewState.usage, responsePlan: viewState.responsePlan, generation: owner.documentGeneration}) : ((viewState.results || {})[workspace] || {})
     readonly property string status: viewState.statusView === workspace ? viewState.status || "" : (((viewState.results || {})[workspace] || {}).status || "")
     padding: 10
     background: Rectangle { color: app.colors.sidebarBg }
-    function prepare() {
+    function baseRequest(requestAction) {
         const settings = app.aiSettings;
-        const modes = ["SummarizePage", "SummarizeDocument", "AskSelection", "TranslateSelection", "DocumentChat", "SummarizeSelection"];
-        owner.prepareAi({
-            action: modes[action],
+        return {
+            action: requestAction,
             document_knowledge: false, document_knowledge_text: null, document_knowledge_pages: [],
             history: [], region: null, current_page: app.currentPage,
             selection: app.selection ? {page: app.selection.page, start: Math.min(app.selection.start, app.selection.end), end: Math.max(app.selection.start, app.selection.end)} : null,
-            question: (action === 2 || action === 4) ? input.question || null : null,
-            language: action === 3 ? (input.language === undefined ? "English" : input.language) : null,
+            question: (requestAction === "AskSelection" || requestAction === "DocumentChat") ? input.question || null : null,
+            language: requestAction === "TranslateSelection" ? (input.language === undefined ? "English" : input.language) : null,
             base_url: settings.baseUrl || "http://localhost:11434/v1", model: settings.model || "",
             temperature: null, max_tokens: null,
             reasoning_mode: settings.reasoningMode || "default", reasoning_encoding: settings.reasoningEncoding || "none"
-        });
+        };
+    }
+    function prepareUnit(id) {
+        owner.prepareSummaryUnit(id, baseRequest("SummarizeDocument"));
+    }
+    function prepare() {
+        if (unitMode) { prepareUnit(summaryUnit.id); return; }
+        const modes = ["SummarizePage", "SummarizeDocument", "AskSelection", "TranslateSelection", "DocumentChat", "SummarizeSelection"];
+        owner.prepareAi(baseRequest(modes[action]));
     }
     function followLink(link) {
         const plan=aiPanel.result.responsePlan || {};
@@ -95,17 +104,42 @@ Pane {
             id: summaryCatalog
             objectName: "summaryCatalog"
             app: aiPanel.app
+            onPreviewUnit: function(id) { aiPanel.prepareUnit(id); }
             visible: aiPanel.workspace === "summary"
             Layout.fillWidth: true
         }
         ComboBox {
             objectName: "aiSummaryTarget"
-            visible: aiPanel.workspace === "summary"
+            visible: aiPanel.workspace === "summary" && !aiPanel.unitMode
             Layout.fillWidth: true
             model: [qsTr("Document"), qsTr("Selected text"), qsTr("This page"), qsTr("Question about selection")]
             currentIndex: [1, 5, 0, 2].indexOf(aiPanel.action)
             Accessible.name: qsTr("Summary target")
             onActivated: aiPanel.owner.setAiInput("action", [1, 5, 0, 2][currentIndex])
+        }
+        ColumnLayout {
+            visible: aiPanel.unitMode
+            Layout.fillWidth: true
+            Label {
+                objectName: "aiSummaryUnitTitle"
+                text: aiPanel.summaryUnit.title || (aiPanel.summaryUnit.unit || {}).title || ""
+                textFormat: Text.PlainText; wrapMode: Text.Wrap; maximumLineCount: 2; elide: Text.ElideRight
+                Layout.fillWidth: true; font.bold: true; color: app.colors.textPrimary
+                Accessible.description: text
+            }
+            Label {
+                objectName: "aiSummaryUnitCoverage"
+                text: (aiPanel.summaryUnit.page_span || "") + (aiPanel.summaryUnit.note ? "\n" + aiPanel.summaryUnit.note : "")
+                textFormat: Text.PlainText; wrapMode: Text.Wrap; maximumLineCount: 3; elide: Text.ElideRight
+                Accessible.description: text
+                Layout.fillWidth: true; color: app.colors.textSecondary; font.pixelSize: 11
+            }
+            ToolButton {
+                objectName: "clearSummaryUnit"
+                text: qsTr("Other summary targets")
+                enabled: !aiPanel.running
+                onClicked: aiPanel.owner.clearSummaryUnit()
+            }
         }
         TextField {
             objectName: "aiTranslationLanguage"
@@ -142,7 +176,7 @@ Pane {
         ScrollView {
             id: composerScroll
             objectName: "aiComposerScroll"
-            visible: aiPanel.action === 2 || aiPanel.workspace === "chat"
+            visible: (!aiPanel.unitMode && aiPanel.action === 2) || aiPanel.workspace === "chat"
             Layout.fillWidth: true; Layout.preferredHeight: 64; Layout.maximumHeight: 64
             contentWidth: availableWidth
             clip: true
@@ -174,9 +208,9 @@ Pane {
         Button {
             id: preview
             objectName: "prepareAiRequest"
-            text: aiPanel.workspace === "chat" ? qsTr("Preview Question") : aiPanel.workspace === "translation" ? qsTr("Preview Translation") : aiPanel.action === 2 ? qsTr("Preview Question") : qsTr("Preview Summary")
+            text: aiPanel.workspace === "chat" ? qsTr("Preview Question") : aiPanel.workspace === "translation" ? qsTr("Preview Translation") : (!aiPanel.unitMode && aiPanel.action === 2) ? qsTr("Preview Question") : qsTr("Preview Summary")
             Layout.fillWidth: true
-            enabled: !aiPanel.running && aiPanel.owner.pageCount > 0 && aiPanel.owner.pendingCommands === 0 && ((aiPanel.action !== 2 && aiPanel.action !== 4) || !!question.text.trim()) && (aiPanel.action !== 3 || aiPanel.input.language === undefined || !!aiPanel.input.language.trim()) && ([2,3,5].indexOf(aiPanel.action) < 0 || !!app.selection)
+            enabled: !aiPanel.running && aiPanel.owner.pageCount > 0 && aiPanel.owner.pendingCommands === 0 && (aiPanel.unitMode || ((aiPanel.action !== 2 && aiPanel.action !== 4) || !!question.text.trim()) && (aiPanel.action !== 3 || aiPanel.input.language === undefined || !!aiPanel.input.language.trim()) && ([2,3,5].indexOf(aiPanel.action) < 0 || !!app.selection))
             onClicked: aiPanel.prepare()
         }
         Label {

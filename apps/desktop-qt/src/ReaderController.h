@@ -35,6 +35,7 @@ class ReaderController : public QObject {
     Q_PROPERTY(QUrl fileUrl READ fileUrl NOTIFY documentChanged)
     Q_PROPERTY(QVariantMap aiState READ aiState NOTIFY aiStateChanged)
     Q_PROPERTY(QVariantMap summaryCatalog READ summaryCatalog NOTIFY summaryCatalogChanged)
+    Q_PROPERTY(QVariantMap summaryUnitContext READ summaryUnitContext NOTIFY summaryCatalogChanged)
     Q_PROPERTY(QVariantMap documentReading READ documentReading NOTIFY documentReadingChanged)
     Q_PROPERTY(QVariantMap aiRegion READ aiRegion NOTIFY aiRegionChanged)
     Q_PROPERTY(QVariantMap aiRegionPaper READ aiRegionPaper NOTIFY aiRegionPaperChanged)
@@ -78,6 +79,9 @@ public:
     Q_INVOKABLE void setSummaryExpanded(bool expanded);
     Q_INVOKABLE void loadSummaryCatalog(const QString &layer,int offset=0);
     Q_INVOKABLE void inspectSummaryUnit(const QString &id);
+    QVariantMap summaryUnitContext()const{return m_summaryUnitContext;}
+    Q_INVOKABLE void prepareSummaryUnit(const QString &id,const QVariantMap &settings);
+    Q_INVOKABLE void clearSummaryUnit();
     QVariantMap documentReading()const{auto state=m_documentReading;state.insert(QStringLiteral("choice_pending"),m_readingChoicePending);return state;}
     Q_INVOKABLE void prepareDocumentReading(const QVariantMap &request);
     Q_INVOKABLE bool startDocumentReading(const QString &key,const QVariantMap &plan,const QString &token);
@@ -110,7 +114,7 @@ public:
     Q_INVOKABLE void clearAiRegion();
     Q_INVOKABLE void setAiRegionQuestion(const QString &text);
     Q_INVOKABLE void prepareAiRegion(const QVariantMap &settings);
-    Q_INVOKABLE void prepareAi(const QVariantMap &request);
+    Q_INVOKABLE void prepareAi(const QVariantMap &request,const QVariantMap &unit={});
     Q_INVOKABLE bool startAi(const QString &key,const QVariantMap &expectedPlan);
     Q_INVOKABLE void cancelAi();
     Q_INVOKABLE void setAiInput(const QString &key,const QVariant &value);
@@ -217,7 +221,7 @@ private:
     void initSummaryCatalog();
     void resetSummaryCatalog();
     void handleSummaryCatalogCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error);
-    QVariantMap m_summaryCatalog;
+    QVariantMap m_summaryCatalog,m_summaryUnitContext;
     quint64 m_summaryCatalogId=0,m_summaryInspectId=0,m_summaryActionEpoch=0;
     QString m_summaryExpectedId;
     void initRegionPersistence();
@@ -267,6 +271,8 @@ private:
     QUrl m_aiRegionImage;
     quint64 m_aiRegionEpoch=0;
     RasterJobs::Handle m_aiRegionJob;
+    QString m_aiSummaryPreviewUnitId;
+    quint64 m_aiPreviewEpoch=0;
     quint64 m_aiPreviewId=0,m_aiStartId=0,m_aiPollId=0,m_aiPlanGeneration=0;
     void enqueue(const Request &request);
     void requestPageInternal(int page,double scale,bool embedded,bool manual);
