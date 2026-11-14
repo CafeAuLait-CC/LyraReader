@@ -65,19 +65,29 @@ def stats(values):
     }
 
 
+def parse_record_line(line, include_excerpt=True):
+    """Decode one shared trace record without launching a platform-specific workload."""
+    if not line.startswith(PREFIX):
+        return None
+    try:
+        record = json.loads(line[len(PREFIX):])
+    except json.JSONDecodeError as error:
+        excerpt = f': {line[:200]}' if include_excerpt else ''
+        raise ValueError(f'unparseable trace line: {error}{excerpt}') from error
+    if not isinstance(record, dict):
+        raise ValueError('a trace record must be an object')
+    if 'time' in record and isinstance(record['time'], (int, float)):
+        if not math.isfinite(record['time']) or record['time'] < 0:
+            raise ValueError(f'record {record.get("kind")} has an invalid time')
+    return record
+
+
 def load_records(log):
     records = []
     for line in Path(log).read_text().splitlines():
-        if not line.startswith(PREFIX):
-            continue
-        try:
-            record = json.loads(line[len(PREFIX):])
-        except json.JSONDecodeError as error:
-            raise ValueError(f'unparseable trace line: {error}: {line[:200]}') from error
-        if 'time' in record and isinstance(record['time'], (int, float)):
-            if not math.isfinite(record['time']) or record['time'] < 0:
-                raise ValueError(f'record {record.get("kind")} has an invalid time')
-        records.append(record)
+        record = parse_record_line(line)
+        if record is not None:
+            records.append(record)
     if not records:
         raise ValueError('trace contains no perf records (was LYRA_READER_PERF_TRACE=1 set?)')
     return records

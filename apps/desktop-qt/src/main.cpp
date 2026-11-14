@@ -9,6 +9,7 @@
 #include "ReaderController.h"
 #include "WorkspaceController.h"
 #include "ReaderWindowFactory.h"
+#include "RenderTrace.h"
 #include "QuitCoordinator.h"
 #include "AnnotationOverlay.h"
 #include "NativeRaster.h"
@@ -56,6 +57,7 @@ int main(int argc, char **argv) {
     parser.addPositionalArgument(QStringLiteral("file"), QStringLiteral("Local PDF to open"));
     parser.addOption({QStringLiteral("quit-after"), QStringLiteral("Exit after N milliseconds (development check)"), QStringLiteral("ms")});
     parser.addOption({QStringLiteral("snapshot"), QStringLiteral("Save a window snapshot before quitting (development check)"), QStringLiteral("path")});
+    parser.addOption({QStringLiteral("render-trace"),QStringLiteral("Record bounded Qt scene diagnostics to a new JSONL file; no presentation timestamps"),QStringLiteral("new-path")});
     parser.addOption({QStringLiteral("graphics"), QStringLiteral("Graphics backend: auto, vulkan, opengl, software"), QStringLiteral("backend"), QStringLiteral("auto")});
     parser.process(application);
     const auto graphics = parser.value(QStringLiteral("graphics"));
@@ -80,44 +82,56 @@ int main(int argc, char **argv) {
     qmlRegisterType<CropItem>("LyraReader",1,0,"PdfCrop");
     qmlRegisterType<ContentDragItem>("LyraReader",1,0,"ContentDragPreview");
     qmlRegisterType<AnnotationOverlay>("LyraReader",1,0,"PdfAnnotations");
-    ReaderWindowFactory windows;
-    QObject::connect(&windows,&ReaderWindowFactory::windowCreated,&application,[](QQuickWindow *created) {
-        QObject::connect(created,&QQuickWindow::sceneGraphInitialized,created,[created] {
-            qInfo()<<"lyra-reader-qt-backend:"<<QGuiApplication::platformName()
-                   <<"graphicsApi="<<graphicsName(created->rendererInterface()->graphicsApi());
-        },Qt::DirectConnection);
-    });
-    auto *window=windows.createWindow();
-    if (!window) return 1;
-    const auto files = parser.positionalArguments();
-    if (!files.isEmpty()) {
-        auto *workspace=window->property("session").value<WorkspaceController *>();
-        if (workspace) for (const auto &file:files) workspace->openFile(QUrl::fromLocalFile(QFileInfo(file).absoluteFilePath()));
+    std::shared_ptr<RenderTrace::Sink> renderTrace;
+    if(parser.isSet(QStringLiteral("render-trace"))) {
+        renderTrace=RenderTrace::Sink::file(parser.value(QStringLiteral("render-trace")));
+        if(!renderTrace){qCritical()<<"Invalid render trace output options.";return 2;}
     }
-    if (parser.isSet(QStringLiteral("quit-after"))) {
-        bool ok = false;
-        const int duration = parser.value(QStringLiteral("quit-after")).toInt(&ok);
-        if (!ok || duration < 1) return 2;
-        const auto snapshot = parser.value(QStringLiteral("snapshot"));
-        QTimer::singleShot(duration, &application, [&application, window=QPointer<QQuickWindow>(window), snapshot] {
-            if(!window){application.quit();return;}
-            if (!snapshot.isEmpty()) {
-                if (auto *sidebar = window->findChild<QObject *>(QStringLiteral("pagesSidebar")))
-                    qInfo() << "lyra-reader-qt-sidebar:" << "height=" << sidebar->property("height")
-                        << "contentHeight=" << sidebar->property("contentHeight")
-                        << "contentY=" << sidebar->property("contentY")
-                        << "originY=" << sidebar->property("originY")
-                        << "current=" << sidebar->property("currentIndex");
-            }
-            if (!snapshot.isEmpty() && !window->grabWindow().save(snapshot)) {
-                qCritical() << "Could not save window snapshot" << snapshot;
-                application.exit(3);
-                return;
-            }
-            application.quit();
+    int result=0;
+    {
+        ReaderWindowFactory windows;windows.setRenderTraceSink(renderTrace);
+        QObject::connect(&windows,&ReaderWindowFactory::windowCreated,&application,[](QQuickWindow *created) {
+            QObject::connect(created,&QQuickWindow::sceneGraphInitialized,created,[created] {
+                qInfo()<<"lyra-reader-qt-backend:"<<QGuiApplication::platformName()
+                       <<"graphicsApi="<<graphicsName(created->rendererInterface()->graphicsApi());
+            },Qt::DirectConnection);
         });
+        auto *window=windows.createWindow();
+        if (!window) return 1;
+        const auto files = parser.positionalArguments();
+        if (!files.isEmpty()) {
+            auto *workspace=window->property("session").value<WorkspaceController *>();
+            if (workspace) for (const auto &file:files) workspace->openFile(QUrl::fromLocalFile(QFileInfo(file).absoluteFilePath()));
+        }
+        if (parser.isSet(QStringLiteral("quit-after"))) {
+            bool ok = false;
+            const int duration = parser.value(QStringLiteral("quit-after")).toInt(&ok);
+            if (!ok || duration < 1) return 2;
+            const auto snapshot = parser.value(QStringLiteral("snapshot"));
+            QTimer::singleShot(duration, &application, [&application, window=QPointer<QQuickWindow>(window), snapshot] {
+                if(!window){application.quit();return;}
+                if (!snapshot.isEmpty()) {
+                    if (auto *sidebar = window->findChild<QObject *>(QStringLiteral("pagesSidebar")))
+                        qInfo() << "lyra-reader-qt-sidebar:" << "height=" << sidebar->property("height")
+                            << "contentHeight=" << sidebar->property("contentHeight")
+                            << "contentY=" << sidebar->property("contentY")
+                            << "originY=" << sidebar->property("originY")
+                            << "current=" << sidebar->property("currentIndex");
+                }
+                if (!snapshot.isEmpty() && !window->grabWindow().save(snapshot)) {
+                    qCritical() << "Could not save window snapshot" << snapshot;
+                    application.exit(3);
+                    return;
+                }
+                application.quit();
+            });
+        }
+        result=application.exec();
     }
-    const int result=application.exec();
-    // The window factory destroys its QML engines before QApplication services.
+    // All QML engines and scene observers are gone before the diagnostic writer stops.
+    if(renderTrace) {
+        renderTrace->finish();
+        if(!renderTrace->error().isEmpty()){qCritical().noquote()<<renderTrace->error();if(!result)result=3;}
+    }
     return result;
 }

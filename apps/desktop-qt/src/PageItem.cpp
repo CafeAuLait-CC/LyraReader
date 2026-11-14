@@ -10,6 +10,7 @@
 namespace {
 constexpr double maximumRasterScale=128;
 constexpr double sceneCoordinateLimit=double(std::numeric_limits<float>::max())/(4*maximumRasterScale);
+QList<PageItem *> &traceRegistry(){static QList<PageItem *> items;return items;}
 // An explicit transform root preserves item transforms and software clips.
 class PageScene final:public QSGTransformNode {
 public:
@@ -17,19 +18,59 @@ public:
     QStringList order;
     quint64 sourceEpoch=0,acceptedDemandEpoch=0;
     PageScene *staging=nullptr;
-    ~PageScene()override{delete staging;}
+    std::shared_ptr<RenderTrace::SceneState> trace;
+    ~PageScene()override {
+        delete staging;
+        if(trace){std::lock_guard lock(trace->mutex);if(trace->owner==this){trace->owner=nullptr;trace->scene={};}}
+    }
+    void publish(const std::shared_ptr<RenderTrace::SceneState> &state,bool complete,bool revision) {
+        trace=state;RenderTrace::Scene snapshot;snapshot.sourceEpoch=sourceEpoch;snapshot.complete=complete;snapshot.revision=revision;
+        for(const auto &key:order) {
+            const auto *node=images.value(key);if(!node || node->empty())continue;
+            auto role=node->traceSource().isEmpty()?QStringLiteral("unattributed"):node->traceSource();
+            if(!node->traceUpdateCurrent()) {
+                if(role==QStringLiteral("page-raster"))role=QStringLiteral("previous-raster");
+                else if(role==QStringLiteral("tile") || role==QStringLiteral("partial-tile"))role=QStringLiteral("previous-tile");
+            }
+            for(int i=0;i<node->traceQuadCount();++i) {
+                if(snapshot.quads.size()>=RenderTrace::SceneState::maximumQuads){snapshot.truncated=true;break;}
+                snapshot.quads.append({node->traceQuads()[i].target,role,!node->traceUpdateCurrent()});
+            }
+        }
+        std::lock_guard lock(state->mutex);state->owner=this;state->scene=std::move(snapshot);
+    }
 };
 }
 
 PageItem::PageItem(QQuickItem *parent):QQuickItem(parent) {
+    traceRegistry().append(this);
     setFlag(ItemHasContents,true);m_requestTimer.setSingleShot(true);m_requestTimer.setInterval(70);
     connect(&m_requestTimer,&QTimer::timeout,this,&PageItem::request);
     connect(RenderBudget::instance(),&RenderBudget::targetsChanged,this,&PageItem::budgetChanged);
+    if(window()){RenderTrace::Window::inherit(window());setSceneTraceEnabled(!m_embedded && window()->property("lyraRenderTraceEnabled").toBool());}
 }
 PageItem::~PageItem() {
+    traceRegistry().removeAll(this);
     RenderBudget::instance()->setClient(this,0);
     if(m_controller)m_controller->clearRasterDemand(quintptr(this));
     for(const auto &connection:m_connections)QObject::disconnect(connection);
+}
+QList<PageItem *> PageItem::traceItems(QQuickWindow *window) {
+    QList<PageItem *> result;for(auto *item:traceRegistry())if(item->window()==window)result.append(item);return result;
+}
+void PageItem::setSceneTraceEnabled(bool enabled) {
+    if(enabled) {
+        if(m_sceneTrace && m_sceneTrace->enabled)return;
+        m_sceneTrace=std::make_shared<RenderTrace::SceneState>();update();
+    }else if(m_sceneTrace) {
+        m_sceneTrace->enabled=false;
+        {std::lock_guard lock(m_sceneTrace->mutex);m_sceneTrace->owner=nullptr;m_sceneTrace->scene={};}
+        m_sceneTrace.reset();
+    }
+}
+RenderTrace::Scene PageItem::sceneTraceSnapshot()const {
+    if(!m_sceneTrace || !m_sceneTrace->enabled)return {};
+    std::lock_guard lock(m_sceneTrace->mutex);return m_sceneTrace->scene;
 }
 double PageItem::paperSceneLimit()const{return sceneCoordinateLimit;}
 void PageItem::setRefined(bool value) {
@@ -98,7 +139,7 @@ void PageItem::resetImages(bool keepRevision) {
         emit revisionFallbackChanged();
     }
     if(m_controller)m_controller->clearRasterDemand(quintptr(this));
-    m_image={};m_usingBackdrop=false;m_tiles.clear();m_tileImages.clear();m_previousTiles.clear();m_previousImages.clear();m_level=-1000;m_demandCurrent=false;
+    m_image={};m_usingBackdrop=false;m_traceBaseCurrent=false;m_tiles.clear();m_tileImages.clear();m_previousTiles.clear();m_previousImages.clear();m_level=-1000;m_demandCurrent=false;
     setRefined(false);update();emit loadedChanged();emit refinementChanged();
 }
 void PageItem::setController(ReaderController *controller) {
@@ -209,7 +250,7 @@ QVariantMap PageItem::paperEraserSegments(const QPointF &from,const QPointF &to)
 }
 void PageItem::setRasterScale(double scale) {if(!std::isfinite(scale) || scale<=0 || scale>maximumRasterScale || qFuzzyCompare(m_scale,scale))return;m_scale=scale;m_demandCurrent=false;setRefined(false);m_requestTimer.start();refresh();emit rasterScaleChanged();update();}
 void PageItem::setPaperAppearance(const QString &appearance) {if(m_paperAppearance==appearance)return;m_paperAppearance=appearance;update();emit paperAppearanceChanged();}
-void PageItem::setEmbeddedAnnotations(bool enabled) {if(m_embedded==enabled)return;m_embedded=enabled;resetImages();m_requestTimer.start();emit embeddedAnnotationsChanged();}
+void PageItem::setEmbeddedAnnotations(bool enabled) {if(m_embedded==enabled)return;m_embedded=enabled;if(window())setSceneTraceEnabled(!m_embedded && window()->property("lyraRenderTraceEnabled").toBool());resetImages();m_requestTimer.start();emit embeddedAnnotationsChanged();}
 void PageItem::setTilesEnabled(bool enabled) {if(m_tilesEnabled==enabled)return;m_tilesEnabled=enabled;m_demandCurrent=false;setRefined(false);m_requestTimer.start();emit tilesEnabledChanged();}
 void PageItem::setVisibleRegion(const QRectF &region) {
     if(m_visibleRegion==region)return;m_visibleRegion=region;m_demandCurrent=false;setRefined(false);
@@ -248,6 +289,7 @@ void PageItem::refresh() {
         if(!retained.isNull())m_image=std::move(retained);else blocked=true;
     }
     const bool fallbackReady=!fallback.isNull() && m_image.pixels.cacheKey()==fallback.cacheKey();
+    m_traceBaseCurrent=fallbackReady;
     if(fallbackReady)m_usingBackdrop=false;
     else if(m_image.isNull()) {
         auto retained=ResidentImage::retain(m_controller->cachedBackdrop(m_page,m_embedded));
@@ -299,7 +341,10 @@ void PageItem::itemChange(ItemChange change,const ItemChangeData &data) {
     QQuickItem::itemChange(change,data);
     if(change==ItemSceneChange) {
         for(const auto &connection:m_windowConnections)QObject::disconnect(connection);m_windowConnections.clear();
-        if(window())m_windowConnections.append(connect(window(),&QWindow::visibilityChanged,this,[this]{budgetChanged();}));
+        if(window()) {
+            RenderTrace::Window::inherit(window());setSceneTraceEnabled(!m_embedded && window()->property("lyraRenderTraceEnabled").toBool());
+            m_windowConnections.append(connect(window(),&QWindow::visibilityChanged,this,[this]{if(auto *target=window()){RenderTrace::Window::inherit(target);setSceneTraceEnabled(!m_embedded && target->property("lyraRenderTraceEnabled").toBool());}else setSceneTraceEnabled(false);budgetChanged();}));
+        }else setSceneTraceEnabled(false);
         syncBudget();
     }
     if(change==ItemVisibleHasChanged) {
@@ -320,34 +365,38 @@ QSGNode *PageItem::paintFrame(QSGNode *old,bool previous,bool &blocked) {
     root->sourceEpoch=previous?m_revisionFrame->sourceEpoch:m_sourceEpoch;
     const int appearance=PaperAppearance::mode(m_paperAppearance);
     QStringList order;bool orderChanged=false;
-    const auto append=[&](const QString &key,const ResidentImage &image,const PaperAppearance::Quad *quads,int count) {
+    const bool traceEnabled=m_sceneTrace && m_sceneTrace->enabled;
+    const auto append=[&](const QString &key,const ResidentImage &image,const PaperAppearance::Quad *quads,int count,const QString &source) {
         if(image.isNull())return;
         auto *node=root->images.value(key);
         if(!node){node=new BudgetedTexture(this);root->images.insert(key,node);root->appendChildNode(node);orderChanged=true;}
         if(!node->setImage(window(),image,appearance))blocked=true;
+        else if(traceEnabled)node->setTraceSource(source);
         if(node->empty())return;
         if(!node->setRects(quads,count))blocked=true;order.append(key);
     };
-    struct Draw {QString key;ResidentImage image;QRectF target,source;};
+    struct Draw {QString key;ResidentImage image;QRectF target,source;QString role;};
     QVector<Draw> draws;
-    const auto collect=[&](const QString &key,const ResidentImage &image,const QRectF &target,const QRectF &source) {
+    const auto collect=[&](const QString &key,const ResidentImage &image,const QRectF &target,const QRectF &source,const QString &role) {
         if(image.isNull())return;
-        if(m_paperLayout){draws.append({key,image,target,source});return;}
+        if(m_paperLayout){draws.append({key,image,target,source,role});return;}
         // Keep the ordinary reader path free of paper-batch allocations or FFI calls.
         const QRectF logical=key==QStringLiteral("base")?boundingRect():QRectF(target.x()*m_scale,target.y()*m_scale,target.width()*m_scale,target.height()*m_scale);
-        const PaperAppearance::Quad quad{logical,source};append(key,image,&quad,1);
+        const PaperAppearance::Quad quad{logical,source};append(key,image,&quad,1,role);
     };
     const QRectF paper= m_paperLayout ? QRectF(0,0,width()/m_scale,m_paperLayout->height) : QRectF(0,0,width()/m_scale,height()/m_scale);
-    collect(QStringLiteral("base"),image,paper,QRectF(0,0,1,1));
-    const auto tiles=[&](const QList<TileSpec> &specs,const QHash<QString,ResidentImage> &images) {
+    const auto baseRole=!traceEnabled?QString{}:previous?QStringLiteral("previous-raster"):m_usingBackdrop?QStringLiteral("history"):m_traceBaseCurrent?(!needsTiles() && m_demandCurrent && m_refined?QStringLiteral("page-raster"):QStringLiteral("preview")):QStringLiteral("previous-raster");
+    collect(QStringLiteral("base"),image,paper,QRectF(0,0,1,1),baseRole);
+    const auto tiles=[&](const QList<TileSpec> &specs,const QHash<QString,ResidentImage> &images,const QString &role) {
         for(const auto &tile:specs) {
             if(!tile.target.intersects(m_visibleRegion))continue;
             const auto image=images.value(tile.key);if(image.isNull())continue;
             const QRectF texture((tile.target.x()-tile.render.x())*tile.scale/image.pixels.width(),(tile.target.y()-tile.render.y())*tile.scale/image.pixels.height(),tile.target.width()*tile.scale/image.pixels.width(),tile.target.height()*tile.scale/image.pixels.height());
-            collect(tile.key,image,tile.target,texture);
+            collect(tile.key,image,tile.target,texture,role);
         }
     };
-    if(!previous)tiles(m_previousTiles,m_previousImages);tiles(currentTiles,currentImages);
+    if(!previous)tiles(m_previousTiles,m_previousImages,QStringLiteral("previous-tile"));
+    tiles(currentTiles,currentImages,previous || !m_demandCurrent?QStringLiteral("previous-tile"):m_refined?QStringLiteral("tile"):QStringLiteral("partial-tile"));
     QVector<LyraReaderPaperQuadPair> mapped;
     if(m_paperLayout) {
         QVector<LyraReaderPaperQuad> requests;requests.reserve(draws.size());
@@ -366,7 +415,7 @@ QSGNode *PageItem::paintFrame(QSGNode *old,bool previous,bool &blocked) {
         const auto &pair=mapped[i];count=int(pair.count);
         for(int k=0;k<count;++k){const auto &q=pair.pieces[k];quads[k]={QRectF(q.target.x,q.target.y,q.target.width,q.target.height),QRectF(q.source.x,q.source.y,q.source.width,q.source.height)};}
         for(int k=0;k<count;++k){auto &r=quads[k].target;r=QRectF(r.x()*m_scale,r.y()*m_scale,r.width()*m_scale,r.height()*m_scale);}
-        append(draw.key,draw.image,quads,count);
+        append(draw.key,draw.image,quads,count,draw.role);
     }
     for(auto it=root->images.begin();it!=root->images.end();) {
         if(!order.contains(it.key())){root->removeChildNode(it.value());delete it.value();it=root->images.erase(it);}else ++it;
@@ -400,6 +449,7 @@ QSGNode *PageItem::updatePaintNode(QSGNode *old,UpdatePaintNodeData *) {
         root=static_cast<PageScene *>(paintFrame(root,false,blocked));ready=m_refined && !blocked;
     }
     ready=ready && root && (!m_image.isNull() || !m_tileImages.isEmpty());
+    if(root && m_sceneTrace && m_sceneTrace->enabled)root->publish(m_sceneTrace,ready,bool(m_revisionFrame && root->sourceEpoch==m_revisionFrame->sourceEpoch));
     if(ready) {
         std::lock_guard lock(m_frameMutex);
         if(!m_acceptedFrame || root->acceptedDemandEpoch!=m_textureEpoch) {

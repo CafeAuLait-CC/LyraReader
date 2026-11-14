@@ -1,6 +1,7 @@
 #pragma once
 #include "ReaderController.h"
 #include "RenderBudget.h"
+#include "RenderTrace.h"
 #include <QQuickItem>
 #include <QPointer>
 #include <QTimer>
@@ -70,6 +71,13 @@ public:
     void setEmbeddedAnnotations(bool enabled);
     void setTilesEnabled(bool enabled);
     void setVisibleRegion(const QRectF &region);
+    // Only read the registry/GUI getters on the GUI thread, or during the window's
+    // direct afterSynchronizing callback while Qt has blocked the GUI thread.
+    static QList<PageItem *> traceItems(QQuickWindow *window);
+    void setSceneTraceEnabled(bool enabled);
+    RenderTrace::Scene sceneTraceSnapshot()const;
+    std::shared_ptr<RenderTrace::SceneState> sceneTraceState()const{return m_sceneTrace;}
+    quint64 traceSourceEpoch()const{return m_sourceEpoch;}
 signals:
     void controllerChanged();void pageIndexChanged();void rasterScaleChanged();void loadedChanged();
     void paperAppearanceChanged();void embeddedAnnotationsChanged();void tilesEnabledChanged();
@@ -112,6 +120,8 @@ private:
     bool m_embedded=false,m_tilesEnabled=false,m_refined=false,m_demandCurrent=false;
     bool m_resourceActive=true;
     bool m_usingBackdrop=false;
+    bool m_traceBaseCurrent=false;
+    std::shared_ptr<RenderTrace::SceneState> m_sceneTrace;
     qint64 m_targetBytes=0;
     bool m_texturesReady=false;
     quint64 m_textureEpoch=0;

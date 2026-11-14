@@ -1,6 +1,7 @@
 #include "ReaderWindowFactory.h"
 #include "WorkspaceController.h"
 #include "NativeRaster.h"
+#include "RenderTrace.h"
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickWindow>
@@ -30,6 +31,7 @@ QQuickWindow *ReaderWindowFactory::createWindow(const QUrl &url,int page,double 
     window->setPersistentSceneGraph(false);
     window->setProperty("requestedPage",page);
     window->setProperty("requestedY",y);
+    if(m_renderTrace)RenderTrace::Window::attach(window,m_renderTrace);
     connect(workspace,&WorkspaceController::newWindowRequested,this,[this](const QUrl &file,int targetPage,double targetY){createWindow(file,targetPage,targetY);});
     connect(workspace,&WorkspaceController::detachActiveTabRequested,this,[this,owner=QPointer<WorkspaceController>(workspace),window=QPointer<QQuickWindow>(window)]{if(owner && window)detachActiveTab(owner,window);});
     connect(workspace,&WorkspaceController::moveActiveTabToWindowRequested,this,[this,owner=QPointer<WorkspaceController>(workspace),window=QPointer<QQuickWindow>(window)](WorkspaceController *target,ReaderController *reader,qulonglong generation){if(owner && window)moveToWindow(owner,window,target,reader,generation);});

@@ -18,6 +18,7 @@ cd "$ROOT"
 bash scripts/build-qt.sh
 cargo test --locked -p lyra-reader-runtime -p lyra-reader-desktop-ffi
 if [ "$NATIVE" = 1 ]; then
+  ctest --test-dir "$ROOT/build/desktop-qt-debug" --output-on-failure -R 'LyraReader(RenderTraceParser|MeasurementParserCompatibility)'
   if [ -n "$BACKEND" ]; then export QSG_RHI_BACKEND="$BACKEND"; fi
   LYRA_READER_REQUIRE_NATIVE_QT=1 "$ROOT/build/desktop-qt-debug/LyraReaderChecks" "$ROOT"
 else
