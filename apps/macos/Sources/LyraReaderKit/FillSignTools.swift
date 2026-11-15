@@ -96,6 +96,11 @@ public enum FillSignDateFormat: String, CaseIterable, Identifiable, Sendable {
     case short
     case iso
 
+    #if DEBUG
+    /// Only the isolated visual capture process sets this; placed dates keep their own clock.
+    @MainActor package static var previewClockOverride: (date: Date, timeZone: TimeZone)?
+    #endif
+
     public var id: String { rawValue }
 
     public var title: String {

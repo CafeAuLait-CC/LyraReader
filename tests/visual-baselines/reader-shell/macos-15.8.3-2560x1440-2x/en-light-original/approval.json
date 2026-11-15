@@ -1,0 +1,24 @@
+{
+  "approved": true,
+  "capture_manifest_sha256": "b841568cd20202c436b4bff9f868505700082eef415cb1cf611bb37a15f30be0",
+  "channel_tolerance": 0,
+  "provisional": false,
+  "review_basis": "User accepted all checkpoints, the macOS 15.8.3 environment and this profile-specific comparison policy in the hash-bound four-batch visual refresh review.",
+  "review_date": "2026-11-12",
+  "review_source_sha256": "97a4dbba4352d40619e14165596b149f290eddd417824a96e226959d8916eb25",
+  "reviewed_product_commit": "c81e97d07d66e25527fb1e0be25a1f90bd6d1ebe",
+  "schema_version": 1,
+  "sha256": {
+    "01-home-empty.png": "c0c8a095c1491899051a0a64f0bc3ba0e73bbdb88a036202742a706113524ed1",
+    "02-one-tab.png": "dde72c74604dfcb57f6ecbb6b19049261a021d097e8fbb3fcd489bd95cc1fac3",
+    "03-three-tabs.png": "026bd550aa3efab6953d82eba921b9e170cdcbf6a5ca03be79ab814e824d1370",
+    "04-eight-tabs.png": "71fec8287882c789fe51fb746698599ce8e7e2c0b366e1a287bac8e8ab80fb2d",
+    "05-first-tab-active.png": "2fda92c416c5a14faf5f4edc17a8e61b5d2a4bd350938eb3c7c15c11aa770c8c",
+    "06-narrow-eight-tabs.png": "24c616b311508931ebff0d34b452eadfd4381d753fd785bd3069c65978827bbe",
+    "07-window-restored.png": "c3bc4b297ca77bac68ce95d2ed7637db64a11a8344513921e50d695203d88739",
+    "08-close-active-tab.png": "f49b28967dfbc07174b1057d8b054455a8badee768aa997eb6ac9bd80fb9bb8f",
+    "09-last-tab.png": "73457a0c9208f17608c1470aa86cd2b68695b8e103c0e23b01aa411ee5b595d5",
+    "10-return-home.png": "1bfeb14d021f6ce3e210c539899660dd23fdaebaa070814dbb983a04785f6797"
+  },
+  "source_capture_manifest_sha256": "d7a8d628c5a3bf5da790f7fa108c72c323ac6495e738ab3978dad36098018694"
+}

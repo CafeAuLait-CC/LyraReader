@@ -127,6 +127,125 @@ The developer commands that are not needed to build and run — headless test ho
 reference-raster comparisons, the CLI inspection commands and the measurement recipes — are documented in the
 design notes rather than here.
 
+## Native visual regression
+
+The debug bundle supports opt-in capture of its native reader and owned preview on macOS 14.4 or later.
+Keep the desktop awake and idle while capture controls its own window and full-screen Space.
+The launcher creates a separate bundle identity and scratch caches.
+The default `paper` suite records 16 checkpoints for paper scale, native edges, sidebar changes,
+resizing, zoom round trips, full-screen entry/exit, Fit Page on a one/three-page fixture, and the
+document end. It checks the ordinary 8 pt document-edge padding and balanced fitted padding.
+The PDFs are generated from synthetic content.
+
+```bash
+./scripts/build-rust.sh --debug
+./scripts/make-app-bundle.sh --debug
+python3 scripts/check-visual.py self-test
+python3 -m unittest discover -s scripts -p test_visual_regression.py
+python3 scripts/check-visual.py capture --output build/visual-en-light --language en --appearance light
+python3 scripts/check-visual.py capture --suite reader-shell --output build/visual-reader-light --appearance light
+python3 scripts/check-visual.py capture --suite toolbar-inspectors --output build/visual-tools-light --appearance light
+python3 scripts/check-visual.py capture --suite search-previews --output build/visual-search-light --appearance light
+```
+
+Open the output's `index.html` to review native-size PNGs and environment details. Repeat with
+`--appearance dark` for dark interface chrome with original document colours. Use
+`--appearance dark --paper-mode night` for the production Night Reading preference, or
+`--appearance light --paper-mode warm` for Warm Paper. The paper mode is recorded separately;
+the original-colour default preserves existing approvals. Each output directory must be new. Capture failure,
+missing GPU content, and unstable compositor pixels fail explicitly; an unreviewed candidate is not
+an accepted baseline. `--mutation scale` and `--mutation chrome` deliberately produce failing runs
+for diagnostic use. Capture waits for registered GPU content and stable native compositor pixels;
+Metal presentation timestamps are recorded when available and are not a performance measurement.
+Display mode points, backing framebuffer pixels and each window's backing scale are recorded separately;
+the framebuffer dimensions do not assert the panel's physical resolution. The flows drive production
+state and native window actions; they do not cover pointer gesture delivery.
+
+The `reader-shell` suite records 10 checkpoints: empty Home, one/three/eight tabs, the first tab
+selected, a narrow window and its restoration, closing the active tab, retaining the last tab,
+and returning Home. Its eight synthetic documents have per-document registration colors; the
+checks verify the active document, tab count and actual rendered pixels. Home requires zero page
+quads and an isolated empty recent-document list. Reviewed baselines are listed below.
+
+The `toolbar-inspectors` suite records 26 checkpoints covering tool rows, armed/cleared tools,
+all seven Fill & Sign inspectors, Edit text/link inspectors, assistant/inspector exclusion,
+sidebar and narrow-window combinations, and closing back to Home. Native chrome probes assert
+the 46 pt row and the exclusive 292 pt inspector column. The date preview uses a fixed UTC clock
+only in the isolated debug capture process; placed dates and ordinary launches keep their usual clock.
+Export's unfinished subtool list is saved separately as a deferred reference, outside the
+checkpoint catalogue. Each captured profile requires visual review before baseline adoption.
+Review repeatability results before choosing a per-channel tolerance. Unreviewed comparisons default
+to zero; adopted profiles use their reviewed policy.
+
+The `search-previews` suite records 28 checkpoints covering empty results, match selection,
+cross-page navigation and wrapping, replacement queries, sidebar/window combinations and clearing;
+single/grouped citations, wrapped entries, preview resizing/moving, Escape, figure/table replacement,
+page jumps and Back, whole-page previews, search coexistence and closing to Home. Its four-page
+synthetic PDF provides six search matches, three references and distinct figure/table raster probes.
+Capture includes only the process-owned reader and its one attached preview panel, at native scale;
+the image bounds expand to their union when necessary. Checks verify resolved text, actual preview
+pixels, crop bounds, reader position, navigation history and panel cleanup. These candidates need
+separate review; the toolbar suite's tolerance does not apply to them automatically.
+Capture also checks compact single-entry sizing against grouped citations, submitted viewport/zoom
+agreement, theme-adapted card/ink and preserved colour probes in figure/table previews, and
+closed-host unmounting. Whole-page previews follow the selected paper mode.
+This suite temporarily parks the pointer outside its windows to avoid accidental hover states
+and restores it when capture ends.
+Preview captures retain native window framing and shadows, with a 48 pt outset clipped to the
+display. Same-window shadow-on/off probes verify actual pixels outside the panel frame; the
+shadow-suppressed images are diagnostics, separate from the checkpoint catalogue. Environment
+matching includes this shadow policy so earlier suppressed-framing captures cannot be mixed in.
+
+```bash
+python3 scripts/check-visual.py compare --baseline BASELINE --actual ACTUAL --output build/visual-diff
+```
+
+Comparison never rescales images and uses exact sRGB pixels unless a reviewed baseline explicitly
+approves a per-channel tolerance. It requires matching environments
+and an explicit `approval.json` in the baseline directory: `schema_version: 1`, `approved: true`,
+`capture_manifest_sha256` for `capture.json`, and a `sha256` object mapping every checkpoint PNG filename
+to its SHA-256 digest. Create that approval only after reviewing the images. Changing an approved image
+or manifest invalidates it. `--allow-unreviewed` is available solely for developer repeatability checks
+and marks the result as **not a regression gate**. No image baselines are accepted automatically.
+An optional integer `channel_tolerance` in the approval records the reviewed comparison policy;
+omitting it keeps zero tolerance. An explicit `--channel-tolerance` may be stricter than that policy
+but cannot widen it for a regression gate. Unreviewed comparisons still default to zero.
+
+The first paper batch is provisionally adopted under
+`tests/visual-baselines/paper/macos-15.7.9-2560x1440-2x/en-light` and `en-dark`: 32 original PNGs,
+sanitized capture manifests and hash-bound approvals. They cover the recorded macOS build,
+2560×1440 logical display, 5120×2880 backing framebuffer and backing scale 2. The user-approved
+reader-shell batch adds 20 original PNGs and hash-bound approvals under
+`tests/visual-baselines/reader-shell/macos-15.7.9-2560x1440-2x/en-light` and `en-dark`.
+The toolbar/inspector profiles add 52 user-approved PNGs under
+`tests/visual-baselines/toolbar-inspectors/macos-15.7.9-2560x1440-2x/en-light` and `en-dark`, with an
+explicitly reviewed one-level per-channel tolerance. Export references are deferred.
+The paper and reader-shell approvals retain zero tolerance.
+All six adopted profiles explicitly used Original Colours, including the dark interface profiles.
+They do not cover Night Reading's dark paper. Captures without a `paper_mode` field are treated as
+that historical original-colour mode; comparisons reject different paper modes. Night Reading
+candidates require separate user review and are never adopted by relabelling the white-paper images.
+The macOS 15.8.3 refresh adds nine explicitly approved profiles and 156 byte-for-byte copies of reviewed PNGs
+under each suite's `macos-15.8.3-2560x1440-2x` directory: `en-light-original`, `en-dark-original`
+and `en-dark-night`. Original-colour paper/reader profiles use zero tolerance and toolbar profiles
+use one level. Night Reading uses one level for paper and zero for reader/toolbar profiles, as
+explicitly selected in review. The older 104 assets remain intact; baseline integrity checks now
+cover 260 images across 15 profiles.
+All 84 search/preview appearances in the refresh were accepted with a one-level comparison policy.
+Those images are not adopted as a pixel gate: independent full-image repeats still match only
+18 of 28 checkpoints in each of the three profiles. The floating-window comparison needs further
+stabilization within that policy; appearance approval does not turn the remaining failures into passes.
+Other environments require separate reviewed baselines. Use the matching directory as `BASELINE`
+above. Each suite requires its own baseline and complete checkpoint set.
+
+CI verifies the adopted baseline bytes and runs the comparer/approval regressions. Its manual
+**Capture unreviewed visual candidates** input additionally collects English original-colour
+light/dark and dark Night Reading candidates
+from all four suites as artifacts. Pixel comparison requires a controlled matching
+desktop; this does not enable a cross-environment PR screenshot gate. Chinese visual checks are deferred until
+Chinese localization is implemented. Existing zh-Hans preference captures show English fallback
+and are not accepted as evidence of Chinese UI coverage.
+
 ## Documentation index
 
 The design documents live in `docs/` in the working copy and are **not committed** (see the note under

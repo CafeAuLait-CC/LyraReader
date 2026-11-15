@@ -1,0 +1,2503 @@
+{
+  "captures": [
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "01-document-idle.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "01-document-idle",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            19,
+            48,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "select",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 0,
+        "fill_tool": null,
+        "open_rows": [],
+        "row_slot_points": [
+          0,
+          90,
+          1200,
+          0
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        1187,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "02-annotate-row.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "02-annotate-row",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            19,
+            48,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "select",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 0,
+        "fill_tool": null,
+        "open_rows": [
+          "annotations"
+        ],
+        "row_content_points": [
+          0,
+          90,
+          1200,
+          46
+        ],
+        "row_slot_points": [
+          0,
+          90,
+          1200,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        1187,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "03-highlight-armed.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "03-highlight-armed",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            19,
+            48,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "highlight",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 0,
+        "fill_tool": null,
+        "open_rows": [
+          "annotations"
+        ],
+        "row_content_points": [
+          0,
+          90,
+          1200,
+          46
+        ],
+        "row_slot_points": [
+          0,
+          90,
+          1200,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        1187,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "04-note-armed.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "04-note-armed",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            19,
+            48,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "note",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 0,
+        "fill_tool": null,
+        "open_rows": [
+          "annotations"
+        ],
+        "row_content_points": [
+          0,
+          90,
+          1200,
+          46
+        ],
+        "row_slot_points": [
+          0,
+          90,
+          1200,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        1187,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "05-annotate-disarmed.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "05-annotate-disarmed",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            19,
+            48,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "select",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 0,
+        "fill_tool": null,
+        "open_rows": [
+          "annotations"
+        ],
+        "row_content_points": [
+          0,
+          90,
+          1200,
+          46
+        ],
+        "row_slot_points": [
+          0,
+          90,
+          1200,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        1187,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "06-edit-row.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "06-edit-row",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            19,
+            48,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "select",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 0,
+        "fill_tool": null,
+        "open_rows": [
+          "contentEdit"
+        ],
+        "row_content_points": [
+          0,
+          90,
+          1200,
+          46
+        ],
+        "row_slot_points": [
+          0,
+          90,
+          1200,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        1187,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "07-edit-text-inspector.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "07-edit-text-inspector",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "select",
+        "assistant_visible": false,
+        "content_tool": "text",
+        "edit_inspector_width": 292,
+        "fill_inspector_width": 0,
+        "fill_tool": null,
+        "open_rows": [
+          "contentEdit"
+        ],
+        "row_content_points": [
+          0,
+          90,
+          908,
+          46
+        ],
+        "row_slot_points": [
+          0,
+          90,
+          908,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        895,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "08-edit-link-inspector.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "08-edit-link-inspector",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "select",
+        "assistant_visible": false,
+        "content_tool": "link",
+        "edit_inspector_width": 292,
+        "fill_inspector_width": 0,
+        "fill_tool": null,
+        "open_rows": [
+          "contentEdit"
+        ],
+        "row_content_points": [
+          0,
+          90,
+          908,
+          46
+        ],
+        "row_slot_points": [
+          0,
+          90,
+          908,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        895,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "09-edit-tool-cleared.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "09-edit-tool-cleared",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            19,
+            48,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "select",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 0,
+        "fill_tool": null,
+        "open_rows": [
+          "contentEdit"
+        ],
+        "row_content_points": [
+          0,
+          90,
+          1200,
+          46
+        ],
+        "row_slot_points": [
+          0,
+          90,
+          1200,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        1187,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "10-fill-sign-row.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "10-fill-sign-row",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            19,
+            48,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "select",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 0,
+        "fill_tool": null,
+        "open_rows": [
+          "fillAndSign"
+        ],
+        "row_content_points": [
+          0,
+          90,
+          1200,
+          46
+        ],
+        "row_slot_points": [
+          0,
+          90,
+          1200,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        1187,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "11-fill-text-inspector.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "11-fill-text-inspector",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "textBox",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 292,
+        "fill_tool": "text",
+        "open_rows": [
+          "fillAndSign"
+        ],
+        "row_content_points": [
+          0,
+          90,
+          908,
+          46
+        ],
+        "row_slot_points": [
+          0,
+          90,
+          908,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        895,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "12-signature-inspector.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "12-signature-inspector",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "select",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 292,
+        "fill_tool": "signature",
+        "open_rows": [
+          "fillAndSign"
+        ],
+        "row_content_points": [
+          0,
+          90,
+          908,
+          46
+        ],
+        "row_slot_points": [
+          0,
+          90,
+          908,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        895,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "13-date-inspector.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "13-date-inspector",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "select",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 292,
+        "fill_tool": "date",
+        "open_rows": [
+          "fillAndSign"
+        ],
+        "row_content_points": [
+          0,
+          90,
+          908,
+          46
+        ],
+        "row_slot_points": [
+          0,
+          90,
+          908,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        895,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "14-checkmark-inspector.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "14-checkmark-inspector",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "select",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 292,
+        "fill_tool": "checkmark",
+        "open_rows": [
+          "fillAndSign"
+        ],
+        "row_content_points": [
+          0,
+          90,
+          908,
+          46
+        ],
+        "row_slot_points": [
+          0,
+          90,
+          908,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        895,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "15-cross-inspector.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "15-cross-inspector",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "select",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 292,
+        "fill_tool": "cross",
+        "open_rows": [
+          "fillAndSign"
+        ],
+        "row_content_points": [
+          0,
+          90,
+          908,
+          46
+        ],
+        "row_slot_points": [
+          0,
+          90,
+          908,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        895,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "16-stamp-inspector.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "16-stamp-inspector",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "stamp",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 292,
+        "fill_tool": "stamp",
+        "open_rows": [
+          "fillAndSign"
+        ],
+        "row_content_points": [
+          0,
+          90,
+          908,
+          46
+        ],
+        "row_slot_points": [
+          0,
+          90,
+          908,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        895,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "17-image-inspector.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "17-image-inspector",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "select",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 292,
+        "fill_tool": "image",
+        "open_rows": [
+          "fillAndSign"
+        ],
+        "row_content_points": [
+          0,
+          90,
+          908,
+          46
+        ],
+        "row_slot_points": [
+          0,
+          90,
+          908,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        895,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "18-fill-tool-cleared.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "18-fill-tool-cleared",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            19,
+            48,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "select",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 0,
+        "fill_tool": null,
+        "open_rows": [
+          "fillAndSign"
+        ],
+        "row_content_points": [
+          0,
+          90,
+          1200,
+          46
+        ],
+        "row_slot_points": [
+          0,
+          90,
+          1200,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        1187,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "19-lyra-row.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "19-lyra-row",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            19,
+            48,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "select",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 0,
+        "fill_tool": null,
+        "open_rows": [
+          "lyra"
+        ],
+        "row_content_points": [
+          0,
+          90,
+          1200,
+          46
+        ],
+        "row_slot_points": [
+          0,
+          90,
+          1200,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        1187,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        922.5,
+        710
+      ],
+      "file": "20-edit-after-assistant.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "20-edit-after-assistant",
+      "page_index": 0,
+      "paper_margins_points": [
+        0.12499307459722786,
+        8,
+        0.12499307459722786,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        0.12499307459722786,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            100,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            1745,
+            286
+          ],
+          "rgb": [
+            19,
+            48,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "select",
+        "assistant_visible": false,
+        "content_tool": "text",
+        "edit_inspector_width": 292,
+        "fill_inspector_width": 0,
+        "fill_tool": null,
+        "open_rows": [
+          "contentEdit"
+        ],
+        "row_content_points": [
+          0,
+          90,
+          908,
+          46
+        ],
+        "row_slot_points": [
+          0,
+          90,
+          908,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        895,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        922.5,
+        710
+      ],
+      "file": "21-fill-after-assistant.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "21-fill-after-assistant",
+      "page_index": 0,
+      "paper_margins_points": [
+        0.12499307459722786,
+        8,
+        0.12499307459722786,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        0.12499307459722786,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            100,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            1745,
+            286
+          ],
+          "rgb": [
+            19,
+            48,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "select",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 292,
+        "fill_tool": "signature",
+        "open_rows": [
+          "fillAndSign"
+        ],
+        "row_content_points": [
+          0,
+          90,
+          908,
+          46
+        ],
+        "row_slot_points": [
+          0,
+          90,
+          908,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        895,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        251,
+        90,
+        922.5,
+        710
+      ],
+      "file": "22-sidebar-with-inspector.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "22-sidebar-with-inspector",
+      "page_index": 0,
+      "paper_margins_points": [
+        0.12499307459722786,
+        8,
+        0.12499307459722786,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        0.12499307459722786,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            602,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "select",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 292,
+        "fill_tool": "signature",
+        "open_rows": [
+          "fillAndSign"
+        ],
+        "row_content_points": [
+          251,
+          90,
+          657,
+          46
+        ],
+        "row_slot_points": [
+          251,
+          90,
+          657,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        644,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        251,
+        90,
+        922.5,
+        550
+      ],
+      "file": "23-narrow-with-inspector.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "23-narrow-with-inspector",
+      "page_index": 0,
+      "paper_margins_points": [
+        0.12499307459722786,
+        8,
+        0.12499307459722786,
+        -651.5000179245717
+      ],
+      "paper_points": [
+        0.12499307459722786,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1280,
+      "pixel_width": 1920,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            602,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "select",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 292,
+        "fill_tool": "signature",
+        "open_rows": [
+          "fillAndSign"
+        ],
+        "row_content_points": [
+          251,
+          90,
+          417,
+          46
+        ],
+        "row_slot_points": [
+          251,
+          90,
+          417,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        404,
+        550
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        960,
+        640
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        922.5,
+        710
+      ],
+      "file": "24-inspector-window-restored.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "24-inspector-window-restored",
+      "page_index": 0,
+      "paper_margins_points": [
+        0.12499307459722786,
+        8,
+        0.12499307459722786,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        0.12499307459722786,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            100,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            1745,
+            286
+          ],
+          "rgb": [
+            19,
+            48,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "select",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 292,
+        "fill_tool": "signature",
+        "open_rows": [
+          "fillAndSign"
+        ],
+        "row_content_points": [
+          0,
+          90,
+          908,
+          46
+        ],
+        "row_slot_points": [
+          0,
+          90,
+          908,
+          46
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        895,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "active_tab_index": 0,
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "canvas_points": [
+        0,
+        90,
+        1187,
+        710
+      ],
+      "file": "25-rows-closed-restored.png",
+      "fullscreen": false,
+      "gpu_marker_visible": true,
+      "id": "25-rows-closed-restored",
+      "page_index": 0,
+      "paper_margins_points": [
+        132.37499307459723,
+        8,
+        132.3749930745971,
+        -491.5000179245717
+      ],
+      "paper_points": [
+        132.37499307459723,
+        8,
+        922.2500138508055,
+        1193.5000179245717
+      ],
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "registration_markers": [
+        {
+          "expected_rgb": [
+            255,
+            0,
+            0
+          ],
+          "match": true,
+          "name": "red",
+          "pixel": [
+            364,
+            286
+          ],
+          "rgb": [
+            255,
+            0,
+            0
+          ]
+        },
+        {
+          "expected_rgb": [
+            0,
+            51,
+            255
+          ],
+          "match": true,
+          "name": "blue",
+          "pixel": [
+            2010,
+            286
+          ],
+          "rgb": [
+            19,
+            48,
+            255
+          ]
+        }
+      ],
+      "required_registration_marker": "red",
+      "tab_count": 1,
+      "tool_chrome": {
+        "annotation_tool": "select",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 0,
+        "fill_tool": null,
+        "open_rows": [],
+        "row_slot_points": [
+          0,
+          90,
+          1200,
+          0
+        ]
+      },
+      "verification": "current-window-compositor-pixels",
+      "visible_canvas_local_points": [
+        0,
+        0,
+        1187,
+        710
+      ],
+      "visible_paper_count": 1,
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "file": "26-home-no-document.png",
+      "id": "26-home-no-document",
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "tab_count": 0,
+      "tool_chrome": {
+        "annotation_tool": "select",
+        "assistant_visible": false,
+        "content_tool": "select",
+        "edit_inspector_width": 0,
+        "fill_inspector_width": 0,
+        "fill_tool": null,
+        "open_rows": [],
+        "row_slot_points": [
+          0,
+          90,
+          1200,
+          0
+        ]
+      },
+      "verification": "stable-native-home-with-zero-page-quads",
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    }
+  ],
+  "environment": {
+    "appearance": "light",
+    "capture": "ScreenCaptureKit.currentProcess.ownWindowInDisplay",
+    "capture_color_space": "sRGB; 8-bit BGRA; SDR",
+    "date_preview_clock": "2000-01-01T12:00:00Z; UTC",
+    "display_backing_pixels": [
+      5120,
+      2880
+    ],
+    "display_mode_points": [
+      2560,
+      1440
+    ],
+    "fixture_sha256": "e042aa2d03b3bff768e34ef93b2a1577632a7022878ef917dc46c386b394bbfe",
+    "gpu": "Apple M4 Pro",
+    "hardware_model": "Mac16,11",
+    "language": "en",
+    "locale": "en_US",
+    "os": "Version 15.8.3 (Build 24H241)",
+    "os_build": "24H241",
+    "paper_mode": "original",
+    "pdfium_sha256": "713947839b0402a1215cb160845a6217f46580ee8f8de5c63f524ee6b5496a65",
+    "screen_points": [
+      2560,
+      1440
+    ],
+    "swift": "Apple Swift version 6.2.4 (swiftlang-6.2.4.1.4 clang-1700.6.4.2)\nTarget: arm64-apple-macosx15.0",
+    "system_font": ".AppleSystemUIFont"
+  },
+  "mutation": null,
+  "schema_version": 1,
+  "status": "candidate",
+  "suite": "toolbar-inspectors"
+}

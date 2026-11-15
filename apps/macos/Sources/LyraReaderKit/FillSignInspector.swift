@@ -167,7 +167,7 @@ struct FillSignInspector: View {
 
     private var dateOptions: some View {
         ReaderPanelSection(title: "Date") {
-            Text(state.fillSignDateFormat.string())
+            Text(datePreview)
                 .font(.system(size: 22, weight: .medium))
                 .frame(maxWidth: .infinity, minHeight: 54)
                 .background(LyraReaderTheme.fieldBg, in: RoundedRectangle(cornerRadius: 6))
@@ -195,6 +195,15 @@ struct FillSignInspector: View {
             }
             placementHint("Click the page to place the date")
         }
+    }
+
+    private var datePreview: String {
+        #if DEBUG
+        if let clock = FillSignDateFormat.previewClockOverride {
+            return state.fillSignDateFormat.string(for: clock.date, timeZone: clock.timeZone)
+        }
+        #endif
+        return state.fillSignDateFormat.string()
     }
 
     // MARK: - Checkmark / Cross

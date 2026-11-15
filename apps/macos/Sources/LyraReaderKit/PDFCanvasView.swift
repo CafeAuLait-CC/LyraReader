@@ -644,6 +644,15 @@ public final class MetalCanvasView: NSView {
     private var framesRendered: UInt64 = 0
     /// Native regression checks observe successful submissions without the HUD's throttle.
     package var submittedFrameCount: UInt64 { framesRendered }
+    #if DEBUG
+    /// Correlate the last accepted submission, rather than a later occluded retry, with the
+    /// presentation callback. Its transform must still match before a visual capture can use it.
+    package private(set) var visualSubmittedFrameIndex: UInt64 = 0
+    package private(set) var visualSubmittedViewportSize = CGSize.zero
+    package private(set) var visualSubmittedStamp = PerfViewportStamp()
+    package private(set) var visualSubmittedZoom: CGFloat = 1
+    package private(set) var visualSubmittedScrollYPt: CGFloat = 0
+    #endif
     /// Page quads in the most recent frame the GPU accepted (`nil` before the first one).
     ///
     /// `0` is a real, observable frame: the background with nothing drawn over it. A check can
@@ -680,6 +689,8 @@ public final class MetalCanvasView: NSView {
     /// Whether this view's layer is attached to an engine surface. Checks use it where they
     /// cannot ask for a presented frame (an occluded window never presents).
     package var hasAttachedSurface: Bool { surfaceId != 0 }
+    /// Correlates a visual check with this surface, including after SwiftUI replaces the view.
+    package var presentationSurfaceID: UInt64 { surfaceId }
     private let traceFrames = ProcessInfo.processInfo.environment["LYRA_READER_SCROLL_TRACE_SECONDS"] != nil
     private let traceScheduling = ProcessInfo.processInfo.environment["LYRA_READER_SCROLL_TRACE_SCHEDULING"] == "1"
 
@@ -2132,6 +2143,13 @@ public final class MetalCanvasView: NSView {
         }
 
         framesRendered += 1
+        #if DEBUG
+        visualSubmittedFrameIndex = frameAttemptCount
+        visualSubmittedViewportSize = bounds.size
+        visualSubmittedStamp = perfStamp
+        visualSubmittedZoom = zoom
+        visualSubmittedScrollYPt = scrollYPt
+        #endif
         // Recorded only for frames the surface actually presented, so it pairs with
         // `submittedFrameCount`: together they say "a new frame reached the screen, and it had
         // this many page quads".

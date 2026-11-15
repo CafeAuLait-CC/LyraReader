@@ -1,0 +1,30 @@
+{
+  "approved": true,
+  "capture_manifest_sha256": "41576252c60d2b7c53807953841be8f3bff60fb98b57aaf147985d4b43058801",
+  "channel_tolerance": 1,
+  "provisional": false,
+  "review_basis": "User accepted all checkpoints, the macOS 15.8.3 environment and this profile-specific comparison policy in the hash-bound four-batch visual refresh review.",
+  "review_date": "2026-11-12",
+  "review_source_sha256": "97a4dbba4352d40619e14165596b149f290eddd417824a96e226959d8916eb25",
+  "reviewed_product_commit": "c81e97d07d66e25527fb1e0be25a1f90bd6d1ebe",
+  "schema_version": 1,
+  "sha256": {
+    "01-default-100.png": "5bcf00145ee1c86f58507bee6e424cac3fe05d3f45bcbd962ab929fdda673d96",
+    "02-fixed-100.png": "5bcf00145ee1c86f58507bee6e424cac3fe05d3f45bcbd962ab929fdda673d96",
+    "03-sidebar-open.png": "74628badbd7cfa44051b9b853e24dcc87f601b6adcb6f4a3082fdd29c348e986",
+    "04-sidebar-restored.png": "5bcf00145ee1c86f58507bee6e424cac3fe05d3f45bcbd962ab929fdda673d96",
+    "05-resize-small.png": "aa73b13bedcef670ac1c92567c2c923061d73c5ac600933363442138382524cc",
+    "06-resize-restored.png": "252c3d71f1b822ca61c8ad99c56e7dfa5e201521e7c80a1f4f11088c0b500387",
+    "07-fit-width.png": "7c0f80731ab8a84493ee08aa851061ca26b07fafb9818c91a1c5f0eca23560f7",
+    "08-zoom-in.png": "97015db61e011e28745320ac83bed9c85a2d3cd88ada7e8d184e1b027e8c456a",
+    "09-zoom-restored.png": "252c3d71f1b822ca61c8ad99c56e7dfa5e201521e7c80a1f4f11088c0b500387",
+    "10-fullscreen.png": "f2071ff78e2c73b81c61db9b045d3b1a5980d3d0ad88d2123eb52c4bcd4941ec",
+    "11-fullscreen-restored.png": "9edeca796b13f1a1218b5778594f87e8ceaa20ea72a90d88b8c9d2132943d255",
+    "12-fit-page-window.png": "c2e10263f9cfa2646f675a039d57215c5dc28dd4e743d9a220dedd3e298bd035",
+    "13-fit-page-first.png": "35a0546a5eac995455f77b3178e108abcf8f3d3cdb5ac8502f97e49469cf94d4",
+    "14-fit-page-middle.png": "4a4fe36f421fe8b2ec47baff59862212efb8cfd56f4b2e5137ffa307a6678c70",
+    "15-fit-page-last.png": "1b9d3248d4db9a19722d5174c63048578a558cf4bb7c5abb81454a27c613cbe7",
+    "16-document-end-100.png": "b0d14981ccd79311024ad011bb1db226a7c789dffd91eb600232db5d8a2184c5"
+  },
+  "source_capture_manifest_sha256": "6aa1a22f4746632559314d8e10b283411b325708a9d4dc7701746c2e4e814def"
+}

@@ -1,0 +1,185 @@
+{
+  "captures": [
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "file": "01-home-empty.png",
+      "id": "01-home-empty",
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "tab_count": 0,
+      "verification": "stable-native-home-with-zero-page-quads",
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "file": "02-one-tab.png",
+      "id": "02-one-tab",
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "tab_count": 1,
+      "verification": "current-window-compositor-pixels",
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "file": "03-three-tabs.png",
+      "id": "03-three-tabs",
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "tab_count": 3,
+      "verification": "current-window-compositor-pixels",
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "file": "04-eight-tabs.png",
+      "id": "04-eight-tabs",
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "tab_count": 8,
+      "verification": "current-window-compositor-pixels",
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "file": "05-first-tab-active.png",
+      "id": "05-first-tab-active",
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "tab_count": 8,
+      "verification": "current-window-compositor-pixels",
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "file": "06-narrow-eight-tabs.png",
+      "id": "06-narrow-eight-tabs",
+      "pixel_height": 1280,
+      "pixel_width": 1920,
+      "tab_count": 8,
+      "verification": "current-window-compositor-pixels",
+      "window_points": [
+        960,
+        640
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "file": "07-window-restored.png",
+      "id": "07-window-restored",
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "tab_count": 8,
+      "verification": "current-window-compositor-pixels",
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "file": "08-close-active-tab.png",
+      "id": "08-close-active-tab",
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "tab_count": 7,
+      "verification": "current-window-compositor-pixels",
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "file": "09-last-tab.png",
+      "id": "09-last-tab",
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "tab_count": 1,
+      "verification": "current-window-compositor-pixels",
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    },
+    {
+      "backing_scale": 2,
+      "calibration": 1.5069444670764796,
+      "file": "10-return-home.png",
+      "id": "10-return-home",
+      "pixel_height": 1600,
+      "pixel_width": 2400,
+      "tab_count": 0,
+      "verification": "stable-native-home-with-zero-page-quads",
+      "window_points": [
+        1200,
+        800
+      ],
+      "zoom_percent": 100
+    }
+  ],
+  "environment": {
+    "appearance": "dark",
+    "capture": "ScreenCaptureKit.currentProcess.ownWindowInDisplay",
+    "display_backing_pixels": [
+      5120,
+      2880
+    ],
+    "display_mode_points": [
+      2560,
+      1440
+    ],
+    "fixture_sha256": "96581341cc51cdf14a38d809030933f23a7b3261c3780353ad9f49f170444535",
+    "gpu": "Apple M4 Pro",
+    "hardware_model": "Mac16,11",
+    "language": "en",
+    "locale": "en_US",
+    "os": "Version 15.8.3 (Build 24H241)",
+    "os_build": "24H241",
+    "paper_mode": "night",
+    "pdfium_sha256": "713947839b0402a1215cb160845a6217f46580ee8f8de5c63f524ee6b5496a65",
+    "screen_points": [
+      2560,
+      1440
+    ],
+    "swift": "Apple Swift version 6.2.4 (swiftlang-6.2.4.1.4 clang-1700.6.4.2)\nTarget: arm64-apple-macosx15.0",
+    "system_font": ".AppleSystemUIFont"
+  },
+  "mutation": null,
+  "schema_version": 1,
+  "status": "candidate",
+  "suite": "reader-shell"
+}
