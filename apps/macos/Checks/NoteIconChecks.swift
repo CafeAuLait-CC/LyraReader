@@ -30,15 +30,29 @@ extension ReaderChecks {
         let normal = render(), hovered = render(.hovered), active = render(.active), dark = render(.normal, .night)
         let reference = root.appendingPathComponent("tests/fixtures/note-icon-reference.png")
         let supplied = CGImageSourceCreateImageAtIndex(CGImageSourceCreateWithURL(reference as CFURL, nil)!, 0, nil)!
-        let error = zip(rgba(cgImage(normal)), rgba(supplied)).reduce(0.0) { $0 + abs(Double($1.0) - Double($1.1)) }
-            / Double(48 * 48 * 4)
+        let rendered = rgba(cgImage(normal)), referencePixels = rgba(supplied)
+        let error = stride(from: 3, to: rendered.count, by: 4).reduce(0.0) {
+            $0 + abs(Double(rendered[$1]) - Double(referencePixels[$1]))
+        } / Double(48 * 48)
         if let directory = ProcessInfo.processInfo.environment["LYRA_READER_CHECK_SNAPSHOT_DIR"] {
             let folder = URL(fileURLWithPath: directory)
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             try NSBitmapImageRep(cgImage: cgImage(normal)).representation(using: .png, properties: [:])!
                 .write(to: folder.appendingPathComponent("note-icon-default.png"))
         }
-        require(error < 5, "native folded-paper artwork matches the supplied 2x PNG (mean error \(error))")
+        require(error < 5, "the recolored note retains the supplied 2x silhouette (mean alpha error \(error))")
+        for (image, background, foreground) in [
+            (normal, [255, 240, 230], [138, 76, 38]),
+            (dark, [70, 49, 38], [243, 189, 148]),
+        ] {
+            let pixels = rgba(cgImage(image))
+            let surface = (27 * 48 + 12) * 4
+            require(Array(pixels[surface..<surface + 3]) == background.map(UInt8.init),
+                    "the default note surface uses the Lyra note background")
+            require(stride(from: 0, to: pixels.count, by: 4).contains { offset in
+                Array(pixels[offset..<offset + 3]) == foreground.map(UInt8.init) && pixels[offset + 3] == 255
+            }, "the default note lines use the Lyra note foreground")
+        }
         require(normal.bgra != hovered.bgra && hovered.bgra != active.bgra && normal.bgra != dark.bgra,
                 "default, hovered, open and dark-paper markers have distinct palettes")
         let masks = [normal, hovered, active, dark].map { image in
@@ -58,7 +72,7 @@ extension ReaderChecks {
                 require(pinkIcon.bgra != orangeIcon.bgra,
                         "inline note colours follow their highlights in every paper and interaction state")
                 require(render(state, paper).bgra == render(state, paper, tint: orange).bgra,
-                        "ordinary stickers keep their supplied palette regardless of highlight colour")
+                        "ordinary stickers keep their note palette regardless of highlight colour")
                 let alpha = stride(from: 3, to: pinkIcon.bgra.count, by: 4)
                 require(alpha.allSatisfy { pinkIcon.bgra[$0] == orangeIcon.bgra[$0] },
                         "highlight colours preserve the folded-paper silhouette")
@@ -137,6 +151,6 @@ extension ReaderChecks {
         require(state.commitTextEditing(), "the reopened draft closes cleanly")
         let finalBytes = try Data(contentsOf: file)
         require(finalBytes == original, "marker states never rewrite source annotation colours or geometry")
-        print("PASS: note icons match supplied artwork and retain stable hover/open/paper behavior")
+        print("PASS: note icons use Lyra note colors and retain stable artwork/hover/open/paper behavior")
     }
 }
