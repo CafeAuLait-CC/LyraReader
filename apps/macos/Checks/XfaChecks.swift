@@ -4,7 +4,7 @@ import LyraReaderKit
 
 /// Read-only XFA support against the real sample.
 ///
-/// The form is the user's `~/Downloads/xml_form.pdf`; it is copied to a scratch directory and
+/// The form is the local corpus's `xfa/xml_form.pdf`; it is copied to a scratch directory and
 /// never written in place. When the sample is absent the checks print SKIP and return: it is
 /// not a repository fixture and must not be committed.
 ///
@@ -21,10 +21,15 @@ import LyraReaderKit
 extension ReaderChecks {
     @MainActor static func xfaChecks(root: URL) async throws {
         let fileManager = FileManager.default
-        let home = fileManager.homeDirectoryForCurrentUser
-        let sample = home.appendingPathComponent("Downloads/xml_form.pdf")
+        let samples: URL
+        if let configured = ProcessInfo.processInfo.environment["LYRA_READER_PDF_SAMPLES"] {
+            samples = URL(fileURLWithPath: configured, isDirectory: true)
+        } else {
+            samples = root.appendingPathComponent("pdf-samples", isDirectory: true)
+        }
+        let sample = samples.appendingPathComponent("xfa/xml_form.pdf")
         guard fileManager.fileExists(atPath: sample.path) else {
-            print("SKIP: ~/Downloads/xml_form.pdf is not present; XFA checks need the local sample")
+            print("SKIP: xfa/xml_form.pdf is not present in the local PDF sample directory")
             return
         }
         let scratch = fileManager.temporaryDirectory
