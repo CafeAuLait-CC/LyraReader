@@ -65,9 +65,11 @@ struct AIRegionCardView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            Rectangle().fill(LyraReaderTheme.accentBorder.opacity(0.18)).frame(height: 1).padding(.horizontal, 18)
+            Rectangle().fill(parchment ? LyraReaderTheme.accentBorder.opacity(0.18) : LyraReaderTheme.separator)
+                .frame(height: 1).padding(.horizontal, 18)
             transcript
-            Rectangle().fill(LyraReaderTheme.accentBorder.opacity(0.18)).frame(height: 1).padding(.horizontal, 18)
+            Rectangle().fill(parchment ? LyraReaderTheme.accentBorder.opacity(0.18) : LyraReaderTheme.separator)
+                .frame(height: 1).padding(.horizontal, 18)
             composer.background(GeometryReader { p in
                 Color.clear.preference(key: AIRegionComposerHeightKey.self, value: p.size.height)
             })
@@ -76,7 +78,7 @@ struct AIRegionCardView: View {
         .foregroundStyle(LyraReaderTheme.textPrimary)
         .background {
             if parchment { RegionNotePaper() }
-            else { RoundedRectangle(cornerRadius: 10).fill(LyraReaderTheme.regionWindowBg)
+            else { RoundedRectangle(cornerRadius: 10).fill(LyraReaderTheme.raisedBg)
                 .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(LyraReaderTheme.border))
                 .shadow(color: .black.opacity(0.06), radius: 4, y: 2) }
         }
@@ -288,11 +290,21 @@ struct AIRegionCardView: View {
     private var composer: some View {
         HStack(alignment: .bottom, spacing: 9) {
             TextField(card.allTurns.isEmpty ? "Ask about this region…" : "Ask a follow-up…",
-                      text: $card.question, axis: .vertical)
+                      text: $card.question,
+                      prompt: parchment ? nil : Text(""), axis: .vertical)
                 .textFieldStyle(.plain).font(.system(size: 13)).lineLimit(1...3)
                 .focused($questionFocused).onSubmit { send() }
                 .disabled(card.isBusy || card.notesBusy)
-                .padding(9).background(LyraReaderTheme.raisedBg.opacity(parchment ? 0.45 : 1), in: RoundedRectangle(cornerRadius: parchment ? 3 : 7))
+                .overlay(alignment: .leading) {
+                    // Keep the Window token instead of the native field's placeholder tint.
+                    if !parchment && card.question.isEmpty {
+                        Text(card.allTurns.isEmpty ? "Ask about this region…" : "Ask a follow-up…")
+                            .font(.system(size: 13)).foregroundStyle(LyraReaderTheme.textPlaceholder)
+                            .allowsHitTesting(false).accessibilityHidden(true)
+                    }
+                }
+                .padding(9).background(parchment ? LyraReaderTheme.raisedBg.opacity(0.45) : LyraReaderTheme.fieldBg,
+                                       in: RoundedRectangle(cornerRadius: parchment ? 3 : 7))
                 .overlay { if !parchment { RoundedRectangle(cornerRadius: 7).strokeBorder(questionFocused ? LyraReaderTheme.focusRing : LyraReaderTheme.controlBorder) } }
                 .overlay(alignment: .bottom) {
                     Rectangle().fill(questionFocused ? LyraReaderTheme.focusRing : LyraReaderTheme.controlBorder)
