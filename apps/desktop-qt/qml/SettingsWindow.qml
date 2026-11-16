@@ -9,6 +9,11 @@ ApplicationWindow {
     property string initialPaper: ""
     property bool appearanceEdited: false
     property bool paperPresetEdited: false
+    property string initialRegionStyle: ""
+    property bool regionStyleEdited: false
+    property bool initialReduceMotion: false
+    property int initialGap: 0
+    property var initialAiDraft: ({})
     objectName:"settingsWindow"
     required property var app
     readonly property var colors:app.colors
@@ -23,6 +28,8 @@ ApplicationWindow {
         if(visible){requestActivate();return;}
         initialAppearance=app.appearance;initialPaper=app.paperAppearance;
         appearanceEdited=false;paperPresetEdited=false;
+        initialRegionStyle=app.regionConversationStyle;regionStyleEdited=false;
+        regionStyle.currentIndex=app.regionConversationStyleIndex(initialRegionStyle);
         appearance.currentIndex=["light","dark","system"].indexOf(app.appearance);
         reduceMotion.checked=app.reduceMotion;
         paper.currentIndex=app.readingPresetIndex(app.paperAppearance);
@@ -31,12 +38,17 @@ ApplicationWindow {
         imageInput.checked=!!app.aiSettings.imageInput;
         reasoning.currentIndex=Math.max(0,reasoning.model.indexOf(app.aiSettings.reasoningMode || "default"));
         encoding.currentIndex=Math.max(0,encoding.model.indexOf(app.aiSettings.reasoningEncoding || "none"));
+        initialReduceMotion=reduceMotion.checked;initialGap=gap.value;initialAiDraft=aiDraft();
         apiKey.clear();
         const saved=app.session ? app.session.preference("auxiliarySettingsGeometry",{}) : ({});
         if(!policy.prepare(settings,app,saved,560,650)){app.operationStatus=qsTr("The Settings window could not find an available display.");return;}
         show();requestActivate();
     }
     function openAudit(){open();if(visible)auditDialog.open();}
+    function aiDraft() {
+        return {baseUrl:baseUrl.text,model:modelName.text,reasoningMode:reasoning.currentText,
+            reasoningEncoding:encoding.currentText,imageInput:imageInput.checked};
+    }
     function save() {
         const selectedPaper=app.readingPresets[paper.currentIndex];
         const selectedAppearance=["light","dark","system"][appearance.currentIndex];
@@ -44,18 +56,26 @@ ApplicationWindow {
                 && !app.applyReadingPreset(selectedPaper.id))return;
         if(selectedAppearance && (appearanceEdited || selectedAppearance!==initialAppearance))
             app.appearance=selectedAppearance;
-        app.reduceMotion=reduceMotion.checked;
-        app.pageGap = gap.value;
-        app.setPageLayout(app.layoutMode);
-        app.aiSettings = {
-                baseUrl: baseUrl.text,
-                model: modelName.text,
-                reasoningMode: reasoning.currentText,
-                reasoningEncoding: encoding.currentText,
-                imageInput: imageInput.checked
-        };
-        if (app.session) {
-            app.session.setPreference("ai", app.aiSettings);
+        const selectedRegionStyle=app.regionConversationStyles[regionStyle.currentIndex];
+        if(selectedRegionStyle && (regionStyleEdited || selectedRegionStyle.id!==initialRegionStyle)
+                && !app.applyRegionConversationStyle(selectedRegionStyle.id))return;
+        if(reduceMotion.checked!==initialReduceMotion)app.reduceMotion=reduceMotion.checked;
+        if(gap.value!==initialGap && gap.value!==app.pageGap) {
+            app.pageGap=gap.value;
+            app.setPageLayout(app.layoutMode);
+        }
+        const draft=aiDraft(),nextAi=Object.assign({},app.aiSettings || {});
+        let aiChanged=false;
+        for(const key of Object.keys(draft)) {
+            if(draft[key]!==initialAiDraft[key] && draft[key]!==nextAi[key]) {
+                nextAi[key]=draft[key];aiChanged=true;
+            }
+        }
+        // An appearance-only save must retain prepared requests and unknown fields.
+        // An explicit credential change still retires pending credential reads/plans.
+        if(aiChanged || apiKey.text.length) {
+            app.aiSettings=nextAi;
+            if(app.session)app.session.setPreference("ai",app.aiSettings);
         }
         if (apiKey.text.length)
             app.saveAiCredential(baseUrl.text, apiKey.text);
@@ -118,6 +138,20 @@ ApplicationWindow {
                     text:qsTr("Presets choose a matching interface theme; you can adjust Appearance independently.")
                     color:settings.colors.textSecondary
                     font.pixelSize:11
+                }
+                Label {text:qsTr("Region conversations")}
+                ComboBox {
+                    id:regionStyle;objectName:"settingsRegionConversationStyle"
+                    Layout.fillWidth:true
+                    model:app.regionConversationStyles;textRole:"title"
+                    currentIndex:app.regionConversationStyleIndex(app.regionConversationStyle)
+                    displayText:currentIndex<0 ? qsTr("Unrecognized saved conversation style") : currentText
+                    Accessible.name:qsTr("Region conversation style")
+                    onActivated:settings.regionStyleEdited=true
+                }
+                Label {
+                    Layout.fillWidth:true;wrapMode:Text.Wrap;font.pixelSize:11;color:settings.colors.textSecondary
+                    text:qsTr("Choose the look of conversations within the page. Your conversation stays the same.")
                 }
                 RowLayout {
                     Label {

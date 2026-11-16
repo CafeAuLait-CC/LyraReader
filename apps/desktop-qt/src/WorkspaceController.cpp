@@ -23,6 +23,7 @@ namespace {
 QList<WorkspaceController *> &workspaces() {static QList<WorkspaceController *> all;return all;}
 QVariantMap &readingPresetState() {static QVariantMap state;return state;}
 qulonglong &readingPresetRevision() {static qulonglong revision=0;return revision;}
+qulonglong &regionStyleRevision() {static qulonglong revision=0;return revision;}
 QVariantList normalizedRecents(const QVariantList &entries) {
     QVariantList result;QSet<QString> seen;
     for(const auto &value:entries) {
@@ -378,6 +379,28 @@ bool WorkspaceController::applyReadingPreset(const QString &id) {
     for(const auto &workspace:recipients) {
         if(revision!=readingPresetRevision())break;
         if(workspace)emit workspace->readingPresetChanged();
+    }
+    return true;
+}
+QVariantList WorkspaceController::regionConversationStyles() const {
+    return {QVariantMap{{"id","window"},{"title",tr("Window")}},
+            QVariantMap{{"id","parchment"},{"title",tr("Parchment")}}};
+}
+QString WorkspaceController::regionConversationStyle() const {
+    return preference(QStringLiteral("lyra.regionConversationStyle"),QStringLiteral("parchment")).toString();
+}
+bool WorkspaceController::applyRegionConversationStyle(const QString &id) {
+    bool supported=false;
+    for(const auto &value:regionConversationStyles())if(value.toMap().value("id").toString()==id){supported=true;break;}
+    if(!supported)return false;
+    setPreference(QStringLiteral("lyra.regionConversationStyle"),id);
+    const auto revision=++regionStyleRevision();
+    QList<QPointer<WorkspaceController>> recipients;
+    for(auto *workspace:workspaces())recipients.append(workspace);
+    // Direct UI observers may close a workspace or choose a newer style.
+    for(const auto &workspace:recipients) {
+        if(revision!=regionStyleRevision())break;
+        if(workspace)emit workspace->regionConversationStyleChanged();
     }
     return true;
 }

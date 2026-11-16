@@ -357,6 +357,19 @@ ApplicationWindow {
     property var pendingPageSelection: []
     property string paperAppearance: session ? session.preference("paper", "original") : "original"
     readonly property var readingPresets: session ? session.readingPresets : []
+    readonly property var regionConversationStyles: session ? session.regionConversationStyles : []
+    readonly property string regionConversationStyle: session ? session.regionConversationStyle : "parchment"
+    function regionConversationStyleIndex(id) {
+        for(let i=0;i<regionConversationStyles.length;++i)if(regionConversationStyles[i].id===id)return i;
+        return -1;
+    }
+    function applyRegionConversationStyle(id) {
+        if(!session || !session.applyRegionConversationStyle(id)) {
+            operationStatus=qsTr("The conversation style could not be applied.");
+            return false;
+        }
+        return true;
+    }
     function readingPresetIndex(id) {
         for(let i=0;i<readingPresets.length;++i)if(readingPresets[i].id===id)return i;
         return -1;

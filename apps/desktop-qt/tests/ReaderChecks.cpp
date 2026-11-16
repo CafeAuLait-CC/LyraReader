@@ -79,7 +79,7 @@ class ReadingPreferenceGuard final {
 public:
     ReadingPreferenceGuard() {
         QSettings settings;
-        for(const auto &key:{"appearance","paper","ai","reduceMotion","auxiliarySettingsGeometry"}) {
+        for(const auto &key:{"appearance","paper","ai","reduceMotion","auxiliarySettingsGeometry","lyra.regionConversationStyle"}) {
             const auto full=QStringLiteral("reader/preferences/")+QLatin1String(key);
             m_values.insert(full,{settings.contains(full),settings.value(full)});
         }
@@ -878,6 +878,81 @@ private slots:
         auto owner=std::make_unique<WorkspaceController>();WorkspaceController tail;QSignalSpy tailDelivered(&tail,SIGNAL(readingPresetChanged()));QVERIFY(tailDelivered.isValid());
         ReadingPresetObserver closing;closing.callback=[&]{owner.reset();};QVERIFY(connect(owner.get(),SIGNAL(readingPresetChanged()),&closing,SLOT(notify())));
         QVERIFY(QMetaObject::invokeMethod(owner.get(),"applyReadingPreset",Q_RETURN_ARG(bool,ok),Q_ARG(QString,"nightWhite")));QVERIFY(ok);QVERIFY(!owner);QCOMPARE(tailDelivered.size(),1);QCOMPARE(tail.property("readingPresetSnapshot").toMap().value("paper").toString(),QString("nightWhite"));
+    }
+    void regionConversationStylesKeepTheirDraftsAndGuardReentrantWindowOwners() {
+        ReadingPreferenceGuard preferences;NativeCorpus::Viewer view,other;QVERIFY(view.window && other.window);
+        QCOMPARE(view.workspace.property("regionConversationStyles").toList().size(),2);
+        const auto apply=[](WorkspaceController &workspace,const QString &id){bool ok=false;return QMetaObject::invokeMethod(&workspace,"applyRegionConversationStyle",Q_RETURN_ARG(bool,ok),Q_ARG(QString,id)) && ok;};
+        QVERIFY(apply(view.workspace,"parchment"));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"showSettings"));auto *settings=view.window->findChild<QQuickWindow *>("settingsWindow");QVERIFY(settings);QTRY_VERIFY(settings->isVisible());
+        auto *style=settings->findChild<QObject *>("settingsRegionConversationStyle");QVERIFY(style);QCOMPARE(style->property("count").toInt(),2);QCOMPARE(style->property("currentIndex").toInt(),1);
+        style->setProperty("currentIndex",0);QVERIFY(QMetaObject::invokeMethod(style,"activated",Q_ARG(int,0)));QVERIFY(settings->close());
+        QCOMPARE(other.window->property("regionConversationStyle").toString(),QString("parchment"));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"showSettings"));QTRY_VERIFY(settings->isVisible());style->setProperty("currentIndex",0);QVERIFY(QMetaObject::invokeMethod(style,"activated",Q_ARG(int,0)));QVERIFY(QMetaObject::invokeMethod(settings,"save"));QTRY_VERIFY(!settings->isVisible());
+        for(auto *window:{view.window,other.window})QCOMPARE(window->property("regionConversationStyle").toString(),QString("window"));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"showSettings"));QTRY_VERIFY(settings->isVisible());QVERIFY(apply(other.workspace,"parchment"));QVERIFY(QMetaObject::invokeMethod(settings,"save"));QTRY_VERIFY(!settings->isVisible());
+        QCOMPARE(view.workspace.preference("lyra.regionConversationStyle").toString(),QString("parchment"));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"showSettings"));QTRY_VERIFY(settings->isVisible());view.workspace.setPreference("lyra.regionConversationStyle","future-style");QVERIFY(QMetaObject::invokeMethod(settings,"save"));QTRY_VERIFY(!settings->isVisible());QCOMPARE(view.workspace.preference("lyra.regionConversationStyle").toString(),QString("future-style"));
+        {NativeCorpus::Viewer reopened;QVERIFY(reopened.window);QCOMPARE(reopened.window->property("regionConversationStyle").toString(),QString("future-style"));QVERIFY(QMetaObject::invokeMethod(reopened.window,"showSettings"));auto *unknown=reopened.window->findChild<QQuickWindow *>("settingsWindow");QVERIFY(unknown);QTRY_VERIFY(unknown->isVisible());auto *choice=unknown->findChild<QObject *>("settingsRegionConversationStyle");QVERIFY(choice);QCOMPARE(choice->property("currentIndex").toInt(),-1);QVERIFY(choice->property("displayText").toString().contains("Unrecognized"));QVERIFY(QMetaObject::invokeMethod(unknown,"save"));QCOMPARE(view.workspace.preference("lyra.regionConversationStyle").toString(),QString("future-style"));}
+        QVERIFY(!apply(view.workspace,"unsupported"));QCOMPARE(view.workspace.preference("lyra.regionConversationStyle").toString(),QString("future-style"));
+        WorkspaceController first;auto middle=std::make_unique<WorkspaceController>();WorkspaceController last;
+        ReadingPresetObserver observer;bool replaced=false;observer.callback=[&]{if(replaced)return;replaced=true;middle.reset();QVERIFY(apply(first,"window"));};
+        QVERIFY(connect(&first,SIGNAL(regionConversationStyleChanged()),&observer,SLOT(notify())));QSignalSpy delivered(&last,SIGNAL(regionConversationStyleChanged()));QVERIFY(delivered.isValid());
+        QVERIFY(apply(first,"parchment"));QVERIFY(replaced);QVERIFY(!middle);QCOMPARE(delivered.size(),1);QCOMPARE(last.property("regionConversationStyle").toString(),QString("window"));
+        for(auto *window:{view.window,other.window})QCOMPARE(window->property("regionConversationStyle").toString(),QString("window"));
+    }
+    void regionConversationStylesKeepTheirFrozenCaptureAndPreview_data() {
+        QTest::addColumn<QString>("appearance");QTest::addColumn<QString>("style");
+        for(const auto &appearance:{QString("light"),QString("dark")})for(const auto &style:{QString("window"),QString("parchment")})QTest::newRow(qPrintable(appearance+"-"+style))<<appearance<<style;
+    }
+    void regionConversationStylesKeepTheirFrozenCaptureAndPreview() {
+        QFETCH(QString,appearance);QFETCH(QString,style);ReadingPreferenceGuard preferences;
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;QCOMPARE(view.workspace.property("regionConversationStyles").toList().size(),2);
+        if(qEnvironmentVariableIsSet("LYRA_READER_REGION_STYLE_NARROW"))window->resize(700,600);
+        MockChatServer server;QVERIFY(server.listen());window->setProperty("appearance",appearance);window->setProperty("reduceMotion",true);window->setProperty("secondaryRow","lyra");
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic-region-style"},{"futureSetting","keep-region-style"}});
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("region-style.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));QFile file(path);QVERIFY(file.open(QIODevice::ReadOnly));const auto sourceBytes=file.readAll();file.close();
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==1 && !reader->pendingCommands());QVERIFY(settleReaderViewport(window));reader->requestText(0);QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",420},{"height",180}},1));QTRY_VERIFY_WITH_TIMEOUT(reader->aiRegion().contains("image_png"),10000);
+        auto *card=window->findChild<QQuickItem *>("aiRegionCard");QVERIFY(card);QVERIFY(QMetaObject::invokeMethod(card,"open"));QTRY_VERIFY_WITH_TIMEOUT(reader->aiRegionPaper().contains("rows") && !card->property("motionActive").toBool(),10000);
+        QTRY_VERIFY_WITH_TIMEOUT(card->y()>=-1 && card->y()+card->height()<=card->parentItem()->height()+1,10000);
+        auto *surface=window->findChild<QQuickItem *>("aiRegionCardSurface"),*question=window->findChild<QQuickItem *>("aiRegionQuestion"),*field=window->findChild<QQuickItem *>("aiRegionQuestionSurface");QVERIFY(surface && question && field);
+        auto *colors=window->property("colors").value<QObject *>();QVERIFY(colors);const auto apply=[&](const QString &id){bool ok=false;return QMetaObject::invokeMethod(&view.workspace,"applyRegionConversationStyle",Q_RETURN_ARG(bool,ok),Q_ARG(QString,id)) && ok;};
+        QVERIFY(apply(style=="window" ? "parchment" : "window"));reader->setAiRegionQuestion("Keep this synthetic preview unchanged");QVERIFY(QMetaObject::invokeMethod(card,"prepare"));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("plan").toMap().isEmpty() && !reader->pendingCommands(),10000);
+        QVERIFY(settleRasterWork(reader));const auto capture=reader->aiRegion();const auto plan=reader->aiState().value("plan");const auto generation=reader->documentGeneration(),rasters=reader->completedRasters();const auto image=reader->aiRegionImage();QSignalSpy imageChanges(reader,&ReaderController::aiRegionImageChanged);
+        const auto readConfig=[&]{const auto value=window->property("aiSettings");return value.metaType()==QMetaType::fromType<QJSValue>() ? value.value<QJSValue>().toVariant().toMap() : value.toMap();};const auto config=readConfig();
+        QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));auto *settings=window->findChild<QQuickWindow *>("settingsWindow");QVERIFY(settings);QTRY_VERIFY(settings->isVisible());auto *choice=settings->findChild<QObject *>("settingsRegionConversationStyle");QVERIFY(choice);const int index=style=="window" ? 0 : 1;choice->setProperty("currentIndex",index);QVERIFY(QMetaObject::invokeMethod(choice,"activated",Q_ARG(int,index)));QVERIFY(QMetaObject::invokeMethod(settings,"save"));QTRY_VERIFY(!settings->isVisible());
+        QVERIFY(card->property("opened").toBool());QCOMPARE(readConfig(),config);
+        auto *transcript=window->findChild<QQuickItem *>("aiRegionTranscript"),*crop=window->findChild<QQuickItem *>("aiRegionImage");QVERIFY(transcript && crop);QTRY_COMPARE(crop->property("status").toInt(),1);
+        const auto readable=[&]{const auto imageRect=crop->mapRectToItem(card,crop->boundingRect()),viewport=transcript->mapRectToItem(card,transcript->boundingRect());return imageRect.height()>=32 && imageRect.top()>=viewport.top()-1 && imageRect.bottom()<=viewport.bottom()+1;};
+        qInfo()<<"Region style actual viewport"<<window->size()<<"card"<<card->size()<<"transcript"<<transcript->height()<<"capture"<<crop->height();QVERIFY2(readable(),"The complete captured-area thumbnail must fit in the transcript viewport");
+        QCOMPARE(card->property("parchment").toBool(),style=="parchment");QCOMPARE(surface->property("color").value<QColor>(),colors->property(style=="window" ? "raisedBg" : "panelBg").value<QColor>());QCOMPARE(question->property("placeholderTextColor").value<QColor>(),colors->property("textPlaceholder").value<QColor>());
+        if(style=="window")QCOMPARE(field->property("color").value<QColor>(),colors->property("fieldBg").value<QColor>());
+        QTest::qWait(150);QCOMPARE(reader->aiRegion(),capture);QCOMPARE(reader->aiState().value("plan"),plan);QCOMPARE(reader->aiRegionImage(),image);QCOMPARE(imageChanges.size(),0);QCOMPARE(reader->documentGeneration(),generation);QCOMPARE(reader->completedRasters(),rasters);QCOMPARE(server.requests.size(),0);
+        question->forceActiveFocus();QTRY_VERIFY(question->hasActiveFocus());
+        if(style=="window")QCOMPARE(QQmlProperty(field,"border.color").read().value<QColor>(),colors->property("focusRing").value<QColor>());
+        const auto snapshots=qEnvironmentVariable("LYRA_READER_REGION_STYLE_EVIDENCE");if(!snapshots.isEmpty())QVERIFY(window->grabWindow().save(snapshots+"-"+appearance+"-"+style+"-question.png"));
+        reader->setAiRegionQuestion(QString{});QTRY_VERIFY(question->property("text").toString().isEmpty());if(!snapshots.isEmpty())QVERIFY(window->grabWindow().save(snapshots+"-"+appearance+"-"+style+"-empty.png"));
+        auto *closeButton=window->findChild<QQuickItem *>("closeAiRegionCard");QVERIFY(closeButton);closeButton->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(closeButton->hasActiveFocus());QVERIFY(!question->hasActiveFocus());if(style=="window")QCOMPARE(QQmlProperty(field,"border.color").read().value<QColor>(),colors->property("controlBorder").value<QColor>());
+        reader->setAiRegionQuestion("Preview before an explicit connection edit");QVERIFY(QMetaObject::invokeMethod(card,"prepare"));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("plan").toMap().isEmpty() && !reader->pendingCommands(),10000);
+        QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));QTRY_VERIFY(settings->isVisible());auto *baseUrl=settings->findChild<QObject *>("settingsBaseUrl");QVERIFY(baseUrl);baseUrl->setProperty("text",server.baseUrl()+"/changed");QVERIFY(QMetaObject::invokeMethod(settings,"save"));QTRY_VERIFY(reader->aiState().value("plan").toMap().isEmpty());QCOMPARE(readConfig().value("futureSetting").toString(),QString("keep-region-style"));
+        if(qEnvironmentVariableIsSet("LYRA_READER_REGION_STYLE_NARROW")) {
+            window->resize(640,440);QVERIFY(settleReaderViewport(window));QTRY_VERIFY_WITH_TIMEOUT(card->property("opened").toBool() && !card->property("motionActive").toBool() && card->y()>=-1 && card->y()+card->height()<=card->parentItem()->height()+1,10000);
+            QTRY_VERIFY2_WITH_TIMEOUT(readable(),"The complete capture must remain usable at the minimum window size",10000);
+            auto *prepare=window->findChild<QQuickItem *>("prepareAiRegion"),*send=window->findChild<QQuickItem *>("sendAiRegion");QVERIFY(prepare && send);auto *status=window->findChild<QQuickItem *>("aiRegionRequestStatus"),*persistence=window->findChild<QQuickItem *>("aiRegionPersistenceStatus");QVERIFY(status && persistence);for(auto *button:{prepare,send,status,persistence}){if(!button->isVisible())continue;const auto bounds=button->mapRectToItem(card,button->boundingRect());QVERIFY(bounds.top()>=0 && bounds.bottom()<=card->height()+1);}
+            qInfo()<<"Region style minimum actual viewport"<<window->size()<<"transcript"<<transcript->height()<<"capture"<<crop->height();if(!snapshots.isEmpty())QVERIFY(window->grabWindow().save(snapshots+"-"+appearance+"-"+style+"-minimum.png"));
+            auto *saveNote=window->findChild<QQuickItem *>("saveAiRegionNote");QVERIFY(saveNote);QTRY_VERIFY(saveNote->isEnabled());saveNote->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(saveNote->hasActiveFocus());
+            const auto actionVisible=[&]{const auto bounds=saveNote->mapRectToItem(transcript,saveNote->boundingRect());return bounds.top()>=-1 && bounds.bottom()<=transcript->height()+1;};QTRY_VERIFY2_WITH_TIMEOUT(actionVisible(),"Keyboard focus must reveal the auxiliary action inside the bounded transcript",5000);if(!snapshots.isEmpty())QVERIFY(window->grabWindow().save(snapshots+"-"+appearance+"-"+style+"-minimum-actions.png"));
+        }
+        QCOMPARE(server.requests.size(),0);QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),sourceBytes);
+    }
+    void settingsCredentialOnlyChangesStillInvalidatePendingReadsWithoutSystemVaultAccess() {
+        ReadingPreferenceGuard preferences;auto *vault=new FakeCredentialStore;QSignalSpy vaultEvents(vault,&CredentialStore::finished);WorkspaceController workspace(nullptr,vault);QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl","https://synthetic-settings.invalid/v1"},{"model","synthetic"},{"futureSetting","keep-on-key-change"}});
+        QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));auto *settings=window->findChild<QQuickWindow *>("settingsWindow");QVERIFY(settings);QTRY_VERIFY(settings->isVisible());auto *key=settings->findChild<QObject *>("settingsApiKey");QVERIFY(key);
+        window->setProperty("credentialReadId",777);window->setProperty("pendingAiReader",QVariant::fromValue(workspace.activeReader()));window->setProperty("pendingAiPlan",QVariantMap{{"host","synthetic-settings.invalid"}});key->setProperty("text","synthetic-style-settings-key");
+        QVERIFY(QMetaObject::invokeMethod(settings,"save"));QTRY_VERIFY(!settings->isVisible());QCOMPARE(window->property("credentialReadId").toDouble(),-1.0);QVERIFY(!window->property("pendingAiReader").value<QObject *>());QCOMPARE(vault->requests.size(),1);QCOMPARE(vault->requests.first().secret,QString("synthetic-style-settings-key"));QVERIFY(key->property("text").toString().isEmpty());
+        const auto persisted=workspace.preference("ai").toMap();QCOMPARE(persisted.value("futureSetting").toString(),QString("keep-on-key-change"));QVERIFY(!QJsonDocument::fromVariant(persisted).toJson().contains("synthetic-style-settings-key"));vault->reply(0);QTRY_VERIFY(!vault->busy());QCOMPARE(vaultEvents.size(),1);QCOMPARE(vaultEvents.first()[1].toString(),QString("write"));
     }
     void auxiliaryGeometryClampsBeforeConvertingSavedValues() {
         QCOMPARE(AuxiliaryWindowPolicy::boundedSize({560,650},{0,0,1920,1080}),QSize(560,650));

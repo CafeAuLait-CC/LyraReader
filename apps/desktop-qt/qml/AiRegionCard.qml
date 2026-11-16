@@ -7,6 +7,8 @@ Item {
     id:card
     objectName:"aiRegionCard"
     required property var app
+    readonly property bool parchment:app.regionConversationStyle!=="window"
+    readonly property color dividerColor:parchment ? Qt.rgba(app.colors.accentBorder.r,app.colors.accentBorder.g,app.colors.accentBorder.b,.18) : app.colors.separator
     property var owner:null
     readonly property var attachment:owner ? owner.aiRegion : ({})
     readonly property var state:owner ? owner.aiState : ({})
@@ -28,6 +30,8 @@ Item {
     y:frame ? frame.y : located ? -height-1 : Math.max(12,((app.documentCanvas ? app.documentCanvas.height : app.height)-height)/2)
     width:frame ? frame.width : Math.min(560,(app.documentCanvas ? app.documentCanvas.width : app.width)-24)
     readonly property real fullHeight:Math.max(44,Math.min(result.output || result.reasoning ? 740 : 560,(app.documentCanvas ? app.documentCanvas.height : app.height)-24))
+    readonly property bool compact:fullHeight<400
+    readonly property bool veryCompact:fullHeight<280
     property real revealProgress:1
     property bool closing:false
     readonly property bool motionActive:opened && (needsReveal || reveal.running || closing)
@@ -160,6 +164,24 @@ Item {
         target:card.app.documentCanvas
         function onInteractionEpochChanged(){if(reveal.running)card.completeMotion(false);}
     }
+    function revealAuxiliaryFocus() {
+        const item=app.activeFocusItem;
+        if(!opened || !item || owner!==app.currentReader)return;
+        let ancestor=item;
+        while(ancestor && ancestor!==details)ancestor=ancestor.parent;
+        if(!ancestor)return;
+        const target=resultScroll.contentItem;
+        if(!target || typeof target.contentY!=="number" || !target.contentItem)return;
+        const rect=item.mapToItem(target.contentItem,0,0,item.width,item.height);
+        let next=target.contentY;
+        if(rect.y<next)next=rect.y;
+        else if(rect.y+rect.height>next+target.height)next=rect.y+rect.height-target.height;
+        target.contentY=Math.max(0,Math.min(Math.max(0,target.contentHeight-target.height),next));
+    }
+    Connections {
+        target:card.app
+        function onActiveFocusItemChanged(){Qt.callLater(card.revealAuxiliaryFocus);}
+    }
     Keys.onShortcutOverride:function(event){if(event.key===Qt.Key_Escape)event.accepted=true;}
     Keys.onEscapePressed:function(event){closeAnimated();event.accepted=true;}
     function prepare(){if(owner===app.currentReader)owner.prepareAiRegion(app.aiSettings);}
@@ -170,27 +192,34 @@ Item {
     }
     Pane {
         objectName:"aiRegionBody"
-        width:card.width;height:card.fullHeight;padding:12
+        width:card.width;height:card.fullHeight;padding:card.veryCompact ? 4 : card.compact ? 8 : 12
         opacity:.65+.35*card.revealProgress
         enabled:!card.closing
-        background:Rectangle {color:card.app.colors.panelBg;border.color:card.app.colors.separator;radius:8}
+        background:Rectangle {
+            objectName:"aiRegionCardSurface"
+            color:card.parchment ? card.app.colors.panelBg : card.app.colors.raisedBg
+            border.color:card.parchment ? card.dividerColor : card.app.colors.border
+            radius:card.parchment ? 5 : 10
+        }
     contentItem:ColumnLayout {
-        spacing:8
+        spacing:card.veryCompact ? 1 : card.compact ? 4 : 8
         RowLayout {
             Label {text:qsTr("Ask about this area");font.bold:true;Layout.fillWidth:true}
             ToolButton {objectName:"closeAiRegionCard";text:qsTr("Close");onClicked:card.closeAnimated()}
         }
-        Label {visible:!!card.attachment.restored;text:qsTr("Saved conversation · %1 completed turns. Preview includes the recent context.").arg(card.attachment.completed_turn_count || 0);wrapMode:Text.Wrap;Layout.fillWidth:true;color:card.app.colors.textSecondary}
+        Rectangle {Layout.fillWidth:true;Layout.preferredHeight:1;color:card.dividerColor}
         BusyIndicator {running:!!card.attachment.loading;visible:running;Layout.alignment:Qt.AlignHCenter}
         ScrollView {
-            id: resultScroll
+            id: resultScroll;objectName:"aiRegionTranscript"
+            Layout.minimumHeight:card.veryCompact ? 48 : 64
+            Layout.preferredHeight:64
             Layout.fillWidth:true;Layout.fillHeight:true;contentWidth:availableWidth;clip:true
             ColumnLayout {
                 width:parent.width;spacing:8
                 Label {text:card.attachment.error || card.paper.error || "";textFormat:Text.PlainText;visible:text.length>0;wrapMode:Text.Wrap;Layout.fillWidth:true;color:card.app.colors.warningFg}
                 Item {
                     visible:!!card.attachment.image_png
-                    Layout.fillWidth:true;Layout.preferredHeight:Math.min(180,width*(card.attachment.image_height_px || 1)/(card.attachment.image_width_px || 1))
+                    Layout.fillWidth:true;Layout.preferredHeight:Math.min(180,Math.max(32,resultScroll.availableHeight-24),width*(card.attachment.image_height_px || 1)/(card.attachment.image_width_px || 1))
                     PdfCrop {
                         objectName:"aiRegionImage"
                         anchors.centerIn:parent
@@ -220,22 +249,56 @@ Item {
                     color:card.app.colors.textSecondary;font.pixelSize:11
                 }
                 AiResult {app:card.app;viewport:resultScroll.contentItem;value:card.result;answerName:"aiRegionAnswer";Layout.fillWidth:true;onCitation:function(link,plan){card.follow(link,plan);}}
+                ColumnLayout {
+                    id:details;objectName:"aiRegionDetails";Layout.fillWidth:true
+                    spacing:card.compact ? 4 : 8
+                    Label {visible:!!card.attachment.restored;text:qsTr("Saved conversation · %1 completed turns. Preview includes the recent context.").arg(card.attachment.completed_turn_count || 0);wrapMode:Text.Wrap;Layout.fillWidth:true;color:card.app.colors.textSecondary}
+                    RowLayout {
+                        visible:card.owner && !!card.owner.documentReading.choice_pending
+                        Layout.fillWidth:true
+                        Button {text:qsTr("Read document (optional)…");Layout.fillWidth:true;onClicked:card.app.openDocumentReading()}
+                        ToolButton {text:qsTr("Skip");Accessible.name:qsTr("Continue without document reading");onClicked:card.owner.dismissDocumentReadingChoice()}
+                    }
+                    Button {objectName:"saveAiRegionNote";text:qsTr("Save to Reading notes");enabled:!!card.attachment.image_png && !card.running && card.owner && !card.owner.pendingCommands;onClicked:card.owner.saveAiRegionNote()}
+                    Button {objectName:"discardFailedAiRegion";text:qsTr("Discard unsaved changes…");visible:!!card.attachment.image_png && card.owner && !!card.owner.regionPersistenceError;enabled:card.owner && !card.running && !card.owner.pendingCommands;onClicked:discardChanges.open()}
+                    RowLayout {
+                        Button {objectName:"newAiRegion";text:qsTr("New area");enabled:!card.running && !card.attachment.loading;onClicked:card.app.armRegion()}
+                        Button {objectName:"clearAiRegion";text:qsTr("Clear area");enabled:!card.running;onClicked:card.owner.clearAiRegion()}
+                    }
+                }
             }
         }
+        Rectangle {Layout.fillWidth:true;Layout.preferredHeight:1;color:card.dividerColor}
         ScrollView {
             id:composer
             visible:!!card.attachment.image_png
-            Layout.fillWidth:true;Layout.preferredHeight:80;Layout.maximumHeight:80;contentWidth:availableWidth;clip:true
+            Layout.fillWidth:true;Layout.preferredHeight:Math.min(80,Math.max(card.veryCompact ? 36 : 48,card.fullHeight*.18));Layout.maximumHeight:Layout.preferredHeight;contentWidth:availableWidth;clip:true
             TextArea {
                 id:questionEditor;objectName:"aiRegionQuestion"
                 width:composer.availableWidth;text:card.attachment.question || ""
                 readOnly:card.running
                 wrapMode:TextEdit.Wrap;textFormat:TextEdit.PlainText
                 placeholderText:qsTr("Question about this area…");Accessible.name:qsTr("Question about area")
+                color:card.app.colors.textPrimary;placeholderTextColor:card.app.colors.textPlaceholder
+                selectionColor:card.app.colors.textSelectionBg;selectedTextColor:card.app.colors.textSelectionFg
+                padding:9
+                background:Rectangle {
+                    objectName:"aiRegionQuestionSurface"
+                    color:card.parchment ? Qt.rgba(card.app.colors.raisedBg.r,card.app.colors.raisedBg.g,card.app.colors.raisedBg.b,.45) : card.app.colors.fieldBg
+                    radius:card.parchment ? 3 : 7
+                    border.width:card.parchment ? 0 : 1
+                    border.color:questionEditor.activeFocus ? card.app.colors.focusRing : card.app.colors.controlBorder
+                    Rectangle {
+                        visible:card.parchment;anchors.left:parent.left;anchors.right:parent.right;anchors.bottom:parent.bottom
+                        height:questionEditor.activeFocus ? 1.5 : .7
+                        color:questionEditor.activeFocus ? card.app.colors.focusRing : card.app.colors.controlBorder
+                    }
+                }
                 onTextChanged:if(activeFocus && card.owner)card.owner.setAiRegionQuestion(text)
             }
         }
         Label {
+            objectName:"aiRegionRequestStatus"
             text:card.running && card.state.responseView!=="region" ? qsTr("Another assistant request is running in this tab.") : card.state.statusView==="region" ? card.state.status || "" : ""
             textFormat:Text.PlainText
             visible:text.length>0;wrapMode:Text.Wrap;Layout.fillWidth:true;font.pixelSize:11;color:card.app.colors.textSecondary
@@ -246,16 +309,11 @@ Item {
             color:card.app.colors.infoFg;font.pixelSize:11
         }
         RowLayout {
-            visible:card.owner && !!card.owner.documentReading.choice_pending
-            Layout.fillWidth:true
-            Button {text:qsTr("Read document (optional)…");Layout.fillWidth:true;onClicked:card.app.openDocumentReading()}
-            ToolButton {text:qsTr("Skip");Accessible.name:qsTr("Continue without document reading");onClicked:card.owner.dismissDocumentReadingChoice()}
-        }
-        RowLayout {
             Layout.fillWidth:true
             Button {objectName:"prepareAiRegion";text:qsTr("Preview Question");enabled:!!card.attachment.image_png && !!(card.attachment.question || "").trim() && !card.running && card.owner && card.owner.pendingCommands===0;onClicked:card.prepare()}
             Button {objectName:"inspectAiRegion";text:qsTr("Inspect payload");enabled:card.previewReady;onClicked:payload.open()}
-            Button {objectName:"sendAiRegion";text:qsTr("Send");enabled:card.previewReady && !card.running && card.owner && card.owner.pendingCommands===0;onClicked:card.app.sendAi(card.owner,card.plan)}
+            Button {objectName:"sendAiRegion";text:qsTr("Send");visible:!card.running || card.state.responseView!=="region";enabled:card.previewReady && !card.running && card.owner && card.owner.pendingCommands===0;onClicked:card.app.sendAi(card.owner,card.plan)}
+            Button {objectName:"stopAiRegion";visible:card.running && card.state.responseView==="region";text:qsTr("Stop response");onClicked:card.owner.cancelAi()}
         }
         Label {
             objectName:"aiRegionPersistenceStatus"
@@ -263,13 +321,6 @@ Item {
             text:card.attachment.saved ? qsTr("Saved in Reading notes on this device.") : card.owner && card.owner.regionPersistenceError ? qsTr("This conversation has not been saved. Retry saving to keep the latest changes.") : qsTr("Saving this area and its conversation to Reading notes on this device…")
         }
         Label {text:card.owner ? card.owner.regionHistory.error || "" : "";visible:text.length>0;wrapMode:Text.Wrap;Layout.fillWidth:true;color:card.app.colors.warningFg;textFormat:Text.PlainText}
-        Button {objectName:"saveAiRegionNote";text:qsTr("Save to Reading notes");enabled:!!card.attachment.image_png && !card.running && card.owner && !card.owner.pendingCommands;onClicked:card.owner.saveAiRegionNote()}
-        Button {objectName:"discardFailedAiRegion";text:qsTr("Discard unsaved changes…");visible:!!card.attachment.image_png && card.owner && !!card.owner.regionPersistenceError;enabled:card.owner && !card.running && !card.owner.pendingCommands;onClicked:discardChanges.open()}
-        RowLayout {
-            Button {objectName:"newAiRegion";text:qsTr("New area");enabled:!card.running && !card.attachment.loading;onClicked:card.app.armRegion()}
-            Button {objectName:"stopAiRegion";visible:card.running && card.state.responseView==="region";text:qsTr("Stop response");onClicked:card.owner.cancelAi()}
-            Button {objectName:"clearAiRegion";text:qsTr("Clear area");enabled:!card.running;onClicked:card.owner.clearAiRegion()}
-        }
     }
     }
     Dialog {

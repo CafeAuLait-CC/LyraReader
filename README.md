@@ -89,6 +89,12 @@ outlines. Leaving Lyra closes its drawer while retaining the selected workspace 
 View → Paper Appearance offers four named presets across open reader windows: light Original Colours
 and Warm Paper, or Night Reading with dark or source-white paper. Appearance can still adjust the
 interface independently. Settings keeps these choices as a draft until Save.
+Region conversations also offer Window and Parchment styles in Settings. Both stay within the
+page and retain the current conversation and request preview when their appearance changes.
+Saving unrelated settings preserves the current layout and unedited AI fields. Explicit AI
+connection or credential changes still retire prepared requests before another Send.
+The region card keeps its composer, primary actions and status visible in smaller windows;
+captured-area previews fit their viewport and keyboard focus reveals auxiliary actions.
 The Edit row stages actual text/object/link edits through the shared typed commands and recoverable transaction;
 failed or superseded text drafts remain available to copy or retry. Long drafts use a bounded
 scrolling editor, and position/size fields keep their labels and page-point units visible.
