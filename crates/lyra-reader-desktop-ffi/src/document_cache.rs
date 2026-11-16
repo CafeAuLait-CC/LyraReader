@@ -308,18 +308,27 @@ impl DocumentCache {
             for name in CARRIED_FILES.iter().filter(|n| **n != "source.json") {
                 if let Some(bytes) = read_optional(&self.directory.join(name))? {
                     let destination = next.directory.join(name);
-                    if matches!(
-                        *name,
-                        "region-conversations-v1.json" | "document-knowledge-v1.json"
-                    ) && read_optional(&destination)?
-                        .as_ref()
-                        .is_some_and(|existing| existing != &bytes)
+                    let conflict = match *name {
+                        "summaries.json" => Some(
+                            "The PDF was saved, but destination summaries differ. Both cache versions were kept",
+                        ),
+                        "translations.json" => Some(
+                            "The PDF was saved, but destination translations differ. Both cache versions were kept",
+                        ),
+                        "region-conversations-v1.json" => Some(
+                            "The PDF was saved, but destination reading notes differ. Both cache versions were kept",
+                        ),
+                        "document-knowledge-v1.json" => Some(
+                            "The PDF was saved, but destination document reading differs. Both cache versions were kept",
+                        ),
+                        _ => None,
+                    };
+                    if let Some(message) = conflict
+                        && read_optional(&destination)?
+                            .as_ref()
+                            .is_some_and(|existing| existing != &bytes)
                     {
-                        return Err(if *name=="region-conversations-v1.json" {
-                            "The PDF was saved, but destination reading notes differ. Both cache versions were kept"
-                        } else {
-                            "The PDF was saved, but destination document reading differs. Both cache versions were kept"
-                        }.into());
+                        return Err(message.into());
                     }
                     atomic_write(&destination, &bytes)?;
                 }
@@ -327,5 +336,100 @@ impl DocumentCache {
         }
         next.record_source()?;
         Ok(next)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "lyra-cache-carry-{}",
+                crate::marks::uuid().unwrap()
+            ));
+            fs::create_dir(&root).unwrap();
+            fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/text-page.pdf"),
+                root.join("synthetic.pdf"),
+            )
+            .unwrap();
+            Self(root)
+        }
+        fn caches(&self, name: &str) -> (DocumentCache, DocumentCache, Vec<u8>) {
+            let path = self.0.join("synthetic.pdf");
+            let cache = DocumentCache::open(&path, &self.0.join("cache")).unwrap();
+            fs::write(
+                cache.directory.join(name),
+                b"original exact opaque cache bytes",
+            )
+            .unwrap();
+            let mut saved = fs::read(&path).unwrap();
+            saved.extend_from_slice(b"\n% synthetic saved revision\n");
+            fs::write(&path, &saved).unwrap();
+            let destination = DocumentCache::open(&path, &cache.root).unwrap();
+            assert_ne!(cache.directory, destination.directory);
+            (cache, destination, saved)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            // Only this test's newly created, uniquely named temporary directory is removed.
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn assert_conflict_is_preserved(name: &str, message: &str) {
+        let fixture = Fixture::new();
+        let (cache, next, saved) = fixture.caches(name);
+        let original = fs::read(cache.directory.join(name)).unwrap();
+        let destination = next.directory.join(name);
+        let foreign = br#"{ "entries": [{"unknown":1e-07,"text":"destination / unchanged"}] }"#;
+        fs::write(&destination, foreign).unwrap();
+        let result = cache.after_save();
+        assert_eq!(fs::read(&destination).unwrap(), foreign);
+        assert_eq!(fs::read(cache.directory.join(name)).unwrap(), original);
+        assert_eq!(fs::read(&cache.document).unwrap(), saved);
+        assert!(
+            result
+                .err()
+                .expect("A differing destination must be reported after the PDF save")
+                .contains(message)
+        );
+    }
+
+    #[test]
+    fn save_migration_retains_existing_destination_summaries() {
+        assert_conflict_is_preserved("summaries.json", "destination summaries differ");
+    }
+    #[test]
+    fn save_migration_retains_existing_destination_translations() {
+        assert_conflict_is_preserved("translations.json", "destination translations differ");
+    }
+    #[test]
+    fn save_migration_accepts_identical_or_missing_derived_ai_caches() {
+        for name in [
+            "summaries.json",
+            "translations.json",
+            "document-knowledge-v1.json",
+            "region-conversations-v1.json",
+        ] {
+            for missing in [false, true] {
+                let fixture = Fixture::new();
+                let (cache, destination, saved) = fixture.caches(name);
+                let original = fs::read(cache.directory.join(name)).unwrap();
+                if missing {
+                    fs::remove_file(destination.directory.join(name)).unwrap();
+                }
+                let next = cache.after_save().unwrap();
+                assert_eq!(next.directory, destination.directory);
+                assert_eq!(fs::read(next.directory.join(name)).unwrap(), original);
+                assert_eq!(fs::read(cache.directory.join(name)).unwrap(), original);
+                assert_eq!(fs::read(&cache.document).unwrap(), saved);
+                next.validate_pdf_source().unwrap();
+            }
+        }
     }
 }
