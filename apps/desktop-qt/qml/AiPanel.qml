@@ -18,9 +18,10 @@ Pane {
     readonly property var plan: viewState.previewView === workspace ? viewState.plan || null : null
     readonly property bool previewReady: !!plan && !viewState.planSent
     readonly property bool running: !!viewState.running
-    readonly property var result: viewState.responseView === workspace ? ({unitTitle: viewState.unitTitle, output: viewState.output, reasoning: viewState.reasoning, usage: viewState.usage, responsePlan: viewState.responsePlan, generation: owner.documentGeneration}) : ((viewState.results || {})[workspace] || {})
+    readonly property bool compact: height < 500
+    readonly property var result: viewState.responseView === workspace ? Object.assign({output: viewState.output, reasoning: viewState.reasoning, usage: viewState.usage, responsePlan: viewState.responsePlan, generation: owner.documentGeneration}, viewState.unitTitle === undefined ? {} : {unitTitle: viewState.unitTitle, unitLanguage: viewState.unitLanguage}) : ((viewState.results || {})[workspace] || {})
     readonly property string status: viewState.statusView === workspace ? viewState.status || "" : (((viewState.results || {})[workspace] || {}).status || "")
-    padding: 10
+    padding: compact ? 6 : 10
     background: Rectangle { color: app.colors.sidebarBg }
     function baseRequest(requestAction) {
         const settings = app.aiSettings;
@@ -71,9 +72,48 @@ Pane {
             app.navigate(page);
         else app.operationStatus = qsTr("This citation cannot be verified from the document passages sent.");
     }
+    Component {
+        id: summaryLanguageComponent
+        RowLayout {
+            id: languageEditor
+            objectName: "summaryLanguageEditor"
+            property var targetReader: null
+            property var expectedGeneration: 0
+            function current() {
+                return languageLoader.item === languageEditor && targetReader === aiPanel.owner
+                    && targetReader && expectedGeneration === targetReader.documentGeneration
+                    && aiPanel.unitMode && aiPanel.visible
+                    && aiPanel.summaryUnit.generation === expectedGeneration;
+            }
+            function commitDraft(value) {
+                return current() && targetReader.setSummaryLanguageDraft(value, expectedGeneration);
+            }
+            function applyDraft() { return current() && targetReader.applySummaryLanguage(expectedGeneration); }
+            Label { text: qsTr("Language"); color: app.colors.textSecondary }
+            TextField {
+                id: languageField
+                objectName: "aiSummaryLanguage"
+                Layout.fillWidth: true; Layout.minimumWidth: 40
+                readonly property string modelText: !languageEditor.current() ? "" : (aiPanel.input.summaryLanguageDraft === undefined ? aiPanel.input.summaryLanguage || "" : aiPanel.input.summaryLanguageDraft)
+                function syncModel() { if (text !== modelText) text = modelText; }
+                onModelTextChanged: syncModel()
+                Component.onCompleted: syncModel()
+                placeholderText: qsTr("Document language")
+                Accessible.name: qsTr("Summary language; empty uses document language")
+                onTextEdited: languageEditor.commitDraft(text)
+                onAccepted: languageEditor.applyDraft()
+            }
+            Button {
+                objectName: "applySummaryLanguage"
+                text: qsTr("Apply")
+                enabled: languageEditor.current() && !aiPanel.running
+                onClicked: languageEditor.applyDraft()
+            }
+        }
+    }
     ColumnLayout {
         anchors.fill: parent
-        spacing: 6
+        spacing: aiPanel.compact ? 3 : 6
         RowLayout {
             Layout.fillWidth: true
             spacing: 2
@@ -92,6 +132,8 @@ Pane {
         }
         Label {
             Layout.fillWidth: true; wrapMode: Text.Wrap; textFormat: Text.PlainText
+            // Short unit drawers reserve space for the answer. Setup and receiving states remain visible.
+            visible: !aiPanel.compact || !aiPanel.unitMode || aiPanel.running || !app.aiSettings.model
             text: aiPanel.running ? qsTr("Receiving: %1 · %2").arg(aiPanel.viewState.activeModel || "").arg(aiPanel.viewState.activeHost || "") : (app.aiSettings.model || qsTr("Choose an AI model in Settings"))
             color: app.colors.textSecondary; font.pixelSize: 11
         }
@@ -120,12 +162,22 @@ Pane {
         ColumnLayout {
             visible: aiPanel.unitMode
             Layout.fillWidth: true
-            Label {
-                objectName: "aiSummaryUnitTitle"
-                text: aiPanel.summaryUnit.title || (aiPanel.summaryUnit.unit || {}).title || ""
-                textFormat: Text.PlainText; wrapMode: Text.Wrap; maximumLineCount: 2; elide: Text.ElideRight
-                Layout.fillWidth: true; font.bold: true; color: app.colors.textPrimary
-                Accessible.description: text
+            spacing: aiPanel.compact ? 3 : 5
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    objectName: "aiSummaryUnitTitle"
+                    text: aiPanel.summaryUnit.title || (aiPanel.summaryUnit.unit || {}).title || ""
+                    textFormat: Text.PlainText; wrapMode: Text.Wrap; maximumLineCount: 2; elide: Text.ElideRight
+                    Layout.fillWidth: true; font.bold: true; color: app.colors.textPrimary
+                    Accessible.description: text
+                }
+                ToolButton {
+                    objectName: "clearSummaryUnit"
+                    text: qsTr("Other summary targets")
+                    enabled: !aiPanel.running
+                    onClicked: aiPanel.owner.clearSummaryUnit()
+                }
             }
             Label {
                 objectName: "aiSummaryUnitCoverage"
@@ -134,11 +186,17 @@ Pane {
                 Accessible.description: text
                 Layout.fillWidth: true; color: app.colors.textSecondary; font.pixelSize: 11
             }
-            ToolButton {
-                objectName: "clearSummaryUnit"
-                text: qsTr("Other summary targets")
-                enabled: !aiPanel.running
-                onClicked: aiPanel.owner.clearSummaryUnit()
+            Loader {
+                id: languageLoader
+                Layout.fillWidth: true
+                active: aiPanel.unitMode && aiPanel.visible
+                sourceComponent: summaryLanguageComponent
+                property var contextOwner: aiPanel.owner
+                property var contextGeneration: aiPanel.owner.documentGeneration
+                function recreate() { sourceComponent = null; sourceComponent = summaryLanguageComponent; }
+                onContextOwnerChanged: recreate()
+                onContextGenerationChanged: recreate()
+                onLoaded: { item.targetReader = aiPanel.owner; item.expectedGeneration = aiPanel.owner.documentGeneration; }
             }
         }
         TextField {
@@ -243,7 +301,9 @@ Pane {
             text: qsTr("Stop response"); Layout.fillWidth: true
             onClicked: aiPanel.owner.cancelAi()
         }
-        RowLayout {
+        Flow {
+            Layout.fillWidth: true; Layout.minimumWidth: 0
+            spacing: 4
             LyraToolButton {
                 symbol: "view"; text: qsTr("Inspect Payload")
                 visible: !!aiPanel.plan && !!aiPanel.viewState.planSent
@@ -262,8 +322,8 @@ Pane {
                 enabled: !aiPanel.running && (aiPanel.viewState.chatTurns || []).length > 0
                 onClicked: aiPanel.owner.clearAiChat()
             }
+            Button {objectName:"aiAuditTrail";text:qsTr("Local audit trail…");onClicked:app.showAuditTrail()}
         }
-        Button {objectName:"aiAuditTrail";text:qsTr("Local audit trail…");Layout.fillWidth:true;onClicked:app.showAuditTrail()}
     }
     Dialog {
         id: payload

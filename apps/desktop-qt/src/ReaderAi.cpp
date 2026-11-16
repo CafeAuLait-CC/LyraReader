@@ -27,7 +27,7 @@ void ReaderController::initAi() {
     connect(this,&ReaderController::commandFinished,this,&ReaderController::handleAiCommand);
 }
 void ReaderController::resetAi() {
-    ++m_aiPreviewEpoch;m_aiSummaryPreviewUnitId.clear();
+    ++m_aiPreviewEpoch;m_aiSummaryPreviewUnitId.clear();m_aiSummaryPreviewLanguage.clear();
     resetSummaryCatalog();
     resetRegionPersistence();
     m_aiRegionRestoreId=0;m_regionContinuationPending=false;m_regionContinuationSettings.clear();
@@ -308,6 +308,7 @@ void ReaderController::prepareAi(const QVariantMap &request,const QVariantMap &u
         m_summaryUnitContext.clear();emit summaryCatalogChanged();if(!current())return;
     }
     m_aiSummaryPreviewUnitId=unit.isEmpty()?QString{}:m_summaryUnitContext.value(QStringLiteral("id")).toString();
+    m_aiSummaryPreviewLanguage=unit.isEmpty()?QString{}:request.value(QStringLiteral("language")).toString();
     if(request.value(QStringLiteral("action")).toString()!=QStringLiteral("TranslateSelection") && !m_readingChoiceShown && !m_documentReading.value(QStringLiteral("ready")).toBool()) {
         m_readingChoiceShown=true;m_readingChoicePending=true;emit documentReadingChanged();if(!current())return;
     }
@@ -344,9 +345,10 @@ bool ReaderController::startAi(const QString &key,const QVariantMap &expectedPla
         m_aiState.insert(QStringLiteral("status"),tr("Saving reading notes. Send again when saving has finished."));emit aiStateChanged();return false;
     }
     const auto action=plan.value(QStringLiteral("action")).toString();
-    if(action==QStringLiteral("SummarizeAbstract") || action==QStringLiteral("SummarizeSection") || action==QStringLiteral("SummarizePageLine"))
+    if(action==QStringLiteral("SummarizeAbstract") || action==QStringLiteral("SummarizeSection") || action==QStringLiteral("SummarizePageLine")) {
         m_aiState.insert(QStringLiteral("unitTitle"),m_summaryUnitContext.value(QStringLiteral("title"),m_summaryUnitContext.value(QStringLiteral("unit")).toMap().value(QStringLiteral("title"))));
-    else m_aiState.remove(QStringLiteral("unitTitle"));
+        m_aiState.insert(QStringLiteral("unitLanguage"),m_aiSummaryPreviewLanguage);
+    }else {m_aiState.remove(QStringLiteral("unitTitle"));m_aiState.remove(QStringLiteral("unitLanguage"));}
     m_aiState.insert(QStringLiteral("responsePlan"),plan);
     m_aiState.insert(QStringLiteral("planSent"),true);
     m_aiState.insert(QStringLiteral("responseView"),aiView(plan.value(QStringLiteral("action")).toString()));
@@ -379,6 +381,7 @@ void ReaderController::retainAiResult(const QString &state) {
     if(view==QStringLiteral("region")){result.insert(QStringLiteral("turn_id"),m_aiState.value(QStringLiteral("regionTurn")));result.insert(QStringLiteral("question"),m_aiState.value(QStringLiteral("activeQuestion")));}
     for(const auto *key:{"output","reasoning","usage","status","responsePlan"})result.insert(QLatin1String(key),m_aiState.value(QLatin1String(key)));
     if(m_aiState.contains(QStringLiteral("unitTitle")))result.insert(QStringLiteral("unitTitle"),m_aiState.value(QStringLiteral("unitTitle")));
+    if(m_aiState.contains(QStringLiteral("unitLanguage")))result.insert(QStringLiteral("unitLanguage"),m_aiState.value(QStringLiteral("unitLanguage")));
     auto results=m_aiState.value(QStringLiteral("results")).toMap();results.insert(view,result);m_aiState.insert(QStringLiteral("results"),results);
 }
 void ReaderController::cancelAi() {

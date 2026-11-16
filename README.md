@@ -135,7 +135,9 @@ provider reasoning support keyboard selection and keep the caret visible during 
 composer and collapsed source passages. Layers and coverage lists abstract, section and page units,
 checks text locally and shows the sampled source pages. Preview summary prepares one selected unit
 through the shared planner; Send, Stop and Retry use the assistant's normal preview and local audit
-trail. Unit summaries currently appear in the Summary result; batch generation and persistent
+trail. Unit language drafts take effect only after Apply and a new preview; blank uses the document
+language. Earlier answers retain their requested-language label. Unit summaries currently appear
+in the Summary result; batch generation and persistent
 per-unit caching are still pending. Select & Ask captures a bounded area in its original colours
 and requires a request preview before sending. Save to Reading notes keeps its frozen image, text,
 question draft and completed or partial answer in the application cache; the Notes view reads these

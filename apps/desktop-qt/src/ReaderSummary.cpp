@@ -87,6 +87,37 @@ void ReaderController::clearSummaryUnit() {
     m_summaryUnitContext.clear();QPointer<ReaderController> alive(this);invalidateAiPlan();if(alive)emit summaryCatalogChanged();
 }
 
+bool ReaderController::hasSummaryLanguageContext(qulonglong expectedGeneration)const {
+    return m_document && !m_loading && !m_snapshotMode && expectedGeneration==m_generation
+        && !m_summaryUnitContext.value(QStringLiteral("id")).toString().isEmpty()
+        && m_summaryUnitContext.value(QStringLiteral("generation")).toULongLong()==m_generation;
+}
+
+bool ReaderController::setSummaryLanguageDraft(const QString &language,qulonglong expectedGeneration) {
+    if(!hasSummaryLanguageContext(expectedGeneration))return false;
+    auto input=m_aiState.value(QStringLiteral("input")).toMap();
+    if(input.contains(QStringLiteral("summaryLanguageDraft")) && input.value(QStringLiteral("summaryLanguageDraft")).toString()==language)return true;
+    // Drafting does not retire a prepared request, extract text or affect a running answer.
+    input.insert(QStringLiteral("summaryLanguageDraft"),language);m_aiState.insert(QStringLiteral("input"),input);
+    emit aiStateChanged();return true;
+}
+
+bool ReaderController::applySummaryLanguage(qulonglong expectedGeneration) {
+    if(!hasSummaryLanguageContext(expectedGeneration) || m_aiState.value(QStringLiteral("running")).toBool())return false;
+    auto input=m_aiState.value(QStringLiteral("input")).toMap();
+    const auto previous=input.value(QStringLiteral("summaryLanguage")).toString();
+    const auto language=input.value(QStringLiteral("summaryLanguageDraft"),previous).toString().trimmed();
+    input.insert(QStringLiteral("summaryLanguage"),language);input.insert(QStringLiteral("summaryLanguageDraft"),language);
+    m_aiState.insert(QStringLiteral("input"),input);
+    if(language!=previous) {
+        ++m_aiPreviewEpoch;m_aiPreviewId=0;m_aiSummaryPreviewUnitId.clear();m_aiSummaryPreviewLanguage.clear();
+        m_aiState.remove(QStringLiteral("plan"));
+        m_aiState.insert(QStringLiteral("statusView"),QStringLiteral("summary"));
+        m_aiState.insert(QStringLiteral("status"),tr("Language applied. Preview the summary before sending."));
+    }
+    emit aiStateChanged();return true;
+}
+
 void ReaderController::prepareSummaryUnit(const QString &id,const QVariantMap &settings) {
     if(!m_document || m_loading || m_snapshotMode || m_aiState.value(QStringLiteral("running")).toBool())return;
     QVariantMap row;
@@ -109,6 +140,7 @@ void ReaderController::prepareSummaryUnit(const QString &id,const QVariantMap &s
     emit aiStateChanged();
     if(!alive || document!=m_document || generation!=m_generation || epoch!=m_aiPreviewEpoch)return;
     auto request=settings;request.insert(QStringLiteral("action"),QStringLiteral("SummarizeDocument"));
+    request.insert(QStringLiteral("language"),m_aiState.value(QStringLiteral("input")).toMap().value(QStringLiteral("summaryLanguage")));
     const auto unit=row.value(QStringLiteral("unit")).toMap();
     prepareAi(request,{{QStringLiteral("layer"),unit.value(QStringLiteral("kind"))},{QStringLiteral("index"),unit.value(QStringLiteral("index"))}});
 }

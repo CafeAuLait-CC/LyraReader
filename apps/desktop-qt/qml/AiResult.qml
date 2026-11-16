@@ -47,6 +47,14 @@ ColumnLayout {
         Accessible.description: text
         Layout.fillWidth: true; font.bold: true; color: app.colors.textPrimary
     }
+    Label {
+        objectName: result.answerName + "Language"
+        visible: !!result.value.unitTitle && typeof result.value.unitLanguage === "string"
+        text: visible ? qsTr("Requested language: %1").arg(result.value.unitLanguage || qsTr("Document language")) : ""
+        textFormat: Text.PlainText; wrapMode: Text.Wrap; maximumLineCount: 2; elide: Text.ElideRight
+        Accessible.description: text
+        Layout.fillWidth: true; color: app.colors.textSecondary; font.pixelSize: 11
+    }
     ToolButton {
         id: sources
         objectName: result.answerName + "Sources"

@@ -82,6 +82,8 @@ public:
     QVariantMap summaryUnitContext()const{return m_summaryUnitContext;}
     Q_INVOKABLE void prepareSummaryUnit(const QString &id,const QVariantMap &settings);
     Q_INVOKABLE void clearSummaryUnit();
+    Q_INVOKABLE bool setSummaryLanguageDraft(const QString &language,qulonglong expectedGeneration);
+    Q_INVOKABLE bool applySummaryLanguage(qulonglong expectedGeneration);
     QVariantMap documentReading()const{auto state=m_documentReading;state.insert(QStringLiteral("choice_pending"),m_readingChoicePending);return state;}
     Q_INVOKABLE void prepareDocumentReading(const QVariantMap &request);
     Q_INVOKABLE bool startDocumentReading(const QString &key,const QVariantMap &plan,const QString &token);
@@ -220,6 +222,7 @@ private:
     void initAi();
     void initSummaryCatalog();
     void resetSummaryCatalog();
+    bool hasSummaryLanguageContext(qulonglong expectedGeneration)const;
     void handleSummaryCatalogCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error);
     QVariantMap m_summaryCatalog,m_summaryUnitContext;
     quint64 m_summaryCatalogId=0,m_summaryInspectId=0,m_summaryActionEpoch=0;
@@ -271,7 +274,7 @@ private:
     QUrl m_aiRegionImage;
     quint64 m_aiRegionEpoch=0;
     RasterJobs::Handle m_aiRegionJob;
-    QString m_aiSummaryPreviewUnitId;
+    QString m_aiSummaryPreviewUnitId,m_aiSummaryPreviewLanguage;
     quint64 m_aiPreviewEpoch=0;
     quint64 m_aiPreviewId=0,m_aiStartId=0,m_aiPollId=0,m_aiPlanGeneration=0;
     void enqueue(const Request &request);
