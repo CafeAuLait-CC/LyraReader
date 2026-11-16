@@ -110,6 +110,7 @@ extension ReaderChecks {
         try rightPanelMotionChecks()
         try rightPanelShortcutChecks()
         try sidebarAIMigrationChecks()
+        try await sidePanelInteractionChecks()
         try await rightPanelWindowChecks(root: root)
         try await editInspectorAnchorChecks(root: root)
     }

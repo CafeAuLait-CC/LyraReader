@@ -13,8 +13,14 @@ import Foundation
 // `--shard`, every suite runs in the historical order.
 @main
 struct ReaderChecks {
+    // A failed check is an unsuccessful test run, not an application crash. Using SIGTRAP for
+    // assertions opened macOS crash dialogs during local regression work.
+    static func fail(_ message: String) -> Never {
+        FileHandle.standardError.write(Data("\(message)\n".utf8))
+        exit(1)
+    }
     @MainActor static func require(_ condition: @autoclosure () -> Bool, _ message: String) {
-        guard condition() else { fatalError("FAIL: \(message)") }
+        guard condition() else { fail("FAIL: \(message)") }
         print("PASS: \(message)")
     }
 
@@ -23,7 +29,7 @@ struct ReaderChecks {
             if condition() { print("PASS: \(message)"); return }
             try await Task.sleep(for: .milliseconds(25))
         }
-        fatalError("TIMEOUT: \(message)")
+        fail("TIMEOUT: \(message)")
     }
 
     /// Like `eventually`, but a timeout carries the state that explains it. A bare
@@ -38,7 +44,7 @@ struct ReaderChecks {
             if condition() { print("PASS: \(message)"); return }
             try await Task.sleep(for: .milliseconds(25))
         }
-        fatalError("TIMEOUT: \(message)\n\(explanation())")
+        fail("TIMEOUT: \(message)\n\(explanation())")
     }
 
     /// One registered native suite: a name for the shard log and the body that runs it.
@@ -59,7 +65,12 @@ struct ReaderChecks {
             .standardizedFileURL
     }
 
-    @MainActor static func main() async throws {
+    @MainActor static func main() async {
+        do { try await run() }
+        catch { fail("FAIL: \(error.localizedDescription)") }
+    }
+
+    @MainActor private static func run() async throws {
         // The killed-process checks re-execute this binary; they must handle their arguments
         // before the normal check cache and fixture setup.
         if CommandLine.arguments.contains("--document-transaction-crash-child") {
@@ -395,6 +406,10 @@ struct ReaderChecks {
         }
         if CommandLine.arguments.contains("--check-interleaf-layout") {
             try await interleafStreamingLayoutChecks(root: fastRoot)
+            return
+        }
+        if CommandLine.arguments.contains("--check-side-panel-interaction") {
+            try await sidePanelInteractionChecks()
             return
         }
         if CommandLine.arguments.contains("--check-region-questions") {
