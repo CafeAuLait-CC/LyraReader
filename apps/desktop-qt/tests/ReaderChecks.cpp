@@ -102,6 +102,37 @@ public slots:
     void notify() {callback();}
 };
 
+class FilePickerModelFixture final : public QObject {
+    Q_OBJECT
+    Q_PROPERTY(State status READ status NOTIFY statusChanged)
+    Q_PROPERTY(QUrl folder READ folder CONSTANT)
+public:
+    enum State { Loading, Ready };Q_ENUM(State)
+    State status() const {return Ready;}
+    QUrl folder() const {return QUrl(QStringLiteral("file:///synthetic-picker-readiness"));}
+signals:
+    void statusChanged();
+};
+class FilePickerListFixture final : public QQuickItem {
+    Q_OBJECT
+    Q_PROPERTY(QObject *model READ model CONSTANT)
+    Q_PROPERTY(int count READ count NOTIFY countChanged)
+    Q_PROPERTY(int currentIndex READ currentIndex WRITE setCurrentIndex NOTIFY currentIndexChanged)
+public:
+    FilePickerListFixture(QObject *model,QQuickItem *parent):QQuickItem(parent),m_model(model) {setObjectName("fileDialogListView");}
+    QObject *model() const {return m_model;}
+    int count() const {return m_count;}
+    int currentIndex() const {return m_index;}
+    void setRows(int count) {m_count=count;emit countChanged();}
+    void setCurrentIndex(int index) {if(m_index==index)return;m_index=index;emit currentIndexChanged();}
+signals:
+    void countChanged();
+    void currentIndexChanged();
+private:
+    QObject *m_model;
+    int m_count=0,m_index=-1;
+};
+
 class FakeCredentialStore final : public CredentialStore {
 public:
     struct Request { VaultOperation operation; QString key,secret; Completion complete; };
@@ -1583,6 +1614,17 @@ private slots:
         QTRY_VERIFY(QGuiApplication::focusWindow()!=window);QVERIFY(!window->property("readerKeyboardEnabled").toBool());
         auto *dialog=QGuiApplication::focusWindow();if(!dialog)QSKIP("The platform file picker is outside this process; real keyboard acceptance remains required.");
         QTest::keyClick(dialog,Qt::Key_Escape);QTRY_VERIFY(!picker->property("visible").toBool());window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);QVERIFY(window->property("readerKeyboardEnabled").toBool());
+    }
+    void filePickerWaitsForTheFirstRowsAfterAReadyEmptySnapshot() {
+        QQuickWindow owner;owner.setTitle("Synthetic picker readiness");owner.show();QTRY_VERIFY(owner.isVisible());
+        FilePickerModelFixture model;FilePickerListFixture list(&model,owner.contentItem());QObject dialog;
+        dialog.setProperty("visible",true);dialog.setProperty("currentFolder",model.folder());
+        FileDialogNavigation navigation;navigation.track(&dialog,&owner);
+        QVERIFY(QMetaObject::invokeMethod(&navigation,"refresh"));QCOMPARE(list.currentIndex(),-1);
+        list.setRows(2);QTRY_COMPARE_WITH_TIMEOUT(list.currentIndex(),0,2000);
+        list.setCurrentIndex(1);QCoreApplication::processEvents();QCOMPARE(list.currentIndex(),1);
+        list.setCurrentIndex(-1);QCoreApplication::processEvents();QCOMPARE(list.currentIndex(),-1);
+        navigation.track(nullptr,&owner);list.setRows(3);QCoreApplication::processEvents();QCOMPARE(list.currentIndex(),-1);
     }
     void filePickerKeepsKeyboardSelectionValidAfterEnteringASmallerFolder() {
         QTemporaryDir scratch,empty;QVERIFY(scratch.isValid() && empty.isValid());QDir directory(scratch.path());

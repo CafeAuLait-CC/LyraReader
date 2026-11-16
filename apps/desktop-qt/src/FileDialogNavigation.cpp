@@ -57,6 +57,9 @@ void FileDialogNavigation::refresh() {
     const int ready=status.enumerator().keyToValue("Ready");
     if(ready<0 || status.read(model).toInt()!=ready)return;
     const int count=m_list->property("count").toInt(),index=m_list->property("currentIndex").toInt();
+    // A ready empty snapshot can precede the new folder's first rows.
+    // Keep initialization pending instead of treating that snapshot as a selection.
+    if(count<=0)return;
     // Initialize a new folder's missing delegate even while its location editor owns focus.
     // Later deliberate deselection stays unchanged; valid user choices always stay unchanged.
     if(count>0 && (index>=count || (index<0 && m_initializeMissing)))
