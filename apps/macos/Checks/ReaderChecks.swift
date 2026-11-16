@@ -393,6 +393,10 @@ struct ReaderChecks {
             try await regionReadingNotesChecks(root: fastRoot)
             return
         }
+        if CommandLine.arguments.contains("--check-interleaf-layout") {
+            try await interleafStreamingLayoutChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-region-questions") {
             try await regionQuestionChecks(root: fastRoot)
             print("Region question checks passed")
@@ -1270,6 +1274,9 @@ struct ReaderChecks {
             }),
             ("region-reading-notes", {
                 try await regionReadingNotesChecks(root: root)
+            }),
+            ("interleaf-streaming-layout", {
+                try await interleafStreamingLayoutChecks(root: root)
             }),
             ("region-questions", {
                 try await regionQuestionChecks(root: root)

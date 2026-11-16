@@ -75,6 +75,9 @@ struct AIRegionCardView: View {
             })
             .onPreferenceChange(AIRegionComposerHeightKey.self) { composerHeight = $0 }
         }
+        // The native paper frame follows SwiftUI's measured height. TextKit must not resize
+        // paragraphs independently after that measurement, especially below the window edge.
+        .environment(\.readingStableTextLayout, true)
         .foregroundStyle(LyraReaderTheme.textPrimary)
         .background {
             if parchment { RegionNotePaper() }
@@ -113,6 +116,7 @@ struct AIRegionCardView: View {
                 .background(LyraReaderTheme.panelBg)
         }
         .onChange(of: notes.phase) { _, phase in
+            if phase == .preparing || phase == .streaming { showingNote = true }
             if phase == .finished {
                 card.keepGeneratedNote(); showingNote = true; state.persistRegionHistory()
                 NotificationCenter.default.post(name: .lyraReadingNoteChanged, object: state)

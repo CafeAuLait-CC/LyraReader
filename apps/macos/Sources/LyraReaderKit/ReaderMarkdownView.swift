@@ -174,15 +174,21 @@ public struct AIAnswerView: View {
 
 /// A selectable, wrapping attributed paragraph with inline-math attachments.
 private struct ReadingStableTextLayoutKey: EnvironmentKey { static let defaultValue = false }
+private struct ReadingThemedLinksKey: EnvironmentKey { static let defaultValue = false }
 extension EnvironmentValues {
     var readingStableTextLayout: Bool {
         get { self[ReadingStableTextLayoutKey.self] }
         set { self[ReadingStableTextLayoutKey.self] = newValue }
     }
+    var readingThemedLinks: Bool {
+        get { self[ReadingThemedLinksKey.self] }
+        set { self[ReadingThemedLinksKey.self] = newValue }
+    }
 }
 
 public struct ReaderMarkdownInlineText: NSViewRepresentable {
     @Environment(\.readingStableTextLayout) private var stableReadingLayout
+    @Environment(\.readingThemedLinks) private var themedLinks
     let inlines: [ReaderMarkdownInline]
     let pageCount: Int
     let fontSize: CGFloat
@@ -203,7 +209,7 @@ public struct ReaderMarkdownInlineText: NSViewRepresentable {
         textView.isRichText = true
         textView.isAutomaticLinkDetectionEnabled = false
         textView.linkTextAttributes = [
-            .foregroundColor: stableReadingLayout ? LyraReaderTheme.accentColor : NSColor.controlAccentColor,
+            .foregroundColor: themedLinks ? LyraReaderTheme.accentColor : NSColor.controlAccentColor,
             .underlineStyle: NSUnderlineStyle.single.rawValue,
         ]
         textView.delegate = context.coordinator

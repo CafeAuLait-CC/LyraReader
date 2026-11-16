@@ -51,6 +51,7 @@ struct AIReadingSidebar: View {
             }
         }
         .environment(\.readingStableTextLayout, true)
+        .environment(\.readingThemedLinks, true)
         .background(LyraReaderTheme.panelBg)
         .foregroundStyle(LyraReaderTheme.textPrimary)
         .buttonStyle(.borderless)
