@@ -39,6 +39,7 @@ use std::sync::Mutex;
 // Swift bindings and their C header are produced by `scripts/build-rust.sh`.
 uniffi::setup_scaffolding!();
 
+pub mod ai_workspace;
 pub mod api;
 mod document_id;
 pub mod format;

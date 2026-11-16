@@ -17074,6 +17074,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         refreshSelectionOverlay()
     }
 
+    /// The exact character-range text already used by Copy and AI source previews.
+    public var selectedPassageText: String? {
+        guard let selection, let page = textPages[selection.page] else { return nil }
+        return page.copyText(in: selection.range)
+    }
+
     /// Copies the selected characters (⌘C from the canvas).
     public func copySelection(to pasteboard: NSPasteboard = .general) {
         guard let selection, let textPage = textPages[selection.page] else { return }

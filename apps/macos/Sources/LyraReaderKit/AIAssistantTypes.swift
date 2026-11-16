@@ -14,7 +14,7 @@ public enum AIAssistantTab: String, CaseIterable, Identifiable, Sendable {
         case .summary: "Summary"
         case .translation: "Translate"
         case .chat: "Chat"
-        case .regions: "Regions"
+        case .regions: "Reading notes"
         }
     }
     public var icon: String {
@@ -22,7 +22,7 @@ public enum AIAssistantTab: String, CaseIterable, Identifiable, Sendable {
         case .summary: "doc.text"
         case .translation: "character.bubble"
         case .chat: "text.bubble"
-        case .regions: "rectangle.dashed"
+        case .regions: "note.text"
         }
     }
 }
@@ -667,6 +667,7 @@ public protocol AIChatHandle: AnyObject {
 @MainActor
 public protocol AIChatServicing: AnyObject {
     func prepare(_ request: AIMakePlanRequest) async throws -> AiPlanRecord
+    func prepareReading(_ request: AIMakePlanRequest, options: AiReadingOptionsRecord) async throws -> AiPlanRecord
     func prepareMerge(_ request: AIMergePlanRequest) async throws -> AiPlanRecord
     /// Coverage-only inspection for the layered summary. No prompts are built, so opening the
     /// panel can match cached rows without a request.
@@ -677,6 +678,10 @@ public protocol AIChatServicing: AnyObject {
 }
 
 public extension AIChatServicing {
+    func prepareReading(_ request: AIMakePlanRequest, options: AiReadingOptionsRecord) async throws -> AiPlanRecord {
+        throw AISettingsError.invalid("This service cannot prepare reading tasks.")
+    }
+
     /// Older test doubles do not need to implement consolidation; the production service does.
     func prepareMerge(_ request: AIMergePlanRequest) async throws -> AiPlanRecord {
         throw AISettingsError.invalid("This service cannot prepare a consolidation request.")
@@ -706,6 +711,12 @@ public final class RustAIChatService: AIChatServicing {
     }
 
     public func prepare(_ request: AIMakePlanRequest) async throws -> AiPlanRecord {
+        try await engine.prepareAIPlan(planRecord(request))
+    }
+    public func prepareReading(_ request: AIMakePlanRequest, options: AiReadingOptionsRecord) async throws -> AiPlanRecord {
+        try await engine.prepareAIReadingTask(planRecord(request), options: options)
+    }
+    private func planRecord(_ request: AIMakePlanRequest) -> AiPlanRequestRecord {
         let selection = request.selection.map {
             AiSelectionRecord(
                 page: UInt32(max(0, $0.page - 1)),
@@ -748,7 +759,7 @@ public final class RustAIChatService: AIChatServicing {
             documentKnowledgeText: request.documentKnowledgeText,
             documentKnowledgePages: request.documentKnowledgePages.map { UInt32(max(0, $0)) }
         )
-        return try await engine.prepareAIPlan(record)
+        return record
     }
 
     public func prepareMerge(_ request: AIMergePlanRequest) async throws -> AiPlanRecord {
@@ -1072,6 +1083,9 @@ public final class AISettingsStore: ObservableObject {
             defaults.set(connectionMode.rawValue, forKey: "aiConnectionMode")
         }
     }
+    @Published public var reviewBeforeSending: Bool { didSet { defaults.set(reviewBeforeSending, forKey: "aiReviewBeforeSending") } }
+    @Published public var prereadingPolicy: String { didSet { defaults.set(prereadingPolicy, forKey: "aiPrereadingPolicy") } }
+    @Published public var outputLanguage: String { didSet { defaults.set(outputLanguage, forKey: "aiOutputLanguage") } }
     public let chatGPT: ChatGPTAccountStore
     public var canUseAI: Bool { connectionMode == .chatGPT ? chatGPT.isConnected : hasKey }
     @Published public private(set) var invalidSettingsMessage: String?
@@ -1092,6 +1106,9 @@ public final class AISettingsStore: ObservableObject {
         self.chatGPT = chatGPT ?? ChatGPTAccountStore(defaults: defaults)
         self.connectionMode = defaults.string(forKey: "aiConnectionMode").flatMap(AIConnectionMode.init(rawValue:)) ?? .apiKey
         self.defaults = defaults
+        self.reviewBeforeSending = defaults.bool(forKey: "aiReviewBeforeSending")
+        self.prereadingPolicy = defaults.string(forKey: "aiPrereadingPolicy") ?? "ask"
+        self.outputLanguage = defaults.string(forKey: "aiOutputLanguage") ?? ""
         self.keyStore = keyStore
         self.baseURL = defaults.string(forKey: Self.baseURLKey) ?? Self.defaultBaseURL
         self.model = defaults.string(forKey: Self.modelKey) ?? Self.defaultModel

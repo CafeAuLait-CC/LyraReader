@@ -4490,6 +4490,64 @@ public final class RustEngine: PDFEngine {
         return plan
     }
 
+    public func locateAIReadingSource(page: UInt32, text: String) async throws -> [AiSourceRectRecord] {
+        guard let document else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let epoch = documentEpoch
+        let plan: [AiSourceRectRecord] = try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(returning: try document.locateAiReadingSource(page: page, text: text))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        guard epoch == documentEpoch else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "The document changed while the AI preview was being prepared; nothing was sent."]
+            )
+        }
+        return plan
+    }
+
+    public func prepareAIReadingTask(_ request: AiPlanRequestRecord, options: AiReadingOptionsRecord) async throws -> AiPlanRecord {
+        guard let document else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No document is open"]
+            )
+        }
+        let epoch = documentEpoch
+        let plan: AiPlanRecord = try await withCheckedThrowingContinuation { continuation in
+            rasterQueue.async {
+                do {
+                    continuation.resume(returning: try document.prepareAiReadingTask(request: request, options: options))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        guard epoch == documentEpoch else {
+            throw NSError(
+                domain: "LyraReader",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "The document changed while the AI preview was being prepared; nothing was sent."]
+            )
+        }
+        return plan
+    }
+
     /// Inspect one layered-summary level without building prompts: every unit comes back with
     /// the hash of exactly the text it would send. The panel uses this to show cached rows and
     /// mark a changed section stale with no request. Runs on the serialised raster queue for the

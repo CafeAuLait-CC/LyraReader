@@ -115,6 +115,7 @@ struct AIRegionCardView: View {
         .onChange(of: notes.phase) { _, phase in
             if phase == .finished {
                 card.keepGeneratedNote(); showingNote = true; state.persistRegionHistory()
+                NotificationCenter.default.post(name: .lyraReadingNoteChanged, object: state)
             }
         }
         .confirmationDialog("Delete this conversation?", isPresented: $confirmingDelete,
@@ -164,7 +165,7 @@ struct AIRegionCardView: View {
         [
             LyraReaderMenuItem(showingNote ? "Show Conversation" : "Show Reading Note", icon: "note.text",
                 enabled: !card.knowledgeNote.isEmpty || card.notesBusy) { showingNote.toggle() },
-            LyraReaderMenuItem("Distill into Reading Note", icon: "sparkles",
+            LyraReaderMenuItem(aiReadingLabel("Finish & Make Note"), icon: "sparkles",
                 enabled: !card.conversationContext.isEmpty && !card.isBusy && !card.notesBusy) {
                 guard let context = state.aiReaderContext else { return }
                 showingNote = true; Task { await card.distill(context: context) }
@@ -263,6 +264,7 @@ struct AIRegionCardView: View {
         }.frame(maxWidth: .infinity, alignment: .leading)
     }
     @ViewBuilder private var noteContent: some View {
+        if let error = card.noteError { Text(error).font(.caption).foregroundStyle(LyraReaderTheme.errorFg) }
         if card.notesBusy {
             AIAnswerView(text: notes.answer.isEmpty ? "Organizing key points…" : notes.answer,
                          pageCount: state.document?.pageCount ?? 0,

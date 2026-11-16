@@ -1,8 +1,12 @@
 import AppKit
-import CryptoKit
 import Foundation
 import LyraReaderBindings
 import SwiftUI
+
+struct AIPreReadingPause: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+}
 
 /// One completed reading of the document. Source hashes invalidate it after any PDF change.
 public struct AIDocumentKnowledgeRecord: Codable, Equatable, Sendable {
@@ -18,7 +22,7 @@ public struct AIDocumentKnowledgeRecord: Codable, Equatable, Sendable {
 /// may proceed immediately with their own source passages while that reading is in progress.
 @MainActor
 public final class AIDocumentKnowledge: ObservableObject {
-    public enum Phase: Equatable { case idle, preparing, consent, reading, ready, failed }
+    public enum Phase: String, Equatable { case idle, preparing, consent, reading, ready, failed }
     @Published public private(set) var phase: Phase = .idle
     @Published public var isPresented = false
     @Published public private(set) var record: AIDocumentKnowledgeRecord?
@@ -34,6 +38,7 @@ public final class AIDocumentKnowledge: ObservableObject {
     private var sourceIdentity: String?
     private var allowsWithoutSummary = false
     private var retryAction: (() -> Void)?
+    public var isBlocking: Bool { phase == .preparing || phase == .consent || phase == .reading }
     public init() {}
 
     public func ensure(service: any AIChatServicing, context: AIReaderContext,
@@ -43,8 +48,13 @@ public final class AIDocumentKnowledge: ObservableObject {
         let identity = sourceKey + "|" + cacheKey
         if let sourceIdentity, sourceIdentity != identity { invalidate() }
         sourceIdentity = identity
+        let gate = try aiReadingGate(policy: settings.prereadingPolicy,
+            state: allowsWithoutSummary && record == nil && background == nil ? "skipped" : phase.rawValue, hasCache: false)
+        if gate == "wait" { throw AIPreReadingPause(message: "Document prereading is in progress. Continue when Lyra AI is ready.") }
+        if gate == "ready" { return "" }
+        if phase == .failed { throw AIPreReadingPause(message: "Prereading paused. Retry or choose Continue Without Reading.") }
         if let pending { return try await pending.value }
-        if background != nil || (allowsWithoutSummary && record == nil) { return "" }
+        if allowsWithoutSummary && record == nil { return "" }
         let token = epoch
         let task = Task { @MainActor [weak self] () throws -> String in
             guard let self else { throw CancellationError() }
@@ -72,23 +82,28 @@ public final class AIDocumentKnowledge: ObservableObject {
             guard self.epoch == token else { throw CancellationError() }
             self.phase = .consent
             self.message = model.errorMessage
-            self.isPresented = true
+            self.isPresented = gate == "ask"
             self.retryAction = { [weak self] in
                 Task { @MainActor [weak self] in
                     _ = try? await self?.ensure(service: service, context: context,
                         sourceURL: sourceURL, cacheDocumentURL: cacheDocumentURL)
                 }
             }
-            let startReading = try await withCheckedThrowingContinuation {
-                (continuation: CheckedContinuation<Bool, Error>) in self.approval = continuation
+            let startReading: Bool
+            if gate == "read" { startReading = true }
+            else {
+                startReading = try await withCheckedThrowingContinuation {
+                    (continuation: CheckedContinuation<Bool, Error>) in self.approval = continuation
+                }
             }
             try Task.checkCancellation()
             guard self.epoch == token else { throw CancellationError() }
             self.isPresented = false
-            self.allowsWithoutSummary = true
+            self.allowsWithoutSummary = !startReading
             if startReading, let plan = model.plan, model.phase == .preview {
                 self.startBackground(model: model, plan: plan, sourceURL: sourceURL,
                                      file: file, hash: hash, token: token)
+                throw AIPreReadingPause(message: "Document prereading has started. Continue when Lyra AI is ready.")
             } else {
                 self.phase = .idle
                 self.message = nil
@@ -102,10 +117,7 @@ public final class AIDocumentKnowledge: ObservableObject {
     }
 
     private static func hash(_ url: URL) async throws -> String {
-        try await Task.detached(priority: .utility) {
-            let data = try Data(contentsOf: url, options: .mappedIfSafe)
-            return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        }.value
+        try await Task.detached(priority: .utility) { try aiDocumentFingerprint(path: url.path) }.value
     }
 
     private func startBackground(model: AIAssistantModel, plan: AiPlanRecord, sourceURL: URL,
@@ -114,6 +126,15 @@ public final class AIDocumentKnowledge: ObservableObject {
         background = Task { @MainActor [weak self] in
             guard let self else { return }
             defer { if self.epoch == token { self.background = nil } }
+            if self.settings.reviewBeforeSending {
+                let approved = await AIReadingReviewWindow.review(plan)
+                guard self.epoch == token else { return }
+                guard approved else {
+                    self.phase = .idle; self.message = "Prereading cancelled. Choose whether to preread when you use AI again."
+                    return
+                }
+            }
+            guard self.epoch == token, !Task.isCancelled else { return }
             model.send()
             var consolidated = plan.parts.count <= 1
             do {
@@ -141,7 +162,12 @@ public final class AIDocumentKnowledge: ObservableObject {
                     summary: model.answer, pages: plan.sourcePages.map(Int.init), model: plan.model, readAt: Date())
                 self.record = record
                 self.phase = .ready
-                self.message = "Document reading is ready. New questions can use it."
+                self.message = "Lyra AI is ready. You can continue using AI tools."
+                Task { @MainActor [weak self] in
+                    do { try await Task.sleep(for: .seconds(4)) } catch { return }
+                    guard self?.epoch == token, self?.phase == .ready else { return }
+                    self?.statusVisible = false
+                }
                 do { try JSONEncoder().encode(record).write(to: file, options: .atomic) }
                 catch { self.message = "Document reading is ready, but could not be saved for next time." }
             } catch is CancellationError {
@@ -158,7 +184,10 @@ public final class AIDocumentKnowledge: ObservableObject {
     }
 
     public func proceed() { approval?.resume(returning: true); approval = nil }
-    public func continueWithoutSummary() { approval?.resume(returning: false); approval = nil }
+    public func continueWithoutSummary() {
+        if let approval { approval.resume(returning: false); self.approval = nil }
+        else { allowsWithoutSummary = true; phase = .idle; statusVisible = false; message = nil; failureDetail = nil }
+    }
     public func dismissStatus() { statusVisible = false }
     public func retry() {
         guard background == nil else { return }
@@ -169,7 +198,7 @@ public final class AIDocumentKnowledge: ObservableObject {
         background?.cancel(); reader?.cancelRegionWork()
         pending?.cancel(); pending = nil
         epoch = UUID()
-        background = nil; phase = .idle
+        background = nil; phase = .idle; allowsWithoutSummary = true
         message = "Document reading stopped. You can keep using Lyra without it."
     }
     public func cancel() {
@@ -204,12 +233,16 @@ package final class DocumentKnowledgeService: AIChatServicing {
         return (summary, knowledge.record?.pages ?? [])
     }
     package func prepare(_ request: AIMakePlanRequest) async throws -> AiPlanRecord {
-        if request.action == .translateSelection { return try await base.prepare(request) }
         let prior = try await priorWithPages()
         if prior.text.isEmpty { return try await base.prepare(request) }
         return try await base.prepare(
             request.withDocumentContext()
                 .withDocumentKnowledge(prior.text, pages: prior.pages))
+    }
+    package func prepareReading(_ request: AIMakePlanRequest, options: AiReadingOptionsRecord) async throws -> AiPlanRecord {
+        let prior = try await priorWithPages()
+        let input = prior.text.isEmpty ? request : request.withDocumentKnowledge(prior.text, pages: prior.pages)
+        return try await base.prepareReading(input, options: options)
     }
     package func prepareMerge(_ request: AIMergePlanRequest) async throws -> AiPlanRecord {
         let prior = try await priorWithPages()
@@ -257,7 +290,7 @@ struct AIDocumentKnowledgeSheet: View {
             HStack(spacing: 10) {
                 LyraAIIcon(isActive: knowledge.phase == .reading || knowledge.phase == .preparing).frame(width: 32, height: 32)
                     .foregroundStyle(LyraReaderTheme.accent)
-                Text(knowledge.phase == .reading ? "Getting to know your document…" : "Get to know this document")
+                Text(knowledge.phase == .reading ? "Prereading your document…" : "Get to know this document")
                     .font(.system(size: 18, weight: .semibold))
             }
             Text("Lyra can read this document once to connect ideas across your questions, and save that understanding locally. It works in the background while you read. You can also continue without it; answers may have less context about the whole document.")
@@ -270,7 +303,7 @@ struct AIDocumentKnowledgeSheet: View {
                 Button("Continue Without Reading") { knowledge.continueWithoutSummary() }
                     .buttonStyle(ReaderPanelButtonStyle())
                 if knowledge.phase != .reading {
-                    Button("Read in Background") { knowledge.proceed() }
+                    Button("Start prereading") { knowledge.proceed() }
                         .buttonStyle(ReaderPanelButtonStyle(prominent: true))
                         .keyboardShortcut(.defaultAction)
                         .disabled(knowledge.reader?.plan == nil || knowledge.reader?.phase != .preview)
@@ -308,7 +341,10 @@ struct AIDocumentKnowledgeStatus: View {
                             .font(.caption)
                     }
                     if knowledge.record == nil {
-                        Button("Read Document…") { knowledge.retry() }.buttonStyle(.plain)
+                        HStack {
+                            Button("Retry prereading") { knowledge.retry() }
+                            Button("Continue Without Reading") { knowledge.continueWithoutSummary() }
+                        }.buttonStyle(.plain)
                     }
                 }
             }
@@ -334,9 +370,8 @@ private struct AIDocumentKnowledgeProgress: View {
                         .font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
                 }
                 if reading {
-                    ProgressView(value: Double(reader.partAnswers.count), total: Double(max(1, plan.parts.count)))
-                        .tint(LyraReaderTheme.accent)
-                    Text(reader.mergePlan != nil ? "Connecting the ideas…" : "Reading \(reader.partAnswers.count) of \(plan.parts.count) parts")
+                    ProgressView().controlSize(.small)
+                    Text(reader.mergePlan != nil ? "Connecting the ideas…" : "Prereading is still in progress…")
                         .font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
                 }
             }

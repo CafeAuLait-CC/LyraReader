@@ -9,7 +9,7 @@ import SwiftUI
 /// the 1 pt separator are added on top, exactly like the left sidebar's separator.
 public enum ReaderSidePanelMetrics {
     /// Content width a fresh install opens with.
-    public static let defaultContentWidthPt: CGFloat = 320
+    public static let defaultContentWidthPt: CGFloat = 414
     /// Narrow enough to leave a usable canvas at the window's minimum width, wide enough for the
     /// assistant's action grid and request preview without squeezing them.
     public static let minimumContentWidthPt: CGFloat = 240

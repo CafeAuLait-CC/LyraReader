@@ -41,21 +41,24 @@ extension ReaderChecks {
             sourceURL: source, cacheDocumentURL: source) }
         try await eventually("background reading asks before network work", { background.phase == .consent })
         background.proceed()
-        let released = try await begin.value
-        require(released.isEmpty && !background.isPresented,
-                "starting background reading releases the original action before any answer")
+        do { _ = try await begin.value; require(false, "the original action must pause for prereading") }
+        catch { require(error is AIPreReadingPause, "prereading pauses the action without a provider failure") }
+        require(!background.isPresented, "starting prereading closes the choice window")
         try await eventually("the background request starts", { service.handles.count == 1 })
         let wrapped = DocumentKnowledgeService(base: service, knowledge: background, context: context,
             sourceURL: source, cacheDocumentURL: source)
-        var prepared = false
-        let another = Task { _ = try await wrapped.prepare(request); prepared = true }
-        try await eventually("another AI action prepares while the provider has not answered", { prepared })
-        try await another.value
+        do { _ = try await wrapped.prepare(request); require(false, "another AI action must wait for prereading") }
+        catch { require(error is AIPreReadingPause, "all AI requests share the prereading gate") }
+        require(service.handles.count == 1, "a blocked action cannot start a second provider request")
         service.handles[0].fail()
         try await eventually("a slow provider failure becomes nonmodal status", { background.phase == .failed })
+        do { _ = try await background.ensure(service: service, context: context,
+            sourceURL: source, cacheDocumentURL: source); require(false, "a failed preread requires retry or explicit skip") }
+        catch { require(error is AIPreReadingPause, "prereading failure retains a recoverable gate") }
+        background.continueWithoutSummary()
         let afterFailure = try await background.ensure(service: service, context: context,
             sourceURL: source, cacheDocumentURL: source)
-        require(afterFailure.isEmpty && !background.isPresented && background.statusVisible,
+        require(afterFailure.isEmpty && !background.isPresented,
                 "an idle timeout cannot lock subsequent AI actions behind a retry sheet")
         background.retry()
         try await eventually("retry asks again without sending automatically", { background.phase == .consent })

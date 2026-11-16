@@ -1,7 +1,7 @@
 import AppKit
 import CoreText
 import LyraReaderBindings
-import LyraReaderKit
+@testable import LyraReaderKit
 import SwiftUI
 import Darwin
 import Foundation
@@ -154,6 +154,7 @@ extension ReaderChecks {
         try await aiDocumentChatChecks(root: root)
         try await aiDocumentChatLayoutChecks(root: root)
         try await aiLayeredSummaryChecks(root: root)
+        try await aiReadingWorkspaceChecks(root: root)
     }
 
     @MainActor
@@ -1481,10 +1482,10 @@ extension ReaderChecks {
                 boundedModel.chatTurns.last?.state == .finished
             })
         }
-        require(boundedModel.chatTurns.count == AIAssistantModel.chatTurnLimit,
-                "the visible chat keeps exactly \(AIAssistantModel.chatTurnLimit) turns")
-        require(boundedModel.chatTurns.first?.question.contains("vari2") == true,
-                "the oldest turn was dropped")
+        require(boundedModel.chatTurns.count == 7,
+                "the visible chat keeps all seven turns while request context stays bounded")
+        require(boundedModel.chatTurns.first?.question.contains("vari1") == true,
+                "the oldest turn remains visible")
         require(boundedModel.chatTurns.last?.question.contains("vari7") == true,
                 "the newest turn is present")
         let otherContext = AIReaderContext(
@@ -1498,8 +1499,8 @@ extension ReaderChecks {
         require(boundedModel.chatTurns.isEmpty,
                 "switching documents shows the other document's (empty) conversation")
         boundedModel.attach(service: boundedService, context: context)
-        require(boundedModel.chatTurns.count == AIAssistantModel.chatTurnLimit,
-                "switching back restores the first document's bounded conversation")
+        require(boundedModel.chatTurns.count == 7,
+                "switching back restores the complete conversation")
 
         print("AI-DOCCHAT pages=\(sentPages.sorted()) document_chars=\(preview.parts[0].pageCharacters) request_chars=\(preview.parts[0].requestCharacters) chips=\(links.chips.map(\.page))")
     }
@@ -1671,7 +1672,10 @@ extension ReaderChecks {
         width: CGFloat
     ) async throws -> DocumentChatPanelMeasurements {
         model.selectedTab = .chat
-        model.expandedChatSources = Set(model.chatTurns.map(\.id))
+        let reading = model.readingWorkspace
+        await reading.bind(state)
+        reading.chat.restoreChat(model.chatTurns, draft: model.chatQuestion)
+        reading.chat.expandedChatSources = Set(reading.chat.chatTurns.map(\.id))
         let host = NSHostingView(rootView: AIAssistantRightPanelContent(state: state, model: model))
         let container = NSView(frame: CGRect(x: 0, y: 0, width: width, height: 800))
         host.frame = container.bounds
@@ -1728,7 +1732,10 @@ extension ReaderChecks {
             chat: chat,
             composer: composer,
             actions: actions,
-            composerField: fields.first.map { host.convert($0.bounds, from: $0) },
+            composerField: fields.first.map { host.convert($0.bounds, from: $0) }
+                ?? findViews(NSTextView.self, in: host).first(where: {
+                    $0.isEditable && host.convert($0.bounds, from: $0).intersects(composerFrame)
+                }).map { host.convert($0.bounds, from: $0) },
             askButton: findView(AIDocumentChatAskMarkerView.self, in: host)
                 .map { host.convert($0.bounds, from: $0) }
                 ?? buttons.first.map { host.convert($0.bounds, from: $0) },
@@ -1736,7 +1743,7 @@ extension ReaderChecks {
             historyViewportHeight: history?.contentView.bounds.height ?? 0,
             chipFrames: firstChipPerPage.map { (page: $0.0, frame: $0.1) }
         )
-        model.expandedChatSources = []
+        reading.chat.expandedChatSources = []
         let turnsBefore = model.chatTurns.count
         let languageBefore = model.targetLanguage
         for tab in AIAssistantTab.allCases {

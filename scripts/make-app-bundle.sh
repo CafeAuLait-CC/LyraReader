@@ -49,6 +49,10 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 cp "$BIN" "$APP/Contents/MacOS/LyraReader"
 cp apps/macos/Support/Info.plist "$APP/Contents/Info.plist"
+# The native resource adapter resolves signed app resources inside Contents/Resources.
+for resource in "$BIN_DIR"/*.bundle; do
+  [ -d "$resource" ] && cp -R "$resource" "$APP/Contents/Resources/"
+done
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 if [ -f "$ROOT/apps/macos/Support/AppIcon.icns" ]; then

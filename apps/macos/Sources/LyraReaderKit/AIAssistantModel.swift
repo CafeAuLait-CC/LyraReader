@@ -60,8 +60,8 @@ public final class AIAssistantModel: ObservableObject {
     /// The target language for "Translate selection"; the view binds it.
     @Published public var targetLanguage = "English"
 
-    /// The conversation for the document currently attached. Turns are kept newest-last and
-    /// the list is bounded by `chatTurnLimit`.
+    /// Complete display history for the current document, newest last. Rust bounds only the
+    /// context sent to a provider.
     @Published public private(set) var chatTurns: [AIChatTurn] = []
     /// The exact question the current chat preview/send belongs to. Captured when Ask is
     /// pressed, so editing the composer afterwards cannot change what Send will do.
@@ -70,16 +70,14 @@ public final class AIAssistantModel: ObservableObject {
     /// field; this snapshot is what history and the panel import record.
     @Published public private(set) var regionAskedQuestion: String?
 
-    /// Most recent exchanges kept per document, in the panel and in the request. The Rust
-    /// builder applies the same bound again.
-    public static let chatTurnLimit = 6
     public static let chatLimitDescription =
-        "Keeps the most recent \(chatTurnLimit) questions and answers per document; older turns are dropped."
+        "Conversation history is saved with this document. Only recent context is sent with each question."
 
     public let settings: AISettingsStore
     /// The Summary tab's three-layer summary. It shares the window and settings with the panel
     /// but owns its own request state, so a failed page one-liner never disturbs a chat answer.
     public let layeredSummary: LayeredSummaryModel
+    lazy var readingWorkspace = AIReadingModel(settings: settings, audit: audit)
     /// The local audit trail every request attempt is recorded in. The panel observes it too,
     /// so a new record or a clear is visible without a refresh.
     public let audit: AIAuditTrail
@@ -88,8 +86,13 @@ public final class AIAssistantModel: ObservableObject {
     private var pollTask: Task<Void, Never>?
     private var currentPartIndex: Int?
     private var merging = false
+    private var unifiedReadingTask = false
+    private var readingOptions: AiReadingOptionsRecord?
+    private var readingLanguage = ""
+    private var taskPreparationID = UUID()
     private var preparedConnection: AIConnectionMode = .apiKey
     private var preparedAccountID: UUID?
+    private var preparedProviderSettings: AIProviderSettings?
     /// Per-document conversations. The model is per window (the side panel owns it), so a
     /// document keeps its chat while it is open in this window and loses it when the window closes.
     private var conversations: [String: [AIChatTurn]] = [:]
@@ -191,8 +194,22 @@ public final class AIAssistantModel: ObservableObject {
         settings.reasoningMode == .off && (usage?.reasoningTokens ?? 0) > 0
     }
 
+    var sentSourcePages: [UInt32] {
+        guard let plan else { return [] }
+        return Array(Set(plan.parts.filter { partAnswers[Int($0.index)] != nil }.flatMap(\.pages))).sorted()
+    }
+
     /// How many requests Send will make. The preview lists each one.
     public var requestCount: Int { plan?.parts.count ?? 0 }
+
+    public func restoreChat(_ turns: [AIChatTurn], draft: String) {
+        guard !isSending else { return }
+        clearChatTransientState()
+        plan = nil; phase = .idle
+        chatTurns = turns
+        chatQuestion = draft
+        saveCurrentConversation()
+    }
 
     /// Attach the current window's service and document. Switching documents cancels an
     /// in-flight request and swaps to that document's own conversation: a chat about another
@@ -214,10 +231,12 @@ public final class AIAssistantModel: ObservableObject {
     }
 
     /// Prepare a request preview. This reads document text locally and does not read the key.
-    public func prepare(action: AIAssistantAction, context: AIReaderContext, documentKnowledge: Bool = false) async {
+    public func prepare(action: AIAssistantAction, context: AIReaderContext, documentKnowledge: Bool = false, reading: AiReadingOptionsRecord? = nil, outputLanguage: String? = nil) async {
         if documentKey != context.documentKey {
             attach(service: service, context: context)
         }
+        unifiedReadingTask = reading != nil
+        readingOptions = reading; readingLanguage = outputLanguage ?? ""
         let auditStart = Date()
         let auditKind = AIAuditAction(action)
         requestFailure = .other
@@ -256,6 +275,8 @@ public final class AIAssistantModel: ObservableObject {
         cancelWork()
         preparedConnection = settings.connectionMode
         preparedAccountID = settings.connectionMode == .chatGPT ? settings.chatGPT.selectedID : nil
+        preparedProviderSettings = providerSettings
+        let preparationID = taskPreparationID
         phase = .preparing
         plan = nil
         resetMergeState()
@@ -263,12 +284,11 @@ public final class AIAssistantModel: ObservableObject {
         errorMessage = nil
         statusNote = "Preparing the context preview. Nothing has been sent."
 
-        let question = action == .askSelection
+        let question = action == .askSelection || reading?.kind == "term" || reading?.kind == "note"
             ? question.trimmingCharacters(in: .whitespacesAndNewlines)
             : nil
-        let language = action == .translateSelection
-            ? targetLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
-            : nil
+        let language = outputLanguage ?? (action == .translateSelection
+            ? targetLanguage.trimmingCharacters(in: .whitespacesAndNewlines) : nil)
         let request = AIMakePlanRequest(
             action: action,
             currentPage: context.currentPage,
@@ -280,14 +300,17 @@ public final class AIAssistantModel: ObservableObject {
         )
 
         do {
-            let source = try await service.prepare(request)
+            let source: AiPlanRecord
+            if let reading { source = try await service.prepareReading(request, options: reading) }
+            else { source = try await service.prepare(request) }
             let plan = try AIPlanWire.render(source, connection: preparedConnection)
-            guard documentKey == context.documentKey else { return }
+            guard documentKey == context.documentKey, taskPreparationID == preparationID else { return }
             self.plan = plan
             phase = .preview
             statusNote = "Nothing has been sent yet. Review the request below, then press Send."
         } catch {
-            guard documentKey == context.documentKey else { return }
+            guard documentKey == context.documentKey, taskPreparationID == preparationID else { return }
+            if handlePrereadingPause(error) { return }
             recordRefusal(auditKind,
                           code: AIAuditCode.classifyPreparationFailure(
                             error,
@@ -349,6 +372,8 @@ public final class AIAssistantModel: ObservableObject {
         cancelWork()
         preparedConnection = settings.connectionMode
         preparedAccountID = settings.connectionMode == .chatGPT ? settings.chatGPT.selectedID : nil
+        preparedProviderSettings = providerSettings
+        let preparationID = taskPreparationID
         phase = .preparing
         plan = nil
         resetMergeState()
@@ -370,12 +395,13 @@ public final class AIAssistantModel: ObservableObject {
         do {
             let source = try await service.prepare(request)
             let plan = try AIPlanWire.render(source, connection: preparedConnection)
-            guard documentKey == context.documentKey, pendingChatQuestion == question else { return }
+            guard documentKey == context.documentKey, taskPreparationID == preparationID, pendingChatQuestion == question else { return }
             self.plan = plan
             phase = .preview
             statusNote = "Nothing has been sent yet. The preview lists the pages and characters that will go out; press Send to ask."
         } catch {
-            guard documentKey == context.documentKey, pendingChatQuestion == question else { return }
+            guard documentKey == context.documentKey, taskPreparationID == preparationID, pendingChatQuestion == question else { return }
+            if handlePrereadingPause(error) { return }
             let message = AIReadableError.message(error)
             let nothingRelevant = (error as? LyraReaderFfiError).map { ffi in
                 if case .Ai(_, let code, _) = ffi { return code == .nothingRelevant }
@@ -417,7 +443,7 @@ public final class AIAssistantModel: ObservableObject {
     /// that the card did not display.
     func cancelRegionWork() {
         regionPreparationID = UUID()
-        if phase == .preparing || phase == .streaming {
+        if phase == .preparing || phase == .streaming || phase == .preview || phase == .mergePreview {
             cancelWork()
             phase = .cancelled
             statusNote = "Stopped. The conversation is kept."
@@ -476,6 +502,7 @@ public final class AIAssistantModel: ObservableObject {
         do {
             providerSettings = try settings.providerSettings()
         } catch {
+            if handlePrereadingPause(error) { return }
             recordRefusal(.regionQuestion,
                           code: AIAuditCode.classifyPreparationFailure(
                             error,
@@ -490,6 +517,7 @@ public final class AIAssistantModel: ObservableObject {
         cancelWork()
         preparedConnection = settings.connectionMode
         preparedAccountID = settings.connectionMode == .chatGPT ? settings.chatGPT.selectedID : nil
+        preparedProviderSettings = providerSettings
         phase = .preparing
         plan = nil
         resetMergeState()
@@ -522,6 +550,7 @@ public final class AIAssistantModel: ObservableObject {
             statusNote = "Nothing has been sent yet. \(imageNote) Review the exact request below, then press Ask."
         } catch {
             guard regionPreparationID == preparationID, documentKey == context.documentKey, regionAskedQuestion == question else { return }
+            if handlePrereadingPause(error) { return }
             let message = AIReadableError.message(error)
             recordRefusal(.regionQuestion,
                           code: AIAuditCode.classifyPreparationFailure(
@@ -784,6 +813,7 @@ public final class AIAssistantModel: ObservableObject {
                         "The ChatGPT account changed or signed out. Prepare a new request.",
                         .signedOut)
                 }
+                try validatePreparedProviderSettings()
                 return ChatGPTResponsesHandle(plan: plan, accounts: settings.chatGPT, accountID: id)
             }
             guard settings.connectionMode == preparedConnection else {
@@ -791,10 +821,17 @@ public final class AIAssistantModel: ObservableObject {
                     "The AI connection changed. Prepare a new request before sending.",
                     .connectionChanged)
             }
+            try validatePreparedProviderSettings()
             guard let key = try settings.readKey() else {
                 throw AISettingsError.refused(Self.noKeyMessage, .noApiKey)
             }
             return try service.start(plan, apiKey: key)
+        }
+    }
+
+    private func validatePreparedProviderSettings() throws {
+        if let preparedProviderSettings, try settings.providerSettings() != preparedProviderSettings {
+            throw AISettingsError.refused("The AI configuration changed. Prepare a new request before sending.", .connectionChanged)
         }
     }
 
@@ -834,7 +871,7 @@ public final class AIAssistantModel: ObservableObject {
                 if !merging && partAnswers[index] == nil {
                     partAnswers[index] = ""
                 }
-                if total > 1 {
+                if total > 1 && !unifiedReadingTask {
                     let header = "Part \(index + 1) of \(total) · \(label)"
                     if answer.isEmpty {
                         answer = header + "\n\n"
@@ -842,6 +879,7 @@ public final class AIAssistantModel: ObservableObject {
                         answer += "\n\n" + header + "\n\n"
                     }
                 }
+                if unifiedReadingTask && total > 1 && !answer.isEmpty { answer += "\n\n" }
                 statusNote = total > 1
                     ? "Streaming part \(index + 1) of \(total) — \(label)."
                     : "Streaming…"
@@ -1115,7 +1153,11 @@ public final class AIAssistantModel: ObservableObject {
                     parts: parts
                 )
             )
-            self.mergePlan = try AIPlanWire.render(mergePlan, connection: preparedConnection)
+            let styled: AiPlanRecord
+            if let options = readingOptions {
+                styled = try styleAiReadingPlan(plan: mergePlan, kind: options.kind, detail: options.detail, language: readingLanguage)
+            } else { styled = mergePlan }
+            self.mergePlan = try AIPlanWire.render(styled, connection: preparedConnection)
             phase = .mergePreview
             statusNote = "Part summaries complete. Review the consolidation request below; sending it is a separate request."
         } catch {
@@ -1206,7 +1248,14 @@ public final class AIAssistantModel: ObservableObject {
         handle = nil
     }
 
+    private func handlePrereadingPause(_ error: Error) -> Bool {
+        guard error is AIPreReadingPause else { return false }
+        phase = .idle; errorMessage = nil; statusNote = error.localizedDescription; pendingChatQuestion = nil
+        return true
+    }
+
     private func cancelWork() {
+        taskPreparationID = UUID()
         if streamingChatTurnID != nil {
             finishChatTurn(.cancelled)
         }
@@ -1220,26 +1269,16 @@ public final class AIAssistantModel: ObservableObject {
     /// switching documents restore a chat instead of silently carrying another paper's answers.
     private func saveCurrentConversation() {
         guard let key = documentKey else { return }
-        trimChatTurns()
         conversations[key] = chatTurns
     }
 
     private func appendChatTurn(_ turn: AIChatTurn) {
         chatTurns.append(turn)
-        trimChatTurns()
         saveCurrentConversation()
     }
 
-    /// Bound the visible conversation to the most recent exchanges. The Rust planner applies the
-    /// same bound to the request, so the preview cannot include something the panel dropped.
-    private func trimChatTurns() {
-        if chatTurns.count > Self.chatTurnLimit {
-            chatTurns.removeFirst(chatTurns.count - Self.chatTurnLimit)
-        }
-    }
-
     /// The previous turns that go to the model: finished answers and cancelled partials, newest
-    /// last, at most the bound. Failed and "nothing relevant" turns stay visible but are not fed
+    /// last. Rust applies the request bound. Failed and "nothing relevant" turns stay visible but are not fed
     /// back as if they were model answers.
     private func chatHistoryForRequest() -> [AIConversationTurn] {
         chatTurns
@@ -1247,7 +1286,6 @@ public final class AIAssistantModel: ObservableObject {
                 ($0.state == .finished || $0.state == .cancelled)
                     && !$0.answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             }
-            .suffix(Self.chatTurnLimit)
             .map { AIConversationTurn(question: $0.question, answer: $0.answer) }
     }
 

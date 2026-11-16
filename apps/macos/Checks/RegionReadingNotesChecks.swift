@@ -139,9 +139,9 @@ extension ReaderChecks {
         try await eventually("first AI use asks to read the document") { knowledge.phase == .consent }
         require(service.starts == before, "the first-use prompt sends nothing before Start Reading")
         knowledge.proceed()
-        let immediate = try await reading.value
-        require(immediate.isEmpty && !knowledge.isPresented,
-                "background consent releases the original AI action and closes its sheet")
+        do { _ = try await reading.value; require(false, "prereading must pause the original action") }
+        catch { require(error.localizedDescription.contains("prereading"), "prereading reports a recoverable pause") }
+        require(!knowledge.isPresented, "prereading closes its independent choice window")
         try await eventually("background document reading completes") { knowledge.phase == .ready }
         let prior = knowledge.record?.summary ?? ""
         require(!prior.isEmpty && knowledge.record?.pages == [1], "a completed full reading records its source coverage")
@@ -164,6 +164,7 @@ extension ReaderChecks {
         let messages = body["messages"] as! [[String: Any]]
         require(messages[0]["content"] as? String == plan.parts[0].systemPrompt,
                 "inspectable system context and actual outgoing JSON are identical")
+        settings.prereadingPolicy = "never"
         let noPrior = AIDocumentKnowledge(); noPrior.settings = settings
         let translator = DocumentKnowledgeService(base: service, knowledge: noPrior, context: context,
             sourceURL: source, cacheDocumentURL: source)
@@ -171,6 +172,7 @@ extension ReaderChecks {
             selection: AIReaderSelection(page: 1, start: 0, end: 5), question: nil,
             language: "English", settings: try settings.providerSettings()))
         require(noPrior.phase == .idle && !noPrior.isPresented, "selection-only translation skips document reading")
+        settings.prereadingPolicy = "ask"
         var bytes = try Data(contentsOf: source); bytes.append(Data("\n% changed source\n".utf8)); try bytes.write(to: source)
         let changed = Task { try await restored.ensure(service: service, context: context, sourceURL: source, cacheDocumentURL: source) }
         try await eventually("changed PDF invalidates the prior and asks again") { restored.phase == .consent }

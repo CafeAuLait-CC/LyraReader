@@ -173,7 +173,16 @@ public struct AIAnswerView: View {
 // MARK: - Inline text
 
 /// A selectable, wrapping attributed paragraph with inline-math attachments.
+private struct ReadingStableTextLayoutKey: EnvironmentKey { static let defaultValue = false }
+extension EnvironmentValues {
+    var readingStableTextLayout: Bool {
+        get { self[ReadingStableTextLayoutKey.self] }
+        set { self[ReadingStableTextLayoutKey.self] = newValue }
+    }
+}
+
 public struct ReaderMarkdownInlineText: NSViewRepresentable {
+    @Environment(\.readingStableTextLayout) private var stableReadingLayout
     let inlines: [ReaderMarkdownInline]
     let pageCount: Int
     let fontSize: CGFloat
@@ -187,14 +196,14 @@ public struct ReaderMarkdownInlineText: NSViewRepresentable {
         textView.drawsBackground = false
         textView.textContainerInset = .zero
         textView.textContainer?.lineFragmentPadding = 0
-        textView.textContainer?.widthTracksTextView = true
-        textView.isVerticallyResizable = true
+        textView.textContainer?.widthTracksTextView = !stableReadingLayout
+        textView.isVerticallyResizable = !stableReadingLayout
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
         textView.isRichText = true
         textView.isAutomaticLinkDetectionEnabled = false
         textView.linkTextAttributes = [
-            .foregroundColor: NSColor.controlAccentColor,
+            .foregroundColor: stableReadingLayout ? LyraReaderTheme.accentColor : NSColor.controlAccentColor,
             .underlineStyle: NSUnderlineStyle.single.rawValue,
         ]
         textView.delegate = context.coordinator
@@ -212,6 +221,7 @@ public struct ReaderMarkdownInlineText: NSViewRepresentable {
         )
         if !nsView.attributedString().isEqual(to: attributed) {
             nsView.textStorage?.setAttributedString(attributed)
+            if stableReadingLayout { nsView.invalidateIntrinsicContentSize() }
         }
     }
 
@@ -224,6 +234,20 @@ public struct ReaderMarkdownInlineText: NSViewRepresentable {
         guard width.isFinite, width > 1 else { return nil }
         guard let container = nsView.textContainer, let layout = nsView.layoutManager else {
             return nil
+        }
+        if stableReadingLayout {
+            // A resizable NSTextView can grow after SwiftUI cached the lazy row's height,
+            // painting through later messages. Measure against an independent text container
+            // and let SwiftUI own the visible text view's frame.
+            let storage = NSTextStorage(attributedString: nsView.attributedString())
+            let measurement = NSLayoutManager()
+            let measureContainer = NSTextContainer(size: CGSize(width: width, height: .greatestFiniteMagnitude))
+            measureContainer.lineFragmentPadding = 0
+            measurement.addTextContainer(measureContainer)
+            storage.addLayoutManager(measurement)
+            measurement.ensureLayout(for: measureContainer)
+            container.containerSize = CGSize(width: width, height: .greatestFiniteMagnitude)
+            return CGSize(width: width, height: max(1, ceil(measurement.usedRect(for: measureContainer).height)))
         }
         container.containerSize = CGSize(width: width, height: .greatestFiniteMagnitude)
         layout.ensureLayout(for: container)

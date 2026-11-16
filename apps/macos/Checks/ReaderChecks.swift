@@ -359,6 +359,10 @@ struct ReaderChecks {
             print("Plan wire checks passed")
             return
         }
+        if CommandLine.arguments.contains("--check-ai-reading-workspace") {
+            try await aiReadingWorkspaceChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-ai-assistant") {
             try await aiAssistantChecks(root: fastRoot)
             print("AI assistant checks passed")
