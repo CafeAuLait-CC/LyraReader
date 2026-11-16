@@ -408,7 +408,7 @@ public struct SidebarView: View {
     private var outlineList: some View {
         Group {
             if state.outline.isEmpty {
-                emptyState("No outline", "list.bullet.indent", task: "T2.4")
+                emptyState("No outline", "list.bullet.indent")
             } else {
                 let rows = OutlineNumbering.rows(for: state.outline)
                 List(rows) { row in
@@ -495,7 +495,7 @@ public struct SidebarView: View {
     private var annotationList: some View {
         Group {
             if state.annotations.isEmpty && state.documentAnnotations.isEmpty && !state.documentAnnotationsLoading {
-                emptyState("No annotations yet", "highlighter", task: "T3.6")
+                emptyState("No annotations yet", "highlighter")
             } else {
                 ScrollViewReader { scroll in
                     ScrollView {
@@ -830,7 +830,7 @@ public struct SidebarView: View {
         )
     }
 
-    private func emptyState(_ title: String, _ symbol: String, task: String) -> some View {
+    private func emptyState(_ title: String, _ symbol: String) -> some View {
         VStack(spacing: 10) {
             Image(systemName: symbol)
                 .font(.system(size: 30, weight: .light))
@@ -838,9 +838,6 @@ public struct SidebarView: View {
             Text(title)
                 .font(.callout)
                 .foregroundStyle(LyraReaderTheme.textSecondary)
-            Text("Planned for \(task)")
-                .font(.caption)
-                .foregroundStyle(LyraReaderTheme.textTertiary)
         }
         .multilineTextAlignment(.center)
         .frame(maxWidth: .infinity, maxHeight: .infinity)

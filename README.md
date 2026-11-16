@@ -190,7 +190,8 @@ The Linux branch is not yet a release or a claim of full feature parity.
 ## Capabilities
 
 - **Read**: GPU-composited pages at the display's true resolution, tile pyramid for deep zoom, facing pages,
-  page gap, calibrated zoom (Actual Size / Fit Width / Fit Page), independent windows.
+  page gap, calibrated zoom (Actual Size / Fit Width / Fit Page), independent windows. View → Paper Appearance
+  offers four fixed presets: light Original Colours, light Warm Paper, and dark Night Reading with dark or white paper.
 - **Navigate**: outline with section numbers and levels, thumbnails that show the file's own annotations,
   document-wide search, per-window Back/Forward across preview jumps.
 - **Annotate**: four sliding tool rows — Annotate (markup / pen / placement), Edit (content tools), Fill & Sign

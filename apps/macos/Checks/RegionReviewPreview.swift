@@ -124,9 +124,11 @@ extension ReaderChecks {
             opener: DocumentOpenCoordinator(state: state), aiAssistant: assistant))
         let window = NSWindow(contentRect: CGRect(x: 150, y: 120, width: ProcessInfo.processInfo.environment["LYRA_READER_REVIEW_NARROW"] == "1" ? 760 : 1180, height: 860),
             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-        // Appearance override is confined to this opt-in local review window.
+        let savedAppearance = ReadingAppearanceStore.shared.mode
+        defer { ReadingAppearanceStore.shared.mode = savedAppearance }
+        // Keep source-white paper with a dark interface in this dedicated review process.
         if ProcessInfo.processInfo.environment["LYRA_READER_REVIEW_DARK"] == "1" {
-            window.appearance = NSAppearance(named: .darkAqua)
+            ReadingAppearanceStore.shared.mode = .nightWhite
         }
         window.title = localModel ? "Lyra Interleaf — Local Qwen" : "Lyra Region Review — Local Mock"
         window.contentView = host; window.makeKeyAndOrderFront(nil)

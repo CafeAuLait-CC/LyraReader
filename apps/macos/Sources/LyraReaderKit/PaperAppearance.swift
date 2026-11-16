@@ -2,22 +2,29 @@ import AppKit
 import SwiftUI
 
 public enum PaperAppearance: String, CaseIterable, Identifiable, Sendable {
-    case original, warm, night
+    case original, warm, night, nightWhite
     public var id: String { rawValue }
     public var title: String {
         switch self {
         case .original: "Original Colours"
         case .warm: "Warm Paper"
-        case .night: "Night Reading"
+        case .night: "Night Reading · Dark Paper"
+        case .nightWhite: "Night Reading · White Paper"
         }
     }
-    var code: UInt8 { switch self { case .original: 0; case .warm: 1; case .night: 2 } }
-    var colorScheme: ColorScheme? { switch self { case .original: nil; case .warm: .light; case .night: .dark } }
+    var code: UInt8 { switch self { case .original, .nightWhite: 0; case .warm: 1; case .night: 2 } }
+    // Every preset owns its interface appearance; nil can retain a prior dark window.
+    var colorScheme: ColorScheme {
+        switch self {
+        case .original, .warm: .light
+        case .night, .nightWhite: .dark
+        }
+    }
 
     /// Vector annotations follow the same display conversion as GPU page pixels. No model
     /// colour is edited; switching back to Original restores the exact source colour.
     package func displayColor(_ color: NSColor) -> NSColor {
-        guard self != .original, let rgb = color.usingColorSpace(.sRGB) else { return color }
+        guard self == .warm || self == .night, let rgb = color.usingColorSpace(.sRGB) else { return color }
         func linear(_ c: CGFloat) -> CGFloat { c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4) }
         func srgb(_ c: CGFloat) -> CGFloat { c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1 / 2.4) - 0.055 }
         let encoded = [rgb.redComponent, rgb.greenComponent, rgb.blueComponent]
@@ -60,7 +67,7 @@ struct PaperImageAppearance: ViewModifier {
     let mode: PaperAppearance
     @ViewBuilder func body(content: Content) -> some View {
         switch mode {
-        case .original: content
+        case .original, .nightWhite: content
         case .warm: content.colorMultiply(Color(red: 252/255, green: 247/255, blue: 237/255))
         case .night: content.grayscale(1).colorInvert().contrast(0.6).brightness(-0.05)
         }

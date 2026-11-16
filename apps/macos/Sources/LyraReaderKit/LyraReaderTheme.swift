@@ -4,6 +4,9 @@ import SwiftUI
 /// Native semantic colors from docs/Lyra-Palette (sRGB). PDF pixels keep their source colors.
 @MainActor
 public enum LyraReaderTheme {
+    private static let noteBackground: (light: UInt32, dark: UInt32) = (0xFFF0E6, 0x463126)
+    private static let noteForeground: (light: UInt32, dark: UInt32) = (0x8A4C26, 0xF3BD94)
+
     private static func adaptive(_ light: UInt32, _ dark: UInt32) -> NSColor {
         NSColor(name: nil) { @Sendable appearance in
             let hex = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light
@@ -13,9 +16,25 @@ public enum LyraReaderTheme {
         }
     }
 
-    /// Paper-bound note markers use the supplied icon palette, independent of window appearance.
+    /// Paper-bound stickers use the note tokens; inline comments retain their markup tint.
+    /// Both choose their appearance from the paper rather than the containing window.
     static func noteIconColors(state: NoteGlyph.State, darkPaper: Bool,
                                highlight: AnnotationColor? = nil) -> (paper: NSColor, fold: NSColor, ink: NSColor) {
+        func color(_ hex: UInt32) -> NSColor {
+            NSColor(srgbRed: CGFloat((hex >> 16) & 255) / 255,
+                    green: CGFloat((hex >> 8) & 255) / 255, blue: CGFloat(hex & 255) / 255, alpha: 1)
+        }
+        guard let highlight else {
+            let base = color(darkPaper ? noteBackground.dark : noteBackground.light)
+            let ink = color(darkPaper ? noteForeground.dark : noteForeground.light)
+            // A small ink tint preserves hover/open feedback within the same note palette.
+            let amount: CGFloat = switch state { case .normal: 0; case .hovered: 0.06; case .active: 0.12 }
+            let paper = NSColor(
+                srgbRed: base.redComponent * (1 - amount) + ink.redComponent * amount,
+                green: base.greenComponent * (1 - amount) + ink.greenComponent * amount,
+                blue: base.blueComponent * (1 - amount) + ink.blueComponent * amount, alpha: 1)
+            return (paper, paper, ink)
+        }
         let colors: (UInt32, UInt32, UInt32)
         if darkPaper {
             switch state {
@@ -30,12 +49,7 @@ public enum LyraReaderTheme {
             case .active: colors = (0xEBD7A6, 0xD7BB7D, 0x735423)
             }
         }
-        func color(_ hex: UInt32) -> NSColor {
-            NSColor(srgbRed: CGFloat((hex >> 16) & 255) / 255,
-                    green: CGFloat((hex >> 8) & 255) / 255, blue: CGFloat(hex & 255) / 255, alpha: 1)
-        }
         let base = (paper: color(colors.0), fold: color(colors.1), ink: color(colors.2))
-        guard let highlight else { return base }
         // Keep the paper artwork and its interaction states, with an opaque pastel tint from
         // the attached markup. Highlight opacity belongs to the text, not to this badge.
         let amount: CGFloat = darkPaper ? 0.28 : 0.4
@@ -56,8 +70,6 @@ public enum LyraReaderTheme {
     public static let toolbarBg = Color(nsColor: adaptive(0xF7F4EF, 0x28251F))
     public static let tabbarBg = Color(nsColor: adaptive(0xF0EBE3, 0x211F1C))
     public static let sidebarBg = Color(nsColor: sidebarColor)
-    /// Conversation-only window surface; the global Lyra palette stays unchanged.
-    public static let regionWindowBg = Color(nsColor: adaptive(0xF7F0DF, 0x302B23))
     public static let panelBg = Color(nsColor: adaptive(0xF8F6F2, 0x2B2823))
     /// The floating preview's card colour.
     public static let raisedBgColor = adaptive(0xFFFDFA, 0x343029)
@@ -109,9 +121,9 @@ public enum LyraReaderTheme {
     public static let searchCurrentBg = Color(nsColor: adaptive(0xE6B764, 0x7A571F))
     public static let searchCurrentFg = Color(nsColor: adaptive(0x342710, 0xFFF8E7))
     public static let bookmark = Color(nsColor: adaptive(0x9A6A19, 0xE7C07B))
-    public static let noteBgColor = adaptive(0xFFF0E6, 0x463126)
+    public static let noteBgColor = adaptive(noteBackground.light, noteBackground.dark)
     public static let noteBg = Color(nsColor: noteBgColor)
-    public static let noteFg = Color(nsColor: adaptive(0x8A4C26, 0xF3BD94))
+    public static let noteFg = Color(nsColor: noteTextColor)
     public static let successBg = Color(nsColor: adaptive(0xE9F3ED, 0x243A2D))
     public static let successFg = Color(nsColor: adaptive(0x2F6F53, 0x96CBA9))
     public static let warningBg = Color(nsColor: adaptive(0xFFF2D4, 0x40351F))
@@ -126,7 +138,7 @@ public enum LyraReaderTheme {
     public static let scrollThumbColor = adaptive(0x837968, 0x8D806D)
     public static let scrollThumbHoverColor = adaptive(0x746653, 0xAD9A7A)
     public static let canvasColor = adaptive(0xE7E2D9, 0x171716)
-    public static let noteTextColor = adaptive(0x8A4C26, 0xF3BD94)
+    public static let noteTextColor = adaptive(noteForeground.light, noteForeground.dark)
     public static let titlebarColor = adaptive(0xF4F1EC, 0x24221F)
 
     /// GPU clears are linear; the palette and PDF texture bytes are sRGB.
