@@ -21,6 +21,8 @@
 
 namespace {
 QList<WorkspaceController *> &workspaces() {static QList<WorkspaceController *> all;return all;}
+QVariantMap &readingPresetState() {static QVariantMap state;return state;}
+qulonglong &readingPresetRevision() {static qulonglong revision=0;return revision;}
 QVariantList normalizedRecents(const QVariantList &entries) {
     QVariantList result;QSet<QString> seen;
     for(const auto &value:entries) {
@@ -350,6 +352,34 @@ void WorkspaceController::copyText(const QString &text) { QGuiApplication::clipb
 void WorkspaceController::openExternal(const QUrl &url) {
     if (url.scheme()==QStringLiteral("https") || url.scheme()==QStringLiteral("http") || url.scheme()==QStringLiteral("mailto"))
         QDesktopServices::openUrl(url);
+}
+QVariantList WorkspaceController::readingPresets() const {
+    return {
+        QVariantMap{{"id","original"},{"title",tr("Original Colours")},{"appearance","light"}},
+        QVariantMap{{"id","warm"},{"title",tr("Warm Paper")},{"appearance","light"}},
+        QVariantMap{{"id","night"},{"title",tr("Night Reading · Dark Paper")},{"appearance","dark"}},
+        QVariantMap{{"id","nightWhite"},{"title",tr("Night Reading · White Paper")},{"appearance","dark"}}
+    };
+}
+QVariantMap WorkspaceController::readingPresetSnapshot() const {return readingPresetState();}
+bool WorkspaceController::applyReadingPreset(const QString &id) {
+    QVariantMap chosen;
+    for(const auto &value:readingPresets())if(value.toMap().value("id").toString()==id){chosen=value.toMap();break;}
+    if(chosen.isEmpty())return false;
+    const QString paper=chosen.value("id").toString(),appearance=chosen.value("appearance").toString();
+    setPreference(QStringLiteral("paper"),paper);
+    setPreference(QStringLiteral("appearance"),appearance);
+    const auto revision=++readingPresetRevision();
+    readingPresetState()={{"paper",paper},{"appearance",appearance},{"revision",QVariant::fromValue(revision)}};
+    QList<QPointer<WorkspaceController>> recipients;
+    for(auto *workspace:workspaces())recipients.append(workspace);
+    // UI-owned workspaces can close or apply a newer preset from a direct notification.
+    // Snapshot getters always expose the latest pair, and an older publish stops here.
+    for(const auto &workspace:recipients) {
+        if(revision!=readingPresetRevision())break;
+        if(workspace)emit workspace->readingPresetChanged();
+    }
+    return true;
 }
 QVariant WorkspaceController::preference(const QString &key,const QVariant &fallback) const {
     QSettings settings;

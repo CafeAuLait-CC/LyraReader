@@ -74,6 +74,34 @@ public:
     void copyText(const QString &text) override {copied=text;++copies;}
 };
 
+// Isolated Checks settings retain both values and the original absence of owned keys.
+class ReadingPreferenceGuard final {
+public:
+    ReadingPreferenceGuard() {
+        QSettings settings;
+        for(const auto &key:{"appearance","paper","ai","reduceMotion","auxiliarySettingsGeometry"}) {
+            const auto full=QStringLiteral("reader/preferences/")+QLatin1String(key);
+            m_values.insert(full,{settings.contains(full),settings.value(full)});
+        }
+    }
+    ~ReadingPreferenceGuard() {
+        QSettings settings;
+        for(auto it=m_values.cbegin();it!=m_values.cend();++it) {
+            if(it.value().first)settings.setValue(it.key(),it.value().second);
+            else settings.remove(it.key());
+        }
+    }
+private:
+    QMap<QString,QPair<bool,QVariant>> m_values;
+};
+class ReadingPresetObserver final : public QObject {
+    Q_OBJECT
+public:
+    std::function<void()> callback;
+public slots:
+    void notify() {callback();}
+};
+
 class FakeCredentialStore final : public CredentialStore {
 public:
     struct Request { VaultOperation operation; QString key,secret; Completion complete; };
@@ -739,6 +767,86 @@ private slots:
         }
         QJSEngine js;const auto value=js.evaluate("({width:580,height:620,nested:{values:[1,2]}})");QVERIFY(!value.isError());workspace.setPreference("syntheticPreference",QVariant::fromValue(value));QSettings settings;settings.sync();QCOMPARE(settings.status(),QSettings::NoError);
         auto directory=QFileInfo(settings.fileName()).absoluteDir();QVERIFY(directory.cdUp());auto env=QProcessEnvironment::systemEnvironment();env.insert("LYRA_READER_CHECK_PREF_CHILD","1");env.insert("LYRA_READER_CHECK_SETTINGS_ROOT",directory.absolutePath());QProcess child;child.setProcessEnvironment(env);child.start(QCoreApplication::applicationFilePath(),{root,"qmlPreferencesPersistAsValuesAcrossAProcessRestart"});QVERIFY(child.waitForFinished(10000));QCOMPARE(child.exitStatus(),QProcess::NormalExit);QVERIFY2(child.exitCode()==0,child.readAllStandardOutput().constData());
+    }
+    void readingPresetActionsUpdateDocumentsAndEmptyWindows_data() {
+        QTest::addColumn<QString>("preset");QTest::addColumn<QString>("appearance");QTest::addColumn<int>("mode");
+        QTest::newRow("original")<<QString("original")<<QString("light")<<0;
+        QTest::newRow("warm")<<QString("warm")<<QString("light")<<1;
+        QTest::newRow("night")<<QString("night")<<QString("dark")<<2;
+        QTest::newRow("night-white")<<QString("nightWhite")<<QString("dark")<<0;
+    }
+    void readingPresetActionsUpdateDocumentsAndEmptyWindows() {
+        QFETCH(QString,preset);QFETCH(QString,appearance);QFETCH(int,mode);
+        ReadingPreferenceGuard preferences;NativeCorpus::Viewer view,empty;QVERIFY(view.window && empty.window);
+        const auto catalog=view.workspace.property("readingPresets").toList();QCOMPARE(catalog.size(),4);
+        MockChatServer server;QVERIFY(server.listen());
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("reading-presets.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        QFile file(path);QVERIFY(file.open(QIODevice::ReadOnly));const auto original=file.readAll();file.close();
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==1 && !reader->pendingCommands());QVERIFY(settleReaderViewport(view.window));QVERIFY(settleRasterWork(reader));
+        view.window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic-reading-presets"}});
+        const auto readConfig=[&]{const auto value=view.window->property("aiSettings");return value.metaType()==QMetaType::fromType<QJSValue>() ? value.value<QJSValue>().toVariant().toMap() : value.toMap();};const auto config=readConfig();const auto generation=reader->documentGeneration();const auto rasters=reader->completedRasters();
+        auto *entry=view.window->findChild<QObject *>("paperPreset_"+preset);QVERIFY(entry);auto *action=entry->property("action").value<QObject *>();QVERIFY(action);
+        QVERIFY(QMetaObject::invokeMethod(action,"trigger"));
+        for(auto *window:{view.window,empty.window}) {
+            QTRY_COMPARE(window->property("paperAppearance").toString(),preset);QTRY_COMPARE(window->property("appearance").toString(),appearance);
+        }
+        QTRY_VERIFY(action->property("checked").toBool());QCOMPARE(PaperAppearance::mode(preset),mode);
+        if(mode==0) {
+            const QColor source=QColor::fromRgbF(.2,.7,.4,.3);QCOMPARE(PaperAppearance::displayColor(source,mode),source);
+            QCOMPARE(reader->paperBackground(preset),QColor(Qt::white));
+        }
+        QTest::qWait(120);QVERIFY(settleRasterWork(reader));QCOMPARE(reader->completedRasters(),rasters);QCOMPARE(reader->documentGeneration(),generation);QVERIFY(!reader->hasUnsavedChanges());
+        QCOMPARE(readConfig(),config);QCOMPARE(server.requests.size(),0);QCOMPARE(empty.workspace.activeReader()->pageCount(),0);
+        QCOMPARE(view.workspace.preference("paper").toString(),preset);QCOMPARE(view.workspace.preference("appearance").toString(),appearance);
+        {NativeCorpus::Viewer reopened;QVERIFY(reopened.window);QCOMPARE(reopened.window->property("paperAppearance").toString(),preset);QCOMPARE(reopened.window->property("appearance").toString(),appearance);}
+        const auto snapshot=qEnvironmentVariable("LYRA_READER_READING_PRESET_EVIDENCE");if(!snapshot.isEmpty())QVERIFY(view.window->grabWindow().save(snapshot+"-"+preset+".png"));
+        QVariant accepted;QVERIFY(QMetaObject::invokeMethod(view.window,"applyReadingPreset",Q_RETURN_ARG(QVariant,accepted),Q_ARG(QVariant,"unsupported-future-preset")));QVERIFY(!accepted.toBool());QCOMPARE(view.workspace.preference("paper").toString(),preset);
+        QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),original);
+    }
+    void readingPresetSettingsKeepDraftsUnknownValuesAndNewerWindowChoices() {
+        ReadingPreferenceGuard preferences;NativeCorpus::Viewer view,other;QVERIFY(view.window && other.window);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"showSettings"));auto *settings=view.window->findChild<QQuickWindow *>("settingsWindow");QVERIFY(settings);QTRY_VERIFY(settings->isVisible());
+        auto *paper=settings->findChild<QObject *>("settingsPaper"),*appearance=settings->findChild<QObject *>("settingsAppearance");QVERIFY(paper && appearance);QCOMPARE(paper->property("count").toInt(),4);
+        QVERIFY(settings->close());QVariant accepted;QVERIFY(QMetaObject::invokeMethod(view.window,"applyReadingPreset",Q_RETURN_ARG(QVariant,accepted),Q_ARG(QVariant,"original")));QVERIFY(accepted.toBool());
+        QVERIFY(QMetaObject::invokeMethod(view.window,"showSettings"));QTRY_VERIFY(settings->isVisible());QVERIFY(paper->setProperty("currentIndex",3));QVERIFY(QMetaObject::invokeMethod(paper,"activated",Q_ARG(int,3)));QCOMPARE(appearance->property("currentIndex").toInt(),1);
+        QVERIFY(settings->close());QTRY_VERIFY(!settings->isVisible());QCOMPARE(view.window->property("paperAppearance").toString(),QString("original"));QCOMPARE(other.window->property("appearance").toString(),QString("light"));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"showSettings"));QTRY_VERIFY(settings->isVisible());QVERIFY(paper->setProperty("currentIndex",3));QVERIFY(QMetaObject::invokeMethod(paper,"activated",Q_ARG(int,3)));QVERIFY(QMetaObject::invokeMethod(settings,"save"));QTRY_VERIFY(!settings->isVisible());
+        QCOMPARE(view.window->property("paperAppearance").toString(),QString("nightWhite"));QCOMPARE(other.window->property("paperAppearance").toString(),QString("nightWhite"));QCOMPARE(other.window->property("appearance").toString(),QString("dark"));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"showSettings"));QTRY_VERIFY(settings->isVisible());QCOMPARE(paper->property("currentIndex").toInt(),3);
+        QVERIFY(QMetaObject::invokeMethod(other.window,"applyReadingPreset",Q_RETURN_ARG(QVariant,accepted),Q_ARG(QVariant,"warm")));QVERIFY(accepted.toBool());
+        auto *url=settings->findChild<QObject *>("settingsBaseUrl");QVERIFY(url);url->setProperty("text","http://127.0.0.1:1/reading-preset-test");QVERIFY(QMetaObject::invokeMethod(settings,"save"));QTRY_VERIFY(!settings->isVisible());
+        for(auto *window:{view.window,other.window}){QCOMPARE(window->property("paperAppearance").toString(),QString("warm"));QCOMPARE(window->property("appearance").toString(),QString("light"));}
+        view.window->setProperty("paperAppearance","future-paper");view.workspace.setPreference("paper","future-paper");QVERIFY(QMetaObject::invokeMethod(view.window,"showSettings"));QTRY_VERIFY(settings->isVisible());QCOMPARE(paper->property("currentIndex").toInt(),-1);QVERIFY(paper->property("displayText").toString().contains("Unrecognized"));
+        QVERIFY(QMetaObject::invokeMethod(settings,"save"));QTRY_VERIFY(!settings->isVisible());QCOMPARE(view.workspace.preference("paper").toString(),QString("future-paper"));QCOMPARE(view.window->property("paperAppearance").toString(),QString("future-paper"));
+        view.window->setProperty("paperAppearance","warm");
+        QVERIFY(QMetaObject::invokeMethod(view.window,"showSettings"));QTRY_VERIFY(settings->isVisible());
+        view.workspace.setPreference("paper","newer-unobserved-paper");view.workspace.setPreference("appearance","system");
+        url->setProperty("text","http://127.0.0.1:1/unrelated-settings-change");
+        QVERIFY(QMetaObject::invokeMethod(settings,"save"));QTRY_VERIFY(!settings->isVisible());
+        QCOMPARE(view.workspace.preference("paper").toString(),QString("newer-unobserved-paper"));
+        QCOMPARE(view.workspace.preference("appearance").toString(),QString("system"));
+    }
+    void reentrantReadingPresetsNeverLeaveAWindowWithAnOldPair() {
+        QTest::failOnWarning(QRegularExpression(".*(Binding loop|ReferenceError:|TypeError:).*"));
+        ReadingPreferenceGuard preferences;NativeCorpus::Viewer view,other;QVERIFY(view.window && other.window);
+        QVERIFY(view.workspace.metaObject()->indexOfMethod("applyReadingPreset(QString)")>=0);
+        ReadingPresetObserver observer;bool replaced=false;
+        observer.callback=[&]{if(replaced || view.window->property("paperAppearance").toString()!="night")return;replaced=true;bool ok=false;QVERIFY(QMetaObject::invokeMethod(&view.workspace,"applyReadingPreset",Q_RETURN_ARG(bool,ok),Q_ARG(QString,"warm")));QVERIFY(ok);};
+        QVERIFY(connect(view.window,SIGNAL(paperAppearanceChanged()),&observer,SLOT(notify())));
+        bool ok=false;QVERIFY(QMetaObject::invokeMethod(&view.workspace,"applyReadingPreset",Q_RETURN_ARG(bool,ok),Q_ARG(QString,"night")));QVERIFY(ok);QVERIFY(replaced);
+        for(auto *window:{view.window,other.window}){QCOMPARE(window->property("paperAppearance").toString(),QString("warm"));QCOMPARE(window->property("appearance").toString(),QString("light"));}
+    }
+    void readingPresetPublishingGuardsClosedAndReentrantWorkspaces() {
+        ReadingPreferenceGuard preferences;WorkspaceController first;auto middle=std::make_unique<WorkspaceController>();WorkspaceController last;
+        QVERIFY(first.metaObject()->indexOfMethod("applyReadingPreset(QString)")>=0);
+        ReadingPresetObserver observer;observer.callback=[&]{middle.reset();};
+        QVERIFY(connect(&first,SIGNAL(readingPresetChanged()),&observer,SLOT(notify())));QSignalSpy delivered(&last,SIGNAL(readingPresetChanged()));QVERIFY(delivered.isValid());
+        bool ok=false;QVERIFY(QMetaObject::invokeMethod(&first,"applyReadingPreset",Q_RETURN_ARG(bool,ok),Q_ARG(QString,"nightWhite")));QVERIFY(ok);QVERIFY(!middle);QCOMPARE(delivered.size(),1);
+        bool replaced=false;observer.callback=[&]{if(replaced)return;replaced=true;bool nested=false;QVERIFY(QMetaObject::invokeMethod(&first,"applyReadingPreset",Q_RETURN_ARG(bool,nested),Q_ARG(QString,"warm")));QVERIFY(nested);};
+        delivered.clear();QVERIFY(QMetaObject::invokeMethod(&first,"applyReadingPreset",Q_RETURN_ARG(bool,ok),Q_ARG(QString,"night")));QVERIFY(ok);QVERIFY(replaced);QCOMPARE(delivered.size(),1);QCOMPARE(last.property("readingPresetSnapshot").toMap().value("paper").toString(),QString("warm"));
+        auto owner=std::make_unique<WorkspaceController>();WorkspaceController tail;QSignalSpy tailDelivered(&tail,SIGNAL(readingPresetChanged()));QVERIFY(tailDelivered.isValid());
+        ReadingPresetObserver closing;closing.callback=[&]{owner.reset();};QVERIFY(connect(owner.get(),SIGNAL(readingPresetChanged()),&closing,SLOT(notify())));
+        QVERIFY(QMetaObject::invokeMethod(owner.get(),"applyReadingPreset",Q_RETURN_ARG(bool,ok),Q_ARG(QString,"nightWhite")));QVERIFY(ok);QVERIFY(!owner);QCOMPARE(tailDelivered.size(),1);QCOMPARE(tail.property("readingPresetSnapshot").toMap().value("paper").toString(),QString("nightWhite"));
     }
     void auxiliaryGeometryClampsBeforeConvertingSavedValues() {
         QCOMPARE(AuxiliaryWindowPolicy::boundedSize({560,650},{0,0,1920,1080}),QSize(560,650));

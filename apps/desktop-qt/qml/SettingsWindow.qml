@@ -5,6 +5,10 @@ import LyraReader 1.0
 
 ApplicationWindow {
     id: settings
+    property string initialAppearance: ""
+    property string initialPaper: ""
+    property bool appearanceEdited: false
+    property bool paperPresetEdited: false
     objectName:"settingsWindow"
     required property var app
     readonly property var colors:app.colors
@@ -17,9 +21,11 @@ ApplicationWindow {
     AuxiliaryWindowPolicy {id:policy}
     function open() {
         if(visible){requestActivate();return;}
+        initialAppearance=app.appearance;initialPaper=app.paperAppearance;
+        appearanceEdited=false;paperPresetEdited=false;
         appearance.currentIndex=["light","dark","system"].indexOf(app.appearance);
         reduceMotion.checked=app.reduceMotion;
-        paper.currentIndex=["original","warm","night"].indexOf(app.paperAppearance);
+        paper.currentIndex=app.readingPresetIndex(app.paperAppearance);
         gap.value=app.pageGap;baseUrl.text=app.aiSettings.baseUrl || "http://localhost:11434/v1";
         modelName.text=app.aiSettings.model || "";
         imageInput.checked=!!app.aiSettings.imageInput;
@@ -32,9 +38,13 @@ ApplicationWindow {
     }
     function openAudit(){open();if(visible)auditDialog.open();}
     function save() {
-        app.appearance = ["light", "dark", "system"][appearance.currentIndex];
+        const selectedPaper=app.readingPresets[paper.currentIndex];
+        const selectedAppearance=["light","dark","system"][appearance.currentIndex];
+        if(selectedPaper && (paperPresetEdited || selectedPaper.id!==initialPaper)
+                && !app.applyReadingPreset(selectedPaper.id))return;
+        if(selectedAppearance && (appearanceEdited || selectedAppearance!==initialAppearance))
+            app.appearance=selectedAppearance;
         app.reduceMotion=reduceMotion.checked;
-        app.paperAppearance = ["original", "warm", "night"][paper.currentIndex];
         app.pageGap = gap.value;
         app.setPageLayout(app.layoutMode);
         app.aiSettings = {
@@ -46,7 +56,6 @@ ApplicationWindow {
         };
         if (app.session) {
             app.session.setPreference("ai", app.aiSettings);
-            app.session.setPreference("paper", app.paperAppearance);
         }
         if (apiKey.text.length)
             app.saveAiCredential(baseUrl.text, apiKey.text);
@@ -80,6 +89,9 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     model: [qsTr("Light"), qsTr("Dark"), qsTr("Follow System")]
                     currentIndex: ["light", "dark", "system"].indexOf(app.appearance)
+                    Accessible.name: qsTr("Interface appearance")
+                    displayText: currentIndex<0 ? qsTr("Unrecognized saved appearance") : currentText
+                    onActivated: settings.appearanceEdited=true
                 }
                 CheckBox {
                     id:reduceMotion;objectName:"settingsReduceMotion"
@@ -89,8 +101,23 @@ ApplicationWindow {
                     id: paper
                     objectName:"settingsPaper"
                     Layout.fillWidth: true
-                    model: [qsTr("Original Colours"), qsTr("Warm Paper"), qsTr("Night Reading")]
-                    currentIndex: ["original", "warm", "night"].indexOf(app.paperAppearance)
+                    model: app.readingPresets
+                    textRole: "title"
+                    currentIndex: app.readingPresetIndex(app.paperAppearance)
+                    Accessible.name: qsTr("Paper appearance preset")
+                    displayText: currentIndex<0 ? qsTr("Unrecognized saved paper appearance") : currentText
+                    onActivated: function(index) {
+                        settings.paperPresetEdited=true;settings.appearanceEdited=false;
+                        const preset=app.readingPresets[index];
+                        if(preset)appearance.currentIndex=["light","dark","system"].indexOf(preset.appearance);
+                    }
+                }
+                Label {
+                    Layout.fillWidth:true
+                    wrapMode:Text.Wrap
+                    text:qsTr("Presets choose a matching interface theme; you can adjust Appearance independently.")
+                    color:settings.colors.textSecondary
+                    font.pixelSize:11
                 }
                 RowLayout {
                     Label {

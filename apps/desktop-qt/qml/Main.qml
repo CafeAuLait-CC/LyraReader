@@ -356,6 +356,32 @@ ApplicationWindow {
     property int pendingPage: 0
     property var pendingPageSelection: []
     property string paperAppearance: session ? session.preference("paper", "original") : "original"
+    readonly property var readingPresets: session ? session.readingPresets : []
+    function readingPresetIndex(id) {
+        for(let i=0;i<readingPresets.length;++i)if(readingPresets[i].id===id)return i;
+        return -1;
+    }
+    function applyReadingPreset(id) {
+        if(!session || !session.applyReadingPreset(id)) {
+            operationStatus=qsTr("The reading preset could not be applied.");
+            return false;
+        }
+        return true;
+    }
+    Connections {
+        target: root.session
+        function onReadingPresetChanged() {
+            const owner=root.session;
+            if(!owner)return;
+            const snapshot=owner.readingPresetSnapshot;
+            const revision=snapshot.revision, paper=snapshot.paper, appearance=snapshot.appearance;
+            root.paperAppearance=paper;
+            // A direct property observer may choose a newer preset. Finish only
+            // the current snapshot, without installing a reentrant binding.
+            if(owner && root.session===owner && owner.readingPresetSnapshot.revision===revision)
+                root.appearance=appearance;
+        }
+    }
     readonly property string bibtex: currentReader.data.bibtex || (currentReader.data.metadata ? currentReader.data.metadata.bibtex : "")
     property var metadataDraft: null
     property string operationStatus: ""
@@ -2175,6 +2201,29 @@ ApplicationWindow {
                 onTriggered: root.sidebarVisible = !root.sidebarVisible
             }
             MenuSeparator {}
+            Menu {
+                id: readingAppearanceMenu
+                objectName: "paperAppearanceMenu"
+                title: qsTr("Paper Appearance")
+                ActionGroup { id: readingPresetGroup }
+                Instantiator {
+                    model: root.readingPresets
+                    delegate: MenuItem {
+                        id: presetItem
+                        required property var modelData
+                        objectName: "paperPreset_" + modelData.id
+                        action: Action {
+                            text: presetItem.modelData.title
+                            checkable: true
+                            checked: root.paperAppearance===presetItem.modelData.id && root.appearance===presetItem.modelData.appearance
+                            ActionGroup.group: readingPresetGroup
+                            onTriggered: root.applyReadingPreset(presetItem.modelData.id)
+                        }
+                    }
+                    onObjectAdded: function(index,object) {readingAppearanceMenu.insertItem(index,object);}
+                    onObjectRemoved: function(index,object) {readingAppearanceMenu.removeItem(object);}
+                }
+            }
             Menu {
                 title: qsTr("Appearance")
                 ActionGroup {

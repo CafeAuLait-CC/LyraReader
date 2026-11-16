@@ -81,7 +81,11 @@ public:
 };
 }
 
-int PaperAppearance::mode(const QString &name) { if(name==QStringLiteral("dark-figure"))return 3; return name==QStringLiteral("warm") ? 1 : name==QStringLiteral("night") ? 2 : 0; }
+int PaperAppearance::mode(const QString &name) {
+    if (name==QStringLiteral("nightWhite")) return 0; // White paper retains the original source profile.
+    if (name==QStringLiteral("dark-figure")) return 3;
+    return name==QStringLiteral("warm") ? 1 : name==QStringLiteral("night") ? 2 : 0;
+}
 QColor PaperAppearance::displayColor(const QColor &source,int mode) {
     if (!mode) return source;
     const double r=linear(source.redF()),g=linear(source.greenF()),b=linear(source.blueF());

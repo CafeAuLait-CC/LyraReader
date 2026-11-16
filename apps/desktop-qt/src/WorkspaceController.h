@@ -9,6 +9,8 @@ class QPrinter;
 // Native window session. Tabs retain their own document, raster cache and view state.
 class WorkspaceController : public QObject {
     Q_OBJECT
+    Q_PROPERTY(QVariantList readingPresets READ readingPresets CONSTANT)
+    Q_PROPERTY(QVariantMap readingPresetSnapshot READ readingPresetSnapshot NOTIFY readingPresetChanged)
     Q_PROPERTY(QVariantList tabs READ tabs NOTIFY tabsChanged)
     Q_PROPERTY(ReaderController *activeReader READ activeReader NOTIFY activeReaderChanged)
     Q_PROPERTY(int activeIndex READ activeIndex NOTIFY activeReaderChanged)
@@ -52,11 +54,16 @@ public:
     Q_INVOKABLE void clearRecentDocuments();
     Q_INVOKABLE virtual void copyText(const QString &text);
     Q_INVOKABLE void openExternal(const QUrl &url);
+    QVariantList readingPresets() const;
+    // Last explicit preset; subsequent independent window-theme edits keep their own value.
+    QVariantMap readingPresetSnapshot() const;
+    Q_INVOKABLE bool applyReadingPreset(const QString &id);
     Q_INVOKABLE QVariant preference(const QString &key, const QVariant &fallback = {}) const;
     Q_INVOKABLE void setPreference(const QString &key, const QVariant &value);
     Q_INVOKABLE QString localPath(const QUrl &url) const { return url.toLocalFile(); }
     Q_INVOKABLE QString writeTextFile(const QUrl &url, const QString &text);
 signals:
+    void readingPresetChanged();
     void tabsChanged();
     void printFinished(const QString &error);
     void closeTabRequested(int index);

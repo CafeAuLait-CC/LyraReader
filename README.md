@@ -86,6 +86,9 @@ first to include them. Links and sticky notes are kept, and the result remains e
 With no Edit tool armed, selecting or moving text keeps the inspector closed until the caret opens;
 failed or retained drafts still expose recovery controls. Only this selection state offers hover
 outlines. Leaving Lyra closes its drawer while retaining the selected workspace and question draft.
+View → Paper Appearance offers four named presets across open reader windows: light Original Colours
+and Warm Paper, or Night Reading with dark or source-white paper. Appearance can still adjust the
+interface independently. Settings keeps these choices as a draft until Save.
 The Edit row stages actual text/object/link edits through the shared typed commands and recoverable transaction;
 failed or superseded text drafts remain available to copy or retry. Long drafts use a bounded
 scrolling editor, and position/size fields keep their labels and page-point units visible.
