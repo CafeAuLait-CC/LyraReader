@@ -16,6 +16,9 @@ extension ReaderChecks {
         require(appearance.mode == .original, "new reading preferences preserve source colours")
         appearance.mode = .night
         require(ReadingAppearanceStore(defaults: defaults).mode == .night, "night reading persists across launches")
+        appearance.mode = .nightWhite
+        require(ReadingAppearanceStore(defaults: defaults).mode == .nightWhite,
+                "night white paper persists independently from night dark paper")
         defaults.set("unknown-future-mode", forKey: ReadingAppearanceStore.preferenceKey)
         require(ReadingAppearanceStore(defaults: defaults).mode == .original, "unknown paper preferences safely use original colours")
         let ink = PaperAppearance.night.displayColor(.black).usingColorSpace(.sRGB)!
@@ -36,6 +39,11 @@ extension ReaderChecks {
                 "display conversion retains annotation opacity")
         require(PaperAppearance.original.displayColor(source) === source,
                 "original reading returns the exact source colour object")
+        require(PaperAppearance.nightWhite.displayColor(source) === source,
+                "night white paper retains exact annotation source colours and opacity")
+        require(TranslationPaperColor.forAppearance(.nightWhite)
+                    == TranslationPaperColor(red: 255, green: 255, blue: 255),
+                "night white paper keeps translation covers white")
 
         let history = RecentDocumentStore(defaults: defaults, cacheDirectory: cache, systemDocuments: nil)
         let first = cache.appendingPathComponent("unread-source.pdf")
@@ -116,6 +124,20 @@ extension ReaderChecks {
             host.layoutSubtreeIfNeeded()
             return canvas(in: host)?.paperAppearance == .night
                 && parent.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        })
+        sharedAppearance.mode = .nightWhite
+        try await eventually("night white paper keeps a dark window with the original GPU profile", {
+            host.layoutSubtreeIfNeeded()
+            return canvas(in: host)?.paperAppearance == .nightWhite
+                && canvas(in: host)?.renderingAppearanceCode == 0
+                && parent.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        })
+        sharedAppearance.mode = .original
+        try await eventually("Original directly restores a light window and white source paper", {
+            host.layoutSubtreeIfNeeded()
+            return canvas(in: host)?.paperAppearance == .original
+                && canvas(in: host)?.renderingAppearanceCode == 0
+                && parent.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .aqua
         })
         sharedAppearance.mode = .warm
         try await eventually("warm paper restores a light window and updates the hosted canvas", {

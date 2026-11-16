@@ -54,7 +54,7 @@ public struct TranslationPaperColor: Equatable, Sendable {
 
     public static func forAppearance(_ appearance: PaperAppearance) -> TranslationPaperColor {
         switch appearance {
-        case .original: return TranslationPaperColor(red: 255, green: 255, blue: 255)
+        case .original, .nightWhite: return TranslationPaperColor(red: 255, green: 255, blue: 255)
         case .warm: return TranslationPaperColor(red: 252, green: 247, blue: 237)
         case .night: return TranslationPaperColor(red: 36, green: 34, blue: 30)
         }

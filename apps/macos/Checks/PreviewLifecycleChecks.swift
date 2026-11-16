@@ -9,6 +9,9 @@ extension ReaderChecks {
     /// Its lifetime must not give it ownership of a later preview's viewport.
     @MainActor static func previewLifecycleChecks(root: URL) async throws {
         _ = NSApplication.shared
+        let appearance = ReadingAppearanceStore.shared
+        let savedMode = appearance.mode
+        defer { appearance.mode = savedMode }
         let state = AppState(engine: try RustEngine())
         let panels = ReferencePreviewPanelController()
         let host = NSHostingView(rootView: ReaderWindow(
@@ -46,8 +49,12 @@ extension ReaderChecks {
             })
             return canvas(panels.panel?.contentView)!
         }
-        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
-            window.appearance = NSAppearance(named: appearance)
+        for mode in [PaperAppearance.original, .nightWhite] {
+            appearance.mode = mode
+            try await eventually("the preview lifecycle uses the selected interface theme", {
+                window.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua])
+                    == (mode == .nightWhite ? .darkAqua : .aqua)
+            })
             for iteration in 0..<3 {
                 open("Single", kind: .reference, entries: [.init(label: "1", text: "A short work.")])
                 try await eventually("short citation mounts in a native panel", {
@@ -110,6 +117,9 @@ extension ReaderChecks {
     /// Verify native profile selection and unchanged transparent source bytes. Actual dark ink
     /// coverage and colour are also checked by the GPU offscreen regression and native captures.
     @MainActor static func previewPaperChecks(root: URL) async throws {
+        let application = NSApplication.shared
+        let savedApplicationAppearance = application.appearance
+        defer { application.appearance = savedApplicationAppearance }
         let state = AppState(engine: try RustEngine())
         require(state.open(url: root.appendingPathComponent("tests/fixtures/alpha-crop.pdf")),
                 "preview paper fixture opens")
@@ -129,7 +139,7 @@ extension ReaderChecks {
             return view.subviews.lazy.compactMap { canvas($0) }.first
         }
         for theme in [NSAppearance.Name.aqua, .darkAqua] {
-            window.appearance = NSAppearance(named: theme)
+            application.appearance = NSAppearance(named: theme)
             for mode in PaperAppearance.allCases {
                 appearance.mode = mode
                 state.openReferencePreview(page: 0, title: "Original scientific tones", from: "page 1",
@@ -191,13 +201,17 @@ extension ReaderChecks {
                 && canvas(panels.panel?.contentView) != nil
         })
         let source = state.referencePreviewPages[0].image
-        for theme in [NSAppearance.Name.darkAqua, .aqua, .darkAqua] {
-            window.appearance = NSAppearance(named: theme)
+        for mode in [PaperAppearance.nightWhite, .original, .nightWhite] {
+            appearance.mode = mode
+            let dark = mode == .nightWhite
+            try await eventually("the selected reading preset updates the preview's parent window", {
+                window.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == (dark ? .darkAqua : .aqua)
+            })
             panels.sync(state: state, parentWindow: window)
             try await eventually("theme switch updates the existing figure surface", {
                 panels.panel?.contentView?.layoutSubtreeIfNeeded()
                 guard let view = canvas(panels.panel?.contentView) else { return false }
-                return view.renderingAppearanceCode == (theme == .darkAqua ? 3 : 4)
+                return view.renderingAppearanceCode == (dark ? 3 : 4)
             })
             require(state.referencePreviewPages[0].image.generation == source.generation
                         && state.referencePreviewPages[0].image.bgra == source.bgra,

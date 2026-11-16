@@ -51,7 +51,7 @@ extension ReaderChecks {
         require(render(inline: true).bgra != normal.bgra,
                 "inline text comments remain distinguishable from ordinary sticky notes")
         let orange = AnnotationColor(red: 255, green: 128, blue: 0, alpha: 102)
-        for paper in [PaperAppearance.original, .warm, .night] {
+        for paper in PaperAppearance.allCases {
             for state in [NoteGlyph.State.normal, .hovered, .active] {
                 let pinkIcon = render(state, paper, inline: true)
                 let orangeIcon = render(state, paper, inline: true, tint: orange)
@@ -70,6 +70,8 @@ extension ReaderChecks {
                         "the lower-right fold is slightly darker than the tinted paper")
             }
         }
+        require(render(.normal, .nightWhite).bgra == normal.bgra,
+                "night white paper keeps the light-paper note artwork")
         let opaqueOrange = AnnotationColor(red: 255, green: 128, blue: 0, alpha: 255)
         require(render(inline: true, tint: orange).bgra == render(inline: true, tint: opaqueOrange).bgra,
                 "translucent highlights still have opaque, identifiable note markers")
