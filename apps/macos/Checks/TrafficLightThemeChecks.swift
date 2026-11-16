@@ -7,8 +7,8 @@ extension ReaderChecks {
     /// The traffic lights must not move when the reading theme or the system appearance changes.
     ///
     /// **The defect this pins.** Applying a reading theme makes SwiftUI set the window's
-    /// appearance (Original inherits the system one, Warm Paper forces light, Night Reading forces
-    /// dark). AppKit responds by laying the native titlebar out again at its standard 28 pt height,
+    /// appearance (Original and Warm Paper are light; both Night Reading presets are dark).
+    /// AppKit responds by laying the native titlebar out again at its standard 28 pt height,
     /// while the traffic lights keep the y origin they had in the 44 pt row. The group therefore
     /// sits 16 pt too high and stays there: a resize, a full-screen exit and becoming key were the
     /// only events that re-ran ``ReaderTitlebarLayout``, and none of them happens on a theme
@@ -50,6 +50,9 @@ extension ReaderChecks {
         let registry = ReaderWindowRegistry()
         let state = AppState(engine: PreviewEngine())
         let session = ReaderSession(state: state, registry: registry)
+        // A reader host can retain the explicit appearance applied by Night Reading. Original
+        // must replace that override, including when the view is attached to an existing window.
+        window.appearance = NSAppearance(named: .darkAqua)
         window.contentView = NSHostingView(rootView: ReaderWindow(
             state: session.state,
             opener: session.opener,
@@ -84,19 +87,19 @@ extension ReaderChecks {
         func titlebarHeight() -> CGFloat {
             window.standardWindowButton(.closeButton)?.superview?.frame.height ?? -1
         }
-        func systemAppearanceName() -> NSAppearance.Name {
-            NSApp.appearance?.bestMatch(from: [.aqua, .darkAqua]) ?? .aqua
-        }
         func expectedAppearance(for mode: PaperAppearance) -> NSAppearance.Name {
             switch mode {
-            case .original: systemAppearanceName()
-            case .warm: .aqua
-            case .night: .darkAqua
+            case .original, .warm: .aqua
+            case .night, .nightWhite: .darkAqua
             }
         }
         func effectiveAppearanceName() -> NSAppearance.Name {
             window.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) ?? .aqua
         }
+
+        try await eventually("Original replaces a retained dark window appearance with light", {
+            window.appearance?.bestMatch(from: [.aqua, .darkAqua]) == .aqua && effectiveAppearanceName() == .aqua
+        })
 
         // The initial alignment is queued for the next main-queue turn; wait for it to settle.
         try await eventually("the traffic lights are placed in the 44 pt tab row", {
@@ -137,6 +140,10 @@ extension ReaderChecks {
             // One main-queue turn (and a little slack) for AppKit's appearance layout and the
             // alignment it schedules.
             try await Task.sleep(for: .milliseconds(200))
+            if mode == .original {
+                require(window.appearance?.bestMatch(from: [.aqua, .darkAqua]) == .aqua,
+                        "\(label): Original explicitly restores the light interface")
+            }
 
             let themeFrames = buttonFrames()
             // The same hook that a focus round trip uses: ReaderSession observes
@@ -151,16 +158,46 @@ extension ReaderChecks {
             requirePlacement("\(label): \(mode.title)", frames: themeFrames, base: baseFrames)
         }
 
-        // All three themes under both system appearances, returning to Original each time.
+        // All four presets have fixed interface appearances, under either application theme.
         for system in [NSAppearance.Name.aqua, .darkAqua] {
             NSApp.appearance = NSAppearance(named: system)
             try await Task.sleep(for: .milliseconds(250))
+            require(effectiveAppearanceName() == .aqua,
+                    "Original keeps its light interface when the application appearance changes")
             requirePlacement("system appearance \(system.rawValue) with Original",
                              frames: buttonFrames(), base: baseFrames)
-            for mode in [PaperAppearance.warm, .night, .original] {
+            for mode in [PaperAppearance.night, .original, .warm, .original, .nightWhite, .night, .nightWhite, .original] {
                 try await checkTheme(mode, label: "system \(system.rawValue)")
             }
         }
+
+        // A window created while Night Reading is active must return to the explicit light
+        // appearance along with the existing window, without going through Warm Paper.
+        NSApp.appearance = NSAppearance(named: .aqua)
+        try await checkTheme(.night, label: "before opening another window")
+        let secondSession = ReaderSession(state: AppState(engine: PreviewEngine()), registry: registry)
+        let secondWindow = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 1000, height: 700),
+            styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
+        secondWindow.contentView = NSHostingView(rootView: ReaderWindow(
+            state: secondSession.state, opener: secondSession.opener,
+            previewPanels: secondSession.previewPanels, integratesTitlebar: true))
+        secondSession.attach(window: secondWindow)
+        defer {
+            secondWindow.orderOut(nil)
+            secondSession.close()
+        }
+        try await eventually("a new reader window starts in Night Reading", {
+            secondWindow.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        })
+        try await checkTheme(.nightWhite, label: "both windows switch to night white paper")
+        try await eventually("a new window also supports night white paper", {
+            secondWindow.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        })
+        try await checkTheme(.original, label: "both windows return directly from Night Reading")
+        try await eventually("both windows explicitly restore light in Original", {
+            secondWindow.appearance?.bestMatch(from: [.aqua, .darkAqua]) == .aqua
+                && secondWindow.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .aqua
+        })
 
         // A theme change while a document is opening: PreviewEngine takes ~160 ms to render the
         // first page, so the change lands in the middle of the open.

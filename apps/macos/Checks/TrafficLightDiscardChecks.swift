@@ -149,7 +149,7 @@ extension ReaderChecks {
 
         // The appearance path shares the layout, and the empty window is the state in which the
         // reader saw the displaced button: a theme change must not move the group.
-        for mode in [PaperAppearance.warm, .night, .original] {
+        for mode in PaperAppearance.allCases {
             appearance.mode = mode
             try await waitForLayout("theme \(mode.title) with no document")
         }
