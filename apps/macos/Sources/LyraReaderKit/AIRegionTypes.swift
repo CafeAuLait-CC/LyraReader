@@ -375,7 +375,7 @@ public final class AIRegionCard: ObservableObject, Identifiable {
             regionNumber: regionNumber, draftQuestion: question)
     }
     public func updateHeight(_ height: CGFloat) {
-        guard height.isFinite, height > 0, abs(height - heightViewPt) > 0.5 else { return }
+        guard height.isFinite, height > 0, abs(height - heightViewPt) > 0.01 else { return }
         heightViewPt = height
     }
 }

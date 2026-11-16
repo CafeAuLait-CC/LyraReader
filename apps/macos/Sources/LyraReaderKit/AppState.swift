@@ -1859,6 +1859,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     var regionPaperProgress: [UUID: CGFloat] = [:]
     var regionPaperMotionTasks: [UUID: Task<Void, Never>] = [:]
     var regionPaperMotionIDs: [UUID: UUID] = [:]
+    var regionHeightTargets: [UUID: CGFloat] = [:]
+    var regionHeightMotionTasks: [UUID: Task<Void, Never>] = [:]
     var closingRegionPapers: Set<UUID> = []
     /// Finished conversations by document key. Kept for this window's session; deliberately not
     /// written to disk (see AIRegionState.swift's persistence note).

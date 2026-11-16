@@ -46,10 +46,46 @@ extension ReaderChecks {
         require(ReaderMotion.paperAnimation == nil && !state.beginRegionPaperReveal(UUID()),
                 "Reduce Motion skips both paper transitions and animation tasks")
         ReaderMotion.reduceMotionOverride = false
+        try await Task.sleep(for: .milliseconds(200))
+        let originalHeight = card.heightViewPt
+        let growthTarget = originalHeight + 64
+        let beforeGrowthReloads = state.viewportReloadCount
+        state.updateRegionCardHeight(cardID: card.id, viewHeight: growthTarget)
+        var growthHeights: [CGFloat] = []
+        var growthGapErrors: [CGFloat] = []
+        for _ in 0..<18 {
+            try await Task.sleep(for: .milliseconds(8))
+            let segments = canvas.annotationPageFrames.filter { $0.index == 0 }.sorted { $0.topPt < $1.topPt }
+            let paperHeight = canvas.regionCardFrames.first?.height ?? 0
+            growthHeights.append(paperHeight)
+            if segments.count == 2 {
+                growthGapErrors.append(abs((segments[1].topPt - segments[0].topPt - segments[0].heightPt) * canvas.zoom - paperHeight))
+            }
+        }
+        require(Set(growthHeights.map { Int(($0 * 10).rounded()) }).count > 5
+                    && growthHeights.first! < growthTarget - 1,
+                "one content-height change produces intermediate paper heights instead of a line-sized jump")
+        require(growthGapErrors.count == growthHeights.count && growthGapErrors.allSatisfy { $0 < 0.5 },
+                "every growth sample gives the paper and split-page gap the same height")
+        require(state.viewportReloadCount == beforeGrowthReloads,
+                "growth frames reuse page pixels without rebuilding the visible band")
+        let beforeRetarget = card.heightViewPt
+        let retarget = growthTarget + 28
+        state.updateRegionCardHeight(cardID: card.id, viewHeight: retarget)
+        require(abs(card.heightViewPt - beforeRetarget) < 0.5,
+                "a new streamed line retargets the active motion without jumping")
+        try await eventually("the shared height motion reaches its latest target", {
+            state.regionHeightMotionTasks.isEmpty && abs(card.heightViewPt - retarget) < 0.5
+        })
+        ReaderMotion.reduceMotionOverride = true
+        state.updateRegionCardHeight(cardID: card.id, viewHeight: originalHeight)
+        require(abs(card.heightViewPt - originalHeight) < 0.5 && state.regionHeightMotionTasks.isEmpty,
+                "Reduce Motion applies the target height immediately")
+        ReaderMotion.reduceMotionOverride = false
         state.closeRegionCard(id: card.id, keepHistory: true)
         require(state.closingRegionPapers.contains(card.id), "a visible paper closes through its animation lifecycle")
         try await eventually("the closed paper releases its card and animation task", {
-            state.regionCards.isEmpty && state.regionPaperMotionTasks.isEmpty
+            state.regionCards.isEmpty && state.regionPaperMotionTasks.isEmpty && state.regionHeightMotionTasks.isEmpty
         })
         require(state.pageSegments(forPage: 0).count == 1,
                 "the completed close restores one continuous page")

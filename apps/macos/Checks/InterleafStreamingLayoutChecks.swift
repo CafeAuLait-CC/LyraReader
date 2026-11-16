@@ -25,6 +25,31 @@ import SwiftUI
     }
 }
 
+@MainActor private final class InterleafGrowthProbe: NSObject {
+    let marker: AIRegionCardMarkerView
+    let paper: PaperRegionHost
+    let canvas: MetalCanvasView
+    let page: Int
+    var contentTops: [CGFloat] = []
+    var gapErrors: [CGFloat] = []
+    init(marker: AIRegionCardMarkerView, paper: PaperRegionHost, canvas: MetalCanvasView, page: Int) {
+        self.marker = marker; self.paper = paper
+        self.canvas = canvas; self.page = page
+        super.init()
+        marker.postsFrameChangedNotifications = true
+        NotificationCenter.default.addObserver(self, selector: #selector(sample),
+            name: NSView.frameDidChangeNotification, object: marker)
+    }
+    @objc func sample() {
+        contentTops.append(marker.convert(marker.bounds, to: paper).minY)
+        let segments = canvas.annotationPageFrames.filter { $0.index == page }.sorted { $0.topPt < $1.topPt }
+        if segments.count == 2 {
+            let gap = (segments[1].topPt - segments[0].topPt - segments[0].heightPt) * canvas.zoom
+            gapErrors.append(abs(gap - paper.bounds.height))
+        }
+    }
+}
+
 extension ReaderChecks {
     @MainActor static func interleafStreamingLayoutChecks(root: URL) async throws {
         let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("lyra-interleaf-layout-\(UUID())")
@@ -59,6 +84,9 @@ extension ReaderChecks {
         }
         try await eventually("the real reader mounts the Interleaf canvas", { canvas(in: host) != nil })
         let canvas = canvas(in: host)!
+        func descendants<T: NSView>(_ type: T.Type, in view: NSView) -> [T] {
+            (view as? T).map { [$0] } ?? view.subviews.flatMap { descendants(type, in: $0) }
+        }
         state.zoomPercent = 100
         await state.createRegionCard(page: 1, rect: CGRect(x: 60, y: 60, width: 300, height: 140))
         let card = state.regionCards[0]
@@ -77,6 +105,11 @@ extension ReaderChecks {
         print("INTERLEAF-START frame=\(canvas.regionCardFrames) viewport=\(canvas.visibleRect) scroll=\(state.scrollYPt) target=\(target)")
         require(canvas.regionCardFrames[0].maxY > canvas.visibleRect.maxY,
                 "the streaming fixture starts with its paper clipped by the window bottom")
+        let paper = descendants(PaperRegionHost.self, in: canvas).first!
+        let probe = InterleafGrowthProbe(marker: descendants(AIRegionCardMarkerView.self, in: paper).first!,
+            paper: paper, canvas: canvas, page: card.attachment.page)
+        defer { NotificationCenter.default.removeObserver(probe) }
+        probe.sample()
         card.question = "Explain this synthetic comparison."
         await card.send(context: state.aiReaderContext!)
         require(card.assistant.isSending, "the controlled stream starts without a provider: \(card.assistant.phase) \(card.assistant.errorMessage ?? card.assistant.statusNote ?? "no message")")
@@ -109,10 +142,6 @@ extension ReaderChecks {
                 "the clipped paper stops changing height after the stream ends")
         require(abs(settled.last! - limit) < 1,
                 "long streamed content reaches the bounded paper height without collapsing")
-        func descendants<T: NSView>(_ type: T.Type, in view: NSView) -> [T] {
-            (view as? T).map { [$0] } ?? view.subviews.flatMap { descendants(type, in: $0) }
-        }
-
         await card.distill(context: state.aiReaderContext!)
         require(card.notesBusy, "the note-generation stream starts without a provider")
         let syntheticNote = "## Synthetic evidence\n\n### Key ideas\n\n" + (1...6).map {
@@ -130,7 +159,6 @@ extension ReaderChecks {
         var noteHeights: [CGFloat] = []
         var transcriptHeights: [CGFloat] = []
         var transcriptViewports: [CGFloat] = []
-        let paper = descendants(PaperRegionHost.self, in: canvas).first!
         for _ in 0..<50 {
             try await Task.sleep(for: .milliseconds(20))
             host.layoutSubtreeIfNeeded(); noteHeights.append(card.heightViewPt)
@@ -148,5 +176,11 @@ extension ReaderChecks {
         require(documentHeight <= viewportHeight + 1 || abs(noteHeights.last! - limit) < 1,
                 "the note grows to its height limit before clipping a taller transcript "
                     + "(paper \(noteHeights.last!), limit \(limit), document \(documentHeight), viewport \(viewportHeight))")
+        print("INTERLEAF-GROWTH content top=\(probe.contentTops.min()!)...\(probe.contentTops.max()!) samples=\(probe.contentTops.count)")
+        require(probe.contentTops.allSatisfy { abs($0) < 1 },
+                "the content stays at the paper top through every native layout while growing")
+        print("INTERLEAF-GAP maximum error=\(probe.gapErrors.max() ?? -1) samples=\(probe.gapErrors.count)")
+        require(probe.gapErrors.count > 10 && probe.gapErrors.allSatisfy { $0 < 0.5 },
+                "the native paper and committed split-page gap grow together")
     }
 }
