@@ -25,6 +25,8 @@ final class AIRegionMarkerButton: NSButton {
     override var acceptsFirstResponder: Bool { true }
     var regionID: UUID?
     var activate: (() -> Void)?
+    private var hovered = false
+    private var hoverTracking: NSTrackingArea?
     override init(frame: NSRect) {
         super.init(frame: frame)
         bezelStyle = .rounded; isBordered = false
@@ -34,9 +36,27 @@ final class AIRegionMarkerButton: NSButton {
     override func draw(_ dirtyRect: NSRect) {
         let shape = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 5, yRadius: 5)
         NSColor(LyraReaderTheme.accentSoft).setFill(); shape.fill()
-        NSColor(LyraReaderTheme.accentBorder).withAlphaComponent(0.6).setStroke()
+        if hovered || isHighlighted {
+            LyraReaderTheme.accentColor.withAlphaComponent(isHighlighted ? 0.12 : 0.06).setFill()
+            shape.fill()
+        }
+        NSColor(LyraReaderTheme.accentBorder).withAlphaComponent(hovered ? 0.85 : 0.6).setStroke()
         shape.lineWidth = 1; shape.stroke()
         super.draw(dirtyRect)
+    }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverTracking { removeTrackingArea(hoverTracking) }
+        let area = NSTrackingArea(rect: .zero,
+            options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect], owner: self)
+        addTrackingArea(area); hoverTracking = area
+    }
+    override func mouseEntered(with event: NSEvent) { hovered = true; needsDisplay = true }
+    override func mouseExited(with event: NSEvent) { hovered = false; needsDisplay = true }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil { hovered = false; needsDisplay = true }
+        super.viewWillMove(toWindow: newWindow)
     }
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance(); needsDisplay = true

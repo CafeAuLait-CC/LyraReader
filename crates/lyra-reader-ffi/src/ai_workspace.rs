@@ -1,4 +1,4 @@
-//! Typed workspace adapter; all record rules and serialization live in lyra-reader-ai.
+//! Typed reading adapters; portable rules and serialization live in lyra-reader-ai.
 use crate::api::ErrorSeverity;
 use crate::api::LyraReaderFfiError;
 use lyra_reader_ai::workspace::{ReadingRecord, ReadingWorkspace};
@@ -9,6 +9,11 @@ fn error(message: String) -> LyraReaderFfiError {
         message,
         severity: ErrorSeverity::Recoverable,
     }
+}
+
+#[uniffi::export]
+pub fn ai_math_render_source(source: String) -> String {
+    lyra_reader_ai::math::render_source(&source)
 }
 
 #[derive(Clone, Debug, uniffi::Record)]

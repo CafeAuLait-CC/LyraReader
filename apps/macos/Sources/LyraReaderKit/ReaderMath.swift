@@ -2,6 +2,7 @@ import AppKit
 import CoreGraphics
 import CoreText
 import Foundation
+import LyraReaderBindings
 
 /// A rendered mathematics expression: an image plus the metrics needed to align it on a text
 /// baseline. `source` is the exact LaTeX between the delimiters, which is what a fallback and
@@ -72,7 +73,7 @@ public enum ReaderMathRenderer {
             ))
         }
         do {
-            var parser = MathParser(source: trimmed, display: display)
+            var parser = MathParser(source: aiMathRenderSource(source: trimmed), display: display)
             let nodes = try parser.parse()
             let box = MathLayout.layoutRow(nodes, size: fontSize, display: display, baseSize: fontSize)
             let padding = max(1, fontSize * 0.14)
