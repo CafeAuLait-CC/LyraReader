@@ -408,7 +408,12 @@ private slots:
         for(const auto &folder:{"first-target","second-target"}){QVERIFY(QDir(scratch.path()).mkdir(folder));const auto file=scratch.filePath(QString(folder)+"/"+name);QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",file));auto *target=windows.createWindow();QVERIFY(target);auto *owner=target->property("session").value<WorkspaceController *>();owner->openFile(QUrl::fromLocalFile(file));QTRY_VERIFY_WITH_TIMEOUT(owner->activeReader()->pageCount()==1 && !owner->activeReader()->pendingCommands(),10000);}
         const auto targets=origin->tabTransferTargets();QCOMPARE(targets.size(),2);QVERIFY(targets[0].toMap().value("windowId")!=targets[1].toMap().value("windowId"));
         for(const auto &target:targets){const auto label=target.toMap().value("title").toString();QVERIFY2(label.startsWith("Window "),qPrintable(label));QVERIFY(label.contains(name));QVERIFY(label.contains("-target"));}
-        source->requestActivate();QTRY_VERIFY(QGuiApplication::focusWindow()==source);auto *fileMenu=source->findChild<QObject *>("fileMenu"),*menu=source->findChild<QObject *>("moveTabToWindowMenu");QVERIFY(fileMenu && menu);QVERIFY(QMetaObject::invokeMethod(fileMenu,"open"));QTRY_VERIFY(fileMenu->property("visible").toBool());QVERIFY(QMetaObject::invokeMethod(menu,"open"));QTRY_VERIFY(menu->property("visible").toBool());QTRY_COMPARE(source->findChildren<QObject *>("moveTabDestination").size(),2);
+        const bool native=QGuiApplication::platformName()!=QStringLiteral("offscreen");
+        // Focus is a compositor precondition, not a label-layout latency assertion.
+        // Native runs can need an explicit user/MCP focus action after three tiled windows map.
+        if(native)qInfo()<<"Native compositor focus preflight";
+        source->requestActivate();QTRY_VERIFY_WITH_TIMEOUT(QGuiApplication::focusWindow()==source,native ? 30000 : 5000);
+        auto *fileMenu=source->findChild<QObject *>("fileMenu"),*menu=source->findChild<QObject *>("moveTabToWindowMenu");QVERIFY(fileMenu && menu);QVERIFY(QMetaObject::invokeMethod(fileMenu,"open"));QTRY_VERIFY(fileMenu->property("visible").toBool());QVERIFY(QMetaObject::invokeMethod(menu,"open"));QTRY_VERIFY(menu->property("visible").toBool());QTRY_COMPARE(source->findChildren<QObject *>("moveTabDestination").size(),2);
         for(auto *entry:source->findChildren<QObject *>("moveTabDestination")){auto *label=entry->property("contentItem").value<QQuickItem *>();QVERIFY(label);QCOMPARE(label->property("textFormat").toInt(),int(Qt::PlainText));QCOMPARE(label->property("elide").toInt(),int(Qt::ElideMiddle));QTRY_VERIFY(label->property("truncated").toBool());QCOMPARE(entry->property("destinationDescription").toString(),entry->property("text").toString()+"\n1 tab");}
         QVERIFY(menu->property("width").toDouble()<=source->width()-20);QTest::qWait(30);const auto shot=qEnvironmentVariable("LYRA_READER_DESTINATION_MENU_SNAPSHOT");if(!shot.isEmpty())QVERIFY(source->grabWindow().save(shot+"-"+theme+".png"));
     }
@@ -3344,6 +3349,60 @@ private slots:
             QTRY_VERIFY_WITH_TIMEOUT(RenderBudget::statistics().value("textureBytes").toLongLong()<=texture,10000);
         }
     }
+    void stickyNotePaletteUsesPaperTokensInEveryInteractionState_data() {
+        QTest::addColumn<bool>("darkPaper");
+        QTest::addColumn<bool>("darkWindow");
+        QTest::addColumn<int>("state");
+        for (bool paper : {false, true}) for (bool window : {false, true}) for (int state = 0; state < 3; ++state)
+            QTest::newRow(qPrintable(QString("paper-%1-window-%2-state-%3").arg(paper).arg(window).arg(state))) << paper << window << state;
+    }
+    void stickyNotePaletteUsesPaperTokensInEveryInteractionState() {
+        QFETCH(bool,darkPaper); QFETCH(bool,darkWindow); QFETCH(int,state);
+        QTest::failOnWarning(QRegularExpression(".*(ReferenceError:|TypeError:|Binding loop).*"));
+        QQmlEngine engine; QQmlComponent component(&engine);
+        component.setData(R"(import QtQuick
+            QtObject {
+                id: specimen
+                property bool darkPaper: false
+                property bool darkWindow: false
+                property int state: 0
+                property color highlight: Qt.rgba(.2,.4,1,.01)
+                property QtObject theme: LyraReaderTheme { dark: specimen.darkWindow }
+                property var colors: theme.noteIconColors(state, darkPaper, null)
+                property var inlineColors: theme.noteIconColors(state, darkPaper, highlight)
+            })", QUrl("qrc:/qml/NotePaletteCheck.qml"));
+        QScopedPointer<QObject> object(component.create());
+        QVERIFY2(object,qPrintable(component.errorString()));
+        QVERIFY(object->setProperty("darkPaper",darkPaper));
+        QVERIFY(object->setProperty("darkWindow",darkWindow));
+        QVERIFY(object->setProperty("state",state));
+        const auto colors=object->property("colors").value<QJSValue>().toVariant().toMap();
+        const QColor base(darkPaper ? "#463126" : "#FFF0E6");
+        const QColor ink(darkPaper ? "#F3BD94" : "#8A4C26");
+        const double amount=state*.06;
+        const auto mixed=QColor::fromRgbF(base.redF()*(1-amount)+ink.redF()*amount,
+                                        base.greenF()*(1-amount)+ink.greenF()*amount,
+                                        base.blueF()*(1-amount)+ink.blueF()*amount,1);
+        const auto surface=colors.value("paper").value<QColor>();
+        QVERIFY2(qAbs(surface.red()-mixed.red())<=1 && qAbs(surface.green()-mixed.green())<=1
+                 && qAbs(surface.blue()-mixed.blue())<=1,qPrintable(surface.name()));
+        QCOMPARE(surface.alpha(),255);
+        QCOMPARE(colors.value("fold").value<QColor>(),surface);
+        QCOMPARE(colors.value("ink").value<QColor>(),ink);
+        // Frozen highlight-tint samples from the pre-migration production palette.
+        const QStringList inlinePaper=darkPaper ? QStringList{"#3D4769","#444C6B","#494E69"}
+                                               : QStringList{"#A7BCF9","#A4B8F5","#A1B6F3"};
+        const QStringList inlineInk=darkPaper ? QStringList{"#C1AB7F","#D3BC8C","#E7C07B"}
+                                             : QStringList{"#857252","#79613A","#735423"};
+        const auto inlineValues=object->property("inlineColors").value<QJSValue>().toVariant().toMap();
+        const auto inlineSurface=inlineValues.value("paper").value<QColor>();
+        const QColor expectedInline(inlinePaper[state]);
+        QVERIFY(qAbs(inlineSurface.red()-expectedInline.red())<=1 && qAbs(inlineSurface.green()-expectedInline.green())<=1
+                && qAbs(inlineSurface.blue()-expectedInline.blue())<=1);
+        QCOMPARE(inlineValues.value("ink").value<QColor>(),QColor(inlineInk[state]));
+        QVERIFY(object->setProperty("highlight",QColor::fromRgbF(.2,.4,1,1)));
+        QCOMPARE(object->property("inlineColors").value<QJSValue>().toVariant().toMap(),inlineValues);
+    }
     void foldedNoteGlyphsHaveCompleteOpaqueArtworkAndBoundedTextures() {
         NativeCorpus::Viewer view;QVERIFY(view.window);view.window->requestActivate();QTRY_VERIFY(view.window->isExposed());QTRY_COMPARE(QGuiApplication::focusWindow(),view.window);
         QSize previous;int stable=0;QElapsedTimer configuration;configuration.start();
@@ -3366,7 +3425,9 @@ private slots:
         const auto capture=[&]{QTest::qWait(80);auto grab=badge->grabToImage();if(!grab)return QImage{};QSignalSpy ready(grab.data(),&QQuickItemGrabResult::ready);if(ready.isEmpty() && !ready.wait(3000))return QImage{};return grab->image();};
         const auto sample=[](const QImage &image,double x,double y){return image.pixelColor(qFloor(x/24*image.width()),qFloor(y/24*image.height()));};
         auto normal=capture();QVERIFY(!normal.isNull());QCOMPARE(sample(normal,2,2).alpha(),0);QCOMPARE(sample(normal,19,19).alpha(),0);
-        const auto paper=sample(normal,6,14);QVERIFY2(qAbs(paper.red()-245)<2 && qAbs(paper.green()-236)<2 && qAbs(paper.blue()-215)<2,qPrintable(paper.name()));QCOMPARE(paper.alpha(),255);
+        const auto evidence=qEnvironmentVariable("LYRA_READER_NOTE_PALETTE_EVIDENCE");
+        if(!evidence.isEmpty())QVERIFY(normal.save(evidence+"-normal.png"));
+        const auto paper=sample(normal,6,14);QVERIFY2(qAbs(paper.red()-255)<2 && qAbs(paper.green()-240)<2 && qAbs(paper.blue()-230)<2,qPrintable(paper.name()));QCOMPARE(paper.alpha(),255);
         const auto ink=sample(normal,10,8.25);QVERIFY(ink.red()<paper.red()-30);
         QSignalSpy painted(canvas,SIGNAL(painted()));QVERIFY(painted.isValid());
         QTest::mouseMove(view.window,badge->mapToScene(QPointF(32,32)).toPoint());QTRY_VERIFY(badge->property("hovered").toBool());
@@ -3375,11 +3436,20 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(painted.count()>0 && badge->property("hovered").toBool(),3000);
         QImage hovered;const auto hoverFrame=[&]{hovered=capture();return !hovered.isNull() && badge->property("hovered").toBool() && sample(hovered,6,14)!=paper;};
         QTRY_VERIFY2_WITH_TIMEOUT(hoverFrame(),qPrintable(QString("hover=%1 paint=%2 actual=%3 normal=%4 window=%5").arg(badge->property("hovered").toBool()).arg(painted.count()).arg(hovered.isNull()?QString("no image"):sample(hovered,6,14).name(QColor::HexArgb)).arg(paper.name(QColor::HexArgb)).arg(view.window->isExposed())),3000);
+        if(!evidence.isEmpty())QVERIFY(hovered.save(evidence+"-hovered.png"));
         qInfo()<<"Note hover frame"<<badge->property("hovered")<<"paints"<<painted.count()<<sample(hovered,6,14)<<"normal"<<paper;
         QTest::mouseMove(view.window,QPoint(view.window->width()-20,view.window->height()-20));QTRY_VERIFY(!badge->property("hovered").toBool());
         const auto windowRect=canvas->property("canvasWindow").toRectF();const auto canvasSize=canvas->property("canvasSize").toSizeF();QCOMPARE(windowRect.size(),canvasSize);
         auto *theme=object->property("theme").value<QObject *>();QVERIFY(theme);theme->setProperty("dark",true);QCOMPARE(capture(),normal);
         badge->setProperty("active",true);auto active=capture();QVERIFY(sample(active,6,14)!=paper);
+        if(!evidence.isEmpty())QVERIFY(active.save(evidence+"-active.png"));
+        badge->setProperty("active",false);badge->setProperty("nightPaper",true);
+        const auto darkSticker=capture();QVERIFY(!darkSticker.isNull());QCOMPARE(sample(darkSticker,6,14),QColor("#463126"));
+        QCOMPARE(darkSticker.size(),normal.size());
+        for(int y=0;y<normal.height();++y)for(int x=0;x<normal.width();++x)
+            QCOMPARE(darkSticker.pixelColor(x,y).alpha(),normal.pixelColor(x,y).alpha());
+        if(!evidence.isEmpty())QVERIFY(darkSticker.save(evidence+"-night.png"));
+        badge->setProperty("nightPaper",false);badge->setProperty("active",true);
         badge->setProperty("inlineComment",true);badge->setProperty("highlight",QColor::fromRgbF(.2,.4,1,.01));auto translucent=capture();QCOMPARE(sample(translucent,6,14).alpha(),255);
         badge->setProperty("highlight",QColor::fromRgbF(.2,.4,1,1));QCOMPARE(capture(),translucent);
         const auto dots=sample(translucent,8.375,9.875);QVERIFY(dots.red()<sample(translucent,6,14).red()-20);

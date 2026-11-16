@@ -54,11 +54,24 @@ QtObject {
     readonly property color searchCurrentBg: dark ? "#7A571F" : "#E6B764"
     readonly property color searchCurrentFg: dark ? "#FFF8E7" : "#342710"
     readonly property color bookmark: dark ? "#E7C07B" : "#9A6A19"
-    readonly property color noteBg: dark ? "#463126" : "#FFF0E6"
-    readonly property color noteFg: dark ? "#F3BD94" : "#8A4C26"
-    // Current macOS folded-note artwork tokens. Paper appearance owns these,
-    // independently of the window theme; source annotation opacity is not a badge alpha.
+    readonly property color noteBgLight: "#FFF0E6"
+    readonly property color noteBgDark: "#463126"
+    readonly property color noteFgLight: "#8A4C26"
+    readonly property color noteFgDark: "#F3BD94"
+    readonly property color noteBg: dark ? noteBgDark : noteBgLight
+    readonly property color noteFg: dark ? noteFgDark : noteFgLight
+    // Stickers use the paper's note tokens. Inline comments retain their markup
+    // tint and opaque badge; neither palette follows the containing window.
     function noteIconColors(state, nightPaper, highlight) {
+        if (highlight === null) {
+            const base = nightPaper ? noteBgDark : noteBgLight;
+            const ink = nightPaper ? noteFgDark : noteFgLight;
+            const amount = state * .06;
+            const paper = Qt.rgba(base.r * (1 - amount) + ink.r * amount,
+                                  base.g * (1 - amount) + ink.g * amount,
+                                  base.b * (1 - amount) + ink.b * amount, 1);
+            return {paper: paper, fold: paper, ink: ink};
+        }
         const table = nightPaper
             ? [["#413B2E", "#534A35", "#C1AB7F"], ["#4A4231", "#60533B", "#D3BC8C"], ["#51452F", "#6D5938", "#E7C07B"]]
             : [["#F5ECD7", "#E8DABE", "#857252"], ["#EFE0BC", "#DFCCA0", "#79613A"], ["#EBD7A6", "#D7BB7D", "#735423"]];
