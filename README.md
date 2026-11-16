@@ -139,8 +139,12 @@ trail. Unit language drafts take effect only after Apply and a new preview; blan
 language. Earlier answers retain their requested-language label. Preview these rows prepares a bounded
 batch with an individual wire-body preview for each request. Send uses the shared concurrency limit;
 Stop preserves completed and partial rows without starting the queued remainder. A failed row can be
-previewed and sent again independently. Batch results are temporary: copy them before sending another
-batch or closing the document. Persistent per-unit caching is still pending. Select & Ask captures a bounded area in its original colours
+previewed and sent again independently. Completed unit and batch summaries are saved in the
+document's application cache, keyed by model, applied language and the shared text fingerprint.
+Open saved summary reads locally; exact batch hits need no new request. Older-text answers are
+labelled for regeneration, and cancelled or failed partial answers never replace a completed cache.
+Cache limits or protected files leave the answer available and show a separate warning. Partial
+results remain temporary. Select & Ask captures a bounded area in its original colours
 and requires a request preview before sending. Save to Reading notes keeps its frozen image, text,
 question draft and completed or partial answer in the application cache; the Notes view reads these
 snapshots, shows bounded capture thumbnails and edits local knowledge notes without sending a request.

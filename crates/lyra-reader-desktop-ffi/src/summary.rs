@@ -17,8 +17,8 @@ pub(crate) struct CatalogRequest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct InspectRequest {
-    layer: AiSummaryLayerRecord,
-    index: u32,
+    pub(crate) layer: AiSummaryLayerRecord,
+    pub(crate) index: u32,
 }
 
 #[derive(Serialize)]
@@ -289,12 +289,13 @@ pub(crate) fn unit_span(unit: &AiSummaryUnitRecord, page_count: u32) -> String {
 }
 
 pub(crate) fn prepare(
-    document: &LyraReaderDocument,
+    document: &std::sync::Arc<LyraReaderDocument>,
     request: InspectRequest,
     settings: AiPlanRequestRecord,
-) -> Result<Value, String> {
+) -> Result<(Value, crate::summary_store::Capture), String> {
     let units = Units::new(document, request.layer)?;
     let row = units.row(request.index)?;
+    let language = settings.language.clone().unwrap_or_default();
     let mut prepared = prepare_layer(document, request.layer, vec![row.unit.clone()], settings)?;
     if prepared.units.len() != 1 {
         return Err("The summary planner returned an unexpected unit count.".into());
@@ -304,8 +305,9 @@ pub(crate) fn prepare(
         .pop()
         .ok_or("The prepared summary is unavailable.")?;
     let span = unit_span(&unit, units.page_count);
-    let plan = unit.plan.ok_or_else(|| {
+    let plan = unit.plan.clone().ok_or_else(|| {
         unit.error
+            .clone()
             .unwrap_or_else(|| "This summary has no extractable text.".into())
     })?;
     let plan = render_ai_plan(plan, AiWireTransport::ChatCompletions)
@@ -321,12 +323,14 @@ pub(crate) fn prepare(
         note: Option<String>,
         plan: AiPlanRecord,
     }
-    serde_json::to_value(Preview {
+    let capture = crate::summary_store::Capture::new(document, &row, &unit, &language, &plan)?;
+    let preview = serde_json::to_value(Preview {
         id: row.id,
         title: unit.title,
         page_span: span,
         note: unit.note,
         plan,
     })
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    Ok((preview, capture))
 }

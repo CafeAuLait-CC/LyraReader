@@ -6,7 +6,7 @@ void ReaderController::initSummaryCatalog() {
 }
 
 void ReaderController::resetSummaryCatalog() {
-    ++m_summaryActionEpoch;m_summaryCatalogId=0;m_summaryInspectId=0;m_summaryExpectedId.clear();
+    ++m_summaryActionEpoch;m_summaryCatalogId=0;m_summaryInspectId=0;m_summaryCacheId=0;m_summaryExpectedId.clear();
     m_summaryCatalog.clear();m_summaryUnitContext.clear();emit summaryCatalogChanged();
 }
 
@@ -26,7 +26,7 @@ void ReaderController::loadSummaryCatalog(const QString &layer,int offset) {
         emit summaryCatalogChanged();return;
     }
     const auto document=m_document;const auto generation=m_generation,epoch=++m_summaryActionEpoch;QPointer<ReaderController> alive(this);
-    m_summaryInspectId=0;m_summaryExpectedId.clear();
+    m_summaryInspectId=0;m_summaryCacheId=0;m_summaryExpectedId.clear();
     m_summaryCatalog={{QStringLiteral("expanded"),true},{QStringLiteral("layer"),layer},
         {QStringLiteral("offset"),offset},{QStringLiteral("generation"),m_generation},
         {QStringLiteral("loading"),true}};
@@ -57,7 +57,26 @@ void ReaderController::inspectSummaryUnit(const QString &id) {
 }
 
 void ReaderController::handleSummaryCatalogCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error) {
-    if(operation==QStringLiteral("ai_summary_catalog") && id==m_summaryCatalogId) {
+    if(operation==QStringLiteral("ai_summary_cached") && id==m_summaryCacheId) {
+        m_summaryCacheId=0;const auto value=result.toMap(),entry=value.value(QStringLiteral("entry")).toMap();
+        m_aiState.insert(QStringLiteral("statusView"),QStringLiteral("summary"));
+        if(!error.isEmpty() || entry.isEmpty()) {
+            m_aiState.insert(QStringLiteral("responseView"),QStringLiteral("summary"));m_aiState.insert(QStringLiteral("output"),QString{});m_aiState.insert(QStringLiteral("reasoning"),QString{});m_aiState.remove(QStringLiteral("responsePlan"));
+            auto results=m_aiState.value(QStringLiteral("results")).toMap();results.remove(QStringLiteral("summary"));m_aiState.insert(QStringLiteral("results"),results);
+            m_aiState.insert(QStringLiteral("status"),error.isEmpty()?tr("No saved summary for this model and language. Preview a request to generate one."):error);
+            m_aiState.insert(QStringLiteral("cacheWarning"),value.value(QStringLiteral("cache_warning")));
+            emit aiStateChanged();return;
+        }
+        const bool exact=value.value(QStringLiteral("exact")).toBool();
+        m_aiState.insert(QStringLiteral("responseView"),QStringLiteral("summary"));
+        m_aiState.insert(QStringLiteral("output"),entry.value(QStringLiteral("summary")));m_aiState.insert(QStringLiteral("reasoning"),QString{});
+        m_aiState.insert(QStringLiteral("unitTitle"),entry.value(QStringLiteral("title")));m_aiState.insert(QStringLiteral("activeModel"),entry.value(QStringLiteral("model")));m_aiState.remove(QStringLiteral("activeHost"));
+        m_aiState.insert(QStringLiteral("unitLanguage"),entry.value(QStringLiteral("language")).toString()==QStringLiteral("document")?QString{}:entry.value(QStringLiteral("language")).toString());
+        m_aiState.insert(QStringLiteral("responsePlan"),QVariantMap{{QStringLiteral("action"),entry.value(QStringLiteral("layer")).toString()==QStringLiteral("abstract")?QStringLiteral("SummarizeAbstract"):entry.value(QStringLiteral("layer")).toString()==QStringLiteral("sections")?QStringLiteral("SummarizeSection"):QStringLiteral("SummarizePageLine")},{QStringLiteral("source_pages"),value.value(QStringLiteral("source_pages"))},{QStringLiteral("generation"),m_generation}});
+        m_aiState.insert(QStringLiteral("cacheWarning"),value.value(QStringLiteral("cache_warning")));
+        m_aiState.insert(QStringLiteral("status"),exact?tr("Saved summary. Nothing sent."):tr("Saved summary uses older text. Preview and Send to regenerate; nothing sent."));
+        retainAiResult(QStringLiteral("finished"));emit aiStateChanged();return;
+    }else if(operation==QStringLiteral("ai_summary_catalog") && id==m_summaryCatalogId) {
         m_summaryCatalogId=0;
         const bool expanded=m_summaryCatalog.value(QStringLiteral("expanded")).toBool();
         if(error.isEmpty()) {
@@ -79,6 +98,24 @@ void ReaderController::handleSummaryCatalogCommand(quint64 id,const QString &ope
         m_summaryExpectedId.clear();m_summaryCatalog.insert(QStringLiteral("coverage"),coverage);
         emit summaryCatalogChanged();
     }
+}
+
+void ReaderController::openCachedSummary(const QString &id,const QString &model) {
+    if(!m_document || m_loading || m_snapshotMode || m_summaryCacheId || m_aiState.value(QStringLiteral("running")).toBool() || m_summaryCatalogId || m_summaryInspectId)return;
+    QVariantMap row;for(const auto &value:m_summaryCatalog.value(QStringLiteral("rows")).toList())if(value.toMap().value(QStringLiteral("id")).toString()==id){row=value.toMap();break;}
+    if(row.isEmpty())return;
+    const auto document=m_document;const auto generation=m_generation;QPointer<ReaderController> alive(this);
+    const auto clearEpoch=m_aiPreviewEpoch+1;
+    clearSummaryBatchView();if(!alive || document!=m_document || generation!=m_generation || clearEpoch!=m_aiPreviewEpoch)return;
+    const auto epoch=m_aiPreviewEpoch+1;
+    invalidateAiPlan();if(!alive || document!=m_document || generation!=m_generation || epoch!=m_aiPreviewEpoch)return;
+    row.insert(QStringLiteral("generation"),generation);m_summaryUnitContext=row;
+    auto input=m_aiState.value(QStringLiteral("input")).toMap();input.insert(QStringLiteral("view"),QStringLiteral("summary"));m_aiState.insert(QStringLiteral("input"),input);
+    const auto unit=row.value(QStringLiteral("unit")).toMap();
+    const auto command=submit(QStringLiteral("ai_summary_cached"),{{QStringLiteral("request"),QVariantMap{{QStringLiteral("layer"),unit.value(QStringLiteral("kind"))},{QStringLiteral("index"),unit.value(QStringLiteral("index"))},{QStringLiteral("model"),model},{QStringLiteral("language"),input.value(QStringLiteral("summaryLanguage"),QString{})}}}});
+    if(!alive || document!=m_document || generation!=m_generation || epoch!=m_aiPreviewEpoch)return;
+    m_summaryCacheId=command;
+    emit summaryCatalogChanged();
 }
 
 
@@ -112,6 +149,7 @@ bool ReaderController::applySummaryLanguage(qulonglong expectedGeneration) {
     input.insert(QStringLiteral("summaryLanguage"),language);input.insert(QStringLiteral("summaryLanguageDraft"),language);
     m_aiState.insert(QStringLiteral("input"),input);
     if(language!=previous) {
+        m_summaryCacheId=0;
         m_summaryBatchPreparedToken.clear();
         if(m_document && !m_summaryBatchState.isEmpty())lyra_reader_desktop_cancel_summary_batch(m_document.get());
         ++m_aiPreviewEpoch;m_aiPreviewId=0;m_aiSummaryPreviewUnitId.clear();m_aiSummaryPreviewLanguage.clear();

@@ -158,6 +158,7 @@ Pane {
             objectName: "summaryCatalog"
             app: aiPanel.app
             onPreviewUnit: function(id) { aiPanel.prepareUnit(id); }
+            onCachedUnit: function(id) { aiPanel.owner.openCachedSummary(id, app.aiSettings.model || ""); }
             onPreviewBatch: function(reader, generation, layer, offset) {
                 if (reader === aiPanel.owner && generation === reader.documentGeneration) aiPanel.prepareBatch(layer, offset);
             }
@@ -266,7 +267,7 @@ Pane {
         }
         Label {
             visible: aiPanel.batchMode
-            text: qsTr("Temporary results: copy them before sending another batch or closing this document.")
+            text: qsTr("Completed summaries are saved locally when possible. Cache warnings appear on each row; partial results remain temporary.")
             textFormat: Text.PlainText; wrapMode: Text.Wrap; maximumLineCount: 2; elide: Text.ElideRight
             Accessible.description: text
             Layout.fillWidth: true; font.pixelSize: 11; color: app.colors.textSecondary
@@ -329,6 +330,14 @@ Pane {
             wrapMode: Text.Wrap; textFormat: Text.PlainText; Layout.fillWidth: true
             color: app.colors.textSecondary; font.pixelSize: 11
             Accessible.role: Accessible.StaticText
+        }
+        Label {
+            objectName: "summaryCacheWarning"
+            text: qsTr("Summary cache: %1").arg(aiPanel.viewState.cacheWarning || "")
+            visible: aiPanel.workspace === "summary" && !!aiPanel.viewState.cacheWarning
+            textFormat: Text.PlainText; wrapMode: Text.Wrap
+            Layout.fillWidth: true; color: app.colors.textSecondary
+            Accessible.description: text
         }
         Label {
             visible: aiPanel.previewReady

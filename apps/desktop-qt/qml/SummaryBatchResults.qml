@@ -58,7 +58,7 @@ ListView {
         }
         Label {
             objectName: "summaryBatchStatus_" + row.unitId
-            text: row.entry.state === "ready" ? qsTr("Complete") : row.entry.state === "sending" ? qsTr("Receiving…") : row.entry.state === "queued" ? qsTr("Queued") : row.entry.state === "cancelled" ? qsTr("Cancelled") : row.entry.state === "failed" ? qsTr("Failed") : qsTr("Previewed; not sent")
+            text: row.entry.state === "ready" ? ((row.entry.result || {}).cached ? qsTr("Saved locally") : qsTr("Complete")) : row.entry.state === "sending" ? qsTr("Receiving…") : row.entry.state === "queued" ? qsTr("Queued") : row.entry.state === "cancelled" ? qsTr("Cancelled") : row.entry.state === "failed" ? qsTr("Failed") : qsTr("Previewed; not sent")
             color: row.entry.state === "failed" ? app.colors.errorFg : app.colors.textSecondary
             textFormat: Text.PlainText; Accessible.description: text
         }
@@ -66,6 +66,12 @@ ListView {
             visible: !!row.entry.error; text: row.entry.error || ""
             Layout.fillWidth: true; textFormat: Text.PlainText; wrapMode: Text.Wrap; maximumLineCount: 3; elide: Text.ElideRight
             color: app.colors.errorFg; Accessible.description: text
+        }
+        Label {
+            objectName: "summaryBatchCacheWarning_" + row.unitId
+            visible: !!row.entry.cache_warning; text: qsTr("Summary cache: %1").arg(row.entry.cache_warning || "")
+            Layout.fillWidth: true; textFormat: Text.PlainText; wrapMode: Text.Wrap
+            color: app.colors.textSecondary; Accessible.description: text
         }
         RowLayout {
             Layout.fillWidth: true

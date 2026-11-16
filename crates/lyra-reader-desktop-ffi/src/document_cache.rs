@@ -158,6 +158,24 @@ pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     result
 }
 
+/// Summary generation and identity migration share the same short advisory write lease.
+pub(super) fn lock_summary_cache(directory: &Path) -> Result<fs::File, String> {
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options
+        .open(directory.join(".summaries.lock"))
+        .map_err(|e| e.to_string())?;
+    fs2::FileExt::try_lock_exclusive(&lock).map_err(|e| {
+        format!("Another window is saving summaries. The original cache was kept: {e}")
+    })?;
+    Ok(lock)
+}
+
 impl DocumentCache {
     pub fn open(document: &Path, root: &Path) -> Result<Self, String> {
         Self::open_with_identity(document, root, None)
@@ -234,7 +252,13 @@ impl DocumentCache {
             if !destination.exists()
                 && let Some(bytes) = read_optional(&previous.join(name))?
             {
-                atomic_write(&destination, &bytes)?;
+                let _summary_lease = (*name == "summaries.json")
+                    .then(|| lock_summary_cache(&self.directory))
+                    .transpose()?;
+                // A cooperating writer may have published while this migration acquired its lease.
+                if !destination.exists() {
+                    atomic_write(&destination, &bytes)?;
+                }
             }
         }
         Ok(previous.join("session.json").exists().then(||
@@ -308,6 +332,9 @@ impl DocumentCache {
             for name in CARRIED_FILES.iter().filter(|n| **n != "source.json") {
                 if let Some(bytes) = read_optional(&self.directory.join(name))? {
                     let destination = next.directory.join(name);
+                    let _summary_lease = (*name == "summaries.json")
+                        .then(|| lock_summary_cache(&next.directory))
+                        .transpose()?;
                     let conflict = match *name {
                         "summaries.json" => Some(
                             "The PDF was saved, but destination summaries differ. Both cache versions were kept",
@@ -407,6 +434,29 @@ mod tests {
     #[test]
     fn save_migration_retains_existing_destination_translations() {
         assert_conflict_is_preserved("translations.json", "destination translations differ");
+    }
+    #[test]
+    fn save_migration_respects_an_active_summary_writer_lease() {
+        let fixture = Fixture::new();
+        let (cache, next, saved) = fixture.caches("summaries.json");
+        let before = fs::read(next.directory.join("summaries.json")).unwrap();
+        let _lease = lock_summary_cache(&next.directory).unwrap();
+        assert!(
+            cache
+                .after_save()
+                .err()
+                .expect("Migration must respect the active writer")
+                .contains("Another window")
+        );
+        assert_eq!(
+            fs::read(next.directory.join("summaries.json")).unwrap(),
+            before
+        );
+        assert_eq!(
+            fs::read(cache.directory.join("summaries.json")).unwrap(),
+            before
+        );
+        assert_eq!(fs::read(&cache.document).unwrap(), saved);
     }
     #[test]
     fn save_migration_accepts_identical_or_missing_derived_ai_caches() {

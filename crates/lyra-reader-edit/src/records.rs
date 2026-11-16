@@ -1455,6 +1455,14 @@ fn base64_value(byte: u8) -> Option<u8> {
 /// to preserve a foreign entry exactly is to slice the original text. This scanner finds those
 /// slices; full JSON validation is left to `serde_json`, which every retained entry goes through.
 pub fn parse_array_elements(data: &[u8]) -> Result<Vec<String>, RecordError> {
+    parse_array_elements_bounded(data, usize::MAX)
+}
+
+/// Stop before allocating the next record when the caller's format has a row bound.
+pub fn parse_array_elements_bounded(
+    data: &[u8],
+    maximum: usize,
+) -> Result<Vec<String>, RecordError> {
     let count = data.len();
     let mut index = 0;
 
@@ -1551,6 +1559,9 @@ pub fn parse_array_elements(data: &[u8]) -> Result<Vec<String>, RecordError> {
             }
             let start = index;
             skip_value(data, &mut index, count)?;
+            if elements.len() >= maximum {
+                return failure("The record array exceeds its entry limit");
+            }
             elements.push(String::from_utf8_lossy(&data[start..index]).into_owned());
             while index < count && is_whitespace(data[index]) {
                 index += 1;

@@ -139,7 +139,7 @@ impl RegionStore {
         Ok(())
     }
 }
-fn now() -> f64 {
+pub(crate) fn now() -> f64 {
     chrono::Utc::now().timestamp_millis() as f64 / 1000.0 - 978_307_200.0
 }
 fn field<'a>(r: &'a Value, k: &str) -> Result<&'a str, String> {

@@ -281,6 +281,7 @@ void ReaderController::setAiInput(const QString &key,const QVariant &value) {
     if(alive)emit aiStateChanged();
 }
 void ReaderController::invalidateAiPlan() {
+    m_summaryCacheId=0;
     const bool hadPreview=m_aiPreviewId || m_aiState.contains(QStringLiteral("plan")) || m_regionContinuationPending;
     m_regionContinuationPending=false;m_regionContinuationSettings.clear();
     ++m_aiPreviewEpoch;m_aiPreviewId=0;m_aiState.remove(QStringLiteral("plan"));
@@ -314,6 +315,7 @@ void ReaderController::prepareAi(const QVariantMap &request,const QVariantMap &u
         m_summaryUnitContext.clear();emit summaryCatalogChanged();if(!current())return;
     }
     m_aiSummaryPreviewUnitId=unit.isEmpty()?QString{}:m_summaryUnitContext.value(QStringLiteral("id")).toString();
+    m_summaryCacheId=0;m_aiState.remove(QStringLiteral("cacheWarning"));
     m_aiSummaryPreviewLanguage=unit.isEmpty()?QString{}:request.value(QStringLiteral("language")).toString();
     if(request.value(QStringLiteral("action")).toString()!=QStringLiteral("TranslateSelection") && !m_readingChoiceShown && !m_documentReading.value(QStringLiteral("ready")).toBool()) {
         m_readingChoiceShown=true;m_readingChoicePending=true;emit documentReadingChanged();if(!current())return;
@@ -484,6 +486,7 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
         m_aiState.insert(QStringLiteral("running"),false);m_aiState.insert(QStringLiteral("status"),error);finishAiChat(QStringLiteral("failed"));retainAiResult(QStringLiteral("failed"));m_aiTimer.stop();if(m_aiState.value(QStringLiteral("responseView")).toString()==QStringLiteral("region"))markRegionDirty();emit aiStateChanged();return;
     }
     const auto batch=result.toMap();
+    if(!batch.value(QStringLiteral("cache_warning")).toString().isEmpty())m_aiState.insert(QStringLiteral("cacheWarning"),batch.value(QStringLiteral("cache_warning")));
     const auto priorOutput=m_aiState.value(QStringLiteral("output")).toString();
     auto output=m_aiState.value(QStringLiteral("output")).toString(),reasoning=m_aiState.value(QStringLiteral("reasoning")).toString();
     for(const auto &value:batch.value(QStringLiteral("events")).toList()) {

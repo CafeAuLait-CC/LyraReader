@@ -538,7 +538,7 @@ impl History {
 /// Deterministic compact encoding; legacy unedited records bypass this writer completely.
 /// Foundation's default key order is unspecified, so compatibility assertions compare keys
 /// semantically while freezing primitive/rectangle/date bytes and foreign entries exactly.
-fn foundation_json(value: &Value) -> Result<String, String> {
+pub(crate) fn foundation_json(value: &Value) -> Result<String, String> {
     Ok(match value {
         Value::Null => "null".into(),
         Value::Bool(b) => b.to_string(),

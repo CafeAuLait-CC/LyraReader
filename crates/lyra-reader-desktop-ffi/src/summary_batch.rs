@@ -89,6 +89,8 @@ struct RowView {
     unit_language: String,
     model: String,
     response_plan: Option<Provenance>,
+    cache_warning: Option<String>,
+    cached_output: Option<String>,
 }
 
 struct Row {
@@ -97,6 +99,7 @@ struct Row {
     fingerprint: Option<[u8; 32]>,
     job: Option<Arc<LyraReaderAiRequest>>,
     done_received: bool,
+    capture: Option<crate::summary_store::Capture>,
 }
 
 struct Prepared {
@@ -162,6 +165,8 @@ impl Batch {
         document: &Arc<LyraReaderDocument>,
         request: PrepareRequest,
         settings: AiPlanRequestRecord,
+        store: &mut crate::summary_store::Store,
+        cache: &crate::document_cache::DocumentCache,
     ) -> Result<Value, String> {
         if self.running {
             return Err("Stop the current summary batch before preparing another.".into());
@@ -203,6 +208,7 @@ impl Batch {
             None => String::new(),
         };
         let model = settings.model.clone();
+        let cache_warning = store.load(cache).err().or_else(|| store.warning());
         let mut result = prepare_layer(
             document,
             request.layer,
@@ -238,6 +244,7 @@ impl Batch {
             let span = unit_span(&unit, units.page_count);
             let plan = unit
                 .plan
+                .clone()
                 .map(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions))
                 .transpose()
                 .map_err(|error| error.to_string())?;
@@ -251,13 +258,37 @@ impl Batch {
                 ),
                 None => None,
             };
+            let unit_model = plan
+                .as_ref()
+                .map(|p| p.model.as_str())
+                .unwrap_or(&model)
+                .to_owned();
+            let layer = match unit.kind {
+                AiSummaryLayerRecord::Abstract => "abstract",
+                AiSummaryLayerRecord::Section => "sections",
+                AiSummaryLayerRecord::Page => "pages",
+            };
+            let cached = (!append)
+                .then(|| {
+                    store.cached_entry(
+                        layer,
+                        &descriptor.id,
+                        &unit_model,
+                        &language,
+                        &unit.text_hash,
+                    )
+                })
+                .flatten()
+                .filter(|(_, exact)| *exact)
+                .map(|(entry, _)| entry);
             let ready = !append
-                && source_matches
-                && self.rows.iter().any(|old| {
-                    old.view.id == descriptor.id
-                        && old.view.state == State::Ready
-                        && old.fingerprint == fingerprint
-                });
+                && (cached.is_some()
+                    || (source_matches
+                        && self.rows.iter().any(|old| {
+                            old.view.id == descriptor.id
+                                && old.view.state == State::Ready
+                                && old.fingerprint == fingerprint
+                        })));
             let requested = plan.is_some() && !ready;
             let state = if ready {
                 State::Ready
@@ -271,6 +302,31 @@ impl Batch {
                 source_pages: plan.source_pages.clone(),
                 sources: plan.sources.clone(),
             });
+            let provenance = if let Some(entry) = &cached {
+                provenance.map(|mut p| {
+                    p.source_pages = entry.verified_pages(
+                        &document.document_identity().sha256,
+                        document.page_count(),
+                    );
+                    p.sources.clear();
+                    p
+                })
+            } else {
+                provenance
+            };
+            let capture = plan
+                .as_ref()
+                .filter(|_| requested)
+                .map(|plan| {
+                    crate::summary_store::Capture::new(
+                        document,
+                        &descriptor,
+                        &unit,
+                        &language,
+                        plan,
+                    )
+                })
+                .transpose()?;
             let view = RowView {
                 id: descriptor.id,
                 layer: request.layer,
@@ -284,8 +340,10 @@ impl Batch {
                 requested,
                 requestable: plan.is_some(),
                 unit_language: language.clone(),
-                model: model.clone(),
+                model: unit_model,
                 response_plan: provenance,
+                cache_warning: cache_warning.clone(),
+                cached_output: cached.map(|entry| entry.summary),
             };
             if let Some(plan) = plan.as_ref().filter(|_| requested) {
                 if first_plan.is_none() {
@@ -305,6 +363,7 @@ impl Batch {
                 fingerprint,
                 job: None,
                 done_received: false,
+                capture,
             });
         }
         let mut bytes = [0u8; 16];
@@ -471,6 +530,9 @@ impl Batch {
         // Observe completion before draining: a finished worker has already queued its last event.
         let finished = job.is_finished();
         let events = job.poll();
+        if let Some(capture) = row.capture.as_mut() {
+            capture.observe(&events);
+        }
         for event in &events {
             match event {
                 AiEventRecord::Done => row.done_received = true,
@@ -507,17 +569,24 @@ impl Batch {
         &mut self,
         document: &Arc<LyraReaderDocument>,
         token: &str,
+        store: &mut crate::summary_store::Store,
+        cache: &crate::document_cache::DocumentCache,
     ) -> Result<Value, String> {
         if self.token.is_empty() || self.token != token {
             return Err("This summary batch is no longer active.".into());
         }
         if !self.source.ptr_eq(&Arc::downgrade(document)) || self.scope.cancelled(self.active_scope)
         {
-            return self.cancel(token);
+            return self.cancel(document, token, store, cache);
         }
         let mut deliveries = Vec::new();
         for row in &mut self.rows {
             let events = Self::drain(row);
+            if row.view.state == State::Ready
+                && let Some(capture) = row.capture.take()
+            {
+                row.view.cache_warning = capture.finish(document, store, cache).err();
+            }
             if !events.is_empty() {
                 deliveries.push(Delivery {
                     id: row.view.id.clone(),
@@ -531,7 +600,13 @@ impl Batch {
         self.snapshot(deliveries)
     }
 
-    pub(crate) fn cancel(&mut self, token: &str) -> Result<Value, String> {
+    pub(crate) fn cancel(
+        &mut self,
+        document: &Arc<LyraReaderDocument>,
+        token: &str,
+        store: &mut crate::summary_store::Store,
+        cache: &crate::document_cache::DocumentCache,
+    ) -> Result<Value, String> {
         if self
             .prepared
             .as_ref()
@@ -545,6 +620,11 @@ impl Batch {
         let mut deliveries = Vec::new();
         for row in &mut self.rows {
             let events = Self::drain(row);
+            if row.view.state == State::Ready
+                && let Some(capture) = row.capture.take()
+            {
+                row.view.cache_warning = capture.finish(document, store, cache).err();
+            }
             if !events.is_empty() {
                 deliveries.push(Delivery {
                     id: row.view.id.clone(),
@@ -573,7 +653,7 @@ impl Batch {
         self.running = false;
     }
 
-    fn snapshot(&self, deliveries: Vec<Delivery>) -> Result<Value, String> {
+    fn snapshot(&mut self, deliveries: Vec<Delivery>) -> Result<Value, String> {
         let total = self.rows.iter().filter(|row| row.view.requested).count();
         let finished = self
             .rows
@@ -605,8 +685,12 @@ impl Batch {
         } else {
             "finished"
         };
-        Ok(
+        let snapshot = Ok(
             json!({"token":self.token,"rows":self.rows.iter().map(|row| &row.view).collect::<Vec<_>>(),"deliveries":deliveries,"running":self.running,"total":total,"finished":finished,"active":self.rows.iter().filter(|row| row.job.is_some()).count(),"ready":ready,"failed":failed,"cancelled":cancelled,"rejected":rejected,"phase":phase}),
-        )
+        );
+        for row in &mut self.rows {
+            row.view.cached_output = None;
+        }
+        snapshot
     }
 }

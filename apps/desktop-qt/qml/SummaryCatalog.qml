@@ -7,6 +7,7 @@ Item {
     required property var app
     readonly property var owner: app.currentReader
     signal previewUnit(string id)
+    signal cachedUnit(string id)
     signal previewBatch(var reader, var generation, string layer, int offset)
     property var popupOwner: null
     readonly property var state: popupOwner ? popupOwner.summaryCatalog : ({})
@@ -163,6 +164,20 @@ Item {
                             enabled: !root.state.loading && !root.state.inspecting && !root.popupOwner.aiState.running
                             onClicked: root.previewSummary(row.modelData)
                             Accessible.description: qsTr("Prepare one request locally; Send remains a separate action")
+                        }
+                        Button {
+                            objectName: "openCachedSummaryCatalogRow"
+                            property string unitId: row.modelData.id
+                            text: qsTr("Open saved summary")
+                            enabled: !root.state.loading && !root.state.inspecting && !root.popupOwner.aiState.running && !!root.app.aiSettings.model
+                            onClicked: {
+                                if (!root.popupOwner || root.popupOwner !== root.owner || root.state.generation !== root.owner.documentGeneration) return;
+                                const id = unitId;
+                                const expectedOwner = root.popupOwner, generation = root.state.generation;
+                                detail.close();
+                                if (root.owner === expectedOwner && expectedOwner && generation === expectedOwner.documentGeneration) root.cachedUnit(id);
+                            }
+                            Accessible.description: qsTr("Read this model and language's saved answer locally without sending a request")
                         }
                         ToolButton {
                             objectName: "openSummaryCatalogSource"

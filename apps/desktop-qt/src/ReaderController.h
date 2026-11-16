@@ -80,6 +80,7 @@ public:
     Q_INVOKABLE void setSummaryExpanded(bool expanded);
     Q_INVOKABLE void loadSummaryCatalog(const QString &layer,int offset=0);
     Q_INVOKABLE void inspectSummaryUnit(const QString &id);
+    Q_INVOKABLE void openCachedSummary(const QString &id,const QString &model);
     QVariantMap summaryUnitContext()const{return m_summaryUnitContext;}
     Q_INVOKABLE void prepareSummaryUnit(const QString &id,const QVariantMap &settings);
     Q_INVOKABLE void clearSummaryUnit();
@@ -241,7 +242,7 @@ private:
     static constexpr qsizetype maximumAiCharacters=4*1024*1024;
     void handleSummaryCatalogCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error);
     QVariantMap m_summaryCatalog,m_summaryUnitContext;
-    quint64 m_summaryCatalogId=0,m_summaryInspectId=0,m_summaryActionEpoch=0;
+    quint64 m_summaryCatalogId=0,m_summaryInspectId=0,m_summaryCacheId=0,m_summaryActionEpoch=0;
     QString m_summaryExpectedId;
     void initRegionPersistence();
     void resetRegionPersistence();

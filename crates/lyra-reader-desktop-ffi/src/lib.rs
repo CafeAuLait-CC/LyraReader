@@ -26,6 +26,7 @@ mod selection;
 mod session;
 mod summary;
 mod summary_batch;
+mod summary_store;
 mod tile_plan;
 use document::DesktopDocument as Document;
 use std::{

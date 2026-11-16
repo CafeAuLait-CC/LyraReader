@@ -1,6 +1,24 @@
 #include "ReaderController.h"
 #include <QPointer>
 
+namespace {
+void restoreCachedRows(QVariantMap &rows,qulonglong generation,qsizetype maximum) {
+    qsizetype used=0;
+    for(const auto &value:rows){const auto row=value.toMap(),result=row.value(QStringLiteral("result")).toMap();if(row.value(QStringLiteral("cached_output")).isNull())used+=result.value(QStringLiteral("output")).toString().size()+result.value(QStringLiteral("reasoning")).toString().size();}
+    for(auto it=rows.begin();it!=rows.end();++it){
+        auto row=it.value().toMap();const auto cached=row.take(QStringLiteral("cached_output"));
+        if(!cached.isNull()){
+            auto result=row.value(QStringLiteral("result")).toMap();const auto output=cached.toString();
+            if(output.size()<=maximum-used){result.insert(QStringLiteral("output"),output);used+=output.size();}
+            else {result.insert(QStringLiteral("output"),QString{});row.insert(QStringLiteral("cache_warning"),QObject::tr("Saved answer exceeds the remaining batch display budget. Open this saved summary individually; its full text remains on disk."));}
+            result.insert(QStringLiteral("cached"),true);result.insert(QStringLiteral("reasoning"),QString{});result.insert(QStringLiteral("unitTitle"),row.value(QStringLiteral("title")));result.insert(QStringLiteral("unitLanguage"),row.value(QStringLiteral("unit_language")));result.insert(QStringLiteral("generation"),generation);
+            auto proof=row.value(QStringLiteral("response_plan")).toMap();proof.insert(QStringLiteral("generation"),generation);result.insert(QStringLiteral("responsePlan"),proof);row.insert(QStringLiteral("result"),result);
+        }
+        it.value()=row;
+    }
+}
+}
+
 void ReaderController::initSummaryBatch(){
     connect(this,&ReaderController::commandFinished,this,&ReaderController::handleSummaryBatchCommand);
 }
@@ -66,6 +84,7 @@ bool ReaderController::applySummaryBatchFrame(const QVariantMap &frame,bool fres
         auto proof=row.value(QStringLiteral("response_plan")).toMap();proof.insert(QStringLiteral("generation"),m_generation);result.insert(QStringLiteral("responsePlan"),proof);
         row.insert(QStringLiteral("generation"),m_generation);row.insert(QStringLiteral("result"),result);rows.insert(id,row);ids.append(id);
     }
+    restoreCachedRows(rows,m_generation,maximumAiCharacters);
     qsizetype characters=0;
     for(const auto &value:rows){const auto result=value.toMap().value(QStringLiteral("result")).toMap();characters+=result.value(QStringLiteral("output")).toString().size()+result.value(QStringLiteral("reasoning")).toString().size();}
     bool limited=false;
@@ -115,6 +134,7 @@ void ReaderController::handleSummaryBatchCommand(quint64 id,const QString &opera
                 const auto prior=old.value(unitId).toMap().value(QStringLiteral("result")).toMap();row.insert(QStringLiteral("result"),prior);row.insert(QStringLiteral("generation"),m_generation);
                 rows.insert(unitId,row);if(!ids.contains(unitId))ids.append(unitId);
             }
+            restoreCachedRows(rows,m_generation,maximumAiCharacters);
             m_summaryBatchState.insert(QStringLiteral("rows"),rows);m_summaryBatchState.insert(QStringLiteral("ids"),ids);m_summaryBatchState.insert(QStringLiteral("totalRows"),result.value(QStringLiteral("total")));
         }
         m_aiState.insert(QStringLiteral("status"),!error.isEmpty()?error:plan.isEmpty()?tr("There are no new requests in this batch. Choose another page or preview a row again."):tr("Request previews are ready. Nothing sent yet."));emit aiStateChanged();return;

@@ -356,7 +356,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
     if(mutation)++m_mutationSequence;
     const auto mutationSequence=m_mutationSequence;
     const auto generation = m_generation;
-    const bool latestOnly=operation==QStringLiteral("search") || operation==QStringLiteral("bibtex") || operation==QStringLiteral("layout") || operation==QStringLiteral("ai_preview") || operation==QStringLiteral("ai_summary_catalog") || operation==QStringLiteral("ai_summary_inspect") || operation==QStringLiteral("ai_summary_prepare") || operation==QStringLiteral("ai_summary_batch_prepare") || operation==QStringLiteral("split_plan") || operation==QStringLiteral("content_objects");
+    const bool latestOnly=operation==QStringLiteral("ai_summary_cached") || operation==QStringLiteral("search") || operation==QStringLiteral("bibtex") || operation==QStringLiteral("layout") || operation==QStringLiteral("ai_preview") || operation==QStringLiteral("ai_summary_catalog") || operation==QStringLiteral("ai_summary_inspect") || operation==QStringLiteral("ai_summary_prepare") || operation==QStringLiteral("ai_summary_batch_prepare") || operation==QStringLiteral("split_plan") || operation==QStringLiteral("content_objects");
     if(latestOnly)m_latestRead.insert(operation,id);
     ++m_pendingCommands;
     QPointer<ReaderController> alive(this);emit commandsChanged();if(!alive)return 0;
@@ -412,7 +412,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
             m_documentWidth = layout.value(QStringLiteral("width")).toDouble();
             m_documentHeight = layout.value(QStringLiteral("height")).toDouble();
             emit documentChanged();if(!current())return;
-        } else if (!eraseControl && !operation.startsWith(QStringLiteral("region_")) && !operation.startsWith(QStringLiteral("knowledge_"))) {
+        } else if (!eraseControl && operation!=QStringLiteral("ai_summary_cached") && !operation.startsWith(QStringLiteral("region_")) && !operation.startsWith(QStringLiteral("knowledge_"))) {
             const bool marks=operation==QStringLiteral("ink_erase_commit") || operation==QStringLiteral("marks") || operation.startsWith(QStringLiteral("mark_")) || operation.startsWith(QStringLiteral("marks_")) || operation.startsWith(QStringLiteral("bookmark_")) || operation.startsWith(QStringLiteral("file_"));
             m_data.insert(marks ? QStringLiteral("marks") : operation, outcome.result);
             emit dataChanged();if(!current())return;

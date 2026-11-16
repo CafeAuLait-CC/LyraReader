@@ -20,6 +20,7 @@ pub struct DesktopDocument {
     ai: Mutex<Option<Arc<LyraReaderAiRequest>>>,
     summary_batch: Mutex<crate::summary_batch::Batch>,
     summary_scope: Arc<crate::summary_batch::Scope>,
+    pub(super) summaries: Mutex<crate::summary_store::Store>,
     pub(super) knowledge: Mutex<crate::knowledge::Knowledge>,
     pub(super) regions: Mutex<crate::region_store::RegionStore>,
     pub(super) ai_region_sources: Mutex<Option<Arc<crate::region_store::RequestProvenance>>>,
@@ -215,6 +216,7 @@ impl DesktopDocument {
             ai: Mutex::new(None),
             summary_batch: Mutex::new(crate::summary_batch::Batch::new(Arc::clone(&summary_scope))),
             summary_scope,
+            summaries: Mutex::new(crate::summary_store::Store::default()),
             knowledge: Mutex::new(crate::knowledge::Knowledge::default()),
             regions: Mutex::new(crate::region_store::RegionStore::default()),
             ai_region_sources: Mutex::new(None),
@@ -685,8 +687,18 @@ impl DesktopDocument {
                 request.document_knowledge_text = None;
                 request.document_knowledge_pages.clear();
                 self.enrich_reading(&mut request, &d.document_identity().sha256)?;
-                crate::summary::prepare(&d, arg(&r, "unit")?, request)
+                let (mut preview, capture) =
+                    crate::summary::prepare(&d, arg(&r, "unit")?, request)?;
+                let warning = match self
+                    .with_summary_store(&d, true, |store, cache| Ok(store.prepare(capture, cache)))
+                {
+                    Ok(warning) => warning,
+                    Err(error) => Some(error),
+                };
+                preview["cache_warning"] = json!(warning);
+                Ok(preview)
             }
+            "ai_summary_cached" => self.cached_summary(&d, &r),
             "ai_summary_catalog" => crate::summary::catalog(&d, arg(&r, "request")?),
             "ai_summary_inspect" => crate::summary::inspect(&d, arg(&r, "request")?),
             "ai_summary_batch_prepare" => {
@@ -706,10 +718,12 @@ impl DesktopDocument {
                 request.document_knowledge_text = None;
                 request.document_knowledge_pages.clear();
                 self.enrich_reading(&mut request, &d.document_identity().sha256)?;
-                self.summary_batch
-                    .lock()
-                    .map_err(|_| "Summary batch state is unavailable")?
-                    .prepare(&d, arg(&r, "batch")?, request)
+                self.with_summary_store(&d, true, |store, cache| {
+                    self.summary_batch
+                        .lock()
+                        .map_err(|_| "Summary batch state is unavailable")?
+                        .prepare(&d, arg(&r, "batch")?, request, store, cache)
+                })
             }
             "ai_summary_batch_start" => {
                 if self
@@ -734,16 +748,18 @@ impl DesktopDocument {
                     .map_err(|_| "Summary batch state is unavailable")?
                     .start(&d, &text(&r, "token")?, text(&r, "api_key")?, root)
             }
-            "ai_summary_batch_poll" => self
-                .summary_batch
-                .lock()
-                .map_err(|_| "Summary batch state is unavailable")?
-                .poll(&d, &text(&r, "token")?),
-            "ai_summary_batch_cancel" => self
-                .summary_batch
-                .lock()
-                .map_err(|_| "Summary batch state is unavailable")?
-                .cancel(&text(&r, "token")?),
+            "ai_summary_batch_poll" => self.with_summary_store(&d, false, |store, cache| {
+                self.summary_batch
+                    .lock()
+                    .map_err(|_| "Summary batch state is unavailable")?
+                    .poll(&d, &text(&r, "token")?, store, cache)
+            }),
+            "ai_summary_batch_cancel" => self.with_summary_store(&d, false, |store, cache| {
+                self.summary_batch
+                    .lock()
+                    .map_err(|_| "Summary batch state is unavailable")?
+                    .cancel(&d, &text(&r, "token")?, store, cache)
+            }),
             "ai_endpoint" => value(inspect_ai_base_url(text(&r, "base_url")?)),
             "ai_start" => {
                 if self
@@ -788,9 +804,14 @@ impl DesktopDocument {
                     .ai_region_sources
                     .lock()
                     .map_err(|_| "Region request state is unavailable")? = provenance;
-                let request =
+                let request = {
+                    self.summaries
+                        .lock()
+                        .map_err(|_| "Summary cache state is unavailable")?
+                        .start(&d, &plan)?;
                     start_ai_request_audited(plan, text(&r, "api_key")?, false, Some(audit))
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| e.to_string())?
+                };
                 let mut current = self.ai.lock().map_err(|_| "AI state is unavailable")?;
                 if let Some(old) = current.replace(request) {
                     old.cancel();
@@ -800,7 +821,34 @@ impl DesktopDocument {
             "ai_poll" => {
                 let current = self.ai.lock().map_err(|_| "AI state is unavailable")?;
                 if let Some(job) = current.as_ref() {
-                    Ok(json!({"events":job.poll(),"finished":job.is_finished()}))
+                    let mut events = job.poll();
+                    let finished = job.is_finished();
+                    // The worker can finish between draining and observing its finished flag.
+                    if finished {
+                        events.extend(job.poll());
+                    }
+                    let active = self
+                        .summaries
+                        .lock()
+                        .map_err(|_| "Summary cache state is unavailable")?
+                        .has_active();
+                    let warning = if active {
+                        match self.with_summary_store(&d, false, |store, cache| {
+                            Ok(store.poll(cache, &d, &events, finished))
+                        }) {
+                            Ok(warning) => warning,
+                            Err(error) => {
+                                self.summaries
+                                    .lock()
+                                    .map_err(|_| "Summary cache state is unavailable")?
+                                    .clear_active();
+                                Some(error)
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    Ok(json!({"events":events,"finished":finished,"cache_warning":warning}))
                 } else {
                     Ok(json!({"events":[],"finished":true}))
                 }
