@@ -98,7 +98,22 @@ bool ReaderController::hasUnsavedChanges()const {
     return marks.value(QStringLiteral("page_pending")).toBool() ||
         (!localOnly && marks.value(QStringLiteral("pdf_dirty")).toBool()) || !m_noteDrafts.isEmpty() || hasEditDrafts();
 }
-ReaderController::~ReaderController(){m_indexCancellation->store(true);if(m_aiRegionPaperCancel)m_aiRegionPaperCancel->store(true);RasterJobs::cancel(m_aiRegionJob);clearRasterCache();NativeImageProvider::unregisterSource(m_contentSourceKey);}
+ReaderController::~ReaderController(){abandonSummaryBatch();m_indexCancellation->store(true);if(m_aiRegionPaperCancel)m_aiRegionPaperCancel->store(true);RasterJobs::cancel(m_aiRegionJob);clearRasterCache();NativeImageProvider::unregisterSource(m_contentSourceKey);}
+void ReaderController::abandonSummaryBatch(){
+    const auto document=m_document;
+    if(!document || m_summaryBatchState.isEmpty())return;
+    // Stop admission immediately without UI-thread locks or I/O. Cleanup retains only the
+    // native handle, never this QObject, and closes already in-flight transport handles.
+    lyra_reader_desktop_cancel_summary_batch(document.get());
+    const auto token=m_summaryBatchActive?m_summaryBatchActiveToken:m_summaryBatchPreparedToken;
+    if(token.isEmpty())return;
+    const auto bytes=QJsonDocument(QJsonObject{{QStringLiteral("op"),QStringLiteral("ai_summary_batch_cancel")},{QStringLiteral("token"),token}}).toJson(QJsonDocument::Compact);
+    (void)QtConcurrent::run([document,bytes]{
+        LyraReaderBuffer output{},error{};const auto cleanup=qScopeGuard([&]{lyra_reader_desktop_buffer_free(output);lyra_reader_desktop_buffer_free(error);});
+        if(!lyra_reader_desktop_command(document.get(),reinterpret_cast<const std::uint8_t *>(bytes.constData()),std::size_t(bytes.size()),&output,&error))
+            qWarning()<<"lyra-reader-summary: cleanup cancellation failed:"<<QString::fromUtf8(reinterpret_cast<const char *>(error.data),qsizetype(error.len));
+    });
+}
 void ReaderController::clearRasterCache(){RasterJobs::cancel(m_activeRaster);RasterCache::clearPrefix(m_cachePrefix);m_tileDemand.clear();m_pageDemand.clear();m_manualDemand.clear();}
 int ReaderController::cpuCacheKiB(){return RasterCache::costKiB();}
 
@@ -341,7 +356,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
     if(mutation)++m_mutationSequence;
     const auto mutationSequence=m_mutationSequence;
     const auto generation = m_generation;
-    const bool latestOnly=operation==QStringLiteral("search") || operation==QStringLiteral("bibtex") || operation==QStringLiteral("layout") || operation==QStringLiteral("ai_preview") || operation==QStringLiteral("ai_summary_catalog") || operation==QStringLiteral("ai_summary_inspect") || operation==QStringLiteral("ai_summary_prepare") || operation==QStringLiteral("split_plan") || operation==QStringLiteral("content_objects");
+    const bool latestOnly=operation==QStringLiteral("search") || operation==QStringLiteral("bibtex") || operation==QStringLiteral("layout") || operation==QStringLiteral("ai_preview") || operation==QStringLiteral("ai_summary_catalog") || operation==QStringLiteral("ai_summary_inspect") || operation==QStringLiteral("ai_summary_prepare") || operation==QStringLiteral("ai_summary_batch_prepare") || operation==QStringLiteral("split_plan") || operation==QStringLiteral("content_objects");
     if(latestOnly)m_latestRead.insert(operation,id);
     ++m_pendingCommands;
     QPointer<ReaderController> alive(this);emit commandsChanged();if(!alive)return 0;

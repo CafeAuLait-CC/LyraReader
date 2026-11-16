@@ -18,6 +18,8 @@ pub struct DesktopDocument {
     pub(super) original_signature: SignatureStatusRecord,
     original_xfa: XfaStatusRecord,
     ai: Mutex<Option<Arc<LyraReaderAiRequest>>>,
+    summary_batch: Mutex<crate::summary_batch::Batch>,
+    summary_scope: Arc<crate::summary_batch::Scope>,
     pub(super) knowledge: Mutex<crate::knowledge::Knowledge>,
     pub(super) regions: Mutex<crate::region_store::RegionStore>,
     pub(super) ai_region_sources: Mutex<Option<Arc<crate::region_store::RequestProvenance>>>,
@@ -160,6 +162,9 @@ pub(super) fn layout_value(source_layout: &DocumentLayout, r: &Value) -> Result<
 }
 
 impl DesktopDocument {
+    pub(crate) fn request_summary_cancel(&self) {
+        self.summary_scope.cancel();
+    }
     pub fn open(path: &Path, password: Option<&str>) -> Result<Self, String> {
         Self::open_with_cache_root(path, password, None)
     }
@@ -197,6 +202,7 @@ impl DesktopDocument {
         let marks = Mutex::new(mark_state);
         let original = Arc::clone(&engine);
         let original_layout = DocumentLayout::new(sizes, PAGE_GAP_PT);
+        let summary_scope = Arc::new(crate::summary_batch::Scope::default());
         let document = Self {
             original_signature: engine.signature_status(),
             original_xfa: engine.xfa_status(),
@@ -207,6 +213,8 @@ impl DesktopDocument {
             recovery_status: Mutex::new(Value::Null),
             password: password.map(str::to_owned),
             ai: Mutex::new(None),
+            summary_batch: Mutex::new(crate::summary_batch::Batch::new(Arc::clone(&summary_scope))),
+            summary_scope,
             knowledge: Mutex::new(crate::knowledge::Knowledge::default()),
             regions: Mutex::new(crate::region_store::RegionStore::default()),
             ai_region_sources: Mutex::new(None),
@@ -681,8 +689,71 @@ impl DesktopDocument {
             }
             "ai_summary_catalog" => crate::summary::catalog(&d, arg(&r, "request")?),
             "ai_summary_inspect" => crate::summary::inspect(&d, arg(&r, "request")?),
+            "ai_summary_batch_prepare" => {
+                if self
+                    .ai
+                    .lock()
+                    .map_err(|_| "AI state is unavailable")?
+                    .as_ref()
+                    .is_some_and(|job| !job.is_finished())
+                {
+                    return Err(
+                        "Stop the current response before preparing a summary batch.".into(),
+                    );
+                }
+                let mut request = crate::region::request(r["request"].clone())?;
+                request.action = AiActionRecord::SummarizeDocument;
+                request.document_knowledge_text = None;
+                request.document_knowledge_pages.clear();
+                self.enrich_reading(&mut request, &d.document_identity().sha256)?;
+                self.summary_batch
+                    .lock()
+                    .map_err(|_| "Summary batch state is unavailable")?
+                    .prepare(&d, arg(&r, "batch")?, request)
+            }
+            "ai_summary_batch_start" => {
+                if self
+                    .ai
+                    .lock()
+                    .map_err(|_| "AI state is unavailable")?
+                    .as_ref()
+                    .is_some_and(|job| !job.is_finished())
+                {
+                    return Err("Stop the current response before sending a summary batch.".into());
+                }
+                let root = self
+                    .marks
+                    .lock()
+                    .map_err(|_| "Annotation state is unavailable")?
+                    .cache_root()
+                    .map(Path::to_path_buf)
+                    .map(Ok)
+                    .unwrap_or_else(crate::document_cache::default_root)?;
+                self.summary_batch
+                    .lock()
+                    .map_err(|_| "Summary batch state is unavailable")?
+                    .start(&d, &text(&r, "token")?, text(&r, "api_key")?, root)
+            }
+            "ai_summary_batch_poll" => self
+                .summary_batch
+                .lock()
+                .map_err(|_| "Summary batch state is unavailable")?
+                .poll(&d, &text(&r, "token")?),
+            "ai_summary_batch_cancel" => self
+                .summary_batch
+                .lock()
+                .map_err(|_| "Summary batch state is unavailable")?
+                .cancel(&text(&r, "token")?),
             "ai_endpoint" => value(inspect_ai_base_url(text(&r, "base_url")?)),
             "ai_start" => {
+                if self
+                    .summary_batch
+                    .lock()
+                    .map_err(|_| "Summary batch state is unavailable")?
+                    .is_running()
+                {
+                    return Err("Stop the summary batch before starting another response.".into());
+                }
                 let plan: AiPlanRecord = arg(&r, "plan")?;
                 let root = self
                     .marks
@@ -4442,6 +4513,52 @@ mod tests {
             "base_url":"http://localhost:11434/v1","model":"synthetic-summary",
             "temperature":null,"max_tokens":null,"reasoning_mode":"default","reasoning_encoding":"none",
             "document_knowledge_text":"UNVERIFIED_PARTIAL_CONTEXT","document_knowledge_pages":[1]})
+    }
+
+    #[test]
+    fn summary_batch_previews_keep_independent_canonical_bodies_without_starting_requests() {
+        let fixture = Fixture::new("multipage.pdf");
+        let before = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        let mut expected = Vec::new();
+        for index in 0..3 {
+            let unit = doc.command(json!({"op":"ai_summary_prepare","unit":{"layer":"Page","index":index},"request":summary_settings()})).unwrap();
+            expected.push(unit["plan"]["parts"][0]["wire_body"].clone());
+        }
+        let batch = doc.command(json!({"op":"ai_summary_batch_prepare","batch":{"layer":"Page","offset":0},"request":summary_settings()})).unwrap();
+        assert_eq!(batch["plan"]["kind"], "summary_batch");
+        assert!(
+            batch["plan"]["token"]
+                .as_str()
+                .is_some_and(|token| !token.is_empty())
+        );
+        assert_eq!(batch["rows"].as_array().unwrap().len(), 3);
+        assert_eq!(batch["plan"]["parts"].as_array().unwrap().len(), 3);
+        for (index, body) in expected.into_iter().enumerate() {
+            assert_eq!(
+                batch["plan"]["summary_rows"][index]["id"],
+                format!("page:{}", index + 1)
+            );
+            assert_eq!(batch["plan"]["summary_rows"][index]["part_index"], index);
+            assert_eq!(batch["plan"]["parts"][index]["wire_body"], body);
+        }
+        assert!(doc.ai.lock().unwrap().is_none());
+        assert_eq!(fs::read(&fixture.path).unwrap(), before);
+    }
+
+    #[test]
+    fn summary_batch_admission_cancel_rejects_a_prepared_start_and_allows_a_new_preview() {
+        let fixture = Fixture::new("multipage.pdf");
+        let doc = fixture.open();
+        let request = json!({"op":"ai_summary_batch_prepare","batch":{"layer":"Page","offset":0},"request":summary_settings()});
+        let old = doc.command(request.clone()).unwrap();
+        doc.request_summary_cancel();
+        assert!(doc.command(json!({"op":"ai_summary_batch_start","token":old["plan"]["token"],"api_key":"synthetic"})).is_err());
+        assert!(!doc.summary_batch.lock().unwrap().is_running());
+        let fresh = doc.command(request).unwrap();
+        assert_ne!(old["plan"]["token"], fresh["plan"]["token"]);
+        assert!(doc.command(json!({"op":"ai_summary_batch_start","token":old["plan"]["token"],"api_key":"synthetic"})).is_err());
+        assert!(doc.ai.lock().unwrap().is_none());
     }
 
     #[test]

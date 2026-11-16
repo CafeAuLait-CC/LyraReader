@@ -22,21 +22,24 @@ pub(crate) struct InspectRequest {
 }
 
 #[derive(Serialize)]
-struct Row {
-    id: String,
-    unit: AiSummaryUnitRequestRecord,
-    link_page: Option<u32>,
-    page_span: String,
+pub(crate) struct Row {
+    pub(crate) id: String,
+    pub(crate) unit: AiSummaryUnitRequestRecord,
+    pub(crate) link_page: Option<u32>,
+    pub(crate) page_span: String,
 }
 
-struct Units {
+pub(crate) struct Units {
     layer: AiSummaryLayerRecord,
-    page_count: u32,
+    pub(crate) page_count: u32,
     sections: Vec<AiSummarySectionRecord>,
 }
 
 impl Units {
-    fn new(document: &LyraReaderDocument, layer: AiSummaryLayerRecord) -> Result<Self, String> {
+    pub(crate) fn new(
+        document: &LyraReaderDocument,
+        layer: AiSummaryLayerRecord,
+    ) -> Result<Self, String> {
         let page_count = document.page_count();
         if page_count == 0 {
             return Err("This document has no pages.".into());
@@ -56,7 +59,7 @@ impl Units {
         })
     }
 
-    fn len(&self) -> Result<u32, String> {
+    pub(crate) fn len(&self) -> Result<u32, String> {
         match self.layer {
             AiSummaryLayerRecord::Abstract => Ok(1),
             AiSummaryLayerRecord::Section => u32::try_from(self.sections.len())
@@ -65,7 +68,7 @@ impl Units {
         }
     }
 
-    fn row(&self, index: u32) -> Result<Row, String> {
+    pub(crate) fn row(&self, index: u32) -> Result<Row, String> {
         if index >= self.len()? {
             return Err("The summary row is outside this layer.".into());
         }
@@ -244,17 +247,16 @@ pub(crate) fn inspect(
     .map_err(|error| error.to_string())
 }
 
-pub(crate) fn prepare(
+pub(crate) fn prepare_layer(
     document: &LyraReaderDocument,
-    request: InspectRequest,
+    layer: AiSummaryLayerRecord,
+    units: Vec<AiSummaryUnitRequestRecord>,
     settings: AiPlanRequestRecord,
-) -> Result<Value, String> {
-    let units = Units::new(document, request.layer)?;
-    let row = units.row(request.index)?;
-    let mut prepared = document
+) -> Result<AiSummaryPlanRecord, String> {
+    document
         .prepare_ai_summary(AiSummaryRequestRecord {
-            layer: request.layer,
-            units: vec![row.unit.clone()],
+            layer,
+            units,
             language: settings.language,
             document_title: String::new(),
             base_url: settings.base_url,
@@ -266,7 +268,34 @@ pub(crate) fn prepare(
             document_knowledge_text: settings.document_knowledge_text,
             document_knowledge_pages: settings.document_knowledge_pages,
         })
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn unit_span(unit: &AiSummaryUnitRecord, page_count: u32) -> String {
+    let kind = match unit.kind {
+        AiSummaryLayerRecord::Abstract => "abstract",
+        AiSummaryLayerRecord::Section => "sections",
+        AiSummaryLayerRecord::Page => "pages",
+    };
+    page_span_label(
+        kind.into(),
+        unit.pages.clone(),
+        unit.page_start,
+        unit.page_end,
+        unit.covered_page_end,
+        unit.truncated,
+        page_count,
+    )
+}
+
+pub(crate) fn prepare(
+    document: &LyraReaderDocument,
+    request: InspectRequest,
+    settings: AiPlanRequestRecord,
+) -> Result<Value, String> {
+    let units = Units::new(document, request.layer)?;
+    let row = units.row(request.index)?;
+    let mut prepared = prepare_layer(document, request.layer, vec![row.unit.clone()], settings)?;
     if prepared.units.len() != 1 {
         return Err("The summary planner returned an unexpected unit count.".into());
     }
@@ -274,6 +303,7 @@ pub(crate) fn prepare(
         .units
         .pop()
         .ok_or("The prepared summary is unavailable.")?;
+    let span = unit_span(&unit, units.page_count);
     let plan = unit.plan.ok_or_else(|| {
         unit.error
             .unwrap_or_else(|| "This summary has no extractable text.".into())
@@ -283,20 +313,6 @@ pub(crate) fn prepare(
     if plan.parts.len() != 1 {
         return Err("A single summary unit must contain exactly one request.".into());
     }
-    let kind = match request.layer {
-        AiSummaryLayerRecord::Abstract => "abstract",
-        AiSummaryLayerRecord::Section => "sections",
-        AiSummaryLayerRecord::Page => "pages",
-    };
-    let span = page_span_label(
-        kind.into(),
-        unit.pages,
-        unit.page_start,
-        unit.page_end,
-        unit.covered_page_end,
-        unit.truncated,
-        units.page_count,
-    );
     #[derive(Serialize)]
     struct Preview {
         id: String,

@@ -14,6 +14,13 @@ Pane {
     readonly property int action: workspace === "chat" ? 4 : workspace === "translation" ? 3 : (input.summaryAction === undefined ? 1 : input.summaryAction)
     readonly property var summaryUnit: owner.summaryUnitContext
     readonly property bool unitMode: workspace === "summary" && !!summaryUnit.id
+    readonly property var batchState: owner.summaryBatchState
+    readonly property bool batchMode: workspace === "summary" && !!input.summaryBatch
+    readonly property bool languageMode: unitMode || batchMode
+    readonly property var languageGeneration: batchMode ? batchState.generation : summaryUnit.generation
+    readonly property var ownerGeneration: owner.documentGeneration
+    onOwnerChanged: if (payload && payload.visible) payload.close()
+    onOwnerGenerationChanged: if (payload && payload.visible) payload.close()
     readonly property string workspaceTitle: workspace === "chat" ? qsTr("Document chat") : workspace === "translation" ? qsTr("Translation") : qsTr("Summary")
     readonly property var plan: viewState.previewView === workspace ? viewState.plan || null : null
     readonly property bool previewReady: !!plan && !viewState.planSent
@@ -40,7 +47,11 @@ Pane {
     function prepareUnit(id) {
         owner.prepareSummaryUnit(id, baseRequest("SummarizeDocument"));
     }
+    function prepareBatch(layer, offset, index) {
+        owner.prepareSummaryBatch(layer, offset, baseRequest("SummarizeDocument"), owner.documentGeneration, index === undefined ? -1 : index);
+    }
     function prepare() {
+        if (batchMode) { prepareBatch(batchState.layer, batchState.offset); return; }
         if (unitMode) { prepareUnit(summaryUnit.id); return; }
         const modes = ["SummarizePage", "SummarizeDocument", "AskSelection", "TranslateSelection", "DocumentChat", "SummarizeSelection"];
         owner.prepareAi(baseRequest(modes[action]));
@@ -82,8 +93,8 @@ Pane {
             function current() {
                 return languageLoader.item === languageEditor && targetReader === aiPanel.owner
                     && targetReader && expectedGeneration === targetReader.documentGeneration
-                    && aiPanel.unitMode && aiPanel.visible
-                    && aiPanel.summaryUnit.generation === expectedGeneration;
+                    && aiPanel.languageMode && aiPanel.visible
+                    && aiPanel.languageGeneration === expectedGeneration;
             }
             function commitDraft(value) {
                 return current() && targetReader.setSummaryLanguageDraft(value, expectedGeneration);
@@ -133,7 +144,7 @@ Pane {
         Label {
             Layout.fillWidth: true; wrapMode: Text.Wrap; textFormat: Text.PlainText
             // Short unit drawers reserve space for the answer. Setup and receiving states remain visible.
-            visible: !aiPanel.compact || !aiPanel.unitMode || aiPanel.running || !app.aiSettings.model
+            visible: !aiPanel.compact || !aiPanel.languageMode || aiPanel.running || !app.aiSettings.model
             text: aiPanel.running ? qsTr("Receiving: %1 · %2").arg(aiPanel.viewState.activeModel || "").arg(aiPanel.viewState.activeHost || "") : (app.aiSettings.model || qsTr("Choose an AI model in Settings"))
             color: app.colors.textSecondary; font.pixelSize: 11
         }
@@ -147,12 +158,15 @@ Pane {
             objectName: "summaryCatalog"
             app: aiPanel.app
             onPreviewUnit: function(id) { aiPanel.prepareUnit(id); }
+            onPreviewBatch: function(reader, generation, layer, offset) {
+                if (reader === aiPanel.owner && generation === reader.documentGeneration) aiPanel.prepareBatch(layer, offset);
+            }
             visible: aiPanel.workspace === "summary"
             Layout.fillWidth: true
         }
         ComboBox {
             objectName: "aiSummaryTarget"
-            visible: aiPanel.workspace === "summary" && !aiPanel.unitMode
+            visible: aiPanel.workspace === "summary" && !aiPanel.unitMode && !aiPanel.batchMode
             Layout.fillWidth: true
             model: [qsTr("Document"), qsTr("Selected text"), qsTr("This page"), qsTr("Question about selection")]
             currentIndex: [1, 5, 0, 2].indexOf(aiPanel.action)
@@ -186,10 +200,30 @@ Pane {
                 Accessible.description: text
                 Layout.fillWidth: true; color: app.colors.textSecondary; font.pixelSize: 11
             }
-            Loader {
+        }
+        RowLayout {
+            visible: aiPanel.batchMode
+            Layout.fillWidth: true
+            Label { text: qsTr("Layer batch"); color: app.colors.textPrimary; font.bold: true; Layout.fillWidth: true }
+            ToolButton { objectName: "clearSummaryBatch"; text: qsTr("Other summary targets"); enabled: !aiPanel.running; onClicked: aiPanel.owner.clearSummaryBatchView() }
+        }
+        Label {
+            objectName: "summaryBatchLimits"
+            readonly property var limits: aiPanel.batchState.limits || ({})
+            visible: aiPanel.batchMode && limits.max_requests_per_batch > 0 && limits.max_concurrent_requests > 0
+            Layout.fillWidth: true
+            text: visible ? qsTr("Up to %1 requests per batch · %2 in flight").arg(limits.max_requests_per_batch).arg(limits.max_concurrent_requests) : ""
+            textFormat: Text.PlainText; wrapMode: Text.Wrap; maximumLineCount: 2
+            font.pixelSize: 11; color: app.colors.textSecondary
+            Accessible.description: aiPanel.batchState.note || ""
+            HoverHandler { id: batchLimitsHover }
+            ToolTip.visible: batchLimitsHover.hovered && !!aiPanel.batchState.note
+            ToolTip.text: aiPanel.batchState.note || ""
+        }
+        Loader {
                 id: languageLoader
                 Layout.fillWidth: true
-                active: aiPanel.unitMode && aiPanel.visible
+                active: aiPanel.languageMode && aiPanel.visible
                 sourceComponent: summaryLanguageComponent
                 property var contextOwner: aiPanel.owner
                 property var contextGeneration: aiPanel.owner.documentGeneration
@@ -198,7 +232,6 @@ Pane {
                 onContextGenerationChanged: recreate()
                 onLoaded: { item.targetReader = aiPanel.owner; item.expectedGeneration = aiPanel.owner.documentGeneration; }
             }
-        }
         TextField {
             objectName: "aiTranslationLanguage"
             visible: aiPanel.workspace === "translation"
@@ -211,7 +244,7 @@ Pane {
         ScrollView {
             id: responseScroll
             objectName: "aiResponseScroll"
-            visible: aiPanel.workspace !== "chat"
+            visible: aiPanel.workspace !== "chat" && !aiPanel.batchMode
             Layout.fillWidth: true; Layout.fillHeight: true; Layout.minimumHeight: 24
             contentWidth: availableWidth
             AiResult {
@@ -219,6 +252,24 @@ Pane {
                 app: aiPanel.app; value: aiPanel.result; viewport: responseScroll.contentItem
                 onCitation: function(link, responsePlan) { aiPanel.followHistoryLink(link, responsePlan); }
             }
+        }
+        SummaryBatchResults {
+            app: aiPanel.app; owner: aiPanel.owner
+            visible: aiPanel.batchMode
+            Layout.fillWidth: true; Layout.fillHeight: true; Layout.minimumHeight: 50
+            onPreviewRow: function(reader, generation, layer, index) {
+                if (reader === aiPanel.owner && generation === reader.documentGeneration) aiPanel.prepareBatch(layer, aiPanel.batchState.offset, index);
+            }
+            onCitation: function(reader, generation, link, proof) {
+                if (reader === aiPanel.owner && generation === reader.documentGeneration) aiPanel.followHistoryLink(link, proof);
+            }
+        }
+        Label {
+            visible: aiPanel.batchMode
+            text: qsTr("Temporary results: copy them before sending another batch or closing this document.")
+            textFormat: Text.PlainText; wrapMode: Text.Wrap; maximumLineCount: 2; elide: Text.ElideRight
+            Accessible.description: text
+            Layout.fillWidth: true; font.pixelSize: 11; color: app.colors.textSecondary
         }
         AiConversation {
             id: conversation
@@ -235,7 +286,7 @@ Pane {
         ScrollView {
             id: composerScroll
             objectName: "aiComposerScroll"
-            visible: (!aiPanel.unitMode && aiPanel.action === 2) || aiPanel.workspace === "chat"
+            visible: (!aiPanel.unitMode && !aiPanel.batchMode && aiPanel.action === 2) || aiPanel.workspace === "chat"
             Layout.fillWidth: true; Layout.preferredHeight: 64; Layout.maximumHeight: 64
             contentWidth: availableWidth
             clip: true
@@ -267,9 +318,9 @@ Pane {
         Button {
             id: preview
             objectName: "prepareAiRequest"
-            text: aiPanel.workspace === "chat" ? qsTr("Preview Question") : aiPanel.workspace === "translation" ? qsTr("Preview Translation") : (!aiPanel.unitMode && aiPanel.action === 2) ? qsTr("Preview Question") : qsTr("Preview Summary")
+            text: aiPanel.batchMode ? qsTr("Preview batch") : aiPanel.workspace === "chat" ? qsTr("Preview Question") : aiPanel.workspace === "translation" ? qsTr("Preview Translation") : (!aiPanel.unitMode && !aiPanel.batchMode && aiPanel.action === 2) ? qsTr("Preview Question") : qsTr("Preview Summary")
             Layout.fillWidth: true
-            enabled: !aiPanel.running && aiPanel.owner.pageCount > 0 && aiPanel.owner.pendingCommands === 0 && (aiPanel.unitMode || ((aiPanel.action !== 2 && aiPanel.action !== 4) || !!question.text.trim()) && (aiPanel.action !== 3 || aiPanel.input.language === undefined || !!aiPanel.input.language.trim()) && ([2,3,5].indexOf(aiPanel.action) < 0 || !!app.selection))
+            enabled: !aiPanel.running && aiPanel.owner.pageCount > 0 && aiPanel.owner.pendingCommands === 0 && (aiPanel.batchMode || aiPanel.unitMode || ((aiPanel.action !== 2 && aiPanel.action !== 4) || !!question.text.trim()) && (aiPanel.action !== 3 || aiPanel.input.language === undefined || !!aiPanel.input.language.trim()) && ([2,3,5].indexOf(aiPanel.action) < 0 || !!app.selection))
             onClicked: aiPanel.prepare()
         }
         Label {
@@ -298,7 +349,7 @@ Pane {
         Button {
             objectName: "cancelAiRequest"
             visible: aiPanel.running
-            text: qsTr("Stop response"); Layout.fillWidth: true
+            text: aiPanel.viewState.responseView === "summary_batch" ? qsTr("Stop batch") : qsTr("Stop response"); Layout.fillWidth: true
             onClicked: aiPanel.owner.cancelAi()
         }
         Flow {
@@ -311,6 +362,7 @@ Pane {
             }
             Button {
                 objectName: "retryAiRequest"
+                visible: !aiPanel.batchMode
                 text: qsTr("Retry")
                 enabled: !!aiPanel.plan && !aiPanel.running && aiPanel.owner.pendingCommands === 0
                 onClicked: app.sendAi(aiPanel.owner, aiPanel.plan)
@@ -327,17 +379,37 @@ Pane {
     }
     Dialog {
         id: payload
+        objectName: "aiPayloadDialog"
         title: aiPanel.viewState.planSent ? qsTr("Request payload") : qsTr("Request preview — nothing sent yet")
         modal: true
         width: Math.min(680, app.width - 60); height: Math.min(550, app.height - 60)
         parent: Overlay.overlay; anchors.centerIn: parent
         standardButtons: Dialog.Close
-        ScrollView {
-            anchors.fill: parent; contentWidth: availableWidth
-            TextArea {
-                objectName: "aiWirePayload"
-                text: aiPanel.plan ? aiPanel.plan.parts.map(part => part.wire_body).join("\n\n") : ""
-                readOnly: true; selectByMouse: true; wrapMode: TextEdit.WrapAnywhere; textFormat: TextEdit.PlainText; font.family: "monospace"
+        ColumnLayout {
+            anchors.fill: parent
+            ComboBox {
+                id: payloadRow
+                objectName: "summaryBatchPayloadRow"
+                visible: !!aiPanel.plan && aiPanel.plan.kind === "summary_batch"
+                Layout.fillWidth: true
+                model: aiPanel.plan ? aiPanel.plan.summary_rows || [] : []
+                textRole: "title"
+                onModelChanged: currentIndex = 0
+                Accessible.name: qsTr("Request in this batch")
+            }
+            ScrollView {
+                Layout.fillWidth: true; Layout.fillHeight: true; contentWidth: availableWidth
+                TextArea {
+                    objectName: "aiWirePayload"
+                    text: {
+                        const plan = aiPanel.plan;
+                        if (!plan) return "";
+                        if (plan.kind !== "summary_batch") return plan.parts.map(part => part.wire_body).join("\n\n");
+                        const row = (plan.summary_rows || [])[payloadRow.currentIndex];
+                        return row && plan.parts[row.part_index] ? plan.parts[row.part_index].wire_body : "";
+                    }
+                    readOnly: true; selectByMouse: true; wrapMode: TextEdit.WrapAnywhere; textFormat: TextEdit.PlainText; font.family: "monospace"
+                }
             }
         }
     }

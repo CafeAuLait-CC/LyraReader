@@ -7,6 +7,7 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <memory>
+#include <functional>
 
 // Real loopback HTTP/SSE, used only by the GUI checks. No external service or key.
 class MockChatServer {
@@ -14,13 +15,16 @@ public:
     struct Response {QList<QByteArray> chunks;int delay=50;int status=200;bool holdLast=false;};
     QList<Response> responses;
     QList<QByteArray> requests;
+    std::function<Response(const QByteArray &)> responder;
+    int activeRequests=0,maximumActiveRequests=0;
     bool listen() {
         QObject::connect(&server,&QTcpServer::newConnection,&server,[this]{
             while(auto *socket=server.nextPendingConnection()) {
                 sockets.append(socket);
                 QObject::connect(socket,&QTcpSocket::disconnected,socket,&QObject::deleteLater);
-                struct Input {QByteArray bytes;bool replied=false;};
+                struct Input {QByteArray bytes;bool replied=false,processing=false;};
                 auto input=std::make_shared<Input>();
+                QObject::connect(socket,&QTcpSocket::disconnected,&server,[this,input]{if(input->processing){input->processing=false;--activeRequests;}});
                 QObject::connect(socket,&QTcpSocket::readyRead,socket,[this,socket,input]{
                     input->bytes+=socket->readAll();if(input->replied)return;
                     const auto end=input->bytes.indexOf("\r\n\r\n");if(end<0)return;
@@ -28,14 +32,15 @@ public:
                     for(const auto &line:input->bytes.left(end).split('\n'))if(line.toLower().startsWith("content-length:"))length=line.mid(15).trimmed().toLongLong();
                     if(input->bytes.size()<end+4+length)return;
                     input->replied=true;const auto index=requests.size();requests.append(input->bytes);
-                    const auto response=index<responses.size() ? responses[index] : Response{{QByteArray("unexpected request")},0,400};
+                    input->processing=true;++activeRequests;maximumActiveRequests=qMax(maximumActiveRequests,activeRequests);
+                    const auto response=responder?responder(input->bytes.mid(end+4)):index<responses.size() ? responses[index] : Response{{QByteArray("unexpected request")},0,400};
                     qsizetype size=0;for(const auto &chunk:response.chunks)size+=chunk.size();
                     socket->write(QByteArray("HTTP/1.1 ")+QByteArray::number(response.status)+(response.status==200 ? " OK\r\n" : " Error\r\n")+
                         "Content-Type: "+(response.status==200 ? "text/event-stream" : "application/json")+"\r\nContent-Length: "+QByteArray::number(size)+"\r\nConnection: close\r\n\r\n");
                     for(qsizetype i=0;i<response.chunks.size();++i){
                         // An unfinished response lets cancellation be tested without racing the compositor.
                         if(response.holdLast && i==response.chunks.size()-1)continue;
-                        QTimer::singleShot(int(i)*response.delay,socket,[socket,chunk=response.chunks[i],last=i==response.chunks.size()-1]{if(socket->state()!=QAbstractSocket::ConnectedState || !socket->isOpen())return;socket->write(chunk);socket->flush();if(last)socket->disconnectFromHost();});
+                        QTimer::singleShot(int(i)*response.delay,socket,[this,socket,input,chunk=response.chunks[i],last=i==response.chunks.size()-1]{if(socket->state()!=QAbstractSocket::ConnectedState || !socket->isOpen())return;if(last && input->processing){input->processing=false;--activeRequests;}socket->write(chunk);socket->flush();if(last)socket->disconnectFromHost();});
                     }
                 });
             }

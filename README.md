@@ -136,9 +136,11 @@ composer and collapsed source passages. Layers and coverage lists abstract, sect
 checks text locally and shows the sampled source pages. Preview summary prepares one selected unit
 through the shared planner; Send, Stop and Retry use the assistant's normal preview and local audit
 trail. Unit language drafts take effect only after Apply and a new preview; blank uses the document
-language. Earlier answers retain their requested-language label. Unit summaries currently appear
-in the Summary result; batch generation and persistent
-per-unit caching are still pending. Select & Ask captures a bounded area in its original colours
+language. Earlier answers retain their requested-language label. Preview these rows prepares a bounded
+batch with an individual wire-body preview for each request. Send uses the shared concurrency limit;
+Stop preserves completed and partial rows without starting the queued remainder. A failed row can be
+previewed and sent again independently. Batch results are temporary: copy them before sending another
+batch or closing the document. Persistent per-unit caching is still pending. Select & Ask captures a bounded area in its original colours
 and requires a request preview before sending. Save to Reading notes keeps its frozen image, text,
 question draft and completed or partial answer in the application cache; the Notes view reads these
 snapshots, shows bounded capture thumbnails and edits local knowledge notes without sending a request.

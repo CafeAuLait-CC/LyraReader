@@ -25,6 +25,7 @@ mod saving;
 mod selection;
 mod session;
 mod summary;
+mod summary_batch;
 mod tile_plan;
 use document::DesktopDocument as Document;
 use std::{
@@ -33,10 +34,10 @@ use std::{
     ptr, slice,
 };
 
-/// Version of the Qt boundary, including cache-only selection and clipboard adapters.
+/// Version of the Qt boundary, including bounded layered-summary batch commands.
 #[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_desktop_abi_version() -> u32 {
-    14
+    15
 }
 
 /// Persist one resolved quit without deleting any draft. Resolution: 0=save, 1=discard.
@@ -558,6 +559,18 @@ pub unsafe extern "C" fn lyra_reader_desktop_close(document: *mut Document) {
             drop(unsafe { Box::from_raw(document) });
         }
     }));
+}
+
+/// Stop admission to this document's current summary batch without locks, PDFium or I/O.
+/// The shell also queues normal cancellation to drain events and close in-flight handles.
+/// # Safety
+/// A non-null document is an aligned, initialized open handle and remains alive for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_cancel_summary_batch(document: *const Document) {
+    // SAFETY: the caller retains the live opaque handle for this atomic-only borrow.
+    if let Some(document) = unsafe { document.as_ref() } {
+        document.request_summary_cancel();
+    }
 }
 
 /// # Safety
@@ -1527,7 +1540,7 @@ mod tests {
 
     #[test]
     fn image_byte_boundary_rejects_null_handles_and_reports_its_version() {
-        assert_eq!(lyra_reader_desktop_abi_version(), 14);
+        assert_eq!(lyra_reader_desktop_abi_version(), 15);
         assert_eq!(
             lyra_reader_desktop_zoom_preset_inset_pt(),
             lyra_reader_session::ZOOM_PRESET_INSET_PT

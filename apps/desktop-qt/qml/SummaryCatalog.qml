@@ -7,6 +7,7 @@ Item {
     required property var app
     readonly property var owner: app.currentReader
     signal previewUnit(string id)
+    signal previewBatch(var reader, var generation, string layer, int offset)
     property var popupOwner: null
     readonly property var state: popupOwner ? popupOwner.summaryCatalog : ({})
     readonly property bool popupVisible: detail.visible
@@ -193,6 +194,18 @@ Item {
                     text: qsTr("Next")
                     enabled: !root.state.loading && !root.state.inspecting && root.state.next_offset !== undefined && root.state.next_offset !== null
                     onClicked: root.popupOwner.loadSummaryCatalog(root.state.layer, root.state.next_offset)
+                }
+            }
+            Button {
+                objectName: "previewSummaryBatch"
+                text: qsTr("Preview these rows")
+                Layout.fillWidth: true
+                enabled: !root.state.loading && !root.state.inspecting && root.popupOwner && !root.popupOwner.aiState.running && (root.state.rows || []).length > 0
+                onClicked: {
+                    const reader = root.popupOwner, generation = root.state.generation, layer = root.state.layer, offset = root.state.offset;
+                    detail.close();
+                    if (reader === root.owner && reader && generation === reader.documentGeneration)
+                        root.previewBatch(reader, generation, layer, offset);
                 }
             }
         }

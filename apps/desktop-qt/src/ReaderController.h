@@ -51,6 +51,7 @@ class ReaderController : public QObject {
     Q_PROPERTY(bool hasUnsavedChanges READ hasUnsavedChanges NOTIFY unsavedChangesChanged)
     Q_PROPERTY(qulonglong editRevision READ editRevision NOTIFY commandsChanged)
     Q_PROPERTY(qulonglong documentGeneration READ documentGeneration NOTIFY documentChanged)
+    Q_PROPERTY(QVariantMap summaryBatchState READ summaryBatchState NOTIFY aiStateChanged)
     Q_PROPERTY(QVariantMap data READ data NOTIFY dataChanged)
     Q_PROPERTY(QVariantMap textPages READ textPages NOTIFY textPagesChanged)
     Q_PROPERTY(int pendingCommands READ pendingCommands NOTIFY commandsChanged)
@@ -84,6 +85,9 @@ public:
     Q_INVOKABLE void clearSummaryUnit();
     Q_INVOKABLE bool setSummaryLanguageDraft(const QString &language,qulonglong expectedGeneration);
     Q_INVOKABLE bool applySummaryLanguage(qulonglong expectedGeneration);
+    QVariantMap summaryBatchState()const{return m_summaryBatchState;}
+    Q_INVOKABLE bool prepareSummaryBatch(const QString &layer,int offset,const QVariantMap &settings,qulonglong expectedGeneration,int index=-1);
+    Q_INVOKABLE void clearSummaryBatchView();
     QVariantMap documentReading()const{auto state=m_documentReading;state.insert(QStringLiteral("choice_pending"),m_readingChoicePending);return state;}
     Q_INVOKABLE void prepareDocumentReading(const QVariantMap &request);
     Q_INVOKABLE bool startDocumentReading(const QString &key,const QVariantMap &plan,const QString &token);
@@ -223,6 +227,18 @@ private:
     void initSummaryCatalog();
     void resetSummaryCatalog();
     bool hasSummaryLanguageContext(qulonglong expectedGeneration)const;
+    void initSummaryBatch();
+    void resetSummaryBatch();
+    void abandonSummaryBatch();
+    bool startSummaryBatch(const QString &key,const QVariantMap &plan);
+    void cancelSummaryBatch();
+    void handleSummaryBatchCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error);
+    bool applySummaryBatchFrame(const QVariantMap &frame,bool fresh);
+    QVariantMap m_summaryBatchState;
+    QString m_summaryBatchPreparedToken,m_summaryBatchActiveToken;
+    bool m_summaryBatchActive=false;
+    quint64 m_summaryBatchCancelId=0;
+    static constexpr qsizetype maximumAiCharacters=4*1024*1024;
     void handleSummaryCatalogCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error);
     QVariantMap m_summaryCatalog,m_summaryUnitContext;
     quint64 m_summaryCatalogId=0,m_summaryInspectId=0,m_summaryActionEpoch=0;

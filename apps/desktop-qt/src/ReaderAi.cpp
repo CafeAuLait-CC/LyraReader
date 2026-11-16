@@ -18,15 +18,16 @@ QString aiView(const QString &action) {
 }
 
 void ReaderController::initAi() {
-    initDocumentReading();initRegionPersistence();initSummaryCatalog();
+    initDocumentReading();initRegionPersistence();initSummaryCatalog();initSummaryBatch();
     m_aiTimer.setInterval(60);
     connect(&m_aiTimer,&QTimer::timeout,this,[this]{
         if(!m_aiState.value(QStringLiteral("running")).toBool()){m_aiTimer.stop();return;}
-        if(!m_aiPollId)m_aiPollId=submit(QStringLiteral("ai_poll"));
+        if(!m_aiPollId)m_aiPollId=submit(m_summaryBatchActive?QStringLiteral("ai_summary_batch_poll"):QStringLiteral("ai_poll"),m_summaryBatchActive?QVariantMap{{QStringLiteral("token"),m_summaryBatchActiveToken}}:QVariantMap{});
     });
     connect(this,&ReaderController::commandFinished,this,&ReaderController::handleAiCommand);
 }
 void ReaderController::resetAi() {
+    resetSummaryBatch();
     ++m_aiPreviewEpoch;m_aiSummaryPreviewUnitId.clear();m_aiSummaryPreviewLanguage.clear();
     resetSummaryCatalog();
     resetRegionPersistence();
@@ -283,6 +284,9 @@ void ReaderController::invalidateAiPlan() {
     const bool hadPreview=m_aiPreviewId || m_aiState.contains(QStringLiteral("plan")) || m_regionContinuationPending;
     m_regionContinuationPending=false;m_regionContinuationSettings.clear();
     ++m_aiPreviewEpoch;m_aiPreviewId=0;m_aiState.remove(QStringLiteral("plan"));
+    m_summaryBatchPreparedToken.clear();
+    if(m_summaryBatchActive){cancelSummaryBatch();return;}
+    if(m_document && !m_summaryBatchState.isEmpty())lyra_reader_desktop_cancel_summary_batch(m_document.get());
     if(hadPreview){
         if(!m_aiState.value(QStringLiteral("running")).toBool())m_aiState.insert(QStringLiteral("status"),tr("Preview the updated request before sending."));
         emit aiStateChanged();
@@ -304,6 +308,8 @@ void ReaderController::prepareAi(const QVariantMap &request,const QVariantMap &u
     QPointer<ReaderController> alive(this);
     const auto current=[&]{return alive && document==m_document && generation==m_generation && epoch==m_aiPreviewEpoch;};
     m_aiPreviewId=0;
+    m_summaryBatchPreparedToken.clear();
+    auto workspaceInput=m_aiState.value(QStringLiteral("input")).toMap();workspaceInput.remove(QStringLiteral("summaryBatch"));m_aiState.insert(QStringLiteral("input"),workspaceInput);
     if(unit.isEmpty() && aiView(request.value(QStringLiteral("action")).toString())==QStringLiteral("summary") && !m_summaryUnitContext.isEmpty()) {
         m_summaryUnitContext.clear();emit summaryCatalogChanged();if(!current())return;
     }
@@ -344,6 +350,7 @@ bool ReaderController::startAi(const QString &key,const QVariantMap &expectedPla
         flushAiRegionNote(false);
         m_aiState.insert(QStringLiteral("status"),tr("Saving reading notes. Send again when saving has finished."));emit aiStateChanged();return false;
     }
+    if(plan.value(QStringLiteral("kind")).toString()==QStringLiteral("summary_batch"))return startSummaryBatch(key,plan);
     const auto action=plan.value(QStringLiteral("action")).toString();
     if(action==QStringLiteral("SummarizeAbstract") || action==QStringLiteral("SummarizeSection") || action==QStringLiteral("SummarizePageLine")) {
         m_aiState.insert(QStringLiteral("unitTitle"),m_summaryUnitContext.value(QStringLiteral("title"),m_summaryUnitContext.value(QStringLiteral("unit")).toMap().value(QStringLiteral("title"))));
@@ -385,6 +392,7 @@ void ReaderController::retainAiResult(const QString &state) {
     auto results=m_aiState.value(QStringLiteral("results")).toMap();results.insert(view,result);m_aiState.insert(QStringLiteral("results"),results);
 }
 void ReaderController::cancelAi() {
+    if(m_summaryBatchActive){cancelSummaryBatch();return;}
     if(!m_aiState.value(QStringLiteral("running")).toBool())return;
     m_aiState.insert(QStringLiteral("status"),tr("Cancelling…"));emit aiStateChanged();submit(QStringLiteral("ai_cancel"));
 }
@@ -494,7 +502,7 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
         }
     }
     // Eight MiB of UTF-16 response text per tab, separate from the PDF raster LRU.
-    constexpr qsizetype maximumCharacters=4*1024*1024;
+    constexpr qsizetype maximumCharacters=maximumAiCharacters;
     if(output.size()+reasoning.size()>maximumCharacters) {
         output=output.left(maximumCharacters);reasoning=reasoning.left(qMax<qsizetype>(0,maximumCharacters-output.size()));
         if(!m_aiState.value(QStringLiteral("limited")).toBool()){m_aiState.insert(QStringLiteral("limited"),true);cancelAi();}

@@ -89,8 +89,10 @@ void ReaderController::clearSummaryUnit() {
 
 bool ReaderController::hasSummaryLanguageContext(qulonglong expectedGeneration)const {
     return m_document && !m_loading && !m_snapshotMode && expectedGeneration==m_generation
-        && !m_summaryUnitContext.value(QStringLiteral("id")).toString().isEmpty()
-        && m_summaryUnitContext.value(QStringLiteral("generation")).toULongLong()==m_generation;
+        && ((!m_summaryUnitContext.value(QStringLiteral("id")).toString().isEmpty()
+                && m_summaryUnitContext.value(QStringLiteral("generation")).toULongLong()==m_generation)
+            || (m_aiState.value(QStringLiteral("input")).toMap().value(QStringLiteral("summaryBatch")).toBool()
+                && m_summaryBatchState.value(QStringLiteral("generation")).toULongLong()==m_generation));
 }
 
 bool ReaderController::setSummaryLanguageDraft(const QString &language,qulonglong expectedGeneration) {
@@ -110,6 +112,8 @@ bool ReaderController::applySummaryLanguage(qulonglong expectedGeneration) {
     input.insert(QStringLiteral("summaryLanguage"),language);input.insert(QStringLiteral("summaryLanguageDraft"),language);
     m_aiState.insert(QStringLiteral("input"),input);
     if(language!=previous) {
+        m_summaryBatchPreparedToken.clear();
+        if(m_document && !m_summaryBatchState.isEmpty())lyra_reader_desktop_cancel_summary_batch(m_document.get());
         ++m_aiPreviewEpoch;m_aiPreviewId=0;m_aiSummaryPreviewUnitId.clear();m_aiSummaryPreviewLanguage.clear();
         m_aiState.remove(QStringLiteral("plan"));
         m_aiState.insert(QStringLiteral("statusView"),QStringLiteral("summary"));
