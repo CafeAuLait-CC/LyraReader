@@ -116,3 +116,14 @@
 "Use new selection" = "Use new selection";
 "View conversation" = "View conversation";
 "Whole document" = "Whole document";
+"Return to send · Shift+Return for a new line" = "Return to send · Shift+Return for a new line";
+"Ask about this document…" = "Ask about this document…";
+"Prereading in progress…" = "Prereading in progress…";
+"Prereading progress" = "Prereading progress";
+"Stop Reading" = "Stop Reading";
+"Reading your document…" = "Reading your document…";
+"Document reading" = "Document reading";
+"Expanded" = "Expanded";
+"Collapsed" = "Collapsed";
+"Expand or collapse this section" = "Expand or collapse this section";
+"Lyra can read this document once to connect ideas across your questions, and save that understanding locally. You can keep reading the PDF while it works; AI tools become available when prereading finishes. You can also continue without it." = "Lyra can read this document once to connect ideas across your questions, and save that understanding locally. You can keep reading the PDF while it works; AI tools become available when prereading finishes. You can also continue without it.";

@@ -1,3 +1,4 @@
+import AppKit
 import LyraReaderBindings
 import SwiftUI
 
@@ -8,6 +9,7 @@ struct AIReadingSummaryContent: View {
     let pages: [UInt32]
     let onJump: (Int) -> Void
     @State private var expanded: [Int: Bool] = [:]
+    @State private var hoveredHeading: Int?
     private var groups: [(String, [ReaderMarkdownBlock])] {
         let document = ReaderMarkdown.parse(text, pageCount: pageCount, verifiedPages: Set(pages.map(Int.init)))
         var result: [(String, [ReaderMarkdownBlock])] = []
@@ -29,16 +31,43 @@ struct AIReadingSummaryContent: View {
                 } else if group.1.isEmpty {
                     Text(group.0).font(.system(size: 13, weight: .semibold))
                 } else {
-                    DisclosureGroup(isExpanded: Binding(get: {
-                        expanded[index] ?? (index < 2 || group.0.localizedCaseInsensitiveContains("Key ideas"))
-                    }, set: { expanded[index] = $0 })) {
-                        ReaderMarkdownView(document: ReaderMarkdownDocument(blocks: group.1), pageCount: pageCount, onJump: onJump)
-                            .padding(.top, 8)
-                    } label: { Text(group.0).font(.system(size: 13, weight: .semibold)) }
+                    let open = expanded[index] ?? (index < 2 || group.0.localizedCaseInsensitiveContains("Key ideas"))
+                    VStack(alignment: .leading, spacing: 0) {
+                        Button { expanded[index] = !open } label: {
+                            HStack(spacing: 7) {
+                                Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold))
+                                    .rotationEffect(.degrees(open ? 90 : 0)).foregroundStyle(LyraReaderTheme.textSecondary)
+                                Text(group.0).font(.system(size: 13, weight: .semibold))
+                                    .underline(hoveredHeading == index, color: LyraReaderTheme.accentBorder)
+                                Spacer(minLength: 0)
+                            }.frame(maxWidth: .infinity, minHeight: 30, alignment: .leading).contentShape(Rectangle())
+                        }.buttonStyle(.plain)
+                            .background(AIReadingHeadingProbe(index: index))
+                            .accessibilityValue(Text(aiReadingLabel(open ? "Expanded" : "Collapsed")))
+                            .help(aiReadingLabel("Expand or collapse this section"))
+                            .onHover { inside in
+                                if inside { hoveredHeading = index }
+                                else if hoveredHeading == index { hoveredHeading = nil }
+                            }
+                        if open {
+                            ReaderMarkdownView(document: ReaderMarkdownDocument(blocks: group.1), pageCount: pageCount, onJump: onJump)
+                                .padding(.top, 8)
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+final class AIReadingHeadingMarker: NSView {
+    var index = 0
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+private struct AIReadingHeadingProbe: NSViewRepresentable {
+    let index: Int
+    func makeNSView(context: Context) -> AIReadingHeadingMarker { AIReadingHeadingMarker() }
+    func updateNSView(_ view: AIReadingHeadingMarker, context: Context) { view.index = index }
 }
 
 struct AIReadingTermView: View {

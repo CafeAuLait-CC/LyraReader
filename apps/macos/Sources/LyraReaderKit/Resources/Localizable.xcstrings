@@ -1873,6 +1873,182 @@
           }
         }
       }
+    },
+    "Return to send · Shift+Return for a new line": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Return to send · Shift+Return for a new line"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Return 发送 · Shift+Return 换行"
+          }
+        }
+      }
+    },
+    "Ask about this document…": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ask about this document…"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "询问当前文档…"
+          }
+        }
+      }
+    },
+    "Prereading in progress…": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Prereading in progress…"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "正在预读…"
+          }
+        }
+      }
+    },
+    "Prereading progress": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Prereading progress"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "预读进度"
+          }
+        }
+      }
+    },
+    "Stop Reading": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stop Reading"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "停止预读"
+          }
+        }
+      }
+    },
+    "Reading your document…": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reading your document…"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "正在预读文档…"
+          }
+        }
+      }
+    },
+    "Document reading": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Document reading"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "文档预读"
+          }
+        }
+      }
+    },
+    "Expanded": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Expanded"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已展开"
+          }
+        }
+      }
+    },
+    "Collapsed": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Collapsed"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已收起"
+          }
+        }
+      }
+    },
+    "Expand or collapse this section": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Expand or collapse this section"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "展开或收起此章节"
+          }
+        }
+      }
+    },
+    "Lyra can read this document once to connect ideas across your questions, and save that understanding locally. You can keep reading the PDF while it works; AI tools become available when prereading finishes. You can also continue without it.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Lyra can read this document once to connect ideas across your questions, and save that understanding locally. You can keep reading the PDF while it works; AI tools become available when prereading finishes. You can also continue without it."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Lyra 可以预读这份文档，关联后续问题中的观点，并在本地保存理解结果。预读时可以继续阅读 PDF；完成后即可使用 AI 工具，也可以选择跳过预读。"
+          }
+        }
+      }
     }
   }
 }

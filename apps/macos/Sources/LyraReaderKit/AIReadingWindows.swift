@@ -76,6 +76,13 @@ private struct AIReadingReviewContent: View {
 }
 
 @MainActor
+private final class AIPreReadingPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+    override func cancelOperation(_ sender: Any?) { close() }
+}
+
+@MainActor
 final class AIPreReadingWindow: NSObject, NSWindowDelegate {
     private static var active: [ObjectIdentifier: AIPreReadingWindow] = [:]
     private let knowledge: AIDocumentKnowledge
@@ -92,13 +99,18 @@ final class AIPreReadingWindow: NSObject, NSWindowDelegate {
     }
     private init(_ knowledge: AIDocumentKnowledge) {
         self.knowledge = knowledge
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 440),
-                          styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        window = AIPreReadingPanel(contentRect: NSRect(x: 0, y: 0, width: 460, height: 400),
+                          styleMask: [.borderless], backing: .buffered, defer: false)
         super.init()
         window.title = aiReadingLabel("Document prereading")
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.contentView = NSHostingView(rootView: AIDocumentKnowledgeSheet(knowledge: knowledge))
+        window.isOpaque = false; window.backgroundColor = .clear; window.hasShadow = true
+        window.isMovableByWindowBackground = true
+        window.collectionBehavior.insert(.fullScreenAuxiliary)
+        let content = NSHostingView(rootView: AIDocumentKnowledgeSheet(knowledge: knowledge).clipShape(RoundedRectangle(cornerRadius: 12)))
+        window.contentView = content
+        window.setContentSize(content.fittingSize)
         window.center()
     }
     func windowWillClose(_ notification: Notification) {

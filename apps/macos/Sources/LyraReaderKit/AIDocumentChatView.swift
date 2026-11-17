@@ -115,7 +115,8 @@ public struct AIDocumentChatView: View {
     }
 
     private var showsChatStatus: Bool {
-        model.isDocumentChatPlan || model.isChatStreaming
+        if onAsk != nil { return model.phase == .failed && model.chatTurns.isEmpty }
+        return model.isDocumentChatPlan || model.isChatStreaming
             || model.pendingChatQuestion != nil
             || model.chatTurns.last?.state == .nothingRelevant
             || model.chatTurns.last?.state == .failed
@@ -392,21 +393,13 @@ public struct AIDocumentChatView: View {
 
     private var composer: some View {
         VStack(alignment: .leading, spacing: 5) {
-            ZStack(alignment: .topLeading) {
-                if model.chatQuestion.isEmpty {
-                    Text("Ask about this document…").font(.system(size: 13))
-                        .foregroundStyle(LyraReaderTheme.textTertiary).padding(.horizontal, 5).padding(.top, 7)
-                        .allowsHitTesting(false)
-                }
-                TextEditor(text: $model.chatQuestion)
-                    .font(.system(size: 13)).scrollContentBackground(.hidden)
-                    .frame(minHeight: 54, maxHeight: 100)
-                    .accessibilityLabel("Ask about this document")
-            }.padding(5).background(LyraReaderTheme.fieldBg, in: RoundedRectangle(cornerRadius: 7))
+            AIReadingTextInput(text: $model.chatQuestion, placeholder: aiReadingLabel("Ask about this document…")) {
+                if model.canAskDocument { ask() }
+            }.frame(height: 96).background(LyraReaderTheme.fieldBg, in: RoundedRectangle(cornerRadius: 7))
                 .overlay(RoundedRectangle(cornerRadius: 7).stroke(LyraReaderTheme.controlBorder))
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 6) {
-                    Text("⌘ Return to send")
+                    Text(aiReadingLabel("Return to send · Shift+Return for a new line"))
                         .font(.caption2)
                         .foregroundStyle(LyraReaderTheme.textTertiary)
                         .fixedSize(horizontal: true, vertical: false)
@@ -428,11 +421,10 @@ public struct AIDocumentChatView: View {
         Button {
             if model.isSending { model.cancelRegionWork() } else { ask() }
         } label: { Label(model.isSending ? "Stop" : "Send", systemImage: model.isSending ? "stop.fill" : "arrow.up") }
-            .keyboardShortcut(.return, modifiers: .command)
             .buttonStyle(ReaderPanelButtonStyle(prominent: true))
             .background(AIDocumentChatAskMarkerHost())
             .disabled(!model.isSending && !model.canAskDocument)
-            .help("Find passages across the document and show the exact request before sending")
+            .help(aiReadingLabel("Send question"))
     }
 
     private func ask() {

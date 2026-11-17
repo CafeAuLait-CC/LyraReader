@@ -85,6 +85,7 @@ public final class AIAssistantModel: ObservableObject {
     private var handle: (any AIChatHandle)?
     private var pollTask: Task<Void, Never>?
     private var currentPartIndex: Int?
+    var currentRequestNumber: Int? { currentPartIndex.map { $0 + 1 } }
     private var merging = false
     private var unifiedReadingTask = false
     private var readingOptions: AiReadingOptionsRecord?

@@ -2644,6 +2644,37 @@ fn retrieve(
     results
 }
 
+/// A lexical miss cannot decide whether a question is answerable, particularly across
+/// languages. Keep two opening blocks and sample the rest of the document under the same
+/// context budget. Whole blocks retain their original source geometry without cropping it.
+fn sample_document_context(blocks: &[Block]) -> Vec<Retrieved> {
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+    let count = blocks
+        .len()
+        .min(CHAT_RETRIEVED_BLOCKS)
+        .min(MAX_CHAT_CONTEXT_CHARS / MAX_BLOCK_CHARS);
+    let mut selected: Vec<&Block> = blocks.iter().take(count.min(2)).collect();
+    if count > 2 {
+        // count > 2 implies a nonempty tail; its chunk length is at least one.
+        let stride = (blocks.len() - 2).div_ceil(count - 2);
+        for chunk in blocks[2..].chunks(stride) {
+            if let Some(block) = chunk.last() {
+                selected.push(block);
+            }
+        }
+    }
+    selected
+        .into_iter()
+        .map(|block| Retrieved {
+            page: block.page,
+            text: block.text.clone(),
+            rects: block.rects.clone(),
+        })
+        .collect()
+}
+
 // ── Document chat ───────────────────────────────────────────────────────────────────────────
 
 /// The reader-facing answer when retrieval finds nothing. The shell recognises this sentence to
@@ -2654,8 +2685,8 @@ pub const NOTHING_RELEVANT_MESSAGE: &str = "Nothing in this document is relevant
 /// retrieval budget, carry the bounded conversation forward, and attach the page geometry the
 /// panel needs for citation chips and the transient source highlight.
 ///
-/// No I/O, no key, no network. An empty retrieval is an [`AiError::EmptyContext`], not a plan
-/// with an empty context, so the panel can answer honestly without calling the provider.
+/// No I/O, no key, no network. A lexical miss uses bounded document samples; an unavailable
+/// text layer remains an [`AiError::EmptyContext`] rather than an empty provider request.
 pub fn build_document_chat_plan(request: DocumentChatRequest) -> Result<ChatPlan, AiError> {
     if request.page_count == 0 {
         return Err(empty_context("This document has no pages."));
@@ -2685,15 +2716,21 @@ pub fn build_document_chat_plan(request: DocumentChatRequest) -> Result<ChatPlan
         }
     }
     let blocks = document_blocks(&pages);
-    let retrieved = retrieve(
+    let mut retrieved = retrieve(
         &blocks,
         question,
         None,
         CHAT_RETRIEVED_BLOCKS,
         MAX_CHAT_CONTEXT_CHARS,
     );
+    let sampled = retrieved.is_empty();
+    if sampled {
+        retrieved = sample_document_context(&blocks);
+    }
     if retrieved.is_empty() {
-        return Err(empty_context(NOTHING_RELEVANT_MESSAGE));
+        return Err(empty_context(
+            "No readable document passages are available. If this is a scanned PDF, add OCR or select readable text before asking.",
+        ));
     }
     let context = RetrievalText::render(&retrieved);
 
@@ -2714,6 +2751,9 @@ pub fn build_document_chat_plan(request: DocumentChatRequest) -> Result<ChatPlan
         "Answer the reader's question about the document \"{}\" using the retrieved passages below.\n",
         request.document_title
     );
+    if sampled {
+        user.push_str("\n[Context selection]\nThere was no direct keyword match. The passages below are bounded representative samples, not an exhaustive view of the document. Use them and any supplied shared document understanding to answer in the language of the question. If they are insufficient, state that limitation and ask for a more specific passage; do not infer that the document itself has no answer.\n");
+    }
     if !history.is_empty() {
         user.push_str("\n[Earlier conversation]\n");
         for (index, turn) in history.iter().enumerate() {
@@ -5211,17 +5251,45 @@ mod tests {
     }
 
     #[test]
-    fn document_chat_with_no_relevant_passage_refuses_before_a_request() {
+    fn document_chat_cross_language_question_uses_bounded_document_samples() {
+        let mut request = chat_request(Vec::new());
+        request.question = "这篇文章的研究目的是什么？".into();
+        let plan = build_document_chat_plan(request).unwrap();
+        assert!(!plan.sources.is_empty());
+        assert!(plan.sources.len() <= CHAT_RETRIEVED_BLOCKS);
+        assert!(plan.parts[0].page_characters <= MAX_CHAT_CONTEXT_CHARS as u64);
+        assert!(plan.parts[0].user_prompt.contains("representative samples"));
+        assert!(
+            plan.parts[0]
+                .user_prompt
+                .contains("这篇文章的研究目的是什么？")
+        );
+        assert!(
+            plan.sources
+                .iter()
+                .all(|source| plan.source_pages.contains(&source.page))
+        );
+        assert!(plan.sources.iter().any(|source| !source.rects.is_empty()));
+    }
+
+    #[test]
+    fn document_chat_lexical_miss_is_not_a_local_relevance_judgment() {
         let mut request = chat_request(Vec::new());
         request.question = "zzzz-quasar-xylophone".to_string();
-        let error = build_document_chat_plan(request).unwrap_err();
-        match error {
-            AiError::EmptyContext(message) => {
-                assert!(message.contains("Nothing in this document is relevant"));
-                assert!(message.contains("nothing was sent"));
-            }
-            other => panic!("expected EmptyContext, got {other:?}"),
-        }
+        let plan = build_document_chat_plan(request).unwrap();
+        assert!(!plan.sources.is_empty());
+        assert!(plan.parts[0].user_prompt.contains("not an exhaustive view"));
+        assert!(plan.source_pages.contains(&1));
+        assert!(plan.source_pages.contains(&8));
+
+        let mut unreadable = chat_request(Vec::new());
+        unreadable.pages.iter_mut().for_each(|p| {
+            p.text.clear();
+            p.chars.clear();
+        });
+        assert!(
+            matches!(build_document_chat_plan(unreadable), Err(AiError::EmptyContext(message)) if message.contains("No readable document passages"))
+        );
 
         let mut blank = chat_request(Vec::new());
         blank.question = "   ".to_string();

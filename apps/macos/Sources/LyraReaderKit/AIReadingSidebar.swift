@@ -360,7 +360,10 @@ struct AIReadingSidebar: View {
                 } else {
                     Text(note.title).font(.title3.weight(.semibold)).textSelection(.enabled)
                     Text(sourceLabel(note)).font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
-                    Button(aiReadingLabel("Edit note")) { noteTitle = note.title; noteContent = note.content; noteThoughts = note.thoughts; editing = true }
+                    Button(aiReadingLabel("Edit note")) {
+                        let current = reading.store.records.first(where: { $0.id == note.id }) ?? note
+                        noteTitle = current.title; noteContent = current.content; noteThoughts = current.thoughts; editing = true
+                    }
                     if let entry = state.currentRegionHistory.first(where: { $0.id.uuidString == note.conversationId }),
                        entry.allTurns.count > Int(note.coveredTurns), reading.store.suggestion(note.id) == nil {
                         if reading.updatingNoteID == note.id {
@@ -382,8 +385,15 @@ struct AIReadingSidebar: View {
                     Text(aiReadingLabel("Key ideas")).font(.headline)
                     answer(note.content, pages: note.pages)
                     Text(aiReadingLabel("My thoughts")).font(.headline)
-                    Text(note.thoughts.isEmpty ? aiReadingLabel("Add your own thoughts…") : note.thoughts).font(.callout)
-                        .frame(maxWidth: .infinity, alignment: .leading).padding(14).background(LyraReaderTheme.noteBg, in: RoundedRectangle(cornerRadius: 8))
+                    AIReadingTextInput(text: Binding(get: {
+                        reading.store.records.first(where: { $0.id == note.id })?.thoughts ?? note.thoughts
+                    }, set: { text in
+                        guard var updated = reading.store.records.first(where: { $0.id == note.id }) else { return }
+                        updated.thoughts = text; updated.modified = UInt64(Date().timeIntervalSince1970 * 1000)
+                        reading.store.put(updated)
+                    }), placeholder: aiReadingLabel("Add your own thoughts…"))
+                        .id(note.id).frame(height: 112)
+                        .background(LyraReaderTheme.noteBg, in: RoundedRectangle(cornerRadius: 8))
                     if note.status == "sourceChanged" { Text(aiReadingLabel("The source document has changed. The saved knowledge and source snapshot are preserved.")).font(.caption).foregroundStyle(LyraReaderTheme.warningFg) }
                     if isWholeDocumentNote(note) {
                         Button(aiReadingLabel("Locate whole document")) { state.gotoPage(0) }

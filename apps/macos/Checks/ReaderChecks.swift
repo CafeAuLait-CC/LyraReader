@@ -370,6 +370,10 @@ struct ReaderChecks {
             print("Plan wire checks passed")
             return
         }
+        if CommandLine.arguments.contains("--check-ai-reading-interactions") {
+            try await aiReadingInteractionChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-ai-reading-workspace") {
             try await aiReadingWorkspaceChecks(root: fastRoot)
             return
@@ -1287,6 +1291,7 @@ struct ReaderChecks {
             ("inplace-translation", {
                 try await inPlaceTranslationChecks(root: root)
             }),
+            ("ai-reading-interactions", { try await aiReadingInteractionChecks(root: root) }),
             ("region-reading-notes", {
                 try await regionReadingNotesChecks(root: root)
             }),

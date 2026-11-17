@@ -19,7 +19,7 @@ public struct AIDocumentKnowledgeRecord: Codable, Equatable, Sendable {
 }
 
 /// Optional shared context. Consent decides whether to start a background reading; AI actions
-/// may proceed immediately with their own source passages while that reading is in progress.
+/// wait for this optional reading to finish; ordinary PDF reading remains available.
 @MainActor
 public final class AIDocumentKnowledge: ObservableObject {
     public enum Phase: String, Equatable { case idle, preparing, consent, reading, ready, failed }
@@ -293,7 +293,7 @@ struct AIDocumentKnowledgeSheet: View {
                 Text(knowledge.phase == .reading ? "Prereading your document…" : "Get to know this document")
                     .font(.system(size: 18, weight: .semibold))
             }
-            Text("Lyra can read this document once to connect ideas across your questions, and save that understanding locally. It works in the background while you read. You can also continue without it; answers may have less context about the whole document.")
+            Text(aiReadingLabel("Lyra can read this document once to connect ideas across your questions, and save that understanding locally. You can keep reading the PDF while it works; AI tools become available when prereading finishes. You can also continue without it."))
                 .font(.system(size: 13)).foregroundStyle(LyraReaderTheme.textSecondary)
             if let reader = knowledge.reader { AIDocumentKnowledgeProgress(reader: reader, reading: knowledge.phase == .reading) }
             if let message = knowledge.message {
@@ -302,6 +302,7 @@ struct AIDocumentKnowledgeSheet: View {
             HStack {
                 Button("Continue Without Reading") { knowledge.continueWithoutSummary() }
                     .buttonStyle(ReaderPanelButtonStyle())
+                    .keyboardShortcut(.cancelAction)
                 if knowledge.phase != .reading {
                     Button("Start prereading") { knowledge.proceed() }
                         .buttonStyle(ReaderPanelButtonStyle(prominent: true))
@@ -321,17 +322,20 @@ struct AIDocumentKnowledgeStatus: View {
         if knowledge.statusVisible {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Text(knowledge.phase == .reading ? "Reading your document…" : "Document reading")
+                    Text(aiReadingLabel(knowledge.phase == .reading ? "Reading your document…" : "Document reading"))
                         .font(.system(size: 13, weight: .semibold))
                     Spacer()
-                    Button { knowledge.dismissStatus() } label: {
+                    if knowledge.phase != .reading { Button { knowledge.dismissStatus() } label: {
                         Image(systemName: "xmark").font(.system(size: 10, weight: .semibold))
                     }.buttonStyle(.plain).help("Hide document reading status")
                         .accessibilityLabel("Hide document reading status")
+                    }
                 }
                 if knowledge.phase == .reading, let reader = knowledge.reader {
-                    AIDocumentKnowledgeProgress(reader: reader, reading: true)
-                    Button("Stop Reading") { knowledge.stopReading() }.buttonStyle(.plain)
+                    AIPreReadingActivity(reader: reader)
+                    HStack { Spacer(); Button { knowledge.stopReading() } label: {
+                        Text(aiReadingLabel("Stop Reading")).padding(.horizontal, 12)
+                    }.buttonStyle(ReaderPanelButtonStyle()).fixedSize(horizontal: true, vertical: false) }
                 } else {
                     if let message = knowledge.message {
                         Text(message).font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
@@ -353,6 +357,21 @@ struct AIDocumentKnowledgeStatus: View {
             .background(RoundedRectangle(cornerRadius: 10).fill(LyraReaderTheme.panelBg)
                 .overlay(RoundedRectangle(cornerRadius: 10).stroke(LyraReaderTheme.border))
                 .shadow(color: .black.opacity(0.1), radius: 8, y: 3))
+        }
+    }
+}
+struct AIPreReadingActivity: View {
+    @ObservedObject var reader: AIAssistantModel
+    var body: some View {
+        HStack(spacing: 8) {
+            ProgressView().controlSize(.small)
+            Text(aiReadingLabel("Prereading in progress…")).font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
+            Spacer(minLength: 0)
+            if let plan = reader.plan, plan.parts.count > 1 {
+                Text("\(reader.mergePlan == nil ? min(reader.currentRequestNumber ?? 1, plan.parts.count) : plan.parts.count)/\(plan.parts.count)")
+                    .font(.caption.monospacedDigit()).foregroundStyle(LyraReaderTheme.textSecondary)
+                    .accessibilityLabel(aiReadingLabel("Prereading progress"))
+            }
         }
     }
 }

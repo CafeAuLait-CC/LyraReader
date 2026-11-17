@@ -116,3 +116,14 @@
 "Use new selection" = "使用新选区";
 "View conversation" = "查看对话";
 "Whole document" = "全文";
+"Return to send · Shift+Return for a new line" = "Return 发送 · Shift+Return 换行";
+"Ask about this document…" = "询问当前文档…";
+"Prereading in progress…" = "正在预读…";
+"Prereading progress" = "预读进度";
+"Stop Reading" = "停止预读";
+"Reading your document…" = "正在预读文档…";
+"Document reading" = "文档预读";
+"Expanded" = "已展开";
+"Collapsed" = "已收起";
+"Expand or collapse this section" = "展开或收起此章节";
+"Lyra can read this document once to connect ideas across your questions, and save that understanding locally. You can keep reading the PDF while it works; AI tools become available when prereading finishes. You can also continue without it." = "Lyra 可以预读这份文档，关联后续问题中的观点，并在本地保存理解结果。预读时可以继续阅读 PDF；完成后即可使用 AI 工具，也可以选择跳过预读。";
