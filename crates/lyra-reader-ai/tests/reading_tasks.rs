@@ -39,10 +39,10 @@ fn short_summary_is_one_task_with_actual_sources_and_detail() {
     assert_eq!(plan.source_pages, vec![1, 2]);
     assert!(
         plan.parts[0]
-            .system_prompt
+            .user_prompt
             .contains("evidence and limitations")
     );
-    assert!(plan.parts[0].system_prompt.contains("Simplified Chinese"));
+    assert!(plan.parts[0].user_prompt.contains("Simplified Chinese"));
     assert_eq!(
         plan.chat_completions_body(&plan.parts[0]),
         include_str!("fixtures/reading-summary-chat.golden.json")
@@ -78,6 +78,12 @@ fn selection_keeps_raw_character_offsets_without_surroundings() {
     assert!(!plan.parts[0].user_prompt.contains("prefix"));
     assert!(!plan.parts[0].user_prompt.contains("suffix"));
     assert!(!plan.parts[0].user_prompt.contains("Unrelated private"));
+    assert!(plan.parts[0].user_prompt.contains("selected passage only"));
+    assert!(
+        !plan.parts[0]
+            .user_prompt
+            .contains("shared document understanding")
+    );
     assert_eq!(
         plan.parts[0].page_characters,
         plan.sources[0].snippet.chars().count() as u64

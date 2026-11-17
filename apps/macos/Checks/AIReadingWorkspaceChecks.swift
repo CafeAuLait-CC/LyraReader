@@ -63,6 +63,9 @@ extension ReaderChecks {
         require(reading.store.error == nil, "the Rust workspace loads through native I/O")
         reading.run("summary", state: state)
         try await eventually("one summary action completes and persists", { reading.result("summary") != nil })
+        try await eventually("completed Summary publishes its shared understanding before other AI tools resume", {
+            state.documentKnowledge.phase == .ready
+        })
         require(service.starts == 1, "one click sends the complete summary task without an inline preview")
         let summary = reading.result("summary")!
         require(summary.pages == [1] && summary.content.contains("supported idea"), "saved results retain actual source coverage")
@@ -97,7 +100,7 @@ extension ReaderChecks {
         try await captureReadingWorkspace(state: state, reading: reading)
         settings.reviewBeforeSending = true
         let beforeReview = service.starts
-        reading.run("summary", state: state)
+        reading.run("summary", state: state, force: true)
         try await eventually("optional review pauses before provider I/O", { reading.summary.phase == .preview })
         reading.cancelPresentation()
         try await Task.sleep(for: .milliseconds(150))

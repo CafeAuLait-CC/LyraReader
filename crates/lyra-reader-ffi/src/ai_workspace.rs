@@ -4,6 +4,117 @@ use crate::api::LyraReaderFfiError;
 use lyra_reader_ai::workspace::{ReadingRecord, ReadingWorkspace};
 use std::sync::{Arc, Mutex};
 
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum AiAnalysisClaim {
+    Start { token: u64 },
+    Ready,
+    Waiting,
+}
+
+/// Control-plane adapter. All cache and in-flight ownership rules live in lyra-reader-ai.
+#[derive(uniffi::Object, Default)]
+pub struct LyraDocumentUnderstanding {
+    state: Mutex<lyra_reader_ai::understanding::DocumentUnderstanding>,
+}
+
+#[uniffi::export]
+impl LyraDocumentUnderstanding {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+    pub fn load(&self, bytes: Vec<u8>, source: String) -> Result<bool, LyraReaderFfiError> {
+        lyra_reader_core::sync::lock(&self.state)?
+            .load(&bytes, &source)
+            .map_err(error)
+    }
+    pub fn encode(&self) -> Result<Vec<u8>, LyraReaderFfiError> {
+        lyra_reader_core::sync::lock(&self.state)?
+            .encode()
+            .map_err(error)
+    }
+    pub fn record(&self, source: String) -> Result<Option<AiReadingRecord>, LyraReaderFfiError> {
+        Ok(lyra_reader_core::sync::lock(&self.state)?
+            .record(&source)
+            .map(Into::into))
+    }
+    pub fn reusable(
+        &self,
+        source: String,
+        language: String,
+        detail: String,
+    ) -> Result<Option<AiReadingRecord>, LyraReaderFfiError> {
+        Ok(lyra_reader_core::sync::lock(&self.state)?
+            .reusable(&source, &language, &detail)
+            .map(Into::into))
+    }
+    pub fn begin(
+        &self,
+        source: String,
+        language: String,
+        detail: String,
+        force: bool,
+    ) -> Result<AiAnalysisClaim, LyraReaderFfiError> {
+        use lyra_reader_ai::understanding::Claim;
+        Ok(
+            match lyra_reader_core::sync::lock(&self.state)?
+                .begin(source, language, detail, force)
+                .map_err(error)?
+            {
+                Claim::Start(token) => AiAnalysisClaim::Start { token },
+                Claim::Ready(_) => AiAnalysisClaim::Ready,
+                Claim::Waiting => AiAnalysisClaim::Waiting,
+            },
+        )
+    }
+    pub fn finish(&self, token: u64, record: AiReadingRecord) -> Result<bool, LyraReaderFfiError> {
+        lyra_reader_core::sync::lock(&self.state)?
+            .finish(token, record.into())
+            .map_err(error)
+    }
+    pub fn cancel(&self, token: u64) -> Result<(), LyraReaderFfiError> {
+        lyra_reader_core::sync::lock(&self.state)?.cancel(token);
+        Ok(())
+    }
+}
+
+#[uniffi::export]
+pub fn ai_document_understanding_context(text: String) -> String {
+    lyra_reader_ai::understanding::context(&text)
+}
+
+#[uniffi::export]
+pub fn ai_needs_document_understanding(kind: String) -> bool {
+    lyra_reader_ai::understanding::needs_prior(&kind)
+}
+
+#[uniffi::export]
+pub fn ai_document_understanding_cache_limit() -> u64 {
+    lyra_reader_ai::understanding::MAX_BYTES as u64
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct AiResponseUsage {
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+}
+
+#[uniffi::export]
+pub fn ai_response_usage(json: String) -> Result<Option<AiResponseUsage>, LyraReaderFfiError> {
+    Ok(
+        lyra_reader_ai::openai::response_usage_json(&json)?.map(|u| AiResponseUsage {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+            reasoning_tokens: u.reasoning_tokens,
+            cached_tokens: u.cached_tokens,
+        }),
+    )
+}
+
 fn error(message: String) -> LyraReaderFfiError {
     LyraReaderFfiError::InvalidArgument {
         message,

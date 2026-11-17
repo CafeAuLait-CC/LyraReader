@@ -127,3 +127,8 @@
 "Collapsed" = "已收起";
 "Expand or collapse this section" = "展开或收起此章节";
 "Lyra can read this document once to connect ideas across your questions, and save that understanding locally. You can keep reading the PDF while it works; AI tools become available when prereading finishes. You can also continue without it." = "Lyra 可以预读这份文档，关联后续问题中的观点，并在本地保存理解结果。预读时可以继续阅读 PDF；完成后即可使用 AI 工具，也可以选择跳过预读。";
+"%lld cached input (of prompt)" = "%lld 个缓存输入 token（包含在输入量中）";
+"Document analysis is already in progress." = "文档分析正在进行中。";
+"The document analysis could not start. Please try again." = "无法开始文档分析，请重试。";
+"The document understanding cache limit is unsupported." = "当前文档理解缓存的大小限制不受支持。";
+"The saved document understanding is too large. Its file was kept." = "已保存的文档理解超出大小限制，原缓存文件已保留。";

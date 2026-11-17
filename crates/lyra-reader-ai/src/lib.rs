@@ -13,6 +13,7 @@ pub mod mock;
 pub mod openai;
 pub mod provider;
 pub mod sections;
+pub mod understanding;
 pub mod workspace;
 
 pub use chat::{

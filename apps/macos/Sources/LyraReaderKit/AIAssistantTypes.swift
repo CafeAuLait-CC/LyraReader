@@ -540,22 +540,25 @@ public struct AIUsage: Equatable, Sendable {
     public var totalTokens: Int?
     /// A subset of completion tokens on providers that expose thinking-token details.
     public var reasoningTokens: Int?
+    public var cachedTokens: Int?
 
     public init(
         promptTokens: Int? = nil,
         completionTokens: Int? = nil,
         totalTokens: Int? = nil,
-        reasoningTokens: Int? = nil
+        reasoningTokens: Int? = nil,
+        cachedTokens: Int? = nil
     ) {
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
         self.totalTokens = totalTokens
         self.reasoningTokens = reasoningTokens
+        self.cachedTokens = cachedTokens
     }
 
     public var isEmpty: Bool {
         promptTokens == nil && completionTokens == nil && totalTokens == nil
-            && reasoningTokens == nil
+            && reasoningTokens == nil && cachedTokens == nil
     }
 
     /// Sums the token counts reported by the parts of one plan.
@@ -564,7 +567,8 @@ public struct AIUsage: Equatable, Sendable {
             promptTokens: Self.add(promptTokens, other.promptTokens),
             completionTokens: Self.add(completionTokens, other.completionTokens),
             totalTokens: Self.add(totalTokens, other.totalTokens),
-            reasoningTokens: Self.add(reasoningTokens, other.reasoningTokens)
+            reasoningTokens: Self.add(reasoningTokens, other.reasoningTokens),
+            cachedTokens: Self.add(cachedTokens, other.cachedTokens)
         )
     }
 
@@ -574,6 +578,7 @@ public struct AIUsage: Equatable, Sendable {
         if let promptTokens { pieces.append("\(promptTokens) prompt") }
         if let completionTokens { pieces.append("\(completionTokens) completion") }
         if let reasoningTokens { pieces.append("\(reasoningTokens) reasoning (of completion)") }
+        if let cachedTokens { pieces.append(String(format: aiReadingLabel("%lld cached input (of prompt)"), Int64(cachedTokens))) }
         if let totalTokens { pieces.append("\(totalTokens) total") }
         if pieces.isEmpty { return "No token usage was reported by the provider." }
         return "Tokens: " + pieces.joined(separator: " + ")
@@ -831,12 +836,13 @@ final class RustAIChatHandle: AIChatHandle {
                 return .delta(text)
             case .reasoningDelta(let text):
                 return .reasoningDelta(text)
-            case .usage(let promptTokens, let completionTokens, let totalTokens, let reasoningTokens):
+            case .usage(let promptTokens, let completionTokens, let totalTokens, let reasoningTokens, let cachedTokens):
                 return .usage(AIUsage(
                     promptTokens: promptTokens.map(Int.init),
                     completionTokens: completionTokens.map(Int.init),
                     totalTokens: totalTokens.map(Int.init),
-                    reasoningTokens: reasoningTokens.map(Int.init)
+                    reasoningTokens: reasoningTokens.map(Int.init),
+                    cachedTokens: cachedTokens.map(Int.init)
                 ))
             case .diagnostics(let diagnostics):
                 return .diagnostics(AIStreamDiagnostics(

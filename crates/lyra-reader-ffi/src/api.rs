@@ -4155,10 +4155,10 @@ impl LyraReaderDocument {
                 settings,
                 document_knowledge: knowledge,
             };
-            if let Some(options) = reading {
-                lyra_reader_ai::chat::build_reading_task(input, &options.kind, &options.detail)?
-            } else if request.document_knowledge {
+            if request.document_knowledge {
                 build_document_knowledge_plan(input)?
+            } else if let Some(options) = reading {
+                lyra_reader_ai::chat::build_reading_task(input, &options.kind, &options.detail)?
             } else {
                 build_plan(input)?
             }
@@ -8903,6 +8903,7 @@ pub enum AiEventRecord {
         completion_tokens: Option<u64>,
         total_tokens: Option<u64>,
         reasoning_tokens: Option<u64>,
+        cached_tokens: Option<u64>,
     },
     Diagnostics {
         diagnostics: AiStreamDiagnostics,
@@ -8955,11 +8956,13 @@ impl AiJob {
                 completion_tokens,
                 total_tokens,
                 reasoning_tokens,
+                cached_tokens,
             }) => AiEventRecord::Usage {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens,
                 reasoning_tokens,
+                cached_tokens,
             },
             RunEvent::Diagnostics(StreamDiagnostics {
                 http_status,

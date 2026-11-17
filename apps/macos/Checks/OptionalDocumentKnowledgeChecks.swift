@@ -109,7 +109,14 @@ extension ReaderChecks {
     init(engine: RustEngine) { base = RustAIChatService(engine: engine, useMockProvider: true) }
     func prepare(_ request: AIMakePlanRequest) async throws -> AiPlanRecord {
         lastRequest = request
-        var plan = try await base.prepare(request)
+        return adjust(try await base.prepare(request))
+    }
+    func prepareReading(_ request: AIMakePlanRequest, options: AiReadingOptionsRecord) async throws -> AiPlanRecord {
+        lastRequest = request
+        return adjust(try await base.prepareReading(request, options: options))
+    }
+    private func adjust(_ source: AiPlanRecord) -> AiPlanRecord {
+        var plan = source
         if partCount > 1, let first = plan.parts.first {
             plan.parts = (0..<partCount).map { index in
                 var part = first; part.index = UInt32(index); part.total = UInt32(partCount); return part

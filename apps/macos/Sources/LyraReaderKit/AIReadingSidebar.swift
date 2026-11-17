@@ -191,7 +191,7 @@ struct AIReadingSidebar: View {
                 }
                 if !reading.settings.canUseAI { Text(aiReadingLabel("Connect an AI provider in Settings to continue.")).font(.caption) }
                 Button {
-                    reading.run(kind, state: state)
+                    reading.run(kind, state: state, force: reading.result(kind) != nil)
                 } label: {
                     Label(aiReadingLabel(result == nil ? (kind == "summary" ? (selected ? "Summarize selection" : "Summarize document") : (selected ? "Translate selection" : "Translate document")) : (kind == "summary" ? "Regenerate" : "Retranslate")), systemImage: result == nil ? "sparkles" : "arrow.clockwise")
                 }.buttonStyle(ReaderPanelButtonStyle(prominent: true))

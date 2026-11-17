@@ -1142,100 +1142,12 @@ fn empty_context(message: impl Into<String>) -> AiError {
 /// Build the request plan. No I/O, no key, no network.
 /// Full-document prior knowledge reads every extractable character in bounded requests.
 /// Unlike a sampled abstract, it never silently omits the middle of a long document.
-pub fn build_document_knowledge_plan(request: PlanRequest) -> Result<ChatPlan, AiError> {
-    const PART_CHARS: usize = 24_000;
-    if request.pages.len() != request.page_count as usize {
-        return Err(empty_context(
-            "The complete document text is not available. Nothing was sent.",
-        ));
-    }
-    let mut pages = request.pages.clone();
-    pages.sort_by_key(|page| page.page);
-    if pages
-        .iter()
-        .enumerate()
-        .any(|(index, page)| page.page != index as u32)
-    {
-        return Err(empty_context(
-            "The complete document text is not available. Nothing was sent.",
-        ));
-    }
-    let mut chunks: Vec<Vec<PageText>> = Vec::new();
-    let mut chunk = Vec::new();
-    let mut length = 0;
-    for page in pages {
-        let text = page_context_text(&page);
-        let chars: Vec<char> = text.chars().collect();
-        let mut offset = 0;
-        while offset < chars.len() {
-            let end = (offset + PART_CHARS - length).min(chars.len());
-            let piece: String = chars[offset..end].iter().collect();
-            chunk.push(PageText {
-                page: page.page,
-                text: piece,
-                chars: vec![],
-            });
-            length += end - offset;
-            offset = end;
-            if length == PART_CHARS {
-                chunks.push(std::mem::take(&mut chunk));
-                length = 0;
-            }
-        }
-    }
-    if !chunk.is_empty() {
-        chunks.push(chunk);
-    }
-    if chunks.is_empty() {
-        return Err(empty_context(
-            "This document has no extractable text to read.",
-        ));
-    }
-    let total = chunks.len() as u32;
-    let mut output: Option<ChatPlan> = None;
-    for (index, chunk) in chunks.into_iter().enumerate() {
-        let mut part_request = request.clone();
-        part_request.action = Action::SummarizeDocument;
-        part_request.pages = (0..request.page_count)
-            .map(|page| PageText {
-                page,
-                text: String::new(),
-                chars: vec![],
-            })
-            .collect();
-        for page in chunk {
-            part_request.pages[page.page as usize]
-                .text
-                .push_str(&page.text);
-        }
-        let mut plan = build_plan(part_request)?;
-        for part in &mut plan.parts {
-            part.index = index as u32;
-            part.total = total;
-            part.label = format!("Document reading · part {} of {}", index + 1, total);
-            if total > 1 {
-                part.user_prompt = part
-                    .user_prompt
-                    .replace("complete extracted text", "extracted text in this part");
-                part.user_prompt.push_str("\nPreserve the research aims, terminology, method, claims, evidence, limitations and page references for a later whole-document synthesis.");
-                part.request_characters =
-                    (part.system_prompt.chars().count() + part.user_prompt.chars().count()) as u64;
-            }
-        }
-        if let Some(output) = &mut output {
-            output.source_pages.extend(plan.source_pages);
-            output.parts.extend(plan.parts);
-        } else {
-            output = Some(plan);
-        }
-    }
-    let mut output = output.expect("nonempty document");
-    output.source_pages.sort_unstable();
-    output.source_pages.dedup();
-    output.note = Some(format!(
-        "All extracted document text · {total} reading request(s), followed by consolidation when needed. Images are not sent."
-    ));
-    Ok(output)
+pub fn build_document_knowledge_plan(mut request: PlanRequest) -> Result<ChatPlan, AiError> {
+    // Prereading always covers the document, even when the action that opened its choice
+    // carries a selection. Generated prior text is not another source for its own analysis.
+    request.selection = None;
+    request.document_knowledge = None;
+    build_reading_task(request, "summary", "Standard")
 }
 
 /// Shared rules for the redesigned reading tools. Task structure lives in workspace.
@@ -1347,6 +1259,8 @@ pub fn build_reading_task(
         usize::try_from(budget)
             .map_err(|_| empty_context("Invalid output budget."))?
             .min(16_000)
+    } else if kind == "summary" {
+        crate::understanding::ANALYSIS_PART_CHARS
     } else {
         MAX_COMPLETE_SUMMARY_CHARS
     };
@@ -1405,12 +1319,7 @@ pub fn build_reading_task(
             "{READING_SYSTEM_PROMPT}{instructions}\nEach source paragraph has a numeric marker. Start every translated paragraph with exactly <!--lyra:N--> using its source index N. Do not omit or repeat markers. Translate every source paragraph."
         )
     } else {
-        let scope = if request.selection.is_some() {
-            "selected passage"
-        } else {
-            "whole document or supplied discussion"
-        };
-        format!("{READING_SYSTEM_PROMPT}{instructions}\nSource scope: {scope}.")
+        READING_SYSTEM_PROMPT.to_string()
     };
     let mut output: Option<ChatPlan> = None;
     let mut source_map = Vec::new();
@@ -1444,6 +1353,9 @@ pub fn build_reading_task(
                 "[End terminology context]\nTranslate only the numbered paragraphs below.\n\n",
             );
         }
+        if kind == "summary" {
+            prompt.push_str("[Document original sources]\n");
+        }
         previous_context = chunk.last().map(|(_, text)| grapheme_prefix(text, 1200));
         for (page, text) in &chunk {
             let index = source_map.len();
@@ -1453,6 +1365,19 @@ pub fn build_reading_task(
                 snippet: text.clone(),
                 rects: Vec::new(),
             });
+        }
+        if kind != "translation" {
+            if kind == "summary" {
+                prompt.push_str("[End document original sources]\n\n");
+            }
+            prompt.push_str(&instructions);
+            if kind == "summary" {
+                if request.selection.is_some() {
+                    prompt.push_str("\nSource scope: selected passage only. Explain this passage; do not infer document-wide coverage or invent sections.\n");
+                } else {
+                    prompt.push_str("\nPreserve research aims, terminology, reasoning, evidence, limitations and source references. The result also supplies the shared document understanding.\n");
+                }
+            }
         }
         let mut plan = build_prompt_plan_with_system(
             PromptPlanRequest {
@@ -2675,6 +2600,160 @@ fn sample_document_context(blocks: &[Block]) -> Vec<Retrieved> {
         .collect()
 }
 
+/// The same paragraph framing used by a complete reading task. Only an explicitly completed
+/// preread enables this path, and only when the entire original fits the conservative budget.
+fn complete_chat_prefix(pages: &[Option<&PageText>]) -> Option<(String, Vec<Retrieved>)> {
+    let mut prompt = String::from("[Document original sources]\n");
+    let mut sources = Vec::new();
+    let mut size = 0usize;
+    for page in pages {
+        let page = (*page)?;
+        for paragraph in page_context_text(page)
+            .split("\n\n")
+            .filter(|p| !p.trim().is_empty())
+        {
+            let framed = format!(
+                "[Paragraph {}; Page {}]\n{paragraph}\n\n",
+                sources.len(),
+                page.page + 1
+            );
+            size = size.checked_add(framed.chars().count())?;
+            if size > crate::understanding::FULL_CHAT_PREFIX_CHARS {
+                return None;
+            }
+            prompt.push_str(&framed);
+            sources.push(Retrieved {
+                page: page.page,
+                text: paragraph.into(),
+                rects: locate_reading_source(page, paragraph).ok()?,
+            });
+        }
+    }
+    if sources.is_empty() {
+        return None;
+    }
+    prompt.push_str("[End document original sources]\n\n");
+    Some((prompt, sources))
+}
+
+fn section_number(text: &str) -> Option<String> {
+    let number: String = text
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .take(16)
+        .collect();
+    let number = number.trim_end_matches('.');
+    (!number.is_empty() && number.as_bytes()[0].is_ascii_digit()).then(|| number.to_string())
+}
+
+fn requested_section(question: &str) -> Option<String> {
+    let lower = question.to_lowercase();
+    for marker in ["section ", "sec. ", "§", "第", "章节 "] {
+        if let Some((_, rest)) = lower.split_once(marker) {
+            if let Some(number) = section_number(rest) {
+                return Some(number);
+            }
+            // Common Chinese section references; no model call is needed to resolve these.
+            if marker == "第" {
+                for (word, number) in [
+                    ("十", "10"),
+                    ("九", "9"),
+                    ("八", "8"),
+                    ("七", "7"),
+                    ("六", "6"),
+                    ("五", "5"),
+                    ("四", "4"),
+                    ("三", "3"),
+                    ("二", "2"),
+                    ("一", "1"),
+                ] {
+                    if rest.starts_with(&format!("{word}节"))
+                        || rest.starts_with(&format!("{word}章"))
+                    {
+                        return Some(number.into());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn heading_section(line: &str) -> Option<String> {
+    if line.chars().count() > 120 {
+        return None;
+    }
+    let end = line.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+    let rest = line.get(end..)?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let title = rest.trim();
+    if !title.starts_with(char::is_alphabetic) || title.contains(['=', '+', '\\']) {
+        return None;
+    }
+    section_number(line)
+}
+
+/// Explicit chapter requests read consecutive original text through the next sibling heading.
+/// A budget stop is reported to the model; it must never claim exhaustive chapter coverage.
+fn chapter_context(pages: &[Option<&PageText>], number: &str) -> Option<(Vec<Retrieved>, bool)> {
+    let mut active = false;
+    let mut result = Vec::new();
+    let mut count = 0usize;
+    for page in pages.iter().flatten() {
+        for line in page_context_text(page)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+        {
+            let heading = line.trim_start_matches('#').trim();
+            if let Some(found) = heading_section(heading) {
+                if found == number {
+                    active = true;
+                } else if active && !found.starts_with(&format!("{number}.")) {
+                    return Some((result, false));
+                }
+            }
+            if !active {
+                continue;
+            }
+            for text in split_block(line) {
+                let length = text.chars().count();
+                let framed_length = length + retrieval_context_label().chars().count() + 64;
+                if count + framed_length > 12_000 {
+                    return Some((result, true));
+                }
+                count += framed_length;
+                result.push(Retrieved {
+                    page: page.page,
+                    rects: locate_reading_source(page, &text).ok()?,
+                    text,
+                });
+            }
+        }
+    }
+    (!result.is_empty()).then_some((result, false))
+}
+
+fn is_follow_up(question: &str) -> bool {
+    let lower = question.to_lowercase();
+    [
+        "this",
+        "that",
+        " it ",
+        "它",
+        "这里",
+        "这个",
+        "这一节",
+        "那一节",
+        "继续",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
+}
+
 // ── Document chat ───────────────────────────────────────────────────────────────────────────
 
 /// The reader-facing answer when retrieval finds nothing. The shell recognises this sentence to
@@ -2715,17 +2794,34 @@ pub fn build_document_chat_plan(request: DocumentChatRequest) -> Result<ChatPlan
             *slot = Some(page);
         }
     }
+    let full = request
+        .document_knowledge
+        .as_ref()
+        .and_then(|_| complete_chat_prefix(&pages));
+    let follow_up = request.history.last().filter(|_| is_follow_up(question));
+    let chapter_number = requested_section(question)
+        .or_else(|| follow_up.and_then(|turn| requested_section(&turn.question)));
+    let chapter = chapter_number
+        .as_deref()
+        .and_then(|number| chapter_context(&pages, number));
     let blocks = document_blocks(&pages);
+    let query =
+        follow_up.map(|turn| format!("{}\n{question}", grapheme_prefix(&turn.question, 4000)));
     let mut retrieved = retrieve(
         &blocks,
-        question,
+        query.as_deref().unwrap_or(question),
         None,
         CHAT_RETRIEVED_BLOCKS,
         MAX_CHAT_CONTEXT_CHARS,
     );
-    let sampled = retrieved.is_empty();
+    let sampled = retrieved.is_empty() && full.is_none() && chapter.is_none();
     if sampled {
         retrieved = sample_document_context(&blocks);
+    }
+    if let Some((_, sources)) = &full {
+        retrieved = sources.clone();
+    } else if let Some((sources, _)) = &chapter {
+        retrieved = sources.clone();
     }
     if retrieved.is_empty() {
         return Err(empty_context(
@@ -2747,12 +2843,32 @@ pub fn build_document_chat_plan(request: DocumentChatRequest) -> Result<ChatPlan
         .collect();
 
     let (history, dropped) = bounded_history(&request.history);
-    let mut user = format!(
-        "Answer the reader's question about the document \"{}\" using the retrieved passages below.\n",
+    let mut user = full
+        .as_ref()
+        .map(|(prompt, _)| prompt.clone())
+        .unwrap_or_default();
+    let location = if full.is_some() {
+        "original sources above"
+    } else {
+        "retrieved passages below"
+    };
+    user.push_str(&format!(
+        "Answer the reader's question about the document \"{}\" using the {location}.\n",
         request.document_title
-    );
+    ));
     if sampled {
         user.push_str("\n[Context selection]\nThere was no direct keyword match. The passages below are bounded representative samples, not an exhaustive view of the document. Use them and any supplied shared document understanding to answer in the language of the question. If they are insufficient, state that limitation and ask for a more specific passage; do not infer that the document itself has no answer.\n");
+    }
+    if full.is_none()
+        && let Some((_, limited)) = &chapter
+    {
+        user.push_str(if *limited { "\n[Context selection]\nThe requested chapter was read from its beginning up to this request's source budget. This is partial chapter coverage; state missing evidence and do not claim to have inspected the rest.\n" }
+            else { "\n[Context selection]\nThe supplied original passages follow the requested numbered section through the next detected sibling heading. Only the passages actually included here are evidence.\n" });
+    }
+    if full.is_none() && chapter.is_some() {
+        user.push_str("\n[Retrieved passages from the document]\n");
+        user.push_str(&context);
+        user.push_str("\n[End chapter sources]\n");
     }
     if !history.is_empty() {
         user.push_str("\n[Earlier conversation]\n");
@@ -2766,12 +2882,18 @@ pub fn build_document_chat_plan(request: DocumentChatRequest) -> Result<ChatPlan
             ));
         }
     }
-    user.push_str("\n[Retrieved passages from the document]\n");
-    user.push_str(&context);
+    if full.is_none() && chapter.is_none() {
+        user.push_str("\n[Retrieved passages from the document]\n");
+        user.push_str(&context);
+    }
     user.push_str(&format!(
         "\n\n[Current question]\n{question}\n\nAnswer in a few short paragraphs. Cite every factual claim with [p.N], using only the 1-based page numbers that appear in the retrieved passages above. If the passages do not contain the answer, say so plainly rather than guessing."
     ));
-    let system = document_chat_system_prompt();
+    let system = if full.is_some() {
+        READING_SYSTEM_PROMPT.to_string()
+    } else {
+        document_chat_system_prompt()
+    };
     let wire = ChatWire {
         reasoning,
         stream: true,
@@ -2819,7 +2941,11 @@ pub fn build_document_chat_plan(request: DocumentChatRequest) -> Result<ChatPlan
         history_turns: lyra_reader_core::saturating_u32(history.len()),
         estimated_tokens_override: None,
     };
-    apply_document_knowledge(&mut plan, document_knowledge.as_ref());
+    // A complete original is stronger evidence than a generated digest and already supplies
+    // the stable shared prefix. Do not pay for a duplicate summary alongside it.
+    if full.is_none() {
+        apply_document_knowledge(&mut plan, document_knowledge.as_ref());
+    }
     Ok(plan)
 }
 

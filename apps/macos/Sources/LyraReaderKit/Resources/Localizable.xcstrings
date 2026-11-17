@@ -2049,6 +2049,86 @@
           }
         }
       }
+    },
+    "%lld cached input (of prompt)": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%lld cached input (of prompt)"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%lld 个缓存输入 token（包含在输入量中）"
+          }
+        }
+      }
+    },
+    "Document analysis is already in progress.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Document analysis is already in progress."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "文档分析正在进行中。"
+          }
+        }
+      }
+    },
+    "The document analysis could not start. Please try again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The document analysis could not start. Please try again."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "无法开始文档分析，请重试。"
+          }
+        }
+      }
+    },
+    "The document understanding cache limit is unsupported.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The document understanding cache limit is unsupported."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "当前文档理解缓存的大小限制不受支持。"
+          }
+        }
+      }
+    },
+    "The saved document understanding is too large. Its file was kept.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The saved document understanding is too large. Its file was kept."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已保存的文档理解超出大小限制，原缓存文件已保留。"
+          }
+        }
+      }
     }
   }
 }

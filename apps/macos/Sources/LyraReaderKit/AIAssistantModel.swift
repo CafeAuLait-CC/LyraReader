@@ -87,6 +87,9 @@ public final class AIAssistantModel: ObservableObject {
     private var currentPartIndex: Int?
     var currentRequestNumber: Int? { currentPartIndex.map { $0 + 1 } }
     private var merging = false
+    var completedDocumentSynthesis: Bool { merging && phase == .finished && errorMessage == nil }
+    private var truncatedSource = false
+    var hasTruncatedSource: Bool { truncatedSource }
     private var unifiedReadingTask = false
     private var readingOptions: AiReadingOptionsRecord?
     private var readingLanguage = ""
@@ -905,6 +908,7 @@ public final class AIAssistantModel: ObservableObject {
                     usage = reported
                 }
             case .diagnostics(let reported):
+                if !merging && reported.finishReason == "length" { truncatedSource = true }
                 diagnostics.append(reported)
             case .done:
                 handleDone()
@@ -1306,6 +1310,7 @@ public final class AIAssistantModel: ObservableObject {
         partLabels = [:]
         currentPartIndex = nil
         merging = false
+        truncatedSource = false
     }
 
     private func resetStreamOutput() {

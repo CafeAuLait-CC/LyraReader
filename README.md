@@ -62,6 +62,11 @@ separate features with their own documented limits.
   answers can be kept as editable reading notes with separate personal thoughts; updates require
   reviewing a suggestion. Interleaf keeps its existing inline conversation and page tear, with
   Finish & Make Note in its existing actions menu.
+  Prereading and whole-document Summary share a source-matched analysis; a matching completed
+  result is reused without another request. Chat uses a stable original-text prefix for short
+  analyzed documents and bounded original passages for longer ones, including explicit chapter
+  requests and follow-ups. Provider-reported cached input is shown as a subset of input usage;
+  cache availability and savings depend on the configured service.
   AI uses an OpenAI-compatible endpoint or a ChatGPT plan. Tasks send directly by default;
   optional request review takes place in a separate native window. Document prereading can be
   requested, always enabled or disabled; while it runs, other AI requests wait, and completion

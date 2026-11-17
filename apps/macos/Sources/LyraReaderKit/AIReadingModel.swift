@@ -26,6 +26,7 @@ final class AIReadingModel: ObservableObject {
     @Published var selectedNoteID: String?
     @Published var updatingNoteID: String?
     private var noteWorker: AIAssistantModel?
+    private weak var analysisOwner: AIDocumentKnowledge?
     private var noteGeneration = UUID()
     private var documentKey: String?
     private var documentInstance: UUID?
@@ -143,6 +144,7 @@ final class AIReadingModel: ObservableObject {
     }
 
     func cancelPresentation() {
+        if analysisOwner?.reader === summary { analysisOwner?.cancel() }
         generation = UUID()
         for task in operations.values { task.cancel() }; operations.removeAll()
         for worker in [summary, translation, chat] { worker.cancelRegionWork(); saveCompleted(worker) }
@@ -176,7 +178,7 @@ final class AIReadingModel: ObservableObject {
         else { frozenTranslation = context; translationExcerpt = excerpt }
     }
 
-    func run(_ kind: String, state: AppState) {
+    func run(_ kind: String, state: AppState, force: Bool = false) {
         guard let live = state.aiReaderContext, !state.documentKnowledge.isBlocking else { return }
         let usesSelection = kind == "summary" ? summarySelection : translationSelection
         if usesSelection && (kind == "summary" ? frozenSummary : frozenTranslation) == nil { useSelection(kind, state: state) }
@@ -189,6 +191,7 @@ final class AIReadingModel: ObservableObject {
         guard !usesSelection || context.selection != nil else { notice = "Select a passage first."; return }
         let worker = worker(kind)
         guard !worker.isPreparing, !worker.isSending else { return }
+        if kind == "summary" && !usesSelection { analysisOwner = state.documentKnowledge }
         let token = generation
         let id = UUID().uuidString
         let outputLanguage = kind == "summary" ? language : translationLanguage
@@ -199,16 +202,36 @@ final class AIReadingModel: ObservableObject {
         worker.attach(service: service(state), context: context)
         operations[kind]?.cancel()
         operations[kind] = Task {
+            let source = kind == "summary" && !usesSelection ? state.document?.url : nil
+            let cache = state.translationDocumentURL ?? source
+            var sharedLease: UInt64?
+            defer { if let sharedLease { state.documentKnowledge.cancelSummary(model: worker, lease: sharedLease) } }
+            if let source, let cache {
+                do {
+                    state.documentKnowledge.settings = settings
+                    if !force, let cached = try await state.documentKnowledge.cachedSummary(sourceURL: source,
+                        cacheDocumentURL: cache, language: outputLanguage, detail: requestedDetail) {
+                        guard generation == token, activeResults[kind]?.id == id, !Task.isCancelled else { return }
+                        worker.discard(); store.put(cached); activeResults.removeValue(forKey: kind)
+                        return
+                    }
+                    sharedLease = try await state.documentKnowledge.prepareSummary(model: worker, sourceURL: source,
+                        cacheDocumentURL: cache, language: outputLanguage, detail: requestedDetail, resultID: id,
+                        retry: { [weak self, weak state] in guard let self, let state else { return }; self.run("summary", state: state, force: true) })
+                } catch is CancellationError { return }
+                catch { notice = AIReadableError.message(error); return }
+            }
             let action: AIAssistantAction = usesSelection ? (kind == "summary" ? .summarizeSelection : .translateSelection) : .summarizeDocument
             await worker.prepare(action: action, context: context,
                                  reading: AiReadingOptionsRecord(kind: kind, detail: requestedDetail), outputLanguage: outputLanguage)
             guard generation == token, activeResults[kind]?.id == id, worker.phase == .preview, let plan = worker.plan else { return }
-            if settings.reviewBeforeSending {
+            if settings.reviewBeforeSending && source == nil {
                 let approved = await AIReadingReviewWindow.review(plan)
                 guard generation == token, activeResults[kind]?.id == id, worker.phase == .preview else { return }
                 guard approved else { worker.cancelRegionWork(); return }
             }
-            worker.send()
+            if let source, let cache, let sharedLease { state.documentKnowledge.sendSummary(model: worker, sourceURL: source, cacheDocumentURL: cache, lease: sharedLease) }
+            else { worker.send() }
         }
     }
 
@@ -241,7 +264,7 @@ final class AIReadingModel: ObservableObject {
         record.originals = plan.sources.map(\.snippet)
         record.originalPages = plan.sources.map(\.page)
         if record.excerpt.isEmpty { record.excerpt = plan.sources.map(\.snippet).joined(separator: "\n\n") }
-        record.status = worker.phase == .finished && worker.errorMessage == nil && worker.finishReason != "length" ? "finished" : "partial"
+        record.status = worker.phase == .finished && worker.errorMessage == nil && worker.finishReason != "length" && !worker.hasTruncatedSource ? "finished" : "partial"
         store.put(record)
         activeResults.removeValue(forKey: kind)
     }

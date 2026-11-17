@@ -374,6 +374,10 @@ struct ReaderChecks {
             try await aiReadingInteractionChecks(root: fastRoot)
             return
         }
+        if CommandLine.arguments.contains("--check-shared-reading") {
+            try await sharedDocumentUnderstandingChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-ai-reading-workspace") {
             try await aiReadingWorkspaceChecks(root: fastRoot)
             return
@@ -1292,6 +1296,7 @@ struct ReaderChecks {
                 try await inPlaceTranslationChecks(root: root)
             }),
             ("ai-reading-interactions", { try await aiReadingInteractionChecks(root: root) }),
+            ("shared-document-understanding", { try await sharedDocumentUnderstandingChecks(root: root) }),
             ("region-reading-notes", {
                 try await regionReadingNotesChecks(root: root)
             }),

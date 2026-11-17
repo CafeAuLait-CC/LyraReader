@@ -127,3 +127,8 @@
 "Collapsed" = "Collapsed";
 "Expand or collapse this section" = "Expand or collapse this section";
 "Lyra can read this document once to connect ideas across your questions, and save that understanding locally. You can keep reading the PDF while it works; AI tools become available when prereading finishes. You can also continue without it." = "Lyra can read this document once to connect ideas across your questions, and save that understanding locally. You can keep reading the PDF while it works; AI tools become available when prereading finishes. You can also continue without it.";
+"%lld cached input (of prompt)" = "%lld cached input (of prompt)";
+"Document analysis is already in progress." = "Document analysis is already in progress.";
+"The document analysis could not start. Please try again." = "The document analysis could not start. Please try again.";
+"The document understanding cache limit is unsupported." = "The document understanding cache limit is unsupported.";
+"The saved document understanding is too large. Its file was kept." = "The saved document understanding is too large. Its file was kept.";
