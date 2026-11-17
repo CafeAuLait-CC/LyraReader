@@ -295,6 +295,8 @@ public final class AIDocumentKnowledge: ObservableObject {
     func prepareSummary(model: AIAssistantModel, sourceURL: URL, cacheDocumentURL: URL, language: String, detail: String, resultID: String, retry: @escaping () -> Void) async throws -> UInt64 {
         let (hash, _) = try await loadMemory(sourceURL: sourceURL, cacheDocumentURL: cacheDocumentURL)
         try Task.checkCancellation()
+        // Another entry can acquire the shared choice while the fingerprint/cache I/O awaits.
+        guard !isBlocking else { throw AIPreReadingPause(message: aiReadingLabel("Document analysis is already in progress.")) }
         switch try memory.begin(source: hash, language: language, detail: detail, force: true) {
         case let .start(lease): analysisLease = lease
         case .waiting: throw AIPreReadingPause(message: aiReadingLabel("Document analysis is already in progress."))

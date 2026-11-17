@@ -113,6 +113,12 @@ extension ReaderChecks {
             selection: AIReaderSelection(page: 1, start: 0, end: 3))
         let request = Task { try await otherKnowledge.ensure(service: otherService, context: otherContext, sourceURL: other, cacheDocumentURL: other) }
         try await eventually("prereading still asks before any provider work", { otherKnowledge.phase == .consent })
+        let choiceReader = otherKnowledge.reader
+        do { _ = try await otherKnowledge.prepareSummary(model: AIAssistantModel(settings: settings), sourceURL: other,
+            cacheDocumentURL: other, language: "", detail: "Standard", resultID: UUID().uuidString, retry: {})
+            require(false, "another Summary cannot replace an active prereading choice") }
+        catch { require(error is AIPreReadingPause && otherKnowledge.phase == .consent && otherKnowledge.reader === choiceReader,
+            "Summary preparation preserves the active choice and its original reader") }
         otherKnowledge.proceed()
         do { _ = try await request.value; require(false, "prereading pauses the original action") }
         catch { require(error is AIPreReadingPause, "the approved preread uses the existing recoverable gate") }
