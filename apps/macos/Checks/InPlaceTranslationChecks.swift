@@ -130,8 +130,8 @@ extension ReaderChecks {
     }
 
     @MainActor
-    private static func blockContaining(_ needle: String, textPage: LyraReaderKit.TextPage) -> TranslationBlock {
-        let blocks = TranslationBlockDetector.blocks(page: 0, textPage: textPage)
+    private static func blockContaining(_ needle: String, textPage: LyraReaderKit.TextPage) throws -> TranslationBlock {
+        let blocks = try TranslationBlockDetector.blocks(page: 0, textPage: textPage)
         guard let block = blocks.first(where: { $0.sourceText.contains(needle) }) else {
             fatalError("No translation block contains \(needle). Blocks: \(blocks.map(\.sourceText))")
         }
@@ -159,7 +159,7 @@ extension ReaderChecks {
         guard let textPage = await state.translationTextPage(0) else {
             fatalError("translation fixture has no text layer")
         }
-        let block = blockContaining("Line 1", textPage: textPage)
+        let block = try blockContaining("Line 1", textPage: textPage)
 
         guard let placement = state.canvasPageFrames.first(where: { $0.index == 0 }) else {
             fatalError("The translation fixture has no page placement")
@@ -366,7 +366,7 @@ extension ReaderChecks {
         guard let textPage = await state.translationTextPage(0) else {
             fatalError("translation fixture has no text layer")
         }
-        let block = blockContaining("Line 1", textPage: textPage)
+        let block = try blockContaining("Line 1", textPage: textPage)
         state.selectTranslationRange(page: 0, range: block.range)
         _ = state.performTranslationAction()
         try await waitForTranslation(state)
@@ -389,7 +389,7 @@ extension ReaderChecks {
 
         // The restored tab must still write to the *first* document's cache, not the tab that
         // was on screen a moment ago. Translating another block proves which file was updated.
-        let tabBlocks = TranslationBlockDetector.blocks(page: 0, textPage: textPage)
+        let tabBlocks = try TranslationBlockDetector.blocks(page: 0, textPage: textPage)
         guard let other = tabBlocks.first(where: { $0.range != block.range }) else {
             fatalError("The tab fixture has no second block")
         }
@@ -420,7 +420,7 @@ extension ReaderChecks {
         guard let relaunchedText = await relaunched.translationTextPage(0) else {
             fatalError("relaunched fixture has no text layer")
         }
-        let relaunchedBlock = blockContaining("Line 1", textPage: relaunchedText)
+        let relaunchedBlock = try blockContaining("Line 1", textPage: relaunchedText)
         relaunched.selectTranslationRange(page: 0, range: relaunchedBlock.range)
         require(relaunched.translationSelectionTitle == "Show original",
                 "the restored block offers Show original")
@@ -440,7 +440,7 @@ extension ReaderChecks {
         guard let textPage = await state.translationTextPage(0) else {
             fatalError("translation fixture has no text layer")
         }
-        let block = blockContaining("Line 1", textPage: textPage)
+        let block = try blockContaining("Line 1", textPage: textPage)
         state.selectTranslationRange(page: 0, range: block.range)
         _ = state.performTranslationAction()
         try await waitForTranslation(state)
@@ -503,7 +503,7 @@ extension ReaderChecks {
             fatalError("the translation fixture has no editable text run: \(state.lastError ?? "")")
         }
         // Translate two blocks first: the edited one and a different one on the same page.
-        let blocks = TranslationBlockDetector.blocks(page: 0, textPage: textPage)
+        let blocks = try TranslationBlockDetector.blocks(page: 0, textPage: textPage)
         guard let editedBlock = blocks.first(where: {
             $0.rect.intersects(CGRect(x: item.bounds.x, y: item.bounds.y,
                                       width: item.bounds.width, height: item.bounds.height))
@@ -575,7 +575,7 @@ extension ReaderChecks {
         guard let textPage = await state.translationTextPage(0) else {
             fatalError("translation fixture has no text layer")
         }
-        let blocks = TranslationBlockDetector.blocks(page: 0, textPage: textPage)
+        let blocks = try TranslationBlockDetector.blocks(page: 0, textPage: textPage)
         require(blocks.count >= 2, "the batch check needs at least two paragraph blocks")
         let chosen = Array(blocks.prefix(2))
         let range = chosen[0].range.lowerBound...chosen[1].range.upperBound
@@ -595,7 +595,7 @@ extension ReaderChecks {
         guard let cancelText = await cancelState.translationTextPage(0) else {
             fatalError("cancel fixture has no text layer")
         }
-        let cancelBlock = blockContaining("Line 1", textPage: cancelText)
+        let cancelBlock = try blockContaining("Line 1", textPage: cancelText)
         cancelState.selectTranslationRange(page: 0, range: cancelBlock.range)
         _ = cancelState.performTranslationAction()
         try await eventually("a translating overlay appears") {
@@ -627,7 +627,7 @@ extension ReaderChecks {
         guard let rotationText = await rotationState.translationTextPage(0) else {
             fatalError("rotation fixture has no text layer")
         }
-        let rotationBlock = blockContaining("Line 1", textPage: rotationText)
+        let rotationBlock = try blockContaining("Line 1", textPage: rotationText)
         rotationState.selectTranslationRange(page: 0, range: rotationBlock.range)
         _ = rotationState.performTranslationAction()
         try await waitForTranslation(rotationState)
@@ -649,7 +649,7 @@ extension ReaderChecks {
         guard let deleteText = await deleteState.translationTextPage(0) else {
             fatalError("delete fixture has no text layer")
         }
-        let deleteBlock = blockContaining("Body text", textPage: deleteText)
+        let deleteBlock = try blockContaining("Body text", textPage: deleteText)
         deleteState.selectTranslationRange(page: 0, range: deleteBlock.range)
         _ = deleteState.performTranslationAction()
         try await waitForTranslation(deleteState)
@@ -688,7 +688,7 @@ extension ReaderChecks {
         guard let textPage = await state.translationTextPage(0) else {
             fatalError("the audit fixture has no text layer")
         }
-        let blocks = TranslationBlockDetector.blocks(page: 0, textPage: textPage)
+        let blocks = try TranslationBlockDetector.blocks(page: 0, textPage: textPage)
         require(blocks.count >= 2, "the audit fixture needs two blocks")
         let first = blocks[0], second = blocks[1]
 
@@ -867,7 +867,7 @@ extension ReaderChecks {
         guard let textPage = await state.translationTextPage(0) else {
             fatalError("the tear fixture has no text layer")
         }
-        let blocks = TranslationBlockDetector.blocks(page: 0, textPage: textPage)
+        let blocks = try TranslationBlockDetector.blocks(page: 0, textPage: textPage)
         guard let straddleBlock = blocks.first(where: { $0.lineRects.count >= 2 }),
               let aboveBlock = blocks.last(where: { $0.rect.maxY < straddleBlock.rect.minY - 1 })
         else { fatalError("the tear fixture needs an above block and a multi-line block") }

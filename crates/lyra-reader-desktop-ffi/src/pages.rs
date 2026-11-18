@@ -378,6 +378,15 @@ impl DesktopDocument {
             .lock()
             .map_err(|_| "Annotation state is unavailable")?;
         let mut report = Value::Null;
+        // Capture completed translation bytes before a successful save retires the session.
+        // Cache failures are reported after PDF publication, never disguised as PDF failure.
+        let translation_directory = edits.directory.clone();
+        let translation_save = matches!(op, "page_apply" | "document_save").then(|| {
+            self.translations
+                .lock()
+                .map_err(|_| "Translation state is unavailable.".to_owned())?
+                .save_snapshot(marks.cache_location()?)
+        });
         let (document, next_marks) = match op {
             "page_restore" => {
                 if edits.control.is_some() {
@@ -710,8 +719,44 @@ impl DesktopDocument {
             }
             _ => return Err("Unknown page operation".into()),
         };
+        let next_location = next_marks.cache_location()?.clone();
         drop(marks);
         self.activate(Arc::clone(&document), next_marks)?;
+        let translation_result = (|| {
+            let mut translations = self
+                .translations
+                .lock()
+                .map_err(|_| "Translation state is unavailable.")?;
+            if let Some(snapshot) = translation_save {
+                translations.publish_snapshot(&next_location, snapshot?.as_deref())?;
+            }
+            let state = edits.quit_state()?;
+            translations.adopt_revision(crate::translation::RevisionChange {
+                previous: &current,
+                next: &document,
+                location: &next_location,
+                session: edits.directory.clone(),
+                state: state.as_ref(),
+                report: &report,
+                operation: op,
+                original_path: &self.original_path,
+            })
+        })();
+        if let Err(mut error) = translation_result {
+            if matches!(op, "page_apply" | "document_save")
+                && let Some(directory) = translation_directory
+            {
+                directory.preserve_retired_files();
+                error.push_str(&format!(
+                    " Translation recovery files were kept at {}",
+                    directory.path.display()
+                ));
+            }
+            if let Ok(mut translations) = self.translations.lock() {
+                translations.block_revision(error.clone());
+            }
+            crate::translation::append_warning(&mut report, error);
+        }
         let state = self
             .marks
             .lock()

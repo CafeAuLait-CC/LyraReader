@@ -158,8 +158,16 @@ pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     result
 }
 
+pub(super) fn lock_translation_cache(directory: &Path) -> Result<fs::File, String> {
+    lock_ai_cache(directory, ".translations.lock", "translations")
+}
+
 /// Summary generation and identity migration share the same short advisory write lease.
 pub(super) fn lock_summary_cache(directory: &Path) -> Result<fs::File, String> {
+    lock_ai_cache(directory, ".summaries.lock", "summaries")
+}
+
+fn lock_ai_cache(directory: &Path, name: &str, label: &str) -> Result<fs::File, String> {
     let mut options = fs::OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
     #[cfg(unix)]
@@ -168,10 +176,10 @@ pub(super) fn lock_summary_cache(directory: &Path) -> Result<fs::File, String> {
         options.mode(0o600);
     }
     let lock = options
-        .open(directory.join(".summaries.lock"))
+        .open(directory.join(name))
         .map_err(|e| e.to_string())?;
     fs2::FileExt::try_lock_exclusive(&lock).map_err(|e| {
-        format!("Another window is saving summaries. The original cache was kept: {e}")
+        format!("Another window is saving {label}. The original cache was kept: {e}")
     })?;
     Ok(lock)
 }
@@ -252,8 +260,14 @@ impl DocumentCache {
             if !destination.exists()
                 && let Some(bytes) = read_optional(&previous.join(name))?
             {
-                let _summary_lease = (*name == "summaries.json")
-                    .then(|| lock_summary_cache(&self.directory))
+                let _summary_lease = matches!(*name, "summaries.json" | "translations.json")
+                    .then(|| {
+                        if *name == "translations.json" {
+                            lock_translation_cache(&self.directory)
+                        } else {
+                            lock_summary_cache(&self.directory)
+                        }
+                    })
                     .transpose()?;
                 // A cooperating writer may have published while this migration acquired its lease.
                 if !destination.exists() {
@@ -332,8 +346,14 @@ impl DocumentCache {
             for name in CARRIED_FILES.iter().filter(|n| **n != "source.json") {
                 if let Some(bytes) = read_optional(&self.directory.join(name))? {
                     let destination = next.directory.join(name);
-                    let _summary_lease = (*name == "summaries.json")
-                        .then(|| lock_summary_cache(&next.directory))
+                    let _summary_lease = matches!(*name, "summaries.json" | "translations.json")
+                        .then(|| {
+                            if *name == "translations.json" {
+                                lock_translation_cache(&next.directory)
+                            } else {
+                                lock_summary_cache(&next.directory)
+                            }
+                        })
                         .transpose()?;
                     let conflict = match *name {
                         "summaries.json" => Some(

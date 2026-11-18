@@ -28,6 +28,7 @@ mod summary;
 mod summary_batch;
 mod summary_store;
 mod tile_plan;
+mod translation;
 use document::DesktopDocument as Document;
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
@@ -38,7 +39,7 @@ use std::{
 /// Version of the Qt boundary, including bounded layered-summary batch commands.
 #[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_desktop_abi_version() -> u32 {
-    15
+    16
 }
 
 /// Persist one resolved quit without deleting any draft. Resolution: 0=save, 1=discard.
@@ -571,6 +572,17 @@ pub unsafe extern "C" fn lyra_reader_desktop_cancel_summary_batch(document: *con
     // SAFETY: the caller retains the live opaque handle for this atomic-only borrow.
     if let Some(document) = unsafe { document.as_ref() } {
         document.request_summary_cancel();
+    }
+}
+
+/// Stop translation admission without locks, PDFium or I/O; drain through translation_cancel.
+/// # Safety
+/// A non-null document is an aligned, initialized open handle and remains alive for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_cancel_translation(document: *const Document) {
+    // SAFETY: the caller retains the live opaque handle for this atomic-only borrow.
+    if let Some(document) = unsafe { document.as_ref() } {
+        document.request_translation_cancel();
     }
 }
 
@@ -1541,7 +1553,7 @@ mod tests {
 
     #[test]
     fn image_byte_boundary_rejects_null_handles_and_reports_its_version() {
-        assert_eq!(lyra_reader_desktop_abi_version(), 15);
+        assert_eq!(lyra_reader_desktop_abi_version(), 16);
         assert_eq!(
             lyra_reader_desktop_zoom_preset_inset_pt(),
             lyra_reader_session::ZOOM_PRESET_INSET_PT

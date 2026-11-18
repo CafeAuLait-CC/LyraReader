@@ -92,7 +92,8 @@ ApplicationWindow {
     function openRegionNotes(){if(currentReader.pageCount>0){aiRegionCard.close();showAiPanelMode(true,"notes");}}
     function focusReadingView() {
         if(currentReader.pageCount>0) {
-            const target=overviewVisible ? overviewContent.focusTarget : textViewVisible ? accessibleTextView.focusTarget : pageList;
+            const frame=!overviewVisible && !textViewVisible ? canvas.pageFrame(currentPage,canvas.placementEpoch) : null;
+            const target=overviewVisible ? overviewContent.focusTarget : textViewVisible ? accessibleTextView.focusTarget : frame && frame.focusTarget ? frame.focusTarget : pageList;
             if(target)target.forceActiveFocus();
         } else contentItem.forceActiveFocus();
     }
@@ -2486,7 +2487,7 @@ ApplicationWindow {
                 Accessible.name: qsTr("Go to page")
                 onAccepted: {
                     root.navigate(Number(text) - 1);
-                    pageList.forceActiveFocus();
+                    root.focusReadingView();
                 }
             }
             Label {
@@ -2626,6 +2627,11 @@ ApplicationWindow {
     }
     Connections {
         target: root.currentReader
+        function onTranslationsChanged() {
+            const warning=root.currentReader.translationState.cache_warning;
+            if(warning)root.operationStatus=String(warning);
+        }
+
         function onDocumentReset() {
             root.clearNavigation();
             root.pendingLayoutPosition=null;

@@ -169,7 +169,12 @@ Questions continue independently; Stop, retry and document changes cannot publis
 understanding. A completed reading enriches new previews and is cached by PDF fingerprint; selected
 text translation keeps its original context. Corrupt, foreign or concurrently changed cache files
 are retained, with an in-memory result and a warning when a completed reading cannot be cached.
-Newer AI workflows remain work in progress.
+In-place translation previews each complete selected paragraph, or one partial selection, before
+explicit Send. Up to three audited requests run together. Completed passages appear over the paper;
+their menus show the original or the full translation when fitted text does not fit. Saved translations
+reopen locally without another request and follow working page revisions, undo and verified Save.
+The PDF bytes and exports retain their original text. Corrupt or externally changed translation caches
+are preserved with a warning. Newer AI workflows remain work in progress.
 Reference and figure indices use bounded shared-engine steps, yielding between steps to admitted
 raster work. Page-local citation lookups use the same cooperative gate. Previews share the pinned
 revision and completed indices; closing or switching a reader cancels its pending scan without

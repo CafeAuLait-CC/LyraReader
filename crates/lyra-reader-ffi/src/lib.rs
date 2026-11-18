@@ -45,6 +45,7 @@ pub mod format;
 mod index_cache;
 pub mod navigation;
 pub mod transaction;
+pub mod translation;
 pub use api::{DocumentSummary, LyraReaderDocument, LyraReaderEngine, LyraReaderFfiError};
 pub use navigation::{
     LyraReaderNavigationHistory, NavigationHistorySnapshotRecord, ReaderLocationRecord,

@@ -3,6 +3,7 @@ import CoreGraphics
 import CoreText
 import CryptoKit
 import Foundation
+import LyraReaderBindings
 
 // MARK: - Cache identity
 
@@ -69,8 +70,9 @@ public struct TranslationPaperColor: Equatable, Sendable {
 /// same PDF cannot produce a different key. The page is included because the same sentence at the
 /// same coordinates on two pages is still two translations.
 public struct TranslationCacheKey: Hashable, Sendable {
-    public static let promptVersion = "inplace-translation-v1"
+    public static let promptVersion = inplaceTranslationPromptVersion()
 
+    private let rustDigest: String
     public let sourceHash: String
     public let page: Int
     public let rectXHundredths: Int
@@ -82,7 +84,17 @@ public struct TranslationCacheKey: Hashable, Sendable {
     public let promptVersion: String
 
     public init(sourceText: String, page: Int, rect: CGRect, language: String, model: String,
-                promptVersion: String = TranslationCacheKey.promptVersion) {
+                promptVersion: String = TranslationCacheKey.promptVersion) throws {
+        guard let checkedPage = UInt32(exactly: page) else {
+            throw NSError(domain: "LyraReader", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "The translation page is invalid."])
+        }
+        // Rust validates representability before the diagnostic facts below convert to Int.
+        self.rustDigest = try inplaceTranslationCacheKey(
+            source: sourceText, page: checkedPage,
+            rect: AiSourceRectRecord(xPt: Double(rect.minX), yPt: Double(rect.minY),
+                                     widthPt: Double(rect.width), heightPt: Double(rect.height)),
+            language: language, model: model, version: promptVersion)
         let digest = SHA256.hash(data: Data(sourceText.utf8))
             .map { String(format: "%02x", $0) }.joined()
         self.sourceHash = digest
@@ -97,8 +109,8 @@ public struct TranslationCacheKey: Hashable, Sendable {
     }
 
     public init(entry: InPlaceTranslation, language: String, model: String,
-                promptVersion: String = TranslationCacheKey.promptVersion) {
-        self.init(sourceText: entry.sourceText, page: entry.page, rect: entry.rect,
+                promptVersion: String = TranslationCacheKey.promptVersion) throws {
+        try self.init(sourceText: entry.sourceText, page: entry.page, rect: entry.rect,
                   language: language, model: model, promptVersion: promptVersion)
     }
 
@@ -107,21 +119,8 @@ public struct TranslationCacheKey: Hashable, Sendable {
     }
 
     /// The stable cache filename/dictionary key. SHA-256 of a canonical, locale-free string.
-    public var digest: String {
-        let canonical = [
-            sourceHash,
-            String(page),
-            String(rectXHundredths),
-            String(rectYHundredths),
-            String(rectWidthHundredths),
-            String(rectHeightHundredths),
-            language,
-            model,
-            promptVersion,
-        ].joined(separator: "\u{1F}")
-        return SHA256.hash(data: Data(canonical.utf8))
-            .map { String(format: "%02x", $0) }.joined()
-    }
+    public var digest: String { rustDigest }
+
 }
 
 /// One cached translation. This is what lives in the document edit cache and survives relaunch.
@@ -246,93 +245,21 @@ public struct TranslationBlock: Equatable, Sendable {
 }
 
 public enum TranslationBlockDetector {
-    /// The largest vertical gap, as a multiple of the median line height, that still reads as
-    /// the same paragraph. Same value as the Rust block builder (`blocks_from`: 0.8), so the
-    /// paragraph the translator sees and the paragraph the AI context sees agree.
-    public static let gapFactor: CGFloat = 0.8
-
-    public static func blocks(page: Int, textPage: TextPage) -> [TranslationBlock] {
-        guard !textPage.chars.isEmpty else { return [] }
-        let all = 0...(textPage.chars.count - 1)
-        let lineRects = textPage.selectionRects(in: all)
-        var lines: [(rect: CGRect, range: ClosedRange<Int>)] = []
-        for rect in lineRects where rect.width > 0.5 && rect.height > 0.5 {
-            guard let range = textPage.characterRange(in: rect) else { continue }
-            lines.append((rect, range))
-        }
-        guard !lines.isEmpty else { return [] }
-        let heights = lines.map(\.rect.height).filter { $0 > 0 }.sorted()
-        let medianHeight = heights.isEmpty ? 10 : heights[heights.count / 2]
-        let maxGap = medianHeight * gapFactor
-        let medianFont = max(7, min(18, medianHeight))
-
-        struct Group {
-            var rect: CGRect
-            var lines: [(rect: CGRect, range: ClosedRange<Int>)]
-        }
-        var groups: [Group] = []
-        let sorted = lines.sorted {
-            if abs($0.rect.minY - $1.rect.minY) > 0.5 { return $0.rect.minY < $1.rect.minY }
-            return $0.rect.minX < $1.rect.minX
-        }
-        func column(_ rect: CGRect) -> Int { Int((rect.minX / 20).rounded()) }
-
-        for line in sorted {
-            var target: Int?
-            for (index, group) in groups.enumerated() {
-                guard let previous = group.lines.last?.rect else { continue }
-                let gap = line.rect.minY - previous.maxY
-                let overlaps = line.rect.minX < previous.maxX && previous.minX < line.rect.maxX
-                if gap >= -0.5 && gap <= maxGap && overlaps
-                    && column(previous) == column(line.rect) {
-                    target = index
-                    break
-                }
-            }
-            if let target {
-                groups[target].rect = groups[target].rect.union(line.rect)
-                groups[target].lines.append(line)
-            } else {
-                groups.append(Group(rect: line.rect, lines: [line]))
-            }
-        }
-
-        return groups.compactMap { group in
-            let lower = group.lines.map(\.range.lowerBound).min() ?? 0
-            let upper = group.lines.map(\.range.upperBound).max() ?? lower
-            guard lower <= upper, lower >= 0, upper < textPage.chars.count else { return nil }
-            let trimmed = trimmedRange(lower...upper, in: textPage)
-            guard let trimmed else { return nil }
-            let source = textPage.string(in: trimmed)
-            guard !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-            return TranslationBlock(page: page, range: trimmed, rect: group.rect,
-                                    lineRects: group.lines.map(\.rect), sourceText: source,
-                                    sourceFontPt: medianFont)
-        }
-        .sorted { lhs, rhs in
-            if abs(lhs.rect.minY - rhs.rect.minY) > 0.5 { return lhs.rect.minY < rhs.rect.minY }
-            return lhs.rect.minX < rhs.rect.minX
+    public static func blocks(page: Int, textPage: TextPage) throws -> [TranslationBlock] {
+        try textPage.translationBlocks().map { value in
+            TranslationBlock(page: page, range: Int(value.start)...Int(value.end),
+                             rect: value.translationRect, lineRects: value.translationLineRects,
+                             sourceText: value.sourceText, sourceFontPt: CGFloat(value.sourceFontPt))
         }
     }
+}
 
-    /// Strip leading and trailing whitespace from a character range without changing the
-    /// characters in between. The page string and the selection indices stay aligned: nothing is
-    /// normalised, so the hash is a hash of the text the provider would receive.
-    public static func trimmedRange(_ range: ClosedRange<Int>,
-                                    in textPage: TextPage) -> ClosedRange<Int>? {
-        let clamped = range.clamped(to: 0...(max(0, textPage.chars.count - 1)))
-        guard !clamped.isEmpty else { return nil }
-        func isWhitespace(_ index: Int) -> Bool {
-            guard let scalar = Unicode.Scalar(textPage.chars[index].unicode) else { return true }
-            return CharacterSet.whitespacesAndNewlines.contains(scalar)
-        }
-        var lower = clamped.lowerBound
-        while lower <= clamped.upperBound && isWhitespace(lower) { lower += 1 }
-        guard lower <= clamped.upperBound else { return nil }
-        var upper = clamped.upperBound
-        while upper >= lower && isWhitespace(upper) { upper -= 1 }
-        guard upper >= lower else { return nil }
-        return lower...upper
+private extension TranslationTargetRecord {
+    var translationRect: CGRect {
+        CGRect(x: rect.xPt, y: rect.yPt, width: rect.widthPt, height: rect.heightPt)
+    }
+    var translationLineRects: [CGRect] {
+        lineRects.map { CGRect(x: $0.xPt, y: $0.yPt, width: $0.widthPt, height: $0.heightPt) }
     }
 }
 
@@ -360,59 +287,15 @@ public struct TranslationTarget: Equatable, Sendable {
 }
 
 public enum TranslationTargetResolver {
-    /// Turn the reader's selection into one or more translation targets.
-    ///
-    /// If the selection's non-whitespace characters are exactly the union of one or more whole
-    /// paragraph blocks, each block becomes a target (a multi-paragraph selection is a batch of
-    /// block requests). Anything else — part of a paragraph, a table row, a line crossing a
-    /// gutter — is a free selection and becomes one target over the selected line rectangles.
+    /// Rust owns paragraph grouping, exact scalar extraction and whole-block coverage.
     public static func targets(page: Int, range: ClosedRange<Int>,
-                               textPage: TextPage) -> [TranslationTarget] {
-        guard let trimmed = TranslationBlockDetector.trimmedRange(range, in: textPage) else {
-            return []
+                               textPage: TextPage) throws -> [TranslationTarget] {
+        try textPage.translationTargets(in: range).map { value in
+            TranslationTarget(page: page, range: Int(value.start)...Int(value.end),
+                              rect: value.translationRect, lineRects: value.translationLineRects,
+                              sourceText: value.sourceText, sourceFontPt: CGFloat(value.sourceFontPt),
+                              isBlock: value.isBlock)
         }
-        let blocks = TranslationBlockDetector.blocks(page: page, textPage: textPage)
-        let selected = contentIndices(trimmed, textPage: textPage)
-        var covered = Set<Int>()
-        var whole: [TranslationBlock] = []
-        for block in blocks where trimmed.lowerBound <= block.range.lowerBound
-            && block.range.upperBound <= trimmed.upperBound {
-            let indices = contentIndices(block.range, textPage: textPage)
-            guard !indices.isEmpty, indices.isSubset(of: selected) else { continue }
-            covered.formUnion(indices)
-            whole.append(block)
-        }
-        if !whole.isEmpty && covered == selected {
-            return whole.map { block in
-                TranslationTarget(page: page, range: block.range, rect: block.rect,
-                                  lineRects: block.lineRects, sourceText: block.sourceText,
-                                  sourceFontPt: block.sourceFontPt, isBlock: true)
-            }
-        }
-
-        let lineRects = textPage.selectionRects(in: trimmed)
-        guard let first = lineRects.first else { return [] }
-        let union = lineRects.dropFirst().reduce(first) { $0.union($1) }
-        guard union.width > 0.5, union.height > 0.5 else { return [] }
-        let source = textPage.string(in: trimmed)
-        guard !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
-        let heights = lineRects.map(\.height).filter { $0 > 0 }.sorted()
-        let font = heights.isEmpty ? 10 : max(7, min(18, heights[heights.count / 2]))
-        return [TranslationTarget(page: page, range: trimmed, rect: union, lineRects: lineRects,
-                                  sourceText: source, sourceFontPt: font, isBlock: false)]
-    }
-
-    private static func contentIndices(_ range: ClosedRange<Int>, textPage: TextPage) -> Set<Int> {
-        var result = Set<Int>()
-        for index in range where index >= 0 && index < textPage.chars.count {
-            guard let scalar = Unicode.Scalar(textPage.chars[index].unicode) else { continue }
-            if CharacterSet.whitespacesAndNewlines.contains(scalar) { continue }
-            if textPage.chars[index].widthPt <= 0 || textPage.chars[index].heightPt <= 0 {
-                continue
-            }
-            result.insert(index)
-        }
-        return result
     }
 }
 

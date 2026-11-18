@@ -8,6 +8,7 @@ Item {
     required property var app
     required property var paperMap
     required property Component paint
+    property bool paintActive: true
     property rect sourceRect: Qt.rect(0,0,0,0)
     property real zoom: app.zoom
     property string accessibleName: ""
@@ -55,7 +56,7 @@ Item {
                 objectName: "paperFragmentPaint"+piece.index
                 // Geometry bindings can briefly disagree on a revision during one update.
                 // Keep paint alive and source-sized; only its clip/visibility follows pieces.
-                active: staticRegion.mapped && staticRegion.bounded
+                active: staticRegion.paintActive && staticRegion.mapped && staticRegion.bounded
                 visible: piece.present && staticRegion.visible
                 sourceComponent: staticRegion.paint
                 x: piece.present ? (staticRegion.sourceRect.x-piece.original.x)*staticRegion.zoom : 0

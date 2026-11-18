@@ -3975,6 +3975,52 @@ impl LyraReaderDocument {
         &self,
         request: AiPlanRequestRecord,
     ) -> Result<AiPlanRecord, LyraReaderFfiError> {
+        self.prepare_ai_plan_with_translation_source(request, None)
+    }
+
+    /// Build a local preview from the same filtered scalar selection the reader copies.
+    pub fn prepare_inplace_translation_plan(
+        &self,
+        request: AiPlanRequestRecord,
+    ) -> Result<AiPlanRecord, LyraReaderFfiError> {
+        if request.action != AiActionRecord::TranslateSelection {
+            return Err(LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Recoverable,
+                message: "An in-place translation requires a translation action.".into(),
+            });
+        }
+        let selection = request
+            .selection
+            .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Recoverable,
+                message: "Select text to translate.".into(),
+            })?;
+        if self.prepared_selection_text_page(selection.page)?.is_none() {
+            self.text_page(selection.page)?;
+        }
+        let text = self
+            .prepared_selection_text_page(selection.page)?
+            .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Recoverable,
+                message: "The translation text page is not prepared.".into(),
+            })?;
+        if selection.start > selection.end || selection.end as usize >= text.chars().len() {
+            return Err(LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Recoverable,
+                message: "The translation range is outside the current page.".into(),
+            });
+        }
+        let source = text.string_in_range(selection.start, selection.end);
+        self.prepare_ai_plan_with_translation_source(request, Some(source))
+    }
+}
+
+impl LyraReaderDocument {
+    fn prepare_ai_plan_with_translation_source(
+        &self,
+        request: AiPlanRequestRecord,
+        translation_source: Option<String>,
+    ) -> Result<AiPlanRecord, LyraReaderFfiError> {
         let action = match request.action {
             AiActionRecord::SummarizePage => AiAction::SummarizePage,
             AiActionRecord::SummarizeSelection => AiAction::SummarizeSelection,
@@ -4248,7 +4294,9 @@ impl LyraReaderDocument {
                 settings,
                 document_knowledge: knowledge,
             };
-            if request.document_knowledge {
+            if let Some(source) = translation_source {
+                lyra_reader_ai::chat::build_inplace_translation_plan(input, source)?
+            } else if request.document_knowledge {
                 build_document_knowledge_plan(input)?
             } else {
                 build_plan(input)?
@@ -4256,7 +4304,10 @@ impl LyraReaderDocument {
         };
         Ok(ai_plan_record(plan))
     }
+}
 
+#[uniffi::export]
+impl LyraReaderDocument {
     /// Inspect one layered-summary level without building prompts or wire bodies. The panel
     /// calls this when it opens: every unit returns the hash of exactly the text it would send,
     /// so a cached summary can be matched (or marked stale) with no request.

@@ -301,6 +301,26 @@ public struct TextPage: Sendable {
         self.rust = rust
     }
 
+    /// Explicit translation actions share Rust's cached paragraphs and scalar extraction.
+    public func translationTargets(in range: ClosedRange<Int>) throws -> [TranslationTargetRecord] {
+        guard let start = UInt32(exactly: range.lowerBound), let end = UInt32(exactly: range.upperBound),
+              let page = UInt32(exactly: page) else {
+            throw NSError(domain: "LyraReader", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "The translation range is invalid."])
+        }
+        if let rust, let result = try rust.translationTargets(start: start, end: end) { return result }
+        return try translationTargetsForText(page: page, chars: chars, start: start, end: end)
+    }
+
+    public func translationBlocks() throws -> [TranslationTargetRecord] {
+        guard let page = UInt32(exactly: page) else {
+            throw NSError(domain: "LyraReader", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "The translation page is invalid."])
+        }
+        if let rust, let result = try rust.translationBlocks() { return result }
+        return try translationBlocksForText(page: page, chars: chars)
+    }
+
     /// The text line touched by an annotation, excluding a separate line-number gutter.
     public func lineBounds(overlapping region: CGRect) -> CGRect? {
         selectionLines.map(\.bounds).filter { $0.intersects(region) }.max {
@@ -464,6 +484,14 @@ final class TextPageRust: Sendable {
     func warmIfNeeded() {
         guard !isPrepared else { return }
         warm()
+    }
+
+    func translationTargets(start: UInt32, end: UInt32) throws -> [TranslationTargetRecord]? {
+        try document.textTranslationTargets(page: page, start: start, end: end)
+    }
+
+    func translationBlocks() throws -> [TranslationTargetRecord]? {
+        try document.textTranslationBlocks(page: page)
     }
 
     func characterIndex(at point: CGPoint, extendingSelection: Bool) -> Int?? {
@@ -4461,7 +4489,7 @@ public final class RustEngine: PDFEngine {
     /// and never on the main thread: a document summary reads every page. The result still
     /// describes the document that was open when the call started; an epoch change means the
     /// reader switched tabs, and a stale preview must not be shown for the new file.
-    public func prepareAIPlan(_ request: AiPlanRequestRecord) async throws -> AiPlanRecord {
+    public func prepareAIPlan(_ request: AiPlanRequestRecord, inPlaceTranslation: Bool = false) async throws -> AiPlanRecord {
         guard let document else {
             throw NSError(
                 domain: "LyraReader",
@@ -4473,7 +4501,13 @@ public final class RustEngine: PDFEngine {
         let plan: AiPlanRecord = try await withCheckedThrowingContinuation { continuation in
             rasterQueue.async {
                 do {
-                    continuation.resume(returning: try document.prepareAiPlan(request: request))
+                    let prepared: AiPlanRecord
+                    if inPlaceTranslation {
+                        prepared = try document.prepareInplaceTranslationPlan(request: request)
+                    } else {
+                        prepared = try document.prepareAiPlan(request: request)
+                    }
+                    continuation.resume(returning: prepared)
                 } catch {
                     continuation.resume(throwing: error)
                 }

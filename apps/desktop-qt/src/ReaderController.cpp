@@ -98,7 +98,7 @@ bool ReaderController::hasUnsavedChanges()const {
     return marks.value(QStringLiteral("page_pending")).toBool() ||
         (!localOnly && marks.value(QStringLiteral("pdf_dirty")).toBool()) || !m_noteDrafts.isEmpty() || hasEditDrafts();
 }
-ReaderController::~ReaderController(){abandonSummaryBatch();m_indexCancellation->store(true);if(m_aiRegionPaperCancel)m_aiRegionPaperCancel->store(true);RasterJobs::cancel(m_aiRegionJob);clearRasterCache();NativeImageProvider::unregisterSource(m_contentSourceKey);}
+ReaderController::~ReaderController(){abandonTranslations();abandonSummaryBatch();m_indexCancellation->store(true);if(m_aiRegionPaperCancel)m_aiRegionPaperCancel->store(true);RasterJobs::cancel(m_aiRegionJob);clearRasterCache();NativeImageProvider::unregisterSource(m_contentSourceKey);}
 void ReaderController::abandonSummaryBatch(){
     const auto document=m_document;
     if(!document || m_summaryBatchState.isEmpty())return;
@@ -356,7 +356,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
     if(mutation)++m_mutationSequence;
     const auto mutationSequence=m_mutationSequence;
     const auto generation = m_generation;
-    const bool latestOnly=operation==QStringLiteral("ai_summary_cached") || operation==QStringLiteral("search") || operation==QStringLiteral("bibtex") || operation==QStringLiteral("layout") || operation==QStringLiteral("ai_preview") || operation==QStringLiteral("ai_summary_catalog") || operation==QStringLiteral("ai_summary_inspect") || operation==QStringLiteral("ai_summary_prepare") || operation==QStringLiteral("ai_summary_batch_prepare") || operation==QStringLiteral("split_plan") || operation==QStringLiteral("content_objects");
+    const bool latestOnly=operation==QStringLiteral("translation_prepare") || operation==QStringLiteral("ai_summary_cached") || operation==QStringLiteral("search") || operation==QStringLiteral("bibtex") || operation==QStringLiteral("layout") || operation==QStringLiteral("ai_preview") || operation==QStringLiteral("ai_summary_catalog") || operation==QStringLiteral("ai_summary_inspect") || operation==QStringLiteral("ai_summary_prepare") || operation==QStringLiteral("ai_summary_batch_prepare") || operation==QStringLiteral("split_plan") || operation==QStringLiteral("content_objects");
     if(latestOnly)m_latestRead.insert(operation,id);
     ++m_pendingCommands;
     QPointer<ReaderController> alive(this);emit commandsChanged();if(!alive)return 0;
@@ -376,7 +376,7 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         deliveryGeneration=m_generation;
         if((operation==QStringLiteral("marks") || operation==QStringLiteral("content_objects")) && mutationSequence!=m_mutationSequence)return;
         if(latestOnly && m_latestRead.value(operation)!=id)return;
-        if (!outcome.error.isEmpty() && operation!=QStringLiteral("split_plan") && operation!=QStringLiteral("region_thumbnail") && !operation.startsWith(QStringLiteral("ai_")) && !operation.startsWith(QStringLiteral("knowledge_"))) {setError(outcome.error);if(!current())return;}
+        if (!outcome.error.isEmpty() && operation!=QStringLiteral("split_plan") && operation!=QStringLiteral("region_thumbnail") && !operation.startsWith(QStringLiteral("ai_")) && !operation.startsWith(QStringLiteral("knowledge_")) && !operation.startsWith(QStringLiteral("translation_"))) {setError(outcome.error);if(!current())return;}
         else if (operation==QStringLiteral("content_stage") || operation==QStringLiteral("page_stage") || operation==QStringLiteral("page_undo") || operation==QStringLiteral("page_redo") || operation==QStringLiteral("page_discard") || operation==QStringLiteral("page_apply") || operation==QStringLiteral("document_save") || operation==QStringLiteral("document_discard")) {
             const auto revision=outcome.result.toMap();
             const auto info=revision.value(QStringLiteral("info")).toMap();
@@ -388,7 +388,8 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
             emit revisionAboutToChange(keepLayout);if(!current())return;
             setRasterSource(outcome.source);
             const bool reloadForms=m_data.contains(QStringLiteral("forms"));
-            ++m_generation;deliveryGeneration=m_generation;resetAi();if(!current())return;clearRasterCache();m_pending.clear();m_failed.clear();m_requests.clear();m_textPages.clear();m_textPending.clear();
+            rememberTranslationView(operation,revision.value(QStringLiteral("report")).toMap());
+            ++m_generation;deliveryGeneration=m_generation;resetAi(true);if(!current())return;clearRasterCache();m_pending.clear();m_failed.clear();m_requests.clear();m_textPages.clear();m_textPending.clear();
             if(!samePageSizes(m_pages,info.value(QStringLiteral("pages")).toList()))clearFitPageSpacing();
             if(!keepLayout){m_pages=info.value(QStringLiteral("pages")).toList();m_layoutRows=info.value(QStringLiteral("rows")).toList();m_layoutConfiguration={{QStringLiteral("mode"),info.value(QStringLiteral("mode"))},{QStringLiteral("gap"),info.value(QStringLiteral("gap"))}};m_documentWidth=info.value(QStringLiteral("width")).toDouble();m_documentHeight=info.value(QStringLiteral("height")).toDouble();}
             m_data.clear();m_data.insert(QStringLiteral("marks"),revision.value(QStringLiteral("marks")));m_data.insert(QStringLiteral("signature_status"),info.value(QStringLiteral("signature_status")));

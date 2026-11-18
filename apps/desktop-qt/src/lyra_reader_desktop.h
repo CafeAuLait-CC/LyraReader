@@ -2,7 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 
-inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 15;
+inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 16;
 
 // Owned Rust allocations: free each Buffer exactly once using buffer_free.
 // Output buffers must be zero initialized; calls do not free previous contents.
@@ -116,6 +116,7 @@ bool lyra_reader_desktop_command(const LyraReaderDesktopDocument *document,
     const std::uint8_t *request, std::size_t request_len, LyraReaderBuffer *output, LyraReaderBuffer *error);
 // Atomic-only admission stop; no locks, PDFium or I/O. The live handle is retained by the caller.
 void lyra_reader_desktop_cancel_summary_batch(const LyraReaderDesktopDocument *document);
+void lyra_reader_desktop_cancel_translation(const LyraReaderDesktopDocument *document);
 // These synchronous calls only query prepared text; NotPrepared is distinct from Error.
 // Ready owns a UTF-8 buffer; a miss/error leaves output untouched. Endpoints may be reversed.
 enum class LyraReaderSelectionStatus : std::uint32_t { Error=0, NotPrepared=1, Ready=2 };

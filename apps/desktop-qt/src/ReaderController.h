@@ -37,6 +37,8 @@ class ReaderController : public QObject {
     Q_PROPERTY(QVariantMap summaryCatalog READ summaryCatalog NOTIFY summaryCatalogChanged)
     Q_PROPERTY(QVariantMap summaryUnitContext READ summaryUnitContext NOTIFY summaryCatalogChanged)
     Q_PROPERTY(QVariantMap documentReading READ documentReading NOTIFY documentReadingChanged)
+    Q_PROPERTY(QVariantList translationOverlays READ translationOverlays NOTIFY translationOverlaysChanged)
+    Q_PROPERTY(QVariantMap translationState READ translationState NOTIFY translationsChanged)
     Q_PROPERTY(QVariantMap aiRegion READ aiRegion NOTIFY aiRegionChanged)
     Q_PROPERTY(QVariantMap aiRegionPaper READ aiRegionPaper NOTIFY aiRegionPaperChanged)
     Q_PROPERTY(QVariantMap regionNoteDraft READ regionNoteDraft NOTIFY regionNoteDraftChanged)
@@ -75,6 +77,11 @@ public:
     double documentWidth() const { return m_documentWidth; }
     double documentHeight() const { return m_documentHeight; }
     QUrl fileUrl() const { return m_lastUrl; }
+    QVariantList translationOverlays()const;
+    QVariantMap translationState()const{return m_translationState;}
+    Q_INVOKABLE bool prepareInplaceTranslation(const QVariantMap &request);
+    Q_INVOKABLE void inspectTranslations(int page);
+    Q_INVOKABLE void toggleTranslation(const QString &id);
     QVariantMap aiState()const{return m_aiState;}
     QVariantMap summaryCatalog()const{return m_summaryCatalog;}
     Q_INVOKABLE void setSummaryExpanded(bool expanded);
@@ -188,6 +195,8 @@ public:
     static int cpuCacheKiB();
     static QString rasterKey(int page, double scale,bool embedded=false);
 signals:
+    void translationsChanged();
+    void translationOverlaysChanged();
     void documentChanged();
     void fitPresentationChanged();
     void documentReset();
@@ -228,6 +237,27 @@ private:
     void initSummaryCatalog();
     void resetSummaryCatalog();
     bool hasSummaryLanguageContext(qulonglong expectedGeneration)const;
+    void initTranslations();
+    void resetTranslations(bool preserveViews=false);
+    void rememberTranslationView(const QString &operation,const QVariantMap &report);
+    void abandonTranslations();
+    bool startInplaceTranslation(const QString &key,const QVariantMap &plan);
+    void cancelInplaceTranslation();
+    void applyTranslationFrame(const QVariantMap &frame);
+    void acceptTranslationOverlay(const QVariantMap &target,const QString &id,const QString &text,const QString &language,const QString &model,const QString &viewKey,bool restoreView);
+    void handleTranslationCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error);
+    using TranslationViewMode=QPair<QString,int>;
+    QHash<QString,QSet<TranslationViewMode>> m_translationViews;
+    QSet<TranslationViewMode> m_translationCarryModes;
+    QStringList m_translationViewOrder;
+    bool m_translationRestoreHistory=false;
+    QVariantMap m_translationState;
+    QMap<QString,QVariantMap> m_translationOverlays;
+    QHash<quint64,int> m_translationInspections;
+    QSet<int> m_translationInspectedPages;
+    QString m_translationPreparedToken,m_translationActiveToken;
+    bool m_translationActive=false;
+    quint64 m_translationCancelId=0;
     void initSummaryBatch();
     void resetSummaryBatch();
     void abandonSummaryBatch();
@@ -258,7 +288,7 @@ private:
     quint64 m_regionRevision=0,m_regionSnapshotRevision=0;
     bool m_regionFlushRequested=false,m_regionCancelRequested=false,m_regionClearPending=false;
     QVariantMap m_pendingRegionCapture;
-    void resetAi();
+    void resetAi(bool preserveTranslationViews=false);
     void initDocumentReading();
     void resetDocumentReading();
     void handleDocumentReadingCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error);

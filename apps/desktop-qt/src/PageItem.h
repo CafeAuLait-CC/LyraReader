@@ -51,6 +51,8 @@ public:
     bool paperGeometryActive()const{return m_paperLayout.has_value();}
     qulonglong paperGeometryRevision()const{return m_paperEpoch;}
     double paperSceneLimit()const;
+    Q_INVOKABLE QColor translationPaperColor(const QRectF &source)const;
+    Q_INVOKABLE QColor translationInkColor(const QColor &paper)const;
     std::optional<LyraReaderPaperLayout> paperLayout()const{return m_paperLayout;}
     // One atomic geometry update. It does not change source pixels, raster demand or zoom.
     Q_INVOKABLE bool configurePaper(double originalHeightPt,double splitPt,double gapPt);

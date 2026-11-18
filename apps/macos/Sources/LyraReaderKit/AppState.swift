@@ -1718,13 +1718,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
             translationNotice = "The text layer for this page could not be read, so nothing was sent."
             return
         }
-        let targets = TranslationTargetResolver.targets(
-            page: selection.page, range: selection.range, textPage: textPage)
-        guard !targets.isEmpty else {
-            translationNotice = "The selection has no text to translate."
-            return
+        do {
+            let targets = try TranslationTargetResolver.targets(
+                page: selection.page, range: selection.range, textPage: textPage)
+            guard !targets.isEmpty else {
+                translationNotice = "The selection has no text to translate."
+                return
+            }
+            inPlaceTranslation.translate(targets: targets)
+        } catch {
+            translationNotice = error.localizedDescription
         }
-        inPlaceTranslation.translate(targets: targets)
     }
 
     // MARK: - Translation host

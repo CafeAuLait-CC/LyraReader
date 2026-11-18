@@ -16,6 +16,7 @@ pub mod region_export;
 pub mod region_history;
 pub mod sections;
 pub mod summary_cache;
+pub mod translation;
 
 pub use chat::{
     Action, CHAT_RETRIEVED_BLOCKS, CONNECTION_TEST_MAX_TOKENS, CONNECTION_TEST_PROMPT, ChatImage,

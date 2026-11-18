@@ -87,6 +87,7 @@ final class InPlaceTranslationController {
     private(set) var completedCount = 0
     private(set) var cancelledCount = 0
     private(set) var cacheWriteCount = 0
+    private var cacheWriteError: String?
     private(set) var lastError: String?
 
     private struct Environment {
@@ -128,6 +129,7 @@ final class InPlaceTranslationController {
         failed = [:]
         notice = nil
         lastError = nil
+        cacheWriteError = nil
         guard let url, pageCount > 0 else { publish(); return }
         let cacheURL = DocumentEditCache.translationsURL(for: url)
         do {
@@ -138,6 +140,7 @@ final class InPlaceTranslationController {
             }.map { ($0.key, $0.value) })
         } catch {
             // A damaged cache is kept on disk for recovery; it is never silently replaced.
+            cacheWriteError = error.localizedDescription
             notice = "The cached translations could not be read; nothing was sent. "
                 + "Open AI translation again to request them. (\(error.localizedDescription))"
         }
@@ -211,6 +214,7 @@ final class InPlaceTranslationController {
         entries = [:]
         failed = [:]
         originalKeys = []
+        var validationError: String?
         var dropped = 0
         for entry in snapshot.entries.values {
             if entry.page < 0 || entry.page >= pageCount {
@@ -233,11 +237,12 @@ final class InPlaceTranslationController {
             }
             var moved = entry
             if mappedPage != entry.page {
-                moved.key = TranslationCacheKey(
+                guard let key = validatedCacheKey(
                     sourceText: entry.sourceText, page: mappedPage, rect: entry.rect,
                     language: entry.language, model: entry.model,
                     promptVersion: entry.promptVersion
-                ).digest
+                ) else { continue }
+                moved.key = key
             }
             entries[moved.key] = moved
             if snapshot.originalKeys.contains(entry.key) { originalKeys.insert(moved.key) }
@@ -262,11 +267,11 @@ final class InPlaceTranslationController {
                                            sourceFontPt: target.sourceFontPt,
                                            isBlock: target.isBlock)
             }
-            let key = TranslationCacheKey(
+            guard let key = validatedCacheKey(
                 sourceText: target.sourceText, page: target.page, rect: target.rect,
                 language: item.language, model: item.model,
                 promptVersion: Self.promptVersion
-            ).digest
+            ) else { continue }
             failed[key] = .init(target: target, message: item.message, key: key,
                                 language: item.language, model: item.model)
         }
@@ -274,8 +279,11 @@ final class InPlaceTranslationController {
         // longer matches. Other pages keep their overlays.
         if !editedPages.isEmpty {
             for (key, entry) in entries where editedPages.contains(entry.page) {
-                if let page = await host?.translationTextPage(entry.page),
-                   entryStillMatches(entry, page: page) {
+                guard let page = await host?.translationTextPage(entry.page) else { continue }
+                do {
+                    if try entryStillMatches(entry, page: page) { continue }
+                } catch {
+                    validationError = "A cached translation could not be validated; its original entry was kept: \(error.localizedDescription)"
                     continue
                 }
                 entries.removeValue(forKey: key)
@@ -284,7 +292,11 @@ final class InPlaceTranslationController {
             }
         }
         saveCache()
-        if let reason, dropped > 0 {
+        if let cacheWriteError {
+            notice = "Translation cache writes are blocked; original data was kept: \(cacheWriteError)"
+        } else if let validationError {
+            notice = validationError
+        } else if let reason, dropped > 0 {
             notice = reason + " \(dropped) in-place translation"
                 + (dropped == 1 ? " was" : "s were")
                 + " removed. The PDF itself was not modified."
@@ -304,13 +316,17 @@ final class InPlaceTranslationController {
     func translate(targets: [TranslationTarget]) {
         guard !targets.isEmpty else { return }
         guard let environment = makeEnvironment() else { publish(); return }
-        var cacheHits = 0
+        var keyed: [(TranslationTarget, String)] = []
         for target in targets {
-            let key = TranslationCacheKey(
+            guard let key = validatedCacheKey(
                 sourceText: target.sourceText, page: target.page, rect: target.rect,
                 language: environment.language, model: environment.model,
                 promptVersion: Self.promptVersion
-            ).digest
+            ) else { publish(); return }
+            keyed.append((target, key))
+        }
+        var cacheHits = 0
+        for (target, key) in keyed {
             if entries[key] != nil {
                 originalKeys.remove(key)
                 failed.removeValue(forKey: key)
@@ -683,6 +699,7 @@ final class InPlaceTranslationController {
                                          end: item.target.range.upperBound),
             question: nil,
             language: item.environment.language,
+            inPlaceTranslation: true,
             settings: item.environment.providerSettings
         )
         let plan = try await service.prepare(request)
@@ -748,7 +765,24 @@ final class InPlaceTranslationController {
         return DocumentEditCache.translationsURL(for: documentURL)
     }
 
+    private func validatedCacheKey(sourceText: String, page: Int, rect: CGRect,
+                                   language: String, model: String, promptVersion: String) -> String? {
+        do {
+            return try TranslationCacheKey(sourceText: sourceText, page: page, rect: rect,
+                                           language: language, model: model,
+                                           promptVersion: promptVersion).digest
+        } catch {
+            cacheWriteError = error.localizedDescription
+            notice = "The translation cache identity could not be validated; original data was kept: \(error.localizedDescription)"
+            return nil
+        }
+    }
+
     private func saveCache() {
+        if let cacheWriteError {
+            notice = "Translation cache writes are blocked; original data was kept: \(cacheWriteError)"
+            return
+        }
         guard let cacheURL else { return }
         do {
             try TranslationCacheStore.save(entries, to: cacheURL)
@@ -765,28 +799,26 @@ final class InPlaceTranslationController {
     /// entry therefore needs a block at the same rectangle carrying the same source text. A free
     /// selection needs the same text under the same line rectangles.
     private func entryStillMatches(_ entry: InPlaceTranslation,
-                                   page: TextPage) -> Bool {
-        let blocks = TranslationBlockDetector.blocks(page: entry.page, textPage: page)
+                                   page: TextPage) throws -> Bool {
+        let candidates: [TranslationTarget]
         if entry.isBlock {
-            return blocks.contains { block in
-                block.sourceText == entry.sourceText
-                    && abs(block.rect.minX - entry.rect.minX) < 1.5
-                    && abs(block.rect.minY - entry.rect.minY) < 1.5
-                    && abs(block.rect.width - entry.rect.width) < 1.5
-                    && abs(block.rect.height - entry.rect.height) < 1.5
+            candidates = try TranslationBlockDetector.blocks(page: entry.page, textPage: page).map {
+                TranslationTarget(page: $0.page, range: $0.range, rect: $0.rect,
+                                  lineRects: $0.lineRects, sourceText: $0.sourceText,
+                                  sourceFontPt: $0.sourceFontPt, isBlock: true)
             }
+        } else {
+            guard let range = entry.range, range.lowerBound >= 0,
+                  range.upperBound < page.chars.count else { return false }
+            candidates = try TranslationTargetResolver.targets(page: entry.page, range: range, textPage: page)
         }
-        guard let range = entry.range,
-              range.lowerBound >= 0, range.upperBound < page.chars.count,
-              let trimmed = TranslationBlockDetector.trimmedRange(range, in: page),
-              page.string(in: trimmed) == entry.sourceText else { return false }
-        let rects = page.selectionRects(in: trimmed)
-        guard let first = rects.first else { return false }
-        let union = rects.dropFirst().reduce(first) { $0.union($1) }
-        return abs(union.minX - entry.rect.minX) < 1.5
-            && abs(union.minY - entry.rect.minY) < 1.5
-            && abs(union.width - entry.rect.width) < 1.5
-            && abs(union.height - entry.rect.height) < 1.5
+        return candidates.contains { target in
+            target.sourceText == entry.sourceText
+                && abs(target.rect.minX - entry.rect.minX) < 1.5
+                && abs(target.rect.minY - entry.rect.minY) < 1.5
+                && abs(target.rect.width - entry.rect.width) < 1.5
+                && abs(target.rect.height - entry.rect.height) < 1.5
+        }
     }
 
     /// Drop entries whose source text no longer matches the page. Used after a relaunch (the file
@@ -803,7 +835,12 @@ final class InPlaceTranslationController {
                 entries.removeValue(forKey: key); originalKeys.remove(key); removed += 1; continue
             }
             guard let page = await host.translationTextPage(entry.page) else { continue }
-            if entryStillMatches(entry, page: page) { continue }
+            do {
+                if try entryStillMatches(entry, page: page) { continue }
+            } catch {
+                notice = "A cached translation could not be validated; its original entry was kept: \(error.localizedDescription)"
+                continue
+            }
             entries.removeValue(forKey: key)
             originalKeys.remove(key)
             removed += 1

@@ -140,6 +140,22 @@ impl SessionFiles {
 mod tests {
     use super::*;
     #[test]
+    fn a_retired_auxiliary_cache_error_keeps_its_recovery_files() {
+        let root = std::env::temp_dir().join(format!(
+            "lyra-reader-aux-recovery-{}",
+            crate::marks::uuid().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let file = root.join("unreadable-cache.json");
+        fs::write(&file, b"original foreign bytes").unwrap();
+        let directory = SessionDirectory::temporary(root.clone());
+        directory.retire().unwrap();
+        directory.preserve_retired_files();
+        drop(directory);
+        assert_eq!(fs::read(&file).unwrap(), b"original foreign bytes");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn directory_aliases_share_the_file_lease_registry() {
         let root = std::env::temp_dir().join(format!(
             "lyra-reader-lease-alias-{}",
@@ -245,6 +261,11 @@ impl SessionDirectory {
             control.mutate(|h| h.collect_revision_garbage(protected))?;
         }
         Ok(())
+    }
+    /// A PDF save succeeded but an auxiliary draft could not be decoded or published.
+    /// Retire its recovery pointer normally, while retaining the original files for repair.
+    pub(super) fn preserve_retired_files(&self) {
+        self.files.cleanup.store(false, Ordering::Release);
     }
     pub fn retire(&self) -> Result<(), String> {
         let mut owner = lock(&self.owner).map_err(|e| e.to_string())?;

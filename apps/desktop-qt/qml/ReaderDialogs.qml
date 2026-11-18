@@ -326,6 +326,12 @@ Item {
         }
         MenuSeparator {}
         MenuItem {
+            text: qsTr("Translate in Place…")
+            Accessible.description:qsTr("With page focus, Control+Shift+L opens translation previews.")
+            enabled: !!app.selection
+            onTriggered: {app.currentReader.setAiInput("action",3);app.currentReader.setAiInput("inplace",true);app.showAiPanel(true);}
+        }
+        MenuItem {
             text: qsTr("Ask AI about Selection")
             enabled: !!app.selection
             onTriggered: { app.currentReader.setAiInput("action",2); app.showAiPanel(true); }

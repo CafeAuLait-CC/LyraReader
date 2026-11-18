@@ -54,7 +54,8 @@ Pane {
         if (batchMode) { prepareBatch(batchState.layer, batchState.offset); return; }
         if (unitMode) { prepareUnit(summaryUnit.id); return; }
         const modes = ["SummarizePage", "SummarizeDocument", "AskSelection", "TranslateSelection", "DocumentChat", "SummarizeSelection"];
-        owner.prepareAi(baseRequest(modes[action]));
+        if(workspace==="translation" && input.inplace)owner.prepareInplaceTranslation(baseRequest("TranslateSelection"));
+        else owner.prepareAi(baseRequest(modes[action]));
     }
     function followLink(link) {
         const plan=aiPanel.result.responsePlan || {};
@@ -233,6 +234,26 @@ Pane {
                 onContextGenerationChanged: recreate()
                 onLoaded: { item.targetReader = aiPanel.owner; item.expectedGeneration = aiPanel.owner.documentGeneration; }
             }
+        CheckBox {
+            objectName: "inplaceTranslationMode"
+            visible: aiPanel.workspace === "translation"
+            text: qsTr("Show translation in place")
+            checked: !!aiPanel.input.inplace
+            enabled: !aiPanel.running
+            onToggled: aiPanel.owner.setAiInput("inplace",checked)
+        }
+        Label {
+            visible: aiPanel.workspace === "translation" && !!aiPanel.input.inplace
+            text: qsTr("One request per complete paragraph. Preview before sending. Saved translations and showing the original use no network. Long answers use a bounded page preview; ⋯ retains the full text.")
+            wrapMode:Text.Wrap;textFormat:Text.PlainText;Layout.fillWidth:true
+            color:app.colors.textSecondary;font.pixelSize:11
+        }
+        Label {
+            visible: aiPanel.workspace === "translation" && !!text
+            text: aiPanel.owner.translationState.cache_warning || ""
+            wrapMode:Text.Wrap;textFormat:Text.PlainText;Layout.fillWidth:true
+            color:app.colors.textSecondary;font.pixelSize:11
+        }
         TextField {
             objectName: "aiTranslationLanguage"
             visible: aiPanel.workspace === "translation"
@@ -399,9 +420,9 @@ Pane {
             ComboBox {
                 id: payloadRow
                 objectName: "summaryBatchPayloadRow"
-                visible: !!aiPanel.plan && aiPanel.plan.kind === "summary_batch"
+                visible: !!aiPanel.plan && ["summary_batch","inplace_translation"].indexOf(aiPanel.plan.kind)>=0
                 Layout.fillWidth: true
-                model: aiPanel.plan ? aiPanel.plan.summary_rows || [] : []
+                model: aiPanel.plan ? aiPanel.plan.summary_rows || aiPanel.plan.translation_rows || [] : []
                 textRole: "title"
                 onModelChanged: currentIndex = 0
                 Accessible.name: qsTr("Request in this batch")
@@ -413,8 +434,8 @@ Pane {
                     text: {
                         const plan = aiPanel.plan;
                         if (!plan) return "";
-                        if (plan.kind !== "summary_batch") return plan.parts.map(part => part.wire_body).join("\n\n");
-                        const row = (plan.summary_rows || [])[payloadRow.currentIndex];
+                        if (["summary_batch","inplace_translation"].indexOf(plan.kind)<0) return plan.parts.map(part => part.wire_body).join("\n\n");
+                        const row = (plan.summary_rows || plan.translation_rows || [])[payloadRow.currentIndex];
                         return row && plan.parts[row.part_index] ? plan.parts[row.part_index].wire_body : "";
                     }
                     readOnly: true; selectByMouse: true; wrapMode: TextEdit.WrapAnywhere; textFormat: TextEdit.PlainText; font.family: "monospace"

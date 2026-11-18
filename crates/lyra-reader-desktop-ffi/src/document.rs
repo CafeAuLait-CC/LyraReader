@@ -20,6 +20,8 @@ pub struct DesktopDocument {
     ai: Mutex<Option<Arc<LyraReaderAiRequest>>>,
     summary_batch: Mutex<crate::summary_batch::Batch>,
     summary_scope: Arc<crate::summary_batch::Scope>,
+    pub(super) translation_scope: Arc<crate::summary_batch::Scope>,
+    pub(super) translations: Mutex<crate::translation::Translations>,
     pub(super) summaries: Mutex<crate::summary_store::Store>,
     pub(super) knowledge: Mutex<crate::knowledge::Knowledge>,
     pub(super) regions: Mutex<crate::region_store::RegionStore>,
@@ -163,6 +165,21 @@ pub(super) fn layout_value(source_layout: &DocumentLayout, r: &Value) -> Result<
 }
 
 impl DesktopDocument {
+    pub(crate) fn ai_running(&self) -> Result<bool, String> {
+        Ok(self
+            .ai
+            .lock()
+            .map_err(|_| "AI state is unavailable.")?
+            .as_ref()
+            .is_some_and(|job| !job.is_finished()))
+    }
+    pub(crate) fn summary_running(&self) -> Result<bool, String> {
+        Ok(self
+            .summary_batch
+            .lock()
+            .map_err(|_| "Summary state is unavailable.")?
+            .is_running())
+    }
     pub(crate) fn request_summary_cancel(&self) {
         self.summary_scope.cancel();
     }
@@ -204,6 +221,7 @@ impl DesktopDocument {
         let original = Arc::clone(&engine);
         let original_layout = DocumentLayout::new(sizes, PAGE_GAP_PT);
         let summary_scope = Arc::new(crate::summary_batch::Scope::default());
+        let translation_scope = Arc::new(crate::summary_batch::Scope::default());
         let document = Self {
             original_signature: engine.signature_status(),
             original_xfa: engine.xfa_status(),
@@ -216,6 +234,10 @@ impl DesktopDocument {
             ai: Mutex::new(None),
             summary_batch: Mutex::new(crate::summary_batch::Batch::new(Arc::clone(&summary_scope))),
             summary_scope,
+            translations: Mutex::new(crate::translation::Translations::new(Arc::clone(
+                &translation_scope,
+            ))),
+            translation_scope,
             summaries: Mutex::new(crate::summary_store::Store::default()),
             knowledge: Mutex::new(crate::knowledge::Knowledge::default()),
             regions: Mutex::new(crate::region_store::RegionStore::default()),
@@ -328,6 +350,16 @@ impl DesktopDocument {
             .get("op")
             .and_then(Value::as_str)
             .ok_or("Missing operation")?;
+        if op.starts_with("translation_") {
+            return self.translation_command(op, &r);
+        }
+        if matches!(
+            op,
+            "ai_start" | "ai_summary_batch_prepare" | "ai_summary_batch_start"
+        ) && self.translations_running()?
+        {
+            return Err("Stop the in-place translation before starting another response.".into());
+        }
         if op.starts_with("knowledge_") {
             return self.knowledge_command(op, &r);
         }
@@ -344,6 +376,7 @@ impl DesktopDocument {
                     | "document_discard"
             )
         {
+            self.request_translation_cancel();
             self.invalidate_reading()?;
         }
         // The shared writer already rejects XFA derivatives. Gate shell-side mutations too,
@@ -487,6 +520,13 @@ impl DesktopDocument {
                     d.page_count(),
                     marks.cache_root(),
                 );
+                let translation_snapshot = self
+                    .translations
+                    .lock()
+                    .map_err(|_| "Translation state is unavailable.".to_owned())
+                    .and_then(|mut translations| {
+                        translations.save_snapshot(marks.cache_location()?)
+                    });
                 let payload = marks.payload(&d)?;
                 let prepared = crate::saving::prepare(
                     &d,
@@ -518,6 +558,16 @@ impl DesktopDocument {
                 })?;
                 let mut report = report;
                 report["forms"] = prepared.form_report;
+                let translation_error = (|| {
+                    self.translations
+                        .lock()
+                        .map_err(|_| "Translation state is unavailable.")?
+                        .publish_snapshot(
+                            published.cache_location()?,
+                            translation_snapshot?.as_deref(),
+                        )
+                })()
+                .err();
                 let region_error = (|| {
                     crate::region_store::carry_notes(
                         marks.cache_location()?,
@@ -529,6 +579,9 @@ impl DesktopDocument {
                     (Some(a), Some(b)) => Some(format!("{a}. {b}")),
                     (a, b) => a.or(b),
                 });
+                if let Some(error) = translation_error {
+                    crate::translation::append_warning(&mut report, error);
+                }
                 value(Ok(report))
             }
             "save_current_annotations" | "replace_current_annotations" => {

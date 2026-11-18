@@ -2889,6 +2889,116 @@ private slots:
         const auto connection=connect(raw,&ReaderController::commandsChanged,this,[&]{if(armed && raw->pendingCommands()>0){armed=false;reader.reset();}});
         raw->openCachedSummary("page:1","synthetic-lifetime");QVERIFY(!armed);QVERIFY(alive.isNull());disconnect(connection);
     }
+    void inplaceTranslationKeepsPreviewCacheAndPaperGeometry_data() {
+        QTest::addColumn<QString>("theme");QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
+    }
+    void inplaceTranslationKeepsPreviewCacheAndPaperGeometry() {
+        QFETCH(QString,theme);
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");
+        const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});
+        qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
+        const auto path=scratch.filePath("synthetic-inplace-translation.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        QFile pdf(path);QVERIFY(pdf.open(QIODevice::ReadOnly));const auto original=pdf.readAll();pdf.close();
+        MockChatServer server;QVERIFY(server.listen());
+        server.responder=[](const QByteArray &){return MockChatServer::Response{{MockChatServer::delta({{"content",QString("A synthetic translation with enough words to exercise fitting and the full text disclosure. ").repeated(20)}}),QByteArray("data: [DONE]\n\n")},30};};
+        NativeCorpus::Viewer view;QVERIFY(view.window);QSignalSpy warnings(&view.engine,&QQmlEngine::warnings);auto *window=view.window;window->setProperty("appearance",theme);window->resize(900,760);
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(!reader->loading() && reader->pageCount()==1 && !reader->pendingCommands());
+        reader->requestText(0);QTRY_VERIFY(reader->textPages().contains("0"));
+        const auto chars=reader->textPages().value("0").toMap().value("chars").toList();QVERIFY(!chars.isEmpty());
+        const QVariantMap request{{"action","TranslateSelection"},{"current_page",0},{"selection",QVariantMap{{"page",0},{"start",0},{"end",chars.size()-1}}},{"question",QVariant{}},{"language","French"},{"history",QVariantList{}},{"region",QVariant{}},{"base_url",server.baseUrl()},{"model","synthetic-inplace"},{"temperature",QVariant{}},{"max_tokens",QVariant{}},{"reasoning_mode","default"},{"reasoning_encoding","none"},{"document_knowledge",false},{"document_knowledge_text",QVariant{}},{"document_knowledge_pages",QVariantList{}}};
+        QVERIFY(reader->prepareInplaceTranslation(request));QTRY_COMPARE(reader->pendingCommands(),0);
+        const auto plan=reader->aiState().value("plan").toMap();const auto parts=plan.value("parts").toList();QVERIFY(!parts.isEmpty());QCOMPARE(plan.value("kind").toString(),QString("inplace_translation"));QVERIFY(server.requests.isEmpty());
+        QVERIFY(reader->startAi("local",plan));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),15000);QTRY_COMPARE(reader->pendingCommands(),0);
+        QCOMPARE(server.requests.size(),parts.size());QVERIFY(server.maximumActiveRequests<=3);QCOMPARE(reader->translationOverlays().size(),parts.size());
+        for(const auto &part:parts){const auto body=part.toMap().value("wire_body").toString().toUtf8();QVERIFY(std::any_of(server.requests.begin(),server.requests.end(),[&](const QByteArray &r){return r.mid(r.indexOf("\r\n\r\n")+4)==body;}));}
+        QVERIFY(QMetaObject::invokeMethod(window,"applyFit",Q_ARG(QVariant,"page"),Q_ARG(QVariant,0)));
+        QVERIFY(settleReaderViewport(window));QVERIFY(settleRasterWork(reader));
+        auto *page=qobject_cast<PageItem *>(visualItem(window->contentItem(),"pdfPage0"));QVERIFY(page);QTRY_VERIFY(page->loaded());
+        QTRY_VERIFY(visualItem(window->contentItem(),"inplaceTranslationText"));
+        auto *chip=visualItem(window->contentItem(),"translationDisclosure");QVERIFY(chip && chip->isVisible());
+        window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);chip->forceActiveFocus();QTest::keyClick(window,Qt::Key_Space);
+        auto *menu=chip->findChild<QObject *>("translationMenu");QVERIFY(menu);QTRY_VERIFY(menu->property("visible").toBool());
+        auto *menuContent=menu->property("contentItem").value<QQuickItem *>();QVERIFY(menuContent);auto *full=visualItem(menuContent,"translationShowFull");QVERIFY(full);full->forceActiveFocus();QVERIFY(full->window());QTest::keyClick(full->window(),Qt::Key_Return);
+        auto *translationLayer=visualItem(window->contentItem(),"translationLayer0");QVERIFY(translationLayer);
+        auto *disclosure=translationLayer->findChild<QObject *>("translationFullText");QVERIFY(disclosure);QTRY_VERIFY(disclosure->property("visible").toBool());
+        auto *disclosed=translationLayer->findChild<QObject *>("translationDisclosureText");QVERIFY(disclosed);QVERIFY(disclosed->property("text").toString().size()>1000);
+        QVERIFY(QMetaObject::invokeMethod(disclosure,"close"));QCOMPARE(server.requests.size(),parts.size());
+        chip=visualItem(window->contentItem(),"translationDisclosure");QVERIFY(chip);chip->forceActiveFocus();QTest::keyClick(window,Qt::Key_Space);
+        menu=chip->findChild<QObject *>("translationMenu");QVERIFY(menu);QTRY_VERIFY(menu->property("visible").toBool());
+        menuContent=menu->property("contentItem").value<QQuickItem *>();auto *toggle=visualItem(menuContent,"translationToggleOriginal");QVERIFY(toggle);toggle->forceActiveFocus();QTest::keyClick(toggle->window(),Qt::Key_Return);
+        QTRY_VERIFY(visualItem(window->contentItem(),"translationDisclosure") && visualItem(window->contentItem(),"translationDisclosure")->hasActiveFocus());
+        chip=visualItem(window->contentItem(),"translationDisclosure");QTest::keyClick(window,Qt::Key_Space);menu=chip->findChild<QObject *>("translationMenu");QVERIFY(menu);QTRY_VERIFY(menu->property("visible").toBool());QTest::keyClick(chip->window(),Qt::Key_Escape);
+        const auto toggled=reader->translationOverlays().first().toMap();QVERIFY(toggled.value("original").toBool());reader->toggleTranslation(toggled.value("id").toString());
+        const auto cover=reader->translationOverlays().first().toMap();const auto id=cover.value("id").toString();
+        reader->toggleTranslation(id);QVERIFY(reader->translationOverlays().first().toMap().value("original").toBool());
+        reader->toggleTranslation(id);QVERIFY(!reader->translationOverlays().first().toMap().value("original").toBool());
+        QCOMPARE(server.requests.size(),parts.size());
+        const auto rect=cover.value("target").toMap().value("rect").toMap();
+        const QRectF bounds(rect.value("x_pt").toDouble(),rect.value("y_pt").toDouble(),rect.value("width_pt").toDouble(),rect.value("height_pt").toDouble());
+        const auto paper=page->translationPaperColor(bounds);QVERIFY(paper.isValid());QVERIFY(page->translationInkColor(paper).isValid());QVERIFY(!page->translationPaperColor(QRectF(qQNaN(),0,2,2)).isValid());
+        const auto completed=reader->completedRasters();
+        QVERIFY(page->configurePaper(reader->pages().first().toMap().value("height").toDouble(),bounds.center().y(),80));
+        QTest::qWait(80);QCOMPARE(server.requests.size(),parts.size());QCOMPARE(reader->completedRasters(),completed);
+        reader->inspectTranslations(0);QTRY_COMPARE(reader->pendingCommands(),0);QCOMPARE(server.requests.size(),parts.size());
+        const auto evidence=qEnvironmentVariable("LYRA_READER_TRANSLATION_EVIDENCE");if(!evidence.isEmpty()){QVERIFY(QDir().mkpath(evidence));QVERIFY(window->grabWindow().save(evidence+"/translation-"+theme+".png"));}
+        const auto generation=reader->documentGeneration();reader->openFile(QUrl::fromLocalFile(path));QTRY_VERIFY(reader->documentGeneration()!=generation && reader->pageCount()==1 && !reader->loading());QTRY_COMPARE(reader->pendingCommands(),0);
+        reader->inspectTranslations(0);QTRY_COMPARE(reader->pendingCommands(),0);QCOMPARE(reader->translationOverlays().size(),parts.size());
+        QVERIFY(reader->prepareInplaceTranslation(request));QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(reader->aiState().value("plan").toMap().isEmpty());QCOMPARE(server.requests.size(),parts.size());
+        QVERIFY(pdf.open(QIODevice::ReadOnly));QCOMPARE(pdf.readAll(),original);QVERIFY(!reader->hasUnsavedChanges());
+        for(const auto &record:warnings)for(const auto &warning:qvariant_cast<QList<QQmlError>>(record.first()))QVERIFY2(!warning.url().toString().contains("TranslationLayer.qml"),qPrintable(warning.toString()));
+    }
+    void inplaceTranslationCanvasKeyboardSelectionKeepsTheExplicitSendBoundary() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
+        const auto path=scratch.filePath("synthetic-keyboard-translation.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));MockChatServer server;QVERIFY(server.listen());
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic-keyboard"}});view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(!reader->loading() && reader->pageCount()==1 && !reader->pendingCommands());reader->requestText(0);QTRY_VERIFY(reader->textPages().contains("0"));
+        auto *pointer=visualItem(window->contentItem(),"pdfPointer");QVERIFY(pointer);window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);QTest::keyClick(window,Qt::Key_L,Qt::ControlModifier);QTest::keyClick(window,Qt::Key_Return);QTest::keyClick(window,Qt::Key_A,Qt::ControlModifier);
+        const auto selected=window->property("selection").value<QJSValue>().toVariant().toMap();QCOMPARE(selected.value("page").toInt(),0);QCOMPARE(selected.value("start").toInt(),0);QCOMPARE(selected.value("end").toInt(),reader->textPages().value("0").toMap().value("chars").toList().size()-1);
+        QTest::keyClick(window,Qt::Key_L,Qt::ControlModifier|Qt::ShiftModifier);QVERIFY(reader->aiState().value("input").toMap().value("inplace").toBool());QVERIFY(server.requests.isEmpty());auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_COMPARE(reader->pendingCommands(),0);QCOMPARE(reader->aiState().value("plan").toMap().value("kind").toString(),QString("inplace_translation"));QVERIFY(server.requests.isEmpty());QVERIFY(reader->translationOverlays().isEmpty());
+    }
+
+    void inplaceTranslationOriginalModeFollowsRevisionsAndUndoWithoutRequests() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
+        const auto path=scratch.filePath("synthetic-translation-view-state.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",path));MockChatServer server;QVERIFY(server.listen());server.responder=[](const QByteArray &){return MockChatServer::Response{{MockChatServer::delta({{"content","A synthetic saved translation."}}),QByteArray("data: [DONE]\n\n")},20};};
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(!reader->loading() && reader->pageCount()==3 && !reader->pendingCommands());reader->requestText(0);QTRY_VERIFY(reader->textPages().contains("0"));const auto chars=reader->textPages().value("0").toMap().value("chars").toList();
+        const QVariantMap request{{"action","TranslateSelection"},{"current_page",0},{"selection",QVariantMap{{"page",0},{"start",0},{"end",chars.size()-1}}},{"question",QVariant{}},{"language","French"},{"history",QVariantList{}},{"region",QVariant{}},{"base_url",server.baseUrl()},{"model","synthetic-view-state"},{"temperature",QVariant{}},{"max_tokens",QVariant{}},{"reasoning_mode","default"},{"reasoning_encoding","none"},{"document_knowledge",false},{"document_knowledge_text",QVariant{}},{"document_knowledge_pages",QVariantList{}}};
+        QVERIFY(reader->prepareInplaceTranslation(request));QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(reader->startAi("local",reader->aiState().value("plan").toMap()));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(!reader->translationOverlays().isEmpty());const auto count=server.requests.size();
+        const auto viewKey=reader->translationOverlays().first().toMap().value("view_key").toString();QVERIFY(!viewKey.isEmpty());
+        const auto entry=[&](int page){for(const auto &v:reader->translationOverlays()){const auto e=v.toMap();if(e.value("view_key").toString()==viewKey && e.value("target").toMap().value("page").toInt()==page)return e;}return QVariantMap{};};
+        reader->toggleTranslation(entry(0).value("id").toString());QVERIFY(entry(0).value("original").toBool());
+        reader->submit("page_stage",{{"operation",QVariantMap{{"Rotate",QVariantMap{{"pages",QVariantList{1}},{"quarter_turns",1}}}}}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);reader->inspectTranslations(0);QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(entry(0).value("original").toBool());
+        reader->submit("page_stage",{{"operation",QVariantMap{{"Move",QVariantMap{{"pages",QVariantList{0}},{"destination",2}}}}}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);reader->inspectTranslations(2);QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(entry(2).value("original").toBool());
+        reader->submit("page_undo");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);reader->inspectTranslations(0);QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(entry(0).value("original").toBool());
+        reader->submit("page_redo");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);reader->inspectTranslations(2);QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(entry(2).value("original").toBool());reader->toggleTranslation(entry(2).value("id").toString());QVERIFY(!entry(2).value("original").toBool());
+        reader->submit("page_undo");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);reader->inspectTranslations(0);QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(entry(0).value("original").toBool());
+        reader->submit("page_redo");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);reader->inspectTranslations(2);QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(!entry(2).value("original").toBool());
+        reader->submit("document_save");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);reader->inspectTranslations(2);QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(!entry(2).isEmpty());QVERIFY(!entry(2).value("original").toBool());QVERIFY(!reader->hasUnsavedChanges());QCOMPARE(server.requests.size(),count);
+    }
+
+    void inplaceTranslationResetNotificationsRespectControllerLifetime() {
+        QPointer<ReaderController> reader=new ReaderController;
+        connect(reader,&ReaderController::translationOverlaysChanged,this,[&]{delete reader.data();},Qt::DirectConnection);
+        reader->openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));
+        QVERIFY(reader);QTRY_VERIFY(reader.isNull());
+    }
+
+    void inplaceTranslationRejectsAStalePreviewAndCancelledAdmission() {
+        ReaderController reader;QSignalSpy completed(&reader,&ReaderController::openFinished);reader.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));QTRY_VERIFY(!completed.isEmpty());QTRY_COMPARE(reader.pendingCommands(),0);
+        reader.requestText(0);QTRY_VERIFY(reader.textPages().contains("0"));
+        const auto chars=reader.textPages().value("0").toMap().value("chars").toList();
+        const QVariantMap request{{"action","TranslateSelection"},{"current_page",0},{"selection",QVariantMap{{"page",0},{"start",0},{"end",chars.size()-1}}},{"question",QVariant{}},{"language","French"},{"history",QVariantList{}},{"region",QVariant{}},{"base_url","http://127.0.0.1:9/v1"},{"model","synthetic-stale"},{"temperature",QVariant{}},{"max_tokens",QVariant{}},{"reasoning_mode","default"},{"reasoning_encoding","none"},{"document_knowledge",false},{"document_knowledge_text",QVariant{}},{"document_knowledge_pages",QVariantList{}}};
+        QVERIFY(reader.prepareInplaceTranslation(request));QTRY_COMPARE(reader.pendingCommands(),0);const auto plan=reader.aiState().value("plan").toMap();QVERIFY(!plan.isEmpty());
+        reader.setAiInput("language","German");QVERIFY(!reader.startAi("local",plan));QVERIFY(!reader.aiState().value("running").toBool());
+        QVERIFY(reader.prepareInplaceTranslation(request));QTRY_COMPARE(reader.pendingCommands(),0);const auto next=reader.aiState().value("plan").toMap();QVERIFY(!next.isEmpty());reader.invalidateAiPlan();QVERIFY(!reader.startAi("local",next));
+        QVERIFY(reader.prepareInplaceTranslation(request));QTRY_COMPARE(reader.pendingCommands(),0);const auto sendingPlan=reader.aiState().value("plan").toMap();
+        bool sendReentered=false;const auto sendConnection=connect(&reader,&ReaderController::aiStateChanged,&reader,[&]{if(!sendReentered && reader.aiState().value("running").toBool()){sendReentered=true;reader.setAiInput("language","Dutch");}},Qt::DirectConnection);
+        QVERIFY(!reader.startAi("local",sendingPlan));QVERIFY(sendReentered);QVERIFY(!reader.aiState().value("running").toBool());disconnect(sendConnection);QTRY_COMPARE(reader.pendingCommands(),0);
+        bool reentered=false;const auto connection=connect(&reader,&ReaderController::aiStateChanged,&reader,[&]{if(!reentered && reader.aiState().value("status").toString().startsWith("Preparing in-place")){reentered=true;reader.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));}},Qt::DirectConnection);
+        QVERIFY(!reader.prepareInplaceTranslation(request));QVERIFY(reentered);disconnect(connection);QTRY_VERIFY(!reader.loading() && reader.pageCount()==3 && !reader.pendingCommands());QVERIFY(reader.translationOverlays().isEmpty());QVERIFY(reader.aiState().value("plan").toMap().isEmpty());
+    }
+
     void summaryCacheReopensCompletedBatchAndSingleRowsWithoutRequests_data() {
         QTest::addColumn<QString>("theme");QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
     }
@@ -3650,7 +3760,14 @@ private slots:
                 QTRY_VERIFY_WITH_TIMEOUT(reader->documentGeneration()!=g && !reader->pendingCommands(),15000);QVERIFY(page && page->revisionFallbackActive());QCOMPARE(capture(),before);
             }
         }
-        blocked.clear();auto *current=qobject_cast<PageItem *>(visualItem(window->contentItem(),"pdfPage0"));QVERIFY(current);QTRY_VERIFY_WITH_TIMEOUT(current->refined() && current->texturesReady() && !current->revisionFallbackActive(),15000);
+        blocked.clear();
+        if(action=="replace-url") {
+            // Reopening can restore a different page. Establish the page-zero
+            // viewport before requiring its visible-only texture demand to finish.
+            QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(settleReaderViewport(window));
+            QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QVERIFY(settleReaderViewport(window));
+        }
+        auto *current=qobject_cast<PageItem *>(visualItem(window->contentItem(),"pdfPage0"));QVERIFY(current);QTRY_VERIFY_WITH_TIMEOUT(current->refined() && current->texturesReady() && !current->revisionFallbackActive(),15000);
         // Hiding the final surface must release every previous-revision lease as well.
         current->setResourceActive(false);QVERIFY(!current->loaded());QVERIFY(!current->revisionFallbackActive());
     }

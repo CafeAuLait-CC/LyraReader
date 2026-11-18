@@ -29,6 +29,7 @@ mod paren;
 mod selection;
 mod superscript;
 pub mod tables;
+mod translation;
 
 pub use bibliography::{
     AttributionReason, Bibliography, CitationAttribution, ReferenceList, SectionKind, SectionRef,
@@ -49,6 +50,10 @@ pub use selection::{
 };
 pub use superscript::CitationStyle;
 pub use tables::table_region;
+pub use translation::{
+    MAX_TRANSLATION_TARGETS, TranslationTarget, translation_blocks, translation_targets,
+    translation_trimmed_range,
+};
 
 use lyra_reader_core::{Point, RawCharBox, RawTextPage, Rect};
 

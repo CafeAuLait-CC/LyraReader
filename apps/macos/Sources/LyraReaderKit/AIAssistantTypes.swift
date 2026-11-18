@@ -405,6 +405,7 @@ public struct AIProviderSettings: Equatable, Sendable {
 
 /// A preview request: exactly what the panel needs to ask Rust for a plan. No key.
 public struct AIMakePlanRequest: Sendable {
+    public let inPlaceTranslation: Bool
     public let action: AIAssistantAction
     public let currentPage: Int
     public let selection: AIReaderSelection?
@@ -438,11 +439,13 @@ public struct AIMakePlanRequest: Sendable {
         region: AIRegionAttachment? = nil,
         sendRegionImage: Bool = false,
         includeDocumentContext: Bool = false,
+        inPlaceTranslation: Bool = false,
         documentKnowledge: Bool = false,
         documentKnowledgeText: String? = nil,
         documentKnowledgePages: [Int] = [],
         settings: AIProviderSettings
     ) {
+        self.inPlaceTranslation = inPlaceTranslation
         self.action = action
         self.currentPage = currentPage
         self.selection = selection
@@ -463,7 +466,7 @@ extension AIMakePlanRequest {
     func withDocumentContext() -> Self {
         Self(action: action, currentPage: currentPage, selection: selection, question: question,
              language: language, history: history, region: region, sendRegionImage: sendRegionImage,
-             includeDocumentContext: true, documentKnowledge: documentKnowledge,
+             includeDocumentContext: true, inPlaceTranslation: inPlaceTranslation, documentKnowledge: documentKnowledge,
              documentKnowledgeText: documentKnowledgeText,
              documentKnowledgePages: documentKnowledgePages, settings: settings)
     }
@@ -472,7 +475,7 @@ extension AIMakePlanRequest {
     package func withDocumentKnowledge(_ text: String, pages: [Int]) -> Self {
         Self(action: action, currentPage: currentPage, selection: selection, question: question,
              language: language, history: history, region: region, sendRegionImage: sendRegionImage,
-             includeDocumentContext: includeDocumentContext, documentKnowledge: documentKnowledge,
+             includeDocumentContext: includeDocumentContext, inPlaceTranslation: inPlaceTranslation, documentKnowledge: documentKnowledge,
              documentKnowledgeText: text, documentKnowledgePages: pages, settings: settings)
     }
 }
@@ -748,7 +751,7 @@ public final class RustAIChatService: AIChatServicing {
             documentKnowledgeText: request.documentKnowledgeText,
             documentKnowledgePages: request.documentKnowledgePages.map { UInt32(max(0, $0)) }
         )
-        return try await engine.prepareAIPlan(record)
+        return try await engine.prepareAIPlan(record, inPlaceTranslation: request.inPlaceTranslation)
     }
 
     public func prepareMerge(_ request: AIMergePlanRequest) async throws -> AiPlanRecord {

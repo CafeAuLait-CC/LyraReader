@@ -1238,6 +1238,51 @@ pub fn build_document_knowledge_plan(request: PlanRequest) -> Result<ChatPlan, A
     Ok(output)
 }
 
+/// Build an in-place translation from exactly the shared selection's extracted text.
+/// The document adapter verifies the range against its current cached text page first.
+/// Re-indexing this one passage avoids reintroducing excluded line-number glyphs from
+/// the raw PDF text layer, while retaining the ordinary translation prompt and wire builder.
+pub fn build_inplace_translation_plan(
+    mut request: PlanRequest,
+    source: String,
+) -> Result<ChatPlan, AiError> {
+    if request.action != Action::TranslateSelection {
+        return Err(empty_context(
+            "An in-place translation requires a translation action.",
+        ));
+    }
+    let selection = request
+        .selection
+        .ok_or_else(|| empty_context("Select text to translate."))?;
+    if selection.start > selection.end || selection.page >= request.page_count {
+        return Err(empty_context(
+            "The translation range is outside the document.",
+        ));
+    }
+    let count = source.chars().count();
+    if source.len() > crate::translation::MAX_SOURCE_BYTES
+        || count == 0
+        || count > MAX_SELECTION_CHARS
+    {
+        return Err(empty_context(
+            "Select a nonempty passage of at most 12000 characters; nothing was sent.",
+        ));
+    }
+    request.selection = Some(SelectionRange {
+        page: selection.page,
+        start: 0,
+        end: u32::try_from(count - 1)
+            .map_err(|_| empty_context("The translation range is too large."))?,
+    });
+    request.pages = vec![PageText {
+        page: selection.page,
+        text: source,
+        chars: Vec::new(),
+    }];
+    request.document_knowledge = None;
+    build_plan(request)
+}
+
 pub fn build_plan(request: PlanRequest) -> Result<ChatPlan, AiError> {
     if request.page_count == 0 {
         return Err(empty_context("This document has no pages."));
@@ -3778,6 +3823,53 @@ mod tests {
 
                 chars: Vec::new(),})
             .collect()
+    }
+
+    #[test]
+    fn inplace_translation_reuses_the_wire_builder_with_exact_filtered_source() {
+        let source = "α  β\r\n中文 e\u{301}";
+        let request = PlanRequest {
+            action: Action::TranslateSelection,
+            document_title: "Synthetic".into(),
+            page_count: 7,
+            current_page: 4,
+            selection: Some(SelectionRange {
+                page: 4,
+                start: 100,
+                end: 120,
+            }),
+            question: None,
+            language: Some("French".into()),
+            pages: vec![PageText {
+                page: 4,
+                text: "RAW GUTTER MUST NOT LEAK".into(),
+                chars: vec![],
+            }],
+            settings: settings("http://localhost:11434/v1"),
+            document_knowledge: None,
+        };
+        let actual = build_inplace_translation_plan(request.clone(), source.into()).unwrap();
+        let mut expected = request.clone();
+        expected.selection = Some(SelectionRange {
+            page: 4,
+            start: 0,
+            end: source.chars().count() as u32 - 1,
+        });
+        expected.pages[0].text = source.into();
+        let expected = build_plan(expected).unwrap();
+        assert_eq!(actual, expected);
+        assert!(
+            actual.parts[0]
+                .user_prompt
+                .ends_with(&format!("{source}\n"))
+        );
+        assert_eq!(actual.source_pages, vec![5]);
+        for invalid in [String::new(), "x".repeat(MAX_SELECTION_CHARS + 1)] {
+            assert!(build_inplace_translation_plan(request.clone(), invalid).is_err());
+        }
+        let mut wrong = request;
+        wrong.action = Action::SummarizeSelection;
+        assert!(build_inplace_translation_plan(wrong, source.into()).is_err());
     }
 
     #[test]

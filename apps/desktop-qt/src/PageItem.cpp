@@ -279,6 +279,27 @@ double PageItem::fallbackScale() const {
     const double scale=qMin(effectiveScale(),std::sqrt(bytes/(area*4)));
     return scale>=.125?std::floor(scale*8)/8:std::exp2(std::floor(std::log2(scale)*4)/4);
 }
+QColor PageItem::translationPaperColor(const QRectF &source)const {
+    if(!std::isfinite(source.x()) || !std::isfinite(source.y()) || !std::isfinite(source.right()) || !std::isfinite(source.bottom()) || source.width()<=0 || source.height()<=0)return {};
+    if(!m_controller || m_page<0 || m_page>=m_controller->pages().size() || m_image.isNull())return {};
+    const auto info=m_controller->pages().at(m_page).toMap();const auto w=info.value(QStringLiteral("width")).toDouble(),h=info.value(QStringLiteral("height")).toDouble();
+    if(!std::isfinite(w) || !std::isfinite(h) || w<=0 || h<=0)return {};
+    const auto &image=m_image.pixels;
+    const auto sample=[&](double x,double y){return image.pixelColor(std::clamp(int(std::clamp(x/w,0.,1.)*(image.width()-1)),0,image.width()-1),std::clamp(int(std::clamp(y/h,0.,1.)*(image.height()-1)),0,image.height()-1));};
+    // Reuse the already-budgeted original raster. No readback, image copy or PDFium request.
+    const QPointF positions[]={source.topLeft()+QPointF(-2,-2),source.topRight()+QPointF(2,-2),source.bottomLeft()+QPointF(-2,2),source.bottomRight()+QPointF(2,2),QPointF(3,3)};
+    QColor colors[5];for(int i=0;i<5;++i)colors[i]=sample(positions[i].x(),positions[i].y());
+    int best=0,count=0;
+    for(int i=0;i<5;++i){int nearby=0;for(const auto &c:colors)if(std::abs(c.red()-colors[i].red())+std::abs(c.green()-colors[i].green())+std::abs(c.blue()-colors[i].blue())<24)++nearby;if(nearby>count){count=nearby;best=i;}}
+    return PaperAppearance::displayColor(colors[best],PaperAppearance::mode(m_paperAppearance));
+}
+QColor PageItem::translationInkColor(const QColor &paper)const {
+    if(!paper.isValid())return {};
+    const auto linear=[](double c){return c<=.04045?c/12.92:std::pow((c+.055)/1.055,2.4);};
+    const auto luminance=.2126*linear(paper.redF())+.7152*linear(paper.greenF())+.0722*linear(paper.blueF());
+    return luminance>.179?QColor(Qt::black):QColor(Qt::white);
+}
+
 void PageItem::refresh() {
     syncBudget();if(!demandVisible())return;
     const bool wasLoaded=loaded();

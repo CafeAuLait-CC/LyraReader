@@ -21,7 +21,7 @@ pub(crate) struct Scope {
     cancelled_through: AtomicU64,
 }
 impl Scope {
-    fn begin(&self) -> Result<u64, String> {
+    pub(crate) fn begin(&self) -> Result<u64, String> {
         // Keep the workspace MSRV; the newer atomic try_update API is not required.
         let mut current = NEXT_SCOPE.load(Ordering::SeqCst);
         let id = loop {
@@ -40,7 +40,7 @@ impl Scope {
         self.cancelled_through
             .fetch_max(self.latest.load(Ordering::SeqCst), Ordering::SeqCst);
     }
-    fn cancelled(&self, id: u64) -> bool {
+    pub(crate) fn cancelled(&self, id: u64) -> bool {
         id <= self.cancelled_through.load(Ordering::SeqCst)
     }
 }

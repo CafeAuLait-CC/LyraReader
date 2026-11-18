@@ -160,7 +160,7 @@ Item {
             const sheet=item.pageSheets.itemAt(index);
             if(sheet && sheet.modelData.index===page)
                 return {x:item.x+sheet.x-pageList.contentX,y:item.y+sheet.y-pageList.contentY,
-                    width:sheet.width,height:sheet.height,paperMap:sheet.paperMap,dragHost:sheet.dragHost};
+                    width:sheet.width,height:sheet.height,paperMap:sheet.paperMap,dragHost:sheet.dragHost,focusTarget:sheet.focusTarget};
         }
         return null;
     }
@@ -438,6 +438,7 @@ Item {
                     id: sheet
                     property alias paperMap: pdfPage
                     property alias dragHost: objectDragHost
+                    property alias focusTarget: pageInteraction.focusTarget
                     required property var modelData
                     readonly property var displayGeometry:canvas.paperActive ? canvas.paperState.pages[modelData.index] : modelData
                     function syncPaper() {
@@ -490,7 +491,15 @@ Item {
                         app: canvas.app
                         page: sheet.modelData.index
                     }
+                    TranslationLayer {
+                        anchors.fill: parent
+                        z: 15
+                        app: canvas.app
+                        page: sheet.modelData.index
+                        paperMap: pdfPage
+                    }
                     PageInteraction {
+                        id:pageInteraction
                         anchors.fill: parent
                         app: canvas.app
                         page: sheet.modelData.index

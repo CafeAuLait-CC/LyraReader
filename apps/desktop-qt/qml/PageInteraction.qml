@@ -8,6 +8,7 @@ Item {
     required property var app
     required property int page
     property var paperMap: null
+    property alias focusTarget: pointer
     readonly property bool paperActive: !!paperMap && paperMap.paperGeometryActive
     readonly property var textPage: app.currentReader.textPages[page.toString()] || {
         chars: [],
@@ -98,6 +99,17 @@ Item {
         onActiveFocusChanged: if (!activeFocus)
             finishKeyboardEdit()
         Keys.onPressed: function (event) {
+            // These actions belong to the focused page, so text editors keep Control+A.
+            if((event.modifiers & Qt.ControlModifier) && !(event.modifiers & (Qt.AltModifier|Qt.MetaModifier))) {
+                if(event.key===Qt.Key_A && !(event.modifiers & Qt.ShiftModifier) && app.annotationTool==="select" && app.secondaryRow!=="edit" && !(app.secondaryRow==="fill" && app.fillTool.length) && annotationLayer.textPage.chars.length) {
+                    app.selection={page:page,start:0,end:annotationLayer.textPage.chars.length-1};
+                    event.accepted=true;return;
+                }
+                if(event.key===Qt.Key_L && (event.modifiers & Qt.ShiftModifier) && app.selection && app.selection.page===page) {
+                    app.currentReader.setAiInput("action",3);app.currentReader.setAiInput("inplace",true);app.showAiPanel(true);
+                    event.accepted=true;return;
+                }
+            }
             const arrows = [Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down];
             if (arrows.indexOf(event.key) < 0 || event.modifiers & (Qt.AltModifier | Qt.MetaModifier) || app.annotationTool !== "select")
                 return;
