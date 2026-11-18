@@ -70,6 +70,8 @@ if(QT_CORE_LIBRARY_TYPE STREQUAL "SHARED_LIBRARY")
     set_target_properties(LyraReader PROPERTIES QT_QML_MODULE_NO_IMPORT_SCAN TRUE)
 endif()
 install(TARGETS LyraReader RUNTIME DESTINATION bin)
+install(FILES "${LYRA_READER_ROOT}/LICENSE" "${LYRA_READER_ROOT}/THIRD-PARTY-NOTICES.md"
+    DESTINATION share/licenses/LyraReader)
 install(FILES "${LYRA_READER_ROOT}/apps/macos/Resources/Fonts/OFL.txt" DESTINATION share/licenses/LyraReader/fonts)
 install(DIRECTORY licenses/ DESTINATION share/licenses/LyraReader/qt)
 if(UNIX AND NOT APPLE)

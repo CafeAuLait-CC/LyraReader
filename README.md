@@ -259,7 +259,7 @@ The Linux branch is not yet a release or a claim of full feature parity.
 | PDF engine | **Backend trait abstraction + PDFium as the first implementation** (BSD-3), with a slot reserved for a pure-Rust backend | The only engine that supports rendering, per-glyph text boxes, links, forms and incremental save at once · [ADR-0002](docs/adr/0002-pdf-engine-backend.md) |
 | UI | **SwiftUI + AppKit** (native macOS), with the portable layout, zoom, viewport and navigation-history rules in the platform-independent `lyra-reader-session` | Native look and feel, input methods and accessibility; a future shell swap reuses those rules instead of rewriting them · [ADR-0001](docs/adr/0001-native-ui-stack.md) |
 | Bridging | **UniFFI** (control plane) + hand-written C ABI (GPU surface/device handoff) | Generates Swift bindings automatically, supports async and callback streams · [ADR-0004](docs/adr/0004-rust-swift-ffi.md) |
-| License | This project is **MIT**; all dependencies use permissive licenses | [ADR-0005](docs/adr/0005-licensing.md) |
+| License | This project is **MIT**; the Qt frontend dynamically links LGPL-3.0 Qt (see [third-party notices](THIRD-PARTY-NOTICES.md)) | [ADR-0005](docs/adr/0005-licensing.md) |
 | Build | Cargo workspace + SwiftPM (**Command Line Tools only**, CLT 26.3 on this machine) | Develop without a full Xcode install · [ADR-0006](docs/adr/0006-build-without-xcode.md) |
 
 ## Directory layout
