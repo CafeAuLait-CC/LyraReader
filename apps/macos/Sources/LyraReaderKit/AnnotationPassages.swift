@@ -1,55 +1,21 @@
 import AppKit
 import NaturalLanguage
 import SwiftUI
+import LyraReaderBindings
 
-/// Text offsets belong to normalized Unicode, while source ranges keep PDF character indices.
-/// Keeping that mapping avoids guessing with substring searches (especially repeated words).
+/// Source geometry, Unicode offsets and context expansion share Rust's immutable map.
+/// NaturalLanguage remains the native sentence-boundary provider, preserving macOS behaviour.
 package struct AnnotationSentenceMap {
     package let text: String
-    package let offsets: [Int: Range<Int>]
     package let sentences: [Range<Int>]
+    private let shared: LyraReaderAnnotationTextMap
     private var documentRanges: [String: Range<Int>] = [:]
     private var resolvedDocumentRanges: Set<String> = []
 
-    package init(_ page: TextPage) {
-        var text = ""
-        var offsets: [Int: Range<Int>] = [:]
-        var position = 0
-        var previousWasSpace = true
-        var lineBounds: CGRect?
-        var previousLine: CGRect?
-        for (index, character) in page.chars.enumerated() {
-            guard let scalar = Unicode.Scalar(character.unicode), scalar.value != 0 else { continue }
-            if scalar.properties.isWhitespace {
-                if scalar.value == 10 || scalar.value == 13 {
-                    if let lineBounds { previousLine = lineBounds }
-                    lineBounds = nil
-                }
-                if !previousWasSpace {
-                    text.append(" "); offsets[index] = position..<(position + 1); position += 1
-                }
-                previousWasSpace = true
-            } else {
-                let box = CGRect(x: character.xPt, y: character.yPt,
-                                 width: character.widthPt, height: character.heightPt)
-                if let previous = previousLine, box.height > 0 {
-                    let threshold = max(3, min(previous.height, box.height) * 0.7)
-                    // Join wrapped body lines, but keep headings, paragraph gaps and column
-                    // restarts out of a sentence's context.
-                    if box.minY - previous.maxY > threshold || box.maxY < previous.minY - threshold {
-                        if text.hasSuffix(" ") { text.removeLast(); position -= 1 }
-                        text.append("\n\n"); position += 2
-                    } else if box.minY < previous.maxY { lineBounds = previous }
-                }
-                previousLine = nil
-                if box.height > 0 { lineBounds = lineBounds.map { $0.union(box) } ?? box }
-                let string = String(scalar)
-                text.append(string)
-                offsets[index] = position..<(position + string.utf16.count)
-                position += string.utf16.count
-                previousWasSpace = false
-            }
-        }
+    package init(_ page: TextPage) throws {
+        shared = try annotationTextMapForText(chars: page.sharedTextCharacters(maximum: 65_536))
+        let text = shared.text()
+        self.text = text
         let tokenizer = NLTokenizer(unit: .sentence)
         var sentences: [Range<Int>] = []
         var paragraphOffset = 0
@@ -62,46 +28,40 @@ package struct AnnotationSentenceMap {
             }
             paragraphOffset += paragraph.utf16.count + 2
         }
-        self.text = text
-        self.offsets = offsets
-        self.sentences = sentences.isEmpty && !text.isEmpty ? [0..<position] : sentences
+        self.sentences = sentences.isEmpty && !text.isEmpty ? [0..<text.utf16.count] : sentences
     }
-
-    mutating func range(for annotation: DocumentAnnotation, page: TextPage) -> Range<Int>? {
+    private func range(_ record: AnnotationContextSpanRecord?) -> Range<Int>? {
+        record.map { Int($0.start)..<Int($0.end) }
+    }
+    private func record(_ range: Range<Int>) throws -> AnnotationContextSpanRecord {
+        guard let start = UInt32(exactly: range.lowerBound), let end = UInt32(exactly: range.upperBound) else {
+            throw NSError(domain: "LyraReader", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "The annotation context range is invalid."])
+        }
+        return AnnotationContextSpanRecord(start: start, end: end)
+    }
+    mutating func range(for annotation: DocumentAnnotation, page: TextPage) throws -> Range<Int>? {
         if resolvedDocumentRanges.contains(annotation.id) { return documentRanges[annotation.id] }
-        resolvedDocumentRanges.insert(annotation.id)
-        let range = span(overlapping: annotation.boxes.map {
+        let range = try span(overlapping: annotation.boxes.map {
             CGRect(x: $0.xPt, y: $0.yPt, width: $0.widthPt, height: $0.heightPt)
         }, page: page)
+        resolvedDocumentRanges.insert(annotation.id)
         documentRanges[annotation.id] = range
         return range
     }
-
-    /// File-owned and adopted markup share page-space quads. An adopted mark's 0...0 range
-    /// is only a placeholder; it does not identify the first character of the quoted text.
-    package func span(overlapping regions: [CGRect], page: TextPage) -> Range<Int>? {
-        let indices = page.chars.indices.filter { index in
-            let char = page.chars[index]
-            let rect = CGRect(x: char.xPt, y: char.yPt, width: char.widthPt, height: char.heightPt)
-            guard rect.width > 0, rect.height > 0 else { return false }
-            return regions.contains { region in
-                let overlap = rect.intersection(region)
-                return !overlap.isNull && overlap.width * overlap.height > rect.width * rect.height * 0.35
-            }
-        }
-        return span(indices: indices)
+    package func span(overlapping regions: [CGRect], page _: TextPage) throws -> Range<Int>? {
+        range(try shared.regionsSpan(regions: regions.map {
+            AiSourceRectRecord(xPt: Double($0.minX), yPt: Double($0.minY),
+                               widthPt: Double($0.width), heightPt: Double($0.height))
+        }))
     }
-
-    package func span(indices: [Int]) -> Range<Int>? {
-        let ranges = indices.compactMap { offsets[$0] }
-        guard let start = ranges.map(\.lowerBound).min(), let end = ranges.map(\.upperBound).max() else { return nil }
-        return start..<end
+    package func span(indices: [Int]) throws -> Range<Int>? {
+        // Missing offsets, including negative indices, have always been omitted.
+        range(try shared.indicesSpan(indices: indices.compactMap { UInt32(exactly: $0) }))
     }
-    package func sentence(containing mark: Range<Int>) -> Range<Int> {
-        let touched = sentences.filter { $0.overlaps(mark) }
-        let start = min(mark.lowerBound, touched.first?.lowerBound ?? mark.lowerBound)
-        let end = max(mark.upperBound, touched.last?.upperBound ?? mark.upperBound)
-        return start..<end
+    package func sentence(containing mark: Range<Int>) throws -> Range<Int> {
+        let result = try shared.contextSpan(mark: record(mark), sentences: sentences.map { try record($0) })
+        return Int(result.start)..<Int(result.end)
     }
 }
 
@@ -151,55 +111,61 @@ package struct AnnotationPassage: Identifiable {
     }
 
     @MainActor package static func build(document: [DocumentAnnotation], own: [AppState.Annotation],
-                                 pages: [Int: TextPage], maps: inout [Int: AnnotationSentenceMap]) -> [Self] {
+                                 pages: [Int: TextPage], maps: inout [Int: AnnotationSentenceMap], report: (String) -> Void) -> [Self] {
         var grouped: [Int: [(range: Range<Int>, mark: PassageMark)]] = [:]
         for annotation in document where annotation.visible && !annotation.isReply && annotation.drawing == .markup {
             guard let page = pages[annotation.page], maps[annotation.page] != nil else { continue }
-            guard let range = maps[annotation.page]?.range(for: annotation, page: page),
-                  let map = maps[annotation.page] else { continue }
-            let kind: AppState.Annotation.Kind = ["underline", "squiggly"].contains(annotation.kind) ? .underline
-                : (annotation.kind == "strikeout" ? .strikeout : .highlight)
-            let mark = PassageMark(source: .document(annotation.id), range: range, kind: kind,
-                color: annotation.color ?? .init(red: 255, green: 221, blue: 90, alpha: 255),
-                opacity: annotation.opacity ?? 1, note: annotation.contents ?? "",
-                author: annotation.author, date: annotation.displayDate)
-            grouped[annotation.page, default: []].append((map.sentence(containing: range), mark))
+            do {
+                guard let range = try maps[annotation.page]?.range(for: annotation, page: page),
+                      let map = maps[annotation.page] else { continue }
+                let kind: AppState.Annotation.Kind = ["underline", "squiggly"].contains(annotation.kind) ? .underline
+                    : (annotation.kind == "strikeout" ? .strikeout : .highlight)
+                let mark = PassageMark(source: .document(annotation.id), range: range, kind: kind,
+                    color: annotation.color ?? .init(red: 255, green: 221, blue: 90, alpha: 255),
+                    opacity: annotation.opacity ?? 1, note: annotation.contents ?? "",
+                    author: annotation.author, date: annotation.displayDate)
+                grouped[annotation.page, default: []].append((try map.sentence(containing: range), mark))
+            } catch { report(error.localizedDescription) }
         }
         for annotation in own where annotation.kind.isTextMarkup {
             guard let map = maps[annotation.page], let page = pages[annotation.page] else { continue }
-            let resolved: Range<Int>?
-            if let quads = annotation.fileQuads, !quads.isEmpty {
-                resolved = map.span(overlapping: quads.map {
-                    CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
-                }, page: page)
-            } else {
-                guard annotation.start >= 0, annotation.start < page.chars.count,
-                      annotation.start <= annotation.end else { continue }
-                resolved = map.span(indices: Array(annotation.start...min(annotation.end, page.chars.count - 1)))
-            }
-            guard let range = resolved else { continue }
-            let mark = PassageMark(source: .own(annotation.id), range: range, kind: annotation.kind,
-                color: annotation.color, opacity: Double(annotation.color.alpha) / 255,
-                note: annotation.note, author: nil,
-                date: annotation.createdAt.formatted(date: .abbreviated, time: .shortened))
-            grouped[annotation.page, default: []].append((map.sentence(containing: range), mark))
+            do {
+                let resolved: Range<Int>?
+                if let quads = annotation.fileQuads, !quads.isEmpty {
+                    resolved = try map.span(overlapping: quads.map {
+                        CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
+                    }, page: page)
+                } else {
+                    guard annotation.start >= 0, annotation.start < page.chars.count,
+                          annotation.start <= annotation.end else { continue }
+                    resolved = try map.span(indices: Array(annotation.start...min(annotation.end, page.chars.count - 1)))
+                }
+                guard let range = resolved else { continue }
+                let mark = PassageMark(source: .own(annotation.id), range: range, kind: annotation.kind,
+                    color: annotation.color, opacity: Double(annotation.color.alpha) / 255,
+                    note: annotation.note, author: nil,
+                    date: annotation.createdAt.formatted(date: .abbreviated, time: .shortened))
+                grouped[annotation.page, default: []].append((try map.sentence(containing: range), mark))
+            } catch { report(error.localizedDescription) }
         }
         var result: [Self] = []
         for page in grouped.keys.sorted() {
             guard let map = maps[page] else { continue }
-            let entries = grouped[page]!.sorted { $0.range.lowerBound < $1.range.lowerBound }
-            var clusters: [(range: Range<Int>, marks: [PassageMark])] = []
-            for entry in entries {
-                if let last = clusters.last, last.range.overlaps(entry.range) {
-                    let start = min(last.range.lowerBound, entry.range.lowerBound)
-                    let end = max(last.range.upperBound, entry.range.upperBound)
-                    clusters[clusters.count - 1] = (start..<end, last.marks + [entry.mark])
-                } else { clusters.append((entry.range, [entry.mark])) }
-            }
+            guard let entries = grouped[page] else { continue }
+            let clusters: [AnnotationContextClusterRecord]
+            do {
+                clusters = try annotationContextClusters(ranges: entries.map {
+                    AnnotationContextSpanRecord(start: UInt32($0.range.lowerBound), end: UInt32($0.range.upperBound))
+                })
+            } catch { report(error.localizedDescription); continue }
+
             for cluster in clusters {
-                let range = NSRange(location: cluster.range.lowerBound, length: cluster.range.count)
+                guard cluster.indices.allSatisfy({ Int($0) < entries.count }) else {
+                    report("The annotation context returned an invalid mark index."); continue
+                }
+                let range = NSRange(location: Int(cluster.span.start), length: Int(cluster.span.end - cluster.span.start))
                 result.append(Self(id: "\(page):\(range.location)", page: page,
-                    text: (map.text as NSString).substring(with: range), start: range.location, marks: cluster.marks))
+                    text: (map.text as NSString).substring(with: range), start: range.location, marks: cluster.indices.map { entries[Int($0)].mark }))
             }
         }
         return result

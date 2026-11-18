@@ -4633,7 +4633,7 @@ impl LyraReaderDocument {
     ///
     /// This is the one place that performs the page-space→view-space Y flip for selection; the
     /// cache, the hit test and the box→range methods all read the same geometry.
-    fn extract_text_page(
+    pub(crate) fn extract_text_page(
         &self,
         page: u32,
     ) -> Result<lyra_reader_text::TextPage, LyraReaderFfiError> {

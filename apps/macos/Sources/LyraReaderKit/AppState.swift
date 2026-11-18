@@ -5332,10 +5332,17 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         let wanted = Set(documentAnnotations.filter { $0.drawing == .markup }.map(\.page)
             + annotations.filter { $0.kind.isTextMarkup }.map(\.page))
         for page in wanted where passageTextMaps[page] == nil {
-            if let text = textPages[page] { passageTextMaps[page] = AnnotationSentenceMap(text) }
+            if let text = textPages[page] {
+                do { passageTextMaps[page] = try AnnotationSentenceMap(text) }
+                catch { statusMessage = String(localized: "Annotation context unavailable: \(error.localizedDescription)") }
+            }
         }
+        var contextWarnings: [String] = []
         annotationPassages = AnnotationPassage.build(document: documentAnnotations, own: annotations,
-            pages: textPages, maps: &passageTextMaps)
+            pages: textPages, maps: &passageTextMaps, report: { message in
+                if contextWarnings.count < 3 && !contextWarnings.contains(message) { contextWarnings.append(message) }
+            })
+        if !contextWarnings.isEmpty { statusMessage = String(localized: "Some annotation contexts are unavailable: \(contextWarnings.joined(separator: " · "))") }
         annotationSidebarPages = AnnotationSidebarPage.build(passages: annotationPassages,
             document: documentAnnotations, own: annotations)
     }

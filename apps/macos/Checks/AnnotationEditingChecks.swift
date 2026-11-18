@@ -22,8 +22,8 @@ extension ReaderChecks {
         let pink = AnnotationColor(red: 255, green: 100, blue: 130, alpha: 102)
         let marks = [mark("diffusion\nmodels", color: yellow), mark("several challenges", color: pink),
                      mark("diffusion models", color: yellow, last: true)]
-        var maps = [0: AnnotationSentenceMap(page)]
-        let passages = AnnotationPassage.build(document: [], own: marks, pages: [0: page], maps: &maps)
+        var maps = [0: try AnnotationSentenceMap(page)]
+        let passages = AnnotationPassage.build(document: [], own: marks, pages: [0: page], maps: &maps, report: { require(false, $0) })
         require(passages.count == 2 && passages[0].marks.count == 2,
                 "same-sentence highlights merge while repeated words in another sentence stay separate")
         require(passages[0].text.contains("Generating human motion with diffusion models poses several challenges."),
@@ -37,7 +37,7 @@ extension ReaderChecks {
         underlined.kind = .underline
         var struck = marks[1]
         struck.kind = .strikeout
-        let linePassage = AnnotationPassage.build(document: [], own: [underlined, struck], pages: [0: page], maps: &maps)[0]
+        let linePassage = AnnotationPassage.build(document: [], own: [underlined, struck], pages: [0: page], maps: &maps, report: { require(false, $0) })[0]
         let styledLines = linePassage.attributed(appearance: .original)
         func displayedColor(_ color: AnnotationColor) -> Color {
             Color(nsColor: NSColor(calibratedRed: CGFloat(color.red) / 255, green: CGFloat(color.green) / 255,
@@ -56,10 +56,10 @@ extension ReaderChecks {
             return char
         }
         let headedPage = TextPage(page: 0, chars: headedChars, text: headedText, hasUnicodeMapError: false)
-        let headedMap = AnnotationSentenceMap(headedPage)
+        let headedMap = try AnnotationSentenceMap(headedPage)
         let markStart = Array("A heading\n".unicodeScalars).count
-        let markedSpan = headedMap.span(indices: Array(markStart..<headedChars.count))!
-        let sentence = headedMap.sentence(containing: markedSpan)
+        let markedSpan = try headedMap.span(indices: Array(markStart..<headedChars.count))!
+        let sentence = try headedMap.sentence(containing: markedSpan)
         require((headedMap.text as NSString).substring(with: NSRange(location: sentence.lowerBound, length: sentence.count))
                     == "This is the marked sentence.",
                 "geometric paragraph gaps keep preceding headings out of annotation excerpts")

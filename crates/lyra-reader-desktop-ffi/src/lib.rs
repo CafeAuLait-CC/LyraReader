@@ -16,6 +16,7 @@ mod navigation;
 mod note_markers;
 mod pages;
 mod paper;
+mod passages;
 mod quit;
 mod region;
 mod region_export;

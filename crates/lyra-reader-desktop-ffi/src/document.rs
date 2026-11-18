@@ -51,7 +51,7 @@ fn desktop_annotation_rules() -> Result<Value, String> {
         .ok_or("Invalid annotation rule snapshot")?;
     object.insert(
         "kind_flags".into(),
-        json!(annotation_kind_flags().into_iter().map(|kind| { let editable=lyra_reader_edit::kind::AnnotationKind::from_record_kind(&kind.kind).is_some_and(|k|lyra_reader_edit::text_edit::TextEditMode::Note.supports_kind(&k)); json!({"kind":kind.kind,"is_note":kind.is_note,"is_text_markup":kind.is_text_markup,"note_editable":editable}) }).collect::<Vec<_>>()),
+        json!(annotation_kind_flags().into_iter().map(|kind| { let editable=lyra_reader_edit::kind::AnnotationKind::from_record_kind(&kind.kind).is_some_and(|k|lyra_reader_edit::text_edit::TextEditMode::Note.supports_kind(&k)); json!({"kind":kind.kind,"is_note":kind.is_note,"is_markup":kind.is_markup,"is_text_markup":kind.is_text_markup,"note_editable":editable}) }).collect::<Vec<_>>()),
     );
     Ok(value)
 }

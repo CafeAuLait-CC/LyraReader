@@ -212,6 +212,9 @@ impl RenderSource {
             }
         };
         match request["op"].as_str().unwrap_or("") {
+            "annotation_passages" => {
+                crate::passages::query(&self.engine, page()?, &request["entries"])
+            }
             "note_markers" => {
                 crate::note_markers::query(&self.engine, page()?, &request["entries"])
             }

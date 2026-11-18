@@ -29,30 +29,34 @@ extension ReaderChecks {
         let adopted = AppState.Annotation(id: UUID(), page: 0, start: 0, end: 0,
             color: AppState.highlightPalette[0].color, note: "A title comment", createdAt: Date(),
             fileIdentity: "nm:title", fileQuads: quads)
-        func excerpt(_ annotation: AppState.Annotation) -> [AnnotationPassage] {
-            var maps = [0: AnnotationSentenceMap(page)]
-            return AnnotationPassage.build(document: [], own: [annotation], pages: [0: page], maps: &maps)
+        func excerpt(_ annotation: AppState.Annotation) throws -> [AnnotationPassage] {
+            var maps = [0: try AnnotationSentenceMap(page)]
+            return AnnotationPassage.build(document: [], own: [annotation], pages: [0: page], maps: &maps, report: { require(false, $0) })
         }
         let expected = titleLines.joined(separator: " ")
-        let passages = excerpt(adopted)
+        let passages = try excerpt(adopted)
         require(passages.count == 1 && passages[0].text == expected,
                 "adopted multiline title quotes its PDF quads, excluding the line-number gutter")
         let styled = passages[0].attributed(appearance: .original)
         require(styled.runs.allSatisfy { $0.backgroundColor != nil },
                 "the full Unicode title retains its highlight after geometry-to-text mapping")
         let restored = try JSONDecoder().decode(AppState.Annotation.self, from: JSONEncoder().encode(adopted))
-        require(excerpt(restored).first?.text == expected,
+        let restoredPassages = try excerpt(restored)
+        require(restoredPassages.first?.text == expected,
                 "existing saved annotations with 0...0 and file quads require no migration")
         var missing = adopted
         missing.fileQuads = [.init(x: 500, y: 500, width: 20, height: 12)]
-        require(excerpt(missing).isEmpty, "unmapped file quads never fall back to an unrelated character")
+        let missingPassages = try excerpt(missing)
+        require(missingPassages.isEmpty, "unmapped file quads never fall back to an unrelated character")
         var moved = adopted
         moved.fileQuads = [.init(x: 60, y: 160, width: 180, height: 12)]
-        require(excerpt(moved).first?.text.trimmingCharacters(in: .whitespacesAndNewlines) == "A separate body sentence.",
+        let movedPassages = try excerpt(moved)
+        require(movedPassages.first?.text.trimmingCharacters(in: .whitespacesAndNewlines) == "A separate body sentence.",
                 "changed quad geometry resolves its new text")
         let own = AppState.Annotation(id: UUID(), page: 0, start: bodyStart, end: chars.count - 2,
             color: AppState.highlightPalette[0].color, note: "", createdAt: Date())
-        require(excerpt(own).first?.text.trimmingCharacters(in: .whitespacesAndNewlines) == "A separate body sentence.",
+        let ownPassages = try excerpt(own)
+        require(ownPassages.first?.text.trimmingCharacters(in: .whitespacesAndNewlines) == "A separate body sentence.",
                 "new range-based annotations keep their existing sentence excerpts")
 
         let input = root.appendingPathComponent("pdf-samples/with_annotations/review_ashley_du_0904.pdf")

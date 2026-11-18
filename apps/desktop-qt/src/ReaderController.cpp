@@ -87,7 +87,7 @@ double quantizedRasterScale(double scale) {
 }
 
 ReaderController::ReaderController(QObject *parent) : QObject(parent),m_cachePrefix(QUuid::createUuid().toString()+QLatin1Char('/')),m_mutations(std::make_shared<CommandQueue>()) {
-    initAi();
+    initAi();initPassages();
     connect(this,&ReaderController::dataChanged,this,&ReaderController::unsavedChangesChanged);
     connect(this,&ReaderController::noteDraftsChanged,this,&ReaderController::unsavedChangesChanged);
     connect(this,&ReaderController::editDraftsChanged,this,&ReaderController::unsavedChangesChanged);

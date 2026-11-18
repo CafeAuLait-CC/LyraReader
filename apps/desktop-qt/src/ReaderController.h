@@ -55,6 +55,7 @@ class ReaderController : public QObject {
     Q_PROPERTY(qulonglong documentGeneration READ documentGeneration NOTIFY documentChanged)
     Q_PROPERTY(QVariantMap summaryBatchState READ summaryBatchState NOTIFY aiStateChanged)
     Q_PROPERTY(QVariantMap data READ data NOTIFY dataChanged)
+    Q_PROPERTY(QVariantMap annotationPassages READ annotationPassages NOTIFY annotationPassagesChanged)
     Q_PROPERTY(QVariantMap textPages READ textPages NOTIFY textPagesChanged)
     Q_PROPERTY(int pendingCommands READ pendingCommands NOTIFY commandsChanged)
     Q_PROPERTY(QString title READ title NOTIFY documentChanged)
@@ -144,6 +145,8 @@ public:
     Q_INVOKABLE void setNoteDraft(const QString &id,const QString &text){m_noteDrafts.insert(id,text);emit noteDraftsChanged();}
     Q_INVOKABLE void clearNoteDraft(const QString &id){if(m_noteDrafts.remove(id))emit noteDraftsChanged();}
     QVariantMap data() const { return m_data; }
+    QVariantMap annotationPassages()const;
+    Q_INVOKABLE void requestAnnotationPassages(int page,const QVariantList &entries);
     QVariantMap textPages() const { return m_textPages; }
     int pendingCommands() const { return m_pendingCommands; }
     QString title() const { return m_title; }
@@ -195,6 +198,7 @@ public:
     static int cpuCacheKiB();
     static QString rasterKey(int page, double scale,bool embedded=false);
 signals:
+    void annotationPassagesChanged();
     void translationsChanged();
     void translationOverlaysChanged();
     void documentChanged();
@@ -227,6 +231,16 @@ signals:
     void noteMarkersReady(quint64 request, int page, const QVariantList &markers, const QString &error);
     void commandsChanged();
 private:
+    void initPassages();
+    void cachePassageFrame(int page,QVariantMap frame);
+    void startPassageQuery(int page,const QVariantList &entries,const QByteArray &signature);
+    QMap<int,QVariantMap> m_passageFrames;
+    QHash<int,QByteArray> m_passageInputs;
+    QMap<int,QVariantList> m_passageQueued;
+    QList<int> m_passageQueueOrder,m_passageFrameOrder;
+    QHash<int,qint64> m_passageFrameBytes;
+    qint64 m_passageBytes=0;
+    int m_passageRunning=0;
     TilePlanResult requestPlannedTiles(quintptr consumer,int page,const LyraReaderTilePlanRequest &density,const QRectF &visible,const QSet<QString> &retained);
     void setRasterSource(std::shared_ptr<NativeRasterSource> source);
     QString backdropKey(int page)const;
