@@ -382,6 +382,10 @@ struct ReaderChecks {
             try await aiReadingWorkspaceChecks(root: fastRoot)
             return
         }
+        if CommandLine.arguments.contains("--check-ai-selector-motion") {
+            try await aiReadingSelectorMotionChecks(root: fastRoot)
+            return
+        }
         if CommandLine.arguments.contains("--check-ai-assistant") {
             try await aiAssistantChecks(root: fastRoot)
             print("AI assistant checks passed")

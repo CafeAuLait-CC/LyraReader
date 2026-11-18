@@ -22,6 +22,9 @@ struct AIReadingScrollMemory: NSViewRepresentable {
             Task { @MainActor [weak self] in
                 guard let self, self.key == key, let scroll = self.enclosingScrollView else { return }
                 self.scroll = scroll
+                // A legacy scrollbar keeps its gutter even when the result is short. Scope
+                // changes must not move the selector labels as the content starts scrolling.
+                scroll.autohidesScrollers = false
                 if let origin = reading.scrollPositions[key] {
                     scroll.contentView.scroll(to: origin)
                     scroll.reflectScrolledClipView(scroll.contentView)

@@ -93,7 +93,6 @@ struct LyraReadingSegmentedPicker: View {
     var secondIcon: String? = nil
     @Environment(\.isEnabled) private var enabled
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Namespace private var highlight
     @State private var hovered: Bool?
     @FocusState private var focused: Bool?
 
@@ -101,9 +100,16 @@ struct LyraReadingSegmentedPicker: View {
         HStack(spacing: 4) {
             segment(false, title: first, icon: firstIcon)
             segment(true, title: second, icon: secondIcon)
+        }.background {
+            GeometryReader { geometry in
+                RoundedRectangle(cornerRadius: 6).fill(LyraReaderTheme.selectedBg)
+                    .frame(width: (geometry.size.width - 4) / 2, height: geometry.size.height)
+                    .modifier(ReadingSegmentHighlightOffset(progress: selection ? 1 : 0,
+                        distance: (geometry.size.width + 4) / 2))
+                    .animation((ReaderMotion.reduceMotionOverride ?? reduceMotion) ? nil : .easeInOut(duration: 0.18), value: selection)
+            }.allowsHitTesting(false).accessibilityHidden(true)
         }.padding(3)
             .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(LyraReaderTheme.controlBorder))
-            .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: selection)
             .accessibilityElement(children: .contain).accessibilityLabel(aiReadingLabel(title))
             .onMoveCommand { direction in
                 if direction == .left { choose(false); focused = false }
@@ -111,6 +117,7 @@ struct LyraReadingSegmentedPicker: View {
             }
     }
     private func choose(_ value: Bool) {
+        guard enabled else { return }
         selection = value
     }
     private func segment(_ value: Bool, title: String, icon: String?) -> some View {
@@ -121,12 +128,10 @@ struct LyraReadingSegmentedPicker: View {
             }.font(.system(size: 13)).padding(.horizontal, 6)
                 .frame(maxWidth: .infinity, minHeight: 30).contentShape(Rectangle())
         }.buttonStyle(.plain).focused($focused, equals: value).focusEffectDisabled()
+            .frame(minWidth: 0, maxWidth: .infinity)
             .foregroundStyle(!enabled ? LyraReaderTheme.textDisabled : selection == value ? LyraReaderTheme.selectedFg : LyraReaderTheme.textPrimary)
             .background {
-                if selection == value {
-                    RoundedRectangle(cornerRadius: 6).fill(LyraReaderTheme.selectedBg)
-                        .matchedGeometryEffect(id: "highlight", in: highlight).transition(.identity)
-                } else if hovered == value && enabled {
+                if selection != value && hovered == value && enabled {
                     RoundedRectangle(cornerRadius: 6).fill(LyraReaderTheme.hoverBg)
                 }
             }
@@ -134,5 +139,19 @@ struct LyraReadingSegmentedPicker: View {
             .onHover { hovered = $0 ? value : nil }
             .accessibilityAddTraits(selection == value ? .isSelected : [])
             .background(AITranslationControlProbe(id: "segment-\(title)"))
+            .transaction { $0.animation = nil }
+    }
+}
+
+/// Only the persistent background moves; native Button label transactions stay independent.
+private struct ReadingSegmentHighlightOffset: AnimatableModifier {
+    nonisolated var progress: CGFloat
+    let distance: CGFloat
+    nonisolated var animatableData: CGFloat {
+        get { progress }
+        set { progress = newValue }
+    }
+    func body(content: Content) -> some View {
+        content.transaction { $0.animation = nil }.offset(x: distance * progress)
     }
 }

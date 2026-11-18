@@ -370,7 +370,7 @@ extension ReaderChecks {
             let rendered = textViews(sourceCheck).first { $0.string.contains("Supported") }!.attributedString()
             let font = rendered.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
             let paragraph = rendered.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
-            require(font?.pointSize == 14.5 && paragraph?.lineSpacing == 5,
+            require(font?.pointSize == 14 && paragraph?.lineSpacing == 5,
                     "translated paragraphs use the larger reading font and relaxed line spacing")
         }
     }

@@ -9,7 +9,7 @@ struct ReaderMarkdownTypography: Equatable, Sendable {
     var themedInk = false
     static let standard = Self()
     static let assistant = Self(themedInk: true)
-    static let translation = Self(bodySize: 14.5, lineSpacing: 5, lineHeightMultiple: 1.12, themedInk: true)
+    static let translation = Self(bodySize: 14, lineSpacing: 5, lineHeightMultiple: 1.12, themedInk: true)
 }
 private struct ReaderMarkdownTypographyKey: EnvironmentKey {
     static let defaultValue = ReaderMarkdownTypography.standard

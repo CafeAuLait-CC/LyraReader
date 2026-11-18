@@ -313,8 +313,10 @@ extension ReaderChecks {
             lastSignature = signature
             try await Task.sleep(for: .milliseconds(25))
         }
-        fatalError("TIMEOUT: canvas commit scenario did not settle "
-            + "(tracing=\(PerfTrace.enabled), attempts=\(canvas.frameAttemptCount))")
+        fail("TIMEOUT: canvas commit scenario did not settle "
+            + "(tracing=\(PerfTrace.enabled), attempts=\(canvas.frameAttemptCount), "
+            + "work/pages/rasters=\(lastSignature), "
+            + "visible=\(canvas.window?.occlusionState.contains(.visible) == true))")
     }
 }
 
