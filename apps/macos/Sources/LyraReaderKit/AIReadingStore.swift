@@ -10,6 +10,8 @@ final class AIReadingStore: ObservableObject {
     @Published private(set) var isLoading = false
     var isAvailable: Bool { workspace != nil }
     private var workspace: LyraReadingWorkspace?
+    private var taskHistories: [String: [AiReadingRecord]] = [:]
+    private var scopedTaskHistories: [String: [String: [AiReadingRecord]]] = [:]
     private var file: URL?
     private var identity: String?
     private var generation = UUID()
@@ -20,6 +22,7 @@ final class AIReadingStore: ObservableObject {
         self.identity = identity
         generation = UUID()
         let token = generation
+        taskHistories = [:]; scopedTaskHistories = [:]
         records = []; workspace = nil; error = nil; isLoading = true
         // A fast document/session switch must see the writes queued by its departing view.
         await flush()
@@ -38,7 +41,7 @@ final class AIReadingStore: ObservableObject {
                 return workspace
             }.value
             guard generation == token else { return }
-            workspace = loaded; records = try loaded.records()
+            workspace = loaded; try refreshSnapshot(loaded)
         } catch {
             guard generation == token else { return }
             self.error = AIReadableError.message(error)
@@ -70,6 +73,16 @@ final class AIReadingStore: ObservableObject {
         do { return try workspace.notes(query: query, recent: recent) }
         catch { self.error = AIReadableError.message(error); return [] }
     }
+    func taskHistory(_ kind: String, sourceID: String? = nil) -> [AiReadingRecord] {
+        // Native views read the published snapshot; streaming and hover never clone the
+        // durable Rust workspace or cross the bridge for every body evaluation.
+        if let sourceID { return scopedTaskHistories[kind]?[sourceID] ?? [] }
+        return taskHistories[kind] ?? []
+    }
+    func taskSelection(_ id: String) throws -> AiSelectionRecord? {
+        guard let workspace else { throw CocoaError(.fileReadUnknown) }
+        return try workspace.taskSelection(id: id)
+    }
     func suggestion(_ id: String) -> AiReadingRecord? {
         guard let workspace else { return nil }
         do { return try workspace.suggestion(noteId: id) }
@@ -89,7 +102,7 @@ final class AIReadingStore: ObservableObject {
     func finishPendingWrites() { io.sync { } }
     private func refreshAndSave() throws {
         guard let workspace, let file else { return }
-        records = try workspace.records()
+        try refreshSnapshot(workspace)
         let token = generation
         io.async { [weak self] in
             do {
@@ -105,6 +118,13 @@ final class AIReadingStore: ObservableObject {
                 }
             }
         }
+    }
+    private func refreshSnapshot(_ workspace: LyraReadingWorkspace) throws {
+        var histories: [String: [AiReadingRecord]] = [:]
+        for kind in ["summary", "translation"] { histories[kind] = try workspace.taskHistory(kind: kind, sourceId: nil) }
+        taskHistories = histories
+        scopedTaskHistories = histories.mapValues { Dictionary(grouping: $0, by: \.sourceId) }
+        records = try workspace.records()
     }
 }
 

@@ -132,3 +132,15 @@
 "The document analysis could not start. Please try again." = "无法开始文档分析，请重试。";
 "The document understanding cache limit is unsupported." = "当前文档理解缓存的大小限制不受支持。";
 "The saved document understanding is too large. Its file was kept." = "已保存的文档理解超出大小限制，原缓存文件已保留。";
+"Translation history" = "翻译历史";
+"%d saved translations" = "%d 条已保存翻译";
+"Selection translation" = "选区翻译";
+"Document translation" = "全文翻译";
+"TO" = "译为";
+"More" = "更多";
+"Less" = "收起";
+"Original · p. %d" = "原文 · 第 %d 页";
+"The document has changed. Select the passage again before retranslating." = "文档已更改，请重新选择段落后再翻译。";
+"The saved task has no valid selection. Select the passage again." = "保存的任务没有有效选区，请重新选择段落。";
+"The saved task could not be found." = "找不到保存的任务。";
+"Explain “%@”" = "解释“%@”";

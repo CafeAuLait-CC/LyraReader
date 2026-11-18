@@ -70,8 +70,9 @@ pub fn document_index_cache_path(document: &std::path::Path) -> std::path::PathB
 /// library ship together. Version 3 adds the dark scientific-foreground display profile (3)
 /// to the appearance draw entry points. Version 4 adds light-crop edge compositing (4);
 /// earlier libraries reject the new profile. Version 5 adds shared document analysis handles
-/// and cache-input usage to the matching UniFFI control plane.
-pub const ABI_VERSION: u32 = 5;
+/// and cache-input usage to the matching UniFFI control plane. Version 6 adds saved task
+/// history queries and validated selection replay.
+pub const ABI_VERSION: u32 = 6;
 
 /// Blend mode values in the `blend_modes` array of [`lyra_reader_surface_draw_pages`].
 ///

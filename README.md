@@ -56,7 +56,9 @@ separate features with their own documented limits.
   its existing paper and solid-ink colours.
 - **Assist**: Summary, Translate, Chat and Reading notes share a native right-hand sidebar.
   Summaries cover a document or a fixed selection, with detail levels and expandable sections;
-  translations retain paragraph sources and original-text toggles. A long document remains one
+  translations pair paragraphs with their sources and retain local history across selections and
+  restarts. Long selected passages expand on demand; earlier translations can be reopened or
+  retranslated using their saved source range. A long document remains one
   reader task while Rust plans any required batches and summary synthesis. Chat retains complete
   local sessions and drafts while Rust bounds the context sent with each question. Summaries and
   answers can be kept as editable reading notes with separate personal thoughts; updates require

@@ -13,7 +13,6 @@ struct AIReadingSidebar: View {
     @State private var search = ""
     @State private var recent = false
     @State private var editing = false
-    @State private var selectedTerm: String?
     @State private var noteTitle = ""
     @State private var noteContent = ""
     @State private var noteThoughts = ""
@@ -39,8 +38,11 @@ struct AIReadingSidebar: View {
                         onLocate: { reading.locate(page: UInt32($0.page), excerpt: $0.snippet, state: state) })
                         .disabled(knowledge.isBlocking)
                 } else if navigation.selectedTab == .regions { notes }
-                else if showingTaskHistory { taskHistory(navigation.selectedTab == .summary ? "summary" : "translation") }
-                else { task(navigation.selectedTab == .summary ? "summary" : "translation").background(AIReadingSidebarMarker()) }
+                else if navigation.selectedTab == .translation {
+                    AITranslationView(state: state, reading: reading, showingHistory: $showingTaskHistory).background(AIReadingSidebarMarker())
+                }
+                else if showingTaskHistory { taskHistory("summary") }
+                else { summaryTask.background(AIReadingSidebarMarker()) }
                 if let notice = reading.notice {
                     HStack { Image(systemName: "info.circle"); Text(aiReadingLabel(notice)); Spacer(); Button { reading.notice = nil } label: { Image(systemName: "xmark") } }
                         .font(.caption).padding(10).background(LyraReaderTheme.noteBg)
@@ -82,6 +84,7 @@ struct AIReadingSidebar: View {
             }
             if navigation.selectedTab == .summary || navigation.selectedTab == .translation {
                 Button { showingTaskHistory.toggle(); selectedTaskID = nil } label: { Image(systemName: "clock.arrow.circlepath") }.help(aiReadingLabel("Task history"))
+                    .disabled(navigation.selectedTab == .translation && (reading.translation.isPreparing || reading.translation.isSending || reading.translation.phase == .preview))
             }
             if navigation.selectedTab == .regions {
                 Button { copy(reading.store.notes(query: search, recent: recent).map { "# \($0.title)\n\n\($0.content)\n\n\($0.thoughts)" }.joined(separator: "\n\n---\n\n")) }
@@ -101,15 +104,16 @@ struct AIReadingSidebar: View {
         }.padding(12).background(LyraReaderTheme.accentSoft)
     }
 
-    private func task(_ kind: String) -> some View {
+    private var summaryTask: some View {
+        let kind = "summary"
         let worker = reading.worker(kind)
-        let selected = kind == "summary" ? reading.summarySelection : reading.translationSelection
+        let selected = reading.summarySelection
         let result = reading.result(kind)
         let busy = worker.isPreparing || worker.isSending || worker.phase == .mergePreview || worker.phase == .preview
         return ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 Picker(aiReadingLabel("Source"), selection: Binding(get: { selected }, set: { value in
-                    if kind == "summary" { reading.summarySelection = value } else { reading.translationSelection = value }
+                    reading.summarySelection = value
                     if value && reading.excerpt(kind).isEmpty { reading.useSelection(kind, state: state) }
                 })) {
                     Text(aiReadingLabel("Whole document")).tag(false)
@@ -129,26 +133,17 @@ struct AIReadingSidebar: View {
                 } else {
                     Label(String(format: aiReadingLabel("All %d pages"), state.document?.pageCount ?? 0), systemImage: "doc.text").font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
                 }
-                if kind == "summary" {
-                    HStack { Text(aiReadingLabel("Detail")).font(.caption); Spacer(); Picker(aiReadingLabel("Detail"), selection: $reading.detail) {
-                        ForEach(["Brief", "Standard", "Detailed"], id: \.self) { Text(aiReadingLabel($0)).tag($0) }
-                    }.labelsHidden().fixedSize() }
-                } else {
-                    Picker(aiReadingLabel("Translate to"), selection: $reading.translationLanguage) {
-                        ForEach(Array(Set([reading.translationLanguage, "English", "Simplified Chinese", "Traditional Chinese", "Japanese", "Korean", "French", "Spanish", "German"])).sorted(), id: \.self) {
-                            Text(aiReadingLabel($0)).tag($0)
-                        }
-                    }
-                    Toggle(aiReadingLabel("Show original"), isOn: $reading.showOriginal).toggleStyle(.switch).controlSize(.small)
-                }
+                HStack { Text(aiReadingLabel("Detail")).font(.caption); Spacer(); Picker(aiReadingLabel("Detail"), selection: $reading.detail) {
+                    ForEach(["Brief", "Standard", "Detailed"], id: \.self) { Text(aiReadingLabel($0)).tag($0) }
+                }.labelsHidden().fixedSize() }
                 if busy {
                     HStack {
                         ProgressView().controlSize(.small)
-                        Text(aiReadingLabel(worker.isPreparing ? "Preparing source…" : (kind == "summary" ? "Summarizing…" : "Translating…"))).font(.caption)
+                        Text(aiReadingLabel(worker.isPreparing ? "Preparing source…" : "Summarizing…")).font(.caption)
                         Spacer(); Button(aiReadingLabel("Stop")) { worker.cancelRegionWork() }
                     }
                 }
-                if !busy, let result, (result.detail != reading.detail && kind == "summary" || result.language != (kind == "summary" ? reading.language : reading.translationLanguage)) {
+                if !busy, let result, (result.detail != reading.detail || result.language != reading.language) {
                     Label(aiReadingLabel("Settings changed. Generate again to update this result."), systemImage: "arrow.triangle.2.circlepath")
                         .font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
                 }
@@ -160,16 +155,10 @@ struct AIReadingSidebar: View {
                     if !selected { Text(String(format: aiReadingLabel("Text coverage: %d of %d pages"), result.pages.count, state.document?.pageCount ?? 0)).font(.caption2).foregroundStyle(LyraReaderTheme.textSecondary) }
                     if result.status == "sourceChanged" { Text(aiReadingLabel("The document has changed. This result keeps its original source snapshot.")).font(.caption).foregroundStyle(LyraReaderTheme.warningFg) }
                     if result.status == "partial" { Label(aiReadingLabel("Partial result · stopped or interrupted"), systemImage: "pause.circle").font(.caption) }
-                    if kind == "translation" { translationResult(result) }
-                    else { AIReadingSummaryContent(text: result.content, pageCount: state.document?.pageCount ?? 0, pages: result.pages, onJump: { state.gotoPage($0 - 1) }) }
+                    AIReadingSummaryContent(text: result.content, pageCount: state.document?.pageCount ?? 0, pages: result.pages, onJump: { state.gotoPage($0 - 1) })
                     HStack {
-                        if kind == "translation" {
-                            Menu(aiReadingLabel("Copy translation")) {
-                                Button(aiReadingLabel("Current page")) { if let text = translationText(result, page: state.currentPage) { copy(text) } }
-                                Button(aiReadingLabel("All translated text")) { if let text = translationText(result, page: nil) { copy(text) } }
-                            }
-                        } else { Button { copy(result.content) } label: { Label(aiReadingLabel("Copy"), systemImage: "doc.on.doc") } }
-                        if kind == "summary" { Button { reading.keep(result) } label: { Label(aiReadingLabel("Keep in notes"), systemImage: "note.text.badge.plus") } }
+                        Button { copy(result.content) } label: { Label(aiReadingLabel("Copy"), systemImage: "doc.on.doc") }
+                        Button { reading.keep(result) } label: { Label(aiReadingLabel("Keep in notes"), systemImage: "note.text.badge.plus") }
                     }.controlSize(.small)
                     if storeVersions(result).count > 1 {
                         DisclosureGroup(aiReadingLabel("Previous results")) {
@@ -180,9 +169,9 @@ struct AIReadingSidebar: View {
                     }
                 } else if !busy {
                     VStack(alignment: .leading, spacing: 8) {
-                        Image(systemName: kind == "summary" ? "text.alignleft" : "character.bubble").font(.system(size: 28, weight: .light)).foregroundStyle(LyraReaderTheme.accent)
-                        Text(aiReadingLabel(kind == "summary" ? "Get the shape of this document" : "Read across languages")).font(.headline)
-                        Text(aiReadingLabel(kind == "summary" ? "An overview, key ideas and links back to the source." : "A continuous translation with the original source close at hand."))
+                        Image(systemName: "text.alignleft").font(.system(size: 28, weight: .light)).foregroundStyle(LyraReaderTheme.accent)
+                        Text(aiReadingLabel("Get the shape of this document")).font(.headline)
+                        Text(aiReadingLabel("An overview, key ideas and links back to the source."))
                             .font(.callout).foregroundStyle(LyraReaderTheme.textSecondary)
                     }.padding(.vertical, 12)
                 }
@@ -193,58 +182,25 @@ struct AIReadingSidebar: View {
                 Button {
                     reading.run(kind, state: state, force: reading.result(kind) != nil)
                 } label: {
-                    Label(aiReadingLabel(result == nil ? (kind == "summary" ? (selected ? "Summarize selection" : "Summarize document") : (selected ? "Translate selection" : "Translate document")) : (kind == "summary" ? "Regenerate" : "Retranslate")), systemImage: result == nil ? "sparkles" : "arrow.clockwise")
+                    Label(aiReadingLabel(result == nil ? (selected ? "Summarize selection" : "Summarize document") : "Regenerate"), systemImage: result == nil ? "sparkles" : "arrow.clockwise")
                 }.buttonStyle(ReaderPanelButtonStyle(prominent: true))
                     .disabled(busy || knowledge.isBlocking || !reading.store.isAvailable || !reading.settings.canUseAI || selected && reading.excerpt(kind).isEmpty)
             }.padding(18).frame(maxWidth: .infinity, alignment: .leading)
                 .background(AIReadingScrollMemory(key: "\(state.document?.id.uuidString ?? "none"):\(kind)", reading: reading))
         }.id(kind)
     }
-    @ViewBuilder private func translationResult(_ result: AiReadingRecord) -> some View {
-        if result.status != "sourceChanged" {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack {
-                    ForEach(aiTranslationTerms(originals: result.originals), id: \.self) { term in
-                        Button(term) { selectedTerm = term }.font(.caption)
-                    }
-                }
-            }
-            if let term = selectedTerm {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack { Spacer(); Button { selectedTerm = nil } label: { Image(systemName: "xmark") }.accessibilityLabel(aiReadingLabel("Close term explanation")) }
-                    AIReadingTermView(state: state, settings: reading.settings, term: term, language: result.language)
-                }.padding(10).background(LyraReaderTheme.fieldBg, in: RoundedRectangle(cornerRadius: 8))
-            }
-        }
-        if let blocks = try? aiTranslationBlocks(originals: result.originals, pages: result.originalPages, response: result.content),
-           blocks.contains(where: { !$0.translation.isEmpty }) {
-            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                VStack(alignment: .leading, spacing: 10) {
-                    if reading.showOriginal { Text(block.original).font(.callout).foregroundStyle(LyraReaderTheme.textSecondary).textSelection(.enabled) }
-                    if block.translation.isEmpty { Text(aiReadingLabel("Translation incomplete")).font(.caption).foregroundStyle(LyraReaderTheme.textSecondary) }
-                    else { answer(block.translation, pages: [block.page]) }
-                    Button("Original · p. \(block.page)") { reading.locate(page: block.page, excerpt: block.original, state: state) }.font(.caption)
-                }.padding(.vertical, 10)
-                Divider().overlay(LyraReaderTheme.separator)
-            }
-        } else {
-            Text(aiReadingLabel("Paragraph alignment is unavailable for this response. The returned text is preserved below.")).font(.caption).foregroundStyle(LyraReaderTheme.warningFg)
-            answer(result.content, pages: result.pages)
-        }
-    }
     private func taskHistory(_ kind: String) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 Button { showingTaskHistory = false; selectedTaskID = nil } label: { Label(aiReadingLabel("Current task"), systemImage: "chevron.left") }
-                let records = reading.store.records.filter { $0.kind == kind }.sorted { $0.modified > $1.modified }
+                let records = reading.store.taskHistory(kind)
                 if let selected = records.first(where: { $0.id == selectedTaskID }) {
                     Button(aiReadingLabel("All task results")) { selectedTaskID = nil }
                     Text(selected.title).font(.headline)
                     Text("\(selected.language.isEmpty ? "Document language" : selected.language) · \(selected.detail) · \(selected.model)")
                         .font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
                     if selected.status == "sourceChanged" { Text(aiReadingLabel("The source document has changed. This result retains its original source snapshot.")).font(.caption) }
-                    if kind == "translation" { translationResult(selected) }
-                    else {
+                    Group {
                         AIReadingSummaryContent(text: selected.content, pageCount: state.document?.pageCount ?? 0, pages: selected.pages, onJump: { state.gotoPage($0 - 1) })
                         Button(aiReadingLabel("Keep in notes")) { reading.keep(selected) }
                     }
@@ -268,16 +224,8 @@ struct AIReadingSidebar: View {
         }
     }
 
-    private func translationText(_ record: AiReadingRecord, page: Int?) -> String? {
-        do {
-            let blocks = try aiTranslationBlocks(originals: record.originals, pages: record.originalPages, response: record.content)
-            let text = blocks.filter { page == nil || Int($0.page) == page }.map(\.translation).filter { !$0.isEmpty }.joined(separator: "\n\n")
-            if text.isEmpty && page != nil { reading.notice = "This page has no aligned translation to copy."; return nil }
-            return text.isEmpty ? record.content : text
-        } catch { reading.notice = error.localizedDescription; return page == nil ? record.content : nil }
-    }
     private func storeVersions(_ result: AiReadingRecord) -> [AiReadingRecord] {
-        reading.store.records.filter { $0.kind == result.kind && $0.sourceId == result.sourceId }.sorted { $0.modified > $1.modified }
+        reading.store.taskHistory(result.kind, sourceID: result.sourceId)
     }
     private func answer(_ text: String, pages: [UInt32]) -> some View {
         AIAnswerView(text: text, pageCount: state.document?.pageCount ?? 0,

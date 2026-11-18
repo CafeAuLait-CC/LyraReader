@@ -260,6 +260,31 @@ impl LyraReadingWorkspace {
             .put_all(records.into_iter().map(Into::into).collect())
             .map_err(error)
     }
+    pub fn task_history(
+        &self,
+        kind: String,
+        source_id: Option<String>,
+    ) -> Result<Vec<AiReadingRecord>, LyraReaderFfiError> {
+        Ok(lyra_reader_core::sync::lock(&self.state)?
+            .task_history(&kind, source_id.as_deref())
+            .map_err(error)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+    pub fn task_selection(
+        &self,
+        id: String,
+    ) -> Result<Option<crate::api::AiSelectionRecord>, LyraReaderFfiError> {
+        Ok(lyra_reader_core::sync::lock(&self.state)?
+            .task_selection(&id)
+            .map_err(error)?
+            .map(|selection| crate::api::AiSelectionRecord {
+                page: selection.page,
+                start: selection.start,
+                end: selection.end,
+            }))
+    }
     pub fn put(&self, record: AiReadingRecord) -> Result<AiReadingRecord, LyraReaderFfiError> {
         Ok(lyra_reader_core::sync::lock(&self.state)?
             .put(record.into())

@@ -91,6 +91,44 @@ fn selection_keeps_raw_character_offsets_without_surroundings() {
 }
 
 #[test]
+fn selected_translation_pairs_paragraphs_after_exact_raw_slice() {
+    let selected = "  e\u{301} 中\r\nwrapped line.\r\n\r\nSecond 🔬 paragraph.\n\n\n";
+    let mut input = request(&[&format!("prefix{selected}suffix")]);
+    input.selection = Some(SelectionRange {
+        page: 0,
+        start: 6,
+        end: 6 + selected.chars().count() as u32 - 1,
+    });
+    let plan = build_reading_task(input, "translation", "Standard").unwrap();
+    assert_eq!(plan.sources.len(), 2);
+    assert_eq!(
+        plan.sources
+            .iter()
+            .map(|s| s.snippet.as_str())
+            .collect::<String>(),
+        selected
+    );
+    assert_eq!(
+        plan.sources[0].snippet,
+        "  e\u{301} 中\r\nwrapped line.\r\n\r\n"
+    );
+    let paired = translation_blocks(
+        &plan
+            .sources
+            .iter()
+            .map(|s| s.snippet.clone())
+            .collect::<Vec<_>>(),
+        &[1, 1],
+        "<!--lyra:1-->第二段<!--lyra:0-->第一段",
+    )
+    .unwrap();
+    assert_eq!(paired[0].translation, "第一段");
+    assert_eq!(paired[1].translation, "第二段");
+    assert!(!plan.parts[0].user_prompt.contains("prefix"));
+    assert!(!plan.parts[0].user_prompt.contains("suffix"));
+}
+
+#[test]
 fn translation_splits_for_output_capacity_without_losing_unicode_or_paragraphs() {
     let text =
         "A natural paragraph with consistent terminology.\n\n".repeat(50) + &"中文🔬".repeat(450);

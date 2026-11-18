@@ -1207,7 +1207,17 @@ pub fn build_reading_task(
             .iter()
             .find(|p| p.page == selection.page)
             .ok_or_else(|| empty_context("The selected source page is unavailable."))?;
-        sources.push((selection.page + 1, selection_text(&page.text, selection)?));
+        // Slice the untouched text first: normalization before slicing changes character offsets.
+        let text = selection_text(&page.text, selection)?;
+        if kind == "translation" {
+            sources.extend(
+                translation_paragraphs(&text)
+                    .into_iter()
+                    .map(|text| (selection.page + 1, text.to_string())),
+            );
+        } else {
+            sources.push((selection.page + 1, text));
+        }
     } else {
         if request.pages.len() != request.page_count as usize {
             return Err(empty_context(
@@ -2305,6 +2315,36 @@ fn truncate_graphemes(text: &str, limit: usize) -> (String, bool) {
         return (text.to_string(), false);
     }
     (grapheme_prefix(text, limit), true)
+}
+
+/// Preserve every selected byte, including CRLF and paragraph separators. Single newlines may
+/// be PDF line wraps, so only empty lines establish a new translation paragraph.
+fn translation_paragraphs(text: &str) -> Vec<&str> {
+    let mut paragraphs = Vec::new();
+    let mut start = 0;
+    let mut end = 0;
+    let mut has_text = false;
+    for line in text.split_inclusive('\n') {
+        end += line.len();
+        if line.trim().is_empty() && has_text {
+            paragraphs.push(&text[start..end]);
+            start = end;
+            has_text = false;
+        } else if !line.trim().is_empty() {
+            has_text = true;
+        }
+    }
+    if start < text.len() {
+        if !has_text && !paragraphs.is_empty() {
+            // Trailing blank lines belong to the final source paragraph.
+            if let Some(last) = paragraphs.last_mut() {
+                *last = &text[start - last.len()..];
+            }
+        } else {
+            paragraphs.push(&text[start..]);
+        }
+    }
+    paragraphs
 }
 
 fn selection_text(page_text: &str, selection: SelectionRange) -> Result<String, AiError> {

@@ -76,14 +76,77 @@ impl ReadingWorkspace {
     pub fn records(&self) -> Vec<ReadingRecord> {
         self.records
             .iter()
-            .cloned()
-            .map(|mut r| {
-                if !r.source_hash.is_empty() && r.source_hash != self.source_hash {
-                    r.status = "sourceChanged".into();
-                }
-                r
-            })
+            .map(|record| self.snapshot(record))
             .collect()
+    }
+
+    fn snapshot(&self, record: &ReadingRecord) -> ReadingRecord {
+        let mut record = record.clone();
+        if !record.source_hash.is_empty() && record.source_hash != self.source_hash {
+            record.status = "sourceChanged".into();
+        }
+        record
+    }
+
+    /// Independent task runs remain available across scopes and application launches.
+    pub fn task_history(
+        &self,
+        kind: &str,
+        source_id: Option<&str>,
+    ) -> Result<Vec<ReadingRecord>, String> {
+        if !matches!(kind, "summary" | "translation") {
+            return Err("History is only available for summary and translation tasks.".into());
+        }
+        let mut records: Vec<_> = self
+            .records
+            .iter()
+            .rev()
+            .filter(|record| {
+                record.kind == kind && source_id.is_none_or(|id| record.source_id == id)
+            })
+            .map(|record| self.snapshot(record))
+            .collect();
+        // Stable sorting preserves insertion order for tasks completed in the same millisecond.
+        records.sort_by_key(|record| std::cmp::Reverse(record.modified));
+        Ok(records)
+    }
+
+    /// Replaying a task uses its original range, never the reader's current selection.
+    pub fn task_selection(&self, id: &str) -> Result<Option<crate::SelectionRange>, String> {
+        let record = self
+            .records
+            .iter()
+            .find(|record| {
+                record.id == id && matches!(record.kind.as_str(), "summary" | "translation")
+            })
+            .ok_or("The saved task could not be found.")?;
+        if !record.source_hash.is_empty() && record.source_hash != self.source_hash {
+            return Err(
+                "The document has changed. Select the passage again before retranslating.".into(),
+            );
+        }
+        if record.source_id == "document" {
+            return Ok(None);
+        }
+        let invalid = "The saved task has no valid selection. Select the passage again.";
+        let mut fields = record.source_id.split(':');
+        if fields.next() != Some("selection") {
+            return Err(invalid.into());
+        }
+        let mut number = || fields.next().and_then(|field| field.parse::<u32>().ok());
+        let page = number()
+            .and_then(|page| page.checked_sub(1))
+            .ok_or(invalid)?;
+        let start = number().ok_or(invalid)?;
+        let end = number().ok_or(invalid)?;
+        let selection = crate::SelectionRange { page, start, end };
+        if fields.next().is_some()
+            || end < start
+            || reading_scope_key(Some(selection)) != record.source_id
+        {
+            return Err(invalid.into());
+        }
+        Ok(Some(selection))
     }
 
     pub fn put(&mut self, mut record: ReadingRecord) -> Result<ReadingRecord, String> {
@@ -420,6 +483,87 @@ pub fn translation_terms(originals: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn translation_history_retains_scopes_runs_and_original_ranges_after_relaunch() {
+        let mut workspace = ReadingWorkspace::default();
+        workspace.bind_source("original".into());
+        for (id, scope) in [
+            ("first", "selection:1:0:12"),
+            ("second", "selection:2:8:28"),
+            ("retry", "selection:1:0:12"),
+            ("whole", "document"),
+        ] {
+            workspace
+                .put(ReadingRecord {
+                    id: id.into(),
+                    kind: "translation".into(),
+                    source_id: scope.into(),
+                    content: format!("Translated {id}"),
+                    excerpt: format!("Original {id}"),
+                    modified: 10,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        workspace.put(source()).unwrap();
+        let mut restored = ReadingWorkspace::decode(&workspace.encode().unwrap()).unwrap();
+        let history = restored.task_history("translation", None).unwrap();
+        assert_eq!(
+            history.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["whole", "retry", "second", "first"]
+        );
+        assert_eq!(history.last().unwrap().excerpt, "Original first");
+        assert_eq!(
+            restored
+                .task_history("translation", Some("selection:1:0:12"))
+                .unwrap()
+                .len(),
+            2
+        );
+        let selection = restored.task_selection("second").unwrap().unwrap();
+        assert_eq!((selection.page, selection.start, selection.end), (1, 8, 28));
+        assert!(restored.task_selection("whole").unwrap().is_none());
+        assert!(restored.task_history("note", None).is_err());
+        restored.bind_source("changed".into());
+        assert!(
+            restored
+                .task_history("translation", None)
+                .unwrap()
+                .iter()
+                .all(|r| r.status == "sourceChanged")
+        );
+        assert!(
+            restored
+                .task_selection("second")
+                .unwrap_err()
+                .contains("document has changed")
+        );
+        assert!(restored.task_selection("whole").is_err());
+    }
+
+    #[test]
+    fn replay_rejects_malformed_scope_instead_of_translating_current_selection() {
+        let mut workspace = ReadingWorkspace::default();
+        for scope in [
+            "selection:0:1:2",
+            "selection:1:9:2",
+            "selection:1:0:2:3",
+            "selection:1:0:4294967296",
+            "selection:01:0:2",
+            "missing",
+        ] {
+            workspace
+                .put(ReadingRecord {
+                    id: "bad".into(),
+                    kind: "translation".into(),
+                    source_id: scope.into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert!(workspace.task_selection("bad").is_err(), "{scope}");
+        }
+        assert!(workspace.task_selection("absent").is_err());
+    }
     fn source() -> ReadingRecord {
         ReadingRecord {
             id: "result:1".into(),

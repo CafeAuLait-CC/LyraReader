@@ -132,3 +132,15 @@
 "The document analysis could not start. Please try again." = "The document analysis could not start. Please try again.";
 "The document understanding cache limit is unsupported." = "The document understanding cache limit is unsupported.";
 "The saved document understanding is too large. Its file was kept." = "The saved document understanding is too large. Its file was kept.";
+"Translation history" = "Translation history";
+"%d saved translations" = "%d saved";
+"Selection translation" = "Selection translation";
+"Document translation" = "Document translation";
+"TO" = "TO";
+"More" = "More";
+"Less" = "Less";
+"Original · p. %d" = "Original · p. %d";
+"The document has changed. Select the passage again before retranslating." = "The document has changed. Select the passage again before retranslating.";
+"The saved task has no valid selection. Select the passage again." = "The saved task has no valid selection. Select the passage again.";
+"The saved task could not be found." = "The saved task could not be found.";
+"Explain “%@”" = "Explain “%@”";
