@@ -96,7 +96,7 @@ struct AITranslationView: View {
                 }
             }
             if busy, !worker.answer.isEmpty, let plan = worker.plan {
-                blocks(originals: plan.sources.map(\.snippet), pages: plan.sources.map(\.page), content: worker.answer)
+                blocks(originals: plan.sources.map(\.snippet), pages: plan.sources.map(\.page), content: worker.answer, verifiedPages: worker.sentSourcePages)
             } else if let result {
                 if result.language != reading.translationLanguage {
                     Text(aiReadingLabel("Settings changed. Generate again to update this result.")).font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
@@ -106,7 +106,7 @@ struct AITranslationView: View {
                 } else if result.status == "partial" {
                     Label(aiReadingLabel("Partial result · stopped or interrupted"), systemImage: "pause.circle").font(.caption)
                 }
-                blocks(originals: result.originals, pages: result.originalPages, content: result.content)
+                blocks(originals: result.originals, pages: result.originalPages, content: result.content, verifiedPages: result.pages)
             } else if !busy {
                 Text(aiReadingLabel("A continuous translation with the original source close at hand."))
                     .foregroundStyle(LyraReaderTheme.textSecondary).padding(.vertical, 12)
@@ -180,9 +180,9 @@ struct AITranslationView: View {
             }
         }
     }
-    private func blocks(originals: [String], pages: [UInt32], content: String) -> some View {
+    private func blocks(originals: [String], pages: [UInt32], content: String, verifiedPages: [UInt32]) -> some View {
         AITranslationBlocks(originals: originals, pages: pages, content: content, showOriginal: reading.showOriginal,
-            pageCount: state.document?.pageCount ?? 0, onLocate: { reading.locate(page: $0, excerpt: $1, state: state) },
+            verifiedPages: Set(verifiedPages), pageCount: state.document?.pageCount ?? 0, onLocate: { reading.locate(page: $0, excerpt: $1, state: state) },
             onJump: { state.gotoPage($0 - 1) })
             .contextMenu {
                 ForEach(aiTranslationTerms(originals: originals), id: \.self) { term in
@@ -265,6 +265,7 @@ struct AITranslationBlocks: View {
     let pages: [UInt32]
     let content: String
     let showOriginal: Bool
+    let verifiedPages: Set<UInt32>
     let pageCount: Int
     var onLocate: (UInt32, String) -> Void
     var onJump: (Int) -> Void
@@ -276,7 +277,8 @@ struct AITranslationBlocks: View {
                     if block.translation.isEmpty {
                         Text(aiReadingLabel("Translation incomplete")).font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
                     } else {
-                        AIAnswerView(text: block.translation, pageCount: pageCount, verifiedPages: [Int(block.page)], onJump: onJump)
+                        AIAnswerView(text: block.translation, pageCount: pageCount,
+                                     verifiedPages: verifiedPages.contains(block.page) ? [Int(block.page)] : [], onJump: onJump)
                     }
                     HStack {
                         Button { onLocate(block.page, block.original) } label: {
@@ -290,7 +292,7 @@ struct AITranslationBlocks: View {
             }
         } else {
             Text(aiReadingLabel("Paragraph alignment is unavailable for this response. The returned text is preserved below.")).font(.caption).foregroundStyle(LyraReaderTheme.warningFg)
-            AIAnswerView(text: content, pageCount: pageCount, verifiedPages: Set(pages.map(Int.init)), onJump: onJump)
+            AIAnswerView(text: content, pageCount: pageCount, verifiedPages: Set(verifiedPages.map(Int.init)), onJump: onJump)
         }
     }
 }

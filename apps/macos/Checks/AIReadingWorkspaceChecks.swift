@@ -228,6 +228,34 @@ extension ReaderChecks {
             reading.result("translation")?.id == first.id && !showingHistory
         })
         require(starts() == count, "source expansion and native history navigation do not call a provider")
+        func textViews(_ view: NSView) -> [NSTextView] {
+            (view as? NSTextView).map { [$0] } ?? view.subviews.flatMap(textViews)
+        }
+        for (name, content) in [
+            ("aligned", "<!--lyra:0-->Supported [p.1].\n<!--lyra:1-->Unsupported [p.2]."),
+            ("unaligned", "Supported [p.1]. Unsupported [p.2].")
+        ] {
+            let sourceCheck = NSHostingView(rootView: ScrollView {
+                VStack(alignment: .leading) {
+                    AITranslationBlocks(originals: ["First source", "Unsent source"], pages: [1, 2], content: content,
+                        showOriginal: false, verifiedPages: [1], pageCount: 2, onLocate: { _, _ in }, onJump: { _ in })
+                }.padding(18)
+            }.environment(\.readingStableTextLayout, true))
+            window.contentView = sourceCheck
+            try await eventually("\(name) translation renders its citation fixture", {
+                sourceCheck.layoutSubtreeIfNeeded()
+                return textViews(sourceCheck).contains { $0.string.contains("Unsupported") }
+            })
+            var links = Set<String>()
+            for view in textViews(sourceCheck) {
+                guard let storage = view.textStorage else { continue }
+                storage.enumerateAttribute(.link, in: NSRange(location: 0, length: storage.length)) { value, _, _ in
+                    if let url = value as? URL { links.insert(url.absoluteString) }
+                }
+            }
+            require(links.contains("lyra-reader-page://1") && !links.contains("lyra-reader-page://2"),
+                    "\(name) translation links only actual sent pages, not the complete planned source map")
+        }
     }
 
     @MainActor private static func captureReadingWorkspace(state: AppState, reading: AIReadingModel) async throws {
