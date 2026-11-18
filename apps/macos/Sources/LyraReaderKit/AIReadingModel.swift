@@ -107,7 +107,34 @@ final class AIReadingModel: ObservableObject {
     func changeTranslationSource(selection: Bool, state: AppState) {
         translationSelection = selection
         translationResultID = nil; translationDraft = false
-        if selection { useSelection("translation", state: state) }
+        if selection { refreshTranslationSelection(state) }
+    }
+    /// Called only by the active translation tool. Capturing a preview never sends a request.
+    func refreshTranslationSelection(_ state: AppState) {
+        guard let context = state.aiReaderContext, context.documentKey == documentKey else { return }
+        let excerpt = context.selection == nil ? nil : state.selectedPassageText
+        guard frozenTranslation?.selection != context.selection || translationExcerpt != (excerpt ?? "") else { return }
+        frozenTranslation = excerpt == nil ? nil : context
+        translationExcerpt = excerpt ?? ""
+        translationResultID = nil; translationDraft = true
+    }
+    func translateCurrentSource(state: AppState) {
+        if translationSelection { refreshTranslationSelection(state) }
+        translationResultID = nil; translationDraft = true
+        run("translation", state: state)
+    }
+    func retranslate(_ record: AiReadingRecord, state: AppState) {
+        guard record.kind == "translation", let live = state.aiReaderContext, !state.documentKnowledge.isBlocking else { return }
+        do {
+            let selection = try store.taskSelection(record.id)
+            let context = AIReaderContext(documentKey: live.documentKey, documentTitle: live.documentTitle,
+                pageCount: live.pageCount, currentPage: live.currentPage, selection: selection.map {
+                    AIReaderSelection(page: Int($0.page) + 1, start: Int($0.start), end: Int($0.end))
+                })
+            startReadingTask("translation", state: state, context: context, usesSelection: selection != nil,
+                sourceID: record.sourceId, excerpt: record.excerpt, outputLanguage: record.language,
+                requestedDetail: record.detail, force: true)
+        } catch { notice = AIReadableError.message(error) }
     }
     private func restoreTranslationSource(_ record: AiReadingRecord, live: AIReaderContext) throws {
         let selection = try store.taskSelection(record.id)
@@ -234,14 +261,21 @@ final class AIReadingModel: ObservableObject {
                                       pageCount: live.pageCount, currentPage: live.currentPage, selection: nil)
         }
         guard !usesSelection || context.selection != nil else { notice = "Select a passage first."; return }
+        startReadingTask(kind, state: state, context: context, usesSelection: usesSelection,
+            sourceID: scopeID(kind), excerpt: usesSelection ? excerpt(kind) : "",
+            outputLanguage: kind == "summary" ? language : translationLanguage, requestedDetail: detail, force: force)
+    }
+
+    private func startReadingTask(_ kind: String, state: AppState, context: AIReaderContext, usesSelection: Bool,
+        sourceID: String, excerpt: String, outputLanguage: String, requestedDetail: String, force: Bool) {
+        let worker = worker(kind)
+        guard !worker.isPreparing, !worker.isSending else { return }
         if kind == "summary" && !usesSelection { analysisOwner = state.documentKnowledge }
         let token = generation
         let id = UUID().uuidString
-        let outputLanguage = kind == "summary" ? language : translationLanguage
-        let requestedDetail = detail
         let scope = usesSelection ? "Selected passage" : "Whole document"
-        activeResults[kind] = .make(id: id, kind: kind, title: scope, sourceID: scopeID(kind),
-            excerpt: usesSelection ? excerpt(kind) : "", language: outputLanguage, detail: requestedDetail, status: "preparing")
+        activeResults[kind] = .make(id: id, kind: kind, title: scope, sourceID: sourceID,
+            excerpt: excerpt, language: outputLanguage, detail: requestedDetail, status: "preparing")
         if kind == "translation" { translationResultID = nil; translationDraft = true }
         worker.attach(service: service(state), context: context)
         operations[kind]?.cancel()
@@ -278,6 +312,8 @@ final class AIReadingModel: ObservableObject {
             else { worker.send() }
         }
     }
+
+    var runningTranslation: AiReadingRecord? { activeResults["translation"] }
 
     func askChat(state: AppState) {
         guard let context = state.aiReaderContext, !state.documentKnowledge.isBlocking else { return }

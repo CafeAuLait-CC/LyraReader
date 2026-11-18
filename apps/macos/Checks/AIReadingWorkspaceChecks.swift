@@ -9,6 +9,8 @@ private final class ReadingTaskService: AIChatServicing {
     let base: RustAIChatService
     var starts = 0
     var startedPlans: [AiPlanRecord] = []
+    var holdNext = false
+    var latestHandle: ReadingTaskHandle?
     init(engine: RustEngine) { base = RustAIChatService(engine: engine, useMockProvider: true) }
     func prepare(_ request: AIMakePlanRequest) async throws -> AiPlanRecord { try await base.prepare(request) }
     func prepareReading(_ request: AIMakePlanRequest, options: AiReadingOptionsRecord) async throws -> AiPlanRecord {
@@ -17,7 +19,9 @@ private final class ReadingTaskService: AIChatServicing {
     func start(_ plan: AiPlanRecord, apiKey: String) throws -> any AIChatHandle {
         starts += 1
         startedPlans.append(plan)
-        return ReadingTaskHandle(plan: plan)
+        let handle = ReadingTaskHandle(plan: plan)
+        handle.suspended = holdNext; holdNext = false; latestHandle = handle
+        return handle
     }
 }
 
@@ -25,6 +29,7 @@ private final class ReadingTaskService: AIChatServicing {
 private final class ReadingTaskHandle: AIChatHandle {
     private var events: [AIStreamEvent]
     private(set) var isFinished = false
+    var suspended = false
     init(plan: AiPlanRecord) {
         events = []
         for part in plan.parts {
@@ -37,8 +42,20 @@ private final class ReadingTaskHandle: AIChatHandle {
         }
         events.append(.done)
     }
-    func poll() -> [AIStreamEvent] { let result = events; events = []; isFinished = true; return result }
+    func poll() -> [AIStreamEvent] {
+        guard !suspended else { return [] }
+        let result = events; events = []; isFinished = true; return result
+    }
     func cancel() { events = []; isFinished = true }
+}
+
+private struct TranslationPanelCheckHost: View {
+    @ObservedObject var state: AppState
+    @ObservedObject var reading: AIReadingModel
+    @ObservedObject var navigation: AIAssistantModel
+    var body: some View {
+        AIReadingSidebar(state: state, navigation: navigation, reading: reading, isActive: state.rightPanelVisible)
+    }
 }
 
 extension ReaderChecks {
@@ -90,7 +107,7 @@ extension ReaderChecks {
         reading.showOriginal.toggle()
         require(service.starts == sent, "showing original text sends no request")
         let textPage = try await engine.textPage(0)
-        func select(_ range: ClosedRange<Int>) async throws {
+        func select(_ range: ClosedRange<Int>, capture: Bool = true) async throws {
             state.clearSelection()
             try await eventually("synthetic page has a canvas placement", { !state.canvasPageFrames.isEmpty })
             let placement = state.canvasPageFrames.first { $0.index == 0 }!
@@ -105,7 +122,7 @@ extension ReaderChecks {
             })
             state.extendSelection(to: point(range.upperBound))
             require(state.selectedPassageText?.isEmpty == false, "the selected passage is available through the real canvas")
-            reading.changeTranslationSource(selection: true, state: state)
+            if capture { reading.changeTranslationSource(selection: true, state: state) }
         }
         try await select(0...15)
         reading.run("translation", state: state)
@@ -123,12 +140,18 @@ extension ReaderChecks {
         require(reading.result("translation")?.id == firstSelection.id && reading.excerpt("translation") == firstSelection.excerpt,
                 "opening history restores its result and its source snapshot together")
         require(service.starts == beforeHistory, "opening an earlier translation sends no request")
-        reading.run("translation", state: state, force: true)
+        reading.changeTranslationSource(selection: true, state: state)
+        let currentPreview = reading.excerpt("translation")
+        reading.translationLanguage = "German"
+        reading.retranslate(firstSelection, state: state)
         try await eventually("retranslating a saved passage creates another retained result", {
             reading.result("translation").map { $0.id != firstSelection.id } ?? false
         })
         require(service.startedPlans.last?.sources.map(\.snippet) == firstSelection.originals,
                 "retranslation uses the saved first selection even while the canvas still selects the second")
+        require(reading.excerpt("translation") == currentPreview && reading.translationLanguage == "German"
+                && reading.result("translation")?.language == firstSelection.language,
+                "retranslating an inline result keeps its saved language without changing the next translation's preview")
         require(reading.store.taskHistory("translation").count == 4,
                 "retranslation preserves every earlier run, including the previous result for this scope")
         let session = reading.sessionID
@@ -150,7 +173,8 @@ extension ReaderChecks {
         require(relaunched.result("translation")?.id == reading.result("translation")?.id && relaunched.translationSelection,
                 "a new presentation opens the latest saved selection translation without requiring a new selection")
         relaunched.cancelPresentation()
-        try await translationPresentationChecks(state: state, reading: reading, first: firstSelection, starts: { service.starts })
+        try await translationPresentationChecks(state: state, reading: reading,
+            select: { try await select($0, capture: false) }, service: service)
         try await captureReadingWorkspace(state: state, reading: reading)
         settings.reviewBeforeSending = true
         let beforeReview = service.starts
@@ -173,7 +197,7 @@ extension ReaderChecks {
     }
 
     @MainActor private static func translationPresentationChecks(state: AppState, reading: AIReadingModel,
-        first: AiReadingRecord, starts: () -> Int) async throws {
+        select: (ClosedRange<Int>) async throws -> Void, service: ReadingTaskService) async throws {
         func find(_ view: NSView) -> [AITranslationControlMarker] {
             (view as? AITranslationControlMarker).map { [$0] } ?? view.subviews.flatMap(find)
         }
@@ -213,21 +237,109 @@ extension ReaderChecks {
             excerpt.layoutSubtreeIfNeeded()
             return abs(find(excerpt).first { $0.id == "excerpt-card" }!.bounds.height - collapsed) < 2
         })
-        var showingHistory = true
-        let host = NSHostingView(rootView: AITranslationView(state: state, reading: reading,
-            showingHistory: Binding(get: { showingHistory }, set: { showingHistory = $0 }))
-            .background(LyraReaderTheme.panelBg).foregroundStyle(LyraReaderTheme.textPrimary).preferredColorScheme(.light))
+        let navigation = AIAssistantModel(settings: reading.settings); navigation.selectedTab = .translation
+        state.aiToolsVisible = false; state.rightPanelVisible = false
+        let host = NSHostingView(rootView: TranslationPanelCheckHost(state: state, reading: reading, navigation: navigation)
+            .preferredColorScheme(.light))
         window.contentView = host
-        let count = starts()
-        try await eventually("translation history exposes each retained result", {
-            host.layoutSubtreeIfNeeded(); return find(host).contains { $0.id == first.id }
+        let count = service.starts
+        reading.showOriginal = false
+        try await eventually("saved translations appear directly in the result feed", {
+            host.layoutSubtreeIfNeeded()
+            let ids = Set(reading.store.taskHistory("translation").map(\.id))
+            return find(host).filter { ids.contains($0.id) }.count >= 2
         })
-        try captureReadingInteraction(host, name: "translation-history")
-        click(first.id, in: host)
-        try await eventually("clicking an earlier history row restores it", {
-            reading.result("translation")?.id == first.id && !showingHistory
+        require(!find(host).contains { $0.id == "history" }, "translation results need no separate history screen")
+        click("show-original", in: host)
+        try await eventually("the Lyra checkbox toggles original paragraphs", { reading.showOriginal })
+        try captureReadingInteraction(host, name: "translation-inline-history")
+        click("language", in: host)
+        try await eventually("the destination picker opens the shared Lyra menu panel", {
+            NSApplication.shared.windows.contains { $0.isVisible && $0.accessibilityLabel() == "Toolbar commands" }
         })
-        require(starts() == count, "source expansion and native history navigation do not call a provider")
+        let menu = NSApplication.shared.windows.first { $0.isVisible && $0.accessibilityLabel() == "Toolbar commands" }!
+        try await Task.sleep(for: .milliseconds(150))
+        if let content = menu.contentView { try captureReadingInteraction(content, name: "translation-language-menu") }
+        for _ in 0..<3 {
+            menu.sendEvent(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: menu.windowNumber, context: nil,
+                characters: "\u{F701}", charactersIgnoringModifiers: "\u{F701}", isARepeat: false, keyCode: 125)!)
+            try await Task.sleep(for: .milliseconds(60))
+        }
+        menu.sendEvent(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: menu.windowNumber, context: nil,
+            characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36)!)
+        try await eventually("Lyra menu keyboard navigation selects Japanese", { reading.translationLanguage == "Japanese" })
+        require(AITranslationLanguage.display(reading.translationLanguage).code == "JP", "the destination field uses its short code")
+        require(service.starts == count, "expansion, checkbox and language selection never call a provider")
+
+        let inactiveExcerpt = reading.excerpt("translation")
+        try await select(130...155)
+        try await Task.sleep(for: .milliseconds(180))
+        require(reading.excerpt("translation") == inactiveExcerpt, "a closed translation tool ignores reading selections")
+        state.toggleRightPanel()
+        try await eventually("opening the translation tool captures the current selection", {
+            reading.excerpt("translation") == state.selectedPassageText
+        })
+        try await select(160...190)
+        try await eventually("the active translation preview follows a new selection automatically", {
+            reading.excerpt("translation") == state.selectedPassageText
+        })
+        require(service.starts == count, "automatic selection capture sends no AI request")
+        click("segment-Whole document", in: host)
+        try await eventually("the shared source picker switches Translate to the whole document", { !reading.translationSelection })
+        click("segment-Selection", in: host)
+        try await eventually("the shared source picker returns to the selected passage", { reading.translationSelection })
+        let captured = reading.excerpt("translation")
+        let before = reading.store.taskHistory("translation").count
+        service.holdNext = true
+        click("generate", in: host)
+        try await eventually("Translate explicitly starts one frozen task", { service.starts == count + 1 && reading.translation.isSending })
+        let originals = service.startedPlans.last!.sources.map(\.snippet)
+        try await select(210...235)
+        try await eventually("a new preview can update while an older selection is translating", {
+            reading.excerpt("translation") == state.selectedPassageText && reading.excerpt("translation") != captured
+        })
+        service.latestHandle?.suspended = false
+        try await eventually("the frozen task finishes as another inline result", { reading.store.taskHistory("translation").count == before + 1 })
+        require(reading.store.taskHistory("translation").first?.originals == originals,
+                "changing the preview cannot replace the in-flight task's source")
+        require(service.starts == count + 1, "selection changes during translation do not enqueue another request")
+        let preview = reading.excerpt("translation")
+        navigation.selectedTab = .summary
+        try await Task.sleep(for: .milliseconds(100))
+        try await eventually("Summary exposes the same Lyra source picker", {
+            host.layoutSubtreeIfNeeded(); return find(host).contains { $0.id == "segment-Selection" }
+        })
+        click("segment-Selection", in: host)
+        try await eventually("Summary's shared picker changes its source", { reading.summarySelection })
+        click("segment-Whole document", in: host)
+        try await eventually("Summary's shared picker returns to whole document", { !reading.summarySelection })
+        try await select(245...270)
+        try await Task.sleep(for: .milliseconds(180))
+        require(reading.excerpt("translation") == preview, "Summary does not keep updating the translation selection")
+        navigation.selectedTab = .chat
+        try await select(280...305)
+        try await Task.sleep(for: .milliseconds(180))
+        require(reading.excerpt("translation") == preview, "Chat does not keep updating the translation selection")
+        navigation.selectedTab = .regions; reading.selectedNoteID = nil
+        try await eventually("reading notes expose the same Lyra sorting picker", {
+            host.layoutSubtreeIfNeeded(); return find(host).contains { $0.id == "segment-Recent" }
+        })
+        click("segment-Recent", in: host)
+        try await Task.sleep(for: .milliseconds(70))
+        try captureReadingInteraction(host, name: "notes-sort-sliding")
+        try await Task.sleep(for: .milliseconds(150))
+        try captureReadingInteraction(host, name: "notes-sort-recent")
+        require(service.starts == count + 1, "source and note-order controls never request AI")
+        navigation.selectedTab = .translation
+        try await eventually("returning to Translate refreshes the preview without sending", { reading.excerpt("translation") == state.selectedPassageText })
+        state.aiToolsVisible = false
+        let closed = reading.excerpt("translation")
+        try await select(310...335)
+        try await Task.sleep(for: .milliseconds(180))
+        require(!state.rightPanelVisible && reading.excerpt("translation") == closed,
+                "closing the Lyra row stops automatic translation selection tracking")
         func textViews(_ view: NSView) -> [NSTextView] {
             (view as? NSTextView).map { [$0] } ?? view.subviews.flatMap(textViews)
         }
@@ -255,12 +367,17 @@ extension ReaderChecks {
             }
             require(links.contains("lyra-reader-page://1") && !links.contains("lyra-reader-page://2"),
                     "\(name) translation links only actual sent pages, not the complete planned source map")
+            let rendered = textViews(sourceCheck).first { $0.string.contains("Supported") }!.attributedString()
+            let font = rendered.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+            let paragraph = rendered.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+            require(font?.pointSize == 14.5 && paragraph?.lineSpacing == 5,
+                    "translated paragraphs use the larger reading font and relaxed line spacing")
         }
     }
 
     @MainActor private static func captureReadingWorkspace(state: AppState, reading: AIReadingModel) async throws {
-        guard let directory = ProcessInfo.processInfo.environment["LYRA_AI_EVIDENCE"] else { return }
-        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        let directory = ProcessInfo.processInfo.environment["LYRA_AI_EVIDENCE"]
+        if let directory { try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true) }
         let originals = ["The synthetic experiment measures repeatability across several independent trials. We report the complete procedure, compare the measurements, and discuss the remaining limitations.",
                          "The second synthetic paragraph describes a control condition and the evidence needed to interpret the result."]
         var translated = AiReadingRecord.make(kind: "translation", title: "Selected passage",
@@ -279,7 +396,22 @@ extension ReaderChecks {
                 reading.selectedNoteID = name == "note-detail" ? reading.store.notes(query: "", recent: false).first?.id : nil
                 try await Task.sleep(for: .milliseconds(150))
                 host.layoutSubtreeIfNeeded()
-                if let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+                if let prefix = ["summary": "A supported idea", "translation": "合成实验", "chat": "Answer", "note-detail": "My corrected knowledge"][name] {
+                    try await eventually("\(name) renders its semantic-ink fixture in \(dark ? "dark" : "light") mode", {
+                        host.layoutSubtreeIfNeeded()
+                        return markdownTextViews(host).contains { $0.string.hasPrefix(prefix) }
+                    })
+                    let output = markdownTextViews(host).first { $0.string.hasPrefix(prefix) }!
+                    let color = output.attributedString().attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor
+                    var rgb: [CGFloat] = []
+                    output.effectiveAppearance.performAsCurrentDrawingAppearance {
+                        if let resolved = color?.usingColorSpace(.sRGB) { rgb = [resolved.redComponent, resolved.greenComponent, resolved.blueComponent] }
+                    }
+                    let expected = (dark ? [241, 236, 227] : [48, 43, 37]).map { CGFloat($0) / 255 }
+                    require(rgb.count == 3 && zip(rgb, expected).allSatisfy { abs($0 - $1) < 0.005 },
+                            "\(name) output uses Lyra primary ink in \(dark ? "dark" : "light") mode")
+                }
+                if let directory, let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
                     host.cacheDisplay(in: host.bounds, to: bitmap)
                     try bitmap.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: directory)
                         .appendingPathComponent("reading-\(name)-414-\(dark ? "dark" : "light").png"))
@@ -291,5 +423,50 @@ extension ReaderChecks {
             try captureReadingInteraction(host, name: "translation-320-\(dark ? "dark" : "light")")
             window.orderOut(nil); window.contentView = nil
         }
+        try mathInkIsolationChecks()
+    }
+
+    @MainActor private static func markdownTextViews(_ view: NSView) -> [NSTextView] {
+        (view as? NSTextView).map { [$0] } ?? view.subviews.flatMap(markdownTextViews)
+    }
+
+    @MainActor private static func mathInkIsolationChecks() throws {
+        let expression = "\\frac{x}{2}"
+        guard case .success(let original) = ReaderMathRenderer.render(expression, fontSize: 18),
+              case .success(let themed) = ReaderMathRenderer.render(expression, fontSize: 18,
+                  ink: NSColor(srgbRed: 48 / 255, green: 43 / 255, blue: 37 / 255, alpha: 1)),
+              case .success(let repeated) = ReaderMathRenderer.render(expression, fontSize: 18),
+              let originalData = original.image.tiffRepresentation,
+              let themedData = themed.image.tiffRepresentation,
+              let repeatedData = repeated.image.tiffRepresentation,
+              let bitmap = themed.image.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              bitmap.width < 512, bitmap.height < 512,
+              let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(data: nil, width: bitmap.width, height: bitmap.height,
+                  bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { fail("FAIL: mathematics ink fixtures render") }
+        require(originalData == repeatedData && originalData != themedData,
+                "themed mathematics cannot contaminate the default renderer cache used by Interleaf")
+        context.draw(bitmap, in: CGRect(x: 0, y: 0, width: bitmap.width, height: bitmap.height))
+        guard let data = context.data else { fail("FAIL: mathematics pixels are readable") }
+        let bytes = data.assumingMemoryBound(to: UInt8.self)
+        var samples = 0, matches = true
+        for y in 0..<bitmap.height {
+            for x in 0..<bitmap.width {
+                let offset = y * context.bytesPerRow + x * 4
+                if bytes[offset + 3] > 250 {
+                    samples += 1
+                    matches = matches && zip([48, 43, 37], 0..<3).allSatisfy {
+                        abs(Int(bytes[offset + $1]) - $0) <= 1
+                    }
+                }
+            }
+        }
+        require(samples > 0 && matches, "AI mathematics glyphs and rules use the same warm primary ink as text")
+        guard case .failure = ReaderMathRenderer.render(String(repeating: "x", count: 1200), fontSize: 18,
+            ink: NSColor(srgbRed: 48 / 255, green: 43 / 255, blue: 37 / 255, alpha: 1)) else {
+            fail("FAIL: oversized mathematics is refused before bitmap allocation")
+        }
+        print("PASS: oversized mathematics is refused before bitmap allocation")
     }
 }

@@ -207,17 +207,12 @@ extension ReaderChecks {
                 "the panel's resize range is 240...520 pt")
         require(ReaderSidePanelMetrics.totalWidth(contentWidth: 320) == 327,
                 "the panel's footprint is content + 6 pt handle + 1 pt separator")
-        require(!ReaderSidePanelPreferences.isVisible(defaults: defaults),
-                "a fresh install starts with the panel closed")
         require(ReaderSidePanelPreferences.width(defaults: defaults) == 414,
                 "a fresh install starts at the default width")
 
         ReaderSidePanelPreferences.store(width: 410, defaults: defaults)
-        ReaderSidePanelPreferences.store(visible: true, defaults: defaults)
         require(ReaderSidePanelPreferences.width(defaults: defaults) == 410,
                 "the panel width is remembered (410 pt)")
-        require(ReaderSidePanelPreferences.isVisible(defaults: defaults),
-                "the panel's open state is remembered")
 
         ReaderSidePanelPreferences.store(width: 10, defaults: defaults)
         require(ReaderSidePanelPreferences.width(defaults: defaults) == 240,
@@ -246,17 +241,25 @@ extension ReaderChecks {
         let savedPreferenceMode = AppState.usesStoredSidePanelPreferences
         AppState.usesStoredSidePanelPreferences = true
         defer { AppState.usesStoredSidePanelPreferences = savedPreferenceMode }
-        ReaderSidePanelPreferences.store(visible: false, defaults: defaults)
+        defaults.set(true, forKey: ReaderSidePanelPreferences.visibleKey)
         let first = AppState(engine: try RustEngine(), panelDefaults: defaults)
         require(first.rightPanelWidthPt == 414 && !first.rightPanelVisible,
-                "a new session reads the default width and the stored closed state")
+                "a new session starts closed even when an earlier version stored an open drawer")
         first.setRightPanelWidth(455)
         first.rightPanelVisible = true
+        require(first.aiToolsVisible, "opening the assistant also opens its owning Lyra tool row")
+        defaults.set(true, forKey: ReaderSidePanelPreferences.visibleKey)
         let second = AppState(engine: try RustEngine(), panelDefaults: defaults)
         require(second.rightPanelWidthPt == 455,
                 "the next session remembers the 455 pt width the previous one settled on")
-        require(second.rightPanelVisible,
-                "the next session remembers that the panel was open")
+        require(!second.rightPanelVisible && !second.aiToolsVisible,
+                "the next session preserves width but starts with its drawer and tool row closed")
+        first.aiToolsVisible = false
+        require(!first.rightPanelVisible, "closing the Lyra row closes its assistant drawer")
+        first.rightPanelVisible = true
+        first.toggleAnnotationTools()
+        require(first.annotationToolsVisible && !first.rightPanelVisible && !first.aiToolsVisible,
+                "switching to another tool row closes the assistant with its Lyra owner")
         second.setRightPanelWidth(1000)
         require(second.rightPanelWidthPt == 520,
                 "the state clamps the maximum width to 520 pt")
@@ -892,7 +895,11 @@ extension ReaderChecks {
             let harness = RightPanelHarness(state: state, aiAssistant: model)
             defer { harness.close() }
             try await harness.mount()
-            try await eventually("the tiled-drawer viewport reports its actual width", {
+            try await eventuallyExplaining("the tiled-drawer viewport reports its actual width", {
+                "attached=\(harness.canvas.hasAttachedSurface), visible=\(harness.window.isVisible), "
+                    + "occluded=\(!harness.window.occlusionState.contains(.visible)), "
+                    + "viewport=\(state.canvasViewportWidthPt), actual=\(harness.canvasRect.width)"
+            }, {
                 harness.canvas.hasAttachedSurface
                     && abs(state.canvasViewportWidthPt - harness.canvasRect.width) < 0.5
             })

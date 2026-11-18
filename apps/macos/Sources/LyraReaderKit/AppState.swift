@@ -342,8 +342,8 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
                 }
                 contentEditEnabled = false
             }
-            guard oldValue != rightPanelVisible, Self.usesStoredSidePanelPreferences else { return }
-            ReaderSidePanelPreferences.store(visible: rightPanelVisible, defaults: panelDefaults)
+            // The assistant belongs to the Lyra row, including keyboard and context-menu opens.
+            if rightPanelVisible, !aiToolsVisible { aiToolsVisible = true }
         }
     }
     /// Content width of the right-hand panel, kept across launches and clamped on every write.
@@ -3487,7 +3487,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         if Self.usesStoredSidePanelPreferences {
             rightPanelWidthPt = ReaderSidePanelPreferences.width(defaults: panelDefaults)
-            rightPanelVisible = ReaderSidePanelPreferences.isVisible(defaults: panelDefaults)
+            // Width is a preference; an open tool drawer is session-only UI state.
+            panelDefaults.removeObject(forKey: ReaderSidePanelPreferences.visibleKey)
         }
 
         if Self.usesStoredReadingLayoutPreferences {

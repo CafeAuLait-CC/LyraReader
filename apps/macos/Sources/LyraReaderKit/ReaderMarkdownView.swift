@@ -1,6 +1,26 @@
 import AppKit
 import SwiftUI
 
+/// Reading typography is native presentation; task content and Markdown structure stay intact.
+struct ReaderMarkdownTypography: Equatable, Sendable {
+    var bodySize: CGFloat = 13
+    var lineSpacing: CGFloat = 2
+    var lineHeightMultiple: CGFloat = 0
+    var themedInk = false
+    static let standard = Self()
+    static let assistant = Self(themedInk: true)
+    static let translation = Self(bodySize: 14.5, lineSpacing: 5, lineHeightMultiple: 1.12, themedInk: true)
+}
+private struct ReaderMarkdownTypographyKey: EnvironmentKey {
+    static let defaultValue = ReaderMarkdownTypography.standard
+}
+extension EnvironmentValues {
+    var readerMarkdownTypography: ReaderMarkdownTypography {
+        get { self[ReaderMarkdownTypographyKey.self] }
+        set { self[ReaderMarkdownTypographyKey.self] = newValue }
+    }
+}
+
 /// Renders a parsed answer with the app's normal reading typography.
 ///
 /// Paragraphs, headings, list items and table cells go through a small `NSTextView` so inline
@@ -9,6 +29,7 @@ import SwiftUI
 /// their whitespace; tables use a `Grid`; display mathematics is a centred image with a
 /// monospace fallback. Nothing here interprets HTML.
 public struct ReaderMarkdownView: View {
+    @Environment(\.readerMarkdownTypography) private var typography
     public let document: ReaderMarkdownDocument
     public let pageCount: Int
     public let onJump: (Int) -> Void
@@ -49,7 +70,7 @@ public struct ReaderMarkdownView: View {
             ReaderMarkdownInlineText(
                 inlines: inlines,
                 pageCount: pageCount,
-                fontSize: 13,
+                fontSize: typography.bodySize,
                 onJump: onJump
             )
 
@@ -187,6 +208,7 @@ extension EnvironmentValues {
 }
 
 public struct ReaderMarkdownInlineText: NSViewRepresentable {
+    @Environment(\.readerMarkdownTypography) private var typography
     @Environment(\.readingStableTextLayout) private var stableReadingLayout
     @Environment(\.readingThemedLinks) private var themedLinks
     let inlines: [ReaderMarkdownInline]
@@ -219,12 +241,13 @@ public struct ReaderMarkdownInlineText: NSViewRepresentable {
 
     public func updateNSView(_ nsView: NSTextView, context: Context) {
         context.coordinator.onJump = onJump
-        let attributed = ReaderMarkdownAttributed.build(
-            inlines: inlines,
-            pageCount: pageCount,
-            fontSize: fontSize,
-            weight: weight
-        )
+        let attributed = NSMutableAttributedString()
+        nsView.effectiveAppearance.performAsCurrentDrawingAppearance {
+            attributed.append(ReaderMarkdownAttributed.build(
+                inlines: inlines, pageCount: pageCount, fontSize: fontSize, weight: weight,
+                typography: typography, ink: typography.themedInk ? LyraReaderTheme.textPrimaryColor : nil,
+                linkInk: themedLinks ? LyraReaderTheme.accentColor : nil))
+        }
         if !nsView.attributedString().isEqual(to: attributed) {
             nsView.textStorage?.setAttributedString(attributed)
             if stableReadingLayout { nsView.invalidateIntrinsicContentSize() }
@@ -295,14 +318,19 @@ enum ReaderMarkdownAttributed {
         inlines: [ReaderMarkdownInline],
         pageCount: Int,
         fontSize: CGFloat,
-        weight: NSFont.Weight = .regular
+        weight: NSFont.Weight = .regular,
+        typography: ReaderMarkdownTypography = .standard,
+        ink: NSColor? = nil,
+        linkInk: NSColor? = nil
     ) -> NSAttributedString {
         let base = NSFont.systemFont(ofSize: fontSize, weight: weight)
         let paragraph = NSMutableParagraphStyle()
-        paragraph.lineSpacing = 2
+        paragraph.lineSpacing = typography.lineSpacing
+        paragraph.lineHeightMultiple = typography.lineHeightMultiple
         paragraph.paragraphSpacing = 0
         let output = NSMutableAttributedString()
-        append(inlines, to: output, base: base, paragraph: paragraph, color: .labelColor)
+        append(inlines, to: output, base: base, paragraph: paragraph,
+               color: ink ?? .labelColor, mathInk: ink, linkInk: linkInk)
         return output
     }
 
@@ -311,7 +339,9 @@ enum ReaderMarkdownAttributed {
         to output: NSMutableAttributedString,
         base: NSFont,
         paragraph: NSParagraphStyle,
-        color: NSColor
+        color: NSColor,
+        mathInk: NSColor? = nil,
+        linkInk: NSColor? = nil
     ) {
         for inline in inlines {
             switch inline {
@@ -321,13 +351,13 @@ enum ReaderMarkdownAttributed {
                 ]))
             case .bold(let runs):
                 append(runs, to: output, base: FontTrait.bold(base), paragraph: paragraph,
-                       color: color)
+                       color: color, mathInk: mathInk, linkInk: linkInk)
             case .italic(let runs):
                 append(runs, to: output, base: FontTrait.italic(base), paragraph: paragraph,
-                       color: color)
+                       color: color, mathInk: mathInk, linkInk: linkInk)
             case .strikethrough(let runs):
                 let start = output.length
-                append(runs, to: output, base: base, paragraph: paragraph, color: color)
+                append(runs, to: output, base: base, paragraph: paragraph, color: color, mathInk: mathInk, linkInk: linkInk)
                 output.addAttribute(.strikethroughStyle,
                                     value: NSUnderlineStyle.single.rawValue,
                                     range: NSRange(location: start, length: output.length - start))
@@ -342,27 +372,27 @@ enum ReaderMarkdownAttributed {
                 ]))
             case .link(let runs, let destination):
                 let start = output.length
-                append(runs, to: output, base: base, paragraph: paragraph, color: color)
+                append(runs, to: output, base: base, paragraph: paragraph, color: color, mathInk: mathInk, linkInk: linkInk)
                 guard let url = URL(string: destination) else { continue }
                 let range = NSRange(location: start, length: output.length - start)
                 output.addAttributes([
                     .link: url,
-                    .foregroundColor: NSColor.controlAccentColor,
+                    .foregroundColor: linkInk ?? NSColor.controlAccentColor,
                     .underlineStyle: NSUnderlineStyle.single.rawValue,
                 ], range: range)
             case .citation(let page, let raw):
                 output.append(NSAttributedString(string: raw, attributes: [
                     .font: base,
                     .link: URL(string: "lyra-reader-page://\(page)")!,
-                    .foregroundColor: NSColor.controlAccentColor,
+                    .foregroundColor: linkInk ?? NSColor.controlAccentColor,
                     .underlineStyle: NSUnderlineStyle.single.rawValue,
                     .paragraphStyle: paragraph,
                 ]))
             case .math(let source):
-                appendMath(source, to: output, base: base, paragraph: paragraph)
+                appendMath(source, to: output, base: base, paragraph: paragraph, ink: mathInk, fallbackInk: color)
             case .mathFallback(let source, let reason):
                 appendMathFallback(source, reason: reason, to: output, base: base,
-                                   paragraph: paragraph)
+                                   paragraph: paragraph, ink: color)
             }
         }
     }
@@ -371,9 +401,11 @@ enum ReaderMarkdownAttributed {
         _ source: String,
         to output: NSMutableAttributedString,
         base: NSFont,
-        paragraph: NSParagraphStyle
+        paragraph: NSParagraphStyle,
+        ink: NSColor?,
+        fallbackInk: NSColor
     ) {
-        switch ReaderMathRenderer.render(source, fontSize: base.pointSize * 0.96) {
+        switch ReaderMathRenderer.render(source, fontSize: base.pointSize * 0.96, ink: ink) {
         case .success(let rendered):
             let attachment = NSTextAttachment()
             attachment.image = rendered.image
@@ -389,7 +421,7 @@ enum ReaderMarkdownAttributed {
             output.append(string)
         case .failure(let error):
             appendMathFallback(source, reason: error.localizedDescription, to: output,
-                               base: base, paragraph: paragraph)
+                               base: base, paragraph: paragraph, ink: fallbackInk)
         }
     }
 
@@ -398,13 +430,14 @@ enum ReaderMarkdownAttributed {
         reason: String,
         to output: NSMutableAttributedString,
         base: NSFont,
-        paragraph: NSParagraphStyle
+        paragraph: NSParagraphStyle,
+        ink: NSColor
     ) {
         let mono = NSFont.monospacedSystemFont(ofSize: max(9, base.pointSize - 1),
                                                weight: .regular)
         output.append(NSAttributedString(string: source, attributes: [
             .font: mono,
-            .foregroundColor: NSColor.labelColor,
+            .foregroundColor: ink,
             .backgroundColor: NSColor.textBackgroundColor.withAlphaComponent(0.55),
             .paragraphStyle: paragraph,
             .toolTip: reason,
@@ -483,6 +516,7 @@ private struct ReaderMarkdownTable: View {
 }
 
 private struct ReaderMathBlockView: View {
+    @Environment(\.readerMarkdownTypography) private var typography
     let source: String
     let reason: String?
 
@@ -506,6 +540,8 @@ private struct ReaderMathBlockView: View {
                     HStack {
                         Spacer(minLength: 0)
                         Image(nsImage: rendered.image)
+                            .renderingMode(typography.themedInk ? .template : .original)
+                            .foregroundStyle(LyraReaderTheme.textPrimary)
                             .accessibilityLabel("Mathematics: \(source)")
                         Spacer(minLength: 0)
                     }

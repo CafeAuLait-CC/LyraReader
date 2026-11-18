@@ -39,7 +39,7 @@ struct AIReadingSidebar: View {
                         .disabled(knowledge.isBlocking)
                 } else if navigation.selectedTab == .regions { notes }
                 else if navigation.selectedTab == .translation {
-                    AITranslationView(state: state, reading: reading, showingHistory: $showingTaskHistory).background(AIReadingSidebarMarker())
+                    AITranslationView(state: state, reading: reading, isActive: isActive && state.aiToolsVisible).background(AIReadingSidebarMarker())
                 }
                 else if showingTaskHistory { taskHistory("summary") }
                 else { summaryTask.background(AIReadingSidebarMarker()) }
@@ -54,6 +54,7 @@ struct AIReadingSidebar: View {
         }
         .environment(\.readingStableTextLayout, true)
         .environment(\.readingThemedLinks, true)
+        .environment(\.readerMarkdownTypography, .assistant)
         .background(LyraReaderTheme.panelBg)
         .foregroundStyle(LyraReaderTheme.textPrimary)
         .buttonStyle(.borderless)
@@ -82,9 +83,8 @@ struct AIReadingSidebar: View {
                 Button { reading.newSession(pageCount: state.document?.pageCount ?? 0); history = false } label: { Image(systemName: "square.and.pencil") }
                     .help(aiReadingLabel("New conversation")).disabled(reading.chat.isSending)
             }
-            if navigation.selectedTab == .summary || navigation.selectedTab == .translation {
+            if navigation.selectedTab == .summary {
                 Button { showingTaskHistory.toggle(); selectedTaskID = nil } label: { Image(systemName: "clock.arrow.circlepath") }.help(aiReadingLabel("Task history"))
-                    .disabled(navigation.selectedTab == .translation && (reading.translation.isPreparing || reading.translation.isSending || reading.translation.phase == .preview))
             }
             if navigation.selectedTab == .regions {
                 Button { copy(reading.store.notes(query: search, recent: recent).map { "# \($0.title)\n\n\($0.content)\n\n\($0.thoughts)" }.joined(separator: "\n\n---\n\n")) }
@@ -112,13 +112,11 @@ struct AIReadingSidebar: View {
         let busy = worker.isPreparing || worker.isSending || worker.phase == .mergePreview || worker.phase == .preview
         return ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                Picker(aiReadingLabel("Source"), selection: Binding(get: { selected }, set: { value in
+                LyraReadingSegmentedPicker(title: "Source", selection: Binding(get: { selected }, set: { value in
                     reading.summarySelection = value
                     if value && reading.excerpt(kind).isEmpty { reading.useSelection(kind, state: state) }
-                })) {
-                    Text(aiReadingLabel("Whole document")).tag(false)
-                    Text(aiReadingLabel("Selection")).tag(true)
-                }.pickerStyle(.segmented).labelsHidden().disabled(busy)
+                }), first: "Whole document", second: "Selection", firstIcon: "doc.text", secondIcon: "rectangle.dashed")
+                    .disabled(busy)
                 if selected {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
@@ -250,7 +248,7 @@ struct AIReadingSidebar: View {
             } else {
                 VStack(spacing: 12) {
                     TextField(aiReadingLabel("Search reading notes"), text: $search)
-                    Picker(aiReadingLabel("Sort"), selection: $recent) { Text(aiReadingLabel("Page order")).tag(false); Text(aiReadingLabel("Recent")).tag(true) }.pickerStyle(.segmented)
+                    LyraReadingSegmentedPicker(title: "Sort", selection: $recent, first: "Page order", second: "Recent", firstIcon: "list.number", secondIcon: "clock")
                     let notes = reading.store.notes(query: search, recent: recent)
                     if notes.isEmpty {
                         ContentUnavailableView(aiReadingLabel(search.isEmpty ? "Keep the ideas you discover" : "No matching notes"), systemImage: "note.text",

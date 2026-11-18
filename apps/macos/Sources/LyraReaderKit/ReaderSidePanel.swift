@@ -49,13 +49,14 @@ public enum ReaderSidePanelMetrics {
     }
 }
 
-/// The persisted half of the right panel: its width and whether it is open.
+/// The persisted width of the right panel. Tool visibility is session-only state.
 ///
 /// These are reader preferences, not document state, so they live in `UserDefaults`. The app
 /// reads and writes the standard domain; the checks pass an isolated suite so a run can prove
 /// "remembered across launches" without touching the person's own window.
 public enum ReaderSidePanelPreferences {
     public static let widthKey = "rightPanelWidthPt"
+    /// Retired launch preference, removed when a new reader session is created.
     public static let visibleKey = "rightPanelVisible"
 
     public static func width(defaults: UserDefaults = .standard) -> CGFloat {
@@ -65,17 +66,10 @@ public enum ReaderSidePanelPreferences {
         return ReaderSidePanelMetrics.clampedContentWidth(CGFloat(stored.doubleValue))
     }
 
-    public static func isVisible(defaults: UserDefaults = .standard) -> Bool {
-        defaults.bool(forKey: visibleKey)
-    }
-
     public static func store(width: CGFloat, defaults: UserDefaults = .standard) {
         defaults.set(Double(ReaderSidePanelMetrics.clampedContentWidth(width)), forKey: widthKey)
     }
 
-    public static func store(visible: Bool, defaults: UserDefaults = .standard) {
-        defaults.set(visible, forKey: visibleKey)
-    }
 }
 
 /// Keyboard shortcuts the right panel introduces.

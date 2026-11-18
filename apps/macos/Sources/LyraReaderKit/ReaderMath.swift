@@ -59,13 +59,19 @@ public enum ReaderMathRenderer {
     public static func render(
         _ source: String,
         fontSize: CGFloat = 13,
-        display: Bool = false
+        display: Bool = false,
+        ink: NSColor? = nil
     ) -> Result<ReaderMathImage, ReaderMathError> {
         let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .failure(.empty) }
         let appearance = NSApp?.effectiveAppearance ?? NSAppearance(named: .aqua)
         let dark = appearance?.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        let key = "\(trimmed)|\(fontSize)|\(display)|\(dark)" as NSString
+        let resolvedInk = ink?.usingColorSpace(.sRGB)
+        if ink != nil && resolvedInk == nil {
+            return .failure(.unsupported("The mathematics text color could not be resolved."))
+        }
+        let inkKey = resolvedInk.map { "\($0.redComponent),\($0.greenComponent),\($0.blueComponent),\($0.alphaComponent)" } ?? "system"
+        let key = "\(trimmed)|\(fontSize)|\(display)|\(dark)|\(inkKey)" as NSString
         if let cached = cache.object(forKey: key) {
             return .success(ReaderMathImage(
                 image: cached.image, size: cached.size, ascent: cached.ascent,
@@ -75,17 +81,44 @@ public enum ReaderMathRenderer {
         do {
             var parser = MathParser(source: aiMathRenderSource(source: trimmed), display: display)
             let nodes = try parser.parse()
-            let box = MathLayout.layoutRow(nodes, size: fontSize, display: display, baseSize: fontSize)
+            let box = MathLayout(ink: resolvedInk ?? .labelColor).layoutRow(nodes, size: fontSize, display: display, baseSize: fontSize)
             let padding = max(1, fontSize * 0.14)
             let width = max(1, box.width + padding * 2)
             let height = max(1, box.ascent + box.descent + padding * 2)
-            let image = NSImage(size: NSSize(width: width, height: height))
-            image.lockFocus()
-            defer { image.unlockFocus() }
-            if let context = NSGraphicsContext.current?.cgContext {
+            func draw(_ context: CGContext) {
                 context.setShouldAntialias(true)
                 context.textMatrix = .identity
                 box.draw(context, padding, padding + box.descent)
+            }
+            let image: NSImage
+            if resolvedInk != nil {
+                // Core Text colors and the bitmap must share sRGB. lockFocus uses a generic
+                // profile, which changes the apparent ink when the image is composited.
+                let scale: CGFloat = 2
+                guard width.isFinite, height.isFinite, width > 0, height > 0,
+                      width <= 4096, height <= 4096 else {
+                    return .failure(.unsupported("The mathematics image exceeds the supported dimensions."))
+                }
+                let pixelsWide = Int(ceil(width * scale)), pixelsHigh = Int(ceil(height * scale))
+                let (pixels, overflow) = pixelsWide.multipliedReportingOverflow(by: pixelsHigh)
+                guard !overflow, pixels <= 16_777_216,
+                      let space = CGColorSpace(name: CGColorSpace.sRGB),
+                      let context = CGContext(data: nil, width: pixelsWide, height: pixelsHigh,
+                          bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+                    return .failure(.unsupported("The mathematics image could not be allocated."))
+                }
+                context.scaleBy(x: scale, y: scale)
+                draw(context)
+                guard let bitmap = context.makeImage() else {
+                    return .failure(.unsupported("The mathematics image could not be created."))
+                }
+                image = NSImage(cgImage: bitmap, size: NSSize(width: width, height: height))
+            } else {
+                image = NSImage(size: NSSize(width: width, height: height))
+                image.lockFocus()
+                defer { image.unlockFocus() }
+                if let context = NSGraphicsContext.current?.cgContext { draw(context) }
             }
             let rendered = ReaderMathImage(
                 image: image,
@@ -623,8 +656,10 @@ private struct MathParser {
 
 // MARK: - Layout
 
-private enum MathLayout {
-    static func font(size: CGFloat, italic: Bool = false, bold: Bool = false) -> NSFont {
+private struct MathLayout {
+    let ink: NSColor
+
+    func font(size: CGFloat, italic: Bool = false, bold: Bool = false) -> NSFont {
         let family = NSFont(name: "Times New Roman", size: size)
             ?? NSFont.systemFont(ofSize: size)
         var font = family
@@ -637,7 +672,7 @@ private enum MathLayout {
         return font
     }
 
-    static func textBox(
+    func textBox(
         _ text: String,
         size: CGFloat,
         italic: Bool = false,
@@ -646,7 +681,7 @@ private enum MathLayout {
         let font = font(size: size, italic: italic, bold: bold)
         let attributed = NSAttributedString(
             string: text,
-            attributes: [.font: font, .foregroundColor: NSColor.labelColor]
+            attributes: [.font: font, .foregroundColor: ink]
         )
         let line = CTLineCreateWithAttributedString(attributed)
         var ascent: CGFloat = 0
@@ -662,7 +697,7 @@ private enum MathLayout {
         }
     }
 
-    static func layoutRow(
+    func layoutRow(
         _ nodes: [MathNode],
         size: CGFloat,
         display: Bool,
@@ -685,7 +720,7 @@ private enum MathLayout {
         }
     }
 
-    static func layout(
+    func layout(
         _ node: MathNode,
         size: CGFloat,
         display: Bool,
@@ -716,7 +751,7 @@ private enum MathLayout {
                 let denX = x + (width - den.width) / 2
                 num.draw(context, numX, y + barThickness / 2 + gap + num.descent)
                 den.draw(context, denX, y - barThickness / 2 - gap - den.ascent)
-                context.setFillColor(NSColor.labelColor.cgColor)
+                context.setFillColor(ink.cgColor)
                 context.fill(CGRect(x: x + size * 0.10, y: y - barThickness / 2,
                                     width: width - size * 0.20, height: barThickness))
             }
@@ -734,7 +769,7 @@ private enum MathLayout {
             return MathBox(width: width, ascent: ascent, descent: descent) { context, x, y in
                 let bodyX = x + max(radical.width, indexBox.width) + size * 0.02
                 body.draw(context, bodyX, y)
-                context.setStrokeColor(NSColor.labelColor.cgColor)
+                context.setStrokeColor(ink.cgColor)
                 context.setLineWidth(max(0.6, size * 0.055))
                 context.beginPath()
                 context.move(to: CGPoint(x: bodyX, y: y + body.ascent + size * 0.10))
@@ -869,24 +904,24 @@ private enum MathLayout {
         }
     }
 
-    static func isOperator(_ text: String) -> Bool {
+    func isOperator(_ text: String) -> Bool {
         guard text.count == 1, let scalar = text.unicodeScalars.first else { return false }
         return "=<>≤≥≠≈±∓×÷⇒→←↔∈∉⊂⊆⊃⊇∪∩".unicodeScalars.contains(scalar)
     }
 
-    static func spaced(_ box: MathBox, em: CGFloat) -> MathBox {
+    func spaced(_ box: MathBox, em: CGFloat) -> MathBox {
         let pad = em * 0.16
         return MathBox(width: box.width + pad * 2, ascent: box.ascent, descent: box.descent) { context, x, y in
             box.draw(context, x + pad, y)
         }
     }
 
-    static func delimiter(_ symbol: String, height: CGFloat) -> MathBox {
+    func delimiter(_ symbol: String, height: CGFloat) -> MathBox {
         guard !symbol.isEmpty else { return MathBox.empty() }
         let size = max(10, height * 1.02)
         let font = font(size: size)
         let attributed = NSAttributedString(string: symbol, attributes: [
-            .font: font, .foregroundColor: NSColor.labelColor
+            .font: font, .foregroundColor: ink
         ])
         let line = CTLineCreateWithAttributedString(attributed)
         var ascent: CGFloat = 0
