@@ -2942,7 +2942,7 @@ private slots:
         auto *chip=visualItem(window->contentItem(),"translationDisclosure");QVERIFY(chip && chip->isVisible());
         window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);chip->forceActiveFocus();QTest::keyClick(window,Qt::Key_Space);
         auto *menu=chip->findChild<QObject *>("translationMenu");QVERIFY(menu);QTRY_VERIFY(menu->property("visible").toBool());
-        auto *menuContent=menu->property("contentItem").value<QQuickItem *>();QVERIFY(menuContent);auto *full=visualItem(menuContent,"translationShowFull");QVERIFY(full);full->forceActiveFocus();QVERIFY(full->window());QTest::keyClick(full->window(),Qt::Key_Return);
+        auto *menuContent=menu->property("contentItem").value<QQuickItem *>();QVERIFY(menuContent);const auto menuOrigin=menuContent->mapToGlobal(QPointF(-menu->property("leftPadding").toDouble(),-menu->property("topPadding").toDouble()));const auto menuAnchor=chip->mapToGlobal(QPointF(0,chip->height()));QVERIFY2(QLineF(menuOrigin,menuAnchor).length()<2,"A keyboard-opened translation menu must be anchored to its own button");auto *full=visualItem(menuContent,"translationShowFull");QVERIFY(full);full->forceActiveFocus();QVERIFY(full->window());QTest::keyClick(full->window(),Qt::Key_Return);
         auto *translationLayer=visualItem(window->contentItem(),"translationLayer0");QVERIFY(translationLayer);
         auto *disclosure=translationLayer->findChild<QObject *>("translationFullText");QVERIFY(disclosure);QTRY_VERIFY(disclosure->property("visible").toBool());
         auto *disclosed=translationLayer->findChild<QObject *>("translationDisclosureText");QVERIFY(disclosed);QVERIFY(disclosed->property("text").toString().size()>1000);
