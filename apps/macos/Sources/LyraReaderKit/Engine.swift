@@ -301,6 +301,18 @@ public struct TextPage: Sendable {
         self.rust = rust
     }
 
+    /// One checked value adapter for synthetic pages and helpers that need raw glyph geometry.
+    package func sharedTextCharacters(maximum: Int) throws -> [LyraReaderBindings.TextChar] {
+        guard maximum > 0, chars.count <= maximum else {
+            throw NSError(domain: "LyraReader", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "This page has too much text for this operation."])
+        }
+        return chars.map {
+            LyraReaderBindings.TextChar(unicode: $0.unicode, xPt: Double($0.xPt), yPt: Double($0.yPt),
+                widthPt: Double($0.widthPt), heightPt: Double($0.heightPt))
+        }
+    }
+
     /// Explicit translation actions share Rust's cached paragraphs and scalar extraction.
     public func translationTargets(in range: ClosedRange<Int>) throws -> [TranslationTargetRecord] {
         guard let start = UInt32(exactly: range.lowerBound), let end = UInt32(exactly: range.upperBound),
@@ -309,7 +321,7 @@ public struct TextPage: Sendable {
                           userInfo: [NSLocalizedDescriptionKey: "The translation range is invalid."])
         }
         if let rust, let result = try rust.translationTargets(start: start, end: end) { return result }
-        return try translationTargetsForText(page: page, chars: chars, start: start, end: end)
+        return try translationTargetsForText(page: page, chars: try sharedTextCharacters(maximum: 1 << 20), start: start, end: end)
     }
 
     public func translationBlocks() throws -> [TranslationTargetRecord] {
@@ -318,7 +330,7 @@ public struct TextPage: Sendable {
                           userInfo: [NSLocalizedDescriptionKey: "The translation page is invalid."])
         }
         if let rust, let result = try rust.translationBlocks() { return result }
-        return try translationBlocksForText(page: page, chars: chars)
+        return try translationBlocksForText(page: page, chars: try sharedTextCharacters(maximum: 1 << 20))
     }
 
     /// The text line touched by an annotation, excluding a separate line-number gutter.
