@@ -73,9 +73,13 @@ extension ReaderChecks {
         }
         // Read actual gold pixels. A target-value probe or an endpoint screenshot cannot
         // distinguish a continuous slide from a jump or two backgrounds cross-fading.
-        func paintedHighlight(_ area: CGRect) -> (center: CGFloat, width: CGFloat, labels: [CGRect], bitmap: NSBitmapImageRep) {
+        func captureSelector(_ area: CGRect) -> NSBitmapImageRep {
             guard let bitmap = host.bitmapImageRepForCachingDisplay(in: area) else { fail("FAIL: selector bitmap exists") }
             host.cacheDisplay(in: area, to: bitmap)
+            return bitmap
+        }
+        func paintedHighlight(_ area: CGRect, bitmap supplied: NSBitmapImageRep? = nil) -> (center: CGFloat, width: CGFloat, labels: [CGRect]) {
+            let bitmap = supplied ?? captureSelector(area)
             guard let image = bitmap.cgImage, let space = CGColorSpace(name: CGColorSpace.sRGB),
                   let context = CGContext(data: nil, width: bitmap.pixelsWide, height: bitmap.pixelsHigh,
                       bitsPerComponent: 8, bytesPerRow: 0, space: space,
@@ -110,7 +114,7 @@ extension ReaderChecks {
                 return CGRect(x: CGFloat(inkMinX[index]) / scale, y: CGFloat(inkMinY[index]) / scale,
                     width: CGFloat(inkMaxX[index] - inkMinX[index] + 1) / scale, height: CGFloat(inkMaxY[index] - inkMinY[index] + 1) / scale)
             }
-            return (CGFloat(first + last) / (2 * scale), CGFloat(last - first + 1) / scale, labels, bitmap)
+            return (CGFloat(first + last) / (2 * scale), CGFloat(last - first + 1) / scale, labels)
         }
         for (name, tab, first, second) in [
             ("summary", AIAssistantTab.summary, "Whole document", "Selection"),
@@ -147,21 +151,24 @@ extension ReaderChecks {
                 while ProcessInfo.processInfo.systemUptime < deadline {
                     let l = rect(left), r = rect(right)
                     geometryError = max(geometryError, abs(l.width - originalLeft.width), abs(r.midX - originalRight.midX))
-                    let painted = paintedHighlight(area)
+                    frames.append((ProcessInfo.processInfo.systemUptime - began, captureSelector(area)))
+                    try await Task.sleep(for: .milliseconds(8))
+                }
+                // Decode after the motion. Per-pixel sRGB/ink analysis on the main actor
+                // would otherwise delay the very SwiftUI frames this check is observing.
+                for frame in frames {
+                    let painted = paintedHighlight(area, bitmap: frame.1)
                     samples.append((painted.center, painted.width))
                     for (initial, current) in zip(start.labels, painted.labels) {
                         labelError = max(labelError, abs(initial.minX - current.minX), abs(initial.maxX - current.maxX),
                                          abs(initial.minY - current.minY), abs(initial.maxY - current.maxY))
                     }
-                    if ProcessInfo.processInfo.environment["LYRA_AI_EVIDENCE"] != nil {
-                        frames.append((ProcessInfo.processInfo.systemUptime - began, painted.bitmap))
-                    }
-                    try await Task.sleep(for: .milliseconds(8))
                 }
                 let end = samples.last!.0
                 let previous = direction == 1 ? start.center : originalRight.midX - area.minX
                 let low = min(previous, end) + 8, high = max(previous, end) - 8
                 let intermediate = Set(samples.filter { $0.0 > low && $0.0 < high }.map { Int($0.0.rounded()) })
+                print("INFO: \(name) direction \(direction) captured \(frames.count) frames before pixel analysis")
                 require(geometryError < 0.5, "\(name) labels keep their positions when content gains or loses a scrollbar (error \(geometryError) pt)")
                 require(labelError <= 1, "\(name) keeps painted icon/text bounds fixed throughout the slide (error \(labelError) pt)")
                 require(intermediate.count >= 3, "\(name) paints multiple intermediate highlight positions in direction \(direction) (\(intermediate.count))")
@@ -170,7 +177,8 @@ extension ReaderChecks {
                     let directory = URL(fileURLWithPath: folder).appendingPathComponent("selector-\(name)-\(direction)")
                     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                     for (index, frame) in frames.enumerated() {
-                        try frame.1.representation(using: .png, properties: [:])?.write(to: directory.appendingPathComponent(String(format: "%03d.png", index)))
+                        guard let png = frame.1.representation(using: .png, properties: [:]) else { fail("FAIL: selector frame is encodable") }
+                        try png.write(to: directory.appendingPathComponent(String(format: "%03d.png", index)))
                     }
                     try JSONSerialization.data(withJSONObject: frames.map(\.0)).write(to: directory.appendingPathComponent("times.json"))
                 }
