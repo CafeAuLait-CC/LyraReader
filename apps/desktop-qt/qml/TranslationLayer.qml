@@ -15,21 +15,31 @@ Item {
     readonly property var entries: owner.translationOverlays.filter(function(e){return e.target.page===translationLayer.page;})
     function restore() { if(!loading)owner.inspectTranslations(page); }
     function closeDisclosure() {
+        disclosedContext=null;
         if(disclosure)disclosure.close();
         disclosedText="";disclosedLanguage="";disclosedModel="";
     }
-    function toggleOriginal(id) {
-        const expectedOwner=owner,expectedGeneration=generation;
-        owner.toggleTranslation(id);
-        // Rebuilding the value-model destroys the menu's button. Restore its
-        // keyboard focus only within this same, still-active reading window.
+    function restoreMenuFocus(context) {
+        // A menu or value-model change can retire its old button before the popup closes.
         Qt.callLater(function() {
-            if(owner!==expectedOwner || generation!==expectedGeneration || !app.active)return;
+            if(!context || owner!==context.reader || generation!==context.generation || !app.active)return;
             for(let i=0;i<passages.count;++i) {
                 const item=passages.itemAt(i);
-                if(item && item.modelData.id===id){item.menuButton.forceActiveFocus();return;}
+                if(item && item.modelData.id===context.id && item.menuButton.visible) {
+                    item.menuButton.forceActiveFocus(Qt.TabFocusReason);return;
+                }
             }
         });
+    }
+    function toggleOriginal(id) {
+        const context={reader:owner,generation:generation,id:id};
+        owner.toggleTranslation(id);
+        restoreMenuFocus(context);
+    }
+    function showFull(entry) {
+        disclosedContext={reader:owner,generation:generation,id:entry.id};
+        disclosedText=entry.text;disclosedLanguage=entry.language || "";disclosedModel=entry.model || "";
+        disclosure.open();
     }
     Component.onCompleted: restore()
     onOwnerChanged: {closeDisclosure();restore();}
@@ -154,12 +164,13 @@ Item {
                         text: overlay.original ? qsTr("Show saved translation") : qsTr("Show original")
                         onTriggered:translationLayer.toggleOriginal(overlay.modelData.id)
                     }
-                    MenuItem {objectName:"translationShowFull";text:qsTr("Full translation…");onTriggered:{translationLayer.disclosedText=overlay.modelData.text;translationLayer.disclosedLanguage=overlay.modelData.language || "";translationLayer.disclosedModel=overlay.modelData.model || "";disclosure.open();}}
+                    MenuItem {objectName:"translationShowFull";text:qsTr("Full translation…");onTriggered:translationLayer.showFull(overlay.modelData)}
                 }
             }
 
         }
     }
+    property var disclosedContext:null
     property string disclosedText: ""
     property string disclosedLanguage: ""
     property string disclosedModel: ""
@@ -169,6 +180,12 @@ Item {
                 parent:Overlay.overlay;anchors.centerIn:parent
                 width:Math.min(640,app.width-40);height:Math.min(480,app.height-40)
                 title:qsTr("Full translation");modal:true;standardButtons:Dialog.Close
+                onClosed: {
+                    const context=translationLayer.disclosedContext;
+                    translationLayer.disclosedContext=null;
+                    translationLayer.disclosedText="";translationLayer.disclosedLanguage="";translationLayer.disclosedModel="";
+                    translationLayer.restoreMenuFocus(context);
+                }
                 ColumnLayout {
                     anchors.fill:parent
                     Label {text:translationLayer.disclosedLanguage+" · "+translationLayer.disclosedModel;textFormat:Text.PlainText;Layout.fillWidth:true;elide:Text.ElideRight;color:app.colors.textSecondary}
