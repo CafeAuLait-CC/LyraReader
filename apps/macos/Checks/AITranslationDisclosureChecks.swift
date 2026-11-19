@@ -78,6 +78,11 @@ extension ReaderChecks {
                 }
                 let sourceMore = frame("original-more-long-0"), resultMore = frame("result-more-long")
                 let retry = frame("result-retry-long"), result = frame("translated-preview-long-0")
+                // Native icon and text controls can differ in height. Compare their shared
+                // row, allowing one backing pixel for AppKit frame rounding at either scale.
+                let pixel = 1 / window.backingScaleFactor
+                let rowOverlap = min(resultMore.maxY, retry.maxY) - max(resultMore.minY, retry.minY)
+                print("INFO: inline controls scale=\(window.backingScaleFactor) preview=\(result) more=\(resultMore) retry=\(retry)")
                 let originalView = textViews(host).first { $0.string == original }!
                 let layout = originalView.layoutManager!, container = originalView.textContainer!
                 var originalLines: [CGRect] = []
@@ -90,13 +95,15 @@ extension ReaderChecks {
                         && sourceMore.maxY <= originalLines[2].maxY + 1
                         && frame("original-preview-long-0").contains(sourceMore),
                         "original More stays inside its third text line instead of adding another row")
-                require(result.contains(resultMore) && result.contains(retry) && abs(resultMore.midY - retry.midY) < 0.5
-                        && abs(result.maxX - retry.maxX) < 0.5,
+                require(result.insetBy(dx: -pixel, dy: -pixel).contains(resultMore)
+                        && result.insetBy(dx: -pixel, dy: -pixel).contains(retry)
+                        && rowOverlap >= min(resultMore.height, retry.height) - pixel
+                        && abs(result.maxX - retry.maxX) <= pixel,
                         "translation More and right-aligned Retry share the last visible text row")
-                require(frame("result-source-short-0").contains(frame("result-retry-short")),
+                require(frame("result-source-short-0").insetBy(dx: -pixel, dy: -pixel).contains(frame("result-retry-short")),
                         "a short translation keeps Retry on its source row without a separate action row")
-                require(frame("result-source-equation-0").contains(frame("result-more-equation"))
-                        && frame("result-source-equation-0").contains(frame("result-retry-equation")),
+                require(frame("result-source-equation-0").insetBy(dx: -pixel, dy: -pixel).contains(frame("result-more-equation"))
+                        && frame("result-source-equation-0").insetBy(dx: -pixel, dy: -pixel).contains(frame("result-retry-equation")),
                         "an equation-only ending keeps its complete formula and shares the source row for actions")
                 require(originalView.string == original && container.containerSize.width == originalView.bounds.width,
                         "inline truncation retains the complete selectable original and its real layout width")
