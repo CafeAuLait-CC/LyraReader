@@ -31,7 +31,7 @@ struct AITranslationView: View {
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
+                VStack(alignment: .leading, spacing: 14) {
                     sourceControls
                     HStack(spacing: 12) {
                         Button { reading.translateCurrentSource(state: state) } label: {
@@ -55,7 +55,7 @@ struct AITranslationView: View {
                         Text(aiReadingLabel("A continuous translation with the original source close at hand."))
                             .foregroundStyle(LyraReaderTheme.textSecondary).padding(.vertical, 12)
                     }
-                    LazyVStack(alignment: .leading, spacing: 28) {
+                    LazyVStack(alignment: .leading, spacing: 12) {
                         ForEach(records, id: \.id) { record in
                             savedTranslation(record, onCollapse: { proxy.scrollTo(record.id, anchor: .top) }).id(record.id)
                                 .accessibilityIdentifier("translation-result-\(record.id)")
@@ -125,7 +125,7 @@ struct AITranslationView: View {
         }
     }
     private func savedTranslation(_ record: AiReadingRecord, onCollapse: @escaping () -> Void) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 6) {
             if record.status == "sourceChanged" {
                 Text(aiReadingLabel("The document has changed. This result keeps its original source snapshot.")).font(.caption).foregroundStyle(LyraReaderTheme.warningFg)
             } else if record.status == "partial" {
@@ -204,7 +204,7 @@ struct AITranslationBlocks: View {
                 let hasMore = blocks.count > 1 || overflows
                 ForEach(Array(visible.enumerated()), id: \.offset) { index, block in
                     let last = index == visible.count - 1
-                    VStack(alignment: .leading, spacing: 14) {
+                    VStack(alignment: .leading, spacing: 10) {
                         if showOriginal {
                             if let recordID {
                                 AITranslationOriginal(text: block.original, controlID: "\(recordID)-\(index)", onCollapse: onCollapse)
@@ -226,18 +226,19 @@ struct AITranslationBlocks: View {
                         }
                         HStack(spacing: 10) {
                             Button { onLocate(block.page, block.original) } label: {
-                                Label(String(format: aiReadingLabel("Original · p. %d"), block.page), systemImage: "arrow.up.right")
-                            }.foregroundStyle(LyraReaderTheme.accent)
-                            Text("¶ \(index + 1)").font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
+                                Text(String(format: aiReadingLabel("p. %d"), block.page))
+                            }.buttonStyle(.plain).foregroundStyle(LyraReaderTheme.accent)
+                                .overlay(AITranslationControlProbe(id: "result-page-\(recordID ?? "active")-\(index)", clickable: true))
+                                .modifier(TranslationPointingHand())
                             Spacer(minLength: 0)
                             if last {
-                                if collapsed && hasMore && footerDisclosure { footerMore }
-                                resultActions(showRetry: expanded || !hasMore || footerDisclosure)
+                                if collapsed && hasMore && (footerDisclosure || block.translation.isEmpty) { footerMore }
+                                resultActions(endingWithoutText: block.translation.isEmpty)
                             }
                         }.font(.callout).background {
                             if let recordID { AITranslationControlProbe(id: "result-source-\(recordID)-\(index)") }
                         }
-                    }.padding(.vertical, 12)
+                    }.padding(.vertical, 6)
                     if index < visible.count - 1 { Divider().overlay(LyraReaderTheme.separator) }
                 }
             } else {
@@ -246,11 +247,9 @@ struct AITranslationBlocks: View {
                     AIAnswerView(text: content, pageCount: pageCount, verifiedPages: Set(verifiedPages.map(Int.init)), onJump: onJump)
                         .environment(\.readerMarkdownTypography, .translation)
                 }
-                if expanded || !overflows || footerDisclosure {
-                    HStack {
-                        if collapsed && footerDisclosure { footerMore }
-                        Spacer(minLength: 0); resultActions(showRetry: true)
-                    }
+                HStack {
+                    if collapsed && footerDisclosure { footerMore }
+                    Spacer(minLength: 0); resultActions()
                 }
             }
         }.onPreferenceChange(TranslationPreviewOverflow.self) { overflows = $0 }
@@ -260,28 +259,31 @@ struct AITranslationBlocks: View {
         if let recordID {
             Button(aiReadingLabel("More")) { expanded = true }
                 .font(.caption).buttonStyle(.plain).foregroundStyle(LyraReaderTheme.accent)
-                .background(AITranslationControlProbe(id: "result-more-\(recordID)"))
+                .overlay(AITranslationControlProbe(id: "result-more-\(recordID)", clickable: true))
+                .modifier(TranslationPointingHand())
         }
     }
     @ViewBuilder private func preview<Content: View>(inlineControls: Bool, additionalContent: Bool,
         @ViewBuilder content: () -> Content) -> some View {
         if let recordID, inlineControls {
             TranslationInlinePreview(collapsed: collapsed, additionalContent: additionalContent,
-                moreID: "result-more-\(recordID)", retryID: "result-retry-\(recordID)", retryDisabled: retryDisabled,
-                onExpand: { expanded = true }, onRetry: onRetry, content: content())
+                moreID: "result-more-\(recordID)", onExpand: { expanded = true },
+                onCollapse: { expanded = false; onCollapse?() }, content: content())
         } else { content() }
     }
-    @ViewBuilder private func resultActions(showRetry: Bool) -> some View {
+    @ViewBuilder private func resultActions(endingWithoutText: Bool = false) -> some View {
         if let recordID {
             Group {
-                if expanded {
+                if expanded && (footerDisclosure || endingWithoutText) {
                     Button(aiReadingLabel("Less")) { expanded = false; onCollapse?() }
                         .accessibilityValue(aiReadingLabel("Expanded"))
-                        .background(AITranslationControlProbe(id: "result-more-\(recordID)"))
+                        .overlay(AITranslationControlProbe(id: "result-more-\(recordID)", clickable: true))
+                        .modifier(TranslationPointingHand())
                 }
-                if showRetry, let onRetry {
+                if let onRetry {
                     Button(action: onRetry) { Label(aiReadingLabel("Retry"), systemImage: "arrow.clockwise") }
-                        .disabled(retryDisabled).background(AITranslationControlProbe(id: "result-retry-\(recordID)"))
+                        .disabled(retryDisabled).overlay(AITranslationControlProbe(id: "result-retry-\(recordID)", clickable: !retryDisabled))
+                        .modifier(TranslationPointingHand(enabled: !retryDisabled))
                 }
             }.font(.caption).foregroundStyle(LyraReaderTheme.accent).buttonStyle(.plain)
         }
@@ -303,33 +305,54 @@ private struct TranslationSourceDisclosure: View {
     var lineSpacing: CGFloat = 5
     var onCollapse: (() -> Void)? = nil
     @State private var expanded = false
-    @State private var canExpand = false
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            TranslationInlinePreview(collapsed: !expanded,
-                limit: 3 * (ceil(NSFont.systemFont(ofSize: fontSize).ascender - NSFont.systemFont(ofSize: fontSize).descender) + lineSpacing),
-                maximumLines: 3, moreID: moreID, reportsOverflow: false, onOverflowChange: { canExpand = $0 },
-                onExpand: { expanded = true }, content:
-                    ReaderMarkdownInlineText(inlines: [.text(text)], pageCount: 0, fontSize: fontSize, onJump: { _ in })
-                        .environment(\.readerMarkdownTypography, ReaderMarkdownTypography(bodySize: fontSize,
-                            lineSpacing: lineSpacing, themedInk: true, secondaryInk: true))
-                        .environment(\.readingStableTextLayout, true))
-            if expanded && canExpand {
-                Button(aiReadingLabel("Less")) { expanded = false; onCollapse?() }
-                    .font(.caption).buttonStyle(.plain).foregroundStyle(LyraReaderTheme.accent)
-                    .accessibilityValue(aiReadingLabel("Expanded"))
-                    .background(AITranslationControlProbe(id: moreID))
-            }
-        }
+        TranslationInlinePreview(collapsed: !expanded,
+            limit: 3 * (ceil(NSFont.systemFont(ofSize: fontSize).ascender - NSFont.systemFont(ofSize: fontSize).descender) + lineSpacing),
+            maximumLines: 3, moreID: moreID, reportsOverflow: false,
+            onExpand: { expanded = true }, onCollapse: { expanded = false; onCollapse?() }, content:
+                ReaderMarkdownInlineText(inlines: [.text(text)], pageCount: 0, fontSize: fontSize, onJump: { _ in })
+                    .environment(\.readerMarkdownTypography, ReaderMarkdownTypography(bodySize: fontSize,
+                        lineSpacing: lineSpacing, themedInk: true, secondaryInk: true))
+                    .environment(\.readingStableTextLayout, true))
     }
 }
 /// Non-intercepting native geometry used by the mouse-driven interaction checks.
 final class AITranslationControlMarker: NSView {
     var id = ""
+    var clickable = false
+    override func resetCursorRects() {
+        if clickable { addCursorRect(bounds, cursor: .pointingHand) }
+    }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+/// Track the button itself so the cursor overlay cannot consume its click.
+struct TranslationPointingHand: ViewModifier {
+    var enabled = true
+    @State private var holdsCursor = false
+    func body(content: Content) -> some View {
+        content.onContinuousHover { phase in
+            switch phase {
+            case .active:
+                guard enabled else { return }
+                if !holdsCursor { NSCursor.pointingHand.push(); holdsCursor = true }
+                NSCursor.pointingHand.set()
+            case .ended: releaseCursor()
+            }
+        }.onChange(of: enabled) { _, value in if !value { releaseCursor() } }
+            .onDisappear(perform: releaseCursor)
+    }
+    private func releaseCursor() {
+        if holdsCursor { NSCursor.pop(); holdsCursor = false }
+    }
 }
 struct AITranslationControlProbe: NSViewRepresentable {
     let id: String
+    var clickable = false
     func makeNSView(context: Context) -> AITranslationControlMarker { AITranslationControlMarker() }
-    func updateNSView(_ view: AITranslationControlMarker, context: Context) { view.id = id }
+    func updateNSView(_ view: AITranslationControlMarker, context: Context) {
+        view.id = id
+        if view.clickable != clickable {
+            view.clickable = clickable; view.window?.invalidateCursorRects(for: view)
+        }
+    }
 }

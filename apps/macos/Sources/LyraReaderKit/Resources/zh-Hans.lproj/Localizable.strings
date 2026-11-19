@@ -139,7 +139,7 @@
 "TO" = "译为";
 "More" = "更多";
 "Less" = "收起";
-"Original · p. %d" = "原文 · 第 %d 页";
+"p. %d" = "第 %d 页";
 "The document has changed. Select the passage again before retranslating." = "文档已更改，请重新选择段落后再翻译。";
 "The saved task has no valid selection. Select the passage again." = "保存的任务没有有效选区，请重新选择段落。";
 "The saved task could not be found." = "找不到保存的任务。";

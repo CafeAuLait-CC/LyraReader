@@ -2242,18 +2242,18 @@
         }
       }
     },
-    "Original · p. %d": {
+    "p. %d": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Original · p. %d"
+            "value": "p. %d"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "原文 · 第 %d 页"
+            "value": "第 %d 页"
           }
         }
       }

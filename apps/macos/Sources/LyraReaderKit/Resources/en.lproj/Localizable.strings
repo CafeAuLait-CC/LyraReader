@@ -139,7 +139,7 @@
 "TO" = "TO";
 "More" = "More";
 "Less" = "Less";
-"Original · p. %d" = "Original · p. %d";
+"p. %d" = "p. %d";
 "The document has changed. Select the passage again before retranslating." = "The document has changed. Select the passage again before retranslating.";
 "The saved task has no valid selection. Select the passage again." = "The saved task has no valid selection. Select the passage again.";
 "The saved task could not be found." = "The saved task could not be found.";

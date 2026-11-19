@@ -15,7 +15,19 @@ struct ReaderMarkdownTypography: Equatable, Sendable {
 private struct ReaderMarkdownTypographyKey: EnvironmentKey {
     static let defaultValue = ReaderMarkdownTypography.standard
 }
+/// A presentation-only suffix that participates in the paragraph's native line wrapping.
+struct ReaderMarkdownTrailingAction: Sendable {
+    let id: String
+    let title: String
+}
+private struct ReaderMarkdownTrailingActionKey: EnvironmentKey {
+    static let defaultValue: ReaderMarkdownTrailingAction? = nil
+}
 extension EnvironmentValues {
+    var readerMarkdownTrailingAction: ReaderMarkdownTrailingAction? {
+        get { self[ReaderMarkdownTrailingActionKey.self] }
+        set { self[ReaderMarkdownTrailingActionKey.self] = newValue }
+    }
     var readerMarkdownTypography: ReaderMarkdownTypography {
         get { self[ReaderMarkdownTypographyKey.self] }
         set { self[ReaderMarkdownTypographyKey.self] = newValue }
@@ -31,6 +43,7 @@ extension EnvironmentValues {
 /// monospace fallback. Nothing here interprets HTML.
 public struct ReaderMarkdownView: View {
     @Environment(\.readerMarkdownTypography) private var typography
+    @Environment(\.readerMarkdownTrailingAction) private var trailingAction
     public let document: ReaderMarkdownDocument
     public let pageCount: Int
     public let onJump: (Int) -> Void
@@ -47,8 +60,10 @@ public struct ReaderMarkdownView: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            ForEach(Array(document.blocks.enumerated()), id: \.offset) { _, block in
+            ForEach(Array(document.blocks.enumerated()), id: \.offset) { index, block in
                 blockView(block)
+                    .environment(\.readerMarkdownTrailingAction,
+                        index == document.blocks.count - 1 ? trailingAction : nil)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -141,6 +156,7 @@ public struct ReaderMarkdownView: View {
         case .table(let headers, let alignments, let rows):
             ReaderMarkdownTable(headers: headers, alignments: alignments, rows: rows,
                                 pageCount: pageCount, onJump: onJump)
+                .environment(\.readerMarkdownTrailingAction, nil)
 
         case .mathBlock(let source, let reason):
             ReaderMathBlockView(source: source, reason: reason)
@@ -212,19 +228,45 @@ extension EnvironmentValues {
 /// width follows the frame AppKit actually installs, while SwiftUI owns the row height.
 private final class ReaderMarkdownTextView: NSTextView {
     var stableReadingLayout = false
+    var trailingAction: ReaderMarkdownTrailingAction?
+    var trailingActionRange: NSRange?
+    private var actionMarker: ReaderMarkdownActionMarker?
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         if stableReadingLayout, newSize.width.isFinite, newSize.width > 1,
            textContainer?.containerSize.width != newSize.width {
             textContainer?.containerSize = CGSize(width: newSize.width, height: .greatestFiniteMagnitude)
         }
+        updateActionMarker()
     }
+    override func layout() { super.layout(); updateActionMarker() }
+    func updateActionMarker() {
+        guard let action = trailingAction, let range = trailingActionRange,
+              let layout = layoutManager, let container = textContainer, bounds.width > 1 else {
+            actionMarker?.removeFromSuperview(); actionMarker = nil; return
+        }
+        layout.ensureLayout(for: container)
+        let glyphs = layout.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+        let rect = layout.boundingRect(forGlyphRange: glyphs, in: container)
+            .offsetBy(dx: textContainerOrigin.x, dy: textContainerOrigin.y)
+        let marker = actionMarker ?? ReaderMarkdownActionMarker()
+        marker.identifier = NSUserInterfaceItemIdentifier(action.id)
+        marker.frame = rect
+        if marker.superview == nil { addSubview(marker) }
+        actionMarker = marker
+    }
+}
+
+/// The SwiftUI button follows these bounds after native paragraph wrapping.
+final class ReaderMarkdownActionMarker: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
 public struct ReaderMarkdownInlineText: NSViewRepresentable {
     @Environment(\.readerMarkdownTypography) private var typography
     @Environment(\.readingStableTextLayout) private var stableReadingLayout
     @Environment(\.readingThemedLinks) private var themedLinks
+    @Environment(\.readerMarkdownTrailingAction) private var trailingAction
     let inlines: [ReaderMarkdownInline]
     let pageCount: Int
     let fontSize: CGFloat
@@ -264,9 +306,24 @@ public struct ReaderMarkdownInlineText: NSViewRepresentable {
                     (typography.secondaryInk ? LyraReaderTheme.textSecondaryColor : LyraReaderTheme.textPrimaryColor) : nil,
                 linkInk: themedLinks ? LyraReaderTheme.accentColor : nil))
         }
+        var actionRange: NSRange?
+        if let trailingAction {
+            // Bind the suffix to the last source word, before its original trailing whitespace.
+            // Inserting presentation text preserves all source characters, including newlines.
+            let last = (attributed.string as NSString).rangeOfCharacter(from: .whitespacesAndNewlines.inverted, options: .backwards)
+            let insertion = last.location == NSNotFound ? attributed.length : NSMaxRange(last)
+            actionRange = NSRange(location: insertion + 1, length: (trailingAction.title as NSString).length)
+            attributed.insert(NSAttributedString(string: "\u{00a0}" + trailingAction.title, attributes: [
+                .font: NSFont.systemFont(ofSize: 11), .foregroundColor: LyraReaderTheme.accentColor,
+            ]), at: insertion)
+        }
         if !nsView.attributedString().isEqual(to: attributed) {
             nsView.textStorage?.setAttributedString(attributed)
             if stableReadingLayout { nsView.invalidateIntrinsicContentSize() }
+        }
+        if let view = nsView as? ReaderMarkdownTextView {
+            view.trailingAction = trailingAction; view.trailingActionRange = actionRange
+            view.updateActionMarker()
         }
     }
 

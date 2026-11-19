@@ -11,11 +11,11 @@ extension ReaderChecks {
         defer { window.orderOut(nil); window.contentView = nil }
         for dark in [false, true] {
             for width in [414, 320] {
-                var retries: [String] = [], collapses = 0
+                var retries: [String] = [], collapses = 0, located: [UInt32] = []
                 let host = NSHostingView(rootView: ScrollView {
                     VStack(alignment: .leading, spacing: 28) {
                         AITranslationBlocks(originals: [original], pages: [1], content: content,
-                            showOriginal: true, verifiedPages: [1], pageCount: 1, onLocate: { _, _ in }, onJump: { _ in },
+                            showOriginal: true, verifiedPages: [1], pageCount: 1, onLocate: { page, _ in located.append(page) }, onJump: { _ in },
                             recordID: "long", onCollapse: { collapses += 1 }, onRetry: { retries.append("long") })
                         Divider()
                         AITranslationBlocks(originals: ["Short original"], pages: [1], content: "<!--lyra:0-->简短译文。",
@@ -81,7 +81,6 @@ extension ReaderChecks {
                 // Native icon and text controls can differ in height. Compare their shared
                 // row, allowing one backing pixel for AppKit frame rounding at either scale.
                 let pixel = 1 / window.backingScaleFactor
-                let rowOverlap = min(resultMore.maxY, retry.maxY) - max(resultMore.minY, retry.minY)
                 print("INFO: inline controls scale=\(window.backingScaleFactor) preview=\(result) more=\(resultMore) retry=\(retry)")
                 let originalView = textViews(host).first { $0.string == original }!
                 let layout = originalView.layoutManager!, container = originalView.textContainer!
@@ -95,11 +94,12 @@ extension ReaderChecks {
                         && sourceMore.maxY <= originalLines[2].maxY + 1
                         && frame("original-preview-long-0").contains(sourceMore),
                         "original More stays inside its third text line instead of adding another row")
-                require(result.insetBy(dx: -pixel, dy: -pixel).contains(resultMore)
-                        && result.insetBy(dx: -pixel, dy: -pixel).contains(retry)
-                        && rowOverlap >= min(resultMore.height, retry.height) - pixel
-                        && abs(result.maxX - retry.maxX) <= pixel,
-                        "translation More and right-aligned Retry share the last visible text row")
+                require(result.insetBy(dx: -pixel, dy: -pixel).contains(resultMore),
+                        "translation More stays in its last visible text line")
+                let footer = frame("result-source-long-0")
+                require(footer.insetBy(dx: -pixel, dy: -pixel).contains(retry)
+                        && abs(footer.maxX - retry.maxX) <= pixel && retry.minY > result.maxY,
+                        "long translations keep right-aligned Retry on the page row, separate from More")
                 require(frame("result-source-short-0").insetBy(dx: -pixel, dy: -pixel).contains(frame("result-retry-short")),
                         "a short translation keeps Retry on its source row without a separate action row")
                 require(frame("result-source-equation-0").insetBy(dx: -pixel, dy: -pixel).contains(frame("result-more-equation"))
@@ -112,26 +112,59 @@ extension ReaderChecks {
                 try captureReadingInteraction(host, name: "translation-compact-\(width)-\(dark ? "dark" : "light")")
                 try await click("original-more-long-0")
                 try await eventually("original More expands only the original source", {
-                    marker("original-preview-long-0").bounds.height > sourceHeight + 150
+                    markers(host).contains { $0.id == "original-more-long-0" }
+                        && marker("original-preview-long-0").bounds.height > sourceHeight + 150
                         && abs(marker("translated-preview-long-0").bounds.height - resultHeight) < 1
                 })
+                let sourceLess = frame("original-more-long-0")
+                require(originalView.string.replacingOccurrences(of: "\u{00a0}" + aiReadingLabel("Less"), with: "") == original,
+                        "expanded source retains every original character before its trailing disclosure")
+                requireInlineTail(originalView, marker: marker("original-more-long-0"), host: host)
+                require(frame("original-preview-long-0").insetBy(dx: -pixel, dy: -pixel).contains(sourceLess),
+                        "source Less belongs to the expanded text rather than a separate row")
                 try captureReadingInteraction(host, name: "translation-original-expanded-\(width)-\(dark ? "dark" : "light")")
                 try await click("original-more-long-0")
                 try await eventually("original Less restores its opening lines", { abs(marker("original-preview-long-0").bounds.height - sourceHeight) < 1 })
                 try await click("result-more-long")
                 try await eventually("translation More leaves the original collapsed", {
-                    marker("translated-preview-long-0").bounds.height > resultHeight + 100
+                    markers(host).contains { $0.id == "result-more-long" }
+                        && marker("translated-preview-long-0").bounds.height > resultHeight + 100
                         && abs(marker("original-preview-long-0").bounds.height - sourceHeight) < 1
                 })
+                requireInlineTail(rendered, marker: marker("result-more-long"), host: host)
+                require(frame("result-source-long-0").insetBy(dx: -pixel, dy: -pixel).contains(frame("result-retry-long")),
+                        "expanded translations also keep Retry on the page row")
+                try captureReadingInteraction(host, name: "translation-result-expanded-\(width)-\(dark ? "dark" : "light")")
                 try await click("result-more-long")
                 try await eventually("translation Less restores the compact preview", { abs(marker("translated-preview-long-0").bounds.height - resultHeight) < 1 })
                 require(collapses == 2, "both Less controls notify the parent to keep the result in view")
+                try await click("result-page-long-0")
+                require(located == [1], "the page-only source link remains clickable")
                 try await click("result-retry-long")
                 try await click("result-retry-short")
                 try await click("result-retry-equation")
                 require(retries == ["long", "short", "equation"], "clipped native math and text cannot intercept any result's Retry button")
             }
         }
-        print("PASS: independent original/translation disclosure, compact Retry and adjacent native hit testing at both sidebar widths and appearances")
+        print("PASS: independent original/translation disclosure, inline Less, page-row Retry and adjacent native hit testing at both sidebar widths and appearances")
+    }
+    @MainActor private static func requireInlineTail(_ text: NSTextView, marker: NSView, host: NSView) {
+        let layout = text.layoutManager!, container = text.textContainer!
+        layout.ensureLayout(for: container)
+        let suffix = (text.string as NSString).range(of: "\u{00a0}" + aiReadingLabel("Less"), options: .backwards)
+        require(suffix.location != NSNotFound && suffix.location > 0, "expanded text retains a trailing disclosure after its source")
+        let glyph = layout.glyphIndexForCharacter(at: suffix.location + 1)
+        let preceding = layout.glyphIndexForCharacter(at: suffix.location - 1)
+        require(layout.lineFragmentRect(forGlyphAt: preceding, effectiveRange: nil).minY
+                == layout.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil).minY,
+                "Less shares the final source word's line instead of wrapping onto its own row")
+        let lastLine = layout.lineFragmentUsedRect(forGlyphAt: glyph, effectiveRange: nil)
+            .offsetBy(dx: text.textContainerOrigin.x, dy: text.textContainerOrigin.y)
+        let line = host.convert(lastLine, from: text), action = host.convert(marker.bounds, from: marker)
+        require(action.minY >= line.minY - 1 && action.maxY <= line.maxY + 1
+                && action.maxX <= line.maxX + 1 && action.minX >= line.minX - 1,
+                "expanded Less is an inline button at the end of the complete final text line")
+        require(action.width > 1 && action.height > 1,
+                "the trailing disclosure has its own native button hit region")
     }
 }
