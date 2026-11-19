@@ -73,7 +73,18 @@ extension ReaderChecks {
         // Read actual gold pixels. A target-value probe or an endpoint screenshot cannot
         // distinguish a continuous slide from a jump or two backgrounds cross-fading.
         func captureSelector(_ area: CGRect) -> NSBitmapImageRep {
-            guard let bitmap = host.bitmapImageRepForCachingDisplay(in: area) else { fail("FAIL: selector bitmap exists") }
+            let bitmap: NSBitmapImageRep
+            if CommandLine.arguments.contains("--selector-one-times-pixels") {
+                guard let unscaled = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(ceil(area.width)),
+                    pixelsHigh: Int(ceil(area.height)), bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                    isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else {
+                    fail("FAIL: selector single-scale bitmap exists")
+                }
+                unscaled.size = area.size; bitmap = unscaled
+            } else {
+                guard let native = host.bitmapImageRepForCachingDisplay(in: area) else { fail("FAIL: selector bitmap exists") }
+                bitmap = native
+            }
             host.cacheDisplay(in: area, to: bitmap)
             return bitmap
         }
@@ -177,6 +188,7 @@ extension ReaderChecks {
                 let low = min(previous, end) + 8, high = max(previous, end) - 8
                 let intermediate = Set(samples.filter { $0.0 > low && $0.0 < high }.map { Int($0.0.rounded()) })
                 print("INFO: \(name) direction \(direction) captured \(frames.count) frames before pixel analysis")
+                print("INFO: \(name) highlight widths start=\(start.width) samples=\(samples.map(\.1))")
                 require(geometryError < 0.5, "\(name) labels keep their positions when content gains or loses a scrollbar (error \(geometryError) pt)")
                 require(labelError <= 1, "\(name) keeps painted icon/text bounds fixed throughout the slide (error \(labelError) pt)")
                 require(intermediate.count >= 3, "\(name) paints multiple intermediate highlight positions in direction \(direction) (\(intermediate.count))")
