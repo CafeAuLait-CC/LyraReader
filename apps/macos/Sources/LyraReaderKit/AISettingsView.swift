@@ -3,6 +3,7 @@ import SwiftUI
 /// Settings > AI. The read/write rules are in `AISettingsStore`; this view is only the form.
 public struct AISettingsView: View {
     @ObservedObject private var store: AISettingsStore
+    @ObservedObject private var audit = AIAuditTrail.shared
     @ObservedObject private var route = AISettingsRoute.shared
     @StateObject private var connectionTest: AIConnectionTestModel
     @FocusState private var baseURLFocused: Bool
@@ -23,6 +24,29 @@ public struct AISettingsView: View {
 
     public var body: some View {
         Form {
+            Section(aiReadingLabel("Reading workflow")) {
+                Toggle(aiReadingLabel("Review before sending"), isOn: $store.reviewBeforeSending)
+                Text(aiReadingLabel("Review sidebar tasks and Interleaf questions in a separate window before sending.")).font(.caption)
+                Picker(aiReadingLabel("Document prereading"), selection: $store.prereadingPolicy) {
+                    Text(aiReadingLabel("Ask for each document")).tag("ask")
+                    Text(aiReadingLabel("Preread before using AI")).tag("always")
+                    Text(aiReadingLabel("Do not preread")).tag("never")
+                }
+                Text(aiReadingLabel("During prereading, other AI requests wait. A ready status appears when you can continue.")).font(.caption)
+                TextField(aiReadingLabel("Output language (blank uses document language)"), text: $store.outputLanguage)
+            }
+
+            Section(aiReadingLabel("Request history")) {
+                DisclosureGroup(aiReadingLabel("Recent AI requests")) {
+                    ForEach(Array(audit.records.prefix(20).enumerated()), id: \.offset) { _, record in
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("\(record.at.formatted()) · \(record.action.label)")
+                            Text("\(record.host) · \(record.model) · \(record.outcome.label)").foregroundStyle(LyraReaderTheme.textSecondary)
+                        }.font(.caption).textSelection(.enabled)
+                    }
+                    if audit.records.isEmpty { Text(aiReadingLabel("No requests recorded.")).font(.caption) }
+                }
+            }
             Section("Connection") {
                 Picker("Use AI with", selection: $store.connectionMode) {
                     ForEach(AIConnectionMode.allCases) { Text($0.title).tag($0) }

@@ -1,6 +1,39 @@
 import AppKit
 import SwiftUI
 
+/// Reading typography is native presentation; task content and Markdown structure stay intact.
+struct ReaderMarkdownTypography: Equatable, Sendable {
+    var bodySize: CGFloat = 13
+    var lineSpacing: CGFloat = 2
+    var lineHeightMultiple: CGFloat = 0
+    var themedInk = false
+    var secondaryInk = false
+    static let standard = Self()
+    static let assistant = Self(themedInk: true)
+    static let translation = Self(bodySize: 14, lineSpacing: 5, lineHeightMultiple: 1.12, themedInk: true)
+}
+private struct ReaderMarkdownTypographyKey: EnvironmentKey {
+    static let defaultValue = ReaderMarkdownTypography.standard
+}
+/// A presentation-only suffix that participates in the paragraph's native line wrapping.
+struct ReaderMarkdownTrailingAction: Sendable {
+    let id: String
+    let title: String
+}
+private struct ReaderMarkdownTrailingActionKey: EnvironmentKey {
+    static let defaultValue: ReaderMarkdownTrailingAction? = nil
+}
+extension EnvironmentValues {
+    var readerMarkdownTrailingAction: ReaderMarkdownTrailingAction? {
+        get { self[ReaderMarkdownTrailingActionKey.self] }
+        set { self[ReaderMarkdownTrailingActionKey.self] = newValue }
+    }
+    var readerMarkdownTypography: ReaderMarkdownTypography {
+        get { self[ReaderMarkdownTypographyKey.self] }
+        set { self[ReaderMarkdownTypographyKey.self] = newValue }
+    }
+}
+
 /// Renders a parsed answer with the app's normal reading typography.
 ///
 /// Paragraphs, headings, list items and table cells go through a small `NSTextView` so inline
@@ -9,6 +42,8 @@ import SwiftUI
 /// their whitespace; tables use a `Grid`; display mathematics is a centred image with a
 /// monospace fallback. Nothing here interprets HTML.
 public struct ReaderMarkdownView: View {
+    @Environment(\.readerMarkdownTypography) private var typography
+    @Environment(\.readerMarkdownTrailingAction) private var trailingAction
     public let document: ReaderMarkdownDocument
     public let pageCount: Int
     public let onJump: (Int) -> Void
@@ -25,8 +60,10 @@ public struct ReaderMarkdownView: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            ForEach(Array(document.blocks.enumerated()), id: \.offset) { _, block in
+            ForEach(Array(document.blocks.enumerated()), id: \.offset) { index, block in
                 blockView(block)
+                    .environment(\.readerMarkdownTrailingAction,
+                        index == document.blocks.count - 1 ? trailingAction : nil)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -49,7 +86,7 @@ public struct ReaderMarkdownView: View {
             ReaderMarkdownInlineText(
                 inlines: inlines,
                 pageCount: pageCount,
-                fontSize: 13,
+                fontSize: typography.bodySize,
                 onJump: onJump
             )
 
@@ -119,6 +156,7 @@ public struct ReaderMarkdownView: View {
         case .table(let headers, let alignments, let rows):
             ReaderMarkdownTable(headers: headers, alignments: alignments, rows: rows,
                                 pageCount: pageCount, onJump: onJump)
+                .environment(\.readerMarkdownTrailingAction, nil)
 
         case .mathBlock(let source, let reason):
             ReaderMathBlockView(source: source, reason: reason)
@@ -173,7 +211,62 @@ public struct AIAnswerView: View {
 // MARK: - Inline text
 
 /// A selectable, wrapping attributed paragraph with inline-math attachments.
+private struct ReadingStableTextLayoutKey: EnvironmentKey { static let defaultValue = false }
+private struct ReadingThemedLinksKey: EnvironmentKey { static let defaultValue = false }
+extension EnvironmentValues {
+    var readingStableTextLayout: Bool {
+        get { self[ReadingStableTextLayoutKey.self] }
+        set { self[ReadingStableTextLayoutKey.self] = newValue }
+    }
+    var readingThemedLinks: Bool {
+        get { self[ReadingThemedLinksKey.self] }
+        set { self[ReadingThemedLinksKey.self] = newValue }
+    }
+}
+
+/// SwiftUI's measurement proposals must not mutate the visible TextKit container. Its
+/// width follows the frame AppKit actually installs, while SwiftUI owns the row height.
+private final class ReaderMarkdownTextView: NSTextView {
+    var stableReadingLayout = false
+    var trailingAction: ReaderMarkdownTrailingAction?
+    var trailingActionRange: NSRange?
+    private var actionMarker: ReaderMarkdownActionMarker?
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        if stableReadingLayout, newSize.width.isFinite, newSize.width > 1,
+           textContainer?.containerSize.width != newSize.width {
+            textContainer?.containerSize = CGSize(width: newSize.width, height: .greatestFiniteMagnitude)
+        }
+        updateActionMarker()
+    }
+    override func layout() { super.layout(); updateActionMarker() }
+    func updateActionMarker() {
+        guard let action = trailingAction, let range = trailingActionRange,
+              let layout = layoutManager, let container = textContainer, bounds.width > 1 else {
+            actionMarker?.removeFromSuperview(); actionMarker = nil; return
+        }
+        layout.ensureLayout(for: container)
+        let glyphs = layout.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+        let rect = layout.boundingRect(forGlyphRange: glyphs, in: container)
+            .offsetBy(dx: textContainerOrigin.x, dy: textContainerOrigin.y)
+        let marker = actionMarker ?? ReaderMarkdownActionMarker()
+        marker.identifier = NSUserInterfaceItemIdentifier(action.id)
+        marker.frame = rect
+        if marker.superview == nil { addSubview(marker) }
+        actionMarker = marker
+    }
+}
+
+/// The SwiftUI button follows these bounds after native paragraph wrapping.
+final class ReaderMarkdownActionMarker: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 public struct ReaderMarkdownInlineText: NSViewRepresentable {
+    @Environment(\.readerMarkdownTypography) private var typography
+    @Environment(\.readingStableTextLayout) private var stableReadingLayout
+    @Environment(\.readingThemedLinks) private var themedLinks
+    @Environment(\.readerMarkdownTrailingAction) private var trailingAction
     let inlines: [ReaderMarkdownInline]
     let pageCount: Int
     let fontSize: CGFloat
@@ -181,20 +274,21 @@ public struct ReaderMarkdownInlineText: NSViewRepresentable {
     let onJump: (Int) -> Void
 
     public func makeNSView(context: Context) -> NSTextView {
-        let textView = NSTextView(frame: .zero)
+        let textView = ReaderMarkdownTextView(frame: .zero)
+        textView.stableReadingLayout = stableReadingLayout
         textView.isEditable = false
         textView.isSelectable = true
         textView.drawsBackground = false
         textView.textContainerInset = .zero
         textView.textContainer?.lineFragmentPadding = 0
-        textView.textContainer?.widthTracksTextView = true
-        textView.isVerticallyResizable = true
+        textView.textContainer?.widthTracksTextView = !stableReadingLayout
+        textView.isVerticallyResizable = !stableReadingLayout
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
         textView.isRichText = true
         textView.isAutomaticLinkDetectionEnabled = false
         textView.linkTextAttributes = [
-            .foregroundColor: NSColor.controlAccentColor,
+            .foregroundColor: themedLinks ? LyraReaderTheme.accentColor : NSColor.controlAccentColor,
             .underlineStyle: NSUnderlineStyle.single.rawValue,
         ]
         textView.delegate = context.coordinator
@@ -204,14 +298,32 @@ public struct ReaderMarkdownInlineText: NSViewRepresentable {
 
     public func updateNSView(_ nsView: NSTextView, context: Context) {
         context.coordinator.onJump = onJump
-        let attributed = ReaderMarkdownAttributed.build(
-            inlines: inlines,
-            pageCount: pageCount,
-            fontSize: fontSize,
-            weight: weight
-        )
+        let attributed = NSMutableAttributedString()
+        nsView.effectiveAppearance.performAsCurrentDrawingAppearance {
+            attributed.append(ReaderMarkdownAttributed.build(
+                inlines: inlines, pageCount: pageCount, fontSize: fontSize, weight: weight,
+                typography: typography, ink: typography.themedInk ?
+                    (typography.secondaryInk ? LyraReaderTheme.textSecondaryColor : LyraReaderTheme.textPrimaryColor) : nil,
+                linkInk: themedLinks ? LyraReaderTheme.accentColor : nil))
+        }
+        var actionRange: NSRange?
+        if let trailingAction {
+            // Bind the suffix to the last source word, before its original trailing whitespace.
+            // Inserting presentation text preserves all source characters, including newlines.
+            let last = (attributed.string as NSString).rangeOfCharacter(from: .whitespacesAndNewlines.inverted, options: .backwards)
+            let insertion = last.location == NSNotFound ? attributed.length : NSMaxRange(last)
+            actionRange = NSRange(location: insertion + 1, length: (trailingAction.title as NSString).length)
+            attributed.insert(NSAttributedString(string: "\u{00a0}" + trailingAction.title, attributes: [
+                .font: NSFont.systemFont(ofSize: 11), .foregroundColor: LyraReaderTheme.accentColor,
+            ]), at: insertion)
+        }
         if !nsView.attributedString().isEqual(to: attributed) {
             nsView.textStorage?.setAttributedString(attributed)
+            if stableReadingLayout { nsView.invalidateIntrinsicContentSize() }
+        }
+        if let view = nsView as? ReaderMarkdownTextView {
+            view.trailingAction = trailingAction; view.trailingActionRange = actionRange
+            view.updateActionMarker()
         }
     }
 
@@ -224,6 +336,19 @@ public struct ReaderMarkdownInlineText: NSViewRepresentable {
         guard width.isFinite, width > 1 else { return nil }
         guard let container = nsView.textContainer, let layout = nsView.layoutManager else {
             return nil
+        }
+        if stableReadingLayout {
+            // A resizable NSTextView can grow after SwiftUI cached the lazy row's height,
+            // painting through later messages. Measure against an independent text container
+            // and let SwiftUI own the visible text view's frame.
+            let storage = NSTextStorage(attributedString: nsView.attributedString())
+            let measurement = NSLayoutManager()
+            let measureContainer = NSTextContainer(size: CGSize(width: width, height: .greatestFiniteMagnitude))
+            measureContainer.lineFragmentPadding = 0
+            measurement.addTextContainer(measureContainer)
+            storage.addLayoutManager(measurement)
+            measurement.ensureLayout(for: measureContainer)
+            return CGSize(width: width, height: max(1, ceil(measurement.usedRect(for: measureContainer).height)))
         }
         container.containerSize = CGSize(width: width, height: .greatestFiniteMagnitude)
         layout.ensureLayout(for: container)
@@ -265,14 +390,19 @@ enum ReaderMarkdownAttributed {
         inlines: [ReaderMarkdownInline],
         pageCount: Int,
         fontSize: CGFloat,
-        weight: NSFont.Weight = .regular
+        weight: NSFont.Weight = .regular,
+        typography: ReaderMarkdownTypography = .standard,
+        ink: NSColor? = nil,
+        linkInk: NSColor? = nil
     ) -> NSAttributedString {
         let base = NSFont.systemFont(ofSize: fontSize, weight: weight)
         let paragraph = NSMutableParagraphStyle()
-        paragraph.lineSpacing = 2
+        paragraph.lineSpacing = typography.lineSpacing
+        paragraph.lineHeightMultiple = typography.lineHeightMultiple
         paragraph.paragraphSpacing = 0
         let output = NSMutableAttributedString()
-        append(inlines, to: output, base: base, paragraph: paragraph, color: .labelColor)
+        append(inlines, to: output, base: base, paragraph: paragraph,
+               color: ink ?? .labelColor, mathInk: ink, linkInk: linkInk)
         return output
     }
 
@@ -281,7 +411,9 @@ enum ReaderMarkdownAttributed {
         to output: NSMutableAttributedString,
         base: NSFont,
         paragraph: NSParagraphStyle,
-        color: NSColor
+        color: NSColor,
+        mathInk: NSColor? = nil,
+        linkInk: NSColor? = nil
     ) {
         for inline in inlines {
             switch inline {
@@ -291,13 +423,13 @@ enum ReaderMarkdownAttributed {
                 ]))
             case .bold(let runs):
                 append(runs, to: output, base: FontTrait.bold(base), paragraph: paragraph,
-                       color: color)
+                       color: color, mathInk: mathInk, linkInk: linkInk)
             case .italic(let runs):
                 append(runs, to: output, base: FontTrait.italic(base), paragraph: paragraph,
-                       color: color)
+                       color: color, mathInk: mathInk, linkInk: linkInk)
             case .strikethrough(let runs):
                 let start = output.length
-                append(runs, to: output, base: base, paragraph: paragraph, color: color)
+                append(runs, to: output, base: base, paragraph: paragraph, color: color, mathInk: mathInk, linkInk: linkInk)
                 output.addAttribute(.strikethroughStyle,
                                     value: NSUnderlineStyle.single.rawValue,
                                     range: NSRange(location: start, length: output.length - start))
@@ -312,27 +444,27 @@ enum ReaderMarkdownAttributed {
                 ]))
             case .link(let runs, let destination):
                 let start = output.length
-                append(runs, to: output, base: base, paragraph: paragraph, color: color)
+                append(runs, to: output, base: base, paragraph: paragraph, color: color, mathInk: mathInk, linkInk: linkInk)
                 guard let url = URL(string: destination) else { continue }
                 let range = NSRange(location: start, length: output.length - start)
                 output.addAttributes([
                     .link: url,
-                    .foregroundColor: NSColor.controlAccentColor,
+                    .foregroundColor: linkInk ?? NSColor.controlAccentColor,
                     .underlineStyle: NSUnderlineStyle.single.rawValue,
                 ], range: range)
             case .citation(let page, let raw):
                 output.append(NSAttributedString(string: raw, attributes: [
                     .font: base,
                     .link: URL(string: "lyra-reader-page://\(page)")!,
-                    .foregroundColor: NSColor.controlAccentColor,
+                    .foregroundColor: linkInk ?? NSColor.controlAccentColor,
                     .underlineStyle: NSUnderlineStyle.single.rawValue,
                     .paragraphStyle: paragraph,
                 ]))
             case .math(let source):
-                appendMath(source, to: output, base: base, paragraph: paragraph)
+                appendMath(source, to: output, base: base, paragraph: paragraph, ink: mathInk, fallbackInk: color)
             case .mathFallback(let source, let reason):
                 appendMathFallback(source, reason: reason, to: output, base: base,
-                                   paragraph: paragraph)
+                                   paragraph: paragraph, ink: color)
             }
         }
     }
@@ -341,9 +473,11 @@ enum ReaderMarkdownAttributed {
         _ source: String,
         to output: NSMutableAttributedString,
         base: NSFont,
-        paragraph: NSParagraphStyle
+        paragraph: NSParagraphStyle,
+        ink: NSColor?,
+        fallbackInk: NSColor
     ) {
-        switch ReaderMathRenderer.render(source, fontSize: base.pointSize * 0.96) {
+        switch ReaderMathRenderer.render(source, fontSize: base.pointSize * 0.96, ink: ink) {
         case .success(let rendered):
             let attachment = NSTextAttachment()
             attachment.image = rendered.image
@@ -359,7 +493,7 @@ enum ReaderMarkdownAttributed {
             output.append(string)
         case .failure(let error):
             appendMathFallback(source, reason: error.localizedDescription, to: output,
-                               base: base, paragraph: paragraph)
+                               base: base, paragraph: paragraph, ink: fallbackInk)
         }
     }
 
@@ -368,13 +502,14 @@ enum ReaderMarkdownAttributed {
         reason: String,
         to output: NSMutableAttributedString,
         base: NSFont,
-        paragraph: NSParagraphStyle
+        paragraph: NSParagraphStyle,
+        ink: NSColor
     ) {
         let mono = NSFont.monospacedSystemFont(ofSize: max(9, base.pointSize - 1),
                                                weight: .regular)
         output.append(NSAttributedString(string: source, attributes: [
             .font: mono,
-            .foregroundColor: NSColor.labelColor,
+            .foregroundColor: ink,
             .backgroundColor: NSColor.textBackgroundColor.withAlphaComponent(0.55),
             .paragraphStyle: paragraph,
             .toolTip: reason,
@@ -453,6 +588,7 @@ private struct ReaderMarkdownTable: View {
 }
 
 private struct ReaderMathBlockView: View {
+    @Environment(\.readerMarkdownTypography) private var typography
     let source: String
     let reason: String?
 
@@ -476,6 +612,8 @@ private struct ReaderMathBlockView: View {
                     HStack {
                         Spacer(minLength: 0)
                         Image(nsImage: rendered.image)
+                            .renderingMode(typography.themedInk ? .template : .original)
+                            .foregroundStyle(LyraReaderTheme.textPrimary)
                             .accessibilityLabel("Mathematics: \(source)")
                         Spacer(minLength: 0)
                     }

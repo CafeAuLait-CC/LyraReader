@@ -27,8 +27,7 @@ extension ReaderChecks {
     }
 
     @MainActor static func tabHitRegionChecks() async throws {
-        // The check records every failing point before it traps, so its PASS/FAIL summary must not
-        // sit in a redirected stdout's buffer when the process exits on the final `fatalError`.
+        // Flush each result before the runner reports an unsuccessful exit.
         setvbuf(stdout, nil, _IONBF, 0)
         _ = NSApplication.shared
         let coordinator = TabDragCoordinator.shared
@@ -144,7 +143,7 @@ extension ReaderChecks {
             alignTitlebar(window, host)
             let hostedInputs = inputs(host).sorted { frameInWindow($0).minX < frameInWindow($1).minX }
             guard hostedInputs.count == tabCount else {
-                fatalError("FAIL: \(tabCount) tabs host \(hostedInputs.count) tab input views")
+                fail("FAIL: \(tabCount) tabs host \(hostedInputs.count) tab input views")
             }
             let tabFrames = hostedInputs.map(frameInWindow)
             let row = tabFrames.dropFirst().reduce(tabFrames[0]) { $0.union($1) }
@@ -153,10 +152,10 @@ extension ReaderChecks {
                    "the tab row is flush with the window top, as in ReaderWindowRoot (row \(row), host \(host.convert(host.bounds, to: nil)))")
             let stripStart = TabRowLayout.tabStripLeadingInset
             let stripEnd = window.contentView!.bounds.width
-            guard let drag = dragView(host) else { fatalError("FAIL: the explicit window-drag area is missing") }
+            guard let drag = dragView(host) else { fail("FAIL: the explicit window-drag area is missing") }
             let dragRect = frameInWindow(drag)
             guard let scroll = firstScrollView(host) else {
-                fatalError("FAIL: the tab strip is not backed by an NSScrollView (tabs=\(tabCount))")
+                fail("FAIL: the tab strip is not backed by an NSScrollView (tabs=\(tabCount))")
             }
             // The scroll view's frame is the visible tab viewport. A tab input's NSView frame can
             // extend behind the trailing drag area when the content is wider than the viewport;
@@ -281,7 +280,7 @@ extension ReaderChecks {
             var closeTargetIndex = 0
             if tabCount == 8 {
                 guard let document = scroll.documentView else {
-                    fatalError("FAIL: the 8-tab scroll view has no document view")
+                    fail("FAIL: the 8-tab scroll view has no document view")
                 }
                 expect(document.frame.width > scroll.contentView.bounds.width + 1,
                        "8 tabs overflow the visible strip (content \(document.frame.width) > clip \(scroll.contentView.bounds.width))")
@@ -449,6 +448,9 @@ extension ReaderChecks {
         // release are sent to the input view that received the press (the same native handlers
         // `TabPointerChecks` drives).
         func reorder(startingAt padding: Bool) -> Bool {
+            // These assertions exercise a drop onto the source strip. An inactive test app can
+            // order the new window behind earlier fixtures, turning it into a cross-window move.
+            for earlier in windows { earlier.orderOut(nil) }
             let (state, window, host) = makeWindow(tabs: 3)
             alignTitlebar(window, host)
             coordinator.endDrag()
@@ -463,6 +465,9 @@ extension ReaderChecks {
                 x: padding ? sourceFrame.maxX - 2 : sourceFrame.midX,
                 y: sourceFrame.midY)
             let target = NSPoint(x: targetFrame.minX + 4, y: targetFrame.midY)
+            let screenTarget = window.convertPoint(toScreen: target)
+            expect(coordinator.target(atScreenPoint: screenTarget)?.state === state,
+                   "the same-window reorder fixture owns its drop target")
             window.resetDrags()
             hook.count = 0
             window.sendEvent(tabHitEvent(.leftMouseDown, at: start, in: window))
@@ -481,7 +486,7 @@ extension ReaderChecks {
 
         if !failures.isEmpty {
             for failure in failures { print("FAIL: \(failure)") }
-            fatalError("FAIL: \(failures.count) tab hit-region assertion(s) failed")
+            fail("FAIL: \(failures.count) tab hit-region assertion(s) failed")
         }
         print("PASS: tabs, gaps and strip padding never start a window drag; the explicit drag area does; "
               + "close, + and both reorder origins still work")

@@ -3829,6 +3829,54 @@ impl LyraReaderDocument {
         &self,
         request: AiPlanRequestRecord,
     ) -> Result<AiPlanRecord, LyraReaderFfiError> {
+        self.prepare_ai_plan_inner(request, None)
+    }
+
+    /// Resolve a saved paragraph on the current page without a provider request.
+    pub fn locate_ai_reading_source(
+        &self,
+        page: u32,
+        text: String,
+    ) -> Result<Vec<AiSourceRectRecord>, LyraReaderFfiError> {
+        if page >= self.page_count() {
+            return Err(LyraReaderFfiError::InvalidArgument {
+                message: "The saved source is outside the document or exceeds the supported size."
+                    .into(),
+                severity: ErrorSeverity::Recoverable,
+            });
+        }
+        let (raw, chars) = self.ai_page(page)?;
+        Ok(lyra_reader_ai::chat::locate_reading_source(
+            &PageText {
+                page,
+                text: raw,
+                chars,
+            },
+            &text,
+        )?
+        .into_iter()
+        .map(|r| AiSourceRectRecord {
+            x_pt: r.x_pt,
+            y_pt: r.y_pt,
+            width_pt: r.width_pt,
+            height_pt: r.height_pt,
+        })
+        .collect())
+    }
+
+    pub fn prepare_ai_reading_task(
+        &self,
+        request: AiPlanRequestRecord,
+        options: AiReadingOptionsRecord,
+    ) -> Result<AiPlanRecord, LyraReaderFfiError> {
+        self.prepare_ai_plan_inner(request, Some(options))
+    }
+
+    fn prepare_ai_plan_inner(
+        &self,
+        request: AiPlanRequestRecord,
+        reading: Option<AiReadingOptionsRecord>,
+    ) -> Result<AiPlanRecord, LyraReaderFfiError> {
         let action = match request.action {
             AiActionRecord::SummarizePage => AiAction::SummarizePage,
             AiActionRecord::SummarizeSelection => AiAction::SummarizeSelection,
@@ -4013,7 +4061,12 @@ impl LyraReaderDocument {
 
         // Selection-only summary and translation send only the exact selected target.
         // Questions can retrieve context; a document summary needs every page.
-        let page_list: Vec<u32> = if matches!(
+        let page_list: Vec<u32> = if reading
+            .as_ref()
+            .is_some_and(|options| options.kind == "note")
+        {
+            vec![request.current_page]
+        } else if matches!(
             action,
             AiAction::TranslateSelection | AiAction::SummarizeSelection
         ) {
@@ -4104,6 +4157,8 @@ impl LyraReaderDocument {
             };
             if request.document_knowledge {
                 build_document_knowledge_plan(input)?
+            } else if let Some(options) = reading {
+                lyra_reader_ai::chat::build_reading_task(input, &options.kind, &options.detail)?
             } else {
                 build_plan(input)?
             }
@@ -8326,6 +8381,13 @@ impl LyraReaderEngine {
 
 // ── AI assistant: plans and streaming requests ──────────────────────────────────────────────
 
+/// Presentation-independent reading-task settings.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AiReadingOptionsRecord {
+    pub kind: String,
+    pub detail: String,
+}
+
 /// What the reader asked the assistant to do, as the Swift panel names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum AiActionRecord {
@@ -8841,6 +8903,7 @@ pub enum AiEventRecord {
         completion_tokens: Option<u64>,
         total_tokens: Option<u64>,
         reasoning_tokens: Option<u64>,
+        cached_tokens: Option<u64>,
     },
     Diagnostics {
         diagnostics: AiStreamDiagnostics,
@@ -8893,11 +8956,13 @@ impl AiJob {
                 completion_tokens,
                 total_tokens,
                 reasoning_tokens,
+                cached_tokens,
             }) => AiEventRecord::Usage {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens,
                 reasoning_tokens,
+                cached_tokens,
             },
             RunEvent::Diagnostics(StreamDiagnostics {
                 http_status,
@@ -9086,6 +9151,27 @@ pub fn start_ai_request(
             message: format!("could not start the AI request worker: {error}"),
         })?;
     Ok(Arc::new(LyraReaderAiRequest { job }))
+}
+
+/// Apply the same reading settings to the final synthesis before either transport renders it.
+#[uniffi::export]
+pub fn style_ai_reading_plan(
+    plan: AiPlanRecord,
+    kind: String,
+    detail: String,
+    language: String,
+) -> Result<AiPlanRecord, LyraReaderFfiError> {
+    let plan = lyra_reader_ai::chat::style_reading_plan(
+        chat_plan_from_record(plan)?,
+        &kind,
+        &detail,
+        &language,
+    )
+    .map_err(|message| LyraReaderFfiError::InvalidArgument {
+        message,
+        severity: ErrorSeverity::Recoverable,
+    })?;
+    Ok(ai_plan_record(plan))
 }
 
 /// Build the previewable consolidation request from part summaries. This never touches the
@@ -11477,4 +11563,17 @@ mod content_command_tests {
             }
         }
     }
+}
+
+/// The shell supplies typed conversation turns; the engine owns note-update instructions.
+#[uniffi::export]
+pub fn ai_reading_note_input(turns: Vec<AiConversationTurnRecord>, previous: String) -> String {
+    let turns: Vec<_> = turns
+        .into_iter()
+        .map(|turn| ConversationTurn {
+            question: turn.question,
+            answer: turn.answer,
+        })
+        .collect();
+    lyra_reader_ai::workspace::note_input(&turns, &previous)
 }

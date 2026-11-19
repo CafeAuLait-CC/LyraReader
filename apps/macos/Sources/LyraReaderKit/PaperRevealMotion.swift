@@ -52,6 +52,48 @@ extension AppState {
         regionPaperMotionTasks.values.forEach { $0.cancel() }
         regionPaperMotionTasks.removeAll(); regionPaperMotionIDs.removeAll()
         regionPaperProgress.removeAll(); closingRegionPapers.removeAll()
+        regionHeightMotionTasks.values.forEach { $0.cancel() }
+        regionHeightMotionTasks.removeAll(); regionHeightTargets.removeAll()
+    }
+
+    /// Measured content is a target; the native card and split-page quads share this displayed
+    /// height. Retarget the running motion without restarting it on every streamed line.
+    func setRegionCardHeightTarget(_ id: UUID, height: CGFloat) {
+        guard height.isFinite, height > 0,
+              !closingRegionPapers.contains(id),
+              let card = regionCards.first(where: { $0.id == id }),
+              abs(height - (regionHeightTargets[id] ?? card.heightViewPt)) > 0.5 else { return }
+        regionHeightTargets[id] = height
+        guard canAnimateRegionPaper, regionPaperRevealProgress(for: id) >= 1 else {
+            regionHeightMotionTasks.removeValue(forKey: id)?.cancel()
+            regionHeightTargets[id] = nil
+            applyRegionCardHeight(cardID: id, viewHeight: height)
+            reloadVisiblePages()
+            return
+        }
+        guard regionHeightMotionTasks[id] == nil else { return }
+        regionHeightMotionTasks[id] = Task { @MainActor [weak self] in
+            var previousTime = ProcessInfo.processInfo.systemUptime
+            while let self, !Task.isCancelled,
+                  let card = self.regionCards.first(where: { $0.id == id }),
+                  let target = self.regionHeightTargets[id] {
+                let now = ProcessInfo.processInfo.systemUptime
+                let elapsed = min(0.05, max(0, now - previousTime))
+                previousTime = now
+                let distance = target - card.heightViewPt
+                let done = abs(distance) < 0.25 || !self.canAnimateRegionPaper
+                    || self.closingRegionPapers.contains(id)
+                let height = done ? target : card.heightViewPt + distance * CGFloat(1 - exp(-elapsed / 0.055))
+                self.applyRegionCardHeight(cardID: id, viewHeight: height)
+                if done {
+                    self.regionHeightMotionTasks[id] = nil
+                    self.regionHeightTargets[id] = nil
+                    self.reloadVisiblePages()
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(16))
+            }
+        }
     }
 }
 

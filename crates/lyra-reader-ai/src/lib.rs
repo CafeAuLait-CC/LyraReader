@@ -8,10 +8,13 @@
 
 pub mod chat;
 pub mod citation;
+pub mod math;
 pub mod mock;
 pub mod openai;
 pub mod provider;
 pub mod sections;
+pub mod understanding;
+pub mod workspace;
 
 pub use chat::{
     Action, CHAT_RETRIEVED_BLOCKS, CONNECTION_TEST_MAX_TOKENS, CONNECTION_TEST_PROMPT, ChatImage,

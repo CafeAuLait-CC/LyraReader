@@ -366,6 +366,8 @@ extension AppState {
     /// question and answer in Region questions, Delete does not.
     public func closeRegionCard(id: UUID, keepHistory: Bool, reason: String? = nil) {
         guard let card = regionCards.first(where: { $0.id == id }), !closingRegionPapers.contains(id) else { return }
+        regionHeightMotionTasks.removeValue(forKey: id)?.cancel()
+        regionHeightTargets[id] = nil
         card.assistant.cancelRegionWork(); card.notesAssistant.cancelRegionWork()
         if canAnimateRegionPaper {
             closingRegionPapers.insert(id)
@@ -376,6 +378,8 @@ extension AppState {
     }
 
     private func finishClosingRegionCard(id: UUID, keepHistory: Bool, reason: String?) {
+        regionHeightMotionTasks.removeValue(forKey: id)?.cancel()
+        regionHeightTargets[id] = nil
         guard let index = regionCards.firstIndex(where: { $0.id == id }) else { return }
         let card = regionCards[index]
         card.assistant.cancelRegionWork()
@@ -453,6 +457,10 @@ extension AppState {
     }
 
     public func updateRegionCardHeight(cardID: UUID, viewHeight: CGFloat) {
+        setRegionCardHeightTarget(cardID, height: viewHeight)
+    }
+
+    func applyRegionCardHeight(cardID: UUID, viewHeight: CGFloat) {
         guard let card = regionCards.first(where: { $0.id == cardID }) else { return }
         let previousGap = regionGapTotalPt
         let previousTop = regionGapTop(for: card) ?? 0
@@ -468,7 +476,9 @@ extension AppState {
         if scrollYPt >= previousTop + previousGap {
             scrollYPt = max(0, scrollYPt + delta + max(0, anchorMove))
         }
-        refreshRegionLayout(preservingScroll: false)
+        // Reuse the reveal's synchronous geometry commit. Reloading the page band here left
+        // the paper at its new height while the split-page quads still described the old gap.
+        refreshRegionPaperGeometry()
     }
 
     // MARK: - History

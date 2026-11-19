@@ -95,12 +95,11 @@ package enum ChatGPTResponses {
             return ((object["delta"] as? String).map { [.delta($0)] } ?? [], false)
         case "response.completed":
             let response = object["response"] as? [String: Any] ?? [:]
-            let usage = response["usage"] as? [String: Any] ?? [:]
-            let details = usage["output_tokens_details"] as? [String: Any] ?? [:]
-            return ([.usage(AIUsage(promptTokens: usage["input_tokens"] as? Int,
-                                    completionTokens: usage["output_tokens"] as? Int,
-                                    totalTokens: usage["total_tokens"] as? Int,
-                                    reasoningTokens: details["reasoning_tokens"] as? Int))], true)
+            let bytes = try JSONSerialization.data(withJSONObject: ["usage": response["usage"] as? [String: Any] ?? [:]])
+            let usage = try aiResponseUsage(json: String(decoding: bytes, as: UTF8.self))
+            return ([.usage(AIUsage(promptTokens: usage?.promptTokens.map(Int.init),
+                completionTokens: usage?.completionTokens.map(Int.init), totalTokens: usage?.totalTokens.map(Int.init),
+                reasoningTokens: usage?.reasoningTokens.map(Int.init), cachedTokens: usage?.cachedTokens.map(Int.init)))], true)
         case "response.failed", "response.incomplete", "error":
             let response = object["response"] as? [String: Any] ?? [:]
             let error = response["error"] as? [String: Any] ?? object["error"] as? [String: Any] ?? object

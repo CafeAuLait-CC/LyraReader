@@ -748,31 +748,9 @@ public struct AIAssistantRightPanelContent: View {
     }
 
     public var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Label { Text(model.selectedTab.title) } icon: {
-                    LyraAIActivityIcon(model: model).frame(width: 20, height: 20)
-                }.font(.system(size: 13, weight: .semibold))
-                Spacer()
-                SettingsLink { Image(systemName: "gearshape") }
-                    .lyraToolStyle().help("AI connection settings")
-                Button { state.toggleRightPanel() } label: { Image(systemName: "xmark") }
-                    .lyraToolStyle().accessibilityLabel("Close AI assistant")
-            }.padding(.horizontal, 14).padding(.vertical, 8)
-            Divider().overlay(LyraReaderTheme.separator)
-            if model.selectedTab == .chat {
-                AIDocumentChatView(state: state, model: model)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if model.selectedTab == .regions {
-                AIRegionHistoryView(state: state, aiAssistant: model)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                AIAssistantPanel(state: state, model: model, isActive: isActive)
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(LyraReaderTheme.panelBg)
+        AIReadingSidebar(state: state, navigation: model, reading: model.readingWorkspace, isActive: isActive)
     }
+
 }
 
 /// A zero-size marker view for the hosted-window checks.
