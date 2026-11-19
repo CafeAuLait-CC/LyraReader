@@ -155,6 +155,7 @@ extension ReaderChecks {
         try await aiDocumentChatLayoutChecks(root: root)
         try await aiLayeredSummaryChecks(root: root)
         try await aiReadingWorkspaceChecks(root: root)
+        try await aiTranslationDisclosureChecks()
         try await aiReadingSelectorMotionChecks(root: root)
     }
 

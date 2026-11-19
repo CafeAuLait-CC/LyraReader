@@ -50,7 +50,7 @@ typedef struct LyraReaderFrameStats {
 } LyraReaderFrameStats;
 
 /* ABI version; checked by the host at startup. */
-enum { LYRA_READER_ABI_VERSION = 6 };
+enum { LYRA_READER_ABI_VERSION = 7 };
 uint32_t lyra_reader_abi_version(void);
 
 /* Creates the wgpu instance/adapter/device. flags: bit0 = validation layers. */

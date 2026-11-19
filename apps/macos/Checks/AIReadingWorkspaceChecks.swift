@@ -167,6 +167,10 @@ extension ReaderChecks {
         require(restored.notes(query: "independent", recent: true).count == 1, "native relaunch restores edited notes and searchable personal thoughts")
         require(restored.taskHistory("translation").count == 4 && restored.taskHistory("translation").contains { $0.id == firstSelection.id },
                 "native disk restoration retains every translation and its original identity")
+        require(restored.translationHistory(selection: false).map(\.id) == [translated.id]
+                && restored.translationHistory(selection: true).count == 3
+                && restored.translationHistory(selection: true).contains { $0.id == secondSelection.id },
+                "disk restoration keeps whole-document and all selected-passage timelines separate")
         let relaunched = AIReadingModel(settings: settings, audit: AIAuditTrail.shared)
         relaunched.serviceOverride = service
         await relaunched.bind(state)
@@ -288,8 +292,21 @@ extension ReaderChecks {
         require(service.starts == count, "automatic selection capture sends no AI request")
         click("segment-Whole document", in: host)
         try await eventually("the shared source picker switches Translate to the whole document", { !reading.translationSelection })
+        try await eventually("the document feed hides every selected-passage result", {
+            host.layoutSubtreeIfNeeded()
+            let ids = Set(find(host).map(\.id))
+            return reading.store.translationHistory(selection: false).allSatisfy { ids.contains($0.id) }
+                && reading.store.translationHistory(selection: true).allSatisfy { !ids.contains($0.id) }
+        })
         click("segment-Selection", in: host)
         try await eventually("the shared source picker returns to the selected passage", { reading.translationSelection })
+        try await eventually("the selection feed restores earlier passages without document results", {
+            host.layoutSubtreeIfNeeded()
+            let ids = Set(find(host).map(\.id))
+            return reading.store.translationHistory(selection: true).contains { ids.contains($0.id) }
+                && reading.store.translationHistory(selection: false).allSatisfy { !ids.contains($0.id) }
+        })
+        require(service.starts == count, "switching translation timelines sends no AI requests")
         let captured = reading.excerpt("translation")
         let before = reading.store.taskHistory("translation").count
         service.holdNext = true

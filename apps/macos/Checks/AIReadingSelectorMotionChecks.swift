@@ -44,7 +44,6 @@ extension ReaderChecks {
             content: "<!--lyra:0-->A synthetic translation.", sourceID: aiReadingScopeKey(selection: nil), pages: [1]))
         let notes = (0..<16).map { AiReadingRecord.make(kind: "note", title: "Synthetic note \($0)",
             content: "A local note with enough content to make the list scroll.", sourceID: "synthetic:\($0)", pages: [1]) }
-        reading.store.put(notes[0])
         let navigation = AIAssistantModel(settings: settings)
         let appearance = ReadingSelectorAppearance()
         let savedMotion = ReaderMotion.reduceMotionOverride
@@ -116,6 +115,11 @@ extension ReaderChecks {
             }
             return (CGFloat(first + last) / (2 * scale), CGFloat(last - first + 1) / scale, labels)
         }
+        func scrollers(_ view: NSView, style: NSScroller.Style) {
+            if let scroll = view as? NSScrollView { scroll.scrollerStyle = style; scroll.tile() }
+            view.subviews.forEach { scrollers($0, style: style) }
+        }
+        var sharedSelectorWidth: CGFloat?
         for (name, tab, first, second) in [
             ("summary", AIAssistantTab.summary, "Whole document", "Selection"),
             ("translation", .translation, "Whole document", "Selection"),
@@ -124,21 +128,25 @@ extension ReaderChecks {
             navigation.selectedTab = tab; reading.selectedNoteID = nil
             try await Task.sleep(for: .milliseconds(220))
             // Force the space-consuming system scroller used in the user's recording.
-            func legacyScrollers(_ view: NSView) {
-                if let scroll = view as? NSScrollView { scroll.scrollerStyle = .legacy; scroll.tile() }
-                view.subviews.forEach(legacyScrollers)
-            }
-            legacyScrollers(host)
+            scrollers(host, style: .legacy)
             try await Task.sleep(for: .milliseconds(100))
             let left = "segment-\(first)", right = "segment-\(second)"
             click(left); try await Task.sleep(for: .milliseconds(250))
             let originalLeft = rect(left), originalRight = rect(right)
             let area = originalLeft.union(originalRight)
+            // The probes cover the two cells, inside the selector's 3 pt border inset.
+            let expectedWidth = 414 - 2 * AIReadingScrollMetrics.horizontalInset - AIReadingScrollMetrics.gutterWidth - 6
+            require(abs(area.width - expectedWidth) < 0.5,
+                    "\(name) reserves a complete scrollbar gutter even for empty or short content (\(area.width), expected \(expectedWidth))")
+            if let sharedSelectorWidth {
+                require(abs(area.width - sharedSelectorWidth) < 0.5, "all three AI panels use the same selector width")
+            } else { sharedSelectorWidth = area.width }
             let start = paintedHighlight(area)
             if name == "notes" {
                 reading.store.putAll(notes)
                 try await Task.sleep(for: .milliseconds(150))
-                require(abs(rect(left).width - originalLeft.width) < 0.5 && abs(rect(right).midX - originalRight.midX) < 0.5,
+                require(abs(rect(left).width - originalLeft.width) < 0.5 && abs(rect(right).midX - originalRight.midX) < 0.5
+                        && abs(rect(left).minY - originalLeft.minY) < 0.5,
                         "a long notes list does not change its sort selector's geometry")
             }
             for (direction, target) in [(1, right), (-1, left)] {
@@ -186,13 +194,21 @@ extension ReaderChecks {
             }
             ReaderMotion.reduceMotionOverride = true; appearance.reduced = true
             try await Task.sleep(for: .milliseconds(80))
-            host.layoutSubtreeIfNeeded(); legacyScrollers(host)
+            host.layoutSubtreeIfNeeded(); scrollers(host, style: .legacy)
             try await Task.sleep(for: .milliseconds(80))
             click(right)
             try await Task.sleep(for: .milliseconds(40))
             require(abs(paintedHighlight(area).center - (originalRight.midX - area.minX)) < 2,
                     "\(name) switches immediately with Reduce Motion")
             ReaderMotion.reduceMotionOverride = false; appearance.reduced = false
+            try await Task.sleep(for: .milliseconds(100))
+            scrollers(host, style: .overlay)
+            try await Task.sleep(for: .milliseconds(150))
+            require(abs(rect(left).width - originalLeft.width) < 0.5 && abs(rect(right).midX - originalRight.midX) < 0.5,
+                    "\(name) reserves the same width when the system uses overlay scrollbars")
+            click(left); try await Task.sleep(for: .milliseconds(250))
+            require(abs(rect(left).width - originalLeft.width) < 0.5 && abs(rect(right).midX - originalRight.midX) < 0.5,
+                    "\(name) keeps the reserved overlay gutter when switching between empty and populated results")
         }
     }
 }

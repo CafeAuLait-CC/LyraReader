@@ -207,6 +207,19 @@ extension EnvironmentValues {
     }
 }
 
+/// SwiftUI's measurement proposals must not mutate the visible TextKit container. Its
+/// width follows the frame AppKit actually installs, while SwiftUI owns the row height.
+private final class ReaderMarkdownTextView: NSTextView {
+    var stableReadingLayout = false
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        if stableReadingLayout, newSize.width.isFinite, newSize.width > 1,
+           textContainer?.containerSize.width != newSize.width {
+            textContainer?.containerSize = CGSize(width: newSize.width, height: .greatestFiniteMagnitude)
+        }
+    }
+}
+
 public struct ReaderMarkdownInlineText: NSViewRepresentable {
     @Environment(\.readerMarkdownTypography) private var typography
     @Environment(\.readingStableTextLayout) private var stableReadingLayout
@@ -218,7 +231,8 @@ public struct ReaderMarkdownInlineText: NSViewRepresentable {
     let onJump: (Int) -> Void
 
     public func makeNSView(context: Context) -> NSTextView {
-        let textView = NSTextView(frame: .zero)
+        let textView = ReaderMarkdownTextView(frame: .zero)
+        textView.stableReadingLayout = stableReadingLayout
         textView.isEditable = false
         textView.isSelectable = true
         textView.drawsBackground = false
@@ -275,7 +289,6 @@ public struct ReaderMarkdownInlineText: NSViewRepresentable {
             measurement.addTextContainer(measureContainer)
             storage.addLayoutManager(measurement)
             measurement.ensureLayout(for: measureContainer)
-            container.containerSize = CGSize(width: width, height: .greatestFiniteMagnitude)
             return CGSize(width: width, height: max(1, ceil(measurement.usedRect(for: measureContainer).height)))
         }
         container.containerSize = CGSize(width: width, height: .greatestFiniteMagnitude)

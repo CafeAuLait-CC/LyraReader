@@ -111,6 +111,17 @@ impl ReadingWorkspace {
         Ok(records)
     }
 
+    /// Whole-document and selected-passage translations have independent timelines.
+    /// Non-document scopes remain in the selection timeline even when a saved range is
+    /// invalid: replay validation still reports that error instead of hiding the record.
+    pub fn translation_history(&self, selection: bool) -> Result<Vec<ReadingRecord>, String> {
+        Ok(self
+            .task_history("translation", None)?
+            .into_iter()
+            .filter(|record| (record.source_id != "document") == selection)
+            .collect())
+    }
+
     /// Replaying a task uses its original range, never the reader's current selection.
     pub fn task_selection(&self, id: &str) -> Result<Option<crate::SelectionRange>, String> {
         let record = self
@@ -513,6 +524,24 @@ mod tests {
             ["whole", "retry", "second", "first"]
         );
         assert_eq!(history.last().unwrap().excerpt, "Original first");
+        assert_eq!(
+            restored
+                .translation_history(false)
+                .unwrap()
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            ["whole"]
+        );
+        assert_eq!(
+            restored
+                .translation_history(true)
+                .unwrap()
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            ["retry", "second", "first"]
+        );
         assert_eq!(
             restored
                 .task_history("translation", Some("selection:1:0:12"))

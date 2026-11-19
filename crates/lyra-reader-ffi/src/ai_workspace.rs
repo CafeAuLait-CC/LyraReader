@@ -272,6 +272,17 @@ impl LyraReadingWorkspace {
             .map(Into::into)
             .collect())
     }
+    pub fn translation_history(
+        &self,
+        selection: bool,
+    ) -> Result<Vec<AiReadingRecord>, LyraReaderFfiError> {
+        Ok(lyra_reader_core::sync::lock(&self.state)?
+            .translation_history(selection)
+            .map_err(error)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
     pub fn task_selection(
         &self,
         id: String,

@@ -16,6 +16,9 @@ struct AIReadingSidebar: View {
     @State private var noteTitle = ""
     @State private var noteContent = ""
     @State private var noteThoughts = ""
+    @State private var summaryTrailingGutter = AIReadingScrollMetrics.initialAdditionalInset
+    @State private var notesTrailingGutter = AIReadingScrollMetrics.initialAdditionalInset
+    @State private var noteDetailTrailingGutter = AIReadingScrollMetrics.initialAdditionalInset
     let isActive: Bool
 
     init(state: AppState, navigation: AIAssistantModel, reading: AIReadingModel, isActive: Bool) {
@@ -183,8 +186,10 @@ struct AIReadingSidebar: View {
                     Label(aiReadingLabel(result == nil ? (selected ? "Summarize selection" : "Summarize document") : "Regenerate"), systemImage: result == nil ? "sparkles" : "arrow.clockwise")
                 }.buttonStyle(ReaderPanelButtonStyle(prominent: true))
                     .disabled(busy || knowledge.isBlocking || !reading.store.isAvailable || !reading.settings.canUseAI || selected && reading.excerpt(kind).isEmpty)
-            }.padding(18).frame(maxWidth: .infinity, alignment: .leading)
-                .background(AIReadingScrollMemory(key: "\(state.document?.id.uuidString ?? "none"):\(kind)", reading: reading))
+            }.padding(.vertical, 18).padding(.horizontal, AIReadingScrollMetrics.horizontalInset)
+                .padding(.trailing, summaryTrailingGutter).frame(maxWidth: .infinity, alignment: .leading)
+                .background(AIReadingScrollMemory(key: "\(state.document?.id.uuidString ?? "none"):\(kind)", reading: reading,
+                    onGutterChange: { summaryTrailingGutter = $0 }))
         }.id(kind)
     }
     private func taskHistory(_ kind: String) -> some View {
@@ -247,12 +252,16 @@ struct AIReadingSidebar: View {
                 noteDetail(note)
             } else {
                 VStack(spacing: 12) {
-                    TextField(aiReadingLabel("Search reading notes"), text: $search)
-                    LyraReadingSegmentedPicker(title: "Sort", selection: $recent, first: "Page order", second: "Recent", firstIcon: "list.number", secondIcon: "clock")
+                    VStack(spacing: 12) {
+                        TextField(aiReadingLabel("Search reading notes"), text: $search)
+                        LyraReadingSegmentedPicker(title: "Sort", selection: $recent, first: "Page order", second: "Recent", firstIcon: "list.number", secondIcon: "clock")
+                    }.padding(.trailing, AIReadingScrollMetrics.gutterWidth)
                     let notes = reading.store.notes(query: search, recent: recent)
                     if notes.isEmpty {
                         ContentUnavailableView(aiReadingLabel(search.isEmpty ? "Keep the ideas you discover" : "No matching notes"), systemImage: "note.text",
                             description: Text(aiReadingLabel(search.isEmpty ? "Save a summary, a Chat answer, or finish an Interleaf discussion." : "Try another search or clear the search field.")))
+                            .padding(.trailing, AIReadingScrollMetrics.gutterWidth)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else {
                         ScrollView {
                             LazyVStack(alignment: .leading, spacing: 0) {
@@ -266,10 +275,13 @@ struct AIReadingSidebar: View {
                                     }.buttonStyle(.plain)
                                     Divider().overlay(LyraReaderTheme.separator)
                                 }
-                            }
+                            }.padding(.trailing, notesTrailingGutter).frame(maxWidth: .infinity, alignment: .leading)
+                                .background(AIReadingScrollMemory(key: "\(state.document?.id.uuidString ?? "none"):notes", reading: reading,
+                                    onGutterChange: { notesTrailingGutter = $0 }))
                         }
                     }
-                }.padding(16)
+                }.padding(.vertical, 16).padding(.horizontal, AIReadingScrollMetrics.horizontalInset)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
         }
     }
@@ -365,7 +377,10 @@ struct AIReadingSidebar: View {
                         Button(aiReadingLabel("Continue conversation")) { reading.openSession(note.conversationId, pageCount: state.document?.pageCount ?? 0); navigation.selectedTab = .chat }
                     }
                 }
-            }.padding(18).frame(maxWidth: .infinity, alignment: .leading)
+            }.padding(.vertical, 18).padding(.horizontal, AIReadingScrollMetrics.horizontalInset)
+                .padding(.trailing, noteDetailTrailingGutter).frame(maxWidth: .infinity, alignment: .leading)
+                .background(AIReadingScrollMemory(key: "\(state.document?.id.uuidString ?? "none"):note-\(note.id)", reading: reading,
+                    onGutterChange: { noteDetailTrailingGutter = $0 }))
         }
     }
     private func copy(_ text: String) { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string); reading.notice = "Copied" }

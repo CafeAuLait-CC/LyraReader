@@ -11,6 +11,7 @@ final class AIReadingStore: ObservableObject {
     var isAvailable: Bool { workspace != nil }
     private var workspace: LyraReadingWorkspace?
     private var taskHistories: [String: [AiReadingRecord]] = [:]
+    private var translationHistories: [Bool: [AiReadingRecord]] = [:]
     private var scopedTaskHistories: [String: [String: [AiReadingRecord]]] = [:]
     private var file: URL?
     private var identity: String?
@@ -22,7 +23,7 @@ final class AIReadingStore: ObservableObject {
         self.identity = identity
         generation = UUID()
         let token = generation
-        taskHistories = [:]; scopedTaskHistories = [:]
+        taskHistories = [:]; scopedTaskHistories = [:]; translationHistories = [:]
         records = []; workspace = nil; error = nil; isLoading = true
         // A fast document/session switch must see the writes queued by its departing view.
         await flush()
@@ -83,6 +84,9 @@ final class AIReadingStore: ObservableObject {
         guard let workspace else { throw CocoaError(.fileReadUnknown) }
         return try workspace.taskSelection(id: id)
     }
+    func translationHistory(selection: Bool) -> [AiReadingRecord] {
+        translationHistories[selection] ?? []
+    }
     func suggestion(_ id: String) -> AiReadingRecord? {
         guard let workspace else { return nil }
         do { return try workspace.suggestion(noteId: id) }
@@ -122,9 +126,12 @@ final class AIReadingStore: ObservableObject {
     private func refreshSnapshot(_ workspace: LyraReadingWorkspace) throws {
         var histories: [String: [AiReadingRecord]] = [:]
         for kind in ["summary", "translation"] { histories[kind] = try workspace.taskHistory(kind: kind, sourceId: nil) }
+        let translations = [false: try workspace.translationHistory(selection: false), true: try workspace.translationHistory(selection: true)]
+        let records = try workspace.records()
         taskHistories = histories
         scopedTaskHistories = histories.mapValues { Dictionary(grouping: $0, by: \.sourceId) }
-        records = try workspace.records()
+        translationHistories = translations
+        self.records = records
     }
 }
 
