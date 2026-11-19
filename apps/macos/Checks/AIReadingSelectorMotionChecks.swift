@@ -153,6 +153,10 @@ extension ReaderChecks {
                 require(abs(area.width - sharedSelectorWidth) < 0.5, "all three AI panels use the same selector width")
             } else { sharedSelectorWidth = area.width }
             let start = paintedHighlight(area)
+            // Each rasterized edge can round independently. Compare every frame with
+            // the actual cell width, not with a first bitmap that has its own rounding bias.
+            require(abs(start.width - originalLeft.width) < 2,
+                    "\(name) initially paints a full cell-width highlight")
             if name == "notes" {
                 reading.store.putAll(notes)
                 try await Task.sleep(for: .milliseconds(150))
@@ -192,7 +196,8 @@ extension ReaderChecks {
                 require(geometryError < 0.5, "\(name) labels keep their positions when content gains or loses a scrollbar (error \(geometryError) pt)")
                 require(labelError <= 1, "\(name) keeps painted icon/text bounds fixed throughout the slide (error \(labelError) pt)")
                 require(intermediate.count >= 3, "\(name) paints multiple intermediate highlight positions in direction \(direction) (\(intermediate.count))")
-                require(samples.allSatisfy { abs($0.1 - start.width) < 2 }, "\(name) moves one constant-width gold block without cross-fading")
+                require(samples.allSatisfy { abs($0.1 - originalLeft.width) < 2 },
+                        "\(name) moves one cell-width gold block without cross-fading (expected \(originalLeft.width) pt)")
                 if let folder = ProcessInfo.processInfo.environment["LYRA_AI_EVIDENCE"] {
                     let directory = URL(fileURLWithPath: folder).appendingPathComponent("selector-\(name)-\(direction)")
                     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
