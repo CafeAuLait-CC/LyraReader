@@ -413,6 +413,20 @@ extension ReaderChecks {
                 reading.selectedNoteID = name == "note-detail" ? reading.store.notes(query: "", recent: false).first?.id : nil
                 try await Task.sleep(for: .milliseconds(150))
                 host.layoutSubtreeIfNeeded()
+                if name == "translation" {
+                    func markers(_ view: NSView) -> [AITranslationControlMarker] {
+                        (view as? AITranslationControlMarker).map { [$0] } ?? view.subviews.flatMap(markers)
+                    }
+                    let views = markers(host)
+                    guard let entry = views.first(where: { $0.id == translated.id }),
+                          let original = views.first(where: { $0.id == "original-preview-\(translated.id)-0" }) else {
+                        fail("FAIL: the saved translation exposes its entry and original source")
+                    }
+                    let entryRect = host.convert(entry.bounds, from: entry)
+                    let sourceRect = host.convert(original.bounds, from: original)
+                    require(sourceRect.minY - entryRect.minY <= 13,
+                            "saved translation entries start with their source rather than repeated type/language/time metadata")
+                }
                 if let prefix = ["summary": "A supported idea", "translation": "合成实验", "chat": "Answer", "note-detail": "My corrected knowledge"][name] {
                     try await eventually("\(name) renders its semantic-ink fixture in \(dark ? "dark" : "light") mode", {
                         host.layoutSubtreeIfNeeded()

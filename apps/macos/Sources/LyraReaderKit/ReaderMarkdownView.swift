@@ -7,6 +7,7 @@ struct ReaderMarkdownTypography: Equatable, Sendable {
     var lineSpacing: CGFloat = 2
     var lineHeightMultiple: CGFloat = 0
     var themedInk = false
+    var secondaryInk = false
     static let standard = Self()
     static let assistant = Self(themedInk: true)
     static let translation = Self(bodySize: 14, lineSpacing: 5, lineHeightMultiple: 1.12, themedInk: true)
@@ -259,7 +260,8 @@ public struct ReaderMarkdownInlineText: NSViewRepresentable {
         nsView.effectiveAppearance.performAsCurrentDrawingAppearance {
             attributed.append(ReaderMarkdownAttributed.build(
                 inlines: inlines, pageCount: pageCount, fontSize: fontSize, weight: weight,
-                typography: typography, ink: typography.themedInk ? LyraReaderTheme.textPrimaryColor : nil,
+                typography: typography, ink: typography.themedInk ?
+                    (typography.secondaryInk ? LyraReaderTheme.textSecondaryColor : LyraReaderTheme.textPrimaryColor) : nil,
                 linkInk: themedLinks ? LyraReaderTheme.accentColor : nil))
         }
         if !nsView.attributedString().isEqual(to: attributed) {

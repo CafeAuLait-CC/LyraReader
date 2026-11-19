@@ -126,12 +126,6 @@ struct AITranslationView: View {
     }
     private func savedTranslation(_ record: AiReadingRecord, onCollapse: @escaping () -> Void) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(aiReadingLabel(record.sourceId == aiReadingScopeKey(selection: nil) ? "Document translation" : "Selection translation"))
-                Text(AITranslationLanguage.display(record.language).code).font(.caption.monospaced())
-                Spacer(minLength: 4)
-                Text(Date(timeIntervalSince1970: Double(record.modified) / 1000), format: .dateTime.hour().minute()).font(.caption)
-            }.font(.callout).foregroundStyle(LyraReaderTheme.textSecondary)
             if record.status == "sourceChanged" {
                 Text(aiReadingLabel("The document has changed. This result keeps its original source snapshot.")).font(.caption).foregroundStyle(LyraReaderTheme.warningFg)
             } else if record.status == "partial" {
@@ -167,9 +161,6 @@ struct AITranslationExcerpt: View {
     let text: String
     let page: Int?
     var onLocate: () -> Void
-    @State private var expanded = false
-    @State private var heights: [Bool: CGFloat] = [:]
-    private var canExpand: Bool { (heights[true] ?? 0) > (heights[false] ?? 0) + 1 }
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
@@ -180,38 +171,13 @@ struct AITranslationExcerpt: View {
             }.font(.callout)
             HStack(alignment: .top, spacing: 12) {
                 Rectangle().fill(LyraReaderTheme.separator).frame(width: 2)
-                VStack(alignment: .leading, spacing: 6) {
-                    quote.lineLimit(expanded ? nil : 3).textSelection(.enabled)
-                        .background {
-                            ForEach([false, true], id: \.self) { full in
-                                quote.lineLimit(full ? nil : 3).fixedSize(horizontal: false, vertical: true).hidden()
-                                    .background(GeometryReader { geometry in
-                                        Color.clear.preference(key: TranslationExcerptHeight.self, value: [full: geometry.size.height])
-                                    })
-                            }.allowsHitTesting(false).accessibilityHidden(true)
-                        }
-                    if canExpand {
-                        Button(aiReadingLabel(expanded ? "Less" : "More")) { expanded.toggle() }
-                            .buttonStyle(.plain).foregroundStyle(LyraReaderTheme.accent)
-                            .font(.caption).accessibilityIdentifier("translation-excerpt-more")
-                            .accessibilityValue(aiReadingLabel(expanded ? "Expanded" : "Collapsed"))
-                            .background(AITranslationControlProbe(id: "excerpt-more"))
-                    }
-                }
+                TranslationSourceDisclosure(text: text.isEmpty ? aiReadingLabel("Select a passage in the document.") : text,
+                    moreID: "excerpt-more", fontSize: 13, lineSpacing: 0)
             }.fixedSize(horizontal: false, vertical: true)
         }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
             .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(LyraReaderTheme.separator))
             .background(AITranslationControlProbe(id: "excerpt-card"))
-            .onPreferenceChange(TranslationExcerptHeight.self) { if heights != $0 { heights = $0 } }
     }
-    private var quote: some View {
-        Text(text.isEmpty ? aiReadingLabel("Select a passage in the document.") : text)
-            .font(.callout).foregroundStyle(LyraReaderTheme.textSecondary).frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-private struct TranslationExcerptHeight: PreferenceKey {
-    static let defaultValue: [Bool: CGFloat] = [:]
-    static func reduce(value: inout [Bool: CGFloat], nextValue: () -> [Bool: CGFloat]) { value.merge(nextValue(), uniquingKeysWith: { _, next in next }) }
 }
 
 struct AITranslationBlocks: View {
@@ -229,12 +195,15 @@ struct AITranslationBlocks: View {
     var onRetry: (() -> Void)? = nil
     @State private var expanded = false
     @State private var overflows = false
+    @State private var footerDisclosure = false
     private var collapsed: Bool { recordID != nil && !expanded }
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if let blocks = try? aiTranslationBlocks(originals: originals, pages: pages, response: content), blocks.contains(where: { !$0.translation.isEmpty }) {
                 let visible = collapsed ? Array(blocks.prefix(1)) : blocks
+                let hasMore = blocks.count > 1 || overflows
                 ForEach(Array(visible.enumerated()), id: \.offset) { index, block in
+                    let last = index == visible.count - 1
                     VStack(alignment: .leading, spacing: 14) {
                         if showOriginal {
                             if let recordID {
@@ -247,56 +216,72 @@ struct AITranslationBlocks: View {
                         if block.translation.isEmpty {
                             Text(aiReadingLabel("Translation incomplete")).font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
                         } else {
-                            preview(height: 180) {
+                            preview(inlineControls: last, additionalContent: blocks.count > 1) {
                                 AIAnswerView(text: block.translation, pageCount: pageCount,
-                                             verifiedPages: verifiedPages.contains(block.page) ? [Int(block.page)] : [], onJump: onJump)
+                                    verifiedPages: verifiedPages.contains(block.page) ? [Int(block.page)] : [], onJump: onJump)
                                     .environment(\.readerMarkdownTypography, .translation)
-                            }
-                            .background {
+                            }.background {
                                 if let recordID { AITranslationControlProbe(id: "translated-preview-\(recordID)-\(index)") }
                             }
                         }
-                        HStack {
+                        HStack(spacing: 10) {
                             Button { onLocate(block.page, block.original) } label: {
                                 Label(String(format: aiReadingLabel("Original · p. %d"), block.page), systemImage: "arrow.up.right")
                             }.foregroundStyle(LyraReaderTheme.accent)
-                            Spacer()
-                            Text("¶ \(index + 1)").foregroundStyle(LyraReaderTheme.textSecondary)
-                        }.font(.callout)
+                            Text("¶ \(index + 1)").font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
+                            Spacer(minLength: 0)
+                            if last {
+                                if collapsed && hasMore && footerDisclosure { footerMore }
+                                resultActions(showRetry: expanded || !hasMore || footerDisclosure)
+                            }
+                        }.font(.callout).background {
+                            if let recordID { AITranslationControlProbe(id: "result-source-\(recordID)-\(index)") }
+                        }
                     }.padding(.vertical, 12)
                     if index < visible.count - 1 { Divider().overlay(LyraReaderTheme.separator) }
                 }
-                footer(hasMore: blocks.count > 1 || overflows)
             } else {
                 Text(aiReadingLabel("Paragraph alignment is unavailable for this response. The returned text is preserved below.")).font(.caption).foregroundStyle(LyraReaderTheme.warningFg)
-                preview(height: 180) {
+                preview(inlineControls: true, additionalContent: false) {
                     AIAnswerView(text: content, pageCount: pageCount, verifiedPages: Set(verifiedPages.map(Int.init)), onJump: onJump)
                         .environment(\.readerMarkdownTypography, .translation)
                 }
-                footer(hasMore: overflows)
+                if expanded || !overflows || footerDisclosure {
+                    HStack {
+                        if collapsed && footerDisclosure { footerMore }
+                        Spacer(minLength: 0); resultActions(showRetry: true)
+                    }
+                }
             }
         }.onPreferenceChange(TranslationPreviewOverflow.self) { overflows = $0 }
+            .onPreferenceChange(TranslationPreviewFooter.self) { footerDisclosure = $0 }
     }
-    @ViewBuilder private func preview<Content: View>(height: CGFloat, @ViewBuilder content: () -> Content) -> some View {
-        if recordID != nil {
-            TranslationPreviewClip(collapsed: collapsed, limit: height, content: content())
+    @ViewBuilder private var footerMore: some View {
+        if let recordID {
+            Button(aiReadingLabel("More")) { expanded = true }
+                .font(.caption).buttonStyle(.plain).foregroundStyle(LyraReaderTheme.accent)
+                .background(AITranslationControlProbe(id: "result-more-\(recordID)"))
+        }
+    }
+    @ViewBuilder private func preview<Content: View>(inlineControls: Bool, additionalContent: Bool,
+        @ViewBuilder content: () -> Content) -> some View {
+        if let recordID, inlineControls {
+            TranslationInlinePreview(collapsed: collapsed, additionalContent: additionalContent,
+                moreID: "result-more-\(recordID)", retryID: "result-retry-\(recordID)", retryDisabled: retryDisabled,
+                onExpand: { expanded = true }, onRetry: onRetry, content: content())
         } else { content() }
     }
-    @ViewBuilder private func footer(hasMore: Bool) -> some View {
+    @ViewBuilder private func resultActions(showRetry: Bool) -> some View {
         if let recordID {
-            HStack(spacing: 12) {
-                if expanded || hasMore {
-                    Button(aiReadingLabel(expanded ? "Less" : "More")) {
-                        expanded.toggle()
-                        if !expanded { onCollapse?() }
-                    }.accessibilityValue(aiReadingLabel(expanded ? "Expanded" : "Collapsed"))
+            Group {
+                if expanded {
+                    Button(aiReadingLabel("Less")) { expanded = false; onCollapse?() }
+                        .accessibilityValue(aiReadingLabel("Expanded"))
                         .background(AITranslationControlProbe(id: "result-more-\(recordID)"))
                 }
-                Spacer(minLength: 0)
-                if let onRetry {
+                if showRetry, let onRetry {
                     Button(action: onRetry) { Label(aiReadingLabel("Retry"), systemImage: "arrow.clockwise") }
-                        .disabled(retryDisabled)
-                        .background(AITranslationControlProbe(id: "result-retry-\(recordID)"))
+                        .disabled(retryDisabled).background(AITranslationControlProbe(id: "result-retry-\(recordID)"))
                 }
             }.font(.caption).foregroundStyle(LyraReaderTheme.accent).buttonStyle(.plain)
         }
@@ -306,71 +291,36 @@ struct AITranslationOriginal: View {
     let text: String
     let controlID: String
     var onCollapse: (() -> Void)? = nil
+    var body: some View {
+        TranslationSourceDisclosure(text: text, moreID: "original-more-\(controlID)", onCollapse: onCollapse)
+            .background(AITranslationControlProbe(id: "original-preview-\(controlID)"))
+    }
+}
+private struct TranslationSourceDisclosure: View {
+    let text: String
+    let moreID: String
+    var fontSize: CGFloat = 13.5
+    var lineSpacing: CGFloat = 5
+    var onCollapse: (() -> Void)? = nil
     @State private var expanded = false
-    @State private var heights: [Bool: CGFloat] = [:]
-    private var canExpand: Bool { (heights[true] ?? 0) > (heights[false] ?? 0) + 1 }
+    @State private var canExpand = false
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            original.lineLimit(expanded ? nil : 3).textSelection(.enabled)
-                .background {
-                    ForEach([false, true], id: \.self) { full in
-                        original.lineLimit(full ? nil : 3).fixedSize(horizontal: false, vertical: true).hidden()
-                            .background(GeometryReader { geometry in
-                                Color.clear.preference(key: TranslationExcerptHeight.self, value: [full: geometry.size.height])
-                            })
-                    }.allowsHitTesting(false).accessibilityHidden(true)
-                }
-            if canExpand {
-                Button(aiReadingLabel(expanded ? "Less" : "More")) {
-                    expanded.toggle()
-                    if !expanded { onCollapse?() }
-                }.font(.caption).buttonStyle(.plain).foregroundStyle(LyraReaderTheme.accent)
-                    .accessibilityValue(aiReadingLabel(expanded ? "Expanded" : "Collapsed"))
-                    .background(AITranslationControlProbe(id: "original-more-\(controlID)"))
+            TranslationInlinePreview(collapsed: !expanded,
+                limit: 3 * (ceil(NSFont.systemFont(ofSize: fontSize).ascender - NSFont.systemFont(ofSize: fontSize).descender) + lineSpacing),
+                maximumLines: 3, moreID: moreID, reportsOverflow: false, onOverflowChange: { canExpand = $0 },
+                onExpand: { expanded = true }, content:
+                    ReaderMarkdownInlineText(inlines: [.text(text)], pageCount: 0, fontSize: fontSize, onJump: { _ in })
+                        .environment(\.readerMarkdownTypography, ReaderMarkdownTypography(bodySize: fontSize,
+                            lineSpacing: lineSpacing, themedInk: true, secondaryInk: true))
+                        .environment(\.readingStableTextLayout, true))
+            if expanded && canExpand {
+                Button(aiReadingLabel("Less")) { expanded = false; onCollapse?() }
+                    .font(.caption).buttonStyle(.plain).foregroundStyle(LyraReaderTheme.accent)
+                    .accessibilityValue(aiReadingLabel("Expanded"))
+                    .background(AITranslationControlProbe(id: moreID))
             }
-        }.background(AITranslationControlProbe(id: "original-preview-\(controlID)"))
-            .onPreferenceChange(TranslationExcerptHeight.self) { if heights != $0 { heights = $0 } }
-    }
-    private var original: some View {
-        Text(text).font(.system(size: 13.5)).lineSpacing(5).foregroundStyle(LyraReaderTheme.textSecondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-private struct TranslationPreviewOverflow: PreferenceKey {
-    static let defaultValue = false
-    static func reduce(value: inout Bool, nextValue: () -> Bool) { value = value || nextValue() }
-}
-private struct TranslationPreviewClip<Content: View>: View {
-    let collapsed: Bool
-    let limit: CGFloat
-    let content: Content
-    @State private var height: CGFloat = 0
-    var body: some View {
-        TranslationPreviewLayout(limit: collapsed ? limit : nil) {
-            content.onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height = $0 }
         }
-            .clipped().contentShape(Rectangle())
-            .overlay(alignment: .bottom) {
-                if collapsed && height > limit + 0.5 {
-                    LinearGradient(colors: [.clear, LyraReaderTheme.panelBg], startPoint: .top, endPoint: .bottom)
-                        .frame(height: 16).allowsHitTesting(false).accessibilityHidden(true)
-                }
-            }
-            .preference(key: TranslationPreviewOverflow.self, value: height > limit + 0.5)
-    }
-}
-/// Measure and place the native rich text at the same width, with an unconstrained height.
-/// Only the enclosing viewport shrinks; text never reflows into a narrow ideal-size column.
-private struct TranslationPreviewLayout: Layout {
-    let limit: CGFloat?
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        guard let content = subviews.first else { return .zero }
-        let size = content.sizeThatFits(ProposedViewSize(width: proposal.width, height: nil))
-        return CGSize(width: size.width, height: limit.map { min($0, size.height) } ?? size.height)
-    }
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        subviews.first?.place(at: bounds.origin, anchor: .topLeading,
-            proposal: ProposedViewSize(width: bounds.width, height: nil))
     }
 }
 /// Non-intercepting native geometry used by the mouse-driven interaction checks.

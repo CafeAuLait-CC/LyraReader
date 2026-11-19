@@ -21,6 +21,11 @@ extension ReaderChecks {
                         AITranslationBlocks(originals: ["Short original"], pages: [1], content: "<!--lyra:0-->简短译文。",
                             showOriginal: true, verifiedPages: [1], pageCount: 1, onLocate: { _, _ in }, onJump: { _ in },
                             recordID: "short", onRetry: { retries.append("short") })
+                        Divider()
+                        AITranslationBlocks(originals: ["Equation source", "Another source"], pages: [1, 1],
+                            content: "<!--lyra:0-->\\[x=1\\tag{3}\\]\n<!--lyra:1-->Another paragraph.",
+                            showOriginal: true, verifiedPages: [1], pageCount: 1, onLocate: { _, _ in }, onJump: { _ in },
+                            recordID: "equation", onRetry: { retries.append("equation") })
                     }.padding(18)
                 }.environment(\.readingStableTextLayout, true)
                     .foregroundStyle(LyraReaderTheme.textPrimary).background(LyraReaderTheme.panelBg)
@@ -68,6 +73,33 @@ extension ReaderChecks {
                 let sourceHeight = marker("original-preview-long-0").bounds.height
                 let resultHeight = marker("translated-preview-long-0").bounds.height
                 require(sourceHeight < 100 && resultHeight <= 181, "long originals start at three lines and translations have a compact preview")
+                func frame(_ id: String) -> CGRect {
+                    let view = marker(id); return host.convert(view.bounds, from: view)
+                }
+                let sourceMore = frame("original-more-long-0"), resultMore = frame("result-more-long")
+                let retry = frame("result-retry-long"), result = frame("translated-preview-long-0")
+                let originalView = textViews(host).first { $0.string == original }!
+                let layout = originalView.layoutManager!, container = originalView.textContainer!
+                var originalLines: [CGRect] = []
+                layout.enumerateLineFragments(forGlyphRange: NSRange(location: 0, length: layout.numberOfGlyphs)) { _, used, _, _, stop in
+                    originalLines.append(host.convert(used.offsetBy(dx: originalView.textContainerOrigin.x,
+                        dy: originalView.textContainerOrigin.y), from: originalView))
+                    if originalLines.count == 3 { stop.pointee = true }
+                }
+                require(originalLines.count == 3 && sourceMore.minY >= originalLines[2].minY - 1
+                        && sourceMore.maxY <= originalLines[2].maxY + 1
+                        && frame("original-preview-long-0").contains(sourceMore),
+                        "original More stays inside its third text line instead of adding another row")
+                require(result.contains(resultMore) && result.contains(retry) && abs(resultMore.midY - retry.midY) < 0.5
+                        && abs(result.maxX - retry.maxX) < 0.5,
+                        "translation More and right-aligned Retry share the last visible text row")
+                require(frame("result-source-short-0").contains(frame("result-retry-short")),
+                        "a short translation keeps Retry on its source row without a separate action row")
+                require(frame("result-source-equation-0").contains(frame("result-more-equation"))
+                        && frame("result-source-equation-0").contains(frame("result-retry-equation")),
+                        "an equation-only ending keeps its complete formula and shares the source row for actions")
+                require(originalView.string == original && container.containerSize.width == originalView.bounds.width,
+                        "inline truncation retains the complete selectable original and its real layout width")
                 require(!markers(host).contains { ["original-more-short-0", "result-more-short"].contains($0.id) },
                         "short originals and translations need no disclosure buttons")
                 try captureReadingInteraction(host, name: "translation-compact-\(width)-\(dark ? "dark" : "light")")
@@ -89,7 +121,8 @@ extension ReaderChecks {
                 require(collapses == 2, "both Less controls notify the parent to keep the result in view")
                 try await click("result-retry-long")
                 try await click("result-retry-short")
-                require(retries == ["long", "short"], "clipped native math and text cannot intercept either result's Retry button")
+                try await click("result-retry-equation")
+                require(retries == ["long", "short", "equation"], "clipped native math and text cannot intercept any result's Retry button")
             }
         }
         print("PASS: independent original/translation disclosure, compact Retry and adjacent native hit testing at both sidebar widths and appearances")
