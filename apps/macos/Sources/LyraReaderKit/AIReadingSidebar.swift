@@ -121,16 +121,9 @@ struct AIReadingSidebar: View {
                 }), first: "Whole document", second: "Selection", firstIcon: "doc.text", secondIcon: "rectangle.dashed")
                     .disabled(busy)
                 if selected {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text(aiReadingLabel("Selected passage")).font(.caption.weight(.medium))
-                            Spacer()
-                            Button(aiReadingLabel("Locate")) { reading.locateSelection(kind, state: state) }
-                                .disabled(reading.excerpt(kind).isEmpty)
-                        }
-                        Text(reading.excerpt(kind).isEmpty ? aiReadingLabel("Select a passage in the document.") : reading.excerpt(kind))
-                            .font(.caption).lineLimit(5).textSelection(.enabled)
-                    }.padding(12).background(LyraReaderTheme.fieldBg, in: RoundedRectangle(cornerRadius: 8))
+                    AITranslationExcerpt(text: reading.excerpt(kind), page: reading.selectionPage(kind)) {
+                        reading.locateSelection(kind, state: state)
+                    }.id(reading.excerpt(kind))
                 } else {
                     Label(String(format: aiReadingLabel("All %d pages"), state.document?.pageCount ?? 0), systemImage: "doc.text").font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
                 }

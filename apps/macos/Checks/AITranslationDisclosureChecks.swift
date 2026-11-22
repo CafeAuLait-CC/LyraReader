@@ -116,10 +116,10 @@ extension ReaderChecks {
                         && marker("original-preview-long-0").bounds.height > sourceHeight + 150
                         && abs(marker("translated-preview-long-0").bounds.height - resultHeight) < 1
                 })
-                let sourceLess = frame("original-more-long-0")
                 require(originalView.string.replacingOccurrences(of: "\u{00a0}" + aiReadingLabel("Less"), with: "") == original,
                         "expanded source retains every original character before its trailing disclosure")
-                requireInlineTail(originalView, marker: marker("original-more-long-0"), host: host)
+                try await requireInlineTail(originalView, controlID: "original-more-long-0", host: host)
+                let sourceLess = frame("original-more-long-0")
                 require(frame("original-preview-long-0").insetBy(dx: -pixel, dy: -pixel).contains(sourceLess),
                         "source Less belongs to the expanded text rather than a separate row")
                 try captureReadingInteraction(host, name: "translation-original-expanded-\(width)-\(dark ? "dark" : "light")")
@@ -131,7 +131,7 @@ extension ReaderChecks {
                         && marker("translated-preview-long-0").bounds.height > resultHeight + 100
                         && abs(marker("original-preview-long-0").bounds.height - sourceHeight) < 1
                 })
-                requireInlineTail(rendered, marker: marker("result-more-long"), host: host)
+                try await requireInlineTail(rendered, controlID: "result-more-long", host: host)
                 require(frame("result-source-long-0").insetBy(dx: -pixel, dy: -pixel).contains(frame("result-retry-long")),
                         "expanded translations also keep Retry on the page row")
                 try captureReadingInteraction(host, name: "translation-result-expanded-\(width)-\(dark ? "dark" : "light")")
@@ -148,7 +148,7 @@ extension ReaderChecks {
         }
         print("PASS: independent original/translation disclosure, inline Less, page-row Retry and adjacent native hit testing at both sidebar widths and appearances")
     }
-    @MainActor private static func requireInlineTail(_ text: NSTextView, marker: NSView, host: NSView) {
+    @MainActor private static func requireInlineTail(_ text: NSTextView, controlID: String, host: NSView) async throws {
         let layout = text.layoutManager!, container = text.textContainer!
         layout.ensureLayout(for: container)
         let suffix = (text.string as NSString).range(of: "\u{00a0}" + aiReadingLabel("Less"), options: .backwards)
@@ -158,13 +158,24 @@ extension ReaderChecks {
         require(layout.lineFragmentRect(forGlyphAt: preceding, effectiveRange: nil).minY
                 == layout.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil).minY,
                 "Less shares the final source word's line instead of wrapping onto its own row")
-        let lastLine = layout.lineFragmentUsedRect(forGlyphAt: glyph, effectiveRange: nil)
-            .offsetBy(dx: text.textContainerOrigin.x, dy: text.textContainerOrigin.y)
-        let line = host.convert(lastLine, from: text), action = host.convert(marker.bounds, from: marker)
-        require(action.minY >= line.minY - 1 && action.maxY <= line.maxY + 1
-                && action.maxX <= line.maxX + 1 && action.minX >= line.minX - 1,
-                "expanded Less is an inline button at the end of the complete final text line")
-        require(action.width > 1 && action.height > 1,
-                "the trailing disclosure has its own native button hit region")
+        func controls(_ view: NSView) -> [AITranslationControlMarker] {
+            (view as? AITranslationControlMarker).map { [$0] } ?? view.subviews.flatMap(controls)
+        }
+        var line = CGRect.zero, actions: [CGRect] = []
+        try await eventuallyExplaining("expanded Less settles on the complete final text line", {
+            "scale=\(host.window?.backingScaleFactor ?? 0), line=\(line), controls=\(actions)"
+        }, {
+            host.layoutSubtreeIfNeeded()
+            layout.ensureLayout(for: container)
+            let lastLine = layout.lineFragmentUsedRect(forGlyphAt: glyph, effectiveRange: nil)
+                .offsetBy(dx: text.textContainerOrigin.x, dy: text.textContainerOrigin.y)
+            line = host.convert(lastLine, from: text)
+            actions = controls(host).filter { $0.id == controlID && !$0.isHiddenOrHasHiddenAncestor }
+                .map { host.convert($0.bounds, from: $0) }
+            guard actions.count == 1, let action = actions.first else { return false }
+            return action.minY >= line.minY - 1 && action.maxY <= line.maxY + 1
+                && action.maxX <= line.maxX + 1 && action.minX >= line.minX - 1
+                && action.width > 1 && action.height > 1
+        })
     }
 }

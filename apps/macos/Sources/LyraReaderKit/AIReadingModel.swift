@@ -49,7 +49,7 @@ final class AIReadingModel: ObservableObject {
     private var bindings = Set<AnyCancellable>()
     private var frozenSummary: AIReaderContext?
     private var frozenTranslation: AIReaderContext?
-    private var summaryExcerpt = ""
+    @Published private var summaryExcerpt = ""
     private var translationExcerpt = ""
 
     init(settings: AISettingsStore, audit: AIAuditTrail) {

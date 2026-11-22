@@ -248,6 +248,18 @@ extension ReaderChecks {
         let host = NSHostingView(rootView: TranslationPanelCheckHost(state: state, reading: reading, navigation: navigation)
             .preferredColorScheme(.light))
         window.contentView = host
+        func renderedSummaryExcerpt() -> NSTextView? {
+            host.layoutSubtreeIfNeeded()
+            guard let card = find(host).first(where: { $0.id == "excerpt-card" }) else { return nil }
+            let area = host.convert(card.bounds, from: card)
+            func textViews(_ view: NSView) -> [NSTextView] {
+                (view as? NSTextView).map { [$0] } ?? view.subviews.flatMap(textViews)
+            }
+            return textViews(host).first { text in
+                let rect = host.convert(text.bounds, from: text)
+                return !text.isHiddenOrHasHiddenAncestor && area.contains(rect.origin)
+            }
+        }
         let count = service.starts
         reading.showOriginal = false
         try await eventually("saved translations appear directly in the result feed", {
@@ -334,6 +346,7 @@ extension ReaderChecks {
         require(service.starts == count + 1, "selection changes during translation do not enqueue another request")
         let preview = reading.excerpt("translation")
         navigation.selectedTab = .summary
+        reading.notice = nil
         try await Task.sleep(for: .milliseconds(100))
         try await eventually("Summary exposes the same Lyra source picker", {
             host.layoutSubtreeIfNeeded(); return find(host).contains { $0.id == "segment-Selection" }
@@ -346,6 +359,12 @@ extension ReaderChecks {
         try await eventually("the active Summary preview follows a new selection without a button", {
             reading.excerpt("summary") == state.selectedPassageText
         })
+        try await eventuallyExplaining("Summary renders the newly selected source after debounce", {
+            "rendered \(String(describing: renderedSummaryExcerpt()?.string)), captured \(reading.excerpt("summary"))"
+        }, { renderedSummaryExcerpt()?.string == state.selectedPassageText })
+        let sourceFont = renderedSummaryExcerpt()?.attributedString().attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        require(sourceFont?.pointSize == 13, "Summary uses the same 13-point native selection typography as Translate")
+        try captureReadingInteraction(host, name: "summary-selection-card")
         require(reading.excerpt("translation") == preview && service.starts == count + 1,
                 "Summary preview updates neither translation sources nor provider usage")
         for (detail, moves) in [("Brief", 0), ("Detailed", 2), ("Standard", 1)] {
@@ -390,6 +409,9 @@ extension ReaderChecks {
         state.clearSelection()
         try await eventually("clearing the canvas removes Summary's stale source", {
             reading.excerpt("summary").isEmpty && reading.selectionPage("summary") == nil
+        })
+        try await eventually("Summary renders its empty-selection prompt", {
+            renderedSummaryExcerpt()?.string == aiReadingLabel("Select a passage in the document.")
         })
         try await select(270...290)
         try await eventually("Summary accepts a new source after clearing", { reading.excerpt("summary") == state.selectedPassageText })
