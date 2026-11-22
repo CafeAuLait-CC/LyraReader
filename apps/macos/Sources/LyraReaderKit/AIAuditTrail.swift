@@ -626,6 +626,9 @@ final class AIAuditedChatHandle: AIChatHandle {
     private let base: any AIChatHandle
     private let attempt: AIAuditAttempt
     private var recorded = false
+    /// Events drained during cancel for the audit. They are handed back to the panel's poll loop
+    /// on its next poll, so auditing a queued part does not steal it from the UI.
+    private var replayed: [AIStreamEvent] = []
 
     init(base: any AIChatHandle, attempt: AIAuditAttempt) {
         self.base = base
@@ -633,8 +636,11 @@ final class AIAuditedChatHandle: AIChatHandle {
     }
 
     func poll() -> [AIStreamEvent] {
-        var events = base.poll()
-        observe(events)
+        var events = replayed
+        replayed = []
+        let fresh = base.poll()
+        observe(fresh)
+        events.append(contentsOf: fresh)
         // A finished base may still deliver its last events in a final poll (the handle contract
         // says so). Asking once more before calling it a failure is what keeps this wrapper from
         // recording `failed` for a request whose `.done` arrives on that poll.
@@ -673,7 +679,26 @@ final class AIAuditedChatHandle: AIChatHandle {
 
     func cancel() {
         base.cancel()
+        // The transport may have queued `partStarted` (and even a delta or a terminal event)
+        // before cancel closed it. Draining those events is what keeps a cancelled request from
+        // being recorded as a zero-character refusal: it did start, and the audit must say so.
+        // `poll()` is deliberately not used here — its "finished without a terminal event is a
+        // failure" fallback would mislabel the cancellation.
+        drainPendingEvents()
         record(.cancelled, code: nil)
+    }
+
+    /// Observe the events the transport produced before cancel closed it.
+    ///
+    /// Bounded: a transport that never stops yielding events must not spin the main actor, and a
+    /// terminal event stops the drain early because it already recorded the attempt.
+    private func drainPendingEvents() {
+        for _ in 0..<64 where !recorded {
+            let events = base.poll()
+            if events.isEmpty { return }
+            observe(events)
+            replayed.append(contentsOf: events)
+        }
     }
 
     var isFinished: Bool { base.isFinished }
