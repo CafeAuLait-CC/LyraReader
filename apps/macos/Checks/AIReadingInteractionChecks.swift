@@ -140,13 +140,19 @@ extension ReaderChecks {
                         try await eventuallyExplaining("\(label) keeps any visible scrollbar at the panel edge", {
                             "scroller=\(String(describing: scroll.verticalScroller?.frame)), "
                                 + "hidden=\(String(describing: scroll.verticalScroller?.isHidden)), "
-                                + "document=\(String(describing: scroll.documentView?.frame)), clip=\(scroll.contentView.bounds)"
+                                + "document=\(String(describing: scroll.documentView?.frame)), "
+                                + "clip=\(scroll.contentView.bounds), scroll=\(scroll.bounds), host=\(host.bounds)"
                         }, {
                             host.layoutSubtreeIfNeeded()
+                            scroll.layoutSubtreeIfNeeded()
                             guard let scroller = scroll.verticalScroller else { return false }
-                            if !populated && (scroller.isHidden || scroller.bounds.width < 1) { return true }
-                            let track = host.convert(scroller.bounds, from: scroller)
-                            return track.width > 1 && abs(track.maxX - host.bounds.maxX) <= 2
+                            if !populated && (scroller.isHidden || scroller.frame.width < 1) { return true }
+                            // Compare inside the scroll view: the scroller's frame already lives in
+                            // that space, and converting through the window can lag one layout
+                            // pass behind the resize the loop just made. The scroll view itself is
+                            // already asserted flush with the panel above.
+                            let width = scroll.bounds.width
+                            return scroller.frame.width > 1 && abs(scroller.frame.maxX - width) <= 2
                         })
                         guard let scroller = scroll.verticalScroller else { fail("FAIL: missing notes scroller") }
                         assertTrackPalette(scroller, label: label, empty: !populated)
