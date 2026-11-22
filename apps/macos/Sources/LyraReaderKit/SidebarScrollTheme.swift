@@ -56,12 +56,14 @@ struct SidebarScrollTheme: NSViewRepresentable {
 package final class LyraReaderSidebarScroller: NSScroller {
     package var transparentTrack = false { didSet { needsDisplay = true } }
     package var trackColor: NSColor = LyraReaderTheme.sidebarColor { didSet { needsDisplay = true } }
+    package var hidesInactiveTrack = false { didSet { needsDisplay = true } }
     private var hovered = false
     private var hoverTracking: NSTrackingArea?
     override package class var isCompatibleWithOverlayScrollers: Bool { true }
 
     package static func install(on scroll: NSScrollView,
-                                trackColor: NSColor = LyraReaderTheme.sidebarColor) {
+                                trackColor: NSColor = LyraReaderTheme.sidebarColor,
+                                hidesInactiveTrack: Bool = false) {
         if !(scroll.verticalScroller is LyraReaderSidebarScroller) {
             let old = scroll.verticalScroller
             let replacement = LyraReaderSidebarScroller(frame: old?.frame
@@ -79,7 +81,21 @@ package final class LyraReaderSidebarScroller: NSScroller {
             scroll.reflectScrolledClipView(scroll.contentView)
         }
         (scroll.verticalScroller as? LyraReaderSidebarScroller)?.trackColor = trackColor
+        (scroll.verticalScroller as? LyraReaderSidebarScroller)?.hidesInactiveTrack = hidesInactiveTrack
         scroll.verticalScroller?.needsDisplay = true
+    }
+
+    override package func draw(_ dirtyRect: NSRect) {
+        // Keep the reserved native gutter visually part of the panel when no scrolling is
+        // possible. AppKit's disabled-scroller drawing otherwise leaves a system-colored strip.
+        if hidesInactiveTrack && (!isEnabled || knobProportion >= 1) {
+            if scrollerStyle == .legacy && !transparentTrack {
+                trackColor.setFill()
+                dirtyRect.fill()
+            }
+            return
+        }
+        super.draw(dirtyRect)
     }
 
     override package func drawKnobSlot(in slotRect: NSRect, highlight flag: Bool) {

@@ -46,6 +46,7 @@ impl MockProvider {
                 total_tokens: Some(168),
 
                 reasoning_tokens: None,
+                cached_tokens: None,
             },
         }
     }

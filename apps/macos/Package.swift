@@ -24,6 +24,7 @@ let packageRoot = #filePath
 
 let package = Package(
     name: "LyraReader",
+    defaultLocalization: "en",
     platforms: [.macOS(.v14)],
     products: [
         .executable(name: "LyraReader", targets: ["LyraReader"]),
@@ -57,7 +58,8 @@ let package = Package(
         .target(
             name: "LyraReaderKit",
             dependencies: ["LyraReaderFFI", "LyraReaderBindings"],
-            path: "Sources/LyraReaderKit"
+            path: "Sources/LyraReaderKit",
+            resources: [.process("Resources")]
         ),
         .executableTarget(
             name: "LyraReader",

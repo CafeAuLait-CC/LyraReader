@@ -358,6 +358,7 @@ fn request_matches_the_preview_and_streams_split_sse() {
             total_tokens: Some(16),
 
             reasoning_tokens: None,
+            cached_tokens: None,
         })
     );
     assert!(done);
@@ -778,6 +779,7 @@ fn tls_streaming_round_trip_with_an_injected_ca() {
             total_tokens: Some(10),
 
             reasoning_tokens: None,
+            cached_tokens: None,
         })
     );
     assert!(done);
@@ -1097,6 +1099,7 @@ fn a_non_sse_json_answer_is_read_as_a_complete_response() {
         total_tokens: Some(312),
 
         reasoning_tokens: None,
+        cached_tokens: None,
     })));
     assert!(events.contains(&RunEvent::Done));
 }
@@ -1187,6 +1190,7 @@ fn reasoning_deltas_are_separate_from_the_answer() {
         total_tokens: Some(1200),
 
         reasoning_tokens: None,
+        cached_tokens: None,
     })));
     assert!(events.contains(&RunEvent::Done));
 }

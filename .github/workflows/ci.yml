@@ -305,8 +305,11 @@ jobs:
           set -euo pipefail
           tar -czf "$RUNNER_TEMP/LyraReader-app.tar.gz" -C "$GITHUB_WORKSPACE" build/LyraReader.app
           # .build/debug is a symlink to the architecture-specific directory. -h stores the
-          # executable as a regular file, so a shard can extract it anywhere.
-          tar -czhf "$RUNNER_TEMP/reader-checks.tar.gz" -C apps/macos/.build/debug LyraReaderChecks
+          # executable as a regular file. SwiftPM resolves Bundle.module beside it, so the
+          # resource bundle must travel with the executable to the separate shard runners.
+          # Name it explicitly: a missing bundle must fail packaging, not crash a later shard.
+          tar -czhf "$RUNNER_TEMP/reader-checks.tar.gz" -C apps/macos/.build/debug \
+            LyraReaderChecks LyraReader_LyraReaderKit.bundle
 
       - name: Upload the application bundle
         uses: actions/upload-artifact@v4

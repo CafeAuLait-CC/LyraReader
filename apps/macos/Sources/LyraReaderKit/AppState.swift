@@ -342,8 +342,8 @@ public final class AppState: ObservableObject, InPlaceTranslationHost {
                 }
                 contentEditEnabled = false
             }
-            guard oldValue != rightPanelVisible, Self.usesStoredSidePanelPreferences else { return }
-            ReaderSidePanelPreferences.store(visible: rightPanelVisible, defaults: panelDefaults)
+            // The assistant belongs to the Lyra row, including keyboard and context-menu opens.
+            if rightPanelVisible, !aiToolsVisible { aiToolsVisible = true }
         }
     }
     /// Content width of the right-hand panel, kept across launches and clamped on every write.
@@ -1859,6 +1859,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
     var regionPaperProgress: [UUID: CGFloat] = [:]
     var regionPaperMotionTasks: [UUID: Task<Void, Never>] = [:]
     var regionPaperMotionIDs: [UUID: UUID] = [:]
+    var regionHeightTargets: [UUID: CGFloat] = [:]
+    var regionHeightMotionTasks: [UUID: Task<Void, Never>] = [:]
     var closingRegionPapers: Set<UUID> = []
     /// Finished conversations by document key. Kept for this window's session; deliberately not
     /// written to disk (see AIRegionState.swift's persistence note).
@@ -3485,7 +3487,8 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         }
         if Self.usesStoredSidePanelPreferences {
             rightPanelWidthPt = ReaderSidePanelPreferences.width(defaults: panelDefaults)
-            rightPanelVisible = ReaderSidePanelPreferences.isVisible(defaults: panelDefaults)
+            // Width is a preference; an open tool drawer is session-only UI state.
+            panelDefaults.removeObject(forKey: ReaderSidePanelPreferences.visibleKey)
         }
 
         if Self.usesStoredReadingLayoutPreferences {
@@ -17072,6 +17075,12 @@ public struct Annotation: Identifiable, Codable, Equatable, Sendable {
         guard selectedAnnotationID != nil else { return }
         selectedAnnotationID = nil
         refreshSelectionOverlay()
+    }
+
+    /// The exact character-range text already used by Copy and AI source previews.
+    public var selectedPassageText: String? {
+        guard let selection, let page = textPages[selection.page] else { return nil }
+        return page.copyText(in: selection.range)
     }
 
     /// Copies the selected characters (⌘C from the canvas).

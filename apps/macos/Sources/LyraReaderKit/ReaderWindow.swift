@@ -197,9 +197,7 @@ public struct ReaderWindow: View {
             AIDocumentKnowledgeStatus(knowledge: documentKnowledge)
                 .padding(.trailing, 24).padding(.bottom, 44)
         }
-        .sheet(isPresented: $documentKnowledge.isPresented) {
-            AIDocumentKnowledgeSheet(knowledge: documentKnowledge)
-        }
+        .modifier(AIPreReadingWindowBridge(knowledge: documentKnowledge))
         .sheet(isPresented: $state.showDocumentInformation) { DocumentInformationView(state: state) }
         .modifier(ReaderConfirmationModifier(state: state))
         .onAppear {
@@ -284,6 +282,20 @@ public struct ReaderWindow: View {
             case .failure(let error):
                 state.present(error, message: String(describing: error))
             }
+        }
+    }
+
+    private func openRegionInReadingPanel(_ entry: AIRegionHistoryEntry) {
+        guard let context = state.aiReaderContext else { return }
+        aiAssistant.selectedTab = .chat
+        state.rightPanelVisible = true
+        Task {
+            let reading = aiAssistant.readingWorkspace
+            await reading.bind(state)
+            guard state.aiReaderContext?.documentKey == context.documentKey else { return }
+            reading.chat.importConversation(question: entry.question, answer: entry.answer,
+                attachment: entry.attachment, context: context)
+            reading.saveChat()
         }
     }
 
@@ -462,12 +474,7 @@ public struct ReaderWindow: View {
                 onTranslationToggle: { id in state.toggleTranslation(id: id) },
                 onTranslationCancel: { id in state.cancelTranslation(id: id) },
                 regionState: state,
-                onOpenRegionInPanel: { entry in
-                    guard let context = state.aiReaderContext else { return }
-                    aiAssistant.importConversation(question: entry.question, answer: entry.answer,
-                        attachment: entry.attachment, context: context)
-                    state.rightPanelVisible = true
-                },
+                onOpenRegionInPanel: openRegionInReadingPanel,
                 onShowRegionHistory: {
                     state.rightPanelVisible = true
                     aiAssistant.selectedTab = .regions

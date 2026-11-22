@@ -12,16 +12,20 @@ public struct AIDocumentChatView: View {
     @ObservedObject private var state: AppState
     @ObservedObject private var model: AIAssistantModel
     @State private var followsLatest = true
+    private var onKeep: ((AIChatTurn) -> Void)?
+    private var onAsk: (() -> Void)?
+    private var onLocate: ((AIChatChip) -> Void)?
 
-    public init(state: AppState, model: AIAssistantModel) {
+    public init(state: AppState, model: AIAssistantModel, onKeep: ((AIChatTurn) -> Void)? = nil, onAsk: (() -> Void)? = nil, onLocate: ((AIChatChip) -> Void)? = nil) {
         self.state = state
         self.model = model
+        self.onKeep = onKeep; self.onAsk = onAsk; self.onLocate = onLocate
     }
 
     public var body: some View {
         VStack(spacing: 0) {
-            header
-            Divider()
+            if onAsk == nil { header; Divider() }
+            else { Label("Current document · \(state.document?.pageCount ?? 0) pages", systemImage: "doc.text").font(.caption).padding(12) }
             conversation
             Divider()
             composer
@@ -79,7 +83,7 @@ public struct AIDocumentChatView: View {
                                 .foregroundStyle(LyraReaderTheme.textSecondary)
                         }
                     } else if model.isDocumentChatPlan, let plan = model.plan,
-                              model.phase == .preview {
+                              model.phase == .preview, onAsk == nil {
                         requestPreview(plan)
                     }
                     if let note = model.statusNote, !note.isEmpty, showsChatStatus {
@@ -111,7 +115,8 @@ public struct AIDocumentChatView: View {
     }
 
     private var showsChatStatus: Bool {
-        model.isDocumentChatPlan || model.isChatStreaming
+        if onAsk != nil { return model.phase == .failed && model.chatTurns.isEmpty }
+        return model.isDocumentChatPlan || model.isChatStreaming
             || model.pendingChatQuestion != nil
             || model.chatTurns.last?.state == .nothingRelevant
             || model.chatTurns.last?.state == .failed
@@ -129,7 +134,7 @@ public struct AIDocumentChatView: View {
                 .foregroundStyle(LyraReaderTheme.accent).padding(.bottom, 8)
             Text("Ask the whole document")
                 .font(.callout.weight(.semibold))
-            Text("Answers cite pages as [p.N]. Press Send on the preview to ask; nothing is sent while you type.")
+            Text("Ask a question or choose a suggestion below. Answers link back to passages in this document.")
                 .font(.caption)
                 .foregroundStyle(LyraReaderTheme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -168,6 +173,10 @@ public struct AIDocumentChatView: View {
                         .font(.caption.weight(.semibold)).foregroundStyle(LyraReaderTheme.accent)
                     Spacer()
                     if !turn.answer.isEmpty {
+                        if let onKeep {
+                            Button { onKeep(turn) } label: { Image(systemName: "note.text.badge.plus") }
+                                .buttonStyle(.plain).help("Keep in notes").accessibilityLabel("Keep in notes")
+                        }
                         Button {
                             NSPasteboard.general.clearContents()
                             NSPasteboard.general.setString(turn.answer, forType: .string)
@@ -190,7 +199,7 @@ public struct AIDocumentChatView: View {
                     pageCount: turn.pageCount,
                     verifiedPages: turn.sentPages,
                     onJump: { page in state.gotoPage(page - 1) }
-                )
+                ).fixedSize(horizontal: false, vertical: true)
             }
 
             if turn.isStreaming {
@@ -265,13 +274,13 @@ public struct AIDocumentChatView: View {
             }
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(LyraReaderTheme.raisedBg, in: RoundedRectangle(cornerRadius: 10))
+            .background(onAsk == nil ? LyraReaderTheme.raisedBg : Color.clear, in: RoundedRectangle(cornerRadius: 10))
         }
     }
 
     private func sourceChip(_ chip: AIChatChip) -> some View {
         Button {
-            chip.follow(in: state)
+            if let onLocate { onLocate(chip) } else { chip.follow(in: state) }
         } label: {
             HStack(alignment: .top, spacing: 6) {
                 Text("p.\(chip.page)")
@@ -384,13 +393,13 @@ public struct AIDocumentChatView: View {
 
     private var composer: some View {
         VStack(alignment: .leading, spacing: 5) {
-            TextField("Ask about this document…", text: $model.chatQuestion, axis: .vertical)
-                .textFieldStyle(ReaderPanelFieldStyle())
-                .lineLimit(2...5)
-                .onSubmit(ask)
+            AIReadingTextInput(text: $model.chatQuestion, placeholder: aiReadingLabel("Ask about this document…")) {
+                if model.canAskDocument { ask() }
+            }.frame(height: 96).background(LyraReaderTheme.fieldBg, in: RoundedRectangle(cornerRadius: 7))
+                .overlay(RoundedRectangle(cornerRadius: 7).stroke(LyraReaderTheme.controlBorder))
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 6) {
-                    Text("Review sources before sending.")
+                    Text(aiReadingLabel("Return to send · Shift+Return for a new line"))
                         .font(.caption2)
                         .foregroundStyle(LyraReaderTheme.textTertiary)
                         .fixedSize(horizontal: true, vertical: false)
@@ -409,14 +418,17 @@ public struct AIDocumentChatView: View {
     }
 
     private var askButton: some View {
-        Button { ask() } label: { Label("Review", systemImage: "arrow.up") }
+        Button {
+            if model.isSending { model.cancelRegionWork() } else { ask() }
+        } label: { Label(model.isSending ? "Stop" : "Send", systemImage: model.isSending ? "stop.fill" : "arrow.up") }
             .buttonStyle(ReaderPanelButtonStyle(prominent: true))
             .background(AIDocumentChatAskMarkerHost())
-            .disabled(!model.canAskDocument)
-            .help("Find passages across the document and show the exact request before sending")
+            .disabled(!model.isSending && !model.canAskDocument)
+            .help(aiReadingLabel("Send question"))
     }
 
     private func ask() {
+        if let onAsk { onAsk(); return }
         guard let context = state.aiReaderContext else { return }
         followsLatest = true
         Task { await model.prepareDocumentChat(context: context) }

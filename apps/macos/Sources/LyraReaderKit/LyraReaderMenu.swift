@@ -37,13 +37,15 @@ struct LyraReaderMenu<Label: View>: View {
     let items: [LyraReaderMenuItem]
     @ViewBuilder let label: () -> Label
     @State private var presented = false
+    @State private var placement = CGRect.zero
 
     var body: some View {
         Button { presented.toggle() } label: { label() }
             .lyraToolStyle(selected: presented)
             .help(title).accessibilityLabel(title)
             .accessibilityValue(presented ? "Expanded" : "Collapsed")
-            .background(LyraReaderMenuAnchor(presented: $presented, items: items))
+            .background(LyraReaderMenuAnchor(presented: $presented, items: items, placement: placement))
+            .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { placement = $0 }
     }
 }
 
@@ -146,26 +148,44 @@ private struct LyraReaderMenuContent: View {
 private struct LyraReaderMenuAnchor: NSViewRepresentable {
     @Binding var presented: Bool
     let items: [LyraReaderMenuItem]
+    let placement: CGRect
 
     func makeNSView(context: Context) -> AnchorView { AnchorView() }
     func updateNSView(_ view: AnchorView, context: Context) {
         view.requested = presented
-        if presented {
-            DispatchQueue.main.async { [weak view] in
-                guard let view, view.requested, let window = view.window else { return }
-                let rect = window.convertToScreen(view.convert(view.bounds, to: nil))
-                LyraReaderMenuPresenter.shared.show(items: items, below: rect, in: window,
+        if view.placement != placement { view.placement = placement; view.needsLayout = true }
+        view.present = { [weak view] in
+            guard let view, view.requested, let window = view.window else { return }
+            let rect = window.convertToScreen(view.convert(view.bounds, to: nil))
+            LyraReaderMenuPresenter.shared.show(items: items, below: rect, in: window,
                                               owner: view, dismiss: { presented = false })
-            }
-        } else {
+        }
+        if presented { view.schedulePresentation() }
+        else {
             LyraReaderMenuPresenter.shared.dismiss(owner: view)
         }
     }
     static func dismantleNSView(_ view: AnchorView, coordinator: ()) {
+        view.requested = false; view.present = nil
         LyraReaderMenuPresenter.shared.dismiss(owner: view)
     }
     final class AnchorView: NSView {
         var requested = false
+        var placement = CGRect.zero
+        var present: (() -> Void)?
+        private var pending = false
+        override func layout() { super.layout(); schedulePresentation() }
+        override func setFrameOrigin(_ newOrigin: NSPoint) { super.setFrameOrigin(newOrigin); schedulePresentation() }
+        override func setFrameSize(_ newSize: NSSize) { super.setFrameSize(newSize); schedulePresentation() }
+        func schedulePresentation() {
+            guard requested, !pending else { return }
+            pending = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.pending = false
+                if self.requested { self.present?() }
+            }
+        }
         override func hitTest(_ point: NSPoint) -> NSView? { nil }
     }
 }
@@ -196,20 +216,27 @@ private struct LyraReaderMenuAnchor: NSViewRepresentable {
 
     func show(items: [LyraReaderMenuItem], below anchor: NSRect, in window: NSWindow,
               owner: NSView, contextMenu: Bool = false, dismiss: @escaping () -> Void) {
-        guard self.owner !== owner || panel == nil else { return }
-        close()
-        guard !items.isEmpty else { return }
-        self.owner = owner
-        onDismiss = dismiss
+        guard !items.isEmpty else { close(); return }
         let visible = (window.screen ?? NSScreen.main)?.visibleFrame ?? window.frame
         let width = LyraReaderMenuContent.width(for: items)
         let naturalHeight = LyraReaderMenuContent.height(for: items)
         let top = anchor.minY - (contextMenu ? 0 : 5)
         let available = max(1, top - visible.minY - 5)
         let height = contextMenu ? min(naturalHeight, visible.height - 10) : min(naturalHeight, available)
-        let x = min(max(anchor.minX, visible.minX + 5), visible.maxX - width - 5)
+        let preferredX = contextMenu ? anchor.minX : anchor.maxX - width
+        let x = min(max(preferredX, visible.minX + 5), visible.maxX - width - 5)
         let y = contextMenu ? max(visible.minY + 5, top - height) : top - height
-        let panel = CommandPanel(contentRect: NSRect(x: x, y: y, width: width, height: height),
+        let frame = NSRect(x: x, y: y, width: width, height: height)
+        if self.owner === owner, let panel {
+            // Content layout can settle after the menu opens, for example when a scroller appears.
+            // Move the existing panel without recreating its keyboard focus or selection.
+            if panel.frame != frame { panel.setFrame(frame, display: true) }
+            return
+        }
+        close()
+        self.owner = owner
+        onDismiss = dismiss
+        let panel = CommandPanel(contentRect: frame,
                                  styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.appearance = window.effectiveAppearance
         panel.isOpaque = false

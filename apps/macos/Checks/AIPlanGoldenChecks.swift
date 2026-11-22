@@ -7,7 +7,7 @@ import LyraReaderKit
 
 // AI plan goldens: the exact request bodies and accounting for the region question, the
 // document-knowledge-enriched question, the 120-page two-window abstract and every outline
-// section. The file `tests/fixtures/ai-plan-goldens.json` was captured with the pre-change code;
+// section. The file `tests/fixtures/ai-plan-goldens.json` freezes the reviewed request contract;
 // the check recomputes the same inputs through today's production paths and requires the whole
 // snapshot (body, prompts, character counts, token estimate, coverage and section list) to be
 // identical.
@@ -53,7 +53,7 @@ extension ReaderChecks {
                 "AI plan goldens differ (\(sectionNote)); expected \(expectedFile.path), "
                     + "actual \(actualFile.path)")
         }
-        print("PASS: AI plan bodies, counts and section list match the frozen pre-change goldens")
+        print("PASS: AI plan bodies, counts and section list match the reviewed goldens")
         printGoldenBodies(current)
         let sections = current["summary_sections"] as? [[String: Any]] ?? []
         for section in sections {

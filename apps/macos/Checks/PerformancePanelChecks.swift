@@ -300,7 +300,7 @@ extension ReaderChecks {
                     String(format: "one snapshot costs less than a 60 Hz frame (measured %.2f ms)",
                            sampleCost))
         } else {
-            fatalError("FAIL: the panel does not report its sampling cost")
+            fail("FAIL: the panel does not report its sampling cost")
         }
         require(PerformancePanelController.samplingIntervalMilliseconds == 250,
                 "the stated sampling interval is 250 ms (4 Hz)")
@@ -439,7 +439,7 @@ extension ReaderChecks {
         _ state: AppState, _ what: String
     ) throws -> PerformanceSnapshot {
         guard let snapshot = state.performancePanel.snapshot else {
-            fatalError("FAIL: no snapshot available (\(what))")
+            fail("FAIL: no snapshot available (\(what))")
         }
         return snapshot
     }
@@ -460,6 +460,6 @@ private extension ReaderChecks {
             }
             try await Task.sleep(for: .milliseconds(25))
         }
-        fatalError("TIMEOUT: \(message)")
+        fail("TIMEOUT: \(message)")
     }
 }
