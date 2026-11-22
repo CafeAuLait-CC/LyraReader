@@ -145,6 +145,10 @@ extension ReaderChecks {
             click(left); try await Task.sleep(for: .milliseconds(250))
             let originalLeft = rect(left), originalRight = rect(right)
             let area = originalLeft.union(originalRight)
+            // AppKit can snap the two equal SwiftUI cells to different pixel widths.
+            // Their mean preserves the actual half-point width without choosing one edge's bias.
+            let cellWidth = (originalLeft.width + originalRight.width) / 2
+            print("INFO: \(name) native cells left=\(originalLeft), right=\(originalRight), mean width=\(cellWidth)")
             // The probes cover the two cells, inside the selector's 3 pt border inset.
             let expectedWidth = 414 - 2 * AIReadingScrollMetrics.horizontalInset - AIReadingScrollMetrics.gutterWidth - 6
             require(abs(area.width - expectedWidth) < 0.5,
@@ -155,7 +159,7 @@ extension ReaderChecks {
             let start = paintedHighlight(area)
             // Each rasterized edge can round independently. Compare every frame with
             // the actual cell width, not with a first bitmap that has its own rounding bias.
-            require(abs(start.width - originalLeft.width) < 2,
+            require(abs(start.width - cellWidth) < 2,
                     "\(name) initially paints a full cell-width highlight")
             if name == "notes" {
                 reading.store.putAll(notes)
@@ -171,11 +175,16 @@ extension ReaderChecks {
                 var samples: [(CGFloat, CGFloat)] = []
                 var geometryError: CGFloat = 0, labelError: CGFloat = 0
                 var frames: [(TimeInterval, NSBitmapImageRep)] = []
+                var captureCosts: [TimeInterval] = []
                 while ProcessInfo.processInfo.systemUptime < deadline {
                     let l = rect(left), r = rect(right)
                     geometryError = max(geometryError, abs(l.width - originalLeft.width), abs(r.midX - originalRight.midX))
-                    frames.append((ProcessInfo.processInfo.systemUptime - began, captureSelector(area)))
-                    try await Task.sleep(for: .milliseconds(8))
+                    let captureBegan = ProcessInfo.processInfo.systemUptime
+                    frames.append((captureBegan - began, captureSelector(area)))
+                    captureCosts.append(ProcessInfo.processInfo.systemUptime - captureBegan)
+                    // Raster capture already consumes part of a display interval. Yield to
+                    // SwiftUI without adding another fixed 8 ms to each observed frame.
+                    try await Task.sleep(for: .milliseconds(1))
                 }
                 // Decode after the motion. Per-pixel sRGB/ink analysis on the main actor
                 // would otherwise delay the very SwiftUI frames this check is observing.
@@ -193,11 +202,15 @@ extension ReaderChecks {
                 let intermediate = Set(samples.filter { $0.0 > low && $0.0 < high }.map { Int($0.0.rounded()) })
                 print("INFO: \(name) direction \(direction) captured \(frames.count) frames before pixel analysis")
                 print("INFO: \(name) highlight widths start=\(start.width) samples=\(samples.map(\.1))")
+                let trace = zip(frames, zip(captureCosts, samples)).map { frame, measurement in
+                    String(format: "%.1f/%.1f/%.1f", frame.0 * 1000, measurement.0 * 1000, measurement.1.0)
+                }
+                print("INFO: \(name) time_ms/capture_ms/center_pt=\(trace.joined(separator: ","))")
                 require(geometryError < 0.5, "\(name) labels keep their positions when content gains or loses a scrollbar (error \(geometryError) pt)")
                 require(labelError <= 1, "\(name) keeps painted icon/text bounds fixed throughout the slide (error \(labelError) pt)")
                 require(intermediate.count >= 3, "\(name) paints multiple intermediate highlight positions in direction \(direction) (\(intermediate.count))")
-                require(samples.allSatisfy { abs($0.1 - originalLeft.width) < 2 },
-                        "\(name) moves one cell-width gold block without cross-fading (expected \(originalLeft.width) pt)")
+                require(samples.allSatisfy { abs($0.1 - cellWidth) < 2 },
+                        "\(name) moves one cell-width gold block without cross-fading (expected \(cellWidth) pt)")
                 if let folder = ProcessInfo.processInfo.environment["LYRA_AI_EVIDENCE"] {
                     let directory = URL(fileURLWithPath: folder).appendingPathComponent("selector-\(name)-\(direction)")
                     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

@@ -456,8 +456,13 @@ extension ReaderChecks {
         // The AI view is the panel's content, not a copy of it or a placeholder: the assistant's
         // own marker view is in the AppKit hierarchy, and its scrolling content is an NSScrollView
         // inside the panel's region.
-        require(containsAIAssistantPanelMarker(in: harness.host),
-                "the right panel hosts the AI assistant view itself (marker present)")
+        try await eventuallyExplaining("the right panel hosts the AI assistant view itself (marker present)", {
+            "panelWidth=\(harness.panelTotalWidth), canvas=\(harness.canvasRect), "
+                + "scrollViews=\(nativeScrollViewCount(in: harness.host))"
+        }, {
+            harness.host.layoutSubtreeIfNeeded()
+            return containsAIAssistantPanelMarker(in: harness.host)
+        })
         require(nativeScrollViewCount(in: harness.host) > 0,
                 "the AI view's scrolling content is present in the panel")
         if let marker = findAIAssistantPanelMarker(in: harness.host) {

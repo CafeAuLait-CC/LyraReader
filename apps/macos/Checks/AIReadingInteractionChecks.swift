@@ -75,6 +75,131 @@ extension ReaderChecks {
         require(restored.records.first(where: { $0.id == note.id })?.thoughts == entered,
                 "personal thoughts survive a new store without a separate edit mode")
 
+        func assertTrackPalette(_ scroller: NSScroller, label: String, empty: Bool) {
+            guard scroller.scrollerStyle == .legacy, !scroller.isHidden, scroller.bounds.width > 1 else { return }
+            scroller.effectiveAppearance.performAsCurrentDrawingAppearance {
+                guard let bitmap = scroller.bitmapImageRepForCachingDisplay(in: scroller.bounds) else {
+                    fail("FAIL: reading scrollbar bitmap is unavailable")
+                }
+                scroller.cacheDisplay(in: scroller.bounds, to: bitmap)
+                let backgroundArea = CGRect(x: 0, y: host.bounds.midY, width: 4, height: 4)
+                guard let background = host.bitmapImageRepForCachingDisplay(in: backgroundArea) else {
+                    fail("FAIL: reading panel background bitmap is unavailable")
+                }
+                host.cacheDisplay(in: backgroundArea, to: background)
+                guard let expected = background.colorAt(x: 1, y: 1)?.usingColorSpace(.sRGB) else {
+                    fail("FAIL: reading panel background pixels are unavailable")
+                }
+                let points = [(1, 1)] + (empty ? [(bitmap.pixelsWide / 2, bitmap.pixelsHigh / 2)] : [])
+                for (x, y) in points {
+                    guard let actual = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else {
+                        fail("FAIL: reading scrollbar pixels are unavailable")
+                    }
+                    let matches = abs(actual.redComponent - expected.redComponent) < 0.02
+                        && abs(actual.greenComponent - expected.greenComponent) < 0.02
+                        && abs(actual.blueComponent - expected.blueComponent) < 0.02
+                    if !matches {
+                        fail("FAIL: \(label) track actual=\(actual), expected=\(expected), "
+                            + "appearance=\(scroller.effectiveAppearance.name), "
+                            + "enabled=\(scroller.isEnabled), proportion=\(scroller.knobProportion)")
+                    }
+                    require(matches, "\(label) keeps its reserved track in the panel palette at \(x),\(y)")
+                }
+            }
+        }
+        reading.selectedNoteID = nil
+        for populated in [false, true] {
+            if populated {
+                reading.store.putAll((0..<24).map { index in
+                    .make(kind: "note", title: "Synthetic note \(index)",
+                          content: "A local paragraph for checking real note-list scrolling.",
+                          sourceID: "scroll:\(index)", pages: [1])
+                })
+            }
+            for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+                window.appearance = NSAppearance(named: appearance)
+                for style in [NSScroller.Style.legacy, .overlay] {
+                    for width: CGFloat in [480, 320, 520, 414] {
+                        window.setContentSize(CGSize(width: width, height: 800))
+                        try await eventually("the resized notes list exposes one native scroll view", {
+                            host.layoutSubtreeIfNeeded()
+                            return find(NSScrollView.self, in: host).count == 1
+                        })
+                        let scroll = find(NSScrollView.self, in: host)[0]
+                        scroll.scrollerStyle = style; scroll.tile()
+                        let label = "notes \(populated ? "long" : "short") \(appearance.rawValue) \(style.rawValue) \(width) pt"
+                        try await eventuallyExplaining("\(label) keeps its scroll viewport flush with the panel edge", {
+                            "scroll=\(host.convert(scroll.bounds, from: scroll)), host=\(host.bounds)"
+                        }, {
+                            host.layoutSubtreeIfNeeded()
+                            return abs(host.convert(scroll.bounds, from: scroll).maxX - host.bounds.maxX) < 0.5
+                        })
+                        try await eventually("\(label) keeps the Lyra native scroller after resizing", {
+                            scroll.verticalScroller is LyraReaderSidebarScroller
+                        })
+                        try await eventuallyExplaining("\(label) keeps any visible scrollbar at the panel edge", {
+                            "scroller=\(String(describing: scroll.verticalScroller?.frame)), "
+                                + "hidden=\(String(describing: scroll.verticalScroller?.isHidden)), "
+                                + "document=\(String(describing: scroll.documentView?.frame)), clip=\(scroll.contentView.bounds)"
+                        }, {
+                            host.layoutSubtreeIfNeeded()
+                            guard let scroller = scroll.verticalScroller else { return false }
+                            if !populated && (scroller.isHidden || scroller.bounds.width < 1) { return true }
+                            let track = host.convert(scroller.bounds, from: scroller)
+                            return track.width > 1 && abs(track.maxX - host.bounds.maxX) <= 2
+                        })
+                        guard let scroller = scroll.verticalScroller else { fail("FAIL: missing notes scroller") }
+                        assertTrackPalette(scroller, label: label, empty: !populated)
+                        if populated {
+                            try await eventually("\(label) retains a working thumb for overflowing notes", {
+                                (scroll.verticalScroller?.knobProportion ?? 1) < 1 && scroll.verticalScroller?.isEnabled == true
+                            })
+                        } else {
+                            require((scroll.documentView?.frame.height ?? .infinity) <= scroll.contentView.bounds.height + 1,
+                                    "\(label) fits without a scrollable range")
+                        }
+                    }
+                }
+            }
+            try captureReadingInteraction(host, name: "notes-\(populated ? "long" : "short")-resized-scrollbar")
+        }
+        reading.summarySelection = true; reading.translationSelection = true
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            window.appearance = NSAppearance(named: appearance)
+            for style in [NSScroller.Style.legacy, .overlay] {
+                for tab in [AIAssistantTab.summary, .translation] {
+                    navigation.selectedTab = .regions
+                    try await eventually("the long notes list scrolls before changing tools", {
+                        host.layoutSubtreeIfNeeded()
+                        return find(NSScrollView.self, in: host).contains {
+                            ($0.documentView?.frame.height ?? 0) > $0.contentView.bounds.height + 1
+                                && $0.verticalScroller?.isEnabled == true
+                        }
+                    })
+                    navigation.selectedTab = tab
+                    try await eventually("the shorter tool installs its own scroll view", {
+                        host.layoutSubtreeIfNeeded()
+                        return find(NSScrollView.self, in: host).count == 1
+                            && find(AITranslationControlMarker.self, in: host).contains { $0.id == "segment-Whole document" }
+                    })
+                    let scroll = find(NSScrollView.self, in: host)[0]
+                    scroll.scrollerStyle = style; scroll.tile()
+                    try await eventuallyExplaining("\(tab) settles without inheriting the long notes scrollbar", {
+                        "attached=\(scroll.window != nil), scroller=\(String(describing: scroll.verticalScroller)), "
+                            + "document=\(String(describing: scroll.documentView?.frame)), clip=\(scroll.contentView.bounds)"
+                    }, {
+                        host.layoutSubtreeIfNeeded()
+                        return scroll.verticalScroller is LyraReaderSidebarScroller
+                            && (scroll.documentView?.frame.height ?? .infinity) <= scroll.contentView.bounds.height + 1
+                    })
+                    guard let scroller = scroll.verticalScroller else { fail("FAIL: missing tool scroller") }
+                    assertTrackPalette(scroller, label: "\(tab) after long notes \(appearance.rawValue)", empty: true)
+                }
+            }
+        }
+        window.appearance = NSAppearance(named: .aqua)
+        window.setContentSize(CGSize(width: 480, height: 800))
+
         reading.newSession(pageCount: 1); navigation.selectedTab = .chat
         try await eventually("the chat input mounts", {
             host.layoutSubtreeIfNeeded()

@@ -279,11 +279,13 @@ struct AIReadingSidebar: View {
                         TextField(aiReadingLabel("Search reading notes"), text: $search)
                         LyraReadingSegmentedPicker(title: "Sort", selection: $recent, first: "Page order", second: "Recent", firstIcon: "list.number", secondIcon: "clock")
                     }.padding(.trailing, AIReadingScrollMetrics.gutterWidth)
+                        .padding(.horizontal, AIReadingScrollMetrics.horizontalInset)
                     let notes = reading.store.notes(query: search, recent: recent)
                     if notes.isEmpty {
                         ContentUnavailableView(aiReadingLabel(search.isEmpty ? "Keep the ideas you discover" : "No matching notes"), systemImage: "note.text",
                             description: Text(aiReadingLabel(search.isEmpty ? "Save a summary, a Chat answer, or finish an Interleaf discussion." : "Try another search or clear the search field.")))
                             .padding(.trailing, AIReadingScrollMetrics.gutterWidth)
+                            .padding(.horizontal, AIReadingScrollMetrics.horizontalInset)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else {
                         ScrollView {
@@ -298,12 +300,13 @@ struct AIReadingSidebar: View {
                                     }.buttonStyle(.plain)
                                     Divider().overlay(LyraReaderTheme.separator)
                                 }
-                            }.padding(.trailing, notesTrailingGutter).frame(maxWidth: .infinity, alignment: .leading)
+                            }.padding(.horizontal, AIReadingScrollMetrics.horizontalInset)
+                                .padding(.trailing, notesTrailingGutter).frame(maxWidth: .infinity, alignment: .leading)
                                 .background(AIReadingScrollMemory(key: "\(state.document?.id.uuidString ?? "none"):notes", reading: reading,
                                     onGutterChange: { notesTrailingGutter = $0 }))
                         }
                     }
-                }.padding(.vertical, 16).padding(.horizontal, AIReadingScrollMetrics.horizontalInset)
+                }.padding(.vertical, 16)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
         }
