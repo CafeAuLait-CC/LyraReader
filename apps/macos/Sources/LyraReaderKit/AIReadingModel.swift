@@ -111,12 +111,25 @@ final class AIReadingModel: ObservableObject {
     }
     /// Called only by the active translation tool. Capturing a preview never sends a request.
     func refreshTranslationSelection(_ state: AppState) {
+        refreshSelection("translation", state: state)
+    }
+    /// Called only by the active Summary selection view, or its explicit Generate action.
+    func refreshSummarySelection(_ state: AppState) {
+        refreshSelection("summary", state: state)
+    }
+    private func refreshSelection(_ kind: String, state: AppState) {
         guard let context = state.aiReaderContext, context.documentKey == documentKey else { return }
         let excerpt = context.selection == nil ? nil : state.selectedPassageText
-        guard frozenTranslation?.selection != context.selection || translationExcerpt != (excerpt ?? "") else { return }
-        frozenTranslation = excerpt == nil ? nil : context
-        translationExcerpt = excerpt ?? ""
-        translationResultID = nil; translationDraft = true
+        let previous = kind == "summary" ? frozenSummary : frozenTranslation
+        guard previous?.selection != context.selection || self.excerpt(kind) != (excerpt ?? "") else { return }
+        if kind == "summary" {
+            frozenSummary = excerpt == nil ? nil : context
+            summaryExcerpt = excerpt ?? ""
+        } else {
+            frozenTranslation = excerpt == nil ? nil : context
+            translationExcerpt = excerpt ?? ""
+            translationResultID = nil; translationDraft = true
+        }
     }
     func translateCurrentSource(state: AppState) {
         if translationSelection { refreshTranslationSelection(state) }
@@ -248,6 +261,7 @@ final class AIReadingModel: ObservableObject {
         guard let live = state.aiReaderContext, !state.documentKnowledge.isBlocking else { return }
         let worker = worker(kind)
         guard !worker.isPreparing, !worker.isSending else { return }
+        if kind == "summary", summarySelection { refreshSummarySelection(state) }
         if kind == "translation", translationResultID != nil, let record = result(kind) {
             do { try restoreTranslationSource(record, live: live) }
             catch { notice = AIReadableError.message(error); return }

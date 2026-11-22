@@ -202,6 +202,8 @@ extension ReaderChecks {
 
     @MainActor private static func translationPresentationChecks(state: AppState, reading: AIReadingModel,
         select: (ClosedRange<Int>) async throws -> Void, service: ReadingTaskService) async throws {
+        let previousSummaryScope = reading.summarySelection, previousDetail = reading.detail
+        defer { reading.summarySelection = previousSummaryScope; reading.detail = previousDetail }
         func find(_ view: NSView) -> [AITranslationControlMarker] {
             (view as? AITranslationControlMarker).map { [$0] } ?? view.subviews.flatMap(find)
         }
@@ -262,6 +264,14 @@ extension ReaderChecks {
             NSApplication.shared.windows.contains { $0.isVisible && $0.accessibilityLabel() == "Toolbar commands" }
         })
         let menu = NSApplication.shared.windows.first { $0.isVisible && $0.accessibilityLabel() == "Toolbar commands" }!
+        let languageAnchor = find(host).first { $0.id == "language" }!
+        try captureReadingInteraction(host, name: "translation-menu-open-host")
+        try await eventuallyExplaining("the language menu aligns right even when space remains on the right", {
+            "menu \(menu.frame), button \(window.convertToScreen(languageAnchor.convert(languageAnchor.bounds, to: nil)))"
+        }, {
+            host.layoutSubtreeIfNeeded()
+            return abs(menu.frame.maxX - window.convertToScreen(languageAnchor.convert(languageAnchor.bounds, to: nil)).maxX) <= 1
+        })
         try await Task.sleep(for: .milliseconds(150))
         if let content = menu.contentView { try captureReadingInteraction(content, name: "translation-language-menu") }
         for _ in 0..<3 {
@@ -329,16 +339,97 @@ extension ReaderChecks {
             host.layoutSubtreeIfNeeded(); return find(host).contains { $0.id == "segment-Selection" }
         })
         click("segment-Selection", in: host)
-        try await eventually("Summary's shared picker changes its source", { reading.summarySelection })
+        try await eventually("Summary's selection preview captures the current canvas", {
+            reading.summarySelection && reading.excerpt("summary") == state.selectedPassageText
+        })
+        try await select(245...270)
+        try await eventually("the active Summary preview follows a new selection without a button", {
+            reading.excerpt("summary") == state.selectedPassageText
+        })
+        require(reading.excerpt("translation") == preview && service.starts == count + 1,
+                "Summary preview updates neither translation sources nor provider usage")
+        for (detail, moves) in [("Brief", 0), ("Detailed", 2), ("Standard", 1)] {
+            click("summary-detail", in: host)
+            try await eventually("Summary detail opens the shared Lyra menu", {
+                NSApplication.shared.windows.contains { $0.isVisible && $0.accessibilityLabel() == "Toolbar commands" }
+            })
+            let detailMenu = NSApplication.shared.windows.first { $0.isVisible && $0.accessibilityLabel() == "Toolbar commands" }!
+            let detailAnchor = find(host).first { $0.id == "summary-detail" }!
+            let detailBounds = window.convertToScreen(detailAnchor.convert(detailAnchor.bounds, to: nil))
+            require(abs(detailMenu.frame.maxX - detailBounds.maxX) <= 1,
+                    "the detail menu aligns its right edge with its trigger (menu \(detailMenu.frame), button \(detailBounds))")
+            try await Task.sleep(for: .milliseconds(120))
+            if let content = detailMenu.contentView {
+                try captureReadingInteraction(content, name: "summary-detail-menu-\(detail.lowercased())")
+            }
+            for _ in 0..<moves {
+                detailMenu.sendEvent(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: detailMenu.windowNumber, context: nil,
+                    characters: "\u{F701}", charactersIgnoringModifiers: "\u{F701}", isARepeat: false, keyCode: 125)!)
+            }
+            detailMenu.sendEvent(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: detailMenu.windowNumber, context: nil,
+                characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36)!)
+            try await eventually("the Lyra detail menu selects \(detail) using the keyboard", { reading.detail == detail })
+        }
+        require(service.starts == count + 1, "changing Summary detail never starts an AI task")
+        let visible = window.screen!.visibleFrame
+        let point = CGPoint(x: visible.midX, y: visible.midY)
+        let contextMenu = NSMenu(title: "Synthetic context")
+        contextMenu.addItem(NSMenuItem(title: "Synthetic command", action: nil, keyEquivalent: ""))
+        LyraReaderMenuPresenter.shared.show(menu: contextMenu, at: point, in: window, owner: host)
+        let contextPanel = NSApplication.shared.windows.first { $0.isVisible && $0.accessibilityLabel() == "Document commands" }!
+        require(abs(contextPanel.frame.minX - point.x) <= 1, "document context menus retain their pointer origin")
+        LyraReaderMenuPresenter.shared.dismiss(owner: host)
+        LyraReaderMenuPresenter.shared.show(items: [LyraReaderMenuItem("Synthetic command", icon: "doc", action: {})],
+            below: CGRect(x: visible.minX + 10, y: visible.midY, width: 24, height: 24), in: window, owner: host, dismiss: {})
+        let edgePanel = NSApplication.shared.windows.first { $0.isVisible && $0.accessibilityLabel() == "Toolbar commands" }!
+        require(abs(edgePanel.frame.minX - visible.minX - 5) <= 1 && visible.contains(edgePanel.frame),
+                "right-aligned dropdowns remain on screen beside a left-edge button")
+        LyraReaderMenuPresenter.shared.dismiss(owner: host)
+        state.clearSelection()
+        try await eventually("clearing the canvas removes Summary's stale source", {
+            reading.excerpt("summary").isEmpty && reading.selectionPage("summary") == nil
+        })
+        try await select(270...290)
+        try await eventually("Summary accepts a new source after clearing", { reading.excerpt("summary") == state.selectedPassageText })
+        try await select(280...305)
+        let expectedSummarySource = state.selectedPassageText!
+        let summaryCount = reading.store.taskHistory("summary").count
+        service.holdNext = true
+        reading.run("summary", state: state)
+        try await eventually("Generate starts exactly one Summary from the latest canvas", {
+            service.starts == count + 2 && reading.summary.isSending
+        })
+        let summaryOriginals = service.startedPlans.last!.sources.map(\.snippet)
+        require(summaryOriginals == [expectedSummarySource], "Summary Generate captures the latest source even before debounce finishes")
+        try await select(245...270)
+        try await eventually("a new Summary preview can update during an earlier task", { reading.excerpt("summary") == state.selectedPassageText })
+        service.latestHandle?.suspended = false
+        try await eventually("the frozen Summary finishes without losing its captured source", { reading.store.taskHistory("summary").count == summaryCount + 1 })
+        require(reading.store.taskHistory("summary").first?.originals == summaryOriginals,
+                "changing Summary's preview cannot replace an in-flight task's source")
+        let summaryPreview = reading.excerpt("summary")
         click("segment-Whole document", in: host)
         try await eventually("Summary's shared picker returns to whole document", { !reading.summarySelection })
+        try await select(280...305)
+        try await Task.sleep(for: .milliseconds(180))
+        require(reading.excerpt("summary") == summaryPreview, "whole-document Summary does not track selection changes")
+        click("segment-Selection", in: host)
+        try await eventually("returning to Summary Selection refreshes its source", { reading.excerpt("summary") == state.selectedPassageText })
+        state.aiToolsVisible = false
+        let closedSummary = reading.excerpt("summary")
         try await select(245...270)
         try await Task.sleep(for: .milliseconds(180))
-        require(reading.excerpt("translation") == preview, "Summary does not keep updating the translation selection")
+        require(reading.excerpt("summary") == closedSummary, "closing the Lyra row stops Summary selection tracking")
+        state.toggleRightPanel()
+        try await eventually("reopening Summary refreshes the current selection", { reading.excerpt("summary") == state.selectedPassageText })
+        let summaryFrozen = reading.excerpt("summary")
         navigation.selectedTab = .chat
         try await select(280...305)
         try await Task.sleep(for: .milliseconds(180))
-        require(reading.excerpt("translation") == preview, "Chat does not keep updating the translation selection")
+        require(reading.excerpt("translation") == preview && reading.excerpt("summary") == summaryFrozen,
+                "Chat does not keep updating Summary or translation selections")
         navigation.selectedTab = .regions; reading.selectedNoteID = nil
         try await eventually("reading notes expose the same Lyra sorting picker", {
             host.layoutSubtreeIfNeeded(); return find(host).contains { $0.id == "segment-Recent" }
@@ -348,7 +439,7 @@ extension ReaderChecks {
         try captureReadingInteraction(host, name: "notes-sort-sliding")
         try await Task.sleep(for: .milliseconds(150))
         try captureReadingInteraction(host, name: "notes-sort-recent")
-        require(service.starts == count + 1, "source and note-order controls never request AI")
+        require(service.starts == count + 2, "source and note-order controls never request AI")
         navigation.selectedTab = .translation
         try await eventually("returning to Translate refreshes the preview without sending", { reading.excerpt("translation") == state.selectedPassageText })
         state.aiToolsVisible = false

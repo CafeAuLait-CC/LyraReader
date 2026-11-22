@@ -23,9 +23,9 @@ struct AITranslationView: View {
         !busy && !knowledge.isBlocking && reading.store.isAvailable && reading.settings.canUseAI &&
         (!reading.translationSelection || !reading.excerpt("translation").isEmpty)
     }
-    private var selectionObservation: TranslationSelectionObservation {
+    private var selectionObservation: AIReadingSelectionObservation {
         let enabled = isActive && reading.translationSelection && !reading.store.isLoading
-        return TranslationSelectionObservation(document: state.document?.id,
+        return AIReadingSelectionObservation(document: state.document?.id,
             selection: enabled ? state.selection : nil, enabled: enabled)
     }
     var body: some View {
@@ -151,7 +151,7 @@ struct AITranslationView: View {
             }
     }
 }
-private struct TranslationSelectionObservation: Equatable {
+struct AIReadingSelectionObservation: Equatable {
     let document: UUID?
     let selection: AppState.Selection?
     let enabled: Bool

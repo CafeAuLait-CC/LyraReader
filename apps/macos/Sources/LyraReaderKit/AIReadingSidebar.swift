@@ -126,7 +126,7 @@ struct AIReadingSidebar: View {
                             Text(aiReadingLabel("Selected passage")).font(.caption.weight(.medium))
                             Spacer()
                             Button(aiReadingLabel("Locate")) { reading.locateSelection(kind, state: state) }
-                            Button(aiReadingLabel("Use new selection")) { reading.useSelection(kind, state: state) }.disabled(state.selection == nil || busy)
+                                .disabled(reading.excerpt(kind).isEmpty)
                         }
                         Text(reading.excerpt(kind).isEmpty ? aiReadingLabel("Select a passage in the document.") : reading.excerpt(kind))
                             .font(.caption).lineLimit(5).textSelection(.enabled)
@@ -134,9 +134,24 @@ struct AIReadingSidebar: View {
                 } else {
                     Label(String(format: aiReadingLabel("All %d pages"), state.document?.pageCount ?? 0), systemImage: "doc.text").font(.caption).foregroundStyle(LyraReaderTheme.textSecondary)
                 }
-                HStack { Text(aiReadingLabel("Detail")).font(.caption); Spacer(); Picker(aiReadingLabel("Detail"), selection: $reading.detail) {
-                    ForEach(["Brief", "Standard", "Detailed"], id: \.self) { Text(aiReadingLabel($0)).tag($0) }
-                }.labelsHidden().fixedSize() }
+                HStack {
+                    Text(aiReadingLabel("Detail")).font(.caption)
+                    Spacer()
+                    LyraReaderMenu(title: aiReadingLabel("Detail"), items: ["Brief", "Standard", "Detailed"].map { detail in
+                        LyraReaderMenuItem(aiReadingLabel(detail), icon: "text.alignleft", selected: reading.detail == detail) {
+                            reading.detail = detail
+                        }
+                    }) {
+                        HStack(spacing: 10) {
+                            Text(aiReadingLabel(reading.detail)).font(.system(size: 13))
+                            Image(systemName: "chevron.down").font(.system(size: 11))
+                        }.frame(minWidth: 82, minHeight: 28).padding(.horizontal, 8)
+                            .background(LyraReaderTheme.fieldBg, in: RoundedRectangle(cornerRadius: 6))
+                            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(LyraReaderTheme.controlBorder))
+                    }.accessibilityHint(aiReadingLabel(reading.detail))
+                        .accessibilityIdentifier("summary-detail")
+                        .background(AITranslationControlProbe(id: "summary-detail"))
+                }
                 if busy {
                     HStack {
                         ProgressView().controlSize(.small)
@@ -190,7 +205,19 @@ struct AIReadingSidebar: View {
                 .padding(.trailing, summaryTrailingGutter).frame(maxWidth: .infinity, alignment: .leading)
                 .background(AIReadingScrollMemory(key: "\(state.document?.id.uuidString ?? "none"):\(kind)", reading: reading,
                     onGutterChange: { summaryTrailingGutter = $0 }))
-        }.id(kind)
+        }.id(kind).task(id: summarySelectionObservation) {
+            guard summarySelectionObservation.enabled else { return }
+            // Coalesce pointer movement; only this visible selection preview follows the canvas.
+            do { try await Task.sleep(for: .milliseconds(80)) } catch { return }
+            guard !Task.isCancelled else { return }
+            reading.refreshSummarySelection(state)
+        }
+    }
+    private var summarySelectionObservation: AIReadingSelectionObservation {
+        let enabled = isActive && state.aiToolsVisible && navigation.selectedTab == .summary
+            && reading.summarySelection && !reading.store.isLoading && !showingTaskHistory
+        return AIReadingSelectionObservation(document: state.document?.id,
+            selection: enabled ? state.selection : nil, enabled: enabled)
     }
     private func taskHistory(_ kind: String) -> some View {
         ScrollView {
