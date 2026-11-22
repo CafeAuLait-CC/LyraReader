@@ -367,6 +367,14 @@ extension ReaderChecks {
         try captureReadingInteraction(host, name: "summary-selection-card")
         require(reading.excerpt("translation") == preview && service.starts == count + 1,
                 "Summary preview updates neither translation sources nor provider usage")
+        func chevronInset(_ detail: String) -> CGFloat? {
+            host.layoutSubtreeIfNeeded()
+            guard let arrow = find(host).first(where: { $0.id == "summary-detail-chevron-\(detail)" }),
+                  let field = find(host).first(where: { $0.id == "summary-detail" }) else { return nil }
+            return host.convert(field.bounds, from: field).maxX - host.convert(arrow.bounds, from: arrow).midX
+        }
+        try await eventually("the detail field exposes its chevron", { chevronInset(reading.detail) != nil })
+        guard let initialChevronInset = chevronInset(reading.detail) else { fail("FAIL: missing initial detail chevron") }
         for (detail, moves) in [("Brief", 0), ("Detailed", 2), ("Standard", 1)] {
             click("summary-detail", in: host)
             try await eventually("Summary detail opens the shared Lyra menu", {
@@ -390,6 +398,9 @@ extension ReaderChecks {
                 timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: detailMenu.windowNumber, context: nil,
                 characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36)!)
             try await eventually("the Lyra detail menu selects \(detail) using the keyboard", { reading.detail == detail })
+            try await eventually("the detail field renders \(detail)", { chevronInset(detail) != nil })
+            require(chevronInset(detail).map { abs($0 - initialChevronInset) <= 1 } == true,
+                    "the detail chevron stays fixed when switching to \(detail)")
         }
         require(service.starts == count + 1, "changing Summary detail never starts an AI task")
         let visible = window.screen!.visibleFrame

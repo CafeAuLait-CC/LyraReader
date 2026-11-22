@@ -136,9 +136,12 @@ struct AIReadingSidebar: View {
                         }
                     }) {
                         HStack(spacing: 10) {
-                            Text(aiReadingLabel(reading.detail)).font(.system(size: 13))
+                            Text(aiReadingLabel(reading.detail)).font(.system(size: 13)).lineLimit(1)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                             Image(systemName: "chevron.down").font(.system(size: 11))
-                        }.frame(minWidth: 82, minHeight: 28).padding(.horizontal, 8)
+                                .fixedSize()
+                                .background(AITranslationControlProbe(id: "summary-detail-chevron-\(reading.detail)"))
+                        }.frame(width: 82, height: 28).padding(.horizontal, 8)
                             .background(LyraReaderTheme.fieldBg, in: RoundedRectangle(cornerRadius: 6))
                             .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(LyraReaderTheme.controlBorder))
                     }.accessibilityHint(aiReadingLabel(reading.detail))
