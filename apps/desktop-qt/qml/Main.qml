@@ -469,7 +469,7 @@ ApplicationWindow {
         return "";
     }
     function prepareForQuit() {
-        if ((session && session.tabTransferInProgress) || closeOperation || pendingDocumentSave || dialogs.closePromptVisible || dialogs.saveDialog.visible) return false;
+        if ((session && (session.tabTransferInProgress || session.nativeTabDragInProgress())) || closeOperation || pendingDocumentSave || dialogs.closePromptVisible || dialogs.saveDialog.visible) return false;
         const tabs=session?session.tabs:[{reader:currentReader}];
         tabs.forEach(tab=>{tab.reader.flushAiRegionNote();tab.reader.flushAiChatDraft(true);});
         if(tabs.some(tab=>tab.reader.hasUnsavedReadingNotes && !tab.reader.regionPersistencePending)){readingNotesBlockClose(-1);return false;}
@@ -650,7 +650,7 @@ ApplicationWindow {
     }
     onClosing: function (event) {
         if (closeApproved) return;
-        if (session && session.tabTransferInProgress) {event.accepted=false;return;}
+        if (session && (session.tabTransferInProgress || readerChrome.nativeTabToken.length)) {event.accepted=false;return;}
         if (session && session.quitCoordinator.busy) {event.accepted=false;return;}
         if (secondaryRow==="edit" && contentController.deferAction({kind:"windowClose"})) {event.accepted=false;return;}
         cancelErase();

@@ -18,6 +18,7 @@ signals:
     void windowCreated(QQuickWindow *window);
 private:
     std::shared_ptr<RenderTrace::Sink> m_renderTrace;
-    void detachActiveTab(WorkspaceController *source,QQuickWindow *sourceWindow);
-    void moveToWindow(WorkspaceController *source,QQuickWindow *sourceWindow,WorkspaceController *target,ReaderController *reader,qulonglong generation);
+    void detachTab(WorkspaceController *source, QQuickWindow *sourceWindow, ReaderController *reader, qulonglong generation);
+    void moveToWindow(WorkspaceController *source, QQuickWindow *sourceWindow, WorkspaceController *target,
+                      ReaderController *reader, qulonglong generation, ReaderController *before);
 };

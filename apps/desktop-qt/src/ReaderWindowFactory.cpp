@@ -33,8 +33,14 @@ QQuickWindow *ReaderWindowFactory::createWindow(const QUrl &url,int page,double 
     window->setProperty("requestedY",y);
     if(m_renderTrace)RenderTrace::Window::attach(window,m_renderTrace);
     connect(workspace,&WorkspaceController::newWindowRequested,this,[this](const QUrl &file,int targetPage,double targetY){createWindow(file,targetPage,targetY);});
-    connect(workspace,&WorkspaceController::detachActiveTabRequested,this,[this,owner=QPointer<WorkspaceController>(workspace),window=QPointer<QQuickWindow>(window)]{if(owner && window)detachActiveTab(owner,window);});
-    connect(workspace,&WorkspaceController::moveActiveTabToWindowRequested,this,[this,owner=QPointer<WorkspaceController>(workspace),window=QPointer<QQuickWindow>(window)](WorkspaceController *target,ReaderController *reader,qulonglong generation){if(owner && window)moveToWindow(owner,window,target,reader,generation);});
+    const QPointer<WorkspaceController> owner(workspace);
+    const QPointer<QQuickWindow> ownerWindow(window);
+    connect(workspace,&WorkspaceController::detachTabRequested,this,[this,owner,ownerWindow](ReaderController *reader,qulonglong generation) {
+        if(owner && ownerWindow)detachTab(owner,ownerWindow,reader,generation);
+    });
+    connect(workspace,&WorkspaceController::moveTabToWindowRequested,this,[this,owner,ownerWindow](WorkspaceController *target,ReaderController *reader,qulonglong generation,ReaderController *before) {
+        if(owner && ownerWindow)moveToWindow(owner,ownerWindow,target,reader,generation,before);
+    });
     connect(window,&QQuickWindow::closing,engine,[engine,window]{
         QTimer::singleShot(0,engine,[engine,window]{if(!window->isVisible())engine->deleteLater();});
     });
@@ -46,12 +52,11 @@ QQuickWindow *ReaderWindowFactory::createWindow(const QUrl &url,int page,double 
     return guard;
 }
 
-void ReaderWindowFactory::detachActiveTab(WorkspaceController *source,QQuickWindow *sourceWindow) {
+void ReaderWindowFactory::detachTab(WorkspaceController *source, QQuickWindow *sourceWindow, ReaderController *reader, qulonglong generation) {
     QPointer<WorkspaceController> origin(source);
     QPointer<QQuickWindow> oldWindow(sourceWindow);
-    QPointer<ReaderController> originalReader(source->activeReader());
-    const auto generation=originalReader ? originalReader->documentGeneration() : 0;
-    const auto reason=source->tabTransferBlockReason();
+    QPointer<ReaderController> originalReader(reader),originalActive(source->activeReader());
+    const auto reason=source->tabTransferBlockReason(reader);
     if(!origin)return;
     if(!reason.isEmpty()){emit origin->tabTransferFailed(reason);return;}
     // Load the destination before changing ownership; a failed QML load leaves the
@@ -61,8 +66,10 @@ void ReaderWindowFactory::detachActiveTab(WorkspaceController *source,QQuickWind
     if(!window){emit origin->tabTransferFailed(tr("The new reader window could not be opened. The tab is still here."));return;}
     QPointer<WorkspaceController> target(window->property("session").value<WorkspaceController *>());
     QPointer<ReaderController> emptySource;
-    const auto error=(!originalReader || origin->activeReader()!=originalReader || originalReader->documentGeneration()!=generation)
-        ? tr("The active tab changed before the new window was ready. Nothing was moved.") : origin->transferActiveTabTo(target,&emptySource);
+    const auto error=(!originalReader || !originalActive || origin->activeReader()!=originalActive ||
+                      originalReader->parent()!=origin || originalReader->documentGeneration()!=generation)
+        ? tr("The tab changed before the new window was ready. Nothing was moved.")
+        : origin->transferTabTo(target,originalReader,nullptr,&emptySource);
     if(!error.isEmpty()) {
         if(window)qmlEngine(window)->deleteLater();
         if(origin)emit origin->tabTransferFailed(error);
@@ -70,18 +77,19 @@ void ReaderWindowFactory::detachActiveTab(WorkspaceController *source,QQuickWind
     }
     finishTransfer(origin,oldWindow,window,emptySource);
 }
-void ReaderWindowFactory::moveToWindow(WorkspaceController *source,QQuickWindow *sourceWindow,WorkspaceController *target,ReaderController *reader,qulonglong generation) {
+void ReaderWindowFactory::moveToWindow(WorkspaceController *source,QQuickWindow *sourceWindow,WorkspaceController *target,
+                                      ReaderController *reader,qulonglong generation,ReaderController *before) {
     QPointer<WorkspaceController> origin(source);
     QPointer<QQuickWindow> oldWindow(sourceWindow);
     if(!WorkspaceController::allWorkspaces().contains(target) || target==source) {
         emit source->tabTransferFailed(tr("The selected reader window is no longer available. Nothing was moved."));return;
     }
     QPointer<QQuickWindow> window(qobject_cast<QQuickWindow *>(target->readerWindow()));
-    if(!reader || origin->activeReader()!=reader || reader->documentGeneration()!=generation || !window || !window->isVisible()) {
+    if(!reader || reader->parent()!=origin || reader->documentGeneration()!=generation || !window || !window->isVisible()) {
         emit source->tabTransferFailed(tr("The selected tab or window changed. Nothing was moved."));return;
     }
     QPointer<ReaderController> emptySource;
-    const auto error=origin->transferActiveTabTo(target,&emptySource);
+    const auto error=origin->transferTabTo(target,reader,before,&emptySource);
     if(!error.isEmpty()){if(origin)emit origin->tabTransferFailed(error);return;}
     finishTransfer(origin,oldWindow,window,emptySource);
 }

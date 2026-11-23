@@ -4,12 +4,72 @@ import QtQuick.Layouts
 
 ColumnLayout {
     id: chrome
+    objectName: "readerChrome"
     required property var app
     readonly property bool menuOpen: viewMenu.visible || zoomMenu.visible || moreMenu.visible
     readonly property bool tabDragActive: !!tabStrip.tabDrag
+    readonly property string nativeTabMime: "application/x-lyrareader-tab"
+    property string nativeTabToken: ""
     spacing: 0
     property int tabDragCancelEpoch:0
     implicitHeight: 90
+    function startNativeTabDrag(reader) {
+        nativeTabToken = app.session.prepareNativeTabDrag(reader);
+        if (nativeTabToken.length)
+            nativeDragSource.Drag.active = true;
+    }
+    function acceptsTabDrop(event, newWindow) {
+        return !!app.session && app.session.nativeTabDragInProgress() && (event.supportedActions & Qt.MoveAction) !== 0 &&
+            app.session.acceptsNativeTabDrag(event.getDataAsString(nativeTabMime), newWindow);
+    }
+    function tabDropped(event, before, newWindow) {
+        if (acceptsTabDrop(event, newWindow) &&
+            app.session.queueNativeTabDrop(event.getDataAsString(nativeTabMime), before, newWindow))
+            event.accept(Qt.MoveAction);
+        else
+            event.accepted = false;
+    }
+    Item {
+        id: nativeDragSource
+        parent: chrome
+        visible: false
+        Drag.dragType: Drag.Automatic
+        Drag.supportedActions: Qt.MoveAction
+        Drag.mimeData: ({ [chrome.nativeTabMime]: chrome.nativeTabToken })
+        Drag.onDragFinished: function(action) {
+            const token = chrome.nativeTabToken;
+            chrome.nativeTabToken = "";
+            if (app.session)
+                app.session.finishNativeTabDrag(token, action === Qt.MoveAction);
+        }
+    }
+    Rectangle {
+        parent: primaryTools
+        visible: chrome.nativeTabToken.length > 0
+        z: 20
+        anchors.horizontalCenter: parent.horizontalCenter
+        y: 2
+        width: Math.min(parent.width, detachLabel.implicitWidth + 32)
+        height: 42
+        radius: 7
+        color: detachDrop.containsDrag ? app.colors.selectedBg : app.colors.raisedBg
+        border.color: app.colors.accent
+        Accessible.ignored: true
+        Label {
+            id: detachLabel
+            anchors.centerIn: parent
+            color: detachDrop.containsDrag ? app.colors.selectedFg : app.colors.textPrimary
+            text: qsTr("Drop to open in a new window")
+        }
+        DropArea {
+            id: detachDrop
+            objectName: "tabDetachDropArea"
+            anchors.fill: parent
+            keys: [chrome.nativeTabMime]
+            onEntered: function(drag) { drag.accepted = chrome.acceptsTabDrop(drag, true); }
+            onDropped: function(drop) { chrome.tabDropped(drop, null, true); }
+        }
+    }
     Rectangle {
         Layout.fillWidth: true
         Layout.preferredHeight: 44
@@ -23,6 +83,11 @@ ColumnLayout {
                 id: tabStrip
                 objectName:"tabStrip"
                 property var tabDrag:null
+                readonly property real tabWidth: Math.max(120, Math.min(230, (width - 30) / Math.max(1, count) - 4))
+                function dropGap(x) {
+                    const offset = x + contentX - originX;
+                    return Math.max(0, Math.min(count, Math.floor((offset + tabWidth / 2) / (tabWidth + spacing))));
+                }
                 function sameOrder() {
                     return tabDrag && app.session && tabDrag.readers.length===app.session.tabs.length &&
                         tabDrag.readers.every(function(reader,index){return reader===app.session.tabs[index].reader;});
@@ -78,7 +143,7 @@ ColumnLayout {
                     // currentIndex while documents finish loading. The workspace
                     // remains the source of truth for the actual active reader.
                     readonly property bool selected: index === (app.session ? app.session.activeIndex : 0)
-                    width: Math.max(120, Math.min(230, (tabStrip.width - 30) / Math.max(1, tabStrip.count) - 4))
+                    width: tabStrip.tabWidth
                     height: 40
                     y: 4
                     topLeftRadius: 7
@@ -135,6 +200,14 @@ ColumnLayout {
                             if(!hadDrag && Math.hypot(p.x+tabStrip.contentX-pressPoint.x,p.y-pressPoint.y)<3)return;
                             if(!hadDrag){hadDrag=true;tabStrip.tabDrag={reader:modelData.reader,readers:pressReaders,sourceIndex:tab.index,width:tab.width,dx:0,gap:tab.index,inside:true,pressX:pressPoint.x,pressY:pressPoint.y,title:modelData.title};}
                             if(!tabStrip.sameOrder()){tabStrip.tabDrag=null;canceled=true;return;}
+                            if(p.x < -12 || p.x > tabStrip.width + 12 || p.y < -12 || p.y > tabStrip.height + 12) {
+                                const reader = tabStrip.tabDrag.reader;
+                                tabStrip.tabDrag = null;
+                                canceled = true;
+                                hadDrag = false;
+                                chrome.startNativeTabDrag(reader);
+                                return;
+                            }
                             tabStrip.updateDrag(p.x,p.y);}
                         onReleased:function(mouse){if(canceled || pressCancelEpoch!==chrome.tabDragCancelEpoch){hadDrag=false;tabStrip.tabDrag=null;return;}
                             if(!hadDrag){app.selectReaderTab(tab.index);return;}
@@ -150,7 +223,7 @@ ColumnLayout {
                             app.selectReaderTab(tab.index)
                         Keys.onSpacePressed: if (app.session)
                             app.selectReaderTab(tab.index)
-                        Accessible.description:qsTr("Drag half a tab width to reorder; Alt+Shift+Left or Right moves this tab. Escape cancels.")
+                        Accessible.description:qsTr("Drag to reorder or move to another window. Alt+Shift+Left or Right reorders. Escape cancels.")
                         Accessible.role: Accessible.PageTab
                         Accessible.name: modelData.title
                         Accessible.selectable: true
@@ -164,6 +237,45 @@ ColumnLayout {
                         height: 2
                         visible: tab.selected || tabMouse.activeFocus
                         color: tabMouse.activeFocus ? app.colors.focusRing : app.colors.accent
+                    }
+                }
+            }
+            DropArea {
+                id: tabDrop
+                objectName: "tabStripDropArea"
+                parent: tabStrip
+                anchors.fill: parent
+                z: 12
+                keys: [chrome.nativeTabMime]
+                onEntered: function(drag) { drag.accepted = chrome.acceptsTabDrop(drag, false); }
+                onDropped: function(drop) {
+                    const gap = tabStrip.dropGap(drop.x);
+                    chrome.tabDropped(drop, app.session && gap < app.session.tabs.length ?
+                                         app.session.tabs[gap].reader : null, false);
+                }
+                Rectangle {
+                    visible: tabDrop.containsDrag
+                    x: Math.max(0, Math.min(tabStrip.width - width,
+                        tabStrip.dropGap(tabDrop.drag.x) * (tabStrip.tabWidth + tabStrip.spacing) -
+                        tabStrip.contentX + tabStrip.originX - tabStrip.spacing / 2));
+                    y: 6
+                    width: 2
+                    height: 36
+                    color: app.colors.accent
+                    Accessible.ignored: true
+                }
+                Timer {
+                    interval: 16
+                    running: tabDrop.containsDrag
+                    repeat: true
+                    onTriggered: {
+                        const x = tabDrop.drag.x;
+                        const step = x < 24 ? -8 : x > tabStrip.width - 24 ? 8 : 0;
+                        if (step) {
+                            const start = tabStrip.originX;
+                            const end = start + Math.max(0, tabStrip.contentWidth - tabStrip.width);
+                            tabStrip.contentX = Math.max(start, Math.min(end, tabStrip.contentX + step));
+                        }
                     }
                 }
             }
@@ -199,6 +311,7 @@ ColumnLayout {
         }
     }
     ToolBar {
+        id: primaryTools
         Layout.fillWidth: true
         Layout.preferredHeight: 46
         background: Rectangle {

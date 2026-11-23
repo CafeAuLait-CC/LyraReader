@@ -47,6 +47,8 @@
 #include <QJSValue>
 #include <QUrlQuery>
 #include <QInputMethodEvent>
+#include <QDragEnterEvent>
+#include <QMimeData>
 #include <QQmlExpression>
 #include <QProcess>
 #include <QQuickStyle>
@@ -786,6 +788,163 @@ private slots:
         QVERIFY(drag(2,5,-half-2,true));QCOMPARE(visualItem(window->contentItem(),"tabSurface2")->property("cursorShape").toInt(),int(Qt::ArrowCursor));QCOMPARE(order(),readers);QCOMPARE(workspace.activeReader(),readers[0]);
         auto *keyboard=visualItem(window->contentItem(),"tabSurface0");QVERIFY(keyboard);keyboard->forceActiveFocus();QTest::keyClick(window,Qt::Key_Right,Qt::AltModifier|Qt::ShiftModifier);QTRY_COMPARE(order(),QList<ReaderController *>({readers[1],readers[0],readers[2]}));QCOMPARE(workspace.activeReader(),readers[0]);
         readers[0]->submit("bookmark_create",{{"page",0},{"title","Retained while reordered"},{"yPt",24}});QTRY_COMPARE_WITH_TIMEOUT(readers[0]->pendingCommands(),0,10000);QVERIFY(readers[0]->hasUnsavedChanges());workspace.saveViewState(readers[0],{{"page",0},{"zoom",1.5},{"y",71}});QVERIFY(workspace.moveTab(readers[0],nullptr));QCOMPARE(workspace.activeReader(),readers[0]);QVERIFY(readers[0]->hasUnsavedChanges());QCOMPARE(workspace.viewState(readers[0]).value("y").toInt(),71);QCOMPARE(readers[0]->data().value("marks").toMap().value("bookmarks").toList().first().toMap().value("title").toString(),QString("Retained while reordered"));QVERIFY(!workspace.moveTab(readers[0],nullptr));QVERIFY(!workspace.moveTab(nullptr,readers[0]));
+    }
+    void nativeTabDropInsertsAnInactiveReaderAndRejectsUnclaimedOrCancelledOffers() {
+        QTemporaryDir scratch;
+        QVERIFY(scratch.isValid());
+        ReaderWindowFactory windows;
+        auto *source=windows.createWindow();
+        auto *target=windows.createWindow();
+        QVERIFY(source && target);
+        auto *origin=source->property("session").value<WorkspaceController *>();
+        auto *destination=target->property("session").value<WorkspaceController *>();
+
+        QList<ReaderController *> readers;
+        for (const auto &name:{"incoming","retained","first-target","active-target"}) {
+            auto *workspace=readers.size()<2 ? origin : destination;
+            const auto path=scratch.filePath(QString(name)+".pdf");
+            QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+            workspace->openFile(QUrl::fromLocalFile(path));
+            auto *opened=workspace->activeReader();
+            QTRY_VERIFY_WITH_TIMEOUT(opened->pageCount()==1 && !opened->pendingCommands(),10000);
+            readers.append(opened);
+        }
+        auto *reader=readers[0];
+        auto *sourceActive=readers[1];
+        auto *targetFirst=readers[2];
+        const auto generation=reader->documentGeneration();
+        const auto handle=reader->documentHandle();
+        destination->saveViewState(targetFirst,{{"page",0},{"zoom",1.25}});
+        origin->saveViewState(reader,{{"page",0},{"zoom",1.45}});
+        const auto carriedView=origin->viewState(reader);
+        QVERIFY(settleReaderViewport(source));
+        QVERIFY(settleReaderViewport(target));
+        auto *strip=visualItem(target->contentItem(),"tabStripDropArea");
+        QVERIFY(strip && strip->width()>100);
+        const auto position=strip->mapToScene(QPointF(15,22)).toPoint();
+        QString refusal;
+        const auto dropOnStrip=[&](const QString &token) {
+            QMimeData payload;
+            payload.setData("application/x-lyrareader-tab",token.toUtf8());
+            QDragEnterEvent enter(position,Qt::MoveAction,&payload,Qt::LeftButton,Qt::NoModifier);
+            QCoreApplication::sendEvent(target,&enter);
+            if (!enter.isAccepted()) {
+                refusal=QStringLiteral("Tab strip rejected entry at %1,%2").arg(position.x()).arg(position.y());
+                QDragLeaveEvent leave;
+                QCoreApplication::sendEvent(target,&leave);
+                return false;
+            }
+            QDropEvent drop(position,Qt::MoveAction,&payload,Qt::NoButton,Qt::NoModifier);
+            QCoreApplication::sendEvent(target,&drop);
+            refusal=QStringLiteral("Tab strip rejected drop, action %1").arg(int(drop.dropAction()));
+            return drop.isAccepted() && drop.dropAction()==Qt::MoveAction;
+        };
+
+        auto token=origin->prepareNativeTabDrag(reader);
+        QVERIFY(!token.isEmpty());
+        QVERIFY(!dropOnStrip(token+"foreign"));
+        QVERIFY(destination->acceptsNativeTabDrag(token,false));
+        QVERIFY2(dropOnStrip(token),qPrintable(refusal));
+        QCOMPARE(reader->parent(),origin);
+        origin->finishNativeTabDrag(token,false);
+        QTest::qWait(20);
+        QCOMPARE(reader->parent(),origin);
+        QVERIFY(!dropOnStrip(token));
+
+        QSignalSpy sourceChange(origin,&WorkspaceController::activeReaderAboutToChange);
+        QSignalSpy reset(reader,&ReaderController::documentReset);
+        token=origin->prepareNativeTabDrag(reader);
+        QVERIFY2(dropOnStrip(token),qPrintable(refusal));
+        origin->finishNativeTabDrag(token,true);
+        QCOMPARE(reader->parent(),origin);
+        QTRY_COMPARE(reader->parent(),destination);
+        QCOMPARE(sourceChange.count(),0);
+        QCOMPARE(origin->activeReader(),sourceActive);
+        QCOMPARE(origin->activeIndex(),0);
+        QCOMPARE(destination->tabs()[0].toMap().value("reader").value<ReaderController *>(),reader);
+        QCOMPARE(destination->tabs()[1].toMap().value("reader").value<ReaderController *>(),targetFirst);
+        QCOMPARE(destination->tabs()[2].toMap().value("reader").value<ReaderController *>(),readers[3]);
+        QCOMPARE(destination->activeReader(),reader);
+        QCOMPARE(reader->documentHandle(),handle);
+        QCOMPARE(reader->documentGeneration(),generation);
+        QCOMPARE(destination->viewState(reader),carriedView);
+        QCOMPARE(destination->viewState(targetFirst).value("zoom").toDouble(),1.25);
+        QCOMPARE(reset.count(),0);
+    }
+    void nativeTabDropDetachesOnlyOnItsExplicitTargetAndRechecksStaleHits() {
+        QTemporaryDir scratch;
+        QVERIFY(scratch.isValid());
+        ReaderWindowFactory windows;
+        QPointer<QQuickWindow> source(windows.createWindow());
+        auto *other=windows.createWindow();
+        QVERIFY(source && other);
+        auto *origin=source->property("session").value<WorkspaceController *>();
+        auto *destination=other->property("session").value<WorkspaceController *>();
+        const auto path=scratch.filePath("detach.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        origin->openFile(QUrl::fromLocalFile(path));
+        auto *reader=origin->activeReader();
+        QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()==1 && !reader->pendingCommands(),10000);
+        QVERIFY(settleReaderViewport(source));
+        auto *chrome=visualItem(source->contentItem(),"readerChrome");
+        auto *detach=visualItem(source->contentItem(),"tabDetachDropArea");
+        QVERIFY(chrome && detach);
+        if (QGuiApplication::platformName()==QStringLiteral("offscreen")) {
+            auto *tab=visualItem(source->contentItem(),"tabSurface0");
+            QVERIFY(tab);
+            const auto at=tab->mapToScene(QPointF(25,15)).toPoint();
+            QSignalSpy gesture(chrome,SIGNAL(nativeTabTokenChanged()));
+            QTest::mousePress(source,Qt::LeftButton,Qt::NoModifier,at);
+            QTimer::singleShot(80,source,[window=source] {
+                if(window)QTest::keyClick(window,Qt::Key_Escape);
+            });
+            QTest::mouseMove(source,at+QPoint(0,66),20);
+            QTest::mouseRelease(source,Qt::LeftButton,Qt::NoModifier,at+QPoint(0,66));
+            QTRY_COMPARE_WITH_TIMEOUT(gesture.count(),2,1000);
+            QVERIFY(!origin->nativeTabDragInProgress());
+            QVERIFY(!detach->isVisible());
+            QCOMPARE(reader->parent(),origin);
+        }
+        QSignalSpy failures(origin,&WorkspaceController::tabTransferFailed);
+        auto token=origin->prepareNativeTabDrag(reader);
+        QVERIFY(!token.isEmpty());
+        QVERIFY(!destination->queueNativeTabDrop(token,nullptr,true));
+        QVERIFY(destination->queueNativeTabDrop(token,destination->activeReader(),false));
+        destination->newTab();
+        origin->finishNativeTabDrag(token,true);
+        QTRY_COMPARE(failures.count(),1);
+        QCOMPARE(reader->parent(),origin);
+
+        QSignalSpy created(&windows,&ReaderWindowFactory::windowCreated);
+        token=origin->prepareNativeTabDrag(reader);
+        QVERIFY(!token.isEmpty());
+        origin->finishNativeTabDrag(token,true);
+        QTest::qWait(20);
+        QCOMPARE(created.count(),0);
+        QVERIFY(source);
+
+        token=origin->prepareNativeTabDrag(reader);
+        QVERIFY(!token.isEmpty());
+        QVERIFY(chrome->setProperty("nativeTabToken",token));
+        QTRY_VERIFY(detach->isVisible() && detach->width()>100);
+        QVERIFY(!source->close());
+        const auto position=detach->mapToScene(QPointF(detach->width()/2,detach->height()/2)).toPoint();
+        QMimeData payload;
+        payload.setData("application/x-lyrareader-tab",token.toUtf8());
+        QDragEnterEvent enter(position,Qt::MoveAction,&payload,Qt::LeftButton,Qt::NoModifier);
+        QCoreApplication::sendEvent(source,&enter);
+        QVERIFY(enter.isAccepted());
+        QDropEvent drop(position,Qt::MoveAction,&payload,Qt::NoButton,Qt::NoModifier);
+        QCoreApplication::sendEvent(source,&drop);
+        QVERIFY(drop.isAccepted());
+        QVERIFY(chrome->setProperty("nativeTabToken",QString{}));
+        origin->finishNativeTabDrag(token,true);
+        QTRY_COMPARE(created.count(),1);
+        QTRY_VERIFY(source.isNull());
+        auto *newWindow=created.first().first().value<QQuickWindow *>();
+        QVERIFY(newWindow && newWindow->isVisible());
+        QCOMPARE(newWindow->property("session").value<WorkspaceController *>()->activeReader(),reader);
+        QCOMPARE(newWindow->flags() & Qt::WindowType_Mask,Qt::Window);
     }
     void contentDraftAppliesBeforeAnInactiveTabIsReordered() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);

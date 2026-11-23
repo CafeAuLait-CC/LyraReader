@@ -44,9 +44,16 @@ public:
     Q_INVOKABLE void selectTab(int index);
     Q_INVOKABLE bool moveTab(ReaderController *reader, ReaderController *before);
     Q_INVOKABLE void detachActiveTab();
+    Q_INVOKABLE QString prepareNativeTabDrag(ReaderController *reader);
+    Q_INVOKABLE bool nativeTabDragInProgress() const;
+    Q_INVOKABLE bool acceptsNativeTabDrag(const QString &token, bool newWindow) const;
+    Q_INVOKABLE bool queueNativeTabDrop(const QString &token, ReaderController *before, bool newWindow);
+    Q_INVOKABLE void finishNativeTabDrag(const QString &token, bool moved);
     bool tabTransferInProgress()const{return m_tabTransfer;}
-    QString tabTransferBlockReason()const;
+    QString tabTransferBlockReason(ReaderController *reader) const;
     QString transferActiveTabTo(WorkspaceController *target,QPointer<ReaderController> *emptySource=nullptr);
+    QString transferTabTo(WorkspaceController *target, ReaderController *reader, ReaderController *before,
+                          QPointer<ReaderController> *emptySource=nullptr);
     Q_INVOKABLE void closeTab(int index, bool discardPending = false);
     Q_INVOKABLE void newTab();
     Q_INVOKABLE void requestQuit();
@@ -77,8 +84,8 @@ signals:
     void activeReaderAboutToChange();
     void recentDocumentsChanged();
     void newWindowRequested(const QUrl &url, int page, double y);
-    void detachActiveTabRequested();
-    void moveActiveTabToWindowRequested(WorkspaceController *target,ReaderController *reader,qulonglong generation);
+    void detachTabRequested(ReaderController *reader, qulonglong generation);
+    void moveTabToWindowRequested(WorkspaceController *target, ReaderController *reader, qulonglong generation, ReaderController *before);
     void tabTransferFailed(const QString &reason);
     void tabTransferStateChanged();
 private:
