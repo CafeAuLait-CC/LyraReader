@@ -49,9 +49,9 @@ Item {
     readonly property bool paperActive:!!paperState.rows && !paperState.error
     readonly property bool paperPlanning:!!paperState.loading
     readonly property real paperProgress:paperActive && app.regionPaper.owner===app.currentReader
-            && app.regionPaper.opened ? app.regionPaper.revealProgress : 1
+            && app.regionPaper.opened ? app.regionPaper.paperProgress : 1
     readonly property bool paperMotionActive:paperActive && app.regionPaper.owner===app.currentReader
-            && app.regionPaper.motionActive
+            && (app.regionPaper.motionActive || app.regionPaper.streamKeepsDemand)
     // Animate between the two Rust-produced endpoint layouts. This is a native view
     // interpolation, not another row grouping or paper-placement implementation.
     function paperMetric(source,target){return source+(target-source)*paperProgress;}

@@ -29,9 +29,27 @@ Item {
     x:frame ? frame.x : 12
     y:frame ? frame.y : located ? -height-1 : Math.max(12,((app.documentCanvas ? app.documentCanvas.height : app.height)-height)/2)
     width:frame ? frame.width : Math.min(560,(app.documentCanvas ? app.documentCanvas.width : app.width)-24)
-    readonly property real fullHeight:Math.max(44,Math.min(result.output || result.reasoning ? 740 : 560,(app.documentCanvas ? app.documentCanvas.height : app.height)-24))
-    readonly property bool compact:fullHeight<400
-    readonly property bool veryCompact:fullHeight<280
+    readonly property real heightLimit:Math.max(44,Math.min(740,(app.documentCanvas ? app.documentCanvas.height : app.height)-24))
+    readonly property real fullHeight:Math.min(heightLimit,Math.max(44,
+        Math.ceil(body.implicitHeight + Math.max(0,transcript.implicitHeight-resultScroll.Layout.preferredHeight))))
+    readonly property bool streamGrowing:opened && running && state.responseView==="region"
+    readonly property real plannedHeight:streamGrowing ? heightLimit : fullHeight
+    readonly property real allocatedHeight:located && paper.card ? paper.card.gap_pt*app.zoom : fullHeight
+    readonly property real paperProgress:allocatedHeight>0
+        ? revealProgress*Math.min(1,fullHeight/allocatedHeight) : 0
+    readonly property bool compact:heightLimit<400
+    readonly property bool veryCompact:heightLimit<280
+    property int streamInteraction:-1
+    property size streamViewport:Qt.size(0,0)
+    property real streamZoom:0
+    readonly property bool streamKeepsDemand:streamGrowing && app.documentCanvas
+        && streamInteraction===app.documentCanvas.interactionEpoch && streamZoom===app.zoom
+        && streamViewport.width===app.documentCanvas.width && streamViewport.height===app.documentCanvas.height
+    onStreamGrowingChanged:if(streamGrowing && app.documentCanvas) {
+        streamInteraction=app.documentCanvas.interactionEpoch;
+        streamZoom=app.zoom;
+        streamViewport=Qt.size(app.documentCanvas.width,app.documentCanvas.height);
+    }
     property real revealProgress:1
     property bool closing:false
     readonly property bool motionActive:opened && (needsReveal || reveal.running || closing)
@@ -40,7 +58,7 @@ Item {
     property var motionAnchor:null
     property real motionGapBottom:NaN
     property int motionInteraction:-1
-    height:fullHeight*revealProgress
+    height:Math.min(fullHeight,allocatedHeight)*revealProgress
     clip:true;focus:true
     NumberAnimation {
         id:reveal;objectName:"paperRevealMotion";target:card;property:"revealProgress";duration:220;easing.type:Easing.InOutCubic
@@ -122,7 +140,9 @@ Item {
         // an offscreen conversation when a delayed zoom/content replan completes.
         pendingFocused=focusedWithin() && !!frame && frame.y<app.documentCanvas.height
                 && frame.y+height>0;
-        owner.configureAiRegionPaper(config.mode,config.gap,fullHeight/app.zoom);
+        // While streaming, one maximum-gap plan covers every measured transcript size.
+        // Canvas interpolates that existing endpoint; no per-token document plan is needed.
+        owner.configureAiRegionPaper(config.mode,config.gap,plannedHeight/app.zoom);
     }
     Timer {id:layoutApply;interval:0;onTriggered:card.settlePaper();}
     function focusedWithin() {
@@ -149,7 +169,14 @@ Item {
         else if(opened && attachment.error){reveal.stop();closing=false;needsReveal=false;revealProgress=1;}
         else requestPaper();
     }
-    onFullHeightChanged:requestPaper()
+    onPlannedHeightChanged:requestPaper()
+    onFullHeightChanged:if(streamKeepsDemand)Qt.callLater(card.followGrowth)
+    function followGrowth() {
+        if(!streamKeepsDemand || owner!==app.currentReader || !located || !focusedWithin())return;
+        const visibleFrame=app.documentCanvas.regionCardFrame(owner);
+        if(visibleFrame && visibleFrame.y<app.documentCanvas.height && visibleFrame.y+height>0)
+            app.documentCanvas.showRegionCard(owner);
+    }
     onPaperChanged:if(opened && paper.error){reveal.stop();closing=false;needsReveal=false;revealProgress=1;}
     Connections {
         target:card.owner
@@ -191,6 +218,7 @@ Item {
         if(match && (plan.source_pages || []).indexOf(Number(match[1]))>=0){app.navigate(Number(match[1])-1);close();}
     }
     Pane {
+        id:body
         objectName:"aiRegionBody"
         width:card.width;height:card.fullHeight;padding:card.veryCompact ? 4 : card.compact ? 8 : 12
         opacity:.65+.35*card.revealProgress
@@ -209,17 +237,19 @@ Item {
         }
         Rectangle {Layout.fillWidth:true;Layout.preferredHeight:1;color:card.dividerColor}
         BusyIndicator {running:!!card.attachment.loading;visible:running;Layout.alignment:Qt.AlignHCenter}
-        ScrollView {
+        AiReadingScrollView {
             id: resultScroll;objectName:"aiRegionTranscript"
             Layout.minimumHeight:card.veryCompact ? 48 : 64
             Layout.preferredHeight:64
             Layout.fillWidth:true;Layout.fillHeight:true;contentWidth:availableWidth;clip:true
             ColumnLayout {
-                width:parent.width;spacing:8
+                id:transcript
+                objectName:"aiRegionTranscriptContent"
+                width:resultScroll.availableWidth;spacing:8
                 Label {text:card.attachment.error || card.paper.error || "";textFormat:Text.PlainText;visible:text.length>0;wrapMode:Text.Wrap;Layout.fillWidth:true;color:card.app.colors.warningFg}
                 Item {
                     visible:!!card.attachment.image_png
-                    Layout.fillWidth:true;Layout.preferredHeight:Math.min(180,Math.max(32,resultScroll.availableHeight-24),width*(card.attachment.image_height_px || 1)/(card.attachment.image_width_px || 1))
+                    Layout.fillWidth:true;Layout.preferredHeight:Math.min(180,width*(card.attachment.image_height_px || 1)/(card.attachment.image_width_px || 1))
                     PdfCrop {
                         objectName:"aiRegionImage"
                         anchors.centerIn:parent
@@ -272,7 +302,7 @@ Item {
         ScrollView {
             id:composer
             visible:!!card.attachment.image_png
-            Layout.fillWidth:true;Layout.preferredHeight:Math.min(80,Math.max(card.veryCompact ? 36 : 48,card.fullHeight*.18));Layout.maximumHeight:Layout.preferredHeight;contentWidth:availableWidth;clip:true
+            Layout.fillWidth:true;Layout.preferredHeight:Math.min(80,Math.max(card.veryCompact ? 36 : 48,card.heightLimit*.18));Layout.maximumHeight:Layout.preferredHeight;contentWidth:availableWidth;clip:true
             TextArea {
                 id:questionEditor;objectName:"aiRegionQuestion"
                 width:composer.availableWidth;text:card.attachment.question || ""
