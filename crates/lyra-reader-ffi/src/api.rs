@@ -8668,6 +8668,7 @@ impl LyraReaderEngine {
 
 /// Presentation-independent reading-task settings.
 #[derive(Debug, Clone, uniffi::Record)]
+#[cfg_attr(feature = "desktop-json", derive(serde::Deserialize))]
 pub struct AiReadingOptionsRecord {
     pub kind: String,
     pub detail: String,

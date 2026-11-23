@@ -121,17 +121,14 @@ impl fmt::Debug for RequestSpec {
     }
 }
 
-/// Endpoint/model pairs that rejected `stream_options` with a 400 and then accepted the same
-/// request without it. In memory only: a fresh process tries the field first, which is what keeps
-/// token usage available on providers that support it.
+/// Endpoint/model pairs that rejected the optional `stream_options` field. In memory only:
+/// a fresh process tries the field first, preserving usage on providers that support it.
 fn stream_options_rejections() -> &'static Mutex<HashSet<(String, String)>> {
     static REJECTED: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
     REJECTED.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// Whether this endpoint/model has already rejected `stream_options` and then accepted the same
-/// request without it. Plan builders consult this so the previewed body and the sent body stay
-/// byte-identical after a fallback.
+/// Plan builders use this rejection cache before rendering a request for review.
 pub fn stream_options_unsupported(endpoint: &str, model: &str) -> bool {
     let cache = stream_options_rejections()
         // Pure cache of "this endpoint rejected stream_options": a poisoned guard can only
@@ -221,7 +218,8 @@ fn assemble_request_spec(plan: &ChatPlan, api_key: &str, body: Vec<u8>) -> Reque
 /// The key is checked for line breaks (header injection) and placed only in the `Authorization`
 /// header. The body is the one rendered for the selected transport (or rendered here for a
 /// plan that has not been previewed). If this endpoint/model previously rejected
-/// `stream_options`, the optional field is removed so every later request goes straight through.
+/// `stream_options`, a programmatic request can omit it. A previously rendered preview must
+/// be rebuilt and reviewed if it still contains the rejected field.
 pub fn build_request_spec(
     plan: &ChatPlan,
     part: &ChatPart,
@@ -233,6 +231,11 @@ pub fn build_request_spec(
     let body = if stream_options_unsupported(&plan.endpoint, &plan.model)
         && parsed.get("stream_options").is_some()
     {
+        if part.wire_body.is_some() {
+            return Err(AiError::InvalidSettings(
+                "The server rejected streaming usage options. Preview the request again before sending.".into(),
+            ));
+        }
         encode_without_stream_options(parsed)
     } else {
         body.into_bytes()
@@ -1486,6 +1489,12 @@ fn run_plan_inner(
             let reason = response.reason().to_string();
             let body = read_error_body(&mut *response, cancel)?;
             if rejected_stream_options(status, &body) && body_has_stream_options(&spec.body) {
+                if part.wire_body.is_some() {
+                    remember_stream_options_unsupported(&plan.endpoint, &plan.model);
+                    return Err(AiError::HttpStatus(
+                        "HTTP 400: the server rejected streaming usage options. Preview the request again before sending.".into(),
+                    ));
+                }
                 cancel.check()?;
                 trace("retrying without stream_options after an HTTP 400");
                 let retry_spec = build_request_spec_without_stream_options(plan, part, api_key)?;
@@ -2402,6 +2411,42 @@ mod tests {
         let spec = build_request_spec(&plan, &plan.parts[0], "sk-test").unwrap();
         let body: Value = serde_json::from_slice(&spec.body).unwrap();
         assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn a_reviewed_body_is_neither_retried_nor_rewritten_after_rejection() {
+        let endpoint = "http://127.0.0.1:9/v1";
+        let model = unique_model("reviewed-rejection");
+        let preview =
+            retry_plan(endpoint, &model).rendered(crate::chat::ChatTransport::ChatCompletions);
+        let transport = ScriptedTransport::new(vec![ScriptedReply::error(
+            400,
+            "{\"error\":{\"message\":\"Unsupported parameter: stream_options\"}}",
+        )]);
+        let cancel = CancellationToken::new();
+        let error = run_plan_with_transport(&preview, "sk-test", &transport, &cancel, &mut |_| {})
+            .expect_err("reviewed plans must stop after the rejected body");
+        assert!(error.to_string().contains("Preview the request again"));
+        assert_eq!(transport.request_count(), 1);
+        assert_eq!(
+            transport.recorded.lock().unwrap()[0],
+            preview.parts[0].wire_body.as_ref().unwrap().as_bytes()
+        );
+        assert!(
+            run_plan_with_transport(&preview, "sk-test", &transport, &cancel, &mut |_| {}).is_err()
+        );
+        assert_eq!(
+            transport.request_count(),
+            1,
+            "a stale preview sends no new body"
+        );
+        let next =
+            retry_plan(endpoint, &model).rendered(crate::chat::ChatTransport::ChatCompletions);
+        let body = next.parts[0].wire_body.as_ref().unwrap();
+        assert!(!body.contains("stream_options"));
+        let transport = ScriptedTransport::new(vec![ScriptedReply::success("again")]);
+        run_plan_with_transport(&next, "sk-test", &transport, &cancel, &mut |_| {}).unwrap();
+        assert_eq!(transport.recorded.lock().unwrap()[0], body.as_bytes());
     }
 
     #[test]

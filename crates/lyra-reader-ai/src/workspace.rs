@@ -410,11 +410,24 @@ pub fn translation_blocks(
     pages: &[u32],
     response: &str,
 ) -> Result<Vec<TranslationBlock>, String> {
+    translation_blocks_from_parts(originals, pages, std::iter::once(response))
+}
+
+/// Each provider response has its own prefix. Keep the boundaries so text preceding
+/// the first marker of a later reply cannot be appended to the previous translation.
+pub fn translation_blocks_from_parts<'a>(
+    originals: &[String],
+    pages: &[u32],
+    responses: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<TranslationBlock>, String> {
     if originals.len() != pages.len() {
         return Err("The translation source map is incomplete.".into());
     }
     let mut translated = BTreeMap::new();
-    for section in response.split("<!--lyra:").skip(1) {
+    for section in responses
+        .into_iter()
+        .flat_map(|response| response.split("<!--lyra:").skip(1))
+    {
         let Some((index, content)) = section.split_once("-->") else {
             continue;
         };

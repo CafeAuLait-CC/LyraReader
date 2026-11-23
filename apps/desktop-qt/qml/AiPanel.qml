@@ -18,10 +18,13 @@ Pane {
     readonly property bool batchMode: workspace === "summary" && !!input.summaryBatch
     readonly property bool languageMode: unitMode || batchMode
     readonly property bool selectedSummary: workspace === "summary" && action === 5 && !unitMode && !batchMode
+    readonly property bool translateDocument: workspace === "translation" && input.translationScope === "document"
+    readonly property bool translateInPlace: workspace === "translation" && !translateDocument && !!input.inplace
     readonly property string summaryDetail: input.summaryDetail || "Standard"
-    readonly property var selectedSources: selectedSummary && plan && plan.action === "SummarizeSelection" ? plan.sources || [] : []
-    readonly property var preparedRange: selectedSources.length ? viewState.previewSelection || null : null
-    readonly property var liveRange: visible && (selectedSummary || workspace === "translation") && app.selection
+    readonly property var preparedRange: plan && (selectedSummary || plan.kind === "reading_translation")
+                                         ? viewState.previewSelection || null : null
+    readonly property var selectedSources: preparedRange ? plan.sources || [] : []
+    readonly property var liveRange: visible && (selectedSummary || (workspace === "translation" && !translateDocument)) && app.selection
                                      ? sortedRange(app.selection) : null
     readonly property var currentExcerpt: liveExcerpt && liveExcerpt.owner === owner
                                           && liveExcerpt.generation === ownerGeneration
@@ -51,7 +54,10 @@ Pane {
     readonly property bool previewReady: !!plan && !viewState.planSent
     readonly property bool running: !!viewState.running
     readonly property bool compact: height < 500
-    readonly property var result: viewState.responseView === workspace ? Object.assign({output: viewState.output, reasoning: viewState.reasoning, usage: viewState.usage, responsePlan: viewState.responsePlan, generation: owner.documentGeneration}, viewState.unitTitle === undefined ? {} : {unitTitle: viewState.unitTitle, unitLanguage: viewState.unitLanguage}) : ((viewState.results || {})[workspace] || {})
+    readonly property var result: viewState.responseView === workspace ? Object.assign({output: viewState.output, reasoning: viewState.reasoning, usage: viewState.usage, responsePlan: viewState.responsePlan, generation: owner.documentGeneration, translationBlocks: viewState.translationBlocks, translationWarning: viewState.translationWarning}, viewState.unitTitle === undefined ? {} : {unitTitle: viewState.unitTitle, unitLanguage: viewState.unitLanguage}) : ((viewState.results || {})[workspace] || {})
+    readonly property var pairedTranslation: workspace === "translation" && result.responsePlan
+                                             && result.responsePlan.kind === "reading_translation"
+                                             ? result.translationBlocks || [] : []
     readonly property string status: viewState.statusView === workspace ? viewState.status || "" : (((viewState.results || {})[workspace] || {}).status || "")
     padding: compact ? 6 : 10
     background: Rectangle { color: app.colors.sidebarBg }
@@ -173,8 +179,16 @@ Pane {
         if (batchMode) { prepareBatch(batchState.layer, batchState.offset); return; }
         if (unitMode) { prepareUnit(summaryUnit.id); return; }
         const modes = ["SummarizePage", "SummarizeDocument", "AskSelection", "TranslateSelection", "DocumentChat", "SummarizeSelection"];
-        if(workspace==="translation" && input.inplace)owner.prepareInplaceTranslation(baseRequest("TranslateSelection"));
-        else if (selectedSummary) owner.prepareAi(baseRequest("SummarizeSelection"), {}, summaryDetail);
+        if (workspace === "translation") {
+            const request = baseRequest("TranslateSelection");
+            if (translateInPlace) { owner.prepareInplaceTranslation(request); return; }
+            if (translateDocument) {
+                request.action = "SummarizeDocument";
+                request.selection = null;
+            }
+            owner.prepareAi(request, {}, {kind: "translation", detail: "Standard"});
+        }
+        else if (selectedSummary) owner.prepareAi(baseRequest("SummarizeSelection"), {}, {kind: "summary", detail: summaryDetail});
         else owner.prepareAi(baseRequest(modes[action]));
     }
     function followLink(link) {
@@ -302,8 +316,8 @@ Pane {
             range: aiPanel.preparedRange
             prepared: true
             title: qsTr("Previewed source")
-            text: aiPanel.selectedSources.length ? aiPanel.selectedSources[0].snippet : ""
-            labelName: "aiSelectedSummarySource"
+            text: aiPanel.selectedSources.map(source => source.snippet).join("")
+            labelName: aiPanel.workspace === "translation" ? "aiSelectedTranslationSource" : "aiSelectedSummarySource"
         }
         ColumnLayout {
             visible: aiPanel.unitMode
@@ -364,16 +378,26 @@ Pane {
                 onContextGenerationChanged: recreate()
                 onLoaded: { item.targetReader = aiPanel.owner; item.expectedGeneration = aiPanel.owner.documentGeneration; }
             }
+        ComboBox {
+            objectName: "aiTranslationScope"
+            visible: aiPanel.workspace === "translation"
+            enabled: !aiPanel.running
+            Layout.fillWidth: true
+            model: [qsTr("Selected text"), qsTr("Document")]
+            currentIndex: aiPanel.translateDocument ? 1 : 0
+            Accessible.name: qsTr("Translation scope")
+            onActivated: aiPanel.owner.setAiInput("translationScope", currentIndex === 1 ? "document" : "selection")
+        }
         CheckBox {
             objectName: "inplaceTranslationMode"
-            visible: aiPanel.workspace === "translation"
+            visible: aiPanel.workspace === "translation" && !aiPanel.translateDocument
             text: qsTr("Show translation in place")
             checked: !!aiPanel.input.inplace
             enabled: !aiPanel.running
             onToggled: aiPanel.owner.setAiInput("inplace",checked)
         }
         Label {
-            visible: aiPanel.workspace === "translation" && !!aiPanel.input.inplace
+            visible: aiPanel.translateInPlace
             text: qsTr("One request per complete paragraph. Preview before sending. Saved translations and showing the original use no network. Long answers use a bounded page preview; ⋯ retains the full text.")
             wrapMode:Text.Wrap;textFormat:Text.PlainText;Layout.fillWidth:true
             color:app.colors.textSecondary;font.pixelSize:11
@@ -393,10 +417,60 @@ Pane {
             Accessible.name: qsTr("Translation language")
             onTextEdited: aiPanel.owner.setAiInput("language", text)
         }
+        RowLayout {
+            visible: aiPanel.pairedTranslation.length > 0
+            Layout.fillWidth: true
+            Button {
+                text: qsTr("Copy translation")
+                onClicked: if (app.session) app.session.copyText(aiPanel.pairedTranslation.map(block => block.translation).join("\n\n"))
+            }
+            CheckBox {
+                id: rawTranslation
+                text: qsTr("Response details")
+                checked: false
+                onVisibleChanged: if (!visible) checked = false
+            }
+        }
+        Label {
+            visible: aiPanel.workspace === "translation" && !!aiPanel.result.translationWarning
+            text: visible ? aiPanel.result.translationWarning : ""
+            Layout.fillWidth: true; wrapMode: Text.Wrap; textFormat: Text.PlainText
+            color: app.colors.textSecondary
+        }
+        ListView {
+            id: paragraphList
+            objectName: "aiPairedTranslation"
+            visible: aiPanel.pairedTranslation.length > 0 && !rawTranslation.checked
+            Layout.fillWidth: true; Layout.fillHeight: true; Layout.minimumHeight: 24
+            model: aiPanel.pairedTranslation
+            clip: true; spacing: 8
+            ScrollBar.vertical: AiReadingScrollBar { id: translationBar }
+            delegate: ColumnLayout {
+                id: paragraph
+                required property var modelData
+                x: paragraphList.LayoutMirroring.enabled ? translationBar.gutterWidth : 0
+                width: Math.max(0, paragraphList.width - translationBar.gutterWidth)
+                spacing: 3
+                Label {
+                    text: qsTr("Page %1").arg(paragraph.modelData.page)
+                    color: app.colors.textSecondary; font.pixelSize: 11
+                }
+                Label {
+                    text: paragraph.modelData.original; textFormat: Text.PlainText; wrapMode: Text.Wrap
+                    color: app.colors.textSecondary; Layout.fillWidth: true
+                }
+                Label {
+                    text: paragraph.modelData.translation; textFormat: Text.PlainText; wrapMode: Text.Wrap
+                    color: app.colors.textPrimary; Layout.fillWidth: true
+                }
+                Rectangle { color: app.colors.separator; Layout.fillWidth: true; height: 1 }
+            }
+        }
         AiReadingScrollView {
             id: responseScroll
             objectName: "aiResponseScroll"
             visible: aiPanel.workspace !== "chat" && !aiPanel.batchMode
+                     && (!aiPanel.pairedTranslation.length || rawTranslation.checked)
             Layout.fillWidth: true; Layout.fillHeight: true; Layout.minimumHeight: 24
             AiResult {
                 width: responseScroll.availableWidth
@@ -471,7 +545,7 @@ Pane {
             objectName: "prepareAiRequest"
             text: aiPanel.batchMode ? qsTr("Preview batch") : aiPanel.workspace === "chat" ? qsTr("Preview Question") : aiPanel.workspace === "translation" ? qsTr("Preview Translation") : (!aiPanel.unitMode && !aiPanel.batchMode && aiPanel.action === 2) ? qsTr("Preview Question") : qsTr("Preview Summary")
             Layout.fillWidth: true
-            enabled: !aiPanel.running && aiPanel.owner.pageCount > 0 && aiPanel.owner.pendingCommands === 0 && (aiPanel.batchMode || aiPanel.unitMode || ((aiPanel.action !== 2 && aiPanel.action !== 4) || !!question.text.trim()) && (aiPanel.action !== 3 || aiPanel.input.language === undefined || !!aiPanel.input.language.trim()) && ([2,3,5].indexOf(aiPanel.action) < 0 || !!app.selection))
+            enabled: !aiPanel.running && aiPanel.owner.pageCount > 0 && aiPanel.owner.pendingCommands === 0 && (aiPanel.batchMode || aiPanel.unitMode || ((aiPanel.action !== 2 && aiPanel.action !== 4) || !!question.text.trim()) && (aiPanel.action !== 3 || aiPanel.input.language === undefined || !!aiPanel.input.language.trim()) && ([2,3,5].indexOf(aiPanel.action) < 0 || aiPanel.translateDocument || !!app.selection))
             onClicked: aiPanel.prepare()
         }
         Label {

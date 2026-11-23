@@ -17,7 +17,7 @@ pub struct DesktopDocument {
     pub(super) layout: RwLock<DocumentLayout>,
     pub(super) original_signature: SignatureStatusRecord,
     original_xfa: XfaStatusRecord,
-    ai: Mutex<Option<Arc<LyraReaderAiRequest>>>,
+    ai: Mutex<Option<DesktopAiRequest>>,
     summary_batch: Mutex<crate::summary_batch::Batch>,
     summary_scope: Arc<crate::summary_batch::Scope>,
     pub(super) translation_scope: Arc<crate::summary_batch::Scope>,
@@ -31,6 +31,69 @@ pub struct DesktopDocument {
     pub(super) original_path: PathBuf,
     pub(super) recovery_status: Mutex<Value>,
     pub(super) password: Option<String>,
+}
+
+const MAX_READING_TRANSLATION_REPLY_BYTES: usize = 8 * 1024 * 1024;
+
+struct DesktopAiRequest {
+    request: Arc<LyraReaderAiRequest>,
+    translation: Option<ReadingTranslation>,
+}
+
+struct ReadingTranslation {
+    originals: Vec<String>,
+    pages: Vec<u32>,
+    replies: Vec<String>,
+    reply_bytes: Option<usize>,
+    done: bool,
+}
+
+impl ReadingTranslation {
+    fn observe(&mut self, events: &[AiEventRecord]) {
+        for event in events {
+            match event {
+                AiEventRecord::Done => self.done = true,
+                AiEventRecord::PartStarted { .. } if self.reply_bytes.is_some() => {
+                    self.replies.push(String::new());
+                }
+                AiEventRecord::Delta { text } => {
+                    if let Some(bytes) = self.reply_bytes {
+                        if let Some(reply) = self.replies.last_mut()
+                            && text.len() <= MAX_READING_TRANSLATION_REPLY_BYTES - bytes
+                        {
+                            reply.push_str(text);
+                            self.reply_bytes = Some(bytes + text.len());
+                        } else {
+                            self.reply_bytes = None;
+                            self.replies.clear();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn complete(self) -> Option<Result<Value, String>> {
+        if !self.done {
+            return None;
+        }
+        Some((|| {
+            self.reply_bytes
+                .ok_or("The translation could not fit in the paragraph display.")?;
+            let rows = lyra_reader_ai::workspace::translation_blocks_from_parts(
+                &self.originals,
+                &self.pages,
+                self.replies.iter().map(String::as_str),
+            )?;
+            if rows.is_empty() || rows.iter().any(|row| row.translation.is_empty()) {
+                return Err("The response did not translate every requested paragraph.".into());
+            }
+            Ok(Value::Array(rows.into_iter().map(|row| {
+                json!({"original": row.original, "translation": row.translation, "page": row.page})
+            }).collect()))
+        })())
+    }
 }
 
 fn value<T: Serialize>(result: Result<T, LyraReaderFfiError>) -> Result<Value, String> {
@@ -171,7 +234,7 @@ impl DesktopDocument {
             .lock()
             .map_err(|_| "AI state is unavailable.")?
             .as_ref()
-            .is_some_and(|job| !job.is_finished()))
+            .is_some_and(|job| !job.request.is_finished()))
     }
     pub(crate) fn summary_running(&self) -> Result<bool, String> {
         Ok(self
@@ -717,33 +780,40 @@ impl DesktopDocument {
             ),
             "ai_preview" => {
                 let mut request = crate::region::request(r["request"].clone())?;
-                if r.get("summary_detail").is_some() {
-                    let detail = text(&r, "summary_detail")?;
+                if r.get("reading").is_some() {
+                    let options: AiReadingOptionsRecord = arg(&r, "reading")?;
                     let limit = lyra_reader_ai::chat::MAX_SELECTION_CHARS as u64;
-                    if request.action != AiActionRecord::SummarizeSelection
-                        || request.document_knowledge
-                        || !request.selection.is_some_and(|range| {
-                            range.end >= range.start && u64::from(range.end - range.start) < limit
-                        })
-                    {
+                    let selected = request.selection.is_some_and(|range| {
+                        range.end >= range.start && u64::from(range.end - range.start) < limit
+                    });
+                    let translation = options.kind == "translation";
+                    let valid = match (options.kind.as_str(), request.action) {
+                        ("summary", AiActionRecord::SummarizeSelection)
+                        | ("translation", AiActionRecord::TranslateSelection) => selected,
+                        ("translation", AiActionRecord::SummarizeDocument) => {
+                            request.selection.is_none()
+                        }
+                        _ => false,
+                    };
+                    if !valid || request.document_knowledge {
                         return Err(format!(
-                            "Select a passage of at most {limit} characters to summarize."
+                            "Select a passage of at most {limit} characters or choose a supported document task."
                         ));
                     }
-                    // A passage summary only receives the approved selection, never
-                    // the background analysis or preceding document conversation.
+                    // Translation and passage summaries only receive the approved
+                    // source, without the optional background document analysis.
                     request.document_knowledge_text = None;
                     request.document_knowledge_pages.clear();
-                    return value(
-                        d.prepare_ai_reading_task(
-                            request,
-                            lyra_reader_ffi::api::AiReadingOptionsRecord {
-                                kind: "summary".into(),
-                                detail,
-                            },
-                        )
-                        .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),
-                    );
+                    let mut plan = value(
+                        d.prepare_ai_reading_task(request, options)
+                            .and_then(|plan| {
+                                render_ai_plan(plan, AiWireTransport::ChatCompletions)
+                            }),
+                    )?;
+                    if translation {
+                        plan["kind"] = json!("reading_translation");
+                    }
+                    return Ok(plan);
                 }
                 self.enrich_region_history(
                     &mut request,
@@ -788,7 +858,7 @@ impl DesktopDocument {
                     .lock()
                     .map_err(|_| "AI state is unavailable")?
                     .as_ref()
-                    .is_some_and(|job| !job.is_finished())
+                    .is_some_and(|job| !job.request.is_finished())
                 {
                     return Err(
                         "Stop the current response before preparing a summary batch.".into(),
@@ -812,7 +882,7 @@ impl DesktopDocument {
                     .lock()
                     .map_err(|_| "AI state is unavailable")?
                     .as_ref()
-                    .is_some_and(|job| !job.is_finished())
+                    .is_some_and(|job| !job.request.is_finished())
                 {
                     return Err("Stop the current response before sending a summary batch.".into());
                 }
@@ -852,6 +922,19 @@ impl DesktopDocument {
                     return Err("Stop the summary batch before starting another response.".into());
                 }
                 let plan: AiPlanRecord = arg(&r, "plan")?;
+                let translation = (r["plan"]["kind"] == "reading_translation"
+                    && plan.action == AiActionRecord::TranslateSelection)
+                    .then(|| ReadingTranslation {
+                        originals: plan
+                            .sources
+                            .iter()
+                            .map(|source| source.snippet.clone())
+                            .collect(),
+                        pages: plan.sources.iter().map(|source| source.page).collect(),
+                        replies: Vec::new(),
+                        reply_bytes: Some(0),
+                        done: false,
+                    });
                 let root = self
                     .marks
                     .lock()
@@ -894,20 +977,31 @@ impl DesktopDocument {
                         .map_err(|e| e.to_string())?
                 };
                 let mut current = self.ai.lock().map_err(|_| "AI state is unavailable")?;
-                if let Some(old) = current.replace(request) {
-                    old.cancel();
+                if let Some(old) = current.replace(DesktopAiRequest {
+                    request,
+                    translation,
+                }) {
+                    old.request.cancel();
                 }
                 Ok(Value::Bool(true))
             }
             "ai_poll" => {
-                let current = self.ai.lock().map_err(|_| "AI state is unavailable")?;
-                if let Some(job) = current.as_ref() {
-                    let mut events = job.poll();
-                    let finished = job.is_finished();
+                let mut current = self.ai.lock().map_err(|_| "AI state is unavailable")?;
+                if let Some(job) = current.as_mut() {
+                    let mut events = job.request.poll();
+                    let finished = job.request.is_finished();
                     // The worker can finish between draining and observing its finished flag.
                     if finished {
-                        events.extend(job.poll());
+                        events.extend(job.request.poll());
                     }
+                    if let Some(translation) = &mut job.translation {
+                        translation.observe(&events);
+                    }
+                    let translation = if finished {
+                        job.translation.take()
+                    } else {
+                        None
+                    };
                     let active = self
                         .summaries
                         .lock()
@@ -929,7 +1023,16 @@ impl DesktopDocument {
                     } else {
                         None
                     };
-                    Ok(json!({"events":events,"finished":finished,"cache_warning":warning}))
+                    drop(current);
+                    let mut result =
+                        json!({"events":events,"finished":finished,"cache_warning":warning});
+                    if let Some(pairs) = translation.and_then(ReadingTranslation::complete) {
+                        match pairs {
+                            Ok(pairs) => result["translation_blocks"] = pairs,
+                            Err(error) => result["translation_warning"] = json!(error),
+                        }
+                    }
+                    Ok(result)
                 } else {
                     Ok(json!({"events":[],"finished":true}))
                 }
@@ -941,7 +1044,7 @@ impl DesktopDocument {
                     .map_err(|_| "AI state is unavailable")?
                     .as_ref()
                 {
-                    job.cancel();
+                    job.request.cancel();
                 }
                 Ok(Value::Bool(true))
             }

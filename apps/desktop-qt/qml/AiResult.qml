@@ -101,8 +101,10 @@ ColumnLayout {
         id: answerArea
         objectName: result.answerName
         Layout.fillWidth: true
-        text: Logic.answerMarkup(result.value.output || "", result.sent.action === "TranslateSelection" ? false : result.sent.action === "DocumentChat" ? (result.sent.sources || []).map(source => source.page) : (result.sent.source_pages || []))
-        readOnly: true; selectByMouse: true; selectByKeyboard: true; wrapMode: TextEdit.Wrap; background: null; textFormat: TextEdit.RichText
+        text: result.sent.kind === "reading_translation" ? result.value.output || ""
+              : Logic.answerMarkup(result.value.output || "", result.sent.action === "TranslateSelection" ? false : result.sent.action === "DocumentChat" ? (result.sent.sources || []).map(source => source.page) : (result.sent.source_pages || []))
+        readOnly: true; selectByMouse: true; selectByKeyboard: true; wrapMode: TextEdit.Wrap; background: null
+        textFormat: result.sent.kind === "reading_translation" ? TextEdit.PlainText : TextEdit.RichText
         Accessible.name: qsTr("AI response")
         Keys.onPressed: function(event) { result.cursorKey(answerArea, event); }
         onLinkActivated: function(link) { result.citation(link, {action: result.sent.action, sources: result.sent.sources || [], source_pages: result.sent.source_pages || [], generation: result.value.generation}); }

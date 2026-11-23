@@ -2910,6 +2910,96 @@ private slots:
         QCOMPARE(server.requests.size(),1);
     }
 
+    void sidebarTranslationPairsOnlyApprovedParagraphs() {
+        QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
+        MockChatServer server;QVERIFY(server.listen());
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-translation.pdf");
+        {
+            QPdfWriter pdf(path);pdf.setResolution(72);pdf.setPageSize(QPageSize(QPageSize::A4));
+            QPainter painter(&pdf);QVERIFY(painter.isActive());painter.setFont(QFont("Sans Serif",9));
+            for(int page=0;page<8;++page) {
+                if(page)QVERIFY(pdf.newPage());
+                for(int line=0;line<14;++line)
+                    painter.drawText(QPointF(30,35+line*24),QString("Public synthetic translation page %1 line %2. A bounded source stays visible for review.").arg(page+1).arg(line+1));
+            }
+            QVERIFY(painter.end());
+        }
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE(reader->pageCount(),8);QTRY_COMPARE(reader->pendingCommands(),0);
+        reader->requestText(0);QTRY_VERIFY(reader->textPages().contains("0"));QTRY_COMPARE(reader->pendingCommands(),0);
+        const auto selected=reader->selectionText(0,0,38).value("text").toString();QVERIFY(!selected.isEmpty());
+        QVERIFY(window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",38}}));
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","fixture"}});
+        QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"translation")));
+        reader->setAiInput("language","Spanish");
+        auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);
+        const auto plan=[&]{return reader->aiState().value("plan").toMap();};
+        QList<QByteArray> expectedBodies;
+        const auto script=[&](const QVariantMap &prepared,bool malformed) {
+            const QRegularExpression paragraph(QStringLiteral("(?m)^\\[Paragraph (\\d+); Page (\\d+)\\]$"));
+            for(const auto &partValue:prepared.value("parts").toList()) {
+                const auto part=partValue.toMap();const auto body=part.value("wire_body").toString().toUtf8();QVERIFY(!body.isEmpty());
+                expectedBodies.append(body);
+                auto markers=paragraph.globalMatch(part.value("user_prompt").toString());QVERIFY(markers.hasNext());
+                QString reply = "Preamble outside the approved paragraph markers.\n";
+                while(markers.hasNext()) {
+                    const auto match=markers.next();
+                    reply+=QString("<!--lyra:%1--> Traducción %1 [p.999]\n\n").arg(match.captured(1));
+                }
+                if(malformed)reply+=QStringLiteral("<!--lyra:0--> Duplicado");
+                server.responses.append({{MockChatServer::delta({{"content",reply.left(6)}}),
+                                          MockChatServer::delta({{"content",reply.mid(6)}}),
+                                          QByteArray("data: [DONE]\n\n")},5,200});
+            }
+        };
+        const auto verifyWire=[&] {
+            QCOMPARE(server.requests.size(),expectedBodies.size());
+            for(qsizetype i=0;i<expectedBodies.size();++i) {
+                const auto request=server.requests.at(i);
+                QCOMPARE(request.mid(request.indexOf("\r\n\r\n")+4),expectedBodies.at(i));
+            }
+        };
+        const auto verifyPairs=[&](const QVariantMap &prepared) {
+            const auto rows=reader->aiState().value("translationBlocks").toList();
+            const auto sources=prepared.value("sources").toList();
+            QCOMPARE(rows.size(),sources.size());QVERIFY(!rows.isEmpty());
+            for(qsizetype i=0;i<rows.size();++i) {
+                const auto row=rows.at(i).toMap(),source=sources.at(i).toMap();
+                QCOMPARE(row.value("original"),source.value("snippet"));
+                QCOMPARE(row.value("page"),source.value("page"));
+                QCOMPARE(row.value("translation").toString(),QString("Traducción %1 [p.999]").arg(i));
+            }
+            auto *list=visualItem(window->contentItem(),"aiPairedTranslation");
+            QVERIFY(list && list->isVisible());QCOMPARE(list->property("count").toLongLong(),rows.size());
+        };
+
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(!plan().isEmpty());QTRY_COMPARE(reader->pendingCommands(),0);
+        const auto selectedPlan=plan();QCOMPARE(selectedPlan.value("kind").toString(),QString("reading_translation"));
+        QCOMPARE(selectedPlan.value("source_pages").toList(),QVariantList{1});
+        QCOMPARE(selectedPlan.value("sources").toList().first().toMap().value("snippet").toString(),selected);
+        QCOMPARE(server.requests.size(),0);
+        script(selectedPlan,false);QVERIFY(reader->startAi("local",selectedPlan));
+        QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);verifyWire();verifyPairs(selectedPlan);
+
+        reader->setAiInput("translationScope","document");
+        QVERIFY(!reader->startAi("local",selectedPlan));
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(!plan().isEmpty());QTRY_COMPARE(reader->pendingCommands(),0);
+        const auto wholePlan=plan();QVERIFY(wholePlan.value("parts").toList().size()>1);
+        QCOMPARE(wholePlan.value("source_pages").toList().size(),8);
+        QCOMPARE(panel->property("plan").toMap(),wholePlan);QCOMPARE(server.requests.size(),1);
+        script(wholePlan,false);QVERIFY(reader->startAi("local",wholePlan));
+        QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);verifyWire();verifyPairs(wholePlan);
+
+        reader->setAiInput("translationScope","selection");
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(!plan().isEmpty());QTRY_COMPARE(reader->pendingCommands(),0);
+        const auto malformed=plan();script(malformed,true);QVERIFY(reader->startAi("local",malformed));
+        QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);verifyWire();
+        QVERIFY(reader->aiState().value("translationBlocks").toList().isEmpty());
+        QVERIFY(reader->aiState().value("translationWarning").toString().contains("duplicate"));
+        QVERIFY(reader->aiState().value("output").toString().contains("Duplicado"));
+    }
+
 
 
     void commandCompletionAllowsDestructionFromItsNotifications_data() {
