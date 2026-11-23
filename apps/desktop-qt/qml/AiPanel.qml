@@ -552,6 +552,7 @@ Pane {
             visible: aiPanel.workspace === "chat"
             Layout.fillWidth: true; Layout.fillHeight: true; Layout.minimumHeight: 24
             onCitation: function(link, responsePlan) { aiPanel.followHistoryLink(link, responsePlan); }
+            onKeepNote: function(source) { readingNotes.browse(source); }
         }
         Label {
             visible: aiPanel.workspace === "chat" && !!aiPanel.viewState.conversationLimited
@@ -701,7 +702,7 @@ Pane {
                 objectName: "keepAiSummaryNote"
                 text: qsTr("Keep as note")
                 visible: aiPanel.workspace === "summary" && !!aiPanel.result.summaryNoteSource
-                enabled: !aiPanel.running && aiPanel.owner.pendingCommands === 0
+                enabled: !aiPanel.running && aiPanel.owner.pendingCommands === 0 && !aiPanel.owner.readingNoteDraft.id
                 onClicked: readingNotes.browse(aiPanel.result.summaryNoteSource)
             }
             Button {

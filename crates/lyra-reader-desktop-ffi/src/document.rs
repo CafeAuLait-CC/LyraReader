@@ -1,7 +1,7 @@
 //! Desktop transport over the same portable Rust control plane the macOS shell uses.
 //! JSON only crosses the narrow C boundary; requests are decoded into typed engine records.
 use crate::analysis_cache::{PendingSummary, SummaryCapture};
-use lyra_reader_ai::workspace::ReadingRecord;
+use lyra_reader_ai::workspace::{ReadingRecord, reading_scope_key};
 use lyra_reader_core::Size;
 use lyra_reader_ffi::api::*;
 use lyra_reader_runtime::{MAX_PAGE_BYTES, PAGE_GAP_PT, bounded_raster_scale};
@@ -986,20 +986,23 @@ impl DesktopDocument {
                             Err(error) => cache_warning = Some(error),
                         }
                     }
-                    let translation_scope =
-                        translation.then(|| crate::reading_history::TranslationScope {
-                            selection: request.selection,
-                            language: request.language.as_deref().unwrap_or("").to_owned(),
-                            detail: options.detail.clone(),
-                        });
+                    let scope = (!whole_summary).then(|| crate::reading_history::ReadingScope {
+                        selection: request.selection,
+                        language: request.language.as_deref().unwrap_or("").to_owned(),
+                        detail: options.detail.clone(),
+                    });
                     let mut plan = value(
                         d.prepare_ai_reading_task(request, options)
                             .and_then(|plan| {
                                 render_ai_plan(plan, AiWireTransport::ChatCompletions)
                             }),
                     )?;
-                    if let Some(scope) = translation_scope {
-                        plan["kind"] = json!("reading_translation");
+                    if let Some(scope) = scope {
+                        plan["kind"] = json!(if translation {
+                            "reading_translation"
+                        } else {
+                            "reading_summary_selection"
+                        });
                         plan["reading_scope"] =
                             serde_json::to_value(scope).map_err(|error| error.to_string())?;
                     } else if let Some(style) = style {
@@ -1035,7 +1038,7 @@ impl DesktopDocument {
             ),
             "ai_reading_note" => self.reading_note(&d, &text(&r, "id")?),
             "ai_reading_note_update" => self.save_reading_note(&d, arg(&r, "draft")?),
-            "ai_reading_keep_summary" => self.keep_summary_note(&d, &text(&r, "id")?),
+            "ai_reading_keep" => self.keep_reading_note(&d, &text(&r, "id")?),
             "ai_merge_preview" => value(
                 build_ai_merge_plan(arg(&r, "request")?)
                     .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),
@@ -1140,15 +1143,15 @@ impl DesktopDocument {
                         )))
                     }
                     (Some("reading_translation"), AiActionRecord::TranslateSelection) => {
-                        let scope: crate::reading_history::TranslationScope =
+                        let scope: crate::reading_history::ReadingScope =
                             arg(&r["plan"], "reading_scope")?;
                         Some(ReadingOutput::Translation(Box::new(
-                            scope.capture(&plan, d.document_identity().sha256)?,
+                            scope.capture_translation(&plan, d.document_identity().sha256)?,
                         )))
                     }
                     (Some("reading_summary"), AiActionRecord::SummarizeDocument) => {
                         let style: ReadingSummaryStyle = arg(&r["plan"], "reading_style")?;
-                        let capture=Arc::new(SummaryCapture::new(&plan,d.document_identity().sha256,style.language.clone(),style.detail.clone())?);
+                        let capture=Arc::new(SummaryCapture::new(&plan,d.document_identity().sha256,style.language.clone(),style.detail.clone(),None)?);
                         if plan.parts.len()==1 {
                             Some(ReadingOutput::Summary { capture, model:plan.model.clone() })
                         } else {
@@ -1185,6 +1188,17 @@ impl DesktopDocument {
                             capture,
                         })
                         }
+                    }
+                    (Some("reading_summary_selection"), AiActionRecord::SummarizeSelection) => {
+                        let scope: crate::reading_history::ReadingScope = arg(&r["plan"], "reading_scope")?;
+                        let selection = scope.selection.filter(|range| range.page < d.page_count() && range.start <= range.end)
+                            .ok_or("The summary no longer has a valid source passage.")?;
+                        if plan.parts.len() != 1 || plan.source_pages != [selection.page + 1] {
+                            return Err("The selected summary does not match its reviewed source.".into());
+                        }
+                        let capture = Arc::new(SummaryCapture::new(&plan,d.document_identity().sha256,scope.language,scope.detail,
+                            Some(lyra_reader_ai::SelectionRange {page: selection.page, start: selection.start, end: selection.end}))?);
+                        Some(ReadingOutput::Summary { capture, model: plan.model.clone() })
                     }
                     (Some("summary_synthesis"), AiActionRecord::SummarizeDocument) => {
                         if let Some(token)=r["plan"]["summary_capture"].as_str() {
@@ -1313,15 +1327,17 @@ impl DesktopDocument {
                                 Some(snapshot);
                         }
                         Some(ReadingArchive::Summary(record)) => {
-                            match record
-                                .and_then(|record| self.publish_summary(&d, record))
-                                .and_then(|(context, id)| {
-                                    self.adopt_understanding(context).map(|state| (state, id))
-                                }) {
-                                Ok((context, id)) => {
-                                    result["understanding"] = context;
-                                    result["summary_note_source"] = json!(id);
+                            let published = record.and_then(|record| {
+                                if record.source_id == reading_scope_key(None) {
+                                    let (context, id) = self.publish_summary(&d, record)?;
+                                    result["understanding"] = self.adopt_understanding(context)?;
+                                    Ok(id)
+                                } else {
+                                    self.archive_selection_summary(&d, record)
                                 }
+                            });
+                            match published {
+                                Ok(id) => result["summary_note_source"] = json!(id),
                                 Err(error) => result["cache_warning"] = json!(error),
                             }
                         }

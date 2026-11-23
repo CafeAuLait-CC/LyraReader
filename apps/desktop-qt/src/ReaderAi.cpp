@@ -605,12 +605,12 @@ void ReaderController::cancelAi() {
     m_aiState.insert(QStringLiteral("cancelRequested"),true);
     m_aiState.insert(QStringLiteral("status"),tr("Cancelling…"));emit aiStateChanged();submit(QStringLiteral("ai_cancel"));
 }
-void ReaderController::finishAiChat(const QString &state) {
+void ReaderController::finishAiChat(const QString &state,const QString &noteSource) {
     if(!m_aiState.value(QStringLiteral("activeChat")).toBool())return;
     m_aiState.insert(QStringLiteral("activeChat"),false);
     if(chatDraftPending())m_chatDraftTimer.start();
     auto turns=m_aiState.value(QStringLiteral("chatTurns")).toList();const auto plan=m_aiState.value(QStringLiteral("responsePlan")).toMap();
-    turns.append(QVariantMap{{QStringLiteral("question"),m_aiState.value(QStringLiteral("activeQuestion"))},{QStringLiteral("answer"),m_aiState.value(QStringLiteral("output"))},{QStringLiteral("reasoning"),m_aiState.value(QStringLiteral("reasoning"))},{QStringLiteral("usage"),m_aiState.value(QStringLiteral("usage"))},{QStringLiteral("state"),state},{QStringLiteral("sources"),plan.value(QStringLiteral("sources"))},{QStringLiteral("source_pages"),plan.value(QStringLiteral("source_pages"))},{QStringLiteral("generation"),m_generation}});
+    turns.append(QVariantMap{{QStringLiteral("question"),m_aiState.value(QStringLiteral("activeQuestion"))},{QStringLiteral("answer"),m_aiState.value(QStringLiteral("output"))},{QStringLiteral("reasoning"),m_aiState.value(QStringLiteral("reasoning"))},{QStringLiteral("usage"),m_aiState.value(QStringLiteral("usage"))},{QStringLiteral("state"),state},{QStringLiteral("sources"),plan.value(QStringLiteral("sources"))},{QStringLiteral("source_pages"),plan.value(QStringLiteral("source_pages"))},{QStringLiteral("generation"),m_generation},{QStringLiteral("note_source"),noteSource}});
     const auto limit=m_data.value(QStringLiteral("ai_history_limit")).toUInt();
     // Bound question/answer/reasoning text to eight MiB of UTF-16. The Rust
     // planner owns the smaller request-history character budget and truncation.
@@ -777,12 +777,13 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
     const auto batch=result.toMap();
     auto understanding=batch.value(QStringLiteral("understanding")).toMap();
     const bool updatedUnderstanding=!understanding.isEmpty();
+    if(batch.contains(QStringLiteral("summary_note_source")))
+        m_aiState.insert(QStringLiteral("summaryNoteSource"),batch.value(QStringLiteral("summary_note_source")));
     if(updatedUnderstanding) {
         if(understanding.value(QStringLiteral("phase"))!=QStringLiteral("ready"))
             understanding.insert(QStringLiteral("plan"),m_documentReading.value(QStringLiteral("plan")));
         m_documentReading=understanding;
         m_readingChoiceShown=true;m_readingChoicePending=false;
-        m_aiState.insert(QStringLiteral("summaryNoteSource"),batch.value(QStringLiteral("summary_note_source")));
     }
     const auto chatCheckpoint=batch.value(QStringLiteral("chat_checkpoint")).toMap();
     if(!chatCheckpoint.isEmpty()) {
@@ -850,7 +851,12 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
         }
     }
     if(m_aiState.value(QStringLiteral("limited")).toBool())m_aiState.insert(QStringLiteral("status"),tr("Response exceeded the 8 MiB display budget; request cancelled."));
-    if(!m_aiState.value(QStringLiteral("running")).toBool()){finishAiChat(m_aiState.value(QStringLiteral("chatOutcome")).toString());retainAiResult(m_aiState.value(QStringLiteral("chatOutcome")).toString());m_aiTimer.stop();}
+    if(!m_aiState.value(QStringLiteral("running")).toBool()) {
+        const auto outcome=m_aiState.value(QStringLiteral("chatOutcome")).toString();
+        const auto savedChatState=chatCheckpoint.value(QStringLiteral("state"),outcome).toString();
+        finishAiChat(savedChatState,chatCheckpoint.value(QStringLiteral("note_source")).toString());
+        retainAiResult(outcome);m_aiTimer.stop();
+    }
     if(m_aiState.value(QStringLiteral("responseView")).toString()==QStringLiteral("region") && (output!=priorOutput || !m_aiState.value(QStringLiteral("running")).toBool()))markRegionDirty();
     QPointer<ReaderController> alive(this);
     const auto generation=m_generation;

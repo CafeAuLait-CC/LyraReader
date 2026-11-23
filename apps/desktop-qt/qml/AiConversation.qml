@@ -12,6 +12,7 @@ AiReadingScrollView {
     readonly property var owner: app.currentReader
     readonly property bool active: !!viewState.running && viewState.responseView === "chat"
     signal citation(string link, var plan)
+    signal keepNote(string source)
     clip: true
     function followAnswer() {
         if (!visible || !followTail) return;
@@ -79,6 +80,13 @@ AiReadingScrollView {
                     if ([Qt.Key_Up, Qt.Key_PageUp, Qt.Key_Home].indexOf(key) >= 0) conversation.followTail = false;
                 }
                 onCitation: function(link, plan) { conversation.citation(link, plan); }
+                }
+                Button {
+                    objectName: "keepAiChatNote" + index
+                    text: qsTr("Keep as note")
+                    visible: !!modelData.note_source && modelData.state === "finished"
+                    enabled: visible && !conversation.owner.readingNoteDraft.id
+                    onClicked: conversation.keepNote(modelData.note_source)
                 }
                 Rectangle { Layout.fillWidth: true; height: 1; color: app.colors.separator }
             }

@@ -2857,6 +2857,11 @@ private slots:
         MockChatServer server;QVERIFY(server.listen());
         server.responses.append({{MockChatServer::delta({{"content","Synthetic selected summary"}}),
                                   QByteArray("data: [DONE]\n\n")},0,200});
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto cache=scratch.filePath("cache");
+        const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");
+        const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});
+        qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",cache.toUtf8());
         NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);
         view.workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/two-column-line-numbers.pdf"));
         auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()>0);QTRY_COMPARE(reader->pendingCommands(),0);
@@ -2907,6 +2912,24 @@ private slots:
         const auto request=server.requests.first();QCOMPARE(request.mid(request.indexOf("\r\n\r\n")+4),wire);
         QVERIFY(reader->aiState().value("output").toString().contains("Synthetic selected summary"));
         reader->setAiInput("summaryDetail","Detailed");QVERIFY(!reader->startAi("local",plan));
+        auto *keep=window->findChild<QObject *>("keepAiSummaryNote"),*notes=window->findChild<QObject *>("aiReadingNotes");
+        QVERIFY(keep && notes);
+        QTRY_VERIFY(keep->property("enabled").toBool() && keep->property("visible").toBool());
+        const auto sourceId=reader->aiState().value("summaryNoteSource").toString();QVERIFY(!sourceId.isEmpty());
+        QVERIFY(QMetaObject::invokeMethod(keep,"clicked"));
+        const auto note=[&]{return notes->property("note").toMap();};
+        QTRY_COMPARE(note().value("content").toString(),QString("Synthetic selected summary"));
+        QCOMPARE(note().value("source_pages").toList(),QVariantList{1});
+        QDirIterator understanding(cache,{"document-understanding-v2.json"},QDir::Files,QDirIterator::Subdirectories);
+        QVERIFY(!understanding.hasNext());
+        QDirIterator files(cache,{"ai-reading-workspace.json"},QDir::Files,QDirIterator::Subdirectories);
+        QVERIFY(files.hasNext());QFile archive(files.next());QVERIFY(archive.open(QIODevice::ReadOnly));
+        const auto records=QJsonDocument::fromJson(archive.readAll()).object().value("records").toArray();
+        const auto source=std::find_if(records.cbegin(),records.cend(),[&](const auto &record){return record.toObject().value("id").toString()==sourceId;});
+        QVERIFY(source!=records.cend());
+        QCOMPARE((*source).toObject().value("source_id").toString(),QString("selection:1:0:%1").arg(end));
+        QCOMPARE((*source).toObject().value("originals").toArray(),QJsonArray{exact});
+        QVERIFY(QMetaObject::invokeMethod(notes,"close"));
         QCOMPARE(server.requests.size(),1);
     }
 
@@ -3105,7 +3128,8 @@ private slots:
         QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
         const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");
         const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});
-        qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
+        const auto cache=scratch.filePath("cache");
+        qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",cache.toUtf8());
         NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);
         view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
         QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
@@ -3131,6 +3155,7 @@ private slots:
         };
         review("Where is the body text? CHAT_ALPHA");reply("First synthetic ALPHA answer [p.1]",1);
         const auto first=reader->aiState().value("chatSession").toString();QVERIFY(!first.isEmpty());
+        const auto firstTurn=reader->aiState().value("chatTurns").toList().first().toMap().value("note_source").toString();QVERIFY(!firstTurn.isEmpty());
         auto *newChat=window->findChild<QObject *>("clearAiConversation");QVERIFY(newChat);
         QVERIFY(QMetaObject::invokeMethod(newChat,"clicked"));
         QVERIFY(reader->aiState().value("input").toMap().value("chatQuestion").toString().isEmpty());
@@ -3161,16 +3186,38 @@ private slots:
         QCOMPARE(reader->aiState().value("chatTurns").toList().size(),1);
         QVERIFY(reader->aiState().value("chatTurns").toList().first().toMap().value("answer").toString().contains("ALPHA"));
         QVERIFY(!reader->aiState().value("chatReadOnly").toBool());
+        QCOMPARE(reader->aiState().value("chatTurns").toList().first().toMap().value("note_source").toString(),firstTurn);
+        auto *keep=visualItem(window->contentItem(),"keepAiChatNote0");
+        auto *notes=window->findChild<QObject *>("aiReadingNotes");QVERIFY(keep && notes);
+        QVERIFY(keep->isVisible());QVERIFY(QMetaObject::invokeMethod(keep,"clicked"));
+        const auto note=[&]{return notes->property("note").toMap();};
+        QTRY_COMPARE(note().value("content").toString(),QString("First synthetic ALPHA answer [p.1]"));
+        QCOMPARE(note().value("source_pages").toList(),QVariantList{1});
+        QTRY_COMPARE(reader->pendingCommands(),0);const auto savedNote=note().value("id").toString();QVERIFY(!savedNote.isEmpty());
+        QVERIFY(QMetaObject::invokeMethod(notes,"close"));QTRY_VERIFY(!notes->property("visible").toBool());
+        QVERIFY(QMetaObject::invokeMethod(keep,"clicked"));QTRY_COMPARE(note().value("id").toString(),savedNote);
+        QVERIFY(QMetaObject::invokeMethod(notes,"close"));QTRY_VERIFY(!notes->property("visible").toBool());
+        QCOMPARE(server.requests.size(),2);
         review("Which page contains BODY_TEXT? CHAT_CONTINUE");
         QVERIFY(payload().contains("First synthetic ALPHA answer"));QVERIFY(!payload().contains("Second synthetic BETA answer"));
         QCOMPARE(server.requests.size(),2);reply("Continued synthetic ALPHA answer",3);
 
+        QDirIterator files(cache,{"ai-reading-workspace.json"},QDir::Files,QDirIterator::Subdirectories);
+        QVERIFY(files.hasNext());QFile archive(files.next());QVERIFY(archive.open(QIODevice::ReadOnly));
+        const auto savedWorkspace=archive.readAll();archive.close();
         QFile source(path);QVERIFY(source.open(QIODevice::WriteOnly|QIODevice::Append));
         const QByteArray externalComment("\n% Local fixture revision\n");QCOMPARE(source.write(externalComment),externalComment.size());source.close();
         reopen();choose(first);QVERIFY(reader->aiState().value("chatReadOnly").toBool());
         QCOMPARE(reader->aiState().value("chatTurns").toList().size(),2);
         QCOMPARE(reader->aiState().value("chatTurns").toList().first().toMap().value("state").toString(),QString("archived"));
         QVERIFY(reader->aiState().value("chatTurns").toList().first().toMap().value("sources").toList().isEmpty());
+        QVERIFY(reader->aiState().value("chatTurns").toList().first().toMap().value("note_source").toString().isEmpty());
+        QSignalSpy rejected(reader,&ReaderController::commandFinished);
+        const auto command=reader->submit("ai_reading_keep",{{"id",firstTurn}});
+        QTRY_COMPARE(rejected.size(),1);QCOMPARE(rejected.at(0).at(0).toULongLong(),command);
+        const auto error=rejected.at(0).at(3).toString();
+        QVERIFY2(error.contains("PDF changed outside LyraReader"),qPrintable(error));
+        QVERIFY(archive.open(QIODevice::ReadOnly));QCOMPARE(archive.readAll(),savedWorkspace);
         QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QVERIFY(plan().isEmpty());QCOMPARE(server.requests.size(),3);
     }
 

@@ -28,7 +28,7 @@ Dialog {
     function current() {
         return reader && reader === app.currentReader && generation === reader.documentGeneration;
     }
-    function browse(summary) {
+    function browse(source) {
         reader = app.currentReader;
         generation = reader.documentGeneration;
         open();
@@ -36,7 +36,7 @@ Dialog {
         if (draft.id) {
             preferred = draft.id;
             refresh();
-        } else if (summary) command = reader.submit("ai_reading_keep_summary", {id: summary});
+        } else if (source) command = reader.submit("ai_reading_keep", {id: source});
         else refresh();
     }
     function refresh() {
@@ -106,7 +106,7 @@ Dialog {
             notes.command = 0;
             notes.failure = error;
             if (error) return;
-            if (operation === "ai_reading_keep_summary") {
+            if (operation === "ai_reading_keep") {
                 notes.preferred = result.id;
                 notes.refresh();
             } else if (operation === "ai_reading_notes") {

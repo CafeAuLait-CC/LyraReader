@@ -72,7 +72,7 @@ impl ChatArchive {
 }
 
 #[derive(Deserialize, Serialize)]
-pub(super) struct TranslationScope {
+pub(super) struct ReadingScope {
     pub selection: Option<AiSelectionRecord>,
     pub language: String,
     pub detail: String,
@@ -83,8 +83,8 @@ pub(super) struct PendingTranslation {
     request_pages: Vec<Vec<u32>>,
 }
 
-impl TranslationScope {
-    pub fn capture(
+impl ReadingScope {
+    pub fn capture_translation(
         self,
         plan: &AiPlanRecord,
         source_hash: String,
@@ -472,7 +472,8 @@ impl DesktopDocument {
                         (true, _) => "partial",
                     };
                     json!({"id":turn.id,"question":turn.question,"answer":turn.content,
-                    "state":state,"sources":sources})
+                    "state":state,"sources":sources,
+                    "note_source":(state == "finished" && !turn.content.trim().is_empty()).then_some(&turn.id)})
                 })
                 .collect();
             Ok(
@@ -506,6 +507,8 @@ impl DesktopDocument {
                 || turn.question.trim().chars().take(120).collect(),
                 |record| record.title.clone(),
             );
+            let checkpoint = json!({"modified":modified,"state":turn.state,
+                "note_source":(turn.state == "finished").then_some(&turn.id)});
             let (original_pages, originals) = turn
                 .sources
                 .into_iter()
@@ -542,7 +545,7 @@ impl DesktopDocument {
                     ..ReadingRecord::default()
                 },
             ])?;
-            Ok(json!({"modified":modified}))
+            Ok(checkpoint)
         })
     }
 

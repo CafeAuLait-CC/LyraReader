@@ -23,12 +23,13 @@ impl SummaryCapture {
         source_hash: String,
         language: String,
         detail: String,
+        selection: Option<lyra_reader_ai::SelectionRange>,
     ) -> Result<Self, String> {
         Ok(Self {
             record: ReadingRecord {
                 id: crate::marks::uuid()?,
                 kind: "summary".into(),
-                source_id: reading_scope_key(None),
+                source_id: reading_scope_key(selection),
                 title: plan.document_title.clone(),
                 pages: plan.source_pages.clone(),
                 language,

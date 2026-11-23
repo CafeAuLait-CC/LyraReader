@@ -16,16 +16,34 @@ pub(super) struct NoteDraft {
 }
 
 impl DesktopDocument {
-    pub(super) fn keep_summary_note(
+    pub(super) fn archive_selection_summary(
+        &self,
+        source: &Arc<LyraReaderDocument>,
+        summary: ReadingRecord,
+    ) -> Result<String, String> {
+        self.update_reading_workspace(source, |workspace, sha, _| {
+            if summary.source_hash != sha {
+                return Err("The selected summary no longer matches this document.".into());
+            }
+            let record = workspace.put(summary)?;
+            if workspace.task_selection(&record.id)?.is_none() {
+                return Err("The selected summary is missing its passage.".into());
+            }
+            Ok(record.id)
+        })
+    }
+
+    pub(super) fn keep_reading_note(
         &self,
         source: &Arc<LyraReaderDocument>,
         id: &str,
     ) -> Result<Value, String> {
         self.update_reading_workspace(source, |workspace, sha, cache| {
-            let archived = workspace.records().into_iter().find(|record| {
-                record.id == id && record.kind == "summary" && record.source_hash == sha
-            });
-            let summary = match archived {
+            let archived = workspace
+                .records()
+                .into_iter()
+                .find(|record| record.id == id);
+            let original = match archived {
                 Some(record) => record,
                 None => {
                     let mut record = crate::analysis_cache::summary_record(
@@ -44,7 +62,26 @@ impl DesktopDocument {
                     workspace.put(record)?
                 }
             };
-            let note = workspace.keep(summary, crate::marks::uuid()?)?;
+            if !matches!(original.kind.as_str(), "summary" | "message")
+                || original.source_hash != sha
+                || original.status != "finished"
+                || original.content.trim().is_empty()
+                || original
+                    .pages
+                    .iter()
+                    .any(|page| *page > source.page_count())
+            {
+                return Err(
+                    "This answer is incomplete or belongs to an earlier PDF revision.".into(),
+                );
+            }
+            let mut original = original;
+            if original.title.is_empty() && original.kind == "message" {
+                original.title = original.question.clone();
+            }
+            original.originals.clear();
+            original.original_pages.clear();
+            let note = workspace.keep(original, crate::marks::uuid()?)?;
             Ok(json!({"id":note.id,"title":note.title}))
         })
     }

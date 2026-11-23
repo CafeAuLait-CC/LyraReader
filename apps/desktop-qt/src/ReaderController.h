@@ -327,7 +327,7 @@ private:
     bool m_readingChoiceShown=false,m_readingChoicePending=false;
     quint64 m_readingPreviewId=0,m_readingStartId=0,m_readingPollId=0,m_readingCancelId=0;
     void handleAiCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error);
-    void finishAiChat(const QString &state);
+    void finishAiChat(const QString &state,const QString &noteSource={});
     void retainAiResult(const QString &state);
     QTimer m_aiTimer;
     QVariantMap m_aiState;
