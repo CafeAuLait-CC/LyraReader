@@ -1013,10 +1013,7 @@ impl DesktopDocument {
                     let eligible = match request.action {
                         AiActionRecord::DocumentChat => r.get("reading").is_none(),
                         AiActionRecord::SummarizeSelection => reading == Some("summary"),
-                        AiActionRecord::TranslateSelection => {
-                            reading == Some("translation")
-                                && r["reading"]["saved_translation"].is_null()
-                        }
+                        AiActionRecord::TranslateSelection => reading == Some("translation"),
                         AiActionRecord::RegionQuestion => {
                             r.get("reading").is_none()
                                 && request.region.as_ref().is_some_and(|region| {
@@ -1070,6 +1067,10 @@ impl DesktopDocument {
                             );
                         }
                         self.replay_translation_source(&d, id, &mut request)?;
+                        if account.is_some() && request.action != AiActionRecord::TranslateSelection
+                        {
+                            return Err("ChatGPT retranslation requires a saved selection.".into());
+                        }
                     }
                     let limit = lyra_reader_ai::chat::MAX_SELECTION_CHARS as u64;
                     let selected = request.selection.is_some_and(|range| {
@@ -1169,6 +1170,12 @@ impl DesktopDocument {
             ),
             "ai_summary_prepare" => {
                 let mut request = crate::region::request(r["request"].clone())?;
+                let account = chatgpt_account(&r["request"])?;
+                if account.is_some() {
+                    request.base_url = "https://api.openai.com/v1".into();
+                    request.reasoning_mode = "default".into();
+                    request.reasoning_encoding = "none".into();
+                }
                 // Only completed, matching document knowledge may enrich this local preview.
                 // Questions, selections and chat history are never forwarded to a summary unit.
                 request.action = AiActionRecord::SummarizeDocument;
@@ -1176,7 +1183,7 @@ impl DesktopDocument {
                 request.document_knowledge_pages.clear();
                 self.enrich_reading(&mut request, &d.document_identity().sha256)?;
                 let (mut preview, capture) =
-                    crate::summary::prepare(&d, arg(&r, "unit")?, request)?;
+                    crate::summary::prepare(&d, arg(&r, "unit")?, request, account)?;
                 let warning = match self
                     .with_summary_store(&d, true, |store, cache| Ok(store.prepare(capture, cache)))
                 {
@@ -1202,6 +1209,12 @@ impl DesktopDocument {
                     );
                 }
                 let mut request = crate::region::request(r["request"].clone())?;
+                let account = chatgpt_account(&r["request"])?.map(str::to_owned);
+                if account.is_some() {
+                    request.base_url = "https://api.openai.com/v1".into();
+                    request.reasoning_mode = "default".into();
+                    request.reasoning_encoding = "none".into();
+                }
                 request.action = AiActionRecord::SummarizeDocument;
                 request.document_knowledge_text = None;
                 request.document_knowledge_pages.clear();
@@ -1210,7 +1223,7 @@ impl DesktopDocument {
                     self.summary_batch
                         .lock()
                         .map_err(|_| "Summary batch state is unavailable")?
-                        .prepare(&d, arg(&r, "batch")?, request, store, cache)
+                        .prepare(&d, arg(&r, "batch")?, request, account, store, cache)
                 })
             }
             "ai_summary_batch_start" => {
@@ -1231,10 +1244,22 @@ impl DesktopDocument {
                     .map(Path::to_path_buf)
                     .map(Ok)
                     .unwrap_or_else(crate::document_cache::default_root)?;
+                let account = chatgpt_account(&r)?;
+                let credential = if account.is_some() {
+                    "chatgpt_access_token"
+                } else {
+                    "api_key"
+                };
                 self.summary_batch
                     .lock()
                     .map_err(|_| "Summary batch state is unavailable")?
-                    .start(&d, &text(&r, "token")?, text(&r, "api_key")?, root)
+                    .start(
+                        &d,
+                        &text(&r, "token")?,
+                        text(&r, credential)?,
+                        account,
+                        root,
+                    )
             }
             "ai_summary_batch_poll" => self.with_summary_store(&d, false, |store, cache| {
                 self.summary_batch
@@ -1266,6 +1291,12 @@ impl DesktopDocument {
                 if account.is_some() {
                     let eligible = match (plan.action, r["plan"]["kind"].as_str()) {
                         (AiActionRecord::DocumentChat, None) => true,
+                        (
+                            AiActionRecord::SummarizeAbstract
+                            | AiActionRecord::SummarizeSection
+                            | AiActionRecord::SummarizePageLine,
+                            None,
+                        ) => true,
                         (AiActionRecord::RegionQuestion, None) => {
                             plan.parts.len() == 1 && plan.parts[0].image.is_some()
                         }
@@ -5257,6 +5288,51 @@ mod tests {
         assert_eq!(fs::read(&fixture.path).unwrap(), before);
     }
 
+    #[test]
+    fn chatgpt_summary_units_and_batch_use_the_same_reviewed_bodies() {
+        let fixture = Fixture::new("multipage.pdf");
+        let doc = fixture.open();
+        let mut request = summary_settings();
+        request["chatgpt_account"] = json!("synthetic-layered-connection");
+        let mut expected = Vec::new();
+        for index in 0..3 {
+            let unit = doc.command(json!({"op":"ai_summary_prepare","unit":{"layer":"Page","index":index},"request":request})).unwrap();
+            assert_eq!(
+                unit["plan"]["chatgpt_account"],
+                "synthetic-layered-connection"
+            );
+            assert_eq!(
+                unit["plan"]["endpoint"],
+                lyra_reader_ai::openai::CHATGPT_RESPONSES_ENDPOINT
+            );
+            expected.push(unit["plan"]["parts"][0]["wire_body"].clone());
+        }
+        let batch = doc.command(json!({"op":"ai_summary_batch_prepare","batch":{"layer":"Page","offset":0},"request":request})).unwrap();
+        assert_eq!(
+            batch["plan"]["chatgpt_account"],
+            "synthetic-layered-connection"
+        );
+        for (index, body) in expected.into_iter().enumerate() {
+            assert_eq!(batch["plan"]["parts"][index]["wire_body"], body);
+            let wire: Value = serde_json::from_str(body.as_str().unwrap()).unwrap();
+            assert_eq!(wire["store"], false);
+            assert!(wire["input"].is_array());
+        }
+        let token = &batch["plan"]["token"];
+        let other = json!({"op":"ai_summary_batch_start","token":token,
+            "chatgpt_account":"another-connection","chatgpt_access_token":"synthetic-token"});
+        assert!(
+            doc.command(other)
+                .unwrap_err()
+                .contains("connection changed")
+        );
+        assert!(
+            doc.command(json!({"op":"ai_summary_batch_start","token":token,"api_key":"synthetic"}))
+                .is_err()
+        );
+        assert!(!doc.summary_batch.lock().unwrap().is_running());
+        assert!(doc.ai.lock().unwrap().is_none());
+    }
     #[test]
     fn summary_batch_admission_cancel_rejects_a_prepared_start_and_allows_a_new_preview() {
         let fixture = Fixture::new("multipage.pdf");

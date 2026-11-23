@@ -367,6 +367,7 @@ void ReaderController::invalidateAiPlan() {
     m_regionContinuationPending=false;m_regionContinuationSettings.clear();
     ++m_aiPreviewEpoch;m_aiPreviewId=0;m_aiState.remove(QStringLiteral("plan"));
     m_aiState.remove(QStringLiteral("previewChatGptAccount"));
+    m_aiState.remove(QStringLiteral("previewLayeredSummary"));
     m_summaryBatchPreparedToken.clear();
     m_translationPreparedToken.clear();if(m_document)lyra_reader_desktop_cancel_translation(m_document.get());
     if(m_translationActive){cancelInplaceTranslation();return;}
@@ -574,6 +575,7 @@ void ReaderController::prepareAi(const QVariantMap &request,const QVariantMap &u
     m_aiState.insert(QStringLiteral("planSent"),false);
     m_aiState.insert(QStringLiteral("previewView"),previewView);
     m_aiState.insert(QStringLiteral("previewChatGptAccount"),input.value(QStringLiteral("chatgpt_account")));
+    m_aiState.insert(QStringLiteral("previewLayeredSummary"),!unit.isEmpty());
     if(previewView==QStringLiteral("note"))m_aiState.remove(QStringLiteral("noteSuggestion"));
     m_aiState.insert(QStringLiteral("statusView"),m_aiState.value(QStringLiteral("previewView")));
     m_aiState.remove(QStringLiteral("plan"));m_aiState.insert(QStringLiteral("status"),tr("Preparing request locally…"));

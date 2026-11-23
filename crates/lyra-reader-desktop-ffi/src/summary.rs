@@ -4,7 +4,7 @@
 //! Explicit single-unit preparation builds a preview over the same shared planner, not a send.
 use lyra_reader_ffi::api::*;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -292,6 +292,7 @@ pub(crate) fn prepare(
     document: &std::sync::Arc<LyraReaderDocument>,
     request: InspectRequest,
     settings: AiPlanRequestRecord,
+    account: Option<&str>,
 ) -> Result<(Value, crate::summary_store::Capture), String> {
     let units = Units::new(document, request.layer)?;
     let row = units.row(request.index)?;
@@ -310,8 +311,12 @@ pub(crate) fn prepare(
             .clone()
             .unwrap_or_else(|| "This summary has no extractable text.".into())
     })?;
-    let plan = render_ai_plan(plan, AiWireTransport::ChatCompletions)
-        .map_err(|error| error.to_string())?;
+    let plan = if account.is_some() {
+        render_chatgpt_plan(plan)
+    } else {
+        render_ai_plan(plan, AiWireTransport::ChatCompletions)
+    }
+    .map_err(|error| error.to_string())?;
     if plan.parts.len() != 1 {
         return Err("A single summary unit must contain exactly one request.".into());
     }
@@ -324,7 +329,7 @@ pub(crate) fn prepare(
         plan: AiPlanRecord,
     }
     let capture = crate::summary_store::Capture::new(document, &row, &unit, &language, &plan)?;
-    let preview = serde_json::to_value(Preview {
+    let mut preview = serde_json::to_value(Preview {
         id: row.id,
         title: unit.title,
         page_span: span,
@@ -332,5 +337,8 @@ pub(crate) fn prepare(
         plan,
     })
     .map_err(|error| error.to_string())?;
+    if let Some(account) = account {
+        preview["plan"]["chatgpt_account"] = json!(account);
+    }
     Ok((preview, capture))
 }

@@ -105,6 +105,7 @@ struct Row {
 struct Prepared {
     scope: u64,
     token: String,
+    account: Option<String>,
     source: Weak<LyraReaderDocument>,
     rows: Vec<Row>,
     append: bool,
@@ -124,6 +125,7 @@ pub(crate) struct Batch {
     source: Weak<LyraReaderDocument>,
     rows: Vec<Row>,
     token: String,
+    account: Option<String>,
     // Present only between explicit Send and completion/cancellation. Never serialized.
     key: Option<String>,
     audit_root: Option<PathBuf>,
@@ -150,6 +152,7 @@ impl Batch {
             source: Weak::new(),
             rows: Vec::new(),
             token: String::new(),
+            account: None,
             key: None,
             audit_root: None,
             concurrency: 0,
@@ -165,6 +168,7 @@ impl Batch {
         document: &Arc<LyraReaderDocument>,
         request: PrepareRequest,
         settings: AiPlanRequestRecord,
+        account: Option<String>,
         store: &mut crate::summary_store::Store,
         cache: &crate::document_cache::DocumentCache,
     ) -> Result<Value, String> {
@@ -245,7 +249,13 @@ impl Batch {
             let plan = unit
                 .plan
                 .clone()
-                .map(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions))
+                .map(|plan| {
+                    if account.is_some() {
+                        render_chatgpt_plan(plan)
+                    } else {
+                        render_ai_plan(plan, AiWireTransport::ChatCompletions)
+                    }
+                })
                 .transpose()
                 .map_err(|error| error.to_string())?;
             if plan.as_ref().is_some_and(|plan| plan.parts.len() != 1) {
@@ -381,6 +391,9 @@ impl Batch {
             plan.note = Some(result.note.clone());
             let mut value = serde_json::to_value(plan).map_err(|error| error.to_string())?;
             let object = value.as_object_mut().ok_or("Invalid summary preview.")?;
+            if let Some(account) = &account {
+                object.insert("chatgpt_account".into(), json!(account));
+            }
             object.insert("kind".into(), json!("summary_batch"));
             object.insert("token".into(), json!(token));
             object.insert("summary_rows".into(), json!(preview_rows));
@@ -394,6 +407,7 @@ impl Batch {
             self.prepared = Some(Prepared {
                 scope,
                 token,
+                account,
                 source: Arc::downgrade(document),
                 rows,
                 append,
@@ -408,6 +422,7 @@ impl Batch {
         document: &Arc<LyraReaderDocument>,
         token: &str,
         key: String,
+        account: Option<&str>,
         audit_root: PathBuf,
     ) -> Result<Value, String> {
         if self.running {
@@ -419,6 +434,9 @@ impl Batch {
             .ok_or("Preview the summary batch before sending.")?;
         if prepared.token != token {
             return Err("The summary preview changed. Preview it again before sending.".into());
+        }
+        if prepared.account.as_deref() != account {
+            return Err("The ChatGPT connection changed. Preview the summary batch again.".into());
         }
         if self.scope.cancelled(prepared.scope) {
             self.prepared = None;
@@ -456,6 +474,7 @@ impl Batch {
         }
         self.source = prepared.source;
         self.active_scope = prepared.scope;
+        self.account = prepared.account;
         self.token = token.to_owned();
         self.concurrency = prepared.concurrency;
         self.key = Some(key);
@@ -501,7 +520,12 @@ impl Batch {
                 .as_ref()
                 .ok_or("The summary audit directory is unavailable.")?;
             let observer = crate::audit::observer(root.clone(), plan.action, plan.is_local);
-            match start_ai_request_audited(plan, key.clone(), false, Some(observer)) {
+            let job = if self.account.is_some() {
+                start_chatgpt_request_audited(plan, key.clone(), observer)
+            } else {
+                start_ai_request_audited(plan, key.clone(), false, Some(observer))
+            };
+            match job {
                 Ok(job) => {
                     row.job = Some(job);
                     row.view.state = State::Sending;

@@ -319,6 +319,8 @@ private slots:
         QVERIFY(!accounts->useForChat());
         accounts->setUseForSelection(true);
         QVERIFY(!accounts->useForSelection());
+        accounts->setUseForLayeredSummaries(true);
+        QVERIFY(!accounts->useForLayeredSummaries());
         QVERIFY(accounts->accounts().isEmpty());
         capturedChatGptUrl.clear();
         QDesktopServices::setUrlHandler("https", this, "captureChatGptUrl");
@@ -646,6 +648,41 @@ private slots:
         QVERIFY(!reader->aiState().contains("plan"));
         QVERIFY(!reader->startAi("synthetic-only", plan));
         QVERIFY(reader->translationOverlays().isEmpty());
+    }
+    void chatGptLayeredSummaryBatchRequiresTheReviewedConnection() {
+        QTemporaryDir scratch;
+        QVERIFY(scratch.isValid());
+        const auto path = scratch.filePath("synthetic-batch.pdf");
+        QVERIFY(QFile::copy(root + "/tests/fixtures/multipage.pdf", path));
+        NativeCorpus::Viewer view;
+        QVERIFY(view.window);
+        auto *accounts = view.workspace.chatGptAccounts();
+        QVERIFY(!accounts->connected());
+        view.workspace.openFile(QUrl::fromLocalFile(path));
+        auto *reader = view.workspace.activeReader();
+        QTRY_COMPARE(reader->pageCount(), 3);
+        QTRY_COMPARE(reader->pendingCommands(), 0);
+        const QVariantMap request{{"current_page", 0}, {"base_url", "http://127.0.0.1:1/v1"},
+                                  {"model", "synthetic-layered-model"}, {"chatgpt_account", "synthetic-layered-registration"},
+                                  {"document_knowledge_pages", QVariantList{}},
+                                  {"reasoning_mode", "default"}, {"reasoning_encoding", "none"}};
+        QVERIFY(reader->prepareSummaryBatch("Page", 0, request, reader->documentGeneration(), -1));
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(), 0, 10000);
+        const auto state = reader->aiState();
+        const auto plan = state.value("plan").toMap();
+        QVERIFY2(!plan.isEmpty(), qPrintable(state.value("status").toString()));
+        QCOMPARE(plan.value("kind").toString(), QString("summary_batch"));
+        QCOMPARE(plan.value("endpoint").toString(), QString("https://api.openai.com/v1/responses"));
+        QCOMPARE(plan.value("parts").toList().size(), 3);
+
+        QVERIFY(QMetaObject::invokeMethod(view.window, "sendAi", Q_ARG(QVariant, QVariant::fromValue(reader)),
+                                         Q_ARG(QVariant, plan), Q_ARG(QVariant, QString()), Q_ARG(QVariant, QString())));
+        QCOMPARE(view.window->property("credentialReadId").toDouble(), -1.0);
+        QVERIFY(view.window->property("operationStatus").toString().contains("Check the ChatGPT connection"));
+        QVERIFY(QMetaObject::invokeMethod(accounts, "profileChanged"));
+        QTRY_COMPARE(reader->pendingCommands(), 0);
+        QVERIFY(!reader->aiState().contains("plan"));
+        QVERIFY(!reader->startAi("synthetic-only",plan));
     }
     void objectDragKeepsTheColourBehindTransparentPixels() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("alpha-drag.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;window->setProperty("paperAppearance","original");view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(!reader->loading() && reader->pageCount()==1 && !reader->pendingCommands());QVERIFY(QMetaObject::invokeMethod(window,"setSecondaryRow",Q_ARG(QVariant,"edit"),Q_ARG(QVariant,false)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(settleReaderViewport(window));const auto model=reader->data().value("content_objects").toMap();QVariantMap title;for(const auto &v:model.value("items").toList())if(v.toMap().value("text").toString().contains("LyraReader fixture")){title=v.toMap();break;}QVERIFY(!title.isEmpty());const auto b=title.value("bounds").toMap();const QRectF bounds(b.value("x").toDouble(),b.value("y").toDouble(),b.value("width").toDouble(),b.value("height").toDouble());auto *drag=window->findChild<ContentDragItem *>("contentDragPreview");auto *pointer=visualItem(window->contentItem(),"contentPointer0");QVERIFY(drag && pointer);const auto colour=[&]{const auto image=window->grabWindow();if(image.isNull())return QColor();const auto p=pointer->mapToScene(QPointF(371,261)*window->property("zoom").toDouble());return image.pixelColor(qRound(p.x()*image.width()/window->width()),qRound(p.y()*image.height()/window->height()));};QTRY_VERIFY(colour().red()>100 && colour().green()<150);const auto original=colour();drag->prepare(0,title.value("id").toString(),model.value("revision").toString(),bounds);const auto region=bounds.adjusted(-2,-2,2,2);drag->setOffset(QPointF(370-region.x(),260-region.y()));QTRY_COMPARE_WITH_TIMEOUT(drag->status(),1,15000);QTest::qWait(100);const auto painted=colour();qInfo()<<"Transparent drag sample"<<original<<painted;QVERIFY2(qAbs(painted.red()-original.red())<6 && qAbs(painted.green()-original.green())<6 && qAbs(painted.blue()-original.blue())<6,"Transparent margins must preserve the coloured page below the dragged object");drag->cancel();QVERIFY(!reader->hasUnsavedChanges());
@@ -3630,6 +3667,19 @@ private slots:
         QCOMPARE(saved.value("content").toString(),QString("PARTIAL_RAW_FROM_FIRST_REQUEST"));
         QCOMPARE(saved.value("pages").toArray().toVariantList(),parts.first().toMap().value("pages").toList());
         QVERIFY(saved.value("originals").toArray().isEmpty());
+
+        // The saved scope, not the currently selected action or passage, controls dispatch.
+        const auto wholeId = rows.at(1).toObject().value("id").toString();
+        QVERIFY(!wholeId.isEmpty());
+        reader->prepareAi({{"action", "TranslateSelection"}, {"current_page", 0}, {"base_url", server.baseUrl()},
+                           {"model", "synthetic"}, {"chatgpt_account", "synthetic-history-registration"},
+                           {"document_knowledge_pages", QVariantList{}}, {"reasoning_mode", "default"},
+                           {"reasoning_encoding", "none"}, {"selection", QVariantMap{{"page", 0}, {"start", 0}, {"end", 38}}}},
+                          {}, {{"kind", "translation"}, {"detail", "Standard"}, {"saved_translation", wholeId}});
+        QTRY_COMPARE(reader->pendingCommands(), 0);
+        QVERIFY(plan().isEmpty());
+        QVERIFY(reader->aiState().value("status").toString().contains("requires a saved selection"));
+        verifyWire();
     }
 
     void sidebarTranslationHistoryReopensAndReplaysTheSavedRange() {
@@ -3685,6 +3735,8 @@ private slots:
         reader->setAiInput("translationScope","selection");reader->setAiInput("language","Spanish");
         QVERIFY(window->setProperty("selection",QVariantMap{{"page",0},{"start",2},{"end",5}}));
         browse();QTRY_VERIFY(savedText->property("text").toString().contains("Synthetic saved translation"));
+        const auto savedEntry = history->property("entry").toMap();
+        QVERIFY(savedEntry.value("selection").toBool());
         QCOMPARE(server.requests.size(),1);QVERIFY(replay->property("enabled").toBool());
         QVERIFY(QMetaObject::invokeMethod(replay,"clicked"));
         QTRY_VERIFY(!plan().isEmpty());QTRY_COMPARE(reader->pendingCommands(),0);
@@ -3692,6 +3744,23 @@ private slots:
         QCOMPARE(restored.value("reading_scope").toMap().value("selection").toMap(),savedRange);
         QCOMPARE(restored.value("reading_scope").toMap().value("language").toString(),QString("French"));
         QCOMPARE(payload(),originalBody);QCOMPARE(server.requests.size(),1);
+
+        reader->prepareAi({{"action", "TranslateSelection"}, {"current_page", 0}, {"language", "Spanish"},
+                           {"base_url", server.baseUrl()}, {"model", "synthetic"},
+                           {"chatgpt_account", "synthetic-history-registration"}, {"document_knowledge_pages", QVariantList{}},
+                           {"selection", QVariantMap{{"page", 0}, {"start", 2}, {"end", 5}}},
+                           {"reasoning_mode", "default"}, {"reasoning_encoding", "none"}},
+                          {}, {{"kind", "translation"}, {"detail", "Standard"}, {"saved_translation", savedEntry.value("id")}});
+        QTRY_COMPARE(reader->pendingCommands(), 0);
+        QVERIFY2(!plan().isEmpty(), qPrintable(reader->aiState().value("status").toString()));
+        QCOMPARE(plan().value("endpoint").toString(), QString("https://api.openai.com/v1/responses"));
+        QCOMPARE(plan().value("reading_scope").toMap().value("selection").toMap(), savedRange);
+        QCOMPARE(plan().value("reading_scope").toMap().value("language").toString(), QString("French"));
+        QCOMPARE(plan().value("sources"), original.value("sources"));
+        QVERIFY(QMetaObject::invokeMethod(window, "sendAi", Q_ARG(QVariant, QVariant::fromValue(reader)),
+                                         Q_ARG(QVariant, plan()), Q_ARG(QVariant, QString()), Q_ARG(QVariant, QString())));
+        QVERIFY(window->property("operationStatus").toString().contains("Check the ChatGPT connection"));
+        QCOMPARE(server.requests.size(), 1);
 
         QFile source(path);QVERIFY(source.open(QIODevice::WriteOnly|QIODevice::Append));
         const QByteArray externalComment("\n% Local fixture revision\n");QCOMPARE(source.write(externalComment),externalComment.size());source.close();

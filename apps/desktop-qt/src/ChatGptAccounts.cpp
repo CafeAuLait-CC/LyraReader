@@ -54,6 +54,7 @@ ChatGptAccounts::ChatGptAccounts(QObject *parent):QObject(parent) {
     m_selected=settings.value(QStringLiteral("selected")).toString();
     m_useForChat=settings.value(QStringLiteral("useForChat"),false).toBool();
     m_useForSelection=settings.value(QStringLiteral("useForSelection"),false).toBool();
+    m_useForLayeredSummaries=settings.value(QStringLiteral("useForLayeredSummaries"),false).toBool();
     m_pollTimer.setInterval(75);
     connect(&m_pollTimer,&QTimer::timeout,this,&ChatGptAccounts::poll);
     connect(&m_vault,&CredentialStore::finished,this,
@@ -97,6 +98,7 @@ bool ChatGptAccounts::savePreferences() {
     settings.setValue(QStringLiteral("selected"),m_selected);
     settings.setValue(QStringLiteral("useForChat"),m_useForChat);
     settings.setValue(QStringLiteral("useForSelection"),m_useForSelection);
+    settings.setValue(QStringLiteral("useForLayeredSummaries"),m_useForLayeredSummaries);
     settings.sync();
     return settings.status()==QSettings::NoError;
 }
@@ -131,6 +133,9 @@ void ChatGptAccounts::setUseForChat(bool value) {
 
 void ChatGptAccounts::setUseForSelection(bool value) {
     setUsagePreference(m_useForSelection,value);
+}
+void ChatGptAccounts::setUseForLayeredSummaries(bool value) {
+    setUsagePreference(m_useForLayeredSummaries,value);
 }
 
 void ChatGptAccounts::setUsagePreference(bool &current,bool value) {
@@ -302,10 +307,12 @@ void ChatGptAccounts::signOut() {
 
 bool ChatGptAccounts::send(ReaderController *reader,const QVariantMap &plan,const QString &readingToken) {
     const auto action=plan.value(QStringLiteral("action")).toString();
+    const bool layered=action==QStringLiteral("SummarizeAbstract") || action==QStringLiteral("SummarizeSection")
+        || action==QStringLiteral("SummarizePageLine");
     const bool allowed=readingToken.isEmpty()
         ? (action==QStringLiteral("DocumentChat") && m_useForChat)
         || (m_useForSelection && (action==QStringLiteral("SummarizeSelection") || action==QStringLiteral("TranslateSelection")))
-        || action==QStringLiteral("RegionQuestion")
+        || action==QStringLiteral("RegionQuestion") || (layered && m_useForLayeredSummaries)
         : action==QStringLiteral("SummarizeDocument"); // Reading has its own explicit ChatGPT preview.
     if(!reader || busy() || !allowed || !connected()
        || plan.value(QStringLiteral("chatgpt_account")).toString()!=m_selected

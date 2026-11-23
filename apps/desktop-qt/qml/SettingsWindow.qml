@@ -306,6 +306,15 @@ ApplicationWindow {
                             (checked || (chatGptSettings.accounts.connected && !!chatGptSettings.accounts.model))
                         onToggled: chatGptSettings.accounts.useForSelection = checked
                     }
+                    CheckBox {
+                        objectName: "useChatGptForLayeredSummaries"
+                        Layout.fillWidth: true
+                        text: qsTr("Use ChatGPT plan for layered summaries")
+                        checked: !!chatGptSettings.accounts && chatGptSettings.accounts.useForLayeredSummaries
+                        enabled: !!chatGptSettings.accounts && !chatGptSettings.accounts.busy &&
+                            (checked || (chatGptSettings.accounts.connected && !!chatGptSettings.accounts.model))
+                        onToggled: chatGptSettings.accounts.useForLayeredSummaries = checked
+                    }
                     RowLayout {
                         Button {
                             text: qsTr("Sign Out")

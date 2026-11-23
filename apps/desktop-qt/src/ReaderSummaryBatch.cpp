@@ -33,6 +33,9 @@ bool ReaderController::prepareSummaryBatch(const QString &layer,int offset,const
     const auto document=m_document;const auto generation=m_generation,epoch=++m_aiPreviewEpoch;QPointer<ReaderController> alive(this);
     const auto current=[&]{return alive && document==m_document && generation==m_generation && epoch==m_aiPreviewEpoch;};
     m_aiPreviewId=0;m_aiState.remove(QStringLiteral("plan"));m_summaryUnitContext.clear();
+    m_aiState.remove(QStringLiteral("previewSelection"));
+    m_aiState.insert(QStringLiteral("previewChatGptAccount"),settings.value(QStringLiteral("chatgpt_account")));
+    m_aiState.insert(QStringLiteral("previewLayeredSummary"),true);
     m_summaryBatchState.insert(QStringLiteral("generation"),generation);m_summaryBatchState.insert(QStringLiteral("layer"),layer);m_summaryBatchState.insert(QStringLiteral("offset"),offset);m_summaryBatchState.insert(QStringLiteral("phase"),QStringLiteral("preparing"));
     auto input=m_aiState.value(QStringLiteral("input")).toMap();input.insert(QStringLiteral("view"),QStringLiteral("summary"));input.insert(QStringLiteral("summaryBatch"),true);m_aiState.insert(QStringLiteral("input"),input);
     m_aiState.insert(QStringLiteral("previewView"),QStringLiteral("summary"));m_aiState.insert(QStringLiteral("statusView"),QStringLiteral("summary"));m_aiState.insert(QStringLiteral("planSent"),false);m_aiState.insert(QStringLiteral("status"),tr("Preparing the summary batch locally…"));m_aiPlanGeneration=generation;
@@ -59,7 +62,14 @@ bool ReaderController::startSummaryBatch(const QString &key,const QVariantMap &p
     m_aiState.insert(QStringLiteral("activeModel"),plan.value(QStringLiteral("model")));m_aiState.insert(QStringLiteral("activeHost"),plan.value(QStringLiteral("host")));
     emit aiStateChanged();
     if(!alive || document!=m_document || generation!=m_generation || epoch!=m_aiPreviewEpoch || !m_summaryBatchActive || !m_aiState.value(QStringLiteral("running")).toBool())return false;
-    const auto id=submit(QStringLiteral("ai_summary_batch_start"),{{QStringLiteral("token"),token},{QStringLiteral("api_key"),key}});
+    QVariantMap request{{QStringLiteral("token"),token}};
+    if(plan.contains(QStringLiteral("chatgpt_account"))) {
+        request.insert(QStringLiteral("chatgpt_account"),plan.value(QStringLiteral("chatgpt_account")));
+        request.insert(QStringLiteral("chatgpt_access_token"),key);
+    } else {
+        request.insert(QStringLiteral("api_key"),key);
+    }
+    const auto id=submit(QStringLiteral("ai_summary_batch_start"),request);
     if(!alive || document!=m_document || generation!=m_generation || epoch!=m_aiPreviewEpoch)return false;m_aiStartId=id;return true;
 }
 

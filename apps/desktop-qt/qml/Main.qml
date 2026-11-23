@@ -1958,11 +1958,12 @@ ApplicationWindow {
                 const reader = tab.reader;
                 const state = reader.aiState;
                 if (state.running && state.responsePlan && state.responsePlan.chatgpt_account
-                        && state.responsePlan.kind !== "inplace_translation")
+                        && state.responsePlan.kind !== "inplace_translation" && state.responseView !== "summary_batch")
                     reader.cancelAi();
                 const selection = (state.previewView === "summary" || state.previewView === "translation") && state.previewSelection;
+                const layered = state.previewView === "summary" && state.previewLayeredSummary;
                 if (state.previewChatGptAccount || (state.previewView === "chat" && accounts.useForChat)
-                        || (selection && accounts.useForSelection))
+                        || (selection && accounts.useForSelection) || (layered && accounts.useForLayeredSummaries))
                     reader.invalidateAiPlan();
                 const reading = reader.documentReading;
                 if (reading.chatgpt_account && ["preparing","preview","starting","reading"].includes(reading.phase))

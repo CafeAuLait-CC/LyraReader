@@ -192,10 +192,16 @@ Pane {
         return true;
     }
     function prepareUnit(id) {
-        owner.prepareSummaryUnit(id, baseRequest("SummarizeDocument"));
+        const request = baseRequest("SummarizeDocument");
+        const accounts = app.session ? app.session.chatGptAccounts : null;
+        if (accounts && !connectChatGpt(request, accounts, accounts.useForLayeredSummaries)) return;
+        owner.prepareSummaryUnit(id, request);
     }
     function prepareBatch(layer, offset, index) {
-        owner.prepareSummaryBatch(layer, offset, baseRequest("SummarizeDocument"), owner.documentGeneration, index === undefined ? -1 : index);
+        const request = baseRequest("SummarizeDocument");
+        const accounts = app.session ? app.session.chatGptAccounts : null;
+        if (accounts && !connectChatGpt(request, accounts, accounts.useForLayeredSummaries)) return;
+        owner.prepareSummaryBatch(layer, offset, request, owner.documentGeneration, index === undefined ? -1 : index);
     }
     function prepare() {
         if (batchMode) { prepareBatch(batchState.layer, batchState.offset); return; }
@@ -898,9 +904,12 @@ Pane {
                 enabled: translationHistory.current() && !translationHistory.command && !!translationHistory.entry
                          && translationHistory.entry.can_replay && !aiPanel.running && aiPanel.owner.pendingCommands === 0
                 onClicked: {
-                    const id = translationHistory.entry.id;
-                    aiPanel.owner.prepareAi(aiPanel.baseRequest("TranslateSelection"), {}, {
-                        kind: "translation", detail: "Standard", saved_translation: id
+                    const entry = translationHistory.entry;
+                    const request = aiPanel.baseRequest("TranslateSelection");
+                    const accounts = app.session ? app.session.chatGptAccounts : null;
+                    if (entry.selection && accounts && !aiPanel.connectChatGpt(request, accounts, accounts.useForSelection)) return;
+                    aiPanel.owner.prepareAi(request, {}, {
+                        kind: "translation", detail: "Standard", saved_translation: entry.id
                     });
                     translationHistory.close();
                 }

@@ -334,10 +334,11 @@ impl DesktopDocument {
     ) -> Result<Value, String> {
         self.read_workspace(source, false, |workspace| {
             let record = translation_record(workspace, id)?;
+            let selection = workspace.task_selection(id).is_ok_and(|range| range.is_some());
             if record.status == "partial" || record.originals.is_empty() {
                 return Ok(json!({"id": record.id, "language": record.language, "status": record.status,
                     "can_replay": !record.source_hash.is_empty() && record.status != "sourceChanged",
-                    "content": record.content, "blocks": []}));
+                    "content": record.content, "blocks": [], "selection": selection}));
             }
             let pairs =
                 translation_blocks(&record.originals, &record.original_pages, &record.content);
@@ -356,7 +357,7 @@ impl DesktopDocument {
             Ok(
                 json!({"id": record.id, "language": record.language, "status": record.status,
                 "can_replay": !record.source_hash.is_empty() && record.status != "sourceChanged",
-                "content": record.content, "blocks": rows, "warning": warning}),
+                "content": record.content, "blocks": rows, "warning": warning, "selection": selection}),
             )
         })
     }
