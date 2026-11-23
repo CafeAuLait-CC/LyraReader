@@ -505,7 +505,8 @@ ColumnLayout {
                 parent: moreCommandsButton
                 focus: true
                 MenuItem {
-                    text: qsTr("Fill & Sign")
+                    text: qsTr("Fill && Sign")
+                    Accessible.name: qsTr("Fill & Sign")
                     enabled: app.canModifyPdf
                     onTriggered: app.toggleForms()
                 }

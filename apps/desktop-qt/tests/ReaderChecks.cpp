@@ -1926,6 +1926,13 @@ private slots:
         window->requestActivate();button->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(button->hasActiveFocus());
         QTest::keyClick(window,Qt::Key_Space);QTRY_VERIFY(menu->property("visible").toBool());QTest::qWait(40);
         auto *body=menu->property("contentItem").value<QQuickItem *>();QVERIFY(body);
+        if(buttonName=="moreCommands") {
+            QQmlExpression itemAt(QQmlEngine::contextForObject(menu),menu,QStringLiteral("itemAt(0)"));
+            auto *fill=itemAt.evaluate().value<QQuickItem *>();QVERIFY(!itemAt.hasError());QVERIFY(fill);
+            auto *accessible=QAccessible::queryAccessibleInterface(fill);QVERIFY(accessible);
+            QCOMPARE(accessible->text(QAccessible::Name),QStringLiteral("Fill & Sign"));
+            QCOMPARE(fill->property("text").toString(),QStringLiteral("Fill && Sign"));
+        }
         const auto actual=body->mapToGlobal(QPointF(-menu->property("leftPadding").toDouble(),-menu->property("topPadding").toDouble()));const auto expected=button->mapToGlobal(QPointF(0,button->height()));
         qInfo()<<"Toolbar popup anchor"<<buttonName<<actual<<expected<<"window"<<window->size();
         QVERIFY2(QLineF(actual,expected).length()<2,"The menu must open below its own toolbar button");
