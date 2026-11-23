@@ -3098,6 +3098,82 @@ private slots:
         QVERIFY(archive.open(QIODevice::ReadOnly));QCOMPARE(archive.readAll(),archived);
     }
 
+    void documentChatReopensSeparateLocalConversations() {
+        QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
+        MockChatServer server;QVERIFY(server.listen());
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-saved-chat.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");
+        const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});
+        qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic"}});
+        QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"chat")));
+        auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);
+        const auto plan=[&]{return reader->aiState().value("plan").toMap();};
+        const auto payload=[&]{return plan().value("parts").toList().first().toMap().value("wire_body").toString().toUtf8();};
+        const auto review=[&](const QString &question) {
+            reader->setAiInput("question",question);
+            QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));
+            QTRY_VERIFY(!plan().isEmpty());QTRY_COMPARE(reader->pendingCommands(),0);
+        };
+        const auto reply=[&](const QString &answer,int total) {
+            const auto expected=payload();QVERIFY(!expected.isEmpty());
+            server.responses.append({{MockChatServer::delta({{"content",answer}}),QByteArray("data: [DONE]\n\n")},5,200});
+            QVERIFY(reader->startAi("local",plan()));
+            QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
+            QCOMPARE(server.requests.size(),total);
+            const auto wire=server.requests.last();QCOMPARE(wire.mid(wire.indexOf("\r\n\r\n")+4),expected);
+            QVERIFY(reader->aiState().value("chatHistoryWarning").toString().isEmpty());
+            QVERIFY(reader->aiState().value("chatModified").toLongLong()>0);
+        };
+        review("Where is the body text? CHAT_ALPHA");reply("First synthetic ALPHA answer [p.1]",1);
+        const auto first=reader->aiState().value("chatSession").toString();QVERIFY(!first.isEmpty());
+        auto *newChat=window->findChild<QObject *>("clearAiConversation");QVERIFY(newChat);
+        QVERIFY(QMetaObject::invokeMethod(newChat,"clicked"));
+        QVERIFY(reader->aiState().value("input").toMap().value("chatQuestion").toString().isEmpty());
+        review("Where is the body text? CHAT_BETA");reply("Second synthetic BETA answer [p.1]",2);
+        QVERIFY(reader->aiState().value("chatSession").toString()!=first);
+
+        const auto reopen=[&] {
+            const auto generation=reader->documentGeneration();reader->openFile(QUrl::fromLocalFile(path));
+            QTRY_VERIFY(reader->documentGeneration()!=generation);QTRY_COMPARE(reader->pageCount(),1);
+            QTRY_COMPARE(reader->pendingCommands(),0);
+            QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"chat")));
+        };
+        auto *history=window->findChild<QObject *>("aiChatHistory");QVERIFY(history);
+        auto *historyButton=window->findChild<QObject *>("openAiChatHistory");QVERIFY(historyButton);
+        auto *picker=history->findChild<QObject *>("aiSavedChatChoice");QVERIFY(picker);
+        auto *restoreChat=history->findChild<QObject *>("restoreAiChat");QVERIFY(restoreChat);
+        const auto choose=[&](const QString &id) {
+            QVERIFY(QMetaObject::invokeMethod(historyButton,"clicked"));
+            QTRY_COMPARE(history->property("sessions").toList().size(),2);
+            QTRY_COMPARE(reader->pendingCommands(),0);
+            const auto sessions=history->property("sessions").toList();
+            int index=0;for(;index<sessions.size();++index)if(sessions[index].toMap().value("id")==id)break;
+            QVERIFY(index<sessions.size());QVERIFY(picker->setProperty("currentIndex",index));
+            QVERIFY(QMetaObject::invokeMethod(restoreChat,"clicked"));
+            QTRY_COMPARE(reader->aiState().value("chatSession").toString(),id);QTRY_COMPARE(reader->pendingCommands(),0);
+        };
+        reopen();choose(first);QCOMPARE(server.requests.size(),2);
+        QCOMPARE(reader->aiState().value("chatTurns").toList().size(),1);
+        QVERIFY(reader->aiState().value("chatTurns").toList().first().toMap().value("answer").toString().contains("ALPHA"));
+        QVERIFY(!reader->aiState().value("chatReadOnly").toBool());
+        review("Which page contains BODY_TEXT? CHAT_CONTINUE");
+        QVERIFY(payload().contains("First synthetic ALPHA answer"));QVERIFY(!payload().contains("Second synthetic BETA answer"));
+        QCOMPARE(server.requests.size(),2);reply("Continued synthetic ALPHA answer",3);
+
+        QFile source(path);QVERIFY(source.open(QIODevice::WriteOnly|QIODevice::Append));
+        const QByteArray externalComment("\n% Local fixture revision\n");QCOMPARE(source.write(externalComment),externalComment.size());source.close();
+        reopen();choose(first);QVERIFY(reader->aiState().value("chatReadOnly").toBool());
+        QCOMPARE(reader->aiState().value("chatTurns").toList().size(),2);
+        QCOMPARE(reader->aiState().value("chatTurns").toList().first().toMap().value("state").toString(),QString("archived"));
+        QVERIFY(reader->aiState().value("chatTurns").toList().first().toMap().value("sources").toList().isEmpty());
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QVERIFY(plan().isEmpty());QCOMPARE(server.requests.size(),3);
+    }
+
     void wholeSummaryRequiresSeparateReviewForSynthesis() {
         QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
         MockChatServer server;QVERIFY(server.listen());

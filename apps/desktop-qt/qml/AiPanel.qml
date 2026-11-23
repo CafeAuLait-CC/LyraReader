@@ -6,7 +6,7 @@ Pane {
     id: aiPanel
     objectName: "aiPanel"
     required property var app
-    readonly property bool tabTransferDialogVisible: payload.visible || summaryCatalog.popupVisible || selectionSource.visible || translationHistory.visible
+    readonly property bool tabTransferDialogVisible: payload.visible || summaryCatalog.popupVisible || selectionSource.visible || translationHistory.visible || chatHistory.visible
     readonly property var owner: app.currentReader
     readonly property var viewState: owner.aiState
     readonly property var input: viewState.input || ({})
@@ -45,6 +45,7 @@ Pane {
     onVisibleChanged: if (!visible) {
         if (selectionSource) selectionSource.close();
         if (translationHistory) translationHistory.close();
+        if (chatHistory) chatHistory.close();
         pendingLocate = null;
     }
     readonly property var languageGeneration: batchMode ? batchState.generation : summaryUnit.generation
@@ -74,6 +75,7 @@ Pane {
         if (payload && payload.visible) payload.close();
         if (selectionSource && selectionSource.visible) selectionSource.close();
         if (translationHistory && translationHistory.visible) translationHistory.close();
+        if (chatHistory && chatHistory.visible) chatHistory.close();
         liveExcerpt = null;
         pendingLocate = null;
         if (liveRange) refreshSelection.restart();
@@ -553,6 +555,12 @@ Pane {
             text: qsTr("Older exchanges were removed to keep the conversation within its display budget.")
             textFormat: Text.PlainText; wrapMode: Text.Wrap; Layout.fillWidth: true; color: app.colors.textSecondary; font.pixelSize: 11
         }
+        Label {
+            visible: aiPanel.workspace === "chat" && !!aiPanel.viewState.chatHistoryWarning
+            text: visible ? qsTr("Could not save this exchange locally. %1").arg(aiPanel.viewState.chatHistoryWarning) : ""
+            textFormat: Text.PlainText; wrapMode: Text.Wrap; Layout.fillWidth: true
+            color: app.colors.textSecondary
+        }
         ScrollView {
             id: composerScroll
             objectName: "aiComposerScroll"
@@ -575,6 +583,7 @@ Pane {
                 onModelTextChanged:syncModelText()
                 Component.onCompleted:syncModelText()
                 textFormat: TextEdit.PlainText; wrapMode: TextEdit.Wrap
+                readOnly: aiPanel.workspace === "chat" && !!aiPanel.viewState.chatReadOnly
                 placeholderText: aiPanel.workspace === "chat" ? qsTr("Ask about this document…") : qsTr("Question about selected text…")
                 Accessible.name: aiPanel.workspace === "chat" ? qsTr("Question about document") : qsTr("Question about selection")
                 // TextEdit can normalize displayed line separators. Only real edits
@@ -590,7 +599,8 @@ Pane {
             objectName: "prepareAiRequest"
             text: aiPanel.batchMode ? qsTr("Preview batch") : aiPanel.workspace === "chat" ? qsTr("Preview Question") : aiPanel.workspace === "translation" ? qsTr("Preview Translation") : (!aiPanel.unitMode && !aiPanel.batchMode && aiPanel.action === 2) ? qsTr("Preview Question") : qsTr("Preview Summary")
             Layout.fillWidth: true
-            enabled: !aiPanel.running && aiPanel.owner.pageCount > 0 && aiPanel.owner.pendingCommands === 0 && (aiPanel.batchMode || aiPanel.unitMode || ((aiPanel.action !== 2 && aiPanel.action !== 4) || !!question.text.trim()) && (aiPanel.action !== 3 || aiPanel.input.language === undefined || !!aiPanel.input.language.trim()) && ([2,3,5].indexOf(aiPanel.action) < 0 || aiPanel.translateDocument || !!app.selection))
+            enabled: !aiPanel.running && (aiPanel.workspace !== "chat" || !aiPanel.viewState.chatReadOnly)
+                     && aiPanel.owner.pageCount > 0 && aiPanel.owner.pendingCommands === 0 && (aiPanel.batchMode || aiPanel.unitMode || ((aiPanel.action !== 2 && aiPanel.action !== 4) || !!question.text.trim()) && (aiPanel.action !== 3 || aiPanel.input.language === undefined || !!aiPanel.input.language.trim()) && ([2,3,5].indexOf(aiPanel.action) < 0 || aiPanel.translateDocument || !!app.selection))
             onClicked: aiPanel.prepare()
         }
         Label {
@@ -647,12 +657,79 @@ Pane {
             }
             Button {
                 objectName: "clearAiConversation"
-                text: qsTr("Clear chat")
+                text: qsTr("New chat")
                 visible: aiPanel.workspace === "chat"
-                enabled: !aiPanel.running && (aiPanel.viewState.chatTurns || []).length > 0
-                onClicked: aiPanel.owner.clearAiChat()
+                enabled: !aiPanel.running && ((aiPanel.viewState.chatTurns || []).length > 0 || !!aiPanel.viewState.chatReadOnly)
+                onClicked: {
+                    aiPanel.owner.clearAiChat();
+                    aiPanel.owner.setAiInput("question", "");
+                }
+            }
+            Button {
+                objectName: "openAiChatHistory"
+                text: qsTr("Past chats…")
+                visible: aiPanel.workspace === "chat"
+                enabled: !aiPanel.running && aiPanel.owner.pageCount > 0 && aiPanel.owner.pendingCommands === 0
+                onClicked: chatHistory.browse()
             }
             Button {objectName:"aiAuditTrail";text:qsTr("Local audit trail…");onClicked:app.showAuditTrail()}
+        }
+    }
+    Dialog {
+        id: chatHistory
+        objectName: "aiChatHistory"
+        property var reader: null
+        property double generation: 0
+        property double command: 0
+        property var sessions: []
+        property string error: ""
+        title: qsTr("Past chats for this PDF")
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: Math.max(230, Math.min(460, app.width - 48))
+        standardButtons: Dialog.Cancel
+        function current() { return reader && reader === aiPanel.owner && generation === aiPanel.ownerGeneration; }
+        function browse() {
+            reader = aiPanel.owner;
+            generation = aiPanel.ownerGeneration;
+            open();
+            command = reader.submit("ai_chat_sessions", {});
+        }
+        onClosed: { reader = null; command = 0; sessions = []; error = ""; }
+        Connections {
+            target: chatHistory.reader
+            function onCommandFinished(id, operation, result, error) {
+                if (!chatHistory.current() || id !== chatHistory.command || operation !== "ai_chat_sessions") return;
+                chatHistory.command = 0;
+                chatHistory.error = error;
+                if (!error) chatHistory.sessions = result;
+            }
+        }
+        contentItem: ColumnLayout {
+            ComboBox {
+                id: savedChat
+                objectName: "aiSavedChatChoice"
+                Layout.fillWidth: true
+                model: chatHistory.sessions
+                textRole: "title"
+                enabled: count > 0
+                Accessible.name: qsTr("Saved chats")
+            }
+            Label {
+                text: chatHistory.error || (chatHistory.command ? qsTr("Loading chats…") : !savedChat.count ? qsTr("No saved chats.") : "")
+                visible: !!text
+                Layout.fillWidth: true; textFormat: Text.PlainText; wrapMode: Text.Wrap
+            }
+            Button {
+                objectName: "restoreAiChat"
+                text: qsTr("Open chat")
+                enabled: chatHistory.current() && savedChat.currentIndex >= 0 && !chatHistory.command
+                         && aiPanel.owner.pendingCommands === 0 && !aiPanel.running
+                onClicked: {
+                    if (chatHistory.reader.reopenAiChat(chatHistory.sessions[savedChat.currentIndex].id))
+                        chatHistory.close();
+                }
+            }
         }
     }
     Dialog {

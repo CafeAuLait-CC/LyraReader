@@ -6,7 +6,8 @@ use lyra_reader_ai::workspace::{
     ReadingRecord, ReadingWorkspace, TranslationBlock, reading_scope_key, translation_blocks,
 };
 use lyra_reader_ffi::api::{
-    AiActionRecord, AiPlanRecord, AiPlanRequestRecord, AiSelectionRecord, LyraReaderDocument,
+    AiActionRecord, AiPlanRecord, AiPlanRequestRecord, AiSelectionRecord, AiSourceRecord,
+    LyraReaderDocument,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -14,6 +15,56 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 pub(super) const WORKSPACE_FILE: &str = "ai-reading-workspace.json";
+
+#[derive(Deserialize)]
+pub(super) struct ChatStart {
+    session_id: String,
+    expected_modified: Option<u64>,
+    question: String,
+}
+
+pub(super) struct ChatArchive {
+    session_id: String,
+    expected_modified: Option<u64>,
+    source_hash: String,
+    turn: ChatTurn,
+}
+
+struct ChatTurn {
+    id: String,
+    question: String,
+    answer: String,
+    state: String,
+    sources: Vec<AiSourceRecord>,
+}
+
+impl ChatStart {
+    pub fn capture(self, plan: &AiPlanRecord, source_hash: String) -> Result<ChatArchive, String> {
+        if lyra_reader_edit::records::normalize_uuid(&self.session_id).is_none() {
+            return Err("The chat session identifier is invalid.".into());
+        }
+        Ok(ChatArchive {
+            session_id: self.session_id,
+            expected_modified: self.expected_modified,
+            source_hash,
+            turn: ChatTurn {
+                id: crate::marks::uuid()?,
+                question: self.question,
+                answer: String::new(),
+                state: String::new(),
+                sources: plan.sources.clone(),
+            },
+        })
+    }
+}
+
+impl ChatArchive {
+    pub fn with_reply(mut self, replies: &[String], state: &str) -> Self {
+        self.turn.answer = replies.join("\n\n");
+        self.turn.state = state.into();
+        self
+    }
+}
 
 #[derive(Deserialize, Serialize)]
 pub(super) struct TranslationScope {
@@ -178,15 +229,25 @@ impl DesktopDocument {
         source: &Arc<LyraReaderDocument>,
         record: ReadingRecord,
     ) -> Result<(), String> {
-        self.with_reading_cache(source, true, |cache, sha| {
+        self.update_reading_workspace(source, |workspace, sha| {
             if record.source_hash != sha {
                 return Err("The PDF revision changed before archiving the translation.".into());
             }
+            workspace.put(record).map(|_| ())
+        })
+    }
+
+    fn update_reading_workspace<T>(
+        &self,
+        source: &Arc<LyraReaderDocument>,
+        update: impl FnOnce(&mut ReadingWorkspace, &str) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.with_reading_cache(source, true, |cache, sha| {
             let _lease = lock_reading_workspace(&cache.directory)?;
             let path = cache.directory.join(WORKSPACE_FILE);
             let previous = read_optional(&path)?;
-            let mut workspace = workspace(previous.as_deref(), sha)?;
-            workspace.put(record)?;
+            let mut workspace = workspace(previous.as_deref(), sha.clone())?;
+            let output = update(&mut workspace, &sha)?;
             let bytes = workspace.encode()?;
             if read_optional(&path)? != previous {
                 return Err(
@@ -199,11 +260,12 @@ impl DesktopDocument {
                     &previous,
                 )?;
             }
-            atomic_write(&path, &bytes)
+            atomic_write(&path, &bytes)?;
+            Ok(output)
         })
     }
 
-    fn translations<T>(
+    fn read_workspace<T>(
         &self,
         source: &Arc<LyraReaderDocument>,
         validate_file: bool,
@@ -220,7 +282,7 @@ impl DesktopDocument {
         source: &Arc<LyraReaderDocument>,
         selection: bool,
     ) -> Result<Value, String> {
-        self.translations(source, false, |workspace| {
+        self.read_workspace(source, false, |workspace| {
             Ok(Value::Array(workspace.translation_history(selection)?.into_iter().map(|record| {
                 json!({"id": record.id, "excerpt": record.excerpt.chars().take(160).collect::<String>(),
                     "language": record.language, "modified": record.modified, "status": record.status,
@@ -234,7 +296,7 @@ impl DesktopDocument {
         source: &Arc<LyraReaderDocument>,
         id: &str,
     ) -> Result<Value, String> {
-        self.translations(source, false, |workspace| {
+        self.read_workspace(source, false, |workspace| {
             let record = translation_record(workspace, id)?;
             if record.status == "partial" || record.originals.is_empty() {
                 return Ok(json!({"id": record.id, "language": record.language, "status": record.status,
@@ -269,7 +331,7 @@ impl DesktopDocument {
         id: &str,
         request: &mut AiPlanRequestRecord,
     ) -> Result<(), String> {
-        self.translations(source, true, |workspace| {
+        self.read_workspace(source, true, |workspace| {
             let record = translation_record(workspace, id)?;
             if record.source_hash.is_empty() {
                 return Err(
@@ -291,6 +353,171 @@ impl DesktopDocument {
             };
             request.language = Some(record.language);
             Ok(())
+        })
+    }
+
+    pub(super) fn chat_sessions(&self, source: &Arc<LyraReaderDocument>) -> Result<Value, String> {
+        self.read_workspace(source, false, |workspace| {
+            let mut sessions = workspace.records();
+            sessions.retain(|record| record.kind == "conversation");
+            sessions.sort_by_key(|record| std::cmp::Reverse(record.modified));
+            Ok(json!(
+                sessions
+                    .into_iter()
+                    .map(|session| json!({
+                        "id": session.id, "title": session.title, "modified": session.modified,
+                        "status": session.status
+                    }))
+                    .collect::<Vec<_>>()
+            ))
+        })
+    }
+
+    pub(super) fn chat_session(
+        &self,
+        source: &Arc<LyraReaderDocument>,
+        id: &str,
+    ) -> Result<Value, String> {
+        self.read_workspace(source, false, |workspace| {
+            let records = workspace.records();
+            let session = records
+                .iter()
+                .find(|record| record.id == id && record.kind == "conversation")
+                .ok_or("The saved chat session is unavailable.")?;
+            let read_only = session.status == "sourceChanged" || session.source_hash.is_empty();
+            let mut turns: Vec<_> = records
+                .iter()
+                .filter(|record| record.kind == "message" && record.conversation_id == id)
+                .collect();
+            turns.sort_by_key(|record| record.modified);
+            let limit = lyra_reader_ai::chat::MAX_CHAT_HISTORY_TURNS;
+            let limited = turns.len() > limit;
+            if limited {
+                turns.drain(..turns.len() - limit);
+            }
+            let mut remaining = 8 * 1024 * 1024;
+            let previous_len = turns.len();
+            let turns: Vec<_> = turns
+                .into_iter()
+                .rev()
+                .take_while(|turn| {
+                    let bytes = turn.content.len().saturating_add(turn.question.len());
+                    if bytes > remaining {
+                        return false;
+                    }
+                    remaining -= bytes;
+                    true
+                })
+                .collect();
+            let limited = limited || turns.len() != previous_len;
+            let turns: Vec<_> = turns
+                .into_iter()
+                .rev()
+                .map(|turn| {
+                    let verified = !read_only && turn.source_hash == session.source_hash;
+                    let sources: Vec<_> =
+                        if verified {
+                            turn.original_pages.iter().zip(&turn.originals)
+                        .filter(|(page, _)| **page > 0 && **page <= source.page_count())
+                        .map(|(page, snippet)| json!({"page":page,"snippet":snippet,"rects":[]}))
+                        .collect()
+                        } else {
+                            Vec::new()
+                        };
+                    let state = match (verified, turn.status.as_str()) {
+                        (false, _) => "archived",
+                        (true, "finished") => "finished",
+                        (true, "failed") => "failed",
+                        (true, "cancelled") => "cancelled",
+                        (true, _) if turn.content.is_empty() => "failed",
+                        (true, _) => "partial",
+                    };
+                    json!({"id":turn.id,"question":turn.question,"answer":turn.content,
+                    "state":state,"sources":sources})
+                })
+                .collect();
+            Ok(
+                json!({"id": session.id, "modified":session.modified, "draft":session.question,
+                "turns":turns,"limited":limited,"read_only":read_only}),
+            )
+        })
+    }
+
+    pub(super) fn archive_chat(
+        &self,
+        source: &Arc<LyraReaderDocument>,
+        archive: ChatArchive,
+    ) -> Result<Value, String> {
+        self.update_reading_workspace(source, |workspace, sha| {
+            let records = workspace.records();
+            let old = records
+                .iter()
+                .find(|record| record.id == archive.session_id);
+            if archive.source_hash != sha
+                || old.map(|record| record.modified) != archive.expected_modified
+                || old.is_some_and(|record| {
+                    record.kind != "conversation" || record.source_hash != sha
+                })
+            {
+                return Err(
+                    "This chat changed in another window or PDF revision. Reopen it before saving."
+                        .into(),
+                );
+            }
+            let mut modified = u64::try_from(chrono::Utc::now().timestamp_millis())
+                .map_err(|_| "The local clock cannot date the chat.")?;
+            if let Some(old) = old {
+                modified = modified.max(
+                    old.modified
+                        .checked_add(1)
+                        .ok_or("The chat timestamp is outside its supported range.")?,
+                );
+            }
+            let turn = archive.turn;
+            if turn.id == archive.session_id || records.iter().any(|record| record.id == turn.id) {
+                return Err("The archived chat exchange has a duplicate identity.".into());
+            }
+            let title = old.map_or_else(
+                || turn.question.trim().chars().take(120).collect(),
+                |record| record.title.clone(),
+            );
+            let (original_pages, originals) = turn
+                .sources
+                .into_iter()
+                .filter(|item| {
+                    !turn.answer.trim().is_empty()
+                        && item.page > 0
+                        && item.page <= source.page_count()
+                })
+                .map(|item| (item.page, item.snippet))
+                .unzip::<_, _, Vec<_>, Vec<_>>();
+            workspace.put_all(vec![
+                ReadingRecord {
+                    id: turn.id,
+                    kind: "message".into(),
+                    conversation_id: archive.session_id.clone(),
+                    question: turn.question.clone(),
+                    content: turn.answer,
+                    pages: original_pages.clone(),
+                    originals,
+                    original_pages,
+                    status: turn.state,
+                    source_hash: sha.into(),
+                    modified,
+                    ..ReadingRecord::default()
+                },
+                ReadingRecord {
+                    id: archive.session_id,
+                    kind: "conversation".into(),
+                    title,
+                    question: turn.question,
+                    source_hash: sha.into(),
+                    status: "finished".into(),
+                    modified,
+                    ..ReadingRecord::default()
+                },
+            ])?;
+            Ok(json!({"modified":modified}))
         })
     }
 }

@@ -135,6 +135,7 @@ public:
     Q_INVOKABLE void setAiInput(const QString &key,const QVariant &value);
     Q_INVOKABLE void invalidateAiPlan();
     Q_INVOKABLE void clearAiChat();
+    Q_INVOKABLE bool reopenAiChat(const QString &id);
     QVariantMap editDrafts()const{return m_editDrafts;}
     bool hasEditDrafts()const{return !m_editDrafts.isEmpty();}
     Q_INVOKABLE void setEditDraft(const QString &key,const QVariant &value);
@@ -338,6 +339,8 @@ private:
     QString m_aiSummaryPreviewUnitId,m_aiSummaryPreviewLanguage;
     quint64 m_aiPreviewEpoch=0,m_aiActivePreviewEpoch=0;
     quint64 m_aiPreviewId=0,m_aiStartId=0,m_aiPollId=0,m_aiPlanGeneration=0;
+    quint64 m_aiChatLoadId=0,m_aiChatLoadEpoch=0;
+    void resetAiChat();
     void enqueue(const Request &request);
     void requestPageInternal(int page,double scale,bool embedded,bool manual);
     void pruneTileRequests();

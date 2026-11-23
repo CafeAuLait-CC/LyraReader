@@ -51,10 +51,16 @@ struct ReadingSummaryStyle {
 
 enum ReadingOutput {
     Translation(Box<crate::reading_history::PendingTranslation>),
+    Chat(Box<crate::reading_history::ChatArchive>),
     Synthesis {
         request: Box<AiMergePlanRequestRecord>,
         style: ReadingSummaryStyle,
     },
+}
+
+enum ReadingArchive {
+    Translation(Box<Result<ReadingRecord, String>>),
+    Chat(crate::reading_history::ChatArchive),
 }
 
 struct ReadingReplies {
@@ -64,6 +70,7 @@ struct ReadingReplies {
     remaining_bytes: usize,
     failure: Option<&'static str>,
     incomplete: bool,
+    cancelled: bool,
     done: bool,
 }
 
@@ -76,6 +83,7 @@ impl ReadingReplies {
             remaining_bytes: MAX_READING_REPLY_BYTES,
             failure: None,
             incomplete: false,
+            cancelled: false,
             done: false,
         }
     }
@@ -84,6 +92,15 @@ impl ReadingReplies {
         for event in events {
             if matches!(event, AiEventRecord::Done) {
                 self.done = true;
+            }
+            if matches!(
+                event,
+                AiEventRecord::Error {
+                    cancelled: true,
+                    ..
+                }
+            ) {
+                self.cancelled = true;
             }
             if self.failure.is_some() {
                 continue;
@@ -127,7 +144,7 @@ impl ReadingReplies {
         }
     }
 
-    fn publish(self, result: &mut Value) -> Option<Result<ReadingRecord, String>> {
+    fn publish(self, result: &mut Value) -> Option<ReadingArchive> {
         let failure = self
             .failure
             .or((self.incomplete || !self.done)
@@ -135,7 +152,25 @@ impl ReadingReplies {
             .or((self.replies.len() != self.expected_parts)
                 .then_some("The response is missing reviewed parts."));
         match self.output {
-            ReadingOutput::Translation(pending) => pending.finish(&self.replies, failure, result),
+            ReadingOutput::Translation(pending) => pending
+                .finish(&self.replies, failure, result)
+                .map(|record| ReadingArchive::Translation(Box::new(record))),
+            ReadingOutput::Chat(pending) => {
+                let state = if self.cancelled {
+                    "cancelled"
+                } else if failure.is_none()
+                    && self.replies.iter().any(|reply| !reply.trim().is_empty())
+                {
+                    "finished"
+                } else if self.done {
+                    "partial"
+                } else {
+                    "failed"
+                };
+                Some(ReadingArchive::Chat(
+                    pending.with_reply(&self.replies, state),
+                ))
+            }
             ReadingOutput::Synthesis { mut request, style } => {
                 if !self.done {
                     return None;
@@ -933,6 +968,8 @@ impl DesktopDocument {
             }
             "ai_translation_history" => self.translation_history(&d, arg(&r, "selection")?),
             "ai_translation_history_entry" => self.translation_history_entry(&d, &text(&r, "id")?),
+            "ai_chat_sessions" => self.chat_sessions(&d),
+            "ai_chat_session" => self.chat_session(&d, &text(&r, "id")?),
             "ai_merge_preview" => value(
                 build_ai_merge_plan(arg(&r, "request")?)
                     .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),
@@ -1030,6 +1067,12 @@ impl DesktopDocument {
                 }
                 let plan: AiPlanRecord = arg(&r, "plan")?;
                 let reading = match (r["plan"]["kind"].as_str(), plan.action) {
+                    (_, AiActionRecord::DocumentChat) if r.get("chat").is_some() => {
+                        let chat: crate::reading_history::ChatStart = arg(&r, "chat")?;
+                        Some(ReadingOutput::Chat(Box::new(
+                            chat.capture(&plan, d.document_identity().sha256)?,
+                        )))
+                    }
                     (Some("reading_translation"), AiActionRecord::TranslateSelection) => {
                         let scope: crate::reading_history::TranslationScope =
                             arg(&r["plan"], "reading_scope")?;
@@ -1165,11 +1208,20 @@ impl DesktopDocument {
                     drop(current);
                     let mut result =
                         json!({"events":events,"finished":finished,"cache_warning":warning});
-                    if let Some(archive) = reading.and_then(|reading| reading.publish(&mut result))
-                        && let Err(error) =
-                            archive.and_then(|record| self.archive_translation(&d, record))
-                    {
-                        result["translation_history_warning"] = json!(error);
+                    match reading.and_then(|reading| reading.publish(&mut result)) {
+                        Some(ReadingArchive::Translation(archive)) => {
+                            if let Err(error) =
+                                archive.and_then(|record| self.archive_translation(&d, record))
+                            {
+                                result["translation_history_warning"] = json!(error);
+                            }
+                        }
+                        Some(ReadingArchive::Chat(archive)) => match self.archive_chat(&d, archive)
+                        {
+                            Ok(checkpoint) => result["chat_checkpoint"] = checkpoint,
+                            Err(error) => result["chat_history_warning"] = json!(error),
+                        },
+                        None => {}
                     }
                     Ok(result)
                 } else {

@@ -66,7 +66,10 @@ AiReadingScrollView {
                     Label { id: question; anchors.fill: parent; anchors.margins: 8; text: modelData.question; textFormat: Text.PlainText; wrapMode: Text.Wrap; color: app.colors.textPrimary }
                 }
                 Label {
-                    text: modelData.state === "cancelled" ? qsTr("Cancelled · partial answer") : modelData.state === "failed" ? qsTr("Request failed") : qsTr("Completed")
+                    text: modelData.state === "archived" ? qsTr("Saved exchange")
+                          : modelData.state === "cancelled" ? qsTr("Cancelled · partial answer")
+                          : modelData.state === "failed" ? qsTr("Request failed")
+                          : modelData.state === "partial" ? qsTr("Partial answer") : qsTr("Completed")
                     color: app.colors.textSecondary; font.pixelSize: 11
                 }
                 AiResult {
