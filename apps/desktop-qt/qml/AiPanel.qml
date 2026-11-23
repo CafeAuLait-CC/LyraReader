@@ -198,7 +198,8 @@ Pane {
             const request = baseRequest(modes[action]);
             if (wholeSummary) request.selection = null;
             request.language = input.summaryLanguage || null;
-            owner.prepareAi(request, {}, {kind: "summary", detail: summaryDetail});
+            owner.prepareAi(request, {}, {kind: "summary", detail: summaryDetail,
+                force: wholeSummary && !!viewState.cachedWholeSummary});
         }
         else owner.prepareAi(baseRequest(modes[action]));
     }
@@ -621,7 +622,7 @@ Pane {
         Button {
             id: preview
             objectName: "prepareAiRequest"
-            text: aiPanel.batchMode ? qsTr("Preview batch") : aiPanel.workspace === "chat" ? qsTr("Preview Question") : aiPanel.workspace === "translation" ? qsTr("Preview Translation") : (!aiPanel.unitMode && !aiPanel.batchMode && aiPanel.action === 2) ? qsTr("Preview Question") : qsTr("Preview Summary")
+            text: aiPanel.batchMode ? qsTr("Preview batch") : aiPanel.workspace === "chat" ? qsTr("Preview Question") : aiPanel.workspace === "translation" ? qsTr("Preview Translation") : (!aiPanel.unitMode && !aiPanel.batchMode && aiPanel.action === 2) ? qsTr("Preview Question") : aiPanel.wholeSummary && aiPanel.viewState.cachedWholeSummary ? qsTr("Preview fresh summary") : qsTr("Preview Summary")
             Layout.fillWidth: true
             enabled: !aiPanel.running && (aiPanel.workspace !== "chat" || !aiPanel.viewState.chatReadOnly)
                      && aiPanel.owner.pageCount > 0 && aiPanel.owner.pendingCommands === 0 && (aiPanel.batchMode || aiPanel.unitMode || ((aiPanel.action !== 2 && aiPanel.action !== 4) || !!question.text.trim()) && (aiPanel.action !== 3 || aiPanel.input.language === undefined || !!aiPanel.input.language.trim()) && ([2,3,5].indexOf(aiPanel.action) < 0 || aiPanel.translateDocument || !!app.selection))

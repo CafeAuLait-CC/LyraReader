@@ -234,7 +234,7 @@ fn chat_revision<'a>(
 }
 
 impl DesktopDocument {
-    fn with_reading_cache<T>(
+    pub(super) fn with_reading_cache<T>(
         &self,
         source: &Arc<LyraReaderDocument>,
         validate_file: bool,

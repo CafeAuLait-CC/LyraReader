@@ -1,5 +1,6 @@
 //! Desktop transport over the same portable Rust control plane the macOS shell uses.
 //! JSON only crosses the narrow C boundary; requests are decoded into typed engine records.
+use crate::analysis_cache::{PendingSummary, SummaryCapture};
 use lyra_reader_ai::workspace::ReadingRecord;
 use lyra_reader_core::Size;
 use lyra_reader_ffi::api::*;
@@ -25,6 +26,7 @@ pub struct DesktopDocument {
     pub(super) translations: Mutex<crate::translation::Translations>,
     pub(super) summaries: Mutex<crate::summary_store::Store>,
     pub(super) knowledge: Mutex<crate::knowledge::Knowledge>,
+    pub(super) pending_summary: Mutex<Option<PendingSummary>>,
     pub(super) regions: Mutex<crate::region_store::RegionStore>,
     pub(super) ai_region_sources: Mutex<Option<Arc<crate::region_store::RequestProvenance>>>,
     pub(super) marks: Mutex<crate::marks::Marks>,
@@ -55,12 +57,19 @@ enum ReadingOutput {
     Synthesis {
         request: Box<AiMergePlanRequestRecord>,
         style: ReadingSummaryStyle,
+        capture: Arc<SummaryCapture>,
+    },
+    Summary {
+        capture: Arc<SummaryCapture>,
+        model: String,
     },
 }
 
 enum ReadingArchive {
     Translation(Box<Result<ReadingRecord, String>>),
     Chat(crate::reading_history::ChatArchive),
+    PendingSummary(PendingSummary),
+    Summary(Box<Result<ReadingRecord, String>>),
 }
 
 struct ReadingReplies {
@@ -171,7 +180,23 @@ impl ReadingReplies {
                     pending.with_reply(&self.replies, state),
                 ))
             }
-            ReadingOutput::Synthesis { mut request, style } => {
+            ReadingOutput::Summary { capture, model } => {
+                if failure.is_some() {
+                    return None;
+                }
+                let answer = self.replies.into_iter().next()?;
+                if answer.trim().is_empty() {
+                    return None;
+                }
+                Some(ReadingArchive::Summary(Box::new(
+                    Arc::unwrap_or_clone(capture).ready(model, answer),
+                )))
+            }
+            ReadingOutput::Synthesis {
+                mut request,
+                style,
+                capture,
+            } => {
                 if !self.done {
                     return None;
                 }
@@ -194,14 +219,32 @@ impl ReadingReplies {
                         })
                         .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),
                 );
-                match preview {
-                    Ok(mut plan) => {
-                        plan["kind"] = json!("summary_synthesis");
-                        result["synthesis_plan"] = plan;
+                let mut plan = match preview {
+                    Ok(plan) => plan,
+                    Err(message) => {
+                        result["synthesis_warning"] = json!(message);
+                        return None;
                     }
-                    Err(message) => result["synthesis_warning"] = json!(message),
-                }
-                None
+                };
+                let pending = plan["parts"][0]["wire_body"]
+                    .as_str()
+                    .ok_or(
+                        "The summary synthesis preview did not contain a request body.".to_owned(),
+                    )
+                    .and_then(|body| PendingSummary::new(capture, body));
+                plan["kind"] = json!("summary_synthesis");
+                let archive = match pending {
+                    Ok(pending) => {
+                        plan["summary_capture"] = json!(pending.token);
+                        Some(ReadingArchive::PendingSummary(pending))
+                    }
+                    Err(error) => {
+                        result["cache_warning"] = json!(error);
+                        None
+                    }
+                };
+                result["synthesis_plan"] = plan;
+                archive
             }
         }
     }
@@ -414,6 +457,7 @@ impl DesktopDocument {
             translation_scope,
             summaries: Mutex::new(crate::summary_store::Store::default()),
             knowledge: Mutex::new(crate::knowledge::Knowledge::default()),
+            pending_summary: Mutex::new(None),
             regions: Mutex::new(crate::region_store::RegionStore::default()),
             ai_region_sources: Mutex::new(None),
             marks,
@@ -932,6 +976,16 @@ impl DesktopDocument {
                         reasoning_mode: request.reasoning_mode.clone(),
                         reasoning_encoding: request.reasoning_encoding.clone(),
                     });
+                    let mut cache_warning = None;
+                    if let Some(summary) = &style
+                        && r["reading"]["force"].as_bool() != Some(true)
+                    {
+                        match self.cached_document_summary(&d, &summary.language, &summary.detail) {
+                            Ok(Some(record)) => return Ok(json!({"saved_summary":record})),
+                            Ok(None) => {}
+                            Err(error) => cache_warning = Some(error),
+                        }
+                    }
                     let translation_scope =
                         translation.then(|| crate::reading_history::TranslationScope {
                             selection: request.selection,
@@ -952,6 +1006,9 @@ impl DesktopDocument {
                         plan["kind"] = json!("reading_summary");
                         plan["reading_style"] =
                             serde_json::to_value(style).map_err(|error| error.to_string())?;
+                        if let Some(warning) = cache_warning {
+                            plan["cache_warning"] = json!(warning);
+                        }
                     }
                     return Ok(plan);
                 }
@@ -1081,10 +1138,12 @@ impl DesktopDocument {
                             scope.capture(&plan, d.document_identity().sha256)?,
                         )))
                     }
-                    (Some("reading_summary"), AiActionRecord::SummarizeDocument)
-                        if plan.parts.len() > 1 =>
-                    {
+                    (Some("reading_summary"), AiActionRecord::SummarizeDocument) => {
                         let style: ReadingSummaryStyle = arg(&r["plan"], "reading_style")?;
+                        let capture=Arc::new(SummaryCapture::new(&plan,d.document_identity().sha256,style.language.clone(),style.detail.clone())?);
+                        if plan.parts.len()==1 {
+                            Some(ReadingOutput::Summary { capture, model:plan.model.clone() })
+                        } else {
                         let parts = plan
                             .parts
                             .iter()
@@ -1115,7 +1174,23 @@ impl DesktopDocument {
                         Some(ReadingOutput::Synthesis {
                             request: Box::new(request),
                             style,
+                            capture,
                         })
+                        }
+                    }
+                    (Some("summary_synthesis"), AiActionRecord::SummarizeDocument) => {
+                        if let Some(token)=r["plan"]["summary_capture"].as_str() {
+                            let body=plan.parts.first().map(|part| part.wire_body.as_str()).filter(|body| !body.is_empty())
+                                .ok_or("The synthesis request body is missing. Review it again.")?;
+                            let pending=self.pending_summary.lock().map_err(|_| "Summary source state is unavailable")?;
+                            let capture=pending.as_ref()
+                                .filter(|pending|plan.parts.len()==1 && pending.matches(token,body,&d.document_identity().sha256))
+                                .ok_or("The document or synthesis request changed. Review a fresh summary.")?
+                                .capture();
+                            Some(ReadingOutput::Summary { capture, model:plan.model.clone() })
+                        } else {
+                            None
+                        }
                     }
                     _ => None,
                 }
@@ -1222,6 +1297,22 @@ impl DesktopDocument {
                             Ok(checkpoint) => result["chat_checkpoint"] = checkpoint,
                             Err(error) => result["chat_history_warning"] = json!(error),
                         },
+                        Some(ReadingArchive::PendingSummary(snapshot)) => {
+                            *self
+                                .pending_summary
+                                .lock()
+                                .map_err(|_| "Summary source state is unavailable")? =
+                                Some(snapshot);
+                        }
+                        Some(ReadingArchive::Summary(record)) => {
+                            match record
+                                .and_then(|record| self.publish_summary(&d, record))
+                                .and_then(|context| self.adopt_understanding(context))
+                            {
+                                Ok(context) => result["understanding"] = context,
+                                Err(error) => result["cache_warning"] = json!(error),
+                            }
+                        }
                         None => {}
                     }
                     Ok(result)

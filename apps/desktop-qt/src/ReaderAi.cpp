@@ -287,6 +287,8 @@ void ReaderController::setAiInput(const QString &key,const QVariant &value) {
         if(m_document)lyra_reader_desktop_cancel_translation(m_document.get());m_translationPreparedToken.clear();
     }
     input.insert(key,value);m_aiState.insert(QStringLiteral("input"),input);
+    if(key==QStringLiteral("action") || key==QStringLiteral("summaryDetail") || key==QStringLiteral("language"))
+        m_aiState.remove(QStringLiteral("cachedWholeSummary"));
     if(chatEdit) {
         if(chatDraftPending() && !m_aiState.value(QStringLiteral("activeChat")).toBool())
             m_chatDraftTimer.start();
@@ -492,7 +494,8 @@ void ReaderController::prepareAi(const QVariantMap &request,const QVariantMap &u
     m_aiSummaryPreviewUnitId=unit.isEmpty()?QString{}:m_summaryUnitContext.value(QStringLiteral("id")).toString();
     m_summaryCacheId=0;m_aiState.remove(QStringLiteral("cacheWarning"));
     m_aiSummaryPreviewLanguage=unit.isEmpty()?QString{}:request.value(QStringLiteral("language")).toString();
-    if(previewView!=QStringLiteral("translation") && !m_readingChoiceShown && !m_documentReading.value(QStringLiteral("ready")).toBool()) {
+    if(previewView==QStringLiteral("summary"))m_aiState.remove(QStringLiteral("cachedWholeSummary"));
+    if(reading.isEmpty() && previewView!=QStringLiteral("translation") && !m_readingChoiceShown && !m_documentReading.value(QStringLiteral("ready")).toBool()) {
         m_readingChoiceShown=true;m_readingChoicePending=true;emit documentReadingChanged();if(!current())return;
     }
     auto input=request;
@@ -703,8 +706,22 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
                 emit summaryCatalogChanged();if(!alive || epoch!=m_aiPreviewEpoch)return;
             }
         }else if(failure.isEmpty()) {
-            m_aiState.insert(QStringLiteral("plan"),result);
             const auto plan=result.toMap();
+            const auto cached=plan.value(QStringLiteral("saved_summary")).toMap();
+            if(!cached.isEmpty()) {
+                for(const auto *key:{"plan","reasoning","usage","unitTitle","unitLanguage","synthesisParts"})
+                    m_aiState.remove(QLatin1String(key));
+                m_aiState.insert(QStringLiteral("cachedWholeSummary"),true);
+                m_aiState.insert(QStringLiteral("responseView"),QStringLiteral("summary"));
+                m_aiState.insert(QStringLiteral("output"),cached.value(QStringLiteral("output")));
+                m_aiState.insert(QStringLiteral("responsePlan"),QVariantMap{
+                    {QStringLiteral("action"),QStringLiteral("SummarizeDocument")},
+                    {QStringLiteral("source_pages"),cached.value(QStringLiteral("source_pages"))}});
+                m_aiState.insert(QStringLiteral("status"),tr("Opened a matching saved summary locally."));
+                retainAiResult(QStringLiteral("finished"));emit aiStateChanged();return;
+            }
+            m_aiState.insert(QStringLiteral("plan"),result);
+            if(plan.contains(QStringLiteral("cache_warning")))m_aiState.insert(QStringLiteral("cacheWarning"),plan.value(QStringLiteral("cache_warning")));
             if(plan.value(QStringLiteral("kind"))==QStringLiteral("reading_translation"))
                 m_aiState.insert(QStringLiteral("previewSelection"),plan.value(QStringLiteral("reading_scope")).toMap().value(QStringLiteral("selection")));
         }
@@ -722,6 +739,14 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
         m_aiState.insert(QStringLiteral("running"),false);m_aiState.insert(QStringLiteral("status"),error);finishAiChat(QStringLiteral("failed"));retainAiResult(QStringLiteral("failed"));m_aiTimer.stop();if(m_aiState.value(QStringLiteral("responseView")).toString()==QStringLiteral("region"))markRegionDirty();emit aiStateChanged();return;
     }
     const auto batch=result.toMap();
+    auto understanding=batch.value(QStringLiteral("understanding")).toMap();
+    const bool updatedUnderstanding=!understanding.isEmpty();
+    if(updatedUnderstanding) {
+        if(understanding.value(QStringLiteral("phase"))!=QStringLiteral("ready"))
+            understanding.insert(QStringLiteral("plan"),m_documentReading.value(QStringLiteral("plan")));
+        m_documentReading=understanding;
+        m_readingChoiceShown=true;m_readingChoicePending=false;
+    }
     const auto chatCheckpoint=batch.value(QStringLiteral("chat_checkpoint")).toMap();
     if(!chatCheckpoint.isEmpty()) {
         m_aiState.insert(QStringLiteral("chatModified"),chatCheckpoint.value(QStringLiteral("modified")));
@@ -790,5 +815,8 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
     if(m_aiState.value(QStringLiteral("limited")).toBool())m_aiState.insert(QStringLiteral("status"),tr("Response exceeded the 8 MiB display budget; request cancelled."));
     if(!m_aiState.value(QStringLiteral("running")).toBool()){finishAiChat(m_aiState.value(QStringLiteral("chatOutcome")).toString());retainAiResult(m_aiState.value(QStringLiteral("chatOutcome")).toString());m_aiTimer.stop();}
     if(m_aiState.value(QStringLiteral("responseView")).toString()==QStringLiteral("region") && (output!=priorOutput || !m_aiState.value(QStringLiteral("running")).toBool()))markRegionDirty();
+    QPointer<ReaderController> alive(this);
+    const auto generation=m_generation;
     emit aiStateChanged();
+    if(alive && generation==m_generation && updatedUnderstanding)emit documentReadingChanged();
 }

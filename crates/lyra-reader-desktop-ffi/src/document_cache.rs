@@ -17,6 +17,7 @@ const CARRIED_FILES: &[&str] = &[
     "document-knowledge-v1.json",
     "region-conversations-v1.json",
     crate::reading_history::WORKSPACE_FILE,
+    crate::analysis_cache::FILE,
 ];
 
 #[derive(Clone)]
@@ -193,11 +194,20 @@ pub(super) fn lock_reading_workspace(directory: &Path) -> Result<fs::File, Strin
     )
 }
 
+pub(super) fn lock_understanding_cache(directory: &Path) -> Result<fs::File, String> {
+    lock_ai_cache(
+        directory,
+        ".document-understanding.lock",
+        "document understanding",
+    )
+}
+
 fn lock_carried_cache(directory: &Path, name: &str) -> Result<Option<fs::File>, String> {
     match name {
         "summaries.json" => lock_summary_cache(directory).map(Some),
         "translations.json" => lock_translation_cache(directory).map(Some),
         crate::reading_history::WORKSPACE_FILE => lock_reading_workspace(directory).map(Some),
+        crate::analysis_cache::FILE => lock_understanding_cache(directory).map(Some),
         _ => Ok(None),
     }
 }
@@ -372,6 +382,9 @@ impl DocumentCache {
                         ),
                         crate::reading_history::WORKSPACE_FILE => Some(
                             "The PDF was saved, but destination AI reading history differs. Both cache versions were kept",
+                        ),
+                        crate::analysis_cache::FILE => Some(
+                            "The PDF was saved, but destination document understanding differs. Both cache versions were kept",
                         ),
                         _ => None,
                     };

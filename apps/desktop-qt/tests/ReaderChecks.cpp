@@ -3236,6 +3236,9 @@ private slots:
         QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
         MockChatServer server;QVERIFY(server.listen());
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-whole-summary.pdf");
+        const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");
+        const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});
+        const auto cache=scratch.filePath("cache");qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",cache.toUtf8());
         {
             QPdfWriter pdf(path);pdf.setResolution(72);pdf.setPageSize(QPageSize(QPageSize::A4));
             QPainter painter(&pdf);QVERIFY(painter.isActive());painter.setFont(QFont("Sans Serif",9));
@@ -3258,6 +3261,10 @@ private slots:
         const auto plan=[&]{return reader->aiState().value("plan").toMap();};
         const auto prepare=[&] {
             QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));
+            QTRY_COMPARE(reader->pendingCommands(),0);
+            if(reader->aiState().value("cachedWholeSummary").toBool()) {
+                QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));
+            }
             QTRY_COMPARE(plan().value("kind").toString(),QString("reading_summary"));
             QTRY_COMPARE(reader->pendingCommands(),0);
             QCOMPARE(plan().value("source_pages").toList().size(),16);
@@ -3285,6 +3292,8 @@ private slots:
         scriptedParts(whole,false,false);QVERIFY(send->isVisible());QVERIFY(QMetaObject::invokeMethod(send,"clicked"));
         QTRY_COMPARE(plan().value("kind").toString(),QString("summary_synthesis"));
         QTRY_COMPARE(reader->pendingCommands(),0);verifyWire();
+        QDirIterator before(cache,{"document-understanding-v2.json"},QDir::Files,QDirIterator::Subdirectories);
+        QVERIFY(!before.hasNext());QVERIFY(!reader->documentReading().value("ready").toBool());
         QVERIFY(!reader->aiState().value("planSent").toBool());
         QVERIFY(!reader->startAi("local",whole));
         QVERIFY(send->isVisible());QCOMPARE(send->property("text").toString(),QString("Send synthesis"));
@@ -3298,6 +3307,11 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(send,"clicked"));
         QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);verifyWire();
         QVERIFY(reader->aiState().value("output").toString().contains("Synthetic consolidated result"));
+        QVERIFY(reader->documentReading().value("ready").toBool());
+        QDirIterator files(cache,{"document-understanding-v2.json"},QDir::Files,QDirIterator::Subdirectories);
+        QVERIFY(files.hasNext());QFile savedAnalysis(files.next());QVERIFY(savedAnalysis.open(QIODevice::ReadOnly));
+        const auto originalAnalysis=savedAnalysis.readAll();savedAnalysis.close();
+        QVERIFY(originalAnalysis.contains("Synthetic consolidated result"));QVERIFY(!originalAnalysis.contains("Synthetic reviewed part 1"));
         QVERIFY(reader->aiState().value("synthesisParts").toMap().value("output").toString().contains("Synthetic reviewed part 1"));
         auto *showParts=window->findChild<QQuickItem *>("aiShowPartSummaries");QVERIFY(showParts && showParts->isVisible());
         QVERIFY(showParts->setProperty("checked",true));
@@ -3316,6 +3330,65 @@ private slots:
         QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);verifyWire();
         QVERIFY(plan().isEmpty());QVERIFY(!reader->startAi("local",stale));
         QVERIFY(reader->aiState().value("output").toString().contains("Synthetic reviewed part 1"));
+        QVERIFY(savedAnalysis.open(QIODevice::ReadOnly));QCOMPARE(savedAnalysis.readAll(),originalAnalysis);
+    }
+
+    void wholeSummaryReusesOnlyTheMatchingLocalFormatAndSource() {
+        QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
+        MockChatServer server;QVERIFY(server.listen());
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-understanding.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");
+        const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});
+        const auto cache=scratch.filePath("cache");qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",cache.toUtf8());
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic"}});
+        QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));
+        auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);
+        const auto plan=[&]{return reader->aiState().value("plan").toMap();};
+        const auto body=[&]{return plan().value("parts").toList().value(0).toMap().value("wire_body").toString().toUtf8();};
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(!body().isEmpty());QTRY_COMPARE(reader->pendingCommands(),0);
+        QCOMPARE(server.requests.size(),0);QVERIFY(!reader->documentReading().value("choice_pending").toBool());
+        const auto reviewed=body();
+        server.responses.append({{MockChatServer::delta({{"content","Synthetic completed understanding [p.1]"}}),QByteArray("data: [DONE]\n\n")},5,200});
+        QVERIFY(reader->startAi("local",plan()));QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
+        QCOMPARE(server.requests.size(),1);const auto request=server.requests.first();QCOMPARE(request.mid(request.indexOf("\r\n\r\n")+4),reviewed);
+        QVERIFY(reader->documentReading().value("ready").toBool());QVERIFY(reader->aiState().value("cacheWarning").toString().isEmpty());
+        QDirIterator files(cache,{"document-understanding-v2.json"},QDir::Files,QDirIterator::Subdirectories);
+        QVERIFY(files.hasNext());QFile cacheFile(files.next());QVERIFY(cacheFile.open(QIODevice::ReadOnly));
+        const auto prior=cacheFile.readAll();cacheFile.close();
+        const auto record=QJsonDocument::fromJson(prior).object().value("record").toObject();
+        QCOMPARE(record.value("detail").toString(),QString("Standard"));
+        QCOMPARE(record.value("pages").toArray(),QJsonArray{1});
+        QVERIFY(!record.value("originals").toArray().isEmpty());
+
+        const auto reopen=[&] {
+            const auto generation=reader->documentGeneration();reader->openFile(QUrl::fromLocalFile(path));
+            QTRY_VERIFY(reader->documentGeneration()!=generation);QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
+            QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));
+        };
+        reopen();QTRY_VERIFY(reader->documentReading().value("ready").toBool());
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));
+        QTRY_VERIFY(reader->aiState().value("cachedWholeSummary").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(plan().isEmpty());QCOMPARE(server.requests.size(),1);
+        QCOMPARE(reader->aiState().value("output").toString(),QString("Synthetic completed understanding [p.1]"));
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(!body().isEmpty());QTRY_COMPARE(reader->pendingCommands(),0);
+        QCOMPARE(body(),reviewed);QCOMPARE(server.requests.size(),1);
+        reader->setAiInput("summaryDetail","Brief");
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(body().contains("Be brief"));QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(!reader->aiState().value("cachedWholeSummary").toBool());QCOMPARE(server.requests.size(),1);
+        reader->setAiInput("action",0);
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(body().contains("Synthetic completed understanding"));QTRY_COMPARE(reader->pendingCommands(),0);
+        QCOMPARE(server.requests.size(),1);
+
+        QFile source(path);QVERIFY(source.open(QIODevice::WriteOnly|QIODevice::Append));
+        const QByteArray externalComment("\n% Local fixture revision\n");QCOMPARE(source.write(externalComment),externalComment.size());source.close();
+        reopen();QVERIFY(!reader->documentReading().value("ready").toBool());
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(!body().isEmpty());QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(!reader->aiState().value("cachedWholeSummary").toBool());QCOMPARE(server.requests.size(),1);
+        QVERIFY(cacheFile.open(QIODevice::ReadOnly));QCOMPARE(cacheFile.readAll(),prior);
     }
 
 

@@ -47,6 +47,7 @@ pub(super) struct Knowledge {
     baseline: Option<Vec<u8>>,
     cache_error: Option<String>,
     record: Option<DocumentReading>,
+    understanding: Option<DocumentReading>,
     job: Option<ReadingJob>,
     message: Option<String>,
     merge_payloads: Vec<String>,
@@ -63,6 +64,7 @@ impl Default for Knowledge {
             baseline: None,
             cache_error: None,
             record: None,
+            understanding: None,
             job: None,
             message: None,
             merge_payloads: Vec::new(),
@@ -74,7 +76,7 @@ impl Knowledge {
         self.status(true)
     }
     fn status(&self, include_plan: bool) -> Result<Value, String> {
-        let mut result = json!({"phase":self.phase,"token":self.token,"ready":self.record.is_some(),"message":self.message,"cache_warning":self.cache_error,"merge_payloads":self.merge_payloads});
+        let mut result = json!({"phase":self.phase,"token":self.token,"ready":self.record.is_some() || self.understanding.is_some(),"message":self.message,"cache_warning":self.cache_error,"merge_payloads":self.merge_payloads});
         if include_plan {
             result["plan"] = serde_json::to_value(&self.plan).map_err(|e| e.to_string())?;
         }
@@ -99,6 +101,7 @@ impl Knowledge {
         self.message = Some("Document reading stopped. You can keep using Lyra without it.".into());
         if invalidate {
             self.record = None;
+            self.understanding = None;
             self.cache = None;
             self.source_hash.clear();
         }
@@ -116,6 +119,10 @@ fn current_hash(document: &LyraReaderDocument) -> Result<String, String> {
 }
 impl DesktopDocument {
     pub(super) fn invalidate_reading(&self) -> Result<(), String> {
+        *self
+            .pending_summary
+            .lock()
+            .map_err(|_| "Summary source state is unavailable")? = None;
         self.knowledge
             .lock()
             .map_err(|_| "Document reading state is unavailable")?
@@ -139,11 +146,32 @@ impl DesktopDocument {
                 return Err("Document reading state is unavailable".into());
             }
         };
-        if let Some(record) = state.record.as_ref().filter(|r| r.source_hash == hash) {
+        if let Some(record) = state
+            .understanding
+            .as_ref()
+            .filter(|r| r.source_hash == hash)
+            .or_else(|| state.record.as_ref().filter(|r| r.source_hash == hash))
+        {
             request.document_knowledge_text = Some(record.summary.clone());
             request.document_knowledge_pages = record.pages.clone();
         }
         Ok(())
+    }
+    pub(super) fn adopt_understanding(&self, record: DocumentReading) -> Result<Value, String> {
+        if self.active()?.document_identity().sha256 != record.source_hash {
+            return Err("The document changed before publishing the summary context.".into());
+        }
+        let mut state = self
+            .knowledge
+            .lock()
+            .map_err(|_| "Document reading state is unavailable")?;
+        state.understanding = Some(record);
+        if state.job.is_none() && !matches!(state.phase, "preparing" | "preview" | "starting") {
+            state.phase = "ready";
+            state.message =
+                Some("The completed document summary is ready for new questions.".into());
+        }
+        state.status(false)
     }
     fn reading_context(&self) -> Result<(Arc<LyraReaderDocument>, DocumentCache), String> {
         let _edits = self
@@ -188,11 +216,19 @@ impl DesktopDocument {
                 .as_ref()
                 .map(|b| DocumentReading::decode(b, active.page_count()))
                 .transpose();
-            let (record, cache_error) = match decoded {
+            let (record, mut cache_error) = match decoded {
                 Ok(record) => (record.filter(|r| r.source_hash == hash), None),
                 Err(error) => (None, Some(error)),
             };
-            let (plan, settings) = if record.is_none() {
+            let understanding =
+                match crate::analysis_cache::context(&cache, &hash, active.page_count()) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        cache_error = Some(error);
+                        None
+                    }
+                };
+            let (plan, settings) = if record.is_none() && understanding.is_none() {
                 if let Some(mut request) = request {
                     request.action = AiActionRecord::SummarizeDocument;
                     request.document_knowledge = true;
@@ -229,7 +265,16 @@ impl DesktopDocument {
                     "The PDF changed while the reading preview was prepared. Preview again.".into(),
                 );
             }
-            Ok::<_, String>((cache, hash, baseline, record, cache_error, plan, settings))
+            Ok::<_, String>((
+                cache,
+                hash,
+                baseline,
+                record,
+                understanding,
+                cache_error,
+                plan,
+                settings,
+            ))
         })();
         let mut state = self
             .knowledge
@@ -239,8 +284,8 @@ impl DesktopDocument {
             return Err("The document reading preview was cancelled or superseded.".into());
         }
         match prepared {
-            Ok((cache, hash, baseline, record, error, plan, settings)) => {
-                state.phase = if record.is_some() {
+            Ok((cache, hash, baseline, record, understanding, error, plan, settings)) => {
+                state.phase = if record.is_some() || understanding.is_some() {
                     "ready"
                 } else if plan.is_some() {
                     "preview"
@@ -251,6 +296,7 @@ impl DesktopDocument {
                 state.source_hash = hash;
                 state.baseline = baseline;
                 state.record = record;
+                state.understanding = understanding;
                 state.cache_error = error;
                 state.plan = plan;
                 state.settings = settings;
