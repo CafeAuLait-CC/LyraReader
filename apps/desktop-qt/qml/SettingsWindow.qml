@@ -14,6 +14,7 @@ ApplicationWindow {
     property bool initialReduceMotion: false
     property int initialGap: 0
     property var initialAiDraft: ({})
+    property bool auditOnOpen: false
     objectName:"settingsWindow"
     required property var app
     readonly property var colors:app.colors
@@ -41,10 +42,24 @@ ApplicationWindow {
         initialReduceMotion=reduceMotion.checked;initialGap=gap.value;initialAiDraft=aiDraft();
         apiKey.clear();
         const saved=app.session ? app.session.preference("auxiliarySettingsGeometry",{}) : ({});
-        if(!policy.prepare(settings,app,saved,560,650)){app.operationStatus=qsTr("The Settings window could not find an available display.");return;}
-        show();requestActivate();
+        if(!policy.prepare(settings,app,saved,560,650)){auditOnOpen=false;app.operationStatus=qsTr("The Settings window could not find an available display.");return;}
+        policy.present();
     }
-    function openAudit(){open();if(visible)auditDialog.open();}
+    function openAudit() {
+        if(visible) {
+            requestActivate();
+            auditDialog.open();
+        } else {
+            auditOnOpen=true;
+            open();
+        }
+    }
+    onVisibleChanged: {
+        if(visible && auditOnOpen) {
+            auditOnOpen=false;
+            auditDialog.open();
+        }
+    }
     function aiDraft() {
         return {baseUrl:baseUrl.text,model:modelName.text,reasoningMode:reasoning.currentText,
             reasoningEncoding:encoding.currentText,imageInput:imageInput.checked};
@@ -83,6 +98,8 @@ ApplicationWindow {
         close();
     }
     onClosing: {
+        policy.cancelPresentation();
+        auditOnOpen=false;
         if(app.session)app.session.setPreference("auxiliarySettingsGeometry",policy.geometry());
         auditDialog.close();apiKey.clear();policy.returnFocus();
     }

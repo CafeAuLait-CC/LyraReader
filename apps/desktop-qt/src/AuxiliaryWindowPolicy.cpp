@@ -1,5 +1,6 @@
 #include "AuxiliaryWindowPolicy.h"
 #include <QGuiApplication>
+#include <QQuickWindow>
 #include <QScreen>
 #include <QTimer>
 #include <cmath>
@@ -25,6 +26,7 @@ bool AuxiliaryWindowPolicy::prepare(QWindow *window,QWindow *owner,const QVarian
     const double savedHeight=saved.value(QStringLiteral("height")).toDouble(&heightOk);
     const auto size=boundedSize({widthOk ? savedWidth : double(width),heightOk ? savedHeight : double(height)},screen->availableGeometry());
     if(size.isEmpty())return false;
+    cancelPresentation();
     disconnect(m_ownerVisibility);disconnect(m_ownerDestroyed);
     m_window=window;m_owner=owner;
     // Set the relationship and type before show/map, including on Wayland. No fixed size,
@@ -47,9 +49,47 @@ bool AuxiliaryWindowPolicy::prepare(QWindow *window,QWindow *owner,const QVarian
         window->setPosition(bounded(x,centered.x(),available.left(),available.right()-size.width()+1,xOk),
                             bounded(y,centered.y(),available.top(),available.bottom()-size.height()+1,yOk));
     }
-    m_ownerVisibility=connect(owner,&QWindow::visibleChanged,this,[this](bool visible){if(!visible && m_window)m_window->close();});
-    m_ownerDestroyed=connect(owner,&QObject::destroyed,this,[this]{if(m_window)m_window->hide();});
+    m_ownerVisibility=connect(owner,&QWindow::visibleChanged,this,[this](bool visible) {
+        if(visible)return;
+        cancelPresentation();
+        if(m_window)m_window->close();
+    });
+    m_ownerDestroyed=connect(owner,&QObject::destroyed,this,[this] {
+        cancelPresentation();
+        if(m_window)m_window->hide();
+    });
     return true;
+}
+
+void AuxiliaryWindowPolicy::present() {
+    if(!m_window || !m_owner || !m_owner->isVisible() || m_ownerFrame)return;
+    auto *owner=qobject_cast<QQuickWindow *>(m_owner.data());
+    if(m_window->isVisible() || !owner || !QGuiApplication::platformName().startsWith(QStringLiteral("wayland"))) {
+        showPreparedWindow();
+        return;
+    }
+    // xdg-shell treats a parent without a mapped buffer as unset. Queue the
+    // auxiliary show after Qt submits an owner frame, on the owner's connection.
+    const auto presentation=++m_presentation;
+    m_ownerFrame=connect(owner,&QQuickWindow::frameSwapped,this,[this,presentation] {
+        if(presentation!=m_presentation)return;
+        cancelPresentation();
+        showPreparedWindow();
+    },Qt::QueuedConnection);
+    owner->update();
+}
+
+void AuxiliaryWindowPolicy::cancelPresentation() {
+    ++m_presentation;
+    disconnect(m_ownerFrame);
+    m_ownerFrame={};
+}
+
+void AuxiliaryWindowPolicy::showPreparedWindow() {
+    const auto window=m_window;
+    if(!window || !m_owner || !m_owner->isVisible())return;
+    window->show();
+    if(window && window->isVisible())window->requestActivate();
 }
 
 QVariantMap AuxiliaryWindowPolicy::geometry() const {

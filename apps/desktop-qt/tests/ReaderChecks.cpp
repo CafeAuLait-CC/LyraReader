@@ -1702,10 +1702,22 @@ private slots:
     void settingsAreIndependentTransientWindowsWithSafeReopenAndOwnerLifetime() {
         WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
         const auto oldMotion=window->property("reduceMotion");auto restoreMotion=qScopeGuard([&]{window->setProperty("reduceMotion",oldMotion);});
-        auto *settings=window->findChild<QQuickWindow *>("settingsWindow");QVERIFY(settings);QVERIFY(!settings->isVisible());bool preparedAtFirstShow=false;
-        connect(settings,&QWindow::visibleChanged,this,[&](bool shown){if(shown)preparedAtFirstShow=settings->transientParent()==window && settings->type()==Qt::Dialog && settings->modality()==Qt::NonModal;});
+        auto *settings=window->findChild<QQuickWindow *>("settingsWindow");
+        QVERIFY(settings);
+        QVERIFY(!settings->isVisible());
+        const bool wayland=QGuiApplication::platformName().startsWith(QStringLiteral("wayland"));
+        bool ownerFrameSubmitted=false,preparedAtFirstShow=false,frameBeforeFirstShow=false;
+        QObject observations;
+        if(wayland)
+            connect(window,&QQuickWindow::frameSwapped,&observations,[&]{ownerFrameSubmitted=true;},Qt::QueuedConnection);
+        connect(settings,&QWindow::visibleChanged,&observations,[&](bool shown) {
+            if(!shown)return;
+            preparedAtFirstShow=settings->transientParent()==window && settings->type()==Qt::Dialog && settings->modality()==Qt::NonModal;
+            frameBeforeFirstShow=!wayland || ownerFrameSubmitted;
+        });
         workspace.setPreference("auxiliarySettingsGeometry",QVariantMap{{"width",1e300},{"height",-10},{"x",-1e300},{"y",1e300}});
         QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));QTRY_VERIFY(settings->isVisible());QVERIFY(preparedAtFirstShow);QVERIFY(settings->minimumWidth()<settings->maximumWidth());QVERIFY(settings->minimumHeight()<settings->maximumHeight());
+        QVERIFY(frameBeforeFirstShow);
         const auto available=settings->screen()->availableGeometry();QVERIFY(settings->width()<=available.width());QVERIFY(settings->height()<=available.height());QVERIFY(!(settings->flags() & Qt::WindowStaysOnTopHint));
         if(qEnvironmentVariableIsSet("LYRA_READER_CHECK_AUX_OBSERVE"))QTest::qWait(1800);
         if(qEnvironmentVariableIsSet("LYRA_READER_CHECK_AUX_SNAPSHOT")){QTest::qWait(80);QVERIFY(settings->grabWindow().save(qEnvironmentVariable("LYRA_READER_CHECK_AUX_SNAPSHOT")));}

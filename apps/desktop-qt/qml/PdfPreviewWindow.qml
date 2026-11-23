@@ -32,8 +32,9 @@ ApplicationWindow {
         const saved=app.session ? app.session.preference("auxiliaryPdfGeometry",{}) : ({});
         if(!policy.prepare(preview,app,saved,760,700))return false;
         pendingPoint={page:requestedPage,x:targetRegion.x_pt || 0,y:targetRegion.y_pt || 0};
-        show();requestActivate();placePending();return true;
+        policy.present();placePending();return true;
     }
+    onVisibleChanged:if(visible)placePending()
     function navigate(index,y) {
         if(!previewReader || !previewReader.pageCount || shuttingDown)return;
         pendingPoint={page:Math.max(0,Math.min(previewReader.pageCount-1,index)),x:0,y:y || 0};
@@ -66,6 +67,7 @@ ApplicationWindow {
     function copyPageText() {const data=previewReader ? previewReader.textPages[String(page)] : null;if(data && app.session)app.session.copyText(data.text);}
     function readText() {textMode=!textMode;if(textMode && previewReader)previewReader.requestText(page);}
     onClosing: {
+        policy.cancelPresentation();
         shuttingDown=true;++navigationEpoch;
         if(app && app.session)app.session.setPreference("auxiliaryPdfGeometry",policy.geometry());
         if(previewReader)previewReader.closeSnapshot();
