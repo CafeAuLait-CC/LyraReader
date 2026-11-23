@@ -61,7 +61,8 @@ struct AIRegionCardView: View {
         _notes = ObservedObject(wrappedValue: card.notesAssistant)
     }
     private var transcriptLimit: CGFloat { max(30, maximumHeight - 58 - composerHeight) }
-    private var transcriptViewHeight: CGFloat { min(max(32, transcriptHeight), transcriptLimit) }
+    private var targetHeight: CGFloat { 58 + composerHeight + min(max(32, transcriptHeight), transcriptLimit) }
+    private var transcriptViewHeight: CGFloat { min(transcriptLimit, max(0, card.heightViewPt - 58 - composerHeight)) }
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -75,6 +76,9 @@ struct AIRegionCardView: View {
             })
             .onPreferenceChange(AIRegionComposerHeightKey.self) { composerHeight = $0 }
         }
+        // The native paper frame follows SwiftUI's measured height. TextKit must not resize
+        // paragraphs independently after that measurement, especially below the window edge.
+        .environment(\.readingStableTextLayout, true)
         .foregroundStyle(LyraReaderTheme.textPrimary)
         .background {
             if parchment { RegionNotePaper() }
@@ -83,10 +87,8 @@ struct AIRegionCardView: View {
                 .shadow(color: .black.opacity(0.06), radius: 4, y: 2) }
         }
         .padding(.vertical, 8)
-        .background(GeometryReader { proxy in
-            Color.clear.preference(key: AIRegionCardHeightKey.self, value: proxy.size.height)
-        })
-        .onPreferenceChange(AIRegionCardHeightKey.self) { height in
+        .fixedSize(horizontal: false, vertical: true)
+        .onChange(of: targetHeight, initial: true) { _, height in
             Task { @MainActor in state.updateRegionCardHeight(cardID: card.id, viewHeight: height) }
         }
         .background(AIRegionCardMarkerHost())
@@ -95,6 +97,10 @@ struct AIRegionCardView: View {
         }, delete: {
             requestDelete()
         }, regionID: card.id, enabled: state.selectedAnnotationID == nil && !state.contentEditEnabled && !confirmingDelete && !editingNote && !showingSelection && !showingDetails))
+        // The paper's native frame catches up after the measured-height callback. Keep the
+        // natural-sized content at its top during that interval instead of centering it in
+        // the previous frame, which visibly moves the header and composer on every growth.
+        .frame(maxHeight: .infinity, alignment: .top)
         .onAppear { questionFocused = card.focusesComposerOnOpen }
         .sheet(isPresented: $editingNote, onDismiss: { state.persistRegionHistory() }) {
             VStack(spacing: 12) {
@@ -113,8 +119,10 @@ struct AIRegionCardView: View {
                 .background(LyraReaderTheme.panelBg)
         }
         .onChange(of: notes.phase) { _, phase in
+            if phase == .preparing || phase == .streaming { showingNote = true }
             if phase == .finished {
                 card.keepGeneratedNote(); showingNote = true; state.persistRegionHistory()
+                NotificationCenter.default.post(name: .lyraReadingNoteChanged, object: state)
             }
         }
         .confirmationDialog("Delete this conversation?", isPresented: $confirmingDelete,
@@ -164,7 +172,7 @@ struct AIRegionCardView: View {
         [
             LyraReaderMenuItem(showingNote ? "Show Conversation" : "Show Reading Note", icon: "note.text",
                 enabled: !card.knowledgeNote.isEmpty || card.notesBusy) { showingNote.toggle() },
-            LyraReaderMenuItem("Distill into Reading Note", icon: "sparkles",
+            LyraReaderMenuItem(aiReadingLabel("Finish & Make Note"), icon: "sparkles",
                 enabled: !card.conversationContext.isEmpty && !card.isBusy && !card.notesBusy) {
                 guard let context = state.aiReaderContext else { return }
                 showingNote = true; Task { await card.distill(context: context) }
@@ -263,6 +271,7 @@ struct AIRegionCardView: View {
         }.frame(maxWidth: .infinity, alignment: .leading)
     }
     @ViewBuilder private var noteContent: some View {
+        if let error = card.noteError { Text(error).font(.caption).foregroundStyle(LyraReaderTheme.errorFg) }
         if card.notesBusy {
             AIAnswerView(text: notes.answer.isEmpty ? "Organizing key points…" : notes.answer,
                          pageCount: state.document?.pageCount ?? 0,
@@ -333,10 +342,6 @@ struct AIRegionCardView: View {
     }
 }
 
-private struct AIRegionCardHeightKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
-}
 private struct AIRegionComposerHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 54
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
@@ -530,7 +535,11 @@ final class PaperRegionHost: NSView {
         var revealed = restingFrame
         revealed.size.height *= min(1, max(0, progress))
         frame = revealed
-        content.frame = CGRect(origin: .zero, size: restingFrame.size)
+        let contentFrame = CGRect(origin: .zero, size: restingFrame.size)
+        if content.frame != contentFrame {
+            content.frame = contentFrame
+            content.layoutSubtreeIfNeeded()
+        }
         alphaValue = 0.65 + 0.35 * progress
     }
     override func hitTest(_ point: NSPoint) -> NSView? {

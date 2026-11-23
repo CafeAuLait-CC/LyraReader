@@ -355,6 +355,8 @@ pub struct TokenUsage {
     pub total_tokens: Option<u64>,
     /// Reasoning tokens are a subset of completion tokens on providers that expose them.,
     pub reasoning_tokens: Option<u64>,
+    /// Cached input is a subset of prompt tokens, not additional usage. None is unreported.
+    pub cached_tokens: Option<u64>,
 }
 
 impl TokenUsage {
@@ -364,6 +366,7 @@ impl TokenUsage {
             completion_tokens: add_optional(self.completion_tokens, other.completion_tokens),
             total_tokens: add_optional(self.total_tokens, other.total_tokens),
             reasoning_tokens: add_optional(self.reasoning_tokens, other.reasoning_tokens),
+            cached_tokens: add_optional(self.cached_tokens, other.cached_tokens),
         }
     }
 
@@ -1175,23 +1178,62 @@ fn append_text_payloads(container: &Value, payloads: &mut Vec<StreamPayload>) {
 }
 
 fn append_usage(value: &Value, payloads: &mut Vec<StreamPayload>) {
+    if let Some(usage) = response_usage(value) {
+        payloads.push(StreamPayload::Usage(usage));
+    }
+}
+
+/// Both supported transports use this accounting, including their optional cache-hit subset.
+pub fn response_usage(value: &Value) -> Option<TokenUsage> {
     if let Some(usage) = value.get("usage").and_then(Value::as_object) {
         let reasoning_tokens = usage
             .get("completion_tokens_details")
             .and_then(Value::as_object)
             .and_then(|details| details.get("reasoning_tokens"))
             .and_then(Value::as_u64)
+            .or_else(|| {
+                usage
+                    .get("output_tokens_details")
+                    .and_then(|v| v.get("reasoning_tokens"))
+                    .and_then(Value::as_u64)
+            })
             .or_else(|| usage.get("reasoning_tokens").and_then(Value::as_u64));
+        let prompt_tokens = usage
+            .get("prompt_tokens")
+            .or_else(|| usage.get("input_tokens"))
+            .and_then(Value::as_u64);
+        let cached_tokens = usage
+            .get("prompt_tokens_details")
+            .or_else(|| usage.get("input_tokens_details"))
+            .and_then(|v| v.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .filter(|cached| prompt_tokens.is_none_or(|prompt| *cached <= prompt));
         let parsed = TokenUsage {
-            prompt_tokens: usage.get("prompt_tokens").and_then(Value::as_u64),
-            completion_tokens: usage.get("completion_tokens").and_then(Value::as_u64),
+            prompt_tokens,
+            completion_tokens: usage
+                .get("completion_tokens")
+                .or_else(|| usage.get("output_tokens"))
+                .and_then(Value::as_u64),
             total_tokens: usage.get("total_tokens").and_then(Value::as_u64),
             reasoning_tokens,
+            cached_tokens,
         };
         if parsed != TokenUsage::default() {
-            payloads.push(StreamPayload::Usage(parsed));
+            return Some(parsed);
         }
     }
+    None
+}
+
+pub fn response_usage_json(json: &str) -> Result<Option<TokenUsage>, AiError> {
+    if json.len() > MAX_COMPLETE_BODY {
+        return Err(AiError::Protocol(
+            "Response usage exceeds the supported size.".into(),
+        ));
+    }
+    let value: Value = serde_json::from_str(json)
+        .map_err(|e| AiError::Protocol(format!("Invalid response usage JSON: {e}")))?;
+    Ok(response_usage(&value))
 }
 
 fn error_message(error: &Value) -> Option<&str> {
@@ -1864,6 +1906,7 @@ mod tests {
                     total_tokens: Some(12),
 
                     reasoning_tokens: None,
+                    cached_tokens: None,
                 })
             ]
         );
@@ -1906,6 +1949,7 @@ mod tests {
                     total_tokens: Some(18),
 
                     reasoning_tokens: None,
+                    cached_tokens: None,
                 })
             ]
         );
@@ -1924,6 +1968,7 @@ mod tests {
                     total_tokens: None,
 
                     reasoning_tokens: None,
+                    cached_tokens: None,
                 })
             ]
         );
@@ -1945,6 +1990,7 @@ mod tests {
                     total_tokens: Some(5),
 
                     reasoning_tokens: None,
+                    cached_tokens: None,
                 })
             ]
         );

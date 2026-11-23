@@ -234,17 +234,27 @@ The Linux branch is not yet a release or a claim of full feature parity.
   compositing; dark previews use soft warm gray-gold neutral ink while retaining chart colours),
   metadata recognition with BibTeX export. Night reading moderates neutral edge brightness while keeping
   its existing paper and solid-ink colours.
-- **Assist**: an optional assistant in its own right-hand panel — document chat with retrieval across the whole
-  file and citation chips that jump to the verified source and flash it; region questions, where a drag opens the
-  answer in a card set into a real tear in the page (the page's pixels are clipped into two pieces, never
-  re-rendered) and the exchange later exports as a Markdown knowledge document; layered summaries over the whole
-  document, its sections and its pages, each linking to its source; and in-place translation with a Show original
-  toggle that sends nothing on a cache hit. It works over an OpenAI-compatible endpoint or a ChatGPT plan, previews
-  every request before anything leaves the machine, keeps the key in the Keychain, and keeps a local record of what
-  each send contained (pages, characters, whether a picture went) that never stores document text.
-  Summary, Translate and Chat have separate tabs. The assistant and Edit inspectors share the right
-  edge; switching between them preserves drafts, reserves the panel's width in the document
-  viewport and keeps the document's vertical position stable. Wide pages can scroll horizontally.
+- **Assist**: Summary, Translate, Chat and Reading notes share a native right-hand sidebar.
+  Summaries cover a document or a fixed selection, with detail levels and expandable sections;
+  translations pair paragraphs with their sources and retain local history across selections and
+  restarts. Long selected passages expand on demand; earlier translations can be reopened or
+  retranslated using their saved source range. A long document remains one
+  reader task while Rust plans any required batches and summary synthesis. Chat retains complete
+  local sessions and drafts while Rust bounds the context sent with each question. Summaries and
+  answers can be kept as editable reading notes with separate personal thoughts; updates require
+  reviewing a suggestion. Interleaf keeps its existing inline conversation and page tear, with
+  Finish & Make Note in its existing actions menu.
+  Prereading and whole-document Summary share a source-matched analysis; a matching completed
+  result is reused without another request. Chat uses a stable original-text prefix for short
+  analyzed documents and bounded original passages for longer ones, including explicit chapter
+  requests and follow-ups. Provider-reported cached input is shown as a subset of input usage;
+  cache availability and savings depend on the configured service.
+  AI uses an OpenAI-compatible endpoint or a ChatGPT plan. Tasks send directly by default;
+  optional request review takes place in a separate native window. Document prereading can be
+  requested, always enabled or disabled; while it runs, other AI requests wait, and completion
+  shows a nonmodal ready status. Credentials stay in Keychain, and the local request log records
+  metadata without document text. The AI and Edit inspectors preserve the document's vertical
+  position and share the resizable right edge. Wide pages can scroll horizontally.
 - **Translate in place**: select a paragraph and choose Translate from the context menu, the toolbar or
   ⇧⌘L; the translation is drawn over that block with a Show original / Translate chip and a fitted font size,
   never a side-by-side panel. Per-block results are cached in the document cache, so flipping, switching tabs,
@@ -347,7 +357,7 @@ carries the overview, and the only documents that ship with the code are this fi
 | M2 | Reading experience | Complete: tabs, independent windows, outline, search, bookmarks, page-corner flags, facing pages |
 | M3 | Annotation and editing | Complete: annotations (incl. stamps, image signatures, typed/drawn/Continuity signatures), page operations, forms filling without a tool, redaction (Edit workspace), flattened copies, printing |
 | M4 | Advanced reading | Complete: citation/figure/table previews, citation attribution, captions, metadata and BibTeX |
-| M5 | AI assistant | Broadly complete: document chat, region questions with an inline card, layered summaries, in-place translation, vision on both connections, local request log; cross-document Q&A not done |
+| M5 | AI assistant | Broadly complete: document chat, region questions with an inline card, document/selection summaries, sidebar and in-place translation, reading notes, vision on both connections, local request log; cross-document Q&A not done |
 | M6 | Cross-platform | In progress: native Linux port on a separate, unmerged branch; Windows shell not started |
 | M7 | Polish: accessibility, i18n, updates | In progress: performance pass delivered (startup, sharp-on-stop, memory audit); accessibility, i18n and updates not started |
 

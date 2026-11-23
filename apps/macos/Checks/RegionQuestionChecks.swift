@@ -910,20 +910,29 @@ extension ReaderChecks {
             #"\left( \frac{a+b}{c} \right)"#,
             #"\int_0^1 x^2\,dx"#,
             #"\sqrt[3]{x}"#,
+            #"\mathcal J_{\text{all}} = \mathcal J_{\text{fit}} + \mu_{\text{aux}}\mathcal J_{\text{aux}}"#,
+            #"c_k = W_c u_k + e_{\tau}(\tau_k). \tag{3}"#,
+            #"x=1\tag*{A.2}"#,
         ]
         for expression in expressions {
             switch ReaderMathRenderer.render(expression, fontSize: 13, display: true) {
             case .success(let rendered):
                 require(rendered.size.width > 0 && rendered.size.height > 0,
                         "math renders with a positive size: \(expression)")
+                require(rendered.source == expression, "rendering preserves the exact copyable mathematics source")
             case .failure(let error):
-                fatalError("FAIL: supported math did not render: \(expression) (\(error))")
+                fail("FAIL: supported math did not render: \(expression) (\(error))")
             }
         }
+        guard case .success(let plain) = ReaderMathRenderer.render("x=1", fontSize: 13),
+              case .success(let numbered) = ReaderMathRenderer.render(#"x=1\tag{3}"#, fontSize: 13) else {
+            fail("FAIL: equation number compatibility renders")
+        }
+        require(numbered.size.width > plain.size.width + 10, "equation tag compatibility retains a visible number")
         if case .success = ReaderMathRenderer.render(#"\frac{1}{2}"#, fontSize: 13) {
             require(true, "a fraction renders")
         } else {
-            fatalError("FAIL: a fraction must render")
+            fail("FAIL: a fraction must render")
         }
         require(ReaderMathRenderer.unsupportedReason(for: #"\foo{bar}"#) != nil,
                 "an unsupported command reports its fallback reason")

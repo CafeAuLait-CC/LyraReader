@@ -9,7 +9,7 @@ import SwiftUI
 /// the 1 pt separator are added on top, exactly like the left sidebar's separator.
 public enum ReaderSidePanelMetrics {
     /// Content width a fresh install opens with.
-    public static let defaultContentWidthPt: CGFloat = 320
+    public static let defaultContentWidthPt: CGFloat = 414
     /// Narrow enough to leave a usable canvas at the window's minimum width, wide enough for the
     /// assistant's action grid and request preview without squeezing them.
     public static let minimumContentWidthPt: CGFloat = 240
@@ -49,13 +49,14 @@ public enum ReaderSidePanelMetrics {
     }
 }
 
-/// The persisted half of the right panel: its width and whether it is open.
+/// The persisted width of the right panel. Tool visibility is session-only state.
 ///
 /// These are reader preferences, not document state, so they live in `UserDefaults`. The app
 /// reads and writes the standard domain; the checks pass an isolated suite so a run can prove
 /// "remembered across launches" without touching the person's own window.
 public enum ReaderSidePanelPreferences {
     public static let widthKey = "rightPanelWidthPt"
+    /// Retired launch preference, removed when a new reader session is created.
     public static let visibleKey = "rightPanelVisible"
 
     public static func width(defaults: UserDefaults = .standard) -> CGFloat {
@@ -65,17 +66,10 @@ public enum ReaderSidePanelPreferences {
         return ReaderSidePanelMetrics.clampedContentWidth(CGFloat(stored.doubleValue))
     }
 
-    public static func isVisible(defaults: UserDefaults = .standard) -> Bool {
-        defaults.bool(forKey: visibleKey)
-    }
-
     public static func store(width: CGFloat, defaults: UserDefaults = .standard) {
         defaults.set(Double(ReaderSidePanelMetrics.clampedContentWidth(width)), forKey: widthKey)
     }
 
-    public static func store(visible: Bool, defaults: UserDefaults = .standard) {
-        defaults.set(visible, forKey: visibleKey)
-    }
 }
 
 /// Keyboard shortcuts the right panel introduces.
@@ -94,9 +88,8 @@ public enum ReaderShortcuts {
 /// A sliding right-hand column beside the reader canvas.
 ///
 /// It is deliberately generic: the AI assistant is its first tenant, but the host knows nothing
-/// about the assistant's model, its settings or its request state. The content is laid out once
-/// at `contentWidth` and the *frame around it* animates between zero and the full width, exactly
-/// like ``ReaderSidebarTransition``:
+/// about the assistant's model, its settings or its request state. A single animated progress
+/// moves the full-width content and allocates its visible width together:
 ///
 /// * the panel's own content keeps its geometry for the whole transition (no per-frame reflow of
 ///   the action grid, preview or answer);
@@ -120,9 +113,6 @@ public struct ReaderSidePanel<Content: View>: View {
     private let onResize: (CGFloat) -> Void
     private let onResizeEnded: () -> Void
     private let content: Content
-
-    @State private var dragStartWidth: CGFloat?
-    @State private var isHoveringHandle = false
 
     public init(
         isVisible: Bool,
@@ -167,9 +157,7 @@ public struct ReaderSidePanel<Content: View>: View {
                 .frame(width: contentWidth)
         }
         .frame(width: totalWidth)
-        // Leading alignment is the mirror of the left drawer: as the frame closes, the content
-        // stays anchored to the inner edge and slides out past the window's trailing edge.
-        .frame(width: totalWidth * progress, alignment: .leading)
+        .modifier(ReaderSidePanelSlide(progress: progress, fullWidth: totalWidth))
         .background(LyraReaderTheme.panelBg)
         .background(ReaderSidePanelMarkerHost())
         .clipped()
@@ -183,53 +171,29 @@ public struct ReaderSidePanel<Content: View>: View {
     /// real target; the hover tint and the resize cursor are the only affordances the panel has
     /// for a gesture that is otherwise invisible until it is used.
     private var resizeHandle: some View {
-        Rectangle()
-            .fill(isHoveringHandle ? LyraReaderTheme.accent.opacity(0.55) : Color.clear)
+        ReaderSidePanelResizeHandle(width: contentWidth, label: resizeAccessibilityLabel,
+            interactive: isVisible || progressOverride != nil,
+            began: onResizeBegan, resize: onResize, ended: onResizeEnded)
             .frame(width: ReaderSidePanelMetrics.resizeHandleWidthPt)
-            .contentShape(Rectangle())
-            .onHover { inside in
-                guard inside != isHoveringHandle else { return }
-                isHoveringHandle = inside
-                if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
-            }
-            .onDisappear {
-                if isHoveringHandle {
-                    NSCursor.pop()
-                    isHoveringHandle = false
-                }
-            }
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { value in
-                        let base = dragStartWidth ?? contentWidth
-                        if dragStartWidth == nil {
-                            dragStartWidth = base
-                            onResizeBegan()
-                        }
-                        onResize(ReaderSidePanelMetrics.contentWidth(
-                            base: base, dragTranslationX: value.translation.width))
-                    }
-                    .onEnded { _ in
-                        dragStartWidth = nil
-                        onResizeEnded()
-                    }
-            )
-            .accessibilityElement()
-            .accessibilityLabel(resizeAccessibilityLabel)
-            .accessibilityValue("\(Int(contentWidth.rounded())) points")
-            .accessibilityAdjustableAction { direction in
-                onResizeBegan()
-                switch direction {
-                case .increment:
-                    onResize(ReaderSidePanelMetrics.clampedContentWidth(contentWidth + 16))
-                case .decrement:
-                    onResize(ReaderSidePanelMetrics.clampedContentWidth(contentWidth - 16))
-                @unknown default:
-                    onResizeEnded()
-                    return
-                }
-                onResizeEnded()
-            }
+            .frame(maxHeight: .infinity)
+    }
+}
+
+/// Resolve the translation and the clip from the same intermediate value. Animating just an
+/// outer frame can reveal descendants already drawn at their destination, particularly when
+/// native scroll content changes while the drawer opens.
+private struct ReaderSidePanelSlide: AnimatableModifier {
+    nonisolated var progress: CGFloat
+    let fullWidth: CGFloat
+    nonisolated var animatableData: CGFloat {
+        get { progress }
+        set { progress = newValue }
+    }
+    func body(content: Content) -> some View {
+        content
+            .transaction { $0.animation = nil }
+            .offset(x: fullWidth * (1 - progress))
+            .frame(width: fullWidth * progress, alignment: .trailing)
     }
 }
 

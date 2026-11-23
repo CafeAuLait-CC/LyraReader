@@ -162,6 +162,7 @@ public struct AIRegionHistoryEntry: Codable, Identifiable, Equatable, Sendable {
     public let createdAt: Date
     public let turns: [AIRegionTurn]
     public let knowledgeNote: String
+    public let noteTurnCount: Int?
     public var regionNumber: Int?
     public var draftQuestion: String?
     /// Captured content remains readable after edits, but its old location must not be reopened.
@@ -179,6 +180,7 @@ public struct AIRegionHistoryEntry: Codable, Identifiable, Equatable, Sendable {
         createdAt: Date = Date(),
         turns: [AIRegionTurn] = [],
         knowledgeNote: String = "",
+        noteTurnCount: Int? = nil,
         regionNumber: Int? = nil, draftQuestion: String? = nil
     ) {
         self.id = id
@@ -192,6 +194,7 @@ public struct AIRegionHistoryEntry: Codable, Identifiable, Equatable, Sendable {
         self.createdAt = createdAt
         self.turns = turns
         self.knowledgeNote = knowledgeNote
+        self.noteTurnCount = noteTurnCount
         self.regionNumber = regionNumber; self.draftQuestion = draftQuestion
     }
 
@@ -266,6 +269,8 @@ public final class AIRegionCard: ObservableObject, Identifiable {
     public var regionNumber: Int = 1
     @Published public var question = ""
     @Published public var knowledgeNote = ""
+    @Published public private(set) var noteTurnCount = 0
+    @Published public private(set) var noteError: String?
     @Published public private(set) var turns: [AIRegionTurn] = []
     @Published public private(set) var heightViewPt: CGFloat = initialHeightViewPt
     public internal(set) var tearSplitPt: CGFloat?
@@ -315,6 +320,7 @@ public final class AIRegionCard: ObservableObject, Identifiable {
     public func restore(_ entry: AIRegionHistoryEntry) {
         turns = entry.allTurns
         knowledgeNote = entry.knowledgeNote
+        noteTurnCount = entry.noteTurnCount ?? 0
         question = entry.draftQuestion ?? ""
         regionNumber = entry.regionNumber ?? regionNumber
     }
@@ -326,7 +332,11 @@ public final class AIRegionCard: ObservableObject, Identifiable {
         liveTurnID = UUID(); liveTurnDate = Date()
         await assistant.prepareRegion(question: next, attachment: attachment,
                                       context: context, history: history)
-        if assistant.phase == .preview {
+        if assistant.phase == .preview, let plan = assistant.plan {
+            if assistant.settings.reviewBeforeSending {
+                guard await AIReadingReviewWindow.review(plan) else { return }
+            }
+            guard assistant.phase == .preview, assistant.plan?.parts.map(\.wireBody) == plan.parts.map(\.wireBody) else { return }
             question = ""
             assistant.send()
         }
@@ -334,27 +344,38 @@ public final class AIRegionCard: ObservableObject, Identifiable {
     /// Distillation is an explicit request. Its output never replaces the conversation.
     public func distill(context: AIReaderContext) async {
         guard !isBusy, !notesBusy, !conversationContext.isEmpty else { return }
+        let prompt: String
+        do { prompt = try aiReadingNotePrompt(language: notesAssistant.settings.outputLanguage) }
+        catch { noteError = AIReadableError.message(error); return }
+        noteError = nil
         pendingNoteApplication = true
         await notesAssistant.prepareRegion(
-            question: "Summarize the earlier conversation into concise reading notes in the reader's language. Keep key concepts, evidence, important notation, and unresolved questions. Cite the selected page as [p.N]. Do not invent facts. Return Markdown bullet points only.",
+            question: prompt,
             attachment: attachment, context: context, history: conversationContext)
-        if notesAssistant.phase == .preview { notesAssistant.send() }
+        if notesAssistant.phase == .preview, let plan = notesAssistant.plan {
+            if notesAssistant.settings.reviewBeforeSending {
+                guard await AIReadingReviewWindow.review(plan) else { return }
+            }
+            guard notesAssistant.phase == .preview, notesAssistant.plan?.parts.map(\.wireBody) == plan.parts.map(\.wireBody) else { return }
+            notesAssistant.send()
+        }
     }
     public func keepGeneratedNote() {
         guard pendingNoteApplication, notesAssistant.phase == .finished, !notesAssistant.answer.isEmpty else { return }
         pendingNoteApplication = false
         knowledgeNote = notesAssistant.answer
+        noteTurnCount = allTurns.count
     }
     public var historyEntry: AIRegionHistoryEntry? {
         let first = allTurns.first
         return AIRegionHistoryEntry(id: id, documentKey: documentKey, attachment: attachment,
             question: first?.question ?? "", answer: allTurns.last?.answer ?? "", state: answerState,
             error: assistant.errorMessage, failure: assistant.requestFailure, createdAt: createdAt,
-            turns: allTurns, knowledgeNote: knowledgeNote,
+            turns: allTurns, knowledgeNote: knowledgeNote, noteTurnCount: noteTurnCount,
             regionNumber: regionNumber, draftQuestion: question)
     }
     public func updateHeight(_ height: CGFloat) {
-        guard height.isFinite, height > 0, abs(height - heightViewPt) > 0.5 else { return }
+        guard height.isFinite, height > 0, abs(height - heightViewPt) > 0.01 else { return }
         heightViewPt = height
     }
 }

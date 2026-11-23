@@ -133,6 +133,50 @@ private final class AuditScriptedHandle: AIChatHandle {
     var isFinished: Bool { finished }
 }
 
+/// A transport that emits nothing until cancel, then either hands over the part event that had
+/// already started or finishes without one. This makes the audit's cancellation drain
+/// deterministic instead of depending on whether the poll loop happened to run first.
+@MainActor
+private final class AuditCancelRaceService: AIChatServicing {
+    let plan: AiPlanRecord
+    let queuedAtCancel: [AIStreamEvent]
+
+    init(plan: AiPlanRecord, queuedAtCancel: [AIStreamEvent]) {
+        self.plan = plan
+        self.queuedAtCancel = queuedAtCancel
+    }
+
+    func prepare(_ request: AIMakePlanRequest) async throws -> AiPlanRecord { plan }
+
+    func start(_ plan: AiPlanRecord, apiKey: String) throws -> any AIChatHandle {
+        AuditCancelRaceHandle(queuedAtCancel: queuedAtCancel)
+    }
+}
+
+@MainActor
+private final class AuditCancelRaceHandle: AIChatHandle {
+    private var events: [AIStreamEvent] = []
+    private let queuedAtCancel: [AIStreamEvent]
+    private var finished = false
+
+    init(queuedAtCancel: [AIStreamEvent]) {
+        self.queuedAtCancel = queuedAtCancel
+    }
+
+    func poll() -> [AIStreamEvent] {
+        let pending = events
+        events = []
+        return pending
+    }
+
+    func cancel() {
+        events = queuedAtCancel
+        finished = true
+    }
+
+    var isFinished: Bool { finished }
+}
+
 private struct AuditSettingsFixture {
     let suiteName: String
     let defaults: UserDefaults
@@ -151,6 +195,7 @@ extension ReaderChecks {
         try await auditFinalPollChecks(root: root)
         try await auditRefusalChecks(root: root)
         try await auditCancelledAndFailedChecks(root: root)
+        try await auditCancelRaceChecks()
         try await auditTornPageRegionChecks(root: root)
         try await auditMultiPartPlanChecks(root: root)
         try await auditLayeredSummaryBatchChecks(root: root)
@@ -546,6 +591,62 @@ extension ReaderChecks {
 
     // MARK: - Cancelled and failed
 
+    /// Cancel at the exact moment a part has started but the audit has not polled it yet. The
+    /// cancelled attempt must still record the characters that left the Mac; a request that
+    /// never started must stay a zero-character cancellation.
+    @MainActor
+    private static func auditCancelRaceChecks() async throws {
+        func plan(characters: UInt64) -> AiPlanRecord {
+            let baseURL = "http://127.0.0.1:11434/v1"
+            let part = AiPlanPartRecord(
+                index: 0, total: 1, label: "Page 1", primaryPage: 1, pages: [1],
+                pageCharacters: characters, requestCharacters: characters,
+                systemPrompt: "system", userPrompt: "page", wireBody: "{\"stream\":true}",
+                note: nil, image: nil)
+            return AiPlanRecord(
+                action: .summarizePage, actionLabel: "Summarise page",
+                documentTitle: "Cancel race", pageCount: 1, baseUrl: baseURL,
+                endpoint: baseURL + "/chat/completions", host: "127.0.0.1", isLocal: true,
+                model: "mock-model", temperature: 0.2, maxTokens: 900, stream: true,
+                includeStreamOptions: true, reasoningField: nil, reasoningValue: nil,
+                parts: [part], sourcePages: [1], note: nil, sources: [], historyTurns: 0,
+                previewHeaders: [], estimatedTokens: 100)
+        }
+        func run(queued: [AIStreamEvent]) async throws -> [AIAuditRecord] {
+            let fixture = makeAuditSettings()
+            defer { fixture.cleanup() }
+            let directory = makeAuditDirectory()
+            defer { removeAuditDirectory(directory) }
+            let trail = AIAuditTrail(directory: directory)
+            let model = AIAssistantModel(settings: fixture.store, audit: trail)
+            let context = AIReaderContext(
+                documentKey: "audit-cancel-race", documentTitle: "Cancel race",
+                pageCount: 1, currentPage: 1, selection: nil)
+            let service = AuditCancelRaceService(plan: plan(characters: 200), queuedAtCancel: queued)
+            model.attach(service: service, context: context)
+            await model.prepare(action: .summarizePage, context: context)
+            require(model.phase == .preview, "the cancel-race plan has a preview")
+            model.send()
+            model.cancel()
+            try await eventually("the cancelled attempt is recorded once", {
+                trail.records.count == 1
+            })
+            return trail.records
+        }
+
+        let started = try await run(queued: [.partStarted(index: 0, total: 1, label: "Page 1")])
+        require(started.count == 1, "a part queued at cancel writes one record")
+        require(started[0].outcome == .cancelled, "the queued-start attempt is cancelled")
+        require(started[0].characters == 200,
+                "a part that had started before cancel keeps its characters: \(started[0].characters)")
+
+        let neverStarted = try await run(queued: [])
+        require(neverStarted.count == 1, "a cancel before any part writes one record")
+        require(neverStarted[0].outcome == .cancelled, "the never-started attempt is cancelled")
+        require(neverStarted[0].characters == 0,
+                "a request that never started records no characters: \(neverStarted[0].characters)")
+    }
+
     @MainActor
     private static func auditCancelledAndFailedChecks(root: URL) async throws {
         let (engine, _, context) = try openAuditDocument(root: root)
@@ -562,14 +663,12 @@ extension ReaderChecks {
         await cancelModel.prepare(action: .summarizePage, context: context)
         require(cancelModel.phase == .preview, "the cancelled request has a preview")
         cancelModel.send()
-        // Wait for the request to actually start streaming rather than assuming a fixed 120 ms
-        // is enough on every machine. The cancellation below must land after the first part, or
-        // the attempt has recorded no characters yet; a slow CI runner lost that race and the
-        // "started request records the characters it began to send" assertion failed. The sleep
-        // after the wait still keeps the audited open interval at least 120 ms, so the duration
-        // assertion below stays meaningful.
-        try await eventually("the cancelled request starts streaming", {
-            cancelModel.phase == .streaming
+        // Wait for text to arrive, not merely for the phase: `send()` sets `.streaming` before
+        // the transport has emitted anything, while the audit only learns the character count
+        // from the partStarted event that precedes the first delta. Waiting for output means the
+        // audit has observed that event, so the character assertion below is deterministic.
+        try await eventually("the cancelled request starts streaming text", {
+            !cancelModel.answer.isEmpty || !cancelModel.reasoning.isEmpty
         })
         try await Task.sleep(for: .milliseconds(120))
         cancelModel.cancel()

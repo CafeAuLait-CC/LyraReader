@@ -70,7 +70,8 @@ public enum LyraReaderTheme {
     public static let toolbarBg = Color(nsColor: adaptive(0xF7F4EF, 0x28251F))
     public static let tabbarBg = Color(nsColor: adaptive(0xF0EBE3, 0x211F1C))
     public static let sidebarBg = Color(nsColor: sidebarColor)
-    public static let panelBg = Color(nsColor: adaptive(0xF8F6F2, 0x2B2823))
+    public static let panelBgColor = adaptive(0xF8F6F2, 0x2B2823)
+    public static let panelBg = Color(nsColor: panelBgColor)
     /// The floating preview's card colour.
     public static let raisedBgColor = adaptive(0xFFFDFA, 0x343029)
     public static let raisedBg = Color(nsColor: raisedBgColor)

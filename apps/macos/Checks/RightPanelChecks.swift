@@ -110,6 +110,7 @@ extension ReaderChecks {
         try rightPanelMotionChecks()
         try rightPanelShortcutChecks()
         try sidebarAIMigrationChecks()
+        try await sidePanelInteractionChecks()
         try await rightPanelWindowChecks(root: root)
         try await editInspectorAnchorChecks(root: root)
     }
@@ -199,24 +200,19 @@ extension ReaderChecks {
         defaults.removePersistentDomain(forName: suiteName)
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
-        require(ReaderSidePanelMetrics.defaultContentWidthPt == 320,
-                "the right panel's default content width is 320 pt")
+        require(ReaderSidePanelMetrics.defaultContentWidthPt == 414,
+                "the right panel's default content width is 414 pt")
         require(ReaderSidePanelMetrics.minimumContentWidthPt == 240
                     && ReaderSidePanelMetrics.maximumContentWidthPt == 520,
                 "the panel's resize range is 240...520 pt")
         require(ReaderSidePanelMetrics.totalWidth(contentWidth: 320) == 327,
                 "the panel's footprint is content + 6 pt handle + 1 pt separator")
-        require(!ReaderSidePanelPreferences.isVisible(defaults: defaults),
-                "a fresh install starts with the panel closed")
-        require(ReaderSidePanelPreferences.width(defaults: defaults) == 320,
+        require(ReaderSidePanelPreferences.width(defaults: defaults) == 414,
                 "a fresh install starts at the default width")
 
         ReaderSidePanelPreferences.store(width: 410, defaults: defaults)
-        ReaderSidePanelPreferences.store(visible: true, defaults: defaults)
         require(ReaderSidePanelPreferences.width(defaults: defaults) == 410,
                 "the panel width is remembered (410 pt)")
-        require(ReaderSidePanelPreferences.isVisible(defaults: defaults),
-                "the panel's open state is remembered")
 
         ReaderSidePanelPreferences.store(width: 10, defaults: defaults)
         require(ReaderSidePanelPreferences.width(defaults: defaults) == 240,
@@ -226,8 +222,8 @@ extension ReaderChecks {
                 "a stored width above the maximum is clamped down to 520 pt")
 
         defaults.set("not-a-number", forKey: ReaderSidePanelPreferences.widthKey)
-        require(ReaderSidePanelPreferences.width(defaults: defaults) == 320,
-                "an unreadable stored width falls back to the default (320 pt)")
+        require(ReaderSidePanelPreferences.width(defaults: defaults) == 414,
+                "an unreadable stored width falls back to the default (414 pt)")
 
         require(ReaderSidePanelMetrics.contentWidth(base: 320, dragTranslationX: -120) == 440,
                 "dragging the inner edge 120 pt left widens the panel to 440 pt")
@@ -237,7 +233,7 @@ extension ReaderChecks {
                 "a drag past the minimum stops at 240 pt")
         require(ReaderSidePanelMetrics.contentWidth(base: 320, dragTranslationX: .nan) == 320,
                 "a non-finite drag sample does not corrupt the width")
-        require(ReaderSidePanelMetrics.clampedContentWidth(.infinity) == 320,
+        require(ReaderSidePanelMetrics.clampedContentWidth(.infinity) == 414,
                 "a non-finite stored width falls back to the default")
 
         // The same values through AppState, including a second instance reading the same suite:
@@ -245,17 +241,25 @@ extension ReaderChecks {
         let savedPreferenceMode = AppState.usesStoredSidePanelPreferences
         AppState.usesStoredSidePanelPreferences = true
         defer { AppState.usesStoredSidePanelPreferences = savedPreferenceMode }
-        ReaderSidePanelPreferences.store(visible: false, defaults: defaults)
+        defaults.set(true, forKey: ReaderSidePanelPreferences.visibleKey)
         let first = AppState(engine: try RustEngine(), panelDefaults: defaults)
-        require(first.rightPanelWidthPt == 320 && !first.rightPanelVisible,
-                "a new session reads the default width and the stored closed state")
+        require(first.rightPanelWidthPt == 414 && !first.rightPanelVisible,
+                "a new session starts closed even when an earlier version stored an open drawer")
         first.setRightPanelWidth(455)
         first.rightPanelVisible = true
+        require(first.aiToolsVisible, "opening the assistant also opens its owning Lyra tool row")
+        defaults.set(true, forKey: ReaderSidePanelPreferences.visibleKey)
         let second = AppState(engine: try RustEngine(), panelDefaults: defaults)
         require(second.rightPanelWidthPt == 455,
                 "the next session remembers the 455 pt width the previous one settled on")
-        require(second.rightPanelVisible,
-                "the next session remembers that the panel was open")
+        require(!second.rightPanelVisible && !second.aiToolsVisible,
+                "the next session preserves width but starts with its drawer and tool row closed")
+        first.aiToolsVisible = false
+        require(!first.rightPanelVisible, "closing the Lyra row closes its assistant drawer")
+        first.rightPanelVisible = true
+        first.toggleAnnotationTools()
+        require(first.annotationToolsVisible && !first.rightPanelVisible && !first.aiToolsVisible,
+                "switching to another tool row closes the assistant with its Lyra owner")
         second.setRightPanelWidth(1000)
         require(second.rightPanelWidthPt == 520,
                 "the state clamps the maximum width to 520 pt")
@@ -439,12 +443,12 @@ extension ReaderChecks {
         // The panel opens from the menu/state path. Measure the drawer, not just the boolean.
         state.toggleRightPanel()
         require(state.rightPanelVisible, "the toggle opens the panel")
-        try await eventually("the open panel lays out at its 320 pt width", {
+        try await eventually("the open panel lays out at its 414 pt default width", {
             abs(harness.panelContentWidth - ReaderSidePanelMetrics.defaultContentWidthPt) < 0.5
         })
         let openFootprint = harness.panelTotalWidth
-        require(abs(openFootprint - ReaderSidePanelMetrics.totalWidth(contentWidth: 320)) < 0.5,
-                "the open panel's footprint is 327 pt (measured \(openFootprint) pt)")
+        require(abs(openFootprint - ReaderSidePanelMetrics.defaultTotalWidthPt) < 0.5,
+                "the open panel's footprint follows the 414 pt default (measured \(openFootprint) pt)")
         try await eventually("the canvas reports the width the panel left it", {
             abs(state.canvasViewportWidthPt - harness.canvasRect.width) < 0.5
         })
@@ -452,8 +456,13 @@ extension ReaderChecks {
         // The AI view is the panel's content, not a copy of it or a placeholder: the assistant's
         // own marker view is in the AppKit hierarchy, and its scrolling content is an NSScrollView
         // inside the panel's region.
-        require(containsAIAssistantPanelMarker(in: harness.host),
-                "the right panel hosts the AI assistant view itself (marker present)")
+        try await eventuallyExplaining("the right panel hosts the AI assistant view itself (marker present)", {
+            "panelWidth=\(harness.panelTotalWidth), canvas=\(harness.canvasRect), "
+                + "scrollViews=\(nativeScrollViewCount(in: harness.host))"
+        }, {
+            harness.host.layoutSubtreeIfNeeded()
+            return containsAIAssistantPanelMarker(in: harness.host)
+        })
         require(nativeScrollViewCount(in: harness.host) > 0,
                 "the AI view's scrolling content is present in the panel")
         if let marker = findAIAssistantPanelMarker(in: harness.host) {
@@ -486,7 +495,7 @@ extension ReaderChecks {
         var panelWidths: [CGFloat] = []
         for progress in stride(from: 0.0, through: 1.0, by: 0.25) {
             state.transitionProgressOverride = ReaderTransitionProgress(panel: progress)
-            let expected = ReaderSidePanelMetrics.totalWidth(contentWidth: 320) * CGFloat(progress)
+            let expected = ReaderSidePanelMetrics.totalWidth(contentWidth: state.rightPanelWidthPt) * CGFloat(progress)
             try await eventually("the panel lays out at progress \(progress)", {
                 abs(harness.panelTotalWidth - expected) < 1.0
             })
@@ -511,7 +520,7 @@ extension ReaderChecks {
         var closingWidths: [CGFloat] = []
         for progress in stride(from: 1.0, through: 0.0, by: -0.25) {
             state.transitionProgressOverride = ReaderTransitionProgress(panel: progress)
-            let expected = ReaderSidePanelMetrics.totalWidth(contentWidth: 320) * CGFloat(progress)
+            let expected = ReaderSidePanelMetrics.totalWidth(contentWidth: state.rightPanelWidthPt) * CGFloat(progress)
             try await eventually("the close lays out at progress \(progress)", {
                 abs(harness.panelTotalWidth - expected) < 1.0
             })
@@ -528,8 +537,8 @@ extension ReaderChecks {
                 "the page's on-screen top stays at \(pageTopBefore) pt while the panel closes")
         state.transitionProgressOverride = nil
         state.rightPanelVisible = true
-        try await eventually("the panel finishes opening at 320 pt", {
-            abs(harness.panelContentWidth - 320) < 0.5
+        try await eventually("the panel finishes opening at its default width", {
+            abs(harness.panelContentWidth - ReaderSidePanelMetrics.defaultContentWidthPt) < 0.5
         })
 
         // ── Fit Width fits the canvas, not the window ───────────────────────────────────
@@ -605,7 +614,7 @@ extension ReaderChecks {
                     - harness.host.bounds.width) < 0.5,
                 "the scroll lane separates the document viewport from the right panel")
         require(abs(harness.panelTotalWidth
-                    - ReaderSidePanelMetrics.totalWidth(contentWidth: 320)) < 0.5,
+                    - ReaderSidePanelMetrics.totalWidth(contentWidth: state.rightPanelWidthPt)) < 0.5,
                 "the two panels coexist without either changing the other's width")
 
         // ── Resize clamps and the settled canvas ───────────────────────────────────────
@@ -891,7 +900,11 @@ extension ReaderChecks {
             let harness = RightPanelHarness(state: state, aiAssistant: model)
             defer { harness.close() }
             try await harness.mount()
-            try await eventually("the tiled-drawer viewport reports its actual width", {
+            try await eventuallyExplaining("the tiled-drawer viewport reports its actual width", {
+                "attached=\(harness.canvas.hasAttachedSurface), visible=\(harness.window.isVisible), "
+                    + "occluded=\(!harness.window.occlusionState.contains(.visible)), "
+                    + "viewport=\(state.canvasViewportWidthPt), actual=\(harness.canvasRect.width)"
+            }, {
                 harness.canvas.hasAttachedSurface
                     && abs(state.canvasViewportWidthPt - harness.canvasRect.width) < 0.5
             })
@@ -920,7 +933,7 @@ extension ReaderChecks {
             state.transitionProgressOverride = ReaderTransitionProgress(sidebar: 1, panel: 1)
             state.rightPanelVisible = true
             try await eventually("the covering drawer is fully laid out", {
-                abs(harness.panelTotalWidth - 327) < 0.5
+                abs(harness.panelTotalWidth - ReaderSidePanelMetrics.totalWidth(contentWidth: state.rightPanelWidthPt)) < 0.5
                     && abs(state.canvasViewportWidthPt - harness.canvasRect.width) < 0.5
             })
             try await Task.sleep(for: .milliseconds(300))
