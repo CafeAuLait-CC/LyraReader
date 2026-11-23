@@ -416,6 +416,7 @@ Item {
         interactive: !canvas.contentPointerOwner
         flickableDirection: Flickable.AutoFlickIfNeeded
         ScrollBar.vertical: ScrollBar {
+            objectName: "documentVerticalScrollBar"
             minimumSize: 0.04
         }
         ScrollBar.horizontal: ScrollBar {}

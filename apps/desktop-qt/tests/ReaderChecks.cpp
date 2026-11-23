@@ -69,6 +69,7 @@
 #include <vector>
 #include <atomic>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 
@@ -5924,6 +5925,131 @@ private slots:
         QVERIFY(RenderBudget::statistics().value("texturePeakBytes").toLongLong()<=RenderBudget::textureLimit);
         QVERIFY(RasterJobs::statistics().value("peakRunning").toInt()<=RasterJobs::maximumRunning);
         if(inputIntervals.size()<6 || !focusMaintained)QSKIP("Insufficient input-period frames or lost native focus; interactive performance remains unmeasured. Diagnostic JSON was saved.");
+    }
+    void scrollbarDragTracksQtInputTextureReadinessAndResidualWork() {
+        if(!qEnvironmentVariableIsSet("LYRA_READER_CHECK_SCROLL_DRAG"))QSKIP("Opt-in Qt scrollbar-injection measurement; use LYRA_READER_CHECK_SCROLL_DRAG=1.");
+        QTemporaryDir scratch;
+        QVERIFY(scratch.isValid());
+        const QString fixture=scratch.filePath("long-synthetic.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/index-past-120.pdf",fixture));
+        NativeCorpus::Viewer viewer;
+        auto *window=viewer.window;
+        QVERIFY(window);
+        window->resize(1200,820);
+        viewer.workspace.openFile(QUrl::fromLocalFile(fixture));
+        auto *reader=viewer.workspace.activeReader();
+        QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()>100 && !reader->pendingCommands(),15000);
+        QVERIFY(settleReaderViewport(window));
+        auto *viewport=visualItem(window->contentItem(),"pageList");
+        auto *bar=visualItem(window->contentItem(),"documentVerticalScrollBar");
+        QVERIFY(viewport && bar);
+        auto *thumb=bar->property("contentItem").value<QQuickItem *>();
+        QVERIFY(thumb);
+        QTRY_VERIFY_WITH_TIMEOUT(bar->isVisible() && thumb->height()>0 && bar->height()>thumb->height()+100,5000);
+
+        const auto focusedPage=[&] {return window->property("currentPage").toInt();};
+        const auto itemAtPage=[&](int page) {
+            return qobject_cast<PageItem *>(visualItem(window->contentItem(),"pdfPage"+QString::number(page)));
+        };
+        const auto texturesReady=[&](int page) {
+            const auto *item=itemAtPage(page);
+            return item && item->refined() && item->texturesReady();
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(texturesReady(focusedPage()),15000);
+        Performance::Frames frames(window);
+        QVariantList samples;
+        QList<double> settleTimes, drainTimes, actualMoveIntervals;
+        QSet<int> visited{focusedPage()};
+        int maximumPending=0;
+        qint64 sampledRss=Performance::memory("VmRSS");
+        const auto begin=Performance::now();
+        const std::array<double,6> destinations{.38,.84,.38,.14,.84,.14};
+        constexpr int trialCount=30;
+        for(int trial=0;trial<trialCount;++trial) {
+            const double destination=destinations[trial%destinations.size()];
+            const int previous=focusedPage();
+            const auto start=thumb->mapToScene(QPointF(thumb->width()/2,thumb->height()/2)).toPoint();
+            const double top=bar->property("topPadding").toDouble()+thumb->height()/2;
+            const double bottom=bar->height()-bar->property("bottomPadding").toDouble()-thumb->height()/2;
+            const auto end=bar->mapToScene(QPointF(bar->width()/2,top+(bottom-top)*destination)).toPoint();
+            const auto initialPosition=bar->property("position").toDouble();
+            const auto startCancelled=RasterJobs::statistics().value("cancelled").toLongLong();
+            QTest::mouseMove(window,start);
+            QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,start);
+            QVERIFY(bar->property("pressed").toBool());
+            frames.clear();
+            const auto firstMove=Performance::now();
+            auto lastMove=firstMove;
+            for(int step=1;step<=12;++step) {
+                const auto now=Performance::now();
+                if(step>1)actualMoveIntervals.append((now-lastMove)/1000.0);
+                lastMove=now;
+                QTest::mouseMove(window,start+(end-start)*(step/12.0));
+                QTest::qWait(16);
+                maximumPending=qMax(maximumPending,reader->pendingRasters());
+                sampledRss=qMax(sampledRss,Performance::memory("VmRSS"));
+            }
+            const auto released=Performance::now();
+            QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,end);
+            const auto queuedAtRelease=reader->pendingRasters();
+            const int pageAtRelease=focusedPage();
+            const bool immediateBackdrop=itemAtPage(pageAtRelease) && itemAtPage(pageAtRelease)->backdropVisible();
+            QVERIFY(!bar->property("pressed").toBool());
+            QVERIFY(qAbs(bar->property("position").toDouble()-initialPosition)>.12);
+            QTRY_VERIFY(focusedPage()!=previous);
+            const auto selected=focusedPage();
+            QVERIFY2(qAbs(selected/double(reader->pageCount()-1)-destination)<.12,"The thumb did not reach the requested part of the document.");
+            bool armed=false;
+            qint64 drained=0;
+            const auto poll=[&] {
+                if(focusedPage()!=selected || !texturesReady(selected))return;
+                if(!armed){armed=true;frames.arm();window->update();}
+                if(!drained && !reader->pendingRasters())drained=Performance::now();
+            };
+            QTimer ready;
+            ready.setTimerType(Qt::PreciseTimer);
+            ready.setInterval(5);
+            connect(&ready,&QTimer::timeout,&ready,poll);
+            poll();
+            ready.start();
+            QTRY_VERIFY_WITH_TIMEOUT(frames.queued()>0 && drained>0,15000);
+            ready.stop();
+            QCOMPARE(focusedPage(),selected);
+            settleTimes.append((frames.queued()-released)/1000.0);
+            drainTimes.append((drained-released)/1000.0);
+            const auto intervals=frames.intervals(firstMove,released);
+            samples.append(QVariantMap{{"fromPage",previous},{"pageAtRelease",pageAtRelease},{"landedPage",selected},
+                {"revisited",visited.contains(selected)},{"backdropVisibleAtRelease",immediateBackdrop},
+                {"draggedThumbFraction",destination},{"rasterRequestsAtRelease",queuedAtRelease},
+                {"cancelledRastersDuringTrial",RasterJobs::statistics().value("cancelled").toLongLong()-startCancelled},
+                {"releaseToRefinedFrameQueueMs",settleTimes.last()},{"releaseToDrainObservedMs",drainTimes.last()},
+                {"inputFrameQueueIntervalsMs",Performance::distribution(intervals)}});
+            visited.insert(selected);
+        }
+        QCOMPARE(samples.size(),trialCount);
+        QVERIFY(visited.size()>=4);
+        const QVariantMap result{{"schema",1},{"complete",true},{"input","QtTest mouse events delivered to the real Qt Quick scroll thumb"},
+            {"physicalPointerOrPresentationMeasured",false},{"platform",QGuiApplication::platformName()},
+            {"graphicsApi",int(window->rendererInterface()->graphicsApi())},{"fixturePages",reader->pageCount()},
+            {"windowWidth",window->width()},{"windowHeight",window->height()},
+            {"viewportWidth",viewport->width()},{"viewportHeight",viewport->height()},{"devicePixelRatio",window->effectiveDevicePixelRatio()},
+            {"qt",qVersion()},{"architecture",QSysInfo::currentCpuArchitecture()},{"percentileMethod","lower order statistic"},
+            {"pageIndicesStartAt",0},{"trialsRequested",trialCount},{"movesPerDrag",12},{"requestedMoveIntervalMs",16},{"actualMoveIntervalsMs",Performance::distribution(actualMoveIntervals)},
+            {"trials",samples},{"pendingRasterPeakSampled",maximumPending},
+            {"releaseToRefinedFrameQueueMs",Performance::distribution(settleTimes)},
+            {"releaseToDrainObservedMs",Performance::distribution(drainTimes)},{"elapsedMs",(Performance::now()-begin)/1000.0},
+            {"rssPeakSampledDuringInputBytes",sampledRss},{"rssAtEndBytes",Performance::memory("VmRSS")},
+            {"rasterJobs",RasterJobs::statistics()},{"renderResourcePayloads",RenderBudget::statistics()},
+            {"measurementNotes","Time starts before dispatching the injected release. Refined frame latency includes 5 ms readiness polling and a queued Qt frame. Drain is the first observed empty Reader queue with the target textures ready. Frame callbacks are not physical presentation timestamps. A backdrop reported here is an observation at release, not a cache miss/hit count."}};
+        const auto output=qEnvironmentVariable("LYRA_READER_SCROLL_DRAG_OUTPUT");
+        const auto body=QJsonDocument::fromVariant(result).toJson(QJsonDocument::Indented);
+        if(!output.isEmpty()){
+            QSaveFile file(output);
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            QCOMPARE(file.write(body),body.size());
+            QVERIFY(file.commit());
+        }
+        qInfo().noquote()<<"lyra-reader-scrollbar-drag:"<<QJsonDocument::fromVariant(result).toJson(QJsonDocument::Compact);
     }
     void revisitBackdropCacheIsBoundedAndKeepsItsResidentLease() {
         QTRY_COMPARE_WITH_TIMEOUT(RenderBudget::statistics().value("residentBytes").toLongLong(),0,10000);
