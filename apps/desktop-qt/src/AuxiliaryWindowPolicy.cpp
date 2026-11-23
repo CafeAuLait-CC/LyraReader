@@ -8,6 +8,21 @@ namespace {
 bool isWayland() {
     return QGuiApplication::platformName().startsWith(QStringLiteral("wayland"));
 }
+
+QSize preferredSize(const QSizeF &requested) {
+    const auto dimension=[](double value,int fallback,int minimum) {
+        if(!std::isfinite(value) || value<=0 || value>32768)value=fallback;
+        // Validate saved preferences before converting to logical pixels.
+        return qRound(qMax(double(minimum),value));
+    };
+    return {dimension(requested.width(),560,360),dimension(requested.height(),650,280)};
+}
+
+QSize fitToAvailable(QSize size,const QRect &available) {
+    if(!available.isValid())return {};
+    const auto limit=available.size()-QSize(qMin(32,available.width()-1),qMin(32,available.height()-1));
+    return size.boundedTo(limit);
+}
 }
 
 void AuxiliaryWindowOwner::setWindow(QQuickWindow *window) {
@@ -36,14 +51,7 @@ void AuxiliaryWindowOwner::observeFirstFrame() {
 }
 
 QSize AuxiliaryWindowPolicy::boundedSize(const QSizeF &requested,const QRect &available) {
-    if(!available.isValid())return {};
-    const auto limit=available.size()-QSize(qMin(32,available.width()-1),qMin(32,available.height()-1));
-    auto dimension=[](double value,int fallback,int minimum,int maximum) {
-        if(!std::isfinite(value) || value<=0 || value>32768)value=fallback;
-        // Clamp before rounding/converting, including malformed saved local preferences.
-        return qRound(qBound(double(qMin(minimum,maximum)),value,double(maximum)));
-    };
-    return {dimension(requested.width(),560,360,limit.width()),dimension(requested.height(),650,280,limit.height())};
+    return fitToAvailable(preferredSize(requested),available);
 }
 
 bool AuxiliaryWindowPolicy::prepare(QWindow *window,QWindow *owner,const QVariantMap &saved,int width,int height) {
@@ -54,11 +62,14 @@ bool AuxiliaryWindowPolicy::prepare(QWindow *window,QWindow *owner,const QVarian
     bool widthOk=false,heightOk=false;
     const double savedWidth=saved.value(QStringLiteral("width")).toDouble(&widthOk);
     const double savedHeight=saved.value(QStringLiteral("height")).toDouble(&heightOk);
-    const auto size=boundedSize({widthOk ? savedWidth : double(width),heightOk ? savedHeight : double(height)},screen->availableGeometry());
+    const auto preference=preferredSize({widthOk ? savedWidth : double(width),heightOk ? savedHeight : double(height)});
+    const auto size=fitToAvailable(preference,screen->availableGeometry());
     if(size.isEmpty())return false;
     cancelPresentation();
     disconnect(m_ownerVisibility);disconnect(m_ownerDestroyed);
     m_window=window;m_owner=owner;
+    m_preferredSize=preference;
+    m_initialSize=size;
     // Set the relationship and type before show/map, including on Wayland. No fixed size,
     // topmost/layer-shell hint or compositor-specific layout command is used.
     window->setFlags(Qt::Dialog|Qt::WindowTitleHint|Qt::WindowSystemMenuHint|Qt::WindowCloseButtonHint);
@@ -130,7 +141,12 @@ void AuxiliaryWindowPolicy::showPreparedWindow() {
 
 QVariantMap AuxiliaryWindowPolicy::geometry() const {
     if(!m_window)return {};
-    QVariantMap value{{QStringLiteral("width"),m_window->width()},{QStringLiteral("height"),m_window->height()}};
+    const auto current=m_window->size();
+    // A smaller output can constrain either axis without changing the user's
+    // preferred size. Save each axis only when it moved from its opening size.
+    const int width=current.width()==m_initialSize.width() ? m_preferredSize.width() : current.width();
+    const int height=current.height()==m_initialSize.height() ? m_preferredSize.height() : current.height();
+    QVariantMap value{{QStringLiteral("width"),width},{QStringLiteral("height"),height}};
     if(!isWayland()) {
         value.insert(QStringLiteral("x"),m_window->x());value.insert(QStringLiteral("y"),m_window->y());
     }

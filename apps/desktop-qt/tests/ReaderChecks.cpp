@@ -1679,6 +1679,27 @@ private slots:
         QCOMPARE(AuxiliaryWindowPolicy::boundedSize({1,1},{0,0,100,90}),QSize(68,58));
         QVERIFY(AuxiliaryWindowPolicy::boundedSize({560,650},{}).isEmpty());
     }
+    void auxiliaryGeometryPreservesPreferredSizeWhenAnOutputClampsIt() {
+        QWindow owner;
+        QWindow dialog;
+        AuxiliaryWindowPolicy policy;
+        QVERIFY(owner.screen());
+        const QSize preferred{32768,32768};
+        const QVariantMap saved{{"width",preferred.width()},{"height",preferred.height()}};
+        QVERIFY(policy.prepare(&dialog,&owner,saved,560,650));
+        const auto initial=dialog.size();
+        QVERIFY(initial.width()<preferred.width() && initial.height()<preferred.height());
+        const auto afterClamping=policy.geometry();
+        QCOMPARE(afterClamping.value("width").toInt(),preferred.width());
+        QCOMPARE(afterClamping.value("height").toInt(),preferred.height());
+
+        const auto resizedWidth=initial.width()-24;
+        QVERIFY(resizedWidth>=dialog.minimumWidth());
+        dialog.resize(resizedWidth,initial.height());
+        const auto afterResize=policy.geometry();
+        QCOMPARE(afterResize.value("width").toInt(),resizedWidth);
+        QCOMPARE(afterResize.value("height").toInt(),preferred.height());
+    }
     void preferencesKeysOpenSettingsWithoutADocumentAndYieldToItsWindow() {
         NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;
         auto *settings=window->findChild<QQuickWindow *>("settingsWindow");QVERIFY(settings);QVERIFY(!settings->isVisible());

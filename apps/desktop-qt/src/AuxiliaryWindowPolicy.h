@@ -38,6 +38,7 @@ public:
 private:
     void showPreparedWindow();
     QPointer<QWindow> m_window,m_owner;
+    QSize m_preferredSize,m_initialSize;
     QMetaObject::Connection m_ownerVisibility,m_ownerDestroyed,m_ownerFrame;
     quint64 m_presentation=0;
 };
