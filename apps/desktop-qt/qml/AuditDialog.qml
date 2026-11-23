@@ -82,7 +82,13 @@ Dialog {
         onClosed:{fingerprint="";count=0;}
         contentItem:ScrollView {
             contentWidth:availableWidth;clip:true
-            Text {width:parent.width;font:confirmation.font;color:audit.colors.textPrimary;textFormat:Text.PlainText;text:qsTr("Permanently remove these %1 local metadata entries? This cannot be undone. Nothing is sent anywhere. If the trail changes, refresh and review it again.").arg(confirmation.count);wrapMode:Text.Wrap}
+            Text {
+                objectName:"clearAuditDescription"
+                width:parent.width;font:confirmation.font;color:audit.colors.textPrimary;textFormat:Text.PlainText;wrapMode:Text.Wrap
+                text:qsTr("Permanently remove these %1 local metadata entries? This cannot be undone. Nothing is sent anywhere. If the trail changes, refresh and review it again.").arg(confirmation.count)
+                Accessible.role:Accessible.StaticText
+                Accessible.name:text
+            }
         }
     }
 }

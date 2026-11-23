@@ -5010,6 +5010,11 @@ private slots:
         const auto rows=(QJsonDocument(first).toJson(QJsonDocument::Compact)+"\n"+QJsonDocument(second).toJson(QJsonDocument::Compact)+"\n").replace("\"duration_ms\":31","\"duration_ms\":18446744073709551615");
         QSaveFile file(path);QVERIFY(file.open(QIODevice::WriteOnly));QCOMPARE(file.write(rows),rows.size());QVERIFY(file.commit());controller->reload();QTRY_VERIFY_WITH_TIMEOUT(!controller->busy(),10000);QVERIFY(controller->error().isEmpty());QCOMPARE(controller->state().value("records").toList().size(),2);QCOMPARE(controller->state().value("records").toList()[0].toMap().value("http_status").toInt(),400);QVERIFY(controller->metadata().contains("18446744073709551615"));
         auto *clear=settings->findChild<QObject *>("clearAuditTrail");auto *confirm=settings->findChild<QObject *>("clearAuditConfirmation");QVERIFY(clear && confirm);QVERIFY(clear->property("enabled").toBool());QVERIFY(QMetaObject::invokeMethod(clear,"clicked"));QTRY_VERIFY(confirm->property("opened").toBool());
+        auto *description=settings->findChild<QQuickItem *>("clearAuditDescription");QVERIFY(description);
+        auto *accessibleDescription=QAccessible::queryAccessibleInterface(description);QVERIFY(accessibleDescription);
+        QCOMPARE(accessibleDescription->role(),QAccessible::StaticText);
+        QCOMPARE(accessibleDescription->text(QAccessible::Name),description->property("text").toString());
+        QVERIFY(accessibleDescription->text(QAccessible::Name).contains(QStringLiteral("2 local metadata entries")));
         auto *auditContent=qvariant_cast<QQuickItem *>(dialog->property("contentItem"));auto *confirmContent=qvariant_cast<QQuickItem *>(confirm->property("contentItem"));QVERIFY(auditContent && confirmContent);
         const auto diagnostic=qEnvironmentVariable("LYRA_READER_AUDIT_SNAPSHOT");if(!diagnostic.isEmpty())QVERIFY(settings->grabWindow().save(diagnostic+"-confirm.png"));
         QCOMPARE(auditContent->window(),settings);QCOMPARE(confirmContent->window(),settings);
