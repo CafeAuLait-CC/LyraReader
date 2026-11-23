@@ -635,7 +635,41 @@ quint64 ReaderController::saveRegionNoteDraft() {
     if(!m_document || m_pendingCommands || m_regionNoteDraft.isEmpty())return 0;
     m_regionNoteSaveSnapshot=m_regionNoteDraft;m_regionNoteSaveId=submit(QStringLiteral("region_note"),m_regionNoteSaveSnapshot);return m_regionNoteSaveId;
 }
+bool ReaderController::setReadingNoteDraft(const QVariantMap &draft) {
+    const auto id=draft.value(QStringLiteral("id")).toString();
+    if(!m_document || m_snapshotMode || m_loading || m_revisionCommands || id.isEmpty()
+       || (!m_readingNoteDraft.isEmpty() && m_readingNoteDraft.value(QStringLiteral("id")).toString()!=id))return false;
+    if(m_readingNoteDraft!=draft) {
+        m_readingNoteDraft=draft;
+        emit regionNoteDraftChanged();
+    }
+    return true;
+}
+void ReaderController::discardReadingNoteDraft() {
+    if(m_readingNoteSaveId || m_readingNoteDraft.isEmpty())return;
+    m_readingNoteDraft.clear();
+    emit regionNoteDraftChanged();
+}
+quint64 ReaderController::saveReadingNoteDraft() {
+    if(!m_document || m_snapshotMode || m_loading || m_revisionCommands || m_readingNoteSaveId || m_readingNoteDraft.isEmpty())return 0;
+    m_readingNoteSaveSnapshot=m_readingNoteDraft;
+    m_readingNoteSaveId=m_commandSequence+1;
+    QPointer<ReaderController> alive(this);
+    const auto id=submit(QStringLiteral("ai_reading_note_update"),{{QStringLiteral("draft"),m_readingNoteSaveSnapshot}});
+    if(alive)emit regionNoteDraftChanged();
+    return id;
+}
 void ReaderController::handleAiCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error) {
+    if(operation==QStringLiteral("ai_reading_note_update") && id==m_readingNoteSaveId) {
+        m_readingNoteSaveId=0;
+        if(error.isEmpty()) {
+            if(m_readingNoteDraft==m_readingNoteSaveSnapshot)m_readingNoteDraft.clear();
+            else m_readingNoteDraft.insert(QStringLiteral("expected_modified"),result.toMap().value(QStringLiteral("modified")));
+        }
+        m_readingNoteSaveSnapshot.clear();
+        emit regionNoteDraftChanged();
+        return;
+    }
     if(operation.startsWith(QStringLiteral("knowledge_"))){handleDocumentReadingCommand(id,operation,result,error);return;}
     if(operation==QStringLiteral("region_reopen")) {
         if(id!=m_aiRegionRestoreId)return;m_aiRegionRestoreId=0;

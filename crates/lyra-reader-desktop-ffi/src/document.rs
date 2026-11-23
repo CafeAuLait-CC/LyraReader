@@ -1028,8 +1028,13 @@ impl DesktopDocument {
             "ai_chat_sessions" => self.chat_sessions(&d),
             "ai_chat_session" => self.chat_session(&d, &text(&r, "id")?),
             "ai_chat_draft" => self.save_chat_draft(&d, arg(&r, "draft")?),
-            "ai_reading_notes" => self.reading_notes(&d, &text(&r, "query")?),
+            "ai_reading_notes" => self.reading_notes(
+                &d,
+                &text(&r, "query")?,
+                r["recent"].as_bool().unwrap_or(true),
+            ),
             "ai_reading_note" => self.reading_note(&d, &text(&r, "id")?),
+            "ai_reading_note_update" => self.save_reading_note(&d, arg(&r, "draft")?),
             "ai_reading_keep_summary" => self.keep_summary_note(&d, &text(&r, "id")?),
             "ai_merge_preview" => value(
                 build_ai_merge_plan(arg(&r, "request")?)

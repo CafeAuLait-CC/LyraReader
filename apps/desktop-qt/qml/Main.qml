@@ -608,12 +608,14 @@ ApplicationWindow {
     }
     function discardAndClose(index) { beginCloseOperation("discard",closeTarget(index),index<0); }
     function closeCommandFinished(owner,id,operation,result,error) {
-        if (operation === "ai_chat_draft" && error.length && closingTab !== -2
+        if ((operation === "ai_chat_draft" || operation === "ai_reading_note_update") && error.length && closingTab !== -2
                 && (closingTab < 0 || pendingCloseReader === owner)) {
             closeRetry.stop();
             closingTab = -2;
             pendingCloseReader = null;
-            operationStatus = qsTr("The chat draft could not be saved. The document is still open.");
+            operationStatus = operation === "ai_chat_draft"
+                ? qsTr("The chat draft could not be saved. The document is still open.")
+                : qsTr("The reading note could not be saved. The document is still open.");
         }
         const ticket=closeOperation;
         if (!ticket || ticket.reader !== owner || ticket.id !== id) return;

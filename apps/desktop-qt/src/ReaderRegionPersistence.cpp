@@ -7,7 +7,7 @@ bool ReaderController::regionRequestRunning()const {
     return m_aiState.value(QStringLiteral("running")).toBool() && m_aiState.value(QStringLiteral("responseView")).toString()==QStringLiteral("region");
 }
 bool ReaderController::regionPersistencePending()const {
-    return m_aiRegionSaveId || (m_regionSaveError.isEmpty() && (m_regionSaveTimer.isActive() || m_regionFlushRequested));
+    return m_readingNoteSaveId || m_aiRegionSaveId || (m_regionSaveError.isEmpty() && (m_regionSaveTimer.isActive() || m_regionFlushRequested));
 }
 void ReaderController::initRegionPersistence() {
     m_regionSaveTimer.setSingleShot(true);m_regionSaveTimer.setInterval(750);

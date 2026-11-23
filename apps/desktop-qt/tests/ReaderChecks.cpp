@@ -3436,11 +3436,54 @@ private slots:
             QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));
         };
         reopen();QVERIFY(QMetaObject::invokeMethod(browse,"clicked"));QTRY_COMPARE(current().value("id").toString(),id);
-        QCOMPARE(text->property("text").toString(),completed);QCOMPARE(pages->property("count").toInt(),1);dismiss();
+        QCOMPARE(text->property("text").toString(),completed);QCOMPARE(pages->property("count").toInt(),1);
+        const auto version=current().value("modified").toString();QVERIFY(!version.isEmpty());
+        auto *titleEditor=notes->findChild<QObject *>("aiReadingNoteTitleEditor");
+        auto *contentEditor=notes->findChild<QObject *>("aiReadingNoteContentEditor");
+        auto *thoughtsEditor=notes->findChild<QObject *>("aiReadingNoteThoughtsEditor");
+        auto *edit=notes->findChild<QObject *>("editAiReadingNote"),*save=notes->findChild<QObject *>("saveAiReadingNote");
+        QVERIFY(titleEditor && contentEditor && thoughtsEditor && edit && save);
+        QVERIFY(QMetaObject::invokeMethod(edit,"clicked"));
+        const QString revisedTitle="Verified notes",revisedContent="My local notes\n\nNo additional AI request.",thoughts="Follow up on this finding.";
+        const auto change=[&](const char *key,const QString &value) {
+            return QMetaObject::invokeMethod(notes,"change",Q_ARG(QVariant,QString::fromLatin1(key)),Q_ARG(QVariant,value));
+        };
+        QVERIFY(change("title",revisedTitle));QVERIFY(change("content",revisedContent));QVERIFY(change("thoughts",thoughts));
+        QVERIFY(reader->hasUnsavedReadingNotes());dismiss();
+        QVERIFY(!window->close());QVERIFY(window->isVisible());
+        QVERIFY(QMetaObject::invokeMethod(browse,"clicked"));QTRY_VERIFY(notes->property("editing").toBool());
+        QCOMPARE(titleEditor->property("text").toString(),revisedTitle);
+        QCOMPARE(contentEditor->property("text").toString(),revisedContent);
+        QCOMPARE(thoughtsEditor->property("text").toString(),thoughts);
+        QVERIFY(QMetaObject::invokeMethod(save,"clicked"));
+        QTRY_COMPARE(text->property("text").toString(),revisedContent);QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(!reader->hasUnsavedReadingNotes());QCOMPARE(current().value("title").toString(),revisedTitle);
+        QCOMPARE(current().value("thoughts").toString(),thoughts);
+        QVERIFY(current().value("modified").toString()!=version);
+        dismiss();
+
+        ReaderController concurrent;
+        concurrent.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE(concurrent.pageCount(),1);QTRY_COMPARE(concurrent.pendingCommands(),0);
+        QVERIFY(concurrent.setReadingNoteDraft({{"id",id},{"expected_modified",version},{"content","Stale window draft"}}));
+        QSignalSpy stale(&concurrent,&ReaderController::commandFinished);
+        const auto staleId=concurrent.saveReadingNoteDraft();QVERIFY(staleId);
+        QTRY_COMPARE(stale.size(),1);QCOMPARE(stale.at(0).at(0).toULongLong(),staleId);
+        QVERIFY(stale.at(0).at(3).toString().contains("changed in another window"));
+        QVERIFY(concurrent.hasUnsavedReadingNotes());
+        QCOMPARE(concurrent.readingNoteDraft().value("content").toString(),QString("Stale window draft"));
+        concurrent.discardReadingNoteDraft();QVERIFY(!concurrent.hasUnsavedReadingNotes());
+
+        QDirIterator files(scratch.filePath("cache"),{"ai-reading-workspace.json"},QDir::Files,QDirIterator::Subdirectories);
+        QVERIFY(files.hasNext());QFile archive(files.next());QVERIFY(archive.open(QIODevice::ReadOnly));
+        const auto rows=QJsonDocument::fromJson(archive.readAll()).object().value("records").toArray();
+        const auto stored=std::find_if(rows.cbegin(),rows.cend(),[&](const auto &row){return row.toObject().value("id").toString()==id;});
+        QVERIFY(stored!=rows.cend());
+        QCOMPARE((*stored).toObject().value("versions").toArray(),QJsonArray{completed});
+        QVERIFY(source.open(QIODevice::ReadOnly));QCOMPARE(source.readAll(),original);source.close();
         QVERIFY(source.open(QIODevice::WriteOnly|QIODevice::Append));const QByteArray revision("\n% Local fixture revision\n");
         QCOMPARE(source.write(revision),revision.size());source.close();
         reopen();QVERIFY(QMetaObject::invokeMethod(browse,"clicked"));QTRY_COMPARE(current().value("id").toString(),id);
-        QCOMPARE(text->property("text").toString(),completed);QCOMPARE(pages->property("count").toInt(),0);
+        QCOMPARE(text->property("text").toString(),revisedContent);QCOMPARE(pages->property("count").toInt(),0);
         QCOMPARE(current().value("status").toString(),QString("sourceChanged"));QCOMPARE(server.requests.size(),1);
         dismiss();
     }
