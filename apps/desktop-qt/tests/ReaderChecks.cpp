@@ -5307,6 +5307,64 @@ private slots:
         QVERIFY(reader->reopenAiRegion(id,reader->regionHistory().value("revision").toString()));reader->clearAiRegion();QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(!reader->aiRegion().contains("image_png"));QTRY_VERIFY(!window->findChild<QObject *>("aiRegionCard")->property("opened").toBool());
         QVERIFY(originalFile.open(QIODevice::ReadOnly));QCOMPARE(originalFile.readAll(),original);
     }
+    void regionNotesEmptyActionAndSavedAnswerPreviewsStayLocal() {
+        QTemporaryDir scratch;
+        QVERIFY(scratch.isValid());
+        const auto path=scratch.filePath("synthetic-regions-list.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        MockChatServer sentinel;
+        QVERIFY(sentinel.listen());
+        NativeCorpus::Viewer view;
+        auto *window=view.window;
+        QVERIFY(window);
+        window->resize(736,690);
+        window->setProperty("appearance","dark");
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",sentinel.baseUrl()},{"model","region-list-no-send"}});
+        view.workspace.openFile(QUrl::fromLocalFile(path));
+        auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()==1 && !reader->pendingCommands(),10000);
+        QVERIFY(QMetaObject::invokeMethod(window,"openRegionNotes"));
+        auto *action=visualItem(window->contentItem(),"regionNotesEmptyAction");
+        QVERIFY(action);
+        QTRY_VERIFY(action->isVisible() && action->isEnabled() && action->hasActiveFocus());
+        const auto capture=qEnvironmentVariable("LYRA_READER_REGION_LIST_SNAPSHOT");
+        if(!capture.isEmpty())QVERIFY(window->grabWindow().save(capture+"-empty.png"));
+        QTest::keyClick(window,Qt::Key_Space);
+        QTRY_VERIFY(window->property("regionSelecting").toBool());
+        QVERIFY(!window->property("aiPanelVisible").toBool());
+        QCOMPARE(sentinel.requests.size(),0);
+        QVERIFY(QMetaObject::invokeMethod(window,"cancelRegionSelection"));
+
+        QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",420},{"height",180}},1));
+        QTRY_VERIFY_WITH_TIMEOUT(!reader->aiRegion().value("image_png").toString().isEmpty(),10000);
+        const auto id=reader->aiRegion().value("history_id").toString();
+        QVERIFY(!id.isEmpty());
+        QVERIFY(reader->saveAiRegionNote());
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto note=QStringLiteral("Local\nsummary <img src=ignored> ")+QString(180,QChar(0x754c));
+        reader->submit("region_note",{{"id",id},{"text",note}});
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
+        reader->clearAiRegion();
+        QVERIFY(QMetaObject::invokeMethod(window,"openRegionNotes"));
+        QTRY_VERIFY(visualItem(window->contentItem(),"regionNoteExcerpt1"));
+        auto *preview=visualItem(window->contentItem(),"regionNoteExcerpt1");
+        QTRY_VERIFY(preview->property("text").toString().startsWith("Local summary <img src=ignored> "));
+        const auto excerpt=preview->property("text").toString();
+        QCOMPARE(excerpt.size(),161);
+        QVERIFY(excerpt.endsWith(QChar(0x2026)));
+        QCOMPARE(preview->property("textFormat").toInt(),int(Qt::PlainText));
+        QVERIFY(!action->isVisible());
+        if(!capture.isEmpty())QVERIFY(window->grabWindow().save(capture+"-saved.png"));
+        auto *list=visualItem(window->contentItem(),"regionNotesList");
+        QVERIFY(list);
+        QTRY_VERIFY(list->hasActiveFocus());
+        QTest::keyClick(window,Qt::Key_Return);
+        auto *editor=visualItem(window->contentItem(),"regionKnowledgeNote");
+        QVERIFY(editor);
+        QTRY_COMPARE(editor->property("text").toString(),note);
+        QCOMPARE(sentinel.requests.size(),0);
+    }
     void savedRegionNotesRetainCapturesLateDraftsAndKnowledgeAcrossReopen() {
         QTest::failOnWarning(QRegularExpression(QStringLiteral(".*exception occurred during delayed function evaluation.*")));
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/reading-notes.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));

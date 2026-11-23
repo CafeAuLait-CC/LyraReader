@@ -12,6 +12,7 @@ Pane {
     property var owner:null
     property var detail:null
     property var readId:0
+    property var listLoadId:0
     property var reopenId:0
     property var keepId:0
     property var continueContext:null
@@ -29,6 +30,10 @@ Pane {
     property var exportReader:null
     property var exportId:0
     readonly property bool canExport:owner && !owner.pendingCommands && !owner.hasUnsavedReadingNotes && !exportId && !history.error && (history.entries || []).some(e=>e.has_answer)
+    readonly property bool canSelectArea: !!owner && !owner.loading && !owner.hasUnsavedReadingNotes &&
+        !owner.pendingCommands && !owner.aiState.running
+    readonly property bool emptyHistory: !detail && !readId && !listLoadId && !list.count &&
+        !history.error && !history.foreign_count && !history.writes_blocked
     visible:active;enabled:active;focus:active;padding:10
     background:Rectangle {color:notes.app.colors.sidebarBg}
     signal closed()
@@ -36,14 +41,15 @@ Pane {
     function close(){if(app.aiPanelVisible && app.aiPanelMode==="notes")app.showAiPanel(false);}
     function activate() {
         owner=app.currentReader;ownerGeneration=owner.documentGeneration;
-        detail=null;selectedId="";readError="";owner.submit("region_list",{});
+        detail=null;selectedId="";readError="";
+        listLoadId=owner.submit("region_list",{});
         if(owner.regionNoteDraft.id)load(owner.regionNoteDraft.id);
-        else list.forceActiveFocus();
+        else notes.forceActiveFocus();
     }
     function deactivate() {
         let focused=app.activeFocusItem;let ownedFocus=false;
         while(focused){if(focused===notes){ownedFocus=true;break;}focused=focused.parent;}
-        continueReveal.stop();continueContext=null;exportFile.close();exportContext=null;remove.close();detail=null;readId=0;reopenId=0;keepId=0;owner=null;
+        continueReveal.stop();continueContext=null;exportFile.close();exportContext=null;remove.close();detail=null;readId=0;listLoadId=0;reopenId=0;keepId=0;owner=null;
         if(ownedFocus)app.focusReadingView();closed();
     }
     onActiveChanged:if(active)activate();else deactivate()
@@ -53,6 +59,19 @@ Pane {
     }
     Keys.onShortcutOverride:function(event){if(event.key===Qt.Key_Escape)event.accepted=true;}
     Keys.onEscapePressed:function(event){close();event.accepted=true;}
+    function selectNewArea() {
+        if (!canSelectArea) return;
+        close();
+        app.armRegion(false);
+    }
+    function revealListFocus(expected, generation) {
+        if(!active || owner!==expected || ownerGeneration!==generation || detail || readId) return;
+        let focus=app.activeFocusItem;
+        while(focus && focus!==notes) focus=focus.parent;
+        if(focus!==notes) return;
+        if(emptyHistory && emptyAction.enabled) emptyAction.forceActiveFocus();
+        else if(list.visible) list.forceActiveFocus();
+    }
     function load(id){if(owner.regionNoteDraft.id && owner.regionNoteDraft.id!==id){app.operationStatus=qsTr("Save or discard the current reading note before selecting another area.");return;}selectedId=id;detail=null;readError="";readId=owner.submit("region_get",{id:id});}
     function continueConversation() {
         if(!owner || !detail || !detail.can_reopen || owner.pendingCommands || owner.hasUnsavedReadingNotes || history.writes_blocked)return;
@@ -101,6 +120,11 @@ Pane {
         target:notes.owner
         function onDocumentReset(){notes.close();}
         function onCommandFinished(id,op,result,error){
+            if(op==="region_list" && id===notes.listLoadId) {
+                notes.listLoadId=0;
+                Qt.callLater(notes.revealListFocus,notes.owner,notes.ownerGeneration);
+                return;
+            }
             if(op==="ai_reading_keep_region" && id===notes.keepId) {
                 notes.keepId=0;
                 if(error)notes.readError=error;
@@ -126,14 +150,45 @@ Pane {
             Button {objectName:"regionNotesBack";text:qsTr("All notes");visible:!!notes.detail;enabled:notes.owner && !notes.owner.hasUnsavedReadingNotes && !notes.owner.pendingCommands;onClicked:{notes.detail=null;notes.selectedId="";list.forceActiveFocus();}}
             Label {text:qsTr("Saved locally");color:notes.app.colors.textSecondary;Layout.fillWidth:true}
             LyraToolButton {objectName:"exportRegionNotes";symbol:"export";text:qsTr("Export Reading notes as Markdown and pictures (new file)");enabled:notes.canExport;onClicked:notes.beginExport()}
-            LyraToolButton {objectName:"regionNotesNewArea";symbol:"plus";text:qsTr("Select a new region");enabled:notes.owner && !notes.owner.hasUnsavedReadingNotes && !notes.owner.pendingCommands && !notes.owner.aiState.running;onClicked:{notes.close();notes.app.armRegion(false);}}
+            LyraToolButton {objectName:"regionNotesNewArea";symbol:"plus";text:qsTr("Select a new region");enabled:notes.canSelectArea;onClicked:notes.selectNewArea()}
         }
-        Label {text:qsTr("Local captures and conversations. Opening notes sends no request.");wrapMode:Text.Wrap;Layout.fillWidth:true;color:notes.app.colors.textSecondary}
+        Label {visible:!notes.emptyHistory;text:qsTr("Local captures and conversations. Opening notes sends no request.");wrapMode:Text.Wrap;Layout.fillWidth:true;color:notes.app.colors.textSecondary}
         Label {text:notes.readError || notes.history.error || (notes.history.warnings || []).join("\n");visible:text.length>0;textFormat:Text.PlainText;wrapMode:Text.Wrap;Layout.fillWidth:true;color:notes.app.colors.warningFg}
-        Label {objectName:"regionNotesEmpty";visible:!list.count && !notes.history.error && !notes.history.foreign_count && !notes.history.writes_blocked;text:qsTr("No saved areas. Select & Ask automatically keeps captured areas and conversations in Reading notes.");wrapMode:Text.Wrap;Layout.fillWidth:true}
+        ColumnLayout {
+            objectName:"regionNotesEmpty"
+            visible:notes.emptyHistory
+            Layout.fillWidth:true
+            Layout.fillHeight:true
+            spacing:8
+            Item {Layout.fillHeight:true}
+            Label {
+                text:qsTr("No saved areas")
+                font.bold:true
+                color:notes.app.colors.textPrimary
+                Layout.alignment:Qt.AlignHCenter
+            }
+            Label {
+                text:qsTr("Select part of the PDF with Interleaf to start a conversation and keep it here.")
+                color:notes.app.colors.textSecondary
+                wrapMode:Text.Wrap
+                horizontalAlignment:Text.AlignHCenter
+                Layout.fillWidth:true
+            }
+            Button {
+                id:emptyAction
+                objectName:"regionNotesEmptyAction"
+                text:qsTr("Select && Ask")
+                highlighted:true
+                enabled:notes.canSelectArea
+                Layout.alignment:Qt.AlignHCenter
+                onClicked:notes.selectNewArea()
+            }
+            Item {Layout.fillHeight:true}
+        }
         ListView {
             id:list;objectName:"regionNotesList"
-            visible:!notes.detail && !notes.readId;activeFocusOnTab:true
+            visible:!notes.detail && !notes.readId && !notes.emptyHistory && (!notes.listLoadId || count>0)
+            activeFocusOnTab:true
             Layout.fillWidth:true;Layout.fillHeight:true
             model:notes.history.entries || [];clip:true;spacing:6
             onCountChanged:if(count && currentIndex<0)currentIndex=0
@@ -199,6 +254,12 @@ Pane {
                         Label {text:row.text;textFormat:Text.PlainText;font.bold:true;Layout.fillWidth:true;color:row.highlighted ? notes.app.colors.selectedFg : notes.app.colors.accent}
                         Label {text:row.modelData.question || row.modelData.draft || qsTr("New region");textFormat:Text.PlainText;wrapMode:Text.Wrap;maximumLineCount:2;elide:Text.ElideRight;Layout.fillWidth:true;color:notes.app.colors.textPrimary}
                         Label {text:qsTr("%1 turns · %2").arg(row.modelData.turns).arg(row.modelData.has_note ? qsTr("Reading note") : notes.stateLabel(row.modelData.state));textFormat:Text.PlainText;Layout.fillWidth:true;color:notes.app.colors.textSecondary;font.pixelSize:11}
+                        Label {
+                            objectName:"regionNoteExcerpt"+row.modelData.number
+                            text:row.modelData.answer_preview || (row.modelData.has_answer ? qsTr("Answer saved") : qsTr("No answer yet"))
+                            textFormat:Text.PlainText;wrapMode:Text.Wrap;maximumLineCount:2
+                            elide:Text.ElideRight;Layout.fillWidth:true;color:notes.app.colors.textSecondary;font.pixelSize:11
+                        }
                     }
                 }
                 background:Rectangle {radius:6;color:parent.highlighted ? notes.app.colors.selectedBg : parent.down ? notes.app.colors.pressedBg : parent.hovered ? notes.app.colors.hoverBg : notes.app.colors.raisedBg;border.width:list.activeFocus && list.currentIndex===row.index ? 2 : 1;border.color:list.activeFocus && list.currentIndex===row.index ? notes.app.colors.focusRing : notes.app.colors.separator}
@@ -206,7 +267,7 @@ Pane {
                 onClicked:notes.load(modelData.id)
             }
         }
-        BusyIndicator {visible:!!notes.readId;running:visible;Layout.alignment:Qt.AlignHCenter}
+        BusyIndicator {visible:!!notes.readId || (!!notes.listLoadId && !list.count);running:visible;Layout.alignment:Qt.AlignHCenter}
         AiReadingScrollView {
             id: noteDetail
             visible:!!notes.detail;Layout.fillWidth:true;Layout.fillHeight:true;clip:true

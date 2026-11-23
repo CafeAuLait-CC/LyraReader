@@ -145,6 +145,43 @@ impl Entry {
                 .display_turns()
                 .any(|turn| !turn.answer.trim().is_empty())
     }
+    fn answer_preview(&self) -> String {
+        const PREVIEW_CHARACTERS: usize = 160;
+        let source = if !self.knowledge_note.trim_start().is_empty() {
+            self.knowledge_note.as_str()
+        } else if !self.answer.trim_start().is_empty() {
+            self.answer.as_str()
+        } else {
+            self.display_turns()
+                .map(|turn| turn.answer)
+                .filter(|answer| !answer.trim_start().is_empty())
+                .last()
+                .unwrap_or("")
+        };
+        // Only visit enough text for the list row. Whitespace is compacted in
+        // the presentation DTO; the saved answer and its source remain intact.
+        let mut preview = String::new();
+        let mut length = 0;
+        let mut pending_space = false;
+        for ch in source.chars() {
+            if ch.is_whitespace() {
+                pending_space = length > 0;
+                continue;
+            }
+            if length + usize::from(pending_space) >= PREVIEW_CHARACTERS {
+                preview.push('…');
+                break;
+            }
+            if pending_space {
+                preview.push(' ');
+                length += 1;
+                pending_space = false;
+            }
+            preview.push(ch);
+            length += 1;
+        }
+        preview
+    }
     /// Completed exchanges are eligible request context; partial/error records remain readable.
     pub fn completed_turns(&self) -> impl Iterator<Item = DisplayTurn<'_>> {
         self.display_turns()
@@ -525,6 +562,7 @@ impl History {
                 "turns": turns,
                 "has_note": !e.knowledge_note.is_empty(),
                 "has_answer": e.has_answer(),
+                "answer_preview": e.answer_preview(),
                 "location_invalidated": e.location_invalidated == Some(true)
                     || e.capture_sha256.as_deref().is_some_and(|s| s != sha)
             })
@@ -650,6 +688,27 @@ mod tests {
             .next()
             .unwrap()
             .clone()
+    }
+    #[test]
+    fn region_preview_prefers_the_note_then_the_latest_answer_and_bounds_unicode() {
+        let mut entry = sample();
+        entry.answer = " Original\n\tanswer ".into();
+        entry.knowledge_note.clear();
+        assert_eq!(entry.answer_preview(), "Original answer");
+        entry.knowledge_note = format!("   New\n note {} ", "界".repeat(170));
+        let snippet = entry.answer_preview();
+        assert!(snippet.starts_with("New note "));
+        assert!(snippet.ends_with('…'));
+        assert_eq!(snippet.chars().count(), 161);
+        assert!(entry.knowledge_note.ends_with(' '));
+
+        entry.turns.clear();
+        entry.question = "Earlier question".into();
+        entry.materialize_legacy_turn();
+        entry.answer.clear();
+        entry.knowledge_note.clear();
+        entry.turns.last_mut().unwrap().answer = "Most recent turn".into();
+        assert_eq!(entry.answer_preview(), "Most recent turn");
     }
     #[test]
     fn only_the_current_unfinished_turn_can_grow_or_finish() {
