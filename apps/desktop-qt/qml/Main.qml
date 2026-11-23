@@ -23,6 +23,8 @@ ApplicationWindow {
     readonly property var previewController: session ? session.preview : null
     readonly property var navigationHistory: navigationController.state.back || []
     readonly property var forwardHistory: navigationController.state.forward || []
+    readonly property alias auxiliaryWindowOwner: auxiliaryOwner
+    AuxiliaryWindowOwner {id:auxiliaryOwner;window:root}
     readonly property bool canGoBack: navigationHistory.length > 0
     readonly property bool canGoForward: forwardHistory.length > 0
     NavigationController {id:navigationController;objectName:"navigationController";window:root}

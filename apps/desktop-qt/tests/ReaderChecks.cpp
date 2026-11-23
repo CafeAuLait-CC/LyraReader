@@ -43,6 +43,7 @@
 #include <QDir>
 #include <QDirIterator>
 #include <QDesktopServices>
+#include <QSignalBlocker>
 #include <QSignalSpy>
 #include <QQmlApplicationEngine>
 #include <QQmlError>
@@ -163,6 +164,7 @@ static void registerReaderTypes() {
     qmlRegisterType<FileDialogNavigation>("LyraReader",1,0,"FileDialogNavigation");
     qmlRegisterType<DisplayCalibration>("LyraReader",1,0,"DisplayCalibration");
     qmlRegisterType<AuxiliaryWindowPolicy>("LyraReader",1,0,"AuxiliaryWindowPolicy");
+    qmlRegisterType<AuxiliaryWindowOwner>("LyraReader",1,0,"AuxiliaryWindowOwner");
     qmlRegisterType<PageItem>("LyraReader",1,0,"PdfPage");
     qmlRegisterType<CropItem>("LyraReader",1,0,"PdfCrop");
     qmlRegisterType<ContentDragItem>("LyraReader",1,0,"ContentDragPreview");
@@ -1719,11 +1721,23 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));QTRY_VERIFY(settings->isVisible());QVERIFY(preparedAtFirstShow);QVERIFY(settings->minimumWidth()<settings->maximumWidth());QVERIFY(settings->minimumHeight()<settings->maximumHeight());
         QVERIFY(frameBeforeFirstShow);
         const auto available=settings->screen()->availableGeometry();QVERIFY(settings->width()<=available.width());QVERIFY(settings->height()<=available.height());QVERIFY(!(settings->flags() & Qt::WindowStaysOnTopHint));
-        if(qEnvironmentVariableIsSet("LYRA_READER_CHECK_AUX_OBSERVE"))QTest::qWait(1800);
+        const bool observe=qEnvironmentVariableIsSet("LYRA_READER_CHECK_AUX_OBSERVE");
+        if(observe) {
+            QTRY_COMPARE(QGuiApplication::focusWindow(),settings);
+            QTest::qWait(1800);
+        }
         if(qEnvironmentVariableIsSet("LYRA_READER_CHECK_AUX_SNAPSHOT")){QTest::qWait(80);QVERIFY(settings->grabWindow().save(qEnvironmentVariable("LYRA_READER_CHECK_AUX_SNAPSHOT")));}
         auto *motion=settings->findChild<QObject *>("settingsReduceMotion");QVERIFY(motion);QCOMPARE(motion->property("checked").toBool(),oldMotion.toBool());motion->setProperty("checked",!oldMotion.toBool());
         auto *url=settings->findChild<QObject *>("settingsBaseUrl");auto *key=settings->findChild<QObject *>("settingsApiKey");QVERIFY(url && key);url->setProperty("text","http://127.0.0.1:1/cancelled");key->setProperty("text","synthetic-local-draft");QVERIFY(settings->close());QTRY_VERIFY(!settings->isVisible());QVERIFY(key->property("text").toString().isEmpty());QCOMPARE(window->property("reduceMotion"),oldMotion);
-        QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));QTRY_VERIFY(settings->isVisible());QVERIFY(url->property("text").toString()!="http://127.0.0.1:1/cancelled");
+        if(observe)QTRY_COMPARE(QGuiApplication::focusWindow(),window);
+        {
+            // The mapped owner does not have to submit another frame to
+            // reopen a dialog while compositor frame callbacks are withheld.
+            const QSignalBlocker blockOwnerSignals(window);
+            QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));
+            QTRY_VERIFY(settings->isVisible());
+        }
+        QVERIFY(url->property("text").toString()!="http://127.0.0.1:1/cancelled");
         const auto newSize=QSize(qMax(settings->minimumWidth(),settings->width()-40),qMax(settings->minimumHeight(),settings->height()-30));settings->resize(newSize);QTRY_COMPARE(settings->size(),newSize);QVERIFY(settings->close());
         QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));QTRY_VERIFY(settings->isVisible());QCOMPARE(settings->size(),newSize);QCOMPARE(motion->property("checked").toBool(),oldMotion.toBool());motion->setProperty("checked",!oldMotion.toBool());url->setProperty("text","http://127.0.0.1:1/saved");QVERIFY(QMetaObject::invokeMethod(settings,"save"));QTRY_VERIFY(!settings->isVisible());QCOMPARE(workspace.preference("ai").toMap().value("baseUrl").toString(),QString("http://127.0.0.1:1/saved"));QCOMPARE(workspace.preference("reduceMotion").toBool(),!oldMotion.toBool());
         QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));QTRY_VERIFY(settings->isVisible());window->hide();QTRY_VERIFY(!settings->isVisible());

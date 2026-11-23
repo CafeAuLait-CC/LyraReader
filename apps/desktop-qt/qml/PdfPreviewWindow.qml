@@ -32,7 +32,7 @@ ApplicationWindow {
         const saved=app.session ? app.session.preference("auxiliaryPdfGeometry",{}) : ({});
         if(!policy.prepare(preview,app,saved,760,700))return false;
         pendingPoint={page:requestedPage,x:targetRegion.x_pt || 0,y:targetRegion.y_pt || 0};
-        policy.present();placePending();return true;
+        policy.present(app.auxiliaryWindowOwner);placePending();return true;
     }
     onVisibleChanged:if(visible)placePending()
     function navigate(index,y) {

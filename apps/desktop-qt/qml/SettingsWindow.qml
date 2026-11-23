@@ -43,7 +43,7 @@ ApplicationWindow {
         apiKey.clear();
         const saved=app.session ? app.session.preference("auxiliarySettingsGeometry",{}) : ({});
         if(!policy.prepare(settings,app,saved,560,650)){auditOnOpen=false;app.operationStatus=qsTr("The Settings window could not find an available display.");return;}
-        policy.present();
+        policy.present(app.auxiliaryWindowOwner);
     }
     function openAudit() {
         if(visible) {

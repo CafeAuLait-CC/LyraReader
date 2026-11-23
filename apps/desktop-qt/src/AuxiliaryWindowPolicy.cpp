@@ -1,9 +1,39 @@
 #include "AuxiliaryWindowPolicy.h"
 #include <QGuiApplication>
-#include <QQuickWindow>
 #include <QScreen>
 #include <QTimer>
 #include <cmath>
+
+namespace {
+bool isWayland() {
+    return QGuiApplication::platformName().startsWith(QStringLiteral("wayland"));
+}
+}
+
+void AuxiliaryWindowOwner::setWindow(QQuickWindow *window) {
+    if(window==m_window)return;
+    disconnect(m_visibility);
+    m_window=window;
+    if(window && isWayland())
+        m_visibility=connect(window,&QWindow::visibleChanged,this,[this]{observeFirstFrame();});
+    observeFirstFrame();
+    emit windowChanged();
+}
+
+void AuxiliaryWindowOwner::observeFirstFrame() {
+    const auto observation=++m_observation;
+    disconnect(m_frame);
+    m_frame={};
+    m_hasSubmittedFrame=false;
+    if(!isWayland() || !m_window || !m_window->isVisible())return;
+    m_frame=connect(m_window,&QQuickWindow::frameSwapped,this,[this,observation] {
+        if(observation!=m_observation || !m_window || !m_window->isVisible())return;
+        disconnect(m_frame);
+        m_frame={};
+        m_hasSubmittedFrame=true;
+        emit firstFrameSubmitted();
+    },Qt::QueuedConnection);
+}
 
 QSize AuxiliaryWindowPolicy::boundedSize(const QSizeF &requested,const QRect &available) {
     if(!available.isValid())return {};
@@ -37,7 +67,7 @@ bool AuxiliaryWindowPolicy::prepare(QWindow *window,QWindow *owner,const QVarian
     window->setModality(Qt::NonModal);
     window->setMinimumSize({qMin(360,size.width()),qMin(280,size.height())});
     window->resize(size);
-    if(!QGuiApplication::platformName().startsWith(QStringLiteral("wayland"))) {
+    if(!isWayland()) {
         const auto available=screen->availableGeometry();
         const auto centered=owner->geometry().center()-QPoint(size.width()/2,size.height()/2);
         bool xOk=false,yOk=false;
@@ -61,21 +91,27 @@ bool AuxiliaryWindowPolicy::prepare(QWindow *window,QWindow *owner,const QVarian
     return true;
 }
 
-void AuxiliaryWindowPolicy::present() {
+void AuxiliaryWindowPolicy::present(AuxiliaryWindowOwner *ownerFrames) {
     if(!m_window || !m_owner || !m_owner->isVisible() || m_ownerFrame)return;
     auto *owner=qobject_cast<QQuickWindow *>(m_owner.data());
-    if(m_window->isVisible() || !owner || !QGuiApplication::platformName().startsWith(QStringLiteral("wayland"))) {
+    if(ownerFrames && ownerFrames->window()!=owner)ownerFrames=nullptr;
+    if(m_window->isVisible() || !owner || !isWayland() || (ownerFrames && ownerFrames->hasSubmittedFrame())) {
         showPreparedWindow();
         return;
     }
     // xdg-shell treats a parent without a mapped buffer as unset. Queue the
     // auxiliary show after Qt submits an owner frame, on the owner's connection.
     const auto presentation=++m_presentation;
-    m_ownerFrame=connect(owner,&QQuickWindow::frameSwapped,this,[this,presentation] {
+    const auto show=[this,presentation] {
         if(presentation!=m_presentation)return;
         cancelPresentation();
         showPreparedWindow();
-    },Qt::QueuedConnection);
+    };
+    // Once the owner is mapped, later dialogs must remain available even
+    // when the compositor is deliberately withholding additional frames.
+    m_ownerFrame=ownerFrames
+        ? connect(ownerFrames,&AuxiliaryWindowOwner::firstFrameSubmitted,this,show,Qt::QueuedConnection)
+        : connect(owner,&QQuickWindow::frameSwapped,this,show,Qt::QueuedConnection);
     owner->update();
 }
 
@@ -95,7 +131,7 @@ void AuxiliaryWindowPolicy::showPreparedWindow() {
 QVariantMap AuxiliaryWindowPolicy::geometry() const {
     if(!m_window)return {};
     QVariantMap value{{QStringLiteral("width"),m_window->width()},{QStringLiteral("height"),m_window->height()}};
-    if(!QGuiApplication::platformName().startsWith(QStringLiteral("wayland"))) {
+    if(!isWayland()) {
         value.insert(QStringLiteral("x"),m_window->x());value.insert(QStringLiteral("y"),m_window->y());
     }
     return value;
