@@ -5988,15 +5988,23 @@ private slots:
         if(!qEnvironmentVariableIsSet("LYRA_READER_CHECK_SCROLL_DRAG"))QSKIP("Opt-in Qt scrollbar-injection measurement; use LYRA_READER_CHECK_SCROLL_DRAG=1.");
         QTemporaryDir scratch;
         QVERIFY(scratch.isValid());
-        const QString fixture=scratch.filePath("long-synthetic.pdf");
-        QVERIFY(QFile::copy(root+"/tests/fixtures/index-past-120.pdf",fixture));
+        const auto input=qEnvironmentVariable("LYRA_READER_SCROLL_DRAG_PDF",root+"/tests/fixtures/index-past-120.pdf");
+        const QString fixture=scratch.filePath("scroll-drag-fixture.pdf");
+        QVERIFY(QFile::copy(input,fixture));
+        QFile frozen(fixture);
+        QVERIFY(frozen.open(QIODevice::ReadOnly));
+        QCryptographicHash fingerprint(QCryptographicHash::Sha256);
+        QVERIFY(fingerprint.addData(&frozen));
+        frozen.close();
+        const auto fixtureHash=QString::fromLatin1(fingerprint.result().toHex());
         NativeCorpus::Viewer viewer;
         auto *window=viewer.window;
         QVERIFY(window);
         window->resize(1200,820);
         viewer.workspace.openFile(QUrl::fromLocalFile(fixture));
         auto *reader=viewer.workspace.activeReader();
-        QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()>100 && !reader->pendingCommands(),15000);
+        QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()>0 && !reader->pendingCommands(),15000);
+        QVERIFY2(reader->pageCount()>=30,"Scrollbar trials need at least 30 similarly sized pages.");
         QVERIFY(settleReaderViewport(window));
         auto *viewport=visualItem(window->contentItem(),"pageList");
         auto *bar=visualItem(window->contentItem(),"documentVerticalScrollBar");
@@ -6089,6 +6097,7 @@ private slots:
         const QVariantMap result{{"schema",1},{"complete",true},{"input","QtTest mouse events delivered to the real Qt Quick scroll thumb"},
             {"physicalPointerOrPresentationMeasured",false},{"platform",QGuiApplication::platformName()},
             {"graphicsApi",int(window->rendererInterface()->graphicsApi())},{"fixturePages",reader->pageCount()},
+            {"fixtureSha256",fixtureHash},
             {"windowWidth",window->width()},{"windowHeight",window->height()},
             {"viewportWidth",viewport->width()},{"viewportHeight",viewport->height()},{"devicePixelRatio",window->effectiveDevicePixelRatio()},
             {"qt",qVersion()},{"architecture",QSysInfo::currentCpuArchitecture()},{"percentileMethod","lower order statistic"},
