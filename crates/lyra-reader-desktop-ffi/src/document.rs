@@ -279,6 +279,17 @@ impl ReadingReplies {
 fn value<T: Serialize>(result: Result<T, LyraReaderFfiError>) -> Result<Value, String> {
     serde_json::to_value(result.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
+fn chatgpt_account(request: &Value) -> Result<Option<&str>, String> {
+    request
+        .get("chatgpt_account")
+        .map(|entry| {
+            entry
+                .as_str()
+                .filter(|id| !id.is_empty() && id.len() <= 128)
+                .ok_or_else(|| "The ChatGPT connection changed. Preview the request again.".into())
+        })
+        .transpose()
+}
 fn arg<T: DeserializeOwned>(request: &Value, key: &str) -> Result<T, String> {
     serde_json::from_value(request.get(key).cloned().unwrap_or(Value::Null))
         .map_err(|e| format!("Invalid {key}: {e}"))
@@ -996,22 +1007,36 @@ impl DesktopDocument {
             ),
             "ai_preview" => {
                 let mut request = crate::region::request(r["request"].clone())?;
-                if let Some(account) = r["request"]["chatgpt_account"].as_str() {
-                    if account.is_empty()
-                        || account.len() > 128
-                        || request.action != AiActionRecord::DocumentChat
-                        || r.get("reading").is_some()
-                    {
-                        return Err(
-                            "The ChatGPT plan connection requires a document chat preview.".into(),
-                        );
+                let account = chatgpt_account(&r["request"])?;
+                if account.is_some() {
+                    let reading = r["reading"]["kind"].as_str();
+                    let eligible = match request.action {
+                        AiActionRecord::DocumentChat => r.get("reading").is_none(),
+                        AiActionRecord::SummarizeSelection => reading == Some("summary"),
+                        AiActionRecord::TranslateSelection => {
+                            reading == Some("translation")
+                                && r["reading"]["saved_translation"].is_null()
+                        }
+                        _ => false,
+                    };
+                    if !eligible {
+                        return Err("This request does not use the ChatGPT plan connection.".into());
                     }
                     request.base_url = "https://api.openai.com/v1".into();
-                    self.enrich_reading(&mut request, &d.document_identity().sha256)?;
-                    let mut plan = value(d.prepare_ai_plan(request).and_then(render_chatgpt_plan))?;
-                    plan["chatgpt_account"] = json!(account);
-                    return Ok(plan);
                 }
+                let render_preview = |result: Result<AiPlanRecord, LyraReaderFfiError>| {
+                    let mut plan = value(result.and_then(|plan| {
+                        if account.is_some() {
+                            render_chatgpt_plan(plan)
+                        } else {
+                            render_ai_plan(plan, AiWireTransport::ChatCompletions)
+                        }
+                    }))?;
+                    if let Some(account) = account {
+                        plan["chatgpt_account"] = json!(account);
+                    }
+                    Ok(plan)
+                };
                 if r.get("reading").is_some() {
                     let options: AiReadingOptionsRecord = arg(&r, "reading")?;
                     if options.kind == "note" {
@@ -1084,12 +1109,7 @@ impl DesktopDocument {
                         language: request.language.as_deref().unwrap_or("").to_owned(),
                         detail: options.detail.clone(),
                     });
-                    let mut plan = value(
-                        d.prepare_ai_reading_task(request, options)
-                            .and_then(|plan| {
-                                render_ai_plan(plan, AiWireTransport::ChatCompletions)
-                            }),
-                    )?;
+                    let mut plan = render_preview(d.prepare_ai_reading_task(request, options))?;
                     if let Some(scope) = scope {
                         plan["kind"] = json!(if translation {
                             "reading_translation"
@@ -1114,10 +1134,7 @@ impl DesktopDocument {
                     &d.document_identity().sha256,
                 )?;
                 self.enrich_reading(&mut request, &d.document_identity().sha256)?;
-                value(
-                    d.prepare_ai_plan(request)
-                        .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),
-                )
+                render_preview(d.prepare_ai_plan(request))
             }
             "ai_translation_history" => self.translation_history(&d, arg(&r, "selection")?),
             "ai_translation_history_entry" => self.translation_history_entry(&d, &text(&r, "id")?),
@@ -1234,13 +1251,26 @@ impl DesktopDocument {
                     return Err("Stop the summary batch before starting another response.".into());
                 }
                 let plan: AiPlanRecord = arg(&r, "plan")?;
-                let chatgpt_account = r["plan"]["chatgpt_account"].as_str();
-                if chatgpt_account.is_some()
-                    && (chatgpt_account != r["chatgpt_account"].as_str()
-                        || plan.action != AiActionRecord::DocumentChat
-                        || plan.endpoint != lyra_reader_ai::openai::CHATGPT_RESPONSES_ENDPOINT)
-                {
+                let account = chatgpt_account(&r["plan"])?;
+                if account != chatgpt_account(&r)? {
                     return Err("The ChatGPT connection changed. Preview the request again.".into());
+                }
+                if account.is_some() {
+                    let eligible = match (plan.action, r["plan"]["kind"].as_str()) {
+                        (AiActionRecord::DocumentChat, None) => true,
+                        (AiActionRecord::SummarizeSelection, Some("reading_summary_selection"))
+                        | (AiActionRecord::TranslateSelection, Some("reading_translation")) => {
+                            r["plan"]["reading_scope"]["selection"].is_object()
+                        }
+                        _ => false,
+                    };
+                    if !eligible
+                        || plan.endpoint != lyra_reader_ai::openai::CHATGPT_RESPONSES_ENDPOINT
+                    {
+                        return Err(
+                            "The ChatGPT connection changed. Preview the request again.".into()
+                        );
+                    }
                 }
                 let reading = match (r["plan"]["kind"].as_str(), plan.action) {
                     (_, AiActionRecord::DocumentChat) if r.get("chat").is_some() => {
@@ -1355,7 +1385,7 @@ impl DesktopDocument {
                         .lock()
                         .map_err(|_| "Summary cache state is unavailable")?
                         .start(&d, &plan)?;
-                    if chatgpt_account.is_some() {
+                    if account.is_some() {
                         start_chatgpt_request_audited(
                             plan,
                             text(&r, "chatgpt_access_token")?,

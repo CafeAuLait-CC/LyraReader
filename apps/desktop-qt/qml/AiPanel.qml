@@ -166,7 +166,7 @@ Pane {
     }
     function baseRequest(requestAction) {
         const settings = app.aiSettings;
-        const request = {
+        return {
             action: requestAction,
             document_knowledge: false, document_knowledge_text: null, document_knowledge_pages: [],
             history: [], region: null, current_page: app.currentPage,
@@ -177,15 +177,19 @@ Pane {
             temperature: null, max_tokens: null,
             reasoning_mode: settings.reasoningMode || "default", reasoning_encoding: settings.reasoningEncoding || "none"
         };
-        const accounts = app.session ? app.session.chatGptAccounts : null;
-        if (requestAction === "DocumentChat" && accounts && accounts.useForChat) {
-            request.chatgpt_account = accounts.accountId;
-            request.base_url = "https://api.openai.com/v1";
-            request.model = accounts.model;
-            request.reasoning_mode = "default";
-            request.reasoning_encoding = "none";
+    }
+    function connectChatGpt(request, accounts, enabled) {
+        if (!enabled) return true;
+        if (!accounts.connected || !accounts.model) {
+            app.operationStatus = qsTr("Sign in and choose a ChatGPT model in Settings.");
+            return false;
         }
-        return request;
+        request.chatgpt_account = accounts.accountId;
+        request.base_url = "https://api.openai.com/v1";
+        request.model = accounts.model;
+        request.reasoning_mode = "default";
+        request.reasoning_encoding = "none";
+        return true;
     }
     function prepareUnit(id) {
         owner.prepareSummaryUnit(id, baseRequest("SummarizeDocument"));
@@ -198,28 +202,28 @@ Pane {
         if (unitMode) { prepareUnit(summaryUnit.id); return; }
         const modes = ["SummarizePage", "SummarizeDocument", "AskSelection", "TranslateSelection", "DocumentChat", "SummarizeSelection"];
         const accounts = app.session ? app.session.chatGptAccounts : null;
-        if (modes[action] === "DocumentChat" && accounts && accounts.useForChat &&
-                (!accounts.connected || !accounts.model)) {
-            app.operationStatus = qsTr("Sign in and choose a ChatGPT model in Settings.");
-            return;
-        }
         if (workspace === "translation") {
             const request = baseRequest("TranslateSelection");
             if (translateInPlace) { owner.prepareInplaceTranslation(request); return; }
             if (translateDocument) {
                 request.action = "SummarizeDocument";
                 request.selection = null;
-            }
+            } else if (accounts && !connectChatGpt(request, accounts, accounts.useForSelection)) return;
             owner.prepareAi(request, {}, {kind: "translation", detail: "Standard"});
         }
         else if (selectedSummary || wholeSummary) {
             const request = baseRequest(modes[action]);
             if (wholeSummary) request.selection = null;
+            if (selectedSummary && accounts && !connectChatGpt(request, accounts, accounts.useForSelection)) return;
             request.language = input.summaryLanguage || null;
             owner.prepareAi(request, {}, {kind: "summary", detail: summaryDetail,
                 force: wholeSummary && !!viewState.cachedWholeSummary});
         }
-        else owner.prepareAi(baseRequest(modes[action]));
+        else {
+            const request = baseRequest(modes[action]);
+            if (request.action === "DocumentChat" && accounts && !connectChatGpt(request, accounts, accounts.useForChat)) return;
+            owner.prepareAi(request);
+        }
     }
     function followLink(link) {
         const plan=aiPanel.result.responsePlan || {};

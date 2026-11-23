@@ -53,6 +53,7 @@ ChatGptAccounts::ChatGptAccounts(QObject *parent):QObject(parent) {
     m_accounts=settings.value(QStringLiteral("accounts")).toList();
     m_selected=settings.value(QStringLiteral("selected")).toString();
     m_useForChat=settings.value(QStringLiteral("useForChat"),false).toBool();
+    m_useForSelection=settings.value(QStringLiteral("useForSelection"),false).toBool();
     m_pollTimer.setInterval(75);
     connect(&m_pollTimer,&QTimer::timeout,this,&ChatGptAccounts::poll);
     connect(&m_vault,&CredentialStore::finished,this,
@@ -95,6 +96,7 @@ bool ChatGptAccounts::savePreferences() {
     settings.setValue(QStringLiteral("accounts"),m_accounts);
     settings.setValue(QStringLiteral("selected"),m_selected);
     settings.setValue(QStringLiteral("useForChat"),m_useForChat);
+    settings.setValue(QStringLiteral("useForSelection"),m_useForSelection);
     settings.sync();
     return settings.status()==QSettings::NoError;
 }
@@ -124,11 +126,19 @@ void ChatGptAccounts::selectModel(const QString &id) {
 }
 
 void ChatGptAccounts::setUseForChat(bool value) {
-    if(busy() || m_useForChat==value || (value && (!connected() || model().isEmpty())))return;
-    m_useForChat=value;
+    setUsagePreference(m_useForChat,value);
+}
+
+void ChatGptAccounts::setUseForSelection(bool value) {
+    setUsagePreference(m_useForSelection,value);
+}
+
+void ChatGptAccounts::setUsagePreference(bool &current,bool value) {
+    if(busy() || current==value || (value && (!connected() || model().isEmpty())))return;
+    current=value;
     const bool saved=savePreferences();
     emit profileChanged();
-    setStatus(saved?QString{}:tr("Could not save the ChatGPT chat preference."));
+    setStatus(saved?QString{}:tr("Could not save the ChatGPT usage preference."));
 }
 
 void ChatGptAccounts::beginSignIn(bool addAccount) {
@@ -291,7 +301,10 @@ void ChatGptAccounts::signOut() {
 }
 
 bool ChatGptAccounts::send(ReaderController *reader,const QVariantMap &plan) {
-    if(!reader || busy() || !m_useForChat || !connected()
+    const auto action=plan.value(QStringLiteral("action")).toString();
+    const bool allowed=action==QStringLiteral("DocumentChat") ? m_useForChat : m_useForSelection &&
+        (action==QStringLiteral("SummarizeSelection") || action==QStringLiteral("TranslateSelection"));
+    if(!reader || busy() || !allowed || !connected()
        || plan.value(QStringLiteral("chatgpt_account")).toString()!=m_selected
        || plan.value(QStringLiteral("model")).toString()!=model()
        || !lockAccount(m_selected))return false;

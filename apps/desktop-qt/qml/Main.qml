@@ -1951,13 +1951,15 @@ ApplicationWindow {
         }
         function onProfileChanged() {
             if (!root.session) return;
+            const accounts = root.session.chatGptAccounts;
             for (const tab of root.session.tabs) {
                 const reader = tab.reader;
                 const state = reader.aiState;
                 if (state.running && state.responsePlan && state.responsePlan.chatgpt_account)
                     reader.cancelAi();
-                if (state.previewView === "chat" && (root.session.chatGptAccounts.useForChat
-                        || state.previewChatGptAccount))
+                const selection = (state.previewView === "summary" || state.previewView === "translation") && state.previewSelection;
+                if (state.previewChatGptAccount || (state.previewView === "chat" && accounts.useForChat)
+                        || (selection && accounts.useForSelection))
                     reader.invalidateAiPlan();
             }
         }

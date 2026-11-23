@@ -23,6 +23,7 @@ class ChatGptAccounts : public QObject {
     Q_PROPERTY(QString model READ model NOTIFY profileChanged)
     Q_PROPERTY(bool connected READ connected NOTIFY profileChanged)
     Q_PROPERTY(bool useForChat READ useForChat WRITE setUseForChat NOTIFY profileChanged)
+    Q_PROPERTY(bool useForSelection READ useForSelection WRITE setUseForSelection NOTIFY profileChanged)
     Q_PROPERTY(bool busy READ busy NOTIFY changed)
     Q_PROPERTY(bool signingIn READ signingIn NOTIFY changed)
     Q_PROPERTY(QString status READ status NOTIFY changed)
@@ -35,6 +36,7 @@ public:
     QString model() const;
     bool connected() const;
     bool useForChat() const { return m_useForChat; }
+    bool useForSelection() const { return m_useForSelection; }
     bool busy() const;
     bool signingIn() const { return m_auth && m_worker==WorkerIntent::SignIn; }
     QString status() const { return m_status; }
@@ -47,6 +49,7 @@ public:
     Q_INVOKABLE bool send(ReaderController *reader,const QVariantMap &plan);
 
     void setUseForChat(bool value);
+    void setUseForSelection(bool value);
 
 signals:
     void changed();
@@ -62,6 +65,7 @@ private:
     void poll();
     void vaultFinished(quint64 id,const QString &secret,const QString &error);
     void setStatus(const QString &message);
+    void setUsagePreference(bool &current,bool value);
     bool savePreferences();
     void commitAccount(QVariantMap account);
     bool lockAccount(const QString &id);
@@ -76,6 +80,7 @@ private:
     QVariantList m_accounts;
     QString m_selected,m_status,m_signInSubject,m_registration;
     bool m_useForChat=false;
+    bool m_useForSelection=false;
     VaultIntent m_intent=VaultIntent::None;
     WorkerIntent m_worker=WorkerIntent::SignIn;
     quint64 m_vaultId=0;

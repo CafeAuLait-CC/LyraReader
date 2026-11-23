@@ -297,6 +297,15 @@ ApplicationWindow {
                             (checked || (chatGptSettings.accounts.connected && !!chatGptSettings.accounts.model))
                         onToggled: chatGptSettings.accounts.useForChat = checked
                     }
+                    CheckBox {
+                        objectName: "useChatGptForSelection"
+                        Layout.fillWidth: true
+                        text: qsTr("Use ChatGPT plan for selection summary and translation")
+                        checked: !!chatGptSettings.accounts && chatGptSettings.accounts.useForSelection
+                        enabled: !!chatGptSettings.accounts && !chatGptSettings.accounts.busy &&
+                            (checked || (chatGptSettings.accounts.connected && !!chatGptSettings.accounts.model))
+                        onToggled: chatGptSettings.accounts.useForSelection = checked
+                    }
                     RowLayout {
                         Button {
                             text: qsTr("Sign Out")
