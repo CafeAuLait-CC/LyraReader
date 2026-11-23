@@ -468,15 +468,17 @@ private slots:
         QTest::addColumn<QString>("theme");QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
     }
     void longDestinationLabelsKeepTheirWindowNumberAndCompleteDescription() {
-        QFETCH(QString,theme);QTemporaryDir scratch;QVERIFY(scratch.isValid());ReaderWindowFactory windows;auto *source=windows.createWindow();QVERIFY(source);source->setProperty("appearance",theme);source->resize(700,600);auto *origin=source->property("session").value<WorkspaceController *>();
-        const auto incoming=scratch.filePath("incoming.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",incoming));origin->openFile(QUrl::fromLocalFile(incoming));QTRY_VERIFY_WITH_TIMEOUT(origin->activeReader()->pageCount()==1 && !origin->activeReader()->pendingCommands(),10000);QVERIFY(settleReaderViewport(source));
+        QFETCH(QString,theme);QTemporaryDir scratch;QVERIFY(scratch.isValid());ReaderWindowFactory windows;
         const auto name=QString("identical-")+QString(80,QLatin1Char('w'))+".pdf";
         for(const auto &folder:{"first-target","second-target"}){QVERIFY(QDir(scratch.path()).mkdir(folder));const auto file=scratch.filePath(QString(folder)+"/"+name);QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",file));auto *target=windows.createWindow();QVERIFY(target);auto *owner=target->property("session").value<WorkspaceController *>();owner->openFile(QUrl::fromLocalFile(file));QTRY_VERIFY_WITH_TIMEOUT(owner->activeReader()->pageCount()==1 && !owner->activeReader()->pendingCommands(),10000);}
+        // Map the window whose menus will open last so a compositor does not
+        // have to honor an activation request to switch back from the targets.
+        auto *source=windows.createWindow();QVERIFY(source);source->setProperty("appearance",theme);source->resize(700,600);auto *origin=source->property("session").value<WorkspaceController *>();
+        const auto incoming=scratch.filePath("incoming.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",incoming));origin->openFile(QUrl::fromLocalFile(incoming));QTRY_VERIFY_WITH_TIMEOUT(origin->activeReader()->pageCount()==1 && !origin->activeReader()->pendingCommands(),10000);QVERIFY(settleReaderViewport(source));
         const auto targets=origin->tabTransferTargets();QCOMPARE(targets.size(),2);QVERIFY(targets[0].toMap().value("windowId")!=targets[1].toMap().value("windowId"));
         for(const auto &target:targets){const auto label=target.toMap().value("title").toString();QVERIFY2(label.startsWith("Window "),qPrintable(label));QVERIFY(label.contains(name));QVERIFY(label.contains("-target"));}
         const bool native=QGuiApplication::platformName()!=QStringLiteral("offscreen");
-        // Focus is a compositor precondition, not a label-layout latency assertion.
-        // Native runs can need an explicit user/MCP focus action after three tiled windows map.
+        // A visible, focused window can keep the native menus open while inspected.
         if(native)qInfo()<<"Native compositor focus preflight";
         source->requestActivate();QTRY_VERIFY_WITH_TIMEOUT(QGuiApplication::focusWindow()==source,native ? 30000 : 5000);
         auto *fileMenu=source->findChild<QObject *>("fileMenu"),*menu=source->findChild<QObject *>("moveTabToWindowMenu");QVERIFY(fileMenu && menu);QVERIFY(QMetaObject::invokeMethod(fileMenu,"open"));QTRY_VERIFY(fileMenu->property("visible").toBool());QVERIFY(QMetaObject::invokeMethod(menu,"open"));QTRY_VERIFY(menu->property("visible").toBool());QTRY_COMPARE(source->findChildren<QObject *>("moveTabDestination").size(),2);
