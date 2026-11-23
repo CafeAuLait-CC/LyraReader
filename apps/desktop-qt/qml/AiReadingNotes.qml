@@ -128,7 +128,7 @@ Dialog {
     }
     onClosed: {
         debounce.stop();
-        endPreview();
+        reviewId = "";
         editing = false;
         reader = null; command = 0; entries = []; note = null; preferred = ""; failure = "";
         search.text = "";
@@ -153,8 +153,11 @@ Dialog {
             } else if (operation === "ai_reading_note") {
                 notes.note = result;
                 if (notes.reader.readingNoteDraft.id === result.id) notes.beginEditing();
-                else if (notes.reviewState.running && notes.reviewState.responseView === "note"
-                    && notes.reviewState.responsePlan.note_id === result.id) notes.reviewId = result.id;
+                else if ((notes.reviewState.running && notes.reviewState.responseView === "note"
+                        && notes.reviewState.responsePlan.note_id === result.id)
+                    || (notes.reviewState.previewView === "note" && !notes.reviewState.planSent
+                        && notes.reviewState.plan && notes.reviewState.plan.note_id === result.id))
+                    notes.reviewId = result.id;
             } else if (operation === "ai_reading_note_update") {
                 notes.note = result;
                 notes.editing = false;
@@ -379,7 +382,7 @@ Dialog {
             }
             Button {
                 objectName: "sendAiReadingNoteUpdate"
-                text: qsTr("Send")
+                text: notes.reviewPlan && notes.reviewPlan.consolidation ? qsTr("Send note synthesis") : qsTr("Send")
                 visible: !!notes.reviewPlan && !notes.reviewState.planSent
                 enabled: notes.current() && !notes.reader.pendingCommands && !notes.reviewState.running
                 onClicked: app.sendAi(notes.reader, notes.reviewPlan)

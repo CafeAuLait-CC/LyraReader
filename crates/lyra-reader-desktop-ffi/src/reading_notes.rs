@@ -1,10 +1,10 @@
 //! Native storage adapter for the shared reading-note records.
-use crate::document::DesktopDocument;
+use crate::document::{DesktopDocument, consolidation_request};
 use lyra_reader_ai::workspace::{ReadingRecord, ReadingWorkspace};
 use lyra_reader_ffi::api::{
-    AiActionRecord, AiConversationTurnRecord, AiPlanRecord, AiPlanRequestRecord,
-    AiReadingOptionsRecord, AiWireTransport, LyraReaderDocument, ai_reading_note_input,
-    render_ai_plan,
+    AiActionRecord, AiConversationTurnRecord, AiMergePlanRequestRecord, AiPlanRecord,
+    AiPlanRequestRecord, AiReadingOptionsRecord, AiWireTransport, LyraReaderDocument,
+    ai_reading_note_input, build_ai_merge_plan, render_ai_plan, style_ai_reading_plan,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -44,6 +44,8 @@ pub(super) struct PendingNote {
     covered_turns: u32,
     endpoint: String,
     wire_parts: Vec<[u8; 32]>,
+    consolidation: Option<Box<AiMergePlanRequestRecord>>,
+    language: String,
 }
 
 impl PendingNote {
@@ -60,6 +62,59 @@ impl PendingNote {
         } else {
             "region_note_candidate"
         }
+    }
+    pub(super) fn needs_consolidation(&self) -> bool {
+        self.consolidation.is_some()
+    }
+    fn preview_value(
+        &self,
+        plan: AiPlanRecord,
+        final_consolidation: bool,
+    ) -> Result<Value, String> {
+        let mut result = serde_json::to_value(plan).map_err(|error| error.to_string())?;
+        result["kind"] = json!(self.kind());
+        if let Some(target) = &self.target {
+            result["note_id"] = json!(target.id);
+        } else {
+            result["region_id"] = json!(self.region_id);
+        }
+        result["note_capture"] = json!(self.token);
+        if final_consolidation {
+            result["consolidation"] = json!(true);
+        }
+        Ok(result)
+    }
+    pub(super) fn consolidate(mut self, answers: Vec<String>) -> Result<(Self, Value), String> {
+        let mut request = self
+            .consolidation
+            .take()
+            .ok_or("The note has no consolidation request.")?;
+        if request.parts.len() != answers.len() {
+            return Err("The note synthesis is missing reviewed part responses.".into());
+        }
+        for (part, answer) in request.parts.iter_mut().zip(answers) {
+            part.summary = answer;
+        }
+        let plan = build_ai_merge_plan(*request)
+            .and_then(|plan| {
+                style_ai_reading_plan(
+                    plan,
+                    "note".into(),
+                    "Standard".into(),
+                    self.language.clone(),
+                )
+            })
+            .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions))
+            .map_err(|error| error.to_string())?;
+        self.endpoint = plan.endpoint.clone();
+        self.wire_parts = plan
+            .parts
+            .iter()
+            .map(|part| Sha256::digest(part.wire_body.as_bytes()).into())
+            .collect();
+        self.token = crate::marks::uuid()?;
+        let preview = self.preview_value(plan, true)?;
+        Ok((self, preview))
     }
     pub(super) fn matches(
         &self,
@@ -183,6 +238,9 @@ impl DesktopDocument {
         request.document_knowledge_text = None;
         request.document_knowledge_pages.clear();
         request.question = Some(question);
+        let language = request.language.clone().unwrap_or_default();
+        let reasoning_mode = request.reasoning_mode.clone();
+        let reasoning_encoding = request.reasoning_encoding.clone();
         let plan = document
             .prepare_ai_reading_task(
                 request,
@@ -193,6 +251,9 @@ impl DesktopDocument {
             )
             .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions))
             .map_err(|error| error.to_string())?;
+        let consolidation = (plan.parts.len() > 1)
+            .then(|| consolidation_request(&plan, reasoning_mode, reasoning_encoding).map(Box::new))
+            .transpose()?;
         let capture = PendingNote {
             token: crate::marks::uuid()?,
             target: saved.map(|(note, original)| SavedNoteTarget {
@@ -211,15 +272,10 @@ impl DesktopDocument {
                 .iter()
                 .map(|part| Sha256::digest(part.wire_body.as_bytes()).into())
                 .collect(),
+            consolidation,
+            language,
         };
-        let mut result = serde_json::to_value(plan).map_err(|error| error.to_string())?;
-        result["kind"] = json!(capture.kind());
-        if let Some(target) = &capture.target {
-            result["note_id"] = json!(target.id);
-        } else {
-            result["region_id"] = json!(capture.region_id);
-        }
-        result["note_capture"] = json!(capture.token);
+        let result = capture.preview_value(plan, false)?;
         *self
             .pending_note
             .lock()

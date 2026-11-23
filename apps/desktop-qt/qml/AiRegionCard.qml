@@ -377,7 +377,13 @@ Item {
             Layout.fillWidth:true
             Button {objectName:"prepareAiRegion";text:qsTr("Preview Question");enabled:!!card.attachment.image_png && !!(card.attachment.question || "").trim() && !card.running && card.owner && card.owner.pendingCommands===0;onClicked:card.prepare()}
             Button {objectName:"inspectAiRegion";text:qsTr("Inspect payload");enabled:card.previewReady;onClicked:payload.open()}
-            Button {objectName:"sendAiRegion";text:card.notePreview ? qsTr("Send note request") : qsTr("Send");visible:!card.running || (card.state.responseView!=="region" && !card.noteRunning);enabled:card.previewReady && !card.running && card.owner && card.owner.pendingCommands===0;onClicked:card.app.sendAi(card.owner,card.plan)}
+            Button {
+                objectName:"sendAiRegion"
+                text:card.notePreview ? card.plan && card.plan.consolidation ? qsTr("Send note synthesis") : qsTr("Send note request") : qsTr("Send")
+                visible:!card.running || (card.state.responseView!=="region" && !card.noteRunning)
+                enabled:card.previewReady && !card.running && card.owner && card.owner.pendingCommands===0
+                onClicked:card.app.sendAi(card.owner,card.plan)
+            }
             Button {objectName:"stopAiRegion";visible:card.running && (card.state.responseView==="region" || card.noteRunning);text:qsTr("Stop response");onClicked:card.owner.cancelAi()}
         }
         Label {

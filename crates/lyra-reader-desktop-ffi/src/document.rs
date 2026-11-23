@@ -73,6 +73,7 @@ enum ReadingArchive {
     Translation(Box<Result<ReadingRecord, String>>),
     Chat(crate::reading_history::ChatArchive),
     Note(Box<PendingNote>, String),
+    NoteSynthesis(Box<PendingNote>),
     PendingSummary(PendingSummary),
     Summary(Box<Result<ReadingRecord, String>>),
 }
@@ -191,6 +192,18 @@ impl ReadingReplies {
                         json!("The note update did not finish. The saved note was kept.");
                     return None;
                 }
+                if capture.needs_consolidation() {
+                    match capture.consolidate(self.replies) {
+                        Ok((next, plan)) => {
+                            result["note_synthesis_plan"] = plan;
+                            return Some(ReadingArchive::NoteSynthesis(Box::new(next)));
+                        }
+                        Err(error) => {
+                            result["note_warning"] = json!(error);
+                            return None;
+                        }
+                    }
+                }
                 Some(ReadingArchive::Note(capture, self.replies.join("\n\n")))
             }
             ReadingOutput::Summary { capture, model } => {
@@ -272,6 +285,40 @@ fn arg<T: DeserializeOwned>(request: &Value, key: &str) -> Result<T, String> {
 }
 fn text(request: &Value, key: &str) -> Result<String, String> {
     arg(request, key)
+}
+
+pub(super) fn consolidation_request(
+    plan: &AiPlanRecord,
+    reasoning_mode: String,
+    reasoning_encoding: String,
+) -> Result<AiMergePlanRequestRecord, String> {
+    let parts = plan
+        .parts
+        .iter()
+        .map(|part| {
+            Ok(AiMergePartRecord {
+                index: part
+                    .index
+                    .checked_add(1)
+                    .ok_or("Invalid summary part index.")?,
+                total: part.total,
+                pages: part.pages.clone(),
+                summary: String::new(),
+            })
+        })
+        .collect::<Result<Vec<_>, &str>>()?;
+    Ok(AiMergePlanRequestRecord {
+        document_title: plan.document_title.clone(),
+        parts,
+        base_url: plan.base_url.clone(),
+        model: plan.model.clone(),
+        temperature: plan.temperature,
+        max_tokens: plan.max_tokens,
+        reasoning_mode,
+        reasoning_encoding,
+        document_knowledge_text: None,
+        document_knowledge_pages: Vec::new(),
+    })
 }
 
 fn desktop_annotation_rules() -> Result<Value, String> {
@@ -1191,33 +1238,7 @@ impl DesktopDocument {
                         if plan.parts.len()==1 {
                             Some(ReadingOutput::Summary { capture, model:plan.model.clone() })
                         } else {
-                        let parts = plan
-                            .parts
-                            .iter()
-                            .map(|part| {
-                                Ok(AiMergePartRecord {
-                                    index: part
-                                        .index
-                                        .checked_add(1)
-                                        .ok_or("Invalid summary part index.")?,
-                                    total: part.total,
-                                    pages: part.pages.clone(),
-                                    summary: String::new(),
-                                })
-                            })
-                            .collect::<Result<Vec<_>, &str>>()?;
-                        let request = AiMergePlanRequestRecord {
-                            document_title: plan.document_title.clone(),
-                            parts,
-                            base_url: plan.base_url.clone(),
-                            model: plan.model.clone(),
-                            temperature: plan.temperature,
-                            max_tokens: plan.max_tokens,
-                            reasoning_mode: style.reasoning_mode.clone(),
-                            reasoning_encoding: style.reasoning_encoding.clone(),
-                            document_knowledge_text: None,
-                            document_knowledge_pages: Vec::new(),
-                        };
+                        let request=consolidation_request(&plan,style.reasoning_mode.clone(),style.reasoning_encoding.clone())?;
                         Some(ReadingOutput::Synthesis {
                             request: Box::new(request),
                             style,
@@ -1385,6 +1406,12 @@ impl DesktopDocument {
                                 Ok(suggestion) => result[key] = suggestion,
                                 Err(error) => result["note_warning"] = json!(error),
                             }
+                        }
+                        Some(ReadingArchive::NoteSynthesis(capture)) => {
+                            *self
+                                .pending_note
+                                .lock()
+                                .map_err(|_| "Note review state is unavailable.")? = Some(*capture);
                         }
                         Some(ReadingArchive::PendingSummary(snapshot)) => {
                             *self

@@ -902,6 +902,13 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
         }
         m_aiState.insert(QStringLiteral("running"),false);
         if(responseKind==QStringLiteral("reading_note_suggestion") || responseKind==QStringLiteral("region_knowledge_note")) {
+            const auto synthesis=batch.value(QStringLiteral("note_synthesis_plan")).toMap();
+            if(!synthesis.isEmpty() && m_aiActivePreviewEpoch==m_aiPreviewEpoch && m_aiPlanGeneration==m_generation
+                && !m_aiState.value(QStringLiteral("limited")).toBool() && !m_aiState.value(QStringLiteral("cancelRequested")).toBool()) {
+                m_aiState.insert(QStringLiteral("plan"),synthesis);
+                m_aiState.insert(QStringLiteral("planSent"),false);
+                m_aiState.insert(QStringLiteral("status"),tr("The section notes are ready. Review the synthesis request before sending it."));
+            }
             const auto suggested=batch.value(QStringLiteral("note_suggestion")).toMap();
             if(!suggested.isEmpty()) {
                 m_aiState.insert(QStringLiteral("noteSuggestion"),suggested);

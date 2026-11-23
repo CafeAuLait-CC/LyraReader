@@ -5228,6 +5228,44 @@ private slots:
         QTRY_VERIFY(candidate().isEmpty());
         QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),original);
         QCOMPARE(server.requests.size(),3);
+
+        const auto longNote=QStringLiteral("Synthetic prior note paragraph. ").repeated(8400);
+        QSignalSpy saveLong(reader,&ReaderController::commandFinished);
+        const auto accepted=reader->submit("region_note",{{"id",region},{"text",longNote}});
+        QTRY_COMPARE(saveLong.size(),1);QCOMPARE(saveLong.at(0).at(0).toULongLong(),accepted);
+        QVERIFY(saveLong.at(0).at(3).toString().isEmpty());
+        QTRY_VERIFY(preview->property("enabled").toBool());
+        QVERIFY(QMetaObject::invokeMethod(preview,"clicked"));
+        QTRY_VERIFY(plan().value("parts").toList().size()>1);QTRY_COMPARE(reader->pendingCommands(),0);
+        QCOMPARE(server.requests.size(),3);
+        const auto sectional=plan();
+        QList<QByteArray> expected;
+        int number=1;
+        for(const auto &part:sectional.value("parts").toList()) {
+            expected.append(part.toMap().value("wire_body").toString().toUtf8());
+            respond(QString("Reviewed section note %1.").arg(number++));
+        }
+        QVERIFY(QMetaObject::invokeMethod(send,"clicked"));
+        QTRY_VERIFY(plan().value("consolidation").toBool());
+        QTRY_COMPARE(reader->pendingCommands(),0);
+        QCOMPARE(server.requests.size(),3+expected.size());
+        for(qsizetype i=0;i<expected.size();++i) {
+            const auto request=server.requests.at(3+i);
+            QCOMPARE(request.mid(request.indexOf("\r\n\r\n")+4),expected.at(i));
+        }
+        QVERIFY(candidate().isEmpty());QVERIFY(!reader->startAi("local",sectional));
+        const auto finalBody=plan().value("parts").toList().first().toMap().value("wire_body").toString().toUtf8();
+        QVERIFY(finalBody.contains("Reviewed section note 1.") && finalBody.contains("Reviewed section note 2."));
+        QVERIFY(!finalBody.contains("Synthetic prior note paragraph."));
+        respond("One combined candidate after the separate approval.");
+        QVERIFY(QMetaObject::invokeMethod(send,"clicked"));
+        QTRY_COMPARE(candidate().value("content").toString(),QString("One combined candidate after the separate approval."));
+        QCOMPARE(server.requests.size(),4+expected.size());const auto finalRequest=server.requests.last();
+        QCOMPARE(finalRequest.mid(finalRequest.indexOf("\r\n\r\n")+4),finalBody);
+        QSignalSpy readBeforeSave(reader,&ReaderController::commandFinished);
+        const auto pending=reader->submit("region_get",{{"id",region}});
+        QTRY_COMPARE(readBeforeSave.size(),1);QCOMPARE(readBeforeSave.at(0).at(0).toULongLong(),pending);
+        QCOMPARE(readBeforeSave.at(0).at(2).toMap().value("knowledgeNote").toString(),longNote);
     }
 
     void readingNoteSuggestionsRequireExactPreviewAndExplicitReview() {
