@@ -2,7 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 
-inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 16;
+inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 17;
 
 // Owned Rust allocations: free each Buffer exactly once using buffer_free.
 // Output buffers must be zero initialized; calls do not free previous contents.
@@ -18,6 +18,9 @@ struct LyraReaderDesktopDocument;
 struct LyraReaderRenderSource;
 struct LyraReaderDesktopHistory;
 struct LyraReaderBuffer { std::uint8_t *data; std::size_t len; };
+// Bounded in-memory conversion. Offsets in the returned JSON are UTF-16.
+bool lyra_reader_desktop_math_markup(const std::uint8_t *text,std::size_t len,
+    LyraReaderBuffer *output,LyraReaderBuffer *error);
 struct LyraReaderBitmap {
     std::uint32_t width, height, stride;
     double scale;

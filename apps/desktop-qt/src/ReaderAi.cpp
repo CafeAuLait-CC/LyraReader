@@ -2,6 +2,8 @@
 #include "NativeRaster.h"
 #include "RenderBudget.h"
 #include <QFutureWatcher>
+#include <QJsonArray>
+#include <QJsonDocument>
 #include <QPointer>
 #include <QUuid>
 #include <QtConcurrentRun>
@@ -15,6 +17,20 @@ QString aiView(const QString &action) {
     if(action==QStringLiteral("DocumentChat"))return QStringLiteral("chat");
     return QStringLiteral("summary");
 }
+}
+
+QVariantList ReaderController::aiMathMarkup(const QString &text) const {
+    if(text.size()>128*1024 || (!text.contains(QLatin1String("\\("))
+        && !text.contains(QLatin1String("\\[")) && !text.contains(QLatin1Char('$'))))return {};
+    const auto utf8=text.toUtf8();
+    LyraReaderBuffer output{},error{};
+    const bool ok=lyra_reader_desktop_math_markup(reinterpret_cast<const std::uint8_t *>(utf8.constData()),
+        std::size_t(utf8.size()),&output,&error);
+    const auto result=ok ? QJsonDocument::fromJson(QByteArray::fromRawData(
+        reinterpret_cast<const char *>(output.data),qsizetype(output.len))).array().toVariantList() : QVariantList{};
+    lyra_reader_desktop_buffer_free(output);
+    lyra_reader_desktop_buffer_free(error);
+    return result;
 }
 
 void ReaderController::initAi() {

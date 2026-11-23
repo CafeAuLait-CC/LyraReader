@@ -1,5 +1,8 @@
 //! Portable compatibility rules for mathematics returned by reading assistants.
 
+#[path = "math_inline.rs"]
+pub mod inline;
+
 pub const OUTPUT_GUIDANCE: &str = r"Use \( ... \) for inline mathematics and \[ ... \] on separate lines for display mathematics. Do not put mathematics in backticks or fenced code blocks. Brace LaTeX command arguments explicitly, for example \mathcal{L}, \frac{a}{b}, and \text{label}.";
 
 /// Canonicalize font arguments and equation tags for the native math subset.

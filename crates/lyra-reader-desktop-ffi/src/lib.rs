@@ -13,6 +13,7 @@ mod drag_preview;
 mod exports;
 mod knowledge;
 mod marks;
+mod math_text;
 mod navigation;
 mod note_markers;
 mod pages;
@@ -40,10 +41,10 @@ use std::{
     ptr, slice,
 };
 
-/// Version of the Qt boundary, including bounded layered-summary batch commands.
+/// Version of the Qt boundary, including bounded native mathematics markup.
 #[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_desktop_abi_version() -> u32 {
-    16
+    17
 }
 
 /// Persist one resolved quit without deleting any draft. Resolution: 0=save, 1=discard.
@@ -1557,7 +1558,7 @@ mod tests {
 
     #[test]
     fn image_byte_boundary_rejects_null_handles_and_reports_its_version() {
-        assert_eq!(lyra_reader_desktop_abi_version(), 16);
+        assert_eq!(lyra_reader_desktop_abi_version(), 17);
         assert_eq!(
             lyra_reader_desktop_zoom_preset_inset_pt(),
             lyra_reader_session::ZOOM_PRESET_INSET_PT

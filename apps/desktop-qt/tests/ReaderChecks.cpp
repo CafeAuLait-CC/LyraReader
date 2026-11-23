@@ -52,6 +52,9 @@
 #include <QQuickStyle>
 #include <QQuickWindow>
 #include <QQuickItemGrabResult>
+#include <QQuickTextDocument>
+#include <QTextCursor>
+#include <QTextDocument>
 #include <QRegularExpression>
 #include <QQmlProperty>
 #include <QSGRendererInterface>
@@ -3631,6 +3634,53 @@ private slots:
     void commandCompletionDoesNotPublishAfterANotificationReopensTheDocument() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto first=scratch.filePath("completion-old.pdf"),second=scratch.filePath("completion-new.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",first));QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",second));ReaderController reader;reader.openFile(QUrl::fromLocalFile(first));QTRY_COMPARE(reader.pageCount(),1);QTRY_COMPARE(reader.pendingCommands(),0);QSignalSpy commands(&reader,&ReaderController::commandFinished);bool reopened=false;
         connect(&reader,&ReaderController::dataChanged,this,[&]{if(!reopened && reader.data().contains("links")){reopened=true;reader.openFile(QUrl::fromLocalFile(second));}});reader.submit("links",{{"page",0}});QTRY_VERIFY(reopened);QTRY_COMPARE(reader.pageCount(),3);QTRY_COMPARE(reader.pendingCommands(),0);for(const auto &event:commands)QVERIFY2(event[1].toString()!=QStringLiteral("links"),"The old completion must not be published after a synchronous document switch");QVERIFY(!reader.data().contains("links"));
+    }
+
+    void aiMathUsesNativeMarkupWithoutChangingTheOriginalResponse() {
+        QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
+        MockChatServer server;QVERIFY(server.listen());
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-math-response.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic-math"}});
+        QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));
+        reader->setAiInput("action",0);
+        const auto message=QString::fromUtf8(
+            "🧪 **Before \\(\\mathcal J_{fit}=\\frac{\\alpha}{\\beta}\\) after**.\n"
+            "Money $5, then $x^2$. \\[\\text{<img src=\"https://example.invalid/no\">}\\tag{3}\\]\n"
+            "\\(\\begin{matrix}u\\end{matrix}\\) \\[p.99\\] [p.1] [p.99]");
+        server.responses.append({{MockChatServer::delta({{"content",message}}),QByteArray("data: [DONE]\n\n")},6,200});
+        auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_COMPARE(reader->pendingCommands(),0);
+        const auto plan=reader->aiState().value("plan").toMap();QVERIFY(!plan.isEmpty());
+        const auto expectedWire=plan.value("parts").toList().first().toMap().value("wire_body").toString().toUtf8();
+        QCOMPARE(server.requests.size(),0);QVERIFY(reader->startAi("local",plan));
+        QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
+        QTRY_COMPARE(server.requests.size(),1);
+        const auto request=server.requests.first();
+        QCOMPARE(request.mid(request.indexOf("\r\n\r\n")+4),expectedWire);
+        auto *answer=window->findChild<QObject *>("aiAnswerText");QVERIFY(answer);
+        const auto markup=[&]{return answer->property("text").toString();};
+        const auto math=reader->aiMathMarkup(message);
+        QVERIFY(!math.isEmpty());
+        const auto expectedMath=QString::fromUtf8("𝒥<sub>fit</sub>=<sup>α</sup>⁄<sub>β</sub>");
+        QCOMPARE(math.first().toMap().value("markup").toString(),expectedMath);
+        const auto quickDocument=answer->property("textDocument").value<QQuickTextDocument *>();
+        QVERIFY(quickDocument && quickDocument->textDocument());
+        const auto *document=quickDocument->textDocument();
+        QTRY_VERIFY(document->toPlainText().contains(QString::fromUtf8("𝒥fit=α⁄β")));
+        QCOMPARE(document->find(QStringLiteral("fit")).charFormat().verticalAlignment(),QTextCharFormat::AlignSubScript);
+        QCOMPARE(document->find(QStringLiteral("α")).charFormat().verticalAlignment(),QTextCharFormat::AlignSuperScript);
+        QVERIFY(document->find(QStringLiteral("Before")).charFormat().fontWeight()>=QFont::Bold);
+        QVERIFY(document->find(QStringLiteral("after")).charFormat().fontWeight()>=QFont::Bold);
+        QVERIFY(document->toPlainText().contains("Money $5, then x2"));
+        QVERIFY(document->toPlainText().contains("<img src=\"https://example.invalid/no\">") && !markup().contains("<img"));
+        QVERIFY(document->toPlainText().contains(QStringLiteral("\\begin{matrix}u\\end{matrix}")));
+        QCOMPARE(document->find(QStringLiteral("[p.1]")).charFormat().anchorHref(),QString("p.1"));
+        QVERIFY(!document->find(QStringLiteral("[p.99]")).charFormat().isAnchor());
+        QVERIFY(reader->aiState().value("output").toString().endsWith(message));
     }
 
     void readOnlyAiAnswersRevealTheirKeyboardCursor_data() {

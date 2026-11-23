@@ -102,7 +102,10 @@ ColumnLayout {
         objectName: result.answerName
         Layout.fillWidth: true
         text: result.sent.kind === "reading_translation" ? result.value.output || ""
-              : Logic.answerMarkup(result.value.output || "", result.sent.action === "TranslateSelection" ? false : result.sent.action === "DocumentChat" ? (result.sent.sources || []).map(source => source.page) : (result.sent.source_pages || []))
+              : Logic.answerMarkup(result.value.output || "",
+                  result.sent.action === "TranslateSelection" ? false : result.sent.action === "DocumentChat"
+                      ? (result.sent.sources || []).map(source => source.page) : (result.sent.source_pages || []),
+                  app.currentReader.aiMathMarkup(result.value.output || ""))
         readOnly: true; selectByMouse: true; selectByKeyboard: true; wrapMode: TextEdit.Wrap; background: null
         textFormat: result.sent.kind === "reading_translation" ? TextEdit.PlainText : TextEdit.RichText
         Accessible.name: qsTr("AI response")
