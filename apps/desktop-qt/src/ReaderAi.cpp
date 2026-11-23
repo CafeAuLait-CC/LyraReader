@@ -342,6 +342,7 @@ void ReaderController::prepareAi(const QVariantMap &request,const QVariantMap &u
         input.insert(QStringLiteral("history"),history);
     }
     m_aiState.insert(QStringLiteral("previewQuestion"),unit.isEmpty()?input.value(QStringLiteral("question")):QVariant{});
+    m_aiState.insert(QStringLiteral("previewSelection"),summaryDetail.isEmpty()?QVariant{}:input.value(QStringLiteral("selection")));
     m_aiState.insert(QStringLiteral("planSent"),false);
     m_aiState.insert(QStringLiteral("previewView"),aiView(input.value(QStringLiteral("action")).toString()));
     m_aiState.insert(QStringLiteral("statusView"),m_aiState.value(QStringLiteral("previewView")));

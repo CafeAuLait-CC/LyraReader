@@ -31,6 +31,16 @@ function quads(chars, start, end, excluded) {
     }
     return result
 }
+function firstSelectionRect(chars, start, end, excluded) {
+    const omitted = new Set(excluded || [])
+    for (let i = start; i <= end; ++i) {
+        const character = chars[i]
+        if (!omitted.has(i) && character.width_pt > 0 && character.height_pt > 0
+                && Number.isFinite(character.x_pt) && Number.isFinite(character.y_pt))
+            return character
+    }
+    return null
+}
 function selectedText(chars, start, end, excluded) {
     // Rust supplies the original indices to omit; do not compact the source character array.
     const omitted=new Set(excluded || []), result=[]

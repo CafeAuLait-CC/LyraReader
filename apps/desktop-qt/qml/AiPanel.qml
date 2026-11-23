@@ -20,12 +20,32 @@ Pane {
     readonly property bool selectedSummary: workspace === "summary" && action === 5 && !unitMode && !batchMode
     readonly property string summaryDetail: input.summaryDetail || "Standard"
     readonly property var selectedSources: selectedSummary && plan && plan.action === "SummarizeSelection" ? plan.sources || [] : []
-    onPlanChanged: if (selectionSource && selectionSource.visible) selectionSource.close()
-    onVisibleChanged: if (!visible && selectionSource && selectionSource.visible) selectionSource.close()
+    readonly property var preparedRange: selectedSources.length ? viewState.previewSelection || null : null
+    readonly property var liveRange: visible && (selectedSummary || workspace === "translation") && app.selection
+                                     ? sortedRange(app.selection) : null
+    readonly property var currentExcerpt: liveExcerpt && liveExcerpt.owner === owner
+                                          && liveExcerpt.generation === ownerGeneration
+                                          && sameRange(liveExcerpt.range, liveRange) ? liveExcerpt : null
+    property var liveExcerpt: null
+    property var pendingLocate: null
+    onLiveRangeChanged: {
+        if (selectionSource && selectionSource.snapshot && !selectionSource.snapshot.prepared) selectionSource.close();
+        if (pendingLocate && !pendingLocate.prepared) pendingLocate = null;
+        if (liveRange) refreshSelection.restart();
+        else { refreshSelection.stop(); liveExcerpt = null; }
+    }
+    onPlanChanged: {
+        if (selectionSource && selectionSource.snapshot && selectionSource.snapshot.prepared) selectionSource.close();
+        if (pendingLocate && pendingLocate.prepared) pendingLocate = null;
+    }
+    onVisibleChanged: if (!visible) {
+        if (selectionSource) selectionSource.close();
+        pendingLocate = null;
+    }
     readonly property var languageGeneration: batchMode ? batchState.generation : summaryUnit.generation
     readonly property var ownerGeneration: owner.documentGeneration
-    onOwnerChanged: if (payload && payload.visible) payload.close()
-    onOwnerGenerationChanged: if (payload && payload.visible) payload.close()
+    onOwnerChanged: resetSourceView()
+    onOwnerGenerationChanged: resetSourceView()
     readonly property string workspaceTitle: workspace === "chat" ? qsTr("Document chat") : workspace === "translation" ? qsTr("Translation") : qsTr("Summary")
     readonly property var plan: viewState.previewView === workspace ? viewState.plan || null : null
     readonly property bool previewReady: !!plan && !viewState.planSent
@@ -35,6 +55,100 @@ Pane {
     readonly property string status: viewState.statusView === workspace ? viewState.status || "" : (((viewState.results || {})[workspace] || {}).status || "")
     padding: compact ? 6 : 10
     background: Rectangle { color: app.colors.sidebarBg }
+    function sortedRange(range) {
+        return {page: range.page, start: Math.min(range.start, range.end), end: Math.max(range.start, range.end)};
+    }
+    function sameRange(a, b) {
+        return !!a && !!b && a.page === b.page && a.start === b.start && a.end === b.end;
+    }
+    function resetSourceView() {
+        if (payload && payload.visible) payload.close();
+        if (selectionSource && selectionSource.visible) selectionSource.close();
+        liveExcerpt = null;
+        pendingLocate = null;
+        if (liveRange) refreshSelection.restart();
+    }
+    Timer {
+        id: refreshSelection
+        interval: 85
+        onTriggered: {
+            const range = aiPanel.liveRange;
+            if (!range) return;
+            // A drag may cover a whole dense page. Keep the live excerpt bounded
+            // and leave the complete request to the explicit preview builder.
+            const end = Math.min(range.end, range.start + 2047);
+            const excerpt = app.selectedTextResult({page: range.page, start: range.start, end: end});
+            aiPanel.liveExcerpt = excerpt.error === undefined ? {owner: aiPanel.owner,
+                generation: aiPanel.ownerGeneration, range: range, text: excerpt.text, partial: end < range.end} : null;
+        }
+    }
+    function locate(range, prepared) {
+        if (!visible || !range) return;
+        const ticket = {owner: owner, generation: ownerGeneration, range: range, prepared: prepared};
+        if (owner.textPages[range.page.toString()]) {
+            if (!app.revealSelectionSource(owner, ownerGeneration, range))
+                app.operationStatus = qsTr("This selection could not be located.");
+            return;
+        }
+        pendingLocate = ticket;
+        owner.requestText(range.page);
+    }
+    Connections {
+        target: aiPanel.liveRange || aiPanel.pendingLocate ? aiPanel.owner : null
+        function onTextPagesChanged() {
+            if (aiPanel.liveRange && !aiPanel.currentExcerpt) refreshSelection.restart();
+            const ticket = aiPanel.pendingLocate;
+            if (!ticket || !ticket.owner.textPages[ticket.range.page.toString()]) return;
+            aiPanel.pendingLocate = null;
+            if (aiPanel.visible && ticket.owner === aiPanel.owner && ticket.generation === aiPanel.ownerGeneration
+                    && aiPanel.sameRange(ticket.range, ticket.prepared ? aiPanel.preparedRange : aiPanel.liveRange))
+                aiPanel.locate(ticket.range, ticket.prepared);
+        }
+    }
+    component SelectionCard: ColumnLayout {
+        id: card
+        required property string title
+        required property string text
+        required property var range
+        required property bool prepared
+        required property string labelName
+        spacing: 2
+        Layout.fillWidth: true
+        Label {
+            text: card.title; color: app.colors.textSecondary; font.pixelSize: 11
+            Layout.fillWidth: true
+        }
+        RowLayout {
+            Layout.fillWidth: true
+            Label {
+                id: excerptLabel
+                objectName: card.labelName
+                Layout.fillWidth: true; Layout.minimumWidth: 0
+                textFormat: Text.PlainText; wrapMode: Text.Wrap
+                maximumLineCount: 2; elide: Text.ElideRight
+                text: card.text
+                color: app.colors.textSecondary; font.pixelSize: 13
+                Accessible.name: card.title
+            }
+            ToolButton {
+                objectName: card.labelName + "More"
+                visible: !!card.range && excerptLabel.truncated
+                text: qsTr("More")
+                Accessible.name: qsTr("Show %1").arg(card.title)
+                onClicked: {
+                    selectionSource.snapshot = {prepared: card.prepared, page: card.range.page, title: card.title, text: card.text};
+                    selectionSource.open();
+                }
+            }
+            ToolButton {
+                objectName: card.labelName + "Locate"
+                text: qsTr("Locate")
+                enabled: !!card.range
+                Accessible.name: qsTr("Locate %1 in document").arg(card.title)
+                onClicked: aiPanel.locate(card.range, card.prepared)
+            }
+        }
+    }
     function baseRequest(requestAction) {
         const settings = app.aiSettings;
         return {
@@ -175,22 +289,21 @@ Pane {
             Accessible.name: qsTr("Selected summary detail")
             onActivated: aiPanel.owner.setAiInput("summaryDetail", values[currentIndex])
         }
-        RowLayout {
+        SelectionCard {
+            visible: !!aiPanel.currentExcerpt && !!text && !aiPanel.sameRange(range, aiPanel.preparedRange)
+            range: aiPanel.liveRange
+            prepared: false
+            title: aiPanel.currentExcerpt && aiPanel.currentExcerpt.partial ? qsTr("Start of selection") : qsTr("Current selection")
+            text: aiPanel.currentExcerpt ? aiPanel.currentExcerpt.text : ""
+            labelName: "aiLiveSelection"
+        }
+        SelectionCard {
             visible: aiPanel.selectedSources.length > 0
-            Layout.fillWidth: true
-            Label {
-                objectName: "aiSelectedSummarySource"
-                Layout.fillWidth: true; textFormat: Text.PlainText; wrapMode: Text.Wrap
-                maximumLineCount: 2; elide: Text.ElideRight
-                text: aiPanel.selectedSources.length ? aiPanel.selectedSources[0].snippet : ""
-                color: app.colors.textSecondary
-                Accessible.name: qsTr("Source selected for this request")
-            }
-            ToolButton {
-                objectName: "showAiSelectedSummarySource"
-                text: qsTr("More")
-                onClicked: selectionSource.open()
-            }
+            range: aiPanel.preparedRange
+            prepared: true
+            title: qsTr("Previewed source")
+            text: aiPanel.selectedSources.length ? aiPanel.selectedSources[0].snippet : ""
+            labelName: "aiSelectedSummarySource"
         }
         ColumnLayout {
             visible: aiPanel.unitMode
@@ -427,7 +540,9 @@ Pane {
     Dialog {
         id: selectionSource
         objectName: "aiSelectedSummarySourceDialog"
-        title: aiPanel.selectedSources.length ? qsTr("Selected source · page %1").arg(aiPanel.selectedSources[0].page) : qsTr("Selected source")
+        property var snapshot: null
+        title: snapshot ? qsTr("%1 · page %2").arg(snapshot.title).arg(snapshot.page + 1) : ""
+        onClosed: snapshot = null
         modal: true
         anchors.centerIn: Overlay.overlay
         width: Math.max(220, Math.min(560, app.width - 48))
@@ -438,7 +553,7 @@ Pane {
             contentWidth: availableWidth
             TextArea {
                 width: sourceScroll.availableWidth
-                text: aiPanel.selectedSources.length ? aiPanel.selectedSources[0].snippet : ""
+                text: selectionSource.snapshot ? selectionSource.snapshot.text : ""
                 textFormat: TextEdit.PlainText; wrapMode: TextEdit.Wrap
                 readOnly: true; selectByMouse: true; selectByKeyboard: true
             }

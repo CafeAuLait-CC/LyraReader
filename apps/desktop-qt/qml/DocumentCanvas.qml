@@ -347,6 +347,15 @@ Item {
         if (left >= pageList.contentX + pageList.width || left + placement.width * app.zoom <= pageList.contentX)
             pageList.contentX = Math.max(0, Math.min(pageList.contentWidth - pageList.width, left - 24));
     }
+    function revealPageRegion(page, x, width) {
+        const placement = app.currentReader.pages[page];
+        if (!placement) return;
+        const left = (pageList.contentWidth - app.currentReader.documentWidth * app.zoom) / 2
+                     + (placement.left + x) * app.zoom;
+        const right = left + width * app.zoom;
+        if (left < pageList.contentX || right > pageList.contentX + pageList.width)
+            pageList.contentX = Math.max(0, Math.min(pageList.contentWidth - pageList.width, left - 24));
+    }
     function changeZoom(value, anchorX, anchorY) {
         if(contentDrag.active)contentDrag.cancel();
         stopPaperZoomSettlement();++interactionEpoch;

@@ -889,13 +889,26 @@ ApplicationWindow {
         searchIndex = (searchIndex + delta + searchResults.length) % searchResults.length;
         navigate(activeSearchHit.page);
     }
-    function selectedTextResult() {
-        if (!selection)return {text:""};
-        const text=currentReader.textPages[selection.page.toString()];
+    function selectedTextResult(range) {
+        if (range === undefined) range = selection;
+        if (!range)return {text:""};
+        const text=currentReader.textPages[range.page.toString()];
         if(!text)return {error:qsTr("The page text is still loading. Try the selection again.")};
-        const cached=currentReader.selectionText(selection.page,selection.start,selection.end);
+        const cached=currentReader.selectionText(range.page,range.start,range.end);
         if(cached.error!==undefined)return cached;
-        return {text:cached.ready ? cached.text : Logic.selectedText(text.chars,selection.start,selection.end,text.selection_excluded_indices)};
+        return {text:cached.ready ? cached.text : Logic.selectedText(text.chars,range.start,range.end,text.selection_excluded_indices)};
+    }
+    function revealSelectionSource(owner, generation, range) {
+        if (owner !== currentReader || generation !== owner.documentGeneration || owner.loading
+                || positionRestoring || range.page < 0 || range.page >= owner.pageCount) return false;
+        const text = owner.textPages[range.page.toString()];
+        if (!text || range.start < 0 || range.end < range.start || range.end >= text.chars.length) return false;
+        const rect = Logic.firstSelectionRect(text.chars, range.start, range.end, text.selection_excluded_indices);
+        if (!rect) return false;
+        navigate(range.page, rect.y_pt);
+        if (!textViewVisible) canvas.revealPageRegion(range.page, rect.x_pt, rect.width_pt);
+        selection = range;
+        return true;
     }
     function selectedText() {
         const result=selectedTextResult();

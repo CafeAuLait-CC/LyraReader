@@ -2872,6 +2872,13 @@ private slots:
         reader->setAiInput("action",5);reader->setAiInput("summaryDetail","Brief");
         QVERIFY(window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",end}}));
         auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);
+        auto *live=visualItem(window->contentItem(),"aiLiveSelection");QVERIFY(live);
+        const auto excerpt=reader->selectionText(0,0,int(qMin<qsizetype>(end,2047))).value("text").toString();
+        QTRY_COMPARE(live->property("text").toString(),excerpt);QVERIFY(live->isVisible());
+        // The other reading tools must not retain a live excerpt behind their UI.
+        reader->setAiInput("view","chat");QVERIFY(!live->isVisible());
+        reader->setAiInput("view","translation");QTRY_VERIFY(live->isVisible());
+        reader->setAiInput("view","summary");QTRY_VERIFY(live->isVisible());
         QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));
         // Moving the canvas selection while planning must not substitute a different passage.
         QVERIFY(window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",0}}));
@@ -2887,6 +2894,13 @@ private slots:
         QTRY_VERIFY(visualItem(window->contentItem(),"aiSelectedSummarySource"));
         QCOMPARE(visualItem(window->contentItem(),"aiSelectedSummarySource")->property("text").toString(),exact);
         QCOMPARE(server.requests.size(),0);
+        auto *locate=visualItem(window->contentItem(),"aiSelectedSummarySourceLocate");QVERIFY(locate && locate->isVisible());
+        QTRY_VERIFY(!window->property("positionRestoring").toBool());
+        QVERIFY(QMetaObject::invokeMethod(locate,"clicked"));
+        QCOMPARE(window->property("selection").toMap().value("end").toInt(),int(end));
+        QTRY_VERIFY(!live->isVisible()); // One card when the current and previewed ranges agree.
+        QCOMPARE(server.requests.size(),0);
+        QTRY_COMPARE(reader->pendingCommands(),0);
 
         QVERIFY(reader->startAi("local",plan));QTRY_COMPARE(server.requests.size(),1);
         QTRY_VERIFY(!reader->aiState().value("running").toBool());
