@@ -359,7 +359,8 @@ impl DesktopDocument {
                 "text":a.text,"text_truncated":a.text_truncated,"image_png":a.png,
                 "image_width_px":a.pixel_width,"image_height_px":a.pixel_height,
                 "capture_scale":a.capture_scale,"source_sha256":identity.sha256,
-                "latest_turn":latest,"completed_turn_count":entry.completed_turns().count()}));
+                "latest_turn":latest,"completed_turn_count":entry.completed_turns().count(),
+                "knowledge_note":entry.knowledge_note}));
         }
         if op == "region_get" {
             let entry = store
@@ -461,6 +462,13 @@ impl DesktopDocument {
         marks.validate_source()?;
         if let Some(error) = &store.error {
             return Err(error.clone());
+        }
+        if op == "region_save_generated_note"
+            && field(r, "expected_history_revision")? != store.revision()
+        {
+            return Err(
+                "Saved regions changed. Review the current note before replacing it.".into(),
+            );
         }
         let mut next = store.history.clone();
         let id = field(r, "id")?.to_owned();
@@ -575,6 +583,10 @@ impl DesktopDocument {
                     }
                 }
                 "region_note" => entry.knowledge_note = field(r, "text")?.into(),
+                "region_save_generated_note" => {
+                    entry.validate_reopen(active.page_count(), &identity.sha256)?;
+                    entry.knowledge_note = field(r, "text")?.into();
+                }
                 _ => return Err("Unknown reading-note operation".into()),
             }
             next.put(entry)?;
@@ -587,7 +599,7 @@ impl DesktopDocument {
             state["saved_completed_turn_count"] =
                 json!(store.history.get(&id)?.completed_turns().count());
         }
-        if op == "region_note" {
+        if matches!(op, "region_note" | "region_save_generated_note") {
             state["saved_note"] = r["text"].clone();
         }
         Ok(state)

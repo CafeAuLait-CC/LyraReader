@@ -56,7 +56,7 @@ void ReaderController::resetAi(bool preserveTranslationViews) {
     resetDocumentReading();
     ++m_aiRegionEpoch;RasterJobs::cancel(m_aiRegionJob);m_aiRegionJob.reset();m_aiRegion.clear();emit aiRegionChanged();
     m_aiRegionImage=QUrl{};emit aiRegionImageChanged();
-    m_regionHistory.clear();m_aiRegionSaveId=0;emit regionHistoryChanged();
+    m_regionHistory.clear();m_aiRegionSaveId=0;m_generatedRegionNoteSaveId=0;emit regionHistoryChanged();
     m_chatDraftTimer.stop();m_chatDraftSaveId=0;m_savedChatDraft.clear();m_chatDraftSnapshot.clear();m_afterChatDraft.reset();
     m_aiTimer.stop();m_aiPreviewId=0;m_aiStartId=0;m_aiPollId=0;m_aiChatLoadId=0;m_aiState.clear();emit aiStateChanged();
 }
@@ -72,13 +72,22 @@ void ReaderController::resetAiRegion() {
     m_regionSaveError.clear();emit regionNoteDraftChanged();
     cancelAiRegionCapture();m_aiRegion.clear();
     m_aiRegionImage=QUrl{};emit aiRegionImageChanged();
-    if(m_aiState.value(QStringLiteral("running")).toBool() && m_aiState.value(QStringLiteral("responseView")).toString()==QStringLiteral("region"))cancelAi();
-    if(m_aiState.value(QStringLiteral("previewView")).toString()==QStringLiteral("region"))invalidateAiPlan();
-    auto results=m_aiState.value(QStringLiteral("results")).toMap();results.remove(QStringLiteral("region"));m_aiState.insert(QStringLiteral("results"),results);
-    if(!m_aiState.value(QStringLiteral("running")).toBool() && m_aiState.value(QStringLiteral("responseView")).toString()==QStringLiteral("region")) {
+    const auto responseView=m_aiState.value(QStringLiteral("responseView")).toString();
+    if(m_aiState.value(QStringLiteral("running")).toBool() &&
+       (responseView==QStringLiteral("region") || responseView==QStringLiteral("region_note")))cancelAi();
+    const auto view=m_aiState.value(QStringLiteral("previewView")).toString();
+    if(view==QStringLiteral("region") || view==QStringLiteral("region_note"))invalidateAiPlan();
+    auto results=m_aiState.value(QStringLiteral("results")).toMap();
+    results.remove(QStringLiteral("region"));results.remove(QStringLiteral("region_note"));
+    m_aiState.insert(QStringLiteral("results"),results);
+    m_aiState.remove(QStringLiteral("regionNoteCandidate"));
+    if(!m_aiState.value(QStringLiteral("running")).toBool()
+        && (responseView==QStringLiteral("region") || responseView==QStringLiteral("region_note"))) {
         for(const auto *key:{"output","reasoning","responsePlan","responseView","usage"})m_aiState.remove(QLatin1String(key));
     }
-    if(!m_aiState.value(QStringLiteral("running")).toBool() && m_aiState.value(QStringLiteral("statusView")).toString()==QStringLiteral("region")) {
+    const auto statusView=m_aiState.value(QStringLiteral("statusView")).toString();
+    if(!m_aiState.value(QStringLiteral("running")).toBool()
+        && (statusView==QStringLiteral("region") || statusView==QStringLiteral("region_note"))) {
         m_aiState.remove(QStringLiteral("statusView"));m_aiState.remove(QStringLiteral("status"));
     }
     emit aiStateChanged();
@@ -242,12 +251,14 @@ void ReaderController::startAiRegionPaperPlan() {
 void ReaderController::setAiRegionQuestion(const QString &text) {
     if(m_aiRegion.value(QStringLiteral("question")).toString()==text)return;
     m_aiRegion.insert(QStringLiteral("question"),text);markRegionDirty(true);
-    if(m_aiState.value(QStringLiteral("previewView")).toString()==QStringLiteral("region"))invalidateAiPlan();
+    const auto view=m_aiState.value(QStringLiteral("previewView")).toString();
+    if(view==QStringLiteral("region") || view==QStringLiteral("region_note"))invalidateAiPlan();
     emit aiRegionChanged();
 }
-void ReaderController::prepareAiRegion(const QVariantMap &settings) {
+void ReaderController::prepareAiRegion(const QVariantMap &settings,bool knowledgeNote) {
     if(!m_aiRegion.contains(QStringLiteral("image_png")) || m_aiRegion.value(QStringLiteral("loading")).toBool() || m_pendingCommands || m_aiState.value(QStringLiteral("running")).toBool())return;
     if(regionNeedsSave()) {
+        if(knowledgeNote)return;
         invalidateAiPlan();m_regionContinuationPending=true;m_regionContinuationSettings=settings;
         m_regionContinuationQuestion=m_aiRegion.value(QStringLiteral("question")).toString();m_regionContinuationEpoch=m_aiRegionEpoch;
         m_aiState.insert(QStringLiteral("status"),tr("Saving this conversation before preparing the question…"));emit aiStateChanged();
@@ -258,13 +269,36 @@ void ReaderController::prepareAiRegion(const QVariantMap &settings) {
     for(const auto *key:{"page","x_pt","y_pt","width_pt","height_pt","text","image_png","image_width_px","image_height_px"})region.insert(QLatin1String(key),m_aiRegion.value(QLatin1String(key)));
     region.insert(QStringLiteral("send_image"),settings.value(QStringLiteral("imageInput"),false));
     region.insert(QStringLiteral("include_document_context"),false);
-    prepareAi({{QStringLiteral("action"),QStringLiteral("RegionQuestion")},{QStringLiteral("current_page"),region.value(QStringLiteral("page"))},
+    QVariantMap request{{QStringLiteral("action"),QStringLiteral("RegionQuestion")},{QStringLiteral("current_page"),region.value(QStringLiteral("page"))},
         {QStringLiteral("selection"),QVariant{}},{QStringLiteral("question"),m_aiRegion.value(QStringLiteral("question"))},
         {QStringLiteral("language"),QVariant{}},{QStringLiteral("history"),QVariantList{}},{QStringLiteral("region"),region},
         {QStringLiteral("document_knowledge"),false},{QStringLiteral("document_knowledge_text"),QVariant{}},{QStringLiteral("document_knowledge_pages"),QVariantList{}},
         {QStringLiteral("base_url"),settings.value(QStringLiteral("baseUrl"),QStringLiteral("http://localhost:11434/v1"))},{QStringLiteral("model"),settings.value(QStringLiteral("model"),QString{})},
         {QStringLiteral("temperature"),QVariant{}},{QStringLiteral("max_tokens"),QVariant{}},
-        {QStringLiteral("reasoning_mode"),settings.value(QStringLiteral("reasoningMode"),QStringLiteral("default"))},{QStringLiteral("reasoning_encoding"),settings.value(QStringLiteral("reasoningEncoding"),QStringLiteral("none"))}});
+        {QStringLiteral("reasoning_mode"),settings.value(QStringLiteral("reasoningMode"),QStringLiteral("default"))},{QStringLiteral("reasoning_encoding"),settings.value(QStringLiteral("reasoningEncoding"),QStringLiteral("none"))}};
+    if(!knowledgeNote){prepareAi(request);return;}
+    const auto revision=m_regionHistory.value(QStringLiteral("revision")).toString();
+    if(!m_aiRegion.value(QStringLiteral("persisted")).toBool() || revision.isEmpty()
+        || !m_regionNoteDraft.isEmpty() || !m_regionSaveError.isEmpty())return;
+    request.insert(QStringLiteral("action"),QStringLiteral("SummarizeDocument"));
+    request.insert(QStringLiteral("region"),QVariant{});
+    request.insert(QStringLiteral("question"),QVariant{});
+    prepareAi(request,{},{{QStringLiteral("kind"),QStringLiteral("region_note")},{QStringLiteral("detail"),QStringLiteral("Standard")},
+        {QStringLiteral("id"),m_aiRegion.value(QStringLiteral("history_id"))},{QStringLiteral("expected_history_revision"),revision}});
+}
+bool ReaderController::saveGeneratedRegionNote() {
+    const auto candidate=m_aiState.value(QStringLiteral("regionNoteCandidate")).toMap();
+    const auto id=candidate.value(QStringLiteral("id")).toString();
+    if(!m_document || m_pendingCommands || hasUnsavedReadingNotes() || m_aiState.value(QStringLiteral("running")).toBool()
+        || id.isEmpty() || id!=m_aiRegion.value(QStringLiteral("history_id")).toString())return false;
+    m_generatedRegionNoteSaveId=m_commandSequence+1;
+    return submit(QStringLiteral("region_save_generated_note"),{{QStringLiteral("id"),id},
+        {QStringLiteral("text"),candidate.value(QStringLiteral("content"))},
+        {QStringLiteral("expected_history_revision"),candidate.value(QStringLiteral("revision"))}})!=0;
+}
+void ReaderController::dismissGeneratedRegionNote() {
+    if(m_generatedRegionNoteSaveId || !m_aiState.remove(QStringLiteral("regionNoteCandidate")))return;
+    emit aiStateChanged();
 }
 void ReaderController::setAiInput(const QString &key,const QVariant &value) {
     m_regionContinuationPending=false;m_regionContinuationSettings.clear();
@@ -497,7 +531,7 @@ void ReaderController::prepareAi(const QVariantMap &request,const QVariantMap &u
     if(!m_document || m_aiState.value(QStringLiteral("running")).toBool())return;
     if(request.value(QStringLiteral("action"))==QStringLiteral("DocumentChat") && m_aiState.value(QStringLiteral("chatReadOnly")).toBool())return;
     const auto readingKind=reading.value(QStringLiteral("kind")).toString();
-    const auto previewView=(readingKind==QStringLiteral("translation") || readingKind==QStringLiteral("note"))
+    const auto previewView=(readingKind==QStringLiteral("translation") || readingKind==QStringLiteral("note") || readingKind==QStringLiteral("region_note"))
         ? readingKind : aiView(request.value(QStringLiteral("action")).toString());
     const auto document=m_document;const auto generation=m_generation;const auto epoch=++m_aiPreviewEpoch;
     QPointer<ReaderController> alive(this);
@@ -571,8 +605,10 @@ bool ReaderController::startAi(const QString &key,const QVariantMap &expectedPla
     m_aiState.insert(QStringLiteral("responsePlan"),plan);
     m_aiState.remove(QStringLiteral("summaryNoteSource"));
     m_aiState.insert(QStringLiteral("planSent"),true);
-    m_aiState.insert(QStringLiteral("responseView"),kind==QStringLiteral("reading_note_suggestion")
-        ? QStringLiteral("note") : aiView(action));
+    const auto responseView=kind==QStringLiteral("reading_note_suggestion") ? QStringLiteral("note")
+        : kind==QStringLiteral("region_knowledge_note") ? QStringLiteral("region_note") : aiView(action);
+    m_aiState.insert(QStringLiteral("responseView"),responseView);
+    if(responseView==QStringLiteral("region_note"))m_aiState.remove(QStringLiteral("regionNoteCandidate"));
     m_aiState.insert(QStringLiteral("statusView"),m_aiState.value(QStringLiteral("responseView")));
     m_aiState.insert(QStringLiteral("activeChat"),action==QStringLiteral("DocumentChat"));
     m_aiState.insert(QStringLiteral("activeQuestion"),m_aiState.value(QStringLiteral("previewQuestion")));
@@ -679,6 +715,22 @@ quint64 ReaderController::saveReadingNoteDraft() {
     return id;
 }
 void ReaderController::handleAiCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error) {
+    if(operation==QStringLiteral("region_save_generated_note") && id==m_generatedRegionNoteSaveId) {
+        m_generatedRegionNoteSaveId=0;
+        m_aiState.insert(QStringLiteral("statusView"),QStringLiteral("region_note"));
+        m_aiState.insert(QStringLiteral("status"),error.isEmpty()?tr("Knowledge note saved."):error);
+        if(error.isEmpty()) {
+            m_regionHistory=result.toMap();m_aiState.remove(QStringLiteral("regionNoteCandidate"));
+            QPointer<ReaderController> alive(this);
+            const auto generation=m_generation;
+            emit regionHistoryChanged();if(!alive || generation!=m_generation)return;
+            if(m_regionHistory.value(QStringLiteral("saved_id"))==m_aiRegion.value(QStringLiteral("history_id"))) {
+                m_aiRegion.insert(QStringLiteral("knowledge_note"),m_regionHistory.value(QStringLiteral("saved_note")));
+                emit aiRegionChanged();if(!alive || generation!=m_generation)return;
+            }
+        }
+        emit aiStateChanged();return;
+    }
     if(operation==QStringLiteral("ai_reading_note_update") && id==m_readingNoteSaveId) {
         m_readingNoteSaveId=0;
         if(error.isEmpty()) {
@@ -849,12 +901,17 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
             m_aiState.insert(QStringLiteral("status"),complete?tr("Response complete."):tr("The response ended without a completion event."));
         }
         m_aiState.insert(QStringLiteral("running"),false);
-        if(responseKind==QStringLiteral("reading_note_suggestion")) {
+        if(responseKind==QStringLiteral("reading_note_suggestion") || responseKind==QStringLiteral("region_knowledge_note")) {
             const auto suggested=batch.value(QStringLiteral("note_suggestion")).toMap();
             if(!suggested.isEmpty()) {
                 m_aiState.insert(QStringLiteral("noteSuggestion"),suggested);
                 m_aiState.insert(QStringLiteral("status"),suggested.value(QStringLiteral("available")).toBool()
                     ? tr("The suggested note is ready to review.") : tr("The discussion did not produce new note text."));
+            }
+            const auto candidate=batch.value(QStringLiteral("region_note_candidate")).toMap();
+            if(!candidate.isEmpty() && candidate.value(QStringLiteral("id"))==m_aiRegion.value(QStringLiteral("history_id"))) {
+                m_aiState.insert(QStringLiteral("regionNoteCandidate"),candidate);
+                m_aiState.insert(QStringLiteral("status"),tr("Review the generated knowledge note before saving it."));
             }
             const auto warning=batch.value(QStringLiteral("note_warning")).toString();
             if(!warning.isEmpty())m_aiState.insert(QStringLiteral("status"),warning);

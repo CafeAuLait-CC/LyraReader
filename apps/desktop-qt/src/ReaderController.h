@@ -137,7 +137,9 @@ public:
     Q_INVOKABLE void cancelAiRegionCapture();
     Q_INVOKABLE void clearAiRegion();
     Q_INVOKABLE void setAiRegionQuestion(const QString &text);
-    Q_INVOKABLE void prepareAiRegion(const QVariantMap &settings);
+    Q_INVOKABLE void prepareAiRegion(const QVariantMap &settings,bool knowledgeNote=false);
+    Q_INVOKABLE bool saveGeneratedRegionNote();
+    Q_INVOKABLE void dismissGeneratedRegionNote();
     Q_INVOKABLE void prepareAi(const QVariantMap &request,const QVariantMap &unit={},const QVariantMap &reading={});
     Q_INVOKABLE bool startAi(const QString &key,const QVariantMap &expectedPlan);
     Q_INVOKABLE void cancelAi();
@@ -346,6 +348,7 @@ private:
     quint64 m_readingNoteSaveId=0;
     QString m_regionSaveError;
     quint64 m_regionNoteSaveId=0;
+    quint64 m_generatedRegionNoteSaveId=0;
     quint64 m_aiRegionSaveId=0;
     quint64 m_aiRegionRestoreId=0,m_aiRegionRestoreEpoch=0,m_regionContinuationEpoch=0;
     QVariantMap m_regionContinuationSettings;

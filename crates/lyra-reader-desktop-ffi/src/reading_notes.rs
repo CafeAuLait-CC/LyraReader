@@ -28,12 +28,16 @@ pub(super) struct NoteReview {
     apply: bool,
 }
 
-pub(super) struct PendingNote {
-    token: String,
-    note_id: String,
-    note_modified: u64,
+struct SavedNoteTarget {
+    id: String,
+    modified: u64,
     source_revision: u32,
     source_modified: u64,
+}
+
+pub(super) struct PendingNote {
+    token: String,
+    target: Option<SavedNoteTarget>,
     fingerprint: String,
     region_id: String,
     region_revision: String,
@@ -43,8 +47,29 @@ pub(super) struct PendingNote {
 }
 
 impl PendingNote {
-    pub(super) fn matches(&self, token: &str, plan: &AiPlanRecord, fingerprint: &str) -> bool {
-        self.token == token
+    pub(super) fn kind(&self) -> &'static str {
+        if self.target.is_some() {
+            "reading_note_suggestion"
+        } else {
+            "region_knowledge_note"
+        }
+    }
+    pub(super) fn result_key(&self) -> &'static str {
+        if self.target.is_some() {
+            "note_suggestion"
+        } else {
+            "region_note_candidate"
+        }
+    }
+    pub(super) fn matches(
+        &self,
+        token: &str,
+        kind: &str,
+        plan: &AiPlanRecord,
+        fingerprint: &str,
+    ) -> bool {
+        self.kind() == kind
+            && self.token == token
             && self.fingerprint == fingerprint
             && self.endpoint == plan.endpoint
             && self.wire_parts.len() == plan.parts.len()
@@ -58,11 +83,15 @@ impl PendingNote {
                 })
     }
     fn original(&self, workspace: &ReadingWorkspace) -> Result<ReadingRecord, String> {
-        let note = find_note(workspace, &self.note_id)?;
+        let target = self
+            .target
+            .as_ref()
+            .ok_or("This request does not target a saved reading note.")?;
+        let note = find_note(workspace, &target.id)?;
         let original = note_region_source(workspace, &note, &self.fingerprint)?;
-        if note.modified != self.note_modified
-            || original.revision != self.source_revision
-            || original.modified != self.source_modified
+        if note.modified != target.modified
+            || original.revision != target.source_revision
+            || original.modified != target.source_modified
         {
             return Err("The note or its suggestion changed. Preview it again.".into());
         }
@@ -75,29 +104,43 @@ impl DesktopDocument {
         &self,
         document: &Arc<LyraReaderDocument>,
         id: &str,
+        reviewed_region: Option<&str>,
         mut request: AiPlanRequestRecord,
     ) -> Result<Value, String> {
         let fingerprint = document.document_identity().sha256;
-        let (note, original) = self.read_workspace(document, true, |workspace| {
-            let note = find_note(workspace, id)?;
-            let original = note_region_source(workspace, &note, &fingerprint)?;
-            if workspace.suggestion(id).is_some() {
-                return Err("Review the existing suggestion before generating another.".into());
-            }
-            Ok((note, original))
-        })?;
+        let saved = if reviewed_region.is_none() {
+            Some(self.read_workspace(document, true, |workspace| {
+                let note = find_note(workspace, id)?;
+                let original = note_region_source(workspace, &note, &fingerprint)?;
+                if workspace.suggestion(id).is_some() {
+                    return Err("Review the existing suggestion before generating another.".into());
+                }
+                Ok((note, original))
+            })?)
+        } else {
+            None
+        };
+        let region_id = saved
+            .as_ref()
+            .map_or(id, |(note, _)| note.conversation_id.as_str())
+            .to_owned();
         let (page, question, covered_turns, region_revision) =
             self.with_reading_cache(document, true, |cache, sha| {
                 crate::region_store::with_current_region(
                     cache,
                     document,
                     &sha,
-                    &note.conversation_id,
-                    None,
+                    &region_id,
+                    reviewed_region,
                     |region, revision| {
                         let count = u32::try_from(region.completed_turns().count())
                             .map_err(|_| "The saved discussion is too long.")?;
-                        if count <= original.covered_turns {
+                        let (previous, covered) = saved
+                            .as_ref()
+                            .map_or((region.knowledge_note.as_str(), 0), |(note, original)| {
+                                (note.content.as_str(), original.covered_turns)
+                            });
+                        if count <= covered {
                             return Err(
                                 "This region has no new completed discussion to add.".into()
                             );
@@ -105,7 +148,7 @@ impl DesktopDocument {
                         let bytes =
                             region
                                 .completed_turns()
-                                .try_fold(note.content.len(), |bytes, turn| {
+                                .try_fold(previous.len(), |bytes, turn| {
                                     bytes
                                         .checked_add(turn.question.len())?
                                         .checked_add(turn.answer.len())
@@ -124,7 +167,7 @@ impl DesktopDocument {
                             .collect();
                         Ok((
                             region.attachment.page,
-                            ai_reading_note_input(turns, note.content),
+                            ai_reading_note_input(turns, previous.to_owned()),
                             count,
                             revision,
                         ))
@@ -152,12 +195,14 @@ impl DesktopDocument {
             .map_err(|error| error.to_string())?;
         let capture = PendingNote {
             token: crate::marks::uuid()?,
-            note_id: id.into(),
-            note_modified: note.modified,
-            source_revision: original.revision,
-            source_modified: original.modified,
+            target: saved.map(|(note, original)| SavedNoteTarget {
+                id: note.id,
+                modified: note.modified,
+                source_revision: original.revision,
+                source_modified: original.modified,
+            }),
             fingerprint,
-            region_id: note.conversation_id,
+            region_id,
             region_revision,
             covered_turns,
             endpoint: plan.endpoint.clone(),
@@ -168,8 +213,12 @@ impl DesktopDocument {
                 .collect(),
         };
         let mut result = serde_json::to_value(plan).map_err(|error| error.to_string())?;
-        result["kind"] = json!("reading_note_suggestion");
-        result["note_id"] = json!(capture.note_id);
+        result["kind"] = json!(capture.kind());
+        if let Some(target) = &capture.target {
+            result["note_id"] = json!(target.id);
+        } else {
+            result["region_id"] = json!(capture.region_id);
+        }
         result["note_capture"] = json!(capture.token);
         *self
             .pending_note
@@ -183,9 +232,11 @@ impl DesktopDocument {
         document: &Arc<LyraReaderDocument>,
         capture: &PendingNote,
     ) -> Result<(), String> {
-        self.read_workspace(document, true, |workspace| {
-            capture.original(workspace).map(|_| ())
-        })?;
+        if capture.target.is_some() {
+            self.read_workspace(document, true, |workspace| {
+                capture.original(workspace).map(|_| ())
+            })?;
+        }
         self.with_reading_cache(document, true, |cache, sha| {
             crate::region_store::with_current_region(
                 cache,
@@ -204,14 +255,27 @@ impl DesktopDocument {
         capture: PendingNote,
         answer: String,
     ) -> Result<Value, String> {
+        let Some(target) = &capture.target else {
+            self.validate_note_review(document, &capture)?;
+            return Ok(
+                json!({"id":capture.region_id,"revision":capture.region_revision,"content":answer}),
+            );
+        };
         self.update_reading_workspace(document, |workspace, sha, cache| {
-            let mut original=capture.original(workspace)?;
-            crate::region_store::with_current_region(cache,document,sha,&capture.region_id,Some(&capture.region_revision),|_,_|Ok(()))?;
+            let mut original = capture.original(workspace)?;
+            crate::region_store::with_current_region(
+                cache,
+                document,
+                sha,
+                &capture.region_id,
+                Some(&capture.region_revision),
+                |_, _| Ok(()),
+            )?;
             original.modified = next_note_modified(original.modified)?;
             original.covered_turns = capture.covered_turns;
-            original.content=answer;
+            original.content = answer;
             workspace.put(original)?;
-            Ok(json!({"id":capture.note_id,"available":workspace.suggestion(&capture.note_id).is_some()}))
+            Ok(json!({"id":target.id,"available":workspace.suggestion(&target.id).is_some()}))
         })
     }
 

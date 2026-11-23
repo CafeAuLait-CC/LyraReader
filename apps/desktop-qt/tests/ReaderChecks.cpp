@@ -5159,6 +5159,77 @@ private slots:
         auto *empty=window->findChild<QObject *>("regionNotesEmpty");QVERIFY(empty);QVERIFY(!empty->property("visible").toBool());QCOMPARE(sentinel.requests.size(),0);QFile preserved(historyPath);QVERIFY(preserved.open(QIODevice::ReadOnly));QCOMPARE(preserved.readAll(),QByteArray("invalid saved history"));
 
     }
+    void interleafGeneratedKnowledgeRequiresSendAndAtomicSave() {
+        MockChatServer server;QVERIFY(server.listen());
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-interleaf-note.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        const auto old=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");
+        const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",old);});
+        qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
+        QFile file(path);QVERIFY(file.open(QIODevice::ReadOnly));const auto original=file.readAll();file.close();
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
+        const QVariantMap settings{{"baseUrl",server.baseUrl()},{"model","synthetic-interleaf-note"}};
+        window->setProperty("aiSettings",settings);
+        QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",420},{"height",180}},1));
+        QTRY_VERIFY(!reader->aiRegion().value("image_png").toString().isEmpty());
+        const auto region=reader->aiRegion().value("history_id").toString();
+        QVERIFY(reader->saveAiRegionNote());QTRY_COMPARE(reader->pendingCommands(),0);
+        reader->setAiRegionQuestion("Interpret this synthetic evidence.");
+        reader->prepareAiRegion(settings);
+        const auto plan=[&]{return reader->aiState().value("plan").toMap();};
+        const auto respond=[&](const QString &answer) {server.responses.append({{MockChatServer::delta({{"content",answer}}),QByteArray("data: [DONE]\n\n")},5,200});};
+        QTRY_VERIFY(!plan().isEmpty());QTRY_COMPARE(reader->pendingCommands(),0);
+        respond("The completed region discussion supports this point.");
+        QVERIFY(reader->startAi("local",plan()));QTRY_VERIFY(!reader->aiState().value("running").toBool());
+        reader->flushAiRegionNote(false);QTRY_VERIFY(!reader->regionPersistencePending());QTRY_COMPARE(reader->pendingCommands(),0);
+        QCOMPARE(server.requests.size(),1);
+        auto *card=window->findChild<QObject *>("aiRegionCard");QVERIFY(card);
+        auto *preview=card->findChild<QObject *>("prepareAiRegionKnowledge"),*send=card->findChild<QObject *>("sendAiRegion");
+        auto *save=card->findChild<QObject *>("saveAiRegionKnowledge"),*shown=card->findChild<QObject *>("aiRegionKnowledge");
+        QVERIFY(preview && send && save && shown);
+        const auto candidate=[&]{return reader->aiState().value("regionNoteCandidate").toMap();};
+        const auto review=[&](int previous,const QString &reply) {
+            QVERIFY(QMetaObject::invokeMethod(card,"open"));
+            QTRY_VERIFY(preview->property("visible").toBool() && preview->property("enabled").toBool());
+            QVERIFY(QMetaObject::invokeMethod(preview,"clicked"));
+            QTRY_COMPARE(plan().value("kind").toString(),QString("region_knowledge_note"));
+            QTRY_VERIFY(send->property("enabled").toBool());QCOMPARE(server.requests.size(),previous);
+            const auto exact=plan().value("parts").toList().first().toMap().value("wire_body").toString().toUtf8();
+            QVERIFY(exact.contains("completed region discussion") && !exact.contains("data:image"));
+            respond(reply);QVERIFY(QMetaObject::invokeMethod(send,"clicked"));
+            QTRY_COMPARE(server.requests.size(),previous+1);
+            const auto request=server.requests.last();QCOMPARE(request.mid(request.indexOf("\r\n\r\n")+4),exact);
+            QTRY_COMPARE(candidate().value("content").toString(),reply);
+            QVERIFY(shown->property("text").toString().contains(reply));
+        };
+        review(1,"A generated draft.");if(QTest::currentTestFailed())return;
+        QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(reader->aiRegion().value("knowledge_note").toString().isEmpty());
+
+        ReaderController other;other.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE(other.pageCount(),1);QTRY_COMPARE(other.pendingCommands(),0);
+        QSignalSpy otherFinished(&other,&ReaderController::commandFinished);
+        const auto localEdit=other.submit("region_note",{{"id",region},{"text","Newer local knowledge note."}});
+        QTRY_COMPARE(otherFinished.size(),1);QCOMPARE(otherFinished.at(0).at(0).toULongLong(),localEdit);
+        QVERIFY(otherFinished.at(0).at(3).toString().isEmpty());
+        QVERIFY(QMetaObject::invokeMethod(save,"clicked"));QTRY_COMPARE(reader->pendingCommands(),0);
+        QTRY_VERIFY(reader->aiState().value("status").toString().contains("changed"));
+        QCOMPARE(candidate().value("content").toString(),QString("A generated draft."));
+        QCOMPARE(server.requests.size(),2);
+
+        QVERIFY(QMetaObject::invokeMethod(card,"close"));reader->openFile(QUrl::fromLocalFile(path));
+        QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
+        reader->submit("region_list");QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(reader->reopenAiRegion(region,reader->regionHistory().value("revision").toString()));
+        QTRY_COMPARE(reader->aiRegion().value("knowledge_note").toString(),QString("Newer local knowledge note."));
+        review(2,"The reviewed final local knowledge note.");if(QTest::currentTestFailed())return;
+        QVERIFY(QMetaObject::invokeMethod(save,"clicked"));
+        QTRY_COMPARE(reader->aiRegion().value("knowledge_note").toString(),QString("The reviewed final local knowledge note."));
+        QTRY_VERIFY(candidate().isEmpty());
+        QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),original);
+        QCOMPARE(server.requests.size(),3);
+    }
+
     void readingNoteSuggestionsRequireExactPreviewAndExplicitReview() {
         QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
         MockChatServer server;QVERIFY(server.listen());

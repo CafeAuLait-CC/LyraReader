@@ -612,7 +612,7 @@ ApplicationWindow {
     }
     function discardAndClose(index) { beginCloseOperation("discard",closeTarget(index),index<0); }
     function closeCommandFinished(owner,id,operation,result,error) {
-        if ((operation === "ai_chat_draft" || operation === "ai_reading_note_update") && error.length && closingTab !== -2
+        if ((operation === "ai_chat_draft" || operation === "ai_reading_note_update" || operation === "region_save_generated_note") && error.length && closingTab !== -2
                 && (closingTab < 0 || pendingCloseReader === owner)) {
             closeRetry.stop();
             closingTab = -2;

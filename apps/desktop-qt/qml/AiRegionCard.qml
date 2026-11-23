@@ -13,7 +13,15 @@ Item {
     readonly property var attachment:owner ? owner.aiRegion : ({})
     readonly property var state:owner ? owner.aiState : ({})
     readonly property bool running:!!state.running
-    readonly property var plan:state.previewView==="region" ? state.plan || null : null
+    readonly property bool notePreview:state.previewView==="region_note"
+    readonly property bool noteRunning:running && state.responseView==="region_note"
+    readonly property var candidate:state.regionNoteCandidate && state.regionNoteCandidate.id===attachment.history_id
+        ? state.regionNoteCandidate : null
+    readonly property var knowledgeResult:({
+        output:candidate ? candidate.content : noteRunning ? state.output || "" : attachment.knowledge_note || "",
+        reasoning:noteRunning ? state.reasoning : "",generation:owner ? owner.documentGeneration : 0
+    })
+    readonly property var plan:state.previewView==="region" || notePreview ? state.plan || null : null
     readonly property bool previewReady:!!plan && !state.planSent
     onPreviewReadyChanged:if(!previewReady && payload && payload.visible)payload.close()
     readonly property var result:state.responseView==="region" ? ({output:state.output,reasoning:state.reasoning,usage:state.usage,responsePlan:state.responsePlan,generation:owner.documentGeneration}) : ((state.results || {}).region || {})
@@ -32,7 +40,7 @@ Item {
     readonly property real heightLimit:Math.max(44,Math.min(740,(app.documentCanvas ? app.documentCanvas.height : app.height)-24))
     readonly property real fullHeight:Math.min(heightLimit,Math.max(44,
         Math.ceil(body.implicitHeight + Math.max(0,transcript.implicitHeight-resultScroll.Layout.preferredHeight))))
-    readonly property bool streamGrowing:opened && running && state.responseView==="region"
+    readonly property bool streamGrowing:opened && running && (state.responseView==="region" || noteRunning)
     readonly property real plannedHeight:streamGrowing ? heightLimit : fullHeight
     readonly property real allocatedHeight:located && paper.card ? paper.card.gap_pt*app.zoom : fullHeight
     readonly property real paperProgress:allocatedHeight>0
@@ -279,6 +287,15 @@ Item {
                     color:card.app.colors.textSecondary;font.pixelSize:11
                 }
                 AiResult {app:card.app;viewport:resultScroll.contentItem;value:card.result;answerName:"aiRegionAnswer";Layout.fillWidth:true;onCitation:function(link,plan){card.follow(link,plan);}}
+                Label {
+                    visible:!!card.knowledgeResult.output
+                    text:card.candidate ? qsTr("Generated knowledge note · unsaved") : qsTr("Knowledge note")
+                    font.bold:true;Layout.fillWidth:true;wrapMode:Text.Wrap
+                }
+                AiResult {
+                    app:card.app;viewport:resultScroll.contentItem;value:card.knowledgeResult
+                    answerName:"aiRegionKnowledge";Layout.fillWidth:true;visible:!!card.knowledgeResult.output
+                }
                 ColumnLayout {
                     id:details;objectName:"aiRegionDetails";Layout.fillWidth:true
                     spacing:card.compact ? 4 : 8
@@ -290,6 +307,23 @@ Item {
                         ToolButton {text:qsTr("Skip");Accessible.name:qsTr("Continue without document reading");onClicked:card.owner.dismissDocumentReadingChoice()}
                     }
                     Button {objectName:"saveAiRegionNote";text:qsTr("Save to Reading notes");enabled:!!card.attachment.image_png && !card.running && card.owner && !card.owner.pendingCommands;onClicked:card.owner.saveAiRegionNote()}
+                    Button {
+                        objectName:"prepareAiRegionKnowledge"
+                        text:qsTr("Preview knowledge note")
+                        visible:!!card.attachment.completed_turn_count && !card.candidate
+                        enabled:!!card.owner && card.attachment.saved && !card.running && !card.owner.pendingCommands && !card.owner.hasUnsavedReadingNotes
+                        onClicked:card.owner.prepareAiRegion(card.app.aiSettings,true)
+                    }
+                    RowLayout {
+                        visible:!!card.candidate;Layout.fillWidth:true
+                        Button {
+                            objectName:"saveAiRegionKnowledge"
+                            text:qsTr("Save generated note")
+                            enabled:!!card.owner && !card.running && !card.owner.pendingCommands && !card.owner.hasUnsavedReadingNotes
+                            onClicked:card.owner.saveGeneratedRegionNote()
+                        }
+                        Button {text:qsTr("Dismiss");enabled:!!card.owner && !card.owner.pendingCommands;onClicked:card.owner.dismissGeneratedRegionNote()}
+                    }
                     Button {objectName:"discardFailedAiRegion";text:qsTr("Discard unsaved changes…");visible:!!card.attachment.image_png && card.owner && !!card.owner.regionPersistenceError;enabled:card.owner && !card.running && !card.owner.pendingCommands;onClicked:discardChanges.open()}
                     RowLayout {
                         Button {objectName:"newAiRegion";text:qsTr("New area");enabled:!card.running && !card.attachment.loading;onClicked:card.app.armRegion()}
@@ -329,7 +363,8 @@ Item {
         }
         Label {
             objectName:"aiRegionRequestStatus"
-            text:card.running && card.state.responseView!=="region" ? qsTr("Another assistant request is running in this tab.") : card.state.statusView==="region" ? card.state.status || "" : ""
+            text:card.running && card.state.responseView!=="region" && !card.noteRunning ? qsTr("Another assistant request is running in this tab.")
+                : card.state.statusView==="region" || card.state.statusView==="region_note" ? card.state.status || "" : ""
             textFormat:Text.PlainText
             visible:text.length>0;wrapMode:Text.Wrap;Layout.fillWidth:true;font.pixelSize:11;color:card.app.colors.textSecondary
         }
@@ -342,8 +377,8 @@ Item {
             Layout.fillWidth:true
             Button {objectName:"prepareAiRegion";text:qsTr("Preview Question");enabled:!!card.attachment.image_png && !!(card.attachment.question || "").trim() && !card.running && card.owner && card.owner.pendingCommands===0;onClicked:card.prepare()}
             Button {objectName:"inspectAiRegion";text:qsTr("Inspect payload");enabled:card.previewReady;onClicked:payload.open()}
-            Button {objectName:"sendAiRegion";text:qsTr("Send");visible:!card.running || card.state.responseView!=="region";enabled:card.previewReady && !card.running && card.owner && card.owner.pendingCommands===0;onClicked:card.app.sendAi(card.owner,card.plan)}
-            Button {objectName:"stopAiRegion";visible:card.running && card.state.responseView==="region";text:qsTr("Stop response");onClicked:card.owner.cancelAi()}
+            Button {objectName:"sendAiRegion";text:card.notePreview ? qsTr("Send note request") : qsTr("Send");visible:!card.running || (card.state.responseView!=="region" && !card.noteRunning);enabled:card.previewReady && !card.running && card.owner && card.owner.pendingCommands===0;onClicked:card.app.sendAi(card.owner,card.plan)}
+            Button {objectName:"stopAiRegion";visible:card.running && (card.state.responseView==="region" || card.noteRunning);text:qsTr("Stop response");onClicked:card.owner.cancelAi()}
         }
         Label {
             objectName:"aiRegionPersistenceStatus"

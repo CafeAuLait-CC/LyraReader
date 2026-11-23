@@ -39,6 +39,9 @@ ColumnLayout {
     signal citation(string link, var plan)
     spacing: 4
     readonly property var sent: value.responsePlan || ({})
+    readonly property string outputText: value.output || ""
+    readonly property var formulaMarkup: sent.kind === "reading_translation" || !app.currentReader
+        ? [] : app.currentReader.aiMathMarkup(outputText)
     Label {
         objectName: result.answerName + "UnitTitle"
         visible: !!result.value.unitTitle
@@ -101,11 +104,11 @@ ColumnLayout {
         id: answerArea
         objectName: result.answerName
         Layout.fillWidth: true
-        text: result.sent.kind === "reading_translation" ? result.value.output || ""
-              : Logic.answerMarkup(result.value.output || "",
+        text: result.sent.kind === "reading_translation" ? result.outputText
+              : Logic.answerMarkup(result.outputText,
                   result.sent.action === "TranslateSelection" ? false : result.sent.action === "DocumentChat"
                       ? (result.sent.sources || []).map(source => source.page) : (result.sent.source_pages || []),
-                  app.currentReader.aiMathMarkup(result.value.output || ""))
+                  result.formulaMarkup)
         readOnly: true; selectByMouse: true; selectByKeyboard: true; wrapMode: TextEdit.Wrap; background: null
         textFormat: result.sent.kind === "reading_translation" ? TextEdit.PlainText : TextEdit.RichText
         Accessible.name: qsTr("AI response")

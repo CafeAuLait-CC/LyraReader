@@ -369,7 +369,7 @@ quint64 ReaderController::submitWithId(quint64 id,const QString &operation,const
             draftKey==QStringLiteral("forms") ? draftValues==arguments.value(unifiedSave ? QStringLiteral("forms") : QStringLiteral("values")).toList() : savedDraft.toList()==arguments.value(QStringLiteral("areas")).toList());
     // Region snapshots and complete document-reading previews can be large. Their
     // controller-built maps contain plain values; serialize the immutable copy on the worker.
-    const bool regionPayload=operation==QStringLiteral("region_create") || operation==QStringLiteral("region_snapshot") || operation==QStringLiteral("region_note") || operation==QStringLiteral("knowledge_start") || operation==QStringLiteral("ai_reading_note_update");
+    const bool regionPayload=operation==QStringLiteral("region_create") || operation==QStringLiteral("region_snapshot") || operation==QStringLiteral("region_note") || operation==QStringLiteral("region_save_generated_note") || operation==QStringLiteral("knowledge_start") || operation==QStringLiteral("ai_reading_note_update");
     QByteArray bytes;
     if(!regionPayload) {
         auto request=QJsonObject::fromVariantMap(arguments);request.insert(QStringLiteral("op"),operation);

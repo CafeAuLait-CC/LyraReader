@@ -952,7 +952,20 @@ impl DesktopDocument {
                 if r.get("reading").is_some() {
                     let options: AiReadingOptionsRecord = arg(&r, "reading")?;
                     if options.kind == "note" {
-                        return self.prepare_note_review(&d, &text(&r["reading"], "id")?, request);
+                        return self.prepare_note_review(
+                            &d,
+                            &text(&r["reading"], "id")?,
+                            None,
+                            request,
+                        );
+                    }
+                    if options.kind == "region_note" {
+                        return self.prepare_note_review(
+                            &d,
+                            &text(&r["reading"], "id")?,
+                            Some(&text(&r["reading"], "expected_history_revision")?),
+                            request,
+                        );
                     }
                     if let Some(id) = r["reading"]["saved_translation"].as_str() {
                         if options.kind != "translation" {
@@ -1223,11 +1236,11 @@ impl DesktopDocument {
                             Some(lyra_reader_ai::SelectionRange {page: selection.page, start: selection.start, end: selection.end}))?);
                         Some(ReadingOutput::Summary { capture, model: plan.model.clone() })
                     }
-                    (Some("reading_note_suggestion"), AiActionRecord::SummarizeDocument) => {
+                    (Some(kind @ ("reading_note_suggestion" | "region_knowledge_note")), AiActionRecord::SummarizeDocument) => {
                         let token=text(&r["plan"],"note_capture")?;
                         let capture={
                             let mut pending=self.pending_note.lock().map_err(|_|"Note review state is unavailable.")?;
-                            if !pending.as_ref().is_some_and(|capture|capture.matches(&token,&plan,&d.document_identity().sha256)) {
+                            if !pending.as_ref().is_some_and(|capture|capture.matches(&token,kind,&plan,&d.document_identity().sha256)) {
                                 return Err("This note preview changed. Review it again before sending.".into());
                             }
                             pending.take().ok_or("The reviewed note request is unavailable.")?
@@ -1367,8 +1380,9 @@ impl DesktopDocument {
                             Err(error) => result["chat_history_warning"] = json!(error),
                         },
                         Some(ReadingArchive::Note(capture, answer)) => {
+                            let key = capture.result_key();
                             match self.publish_note_review(&d, *capture, answer) {
-                                Ok(suggestion) => result["note_suggestion"] = suggestion,
+                                Ok(suggestion) => result[key] = suggestion,
                                 Err(error) => result["note_warning"] = json!(error),
                             }
                         }
