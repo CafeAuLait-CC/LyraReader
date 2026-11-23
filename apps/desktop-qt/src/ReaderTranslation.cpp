@@ -65,6 +65,8 @@ bool ReaderController::prepareInplaceTranslation(const QVariantMap &request) {
     const auto document=m_document;const auto generation=m_generation,epoch=++m_aiPreviewEpoch;QPointer<ReaderController> alive(this);
     const auto current=[&]{return alive && document==m_document && generation==m_generation && epoch==m_aiPreviewEpoch;};
     m_aiState.remove(QStringLiteral("plan"));m_aiState.insert(QStringLiteral("previewView"),QStringLiteral("translation"));m_aiState.insert(QStringLiteral("statusView"),QStringLiteral("translation"));
+    m_aiState.insert(QStringLiteral("previewChatGptAccount"),request.value(QStringLiteral("chatgpt_account")));
+    m_aiState.insert(QStringLiteral("previewSelection"),request.value(QStringLiteral("selection")));
     m_aiState.insert(QStringLiteral("planSent"),false);m_aiState.insert(QStringLiteral("status"),tr("Preparing in-place translations locally…"));m_aiPlanGeneration=generation;
     emit aiStateChanged();if(!current())return false;
     const auto id=submit(QStringLiteral("translation_prepare"),{{QStringLiteral("request"),request}});
@@ -85,7 +87,14 @@ bool ReaderController::startInplaceTranslation(const QString &key,const QVariant
     m_aiState.insert(QStringLiteral("responseView"),QStringLiteral("translation"));m_aiState.insert(QStringLiteral("statusView"),QStringLiteral("translation"));m_aiState.insert(QStringLiteral("output"),QString{});m_aiState.insert(QStringLiteral("reasoning"),QString{});
     m_aiState.insert(QStringLiteral("responsePlan"),plan);m_aiState.insert(QStringLiteral("status"),tr("Starting in-place translations…"));
     emit aiStateChanged();if(!current()){retire();return false;}
-    const auto id=submit(QStringLiteral("translation_start"),{{QStringLiteral("token"),token},{QStringLiteral("api_key"),key}});
+    QVariantMap request{{QStringLiteral("token"),token}};
+    if(plan.contains(QStringLiteral("chatgpt_account"))) {
+        request.insert(QStringLiteral("chatgpt_account"),plan.value(QStringLiteral("chatgpt_account")));
+        request.insert(QStringLiteral("chatgpt_access_token"),key);
+    } else {
+        request.insert(QStringLiteral("api_key"),key);
+    }
+    const auto id=submit(QStringLiteral("translation_start"),request);
     if(!current()){retire();return false;}m_aiStartId=id;return id!=0;
 }
 void ReaderController::cancelInplaceTranslation() {

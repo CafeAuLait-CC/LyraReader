@@ -1957,7 +1957,8 @@ ApplicationWindow {
             for (const tab of root.session.tabs) {
                 const reader = tab.reader;
                 const state = reader.aiState;
-                if (state.running && state.responsePlan && state.responsePlan.chatgpt_account)
+                if (state.running && state.responsePlan && state.responsePlan.chatgpt_account
+                        && state.responsePlan.kind !== "inplace_translation")
                     reader.cancelAi();
                 const selection = (state.previewView === "summary" || state.previewView === "translation") && state.previewSelection;
                 if (state.previewChatGptAccount || (state.previewView === "chat" && accounts.useForChat)

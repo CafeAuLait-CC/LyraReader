@@ -603,6 +603,50 @@ private slots:
         for (const auto &completion : commands)
             QVERIFY(completion[1].toString() != "knowledge_prepare");
     }
+    void chatGptInplaceTranslationKeepsItsPreparedAccount() {
+        QTemporaryDir scratch;
+        QVERIFY(scratch.isValid());
+        const auto path = scratch.filePath("synthetic-inplace.pdf");
+        QVERIFY(QFile::copy(root + "/tests/fixtures/text-page.pdf", path));
+        NativeCorpus::Viewer view;
+        QVERIFY(view.window);
+        auto *accounts = view.workspace.chatGptAccounts();
+        QVERIFY(!accounts->connected());
+        view.workspace.openFile(QUrl::fromLocalFile(path));
+        auto *reader = view.workspace.activeReader();
+        QTRY_COMPARE(reader->pageCount(), 1);
+        QTRY_COMPARE(reader->pendingCommands(), 0);
+        reader->requestText(0);
+        QTRY_VERIFY(reader->textPages().contains("0"));
+        QTRY_COMPARE(reader->pendingCommands(), 0);
+        const auto count = reader->textPages().value("0").toMap().value("chars").toList().size();
+        QVERIFY(count > 0);
+        const QVariantMap request{{"action", "TranslateSelection"}, {"current_page", 0}, {"language","French"},
+                                  {"selection", QVariantMap{{"page",0},{"start",0},{"end",count-1}}},
+                                  {"base_url", "http://127.0.0.1:1/v1"}, {"model", "synthetic-plan-model"},
+                                  {"chatgpt_account", "synthetic-translation-registration"},
+                                  {"document_knowledge_pages", QVariantList{}},
+                                  {"reasoning_mode", "default"}, {"reasoning_encoding", "none"}};
+        QVERIFY(reader->prepareInplaceTranslation(request));
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(), 0, 10000);
+        const auto state = reader->aiState();
+        const auto plan = state.value("plan").toMap();
+        QVERIFY2(!plan.isEmpty(), qPrintable(state.value("status").toString()));
+        QCOMPARE(plan.value("kind").toString(), QString("inplace_translation"));
+        QCOMPARE(plan.value("endpoint").toString(), QString("https://api.openai.com/v1/responses"));
+        QVERIFY(!plan.value("translation_rows").toList().isEmpty());
+        QVERIFY(reader->translationOverlays().isEmpty());
+
+        QVERIFY(QMetaObject::invokeMethod(view.window, "sendAi", Q_ARG(QVariant, QVariant::fromValue(reader)),
+                                         Q_ARG(QVariant, plan), Q_ARG(QVariant, QString()), Q_ARG(QVariant, QString())));
+        QCOMPARE(view.window->property("credentialReadId").toDouble(), -1.0);
+        QVERIFY(view.window->property("operationStatus").toString().contains("Check the ChatGPT connection"));
+        QVERIFY(QMetaObject::invokeMethod(accounts, "profileChanged"));
+        QTRY_COMPARE(reader->pendingCommands(), 0);
+        QVERIFY(!reader->aiState().contains("plan"));
+        QVERIFY(!reader->startAi("synthetic-only", plan));
+        QVERIFY(reader->translationOverlays().isEmpty());
+    }
     void objectDragKeepsTheColourBehindTransparentPixels() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("alpha-drag.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;window->setProperty("paperAppearance","original");view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(!reader->loading() && reader->pageCount()==1 && !reader->pendingCommands());QVERIFY(QMetaObject::invokeMethod(window,"setSecondaryRow",Q_ARG(QVariant,"edit"),Q_ARG(QVariant,false)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(settleReaderViewport(window));const auto model=reader->data().value("content_objects").toMap();QVariantMap title;for(const auto &v:model.value("items").toList())if(v.toMap().value("text").toString().contains("LyraReader fixture")){title=v.toMap();break;}QVERIFY(!title.isEmpty());const auto b=title.value("bounds").toMap();const QRectF bounds(b.value("x").toDouble(),b.value("y").toDouble(),b.value("width").toDouble(),b.value("height").toDouble());auto *drag=window->findChild<ContentDragItem *>("contentDragPreview");auto *pointer=visualItem(window->contentItem(),"contentPointer0");QVERIFY(drag && pointer);const auto colour=[&]{const auto image=window->grabWindow();if(image.isNull())return QColor();const auto p=pointer->mapToScene(QPointF(371,261)*window->property("zoom").toDouble());return image.pixelColor(qRound(p.x()*image.width()/window->width()),qRound(p.y()*image.height()/window->height()));};QTRY_VERIFY(colour().red()>100 && colour().green()<150);const auto original=colour();drag->prepare(0,title.value("id").toString(),model.value("revision").toString(),bounds);const auto region=bounds.adjusted(-2,-2,2,2);drag->setOffset(QPointF(370-region.x(),260-region.y()));QTRY_COMPARE_WITH_TIMEOUT(drag->status(),1,15000);QTest::qWait(100);const auto painted=colour();qInfo()<<"Transparent drag sample"<<original<<painted;QVERIFY2(qAbs(painted.red()-original.red())<6 && qAbs(painted.green()-original.green())<6 && qAbs(painted.blue()-original.blue())<6,"Transparent margins must preserve the coloured page below the dragged object");drag->cancel();QVERIFY(!reader->hasUnsavedChanges());
     }

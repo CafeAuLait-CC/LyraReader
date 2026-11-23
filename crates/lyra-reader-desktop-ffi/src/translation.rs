@@ -1,5 +1,5 @@
 //! Document-owned in-place translation: canonical previews, bounded audited jobs and atomic cache I/O.
-use crate::document::DesktopDocument;
+use crate::document::{DesktopDocument, chatgpt_account};
 use crate::document_cache::{DocumentCache, atomic_write, read_optional_bounded};
 use crate::summary_batch::Scope;
 use lyra_reader_ai::translation::{
@@ -156,6 +156,7 @@ pub(crate) struct Translations {
     scope: Arc<Scope>,
     id: u64,
     token: String,
+    account: Option<String>,
     source: Weak<LyraReaderDocument>,
     rows: Vec<Row>,
     store: Store,
@@ -173,6 +174,7 @@ impl Translations {
             scope,
             id: 0,
             token: String::new(),
+            account: None,
             source: Weak::new(),
             rows: Vec::new(),
             store: Store::default(),
@@ -203,6 +205,7 @@ impl Translations {
         &mut self,
         document: &Arc<LyraReaderDocument>,
         mut request: AiPlanRequestRecord,
+        account: Option<String>,
         location: &DocumentCache,
     ) -> Result<Value, String> {
         if self.running {
@@ -210,6 +213,7 @@ impl Translations {
         }
         self.rows.clear();
         self.token.clear();
+        self.account = None;
         self.source = Weak::new();
         self.id = self.scope.begin()?;
         let selection = request
@@ -231,6 +235,11 @@ impl Translations {
         request.document_knowledge = false;
         request.document_knowledge_text = None;
         request.document_knowledge_pages.clear();
+        if account.is_some() {
+            request.base_url = "https://api.openai.com/v1".into();
+            request.reasoning_mode = "default".into();
+            request.reasoning_encoding = "none".into();
+        }
         let language = request
             .language
             .as_deref()
@@ -256,7 +265,13 @@ impl Translations {
             });
             let plan = document
                 .prepare_inplace_translation_plan(request.clone())
-                .and_then(|p| render_ai_plan(p, AiWireTransport::ChatCompletions))
+                .and_then(|plan| {
+                    if account.is_some() {
+                        render_chatgpt_plan(plan)
+                    } else {
+                        render_ai_plan(plan, AiWireTransport::ChatCompletions)
+                    }
+                })
                 .map_err(|e| e.to_string())?;
             if plan.parts.len() != 1 {
                 return Err("One translation target must produce exactly one request.".into());
@@ -348,6 +363,9 @@ impl Translations {
             plan.parts = parts;
             plan.estimated_tokens = estimated;
             let mut value = serde_json::to_value(plan).map_err(|e| e.to_string())?;
+            if let Some(account) = &account {
+                value["chatgpt_account"] = json!(account);
+            }
             value["kind"] = json!("inplace_translation");
             value["token"] = json!(self.token);
             value["translation_rows"] = json!(previews);
@@ -355,13 +373,15 @@ impl Translations {
         } else {
             None
         };
+        self.account = if envelope.is_some() { account } else { None };
         Ok(json!({"plan":envelope,"translation":self.snapshot()}))
     }
     fn start(
         &mut self,
         document: &Arc<LyraReaderDocument>,
         token: &str,
-        key: String,
+        account: Option<&str>,
+        credential: Option<&str>,
         root: PathBuf,
     ) -> Result<Value, String> {
         if self.running {
@@ -377,12 +397,20 @@ impl Translations {
                     .into(),
             );
         }
+        if account != self.account.as_deref() {
+            return Err("The ChatGPT connection changed. Preview the translation again.".into());
+        }
+        let key = credential.ok_or(if account.is_some() {
+            "Sign in to ChatGPT before starting the translation."
+        } else {
+            "Missing API key."
+        })?;
         for row in &mut self.rows {
             if row.view.state == State::Prepared {
                 row.view.state = State::Queued;
             }
         }
-        self.key = Some(key);
+        self.key = Some(key.to_owned());
         self.audit_root = Some(root);
         self.running = true;
         self.schedule()?;
@@ -414,7 +442,12 @@ impl Translations {
                 .as_ref()
                 .ok_or("The translation audit directory is unavailable.")?;
             let observer = crate::audit::observer(root.clone(), plan.action, plan.is_local);
-            match start_ai_request_audited(plan, key.clone(), false, Some(observer)) {
+            let job = if self.account.is_some() {
+                start_chatgpt_request_audited(plan, key.clone(), observer)
+            } else {
+                start_ai_request_audited(plan, key.clone(), false, Some(observer))
+            };
+            match job {
                 Ok(job) => {
                     row.job = Some(job);
                     row.view.state = State::Sending;
@@ -682,14 +715,22 @@ impl DesktopDocument {
             "translation_prepare" => translations.prepare(
                 &document,
                 crate::region::request(r["request"].clone())?,
+                chatgpt_account(&r["request"])?.map(str::to_owned),
                 location,
             ),
             "translation_start" => {
                 location.validate_pdf_source()?;
+                let account = chatgpt_account(r)?;
+                let field = if account.is_some() {
+                    "chatgpt_access_token"
+                } else {
+                    "api_key"
+                };
                 translations.start(
                     &document,
                     r["token"].as_str().ok_or("Missing translation token.")?,
-                    r["api_key"].as_str().ok_or("Missing API key.")?.into(),
+                    account,
+                    r[field].as_str(),
                     location.root.clone(),
                 )
             }
@@ -1225,6 +1266,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn chatgpt_inplace_translation_freezes_each_payload_and_rejects_other_credentials() {
+        let f = Fixture::new();
+        let mut request = f.request("http://127.0.0.1:1/v1");
+        request["chatgpt_account"] = json!("synthetic-translation-account");
+        let preview = f
+            .document
+            .command(json!({"op":"translation_prepare","request":request}))
+            .unwrap();
+        let plan = &preview["plan"];
+        assert_eq!(plan["chatgpt_account"], "synthetic-translation-account");
+        assert_eq!(
+            plan["endpoint"],
+            lyra_reader_ai::openai::CHATGPT_RESPONSES_ENDPOINT
+        );
+        let parts = plan["parts"].as_array().unwrap();
+        assert!(parts.len() > 1);
+        for part in parts {
+            let wire: Value = serde_json::from_str(part["wire_body"].as_str().unwrap()).unwrap();
+            assert_eq!(wire["store"], false);
+            assert!(wire["input"].is_array());
+        }
+        let mut start = json!({"op":"translation_start","token":plan["token"],
+            "chatgpt_account":"other-account","api_key":"synthetic-api-key"});
+        assert!(
+            f.document
+                .command(start.clone())
+                .unwrap_err()
+                .contains("connection changed")
+        );
+        start["chatgpt_account"] = json!("synthetic-translation-account");
+        assert!(
+            f.document
+                .command(start)
+                .unwrap_err()
+                .contains("Sign in to ChatGPT")
+        );
+        let stopped = f
+            .document
+            .command(json!({"op":"translation_cancel","token":plan["token"]}))
+            .unwrap();
+        assert_eq!(stopped["running"], false);
+        assert!(!f.cache.directory.join(FILE).exists());
+    }
     #[test]
     fn translation_preview_and_cancel_admission_do_not_send_or_create_a_cache() {
         let fixture = Fixture::new();

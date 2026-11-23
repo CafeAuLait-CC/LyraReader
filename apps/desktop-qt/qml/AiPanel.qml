@@ -204,11 +204,11 @@ Pane {
         const accounts = app.session ? app.session.chatGptAccounts : null;
         if (workspace === "translation") {
             const request = baseRequest("TranslateSelection");
-            if (translateInPlace) { owner.prepareInplaceTranslation(request); return; }
             if (translateDocument) {
                 request.action = "SummarizeDocument";
                 request.selection = null;
             } else if (accounts && !connectChatGpt(request, accounts, accounts.useForSelection)) return;
+            if (translateInPlace) { owner.prepareInplaceTranslation(request); return; }
             owner.prepareAi(request, {}, {kind: "translation", detail: "Standard"});
         }
         else if (selectedSummary || wholeSummary) {
