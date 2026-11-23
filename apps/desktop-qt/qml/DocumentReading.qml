@@ -18,12 +18,21 @@ Popup {
     onAboutToShow:{owner=app.currentReader;owner.dismissDocumentReadingChoice();}
     onClosed:{payload.close();if(owner===app.currentReader)app.focusReadingView();}
     Connections {target:reading.app;function onCurrentReaderChanged(){if(reading.visible)reading.close();}}
-    function prepare() {
+    readonly property var accounts: app.session ? app.session.chatGptAccounts : null
+    readonly property bool chatGptAvailable: !!accounts && accounts.connected && !!accounts.model
+    function prepare() { prepareForConnection(false); }
+    function prepareForConnection(useChatGpt) {
+        if (useChatGpt && (!chatGptAvailable || accounts.busy)) return;
         const settings=app.aiSettings;
-        owner.prepareDocumentReading({action:"SummarizeDocument",document_knowledge:true,document_knowledge_text:null,document_knowledge_pages:[],
+        const request={action:"SummarizeDocument",document_knowledge:true,document_knowledge_text:null,document_knowledge_pages:[],
             current_page:0,selection:null,question:null,language:null,history:[],region:null,
             base_url:settings.baseUrl || "http://localhost:11434/v1",model:settings.model || "",temperature:null,max_tokens:null,
-            reasoning_mode:settings.reasoningMode || "default",reasoning_encoding:settings.reasoningEncoding || "none"});
+            reasoning_mode:settings.reasoningMode || "default",reasoning_encoding:settings.reasoningEncoding || "none"};
+        if (useChatGpt) {
+            request.chatgpt_account=accounts.accountId;
+            request.model=accounts.model;
+        }
+        owner.prepareDocumentReading(request);
     }
     contentItem:ColumnLayout {
         spacing:10
@@ -62,6 +71,15 @@ Popup {
             }
         }
         Button {objectName:"previewDocumentReading";text:reading.state.phase==="failed" ? qsTr("Retry: Preview Reading") : qsTr("Preview Document Reading");Layout.fillWidth:true;visible:!reading.state.ready;enabled:!!reading.owner && reading.owner.pageCount>0 && !reading.owner.loading && !reading.busy && reading.owner.pendingCommands===0;onClicked:reading.prepare()}
+        Button {
+            objectName:"previewChatGptDocumentReading"
+            text:qsTr("Preview Reading with ChatGPT plan")
+            Layout.fillWidth:true
+            visible:!reading.state.ready && reading.chatGptAvailable
+            enabled:!!reading.owner && reading.owner.pageCount>0 && !reading.owner.loading
+                && !reading.busy && reading.owner.pendingCommands===0 && !!reading.accounts && !reading.accounts.busy
+            onClicked:reading.prepareForConnection(true)
+        }
         Button {objectName:"inspectDocumentReading";text:qsTr("Inspect Payload");Layout.fillWidth:true;visible:!!reading.plan;onClicked:payload.open()}
         Button {objectName:"startDocumentReading";text:qsTr("Read in Background");Layout.fillWidth:true;visible:reading.state.phase==="preview";enabled:!!reading.owner && !reading.owner.pendingCommands;onClicked:reading.app.sendAi(reading.owner,reading.plan,"document-reading",reading.state.token)}
         Button {objectName:"skipDocumentReading";text:qsTr("Continue Without Reading");Layout.fillWidth:true;visible:!reading.state.ready && reading.state.phase!=="reading" && reading.state.phase!=="starting";onClicked:{if(reading.owner)reading.owner.stopDocumentReading();reading.close();}}

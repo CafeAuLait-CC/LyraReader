@@ -46,7 +46,7 @@ public:
     Q_INVOKABLE void beginSignIn(bool addAccount);
     Q_INVOKABLE void cancelSignIn();
     Q_INVOKABLE void signOut();
-    Q_INVOKABLE bool send(ReaderController *reader,const QVariantMap &plan);
+    Q_INVOKABLE bool send(ReaderController *reader,const QVariantMap &plan,const QString &readingToken);
 
     void setUseForChat(bool value);
     void setUseForSelection(bool value);
@@ -88,5 +88,6 @@ private:
     QString m_refreshedToken;
     bool m_revoked=false;
     QVariantMap m_candidate,m_pendingPlan;
+    QString m_pendingReadingToken;
     QPointer<ReaderController> m_pendingReader;
 };

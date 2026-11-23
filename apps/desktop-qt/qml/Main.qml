@@ -1928,7 +1928,9 @@ ApplicationWindow {
         if (!owner || !plan)
             return;
         if (plan.chatgpt_account) {
-            if (!session || !session.chatGptAccounts.send(owner,plan))
+            const readingToken = purpose === "document-reading" ? token || "" : "";
+            if (!session || (purpose === "document-reading" && !readingToken)
+                    || !session.chatGptAccounts.send(owner,plan,readingToken))
                 operationStatus = qsTr("Check the ChatGPT connection, then Preview and Send again.");
             return;
         }
@@ -1961,6 +1963,9 @@ ApplicationWindow {
                 if (state.previewChatGptAccount || (state.previewView === "chat" && accounts.useForChat)
                         || (selection && accounts.useForSelection))
                     reader.invalidateAiPlan();
+                const reading = reader.documentReading;
+                if (reading.chatgpt_account && ["preparing","preview","starting","reading"].includes(reading.phase))
+                    reader.stopDocumentReading();
             }
         }
     }

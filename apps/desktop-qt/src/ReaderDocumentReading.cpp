@@ -1,5 +1,7 @@
 #include "ReaderController.h"
 
+#include <QPointer>
+
 void ReaderController::initDocumentReading() {
     m_readingTimer.setInterval(150);
     connect(&m_readingTimer,&QTimer::timeout,this,[this]{
@@ -21,15 +23,44 @@ void ReaderController::dismissDocumentReadingChoice() {
     m_readingChoiceShown=true;m_readingChoicePending=false;emit documentReadingChanged();
 }
 void ReaderController::prepareDocumentReading(const QVariantMap &request) {
-    if(!m_document || m_snapshotMode || m_loading || m_pendingCommands || m_documentReading.value(QStringLiteral("phase")).toString()==QStringLiteral("reading"))return;
+    const auto phase=m_documentReading.value(QStringLiteral("phase")).toString();
+    if(!m_document || m_snapshotMode || m_loading || m_pendingCommands ||
+       phase==QStringLiteral("reading") || phase==QStringLiteral("preparing") ||
+       phase==QStringLiteral("starting") || phase==QStringLiteral("stopping"))return;
+    const QPointer<ReaderController> owner(this);
+    const auto generation=m_generation;
+    const auto current=[&] {
+        return owner && generation==m_generation && m_documentReading.value(QStringLiteral("phase")).toString()==QStringLiteral("preparing");
+    };
     m_readingChoiceShown=true;m_readingChoicePending=false;
-    m_documentReading={{QStringLiteral("phase"),QStringLiteral("preparing")}};emit documentReadingChanged();
-    m_readingPreviewId=submit(QStringLiteral("knowledge_prepare"),{{QStringLiteral("request"),request}});
+    m_documentReading={{QStringLiteral("phase"),QStringLiteral("preparing")}};
+    if(request.contains(QStringLiteral("chatgpt_account")))
+        m_documentReading.insert(QStringLiteral("chatgpt_account"),request.value(QStringLiteral("chatgpt_account")));
+    emit documentReadingChanged();
+    if(!current())return;
+    const auto id=submit(QStringLiteral("knowledge_prepare"),{{QStringLiteral("request"),request}});
+    if(current())m_readingPreviewId=id;
 }
 bool ReaderController::startDocumentReading(const QString &key,const QVariantMap &plan,const QString &token) {
     if(!m_document || m_snapshotMode || m_loading || m_pendingCommands || m_documentReading.value(QStringLiteral("phase")).toString()!=QStringLiteral("preview") || m_documentReading.value(QStringLiteral("plan")).toMap()!=plan || m_documentReading.value(QStringLiteral("token")).toString()!=token)return false;
+    const QPointer<ReaderController> owner(this);
+    const auto generation=m_generation;
+    const auto current=[&] {
+        return owner && generation==m_generation && m_documentReading.value(QStringLiteral("phase")).toString()==QStringLiteral("starting");
+    };
     m_documentReading.insert(QStringLiteral("phase"),QStringLiteral("starting"));emit documentReadingChanged();
-    m_readingStartId=submit(QStringLiteral("knowledge_start"),{{QStringLiteral("api_key"),key},{QStringLiteral("plan"),plan},{QStringLiteral("token"),token}});return true;
+    if(!current())return false;
+    QVariantMap request{{QStringLiteral("plan"),plan},{QStringLiteral("token"),token}};
+    if(plan.contains(QStringLiteral("chatgpt_account"))) {
+        request.insert(QStringLiteral("chatgpt_account"),plan.value(QStringLiteral("chatgpt_account")));
+        request.insert(QStringLiteral("chatgpt_access_token"),key);
+    } else {
+        request.insert(QStringLiteral("api_key"),key);
+    }
+    const auto id=submit(QStringLiteral("knowledge_start"),request);
+    if(!current())return false;
+    m_readingStartId=id;
+    return id!=0;
 }
 void ReaderController::stopDocumentReading() {
     m_readingChoiceShown=true;m_readingChoicePending=false;

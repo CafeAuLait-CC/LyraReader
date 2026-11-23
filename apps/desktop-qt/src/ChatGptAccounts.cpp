@@ -300,11 +300,13 @@ void ChatGptAccounts::signOut() {
     setStatus(tr("Signing out of the selected ChatGPT connection…"));
 }
 
-bool ChatGptAccounts::send(ReaderController *reader,const QVariantMap &plan) {
+bool ChatGptAccounts::send(ReaderController *reader,const QVariantMap &plan,const QString &readingToken) {
     const auto action=plan.value(QStringLiteral("action")).toString();
-    const bool allowed=(action==QStringLiteral("DocumentChat") && m_useForChat)
+    const bool allowed=readingToken.isEmpty()
+        ? (action==QStringLiteral("DocumentChat") && m_useForChat)
         || (m_useForSelection && (action==QStringLiteral("SummarizeSelection") || action==QStringLiteral("TranslateSelection")))
-        || action==QStringLiteral("RegionQuestion"); // The region has its own explicit ChatGPT preview button.
+        || action==QStringLiteral("RegionQuestion")
+        : action==QStringLiteral("SummarizeDocument"); // Reading has its own explicit ChatGPT preview.
     if(!reader || busy() || !allowed || !connected()
        || plan.value(QStringLiteral("chatgpt_account")).toString()!=m_selected
        || plan.value(QStringLiteral("model")).toString()!=model()
@@ -312,6 +314,7 @@ bool ChatGptAccounts::send(ReaderController *reader,const QVariantMap &plan) {
     m_vault.clearSession();
     m_pendingReader=reader;
     m_pendingPlan=plan;
+    m_pendingReadingToken=readingToken;
     m_intent=VaultIntent::LoadForChat;
     m_vaultId=m_vault.read(vaultKey(m_selected));
     emit changed();
@@ -372,7 +375,9 @@ void ChatGptAccounts::finishChat(const QString &token,const QString &error) {
     const auto reader=m_pendingReader;
     m_pendingReader.clear();
     const auto plan=std::exchange(m_pendingPlan,{});
-    if(error.isEmpty() && reader && reader->startAi(token,plan)) {
+    const auto readingToken=std::exchange(m_pendingReadingToken,{});
+    if(error.isEmpty() && reader && (readingToken.isEmpty()
+        ? reader->startAi(token,plan) : reader->startDocumentReading(token,plan,readingToken))) {
         setStatus({});
         return;
     }

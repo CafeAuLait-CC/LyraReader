@@ -279,7 +279,7 @@ impl ReadingReplies {
 fn value<T: Serialize>(result: Result<T, LyraReaderFfiError>) -> Result<Value, String> {
     serde_json::to_value(result.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
-fn chatgpt_account(request: &Value) -> Result<Option<&str>, String> {
+pub(super) fn chatgpt_account(request: &Value) -> Result<Option<&str>, String> {
     request
         .get("chatgpt_account")
         .map(|entry| {

@@ -263,13 +263,17 @@ pub fn run_document_reading(
             })
         })
         .collect::<Result<Vec<_>, AiError>>()?;
-    let merge = build_merge_plan(MergePlanRequest {
+    let mut merge = build_merge_plan(MergePlanRequest {
         document_title: plan.document_title.clone(),
         settings,
         parts,
         document_knowledge: None,
-    })?
-    .rendered(transport);
+    })?;
+    if transport == ChatTransport::Responses {
+        // A consolidation belongs to the same connection the reader approved.
+        merge.endpoint.clone_from(&plan.endpoint);
+    }
+    let merge = merge.rendered(transport);
     let payloads = merge
         .parts
         .iter()
@@ -335,46 +339,61 @@ mod tests {
     #[test]
     fn consolidation_is_previewed_before_the_exact_materialised_body_runs() {
         use std::cell::RefCell;
-        let (plan, settings) = long_plan();
-        let previews = RefCell::new(Vec::new());
-        let calls = RefCell::new(0);
-        let answer = run_document_reading(
-            &plan,
-            settings,
-            ChatTransport::ChatCompletions,
-            &CancellationToken::new(),
-            |next, emit| {
-                *calls.borrow_mut() += 1;
-                if *calls.borrow() == 2 {
-                    assert_eq!(
-                        previews.borrow().as_slice(),
-                        &next
-                            .parts
-                            .iter()
-                            .map(|p| p.wire_body.clone().unwrap())
-                            .collect::<Vec<_>>()
-                    );
-                }
-                for p in &next.parts {
-                    emit(RunEvent::PartStarted {
-                        index: p.index,
-                        total: p.total,
-                        label: p.label.clone(),
-                    });
-                    emit(RunEvent::Delta("Synthetic completed reading [p.1]".into()));
-                }
-                emit(RunEvent::Done);
-                Ok(())
-            },
-            &mut |event| {
-                if let ReadingUpdate::Combining { payloads } = event {
-                    *previews.borrow_mut() = payloads;
-                }
-            },
-        )
-        .unwrap();
-        assert_eq!(*calls.borrow(), 2);
-        assert_eq!(answer, "Synthetic completed reading [p.1]");
+        for transport in [ChatTransport::ChatCompletions, ChatTransport::Responses] {
+            let (mut plan, mut settings) = long_plan();
+            if transport == ChatTransport::Responses {
+                settings.base_url = "https://api.openai.com/v1".into();
+                plan.endpoint = crate::openai::CHATGPT_RESPONSES_ENDPOINT.into();
+                plan.is_local = false;
+            }
+            let plan = plan.rendered(transport);
+            let previews = RefCell::new(Vec::new());
+            let calls = RefCell::new(0);
+            let answer = run_document_reading(
+                &plan,
+                settings,
+                transport,
+                &CancellationToken::new(),
+                |next, emit| {
+                    *calls.borrow_mut() += 1;
+                    assert_eq!(next.endpoint, plan.endpoint);
+                    if *calls.borrow() == 2 {
+                        assert_eq!(
+                            previews.borrow().as_slice(),
+                            &next
+                                .parts
+                                .iter()
+                                .map(|p| p.wire_body.clone().unwrap())
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                    for p in &next.parts {
+                        if transport == ChatTransport::Responses {
+                            let payload: Value =
+                                serde_json::from_str(p.wire_body.as_deref().unwrap()).unwrap();
+                            assert!(payload["input"].is_array());
+                            assert_eq!(payload["store"], false);
+                        }
+                        emit(RunEvent::PartStarted {
+                            index: p.index,
+                            total: p.total,
+                            label: p.label.clone(),
+                        });
+                        emit(RunEvent::Delta("Synthetic completed reading [p.1]".into()));
+                    }
+                    emit(RunEvent::Done);
+                    Ok(())
+                },
+                &mut |event| {
+                    if let ReadingUpdate::Combining { payloads } = event {
+                        *previews.borrow_mut() = payloads;
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(*calls.borrow(), 2);
+            assert_eq!(answer, "Synthetic completed reading [p.1]");
+        }
     }
     #[test]
     fn incomplete_parts_and_cancellation_never_start_consolidation() {

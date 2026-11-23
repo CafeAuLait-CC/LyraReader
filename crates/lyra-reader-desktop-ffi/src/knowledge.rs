@@ -1,6 +1,6 @@
 //! Optional reading lane. The portable AI policy owns multipart completeness and
 //! consolidation. Provider I/O never occupies the foreground assistant's handle.
-use crate::document::DesktopDocument;
+use crate::document::{DesktopDocument, chatgpt_account};
 use crate::document_cache::{DocumentCache, atomic_write, read_optional_bounded};
 use fs2::FileExt;
 use lyra_reader_ai::chat::{ChatTransport, ReasoningEncoding, ReasoningMode};
@@ -42,6 +42,7 @@ pub(super) struct Knowledge {
     token: String,
     phase: &'static str,
     plan: Option<AiPlanRecord>,
+    account: Option<String>,
     settings: Option<ChatSettings>,
     source_hash: String,
     cache: Option<DocumentCache>,
@@ -59,6 +60,7 @@ impl Default for Knowledge {
             token: String::new(),
             phase: "idle",
             plan: None,
+            account: None,
             settings: None,
             source_hash: String::new(),
             cache: None,
@@ -73,13 +75,25 @@ impl Default for Knowledge {
     }
 }
 impl Knowledge {
+    fn reviewed_plan(&self) -> Result<Value, String> {
+        let mut plan = serde_json::to_value(&self.plan).map_err(|e| e.to_string())?;
+        if let Some(account) = &self.account
+            && plan.is_object()
+        {
+            plan["chatgpt_account"] = json!(account);
+        }
+        Ok(plan)
+    }
     fn view(&self) -> Result<Value, String> {
         self.status(true)
     }
     fn status(&self, include_plan: bool) -> Result<Value, String> {
         let mut result = json!({"phase":self.phase,"token":self.token,"ready":self.record.is_some() || self.understanding.is_some(),"message":self.message,"cache_warning":self.cache_error,"merge_payloads":self.merge_payloads});
+        if let Some(account) = &self.account {
+            result["chatgpt_account"] = json!(account);
+        }
         if include_plan {
-            result["plan"] = serde_json::to_value(&self.plan).map_err(|e| e.to_string())?;
+            result["plan"] = self.reviewed_plan()?;
         }
         if let Some(job) = &self.job {
             let p = job
@@ -96,6 +110,7 @@ impl Knowledge {
         self.token = crate::marks::uuid()?;
         self.job = None;
         self.plan = None;
+        self.account = None;
         self.settings = None;
         self.phase = "idle";
         self.merge_payloads.clear();
@@ -185,7 +200,11 @@ impl DesktopDocument {
             .map_err(|_| "Annotation state is unavailable")?;
         Ok((self.active()?, marks.cache_location()?.clone()))
     }
-    fn prepare_reading(&self, request: Option<AiPlanRequestRecord>) -> Result<Value, String> {
+    fn prepare_reading(
+        &self,
+        request: Option<AiPlanRequestRecord>,
+        account: Option<String>,
+    ) -> Result<Value, String> {
         let token = crate::marks::uuid()?;
         {
             let mut state = self
@@ -235,13 +254,21 @@ impl DesktopDocument {
                     request.document_knowledge = true;
                     request.document_knowledge_text = None;
                     request.document_knowledge_pages.clear();
-                    let plan = render_ai_plan(
-                        active
-                            .prepare_ai_plan(request.clone())
-                            .map_err(|e| e.to_string())?,
-                        AiWireTransport::ChatCompletions,
-                    )
-                    .map_err(|e| e.to_string())?;
+                    if account.is_some() {
+                        request.base_url = "https://api.openai.com/v1".into();
+                        request.reasoning_mode = "default".into();
+                        request.reasoning_encoding = "none".into();
+                    }
+                    let plan = active
+                        .prepare_ai_plan(request.clone())
+                        .and_then(|plan| {
+                            if account.is_some() {
+                                render_chatgpt_plan(plan)
+                            } else {
+                                render_ai_plan(plan, AiWireTransport::ChatCompletions)
+                            }
+                        })
+                        .map_err(|e| e.to_string())?;
                     let settings = ChatSettings {
                         base_url: plan.base_url.clone(),
                         model: plan.model.clone(),
@@ -299,6 +326,7 @@ impl DesktopDocument {
                 state.record = record;
                 state.understanding = understanding;
                 state.cache_error = error;
+                state.account = if plan.is_some() { account } else { None };
                 state.plan = plan;
                 state.settings = settings;
             }
@@ -320,16 +348,31 @@ impl DesktopDocument {
         if state.phase != "preview"
             || state.source_hash != hash
             || r["token"].as_str() != Some(&state.token)
-            || serde_json::to_value(&state.plan).map_err(|e| e.to_string())? != *expected
+            || &state.reviewed_plan()? != expected
         {
             return Err(
                 "The document reading preview changed. Preview before reading again.".into(),
             );
         }
-        let key = r["api_key"]
+        if chatgpt_account(r)? != state.account.as_deref() {
+            return Err(
+                "The ChatGPT connection changed. Preview the document reading again.".into(),
+            );
+        }
+        let use_chatgpt = state.account.is_some();
+        let credential = if use_chatgpt {
+            "chatgpt_access_token"
+        } else {
+            "api_key"
+        };
+        let key = r[credential]
             .as_str()
             .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
-            .ok_or("A valid API key is required to start document reading")?
+            .ok_or(if use_chatgpt {
+                "Sign in to ChatGPT before starting document reading"
+            } else {
+                "A valid API key is required to start document reading"
+            })?
             .to_owned();
         let plan = state
             .plan
@@ -368,17 +411,31 @@ impl DesktopDocument {
                     run_document_reading(
                         &chat,
                         settings,
-                        ChatTransport::ChatCompletions,
+                        if use_chatgpt {
+                            ChatTransport::Responses
+                        } else {
+                            ChatTransport::ChatCompletions
+                        },
                         &worker_cancel,
                         |plan, emit| {
                             worker_cancel.check()?;
-                            lyra_reader_ai::openai::run_plan_audited(
-                                plan,
-                                &key,
-                                &worker_cancel,
-                                emit,
-                                Arc::clone(&audit),
-                            )
+                            if use_chatgpt {
+                                lyra_reader_ai::openai::run_chatgpt_plan_audited(
+                                    plan,
+                                    &key,
+                                    &worker_cancel,
+                                    emit,
+                                    Arc::clone(&audit),
+                                )
+                            } else {
+                                lyra_reader_ai::openai::run_plan_audited(
+                                    plan,
+                                    &key,
+                                    &worker_cancel,
+                                    emit,
+                                    Arc::clone(&audit),
+                                )
+                            }
                         },
                         &mut |update| match worker_progress.lock() {
                             Ok(mut p) => match update {
@@ -532,9 +589,10 @@ impl DesktopDocument {
     }
     pub(super) fn knowledge_command(&self, op: &str, r: &Value) -> Result<Value, String> {
         match op {
-            "knowledge_load" => self.prepare_reading(None),
+            "knowledge_load" => self.prepare_reading(None, None),
             "knowledge_prepare" => {
-                self.prepare_reading(Some(crate::region::request(r["request"].clone())?))
+                let account = chatgpt_account(&r["request"])?.map(str::to_owned);
+                self.prepare_reading(Some(crate::region::request(r["request"].clone())?), account)
             }
             "knowledge_start" => self.start_reading(r),
             "knowledge_poll" => self.poll_reading(),
@@ -725,6 +783,50 @@ mod tests {
             );
             assert_eq!(fs::read(f.file()).unwrap(), before);
         }
+    }
+    #[test]
+    fn chatgpt_reading_requires_the_same_reviewed_connection_before_provider_work() {
+        let f = Fixture::new();
+        let mut request = input();
+        request["chatgpt_account"] = json!("synthetic-reading-account");
+        let preview = f
+            .doc
+            .command(json!({"op":"knowledge_prepare","request":request}))
+            .unwrap();
+        assert_eq!(preview["phase"], "preview");
+        assert_eq!(
+            preview["plan"]["chatgpt_account"],
+            "synthetic-reading-account"
+        );
+        assert_eq!(
+            preview["plan"]["endpoint"],
+            lyra_reader_ai::openai::CHATGPT_RESPONSES_ENDPOINT
+        );
+        let payload: Value =
+            serde_json::from_str(preview["plan"]["parts"][0]["wire_body"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(payload["store"], false);
+        assert!(payload["input"].is_array());
+        let mut start = json!({
+            "op":"knowledge_start","plan":preview["plan"],"token":preview["token"],
+            "chatgpt_account":"another-account","api_key":"synthetic-api-key"
+        });
+        assert!(
+            f.doc
+                .command(start.clone())
+                .unwrap_err()
+                .contains("connection changed")
+        );
+        start["chatgpt_account"] = json!("synthetic-reading-account");
+        assert!(
+            f.doc
+                .command(start)
+                .unwrap_err()
+                .contains("Sign in to ChatGPT")
+        );
+        let state = f.doc.command(json!({"op":"knowledge_cancel"})).unwrap();
+        assert_eq!(state["phase"], "idle");
+        assert!(!f.file().exists());
     }
     #[test]
     fn changed_source_and_stopped_epochs_cannot_publish_or_start_stale_plans() {
