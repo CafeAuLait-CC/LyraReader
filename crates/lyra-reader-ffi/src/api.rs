@@ -3871,7 +3871,9 @@ impl LyraReaderDocument {
     ) -> Result<AiPlanRecord, LyraReaderFfiError> {
         self.prepare_ai_plan_inner(request, Some(options))
     }
+}
 
+impl LyraReaderDocument {
     fn prepare_ai_plan_inner(
         &self,
         request: AiPlanRequestRecord,
@@ -4165,7 +4167,10 @@ impl LyraReaderDocument {
         };
         Ok(ai_plan_record(plan))
     }
+}
 
+#[uniffi::export]
+impl LyraReaderDocument {
     /// Inspect one layered-summary level without building prompts or wire bodies. The panel
     /// calls this when it opens: every unit returns the hash of exactly the text it would send,
     /// so a cached summary can be matched (or marked stale) with no request.
