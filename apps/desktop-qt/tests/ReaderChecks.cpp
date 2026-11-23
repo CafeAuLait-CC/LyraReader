@@ -6534,16 +6534,26 @@ private slots:
         reader.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/alpha-crop.pdf"));
         QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
         QTest::qWait(150); // Let the initial layout and saved-position restore finish.
-        auto *view=window->findChild<QObject *>("pageList");QVERIFY(view);
+        auto *view=visualItem(window->contentItem(),"pageList");QVERIFY(view);
         window->setProperty("fitting",false);
         QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,3.7),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
         QTest::qWait(100);
-        view->setProperty("contentX",1200.0);view->setProperty("contentY",640.0);
-        QTRY_COMPARE(view->property("contentX").toDouble(),1200.0);
         const auto refined=[&] {const auto *page=visualItem(window->contentItem(),"pdfPage0");return page && page->property("refined").toBool() && page->property("loadedTileCount").toInt()>0;};
-        QTRY_VERIFY_WITH_TIMEOUT(refined(),10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingRasters(),0,10000);QTest::qWait(100);
-        auto *page=visualItem(window->contentItem(),"pdfPage0");QVERIFY(page);
+        QTRY_VERIFY(visualItem(window->contentItem(),"pdfPage0"));
+        auto *page=visualItem(window->contentItem(),"pdfPage0");
         const double zoom=window->property("zoom").toDouble();
+        // Qt can clamp zoom differently at each DPR. Pan from the actual page
+        // geometry so the sampled patch and its tile seams land inside the viewport.
+        const auto patchStart=page->mapToScene(QPointF(416*zoom,200*zoom));
+        const auto delta=patchStart-view->mapToScene(QPointF(40,100));
+        view->setProperty("contentX",view->property("contentX").toDouble()+delta.x());
+        view->setProperty("contentY",view->property("contentY").toDouble()+delta.y());
+        QTRY_VERIFY_WITH_TIMEOUT(refined(),10000);QTRY_COMPARE_WITH_TIMEOUT(reader.pendingRasters(),0,10000);QTest::qWait(100);
+        page=visualItem(window->contentItem(),"pdfPage0");QVERIFY(page);
+        const auto first=page->mapToScene(QPointF(416*zoom,200*zoom));
+        const auto last=page->mapToScene(QPointF(520*zoom,200*zoom));
+        const auto visible=view->mapRectToScene(QRectF(0,0,view->width(),view->height()));
+        QVERIFY2(visible.contains(first) && visible.contains(last),"The whole sample line must be inside the PDF viewport");
         const double native=zoom*window->effectiveDevicePixelRatio();const int level=int(std::ceil(std::log2(native)*4));
         const auto tiles=reader.requestTiles(1,0,level,QRectF(400,180,130,70),{});QVERIFY(!tiles.isEmpty());
         QTRY_COMPARE_WITH_TIMEOUT(reader.pendingRasters(),0,10000);
@@ -6552,9 +6562,16 @@ private slots:
         reader.clearTileDemand(1);
         const auto checkBlack=[&](const QImage &frame,const QColor &expected) {
             const double sx=double(frame.width())/window->width(),sy=double(frame.height())/window->height();
-            int count=0;
-            for(int x=416;x<=520;x+=2){const auto p=page->mapToScene(QPointF(x*zoom,200*zoom));const int px=qRound(p.x()*sx),py=qRound(p.y()*sy);if(px<0 || py<0 || px>=frame.width() || py>=frame.height())continue;const auto color=frame.pixelColor(px,py);if(qAbs(color.red()-expected.red())>3 || qAbs(color.green()-expected.green())>3 || qAbs(color.blue()-expected.blue())>3)return false;++count;}
-            return count>=10;
+            const int start=qCeil(first.x()*sx),end=qFloor(last.x()*sx),row=qRound(first.y()*sy);
+            if(start<0 || end>=frame.width() || row<0 || row>=frame.height() || end-start<10)return false;
+            for(int x=start;x<=end;++x) {
+                const auto color=frame.pixelColor(x,row);
+                if(qAbs(color.red()-expected.red())>3 || qAbs(color.green()-expected.green())>3 || qAbs(color.blue()-expected.blue())>3) {
+                    qInfo()<<"Deep zoom patch mismatch at device pixel"<<QPoint(x,row)<<"for scale"<<native<<color;
+                    return false;
+                }
+            }
+            return true;
         };
         const auto original=window->grabWindow();QVERIFY2(checkBlack(original,QColor(0,0,0)),"The black patch must stay solid across tile boundaries");
         const auto completed=reader.completedRasters();window->setProperty("paperAppearance","night");QTest::qWait(150);
