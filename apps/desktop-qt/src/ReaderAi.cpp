@@ -359,6 +359,7 @@ void ReaderController::invalidateAiPlan() {
     const bool hadPreview=m_aiPreviewId || m_aiState.contains(QStringLiteral("plan")) || m_regionContinuationPending;
     m_regionContinuationPending=false;m_regionContinuationSettings.clear();
     ++m_aiPreviewEpoch;m_aiPreviewId=0;m_aiState.remove(QStringLiteral("plan"));
+    m_aiState.remove(QStringLiteral("previewChatGptAccount"));
     m_summaryBatchPreparedToken.clear();
     m_translationPreparedToken.clear();if(m_document)lyra_reader_desktop_cancel_translation(m_document.get());
     if(m_translationActive){cancelInplaceTranslation();return;}
@@ -565,6 +566,7 @@ void ReaderController::prepareAi(const QVariantMap &request,const QVariantMap &u
     m_aiState.insert(QStringLiteral("previewSelection"),reading.isEmpty()?QVariant{}:input.value(QStringLiteral("selection")));
     m_aiState.insert(QStringLiteral("planSent"),false);
     m_aiState.insert(QStringLiteral("previewView"),previewView);
+    m_aiState.insert(QStringLiteral("previewChatGptAccount"),input.value(QStringLiteral("chatgpt_account")));
     if(previewView==QStringLiteral("note"))m_aiState.remove(QStringLiteral("noteSuggestion"));
     m_aiState.insert(QStringLiteral("statusView"),m_aiState.value(QStringLiteral("previewView")));
     m_aiState.remove(QStringLiteral("plan"));m_aiState.insert(QStringLiteral("status"),tr("Preparing request locally…"));
@@ -622,7 +624,13 @@ bool ReaderController::startAi(const QString &key,const QVariantMap &expectedPla
     m_aiState.insert(QStringLiteral("status"),tr("Starting request…"));
     m_aiState.insert(QStringLiteral("activeHost"),plan.value(QStringLiteral("host")));
     m_aiState.insert(QStringLiteral("activeModel"),plan.value(QStringLiteral("model")));
-    QVariantMap args{{QStringLiteral("plan"),plan},{QStringLiteral("api_key"),key}};
+    QVariantMap args{{QStringLiteral("plan"),plan}};
+    if(plan.contains(QStringLiteral("chatgpt_account"))) {
+        args.insert(QStringLiteral("chatgpt_account"),plan.value(QStringLiteral("chatgpt_account")));
+        args.insert(QStringLiteral("chatgpt_access_token"),key);
+    } else {
+        args.insert(QStringLiteral("api_key"),key);
+    }
     if(action==QStringLiteral("DocumentChat")) {
         m_chatDraftTimer.stop();
         m_aiState.insert(QStringLiteral("activeChatDraft"),chatDraft());

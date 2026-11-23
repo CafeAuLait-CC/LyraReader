@@ -227,6 +227,96 @@ ApplicationWindow {
                     text: qsTr("Remove Saved Key")
                     onClicked: app.removeAiCredential(baseUrl.text)
                 }
+                ColumnLayout {
+                    id: chatGptSettings
+                    readonly property var accounts: app.session ? app.session.chatGptAccounts : null
+                    readonly property var selected: accounts ?
+                        accounts.accounts.find(entry => entry.id === accounts.accountId) : null
+                    visible: !!accounts
+                    Layout.topMargin: 12
+                    Layout.fillWidth: true
+                    Label {
+                        text: qsTr("ChatGPT plan")
+                        font.weight: Font.DemiBold
+                        textFormat: Text.PlainText
+                    }
+                    ComboBox {
+                        Layout.fillWidth: true
+                        visible: count > 0
+                        model: chatGptSettings.accounts ? chatGptSettings.accounts.accounts : []
+                        textRole: "label"
+                        valueRole: "id"
+                        currentIndex: chatGptSettings.accounts ? indexOfValue(chatGptSettings.accounts.accountId) : -1
+                        enabled: !!chatGptSettings.accounts && !chatGptSettings.accounts.busy
+                        Accessible.name: qsTr("ChatGPT account")
+                        onActivated: chatGptSettings.accounts.selectAccount(currentValue)
+                    }
+                    Label {
+                        visible: text.length > 0
+                        Layout.fillWidth: true
+                        text: chatGptSettings.selected ? chatGptSettings.selected.email || "" : ""
+                        textFormat: Text.PlainText
+                        elide: Text.ElideMiddle
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Button {
+                            objectName: "continueWithChatGpt"
+                            text: qsTr("Continue with ChatGPT")
+                            enabled: !!chatGptSettings.accounts && !chatGptSettings.accounts.busy
+                            onClicked: chatGptSettings.accounts.beginSignIn(false)
+                        }
+                        Button {
+                            text: qsTr("Add Account")
+                            visible: !!chatGptSettings.selected
+                            enabled: !!chatGptSettings.accounts && !chatGptSettings.accounts.busy
+                            onClicked: chatGptSettings.accounts.beginSignIn(true)
+                        }
+                    }
+                    Button {
+                        text: qsTr("Cancel Sign-In")
+                        visible: !!chatGptSettings.accounts && chatGptSettings.accounts.signingIn
+                        onClicked: chatGptSettings.accounts.cancelSignIn()
+                    }
+                    ComboBox {
+                        Layout.fillWidth: true
+                        model: chatGptSettings.accounts ? chatGptSettings.accounts.models : []
+                        textRole: "name"
+                        valueRole: "id"
+                        currentIndex: chatGptSettings.accounts ? indexOfValue(chatGptSettings.accounts.model) : -1
+                        visible: count > 0
+                        enabled: !!chatGptSettings.accounts && !chatGptSettings.accounts.busy
+                        Accessible.name: qsTr("ChatGPT model")
+                        onActivated: chatGptSettings.accounts.selectModel(currentValue)
+                    }
+                    CheckBox {
+                        Layout.fillWidth: true
+                        text: qsTr("Use ChatGPT plan for document chat")
+                        checked: !!chatGptSettings.accounts && chatGptSettings.accounts.useForChat
+                        enabled: !!chatGptSettings.accounts && !chatGptSettings.accounts.busy &&
+                            (checked || (chatGptSettings.accounts.connected && !!chatGptSettings.accounts.model))
+                        onToggled: chatGptSettings.accounts.useForChat = checked
+                    }
+                    RowLayout {
+                        Button {
+                            text: qsTr("Sign Out")
+                            visible: !!chatGptSettings.accounts && chatGptSettings.accounts.connected
+                            enabled: !!chatGptSettings.accounts && !chatGptSettings.accounts.busy
+                            onClicked: chatGptSettings.accounts.signOut()
+                        }
+                        Button {
+                            text: qsTr("Manage Usage")
+                            onClicked: Qt.openUrlExternally("https://chatgpt.com/settings/usage")
+                        }
+                    }
+                    Label {
+                        visible: text.length > 0
+                        text: chatGptSettings.accounts ? chatGptSettings.accounts.status : ""
+                        textFormat: Text.PlainText
+                        Layout.fillWidth: true
+                        wrapMode: Text.Wrap
+                    }
+                }
             }
         }
 

@@ -36,6 +36,9 @@ use ureq::unversioned::transport::{
 use crate::chat::{ChatPart, ChatPlan};
 use crate::provider::{AiError, AiFailure};
 
+mod responses;
+pub use responses::{CHATGPT_RESPONSES_ENDPOINT, run_chatgpt_plan_audited};
+
 /// Default time allowed to establish a connection.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default time with no bytes received before the request is considered stalled.
@@ -572,16 +575,30 @@ impl Transport for UreqTransport {
     ) -> Result<Box<dyn ResponseStream>, AiError> {
         cancel.check()?;
         let agent = self.make_agent(cancel);
-        let mut request = agent.post(&spec.url);
-        for (name, value) in &spec.headers {
-            request = request.header(name.as_str(), value.as_str());
+        if !matches!(spec.method, "GET" | "POST") || spec.method == "GET" && !spec.body.is_empty() {
+            return Err(AiError::InvalidSettings(
+                "Invalid HTTP request method or body.".into(),
+            ));
         }
         // `http_status_as_error(false)` above is what makes a 401 body readable instead of an
         // opaque status error.
         if let Some(audit) = &self.audit {
             audit.started()?;
         }
-        let response = match request.send(&spec.body) {
+        let result = if spec.method == "GET" {
+            let mut request = agent.get(&spec.url);
+            for (name, value) in &spec.headers {
+                request = request.header(name.as_str(), value.as_str());
+            }
+            request.call()
+        } else {
+            let mut request = agent.post(&spec.url);
+            for (name, value) in &spec.headers {
+                request = request.header(name.as_str(), value.as_str());
+            }
+            request.send(&spec.body)
+        };
+        let response = match result {
             Ok(response) => response,
             Err(error) => {
                 let error = map_ureq_error(error, cancel, spec.is_local);
@@ -1424,13 +1441,24 @@ pub fn run_plan_audited(
             "The endpoint must use http:// or https://.".into(),
         ));
     }
+    run_audited_transport(cancel, emit, audit, |transport, output| {
+        run_plan_with_transport(plan, api_key, transport, cancel, output)
+    })
+}
+
+fn run_audited_transport(
+    cancel: &CancellationToken,
+    emit: &mut dyn FnMut(RunEvent),
+    audit: Arc<dyn RequestAudit>,
+    run: impl FnOnce(&UreqTransport, &mut dyn FnMut(RunEvent)) -> Result<(), AiError>,
+) -> Result<(), AiError> {
     let transport = UreqTransport {
         config: ClientConfig::default(),
         roots: system_roots(),
         audit: Some(Arc::clone(&audit)),
     };
     let mut audit_error = None;
-    let outcome = run_plan_with_transport(plan, api_key, &transport, cancel, &mut |event| {
+    let outcome = run(&transport, &mut |event| {
         if matches!(event, RunEvent::PartStarted { .. } | RunEvent::Done)
             && let Err(error) = audit.finished(RequestOutcome::Sent)
         {

@@ -40,6 +40,7 @@
 #include <QFontDatabase>
 #include <QDir>
 #include <QDirIterator>
+#include <QDesktopServices>
 #include <QSignalSpy>
 #include <QQmlApplicationEngine>
 #include <QQmlError>
@@ -295,6 +296,8 @@ class ReaderChecks : public QObject {
 public:
     QString root;
     QString graphicsBackend;
+private:
+    QUrl capturedChatGptUrl;
 private slots:
     void initTestCase() {
         QCOMPARE(lyra_reader_desktop_abi_version(),LYRA_READER_DESKTOP_ABI_VERSION);
@@ -303,6 +306,99 @@ private slots:
             QVERIFY(QGuiApplication::platformName() == "wayland" || QGuiApplication::platformName() == "xcb");
         }
         registerReaderTypes();
+    }
+    void captureChatGptUrl(const QUrl &url) {
+        capturedChatGptUrl = url;
+    }
+    void chatGptSignInIsExplicitAndCancellationSavesNoAccount() {
+        NativeCorpus::Viewer view;
+        QVERIFY(view.window);
+        auto *accounts = view.workspace.chatGptAccounts();
+        QVERIFY(accounts);
+        QVERIFY(!accounts->useForChat());
+        QVERIFY(accounts->accounts().isEmpty());
+        capturedChatGptUrl.clear();
+        QDesktopServices::setUrlHandler("https", this, "captureChatGptUrl");
+        const auto cleanup = qScopeGuard([&] {
+            accounts->cancelSignIn();
+            QDesktopServices::unsetUrlHandler("https");
+            capturedChatGptUrl.clear();
+        });
+
+        QVERIFY(QMetaObject::invokeMethod(view.window, "showSettings"));
+        auto *settings = view.window->findChild<QQuickWindow *>("settingsWindow");
+        QVERIFY(settings);
+        QTRY_VERIFY(settings->isVisible());
+        QVERIFY(capturedChatGptUrl.isEmpty());
+        auto *button = settings->findChild<QObject *>("continueWithChatGpt");
+        QVERIFY(button && button->property("enabled").toBool());
+        QVERIFY(QMetaObject::invokeMethod(button, "clicked"));
+        QTRY_VERIFY(accounts->signingIn());
+        QTRY_VERIFY(capturedChatGptUrl.isValid());
+        QCOMPARE(capturedChatGptUrl.scheme(), QString("https"));
+        QCOMPARE(capturedChatGptUrl.host(), QString("auth.openai.com"));
+        QCOMPARE(capturedChatGptUrl.path(), QString("/api/accounts/authorize"));
+        const QUrlQuery query(capturedChatGptUrl);
+        const QUrl callback(query.queryItemValue("redirect_uri", QUrl::FullyDecoded));
+        QCOMPARE(callback.scheme(), QString("http"));
+        QCOMPARE(callback.host(), QString("127.0.0.1"));
+        QVERIFY(callback.port() > 0);
+        QCOMPARE(callback.path(), QString("/auth/callback"));
+        QCOMPARE(query.queryItemValue("code_challenge_method"), QString("S256"));
+        for (const auto &field : {"code_challenge", "state", "nonce"})
+            QVERIFY(!query.queryItemValue(QString::fromLatin1(field)).isEmpty());
+
+        accounts->cancelSignIn();
+        QVERIFY(!accounts->busy());
+        QVERIFY(!accounts->useForChat());
+        QVERIFY(accounts->accounts().isEmpty());
+        QVERIFY(settings->close());
+    }
+    void chatGptPreviewCannotFallBackToANonChatGptConnection() {
+        QTemporaryDir scratch;
+        QVERIFY(scratch.isValid());
+        const auto path = scratch.filePath("synthetic-chatgpt.pdf");
+        QVERIFY(QFile::copy(root + "/tests/fixtures/text-page.pdf", path));
+        NativeCorpus::Viewer view;
+        QVERIFY(view.window);
+        view.workspace.openFile(QUrl::fromLocalFile(path));
+        auto *reader = view.workspace.activeReader();
+        QTRY_COMPARE(reader->pageCount(), 1);
+        QTRY_COMPARE(reader->pendingCommands(), 0);
+        QVERIFY(!view.workspace.chatGptAccounts()->connected());
+        const QString accountId = "synthetic-registration-id";
+        reader->prepareAi({{"action", "DocumentChat"}, {"current_page", 0},
+                          {"question", "What is in this synthetic document?"},
+                          {"base_url", "http://127.0.0.1:1/v1"}, {"model", "synthetic-model"},
+                          {"chatgpt_account", accountId}, {"document_knowledge", false},
+                          {"document_knowledge_pages", QVariantList{}},
+                          {"reasoning_mode", "default"}, {"reasoning_encoding", "none"}});
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(), 0, 10000);
+        const auto state = reader->aiState();
+        const auto plan = state.value("plan").toMap();
+        QVERIFY2(!plan.isEmpty(), qPrintable(state.value("status").toString()));
+        QCOMPARE(plan.value("endpoint").toString(), QString("https://api.openai.com/v1/responses"));
+        QCOMPARE(plan.value("chatgpt_account").toString(), accountId);
+        QVERIFY(!plan.value("is_local").toBool());
+        const auto parts = plan.value("parts").toList();
+        QCOMPARE(parts.size(), 1);
+        const auto body = QJsonDocument::fromJson(parts.first().toMap().value("wire_body").toString().toUtf8()).object();
+        QCOMPARE(body.value("model").toString(), QString("synthetic-model"));
+        QVERIFY(body.value("stream").toBool());
+        QVERIFY(body.value("store").isBool() && !body.value("store").toBool());
+        QVERIFY(body.value("input").isArray());
+
+        QVERIFY(QMetaObject::invokeMethod(view.window, "sendAi", Q_ARG(QVariant, QVariant::fromValue(reader)),
+                                         Q_ARG(QVariant, plan), Q_ARG(QVariant, QString()),
+                                         Q_ARG(QVariant, QString())));
+        QCOMPARE(view.window->property("credentialReadId").toDouble(), -1.0);
+        QVERIFY(view.window->property("operationStatus").toString().contains("Check the ChatGPT connection"));
+        QVERIFY(!reader->aiState().value("running").toBool());
+
+        auto *accounts = view.workspace.chatGptAccounts();
+        QVERIFY(QMetaObject::invokeMethod(accounts, "profileChanged"));
+        QVERIFY(!reader->aiState().contains("plan"));
+        QVERIFY(!reader->aiState().contains("previewChatGptAccount"));
     }
     void objectDragKeepsTheColourBehindTransparentPixels() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("alpha-drag.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;window->setProperty("paperAppearance","original");view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(!reader->loading() && reader->pageCount()==1 && !reader->pendingCommands());QVERIFY(QMetaObject::invokeMethod(window,"setSecondaryRow",Q_ARG(QVariant,"edit"),Q_ARG(QVariant,false)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(settleReaderViewport(window));const auto model=reader->data().value("content_objects").toMap();QVariantMap title;for(const auto &v:model.value("items").toList())if(v.toMap().value("text").toString().contains("LyraReader fixture")){title=v.toMap();break;}QVERIFY(!title.isEmpty());const auto b=title.value("bounds").toMap();const QRectF bounds(b.value("x").toDouble(),b.value("y").toDouble(),b.value("width").toDouble(),b.value("height").toDouble());auto *drag=window->findChild<ContentDragItem *>("contentDragPreview");auto *pointer=visualItem(window->contentItem(),"contentPointer0");QVERIFY(drag && pointer);const auto colour=[&]{const auto image=window->grabWindow();if(image.isNull())return QColor();const auto p=pointer->mapToScene(QPointF(371,261)*window->property("zoom").toDouble());return image.pixelColor(qRound(p.x()*image.width()/window->width()),qRound(p.y()*image.height()/window->height()));};QTRY_VERIFY(colour().red()>100 && colour().green()<150);const auto original=colour();drag->prepare(0,title.value("id").toString(),model.value("revision").toString(),bounds);const auto region=bounds.adjusted(-2,-2,2,2);drag->setOffset(QPointF(370-region.x(),260-region.y()));QTRY_COMPARE_WITH_TIMEOUT(drag->status(),1,15000);QTest::qWait(100);const auto painted=colour();qInfo()<<"Transparent drag sample"<<original<<painted;QVERIFY2(qAbs(painted.red()-original.red())<6 && qAbs(painted.green()-original.green())<6 && qAbs(painted.blue()-original.blue())<6,"Transparent margins must preserve the coloured page below the dragged object");drag->cancel();QVERIFY(!reader->hasUnsavedChanges());

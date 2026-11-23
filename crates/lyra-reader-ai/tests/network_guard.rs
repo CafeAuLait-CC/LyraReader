@@ -50,6 +50,21 @@ const ALLOWED_SITES: &[AllowedSite] = &[
         count: 1,
     },
     AllowedSite {
+        path: "crates/lyra-reader-ai/src/openai.rs",
+        marker: "agent.get(",
+        count: 1,
+    },
+    AllowedSite {
+        path: "crates/lyra-reader-ai/src/chatgpt_sign_in/loopback.rs",
+        marker: "TcpListener",
+        count: 3,
+    },
+    AllowedSite {
+        path: "crates/lyra-reader-ai/src/chatgpt_sign_in/loopback.rs",
+        marker: "TcpStream",
+        count: 3,
+    },
+    AllowedSite {
         path: "apps/macos/Sources/LyraReaderKit/ChatGPTResponses.swift",
         marker: "URLRequest(",
         count: 1,
@@ -97,6 +112,7 @@ const NETWORK_MARKERS: &[&str] = &[
     "session.data(",
     "session.bytes(for:",
     "agent.post(",
+    "agent.get(",
     "ureq::Agent::with_parts(",
     "DefaultConnector::new()",
     "TcpStream",
@@ -155,6 +171,30 @@ const REQUIRED_LITERALS: &[(&str, &str)] = &[
     (
         "apps/macos/Sources/LyraReaderKit/ChatGPTSignIn.swift",
         "https://auth.openai.com/api/accounts/authorize",
+    ),
+    (
+        "crates/lyra-reader-ai/src/chatgpt_sign_in/mod.rs",
+        "https://auth.openai.com/api/accounts/authorize",
+    ),
+    (
+        "crates/lyra-reader-ai/src/chatgpt_sign_in/service.rs",
+        "https://auth.openai.com/api/accounts/oauth/token",
+    ),
+    (
+        "crates/lyra-reader-ai/src/chatgpt_sign_in/service.rs",
+        "https://auth.openai.com/.well-known/openid-configuration",
+    ),
+    (
+        "crates/lyra-reader-ai/src/chatgpt_sign_in/service.rs",
+        "https://api.openai.com/v1/models",
+    ),
+    (
+        "crates/lyra-reader-ai/src/chatgpt_sign_in/loopback.rs",
+        "Ipv4Addr::LOCALHOST",
+    ),
+    (
+        "crates/lyra-reader-ai/src/openai/responses.rs",
+        "https://api.openai.com/v1/responses",
     ),
 ];
 

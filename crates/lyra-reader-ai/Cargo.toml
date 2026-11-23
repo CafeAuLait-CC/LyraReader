@@ -18,6 +18,11 @@ serde = { version = "1", features = ["derive"] }
 unicode-segmentation = { workspace = true }
 serde_json = { version = "1", features = ["raw_value"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+base64 = "0.23"
+httparse = "1.10"
+percent-encoding = "2.3"
+ring = "0.17"
+subtle = "2.6"
 # The layered summary cache is keyed by a hash of exactly the page text a request sends, so
 # editing one section invalidates that section and nothing else. SHA-256 is already in the
 # workspace through the document layer; using the same digest keeps the key stable.

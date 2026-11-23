@@ -996,6 +996,22 @@ impl DesktopDocument {
             ),
             "ai_preview" => {
                 let mut request = crate::region::request(r["request"].clone())?;
+                if let Some(account) = r["request"]["chatgpt_account"].as_str() {
+                    if account.is_empty()
+                        || account.len() > 128
+                        || request.action != AiActionRecord::DocumentChat
+                        || r.get("reading").is_some()
+                    {
+                        return Err(
+                            "The ChatGPT plan connection requires a document chat preview.".into(),
+                        );
+                    }
+                    request.base_url = "https://api.openai.com/v1".into();
+                    self.enrich_reading(&mut request, &d.document_identity().sha256)?;
+                    let mut plan = value(d.prepare_ai_plan(request).and_then(render_chatgpt_plan))?;
+                    plan["chatgpt_account"] = json!(account);
+                    return Ok(plan);
+                }
                 if r.get("reading").is_some() {
                     let options: AiReadingOptionsRecord = arg(&r, "reading")?;
                     if options.kind == "note" {
@@ -1218,6 +1234,14 @@ impl DesktopDocument {
                     return Err("Stop the summary batch before starting another response.".into());
                 }
                 let plan: AiPlanRecord = arg(&r, "plan")?;
+                let chatgpt_account = r["plan"]["chatgpt_account"].as_str();
+                if chatgpt_account.is_some()
+                    && (chatgpt_account != r["chatgpt_account"].as_str()
+                        || plan.action != AiActionRecord::DocumentChat
+                        || plan.endpoint != lyra_reader_ai::openai::CHATGPT_RESPONSES_ENDPOINT)
+                {
+                    return Err("The ChatGPT connection changed. Preview the request again.".into());
+                }
                 let reading = match (r["plan"]["kind"].as_str(), plan.action) {
                     (_, AiActionRecord::DocumentChat) if r.get("chat").is_some() => {
                         let chat: crate::reading_history::ChatInput = arg(&r, "chat")?;
@@ -1331,8 +1355,16 @@ impl DesktopDocument {
                         .lock()
                         .map_err(|_| "Summary cache state is unavailable")?
                         .start(&d, &plan)?;
-                    start_ai_request_audited(plan, text(&r, "api_key")?, false, Some(audit))
-                        .map_err(|e| e.to_string())?
+                    if chatgpt_account.is_some() {
+                        start_chatgpt_request_audited(
+                            plan,
+                            text(&r, "chatgpt_access_token")?,
+                            audit,
+                        )
+                    } else {
+                        start_ai_request_audited(plan, text(&r, "api_key")?, false, Some(audit))
+                    }
+                    .map_err(|e| e.to_string())?
                 };
                 let mut current = self.ai.lock().map_err(|_| "AI state is unavailable")?;
                 if let Some(old) = current.replace(DesktopAiRequest {

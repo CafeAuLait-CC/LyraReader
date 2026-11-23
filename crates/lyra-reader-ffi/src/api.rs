@@ -9425,6 +9425,52 @@ pub fn start_ai_request_audited(
         });
     }
     let plan = chat_plan_from_record(plan)?;
+    start_ai_worker(move |cancel, emit| {
+        if use_mock_provider {
+            MockProvider::preset().run(&plan, cancel, emit)
+        } else if let Some(audit) = audit {
+            lyra_reader_ai::openai::run_plan_audited(&plan, &api_key, cancel, emit, audit)
+        } else {
+            run_plan(&plan, &api_key, cancel, emit)
+        }
+    })
+}
+
+/// Prepare the fixed ChatGPT endpoint without exposing a new UniFFI command.
+pub fn render_chatgpt_plan(mut plan: AiPlanRecord) -> Result<AiPlanRecord, LyraReaderFfiError> {
+    plan.base_url = "https://api.openai.com/v1".into();
+    plan.endpoint = lyra_reader_ai::openai::CHATGPT_RESPONSES_ENDPOINT.into();
+    plan.host = "api.openai.com".into();
+    plan.is_local = false;
+    plan.temperature = None;
+    plan.max_tokens = None;
+    plan.stream = true;
+    plan.include_stream_options = false;
+    plan.reasoning_field = None;
+    plan.reasoning_value = None;
+    render_ai_plan(plan, AiWireTransport::Responses)
+}
+
+/// Accept a token only on the separately validated Responses path.
+pub fn start_chatgpt_request_audited(
+    plan: AiPlanRecord,
+    access_token: String,
+    audit: Arc<dyn lyra_reader_ai::openai::RequestAudit>,
+) -> Result<Arc<LyraReaderAiRequest>, LyraReaderFfiError> {
+    let plan = chat_plan_from_record(plan)?;
+    start_ai_worker(move |cancel, emit| {
+        lyra_reader_ai::openai::run_chatgpt_plan_audited(&plan, &access_token, cancel, emit, audit)
+    })
+}
+
+fn start_ai_worker(
+    run: impl FnOnce(
+        &lyra_reader_ai::openai::CancellationToken,
+        &mut dyn FnMut(RunEvent),
+    ) -> Result<(), lyra_reader_ai::AiError>
+    + Send
+    + 'static,
+) -> Result<Arc<LyraReaderAiRequest>, LyraReaderFfiError> {
     let job = Arc::new(AiJob::default());
     let worker_job = Arc::clone(&job);
     std::thread::Builder::new()
@@ -9432,19 +9478,7 @@ pub fn start_ai_request_audited(
         .spawn(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut emit = |event: RunEvent| worker_job.push_event(event);
-                if use_mock_provider {
-                    MockProvider::preset().run(&plan, &worker_job.cancel, &mut emit)
-                } else if let Some(audit) = audit {
-                    lyra_reader_ai::openai::run_plan_audited(
-                        &plan,
-                        &api_key,
-                        &worker_job.cancel,
-                        &mut emit,
-                        audit,
-                    )
-                } else {
-                    run_plan(&plan, &api_key, &worker_job.cancel, &mut emit)
-                }
+                run(&worker_job.cancel, &mut emit)
             }));
             match outcome {
                 Ok(Ok(())) => {}

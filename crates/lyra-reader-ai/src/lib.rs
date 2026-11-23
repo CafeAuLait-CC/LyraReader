@@ -7,6 +7,7 @@
 //! See `docs/06-ai.md` for details.
 
 pub mod chat;
+pub mod chatgpt_sign_in;
 pub mod citation;
 pub mod knowledge;
 pub mod math;

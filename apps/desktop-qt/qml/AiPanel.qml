@@ -166,7 +166,7 @@ Pane {
     }
     function baseRequest(requestAction) {
         const settings = app.aiSettings;
-        return {
+        const request = {
             action: requestAction,
             document_knowledge: false, document_knowledge_text: null, document_knowledge_pages: [],
             history: [], region: null, current_page: app.currentPage,
@@ -177,6 +177,15 @@ Pane {
             temperature: null, max_tokens: null,
             reasoning_mode: settings.reasoningMode || "default", reasoning_encoding: settings.reasoningEncoding || "none"
         };
+        const accounts = app.session ? app.session.chatGptAccounts : null;
+        if (requestAction === "DocumentChat" && accounts && accounts.useForChat) {
+            request.chatgpt_account = accounts.accountId;
+            request.base_url = "https://api.openai.com/v1";
+            request.model = accounts.model;
+            request.reasoning_mode = "default";
+            request.reasoning_encoding = "none";
+        }
+        return request;
     }
     function prepareUnit(id) {
         owner.prepareSummaryUnit(id, baseRequest("SummarizeDocument"));
@@ -188,6 +197,12 @@ Pane {
         if (batchMode) { prepareBatch(batchState.layer, batchState.offset); return; }
         if (unitMode) { prepareUnit(summaryUnit.id); return; }
         const modes = ["SummarizePage", "SummarizeDocument", "AskSelection", "TranslateSelection", "DocumentChat", "SummarizeSelection"];
+        const accounts = app.session ? app.session.chatGptAccounts : null;
+        if (modes[action] === "DocumentChat" && accounts && accounts.useForChat &&
+                (!accounts.connected || !accounts.model)) {
+            app.operationStatus = qsTr("Sign in and choose a ChatGPT model in Settings.");
+            return;
+        }
         if (workspace === "translation") {
             const request = baseRequest("TranslateSelection");
             if (translateInPlace) { owner.prepareInplaceTranslation(request); return; }
@@ -650,7 +665,13 @@ Pane {
         Label {
             visible: aiPanel.previewReady
             Layout.fillWidth: true; wrapMode: Text.Wrap; textFormat: Text.PlainText
-            text: aiPanel.plan ? (aiPanel.plan.is_local ? qsTr("Local endpoint: %1").arg(aiPanel.plan.host) : qsTr("Remote endpoint: %1").arg(aiPanel.plan.host)) + "\n" + qsTr("%1 request(s), about %2 tokens").arg(aiPanel.plan.parts.length).arg(aiPanel.plan.estimated_tokens) : ""
+            text: {
+                const plan = aiPanel.plan;
+                if (!plan) return "";
+                const connection = plan.chatgpt_account ? qsTr("ChatGPT plan: %1 (%2)").arg(plan.model).arg(plan.host)
+                    : (plan.is_local ? qsTr("Local endpoint: %1") : qsTr("Remote endpoint: %1")).arg(plan.host);
+                return connection + "\n" + qsTr("%1 request(s), about %2 tokens").arg(plan.parts.length).arg(plan.estimated_tokens);
+            }
             color: app.colors.infoFg; font.pixelSize: 11
         }
         RowLayout {

@@ -2,7 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 
-inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 17;
+inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 18;
 
 // Owned Rust allocations: free each Buffer exactly once using buffer_free.
 // Output buffers must be zero initialized; calls do not free previous contents.
@@ -18,6 +18,17 @@ struct LyraReaderDesktopDocument;
 struct LyraReaderRenderSource;
 struct LyraReaderDesktopHistory;
 struct LyraReaderBuffer { std::uint8_t *data; std::size_t len; };
+struct LyraReaderDesktopChatGptAuth;
+// Bind only a local browser callback. Poll 0 while pending, 1 for the one vault
+// result, or 2 for error. Results are never displayed or logged. Free cancels.
+LyraReaderDesktopChatGptAuth *lyra_reader_desktop_chatgpt_auth_begin(
+    const std::uint8_t *data,std::size_t len,LyraReaderBuffer *browserUrl,LyraReaderBuffer *error);
+LyraReaderDesktopChatGptAuth *lyra_reader_desktop_chatgpt_session_begin(
+    const std::uint8_t *data,std::size_t len,LyraReaderBuffer *error);
+// 0: pending, 1: result may contain vault material, 2: failure may include a retry registration ID.
+std::uint32_t lyra_reader_desktop_chatgpt_auth_poll(
+    const LyraReaderDesktopChatGptAuth *auth,LyraReaderBuffer *result,LyraReaderBuffer *error);
+void lyra_reader_desktop_chatgpt_auth_free(LyraReaderDesktopChatGptAuth *auth);
 // Bounded in-memory conversion. Offsets in the returned JSON are UTF-16.
 bool lyra_reader_desktop_math_markup(const std::uint8_t *text,std::size_t len,
     LyraReaderBuffer *output,LyraReaderBuffer *error);

@@ -907,15 +907,20 @@ dependencies = [
 name = "lyra-reader-ai"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "chrono",
+ "httparse",
  "lyra-reader-core",
  "lyra-reader-edit",
+ "percent-encoding",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "unicode-segmentation",
  "ureq",
 ]

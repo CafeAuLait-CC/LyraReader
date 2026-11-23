@@ -1927,6 +1927,11 @@ ApplicationWindow {
     function sendAi(owner, plan, purpose, token) {
         if (!owner || !plan)
             return;
+        if (plan.chatgpt_account) {
+            if (!session || !session.chatGptAccounts.send(owner,plan))
+                operationStatus = qsTr("Check the ChatGPT connection, then Preview and Send again.");
+            return;
+        }
         if (plan.is_local) {
             if (!startPreparedAi(owner,"local",plan,purpose,token || ""))
                 operationStatus = qsTr("The request changed or the document is busy. Preview and Send again.");
@@ -1937,6 +1942,24 @@ ApplicationWindow {
             credentialReadId = session ? session.credentials.read(plan.base_url) : -1;
             if (!session)
                 dialogs.credentialDialog.open();
+        }
+    }
+    Connections {
+        target: root.session ? root.session.chatGptAccounts : null
+        function onChatRequestFailed(reader, message) {
+            if (reader === root.currentReader) root.operationStatus = message;
+        }
+        function onProfileChanged() {
+            if (!root.session) return;
+            for (const tab of root.session.tabs) {
+                const reader = tab.reader;
+                const state = reader.aiState;
+                if (state.running && state.responsePlan && state.responsePlan.chatgpt_account)
+                    reader.cancelAi();
+                if (state.previewView === "chat" && (root.session.chatGptAccounts.useForChat
+                        || state.previewChatGptAccount))
+                    reader.invalidateAiPlan();
+            }
         }
     }
     onAiSettingsChanged: {
