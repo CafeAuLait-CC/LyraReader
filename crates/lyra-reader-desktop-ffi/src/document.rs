@@ -1,5 +1,6 @@
 //! Desktop transport over the same portable Rust control plane the macOS shell uses.
 //! JSON only crosses the narrow C boundary; requests are decoded into typed engine records.
+use lyra_reader_ai::workspace::ReadingRecord;
 use lyra_reader_core::Size;
 use lyra_reader_ffi::api::*;
 use lyra_reader_runtime::{MAX_PAGE_BYTES, PAGE_GAP_PT, bounded_raster_scale};
@@ -49,10 +50,7 @@ struct ReadingSummaryStyle {
 }
 
 enum ReadingOutput {
-    Translation {
-        originals: Vec<String>,
-        pages: Vec<u32>,
-    },
+    Translation(Box<ReadingRecord>),
     Synthesis {
         request: Box<AiMergePlanRequestRecord>,
         style: ReadingSummaryStyle,
@@ -131,9 +129,9 @@ impl ReadingReplies {
         }
     }
 
-    fn publish(self, result: &mut Value) {
+    fn publish(self, result: &mut Value) -> Option<Result<ReadingRecord, String>> {
         if !self.done {
-            return;
+            return None;
         }
         let replies = self.failure.map_or_else(
             || {
@@ -143,22 +141,24 @@ impl ReadingReplies {
             },
             Err,
         );
+        let mut archive = None;
         let (key, warning, payload) = match self.output {
-            ReadingOutput::Translation { originals, pages } => (
+            ReadingOutput::Translation(record) => (
                 "translation_blocks",
                 "translation_warning",
                 replies.map_err(str::to_owned).and_then(|replies| {
                     let rows = lyra_reader_ai::workspace::translation_blocks_from_parts(
-                        &originals,
-                        &pages,
+                        &record.originals,
+                        &record.original_pages,
                         replies.iter().map(String::as_str),
                     )?;
                     if rows.is_empty() || rows.iter().any(|row| row.translation.is_empty()) {
-                        return Err("The response did not translate every requested paragraph.".into());
+                        return Err(
+                            "The response did not translate every requested paragraph.".into()
+                        );
                     }
-                    Ok(Value::Array(rows.into_iter().map(|row| {
-                        json!({"original": row.original, "translation": row.translation, "page": row.page})
-                    }).collect()))
+                    archive = Some(crate::reading_history::complete_translation(*record, &rows));
+                    Ok(crate::reading_history::rows_value(&rows))
                 }),
             ),
             ReadingOutput::Synthesis { mut request, style } => (
@@ -170,8 +170,17 @@ impl ReadingReplies {
                     }
                     let mut plan = value(
                         build_ai_merge_plan(*request)
-                            .and_then(|plan| style_ai_reading_plan(plan, "summary".into(), style.detail, style.language))
-                            .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),
+                            .and_then(|plan| {
+                                style_ai_reading_plan(
+                                    plan,
+                                    "summary".into(),
+                                    style.detail,
+                                    style.language,
+                                )
+                            })
+                            .and_then(|plan| {
+                                render_ai_plan(plan, AiWireTransport::ChatCompletions)
+                            }),
                     )?;
                     plan["kind"] = json!("summary_synthesis");
                     Ok(plan)
@@ -182,6 +191,7 @@ impl ReadingReplies {
             Ok(payload) => result[key] = payload,
             Err(message) => result[warning] = json!(message),
         }
+        archive
     }
 }
 
@@ -871,6 +881,14 @@ impl DesktopDocument {
                 let mut request = crate::region::request(r["request"].clone())?;
                 if r.get("reading").is_some() {
                     let options: AiReadingOptionsRecord = arg(&r, "reading")?;
+                    if let Some(id) = r["reading"]["saved_translation"].as_str() {
+                        if options.kind != "translation" {
+                            return Err(
+                                "A saved translation requires a translation preview.".into()
+                            );
+                        }
+                        self.replay_translation_source(&d, id, &mut request)?;
+                    }
                     let limit = lyra_reader_ai::chat::MAX_SELECTION_CHARS as u64;
                     let selected = request.selection.is_some_and(|range| {
                         range.end >= range.start && u64::from(range.end - range.start) < limit
@@ -902,14 +920,22 @@ impl DesktopDocument {
                         reasoning_mode: request.reasoning_mode.clone(),
                         reasoning_encoding: request.reasoning_encoding.clone(),
                     });
+                    let translation_scope =
+                        translation.then(|| crate::reading_history::TranslationScope {
+                            selection: request.selection,
+                            language: request.language.as_deref().unwrap_or("").to_owned(),
+                            detail: options.detail.clone(),
+                        });
                     let mut plan = value(
                         d.prepare_ai_reading_task(request, options)
                             .and_then(|plan| {
                                 render_ai_plan(plan, AiWireTransport::ChatCompletions)
                             }),
                     )?;
-                    if translation {
+                    if let Some(scope) = translation_scope {
                         plan["kind"] = json!("reading_translation");
+                        plan["reading_scope"] =
+                            serde_json::to_value(scope).map_err(|error| error.to_string())?;
                     } else if let Some(style) = style {
                         plan["kind"] = json!("reading_summary");
                         plan["reading_style"] =
@@ -928,6 +954,8 @@ impl DesktopDocument {
                         .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),
                 )
             }
+            "ai_translation_history" => self.translation_history(&d, arg(&r, "selection")?),
+            "ai_translation_history_entry" => self.translation_history_entry(&d, &text(&r, "id")?),
             "ai_merge_preview" => value(
                 build_ai_merge_plan(arg(&r, "request")?)
                     .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),
@@ -1026,14 +1054,11 @@ impl DesktopDocument {
                 let plan: AiPlanRecord = arg(&r, "plan")?;
                 let reading = match (r["plan"]["kind"].as_str(), plan.action) {
                     (Some("reading_translation"), AiActionRecord::TranslateSelection) => {
-                        Some(ReadingOutput::Translation {
-                            originals: plan
-                                .sources
-                                .iter()
-                                .map(|source| source.snippet.clone())
-                                .collect(),
-                            pages: plan.sources.iter().map(|source| source.page).collect(),
-                        })
+                        let scope: crate::reading_history::TranslationScope =
+                            arg(&r["plan"], "reading_scope")?;
+                        Some(ReadingOutput::Translation(Box::new(
+                            scope.reading_record(&plan, d.document_identity().sha256)?,
+                        )))
                     }
                     (Some("reading_summary"), AiActionRecord::SummarizeDocument)
                         if plan.parts.len() > 1 =>
@@ -1158,8 +1183,11 @@ impl DesktopDocument {
                     drop(current);
                     let mut result =
                         json!({"events":events,"finished":finished,"cache_warning":warning});
-                    if let Some(reading) = reading {
-                        reading.publish(&mut result);
+                    if let Some(archive) = reading.and_then(|reading| reading.publish(&mut result))
+                        && let Err(error) =
+                            archive.and_then(|record| self.archive_translation(&d, record))
+                    {
+                        result["translation_history_warning"] = json!(error);
                     }
                     Ok(result)
                 } else {

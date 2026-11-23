@@ -6,7 +6,7 @@ Pane {
     id: aiPanel
     objectName: "aiPanel"
     required property var app
-    readonly property bool tabTransferDialogVisible: payload.visible || summaryCatalog.popupVisible || selectionSource.visible
+    readonly property bool tabTransferDialogVisible: payload.visible || summaryCatalog.popupVisible || selectionSource.visible || translationHistory.visible
     readonly property var owner: app.currentReader
     readonly property var viewState: owner.aiState
     readonly property var input: viewState.input || ({})
@@ -44,6 +44,7 @@ Pane {
     }
     onVisibleChanged: if (!visible) {
         if (selectionSource) selectionSource.close();
+        if (translationHistory) translationHistory.close();
         pendingLocate = null;
     }
     readonly property var languageGeneration: batchMode ? batchState.generation : summaryUnit.generation
@@ -56,7 +57,7 @@ Pane {
     readonly property bool synthesisPreview: previewReady && plan.kind === "summary_synthesis"
     readonly property bool running: !!viewState.running
     readonly property bool compact: height < 500
-    readonly property var result: viewState.responseView === workspace ? Object.assign({output: viewState.output, reasoning: viewState.reasoning, usage: viewState.usage, responsePlan: viewState.responsePlan, generation: owner.documentGeneration, translationBlocks: viewState.translationBlocks, translationWarning: viewState.translationWarning, synthesisParts: viewState.synthesisParts}, viewState.unitTitle === undefined ? {} : {unitTitle: viewState.unitTitle, unitLanguage: viewState.unitLanguage}) : ((viewState.results || {})[workspace] || {})
+    readonly property var result: viewState.responseView === workspace ? Object.assign({output: viewState.output, reasoning: viewState.reasoning, usage: viewState.usage, responsePlan: viewState.responsePlan, generation: owner.documentGeneration, translationBlocks: viewState.translationBlocks, translationWarning: viewState.translationWarning, translationHistoryWarning: viewState.translationHistoryWarning, synthesisParts: viewState.synthesisParts}, viewState.unitTitle === undefined ? {} : {unitTitle: viewState.unitTitle, unitLanguage: viewState.unitLanguage}) : ((viewState.results || {})[workspace] || {})
     readonly property var pairedTranslation: workspace === "translation" && result.responsePlan
                                              && result.responsePlan.kind === "reading_translation"
                                              ? result.translationBlocks || [] : []
@@ -72,6 +73,7 @@ Pane {
     function resetSourceView() {
         if (payload && payload.visible) payload.close();
         if (selectionSource && selectionSource.visible) selectionSource.close();
+        if (translationHistory && translationHistory.visible) translationHistory.close();
         liveExcerpt = null;
         pendingLocate = null;
         if (liveRange) refreshSelection.restart();
@@ -424,6 +426,19 @@ Pane {
             Accessible.name: qsTr("Translation language")
             onTextEdited: aiPanel.owner.setAiInput("language", text)
         }
+        Button {
+            objectName: "openAiTranslationHistory"
+            visible: aiPanel.workspace === "translation" && !aiPanel.translateInPlace
+            enabled: aiPanel.owner.pageCount > 0 && !aiPanel.running && aiPanel.owner.pendingCommands === 0
+            text: qsTr("Translation history…")
+            onClicked: translationHistory.browse()
+        }
+        Label {
+            visible: aiPanel.workspace === "translation" && !!aiPanel.result.translationHistoryWarning
+            text: visible ? qsTr("Could not save the translation to history. %1").arg(aiPanel.result.translationHistoryWarning) : ""
+            Layout.fillWidth: true; wrapMode: Text.Wrap; textFormat: Text.PlainText
+            color: app.colors.textSecondary
+        }
         RowLayout {
             visible: aiPanel.pairedTranslation.length > 0
             Layout.fillWidth: true
@@ -638,6 +653,107 @@ Pane {
                 onClicked: aiPanel.owner.clearAiChat()
             }
             Button {objectName:"aiAuditTrail";text:qsTr("Local audit trail…");onClicked:app.showAuditTrail()}
+        }
+    }
+    Dialog {
+        id: translationHistory
+        objectName: "aiTranslationHistory"
+        property var reader: null
+        property double generation: 0
+        property double command: 0
+        property var entries: []
+        property var entry: null
+        property string error: ""
+        title: aiPanel.translateDocument ? qsTr("Document translation history") : qsTr("Selection translation history")
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: Math.max(230, Math.min(620, app.width - 48))
+        height: Math.max(220, Math.min(520, app.height - 64))
+        standardButtons: Dialog.Close
+        function current() { return reader && reader === aiPanel.owner && generation === aiPanel.ownerGeneration; }
+        function browse() {
+            reader = aiPanel.owner;
+            generation = aiPanel.ownerGeneration;
+            translationHistory.open();
+            command = reader.submit("ai_translation_history", {selection: !aiPanel.translateDocument});
+        }
+        function openEntry(index) {
+            if (!current() || index < 0 || index >= entries.length) return;
+            entry = null; error = "";
+            command = reader.submit("ai_translation_history_entry", {id: entries[index].id});
+        }
+        onClosed: { reader = null; command = 0; entries = []; entry = null; error = ""; }
+        Connections {
+            target: translationHistory.reader
+            function onCommandFinished(id, operation, result, error) {
+                if (id !== translationHistory.command || !translationHistory.current()) return;
+                translationHistory.command = 0;
+                translationHistory.error = error;
+                if (error) return;
+                if (operation === "ai_translation_history") {
+                    translationHistory.entries = result;
+                    if (result.length) translationHistory.openEntry(0);
+                } else if (operation === "ai_translation_history_entry") {
+                    translationHistory.entry = result;
+                }
+            }
+        }
+        contentItem: ColumnLayout {
+            ComboBox {
+                objectName: "aiTranslationHistoryEntry"
+                Layout.fillWidth: true
+                model: translationHistory.entries
+                textRole: "excerpt"
+                enabled: count > 0 && !translationHistory.command
+                Accessible.name: qsTr("Saved translations")
+                delegate: ItemDelegate {
+                    required property var modelData
+                    width: ListView.view.width
+                    text: modelData.excerpt || modelData.language
+                    Accessible.description: new Date(modelData.modified).toLocaleString()
+                }
+                onActivated: translationHistory.openEntry(currentIndex)
+            }
+            Label {
+                Layout.fillWidth: true
+                visible: !!text
+                text: translationHistory.error || (translationHistory.command ? qsTr("Loading history…") :
+                      !translationHistory.entries.length ? qsTr("No saved translations for this source type.") :
+                      !translationHistory.entry ? "" :
+                      translationHistory.entry.status === "sourceChanged" ? qsTr("This translation belongs to an earlier PDF revision.") :
+                      translationHistory.entry.warning || "")
+                wrapMode: Text.Wrap; textFormat: Text.PlainText
+            }
+            AiReadingScrollView {
+                id: savedTranslationScroll
+                Layout.fillWidth: true; Layout.fillHeight: true
+                TextArea {
+                    objectName: "aiSavedTranslationText"
+                    width: savedTranslationScroll.availableWidth
+                    text: {
+                        const entry = translationHistory.entry;
+                        if (!entry) return "";
+                        return entry.blocks && entry.blocks.length
+                                ? entry.blocks.map(block => block.original + "\n" + block.translation).join("\n\n")
+                                : entry.content;
+                    }
+                    readOnly: true; selectByMouse: true; selectByKeyboard: true
+                    wrapMode: Text.Wrap; textFormat: Text.PlainText
+                }
+            }
+            Button {
+                objectName: "previewSavedAiTranslation"
+                text: qsTr("Preview retranslation")
+                enabled: translationHistory.current() && !translationHistory.command && !!translationHistory.entry
+                         && translationHistory.entry.can_replay && !aiPanel.running && aiPanel.owner.pendingCommands === 0
+                onClicked: {
+                    const id = translationHistory.entry.id;
+                    aiPanel.owner.prepareAi(aiPanel.baseRequest("TranslateSelection"), {}, {
+                        kind: "translation", detail: "Standard", saved_translation: id
+                    });
+                    translationHistory.close();
+                }
+            }
         }
     }
     Dialog {

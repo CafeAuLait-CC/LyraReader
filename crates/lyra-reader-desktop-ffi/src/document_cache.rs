@@ -16,6 +16,7 @@ const CARRIED_FILES: &[&str] = &[
     "summaries.json",
     "document-knowledge-v1.json",
     "region-conversations-v1.json",
+    crate::reading_history::WORKSPACE_FILE,
 ];
 
 #[derive(Clone)]
@@ -184,6 +185,23 @@ fn lock_ai_cache(directory: &Path, name: &str, label: &str) -> Result<fs::File, 
     Ok(lock)
 }
 
+pub(super) fn lock_reading_workspace(directory: &Path) -> Result<fs::File, String> {
+    lock_ai_cache(
+        directory,
+        ".ai-reading-workspace.lock",
+        "the AI reading workspace",
+    )
+}
+
+fn lock_carried_cache(directory: &Path, name: &str) -> Result<Option<fs::File>, String> {
+    match name {
+        "summaries.json" => lock_summary_cache(directory).map(Some),
+        "translations.json" => lock_translation_cache(directory).map(Some),
+        crate::reading_history::WORKSPACE_FILE => lock_reading_workspace(directory).map(Some),
+        _ => Ok(None),
+    }
+}
+
 impl DocumentCache {
     pub fn open(document: &Path, root: &Path) -> Result<Self, String> {
         Self::open_with_identity(document, root, None)
@@ -260,15 +278,7 @@ impl DocumentCache {
             if !destination.exists()
                 && let Some(bytes) = read_optional(&previous.join(name))?
             {
-                let _summary_lease = matches!(*name, "summaries.json" | "translations.json")
-                    .then(|| {
-                        if *name == "translations.json" {
-                            lock_translation_cache(&self.directory)
-                        } else {
-                            lock_summary_cache(&self.directory)
-                        }
-                    })
-                    .transpose()?;
+                let _cache_lease = lock_carried_cache(&self.directory, name)?;
                 // A cooperating writer may have published while this migration acquired its lease.
                 if !destination.exists() {
                     atomic_write(&destination, &bytes)?;
@@ -346,15 +356,7 @@ impl DocumentCache {
             for name in CARRIED_FILES.iter().filter(|n| **n != "source.json") {
                 if let Some(bytes) = read_optional(&self.directory.join(name))? {
                     let destination = next.directory.join(name);
-                    let _summary_lease = matches!(*name, "summaries.json" | "translations.json")
-                        .then(|| {
-                            if *name == "translations.json" {
-                                lock_translation_cache(&next.directory)
-                            } else {
-                                lock_summary_cache(&next.directory)
-                            }
-                        })
-                        .transpose()?;
+                    let _cache_lease = lock_carried_cache(&next.directory, name)?;
                     let conflict = match *name {
                         "summaries.json" => Some(
                             "The PDF was saved, but destination summaries differ. Both cache versions were kept",
@@ -367,6 +369,9 @@ impl DocumentCache {
                         ),
                         "document-knowledge-v1.json" => Some(
                             "The PDF was saved, but destination document reading differs. Both cache versions were kept",
+                        ),
+                        crate::reading_history::WORKSPACE_FILE => Some(
+                            "The PDF was saved, but destination AI reading history differs. Both cache versions were kept",
                         ),
                         _ => None,
                     };

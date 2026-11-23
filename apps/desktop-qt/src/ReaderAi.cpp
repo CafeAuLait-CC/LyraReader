@@ -395,6 +395,7 @@ bool ReaderController::startAi(const QString &key,const QVariantMap &expectedPla
     m_aiState.insert(QStringLiteral("cancelRequested"),false);
     m_aiState.insert(QStringLiteral("output"),QString{});m_aiState.insert(QStringLiteral("reasoning"),QString{});
     m_aiState.remove(QStringLiteral("translationBlocks"));m_aiState.remove(QStringLiteral("translationWarning"));
+    m_aiState.remove(QStringLiteral("translationHistoryWarning"));
     m_aiState.insert(QStringLiteral("usage"),QVariantMap{});m_aiState.insert(QStringLiteral("diagnostics"),QVariantMap{});
     m_aiState.insert(QStringLiteral("limited"),false);m_aiState.insert(QStringLiteral("running"),true);
     m_aiState.insert(QStringLiteral("status"),tr("Starting request…"));
@@ -417,7 +418,7 @@ void ReaderController::retainAiResult(const QString &state) {
     if(view.isEmpty())return;
     QVariantMap result{{QStringLiteral("state"),state},{QStringLiteral("generation"),m_generation}};
     if(view==QStringLiteral("region")){result.insert(QStringLiteral("turn_id"),m_aiState.value(QStringLiteral("regionTurn")));result.insert(QStringLiteral("question"),m_aiState.value(QStringLiteral("activeQuestion")));}
-    for(const auto *key:{"output","reasoning","usage","status","responsePlan","translationBlocks","translationWarning","synthesisParts"})result.insert(QLatin1String(key),m_aiState.value(QLatin1String(key)));
+    for(const auto *key:{"output","reasoning","usage","status","responsePlan","translationBlocks","translationWarning","translationHistoryWarning","synthesisParts"})result.insert(QLatin1String(key),m_aiState.value(QLatin1String(key)));
     if(m_aiState.contains(QStringLiteral("unitTitle")))result.insert(QStringLiteral("unitTitle"),m_aiState.value(QStringLiteral("unitTitle")));
     if(m_aiState.contains(QStringLiteral("unitLanguage")))result.insert(QStringLiteral("unitLanguage"),m_aiState.value(QStringLiteral("unitLanguage")));
     auto results=m_aiState.value(QStringLiteral("results")).toMap();results.insert(view,result);m_aiState.insert(QStringLiteral("results"),results);
@@ -502,7 +503,12 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
                 QPointer<ReaderController> alive(this);const auto epoch=m_aiPreviewEpoch;
                 emit summaryCatalogChanged();if(!alive || epoch!=m_aiPreviewEpoch)return;
             }
-        }else if(failure.isEmpty())m_aiState.insert(QStringLiteral("plan"),result);
+        }else if(failure.isEmpty()) {
+            m_aiState.insert(QStringLiteral("plan"),result);
+            const auto plan=result.toMap();
+            if(plan.value(QStringLiteral("kind"))==QStringLiteral("reading_translation"))
+                m_aiState.insert(QStringLiteral("previewSelection"),plan.value(QStringLiteral("reading_scope")).toMap().value(QStringLiteral("selection")));
+        }
         m_aiState.insert(QStringLiteral("status"),failure.isEmpty()?tr("Request ready. Nothing sent yet."):failure);emit aiStateChanged();return;
     }
     if(operation==QStringLiteral("ai_start") && id==m_aiStartId) {
@@ -558,6 +564,7 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
         if(readingTranslation && !m_aiState.value(QStringLiteral("limited")).toBool()) {
             m_aiState.insert(QStringLiteral("translationBlocks"),batch.value(QStringLiteral("translation_blocks")));
             m_aiState.insert(QStringLiteral("translationWarning"),batch.value(QStringLiteral("translation_warning")));
+            m_aiState.insert(QStringLiteral("translationHistoryWarning"),batch.value(QStringLiteral("translation_history_warning")));
         }
         if(responseKind==QStringLiteral("reading_summary") && m_aiActivePreviewEpoch==m_aiPreviewEpoch
             && m_aiPlanGeneration==m_generation && !m_aiState.value(QStringLiteral("limited")).toBool()
