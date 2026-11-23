@@ -3391,6 +3391,60 @@ private slots:
         QVERIFY(cacheFile.open(QIODevice::ReadOnly));QCOMPARE(cacheFile.readAll(),prior);
     }
 
+    void readingNotesKeepOneCompleteSummaryAndRestoreWithoutSending() {
+        QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
+        MockChatServer server;QVERIFY(server.listen());
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-reading-note.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");
+        const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});
+        qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
+        QFile source(path);QVERIFY(source.open(QIODevice::ReadOnly));const auto original=source.readAll();source.close();
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic"}});
+        QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));
+        auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);
+        const QString completed="# Synthetic finding\n\nThe approved source supports this note [p.1].";
+        server.responses.append({{MockChatServer::delta({{"content",completed}}),QByteArray("data: [DONE]\n\n")},5,200});
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(reader->aiState().contains("plan"));QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(reader->startAi("local",reader->aiState().value("plan").toMap()));QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
+        QCOMPARE(server.requests.size(),1);
+        auto *keep=window->findChild<QObject *>("keepAiSummaryNote"),*browse=window->findChild<QObject *>("browseAiReadingNotes");QVERIFY(keep && browse);
+        auto *notes=window->findChild<QObject *>("aiReadingNotes");QVERIFY(notes);
+        auto *search=notes->findChild<QObject *>("aiReadingNoteSearch"),*text=notes->findChild<QObject *>("aiReadingNoteContent");
+        auto *pages=notes->findChild<QObject *>("aiReadingNotePages");QVERIFY(search && text && pages);
+        const auto current=[&]{return notes->property("note").toMap();};
+        const auto dismiss=[&]{QVERIFY(QMetaObject::invokeMethod(notes,"close"));QTRY_VERIFY(!notes->property("visible").toBool());};
+        QVERIFY(keep->property("visible").toBool());QVERIFY(QMetaObject::invokeMethod(keep,"clicked"));
+        QTRY_COMPARE(text->property("text").toString(),completed);QTRY_COMPARE(reader->pendingCommands(),0);
+        const auto id=current().value("id").toString();QVERIFY(!id.isEmpty());
+        QCOMPARE(current().value("title").toString(),QString("Synthetic finding"));
+        QCOMPARE(notes->property("entries").toList().size(),1);QCOMPARE(pages->property("count").toInt(),1);
+        dismiss();QVERIFY(QMetaObject::invokeMethod(keep,"clicked"));QTRY_COMPARE(current().value("id").toString(),id);
+        QCOMPARE(notes->property("entries").toList().size(),1);
+        QVERIFY(search->setProperty("text","no matching phrase"));QVERIFY(QMetaObject::invokeMethod(notes,"refresh"));
+        QTRY_COMPARE(reader->pendingCommands(),0);QCOMPARE(notes->property("entries").toList().size(),0);
+        QVERIFY(search->setProperty("text","finding"));QVERIFY(QMetaObject::invokeMethod(notes,"refresh"));
+        QTRY_COMPARE(current().value("id").toString(),id);dismiss();QCOMPARE(server.requests.size(),1);
+        QVERIFY(source.open(QIODevice::ReadOnly));QCOMPARE(source.readAll(),original);source.close();
+
+        const auto reopen=[&] {
+            const auto generation=reader->documentGeneration();reader->openFile(QUrl::fromLocalFile(path));
+            QTRY_VERIFY(reader->documentGeneration()!=generation);QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
+            QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));
+        };
+        reopen();QVERIFY(QMetaObject::invokeMethod(browse,"clicked"));QTRY_COMPARE(current().value("id").toString(),id);
+        QCOMPARE(text->property("text").toString(),completed);QCOMPARE(pages->property("count").toInt(),1);dismiss();
+        QVERIFY(source.open(QIODevice::WriteOnly|QIODevice::Append));const QByteArray revision("\n% Local fixture revision\n");
+        QCOMPARE(source.write(revision),revision.size());source.close();
+        reopen();QVERIFY(QMetaObject::invokeMethod(browse,"clicked"));QTRY_COMPARE(current().value("id").toString(),id);
+        QCOMPARE(text->property("text").toString(),completed);QCOMPARE(pages->property("count").toInt(),0);
+        QCOMPARE(current().value("status").toString(),QString("sourceChanged"));QCOMPARE(server.requests.size(),1);
+        dismiss();
+    }
+
 
 
     void commandCompletionAllowsDestructionFromItsNotifications_data() {

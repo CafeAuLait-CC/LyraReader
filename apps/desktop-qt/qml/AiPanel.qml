@@ -6,7 +6,7 @@ Pane {
     id: aiPanel
     objectName: "aiPanel"
     required property var app
-    readonly property bool tabTransferDialogVisible: payload.visible || summaryCatalog.popupVisible || selectionSource.visible || translationHistory.visible || chatHistory.visible
+    readonly property bool tabTransferDialogVisible: payload.visible || summaryCatalog.popupVisible || selectionSource.visible || translationHistory.visible || chatHistory.visible || readingNotes.visible
     readonly property var owner: app.currentReader
     readonly property var viewState: owner.aiState
     readonly property var input: viewState.input || ({})
@@ -46,6 +46,7 @@ Pane {
         if (selectionSource) selectionSource.close();
         if (translationHistory) translationHistory.close();
         if (chatHistory) chatHistory.close();
+        if (readingNotes) readingNotes.close();
         pendingLocate = null;
     }
     readonly property var languageGeneration: batchMode ? batchState.generation : summaryUnit.generation
@@ -58,7 +59,7 @@ Pane {
     readonly property bool synthesisPreview: previewReady && plan.kind === "summary_synthesis"
     readonly property bool running: !!viewState.running
     readonly property bool compact: height < 500
-    readonly property var result: viewState.responseView === workspace ? Object.assign({output: viewState.output, reasoning: viewState.reasoning, usage: viewState.usage, responsePlan: viewState.responsePlan, generation: owner.documentGeneration, translationBlocks: viewState.translationBlocks, translationWarning: viewState.translationWarning, translationHistoryWarning: viewState.translationHistoryWarning, synthesisParts: viewState.synthesisParts}, viewState.unitTitle === undefined ? {} : {unitTitle: viewState.unitTitle, unitLanguage: viewState.unitLanguage}) : ((viewState.results || {})[workspace] || {})
+    readonly property var result: viewState.responseView === workspace ? Object.assign({output: viewState.output, reasoning: viewState.reasoning, usage: viewState.usage, responsePlan: viewState.responsePlan, generation: owner.documentGeneration, translationBlocks: viewState.translationBlocks, translationWarning: viewState.translationWarning, translationHistoryWarning: viewState.translationHistoryWarning, synthesisParts: viewState.synthesisParts, summaryNoteSource: viewState.summaryNoteSource}, viewState.unitTitle === undefined ? {} : {unitTitle: viewState.unitTitle, unitLanguage: viewState.unitLanguage}) : ((viewState.results || {})[workspace] || {})
     readonly property var pairedTranslation: workspace === "translation" && result.responsePlan
                                              && result.responsePlan.kind === "reading_translation"
                                              ? result.translationBlocks || [] : []
@@ -76,6 +77,7 @@ Pane {
         if (selectionSource && selectionSource.visible) selectionSource.close();
         if (translationHistory && translationHistory.visible) translationHistory.close();
         if (chatHistory && chatHistory.visible) chatHistory.close();
+        if (readingNotes && readingNotes.visible) readingNotes.close();
         liveExcerpt = null;
         pendingLocate = null;
         if (liveRange) refreshSelection.restart();
@@ -695,8 +697,22 @@ Pane {
                 onClicked: chatHistory.browse()
             }
             Button {objectName:"aiAuditTrail";text:qsTr("Local audit trail…");onClicked:app.showAuditTrail()}
+            Button {
+                objectName: "keepAiSummaryNote"
+                text: qsTr("Keep as note")
+                visible: aiPanel.workspace === "summary" && !!aiPanel.result.summaryNoteSource
+                enabled: !aiPanel.running && aiPanel.owner.pendingCommands === 0
+                onClicked: readingNotes.browse(aiPanel.result.summaryNoteSource)
+            }
+            Button {
+                objectName: "browseAiReadingNotes"
+                text: qsTr("Reading notes…")
+                enabled: aiPanel.owner.pageCount > 0 && aiPanel.owner.pendingCommands === 0
+                onClicked: readingNotes.browse("")
+            }
         }
     }
+    AiReadingNotes { id: readingNotes; app: aiPanel.app }
     Dialog {
         id: chatHistory
         objectName: "aiChatHistory"

@@ -551,6 +551,7 @@ bool ReaderController::startAi(const QString &key,const QVariantMap &expectedPla
         m_aiState.insert(QStringLiteral("unitLanguage"),m_aiSummaryPreviewLanguage);
     }else {m_aiState.remove(QStringLiteral("unitTitle"));m_aiState.remove(QStringLiteral("unitLanguage"));}
     m_aiState.insert(QStringLiteral("responsePlan"),plan);
+    m_aiState.remove(QStringLiteral("summaryNoteSource"));
     m_aiState.insert(QStringLiteral("planSent"),true);
     m_aiState.insert(QStringLiteral("responseView"),aiView(plan.value(QStringLiteral("action")).toString()));
     m_aiState.insert(QStringLiteral("statusView"),m_aiState.value(QStringLiteral("responseView")));
@@ -592,7 +593,7 @@ void ReaderController::retainAiResult(const QString &state) {
     if(view.isEmpty())return;
     QVariantMap result{{QStringLiteral("state"),state},{QStringLiteral("generation"),m_generation}};
     if(view==QStringLiteral("region")){result.insert(QStringLiteral("turn_id"),m_aiState.value(QStringLiteral("regionTurn")));result.insert(QStringLiteral("question"),m_aiState.value(QStringLiteral("activeQuestion")));}
-    for(const auto *key:{"output","reasoning","usage","status","responsePlan","translationBlocks","translationWarning","translationHistoryWarning","synthesisParts"})result.insert(QLatin1String(key),m_aiState.value(QLatin1String(key)));
+    for(const auto *key:{"output","reasoning","usage","status","responsePlan","translationBlocks","translationWarning","translationHistoryWarning","synthesisParts","summaryNoteSource"})result.insert(QLatin1String(key),m_aiState.value(QLatin1String(key)));
     if(m_aiState.contains(QStringLiteral("unitTitle")))result.insert(QStringLiteral("unitTitle"),m_aiState.value(QStringLiteral("unitTitle")));
     if(m_aiState.contains(QStringLiteral("unitLanguage")))result.insert(QStringLiteral("unitLanguage"),m_aiState.value(QStringLiteral("unitLanguage")));
     auto results=m_aiState.value(QStringLiteral("results")).toMap();results.insert(view,result);m_aiState.insert(QStringLiteral("results"),results);
@@ -712,6 +713,7 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
                 for(const auto *key:{"plan","reasoning","usage","unitTitle","unitLanguage","synthesisParts"})
                     m_aiState.remove(QLatin1String(key));
                 m_aiState.insert(QStringLiteral("cachedWholeSummary"),true);
+                m_aiState.insert(QStringLiteral("summaryNoteSource"),cached.value(QStringLiteral("id")));
                 m_aiState.insert(QStringLiteral("responseView"),QStringLiteral("summary"));
                 m_aiState.insert(QStringLiteral("output"),cached.value(QStringLiteral("output")));
                 m_aiState.insert(QStringLiteral("responsePlan"),QVariantMap{
@@ -746,6 +748,7 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
             understanding.insert(QStringLiteral("plan"),m_documentReading.value(QStringLiteral("plan")));
         m_documentReading=understanding;
         m_readingChoiceShown=true;m_readingChoicePending=false;
+        m_aiState.insert(QStringLiteral("summaryNoteSource"),batch.value(QStringLiteral("summary_note_source")));
     }
     const auto chatCheckpoint=batch.value(QStringLiteral("chat_checkpoint")).toMap();
     if(!chatCheckpoint.isEmpty()) {

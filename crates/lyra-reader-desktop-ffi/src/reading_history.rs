@@ -262,7 +262,7 @@ impl DesktopDocument {
         source: &Arc<LyraReaderDocument>,
         record: ReadingRecord,
     ) -> Result<(), String> {
-        self.update_reading_workspace(source, |workspace, sha| {
+        self.update_reading_workspace(source, |workspace, sha, _| {
             if record.source_hash != sha {
                 return Err("The PDF revision changed before archiving the translation.".into());
             }
@@ -270,22 +270,25 @@ impl DesktopDocument {
         })
     }
 
-    fn update_reading_workspace<T>(
+    pub(super) fn update_reading_workspace<T>(
         &self,
         source: &Arc<LyraReaderDocument>,
-        update: impl FnOnce(&mut ReadingWorkspace, &str) -> Result<T, String>,
+        update: impl FnOnce(&mut ReadingWorkspace, &str, &DocumentCache) -> Result<T, String>,
     ) -> Result<T, String> {
         self.with_reading_cache(source, true, |cache, sha| {
             let _lease = lock_reading_workspace(&cache.directory)?;
             let path = cache.directory.join(WORKSPACE_FILE);
             let previous = read_optional(&path)?;
             let mut workspace = workspace(previous.as_deref(), sha.clone())?;
-            let output = update(&mut workspace, &sha)?;
+            let output = update(&mut workspace, &sha, cache)?;
             let bytes = workspace.encode()?;
             if read_optional(&path)? != previous {
                 return Err(
                     "The AI reading workspace changed during the save. Its data was kept.".into(),
                 );
+            }
+            if previous.as_deref() == Some(bytes.as_slice()) {
+                return Ok(output);
             }
             if let Some(previous) = previous {
                 atomic_write(
@@ -298,7 +301,7 @@ impl DesktopDocument {
         })
     }
 
-    fn read_workspace<T>(
+    pub(super) fn read_workspace<T>(
         &self,
         source: &Arc<LyraReaderDocument>,
         validate_file: bool,
@@ -484,7 +487,7 @@ impl DesktopDocument {
         source: &Arc<LyraReaderDocument>,
         archive: ChatArchive,
     ) -> Result<Value, String> {
-        self.update_reading_workspace(source, |workspace, sha| {
+        self.update_reading_workspace(source, |workspace, sha, _| {
             let records = workspace.records();
             if archive.source_hash != sha {
                 return Err("The PDF revision changed before archiving the chat.".into());
@@ -551,7 +554,7 @@ impl DesktopDocument {
         if lyra_reader_edit::records::normalize_uuid(&draft.session_id).is_none() {
             return Err("The chat session identifier is invalid.".into());
         }
-        self.update_reading_workspace(source, |workspace, sha| {
+        self.update_reading_workspace(source, |workspace, sha, _| {
             let records = workspace.records();
             let (old, modified) =
                 chat_revision(&records, &draft.session_id, draft.expected_modified, sha)?;

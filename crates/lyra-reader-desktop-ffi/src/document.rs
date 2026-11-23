@@ -1028,6 +1028,9 @@ impl DesktopDocument {
             "ai_chat_sessions" => self.chat_sessions(&d),
             "ai_chat_session" => self.chat_session(&d, &text(&r, "id")?),
             "ai_chat_draft" => self.save_chat_draft(&d, arg(&r, "draft")?),
+            "ai_reading_notes" => self.reading_notes(&d, &text(&r, "query")?),
+            "ai_reading_note" => self.reading_note(&d, &text(&r, "id")?),
+            "ai_reading_keep_summary" => self.keep_summary_note(&d, &text(&r, "id")?),
             "ai_merge_preview" => value(
                 build_ai_merge_plan(arg(&r, "request")?)
                     .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),
@@ -1307,9 +1310,13 @@ impl DesktopDocument {
                         Some(ReadingArchive::Summary(record)) => {
                             match record
                                 .and_then(|record| self.publish_summary(&d, record))
-                                .and_then(|context| self.adopt_understanding(context))
-                            {
-                                Ok(context) => result["understanding"] = context,
+                                .and_then(|(context, id)| {
+                                    self.adopt_understanding(context).map(|state| (state, id))
+                                }) {
+                                Ok((context, id)) => {
+                                    result["understanding"] = context;
+                                    result["summary_note_source"] = json!(id);
+                                }
                                 Err(error) => result["cache_warning"] = json!(error),
                             }
                         }

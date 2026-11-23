@@ -108,12 +108,22 @@ pub(super) fn context(
     fingerprint: &str,
     page_count: u32,
 ) -> Result<Option<DocumentReading>, String> {
+    Ok(summary_record(cache, fingerprint, page_count)?
+        .as_ref()
+        .map(context_record))
+}
+
+pub(super) fn summary_record(
+    cache: &DocumentCache,
+    fingerprint: &str,
+    page_count: u32,
+) -> Result<Option<ReadingRecord>, String> {
     let (state, _) = load(cache, fingerprint)?;
     state
         .record(fingerprint)
         .map(|record| {
             verify_pages(&record, page_count)?;
-            Ok(context_record(&record))
+            Ok(record)
         })
         .transpose()
 }
@@ -153,7 +163,7 @@ impl DesktopDocument {
             let (state, _) = load(cache, &sha)?;
             state.reusable(&sha, language, detail).map(|record| {
                 verify_pages(&record, source.page_count())?;
-                Ok(json!({"output":record.content,"title":record.title,"source_pages":record.pages}))
+                    Ok(json!({"id":record.id,"output":record.content,"title":record.title,"source_pages":record.pages}))
             }).transpose()
         })
     }
@@ -162,8 +172,9 @@ impl DesktopDocument {
         &self,
         source: &Arc<LyraReaderDocument>,
         record: ReadingRecord,
-    ) -> Result<DocumentReading, String> {
+    ) -> Result<(DocumentReading, String), String> {
         let context = context_record(&record);
+        let id = record.id.clone();
         self.with_reading_cache(source, true, |cache, sha| {
             if record.source_hash != sha {
                 return Err("The PDF revision changed before saving the summary.".into());
@@ -196,6 +207,6 @@ impl DesktopDocument {
             }
             atomic_write(&destination, &bytes)
         })?;
-        Ok(context)
+        Ok((context, id))
     }
 }

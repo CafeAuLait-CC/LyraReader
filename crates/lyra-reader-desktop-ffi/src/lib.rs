@@ -20,6 +20,7 @@ mod paper;
 mod passages;
 mod quit;
 mod reading_history;
+mod reading_notes;
 mod region;
 mod region_export;
 mod region_store;
