@@ -5333,7 +5333,20 @@ private slots:
         QTRY_VERIFY(window->property("regionSelecting").toBool());
         QVERIFY(!window->property("aiPanelVisible").toBool());
         QCOMPARE(sentinel.requests.size(),0);
+        auto *toolbarRegion=visualItem(window->contentItem(),"lyraRegionTool");
+        QTRY_VERIFY(toolbarRegion && toolbarRegion->isVisible());
+        const auto caption=toolbarRegion->property("text").toString();
+        QVERIFY(window->property("operationStatus").toString().contains("Drag an area of the page"));
         QVERIFY(QMetaObject::invokeMethod(window,"cancelRegionSelection"));
+        QVERIFY2(window->property("operationStatus").toString().isEmpty() && caption=="Select && Ask",
+                 qPrintable(caption+" / "+window->property("operationStatus").toString()));
+        auto *accessibleRegion=QAccessible::queryAccessibleInterface(toolbarRegion);
+        QVERIFY(accessibleRegion);
+        QCOMPARE(accessibleRegion->text(QAccessible::Name),QString("Select & Ask"));
+        window->setProperty("operationStatus",QStringLiteral("Other action status"));
+        QVERIFY(QMetaObject::invokeMethod(window,"cancelRegionSelection"));
+        QCOMPARE(window->property("operationStatus").toString(),QString("Other action status"));
+        window->setProperty("operationStatus",QString{});
 
         QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",420},{"height",180}},1));
         QTRY_VERIFY_WITH_TIMEOUT(!reader->aiRegion().value("image_png").toString().isEmpty(),10000);

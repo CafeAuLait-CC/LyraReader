@@ -41,7 +41,11 @@ Item {
         visible:app.secondaryRow==="lyra"
         LyraToolButton {
             objectName:"lyraRegionTool"
-            symbol:"ai";text:qsTr("Select & Ask");display:AbstractButton.TextBesideIcon
+            readonly property string caption: qsTr("Select & Ask")
+            symbol:"ai";display:AbstractButton.TextBesideIcon
+            text:caption.replace(/&/g,"&&")
+            Accessible.name:caption
+            ToolTip.text:caption
             selected:app.regionSelecting
             enabled:app.currentReader.pageCount>0 && !app.currentReader.loading && (!!app.currentReader.aiRegion.image_png || !app.currentReader.aiState.running)
             onClicked:app.openRegionTool()

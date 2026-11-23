@@ -65,7 +65,12 @@ ApplicationWindow {
         && !(activeFocusItem && typeof activeFocusItem.selectedText !== "undefined")
     property bool regionSelecting: false
     property var regionDraft: null
-    function cancelRegionSelection() {regionSelecting=false;regionDraft=null;}
+    readonly property string regionSelectionHint: qsTr("Drag an area of the page to ask about it. Escape cancels.")
+    function cancelRegionSelection() {
+        regionSelecting=false;
+        regionDraft=null;
+        if(operationStatus===regionSelectionHint)operationStatus="";
+    }
     function armRegion(force) {
         if(placedTextController.deferAction(function(){root.armRegion(force);}))return;
         if(!force && secondaryRow==="edit" && contentController.deferAction({kind:"region"}))return;
@@ -73,7 +78,7 @@ ApplicationWindow {
         setSecondaryRow("lyra",true);
         aiRegionCard.close();cancelErase();clearFillTool();annotationTool="select";selection=null;selectedAnnotation=null;
         overviewVisible=false;textViewVisible=false;regionDraft=null;regionSelecting=true;
-        operationStatus=qsTr("Drag an area of the page to ask about it. Escape cancels.");
+        operationStatus=regionSelectionHint;
     }
     function openRegionTool() {
         if(regionSelecting){cancelRegionSelection();return;}
