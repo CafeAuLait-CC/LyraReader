@@ -6095,6 +6095,10 @@ private slots:
         ReaderController reader;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("reader",&reader);engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
         auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);window->setPersistentSceneGraph(false);
         window->setProperty("requestedPage",pageIndex);
+        const bool precisePacing = qEnvironmentVariableIsSet("LYRA_READER_PERF_PRECISE_INPUT");
+        const QString inputMode = precisePacing ? QStringLiteral("precise-timer") : QStringLiteral("qwait");
+        constexpr int inputsPerBurst = 12;
+        constexpr int inputIntervalMs = 16;
         const bool native=QGuiApplication::platformName()!="offscreen";
         if(native)window->setMaximumSize(QSize(1200,820));window->resize(1200,820);
         if(native) {
@@ -6110,11 +6114,11 @@ private slots:
             if(!exposed || !QTest::qWaitForWindowActive(window,2500)) {
                 QVERIFY(publish({{"schema",2},{"phase","preflight"},{"qt",qVersion()},{"platform",QGuiApplication::platformName()},
                     {"requestedBackend",graphicsBackend.isEmpty()?qEnvironmentVariable("QSG_RHI_BACKEND"):graphicsBackend},{"windowActive",window->isActive()},{"windowExposed",window->isExposed()},
-                    {"interactivePresentationMeasured",false},{"inputBurstsAttempted",false},{"reason",exposed ? "Native window could not obtain keyboard focus; no interactive timing was attempted." : "Native window was not exposed within the preflight timeout; no interactive timing was attempted."}}));
+                    {"inputMode",inputMode},{"interactivePresentationMeasured",false},{"inputBurstsAttempted",false},{"reason",exposed ? "Native window could not obtain keyboard focus; no interactive timing was attempted." : "Native window was not exposed within the preflight timeout; no interactive timing was attempted."}}));
                 QSKIP("Native window was not exposed or active; input bursts were not attempted. Diagnostic JSON was saved.");
             }
         }
-        Performance::Frames frames(window),visibleFrames(window);QList<double> inputIntervals,refinement,visibleRefinement,guiIntervals,inputPacing,burstDurations,zoomApply,navigationApply,eventPump;
+        Performance::Frames frames(window),visibleFrames(window);QList<double> inputIntervals,refinement,visibleRefinement,guiIntervals,inputPacing,burstDurations,zoomApply,navigationApply,eventPump,timerSlip;
         qint64 peakRss=Performance::memory("VmRSS"),lastTick=Performance::now();
         bool focusMaintained=true;
         QTimer sampler;connect(window,&QWindow::activeChanged,&sampler,[&]{if(native && !window->isActive())focusMaintained=false;});
@@ -6134,15 +6138,49 @@ private slots:
         QVERIFY2(validTrialCount && trials>=3 && trials<=30,"Diagnostic trial count must be 3...30; default remains 30");
         for(int trial=0;trial<trials;++trial) {
             frames.clear();visibleFrames.clear();const auto begin=Performance::now();qint64 lastInput=begin;
-            for(int step=0;step<12;++step) {
+            const auto scheduled = [=](int step) { return begin + qint64(step) * inputIntervalMs * 1000; };
+            const auto applyInput = [&](int step) {
                 const auto inputTime=Performance::now();if(step)inputPacing.append((inputTime-lastInput)/1000.0);lastInput=inputTime;
+                if(precisePacing)timerSlip.append((inputTime-scheduled(step))/1000.0);
                 const auto scale=step%3==0?2.7:step%3==1?4.0:3.6;
-                QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,scale),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+                if(!QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,scale),Q_ARG(QVariant,0),Q_ARG(QVariant,0)))return false;
                 const auto zoomDone=Performance::now();zoomApply.append((zoomDone-inputTime)/1000.0);
                 view->setProperty("contentX",double((step+trial)%8*70));
-                QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,pageIndex),Q_ARG(QVariant,double(200+(step+trial)%8*70)/scale)));
-                const auto navigationDone=Performance::now();navigationApply.append((navigationDone-zoomDone)/1000.0);
-                if(step<11){QTest::qWait(16);eventPump.append((Performance::now()-navigationDone)/1000.0);}
+                if(!QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,pageIndex),Q_ARG(QVariant,double(200+(step+trial)%8*70)/scale)))return false;
+                navigationApply.append((Performance::now()-zoomDone)/1000.0);
+                return true;
+            };
+            if(precisePacing) {
+                QEventLoop burst;
+                QTimer input;
+                input.setTimerType(Qt::PreciseTimer);
+                input.setSingleShot(true);
+                int step = 0;
+                const auto dispatch = [&] {
+                    const bool delivered = applyInput(step);
+                    if(delivered)++step;
+                    if(!delivered || step == inputsPerBurst) {
+                        burst.quit();
+                        return;
+                    }
+                    // Dispatch at most one input per event turn, even when a deadline was missed.
+                    const qint64 untilDeadline = scheduled(step) - Performance::now();
+                    input.start(untilDeadline > 0 ? int((untilDeadline + 999) / 1000) : 0);
+                };
+                connect(&input,&QTimer::timeout,&burst,dispatch);
+                QTimer::singleShot(5000,&burst,&QEventLoop::quit);
+                dispatch();
+                if(input.isActive())burst.exec();
+                QVERIFY2(step == inputsPerBurst,"The precise input burst did not deliver all steps");
+            } else {
+                for(int step=0;step<inputsPerBurst;++step) {
+                    QVERIFY(applyInput(step));
+                    const auto navigationDone = Performance::now();
+                    if(step+1<inputsPerBurst) {
+                        QTest::qWait(inputIntervalMs);
+                        eventPump.append((Performance::now()-navigationDone)/1000.0);
+                    }
+                }
             }
             const auto endInput=Performance::now();burstDurations.append((endInput-begin)/1000.0);bool armed=false,visibleArmed=false;QTimer ready;ready.setInterval(5);
             connect(&ready,&QTimer::timeout,window,[&]{
@@ -6166,11 +6204,11 @@ private slots:
         QVariantMap report{{"schema",2},{"phase","bursts"},{"qt",qVersion()},{"platform",QGuiApplication::platformName()},{"graphicsApi",int(window->rendererInterface()->graphicsApi())},{"requestedBackend",graphicsBackend.isEmpty()?qEnvironmentVariable("QSG_RHI_BACKEND"):graphicsBackend},
             {"architecture",QSysInfo::currentCpuArchitecture()},{"fixture",QFileInfo(input).fileName()},{"pages",reader.pageCount()},{"pageIndex",pageIndex},{"windowWidth",window->width()},{"windowHeight",window->height()},{"devicePixelRatio",window->effectiveDevicePixelRatio()},
             {"pdfOpenToTexturedFrameQueueMs",openMs},{"lastInputToTexturedFrameQueueMs",Performance::distribution(refinement)},{"lastInputToVisibleTextureFrameQueueMs",Performance::distribution(visibleRefinement)},{"synchronousZoomApplyMs",Performance::distribution(zoomApply)},{"synchronousPanNavigateApplyMs",Performance::distribution(navigationApply)},{"requestedSixteenMsEventPumpMs",Performance::distribution(eventPump)},{"duringInputFrameQueueIntervalsMs",Performance::distribution(inputIntervals)},
-            {"trialsRequested",trials},{"trialsCompleted",refinement.size()},{"inputsPerBurst",12},{"targetInputIntervalMs",16},{"actualInputIntervalsMs",Performance::distribution(inputPacing)},{"inputBurstDurationMs",Performance::distribution(burstDurations)},{"percentileMethod","lower order statistic"},
+            {"trialsRequested",trials},{"trialsCompleted",refinement.size()},{"inputsPerBurst",inputsPerBurst},{"targetInputIntervalMs",inputIntervalMs},{"inputMode",inputMode},{"inputTimerSlipMs",Performance::distribution(timerSlip)},{"actualInputIntervalsMs",Performance::distribution(inputPacing)},{"inputBurstDurationMs",Performance::distribution(burstDurations)},{"percentileMethod","lower order statistic"},
             {"guiTenMsTimerIntervalsMs",Performance::distribution(guiIntervals)},{"rssPeakSampledBytes",peakRss},{"rssFinalBytes",Performance::memory("VmRSS")},{"processLifetimeRssHighWaterBytes",Performance::memory("VmHWM")},
             {"renderResources",RenderBudget::statistics()},{"rasterJobs",RasterJobs::statistics()},{"cpuLruKiB",ReaderController::cpuCacheKiB()},
             {"interactivePresentationMeasured",inputIntervals.size()>=6 && focusMaintained},{"inputBurstsAttempted",true},{"nativeFocusRequired",native},{"focusMaintained",focusMaintained},{"windowExposed",window->isExposed()},{"windowActive",window->isActive()},
-            {"measurementNotes","Up to thirty 12-input zoom/pan bursts targeting 16 ms; actual delivery intervals are recorded. Last input starts before applying its zoom/pan change and includes GUI handling and 5 ms readiness polling. The legacy textured latency also waits for all reader raster requests to drain; the additional visible-texture latency only waits for the current page textures and its next queued frame. Synchronous zoom/navigation calls and the requested 16 ms Qt event pump are timed separately; event-pump time includes GUI/render synchronization and queued event handling, not only sleep. Optional per-trial trace is emitted outside the input burst. frameSwapped measures queued presentation, not physical display FPS. Insufficient input-period frame callbacks or lost native focus invalidate the sample and stop further bursts; no cause for missing callbacks is inferred. RSS includes Qt, PDFium, fonts and index memory; unsupported OS values are -1. The source ledger includes pre-raster capacity reservations. Driver allocations and Qt chrome are outside the pixel payload ledger."}};
+            {"measurementNotes","Up to thirty 12-input zoom/pan bursts targeting 16 ms; actual intervals are recorded. The qwait mode waits after each completed input; precise-timer mode delivers one input per event turn at absolute deadlines and records callback lateness separately. Last input starts before applying its zoom/pan change and includes GUI handling and 5 ms readiness polling. The drained-texture latency waits for all reader raster requests; visible-texture latency waits for just the current page textures and its next queued frame. Synchronous zoom/navigation and qWait event-pump time are separate. The latter also includes GUI/render synchronization. Optional trace is emitted outside the input burst. frameSwapped is a queued frame signal, not physical display FPS. Insufficient frame callbacks during input or lost native focus stops the trial set. RSS includes Qt, PDFium, fonts and index memory; unavailable values are -1. Source accounting includes pre-raster reservations; driver allocations and chrome are outside the pixel payload ledger."}};
         QVERIFY(publish(report));
         QVERIFY(RenderBudget::statistics().value("residentPeakBytes").toLongLong()<=RenderBudget::residentLimit);
         QVERIFY(RenderBudget::statistics().value("texturePeakBytes").toLongLong()<=RenderBudget::textureLimit);
