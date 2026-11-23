@@ -10,6 +10,12 @@ Item {
     property var paperMap: null
     property alias focusTarget: pointer
     readonly property bool paperActive: !!paperMap && paperMap.paperGeometryActive
+    readonly property var noteHoverPosition: {
+        // The canvas MouseArea receives hover before the annotation paint underneath it.
+        if (!pointer.containsMouse || pointer.pressed || (paperActive && !paperMap.paperGeometryRevision))
+            return null;
+        return pointer.paperPosition(Qt.point(pointer.mouseX, pointer.mouseY), false);
+    }
     readonly property var textPage: app.currentReader.textPages[page.toString()] || {
         chars: [],
         text: ""
@@ -149,10 +155,10 @@ Item {
             }
         }
         preventStealing: pressed
-        function paperPosition(mouse) {
+        function paperPosition(mouse, reportError = true) {
             if (annotationLayer.paperActive) {
                 const hit=annotationLayer.paperMap.paperPoint(Qt.point(mouse.x/app.zoom,mouse.y/app.zoom));
-                if(hit.error)app.operationStatus=hit.error;
+                if(reportError && hit.error)app.operationStatus=hit.error;
                 return hit.hit ? {x:hit.x,y:hit.y} : null;
             }
             const size = app.currentReader.pages[page];

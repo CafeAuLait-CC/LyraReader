@@ -11,7 +11,13 @@ Item {
     property bool ownOnly: false
     property bool inlineNotes: false
     property var paperMap: null
+    property var noteHoverPosition: null
     property rect visibleRegion: Qt.rect(0, 0, width / zoom, height / zoom)
+    function underNotePointer(rect) {
+        const p = noteHoverPosition;
+        return !!p && p.x >= rect.x && p.x < rect.x + rect.width
+            && p.y >= rect.y && p.y < rect.y + rect.height;
+    }
     function inViewport(rect) {
         return rect && [rect.x,rect.y,rect.width,rect.height,rect.x+rect.width,rect.y+rect.height].every(Number.isFinite)
             && rect.width>0 && rect.height>0 && rect.x<visibleRegion.x+visibleRegion.width
@@ -108,6 +114,7 @@ Item {
                     nightPaper:annotationLayer.app.paperAppearance==="night"
                     inlineComment:true
                     highlight:inlineDelegate.annotation ? Logic.color(inlineDelegate.annotation) : Qt.rgba(0,0,0,0)
+                    canvasHovered:annotationLayer.underNotePointer(inlineDelegate.modelData.rect)
                     active:!!app.selectedAnnotation && app.selectedAnnotation.id===inlineDelegate.modelData.id
                     Accessible.role:Accessible.Button
                     Accessible.name:qsTr("Read comment on page %1: %2").arg(annotationLayer.page+1).arg(inlineDelegate.annotation ? inlineDelegate.annotation.note : "")
@@ -245,6 +252,7 @@ Item {
                         anchors.fill: parent
                         colors: annotationLayer.app.colors
                         nightPaper: annotationLayer.app.paperAppearance === "night"
+                        canvasHovered: annotationLayer.underNotePointer(noteDelegate.modelData.rect)
                         active: !!app.selectedAnnotation && app.selectedAnnotation.id === noteDelegate.modelData.id
                         Accessible.ignored: noteDelegate.torn
                     }

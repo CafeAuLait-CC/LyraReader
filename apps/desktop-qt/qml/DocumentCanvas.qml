@@ -495,6 +495,7 @@ Item {
                         inlineNotes: true
                         visibleRegion: pdfPage.visibleRegion
                         paperMap: pdfPage
+                        noteHoverPosition: pageInteraction.noteHoverPosition
                     }
                     RedactionLayer {
                         anchors.fill: parent

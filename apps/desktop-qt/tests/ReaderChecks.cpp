@@ -5802,6 +5802,54 @@ private slots:
         item->setWidth(2400);item->setHeight(2400);QCoreApplication::processEvents();QCOMPARE(canvas->property("canvasSize").toSizeF(),QSizeF(192,192));
         item->setWidth(64);item->setHeight(64);
     }
+    void noteBadgesFollowTheReaderCanvasPointer_data() {
+        QTest::addColumn<QString>("fixture");
+        QTest::addColumn<int>("pages");
+        QTest::addColumn<QString>("badgeName");
+        QTest::newRow("sticky") << QString("annotated-notes.pdf") << 1 << QString();
+        QTest::newRow("inline") << QString("annotated-replies.pdf") << 2
+                                 << QString("inlineNoteBadge_nm:parent-highlight");
+    }
+    void noteBadgesFollowTheReaderCanvasPointer() {
+        QFETCH(QString, fixture);
+        QFETCH(int, pages);
+        QFETCH(QString, badgeName);
+        QTemporaryDir scratch;
+        QVERIFY(scratch.isValid());
+        const auto path = scratch.filePath(fixture);
+        QVERIFY(QFile::copy(root + "/tests/fixtures/" + fixture, path));
+        NativeCorpus::Viewer view;
+        auto *window = view.window;
+        QVERIFY(window);
+        window->resize(1200, 820);
+        window->requestActivate();
+        QTRY_COMPARE(QGuiApplication::focusWindow(), window);
+        view.workspace.openFile(QUrl::fromLocalFile(path));
+        auto *reader = view.workspace.activeReader();
+        QTRY_VERIFY(!reader->loading() && reader->pageCount() == pages && !reader->pendingCommands());
+        QVERIFY(settleReaderViewport(window));
+        if (badgeName.isEmpty()) {
+            const auto records = window->property("annotations").value<QJSValue>().toVariant().toList();
+            const auto sticky = std::find_if(records.cbegin(), records.cend(), [](const QVariant &value) {
+                const auto mark = value.toMap();
+                return mark.value("kind") == "stickyNote" && mark.value("visible").toBool();
+            });
+            QVERIFY(sticky != records.cend());
+            badgeName = "foldedNoteBadge_" + sticky->toMap().value("id").toString();
+        }
+        QQuickItem *badge = nullptr;
+        QTRY_VERIFY((badge = visualItem(window->contentItem(), badgeName)) && badge->isVisible());
+        const auto center = badge->mapToScene(QPointF(badge->width() / 2, badge->height() / 2)).toPoint();
+        QVERIFY(QRect(QPoint(), window->size()).contains(center));
+        QTest::mouseMove(window, QPoint(5, 5));
+        QTRY_VERIFY(!badge->property("hovered").toBool());
+        QTest::mouseMove(window, center);
+        QTRY_VERIFY_WITH_TIMEOUT(badge->property("hovered").toBool(), 2000);
+        QTest::mouseMove(window, QPoint(5, 5));
+        QTRY_VERIFY(!badge->property("hovered").toBool());
+        const QVariant selection = window->property("selectedAnnotation");
+        QVERIFY(selection.isNull() || selection.value<QJSValue>().isNull());
+    }
     void inlineCommentsReuseFullLineAnchorsWithoutAdoptingOrMovingPdfBytes() {
         QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/inline-comments.pdf";

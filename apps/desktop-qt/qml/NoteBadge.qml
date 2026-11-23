@@ -10,7 +10,8 @@ Item {
     property bool inlineComment: false
     property color highlight: "transparent"
     property bool active: false
-    readonly property bool hovered: hover.hovered
+    property bool canvasHovered: false
+    readonly property bool hovered: canvasHovered || hover.hovered
     readonly property var ink: colors.noteIconColors(active ? 2 : hovered ? 1 : 0, nightPaper, inlineComment ? highlight : null)
     // Power-of-two buckets match the native artwork cache. Even a malformed or deeply
     // zoomed annotation uses at most 192x192 canvas coordinates here. Qt's own
