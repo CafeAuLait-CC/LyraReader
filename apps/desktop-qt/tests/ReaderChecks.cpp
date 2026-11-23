@@ -1729,6 +1729,79 @@ private slots:
         QVERIFY(reader->data().contains("figures"));QVERIFY(reader->data().value("figures").toList().isEmpty());
         QCOMPARE(nine->indexStatistics().value("figureSteps").toULongLong(),qulonglong(3));
     }
+    void cooperativeIndexIgnoresThumbnailsAndCancelledQueueItemsButWaitsForRunningRaster() {
+        QTemporaryDir scratch;
+        QVERIFY(scratch.isValid());
+        const auto path=scratch.filePath("thumbnail-and-reference.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/narrative-citation.pdf",path));
+        ReaderController reader;
+        reader.openFile(QUrl::fromLocalFile(path));
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pageCount(),2,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(RasterJobs::statistics().value("queued").toInt(),0,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(RasterJobs::statistics().value("running").toInt(),0,10000);
+
+        QSemaphore started, resume;
+        QList<QFuture<void>> workers;
+        for(int slot=0;slot<RasterJobs::maximumRunning;++slot) {
+            workers.append(QtConcurrent::run(RasterJobs::pool(),[&]{started.release();resume.acquire();}));
+        }
+        auto release=qScopeGuard([&] {
+            resume.release(workers.size());
+            for(auto &worker:workers)worker.waitForFinished();
+        });
+        QVERIFY(started.tryAcquire(workers.size(),1000));
+        reader.requestPage(0,1,true);
+        QCOMPARE(RasterJobs::statistics().value("queued").toInt(),1);
+        QVERIFY(!RasterJobs::foregroundBusy());
+
+        HeldRasterAdmission cancelled;
+        QVERIFY(cancelled.ticket);
+        QCOMPARE(RasterJobs::statistics().value("interactiveQueued").toInt(),1);
+        QVERIFY(RasterJobs::foregroundBusy());
+        RasterJobs::cancel(cancelled.ticket);
+        RasterJobs::cancel(cancelled.ticket);
+        QCOMPARE(RasterJobs::statistics().value("queued").toInt(),2);
+        QCOMPARE(RasterJobs::statistics().value("interactiveQueued").toInt(),0);
+        QVERIFY(!RasterJobs::foregroundBusy());
+
+        reader.submit("references");
+        QTRY_COMPARE_WITH_TIMEOUT(reader.pendingCommands(),0,10000);
+        QCOMPARE(reader.data().value("references").toList().size(),8);
+        QCOMPARE(reader.renderSource()->indexStatistics().value("rasterDeferrals").toULongLong(),qulonglong(0));
+        cancelled.release();
+
+        resume.release(workers.size());
+        for(auto &worker:workers)worker.waitForFinished();
+        release.dismiss();
+        QTRY_VERIFY_WITH_TIMEOUT(!reader.cachedPage(0,1,true).isNull(),10000);
+        auto active=RasterJobs::enqueue();
+        QVERIFY(active);
+        {
+            RasterJobs::Run running(active);
+            RasterJobs::cancel(active);
+            QCOMPARE(RasterJobs::statistics().value("interactiveRunning").toInt(),1);
+            QVERIFY(RasterJobs::foregroundBusy());
+        }
+        QCOMPARE(RasterJobs::statistics().value("interactiveRunning").toInt(),0);
+        QVERIFY(!RasterJobs::foregroundBusy());
+
+        const auto coldPath=scratch.filePath("under-continuous-demand.pdf");
+        QVERIFY(QFile::copy(path,coldPath));
+        ReaderController cold;
+        cold.openFile(QUrl::fromLocalFile(coldPath));
+        QTRY_COMPARE_WITH_TIMEOUT(cold.pageCount(),2,10000);
+        QTRY_COMPARE_WITH_TIMEOUT(cold.pendingCommands(),0,10000);
+        HeldRasterAdmission uninterrupted;
+        QVERIFY(uninterrupted.ticket && RasterJobs::foregroundBusy());
+        cold.submit("references");
+        QTRY_COMPARE_WITH_TIMEOUT(cold.pendingCommands(),0,10000);
+        QCOMPARE(cold.data().value("references").toList().size(),8);
+        const auto progress=cold.renderSource()->indexStatistics();
+        QVERIFY(progress.value("rasterDeferrals").toULongLong()>0);
+        QVERIFY(progress.value("maxRasterYieldMs").toDouble()>=200.0);
+        QVERIFY(RasterJobs::foregroundBusy());
+    }
     void coldCitationQueriesUseTheCooperativeReferenceGate() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/citation.pdf";
         QVERIFY(QFile::copy(root+"/tests/fixtures/narrative-citation.pdf",path));

@@ -689,7 +689,8 @@ TilePlanResult ReaderController::requestPlannedTiles(quintptr consumer,int page,
 
 void ReaderController::startNextRaster() {
     if(m_rendering || m_requests.isEmpty() || !m_source)return;
-    auto ticket=RasterJobs::enqueue();if(!ticket){
+    const auto work=m_requests.first().embedded ? RasterJobs::Work::Background : RasterJobs::Work::Interactive;
+    auto ticket=RasterJobs::enqueue(work);if(!ticket){
         if(!m_rasterRetryQueued){m_rasterRetryQueued=true;QTimer::singleShot(100,this,[this]{m_rasterRetryQueued=false;startNextRaster();});}
         return;
     }

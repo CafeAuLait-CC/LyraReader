@@ -50,7 +50,7 @@ public:
         const double height=size.value(QStringLiteral("height")).toDouble();
         const double y=top,bandHeight=qMin(128.0,height-y);
         const int page=pages.at(index);
-        auto ticket=RasterJobs::enqueue();
+        auto ticket=RasterJobs::enqueue(RasterJobs::Work::Background);
         if(!ticket){QTimer::singleShot(100,this,[this]{nextBand();});return;}
         auto *watcher=new QFutureWatcher<Band>(this);
         connect(watcher,&QFutureWatcher<Band>::finished,this,[this,watcher,width,height,y,bandHeight] {
