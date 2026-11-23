@@ -66,6 +66,7 @@ Pane {
     readonly property string status: viewState.statusView === workspace ? viewState.status || "" : (((viewState.results || {})[workspace] || {}).status || "")
     padding: compact ? 6 : 10
     background: Rectangle { color: app.colors.sidebarBg }
+    function openSavedNote(id) { readingNotes.browse("", id); }
     function sortedRange(range) {
         return {page: range.page, start: Math.min(range.start, range.end), end: Math.max(range.start, range.end)};
     }

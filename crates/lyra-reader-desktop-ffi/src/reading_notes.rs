@@ -16,6 +16,36 @@ pub(super) struct NoteDraft {
 }
 
 impl DesktopDocument {
+    pub(super) fn keep_region_note(
+        &self,
+        document: &Arc<LyraReaderDocument>,
+        id: &str,
+        reviewed_revision: &str,
+    ) -> Result<Value, String> {
+        self.update_reading_workspace(document, |workspace, sha, cache| {
+            let current = crate::region_store::reading_note_source(
+                cache,
+                document,
+                sha,
+                id,
+                reviewed_revision,
+            )?;
+            let original = match workspace
+                .records()
+                .into_iter()
+                .find(|record| record.id == current.id)
+            {
+                Some(record) if record.source_hash == sha && record.kind == current.kind => record,
+                Some(_) => {
+                    return Err("This region note belongs to a different PDF revision.".into());
+                }
+                None => workspace.put(current)?,
+            };
+            let note = workspace.keep(original, crate::marks::uuid()?)?;
+            Ok(json!({"id":note.id,"title":note.title}))
+        })
+    }
+
     pub(super) fn archive_selection_summary(
         &self,
         source: &Arc<LyraReaderDocument>,

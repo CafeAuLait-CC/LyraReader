@@ -13,6 +13,7 @@ Pane {
     property var detail:null
     property var readId:0
     property var reopenId:0
+    property var keepId:0
     property var continueContext:null
     property string selectedId:""
     property int turnIndex:0
@@ -42,7 +43,7 @@ Pane {
     function deactivate() {
         let focused=app.activeFocusItem;let ownedFocus=false;
         while(focused){if(focused===notes){ownedFocus=true;break;}focused=focused.parent;}
-        continueReveal.stop();continueContext=null;exportFile.close();exportContext=null;remove.close();detail=null;readId=0;reopenId=0;owner=null;
+        continueReveal.stop();continueContext=null;exportFile.close();exportContext=null;remove.close();detail=null;readId=0;reopenId=0;keepId=0;owner=null;
         if(ownedFocus)app.focusReadingView();closed();
     }
     onActiveChanged:if(active)activate();else deactivate()
@@ -100,6 +101,13 @@ Pane {
         target:notes.owner
         function onDocumentReset(){notes.close();}
         function onCommandFinished(id,op,result,error){
+            if(op==="ai_reading_keep_region" && id===notes.keepId) {
+                notes.keepId=0;
+                if(error)notes.readError=error;
+                else if(notes.owner===notes.app.currentReader && notes.ownerGeneration===notes.owner.documentGeneration)
+                    notes.app.openSavedReadingNote(result.id);
+                return;
+            }
             if(id===notes.reopenId) {
                 notes.reopenId=0;
                 if(error){notes.continueContext=null;notes.readError=error;return;}
@@ -244,6 +252,16 @@ Pane {
                 }
                 Button {text:qsTr("Copy answer");visible:!!notes.turn;enabled:!!notes.turn && !!notes.app.session;onClicked:notes.app.session.copyText(notes.turn.answer)}
                 Label {text:qsTr("Knowledge note");font.bold:true}
+                Button {
+                    objectName:"keepRegionKnowledgeNote"
+                    text:qsTr("Keep as reading note")
+                    visible:!!notes.detail && !!notes.detail.can_reopen && !!(notes.detail.knowledgeNote || "").trim()
+                    enabled:visible && !!notes.owner && !notes.owner.hasUnsavedReadingNotes && !notes.owner.pendingCommands && !notes.history.writes_blocked && !notes.history.error
+                    onClicked:{
+                        notes.readError="";
+                        notes.keepId=notes.owner.submit("ai_reading_keep_region",{id:notes.selectedId,expected_history_revision:notes.history.revision});
+                    }
+                }
                 TextArea {
                     id:noteText;objectName:"regionKnowledgeNote"
                     readOnly:!!notes.history.writes_blocked;selectByMouse:true

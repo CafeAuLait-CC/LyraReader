@@ -1039,6 +1039,11 @@ impl DesktopDocument {
             "ai_reading_note" => self.reading_note(&d, &text(&r, "id")?),
             "ai_reading_note_update" => self.save_reading_note(&d, arg(&r, "draft")?),
             "ai_reading_keep" => self.keep_reading_note(&d, &text(&r, "id")?),
+            "ai_reading_keep_region" => self.keep_region_note(
+                &d,
+                &text(&r, "id")?,
+                &text(&r, "expected_history_revision")?,
+            ),
             "ai_merge_preview" => value(
                 build_ai_merge_plan(arg(&r, "request")?)
                     .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),

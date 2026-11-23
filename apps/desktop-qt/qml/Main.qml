@@ -90,6 +90,10 @@ ApplicationWindow {
     DocumentReading {id:documentReadingPopup;app:root}
     function openDocumentReading(){aiRegionCard.close();regionNotes.close();documentReadingPopup.open();}
     function openRegionNotes(){if(currentReader.pageCount>0){aiRegionCard.close();showAiPanelMode(true,"notes");}}
+    function openSavedReadingNote(id) {
+        showAiPanel(true);
+        if (aiPanelVisible && aiPanelMode === "assistant") aiContent.openSavedNote(id);
+    }
     function focusReadingView() {
         if(currentReader.pageCount>0) {
             const frame=!overviewVisible && !textViewVisible ? canvas.pageFrame(currentPage,canvas.placementEpoch) : null;

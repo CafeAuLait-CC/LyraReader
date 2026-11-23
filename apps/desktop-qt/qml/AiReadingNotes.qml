@@ -28,9 +28,10 @@ Dialog {
     function current() {
         return reader && reader === app.currentReader && generation === reader.documentGeneration;
     }
-    function browse(source) {
+    function browse(source, noteId = "") {
         reader = app.currentReader;
         generation = reader.documentGeneration;
+        preferred = noteId;
         open();
         const draft = reader.readingNoteDraft;
         if (draft.id) {

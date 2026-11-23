@@ -4,7 +4,10 @@ use crate::document::DesktopDocument;
 use crate::document_cache::{DocumentCache, atomic_write, read_optional};
 use fs2::FileExt;
 use lyra_reader_ai::region_history::{AnswerState, Attachment, Entry, History, Turn};
-use lyra_reader_ffi::api::{AiActionRecord, AiConversationTurnRecord, AiPlanRequestRecord};
+use lyra_reader_ai::workspace::ReadingRecord;
+use lyra_reader_ffi::api::{
+    AiActionRecord, AiConversationTurnRecord, AiPlanRequestRecord, LyraReaderDocument,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -156,6 +159,50 @@ fn number(r: &Value, k: &str) -> Result<f64, String> {
         .filter(|n| n.is_finite())
         .ok_or_else(|| format!("Invalid capture {k}"))
 }
+
+pub(super) fn reading_note_source(
+    cache: &DocumentCache,
+    document: &LyraReaderDocument,
+    sha: &str,
+    id: &str,
+    reviewed_revision: &str,
+) -> Result<ReadingRecord, String> {
+    // Read the current disk snapshot, rather than a different window's cached history.
+    let mut store = RegionStore::default();
+    store.load(cache)?;
+    if let Some(error) = store.error {
+        return Err(error);
+    }
+    if store.history.writes_blocked {
+        return Err("Saved regions are protected. Resolve the history warning first.".into());
+    }
+    if store.revision() != reviewed_revision {
+        return Err("Saved regions changed. Reopen this area before keeping its note.".into());
+    }
+    let region = store.history.get(id)?;
+    region.validate_reopen(document.page_count(), sha)?;
+    if region.knowledge_note.trim().is_empty() {
+        return Err("Save a knowledge note for this region first.".into());
+    }
+    let page = region.attachment.page + 1;
+    let modified = u64::try_from(chrono::Utc::now().timestamp_millis())
+        .map_err(|_| "The local clock cannot date the reading note.")?;
+    Ok(ReadingRecord {
+        id: format!("interleaf:{}", region.id),
+        kind: "message".into(),
+        title: format!("Interleaf · page {page}"),
+        content: region.knowledge_note.clone(),
+        conversation_id: region.id.clone(),
+        pages: vec![page],
+        source_hash: sha.into(),
+        status: "finished".into(),
+        modified,
+        covered_turns: u32::try_from(region.completed_turns().count())
+            .map_err(|_| "The saved region has too many exchanges.")?,
+        ..ReadingRecord::default()
+    })
+}
+
 impl DesktopDocument {
     /// Use the stored snapshot and completed context at the same boundary as request planning.
     pub(super) fn enrich_region_history(

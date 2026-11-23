@@ -4927,6 +4927,38 @@ private slots:
         QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",80},{"height",40}},1));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiRegion().value("image_png").toString().isEmpty(),10000);QVERIFY(reader->saveAiRegionNote());QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);const auto extraId=reader->aiRegion().value("history_id").toString();reader->clearAiRegion();
         QVERIFY(QMetaObject::invokeMethod(notes,"exportTo",Q_ARG(QVariant,QUrl::fromLocalFile(staleExport))));QVERIFY(QMetaObject::invokeMethod(exportDialog,"reject"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(reader->error().contains("changed"));QVERIFY(!QFileInfo::exists(staleExport));QVERIFY(!reader->hasUnsavedReadingNotes());reader->dismissError();
         reader->submit("region_delete",{{"id",extraId}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        auto *keepRegion=notes->findChild<QObject *>("keepRegionKnowledgeNote");
+        auto *savedNotes=window->findChild<QObject *>("aiReadingNotes");QVERIFY(keepRegion && savedNotes);
+        QTRY_VERIFY(keepRegion->property("visible").toBool() && keepRegion->property("enabled").toBool());
+        const auto readFile=[&](const QString &name) {
+            QFile file(name);
+            return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray{};
+        };
+        const auto regionBytes=readFile(historyPath);QVERIFY(!regionBytes.isEmpty());
+        QVERIFY(QMetaObject::invokeMethod(keepRegion,"clicked"));
+        const auto imported=[&]{return savedNotes->property("note").toMap();};
+        QTRY_COMPARE(imported().value("content").toString(),QString("A synthetic local knowledge note α/β"));
+        QCOMPARE(imported().value("source_pages").toList(),QVariantList{1});
+        const auto importedId=imported().value("id").toString();QVERIFY(!importedId.isEmpty());
+        QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(QMetaObject::invokeMethod(savedNotes,"close"));QTRY_VERIFY(!savedNotes->property("visible").toBool());
+        const auto keptBytes=readFile(QFileInfo(historyPath).dir().filePath("ai-reading-workspace.json"));QVERIFY(!keptBytes.isEmpty());
+        QSignalSpy staleKeep(reader,&ReaderController::commandFinished);
+        const auto staleKeepId=reader->submit("ai_reading_keep_region",{{"id",id},{"expected_history_revision","obsolete-keep-fixture"}});
+        QTRY_COMPARE(staleKeep.size(),1);QCOMPARE(staleKeep.at(0).at(0).toULongLong(),staleKeepId);
+        QVERIFY(staleKeep.at(0).at(3).toString().contains("changed"));
+        QCOMPARE(readFile(QFileInfo(historyPath).dir().filePath("ai-reading-workspace.json")),keptBytes);
+        QCOMPARE(readFile(historyPath),regionBytes);
+        QVERIFY(QMetaObject::invokeMethod(window,"openRegionNotes"));QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(QMetaObject::invokeMethod(notes,"load",Q_ARG(QVariant,id)));QTRY_COMPARE(reader->pendingCommands(),0);
+        QTRY_VERIFY(keepRegion->property("enabled").toBool());
+        QVERIFY(QMetaObject::invokeMethod(keepRegion,"clicked"));QTRY_COMPARE(imported().value("id").toString(),importedId);
+        QVERIFY(QMetaObject::invokeMethod(savedNotes,"close"));QTRY_VERIFY(!savedNotes->property("visible").toBool());
+        QCOMPARE(readFile(QFileInfo(historyPath).dir().filePath("ai-reading-workspace.json")),keptBytes);
+        QCOMPARE(readFile(historyPath),regionBytes);
+        QCOMPARE(sentinel.requests.size(),0);
+        QVERIFY(QMetaObject::invokeMethod(window,"openRegionNotes"));QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(QMetaObject::invokeMethod(notes,"load",Q_ARG(QVariant,id)));QTRY_COMPARE(reader->pendingCommands(),0);
         if(qEnvironmentVariableIsSet("LYRA_READER_NOTES_DARK_NARROW")){window->setProperty("appearance","dark");window->resize(700,600);QTRY_VERIFY(notesItem->width()>=240 && notesItem->width()<=dock->width());QTRY_VERIFY(notesItem->mapToScene(QPointF(notesItem->width(),0)).x()<=window->width()+1);}
         const auto snapshot=qEnvironmentVariable("LYRA_READER_NOTES_SNAPSHOT");if(!snapshot.isEmpty()){QTest::qWait(100);QVERIFY(window->grabWindow().save(snapshot));}
         QVERIFY(QMetaObject::invokeMethod(notes,"close"));reader->openFile(QUrl::fromLocalFile(path));QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
