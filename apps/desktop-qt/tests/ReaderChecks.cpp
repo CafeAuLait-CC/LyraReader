@@ -3001,6 +3001,30 @@ private slots:
         QVERIFY(reader->aiState().value("translationBlocks").toList().isEmpty());
         QVERIFY(reader->aiState().value("translationWarning").toString().contains("duplicate"));
         QVERIFY(reader->aiState().value("output").toString().contains("Duplicado"));
+
+        reader->setAiInput("translationScope","document");
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(!plan().isEmpty());QTRY_COMPARE(reader->pendingCommands(),0);
+        const auto interrupted=plan();
+        const auto parts=interrupted.value("parts").toList();QVERIFY(parts.size()>1);
+        expectedBodies.append(parts.first().toMap().value("wire_body").toString().toUtf8());
+        MockChatServer::Response held;held.holdLast=true;
+        held.chunks={MockChatServer::delta({{"content","PARTIAL_RAW_FROM_FIRST_REQUEST"}}),QByteArray("data: [DONE]\n\n")};
+        server.responses.append(held);
+        QVERIFY(reader->startAi("local",interrupted));
+        QTRY_VERIFY(reader->aiState().value("output").toString().contains("PARTIAL_RAW_FROM_FIRST_REQUEST"));
+        reader->cancelAi();
+        QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);verifyWire();
+        QDirIterator files(scratch.filePath("cache"),{"ai-reading-workspace.json"},QDir::Files,QDirIterator::Subdirectories);
+        QVERIFY(files.hasNext());QFile archive(files.next());QVERIFY(archive.open(QIODevice::ReadOnly));
+        const auto rows=QJsonDocument::fromJson(archive.readAll()).object().value("records").toArray();
+        QCOMPARE(rows.size(),4);
+        QCOMPARE(rows.at(2).toObject().value("status").toString(),QString("partial"));
+        QVERIFY(rows.at(2).toObject().value("content").toString().contains("Duplicado"));
+        const auto saved=rows.last().toObject();
+        QCOMPARE(saved.value("status").toString(),QString("partial"));
+        QCOMPARE(saved.value("content").toString(),QString("PARTIAL_RAW_FROM_FIRST_REQUEST"));
+        QCOMPARE(saved.value("pages").toArray().toVariantList(),parts.first().toMap().value("pages").toList());
+        QVERIFY(saved.value("originals").toArray().isEmpty());
     }
 
     void sidebarTranslationHistoryReopensAndReplaysTheSavedRange() {

@@ -50,7 +50,7 @@ struct ReadingSummaryStyle {
 }
 
 enum ReadingOutput {
-    Translation(Box<ReadingRecord>),
+    Translation(Box<crate::reading_history::PendingTranslation>),
     Synthesis {
         request: Box<AiMergePlanRequestRecord>,
         style: ReadingSummaryStyle,
@@ -63,6 +63,7 @@ struct ReadingReplies {
     replies: Vec<String>,
     remaining_bytes: usize,
     failure: Option<&'static str>,
+    incomplete: bool,
     done: bool,
 }
 
@@ -74,6 +75,7 @@ impl ReadingReplies {
             replies: Vec::new(),
             remaining_bytes: MAX_READING_REPLY_BYTES,
             failure: None,
+            incomplete: false,
             done: false,
         }
     }
@@ -115,83 +117,58 @@ impl ReadingReplies {
                         Some("length" | "content_filter" | "tool_calls" | "function_call")
                     ) =>
                 {
-                    self.failure =
-                        Some("The provider stopped before completing a reading task part.");
+                    self.incomplete = true;
                 }
                 AiEventRecord::Error { .. } => {
-                    self.failure = Some("The reading task did not complete.");
+                    self.incomplete = true;
                 }
                 _ => {}
-            }
-            if self.failure.is_some() {
-                self.replies.clear();
             }
         }
     }
 
     fn publish(self, result: &mut Value) -> Option<Result<ReadingRecord, String>> {
-        if !self.done {
-            return None;
-        }
-        let replies = self.failure.map_or_else(
-            || {
-                (self.replies.len() == self.expected_parts)
-                    .then_some(self.replies)
-                    .ok_or("The response is missing reviewed parts.")
-            },
-            Err,
-        );
-        let mut archive = None;
-        let (key, warning, payload) = match self.output {
-            ReadingOutput::Translation(record) => (
-                "translation_blocks",
-                "translation_warning",
-                replies.map_err(str::to_owned).and_then(|replies| {
-                    let rows = lyra_reader_ai::workspace::translation_blocks_from_parts(
-                        &record.originals,
-                        &record.original_pages,
-                        replies.iter().map(String::as_str),
-                    )?;
-                    if rows.is_empty() || rows.iter().any(|row| row.translation.is_empty()) {
-                        return Err(
-                            "The response did not translate every requested paragraph.".into()
-                        );
+        let failure = self
+            .failure
+            .or((self.incomplete || !self.done)
+                .then_some("The provider stopped before completing all reading task parts."))
+            .or((self.replies.len() != self.expected_parts)
+                .then_some("The response is missing reviewed parts."));
+        match self.output {
+            ReadingOutput::Translation(pending) => pending.finish(&self.replies, failure, result),
+            ReadingOutput::Synthesis { mut request, style } => {
+                if !self.done {
+                    return None;
+                }
+                if let Some(message) = failure {
+                    result["synthesis_warning"] = json!(message);
+                    return None;
+                }
+                for (part, reply) in request.parts.iter_mut().zip(self.replies) {
+                    part.summary = reply;
+                }
+                let preview = value(
+                    build_ai_merge_plan(*request)
+                        .and_then(|plan| {
+                            style_ai_reading_plan(
+                                plan,
+                                "summary".into(),
+                                style.detail,
+                                style.language,
+                            )
+                        })
+                        .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),
+                );
+                match preview {
+                    Ok(mut plan) => {
+                        plan["kind"] = json!("summary_synthesis");
+                        result["synthesis_plan"] = plan;
                     }
-                    archive = Some(crate::reading_history::complete_translation(*record, &rows));
-                    Ok(crate::reading_history::rows_value(&rows))
-                }),
-            ),
-            ReadingOutput::Synthesis { mut request, style } => (
-                "synthesis_plan",
-                "synthesis_warning",
-                replies.map_err(str::to_owned).and_then(|replies| {
-                    for (part, reply) in request.parts.iter_mut().zip(replies) {
-                        part.summary = reply;
-                    }
-                    let mut plan = value(
-                        build_ai_merge_plan(*request)
-                            .and_then(|plan| {
-                                style_ai_reading_plan(
-                                    plan,
-                                    "summary".into(),
-                                    style.detail,
-                                    style.language,
-                                )
-                            })
-                            .and_then(|plan| {
-                                render_ai_plan(plan, AiWireTransport::ChatCompletions)
-                            }),
-                    )?;
-                    plan["kind"] = json!("summary_synthesis");
-                    Ok(plan)
-                }),
-            ),
-        };
-        match payload {
-            Ok(payload) => result[key] = payload,
-            Err(message) => result[warning] = json!(message),
+                    Err(message) => result["synthesis_warning"] = json!(message),
+                }
+                None
+            }
         }
-        archive
     }
 }
 
@@ -1057,7 +1034,7 @@ impl DesktopDocument {
                         let scope: crate::reading_history::TranslationScope =
                             arg(&r["plan"], "reading_scope")?;
                         Some(ReadingOutput::Translation(Box::new(
-                            scope.reading_record(&plan, d.document_identity().sha256)?,
+                            scope.capture(&plan, d.document_identity().sha256)?,
                         )))
                     }
                     (Some("reading_summary"), AiActionRecord::SummarizeDocument)
@@ -1150,7 +1127,12 @@ impl DesktopDocument {
                 let mut current = self.ai.lock().map_err(|_| "AI state is unavailable")?;
                 if let Some(job) = current.as_mut() {
                     let mut events = job.request.poll();
-                    let finished = job.request.is_finished();
+                    // Error is the final queued event even if the worker has not yet set its
+                    // finished flag. The native shell stops polling as soon as it sees Error.
+                    let finished = job.request.is_finished()
+                        || events
+                            .iter()
+                            .any(|event| matches!(event, AiEventRecord::Error { .. }));
                     // The worker can finish between draining and observing its finished flag.
                     if finished {
                         events.extend(job.request.poll());

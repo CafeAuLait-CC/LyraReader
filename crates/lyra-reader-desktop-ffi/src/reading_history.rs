@@ -22,18 +22,23 @@ pub(super) struct TranslationScope {
     pub detail: String,
 }
 
+pub(super) struct PendingTranslation {
+    record: ReadingRecord,
+    request_pages: Vec<Vec<u32>>,
+}
+
 impl TranslationScope {
-    pub fn reading_record(
+    pub fn capture(
         self,
         plan: &AiPlanRecord,
         source_hash: String,
-    ) -> Result<ReadingRecord, String> {
+    ) -> Result<PendingTranslation, String> {
         let selection = self.selection.map(|range| lyra_reader_ai::SelectionRange {
             page: range.page,
             start: range.start,
             end: range.end,
         });
-        Ok(ReadingRecord {
+        let record = ReadingRecord {
             id: crate::marks::uuid()?,
             kind: "translation".into(),
             source_id: reading_scope_key(selection),
@@ -54,33 +59,87 @@ impl TranslationScope {
             source_hash,
             status: "finished".into(),
             ..ReadingRecord::default()
+        };
+        Ok(PendingTranslation {
+            record,
+            request_pages: plan.parts.iter().map(|part| part.pages.clone()).collect(),
         })
     }
 }
 
-pub(super) fn rows_value(rows: &[TranslationBlock]) -> Value {
+fn rows_value(rows: &[TranslationBlock]) -> Value {
     Value::Array(rows.iter().map(|row| {
         json!({"original": row.original, "translation": row.translation, "page": row.page})
     }).collect())
 }
 
-/// Persist the shared paragraph markers in approved order, with no provider prefixes between
-/// parts. The same shared decoder opens the result on either shell.
-pub(super) fn complete_translation(
-    mut record: ReadingRecord,
-    rows: &[TranslationBlock],
-) -> Result<ReadingRecord, String> {
-    for (index, row) in rows.iter().enumerate() {
-        writeln!(
-            &mut record.content,
-            "<!--lyra:{index}--> {}",
-            row.translation
-        )
-        .map_err(|error| error.to_string())?;
+impl PendingTranslation {
+    pub fn finish(
+        mut self,
+        replies: &[String],
+        failure: Option<&str>,
+        result: &mut Value,
+    ) -> Option<Result<ReadingRecord, String>> {
+        if !replies.iter().any(|reply| !reply.trim().is_empty()) {
+            if failure.is_none() {
+                result["translation_warning"] =
+                    json!("The response did not translate any source paragraphs.");
+            }
+            return None;
+        }
+        let rows = failure
+            .map_or_else(
+                || {
+                    lyra_reader_ai::workspace::translation_blocks_from_parts(
+                        &self.record.originals,
+                        &self.record.original_pages,
+                        replies.iter().map(String::as_str),
+                    )
+                },
+                |message| Err(message.to_owned()),
+            )
+            .and_then(|rows| {
+                if rows.is_empty() || rows.iter().any(|row| row.translation.is_empty()) {
+                    return Err("The response did not translate every requested paragraph.".into());
+                }
+                Ok(rows)
+            });
+        Some((|| {
+            match rows {
+                Ok(rows) => {
+                    result["translation_blocks"] = rows_value(&rows);
+                    // Publish stable markers in approved order for either shell's shared parser.
+                    for (index, row) in rows.iter().enumerate() {
+                        writeln!(
+                            &mut self.record.content,
+                            "<!--lyra:{index}--> {}",
+                            row.translation
+                        )
+                        .map_err(|error| error.to_string())?;
+                    }
+                }
+                Err(error) => {
+                    result["translation_warning"] = json!(error);
+                    self.record.status = "partial".into();
+                    self.record.content = replies.join("\n\n");
+                    self.record.excerpt = self.record.content.trim().chars().take(160).collect();
+                    self.record.originals.clear();
+                    self.record.original_pages.clear();
+                    // A part announcement precedes HTTP. Only received answer text
+                    // establishes which reviewed requests contributed to this archive.
+                    self.record.pages = replies
+                        .iter()
+                        .zip(self.request_pages)
+                        .filter(|(reply, _)| !reply.trim().is_empty())
+                        .flat_map(|(_, pages)| pages)
+                        .collect();
+                }
+            }
+            self.record.modified = u64::try_from(chrono::Utc::now().timestamp_millis())
+                .map_err(|_| "The local clock cannot date this translation.")?;
+            Ok(self.record)
+        })())
     }
-    record.modified = u64::try_from(chrono::Utc::now().timestamp_millis())
-        .map_err(|_| "The local clock cannot date this translation.")?;
-    Ok(record)
 }
 
 fn workspace(bytes: Option<&[u8]>, sha: String) -> Result<ReadingWorkspace, String> {
@@ -177,6 +236,11 @@ impl DesktopDocument {
     ) -> Result<Value, String> {
         self.translations(source, false, |workspace| {
             let record = translation_record(workspace, id)?;
+            if record.status == "partial" || record.originals.is_empty() {
+                return Ok(json!({"id": record.id, "language": record.language, "status": record.status,
+                    "can_replay": !record.source_hash.is_empty() && record.status != "sourceChanged",
+                    "content": record.content, "blocks": []}));
+            }
             let pairs =
                 translation_blocks(&record.originals, &record.original_pages, &record.content);
             let (rows, warning) = match pairs {

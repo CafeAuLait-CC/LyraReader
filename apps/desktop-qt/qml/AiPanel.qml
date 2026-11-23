@@ -721,6 +721,7 @@ Pane {
                       !translationHistory.entries.length ? qsTr("No saved translations for this source type.") :
                       !translationHistory.entry ? "" :
                       translationHistory.entry.status === "sourceChanged" ? qsTr("This translation belongs to an earlier PDF revision.") :
+                      translationHistory.entry.status === "partial" ? qsTr("Incomplete translation. The received text was kept.") :
                       translationHistory.entry.warning || "")
                 wrapMode: Text.Wrap; textFormat: Text.PlainText
             }
