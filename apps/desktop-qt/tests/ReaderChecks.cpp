@@ -3438,6 +3438,73 @@ private slots:
         QVERIFY(cacheFile.open(QIODevice::ReadOnly));QCOMPARE(cacheFile.readAll(),prior);
     }
 
+    void wholeSummaryAndOptionalReadingShareTheLiveDocumentClaim() {
+        MockChatServer server;QVERIFY(server.listen());
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-shared-analysis.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        const auto prior=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");
+        const auto reset=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",prior);});
+        qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
+        NativeCorpus::Viewer manualView,optionalView;QVERIFY(manualView.window && optionalView.window);
+        const QVariantMap settings{{"baseUrl",server.baseUrl()},{"model","synthetic-analysis"}};
+        for(auto *view:{&manualView,&optionalView}) {
+            view->workspace.openFile(QUrl::fromLocalFile(path));
+            auto *reader=view->workspace.activeReader();
+            QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
+            view->window->setProperty("aiSettings",settings);
+        }
+        auto *manual=manualView.workspace.activeReader(),*optional=optionalView.workspace.activeReader();
+        QVERIFY(QMetaObject::invokeMethod(manualView.window,"openAiWorkspace",Q_ARG(QVariant,"summary")));
+        QVERIFY(QMetaObject::invokeMethod(optionalView.window,"openDocumentReading"));
+        auto *panel=manualView.window->findChild<QObject *>("aiPanel");
+        auto *reading=optionalView.window->findChild<QObject *>("documentReadingPopup");
+        QVERIFY(panel && reading);
+        const auto prepareManual=[&] {
+            QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_COMPARE(manual->pendingCommands(),0);
+            QCOMPARE(manual->aiState().value("plan").toMap().value("kind").toString(),QString("reading_summary"));
+        };
+        const auto prepareOptional=[&] {
+            QVERIFY(QMetaObject::invokeMethod(reading,"prepare"));QTRY_COMPARE(optional->pendingCommands(),0);
+            QCOMPARE(optional->documentReading().value("phase").toString(),QString("preview"));
+        };
+        const auto startOptional=[&] {
+            const auto state=optional->documentReading();
+            return optional->startDocumentReading("local",state.value("plan").toMap(),state.value("token").toString());
+        };
+        const auto startManual=[&] {return manual->startAi("local",manual->aiState().value("plan").toMap());};
+        const auto hold=[&] {server.responses.append({{MockChatServer::delta({{"content","Held synthetic response"}}),QByteArray("data: [DONE]\n\n")},4,200,true});};
+        prepareManual();if(QTest::currentTestFailed())return;
+        prepareOptional();if(QTest::currentTestFailed())return;
+        hold();QVERIFY(startManual());QTRY_COMPARE(server.requests.size(),1);QTRY_COMPARE(server.activeConnections(),1);
+        QVERIFY(startOptional());QTRY_COMPARE(optional->documentReading().value("phase").toString(),QString("failed"));
+        QVERIFY(optional->documentReading().value("message").toString().contains("already reading this PDF"));
+        QCOMPARE(server.requests.size(),1);QVERIFY(manual->aiState().value("running").toBool());
+        manual->cancelAi();QTRY_VERIFY(!manual->aiState().value("running").toBool());
+        QTRY_COMPARE(server.activeConnections(),0);QTRY_COMPARE(manual->pendingCommands(),0);
+        QVERIFY(!manual->documentReading().value("ready").toBool());
+
+        prepareOptional();if(QTest::currentTestFailed())return;
+        hold();QVERIFY(startOptional());QTRY_COMPARE(server.requests.size(),2);QTRY_COMPARE(server.activeConnections(),1);
+        prepareManual();if(QTest::currentTestFailed())return;
+        QVERIFY(startManual());QTRY_VERIFY(!manual->aiState().value("running").toBool());
+        QVERIFY(manual->aiState().value("status").toString().contains("already reading this PDF"));
+        QCOMPARE(server.requests.size(),2);QCOMPARE(optional->documentReading().value("phase").toString(),QString("reading"));
+        optional->stopDocumentReading();QTRY_COMPARE(optional->documentReading().value("phase").toString(),QString("idle"));
+        QTRY_COMPARE(server.activeConnections(),0);QTRY_COMPARE(optional->pendingCommands(),0);
+        QVERIFY(!optional->documentReading().value("ready").toBool());
+
+        prepareManual();if(QTest::currentTestFailed())return;
+        const auto wire=manual->aiState().value("plan").toMap().value("parts").toList().first().toMap().value("wire_body").toString();
+        server.responses.append({{MockChatServer::delta({{"content","Completed synthetic result."}}),QByteArray("data: [DONE]\n\n")},4,200});
+        QVERIFY(startManual());QTRY_COMPARE(server.requests.size(),3);QTRY_VERIFY(!manual->aiState().value("running").toBool());
+        QTRY_VERIFY(manual->documentReading().value("ready").toBool());
+        const auto request=server.requests.last();QCOMPARE(request.mid(request.indexOf("\r\n\r\n")+4),wire.toUtf8());
+        QTRY_COMPARE(manual->pendingCommands(),0);
+        QVERIFY(QMetaObject::invokeMethod(reading,"prepare"));QTRY_COMPARE(optional->pendingCommands(),0);
+        QTRY_COMPARE(optional->documentReading().value("phase").toString(),QString("ready"));
+        QCOMPARE(server.requests.size(),3);
+    }
+
     void readingNotesKeepOneCompleteSummaryAndRestoreWithoutSending() {
         QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
         MockChatServer server;QVERIFY(server.listen());

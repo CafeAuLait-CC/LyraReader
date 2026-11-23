@@ -30,6 +30,7 @@ struct Progress {
 struct ReadingJob {
     cancel: CancellationToken,
     progress: Arc<Mutex<Progress>>,
+    _analysis: Arc<crate::analysis_cache::AnalysisRun>,
 }
 impl Drop for ReadingJob {
     fn drop(&mut self) {
@@ -343,6 +344,13 @@ impl DesktopDocument {
             .cache
             .as_ref()
             .ok_or("Document reading cache is not loaded")?;
+        let analysis = Arc::new(crate::analysis_cache::AnalysisRun::begin(
+            cache,
+            hash,
+            String::new(),
+            "Standard".into(),
+        )?);
+        let worker_analysis = Arc::clone(&analysis);
         let audit = crate::audit::observer(cache.root.clone(), plan.action, plan.is_local);
         let cancel = CancellationToken::new();
         let worker_cancel = cancel.clone();
@@ -354,6 +362,7 @@ impl DesktopDocument {
         std::thread::Builder::new()
             .name("lyra-document-reading".into())
             .spawn(move || {
+                let _analysis = worker_analysis;
                 // The credential lives in this worker only, including the consented consolidation.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_document_reading(
@@ -397,7 +406,11 @@ impl DesktopDocument {
                 // Poisoned progress is reported by the next poll; partial data is never reused.
             })
             .map_err(|e| e.to_string())?;
-        state.job = Some(ReadingJob { cancel, progress });
+        state.job = Some(ReadingJob {
+            cancel,
+            progress,
+            _analysis: analysis,
+        });
         state.phase = "reading";
         state.message = None;
         state.view()
@@ -464,8 +477,9 @@ impl DesktopDocument {
                     .clone();
                 state.merge_payloads = payloads;
             }
-            state.job = None;
+            let job = state.job.take();
             let result = outcome.and_then(|summary| self.finish_reading(&mut state, summary));
+            drop(job);
             if let Err(error) = result {
                 state.phase = "failed";
                 state.message = Some(error);
@@ -596,6 +610,7 @@ mod tests {
             assert_eq!(s.phase, "preview");
             s.job = Some(ReadingJob {
                 cancel: CancellationToken::new(),
+                _analysis: claim_test_analysis(&s),
                 progress: Arc::new(Mutex::new(Progress {
                     result: Some(Ok("COMPLETE_SYNTHETIC_READING [p.1]".into())),
                     ..Progress::default()
@@ -610,6 +625,17 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+    fn claim_test_analysis(state: &Knowledge) -> Arc<crate::analysis_cache::AnalysisRun> {
+        Arc::new(
+            crate::analysis_cache::AnalysisRun::begin(
+                state.cache.as_ref().unwrap(),
+                state.source_hash.clone(),
+                String::new(),
+                "Standard".into(),
+            )
+            .unwrap(),
+        )
     }
     fn input() -> Value {
         json!({"action":"SummarizePage","document_knowledge":false,"current_page":0,"selection":null,"question":null,"language":null,"history":[],"region":null,"base_url":"http://127.0.0.1:1/v1","model":"mock","temperature":null,"max_tokens":null,"reasoning_mode":"default","reasoning_encoding":"none","document_knowledge_text":null,"document_knowledge_pages":[]})
@@ -705,10 +731,14 @@ mod tests {
         let f = Fixture::new();
         let preview = f.prepare();
         let token = CancellationToken::new();
-        f.doc.knowledge.lock().unwrap().job = Some(ReadingJob {
-            cancel: token.clone(),
-            progress: Arc::new(Mutex::new(Progress::default())),
-        });
+        {
+            let mut state = f.doc.knowledge.lock().unwrap();
+            state.job = Some(ReadingJob {
+                cancel: token.clone(),
+                progress: Arc::new(Mutex::new(Progress::default())),
+                _analysis: claim_test_analysis(&state),
+            });
+        }
         f.doc.command(json!({"op":"knowledge_cancel"})).unwrap();
         assert!(token.is_cancelled());
         assert!(f.doc.command(json!({"op":"knowledge_start","plan":preview["plan"],"token":preview["token"],"api_key":"local"})).unwrap_err().contains("preview changed"));
@@ -801,6 +831,7 @@ mod tests {
             state.phase = "reading";
             state.job = Some(ReadingJob {
                 cancel: CancellationToken::new(),
+                _analysis: claim_test_analysis(&state),
                 progress: Arc::new(Mutex::new(Progress {
                     result: Some(Ok("UNFINISHED_UNIT_READING".into())),
                     ..Progress::default()

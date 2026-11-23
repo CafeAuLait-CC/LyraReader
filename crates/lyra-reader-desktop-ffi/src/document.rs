@@ -1,6 +1,6 @@
 //! Desktop transport over the same portable Rust control plane the macOS shell uses.
 //! JSON only crosses the narrow C boundary; requests are decoded into typed engine records.
-use crate::analysis_cache::{PendingSummary, SummaryCapture};
+use crate::analysis_cache::{AnalysisRun, PendingSummary, SummaryCapture};
 use crate::reading_notes::PendingNote;
 use lyra_reader_ai::workspace::{ReadingRecord, reading_scope_key};
 use lyra_reader_core::Size;
@@ -43,6 +43,7 @@ const MAX_READING_REPLY_BYTES: usize = 8 * 1024 * 1024;
 struct DesktopAiRequest {
     request: Arc<LyraReaderAiRequest>,
     reading: Option<ReadingReplies>,
+    analysis: Option<AnalysisRun>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1251,6 +1252,13 @@ impl DesktopDocument {
                     _ => None,
                 }
                 .map(|output| ReadingReplies::new(output, plan.parts.len()));
+                let analysis = match reading.as_ref().map(|reading| &reading.output) {
+                    Some(
+                        ReadingOutput::Summary { capture, .. }
+                        | ReadingOutput::Synthesis { capture, .. },
+                    ) => capture.claim(self, &d)?,
+                    _ => None,
+                };
                 let root = self
                     .marks
                     .lock()
@@ -1293,7 +1301,11 @@ impl DesktopDocument {
                         .map_err(|e| e.to_string())?
                 };
                 let mut current = self.ai.lock().map_err(|_| "AI state is unavailable")?;
-                if let Some(old) = current.replace(DesktopAiRequest { request, reading }) {
+                if let Some(old) = current.replace(DesktopAiRequest {
+                    request,
+                    reading,
+                    analysis,
+                }) {
                     old.request.cancel();
                 }
                 Ok(Value::Bool(true))
@@ -1316,6 +1328,7 @@ impl DesktopDocument {
                         reading.observe(&events);
                     }
                     let reading = if finished { job.reading.take() } else { None };
+                    let analysis = if finished { job.analysis.take() } else { None };
                     let active = self
                         .summaries
                         .lock()
@@ -1369,7 +1382,8 @@ impl DesktopDocument {
                         Some(ReadingArchive::Summary(record)) => {
                             let published = record.and_then(|record| {
                                 if record.source_id == reading_scope_key(None) {
-                                    let (context, id) = self.publish_summary(&d, record)?;
+                                    let run=analysis.ok_or("The completed summary no longer owns its document analysis.")?;
+                                    let (context, id) = self.publish_summary(&d, record, run)?;
                                     result["understanding"] = self.adopt_understanding(context)?;
                                     Ok(id)
                                 } else {

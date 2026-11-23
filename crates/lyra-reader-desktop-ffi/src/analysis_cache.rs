@@ -1,7 +1,7 @@
 //! Linux file adapter for the shared source-bound document understanding.
 use crate::document::DesktopDocument;
 use crate::document_cache::{
-    DocumentCache, atomic_write, lock_understanding_cache, read_optional_bounded,
+    DocumentCache, atomic_write, lock_analysis_run, lock_understanding_cache, read_optional_bounded,
 };
 use lyra_reader_ai::knowledge::DocumentReading;
 use lyra_reader_ai::understanding::{Claim, DocumentUnderstanding, MAX_BYTES};
@@ -9,9 +9,37 @@ use lyra_reader_ai::workspace::{ReadingRecord, reading_scope_key};
 use lyra_reader_ffi::api::{AiPlanRecord, LyraReaderDocument};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::{fs::File, path::PathBuf, sync::Arc};
 
 pub(super) const FILE: &str = "document-understanding-v2.json";
+
+pub(super) struct AnalysisRun {
+    _run_lock: File,
+    directory: PathBuf,
+    state: DocumentUnderstanding,
+    token: u64,
+}
+
+impl AnalysisRun {
+    pub(super) fn begin(
+        cache: &DocumentCache,
+        fingerprint: String,
+        language: String,
+        detail: String,
+    ) -> Result<Self, String> {
+        let run_lock = lock_analysis_run(&cache.directory)?;
+        let mut state = DocumentUnderstanding::default();
+        let Claim::Start(token) = state.begin(fingerprint, language, detail, true)? else {
+            return Err("The reviewed document analysis could not start.".into());
+        };
+        Ok(Self {
+            _run_lock: run_lock,
+            directory: cache.directory.clone(),
+            state,
+            token,
+        })
+    }
+}
 
 pub(super) struct SummaryCapture {
     record: ReadingRecord,
@@ -53,6 +81,28 @@ impl SummaryCapture {
         self.record.modified = u64::try_from(chrono::Utc::now().timestamp_millis())
             .map_err(|_| "The local clock cannot date the document summary.")?;
         Ok(self.record)
+    }
+
+    pub(super) fn claim(
+        &self,
+        owner: &DesktopDocument,
+        document: &Arc<LyraReaderDocument>,
+    ) -> Result<Option<AnalysisRun>, String> {
+        if self.record.source_id != reading_scope_key(None) {
+            return Ok(None);
+        }
+        owner.with_reading_cache(document, true, |cache, fingerprint| {
+            if self.record.source_hash != fingerprint {
+                return Err("This summary preview belongs to an earlier revision.".into());
+            }
+            AnalysisRun::begin(
+                cache,
+                fingerprint,
+                self.record.language.clone(),
+                self.record.detail.clone(),
+            )
+            .map(Some)
+        })
     }
 }
 
@@ -173,26 +223,25 @@ impl DesktopDocument {
         &self,
         source: &Arc<LyraReaderDocument>,
         record: ReadingRecord,
+        mut run: AnalysisRun,
     ) -> Result<(DocumentReading, String), String> {
         let context = context_record(&record);
         let id = record.id.clone();
         self.with_reading_cache(source, true, |cache, sha| {
-            if record.source_hash != sha {
+            if record.source_hash != sha || run.directory != cache.directory {
                 return Err("The PDF revision changed before saving the summary.".into());
             }
             verify_pages(&record, source.page_count())?;
             let _lease = lock_understanding_cache(&cache.directory)?;
-            let (mut state, before) = load(cache, &sha)?;
-            let Claim::Start(token) =
-                state.begin(sha, record.language.clone(), record.detail.clone(), true)?
-            else {
-                return Err("The completed summary could not claim its cache record.".into());
-            };
-            if !state.finish(token, record)? {
+            let destination = cache.directory.join(FILE);
+            let before = read_optional_bounded(&destination, MAX_BYTES as u64)?;
+            if let Some(bytes) = &before {
+                run.state.load(bytes, &sha)?;
+            }
+            if !run.state.finish(run.token, record)? {
                 return Err("The completed summary did not match its cache record.".into());
             }
-            let bytes = state.encode()?;
-            let destination = cache.directory.join(FILE);
+            let bytes = run.state.encode()?;
             if read_optional_bounded(&destination, MAX_BYTES as u64)? != before {
                 return Err(
                     "Document understanding changed while saving. Its file was kept.".into(),

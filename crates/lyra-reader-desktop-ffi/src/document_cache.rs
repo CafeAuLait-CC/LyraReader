@@ -161,15 +161,23 @@ pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 pub(super) fn lock_translation_cache(directory: &Path) -> Result<fs::File, String> {
-    lock_ai_cache(directory, ".translations.lock", "translations")
+    lock_ai_cache(
+        directory,
+        ".translations.lock",
+        "Another window is saving translations",
+    )
 }
 
 /// Summary generation and identity migration share the same short advisory write lease.
 pub(super) fn lock_summary_cache(directory: &Path) -> Result<fs::File, String> {
-    lock_ai_cache(directory, ".summaries.lock", "summaries")
+    lock_ai_cache(
+        directory,
+        ".summaries.lock",
+        "Another window is saving summaries",
+    )
 }
 
-fn lock_ai_cache(directory: &Path, name: &str, label: &str) -> Result<fs::File, String> {
+fn lock_ai_cache(directory: &Path, name: &str, busy: &str) -> Result<fs::File, String> {
     let mut options = fs::OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
     #[cfg(unix)]
@@ -180,9 +188,8 @@ fn lock_ai_cache(directory: &Path, name: &str, label: &str) -> Result<fs::File, 
     let lock = options
         .open(directory.join(name))
         .map_err(|e| e.to_string())?;
-    fs2::FileExt::try_lock_exclusive(&lock).map_err(|e| {
-        format!("Another window is saving {label}. The original cache was kept: {e}")
-    })?;
+    fs2::FileExt::try_lock_exclusive(&lock)
+        .map_err(|e| format!("{busy}. The original cache was kept: {e}"))?;
     Ok(lock)
 }
 
@@ -190,7 +197,7 @@ pub(super) fn lock_reading_workspace(directory: &Path) -> Result<fs::File, Strin
     lock_ai_cache(
         directory,
         ".ai-reading-workspace.lock",
-        "the AI reading workspace",
+        "Another window is saving the AI reading workspace",
     )
 }
 
@@ -198,7 +205,17 @@ pub(super) fn lock_understanding_cache(directory: &Path) -> Result<fs::File, Str
     lock_ai_cache(
         directory,
         ".document-understanding.lock",
-        "document understanding",
+        "Another window is saving document understanding",
+    )
+}
+
+pub(super) fn lock_analysis_run(directory: &Path) -> Result<fs::File, String> {
+    // Long network requests coordinate with one another without taking the short
+    // cache-publication lock that a PDF save or identity migration may need.
+    lock_ai_cache(
+        directory,
+        ".document-analysis.inflight.lock",
+        "Another task is already reading this PDF",
     )
 }
 
