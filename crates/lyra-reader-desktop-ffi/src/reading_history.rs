@@ -17,16 +17,19 @@ use std::sync::Arc;
 pub(super) const WORKSPACE_FILE: &str = "ai-reading-workspace.json";
 
 #[derive(Deserialize)]
-pub(super) struct ChatStart {
+pub(super) struct ChatInput {
     session_id: String,
     expected_modified: Option<u64>,
     question: String,
+    #[serde(default)]
+    draft_snapshot: Option<String>,
 }
 
 pub(super) struct ChatArchive {
     session_id: String,
     expected_modified: Option<u64>,
     source_hash: String,
+    draft_snapshot: String,
     turn: ChatTurn,
 }
 
@@ -38,15 +41,17 @@ struct ChatTurn {
     sources: Vec<AiSourceRecord>,
 }
 
-impl ChatStart {
+impl ChatInput {
     pub fn capture(self, plan: &AiPlanRecord, source_hash: String) -> Result<ChatArchive, String> {
         if lyra_reader_edit::records::normalize_uuid(&self.session_id).is_none() {
             return Err("The chat session identifier is invalid.".into());
         }
+        let draft_snapshot = self.draft_snapshot.unwrap_or_else(|| self.question.clone());
         Ok(ChatArchive {
             session_id: self.session_id,
             expected_modified: self.expected_modified,
             source_hash,
+            draft_snapshot,
             turn: ChatTurn {
                 id: crate::marks::uuid()?,
                 question: self.question,
@@ -198,6 +203,34 @@ fn workspace(bytes: Option<&[u8]>, sha: String) -> Result<ReadingWorkspace, Stri
         bytes.map_or_else(|| Ok(ReadingWorkspace::default()), ReadingWorkspace::decode)?;
     workspace.bind_source(sha);
     Ok(workspace)
+}
+
+fn chat_revision<'a>(
+    records: &'a [ReadingRecord],
+    id: &str,
+    expected: Option<u64>,
+    sha: &str,
+) -> Result<(Option<&'a ReadingRecord>, u64), String> {
+    let old = records.iter().find(|record| record.id == id);
+    if old.map(|record| record.modified) != expected
+        || old.is_some_and(|record| record.kind != "conversation" || record.source_hash != sha)
+    {
+        return Err(
+            "This chat changed in another window or PDF revision. Reopen it before saving.".into(),
+        );
+    }
+    let now = u64::try_from(chrono::Utc::now().timestamp_millis())
+        .map_err(|_| "The local clock cannot date the chat.")?;
+    let modified = match old {
+        Some(record) => now.max(
+            record
+                .modified
+                .checked_add(1)
+                .ok_or("The chat timestamp is outside its supported range.")?,
+        ),
+        None => now,
+    };
+    Ok((old, modified))
 }
 
 impl DesktopDocument {
@@ -359,7 +392,10 @@ impl DesktopDocument {
     pub(super) fn chat_sessions(&self, source: &Arc<LyraReaderDocument>) -> Result<Value, String> {
         self.read_workspace(source, false, |workspace| {
             let mut sessions = workspace.records();
-            sessions.retain(|record| record.kind == "conversation");
+            sessions.retain(|record| {
+                record.kind == "conversation"
+                    && (record.status != "draft" || !record.question.is_empty())
+            });
             sessions.sort_by_key(|record| std::cmp::Reverse(record.modified));
             Ok(json!(
                 sessions
@@ -450,29 +486,15 @@ impl DesktopDocument {
     ) -> Result<Value, String> {
         self.update_reading_workspace(source, |workspace, sha| {
             let records = workspace.records();
-            let old = records
-                .iter()
-                .find(|record| record.id == archive.session_id);
-            if archive.source_hash != sha
-                || old.map(|record| record.modified) != archive.expected_modified
-                || old.is_some_and(|record| {
-                    record.kind != "conversation" || record.source_hash != sha
-                })
-            {
-                return Err(
-                    "This chat changed in another window or PDF revision. Reopen it before saving."
-                        .into(),
-                );
+            if archive.source_hash != sha {
+                return Err("The PDF revision changed before archiving the chat.".into());
             }
-            let mut modified = u64::try_from(chrono::Utc::now().timestamp_millis())
-                .map_err(|_| "The local clock cannot date the chat.")?;
-            if let Some(old) = old {
-                modified = modified.max(
-                    old.modified
-                        .checked_add(1)
-                        .ok_or("The chat timestamp is outside its supported range.")?,
-                );
-            }
+            let (old, modified) = chat_revision(
+                &records,
+                &archive.session_id,
+                archive.expected_modified,
+                sha,
+            )?;
             let turn = archive.turn;
             if turn.id == archive.session_id || records.iter().any(|record| record.id == turn.id) {
                 return Err("The archived chat exchange has a duplicate identity.".into());
@@ -510,13 +532,42 @@ impl DesktopDocument {
                     id: archive.session_id,
                     kind: "conversation".into(),
                     title,
-                    question: turn.question,
+                    question: archive.draft_snapshot,
                     source_hash: sha.into(),
                     status: "finished".into(),
                     modified,
                     ..ReadingRecord::default()
                 },
             ])?;
+            Ok(json!({"modified":modified}))
+        })
+    }
+
+    pub(super) fn save_chat_draft(
+        &self,
+        source: &Arc<LyraReaderDocument>,
+        draft: ChatInput,
+    ) -> Result<Value, String> {
+        if lyra_reader_edit::records::normalize_uuid(&draft.session_id).is_none() {
+            return Err("The chat session identifier is invalid.".into());
+        }
+        self.update_reading_workspace(source, |workspace, sha| {
+            let records = workspace.records();
+            let (old, modified) =
+                chat_revision(&records, &draft.session_id, draft.expected_modified, sha)?;
+            let mut record = old.cloned().unwrap_or_else(|| ReadingRecord {
+                id: draft.session_id,
+                kind: "conversation".into(),
+                status: "draft".into(),
+                source_hash: sha.into(),
+                ..ReadingRecord::default()
+            });
+            if record.status == "draft" {
+                record.title = draft.question.trim().chars().take(120).collect();
+            }
+            record.question = draft.question;
+            record.modified = modified;
+            workspace.put(record)?;
             Ok(json!({"modified":modified}))
         })
     }

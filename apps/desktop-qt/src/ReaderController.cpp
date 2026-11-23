@@ -141,6 +141,12 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
         setError(tr("Choose a local PDF file. This version cannot open remote URLs."));
         return;
     }
+    if(chatDraftPending()) {
+        QPointer<ReaderController> alive(this);
+        flushAiChatDraft(true);
+        if(!alive)return;
+        if(chatDraftPending()) {setError(tr("Wait for the chat draft to save before replacing this document."));return;}
+    }
     m_lastUrl = url;
     const auto generation = ++m_generation;
     resetAi();m_document.reset();setRasterSource({});
@@ -302,7 +308,10 @@ QUrl ReaderController::contentPreviewUrl(int page,const QString &target,const QS
 void ReaderController::retryPassword(const QString &password) { openFile(m_lastUrl, password); }
 
 quint64 ReaderController::submit(const QString &operation, const QVariantMap &arguments) {
-    const auto id = ++m_commandSequence;
+    return submitWithId(++m_commandSequence,operation,arguments);
+}
+
+quint64 ReaderController::submitWithId(quint64 id,const QString &operation,const QVariantMap &arguments) {
     const auto document = m_document;
     if(m_snapshotMode)return submitSnapshot(id,operation,arguments);
     if (!document) {
@@ -312,13 +321,28 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
         return id;
     }
     if(NativeRasterSource::isIndexQuery(operation))return submitSnapshot(id,operation,arguments);
-    if(hasUnsavedReadingNotes() && (operation==QStringLiteral("content_stage") || operation.startsWith(QStringLiteral("page_")) || operation.startsWith(QStringLiteral("replace_")) || operation==QStringLiteral("document_save") || operation==QStringLiteral("document_discard"))) {
+    const bool changesRevision=operation==QStringLiteral("content_stage") || operation.startsWith(QStringLiteral("page_")) || operation.startsWith(QStringLiteral("replace_")) || operation==QStringLiteral("document_save") || operation==QStringLiteral("document_discard");
+    if(hasUnsavedReadingNotes() && changesRevision) {
         const auto error=tr("Save or discard the reading-note draft before changing this document.");
         QMetaObject::invokeMethod(this,[this,id,operation,error]{setError(error);emit commandFinished(id,operation,{},error);},Qt::QueuedConnection);return id;
     }
-    if((operation==QStringLiteral("content_stage") || operation.startsWith(QStringLiteral("page_")) || operation.startsWith(QStringLiteral("replace_")) || operation==QStringLiteral("document_save")) && m_aiState.value(QStringLiteral("running")).toBool()) {
+    if(changesRevision && operation!=QStringLiteral("document_discard") && m_aiState.value(QStringLiteral("running")).toBool()) {
         const auto error=tr("Cancel the active AI request before changing the open document.");
         QMetaObject::invokeMethod(this,[this,id,operation,error]{setError(error);emit commandFinished(id,operation,{},error);},Qt::QueuedConnection);return id;
+    }
+    if(changesRevision && chatDraftPending()) {
+        if(m_chatDeferredCommand) {
+            const auto error=tr("A document operation is already waiting for the chat draft.");
+            QMetaObject::invokeMethod(this,[this,id,operation,error]{setError(error);emit commandFinished(id,operation,{},error);},Qt::QueuedConnection);
+            return id;
+        }
+        m_chatDeferredCommand=ChatDeferredCommand{id,m_generation,m_mutationSequence,operation,arguments};
+        ++m_pendingCommands;
+        QPointer<ReaderController> alive(this);
+        emit commandsChanged();
+        if(!alive)return 0;
+        flushAiChatDraft();
+        return id;
     }
     const bool blockedDrafts=operation==QStringLiteral("content_stage") ?
         (m_editDrafts.contains(QStringLiteral("forms")) || m_editDrafts.contains(QStringLiteral("redactions"))) : hasEditDrafts();
@@ -358,14 +382,18 @@ quint64 ReaderController::submit(const QString &operation, const QVariantMap &ar
     const auto generation = m_generation;
     const bool latestOnly=operation==QStringLiteral("translation_prepare") || operation==QStringLiteral("ai_summary_cached") || operation==QStringLiteral("search") || operation==QStringLiteral("bibtex") || operation==QStringLiteral("layout") || operation==QStringLiteral("ai_preview") || operation==QStringLiteral("ai_summary_catalog") || operation==QStringLiteral("ai_summary_inspect") || operation==QStringLiteral("ai_summary_prepare") || operation==QStringLiteral("ai_summary_batch_prepare") || operation==QStringLiteral("split_plan") || operation==QStringLiteral("content_objects");
     if(latestOnly)m_latestRead.insert(operation,id);
+    if(changesRevision)++m_revisionCommands;
     ++m_pendingCommands;
     QPointer<ReaderController> alive(this);emit commandsChanged();if(!alive)return 0;
     auto *watcher = new QFutureWatcher<CommandResult>(this);
-    connect(watcher, &QFutureWatcher<CommandResult>::finished, this, [this,watcher,id,operation,arguments,generation,latestOnly,document,mutation,eraseControl,mutationSequence,draftKey,savedDraft,draftMatchesRequest,discardedNotes,discardedEdits] {
+    connect(watcher, &QFutureWatcher<CommandResult>::finished, this, [this,watcher,id,operation,arguments,generation,latestOnly,document,mutation,eraseControl,changesRevision,mutationSequence,draftKey,savedDraft,draftMatchesRequest,discardedNotes,discardedEdits] {
         const auto outcome = watcher->result();
         watcher->deleteLater();
         // Direct notification listeners may close this reader or publish a newer revision.
         QPointer<ReaderController> currentReader(this);
+        const auto revisionDone=qScopeGuard([this,currentReader,changesRevision] {
+            if(currentReader && changesRevision){--m_revisionCommands;emit commandsChanged();}
+        });
         auto deliveryGeneration=m_generation;
         const auto current=[&]{return currentReader && document==m_document && deliveryGeneration==m_generation;};
         --m_pendingCommands;

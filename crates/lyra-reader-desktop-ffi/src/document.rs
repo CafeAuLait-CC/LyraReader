@@ -970,6 +970,7 @@ impl DesktopDocument {
             "ai_translation_history_entry" => self.translation_history_entry(&d, &text(&r, "id")?),
             "ai_chat_sessions" => self.chat_sessions(&d),
             "ai_chat_session" => self.chat_session(&d, &text(&r, "id")?),
+            "ai_chat_draft" => self.save_chat_draft(&d, arg(&r, "draft")?),
             "ai_merge_preview" => value(
                 build_ai_merge_plan(arg(&r, "request")?)
                     .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),
@@ -1068,7 +1069,7 @@ impl DesktopDocument {
                 let plan: AiPlanRecord = arg(&r, "plan")?;
                 let reading = match (r["plan"]["kind"].as_str(), plan.action) {
                     (_, AiActionRecord::DocumentChat) if r.get("chat").is_some() => {
-                        let chat: crate::reading_history::ChatStart = arg(&r, "chat")?;
+                        let chat: crate::reading_history::ChatInput = arg(&r, "chat")?;
                         Some(ReadingOutput::Chat(Box::new(
                             chat.capture(&plan, d.document_identity().sha256)?,
                         )))

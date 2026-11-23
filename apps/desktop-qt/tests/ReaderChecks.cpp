@@ -3174,6 +3174,64 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QVERIFY(plan().isEmpty());QCOMPARE(server.requests.size(),3);
     }
 
+    void documentChatDraftsSurviveTabCloseAndProtectNewerWindowChanges() {
+        QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
+        MockChatServer server;QVERIFY(server.listen());
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-unsent-chat.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");
+        const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});
+        const auto cache=scratch.filePath("cache");qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",cache.toUtf8());
+        NativeCorpus::Viewer view;QVERIFY(view.window);
+        const auto open=[&](NativeCorpus::Viewer &owner) {
+            owner.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=owner.workspace.activeReader();
+            QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
+            owner.window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic"}});
+            QVERIFY(QMetaObject::invokeMethod(owner.window,"openAiWorkspace",Q_ARG(QVariant,"chat")));
+        };
+        const auto draft=[](ReaderController *reader) {
+            return reader?reader->aiState().value("input").toMap().value("chatQuestion").toString():QString{};
+        };
+        open(view);QPointer<ReaderController> original=view.workspace.activeReader();
+        original->setAiInput("question","First unfinished draft");
+        QVERIFY(original->chatDraftPending());
+        original->flushAiChatDraft();
+        original->setAiInput("question","Exact draft typed during a save\nSecond line");
+        QVERIFY(QMetaObject::invokeMethod(view.window,"requestCloseTab",Q_ARG(QVariant,0)));
+        QTRY_VERIFY(original.isNull());
+        QCOMPARE(server.requests.size(),0);
+        QDirIterator archives(cache,{"ai-reading-workspace.json"},QDir::Files,QDirIterator::Subdirectories);
+        QVERIFY(archives.hasNext());QFile archive(archives.next());QVERIFY(archive.open(QIODevice::ReadOnly));
+        const auto records=QJsonDocument::fromJson(archive.readAll()).object().value("records").toArray();archive.close();
+        QCOMPARE(records.size(),1);
+        const auto stored=records.first().toObject();
+        QCOMPARE(stored.value("status").toString(),QString("draft"));
+        QCOMPARE(stored.value("question").toString(),QString("Exact draft typed during a save\nSecond line"));
+        const auto id=stored.value("id").toString();QVERIFY(!id.isEmpty());
+
+        open(view);auto *first=view.workspace.activeReader();
+        QVERIFY(first->reopenAiChat(id));QTRY_COMPARE(draft(first),stored.value("question").toString());
+        QTRY_COMPARE(first->pendingCommands(),0);
+        NativeCorpus::Viewer rival;QVERIFY(rival.window);
+        open(rival);QPointer<ReaderController> second=rival.workspace.activeReader();
+        QVERIFY(second->reopenAiChat(id));QTRY_COMPARE(draft(second),draft(first));QTRY_COMPARE(second->pendingCommands(),0);
+
+        first->setAiInput("question","Newer unsent draft from the first window");first->flushAiChatDraft();
+        QTRY_VERIFY(!first->chatDraftPending());
+        second->setAiInput("question","Conflicting unsent draft from the second window");second->flushAiChatDraft();
+        QTRY_VERIFY(!second->aiState().value("chatDraftWarning").toString().isEmpty());
+        QVERIFY(second->chatDraftPending());QVERIFY(!second->chatDraftSaving());
+        QCOMPARE(draft(second),QString("Conflicting unsent draft from the second window"));
+        QVERIFY(QMetaObject::invokeMethod(rival.window,"requestCloseTab",Q_ARG(QVariant,0)));
+        QTRY_VERIFY(second && second->pendingCommands()==0);
+        QCOMPARE(rival.window->property("closingTab").toInt(),-2);
+        QCOMPARE(rival.workspace.activeReader(),second.data());QVERIFY(second->chatDraftPending());
+        second->discardAiChatDraft();QVERIFY(!second->chatDraftPending());
+        QVERIFY(second->reopenAiChat(id));
+        QTRY_COMPARE(draft(second),QString("Newer unsent draft from the first window"));
+        QCOMPARE(server.requests.size(),0);
+    }
+
     void wholeSummaryRequiresSeparateReviewForSynthesis() {
         QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
         MockChatServer server;QVERIFY(server.listen());
@@ -3313,7 +3371,7 @@ private slots:
         for(int action=0;action<6;++action) {
             reader->setAiInput("action",action);if(action==2 || action==4)reader->setAiInput("question","Explain the synthetic fixture text.");if(action==3)reader->setAiInput("language","French");QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);const auto plan=reader->aiState().value("plan").toMap();QVERIFY2(!plan.isEmpty(),qPrintable(reader->aiState().value("status").toString()));QJsonArray bodies;for(const auto &part:plan.value("parts").toList()){const auto body=part.toMap().value("wire_body").toString();QVERIFY(!body.isEmpty());bodies.append(body);}actual.append(QJsonObject{{"action",action},{"wire_bodies",bodies},{"source_pages",QJsonArray::fromVariantList(plan.value("source_pages").toList())}});
         }
-        QCOMPARE(sentinel.requests.size(),0);const auto output=qEnvironmentVariable("LYRA_READER_WRITE_QT_AI_GOLDEN");if(!output.isEmpty()){QFile file(output);QVERIFY(file.open(QIODevice::WriteOnly|QIODevice::NewOnly));const auto bytes=QJsonDocument(QJsonObject{{"schema_version",1},{"provenance","Synthetic text-page.pdf; Qt request mapper before unit-summary integration"},{"cases",actual}}).toJson(QJsonDocument::Indented);QCOMPARE(file.write(bytes),bytes.size());return;}
+        QCOMPARE(sentinel.requests.size(),0);const auto output=qEnvironmentVariable("LYRA_READER_WRITE_QT_AI_GOLDEN");if(!output.isEmpty()){QFile file(output);QVERIFY(file.open(QIODevice::WriteOnly|QIODevice::NewOnly));const auto bytes=QJsonDocument(QJsonObject{{"schema_version",1},{"provenance","Synthetic text-page.pdf; native Qt ordinary requests and shared reading tasks"},{"cases",actual}}).toJson(QJsonDocument::Indented);QCOMPARE(file.write(bytes),bytes.size());return;}
         QFile golden(root+"/tests/fixtures/qt-ai-request-goldens.json");QVERIFY2(golden.open(QIODevice::ReadOnly),"The adopted public synthetic Qt request golden is required");const auto expected=QJsonDocument::fromJson(golden.readAll()).object();QCOMPARE(expected.value("schema_version").toInt(),1);QCOMPARE(actual,expected.value("cases").toArray());
     }
 
@@ -3798,15 +3856,28 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(payload,"close"));QTRY_VERIFY(!payload->property("visible").toBool());QVERIFY(displayedPayload->property("text").toString().isEmpty());
         const auto snapshots=qEnvironmentVariable("LYRA_READER_REGION_SNAPSHOT");if(!snapshots.isEmpty()){QTest::qWait(100);QVERIFY(window->grabWindow().save(snapshots));}
         auto *send=window->findChild<QQuickItem *>("sendAiRegion");QVERIFY(send && send->isEnabled());QVERIFY(settleRegionControl(window,paperCard,send,reader));QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,send->mapToScene(QPointF(send->width()/2,send->height()/2)).toPoint());
-        QTRY_COMPARE_WITH_TIMEOUT(server.requests.size(),2,10000);const auto raw=server.requests.first();QCOMPARE(raw.mid(raw.indexOf("\r\n\r\n")+4),body.toUtf8());
-        auto fallback=QJsonDocument::fromJson(body.toUtf8()).object();fallback.remove("stream_options");const auto retry=server.requests[1];QCOMPARE(QJsonDocument::fromJson(retry.mid(retry.indexOf("\r\n\r\n")+4)).object(),fallback);
+        QTRY_COMPARE_WITH_TIMEOUT(server.requests.size(),1,10000);const auto raw=server.requests.first();QCOMPARE(raw.mid(raw.indexOf("\r\n\r\n")+4),body.toUtf8());
+        QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);
+        QVERIFY(reader->aiState().value("status").toString().contains("Preview the request again"));
+        QTRY_VERIFY_WITH_TIMEOUT(!reader->regionPersistencePending() && reader->pendingCommands()==0,10000);
+        QCOMPARE(server.requests.size(),1);
+        QVERIFY(QMetaObject::invokeMethod(card,"prepare"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto reviewed=reader->aiState().value("plan").toMap();QVERIFY(!reviewed.isEmpty() && reviewed!=plan);
+        const auto reviewedBody=reviewed.value("parts").toList().first().toMap().value("wire_body").toString().toUtf8();
+        auto fallback=QJsonDocument::fromJson(body.toUtf8()).object();QVERIFY(fallback.contains("stream_options"));fallback.remove("stream_options");
+        QCOMPARE(QJsonDocument::fromJson(reviewedBody).object(),fallback);QCOMPARE(server.requests.size(),1);
+        QVERIFY(settleRegionControl(window,paperCard,send,reader));QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,send->mapToScene(QPointF(send->width()/2,send->height()/2)).toPoint());
+        QTRY_COMPARE_WITH_TIMEOUT(server.requests.size(),2,10000);const auto retry=server.requests[1];QCOMPARE(retry.mid(retry.indexOf("\r\n\r\n")+4),reviewedBody);
         QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QVERIFY(reader->aiState().value("output").toString().contains("Synthetic area answer"));
         auto *answer=window->findChild<QObject *>("aiRegionAnswer");QVERIFY(answer);QVERIFY(!answer->property("text").toString().contains("href=\"p.99\""));
         QVERIFY(reader->saveAiRegionNote());QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
         const auto savedRegionId=reader->aiRegion().value("history_id").toString();QSignalSpy regionReads(reader,&ReaderController::commandFinished);
         const auto firstRead=reader->submit("region_get",{{"id",savedRegionId}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVariantMap firstEntry;
         for(const auto &row:regionReads)if(row[0].toULongLong()==firstRead){QVERIFY(row[3].toString().isEmpty());firstEntry=row[2].toMap();}
-        QVERIFY(!firstEntry.isEmpty());QCOMPARE(firstEntry.value("turns").toList().size(),1);QCOMPARE(firstEntry.value("turns").toList()[0].toMap().value("sourcePages").toList(),plan.value("source_pages").toList());
+        QVERIFY(!firstEntry.isEmpty());const auto firstTurns=firstEntry.value("turns").toList();QCOMPARE(firstTurns.size(),2);
+        QCOMPARE(firstTurns.first().toMap().value("state").toString(),QString("failed"));
+        QCOMPARE(firstTurns.last().toMap().value("state").toString(),QString("finished"));
+        QCOMPARE(firstTurns.last().toMap().value("sourcePages").toList(),reviewed.value("source_pages").toList());
 
         const auto pageBefore=window->property("currentPage");const QVariant sentSource=QVariantMap{{"source_pages",plan.value("source_pages")},{"generation",reader->documentGeneration()}};QVERIFY(QMetaObject::invokeMethod(card,"follow",Q_ARG(QVariant,"p.99"),Q_ARG(QVariant,sentSource)));QCOMPARE(window->property("currentPage"),pageBefore);
         QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QCOMPARE(auditRows().size(),initialAuditCount+2);
@@ -3826,18 +3897,19 @@ private slots:
         QVERIFY(reader->saveAiRegionNote());QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);regionReads.clear();
         const auto blockedRead=reader->submit("region_get",{{"id",savedRegionId}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVariantMap blockedEntry;
         for(const auto &row:regionReads)if(row[0].toULongLong()==blockedRead){QVERIFY(row[3].toString().isEmpty());blockedEntry=row[2].toMap();}
-        QCOMPARE(blockedEntry.value("turns").toList().size(),3);QCOMPARE(blockedEntry.value("turns").toList()[1].toMap().value("state").toString(),QString("cancelled"));QVERIFY(blockedEntry.value("turns").toList()[1].toMap().value("answer").toString().contains("partial area answer"));QVERIFY(!blockedEntry.value("turns").toList().last().toMap().contains("sourcePages"));QCOMPARE(server.requests.size(),3);
+        QCOMPARE(blockedEntry.value("turns").toList().size(),4);QCOMPARE(blockedEntry.value("turns").toList()[2].toMap().value("state").toString(),QString("cancelled"));QVERIFY(blockedEntry.value("turns").toList()[2].toMap().value("answer").toString().contains("partial area answer"));QVERIFY(!blockedEntry.value("turns").toList().last().toMap().contains("sourcePages"));QCOMPARE(server.requests.size(),3);
 
         QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",220},{"height",440}},1));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiRegion().value("image_png").toString().isEmpty(),10000);QTRY_COMPARE_WITH_TIMEOUT(crop->property("status").toInt(),1,10000);QVERIFY(qAbs(crop->property("width").toDouble()/crop->property("height").toDouble()-.5)<.001);
         window->setProperty("textViewVisible",true);auto *readable=visualItem(window->contentItem(),"accessiblePageText");QVERIFY(readable);QTRY_VERIFY(readable->isVisible());
         QVERIFY(QMetaObject::invokeMethod(card,"close"));QTRY_VERIFY(readable->hasActiveFocus());QVERIFY(reader->aiRegionPaper().isEmpty());QVERIFY(!card->property("opened").toBool());QCOMPARE(server.requests.size(),3);
         QVERIFY(QMetaObject::invokeMethod(window,"openRegionNotes"));auto *savedNotes=window->findChild<QObject *>("regionNotes");QVERIFY(savedNotes);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
         QVERIFY(QMetaObject::invokeMethod(savedNotes,"load",Q_ARG(QVariant,savedRegionId)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        savedNotes->setProperty("turnIndex",1);
         QTRY_VERIFY(visualItem(window->contentItem(),"regionNoteSource1"));auto *sentPage=visualItem(window->contentItem(),"regionNoteSource1");QTRY_VERIFY(sentPage->isVisible());QVERIFY(sentPage->isEnabled());
         const auto beforeSource=window->property("currentPage");QVERIFY(QMetaObject::invokeMethod(savedNotes,"followSource",Q_ARG(QVariant,99)));QCOMPARE(window->property("currentPage"),beforeSource);QVERIFY(window->property("operationStatus").toString().contains("unavailable"));
         window->setProperty("operationStatus",QString{});QVERIFY(QMetaObject::invokeMethod(sentPage,"clicked"));QCOMPARE(window->property("currentPage").toInt(),0);QVERIFY(window->property("operationStatus").toString().isEmpty());
         const auto generation=savedNotes->property("ownerGeneration");savedNotes->setProperty("ownerGeneration",generation.toInt()-1);QVERIFY(QMetaObject::invokeMethod(savedNotes,"followSource",Q_ARG(QVariant,1)));QVERIFY(window->property("operationStatus").toString().contains("unavailable"));savedNotes->setProperty("ownerGeneration",generation);
-        savedNotes->setProperty("turnIndex",2);QTRY_VERIFY(!visualItem(window->contentItem(),"regionNoteSource1"));QVERIFY(QMetaObject::invokeMethod(savedNotes,"followSource",Q_ARG(QVariant,1)));QVERIFY(window->property("operationStatus").toString().contains("unavailable"));
+        savedNotes->setProperty("turnIndex",3);QTRY_VERIFY(!visualItem(window->contentItem(),"regionNoteSource1"));QVERIFY(QMetaObject::invokeMethod(savedNotes,"followSource",Q_ARG(QVariant,1)));QVERIFY(window->property("operationStatus").toString().contains("unavailable"));
         QVERIFY(QMetaObject::invokeMethod(savedNotes,"close"));QCOMPARE(server.requests.size(),3);
         QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),original);
     }

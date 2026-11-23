@@ -561,6 +561,30 @@ Pane {
             textFormat: Text.PlainText; wrapMode: Text.Wrap; Layout.fillWidth: true
             color: app.colors.textSecondary
         }
+        ColumnLayout {
+            id: draftWarning
+            visible: aiPanel.workspace === "chat" && !!aiPanel.viewState.chatDraftWarning
+            Layout.fillWidth: true
+            Label {
+                text: draftWarning.visible ? qsTr("The draft is still in this tab. %1").arg(aiPanel.viewState.chatDraftWarning) : ""
+                textFormat: Text.PlainText; wrapMode: Text.Wrap; Layout.fillWidth: true
+                color: app.colors.textSecondary
+            }
+            Flow {
+                Layout.fillWidth: true
+                spacing: 4
+                Button {
+                    text: qsTr("Retry saving draft")
+                    enabled: aiPanel.owner.chatDraftPending && !aiPanel.owner.chatDraftSaving
+                    onClicked: aiPanel.owner.flushAiChatDraft()
+                }
+                Button {
+                    text: qsTr("Discard unsaved changes to draft")
+                    enabled: aiPanel.owner.chatDraftPending && !aiPanel.owner.chatDraftSaving
+                    onClicked: aiPanel.owner.discardAiChatDraft()
+                }
+            }
+        }
         ScrollView {
             id: composerScroll
             objectName: "aiComposerScroll"
@@ -583,7 +607,7 @@ Pane {
                 onModelTextChanged:syncModelText()
                 Component.onCompleted:syncModelText()
                 textFormat: TextEdit.PlainText; wrapMode: TextEdit.Wrap
-                readOnly: aiPanel.workspace === "chat" && !!aiPanel.viewState.chatReadOnly
+                readOnly: aiPanel.workspace === "chat" && (!!aiPanel.viewState.chatReadOnly || aiPanel.owner.documentRevisionPending)
                 placeholderText: aiPanel.workspace === "chat" ? qsTr("Ask about this document…") : qsTr("Question about selected text…")
                 Accessible.name: aiPanel.workspace === "chat" ? qsTr("Question about document") : qsTr("Question about selection")
                 // TextEdit can normalize displayed line separators. Only real edits
@@ -659,11 +683,8 @@ Pane {
                 objectName: "clearAiConversation"
                 text: qsTr("New chat")
                 visible: aiPanel.workspace === "chat"
-                enabled: !aiPanel.running && ((aiPanel.viewState.chatTurns || []).length > 0 || !!aiPanel.viewState.chatReadOnly)
-                onClicked: {
-                    aiPanel.owner.clearAiChat();
-                    aiPanel.owner.setAiInput("question", "");
-                }
+                enabled: !aiPanel.running && (!!aiPanel.viewState.chatSession || !!aiPanel.input.chatQuestion)
+                onClicked: aiPanel.owner.newAiChat()
             }
             Button {
                 objectName: "openAiChatHistory"

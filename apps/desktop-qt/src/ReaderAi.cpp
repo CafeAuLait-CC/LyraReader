@@ -19,6 +19,9 @@ QString aiView(const QString &action) {
 
 void ReaderController::initAi() {
     initTranslations();initDocumentReading();initRegionPersistence();initSummaryCatalog();initSummaryBatch();
+    m_chatDraftTimer.setSingleShot(true);
+    m_chatDraftTimer.setInterval(350);
+    connect(&m_chatDraftTimer,&QTimer::timeout,this,[this]{flushAiChatDraft();});
     m_aiTimer.setInterval(60);
     connect(&m_aiTimer,&QTimer::timeout,this,[this]{
         if(!m_aiState.value(QStringLiteral("running")).toBool()){m_aiTimer.stop();return;}
@@ -38,6 +41,7 @@ void ReaderController::resetAi(bool preserveTranslationViews) {
     ++m_aiRegionEpoch;RasterJobs::cancel(m_aiRegionJob);m_aiRegionJob.reset();m_aiRegion.clear();emit aiRegionChanged();
     m_aiRegionImage=QUrl{};emit aiRegionImageChanged();
     m_regionHistory.clear();m_aiRegionSaveId=0;emit regionHistoryChanged();
+    m_chatDraftTimer.stop();m_chatDraftSaveId=0;m_savedChatDraft.clear();m_chatDraftSnapshot.clear();m_afterChatDraft.reset();
     m_aiTimer.stop();m_aiPreviewId=0;m_aiStartId=0;m_aiPollId=0;m_aiChatLoadId=0;m_aiState.clear();emit aiStateChanged();
 }
 void ReaderController::cancelAiRegionCapture() {
@@ -274,13 +278,21 @@ void ReaderController::setAiInput(const QString &key,const QVariant &value) {
         if(view==QStringLiteral("summary"))input.insert(QStringLiteral("summaryAction"),action);
         input.insert(QStringLiteral("question"),input.value(view==QStringLiteral("chat")?QStringLiteral("chatQuestion"):QStringLiteral("selectionQuestion")));
     }
-    if(key==QStringLiteral("question"))input.insert(input.value(QStringLiteral("view")).toString()==QStringLiteral("chat")?QStringLiteral("chatQuestion"):QStringLiteral("selectionQuestion"),value);
+    const bool chatEdit=key==QStringLiteral("question") && input.value(QStringLiteral("view"))==QStringLiteral("chat");
+    if(chatEdit && (documentRevisionPending() || m_aiState.value(QStringLiteral("chatReadOnly")).toBool()))return;
+    if(key==QStringLiteral("question"))input.insert(chatEdit?QStringLiteral("chatQuestion"):QStringLiteral("selectionQuestion"),value);
     const bool clearedUnit=key==QStringLiteral("action") && input.value(QStringLiteral("view")).toString()==QStringLiteral("summary") && !m_summaryUnitContext.isEmpty();
     if(clearedUnit)m_summaryUnitContext.clear();
     if(!m_translationActive && !m_translationPreparedToken.isEmpty()) {
         if(m_document)lyra_reader_desktop_cancel_translation(m_document.get());m_translationPreparedToken.clear();
     }
     input.insert(key,value);m_aiState.insert(QStringLiteral("input"),input);
+    if(chatEdit) {
+        if(chatDraftPending() && !m_aiState.value(QStringLiteral("activeChat")).toBool())
+            m_chatDraftTimer.start();
+        else
+            m_chatDraftTimer.stop();
+    }
     ++m_aiPreviewEpoch;m_aiPreviewId=0;m_aiState.remove(QStringLiteral("plan"));
     if(!m_aiState.value(QStringLiteral("running")).toBool()) {
         m_aiState.insert(QStringLiteral("statusView"),input.value(QStringLiteral("view"),QStringLiteral("summary")));
@@ -307,7 +319,9 @@ void ReaderController::invalidateAiPlan() {
 }
 void ReaderController::resetAiChat() {
     m_aiChatLoadId=0;
-    for(const auto *key:{"chatTurns","conversationLimited","chatSession","chatModified","chatReadOnly","chatHistoryWarning"})m_aiState.remove(QLatin1String(key));
+    m_chatDraftTimer.stop();
+    m_savedChatDraft.clear();
+    for(const auto *key:{"chatTurns","conversationLimited","chatSession","chatModified","chatReadOnly","chatHistoryWarning","chatDraftWarning"})m_aiState.remove(QLatin1String(key));
     auto results=m_aiState.value(QStringLiteral("results")).toMap();results.remove(QStringLiteral("chat"));m_aiState.insert(QStringLiteral("results"),results);
     if(m_aiState.value(QStringLiteral("previewView")).toString()==QStringLiteral("chat")){++m_aiPreviewEpoch;m_aiPreviewId=0;m_aiState.remove(QStringLiteral("plan"));}
     if(m_aiState.value(QStringLiteral("responseView")).toString()==QStringLiteral("chat")) {
@@ -316,14 +330,150 @@ void ReaderController::resetAiChat() {
 }
 void ReaderController::clearAiChat() {
     if(m_aiState.value(QStringLiteral("running")).toBool())return;
+    if(chatDraftPending()){newAiChat();return;}
     resetAiChat();
+    m_savedChatDraft=chatDraft();
     m_aiState.insert(QStringLiteral("statusView"),QStringLiteral("chat"));m_aiState.insert(QStringLiteral("status"),tr("New conversation ready."));emit aiStateChanged();
 }
+void ReaderController::newAiChat() {
+    if(m_chatDeferredCommand || m_aiState.value(QStringLiteral("running")).toBool())return;
+    m_afterChatDraft=QString{};
+    if(chatDraftPending())flushAiChatDraft();
+    else finishChatTransition();
+}
 bool ReaderController::reopenAiChat(const QString &id) {
-    if(id.isEmpty() || !m_document || m_pendingCommands || m_aiState.value(QStringLiteral("running")).toBool())return false;
+    if(id.isEmpty() || !m_document || m_chatDeferredCommand || (m_pendingCommands && !chatDraftPending())
+        || m_aiState.value(QStringLiteral("running")).toBool())return false;
+    m_afterChatDraft=id;
+    if(chatDraftPending())flushAiChatDraft();
+    else finishChatTransition();
+    return true;
+}
+void ReaderController::finishChatTransition() {
+    if(!m_afterChatDraft || chatDraftPending())return;
+    const auto id=*m_afterChatDraft;
+    m_afterChatDraft.reset();
+    if(id.isEmpty()) {
+        resetAiChat();
+        setChatDraft({});
+        m_aiState.insert(QStringLiteral("statusView"),QStringLiteral("chat"));
+        m_aiState.insert(QStringLiteral("status"),tr("New conversation ready."));
+        emit aiStateChanged();
+        return;
+    }
     m_aiChatLoadEpoch=++m_aiPreviewEpoch;
     m_aiChatLoadId=submit(QStringLiteral("ai_chat_session"),{{QStringLiteral("id"),id}});
-    return m_aiChatLoadId!=0;
+}
+QString ReaderController::chatDraft()const {
+    return m_aiState.value(QStringLiteral("input")).toMap().value(QStringLiteral("chatQuestion")).toString();
+}
+void ReaderController::setChatDraft(const QString &draft) {
+    auto input=m_aiState.value(QStringLiteral("input")).toMap();
+    input.insert(QStringLiteral("chatQuestion"),draft);
+    if(input.value(QStringLiteral("view"))==QStringLiteral("chat"))
+        input.insert(QStringLiteral("question"),draft);
+    m_aiState.insert(QStringLiteral("input"),input);
+}
+QString ReaderController::ensureChatSession() {
+    auto session=m_aiState.value(QStringLiteral("chatSession")).toString();
+    if(session.isEmpty()) {
+        session=QUuid::createUuid().toString(QUuid::WithoutBraces).toUpper();
+        m_aiState.insert(QStringLiteral("chatSession"),session);
+    }
+    return session;
+}
+bool ReaderController::chatDraftPending()const {
+    return m_document && !m_snapshotMode && !m_aiState.value(QStringLiteral("chatReadOnly")).toBool()
+        && (m_chatDraftSaveId || chatDraft()!=m_savedChatDraft);
+}
+bool ReaderController::chatDraftSaving()const {
+    return chatDraftPending() && (m_chatDraftSaveId || m_chatDraftTimer.isActive() || m_aiState.value(QStringLiteral("activeChat")).toBool());
+}
+void ReaderController::flushAiChatDraft(bool stopResponse) {
+    if(!chatDraftPending() || m_chatDraftSaveId)return;
+    if(m_aiState.value(QStringLiteral("activeChat")).toBool()) {
+        if(stopResponse && !m_aiState.value(QStringLiteral("cancelRequested")).toBool())cancelAi();
+        return;
+    }
+    m_chatDraftTimer.stop();
+    m_chatDraftSnapshot=chatDraft();
+    if(m_chatDraftSnapshot.isEmpty() && m_aiState.value(QStringLiteral("chatModified")).isNull()) {
+        m_savedChatDraft.clear();
+        if(m_chatDeferredCommand)finishChatDeferredCommand({});
+        else if(m_afterChatDraft)finishChatTransition();
+        else emit aiStateChanged();
+        return;
+    }
+    const QVariantMap draft{{QStringLiteral("session_id"),ensureChatSession()},
+        {QStringLiteral("expected_modified"),m_aiState.value(QStringLiteral("chatModified"))},
+        {QStringLiteral("question"),m_chatDraftSnapshot}};
+    QPointer<ReaderController> alive(this);
+    const auto generation=m_generation;
+    m_chatDraftSaveId=m_commandSequence+1;
+    submit(QStringLiteral("ai_chat_draft"),{{QStringLiteral("draft"),draft}});
+    if(!alive || generation!=m_generation)return;
+    emit aiStateChanged();
+}
+void ReaderController::discardAiChatDraft() {
+    if(m_chatDraftSaveId || m_aiState.value(QStringLiteral("activeChat")).toBool())return;
+    m_chatDraftTimer.stop();
+    m_afterChatDraft.reset();
+    setChatDraft(m_savedChatDraft);
+    m_aiState.remove(QStringLiteral("chatDraftWarning"));
+    if(m_aiState.value(QStringLiteral("previewView"))==QStringLiteral("chat")) {
+        ++m_aiPreviewEpoch;m_aiPreviewId=0;m_aiState.remove(QStringLiteral("plan"));
+    }
+    emit aiStateChanged();
+}
+void ReaderController::finishChatDraftSave(const QVariantMap &result,const QString &error) {
+    m_chatDraftSaveId=0;
+    if(!error.isEmpty()) {
+        m_chatDraftTimer.stop();
+        m_afterChatDraft.reset();
+        m_aiState.insert(QStringLiteral("chatDraftWarning"),error);
+        QPointer<ReaderController> alive(this);
+        if(m_chatDeferredCommand)finishChatDeferredCommand(error);
+        if(!alive)return;
+        emit aiStateChanged();
+        return;
+    }
+    m_aiState.remove(QStringLiteral("chatDraftWarning"));
+    m_aiState.insert(QStringLiteral("chatModified"),result.value(QStringLiteral("modified")));
+    m_savedChatDraft=m_chatDraftSnapshot;
+    if(chatDraftPending()) {
+        m_chatDraftTimer.start();
+    } else if(m_chatDeferredCommand) {
+        m_afterChatDraft.reset();
+        QPointer<ReaderController> alive(this);
+        finishChatDeferredCommand({});
+        if(!alive)return;
+    } else if(m_afterChatDraft) {
+        finishChatTransition();
+        return;
+    }
+    emit aiStateChanged();
+}
+void ReaderController::finishChatDeferredCommand(const QString &draftError) {
+    if(!m_chatDeferredCommand)return;
+    auto pending=std::move(*m_chatDeferredCommand);
+    m_chatDeferredCommand.reset();
+    --m_pendingCommands;
+    if(draftError.isEmpty() && pending.generation==m_generation && pending.mutation==m_mutationSequence) {
+        // The command retains its original ID and continues against the same PDF revision.
+        // Its submission replaces the placeholder pending count.
+        QPointer<ReaderController> alive(this);
+        const auto count=m_pendingCommands;
+        submitWithId(pending.id,pending.operation,pending.arguments);
+        if(alive && m_pendingCommands==count)emit commandsChanged();
+        return;
+    }
+    const auto error=draftError.isEmpty()?tr("The document changed while the chat draft was saving. Review the operation again.")
+                                         :tr("The chat draft could not be saved. %1").arg(draftError);
+    QPointer<ReaderController> alive(this);
+    emit commandsChanged();
+    if(!alive)return;
+    setError(error);
+    if(alive)emit commandFinished(pending.id,pending.operation,{},error);
 }
 void ReaderController::prepareAi(const QVariantMap &request,const QVariantMap &unit,const QVariantMap &reading) {
     if(!m_document || m_aiState.value(QStringLiteral("running")).toBool())return;
@@ -415,13 +565,11 @@ bool ReaderController::startAi(const QString &key,const QVariantMap &expectedPla
     m_aiState.insert(QStringLiteral("activeModel"),plan.value(QStringLiteral("model")));
     QVariantMap args{{QStringLiteral("plan"),plan},{QStringLiteral("api_key"),key}};
     if(action==QStringLiteral("DocumentChat")) {
-        auto session=m_aiState.value(QStringLiteral("chatSession")).toString();
-        if(session.isEmpty()) {
-            session=QUuid::createUuid().toString(QUuid::WithoutBraces).toUpper();
-            m_aiState.insert(QStringLiteral("chatSession"),session);
-        }
-        args.insert(QStringLiteral("chat"),QVariantMap{{QStringLiteral("session_id"),session},
+        m_chatDraftTimer.stop();
+        m_aiState.insert(QStringLiteral("activeChatDraft"),chatDraft());
+        args.insert(QStringLiteral("chat"),QVariantMap{{QStringLiteral("session_id"),ensureChatSession()},
             {QStringLiteral("expected_modified"),m_aiState.value(QStringLiteral("chatModified"))},
+            {QStringLiteral("draft_snapshot"),m_aiState.value(QStringLiteral("activeChatDraft"))},
             {QStringLiteral("question"),m_aiState.value(QStringLiteral("activeQuestion"))}});
         m_aiState.remove(QStringLiteral("chatHistoryWarning"));
     }
@@ -456,6 +604,7 @@ void ReaderController::cancelAi() {
 void ReaderController::finishAiChat(const QString &state) {
     if(!m_aiState.value(QStringLiteral("activeChat")).toBool())return;
     m_aiState.insert(QStringLiteral("activeChat"),false);
+    if(chatDraftPending())m_chatDraftTimer.start();
     auto turns=m_aiState.value(QStringLiteral("chatTurns")).toList();const auto plan=m_aiState.value(QStringLiteral("responsePlan")).toMap();
     turns.append(QVariantMap{{QStringLiteral("question"),m_aiState.value(QStringLiteral("activeQuestion"))},{QStringLiteral("answer"),m_aiState.value(QStringLiteral("output"))},{QStringLiteral("reasoning"),m_aiState.value(QStringLiteral("reasoning"))},{QStringLiteral("usage"),m_aiState.value(QStringLiteral("usage"))},{QStringLiteral("state"),state},{QStringLiteral("sources"),plan.value(QStringLiteral("sources"))},{QStringLiteral("source_pages"),plan.value(QStringLiteral("source_pages"))},{QStringLiteral("generation"),m_generation}});
     const auto limit=m_data.value(QStringLiteral("ai_history_limit")).toUInt();
@@ -513,6 +662,9 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
         if(id==m_aiRegionSaveId)finishAiRegionSave(result.toMap(),error);
         return;
     }
+    if(operation==QStringLiteral("ai_chat_draft") && id==m_chatDraftSaveId) {
+        finishChatDraftSave(result.toMap(),error);return;
+    }
     if(operation==QStringLiteral("ai_chat_session") && id==m_aiChatLoadId) {
         m_aiChatLoadId=0;
         if(m_aiChatLoadEpoch!=m_aiPreviewEpoch)return;
@@ -532,10 +684,8 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
         m_aiState.insert(QStringLiteral("chatSession"),session.value(QStringLiteral("id")));
         m_aiState.insert(QStringLiteral("chatModified"),session.value(QStringLiteral("modified")));
         m_aiState.insert(QStringLiteral("chatReadOnly"),readOnly);
-        auto input=m_aiState.value(QStringLiteral("input")).toMap();
-        input.insert(QStringLiteral("chatQuestion"),session.value(QStringLiteral("draft")));
-        if(input.value(QStringLiteral("view"))==QStringLiteral("chat"))input.insert(QStringLiteral("question"),session.value(QStringLiteral("draft")));
-        m_aiState.insert(QStringLiteral("input"),input);
+        m_savedChatDraft=session.value(QStringLiteral("draft")).toString();
+        setChatDraft(m_savedChatDraft);
         m_aiState.insert(QStringLiteral("status"),readOnly?tr("Earlier PDF revision. Start a new chat for the current document."):tr("Conversation reopened."));
         emit aiStateChanged();return;
     }
@@ -573,7 +723,11 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
     }
     const auto batch=result.toMap();
     const auto chatCheckpoint=batch.value(QStringLiteral("chat_checkpoint")).toMap();
-    if(!chatCheckpoint.isEmpty())m_aiState.insert(QStringLiteral("chatModified"),chatCheckpoint.value(QStringLiteral("modified")));
+    if(!chatCheckpoint.isEmpty()) {
+        m_aiState.insert(QStringLiteral("chatModified"),chatCheckpoint.value(QStringLiteral("modified")));
+        m_savedChatDraft=m_aiState.value(QStringLiteral("activeChatDraft")).toString();
+        m_aiState.remove(QStringLiteral("chatDraftWarning"));
+    }
     if(batch.contains(QStringLiteral("chat_history_warning")))m_aiState.insert(QStringLiteral("chatHistoryWarning"),batch.value(QStringLiteral("chat_history_warning")));
     const auto responseKind=m_aiState.value(QStringLiteral("responsePlan")).toMap().value(QStringLiteral("kind")).toString();
     const bool readingTranslation=responseKind==QStringLiteral("reading_translation");

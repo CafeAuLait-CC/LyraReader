@@ -7,6 +7,7 @@
 #include <QColor>
 #include <QSet>
 #include <QTimer>
+#include <optional>
 #include <QUrl>
 #include <QVariantList>
 #include <memory>
@@ -34,6 +35,9 @@ class ReaderController : public QObject {
     Q_PROPERTY(double documentHeight READ documentHeight NOTIFY documentChanged)
     Q_PROPERTY(QUrl fileUrl READ fileUrl NOTIFY documentChanged)
     Q_PROPERTY(QVariantMap aiState READ aiState NOTIFY aiStateChanged)
+    Q_PROPERTY(bool chatDraftPending READ chatDraftPending NOTIFY aiStateChanged)
+    Q_PROPERTY(bool chatDraftSaving READ chatDraftSaving NOTIFY aiStateChanged)
+    Q_PROPERTY(bool documentRevisionPending READ documentRevisionPending NOTIFY commandsChanged)
     Q_PROPERTY(QVariantMap summaryCatalog READ summaryCatalog NOTIFY summaryCatalogChanged)
     Q_PROPERTY(QVariantMap summaryUnitContext READ summaryUnitContext NOTIFY summaryCatalogChanged)
     Q_PROPERTY(QVariantMap documentReading READ documentReading NOTIFY documentReadingChanged)
@@ -135,7 +139,13 @@ public:
     Q_INVOKABLE void setAiInput(const QString &key,const QVariant &value);
     Q_INVOKABLE void invalidateAiPlan();
     Q_INVOKABLE void clearAiChat();
+    Q_INVOKABLE void newAiChat();
     Q_INVOKABLE bool reopenAiChat(const QString &id);
+    Q_INVOKABLE void flushAiChatDraft(bool stopResponse=false);
+    Q_INVOKABLE void discardAiChatDraft();
+    bool chatDraftPending()const;
+    bool chatDraftSaving()const;
+    bool documentRevisionPending()const{return m_revisionCommands>0;}
     QVariantMap editDrafts()const{return m_editDrafts;}
     bool hasEditDrafts()const{return !m_editDrafts.isEmpty();}
     Q_INVOKABLE void setEditDraft(const QString &key,const QVariant &value);
@@ -340,7 +350,28 @@ private:
     quint64 m_aiPreviewEpoch=0,m_aiActivePreviewEpoch=0;
     quint64 m_aiPreviewId=0,m_aiStartId=0,m_aiPollId=0,m_aiPlanGeneration=0;
     quint64 m_aiChatLoadId=0,m_aiChatLoadEpoch=0;
+    quint64 m_chatDraftSaveId=0;
+    QTimer m_chatDraftTimer;
+    QString m_savedChatDraft,m_chatDraftSnapshot;
+    // An empty value opens a new chat. A missing value means no delayed transition.
+    std::optional<QString> m_afterChatDraft;
+    struct ChatDeferredCommand {
+        quint64 id;
+        quint64 generation;
+        quint64 mutation;
+        QString operation;
+        QVariantMap arguments;
+    };
+    std::optional<ChatDeferredCommand> m_chatDeferredCommand;
+    int m_revisionCommands=0;
     void resetAiChat();
+    QString chatDraft()const;
+    void setChatDraft(const QString &draft);
+    QString ensureChatSession();
+    void finishChatDraftSave(const QVariantMap &result,const QString &error);
+    void finishChatTransition();
+    void finishChatDeferredCommand(const QString &draftError);
+    quint64 submitWithId(quint64 id,const QString &operation,const QVariantMap &arguments);
     void enqueue(const Request &request);
     void requestPageInternal(int page,double scale,bool embedded,bool manual);
     void pruneTileRequests();

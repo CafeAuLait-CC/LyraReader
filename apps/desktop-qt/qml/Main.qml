@@ -467,8 +467,9 @@ ApplicationWindow {
     function prepareForQuit() {
         if ((session && session.tabTransferInProgress) || closeOperation || pendingDocumentSave || dialogs.closePromptVisible || dialogs.saveDialog.visible) return false;
         const tabs=session?session.tabs:[{reader:currentReader}];
-        tabs.forEach(tab=>tab.reader.flushAiRegionNote());
+        tabs.forEach(tab=>{tab.reader.flushAiRegionNote();tab.reader.flushAiChatDraft(true);});
         if(tabs.some(tab=>tab.reader.hasUnsavedReadingNotes && !tab.reader.regionPersistencePending)){readingNotesBlockClose(-1);return false;}
+        if(tabs.some(tab=>tab.reader.chatDraftPending && !tab.reader.chatDraftSaving)){chatDraftsBlockClose(-1);return false;}
         tabs.forEach(tab=>tab.reader.cancelIndexQueries());
         cancelErase();dialogs.flushAnnotation();saveReadingPosition();return true;
     }
@@ -510,6 +511,12 @@ ApplicationWindow {
         if(blocked)operationStatus=qsTr("Save or discard the unsaved reading note before closing. A failed save keeps its draft in this tab.");
         return blocked;
     }
+    function chatDraftsBlockClose(index) {
+        const tabs=session ? session.tabs : [{reader:currentReader}];
+        const blocked=tabs.some((tab,i)=>(index<0 || index===i) && tab.reader.chatDraftPending);
+        if(blocked)operationStatus=qsTr("A chat draft still needs to be saved. Its text remains in the original tab.");
+        return blocked;
+    }
     function hasPendingCloseWork(index) {
         const tabs = session ? session.tabs : [
             {
@@ -517,7 +524,7 @@ ApplicationWindow {
             }
         ];
         return tabs.some(function (tab, i) {
-            return (index < 0 || i === index) && (tab.reader.pendingCommands > 0 || tab.reader.regionPersistencePending);
+            return (index < 0 || i === index) && (tab.reader.pendingCommands > 0 || tab.reader.regionPersistencePending || tab.reader.chatDraftSaving);
         });
     }
     function hasUnsavedChanges(index) {
@@ -563,15 +570,15 @@ ApplicationWindow {
         if (!session || closeOperation || dialogs.closePromptVisible) return;
         const owner=closeTarget(index);
         if (!owner) return;
-        owner.cancelIndexQueries();owner.flushAiRegionNote();
+        owner.cancelIndexQueries();owner.flushAiRegionNote();owner.flushAiChatDraft(true);
         dialogs.flushAnnotation();
         closingTab=index;
         pendingCloseReader=owner;
-        if (owner.pendingCommands>0 || owner.regionPersistencePending) { closeRetry.start(); return; }
+        if (owner.pendingCommands>0 || owner.regionPersistencePending || owner.chatDraftSaving) { closeRetry.start(); return; }
         closingTab=-2;
         pendingCloseReader=null;
         const currentIndex=readerIndex(owner);
-        if(readingNotesBlockClose(currentIndex))return;
+        if(readingNotesBlockClose(currentIndex) || chatDraftsBlockClose(currentIndex))return;
         if (owner.hasUnsavedChanges) dialogs.confirmClose(currentIndex);
         else session.closeTab(currentIndex);
     }
@@ -601,6 +608,13 @@ ApplicationWindow {
     }
     function discardAndClose(index) { beginCloseOperation("discard",closeTarget(index),index<0); }
     function closeCommandFinished(owner,id,operation,result,error) {
+        if (operation === "ai_chat_draft" && error.length && closingTab !== -2
+                && (closingTab < 0 || pendingCloseReader === owner)) {
+            closeRetry.stop();
+            closingTab = -2;
+            pendingCloseReader = null;
+            operationStatus = qsTr("The chat draft could not be saved. The document is still open.");
+        }
         const ticket=closeOperation;
         if (!ticket || ticket.reader !== owner || ticket.id !== id) return;
         if (error.length) { cancelCloseOperation(error); return; }
@@ -636,7 +650,7 @@ ApplicationWindow {
         cancelErase();
         if (closeOperation || dialogs.closePromptVisible) {event.accepted=false;return;}
         const tabs=session?session.tabs:[{reader:currentReader}];
-        tabs.forEach(tab=>{tab.reader.cancelIndexQueries();tab.reader.flushAiRegionNote();});
+        tabs.forEach(tab=>{tab.reader.cancelIndexQueries();tab.reader.flushAiRegionNote();tab.reader.flushAiChatDraft(true);});
         dialogs.flushAnnotation();
         saveReadingPosition();
         if (hasPendingCloseWork(-1)) {
@@ -646,7 +660,7 @@ ApplicationWindow {
             closeRetry.start();
             return;
         }
-        if(readingNotesBlockClose(-1)){event.accepted=false;return;}
+        if(readingNotesBlockClose(-1) || chatDraftsBlockClose(-1)){event.accepted=false;return;}
         if (hasUnsavedChanges(-1)) {
             event.accepted = false;
             dialogs.confirmClose(-1);
@@ -656,7 +670,7 @@ ApplicationWindow {
         if (closingTab === -2) return;
         const owner=pendingCloseReader;
         if (closingTab >= 0 && (!owner || readerIndex(owner)<0)) {closingTab=-2;pendingCloseReader=null;return;}
-        if (closingTab < 0 ? hasPendingCloseWork(-1) : (owner.pendingCommands>0 || owner.regionPersistencePending)) return;
+        if (closingTab < 0 ? hasPendingCloseWork(-1) : (owner.pendingCommands>0 || owner.regionPersistencePending || owner.chatDraftSaving)) return;
         if (dialogs.annotationWriteError.length && (closingTab<0 || dialogs.noteReader === owner)) {
             operationStatus = dialogs.annotationWriteError;
             closingTab = -2;
@@ -666,6 +680,7 @@ ApplicationWindow {
         const index = closingTab<0 ? -1 : readerIndex(owner);
         closingTab = -2;
         pendingCloseReader=null;
+        if(chatDraftsBlockClose(index))return;
         if (index < 0)
             root.close();
         else
@@ -2641,6 +2656,7 @@ ApplicationWindow {
         function onTabTransferFailed(reason) {root.operationStatus=reason;}
         function onActiveReaderAboutToChange() {
             root.currentReader.cancelIndexQueries();root.currentReader.flushAiRegionNote();
+            if(!root.session.tabTransferInProgress)root.currentReader.flushAiChatDraft();
             regionNotes.close();aiRegionCard.close();root.currentReader.cancelAiRegionCapture();root.cancelRegionSelection();
             if(placedTextController.waitingForCreation)placedTextController.suppressPendingEditor();
             dialogs.flushAnnotation();

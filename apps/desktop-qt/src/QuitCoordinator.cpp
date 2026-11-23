@@ -80,6 +80,7 @@ void QuitCoordinator::collect() {
             auto *reader=tab.toMap().value(QStringLiteral("reader")).value<ReaderController *>();
             entry.readers.append(reader);
             if(reader && reader->hasUnsavedReadingNotes()){abort(tr("Save or discard the reading-note draft before quitting. All reader windows stay open."));return;}
+            if(reader && reader->chatDraftPending()){abort(tr("Save or discard the unsaved chat draft before quitting. All reader windows stay open."));return;}
             if(!reader || !reader->hasUnsavedChanges())continue;
             const auto marks=reader->data().value(QStringLiteral("marks")).toMap();QStringList parts;
             if(marks.value(QStringLiteral("page_pending")).toBool())parts.append(tr("page edits"));
@@ -195,7 +196,7 @@ void QuitCoordinator::advance() {
     if(all.size()!=m_windows.size()){abort(tr("The reader windows changed while quitting. Try again."));return;}
     for(const auto &window:m_windows)if(!window.workspace || !window.window || !all.contains(window.workspace)){abort(tr("The reader windows changed while quitting. Try again."));return;}
     if(m_phase==QStringLiteral("preparing")) {
-        for(const auto &window:m_windows)if(window.workspace)for(const auto &tab:window.workspace->tabs()){auto *reader=tab.toMap().value(QStringLiteral("reader")).value<ReaderController *>();if(reader && (reader->loading() || reader->pendingCommands()>0 || reader->regionPersistencePending()))return;}
+        for(const auto &window:m_windows)if(window.workspace)for(const auto &tab:window.workspace->tabs()){auto *reader=tab.toMap().value(QStringLiteral("reader")).value<ReaderController *>();if(reader && (reader->loading() || reader->pendingCommands()>0 || reader->regionPersistencePending() || reader->chatDraftSaving()))return;}
         collect();return;
     }
     if(m_phase!=QStringLiteral("saving"))return;
@@ -275,7 +276,7 @@ void QuitCoordinator::finish() {
     for(const auto &window:m_windows)for(const auto &tab:window.workspace->tabs()) {
         auto *reader=tab.toMap().value(QStringLiteral("reader")).value<ReaderController *>();if(!reader)continue;
         const bool resolved=m_resolved && std::any_of(m_documents.cbegin(),m_documents.cend(),[&](const Document &document){return document.reader==reader;});
-        if((reader->hasUnsavedChanges() && !resolved) || reader->hasUnsavedReadingNotes() || reader->pendingCommands()>0){abort(tr("New changes remain unsaved. All reader windows stay open."));return;}
+        if((reader->hasUnsavedChanges() && !resolved) || reader->hasUnsavedReadingNotes() || reader->chatDraftPending() || reader->pendingCommands()>0){abort(tr("New changes remain unsaved. All reader windows stay open."));return;}
     }
     if(m_resolved) {
         LyraReaderBuffer failure{};

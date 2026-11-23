@@ -299,8 +299,9 @@ void WorkspaceController::closeTab(int index, bool discardPending) {
     if (m_tabTransfer || index < 0 || index >= m_tabs.size()) return;
     auto *candidate=m_tabs.at(index);
     candidate->flushAiRegionNote();
+    candidate->flushAiChatDraft(true);
     const auto marks=candidate->data().value(QStringLiteral("marks")).toMap();
-    if(candidate->pendingCommands()>0 || candidate->regionPersistencePending() || candidate->hasUnsavedReadingNotes() || candidate->hasUnsavedChanges() ||
+    if(candidate->pendingCommands()>0 || candidate->regionPersistencePending() || candidate->hasUnsavedReadingNotes() || candidate->chatDraftPending() || candidate->hasUnsavedChanges() ||
         (discardPending && marks.value(QStringLiteral("page_session_active")).toBool())) {
         emit closeTabRequested(index);
         return;
