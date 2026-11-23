@@ -714,7 +714,15 @@ Pane {
             }
         }
     }
-    AiReadingNotes { id: readingNotes; app: aiPanel.app }
+    AiReadingNotes {
+        id: readingNotes
+        app: aiPanel.app
+        onRequestUpdate: function(noteId) {
+            const request = aiPanel.baseRequest("SummarizeDocument");
+            request.language = aiPanel.input.summaryLanguage || null;
+            aiPanel.owner.prepareAi(request, {}, {kind: "note", detail: "Standard", id: noteId});
+        }
+    }
     Dialog {
         id: chatHistory
         objectName: "aiChatHistory"

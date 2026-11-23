@@ -16,6 +16,12 @@ Dialog {
     property bool editing: false
     property bool seeding: false
     property var baseline: ({})
+    property string reviewId: ""
+    readonly property bool reviewing: reviewId.length > 0
+    readonly property var reviewState: reader ? reader.aiState : ({})
+    readonly property var reviewPlan: reviewing && reviewState.previewView === "note"
+        && reviewState.plan && reviewState.plan.note_id === reviewId ? reviewState.plan : null
+    readonly property bool reviewRunning: reviewing && reviewState.responseView === "note" && !!reviewState.running
     readonly property bool dirty: !!(reader && note && reader.readingNoteDraft.id === note.id)
     parent: Overlay.overlay
     anchors.centerIn: parent
@@ -24,6 +30,7 @@ Dialog {
     modal: true
     title: qsTr("Reading notes")
     standardButtons: Dialog.Close
+    signal requestUpdate(string noteId)
 
     function current() {
         return reader && reader === app.currentReader && generation === reader.documentGeneration;
@@ -41,14 +48,14 @@ Dialog {
         else refresh();
     }
     function refresh() {
-        if (!current() || editing) return;
+        if (!current() || editing || reviewing) return;
         preferred = preferred || (note ? note.id : "");
         note = null;
         failure = "";
         command = reader.submit("ai_reading_notes", {query: search.text, recent: order.currentIndex === 0});
     }
     function read(index) {
-        if (!current() || editing || index < 0 || index >= entries.length) return;
+        if (!current() || editing || reviewing || index < 0 || index >= entries.length) return;
         note = null;
         failure = "";
         command = reader.submit("ai_reading_note", {id: entries[index].id});
@@ -94,14 +101,41 @@ Dialog {
         failure = "";
         command = reader.saveReadingNoteDraft();
     }
+    function beginUpdate() {
+        if (!current() || !note || !note.discussion_available || note.suggestion || editing || command || reviewState.running) return;
+        debounce.stop();
+        failure = "";
+        reviewId = note.id;
+        requestUpdate(reviewId);
+    }
+    function endPreview() {
+        if (reader && reviewing && !reviewRunning && reviewState.previewView === "note" && !reviewState.planSent)
+            reader.invalidateAiPlan();
+        reviewId = "";
+    }
+    function resolveSuggestion(apply) {
+        if (!current() || !note || !note.suggestion || editing || reviewing || command) return;
+        command = reader.submit("ai_reading_note_review", {review: {id: note.id,
+            expected_modified: note.modified, expected_suggestion: note.suggestion.revision, apply: apply}});
+    }
+    function finishUpdate() {
+        if (!current() || !reviewing || reviewRunning) return;
+        const result = reviewState.noteSuggestion;
+        if (result && result.available && result.id === reviewId && !command) {
+            reviewId = "";
+            command = reader.submit("ai_reading_note", {id: result.id});
+        }
+    }
     onClosed: {
         debounce.stop();
+        endPreview();
         editing = false;
         reader = null; command = 0; entries = []; note = null; preferred = ""; failure = "";
         search.text = "";
     }
     Connections {
         target: notes.reader
+        function onAiStateChanged() { if (notes.reviewing) Qt.callLater(notes.finishUpdate); }
         function onCommandFinished(id, operation, result, error) {
             if (id !== notes.command || !notes.current()) return;
             notes.command = 0;
@@ -119,11 +153,15 @@ Dialog {
             } else if (operation === "ai_reading_note") {
                 notes.note = result;
                 if (notes.reader.readingNoteDraft.id === result.id) notes.beginEditing();
+                else if (notes.reviewState.running && notes.reviewState.responseView === "note"
+                    && notes.reviewState.responsePlan.note_id === result.id) notes.reviewId = result.id;
             } else if (operation === "ai_reading_note_update") {
                 notes.note = result;
                 notes.editing = false;
                 if (notes.dirty) notes.beginEditing();
                 else notes.refresh();
+            } else if (operation === "ai_reading_note_review") {
+                notes.note = result;
             }
         }
     }
@@ -132,7 +170,7 @@ Dialog {
     contentItem: ColumnLayout {
         RowLayout {
             Layout.fillWidth: true
-            enabled: !notes.editing
+            enabled: !notes.editing && !notes.reviewing
             TextField {
                 id: search
                 objectName: "aiReadingNoteSearch"
@@ -155,14 +193,15 @@ Dialog {
             Layout.fillWidth: true
             model: notes.entries
             textRole: "title"
-            enabled: count > 0 && !notes.command && !notes.editing
+            enabled: count > 0 && !notes.command && !notes.editing && !notes.reviewing
             Accessible.name: qsTr("Saved notes")
             onActivated: notes.read(currentIndex)
         }
         Label {
             Layout.fillWidth: true
             visible: !!text
-            text: notes.failure || (notes.command ? (notes.editing ? qsTr("Saving reading note…") : qsTr("Loading reading notes…"))
+            text: notes.failure || (notes.reviewing ? notes.reviewState.status || ""
+                : notes.command ? (notes.editing ? qsTr("Saving reading note…") : qsTr("Loading reading notes…"))
                 : !notes.entries.length ? qsTr("No matching notes.")
                 : notes.note && notes.note.status === "sourceChanged" ? qsTr("Note from an earlier PDF revision.") : "")
             wrapMode: Text.Wrap; textFormat: Text.PlainText; color: app.colors.textSecondary
@@ -170,7 +209,7 @@ Dialog {
         AiReadingScrollView {
             id: contents
             Layout.fillWidth: true; Layout.fillHeight: true
-            visible: !notes.editing
+            visible: !notes.editing && !notes.reviewing
             Column {
                 width: contents.availableWidth
                 TextArea {
@@ -180,6 +219,22 @@ Dialog {
                     readOnly: true; selectByMouse: true; selectByKeyboard: true
                     textFormat: TextEdit.PlainText; wrapMode: Text.Wrap
                     Accessible.name: qsTr("Saved reading note")
+                    color: app.colors.textPrimary
+                }
+                Label {
+                    visible: notes.note && !!notes.note.suggestion
+                    text: qsTr("Suggested key ideas")
+                    font.bold: true
+                    color: app.colors.textSecondary
+                }
+                TextArea {
+                    objectName: "aiReadingNoteSuggestion"
+                    visible: !!text
+                    width: parent.width
+                    text: notes.note && notes.note.suggestion ? notes.note.suggestion.content : ""
+                    readOnly: true; selectByMouse: true; selectByKeyboard: true
+                    textFormat: TextEdit.PlainText; wrapMode: Text.Wrap
+                    Accessible.name: qsTr("Suggested key ideas")
                     color: app.colors.textPrimary
                 }
                 Label {
@@ -196,6 +251,26 @@ Dialog {
                     Accessible.name: qsTr("My thoughts")
                     color: app.colors.textPrimary
                 }
+            }
+        }
+        Label {
+            visible: notes.reviewing && !!notes.reviewPlan
+            Layout.fillWidth: true
+            text: notes.reviewPlan ? qsTr("Endpoint: %1 · %2 request(s)").arg(notes.reviewPlan.host).arg(notes.reviewPlan.parts.length) : ""
+            wrapMode: Text.Wrap; textFormat: Text.PlainText
+            color: app.colors.infoFg
+        }
+        AiReadingScrollView {
+            id: reviewedRequest
+            visible: notes.reviewing && !!notes.reviewPlan
+            Layout.fillWidth: true; Layout.fillHeight: true
+            TextArea {
+                objectName:"aiReadingNoteWire"
+                width: reviewedRequest.availableWidth
+                text: notes.reviewPlan ? notes.reviewPlan.parts.map(part => part.wire_body).join("\n\n") : ""
+                readOnly: true; selectByMouse: true; selectByKeyboard: true
+                textFormat: TextEdit.PlainText; wrapMode: Text.WrapAnywhere
+                Accessible.name: qsTr("Exact request to update reading note")
             }
         }
         ColumnLayout {
@@ -240,7 +315,7 @@ Dialog {
             }
         }
         RowLayout {
-            visible: !notes.editing && !!notes.note
+            visible: !notes.editing && !notes.reviewing && !!notes.note
             ComboBox {
                 id: sources
                 objectName: "aiReadingNotePages"
@@ -266,6 +341,53 @@ Dialog {
                 text: qsTr("Edit note")
                 enabled: notes.current() && !notes.command && !notes.reader.documentRevisionPending
                 onClicked: notes.beginEditing()
+            }
+        }
+        Flow {
+            Layout.fillWidth: true
+            visible: !notes.editing && !notes.reviewing && !!notes.note
+            spacing: 4
+            Button {
+                objectName: "previewAiReadingNoteUpdate"
+                visible: !!(notes.note && notes.note.discussion_available && !notes.note.suggestion)
+                text: qsTr("Preview update from discussion")
+                enabled: notes.current() && !notes.command && !notes.reviewState.running
+                onClicked: notes.beginUpdate()
+            }
+            Button {
+                objectName: "applyAiReadingNoteSuggestion"
+                visible: !!(notes.note && notes.note.suggestion)
+                text: qsTr("Use suggested key ideas")
+                enabled: !notes.command
+                onClicked: notes.resolveSuggestion(true)
+            }
+            Button {
+                objectName: "dismissAiReadingNoteSuggestion"
+                visible: !!(notes.note && notes.note.suggestion)
+                text: qsTr("Dismiss suggestion")
+                enabled: !notes.command
+                onClicked: notes.resolveSuggestion(false)
+            }
+        }
+        RowLayout {
+            visible: notes.reviewing
+            Layout.alignment: Qt.AlignRight
+            Button {
+                text: qsTr("Back to note")
+                visible: !notes.reviewRunning
+                onClicked: notes.endPreview()
+            }
+            Button {
+                objectName: "sendAiReadingNoteUpdate"
+                text: qsTr("Send")
+                visible: !!notes.reviewPlan && !notes.reviewState.planSent
+                enabled: notes.current() && !notes.reader.pendingCommands && !notes.reviewState.running
+                onClicked: app.sendAi(notes.reader, notes.reviewPlan)
+            }
+            Button {
+                text: qsTr("Stop")
+                visible: notes.reviewRunning
+                onClicked: notes.reader.cancelAi()
             }
         }
         RowLayout {

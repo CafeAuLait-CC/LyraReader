@@ -480,8 +480,9 @@ void ReaderController::finishChatDeferredCommand(const QString &draftError) {
 void ReaderController::prepareAi(const QVariantMap &request,const QVariantMap &unit,const QVariantMap &reading) {
     if(!m_document || m_aiState.value(QStringLiteral("running")).toBool())return;
     if(request.value(QStringLiteral("action"))==QStringLiteral("DocumentChat") && m_aiState.value(QStringLiteral("chatReadOnly")).toBool())return;
-    const bool readingTranslation=reading.value(QStringLiteral("kind")).toString()==QStringLiteral("translation");
-    const auto previewView=readingTranslation?QStringLiteral("translation"):aiView(request.value(QStringLiteral("action")).toString());
+    const auto readingKind=reading.value(QStringLiteral("kind")).toString();
+    const auto previewView=(readingKind==QStringLiteral("translation") || readingKind==QStringLiteral("note"))
+        ? readingKind : aiView(request.value(QStringLiteral("action")).toString());
     const auto document=m_document;const auto generation=m_generation;const auto epoch=++m_aiPreviewEpoch;
     QPointer<ReaderController> alive(this);
     const auto current=[&]{return alive && document==m_document && generation==m_generation && epoch==m_aiPreviewEpoch;};
@@ -514,6 +515,7 @@ void ReaderController::prepareAi(const QVariantMap &request,const QVariantMap &u
     m_aiState.insert(QStringLiteral("previewSelection"),reading.isEmpty()?QVariant{}:input.value(QStringLiteral("selection")));
     m_aiState.insert(QStringLiteral("planSent"),false);
     m_aiState.insert(QStringLiteral("previewView"),previewView);
+    if(previewView==QStringLiteral("note"))m_aiState.remove(QStringLiteral("noteSuggestion"));
     m_aiState.insert(QStringLiteral("statusView"),m_aiState.value(QStringLiteral("previewView")));
     m_aiState.remove(QStringLiteral("plan"));m_aiState.insert(QStringLiteral("status"),tr("Preparing request locally…"));
     m_aiPlanGeneration=m_generation;emit aiStateChanged();if(!current())return;
@@ -553,7 +555,8 @@ bool ReaderController::startAi(const QString &key,const QVariantMap &expectedPla
     m_aiState.insert(QStringLiteral("responsePlan"),plan);
     m_aiState.remove(QStringLiteral("summaryNoteSource"));
     m_aiState.insert(QStringLiteral("planSent"),true);
-    m_aiState.insert(QStringLiteral("responseView"),aiView(plan.value(QStringLiteral("action")).toString()));
+    m_aiState.insert(QStringLiteral("responseView"),kind==QStringLiteral("reading_note_suggestion")
+        ? QStringLiteral("note") : aiView(action));
     m_aiState.insert(QStringLiteral("statusView"),m_aiState.value(QStringLiteral("responseView")));
     m_aiState.insert(QStringLiteral("activeChat"),action==QStringLiteral("DocumentChat"));
     m_aiState.insert(QStringLiteral("activeQuestion"),m_aiState.value(QStringLiteral("previewQuestion")));
@@ -830,6 +833,16 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
             m_aiState.insert(QStringLiteral("status"),complete?tr("Response complete."):tr("The response ended without a completion event."));
         }
         m_aiState.insert(QStringLiteral("running"),false);
+        if(responseKind==QStringLiteral("reading_note_suggestion")) {
+            const auto suggested=batch.value(QStringLiteral("note_suggestion")).toMap();
+            if(!suggested.isEmpty()) {
+                m_aiState.insert(QStringLiteral("noteSuggestion"),suggested);
+                m_aiState.insert(QStringLiteral("status"),suggested.value(QStringLiteral("available")).toBool()
+                    ? tr("The suggested note is ready to review.") : tr("The discussion did not produce new note text."));
+            }
+            const auto warning=batch.value(QStringLiteral("note_warning")).toString();
+            if(!warning.isEmpty())m_aiState.insert(QStringLiteral("status"),warning);
+        }
         if(readingTranslation && !m_aiState.value(QStringLiteral("limited")).toBool()) {
             m_aiState.insert(QStringLiteral("translationBlocks"),batch.value(QStringLiteral("translation_blocks")));
             m_aiState.insert(QStringLiteral("translationWarning"),batch.value(QStringLiteral("translation_warning")));

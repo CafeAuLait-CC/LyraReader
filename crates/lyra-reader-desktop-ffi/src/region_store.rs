@@ -167,6 +167,45 @@ pub(super) fn reading_note_source(
     id: &str,
     reviewed_revision: &str,
 ) -> Result<ReadingRecord, String> {
+    with_current_region(
+        cache,
+        document,
+        sha,
+        id,
+        Some(reviewed_revision),
+        |region, _| {
+            if region.knowledge_note.trim().is_empty() {
+                return Err("Save a knowledge note for this region first.".into());
+            }
+            let page = region.attachment.page + 1;
+            let modified = u64::try_from(chrono::Utc::now().timestamp_millis())
+                .map_err(|_| "The local clock cannot date the reading note.")?;
+            Ok(ReadingRecord {
+                id: format!("interleaf:{}", region.id),
+                kind: "message".into(),
+                title: format!("Interleaf · page {page}"),
+                content: region.knowledge_note.clone(),
+                conversation_id: region.id.clone(),
+                pages: vec![page],
+                source_hash: sha.into(),
+                status: "finished".into(),
+                modified,
+                covered_turns: u32::try_from(region.completed_turns().count())
+                    .map_err(|_| "The saved region has too many exchanges.")?,
+                ..ReadingRecord::default()
+            })
+        },
+    )
+}
+
+pub(super) fn with_current_region<T>(
+    cache: &DocumentCache,
+    document: &LyraReaderDocument,
+    sha: &str,
+    id: &str,
+    reviewed_revision: Option<&str>,
+    read: impl FnOnce(&Entry, String) -> Result<T, String>,
+) -> Result<T, String> {
     // Read the current disk snapshot, rather than a different window's cached history.
     let mut store = RegionStore::default();
     store.load(cache)?;
@@ -176,31 +215,13 @@ pub(super) fn reading_note_source(
     if store.history.writes_blocked {
         return Err("Saved regions are protected. Resolve the history warning first.".into());
     }
-    if store.revision() != reviewed_revision {
-        return Err("Saved regions changed. Reopen this area before keeping its note.".into());
+    let revision = store.revision();
+    if reviewed_revision.is_some_and(|reviewed| reviewed != revision) {
+        return Err("Saved regions changed. Reopen this area and review it again.".into());
     }
     let region = store.history.get(id)?;
     region.validate_reopen(document.page_count(), sha)?;
-    if region.knowledge_note.trim().is_empty() {
-        return Err("Save a knowledge note for this region first.".into());
-    }
-    let page = region.attachment.page + 1;
-    let modified = u64::try_from(chrono::Utc::now().timestamp_millis())
-        .map_err(|_| "The local clock cannot date the reading note.")?;
-    Ok(ReadingRecord {
-        id: format!("interleaf:{}", region.id),
-        kind: "message".into(),
-        title: format!("Interleaf · page {page}"),
-        content: region.knowledge_note.clone(),
-        conversation_id: region.id.clone(),
-        pages: vec![page],
-        source_hash: sha.into(),
-        status: "finished".into(),
-        modified,
-        covered_turns: u32::try_from(region.completed_turns().count())
-            .map_err(|_| "The saved region has too many exchanges.")?,
-        ..ReadingRecord::default()
-    })
+    read(region, revision)
 }
 
 impl DesktopDocument {

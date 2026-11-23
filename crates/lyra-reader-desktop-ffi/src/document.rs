@@ -1,6 +1,7 @@
 //! Desktop transport over the same portable Rust control plane the macOS shell uses.
 //! JSON only crosses the narrow C boundary; requests are decoded into typed engine records.
 use crate::analysis_cache::{PendingSummary, SummaryCapture};
+use crate::reading_notes::PendingNote;
 use lyra_reader_ai::workspace::{ReadingRecord, reading_scope_key};
 use lyra_reader_core::Size;
 use lyra_reader_ffi::api::*;
@@ -27,6 +28,7 @@ pub struct DesktopDocument {
     pub(super) summaries: Mutex<crate::summary_store::Store>,
     pub(super) knowledge: Mutex<crate::knowledge::Knowledge>,
     pub(super) pending_summary: Mutex<Option<PendingSummary>>,
+    pub(super) pending_note: Mutex<Option<PendingNote>>,
     pub(super) regions: Mutex<crate::region_store::RegionStore>,
     pub(super) ai_region_sources: Mutex<Option<Arc<crate::region_store::RequestProvenance>>>,
     pub(super) marks: Mutex<crate::marks::Marks>,
@@ -54,6 +56,7 @@ struct ReadingSummaryStyle {
 enum ReadingOutput {
     Translation(Box<crate::reading_history::PendingTranslation>),
     Chat(Box<crate::reading_history::ChatArchive>),
+    Note(Box<PendingNote>),
     Synthesis {
         request: Box<AiMergePlanRequestRecord>,
         style: ReadingSummaryStyle,
@@ -68,6 +71,7 @@ enum ReadingOutput {
 enum ReadingArchive {
     Translation(Box<Result<ReadingRecord, String>>),
     Chat(crate::reading_history::ChatArchive),
+    Note(Box<PendingNote>, String),
     PendingSummary(PendingSummary),
     Summary(Box<Result<ReadingRecord, String>>),
 }
@@ -179,6 +183,14 @@ impl ReadingReplies {
                 Some(ReadingArchive::Chat(
                     pending.with_reply(&self.replies, state),
                 ))
+            }
+            ReadingOutput::Note(capture) => {
+                if failure.is_some() || self.replies.iter().any(|reply| reply.trim().is_empty()) {
+                    result["note_warning"] =
+                        json!("The note update did not finish. The saved note was kept.");
+                    return None;
+                }
+                Some(ReadingArchive::Note(capture, self.replies.join("\n\n")))
             }
             ReadingOutput::Summary { capture, model } => {
                 if failure.is_some() {
@@ -458,6 +470,7 @@ impl DesktopDocument {
             summaries: Mutex::new(crate::summary_store::Store::default()),
             knowledge: Mutex::new(crate::knowledge::Knowledge::default()),
             pending_summary: Mutex::new(None),
+            pending_note: Mutex::new(None),
             regions: Mutex::new(crate::region_store::RegionStore::default()),
             ai_region_sources: Mutex::new(None),
             marks,
@@ -937,6 +950,9 @@ impl DesktopDocument {
                 let mut request = crate::region::request(r["request"].clone())?;
                 if r.get("reading").is_some() {
                     let options: AiReadingOptionsRecord = arg(&r, "reading")?;
+                    if options.kind == "note" {
+                        return self.prepare_note_review(&d, &text(&r["reading"], "id")?, request);
+                    }
                     if let Some(id) = r["reading"]["saved_translation"].as_str() {
                         if options.kind != "translation" {
                             return Err(
@@ -1038,6 +1054,7 @@ impl DesktopDocument {
             ),
             "ai_reading_note" => self.reading_note(&d, &text(&r, "id")?),
             "ai_reading_note_update" => self.save_reading_note(&d, arg(&r, "draft")?),
+            "ai_reading_note_review" => self.resolve_note_review(&d, arg(&r, "review")?),
             "ai_reading_keep" => self.keep_reading_note(&d, &text(&r, "id")?),
             "ai_reading_keep_region" => self.keep_region_note(
                 &d,
@@ -1205,6 +1222,18 @@ impl DesktopDocument {
                             Some(lyra_reader_ai::SelectionRange {page: selection.page, start: selection.start, end: selection.end}))?);
                         Some(ReadingOutput::Summary { capture, model: plan.model.clone() })
                     }
+                    (Some("reading_note_suggestion"), AiActionRecord::SummarizeDocument) => {
+                        let token=text(&r["plan"],"note_capture")?;
+                        let capture={
+                            let mut pending=self.pending_note.lock().map_err(|_|"Note review state is unavailable.")?;
+                            if !pending.as_ref().is_some_and(|capture|capture.matches(&token,&plan,&d.document_identity().sha256)) {
+                                return Err("This note preview changed. Review it again before sending.".into());
+                            }
+                            pending.take().ok_or("The reviewed note request is unavailable.")?
+                        };
+                        self.validate_note_review(&d,&capture)?;
+                        Some(ReadingOutput::Note(Box::new(capture)))
+                    }
                     (Some("summary_synthesis"), AiActionRecord::SummarizeDocument) => {
                         if let Some(token)=r["plan"]["summary_capture"].as_str() {
                             let body=plan.parts.first().map(|part| part.wire_body.as_str()).filter(|body| !body.is_empty())
@@ -1324,6 +1353,12 @@ impl DesktopDocument {
                             Ok(checkpoint) => result["chat_checkpoint"] = checkpoint,
                             Err(error) => result["chat_history_warning"] = json!(error),
                         },
+                        Some(ReadingArchive::Note(capture, answer)) => {
+                            match self.publish_note_review(&d, *capture, answer) {
+                                Ok(suggestion) => result["note_suggestion"] = suggestion,
+                                Err(error) => result["note_warning"] = json!(error),
+                            }
+                        }
                         Some(ReadingArchive::PendingSummary(snapshot)) => {
                             *self
                                 .pending_summary
