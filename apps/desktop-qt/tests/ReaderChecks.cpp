@@ -363,6 +363,84 @@ private slots:
         QVERIFY(accounts->accounts().isEmpty());
         QVERIFY(settings->close());
     }
+    void chatGptPreferencesKeepChangesFromASecondProcess() {
+        const auto role = qEnvironmentVariable("LYRA_READER_CHECK_CHATGPT_PREFS");
+        const auto run = [&](const QString &childRole, const QString &configDirectory) {
+            auto environment = QProcessEnvironment::systemEnvironment();
+            environment.insert("LYRA_READER_CHECK_CHATGPT_PREFS", childRole);
+            environment.insert("LYRA_READER_CHECK_SETTINGS_ROOT", configDirectory);
+            environment.insert("XDG_CONFIG_HOME", configDirectory);
+            QProcess child;
+            child.setProcessEnvironment(environment);
+            child.setProcessChannelMode(QProcess::MergedChannels);
+            child.start(QCoreApplication::applicationFilePath(),
+                        {root, "chatGptPreferencesKeepChangesFromASecondProcess"});
+            QVERIFY(child.waitForFinished(20000));
+            QCOMPARE(child.exitStatus(), QProcess::NormalExit);
+            const auto output = child.readAll();
+            QVERIFY2(child.exitCode() == 0, output.constData());
+        };
+        if (role.isEmpty()) {
+            QTemporaryDir config;
+            QVERIFY(config.isValid());
+            run("reader", config.path());
+            return;
+        }
+        const auto connection = [](const QString &key) {
+            const QVariantList models{QVariantMap{{"id", "first"}, {"name", "First synthetic model"}},
+                                      QVariantMap{{"id", "second"}, {"name", "Second synthetic model"}}};
+            return QVariantMap{{"id", key}, {"model", "first"}, {"connected", true},
+                               {"models", models}, {"new_metadata", "keep this field"}};
+        };
+        const auto a = connection("synthetic-one");
+        auto b = connection("synthetic-two");
+        b.insert("new_metadata", "written by the other process");
+        QSettings settings;
+        const QString roster = "chatGptPlan/accounts";
+        const QString selected = "chatGptPlan/selected";
+        const QString selection = "chatGptPlan/useForSelection";
+        const QString useForChat = "chatGptPlan/useForChat";
+        if (role == "writer") {
+            settings.setValue(roster, QVariantList{a, b});
+            settings.setValue(selected, "synthetic-two");
+            settings.setValue(selection, false);
+            settings.sync();
+            QCOMPARE(settings.status(), QSettings::NoError);
+            return;
+        }
+        QCOMPARE(role, QString("reader"));
+        settings.setValue(roster, QVariantList{a});
+        settings.setValue(selected, "synthetic-one");
+        settings.setValue(selection, true);
+        settings.sync();
+        QCOMPARE(settings.status(), QSettings::NoError);
+        auto *accounts = ChatGptAccounts::instance();
+        QCOMPARE(accounts->accountId(), QString("synthetic-one"));
+        QVERIFY(accounts->useForSelection());
+        QVERIFY(!accounts->useForChat());
+        QSignalSpy profileChanged(accounts, &ChatGptAccounts::profileChanged);
+
+        run("writer", qEnvironmentVariable("LYRA_READER_CHECK_SETTINGS_ROOT"));
+        accounts->setUseForChat(true);
+        QVERIFY(accounts->useForChat());
+        QVERIFY(!accounts->useForSelection());
+        QCOMPARE(accounts->accountId(), QString("synthetic-two"));
+        QVERIFY(profileChanged.count() > 0);
+        settings.sync();
+        QCOMPARE(settings.value(roster).toList(), QVariantList({a, b}));
+        QCOMPARE(settings.value(selected).toString(), QString("synthetic-two"));
+        QVERIFY(!settings.value(selection).toBool());
+        QVERIFY(settings.value(useForChat).toBool());
+
+        accounts->selectModel("second");
+        QCOMPARE(accounts->model(), QString("second"));
+        settings.sync();
+        b.insert("model", "second");
+        QCOMPARE(settings.value(roster).toList(), QVariantList({a, b}));
+        QCOMPARE(settings.value(selected).toString(), QString("synthetic-two"));
+        QVERIFY(!settings.value(selection).toBool());
+        QVERIFY(settings.value(useForChat).toBool());
+    }
     void chatGptPreviewCannotFallBackToANonChatGptConnection() {
         QTemporaryDir scratch;
         QVERIFY(scratch.isValid());

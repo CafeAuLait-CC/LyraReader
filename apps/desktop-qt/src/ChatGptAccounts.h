@@ -12,6 +12,7 @@
 #include <memory>
 
 class ReaderController;
+class QSettings;
 class QJsonObject;
 
 // One native account coordinator for every reader window. QML only sees metadata.
@@ -71,9 +72,12 @@ private:
     void poll();
     void vaultFinished(quint64 id,const QString &secret,const QString &error);
     void setStatus(const QString &message);
-    void setUsagePreference(bool &current,bool value);
-    bool savePreferences();
-    void commitAccount(QVariantMap account);
+    bool readPreferences(QSettings &settings);
+    bool reloadPreferences();
+    bool writePreference(const QString &key,const QVariant &value);
+    bool writeAccount(const QVariantMap &fields,bool enrolling);
+    void setUsagePreference(const QString &key,bool &current,bool value);
+    bool allowsPlan(const QVariantMap &plan,const QString &readingToken) const;
     bool lockAccount(const QString &id);
     bool startSessionWork(WorkerIntent intent,const QJsonObject &credential);
     void removeFromVault(bool revoked);

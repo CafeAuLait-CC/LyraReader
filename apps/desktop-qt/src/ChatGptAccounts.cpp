@@ -49,13 +49,7 @@ ChatGptAccounts *ChatGptAccounts::instance() {
 
 ChatGptAccounts::ChatGptAccounts(QObject *parent):QObject(parent) {
     QSettings settings;
-    settings.beginGroup(settingsGroup);
-    m_accounts=settings.value(QStringLiteral("accounts")).toList();
-    m_selected=settings.value(QStringLiteral("selected")).toString();
-    m_useForChat=settings.value(QStringLiteral("useForChat"),false).toBool();
-    m_useForSelection=settings.value(QStringLiteral("useForSelection"),false).toBool();
-    m_useForLayeredSummaries=settings.value(QStringLiteral("useForLayeredSummaries"),false).toBool();
-    m_useForWholeDocument=settings.value(QStringLiteral("useForWholeDocument"),false).toBool();
+    readPreferences(settings);
     m_pollTimer.setInterval(75);
     connect(&m_pollTimer,&QTimer::timeout,this,&ChatGptAccounts::poll);
     connect(&m_vault,&CredentialStore::finished,this,
@@ -92,68 +86,94 @@ void ChatGptAccounts::setStatus(const QString &message) {
     emit changed();
 }
 
-bool ChatGptAccounts::savePreferences() {
-    QSettings settings;
+bool ChatGptAccounts::readPreferences(QSettings &settings) {
     settings.beginGroup(settingsGroup);
-    settings.setValue(QStringLiteral("accounts"),m_accounts);
-    settings.setValue(QStringLiteral("selected"),m_selected);
-    settings.setValue(QStringLiteral("useForChat"),m_useForChat);
-    settings.setValue(QStringLiteral("useForSelection"),m_useForSelection);
-    settings.setValue(QStringLiteral("useForLayeredSummaries"),m_useForLayeredSummaries);
-    settings.setValue(QStringLiteral("useForWholeDocument"),m_useForWholeDocument);
+    const auto accounts=settings.value(QStringLiteral("accounts")).toList();
+    const auto selected=settings.value(QStringLiteral("selected")).toString();
+    const bool useForChat=settings.value(QStringLiteral("useForChat"),false).toBool();
+    const bool useForSelection=settings.value(QStringLiteral("useForSelection"),false).toBool();
+    const bool useForLayers=settings.value(QStringLiteral("useForLayeredSummaries"),false).toBool();
+    const bool useForDocument=settings.value(QStringLiteral("useForWholeDocument"),false).toBool();
+    settings.endGroup();
+    const bool changed=accounts!=m_accounts || selected!=m_selected || useForChat!=m_useForChat
+        || useForSelection!=m_useForSelection || useForLayers!=m_useForLayeredSummaries
+        || useForDocument!=m_useForWholeDocument;
+    m_accounts=accounts;
+    m_selected=selected;
+    m_useForChat=useForChat;
+    m_useForSelection=useForSelection;
+    m_useForLayeredSummaries=useForLayers;
+    m_useForWholeDocument=useForDocument;
+    return changed;
+}
+
+bool ChatGptAccounts::reloadPreferences() {
+    QSettings settings;
     settings.sync();
-    return settings.status()==QSettings::NoError;
+    if(settings.status()!=QSettings::NoError) {
+        setStatus(tr("Could not load the ChatGPT account preferences."));
+        return false;
+    }
+    if(readPreferences(settings)) {
+        m_vault.clearSession();
+        emit profileChanged();
+        emit changed();
+    }
+    return true;
+}
+
+bool ChatGptAccounts::writePreference(const QString &key,const QVariant &value) {
+    QSettings settings;
+    settings.setValue(settingsGroup+QLatin1Char('/')+key,value);
+    settings.sync();
+    if(settings.status()!=QSettings::NoError)return false;
+    return reloadPreferences();
 }
 
 void ChatGptAccounts::selectAccount(const QString &id) {
-    if(busy() || id==m_selected)return;
+    if(busy() || !reloadPreferences() || id==m_selected)return;
     const auto exists=std::any_of(m_accounts.cbegin(),m_accounts.cend(),
                                   [&](const auto &entry){return ::accountId(entry)==id;});
     if(!exists)return;
-    m_selected=id;
-    m_vault.clearSession();
-    const bool saved=savePreferences();
-    emit profileChanged();
+    const bool saved=writePreference(QStringLiteral("selected"),id);
     setStatus(saved?QString{}:tr("Could not save the selected ChatGPT account."));
 }
 
 void ChatGptAccounts::selectModel(const QString &id) {
-    if(busy() || id.isEmpty() || id==model())return;
+    if(busy() || id.isEmpty() || !reloadPreferences() || id==model())return;
     const auto available=models();
     const auto exists=std::any_of(available.cbegin(),available.cend(),[&](const auto &entry) {
         return entry.toMap().value(QStringLiteral("id")).toString()==id;
     });
     if(!exists)return;
-    auto account=selected();
-    account.insert(QStringLiteral("model"),id);
-    commitAccount(account);
+    const bool saved=writeAccount({{QStringLiteral("id"),m_selected},{QStringLiteral("model"),id}},false);
+    setStatus(saved?QString{}:tr("Could not save the selected ChatGPT model."));
 }
 
 void ChatGptAccounts::setUseForChat(bool value) {
-    setUsagePreference(m_useForChat,value);
+    setUsagePreference(QStringLiteral("useForChat"),m_useForChat,value);
 }
 
 void ChatGptAccounts::setUseForSelection(bool value) {
-    setUsagePreference(m_useForSelection,value);
+    setUsagePreference(QStringLiteral("useForSelection"),m_useForSelection,value);
 }
 void ChatGptAccounts::setUseForLayeredSummaries(bool value) {
-    setUsagePreference(m_useForLayeredSummaries,value);
+    setUsagePreference(QStringLiteral("useForLayeredSummaries"),m_useForLayeredSummaries,value);
 }
 
 void ChatGptAccounts::setUseForWholeDocument(bool value) {
-    setUsagePreference(m_useForWholeDocument,value);
+    setUsagePreference(QStringLiteral("useForWholeDocument"),m_useForWholeDocument,value);
 }
 
-void ChatGptAccounts::setUsagePreference(bool &current,bool value) {
-    if(busy() || current==value || (value && (!connected() || model().isEmpty())))return;
-    current=value;
-    const bool saved=savePreferences();
-    emit profileChanged();
+void ChatGptAccounts::setUsagePreference(const QString &key,bool &current,bool value) {
+    if(busy() || !reloadPreferences() || current==value || (value && (!connected() || model().isEmpty())))return;
+    const bool saved=writePreference(key,value);
+    if(!saved)emit profileChanged();
     setStatus(saved?QString{}:tr("Could not save the ChatGPT usage preference."));
 }
 
 void ChatGptAccounts::beginSignIn(bool addAccount) {
-    if(busy())return;
+    if(busy() || !reloadPreferences())return;
     QSettings settings;
     const auto key=settingsGroup+QStringLiteral("/hostId");
     auto host=settings.value(key).toString();
@@ -286,24 +306,48 @@ void ChatGptAccounts::poll() {
     emit changed();
 }
 
-void ChatGptAccounts::commitAccount(QVariantMap account) {
-    const auto id=::accountId(account);
-    auto entry=std::find_if(m_accounts.begin(),m_accounts.end(),[&](const auto &value){return ::accountId(value)==id;});
-    if(entry==m_accounts.end())m_accounts.append(account);
-    else *entry=account;
-    m_selected=id;
-    const bool saved=savePreferences();
-    if(saved && account.value(QStringLiteral("connected")).toBool()) {
-        QSettings settings;
-        if(settings.value(pendingRegistrationKey)==account.value(QStringLiteral("clientId")))
+bool ChatGptAccounts::writeAccount(const QVariantMap &fields,bool enrolling) {
+    QSettings settings;
+    const auto id=::accountId(fields);
+    const auto config=QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+    const QDir directory(QDir(config).filePath(QStringLiteral("chatgpt-accounts")));
+    if(id.isEmpty() || config.isEmpty() || !QDir().mkpath(directory.absolutePath()))return false;
+    QLockFile lock(directory.filePath(QStringLiteral("preferences.lock")));
+    if(!lock.tryLock(0))return false;
+    settings.sync();
+    if(settings.status()!=QSettings::NoError)return false;
+    const auto roster=settingsGroup+QStringLiteral("/accounts");
+    auto accounts=settings.value(roster).toList();
+    auto entry=std::find_if(accounts.begin(),accounts.end(),[&](const auto &value){return ::accountId(value)==id;});
+    if(entry==accounts.end()) {
+        if(!enrolling)return false;
+        accounts.append(fields);
+    } else {
+        auto latest=entry->toMap();
+        const auto currentModel=latest.value(QStringLiteral("model")).toString();
+        for(auto it=fields.cbegin();it!=fields.cend();++it)latest.insert(it.key(),it.value());
+        if(enrolling && !currentModel.isEmpty()) {
+            const auto catalog=latest.value(QStringLiteral("models")).toList();
+            if(std::any_of(catalog.cbegin(),catalog.cend(),[&](const auto &model) {
+                return model.toMap().value(QStringLiteral("id")).toString()==currentModel;
+            }))latest.insert(QStringLiteral("model"),currentModel);
+        }
+        *entry=latest;
+    }
+    settings.setValue(roster,accounts);
+    if(enrolling) {
+        settings.setValue(settingsGroup+QStringLiteral("/selected"),id);
+        if(settings.value(pendingRegistrationKey)==fields.value(QStringLiteral("clientId")))
             settings.remove(pendingRegistrationKey);
     }
-    emit profileChanged();
-    setStatus(saved?m_status:tr("Could not save the ChatGPT account preferences."));
+    settings.sync();
+    if(settings.status()!=QSettings::NoError)return false;
+    lock.unlock();
+    return reloadPreferences();
 }
 
 void ChatGptAccounts::signOut() {
-    if(busy() || !connected() || !lockAccount(m_selected))return;
+    if(busy() || !reloadPreferences() || !connected() || !lockAccount(m_selected))return;
     m_vault.clearSession();
     m_intent=VaultIntent::LoadForRevoke;
     m_vaultId=m_vault.read(vaultKey(m_selected));
@@ -311,7 +355,7 @@ void ChatGptAccounts::signOut() {
     setStatus(tr("Signing out of the selected ChatGPT connection…"));
 }
 
-bool ChatGptAccounts::send(ReaderController *reader,const QVariantMap &plan,const QString &readingToken) {
+bool ChatGptAccounts::allowsPlan(const QVariantMap &plan,const QString &readingToken) const {
     const auto action=plan.value(QStringLiteral("action")).toString();
     const auto kind=plan.value(QStringLiteral("kind")).toString();
     const auto scope=plan.value(QStringLiteral("reading_scope")).toMap();
@@ -327,12 +371,17 @@ bool ChatGptAccounts::send(ReaderController *reader,const QVariantMap &plan,cons
         || (wholeTask && m_useForWholeDocument)
         || action==QStringLiteral("RegionQuestion") || (layered && m_useForLayeredSummaries)
         : action==QStringLiteral("SummarizeDocument"); // Reading has its own explicit ChatGPT preview.
-    if(!reader || busy() || !allowed || !connected()
-       || plan.value(QStringLiteral("chatgpt_account")).toString()!=m_selected
-       || plan.value(QStringLiteral("model")).toString()!=model()
-       || !lockAccount(m_selected))return false;
+    return allowed && connected() && plan.value(QStringLiteral("chatgpt_account")).toString()==m_selected
+        && plan.value(QStringLiteral("model")).toString()==model();
+}
+
+bool ChatGptAccounts::send(ReaderController *reader,const QVariantMap &plan,const QString &readingToken) {
+    const QPointer<ReaderController> alive(reader);
+    if(!alive || busy() || !reloadPreferences() || !alive || busy() || !allowsPlan(plan,readingToken))return false;
+    const auto prepared=readingToken.isEmpty()?reader->aiState():reader->documentReading();
+    if(prepared.value(QStringLiteral("plan")).toMap()!=plan || !lockAccount(m_selected))return false;
     m_vault.clearSession();
-    m_pendingReader=reader;
+    m_pendingReader=alive;
     m_pendingPlan=plan;
     m_pendingReadingToken=readingToken;
     m_intent=VaultIntent::LoadForChat;
@@ -389,14 +438,16 @@ void ChatGptAccounts::removeFromVault(bool revoked) {
 }
 
 void ChatGptAccounts::finishChat(const QString &token,const QString &error) {
-    m_accountLock.reset();
+    // Keep this connection locked until the final preference check and dispatch finish.
+    const auto credentialLock=std::move(m_accountLock);
     m_vault.clearSession();
     m_refreshedToken.clear();
     const auto reader=m_pendingReader;
     m_pendingReader.clear();
     const auto plan=std::exchange(m_pendingPlan,{});
     const auto readingToken=std::exchange(m_pendingReadingToken,{});
-    if(error.isEmpty() && reader && reader->startChatGptRequest(m_selected,token,plan,readingToken)) {
+    if(error.isEmpty() && reader && reloadPreferences() && reader && allowsPlan(plan,readingToken)
+       && reader->startChatGptRequest(m_selected,token,plan,readingToken)) {
         setStatus({});
         return;
     }
@@ -421,16 +472,19 @@ void ChatGptAccounts::vaultFinished(quint64 id,const QString &secret,const QStri
     }
     if(intent==VaultIntent::Save) {
         m_vault.clearSession();
-        m_accountLock.reset();
         if(m_status.isEmpty())m_status=tr("ChatGPT plan usage is enabled for this connection.");
-        commitAccount(std::exchange(m_candidate,{}));
-    } else if(intent==VaultIntent::Remove) {
+        const bool saved=writeAccount(std::exchange(m_candidate,{}),true);
         m_accountLock.reset();
-        auto account=selected();
-        account.insert(QStringLiteral("connected"),false);
-        m_status=m_revoked?tr("Signed out."):
-            tr("Signed out locally. Disconnect LyraReader in ChatGPT Settings to end remote access.");
-        commitAccount(account);
+        setStatus(saved?m_status:tr("Could not save the ChatGPT account preferences."));
+    } else if(intent==VaultIntent::Remove) {
+        const bool saved=writeAccount({{QStringLiteral("id"),m_selected},{QStringLiteral("connected"),false}},false);
+        m_accountLock.reset();
+        if(!saved) {
+            setStatus(tr("The credential was removed. Could not update the ChatGPT account preferences."));
+            return;
+        }
+        setStatus(m_revoked?tr("Signed out."):
+            tr("Signed out locally. Disconnect LyraReader in ChatGPT Settings to end remote access."));
     } else if(intent==VaultIntent::LoadForRevoke) {
         const auto session=QJsonDocument::fromJson(secret.toUtf8()).object();
         if(secret.isEmpty())removeFromVault(true);
