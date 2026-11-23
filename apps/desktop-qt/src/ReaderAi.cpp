@@ -370,6 +370,16 @@ bool ReaderController::startAi(const QString &key,const QVariantMap &expectedPla
     }
     if(plan.value(QStringLiteral("kind")).toString()==QStringLiteral("inplace_translation"))return startInplaceTranslation(key,plan);
     if(plan.value(QStringLiteral("kind")).toString()==QStringLiteral("summary_batch"))return startSummaryBatch(key,plan);
+    const auto kind=plan.value(QStringLiteral("kind")).toString();
+    if(kind==QStringLiteral("summary_synthesis")) {
+        if(m_aiState.value(QStringLiteral("responsePlan")).toMap().value(QStringLiteral("kind"))==QStringLiteral("reading_summary")) {
+            const auto parts=m_aiState.value(QStringLiteral("results")).toMap().value(QStringLiteral("summary"));
+            m_aiState.insert(QStringLiteral("synthesisParts"),parts);
+        }
+    } else {
+        m_aiState.remove(QStringLiteral("synthesisParts"));
+    }
+    m_aiActivePreviewEpoch=m_aiPreviewEpoch;
     const auto action=plan.value(QStringLiteral("action")).toString();
     if(action==QStringLiteral("SummarizeAbstract") || action==QStringLiteral("SummarizeSection") || action==QStringLiteral("SummarizePageLine")) {
         m_aiState.insert(QStringLiteral("unitTitle"),m_summaryUnitContext.value(QStringLiteral("title"),m_summaryUnitContext.value(QStringLiteral("unit")).toMap().value(QStringLiteral("title"))));
@@ -382,6 +392,7 @@ bool ReaderController::startAi(const QString &key,const QVariantMap &expectedPla
     m_aiState.insert(QStringLiteral("activeChat"),plan.value(QStringLiteral("action")).toString()==QStringLiteral("DocumentChat"));
     m_aiState.insert(QStringLiteral("activeQuestion"),m_aiState.value(QStringLiteral("previewQuestion")));
     m_aiState.insert(QStringLiteral("terminalReceived"),false);
+    m_aiState.insert(QStringLiteral("cancelRequested"),false);
     m_aiState.insert(QStringLiteral("output"),QString{});m_aiState.insert(QStringLiteral("reasoning"),QString{});
     m_aiState.remove(QStringLiteral("translationBlocks"));m_aiState.remove(QStringLiteral("translationWarning"));
     m_aiState.insert(QStringLiteral("usage"),QVariantMap{});m_aiState.insert(QStringLiteral("diagnostics"),QVariantMap{});
@@ -406,7 +417,7 @@ void ReaderController::retainAiResult(const QString &state) {
     if(view.isEmpty())return;
     QVariantMap result{{QStringLiteral("state"),state},{QStringLiteral("generation"),m_generation}};
     if(view==QStringLiteral("region")){result.insert(QStringLiteral("turn_id"),m_aiState.value(QStringLiteral("regionTurn")));result.insert(QStringLiteral("question"),m_aiState.value(QStringLiteral("activeQuestion")));}
-    for(const auto *key:{"output","reasoning","usage","status","responsePlan","translationBlocks","translationWarning"})result.insert(QLatin1String(key),m_aiState.value(QLatin1String(key)));
+    for(const auto *key:{"output","reasoning","usage","status","responsePlan","translationBlocks","translationWarning","synthesisParts"})result.insert(QLatin1String(key),m_aiState.value(QLatin1String(key)));
     if(m_aiState.contains(QStringLiteral("unitTitle")))result.insert(QStringLiteral("unitTitle"),m_aiState.value(QStringLiteral("unitTitle")));
     if(m_aiState.contains(QStringLiteral("unitLanguage")))result.insert(QStringLiteral("unitLanguage"),m_aiState.value(QStringLiteral("unitLanguage")));
     auto results=m_aiState.value(QStringLiteral("results")).toMap();results.insert(view,result);m_aiState.insert(QStringLiteral("results"),results);
@@ -415,6 +426,7 @@ void ReaderController::cancelAi() {
     if(m_translationActive){cancelInplaceTranslation();return;}
     if(m_summaryBatchActive){cancelSummaryBatch();return;}
     if(!m_aiState.value(QStringLiteral("running")).toBool())return;
+    m_aiState.insert(QStringLiteral("cancelRequested"),true);
     m_aiState.insert(QStringLiteral("status"),tr("Cancelling…"));emit aiStateChanged();submit(QStringLiteral("ai_cancel"));
 }
 void ReaderController::finishAiChat(const QString &state) {
@@ -505,7 +517,8 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
         m_aiState.insert(QStringLiteral("running"),false);m_aiState.insert(QStringLiteral("status"),error);finishAiChat(QStringLiteral("failed"));retainAiResult(QStringLiteral("failed"));m_aiTimer.stop();if(m_aiState.value(QStringLiteral("responseView")).toString()==QStringLiteral("region"))markRegionDirty();emit aiStateChanged();return;
     }
     const auto batch=result.toMap();
-    const bool readingTranslation=m_aiState.value(QStringLiteral("responsePlan")).toMap().value(QStringLiteral("kind"))==QStringLiteral("reading_translation");
+    const auto responseKind=m_aiState.value(QStringLiteral("responsePlan")).toMap().value(QStringLiteral("kind")).toString();
+    const bool readingTranslation=responseKind==QStringLiteral("reading_translation");
     if(!batch.value(QStringLiteral("cache_warning")).toString().isEmpty())m_aiState.insert(QStringLiteral("cacheWarning"),batch.value(QStringLiteral("cache_warning")));
     const auto priorOutput=m_aiState.value(QStringLiteral("output")).toString();
     auto output=m_aiState.value(QStringLiteral("output")).toString(),reasoning=m_aiState.value(QStringLiteral("reasoning")).toString();
@@ -545,6 +558,20 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
         if(readingTranslation && !m_aiState.value(QStringLiteral("limited")).toBool()) {
             m_aiState.insert(QStringLiteral("translationBlocks"),batch.value(QStringLiteral("translation_blocks")));
             m_aiState.insert(QStringLiteral("translationWarning"),batch.value(QStringLiteral("translation_warning")));
+        }
+        if(responseKind==QStringLiteral("reading_summary") && m_aiActivePreviewEpoch==m_aiPreviewEpoch
+            && m_aiPlanGeneration==m_generation && !m_aiState.value(QStringLiteral("limited")).toBool()
+            && !m_aiState.value(QStringLiteral("cancelRequested")).toBool()
+            && m_aiState.value(QStringLiteral("chatOutcome"))==QStringLiteral("finished")) {
+            const auto synthesis=batch.value(QStringLiteral("synthesis_plan")).toMap();
+            const auto warning=batch.value(QStringLiteral("synthesis_warning")).toString();
+            if(!synthesis.isEmpty()) {
+                m_aiState.insert(QStringLiteral("plan"),synthesis);
+                m_aiState.insert(QStringLiteral("planSent"),false);
+                m_aiState.insert(QStringLiteral("status"),tr("Part summaries are ready. Review the separate synthesis request before sending."));
+            } else if(!warning.isEmpty()) {
+                m_aiState.insert(QStringLiteral("status"),tr("%1 Part summaries are kept.").arg(warning));
+            }
         }
     }
     if(m_aiState.value(QStringLiteral("limited")).toBool())m_aiState.insert(QStringLiteral("status"),tr("Response exceeded the 8 MiB display budget; request cancelled."));

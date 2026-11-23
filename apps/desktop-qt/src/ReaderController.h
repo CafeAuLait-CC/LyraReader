@@ -336,7 +336,7 @@ private:
     quint64 m_aiRegionEpoch=0;
     RasterJobs::Handle m_aiRegionJob;
     QString m_aiSummaryPreviewUnitId,m_aiSummaryPreviewLanguage;
-    quint64 m_aiPreviewEpoch=0;
+    quint64 m_aiPreviewEpoch=0,m_aiActivePreviewEpoch=0;
     quint64 m_aiPreviewId=0,m_aiStartId=0,m_aiPollId=0,m_aiPlanGeneration=0;
     void enqueue(const Request &request);
     void requestPageInternal(int page,double scale,bool embedded,bool manual);

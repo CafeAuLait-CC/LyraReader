@@ -18,6 +18,7 @@ Pane {
     readonly property bool batchMode: workspace === "summary" && !!input.summaryBatch
     readonly property bool languageMode: unitMode || batchMode
     readonly property bool selectedSummary: workspace === "summary" && action === 5 && !unitMode && !batchMode
+    readonly property bool wholeSummary: workspace === "summary" && action === 1 && !unitMode && !batchMode
     readonly property bool translateDocument: workspace === "translation" && input.translationScope === "document"
     readonly property bool translateInPlace: workspace === "translation" && !translateDocument && !!input.inplace
     readonly property string summaryDetail: input.summaryDetail || "Standard"
@@ -52,9 +53,10 @@ Pane {
     readonly property string workspaceTitle: workspace === "chat" ? qsTr("Document chat") : workspace === "translation" ? qsTr("Translation") : qsTr("Summary")
     readonly property var plan: viewState.previewView === workspace ? viewState.plan || null : null
     readonly property bool previewReady: !!plan && !viewState.planSent
+    readonly property bool synthesisPreview: previewReady && plan.kind === "summary_synthesis"
     readonly property bool running: !!viewState.running
     readonly property bool compact: height < 500
-    readonly property var result: viewState.responseView === workspace ? Object.assign({output: viewState.output, reasoning: viewState.reasoning, usage: viewState.usage, responsePlan: viewState.responsePlan, generation: owner.documentGeneration, translationBlocks: viewState.translationBlocks, translationWarning: viewState.translationWarning}, viewState.unitTitle === undefined ? {} : {unitTitle: viewState.unitTitle, unitLanguage: viewState.unitLanguage}) : ((viewState.results || {})[workspace] || {})
+    readonly property var result: viewState.responseView === workspace ? Object.assign({output: viewState.output, reasoning: viewState.reasoning, usage: viewState.usage, responsePlan: viewState.responsePlan, generation: owner.documentGeneration, translationBlocks: viewState.translationBlocks, translationWarning: viewState.translationWarning, synthesisParts: viewState.synthesisParts}, viewState.unitTitle === undefined ? {} : {unitTitle: viewState.unitTitle, unitLanguage: viewState.unitLanguage}) : ((viewState.results || {})[workspace] || {})
     readonly property var pairedTranslation: workspace === "translation" && result.responsePlan
                                              && result.responsePlan.kind === "reading_translation"
                                              ? result.translationBlocks || [] : []
@@ -188,7 +190,12 @@ Pane {
             }
             owner.prepareAi(request, {}, {kind: "translation", detail: "Standard"});
         }
-        else if (selectedSummary) owner.prepareAi(baseRequest("SummarizeSelection"), {}, {kind: "summary", detail: summaryDetail});
+        else if (selectedSummary || wholeSummary) {
+            const request = baseRequest(modes[action]);
+            if (wholeSummary) request.selection = null;
+            request.language = input.summaryLanguage || null;
+            owner.prepareAi(request, {}, {kind: "summary", detail: summaryDetail});
+        }
         else owner.prepareAi(baseRequest(modes[action]));
     }
     function followLink(link) {
@@ -295,12 +302,12 @@ Pane {
         }
         ComboBox {
             objectName: "aiSelectedSummaryDetail"
-            visible: aiPanel.selectedSummary
+            visible: aiPanel.selectedSummary || aiPanel.wholeSummary
             Layout.fillWidth: true
             model: [qsTr("Brief"), qsTr("Standard"), qsTr("Detailed")]
             readonly property var values: ["Brief", "Standard", "Detailed"]
             currentIndex: values.indexOf(aiPanel.summaryDetail)
-            Accessible.name: qsTr("Selected summary detail")
+            Accessible.name: qsTr("Summary detail")
             onActivated: aiPanel.owner.setAiInput("summaryDetail", values[currentIndex])
         }
         SelectionCard {
@@ -472,10 +479,33 @@ Pane {
             visible: aiPanel.workspace !== "chat" && !aiPanel.batchMode
                      && (!aiPanel.pairedTranslation.length || rawTranslation.checked)
             Layout.fillWidth: true; Layout.fillHeight: true; Layout.minimumHeight: 24
-            AiResult {
+            ColumnLayout {
                 width: responseScroll.availableWidth
-                app: aiPanel.app; value: aiPanel.result; viewport: responseScroll.contentItem
-                onCitation: function(link, responsePlan) { aiPanel.followHistoryLink(link, responsePlan); }
+                AiResult {
+                    Layout.fillWidth: true
+                    app: aiPanel.app; value: aiPanel.result; viewport: responseScroll.contentItem
+                    onCitation: function(link, responsePlan) { aiPanel.followHistoryLink(link, responsePlan); }
+                }
+                ToolButton {
+                    id: showPartSummaries
+                    objectName: "aiShowPartSummaries"
+                    visible: aiPanel.workspace === "summary" && !!aiPanel.result.synthesisParts
+                    text: checked ? qsTr("Hide part summaries") : qsTr("Show part summaries")
+                    checkable: true
+                    onVisibleChanged: if (!visible) checked = false
+                }
+                Loader {
+                    Layout.fillWidth: true
+                    active: showPartSummaries.visible && showPartSummaries.checked
+                    visible: active
+                    sourceComponent: AiResult {
+                        app: aiPanel.app
+                        value: aiPanel.result.synthesisParts || ({})
+                        answerName: "aiPartSummaryText"
+                        viewport: responseScroll.contentItem
+                        onCitation: function(link, responsePlan) { aiPanel.followHistoryLink(link, responsePlan); }
+                    }
+                }
             }
         }
         SummaryBatchResults {
@@ -574,7 +604,7 @@ Pane {
             Button { text: qsTr("Inspect Payload"); Layout.fillWidth: true; onClicked: payload.open() }
             Button {
                 objectName: "sendAiRequest"
-                text: qsTr("Send"); Layout.fillWidth: true
+                text: aiPanel.synthesisPreview ? qsTr("Send synthesis") : qsTr("Send"); Layout.fillWidth: true
                 enabled: aiPanel.owner.pendingCommands === 0
                 onClicked: app.sendAi(aiPanel.owner, aiPanel.plan)
             }
@@ -595,7 +625,7 @@ Pane {
             }
             Button {
                 objectName: "retryAiRequest"
-                visible: !aiPanel.batchMode
+                visible: !aiPanel.batchMode && !aiPanel.synthesisPreview
                 text: qsTr("Retry")
                 enabled: !!aiPanel.plan && !aiPanel.running && aiPanel.owner.pendingCommands === 0
                 onClicked: app.sendAi(aiPanel.owner, aiPanel.plan)

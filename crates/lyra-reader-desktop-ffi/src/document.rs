@@ -5,7 +5,7 @@ use lyra_reader_ffi::api::*;
 use lyra_reader_runtime::{MAX_PAGE_BYTES, PAGE_GAP_PT, bounded_raster_scale};
 use lyra_reader_session::paper_document::{PaperCard, PaperDocumentLayout};
 use lyra_reader_session::{DocumentLayout, LayoutMode};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
@@ -33,66 +33,155 @@ pub struct DesktopDocument {
     pub(super) password: Option<String>,
 }
 
-const MAX_READING_TRANSLATION_REPLY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_READING_REPLY_BYTES: usize = 8 * 1024 * 1024;
 
 struct DesktopAiRequest {
     request: Arc<LyraReaderAiRequest>,
-    translation: Option<ReadingTranslation>,
+    reading: Option<ReadingReplies>,
 }
 
-struct ReadingTranslation {
-    originals: Vec<String>,
-    pages: Vec<u32>,
+#[derive(Deserialize, Serialize)]
+struct ReadingSummaryStyle {
+    detail: String,
+    language: String,
+    reasoning_mode: String,
+    reasoning_encoding: String,
+}
+
+enum ReadingOutput {
+    Translation {
+        originals: Vec<String>,
+        pages: Vec<u32>,
+    },
+    Synthesis {
+        request: Box<AiMergePlanRequestRecord>,
+        style: ReadingSummaryStyle,
+    },
+}
+
+struct ReadingReplies {
+    output: ReadingOutput,
+    expected_parts: usize,
     replies: Vec<String>,
-    reply_bytes: Option<usize>,
+    remaining_bytes: usize,
+    failure: Option<&'static str>,
     done: bool,
 }
 
-impl ReadingTranslation {
+impl ReadingReplies {
+    fn new(output: ReadingOutput, expected_parts: usize) -> Self {
+        Self {
+            output,
+            expected_parts,
+            replies: Vec::new(),
+            remaining_bytes: MAX_READING_REPLY_BYTES,
+            failure: None,
+            done: false,
+        }
+    }
+
     fn observe(&mut self, events: &[AiEventRecord]) {
         for event in events {
+            if matches!(event, AiEventRecord::Done) {
+                self.done = true;
+            }
+            if self.failure.is_some() {
+                continue;
+            }
             match event {
-                AiEventRecord::Done => self.done = true,
-                AiEventRecord::PartStarted { .. } if self.reply_bytes.is_some() => {
-                    self.replies.push(String::new());
-                }
-                AiEventRecord::Delta { text } => {
-                    if let Some(bytes) = self.reply_bytes {
-                        if let Some(reply) = self.replies.last_mut()
-                            && text.len() <= MAX_READING_TRANSLATION_REPLY_BYTES - bytes
-                        {
-                            reply.push_str(text);
-                            self.reply_bytes = Some(bytes + text.len());
-                        } else {
-                            self.reply_bytes = None;
-                            self.replies.clear();
-                        }
+                AiEventRecord::PartStarted { index, total, .. } => {
+                    if *index as usize == self.replies.len()
+                        && *total as usize == self.expected_parts
+                        && self.replies.len() < self.expected_parts
+                    {
+                        self.replies.push(String::new());
+                    } else {
+                        self.failure =
+                            Some("The response parts do not match the reviewed request.");
                     }
                 }
+                AiEventRecord::Delta { text } => {
+                    if let Some(reply) = self.replies.last_mut()
+                        && text.len() <= self.remaining_bytes
+                    {
+                        reply.push_str(text);
+                        self.remaining_bytes -= text.len();
+                    } else {
+                        self.failure =
+                            Some("The response could not fit in the reading task display.");
+                    }
+                }
+                AiEventRecord::Diagnostics { diagnostics }
+                    if matches!(
+                        diagnostics.finish_reason.as_deref(),
+                        Some("length" | "content_filter" | "tool_calls" | "function_call")
+                    ) =>
+                {
+                    self.failure =
+                        Some("The provider stopped before completing a reading task part.");
+                }
+                AiEventRecord::Error { .. } => {
+                    self.failure = Some("The reading task did not complete.");
+                }
                 _ => {}
+            }
+            if self.failure.is_some() {
+                self.replies.clear();
             }
         }
     }
 
-    fn complete(self) -> Option<Result<Value, String>> {
+    fn publish(self, result: &mut Value) {
         if !self.done {
-            return None;
+            return;
         }
-        Some((|| {
-            self.reply_bytes
-                .ok_or("The translation could not fit in the paragraph display.")?;
-            let rows = lyra_reader_ai::workspace::translation_blocks_from_parts(
-                &self.originals,
-                &self.pages,
-                self.replies.iter().map(String::as_str),
-            )?;
-            if rows.is_empty() || rows.iter().any(|row| row.translation.is_empty()) {
-                return Err("The response did not translate every requested paragraph.".into());
-            }
-            Ok(Value::Array(rows.into_iter().map(|row| {
-                json!({"original": row.original, "translation": row.translation, "page": row.page})
-            }).collect()))
-        })())
+        let replies = self.failure.map_or_else(
+            || {
+                (self.replies.len() == self.expected_parts)
+                    .then_some(self.replies)
+                    .ok_or("The response is missing reviewed parts.")
+            },
+            Err,
+        );
+        let (key, warning, payload) = match self.output {
+            ReadingOutput::Translation { originals, pages } => (
+                "translation_blocks",
+                "translation_warning",
+                replies.map_err(str::to_owned).and_then(|replies| {
+                    let rows = lyra_reader_ai::workspace::translation_blocks_from_parts(
+                        &originals,
+                        &pages,
+                        replies.iter().map(String::as_str),
+                    )?;
+                    if rows.is_empty() || rows.iter().any(|row| row.translation.is_empty()) {
+                        return Err("The response did not translate every requested paragraph.".into());
+                    }
+                    Ok(Value::Array(rows.into_iter().map(|row| {
+                        json!({"original": row.original, "translation": row.translation, "page": row.page})
+                    }).collect()))
+                }),
+            ),
+            ReadingOutput::Synthesis { mut request, style } => (
+                "synthesis_plan",
+                "synthesis_warning",
+                replies.map_err(str::to_owned).and_then(|replies| {
+                    for (part, reply) in request.parts.iter_mut().zip(replies) {
+                        part.summary = reply;
+                    }
+                    let mut plan = value(
+                        build_ai_merge_plan(*request)
+                            .and_then(|plan| style_ai_reading_plan(plan, "summary".into(), style.detail, style.language))
+                            .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),
+                    )?;
+                    plan["kind"] = json!("summary_synthesis");
+                    Ok(plan)
+                }),
+            ),
+        };
+        match payload {
+            Ok(payload) => result[key] = payload,
+            Err(message) => result[warning] = json!(message),
+        }
     }
 }
 
@@ -790,7 +879,7 @@ impl DesktopDocument {
                     let valid = match (options.kind.as_str(), request.action) {
                         ("summary", AiActionRecord::SummarizeSelection)
                         | ("translation", AiActionRecord::TranslateSelection) => selected,
-                        ("translation", AiActionRecord::SummarizeDocument) => {
+                        ("summary" | "translation", AiActionRecord::SummarizeDocument) => {
                             request.selection.is_none()
                         }
                         _ => false,
@@ -800,10 +889,19 @@ impl DesktopDocument {
                             "Select a passage of at most {limit} characters or choose a supported document task."
                         ));
                     }
-                    // Translation and passage summaries only receive the approved
+                    // Reading tasks only receive the approved
                     // source, without the optional background document analysis.
                     request.document_knowledge_text = None;
                     request.document_knowledge_pages.clear();
+                    let whole_summary =
+                        !translation && request.action == AiActionRecord::SummarizeDocument;
+                    let style = whole_summary.then(|| ReadingSummaryStyle {
+                        detail: options.detail.clone(),
+                        // An absent language asks the engine to use the document's language.
+                        language: request.language.as_deref().unwrap_or("").to_owned(),
+                        reasoning_mode: request.reasoning_mode.clone(),
+                        reasoning_encoding: request.reasoning_encoding.clone(),
+                    });
                     let mut plan = value(
                         d.prepare_ai_reading_task(request, options)
                             .and_then(|plan| {
@@ -812,6 +910,10 @@ impl DesktopDocument {
                     )?;
                     if translation {
                         plan["kind"] = json!("reading_translation");
+                    } else if let Some(style) = style {
+                        plan["kind"] = json!("reading_summary");
+                        plan["reading_style"] =
+                            serde_json::to_value(style).map_err(|error| error.to_string())?;
                     }
                     return Ok(plan);
                 }
@@ -922,19 +1024,56 @@ impl DesktopDocument {
                     return Err("Stop the summary batch before starting another response.".into());
                 }
                 let plan: AiPlanRecord = arg(&r, "plan")?;
-                let translation = (r["plan"]["kind"] == "reading_translation"
-                    && plan.action == AiActionRecord::TranslateSelection)
-                    .then(|| ReadingTranslation {
-                        originals: plan
-                            .sources
+                let reading = match (r["plan"]["kind"].as_str(), plan.action) {
+                    (Some("reading_translation"), AiActionRecord::TranslateSelection) => {
+                        Some(ReadingOutput::Translation {
+                            originals: plan
+                                .sources
+                                .iter()
+                                .map(|source| source.snippet.clone())
+                                .collect(),
+                            pages: plan.sources.iter().map(|source| source.page).collect(),
+                        })
+                    }
+                    (Some("reading_summary"), AiActionRecord::SummarizeDocument)
+                        if plan.parts.len() > 1 =>
+                    {
+                        let style: ReadingSummaryStyle = arg(&r["plan"], "reading_style")?;
+                        let parts = plan
+                            .parts
                             .iter()
-                            .map(|source| source.snippet.clone())
-                            .collect(),
-                        pages: plan.sources.iter().map(|source| source.page).collect(),
-                        replies: Vec::new(),
-                        reply_bytes: Some(0),
-                        done: false,
-                    });
+                            .map(|part| {
+                                Ok(AiMergePartRecord {
+                                    index: part
+                                        .index
+                                        .checked_add(1)
+                                        .ok_or("Invalid summary part index.")?,
+                                    total: part.total,
+                                    pages: part.pages.clone(),
+                                    summary: String::new(),
+                                })
+                            })
+                            .collect::<Result<Vec<_>, &str>>()?;
+                        let request = AiMergePlanRequestRecord {
+                            document_title: plan.document_title.clone(),
+                            parts,
+                            base_url: plan.base_url.clone(),
+                            model: plan.model.clone(),
+                            temperature: plan.temperature,
+                            max_tokens: plan.max_tokens,
+                            reasoning_mode: style.reasoning_mode.clone(),
+                            reasoning_encoding: style.reasoning_encoding.clone(),
+                            document_knowledge_text: None,
+                            document_knowledge_pages: Vec::new(),
+                        };
+                        Some(ReadingOutput::Synthesis {
+                            request: Box::new(request),
+                            style,
+                        })
+                    }
+                    _ => None,
+                }
+                .map(|output| ReadingReplies::new(output, plan.parts.len()));
                 let root = self
                     .marks
                     .lock()
@@ -977,10 +1116,7 @@ impl DesktopDocument {
                         .map_err(|e| e.to_string())?
                 };
                 let mut current = self.ai.lock().map_err(|_| "AI state is unavailable")?;
-                if let Some(old) = current.replace(DesktopAiRequest {
-                    request,
-                    translation,
-                }) {
+                if let Some(old) = current.replace(DesktopAiRequest { request, reading }) {
                     old.request.cancel();
                 }
                 Ok(Value::Bool(true))
@@ -994,14 +1130,10 @@ impl DesktopDocument {
                     if finished {
                         events.extend(job.request.poll());
                     }
-                    if let Some(translation) = &mut job.translation {
-                        translation.observe(&events);
+                    if let Some(reading) = &mut job.reading {
+                        reading.observe(&events);
                     }
-                    let translation = if finished {
-                        job.translation.take()
-                    } else {
-                        None
-                    };
+                    let reading = if finished { job.reading.take() } else { None };
                     let active = self
                         .summaries
                         .lock()
@@ -1026,11 +1158,8 @@ impl DesktopDocument {
                     drop(current);
                     let mut result =
                         json!({"events":events,"finished":finished,"cache_warning":warning});
-                    if let Some(pairs) = translation.and_then(ReadingTranslation::complete) {
-                        match pairs {
-                            Ok(pairs) => result["translation_blocks"] = pairs,
-                            Err(error) => result["translation_warning"] = json!(error),
-                        }
+                    if let Some(reading) = reading {
+                        reading.publish(&mut result);
                     }
                     Ok(result)
                 } else {

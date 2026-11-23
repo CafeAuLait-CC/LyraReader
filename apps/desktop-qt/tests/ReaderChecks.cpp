@@ -3000,6 +3000,92 @@ private slots:
         QVERIFY(reader->aiState().value("output").toString().contains("Duplicado"));
     }
 
+    void wholeSummaryRequiresSeparateReviewForSynthesis() {
+        QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
+        MockChatServer server;QVERIFY(server.listen());
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-whole-summary.pdf");
+        {
+            QPdfWriter pdf(path);pdf.setResolution(72);pdf.setPageSize(QPageSize(QPageSize::A4));
+            QPainter painter(&pdf);QVERIFY(painter.isActive());painter.setFont(QFont("Sans Serif",9));
+            for(int page=0;page<16;++page) {
+                if(page)QVERIFY(pdf.newPage());
+                for(int line=0;line<30;++line)
+                    painter.drawText(QPointF(30,35+line*23),QString("Public source sentence page %1 line %2. Each synthetic example describes a reading task.").arg(page+1).arg(line+1));
+            }
+            QVERIFY(painter.end());
+        }
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE(reader->pageCount(),16);QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",12}}));
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","fixture"}});
+        QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));
+        auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);
+        auto *send=window->findChild<QQuickItem *>("sendAiRequest");QVERIFY(send);
+        reader->setAiInput("summaryDetail","Detailed");
+        const auto plan=[&]{return reader->aiState().value("plan").toMap();};
+        const auto prepare=[&] {
+            QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));
+            QTRY_COMPARE(plan().value("kind").toString(),QString("reading_summary"));
+            QTRY_COMPARE(reader->pendingCommands(),0);
+            QCOMPARE(plan().value("source_pages").toList().size(),16);
+            QVERIFY(plan().value("parts").toList().size()>1);
+        };
+        QList<QByteArray> expectedBodies;
+        const auto scriptedParts=[&](const QVariantMap &prepared,bool missing,bool delayed) {
+            const auto parts=prepared.value("parts").toList();
+            for(qsizetype i=0;i<parts.size();++i) {
+                expectedBodies.append(parts.at(i).toMap().value("wire_body").toString().toUtf8());
+                const auto summary=missing && i==0 ? QStringLiteral(" ")
+                    : QString("Synthetic reviewed part %1 [p.1]").arg(i+1);
+                server.responses.append({{MockChatServer::delta({{"content",summary}}),QByteArray("data: [DONE]\n\n")},delayed?250:5,200});
+            }
+        };
+        const auto verifyWire=[&] {
+            QCOMPARE(server.requests.size(),expectedBodies.size());
+            for(qsizetype i=0;i<expectedBodies.size();++i) {
+                const auto request=server.requests.at(i);
+                QCOMPARE(request.mid(request.indexOf("\r\n\r\n")+4),expectedBodies.at(i));
+            }
+        };
+
+        prepare();const auto whole=plan();QCOMPARE(server.requests.size(),0);
+        scriptedParts(whole,false,false);QVERIFY(send->isVisible());QVERIFY(QMetaObject::invokeMethod(send,"clicked"));
+        QTRY_COMPARE(plan().value("kind").toString(),QString("summary_synthesis"));
+        QTRY_COMPARE(reader->pendingCommands(),0);verifyWire();
+        QVERIFY(!reader->aiState().value("planSent").toBool());
+        QVERIFY(!reader->startAi("local",whole));
+        QVERIFY(send->isVisible());QCOMPARE(send->property("text").toString(),QString("Send synthesis"));
+        const auto synthesis=plan();QCOMPARE(synthesis.value("parts").toList().size(),1);
+        const auto part=synthesis.value("parts").toList().first().toMap();
+        const auto body=part.value("wire_body").toString().toUtf8();
+        QVERIFY(body.contains("Synthetic reviewed part 1"));QVERIFY(body.contains("Synthetic reviewed part 2"));
+        QVERIFY(!body.contains("Public source sentence"));QVERIFY(body.contains("Consolidate the part summaries"));
+        expectedBodies.append(body);
+        server.responses.append({{MockChatServer::delta({{"content","Synthetic consolidated result [p.1]"}}),QByteArray("data: [DONE]\n\n")},5,200});
+        QVERIFY(QMetaObject::invokeMethod(send,"clicked"));
+        QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);verifyWire();
+        QVERIFY(reader->aiState().value("output").toString().contains("Synthetic consolidated result"));
+        QVERIFY(reader->aiState().value("synthesisParts").toMap().value("output").toString().contains("Synthetic reviewed part 1"));
+        auto *showParts=window->findChild<QQuickItem *>("aiShowPartSummaries");QVERIFY(showParts && showParts->isVisible());
+        QVERIFY(showParts->setProperty("checked",true));
+        auto *partAnswer=visualItem(window->contentItem(),"aiPartSummaryText");QVERIFY(partAnswer && partAnswer->isVisible());
+
+        prepare();const auto incomplete=plan();scriptedParts(incomplete,true,false);
+        QVERIFY(reader->startAi("local",incomplete));
+        QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);verifyWire();
+        QCOMPARE(plan(),incomplete);
+        QVERIFY(reader->aiState().value("status").toString().contains("missing"));
+        QVERIFY(reader->aiState().value("output").toString().contains("Synthetic reviewed part 2"));
+
+        prepare();const auto stale=plan();scriptedParts(stale,false,true);
+        QVERIFY(reader->startAi("local",stale));
+        reader->setAiInput("summaryDetail","Brief");
+        QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);verifyWire();
+        QVERIFY(plan().isEmpty());QVERIFY(!reader->startAi("local",stale));
+        QVERIFY(reader->aiState().value("output").toString().contains("Synthetic reviewed part 1"));
+    }
+
 
 
     void commandCompletionAllowsDestructionFromItsNotifications_data() {
