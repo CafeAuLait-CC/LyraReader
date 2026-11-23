@@ -2430,6 +2430,16 @@ ApplicationWindow {
                         }
                     }
                     Rectangle { Layout.fillWidth: true; height: 1; color: theme.separator }
+                    AiWorkspacePicker {
+                        app: root
+                        selectedKey: root.aiPanelMode === "notes" ? "notes" : aiContent.workspace
+                        Layout.fillWidth: true
+                        Layout.leftMargin: 10; Layout.rightMargin: 10; Layout.topMargin: 5
+                        onPicked: function(key) {
+                            if (key === "notes") root.openRegionNotes();
+                            else root.openAiWorkspace(key);
+                        }
+                    }
                     AiPanel { id: aiContent; app: root; visible:root.aiPanelMode!=="notes"; Layout.fillWidth: true; Layout.fillHeight: true }
                     RegionNotes {id:regionNotes;app:root;Layout.fillWidth:true;Layout.fillHeight:true}
                 }

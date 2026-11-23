@@ -126,22 +126,6 @@ Pane {
     ColumnLayout {
         anchors.fill: parent
         spacing: aiPanel.compact ? 3 : 6
-        RowLayout {
-            Layout.fillWidth: true
-            spacing: 2
-            Repeater {
-                model: [{key: "summary", title: qsTr("Summary")}, {key: "translation", title: qsTr("Translate")}, {key: "chat", title: qsTr("Chat")}]
-                LyraToolButton {
-                    required property var modelData
-                    objectName: "aiWorkspace" + modelData.key
-                    text: modelData.title
-                    display: AbstractButton.TextOnly
-                    selected: aiPanel.workspace === modelData.key
-                    Layout.fillWidth: true
-                    onClicked: aiPanel.owner.setAiInput("view", modelData.key)
-                }
-            }
-        }
         Label {
             Layout.fillWidth: true; wrapMode: Text.Wrap; textFormat: Text.PlainText
             // Short unit drawers reserve space for the answer. Setup and receiving states remain visible.

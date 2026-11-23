@@ -2807,6 +2807,51 @@ private slots:
         const auto currentPage=view.window->property("currentPage").toInt();QVERIFY(QMetaObject::invokeMethod(panel,"followHistoryLink",Q_ARG(QVariant,QString("p.2")),Q_ARG(QVariant,historicalPlan)));QCOMPARE(view.window->property("currentPage").toInt(),currentPage);QVERIFY(view.window->property("operationStatus").toString().contains("document changed"));
     }
 
+    void aiWorkspacePickerKeepsControlGeometryAndReviewDrafts_data() {
+        QTest::addColumn<bool>("reduceMotion");
+        QTest::newRow("light-motion") << false;
+        QTest::newRow("dark-reduced-motion") << true;
+    }
+    void aiWorkspacePickerKeepsControlGeometryAndReviewDrafts() {
+        QFETCH(bool, reduceMotion);
+        QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
+        MockChatServer server;QVERIFY(server.listen());
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);
+        window->setProperty("appearance",reduceMotion ? "dark" : "light");
+        window->setProperty("reduceMotion",reduceMotion);window->resize(700,600);
+        view.workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));
+        auto *reader=view.workspace.activeReader();QTRY_COMPARE(reader->pageCount(),3);QTRY_COMPARE(reader->pendingCommands(),0);
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","fixture"}});
+        reader->setAiInput("view","chat");reader->setAiInput("question","Retain this local draft");reader->setAiInput("view","summary");
+        QVERIFY(QMetaObject::invokeMethod(window,"resizeAiPanel",Q_ARG(QVariant,280),Q_ARG(QVariant,false)));
+        QVERIFY(QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,true)));
+        window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);
+        auto *picker=visualItem(window->contentItem(),"aiWorkspacePicker");QVERIFY(picker);
+        auto *indicator=visualItem(picker,"aiWorkspaceIndicator");QVERIFY(indicator);
+        const QStringList keys{"summary","translation","chat","notes"};
+        QList<QQuickItem *> buttons;
+        for (const auto &key:keys) {auto *button=visualItem(picker,"aiWorkspace"+key);QVERIFY(button);buttons.append(button);}
+        const auto rect=[&](QQuickItem *item){return item->mapRectToItem(picker,item->boundingRect());};
+        const auto buttonRects=[&]{QList<QRectF> result;for(auto *button:buttons)result.append(rect(button));return result;};
+        QTRY_VERIFY(picker->isVisible() && picker->width()>200);QTRY_COMPARE(rect(indicator),rect(buttons[0]));
+        const auto original=buttonRects();const auto generation=reader->documentGeneration();
+        buttons[0]->forceActiveFocus(Qt::TabFocusReason);
+        for (int i=1;i<=4;++i) {
+            const auto index=i%4;
+            QTest::keyClick(window,Qt::Key_Right);
+            QCOMPARE(picker->property("selectedKey").toString(),keys[index]);
+            QTRY_VERIFY(buttons[index]->hasActiveFocus());
+            if (reduceMotion) QCOMPARE(rect(indicator),rect(buttons[index]));
+            QTRY_COMPARE(rect(indicator),rect(buttons[index]));
+            QCOMPARE(buttonRects(),original);
+            QCOMPARE(visualItem(window->contentItem(),"regionNotes")->isVisible(),index==3);
+            if (index==2) QCOMPARE(reader->aiState().value("input").toMap().value("question").toString(),QString("Retain this local draft"));
+        }
+        QTRY_COMPARE(reader->pendingCommands(),0);
+        QCOMPARE(reader->documentGeneration(),generation);QCOMPARE(server.requests.size(),0);
+        QVERIFY(reader->aiState().value("plan").toMap().isEmpty());
+    }
+
 
 
     void commandCompletionAllowsDestructionFromItsNotifications_data() {
