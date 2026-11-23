@@ -1,10 +1,13 @@
-//! A bounded inline math tree for native presentation. The original response remains
+//! A bounded math tree for native presentation. The original response remains
 //! the source for copying, persistence, and expressions outside the supported subset.
 use std::{iter::Peekable, ops::Range, str::Chars};
 
 const MAX_FORMULA_BYTES: usize = 2048;
 const MAX_FORMULAS: usize = 128;
 const MAX_DEPTH: usize = 16;
+const MAX_GRID_ROWS: usize = 8;
+const MAX_GRID_COLUMNS: usize = 8;
+const MAX_GRID_CELLS: usize = 48;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Style {
@@ -24,11 +27,24 @@ pub enum Node {
     Fraction(Box<Node>, Box<Node>),
     Root(Box<Node>),
     Styled(Style, Box<Node>),
+    Grid {
+        rows: Vec<Vec<Node>>,
+        columns: Vec<Alignment>,
+        left: &'static str,
+        right: &'static str,
+    },
     Scripts {
         base: Box<Node>,
         subscript: Option<Box<Node>>,
         superscript: Option<Box<Node>>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Alignment {
+    Left,
+    Center,
+    Right,
 }
 
 pub struct Formula {
@@ -91,7 +107,7 @@ pub fn formulas(text: &str) -> Vec<Formula> {
                 cursor += delimiter.end().len();
                 open = None;
                 let expression = (body.len() <= MAX_FORMULA_BYTES)
-                    .then(|| parse(body))
+                    .then(|| parse(body, delimiter.display()))
                     .flatten();
                 output.push(Formula {
                     range: start..cursor,
@@ -142,32 +158,47 @@ fn looks_like_dollar_math(body: &str) -> bool {
             || trimmed.bytes().any(|b| b"^_\\=+-*/<>{}".contains(&b)))
 }
 
-fn parse(source: &str) -> Option<Node> {
+fn parse(source: &str, display: bool) -> Option<Node> {
     if source.trim().is_empty() {
         return None;
     }
     let normalized = super::render_source(source);
     let mut parser = Parser {
         input: normalized.chars().peekable(),
+        display,
     };
-    let row = parser.row(0)?;
+    let row = parser.row(0, false)?;
     parser.input.peek().is_none().then_some(row)
 }
 
 struct Parser<'a> {
     input: Peekable<Chars<'a>>,
+    display: bool,
+}
+
+#[derive(PartialEq, Eq)]
+enum GridSeparator {
+    Cell,
+    Row,
+    End,
 }
 
 impl Parser<'_> {
-    fn row(&mut self, depth: usize) -> Option<Node> {
+    fn row(&mut self, depth: usize, grid_cell: bool) -> Option<Node> {
         let mut children = Vec::new();
         self.skip_space();
         while self.input.peek().is_some_and(|&ch| ch != '}') {
+            if grid_cell && self.grid_separator().is_some() {
+                break;
+            }
             let base = self.atom(depth)?;
             self.skip_space();
             let mut subscript = None;
             let mut superscript = None;
             while matches!(self.input.peek(), Some('^' | '_')) {
+                if matches!(base, Node::Grid { .. }) {
+                    return None;
+                }
                 let target = if self.input.next()? == '^' {
                     &mut superscript
                 } else {
@@ -199,11 +230,11 @@ impl Parser<'_> {
         self.skip_space();
         match self.input.next()? {
             '{' => {
-                let row = self.row(depth + 1)?;
+                let row = self.row(depth + 1, false)?;
                 (self.input.next()? == '}').then_some(row)
             }
             '\\' => self.command(depth),
-            '}' | '^' | '_' | '$' | '\u{60}' => None,
+            '}' | '^' | '_' | '$' | '&' | '\u{60}' => None,
             ch if !ch.is_control() => Some(Node::Text(ch.to_string())),
             _ => None,
         }
@@ -235,6 +266,7 @@ impl Parser<'_> {
             "sqrt" if self.input.peek() != Some(&'[') => {
                 Some(Node::Root(Box::new(self.atom(depth + 1)?)))
             }
+            "begin" if self.display && depth == 0 => self.grid(),
             "text" | "operatorname" => self.text_group().map(Node::Text),
             "left" | "right" | "middle" => {
                 self.skip_space();
@@ -259,6 +291,108 @@ impl Parser<'_> {
         while self.input.peek().is_some_and(|ch| ch.is_whitespace()) {
             self.input.next();
         }
+    }
+
+    fn grid_separator(&self) -> Option<GridSeparator> {
+        let mut input = self.input.clone();
+        match (input.next()?, input.next()) {
+            ('&', _) => Some(GridSeparator::Cell),
+            ('\\', Some('\\')) => Some(GridSeparator::Row),
+            ('\\', Some('e'))
+                if input.next() == Some('n')
+                    && input.next() == Some('d')
+                    && !input.next().is_some_and(|ch| ch.is_ascii_alphabetic()) =>
+            {
+                Some(GridSeparator::End)
+            }
+            _ => None,
+        }
+    }
+
+    fn grid(&mut self) -> Option<Node> {
+        let name = self.text_group()?;
+        let (left, right) = match name.as_str() {
+            "matrix" | "aligned" | "array" => ("", ""),
+            "pmatrix" => ("(", ")"),
+            "bmatrix" => ("[", "]"),
+            "Bmatrix" => ("{", "}"),
+            "vmatrix" => ("|", "|"),
+            "Vmatrix" => ("‖", "‖"),
+            "cases" => ("{", ""),
+            _ => return None,
+        };
+        let fixed_alignment = if name == "array" {
+            let labels = self.text_group()?;
+            let columns = labels
+                .trim()
+                .chars()
+                .map(|ch| match ch {
+                    'l' => Some(Alignment::Left),
+                    'c' => Some(Alignment::Center),
+                    'r' => Some(Alignment::Right),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if columns.is_empty() || columns.len() > MAX_GRID_COLUMNS {
+                return None;
+            }
+            Some(columns)
+        } else {
+            None
+        };
+
+        let max_columns = fixed_alignment.as_ref().map_or(MAX_GRID_COLUMNS, Vec::len);
+        let mut rows = Vec::new();
+        let mut row = Vec::new();
+        let mut cells = 0;
+        loop {
+            self.skip_space();
+            if self.grid_separator() == Some(GridSeparator::End) && row.is_empty() {
+                // A final row break closes the preceding row without adding a blank one.
+                break;
+            }
+            if rows.len() >= MAX_GRID_ROWS || row.len() >= max_columns || cells >= MAX_GRID_CELLS {
+                return None;
+            }
+            row.push(self.row(1, true)?);
+            cells += 1;
+            match self.grid_separator()? {
+                GridSeparator::Cell => {
+                    self.input.next();
+                }
+                GridSeparator::Row => {
+                    self.input.next();
+                    self.input.next();
+                    rows.push(std::mem::take(&mut row));
+                }
+                GridSeparator::End => {
+                    rows.push(row);
+                    break;
+                }
+            }
+        }
+        for _ in 0..4 {
+            self.input.next(); // consume the recognized `\end` command
+        }
+        if self.text_group()? != name {
+            return None;
+        }
+        let count = rows.iter().map(Vec::len).max()?;
+        let columns = fixed_alignment.unwrap_or_else(|| {
+            (0..count)
+                .map(|column| match name.as_str() {
+                    "aligned" if column % 2 == 0 => Alignment::Right,
+                    "aligned" | "cases" => Alignment::Left,
+                    _ => Alignment::Center,
+                })
+                .collect()
+        });
+        Some(Node::Grid {
+            rows,
+            columns,
+            left,
+            right,
+        })
     }
 
     fn text_group(&mut self) -> Option<String> {
@@ -414,6 +548,41 @@ mod tests {
         let source = format!(r"\(\begin{{matrix}} a \end{{matrix}}\) {nested} {large}");
         let items = formulas(&source);
         assert_eq!(items.len(), 3);
+        assert!(items.iter().all(|item| item.expression.is_none()));
+    }
+
+    #[test]
+    fn display_grids_keep_cells_delimiters_and_joined_text() {
+        let source = r"\[M=\begin{bmatrix}x_1&\text{a & b}\\z&\frac{p}{q}\\\end{bmatrix}\]";
+        let result = formulas(source);
+        let Some(Node::Row(nodes)) = &result[0].expression else {
+            panic!("display formula was not parsed");
+        };
+        let Some(Node::Grid {
+            rows,
+            columns,
+            left,
+            right,
+        }) = nodes.last()
+        else {
+            panic!("display matrix kept no grid");
+        };
+        assert_eq!((*left, *right), ("[", "]"));
+        assert_eq!(columns, &[Alignment::Center, Alignment::Center]);
+        assert_eq!(rows.iter().map(Vec::len).collect::<Vec<_>>(), [2, 2]);
+        assert_eq!(rows[0][1], Node::Row(vec![Node::Text("a & b".into())]));
+    }
+
+    #[test]
+    fn malformed_nested_and_oversized_grids_keep_the_whole_formula_as_source() {
+        let rows = std::iter::repeat_n("x", MAX_GRID_ROWS + 1)
+            .collect::<Vec<_>>()
+            .join(r"\\");
+        let input = format!(
+            r"\[\begin{{matrix}}{rows}\end{{matrix}}\] \[\begin{{pmatrix}}x\end{{matrix}}\] \[\begin{{matrix}}\begin{{matrix}}x\end{{matrix}}\end{{matrix}}\] \[\begin{{array}}{{l|r}}x&y\end{{array}}\]"
+        );
+        let items = formulas(&input);
+        assert_eq!(items.len(), 4);
         assert!(items.iter().all(|item| item.expression.is_none()));
     }
 }

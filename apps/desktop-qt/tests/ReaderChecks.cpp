@@ -57,6 +57,7 @@
 #include <QQuickTextDocument>
 #include <QTextCursor>
 #include <QTextDocument>
+#include <QTextTable>
 #include <QRegularExpression>
 #include <QQmlProperty>
 #include <QSGRendererInterface>
@@ -3795,12 +3796,19 @@ private slots:
         connect(&reader,&ReaderController::dataChanged,this,[&]{if(!reopened && reader.data().contains("links")){reopened=true;reader.openFile(QUrl::fromLocalFile(second));}});reader.submit("links",{{"page",0}});QTRY_VERIFY(reopened);QTRY_COMPARE(reader.pageCount(),3);QTRY_COMPARE(reader.pendingCommands(),0);for(const auto &event:commands)QVERIFY2(event[1].toString()!=QStringLiteral("links"),"The old completion must not be published after a synchronous document switch");QVERIFY(!reader.data().contains("links"));
     }
 
+    void aiMathUsesNativeMarkupWithoutChangingTheOriginalResponse_data() {
+        QTest::addColumn<bool>("narrow");
+        QTest::newRow("light")<<false;
+        QTest::newRow("dark-narrow")<<true;
+    }
     void aiMathUsesNativeMarkupWithoutChangingTheOriginalResponse() {
+        QFETCH(bool,narrow);
         QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
         MockChatServer server;QVERIFY(server.listen());
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-math-response.pdf");
         QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
         NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);
+        if(narrow){window->setProperty("appearance","dark");window->resize(736,700);}
         view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
         QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
         window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic-math"}});
@@ -3809,6 +3817,8 @@ private slots:
         const auto message=QString::fromUtf8(
             "🧪 **Before \\(\\mathcal J_{fit}=\\frac{\\alpha}{\\beta}\\) after**.\n"
             "Money $5, then $x^2$. \\[\\text{<img src=\"https://example.invalid/no\">}\\tag{3}\\]\n"
+            "\\[A=\\begin{bmatrix}\\theta&\\text{<img src=matrix>}\\\\u&v\\end{bmatrix}\\]\n"
+            "\\[\\frac{\\text{numerator}}{\\text{denominator}}\\]\n"
             "\\(\\begin{matrix}u\\end{matrix}\\) \\[p.99\\] [p.1] [p.99]");
         server.responses.append({{MockChatServer::delta({{"content",message}}),QByteArray("data: [DONE]\n\n")},6,200});
         auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);
@@ -3836,10 +3846,33 @@ private slots:
         QVERIFY(document->find(QStringLiteral("after")).charFormat().fontWeight()>=QFont::Bold);
         QVERIFY(document->toPlainText().contains("Money $5, then x2"));
         QVERIFY(document->toPlainText().contains("<img src=\"https://example.invalid/no\">") && !markup().contains("<img"));
+        const auto *table=document->find(QStringLiteral("θ")).currentTable();
+        QVERIFY(table);
+        QCOMPARE(table->rows(),2);
+        QCOMPARE(table->columns(),5);
+        QCOMPARE(document->find(QStringLiteral("A=")).currentTable(),table);
+        QCOMPARE(table->cellAt(0,1).rowSpan(),2);
+        QCOMPARE(table->cellAt(0,4).rowSpan(),2);
+        QVERIFY(document->find(QStringLiteral("[")).charFormat().font().pixelSize()>=30);
+        QVERIFY(document->toPlainText().contains("<img src=matrix>"));
+        const auto numerator=document->find(QStringLiteral("numerator"));
+        const auto denominator=document->find(QStringLiteral("denominator"));
+        const auto *fraction=numerator.currentTable();
+        QVERIFY(fraction && denominator.currentTable()==fraction);
+        QCOMPARE(fraction->rows(),3);
+        QCOMPARE(fraction->cellAt(numerator).row(),0);
+        QCOMPARE(fraction->cellAt(denominator).row(),2);
         QVERIFY(document->toPlainText().contains(QStringLiteral("\\begin{matrix}u\\end{matrix}")));
         QCOMPARE(document->find(QStringLiteral("[p.1]")).charFormat().anchorHref(),QString("p.1"));
         QVERIFY(!document->find(QStringLiteral("[p.99]")).charFormat().isAnchor());
         QVERIFY(reader->aiState().value("output").toString().endsWith(message));
+        const auto capture=qEnvironmentVariable("LYRA_READER_MATH_SNAPSHOT");
+        if(!capture.isEmpty()){
+            QTest::qWait(60);
+            const QFileInfo image(capture);
+            const auto output=narrow ? image.path()+"/"+image.completeBaseName()+"-narrow."+image.suffix() : capture;
+            QVERIFY(window->grabWindow().save(output));
+        }
     }
 
     void readOnlyAiAnswersRevealTheirKeyboardCursor_data() {

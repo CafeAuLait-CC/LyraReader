@@ -1,7 +1,7 @@
 //! Convert portable math nodes to the Qt rich-text subset. The provider can supply
 //! characters only; every tag and property is chosen by this adapter.
 use crate::{Buffer, bytes, run};
-use lyra_reader_ai::math::inline::{Node, Style, formulas};
+use lyra_reader_ai::math::inline::{Alignment, Node, Style, formulas};
 use serde::Serialize;
 
 const MAX_RESPONSE_BYTES: usize = 128 * 1024;
@@ -30,11 +30,9 @@ fn spans(text: &str) -> Vec<MarkupSpan> {
             let mut markup = String::new();
             if let Some(expression) = formula.expression {
                 if formula.display {
-                    markup.push_str("<br/>");
-                }
-                write_node(&expression, None, &mut markup);
-                if formula.display {
-                    markup.push_str("<br/>");
+                    write_display(&expression, &mut markup);
+                } else {
+                    write_node(&expression, None, &mut markup);
                 }
             } else {
                 for ch in source.chars() {
@@ -44,6 +42,118 @@ fn spans(text: &str) -> Vec<MarkupSpan> {
             MarkupSpan { start, end, markup }
         })
         .collect()
+}
+
+fn write_display(node: &Node, markup: &mut String) {
+    if let Node::Row(children) = node {
+        if let [Node::Fraction(numerator, denominator)] = children.as_slice() {
+            // Native tables are already block elements. No extra blank lines are
+            // needed, and the rule inherits the native document foreground.
+            markup.push_str(
+                r#"<table align="center" cellspacing="0" cellpadding="1"><tr><td align="center">"#,
+            );
+            write_node(numerator, None, markup);
+            markup.push_str(r#"</td></tr><tr><td><hr /></td></tr><tr><td align="center">"#);
+            write_node(denominator, None, markup);
+            markup.push_str("</td></tr></table>");
+            return;
+        }
+        let mut grids = children
+            .iter()
+            .enumerate()
+            .filter(|(_, child)| matches!(child, Node::Grid { .. }));
+        if let Some((
+            index,
+            Node::Grid {
+                rows,
+                columns,
+                left,
+                right,
+            },
+        )) = grids.next()
+            && grids.next().is_none()
+        {
+            // Keep an adjacent expression such as A= aligned with the grid itself.
+            write_grid(
+                rows,
+                columns,
+                left,
+                right,
+                &children[..index],
+                &children[index + 1..],
+                markup,
+            );
+            return;
+        }
+    }
+    markup.push_str("<br/>");
+    write_node(node, None, markup);
+    markup.push_str("<br/>");
+}
+
+fn write_grid(
+    rows: &[Vec<Node>],
+    columns: &[Alignment],
+    left: &str,
+    right: &str,
+    prefix: &[Node],
+    suffix: &[Node],
+    markup: &mut String,
+) {
+    fn row_span(rows: usize, markup: &mut String) {
+        markup.push_str(r#"<td align="center" valign="middle" rowspan=""#);
+        markup.push_str(&rows.to_string());
+        markup.push_str(r#"">"#);
+    }
+
+    fn enclosure(glyph: &str, rows: usize, markup: &mut String) {
+        if glyph.is_empty() {
+            return;
+        }
+        row_span(rows, markup);
+        markup.push_str(r#"<span style="font-size:"#);
+        markup.push_str(&(12 + 12 * rows).to_string());
+        markup.push_str(r#"px">"#);
+        markup.push_str(glyph);
+        markup.push_str("</span></td>");
+    }
+
+    fn side(nodes: &[Node], rows: usize, markup: &mut String) {
+        if nodes.is_empty() {
+            return;
+        }
+        row_span(rows, markup);
+        for node in nodes {
+            write_node(node, None, markup);
+        }
+        markup.push_str("</td>");
+    }
+
+    markup.push_str(r#"<table align="center" cellspacing="0" cellpadding="3">"#);
+    for (index, row) in rows.iter().enumerate() {
+        markup.push_str("<tr>");
+        if index == 0 {
+            side(prefix, rows.len(), markup);
+            enclosure(left, rows.len(), markup);
+        }
+        for (column, alignment) in columns.iter().enumerate() {
+            markup.push_str(match alignment {
+                Alignment::Left => r#"<td align="left" valign="middle">"#,
+                Alignment::Center => r#"<td align="center" valign="middle">"#,
+                Alignment::Right => r#"<td align="right" valign="middle">"#,
+            });
+            if let Some(node) = row.get(column) {
+                write_node(node, None, markup);
+            }
+            markup.push_str("</td>");
+        }
+        if index == 0 {
+            enclosure(right, rows.len(), markup);
+            side(suffix, rows.len(), markup);
+        }
+        markup.push_str("</tr>");
+    }
+    markup.push_str("</table>");
 }
 
 fn escape(ch: char, markup: &mut String) {
@@ -100,6 +210,12 @@ fn write_node(node: &Node, alphabet: Option<&Style>, markup: &mut String) {
             write_node(value, None, markup);
             markup.push_str(close);
         }
+        Node::Grid {
+            rows,
+            columns,
+            left,
+            right,
+        } => write_grid(rows, columns, left, right, &[], &[], markup),
         Node::Scripts {
             base,
             subscript,
@@ -182,5 +298,17 @@ mod tests {
             String::from_utf16(&original[spans[0].start..spans[0].end]).unwrap(),
             r"\(\mathcal J_{fit}=\frac{\alpha}{\beta}\)"
         );
+    }
+
+    #[test]
+    fn display_math_stack_and_grid_only_use_adapter_selected_markup() {
+        let text = r"\[\frac{\alpha}{\beta}\] \[\begin{pmatrix}x&\text{<img src=x>}\\y&z\end{pmatrix}\] \(\frac{u}{v}\)";
+        let spans = spans(text);
+        assert_eq!(spans.len(), 3);
+        assert!(spans[0].markup.contains("<tr><td><hr /></td></tr>"));
+        assert!(spans[1].markup.contains("rowspan=\"2\""));
+        assert!(spans[1].markup.contains("&lt;img src=x&gt;"));
+        assert!(!spans[1].markup.contains("<img"));
+        assert_eq!(spans[2].markup, "<sup>u</sup>⁄<sub>v</sub>");
     }
 }
