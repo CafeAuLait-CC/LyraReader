@@ -1955,6 +1955,52 @@ private slots:
         }
         QVERIFY(!reader->hasUnsavedChanges());
     }
+    void closingSearchRejectsLateResultsAndReturnsToReadingKeys() {
+        QTemporaryDir scratch;
+        QVERIFY(scratch.isValid());
+        const auto path=scratch.filePath("search-close.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",path));
+        NativeCorpus::Viewer view;
+        QVERIFY(view.window);
+        auto *window=view.window;
+        window->resize(1100,700);
+        view.workspace.openFile(QUrl::fromLocalFile(path));
+        auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==3 && !reader->pendingCommands());
+        QVERIFY(settleReaderViewport(window));
+        QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,2),Q_ARG(QVariant,0)));
+        QTRY_COMPARE(window->property("currentPage").toInt(),2);
+
+        QTest::keyClick(window,Qt::Key_F,Qt::ControlModifier);
+        QTRY_VERIFY(window->property("searchVisible").toBool());
+        auto *query=visualItem(window->contentItem(),"searchField");
+        QVERIFY(query);
+        QTRY_VERIFY(query->hasActiveFocus());
+        const auto closeSearch=[&] {
+            auto *button=visualItem(window->contentItem(),"closeSearchButton");
+            return button && QMetaObject::invokeMethod(button,"clicked");
+        };
+
+        // The GUI cannot deliver the worker result between these two calls.
+        window->setProperty("searchQuery","Page 1 of 3");
+        QVERIFY(QMetaObject::invokeMethod(window,"runSearch"));
+        QVERIFY(reader->pendingCommands()>0);
+        QVERIFY(closeSearch());
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(!window->property("searchVisible").toBool());
+        QCOMPARE(window->property("currentPage").toInt(),2);
+        QCOMPARE(window->property("searchQuery").toString(),QStringLiteral("Page 1 of 3"));
+        QVERIFY(!query->hasActiveFocus());
+        QTest::keyClick(window,Qt::Key_Home,Qt::ControlModifier);
+        QTRY_COMPARE(window->property("currentPage").toInt(),0);
+
+        QTest::keyClick(window,Qt::Key_F,Qt::ControlModifier);
+        QTRY_VERIFY(window->property("searchVisible").toBool());
+        window->setProperty("searchQuery","Page 2 of 3");
+        QVERIFY(QMetaObject::invokeMethod(window,"runSearch"));
+        QTRY_COMPARE(window->property("currentPage").toInt(),1);
+        QTRY_COMPARE(window->property("searchResults").toList().size(),1);
+    }
     void ordinaryDocumentEdgesUseSharedSpacingAndCanonicalAnchors_data() {
         QTest::addColumn<QString>("layout");QTest::addColumn<double>("percent");
         for(const auto &layout:{QString("Continuous"),QString("Facing")})

@@ -911,6 +911,12 @@ ApplicationWindow {
                 pattern: searchQuery
             });
     }
+    function closeSearch() {
+        searchTimer.stop();
+        searchRequestId = -1;
+        searchVisible = false;
+        focusReadingView();
+    }
     function stepSearch(delta) {
         if (!searchResults.length)
             return;

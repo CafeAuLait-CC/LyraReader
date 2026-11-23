@@ -20,9 +20,10 @@ Pane {
                 Layout.fillWidth: true
             }
             LyraToolButton {
+                objectName: "closeSearchButton"
                 symbol: "close"
                 text: qsTr("Close search")
-                onClicked: app.searchVisible = false
+                onClicked: app.closeSearch()
             }
         }
         TextField {
