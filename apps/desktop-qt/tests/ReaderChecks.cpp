@@ -2769,7 +2769,7 @@ private slots:
     }
     void documentChatKeepsBoundedCompletedAndCancelledHistoryButExcludesFailures() {
         MockChatServer server;QVERIFY(server.listen());
-        for(int i=0;i<7;++i)server.responses.append({{MockChatServer::delta({{"content",QString("Synthetic answer %1 [p.1]").arg(i)}}),QByteArray("data: [DONE]\n\n")},0,200});
+        for(int i=0;i<7;++i)server.responses.append({{MockChatServer::delta({{"content",QString("Synthetic answer %1 [p.1]").arg(i)}}),i==6?MockChatServer::usage(0):MockChatServer::usage(),QByteArray("data: [DONE]\n\n")},0,200});
         MockChatServer::Response partial;partial.holdLast=true;partial.chunks={MockChatServer::delta({{"content","Synthetic cancelled partial"}}),QByteArray("data: [DONE]\n\n")};server.responses.append(partial);
         server.responses.append({{QByteArray("{\"error\":{\"message\":\"synthetic failure\"}}")},0,400});
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/chat-history.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",path));
@@ -2784,6 +2784,13 @@ private slots:
             QCOMPARE(reader->aiState().value("chatTurns").toList().size(),qMin(i+1,limit));QCOMPARE(reader->aiState().value("chatTurns").toList().last().toMap().value("state").toString(),QString("finished"));
             QCOMPARE(server.requests[i].mid(server.requests[i].indexOf("\r\n\r\n")+4),body);if(i)QVERIFY(body.contains("Synthetic answer"));
         }
+        const auto currentTurns=reader->aiState().value("chatTurns").toList();
+        const auto lastUsage=currentTurns.last().toMap().value("usage").toMap();
+        QVERIFY(!lastUsage.value("cached_tokens").isNull());QCOMPARE(lastUsage.value("cached_tokens").toInt(),0);
+        const auto usageName=QString("aiHistoryAnswer%1Usage").arg(currentTurns.size()-1);
+        QQuickItem *usageLabel=nullptr;
+        QTRY_VERIFY((usageLabel=visualItem(view.window->contentItem(),usageName)));
+        QTRY_COMPARE(usageLabel->property("text").toString(),QString("Tokens: 10 (0 cached input)"));
         QVERIFY(prepare("Which page contains body text? CANCEL_QUESTION"));QTRY_VERIFY(reader->aiState().contains("plan"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(reader->startAi("local",reader->aiState().value("plan").toMap()));QTRY_VERIFY(reader->aiState().value("output").toString().contains("cancelled partial"));reader->cancelAi();QTRY_VERIFY(!reader->aiState().value("running").toBool());QCOMPARE(reader->aiState().value("chatTurns").toList().last().toMap().value("state").toString(),QString("cancelled"));
         QVERIFY(prepare("Which page contains body text? FAIL_QUESTION_ONLY"));QTRY_VERIFY(reader->aiState().contains("plan"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);auto plan=reader->aiState().value("plan").toMap();QVERIFY(plan.value("parts").toList().first().toMap().value("wire_body").toString().contains("Synthetic cancelled partial"));QVERIFY(reader->startAi("local",plan));QTRY_VERIFY(!reader->aiState().value("running").toBool());QCOMPARE(reader->aiState().value("chatTurns").toList().last().toMap().value("state").toString(),QString("failed"));
         QVERIFY(prepare("Which page contains body text? NEXT_QUESTION"));QTRY_VERIFY(reader->aiState().contains("plan"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);plan=reader->aiState().value("plan").toMap();QVERIFY(!plan.value("parts").toList().first().toMap().value("wire_body").toString().contains("FAIL_QUESTION_ONLY"));QCOMPARE(server.requests.size(),9);
@@ -4293,7 +4300,7 @@ private slots:
     void aiPreviewStreamingCancellationAndTabsUseTheRealLocalTransport() {
         MockChatServer server;QVERIFY2(server.listen(),"Loopback HTTP is required for this GUI check; no external service is contacted");
         const auto imageUrl=server.baseUrl()+"/unwanted-image";
-        server.responses.append({{MockChatServer::delta({{"reasoning_content","provider rationale"}}),MockChatServer::delta({{"content","Answer [p.1] **ready**.\n![remote][image]\n[image]: "+imageUrl}}),MockChatServer::usage(),QByteArray("data: [DONE]\n\n")},70,200});
+        server.responses.append({{MockChatServer::delta({{"reasoning_content","provider rationale"}}),MockChatServer::delta({{"content","Answer [p.1] **ready**.\n![remote][image]\n[image]: "+imageUrl}}),MockChatServer::usage(2),QByteArray("data: [DONE]\n\n")},70,200});
         MockChatServer::Response slow;slow.holdLast=true;slow.chunks={MockChatServer::delta({{"content","chunk0 "}}),QByteArray("data: [DONE]\n\n")};server.responses.append(slow);
         server.responses.append({{MockChatServer::delta({{"content","retry succeeded"}}),MockChatServer::usage(),QByteArray("data: [DONE]\n\n")},30,200});
         server.responses.append({{QByteArray("{\"error\":{\"message\":\"fixture rejection\"}}")},0,400});server.responses.append(slow);
@@ -4309,9 +4316,12 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QVERIFY(other->aiState().value("output").toString().isEmpty());QVERIFY(reader->aiState().value("output").toString().contains("Answer"));QVERIFY(!reader->aiState().value("output").toString().contains("provider rationale"));QCOMPARE(reader->aiState().value("reasoning").toString(),QString("provider rationale"));QCOMPARE(reader->aiState().value("usage").toMap().value("total_tokens").toInt(),10);
         workspace.selectTab(0);QTest::qWait(200);QCOMPARE(server.requests.size(),1); // Reference images must remain text.
         auto *answer=window->findChild<QObject *>("aiAnswerText");QVERIFY(answer);QVERIFY(!answer->property("text").toString().contains("<img"));
+        auto *usage=window->findChild<QObject *>("aiAnswerTextUsage");QVERIFY(usage);
+        QCOMPARE(usage->property("text").toString(),QString("Tokens: 10 (2 cached input)"));
         const auto sentPages=plan.value("source_pages").toList();QVERIFY(!sentPages.isEmpty());const int unsent=reader->pageCount()+1;const auto beforeLink=window->property("currentPage").toInt();QVERIFY(QMetaObject::invokeMethod(panel,"followLink",Q_ARG(QVariant,QString("p.%1").arg(unsent))));QCOMPARE(window->property("currentPage").toInt(),beforeLink);QVERIFY(window->property("operationStatus").toString().contains("cannot be verified"));QVERIFY(QMetaObject::invokeMethod(panel,"followLink",Q_ARG(QVariant,QString("p.%1").arg(sentPages.first().toInt()))));QTRY_COMPARE(window->property("currentPage").toInt(),sentPages.first().toInt()-1);
         QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(reader->startAi("local",plan));QTRY_COMPARE(server.requests.size(),2);QTRY_VERIFY(reader->aiState().value("output").toString().contains("chunk0"));reader->cancelAi();QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QVERIFY(reader->aiState().value("status").toString().contains("Cancel",Qt::CaseInsensitive));QTRY_COMPARE_WITH_TIMEOUT(server.activeConnections(),0,10000);
         QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);auto *retry=window->findChild<QQuickItem *>("retryAiRequest");QVERIFY(retry);QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,retry->mapToScene(QPointF(retry->width()/2,retry->height()/2)).toPoint());QTRY_COMPARE(server.requests.size(),3);QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QVERIFY(reader->aiState().value("output").toString().contains("retry succeeded"));
+        QTRY_COMPARE(usage->property("text").toString(),QString("Tokens: 10"));
         QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(reader->startAi("local",plan));QTRY_COMPARE(server.requests.size(),4);QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QVERIFY(reader->aiState().value("status").toString().contains("fixture rejection"));QVERIFY(reader->error().isEmpty());
         reader->invalidateAiPlan();QVERIFY(!reader->startAi("local",plan));QCOMPARE(server.requests.size(),4);
         QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(!reader->aiState().value("plan").toMap().isEmpty());QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(reader->startAi("local",reader->aiState().value("plan").toMap()));QTRY_COMPARE(server.requests.size(),5);

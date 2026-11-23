@@ -74,7 +74,7 @@ ScrollView {
                 }
                 AiResult {
                     Layout.fillWidth: true; app: conversation.app; answerName: "aiHistoryAnswer" + index; showSources: true; viewport: conversation.contentItem
-                    value: ({output: modelData.answer, reasoning: modelData.reasoning, generation: modelData.generation, responsePlan: {action: "DocumentChat", sources: modelData.sources || []}})
+                    value: ({output: modelData.answer, reasoning: modelData.reasoning, usage: modelData.usage, generation: modelData.generation, responsePlan: {action: "DocumentChat", sources: modelData.sources || []}})
                     onKeyboardNavigation: function(key) {
                     if ([Qt.Key_Up, Qt.Key_PageUp, Qt.Key_Home].indexOf(key) >= 0) conversation.followTail = false;
                 }
@@ -92,7 +92,7 @@ ScrollView {
             }
             AiResult {
                 Layout.fillWidth: true; app: conversation.app; answerName: "aiStreamingChatAnswer"; showSources: true; viewport: conversation.contentItem
-                value: ({output: conversation.viewState.output, reasoning: conversation.viewState.reasoning, responsePlan: conversation.viewState.responsePlan, generation: app.currentReader.documentGeneration})
+                value: ({output: conversation.viewState.output, reasoning: conversation.viewState.reasoning, usage: conversation.viewState.usage, responsePlan: conversation.viewState.responsePlan, generation: app.currentReader.documentGeneration})
                 onKeyboardNavigation: function(key) {
                     if ([Qt.Key_Up, Qt.Key_PageUp, Qt.Key_Home].indexOf(key) >= 0) conversation.followTail = false;
                 }

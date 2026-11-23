@@ -8,6 +8,7 @@
 #include <QJsonArray>
 #include <memory>
 #include <functional>
+#include <optional>
 
 // Real loopback HTTP/SSE, used only by the GUI checks. No external service or key.
 class MockChatServer {
@@ -52,7 +53,13 @@ public:
     static QByteArray delta(const QJsonObject &value) {
         return QByteArray("data: ")+QJsonDocument(QJsonObject{{"choices",QJsonArray{QJsonObject{{"delta",value}}}}}).toJson(QJsonDocument::Compact)+"\n\n";
     }
-    static QByteArray usage() {return "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":7,\"total_tokens\":10,\"completion_tokens_details\":{\"reasoning_tokens\":2}}}\n\n";}
+    static QByteArray usage(std::optional<int> cachedTokens = std::nullopt) {
+        QJsonObject counts{{"prompt_tokens", 3}, {"completion_tokens", 7}, {"total_tokens", 10},
+                           {"completion_tokens_details", QJsonObject{{"reasoning_tokens", 2}}}};
+        if (cachedTokens) counts.insert("prompt_tokens_details", QJsonObject{{"cached_tokens", *cachedTokens}});
+        return QByteArray("data: ") + QJsonDocument(QJsonObject{{"choices", QJsonArray{}}, {"usage", counts}})
+            .toJson(QJsonDocument::Compact) + "\n\n";
+    }
 private:
     QTcpServer server;
     QList<QPointer<QTcpSocket>> sockets;

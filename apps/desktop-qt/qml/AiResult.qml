@@ -111,8 +111,19 @@ ColumnLayout {
         visible: !!result.value.output
         Button { text: qsTr("Copy answer"); onClicked: if (app.session) app.session.copyText(result.value.output) }
         Label {
+            objectName: result.answerName + "Usage"
             Layout.fillWidth: true; wrapMode: Text.Wrap; textFormat: Text.PlainText
-            text: result.value.usage && result.value.usage.total_tokens ? qsTr("Tokens: %1").arg(result.value.usage.total_tokens) : ""
+            visible: text.length > 0
+            text: {
+                const usage = result.value.usage || {};
+                const total = usage.total_tokens;
+                const cached = usage.cached_tokens;
+                if (Number.isFinite(total))
+                    return Number.isFinite(cached)
+                        ? qsTr("Tokens: %1 (%2 cached input)").arg(total).arg(cached)
+                        : qsTr("Tokens: %1").arg(total);
+                return Number.isFinite(cached) ? qsTr("Cached input tokens: %1").arg(cached) : "";
+            }
             color: app.colors.textSecondary; font.pixelSize: 10
         }
     }
