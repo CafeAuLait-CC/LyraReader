@@ -3995,22 +3995,7 @@ impl LyraReaderDocument {
                 severity: ErrorSeverity::Recoverable,
                 message: "Select text to translate.".into(),
             })?;
-        if self.prepared_selection_text_page(selection.page)?.is_none() {
-            self.text_page(selection.page)?;
-        }
-        let text = self
-            .prepared_selection_text_page(selection.page)?
-            .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
-                severity: ErrorSeverity::Recoverable,
-                message: "The translation text page is not prepared.".into(),
-            })?;
-        if selection.start > selection.end || selection.end as usize >= text.chars().len() {
-            return Err(LyraReaderFfiError::InvalidArgument {
-                severity: ErrorSeverity::Recoverable,
-                message: "The translation range is outside the current page.".into(),
-            });
-        }
-        let source = text.string_in_range(selection.start, selection.end);
+        let source = self.ai_selected_text(selection)?;
         self.prepare_ai_plan_inner(request, None, Some(source))
     }
 
@@ -4056,6 +4041,25 @@ impl LyraReaderDocument {
 }
 
 impl LyraReaderDocument {
+    fn ai_selected_text(&self, range: AiSelectionRecord) -> Result<String, LyraReaderFfiError> {
+        if self.prepared_selection_text_page(range.page)?.is_none() {
+            self.text_page(range.page)?;
+        }
+        let text = self
+            .prepared_selection_text_page(range.page)?
+            .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Recoverable,
+                message: "The selected page text is not prepared.".into(),
+            })?;
+        if range.start > range.end || range.end as usize >= text.chars().len() {
+            return Err(LyraReaderFfiError::InvalidArgument {
+                severity: ErrorSeverity::Recoverable,
+                message: "The selection range is outside the current page.".into(),
+            });
+        }
+        Ok(text.string_in_range(range.start, range.end))
+    }
+
     fn prepare_ai_plan_inner(
         &self,
         request: AiPlanRequestRecord,
@@ -4099,7 +4103,7 @@ impl LyraReaderDocument {
                 ),
             });
         }
-        let selection = request.selection.map(|selection| AiSelectionRange {
+        let mut selection = request.selection.map(|selection| AiSelectionRange {
             page: selection.page,
             start: selection.start,
             end: selection.end,
@@ -4244,26 +4248,59 @@ impl LyraReaderDocument {
             return Ok(ai_plan_record(plan));
         }
 
-        // Selection-only summary and translation send only the exact selected target.
-        // Questions can retrieve context; a document summary needs every page.
-        let page_list: Vec<u32> = if reading
-            .as_ref()
-            .is_some_and(|options| options.kind == "note")
-        {
-            vec![request.current_page]
-        } else if matches!(
-            action,
-            AiAction::TranslateSelection | AiAction::SummarizeSelection
-        ) {
-            vec![selection_only_page(selection)?]
+        let reading_range = request.selection.filter(|_| {
+            !request.document_knowledge
+                && reading.as_ref().is_some_and(|options| {
+                    matches!(options.kind.as_str(), "summary" | "translation" | "term")
+                })
+        });
+        let pages = if let Some(range) = reading_range {
+            // The canvas range is over the untouched page indices. The selection reader
+            // applies the same excluded-glyph mask as Copy. Rebase only this local plan,
+            // keeping the caller's original range valid for source/history navigation.
+            let text = self.ai_selected_text(range)?;
+            let end = text
+                .chars()
+                .count()
+                .checked_sub(1)
+                .and_then(|end| u32::try_from(end).ok())
+                .ok_or_else(|| LyraReaderFfiError::InvalidArgument {
+                    severity: ErrorSeverity::Recoverable,
+                    message: "Select a readable passage within the supported size.".into(),
+                })?;
+            selection = Some(AiSelectionRange {
+                page: range.page,
+                start: 0,
+                end,
+            });
+            vec![PageText {
+                page: range.page,
+                text,
+                chars: Vec::new(),
+            }]
         } else {
-            (0..page_count).collect()
+            // Selection-only summary and translation need one page. Questions can
+            // retrieve context, and document summaries need every page.
+            let page_list: Vec<u32> = if reading
+                .as_ref()
+                .is_some_and(|options| options.kind == "note")
+            {
+                vec![request.current_page]
+            } else if matches!(
+                action,
+                AiAction::TranslateSelection | AiAction::SummarizeSelection
+            ) {
+                vec![selection_only_page(selection)?]
+            } else {
+                (0..page_count).collect()
+            };
+            let mut pages = Vec::with_capacity(page_list.len());
+            for page in page_list {
+                let (text, chars) = self.ai_page(page)?;
+                pages.push(PageText { page, text, chars });
+            }
+            pages
         };
-        let mut pages = Vec::with_capacity(page_list.len());
-        for page in page_list {
-            let (text, chars) = self.ai_page(page)?;
-            pages.push(PageText { page, text, chars });
-        }
 
         let temperature = request.temperature.and_then(|value| {
             if value.is_finite() {

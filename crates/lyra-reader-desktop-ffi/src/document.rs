@@ -717,6 +717,34 @@ impl DesktopDocument {
             ),
             "ai_preview" => {
                 let mut request = crate::region::request(r["request"].clone())?;
+                if r.get("summary_detail").is_some() {
+                    let detail = text(&r, "summary_detail")?;
+                    let limit = lyra_reader_ai::chat::MAX_SELECTION_CHARS as u64;
+                    if request.action != AiActionRecord::SummarizeSelection
+                        || request.document_knowledge
+                        || !request.selection.is_some_and(|range| {
+                            range.end >= range.start && u64::from(range.end - range.start) < limit
+                        })
+                    {
+                        return Err(format!(
+                            "Select a passage of at most {limit} characters to summarize."
+                        ));
+                    }
+                    // A passage summary only receives the approved selection, never
+                    // the background analysis or preceding document conversation.
+                    request.document_knowledge_text = None;
+                    request.document_knowledge_pages.clear();
+                    return value(
+                        d.prepare_ai_reading_task(
+                            request,
+                            lyra_reader_ffi::api::AiReadingOptionsRecord {
+                                kind: "summary".into(),
+                                detail,
+                            },
+                        )
+                        .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),
+                    );
+                }
                 self.enrich_region_history(
                     &mut request,
                     r.get("region_history_id").and_then(Value::as_str),

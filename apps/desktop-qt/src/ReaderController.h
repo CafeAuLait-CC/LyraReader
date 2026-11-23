@@ -129,7 +129,7 @@ public:
     Q_INVOKABLE void clearAiRegion();
     Q_INVOKABLE void setAiRegionQuestion(const QString &text);
     Q_INVOKABLE void prepareAiRegion(const QVariantMap &settings);
-    Q_INVOKABLE void prepareAi(const QVariantMap &request,const QVariantMap &unit={});
+    Q_INVOKABLE void prepareAi(const QVariantMap &request,const QVariantMap &unit={},const QString &summaryDetail={});
     Q_INVOKABLE bool startAi(const QString &key,const QVariantMap &expectedPlan);
     Q_INVOKABLE void cancelAi();
     Q_INVOKABLE void setAiInput(const QString &key,const QVariant &value);

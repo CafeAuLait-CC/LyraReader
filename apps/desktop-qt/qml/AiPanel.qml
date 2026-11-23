@@ -6,7 +6,7 @@ Pane {
     id: aiPanel
     objectName: "aiPanel"
     required property var app
-    readonly property bool tabTransferDialogVisible: payload.visible || summaryCatalog.popupVisible
+    readonly property bool tabTransferDialogVisible: payload.visible || summaryCatalog.popupVisible || selectionSource.visible
     readonly property var owner: app.currentReader
     readonly property var viewState: owner.aiState
     readonly property var input: viewState.input || ({})
@@ -17,6 +17,11 @@ Pane {
     readonly property var batchState: owner.summaryBatchState
     readonly property bool batchMode: workspace === "summary" && !!input.summaryBatch
     readonly property bool languageMode: unitMode || batchMode
+    readonly property bool selectedSummary: workspace === "summary" && action === 5 && !unitMode && !batchMode
+    readonly property string summaryDetail: input.summaryDetail || "Standard"
+    readonly property var selectedSources: selectedSummary && plan && plan.action === "SummarizeSelection" ? plan.sources || [] : []
+    onPlanChanged: if (selectionSource && selectionSource.visible) selectionSource.close()
+    onVisibleChanged: if (!visible && selectionSource && selectionSource.visible) selectionSource.close()
     readonly property var languageGeneration: batchMode ? batchState.generation : summaryUnit.generation
     readonly property var ownerGeneration: owner.documentGeneration
     onOwnerChanged: if (payload && payload.visible) payload.close()
@@ -55,6 +60,7 @@ Pane {
         if (unitMode) { prepareUnit(summaryUnit.id); return; }
         const modes = ["SummarizePage", "SummarizeDocument", "AskSelection", "TranslateSelection", "DocumentChat", "SummarizeSelection"];
         if(workspace==="translation" && input.inplace)owner.prepareInplaceTranslation(baseRequest("TranslateSelection"));
+        else if (selectedSummary) owner.prepareAi(baseRequest("SummarizeSelection"), {}, summaryDetail);
         else owner.prepareAi(baseRequest(modes[action]));
     }
     function followLink(link) {
@@ -158,6 +164,33 @@ Pane {
             currentIndex: [1, 5, 0, 2].indexOf(aiPanel.action)
             Accessible.name: qsTr("Summary target")
             onActivated: aiPanel.owner.setAiInput("action", [1, 5, 0, 2][currentIndex])
+        }
+        ComboBox {
+            objectName: "aiSelectedSummaryDetail"
+            visible: aiPanel.selectedSummary
+            Layout.fillWidth: true
+            model: [qsTr("Brief"), qsTr("Standard"), qsTr("Detailed")]
+            readonly property var values: ["Brief", "Standard", "Detailed"]
+            currentIndex: values.indexOf(aiPanel.summaryDetail)
+            Accessible.name: qsTr("Selected summary detail")
+            onActivated: aiPanel.owner.setAiInput("summaryDetail", values[currentIndex])
+        }
+        RowLayout {
+            visible: aiPanel.selectedSources.length > 0
+            Layout.fillWidth: true
+            Label {
+                objectName: "aiSelectedSummarySource"
+                Layout.fillWidth: true; textFormat: Text.PlainText; wrapMode: Text.Wrap
+                maximumLineCount: 2; elide: Text.ElideRight
+                text: aiPanel.selectedSources.length ? aiPanel.selectedSources[0].snippet : ""
+                color: app.colors.textSecondary
+                Accessible.name: qsTr("Source selected for this request")
+            }
+            ToolButton {
+                objectName: "showAiSelectedSummarySource"
+                text: qsTr("More")
+                onClicked: selectionSource.open()
+            }
         }
         ColumnLayout {
             visible: aiPanel.unitMode
@@ -389,6 +422,26 @@ Pane {
                 onClicked: aiPanel.owner.clearAiChat()
             }
             Button {objectName:"aiAuditTrail";text:qsTr("Local audit trail…");onClicked:app.showAuditTrail()}
+        }
+    }
+    Dialog {
+        id: selectionSource
+        objectName: "aiSelectedSummarySourceDialog"
+        title: aiPanel.selectedSources.length ? qsTr("Selected source · page %1").arg(aiPanel.selectedSources[0].page) : qsTr("Selected source")
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: Math.max(220, Math.min(560, app.width - 48))
+        height: Math.max(180, Math.min(360, app.height - 64))
+        standardButtons: Dialog.Close
+        contentItem: ScrollView {
+            id: sourceScroll
+            contentWidth: availableWidth
+            TextArea {
+                width: sourceScroll.availableWidth
+                text: aiPanel.selectedSources.length ? aiPanel.selectedSources[0].snippet : ""
+                textFormat: TextEdit.PlainText; wrapMode: TextEdit.Wrap
+                readOnly: true; selectByMouse: true; selectByKeyboard: true
+            }
         }
     }
     Dialog {

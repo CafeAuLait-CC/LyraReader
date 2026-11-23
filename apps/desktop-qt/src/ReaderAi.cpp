@@ -258,7 +258,10 @@ void ReaderController::setAiInput(const QString &key,const QVariant &value) {
         input.insert(QStringLiteral("question"),input.value(view==QStringLiteral("chat")?QStringLiteral("chatQuestion"):QStringLiteral("selectionQuestion")));
         m_aiState.insert(QStringLiteral("input"),input);emit aiStateChanged();return;
     }
-    if(key!=QStringLiteral("action") && key!=QStringLiteral("question") && key!=QStringLiteral("language") && key!=QStringLiteral("inplace"))return;
+    if(key==QStringLiteral("summaryDetail")) {
+        const auto detail=value.toString();
+        if(detail!=QStringLiteral("Brief") && detail!=QStringLiteral("Standard") && detail!=QStringLiteral("Detailed"))return;
+    } else if(key!=QStringLiteral("action") && key!=QStringLiteral("question") && key!=QStringLiteral("language") && key!=QStringLiteral("inplace"))return;
     if(input.value(key)==value && !(key==QStringLiteral("action") && !m_summaryUnitContext.isEmpty()))return;
     if(key==QStringLiteral("action")) {
         bool valid=false;const auto action=value.toInt(&valid);
@@ -309,7 +312,7 @@ void ReaderController::clearAiChat() {
     }
     m_aiState.insert(QStringLiteral("statusView"),QStringLiteral("chat"));m_aiState.insert(QStringLiteral("status"),tr("Conversation cleared locally."));emit aiStateChanged();
 }
-void ReaderController::prepareAi(const QVariantMap &request,const QVariantMap &unit) {
+void ReaderController::prepareAi(const QVariantMap &request,const QVariantMap &unit,const QString &summaryDetail) {
     if(!m_document || m_aiState.value(QStringLiteral("running")).toBool())return;
     const auto document=m_document;const auto generation=m_generation;const auto epoch=++m_aiPreviewEpoch;
     QPointer<ReaderController> alive(this);
@@ -345,6 +348,7 @@ void ReaderController::prepareAi(const QVariantMap &request,const QVariantMap &u
     m_aiState.remove(QStringLiteral("plan"));m_aiState.insert(QStringLiteral("status"),tr("Preparing request locally…"));
     m_aiPlanGeneration=m_generation;emit aiStateChanged();if(!current())return;
     QVariantMap preview{{QStringLiteral("request"),input}};
+    if(!summaryDetail.isEmpty())preview.insert(QStringLiteral("summary_detail"),summaryDetail);
     if(input.value(QStringLiteral("action")).toString()==QStringLiteral("RegionQuestion") && m_aiRegion.value(QStringLiteral("persisted")).toBool())preview.insert(QStringLiteral("region_history_id"),m_aiRegion.value(QStringLiteral("history_id")));
     if(!unit.isEmpty())preview.insert(QStringLiteral("unit"),unit);
     const auto id=submit(unit.isEmpty()?QStringLiteral("ai_preview"):QStringLiteral("ai_summary_prepare"),preview);

@@ -2852,6 +2852,50 @@ private slots:
         QVERIFY(reader->aiState().value("plan").toMap().isEmpty());
     }
 
+    void selectedSummaryFreezesFilteredTextAndRequiresExplicitSend() {
+        QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
+        MockChatServer server;QVERIFY(server.listen());
+        server.responses.append({{MockChatServer::delta({{"content","Synthetic selected summary"}}),
+                                  QByteArray("data: [DONE]\n\n")},0,200});
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);
+        view.workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/two-column-line-numbers.pdf"));
+        auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()>0);QTRY_COMPARE(reader->pendingCommands(),0);
+        reader->requestText(0);QTRY_VERIFY(reader->textPages().contains("0"));
+        const auto page=reader->textPages().value("0").toMap();
+        const auto excluded=page.value("selection_excluded_indices").toList();QVERIFY(!excluded.isEmpty());
+        const auto end=page.value("chars").toList().size()-1;QVERIFY(end>excluded.first().toInt());
+        const auto text=reader->selectionText(0,0,int(end));QVERIFY(text.value("ready").toBool());
+        const auto exact=text.value("text").toString();QVERIFY(!exact.trimmed().isEmpty());
+
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","fixture"}});
+        QVERIFY(QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,true)));
+        reader->setAiInput("action",5);reader->setAiInput("summaryDetail","Brief");
+        QVERIFY(window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",end}}));
+        auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));
+        // Moving the canvas selection while planning must not substitute a different passage.
+        QVERIFY(window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",0}}));
+        QTRY_COMPARE(reader->pendingCommands(),0);
+        const auto plan=reader->aiState().value("plan").toMap();QVERIFY2(!plan.isEmpty(),qPrintable(reader->aiState().value("status").toString()));
+        QCOMPARE(plan.value("source_pages").toList(),QVariantList{1});
+        const auto sources=plan.value("sources").toList();QCOMPARE(sources.size(),1);
+        QCOMPARE(sources.first().toMap().value("snippet").toString(),exact);
+        const auto parts=plan.value("parts").toList();QCOMPARE(parts.size(),1);
+        const auto part=parts.first().toMap();QVERIFY(part.value("user_prompt").toString().contains("Be brief"));
+        QVERIFY(part.value("user_prompt").toString().contains(exact));
+        const auto wire=part.value("wire_body").toString().toUtf8();QVERIFY(!wire.isEmpty());
+        QTRY_VERIFY(visualItem(window->contentItem(),"aiSelectedSummarySource"));
+        QCOMPARE(visualItem(window->contentItem(),"aiSelectedSummarySource")->property("text").toString(),exact);
+        QCOMPARE(server.requests.size(),0);
+
+        QVERIFY(reader->startAi("local",plan));QTRY_COMPARE(server.requests.size(),1);
+        QTRY_VERIFY(!reader->aiState().value("running").toBool());
+        const auto request=server.requests.first();QCOMPARE(request.mid(request.indexOf("\r\n\r\n")+4),wire);
+        QVERIFY(reader->aiState().value("output").toString().contains("Synthetic selected summary"));
+        reader->setAiInput("summaryDetail","Detailed");QVERIFY(!reader->startAi("local",plan));
+        QCOMPARE(server.requests.size(),1);
+    }
+
 
 
     void commandCompletionAllowsDestructionFromItsNotifications_data() {
