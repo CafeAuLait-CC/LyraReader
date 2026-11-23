@@ -39,6 +39,7 @@
 #include <QBuffer>
 #include <QAccessible>
 #include <QFontDatabase>
+#include <QFontMetricsF>
 #include <QDir>
 #include <QDirIterator>
 #include <QDesktopServices>
@@ -440,6 +441,38 @@ private slots:
         QCOMPARE(settings.value(selected).toString(), QString("synthetic-two"));
         QVERIFY(!settings.value(selection).toBool());
         QVERIFY(settings.value(useForChat).toBool());
+    }
+    void chatGptSettingsLabelsFitTheSmallestRestorableWindow_data() {
+        QTest::addColumn<QString>("appearance");
+        QTest::newRow("light") << QStringLiteral("light");
+        QTest::newRow("dark") << QStringLiteral("dark");
+    }
+    void chatGptSettingsLabelsFitTheSmallestRestorableWindow() {
+        QFETCH(QString, appearance);
+        NativeCorpus::Viewer view;
+        QVERIFY(view.window);
+        const QString key = "auxiliarySettingsGeometry";
+        const auto previous = view.workspace.preference(key, {});
+        const auto restore = qScopeGuard([&] { view.workspace.setPreference(key, previous); });
+        view.workspace.setPreference(key, QVariantMap{{"width", 360}, {"height", 580}});
+        QVERIFY(view.window->setProperty("appearance", appearance));
+        QVERIFY(QMetaObject::invokeMethod(view.window, "showSettings"));
+        auto *settings = view.window->findChild<QQuickWindow *>("settingsWindow");
+        QVERIFY(settings);
+        QTRY_VERIFY(settings->isVisible());
+        QTRY_COMPARE(settings->width(), 360);
+        for (const auto *name : {"useChatGptForSelection", "useChatGptForLayeredSummaries", "useChatGptForWholeDocument"}) {
+            auto *checkBox = settings->findChild<QQuickItem *>(name);
+            QVERIFY(checkBox);
+            const auto label = [&] { return checkBox->property("contentItem").value<QQuickItem *>(); };
+            QTRY_VERIFY(label() && label()->width() > 0);
+            const QFontMetricsF metrics(checkBox->property("font").value<QFont>());
+            const auto text = checkBox->property("text").toString();
+            QTRY_VERIFY2_WITH_TIMEOUT(metrics.horizontalAdvance(text) <= label()->width() + 1,
+                    qPrintable(QString("%1 takes %2 pixels in %3").arg(text)
+                               .arg(metrics.horizontalAdvance(text)).arg(label()->width())), 1500);
+        }
+        QVERIFY(settings->close());
     }
     void chatGptPreviewCannotFallBackToANonChatGptConnection() {
         QTemporaryDir scratch;

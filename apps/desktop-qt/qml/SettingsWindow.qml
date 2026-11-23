@@ -92,11 +92,12 @@ ApplicationWindow {
         anchors.fill:parent
         anchors.margins:16
         ScrollView {
+            id: settingsScroll
             Layout.fillWidth:true
             Layout.fillHeight:true
             contentWidth: availableWidth
             ColumnLayout {
-                width: parent.width
+                width: settingsScroll.availableWidth
                 spacing: 12
                 Label {
                     textFormat: Text.PlainText
@@ -291,7 +292,8 @@ ApplicationWindow {
                     }
                     CheckBox {
                         Layout.fillWidth: true
-                        text: qsTr("Use ChatGPT plan for document chat")
+                        text: qsTr("Document chat")
+                        Accessible.name: qsTr("Use ChatGPT plan for document chat")
                         checked: !!chatGptSettings.accounts && chatGptSettings.accounts.useForChat
                         enabled: !!chatGptSettings.accounts && !chatGptSettings.accounts.busy &&
                             (checked || (chatGptSettings.accounts.connected && !!chatGptSettings.accounts.model))
@@ -300,7 +302,8 @@ ApplicationWindow {
                     CheckBox {
                         objectName: "useChatGptForSelection"
                         Layout.fillWidth: true
-                        text: qsTr("Use ChatGPT plan for selection summary and translation")
+                        text: qsTr("Selection summary and translation")
+                        Accessible.name: qsTr("Use ChatGPT plan for selection summary and translation")
                         checked: !!chatGptSettings.accounts && chatGptSettings.accounts.useForSelection
                         enabled: !!chatGptSettings.accounts && !chatGptSettings.accounts.busy &&
                             (checked || (chatGptSettings.accounts.connected && !!chatGptSettings.accounts.model))
@@ -309,7 +312,8 @@ ApplicationWindow {
                     CheckBox {
                         objectName: "useChatGptForLayeredSummaries"
                         Layout.fillWidth: true
-                        text: qsTr("Use ChatGPT plan for layered summaries")
+                        text: qsTr("Layered summaries")
+                        Accessible.name: qsTr("Use ChatGPT plan for layered summaries")
                         checked: !!chatGptSettings.accounts && chatGptSettings.accounts.useForLayeredSummaries
                         enabled: !!chatGptSettings.accounts && !chatGptSettings.accounts.busy &&
                             (checked || (chatGptSettings.accounts.connected && !!chatGptSettings.accounts.model))
@@ -318,7 +322,8 @@ ApplicationWindow {
                     CheckBox {
                         objectName: "useChatGptForWholeDocument"
                         Layout.fillWidth: true
-                        text: qsTr("Use ChatGPT plan for whole-document summary and translation")
+                        text: qsTr("Whole-document summary and translation")
+                        Accessible.name: qsTr("Use ChatGPT plan for whole-document summary and translation")
                         checked: !!chatGptSettings.accounts && chatGptSettings.accounts.useForWholeDocument
                         enabled: !!chatGptSettings.accounts && !chatGptSettings.accounts.busy &&
                             (checked || (chatGptSettings.accounts.connected && !!chatGptSettings.accounts.model))
