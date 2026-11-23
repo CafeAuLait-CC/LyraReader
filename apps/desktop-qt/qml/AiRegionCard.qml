@@ -12,7 +12,11 @@ Item {
     property var owner:null
     readonly property var attachment:owner ? owner.aiRegion : ({})
     readonly property var state:owner ? owner.aiState : ({})
+    readonly property var chatGptAccounts:app.session ? app.session.chatGptAccounts : null
+    readonly property bool chatGptAvailable:!!chatGptAccounts && chatGptAccounts.connected && !!chatGptAccounts.model
     readonly property bool running:!!state.running
+    readonly property bool canPrepare:!!attachment.image_png && !!(attachment.question || "").trim()
+        && !running && !!owner && owner.pendingCommands===0
     readonly property bool notePreview:state.previewView==="region_note"
     readonly property bool noteRunning:running && state.responseView==="region_note"
     readonly property var candidate:state.regionNoteCandidate && state.regionNoteCandidate.id===attachment.history_id
@@ -220,6 +224,11 @@ Item {
     Keys.onShortcutOverride:function(event){if(event.key===Qt.Key_Escape)event.accepted=true;}
     Keys.onEscapePressed:function(event){closeAnimated();event.accepted=true;}
     function prepare(){if(owner===app.currentReader)owner.prepareAiRegion(app.aiSettings);}
+    function prepareWithChatGpt() {
+        if (owner!==app.currentReader || !chatGptAvailable || chatGptAccounts.busy) return;
+        owner.prepareAiRegion({baseUrl:"https://api.openai.com/v1", model:chatGptAccounts.model,
+            imageInput:true, chatgptAccount:chatGptAccounts.accountId});
+    }
     function follow(link,plan) {
         if(owner!==app.currentReader || plan.generation!==owner.documentGeneration)return;
         const match=/^p\.(\d+)$/.exec(link);
@@ -260,8 +269,11 @@ Item {
                     Layout.fillWidth:true;Layout.preferredHeight:Math.min(180,width*(card.attachment.image_height_px || 1)/(card.attachment.image_width_px || 1))
                     PdfCrop {
                         objectName:"aiRegionImage"
-                        anchors.centerIn:parent
-                        width:Math.min(parent.width,parent.height*(card.attachment.image_width_px || 1)/(card.attachment.image_height_px || 1))
+                        anchors.horizontalCenter:parent.horizontalCenter
+                        anchors.top:parent.top
+                        // Fit the painted crop without feeding the viewport size back into paper height.
+                        readonly property real heightBudget:Math.min(parent.height,Math.max(32,resultScroll.availableHeight-24))
+                        width:Math.min(parent.width,heightBudget*(card.attachment.image_width_px || 1)/(card.attachment.image_height_px || 1))
                         height:width*(card.attachment.image_height_px || 1)/(card.attachment.image_width_px || 1)
                         source:card.owner ? card.owner.aiRegionImage : ""
                         // Decode the initial capture once, then defer budget-driven
@@ -283,7 +295,15 @@ Item {
                 TextArea {objectName:"aiRegionText";visible:showText.visible && showText.checked;text:card.attachment.text || "";readOnly:true;selectByMouse:true;wrapMode:TextEdit.Wrap;textFormat:TextEdit.PlainText;Layout.fillWidth:true}
                 Label {
                     visible:!!card.attachment.image_png;Layout.fillWidth:true;wrapMode:Text.Wrap
-                    text:card.app.aiSettings.imageInput ? qsTr("Image input is enabled. The captured PNG above will be included.") : qsTr("Text only. To send the captured PNG, enable region images for this model in Settings.")
+                    text: {
+                        if (card.plan && card.plan.chatgpt_account)
+                            return qsTr("The ChatGPT plan preview includes the captured PNG.");
+                        if (card.app.aiSettings.imageInput)
+                            return qsTr("Image input is enabled. The captured PNG above will be included.");
+                        if (card.chatGptAvailable)
+                            return qsTr("The API-key preview is text only. The ChatGPT plan preview includes the PNG.");
+                        return qsTr("Text only. To send the captured PNG, enable region images for this model in Settings.");
+                    }
                     color:card.app.colors.textSecondary;font.pixelSize:11
                 }
                 AiResult {app:card.app;viewport:resultScroll.contentItem;value:card.result;answerName:"aiRegionAnswer";Layout.fillWidth:true;onCitation:function(link,plan){card.follow(link,plan);}}
@@ -370,12 +390,21 @@ Item {
         }
         Label {
             visible:card.previewReady;Layout.fillWidth:true;wrapMode:Text.Wrap
-            text:card.plan ? qsTr("Destination: %1 · %2 request(s). Nothing is sent before Send.").arg(card.plan.host).arg(card.plan.parts.length) : ""
+            text:card.plan ? (card.plan.chatgpt_account
+                ? qsTr("ChatGPT plan: %1 (%2)").arg(card.plan.model).arg(card.plan.host)
+                : qsTr("Destination: %1").arg(card.plan.host)) + qsTr(" · %1 request(s). Nothing is sent before Send.").arg(card.plan.parts.length) : ""
             color:card.app.colors.infoFg;font.pixelSize:11
+        }
+        Button {
+            objectName:"prepareAiRegionWithChatGpt"
+            text:qsTr("Preview with ChatGPT plan")
+            visible:card.chatGptAvailable
+            enabled:card.canPrepare && !!card.chatGptAccounts && !card.chatGptAccounts.busy
+            onClicked:card.prepareWithChatGpt()
         }
         RowLayout {
             Layout.fillWidth:true
-            Button {objectName:"prepareAiRegion";text:qsTr("Preview Question");enabled:!!card.attachment.image_png && !!(card.attachment.question || "").trim() && !card.running && card.owner && card.owner.pendingCommands===0;onClicked:card.prepare()}
+            Button {objectName:"prepareAiRegion";text:qsTr("Preview Question");enabled:card.canPrepare;onClicked:card.prepare()}
             Button {objectName:"inspectAiRegion";text:qsTr("Inspect payload");enabled:card.previewReady;onClicked:payload.open()}
             Button {
                 objectName:"sendAiRegion"

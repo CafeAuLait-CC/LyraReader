@@ -1017,6 +1017,14 @@ impl DesktopDocument {
                             reading == Some("translation")
                                 && r["reading"]["saved_translation"].is_null()
                         }
+                        AiActionRecord::RegionQuestion => {
+                            r.get("reading").is_none()
+                                && request.region.as_ref().is_some_and(|region| {
+                                    region.send_image
+                                        && !region.include_document_context
+                                        && region.image_png.is_some()
+                                })
+                        }
                         _ => false,
                     };
                     if !eligible {
@@ -1258,6 +1266,9 @@ impl DesktopDocument {
                 if account.is_some() {
                     let eligible = match (plan.action, r["plan"]["kind"].as_str()) {
                         (AiActionRecord::DocumentChat, None) => true,
+                        (AiActionRecord::RegionQuestion, None) => {
+                            plan.parts.len() == 1 && plan.parts[0].image.is_some()
+                        }
                         (AiActionRecord::SummarizeSelection, Some("reading_summary_selection"))
                         | (AiActionRecord::TranslateSelection, Some("reading_translation")) => {
                             r["plan"]["reading_scope"]["selection"].is_object()

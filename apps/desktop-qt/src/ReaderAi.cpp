@@ -257,17 +257,20 @@ void ReaderController::setAiRegionQuestion(const QString &text) {
 }
 void ReaderController::prepareAiRegion(const QVariantMap &settings,bool knowledgeNote) {
     if(!m_aiRegion.contains(QStringLiteral("image_png")) || m_aiRegion.value(QStringLiteral("loading")).toBool() || m_pendingCommands || m_aiState.value(QStringLiteral("running")).toBool())return;
+    const QString chatgptAccount=knowledgeNote?QString{}:settings.value(QStringLiteral("chatgptAccount")).toString();
     if(regionNeedsSave()) {
         if(knowledgeNote)return;
         invalidateAiPlan();m_regionContinuationPending=true;m_regionContinuationSettings=settings;
         m_regionContinuationQuestion=m_aiRegion.value(QStringLiteral("question")).toString();m_regionContinuationEpoch=m_aiRegionEpoch;
+        if(!chatgptAccount.isEmpty())m_aiState.insert(QStringLiteral("previewChatGptAccount"),chatgptAccount);
+        m_aiState.insert(QStringLiteral("statusView"),QStringLiteral("region"));
         m_aiState.insert(QStringLiteral("status"),tr("Saving this conversation before preparing the question…"));emit aiStateChanged();
         if(!saveAiRegionNote()){m_regionContinuationPending=false;m_regionContinuationSettings.clear();}
         return;
     }
     QVariantMap region;
     for(const auto *key:{"page","x_pt","y_pt","width_pt","height_pt","text","image_png","image_width_px","image_height_px"})region.insert(QLatin1String(key),m_aiRegion.value(QLatin1String(key)));
-    region.insert(QStringLiteral("send_image"),settings.value(QStringLiteral("imageInput"),false));
+    region.insert(QStringLiteral("send_image"),!chatgptAccount.isEmpty() || settings.value(QStringLiteral("imageInput"),false).toBool());
     region.insert(QStringLiteral("include_document_context"),false);
     QVariantMap request{{QStringLiteral("action"),QStringLiteral("RegionQuestion")},{QStringLiteral("current_page"),region.value(QStringLiteral("page"))},
         {QStringLiteral("selection"),QVariant{}},{QStringLiteral("question"),m_aiRegion.value(QStringLiteral("question"))},
@@ -276,7 +279,11 @@ void ReaderController::prepareAiRegion(const QVariantMap &settings,bool knowledg
         {QStringLiteral("base_url"),settings.value(QStringLiteral("baseUrl"),QStringLiteral("http://localhost:11434/v1"))},{QStringLiteral("model"),settings.value(QStringLiteral("model"),QString{})},
         {QStringLiteral("temperature"),QVariant{}},{QStringLiteral("max_tokens"),QVariant{}},
         {QStringLiteral("reasoning_mode"),settings.value(QStringLiteral("reasoningMode"),QStringLiteral("default"))},{QStringLiteral("reasoning_encoding"),settings.value(QStringLiteral("reasoningEncoding"),QStringLiteral("none"))}};
-    if(!knowledgeNote){prepareAi(request);return;}
+    if(!knowledgeNote) {
+        if(!chatgptAccount.isEmpty())request.insert(QStringLiteral("chatgpt_account"),chatgptAccount);
+        prepareAi(request);
+        return;
+    }
     const auto revision=m_regionHistory.value(QStringLiteral("revision")).toString();
     if(!m_aiRegion.value(QStringLiteral("persisted")).toBool() || revision.isEmpty()
         || !m_regionNoteDraft.isEmpty() || !m_regionSaveError.isEmpty())return;

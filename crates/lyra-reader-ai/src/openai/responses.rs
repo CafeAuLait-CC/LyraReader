@@ -86,7 +86,8 @@ fn run_with_transport(
         let response = transport
             .execute(&spec, cancel)
             .map_err(|error| redact_error(error, access_token))?;
-        read_stream(response, cancel, emit).map_err(|error| redact_error(error, access_token))?;
+        read_stream(response, part.image.is_some(), cancel, emit)
+            .map_err(|error| redact_error(error, access_token))?;
     }
     cancel.check()?;
     emit(RunEvent::Done);
@@ -95,6 +96,7 @@ fn run_with_transport(
 
 fn read_stream(
     mut response: Box<dyn ResponseStream>,
+    carrying_image: bool,
     cancel: &CancellationToken,
     emit: &mut dyn FnMut(RunEvent),
 ) -> Result<(), AiError> {
@@ -102,6 +104,16 @@ fn read_stream(
     match status {
         401 => return Err(AiError::Unauthorized),
         429 => return Err(AiError::RateLimited),
+        403 if carrying_image => {
+            return Err(AiError::HttpStatus(
+                "ChatGPT plan usage did not authorize the region image (HTTP 403). Check the plan and LyraReader’s permission in ChatGPT Settings.".into(),
+            ));
+        }
+        400 | 413 | 415 | 422 if carrying_image => {
+            return Err(AiError::HttpStatus(format!(
+                "ChatGPT declined the region image (HTTP {status}). Choose a model that accepts images and preview the question again."
+            )));
+        }
         200..=299 => {}
         _ => {
             return Err(AiError::HttpStatus(format!(
@@ -135,7 +147,7 @@ fn read_stream(
                 break;
             };
             stats.data_frames = stats.data_frames.saturating_add(1);
-            if handle_event(&data, emit, &mut stats)? {
+            if handle_event(&data, carrying_image, emit, &mut stats)? {
                 emit(RunEvent::Diagnostics(stats));
                 return Ok(());
             }
@@ -152,6 +164,7 @@ fn read_stream(
 
 fn handle_event(
     data: &str,
+    carrying_image: bool,
     emit: &mut dyn FnMut(RunEvent),
     stats: &mut StreamDiagnostics,
 ) -> Result<bool, AiError> {
@@ -198,6 +211,9 @@ fn handle_event(
             let failure = match code {
                 Some("subscription_sharing_usage_limit_exceeded") => AiError::RateLimited,
                 Some("subscription_sharing_usage_unavailable") => AiError::Unauthorized,
+                _ if carrying_image && event_type != "response.incomplete" => AiError::Other(
+                    "ChatGPT could not complete the request with the region image. Check whether the model accepts images and preview again. The partial answer is kept.".into(),
+                ),
                 _ => AiError::Other(
                     "ChatGPT returned an incomplete answer. The partial answer is kept.".into(),
                 ),
@@ -215,18 +231,20 @@ mod tests {
 
     use super::*;
     use crate::chat::{
-        ChatSettings, ChatTransport, ReasoningEncoding, ReasoningMode, build_connection_test_plan,
+        ChatImage, ChatSettings, ChatTransport, ReasoningEncoding, ReasoningMode,
+        build_connection_test_plan,
     };
     use crate::openai::RequestSpec;
 
     struct Reply {
+        status: u16,
         bytes: Option<Vec<u8>>,
         headers: Vec<(String, String)>,
     }
 
     impl ResponseStream for Reply {
         fn status(&self) -> u16 {
-            200
+            self.status
         }
         fn reason(&self) -> &str {
             "OK"
@@ -240,6 +258,7 @@ mod tests {
     }
 
     struct Playback {
+        status: u16,
         answer: &'static str,
         requests: Mutex<Vec<(String, Vec<u8>)>>,
     }
@@ -247,6 +266,7 @@ mod tests {
     impl Playback {
         fn new(answer: &'static str) -> Self {
             Self {
+                status: 200,
                 answer,
                 requests: Mutex::new(Vec::new()),
             }
@@ -271,6 +291,7 @@ mod tests {
                 .unwrap()
                 .push((spec.url.clone(), spec.body.clone()));
             Ok(Box::new(Reply {
+                status: self.status,
                 bytes: Some(self.answer.as_bytes().to_vec()),
                 headers: vec![("content-type".into(), "text/event-stream".into())],
             }))
@@ -289,6 +310,36 @@ mod tests {
         .unwrap();
         plan.endpoint = CHATGPT_RESPONSES_ENDPOINT.into();
         plan.rendered(ChatTransport::Responses)
+    }
+
+    #[test]
+    fn a_declined_image_never_retries_with_text_only() {
+        let mut plan = review();
+        plan.parts[0].image = Some(ChatImage {
+            width_px: 1,
+            height_px: 1,
+            png: vec![0x89, b'P', b'N', b'G', 1, 2, 3, 4],
+        });
+        plan = plan.rendered(ChatTransport::Responses);
+        let wire = plan.parts[0].wire_body.as_deref().unwrap();
+        assert!(wire.contains("input_image"));
+        let mut mock = Playback::new("");
+        mock.status = 415;
+        let mut events = Vec::new();
+        let result = run_with_transport(
+            &plan,
+            "synthetic-access",
+            &mock,
+            &CancellationToken::new(),
+            &mut |event| events.push(event),
+        );
+        assert!(
+            matches!(result, Err(AiError::HttpStatus(message)) if message.contains("region image"))
+        );
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1.as_slice(), wire.as_bytes());
+        assert!(!events.contains(&RunEvent::Done));
     }
 
     #[test]

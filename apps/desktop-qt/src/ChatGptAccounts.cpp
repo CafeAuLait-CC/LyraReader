@@ -302,8 +302,9 @@ void ChatGptAccounts::signOut() {
 
 bool ChatGptAccounts::send(ReaderController *reader,const QVariantMap &plan) {
     const auto action=plan.value(QStringLiteral("action")).toString();
-    const bool allowed=action==QStringLiteral("DocumentChat") ? m_useForChat : m_useForSelection &&
-        (action==QStringLiteral("SummarizeSelection") || action==QStringLiteral("TranslateSelection"));
+    const bool allowed=(action==QStringLiteral("DocumentChat") && m_useForChat)
+        || (m_useForSelection && (action==QStringLiteral("SummarizeSelection") || action==QStringLiteral("TranslateSelection")))
+        || action==QStringLiteral("RegionQuestion"); // The region has its own explicit ChatGPT preview button.
     if(!reader || busy() || !allowed || !connected()
        || plan.value(QStringLiteral("chatgpt_account")).toString()!=m_selected
        || plan.value(QStringLiteral("model")).toString()!=model()

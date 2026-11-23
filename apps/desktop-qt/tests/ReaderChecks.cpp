@@ -16,6 +16,7 @@
 #include "PerformanceRecorder.h"
 #include "RenderTraceTestSupport.h"
 #include "NativeCorpusChecks.h"
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QCryptographicHash>
 #include <QSaveFile>
@@ -481,6 +482,72 @@ private slots:
         QTRY_COMPARE(reader->pendingCommands(), 0);
         QVERIFY(!reader->aiState().contains("plan"));
         QVERIFY(reader->aiState().value("status").toString().contains("does not use the ChatGPT plan"));
+    }
+    void chatGptRegionPreviewFreezesThePngAndRetiresAnOldAccount() {
+        QTemporaryDir scratch;
+        QVERIFY(scratch.isValid());
+        const auto path = scratch.filePath("synthetic-region.pdf");
+        QVERIFY(QFile::copy(root + "/tests/fixtures/text-page.pdf", path));
+        NativeCorpus::Viewer view;
+        QVERIFY(view.window);
+        auto *accounts = view.workspace.chatGptAccounts();
+        QVERIFY(!accounts->connected());
+        const auto *button = view.window->findChild<QQuickItem *>("prepareAiRegionWithChatGpt");
+        auto *card = view.window->findChild<QQuickItem *>("aiRegionCard");
+        QVERIFY(button && card);
+        view.workspace.openFile(QUrl::fromLocalFile(path));
+        auto *reader = view.workspace.activeReader();
+        QTRY_COMPARE(reader->pageCount(), 1);
+        QTRY_COMPARE(reader->pendingCommands(), 0);
+        QVERIFY(reader->captureAiRegion(0, {{"x", 60}, {"y", 55}, {"width", 420}, {"height", 180}}, 1));
+        QTRY_VERIFY_WITH_TIMEOUT(!reader->aiRegion().value("image_png").toString().isEmpty(), 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(!reader->hasUnsavedReadingNotes() && !reader->pendingCommands(), 10000);
+        QVERIFY(QMetaObject::invokeMethod(card, "open"));
+        QTRY_VERIFY(card->isVisible());
+        QVERIFY(!button->isVisible());
+        const auto png = reader->aiRegion().value("image_png").toString();
+        const QVariantMap settings{{"baseUrl", "http://127.0.0.1:1/v1"}, {"model", "fixture"},
+                                   {"chatgptAccount", "synthetic-registration-id"}, {"imageInput", false}};
+        const QString question = "Which text is in the synthetic image?";
+
+        reader->setAiRegionQuestion(question);
+        reader->prepareAiRegion(settings);
+        QVERIFY(reader->aiState().value("status").toString().contains("Saving this conversation"));
+        QCOMPARE(reader->aiState().value("previewChatGptAccount").toString(), QString("synthetic-registration-id"));
+        QVERIFY(QMetaObject::invokeMethod(accounts, "profileChanged"));
+        QTRY_VERIFY_WITH_TIMEOUT(!reader->hasUnsavedReadingNotes() && !reader->pendingCommands(), 10000);
+        QVERIFY(!reader->aiState().contains("plan"));
+        QCOMPARE(reader->aiRegion().value("question").toString(), question);
+
+        reader->prepareAiRegion(settings);
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(), 0, 10000);
+        const auto state = reader->aiState();
+        const auto plan = state.value("plan").toMap();
+        QVERIFY2(!plan.isEmpty(), qPrintable(state.value("status").toString()));
+        QCOMPARE(plan.value("action").toString(), QString("RegionQuestion"));
+        QCOMPARE(plan.value("endpoint").toString(), QString("https://api.openai.com/v1/responses"));
+        QCOMPARE(plan.value("source_pages").toList(), QVariantList{1});
+        const auto parts = plan.value("parts").toList();
+        QCOMPARE(parts.size(), 1);
+        const auto body = QJsonDocument::fromJson(parts.first().toMap().value("wire_body").toString().toUtf8()).object();
+        QVERIFY(body.value("store").isBool() && !body.value("store").toBool());
+        int imageCount = 0;
+        for (const auto &message : body.value("input").toArray()) {
+            for (const auto &content : message.toObject().value("content").toArray()) {
+                const auto entry = content.toObject();
+                if (entry.value("type").toString() == "input_image") {
+                    QCOMPARE(entry.value("image_url").toString(), QString("data:image/png;base64,") + png);
+                    ++imageCount;
+                }
+            }
+        }
+        QCOMPARE(imageCount, 1);
+
+        QVERIFY(QMetaObject::invokeMethod(view.window, "sendAi", Q_ARG(QVariant, QVariant::fromValue(reader)),
+                                         Q_ARG(QVariant, plan), Q_ARG(QVariant, QString()), Q_ARG(QVariant, QString())));
+        QCOMPARE(view.window->property("credentialReadId").toDouble(), -1.0);
+        QVERIFY(view.window->property("operationStatus").toString().contains("Check the ChatGPT connection"));
+        QVERIFY(!reader->aiState().value("running").toBool());
     }
     void objectDragKeepsTheColourBehindTransparentPixels() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("alpha-drag.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;window->setProperty("paperAppearance","original");view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(!reader->loading() && reader->pageCount()==1 && !reader->pendingCommands());QVERIFY(QMetaObject::invokeMethod(window,"setSecondaryRow",Q_ARG(QVariant,"edit"),Q_ARG(QVariant,false)));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(settleReaderViewport(window));const auto model=reader->data().value("content_objects").toMap();QVariantMap title;for(const auto &v:model.value("items").toList())if(v.toMap().value("text").toString().contains("LyraReader fixture")){title=v.toMap();break;}QVERIFY(!title.isEmpty());const auto b=title.value("bounds").toMap();const QRectF bounds(b.value("x").toDouble(),b.value("y").toDouble(),b.value("width").toDouble(),b.value("height").toDouble());auto *drag=window->findChild<ContentDragItem *>("contentDragPreview");auto *pointer=visualItem(window->contentItem(),"contentPointer0");QVERIFY(drag && pointer);const auto colour=[&]{const auto image=window->grabWindow();if(image.isNull())return QColor();const auto p=pointer->mapToScene(QPointF(371,261)*window->property("zoom").toDouble());return image.pixelColor(qRound(p.x()*image.width()/window->width()),qRound(p.y()*image.height()/window->height()));};QTRY_VERIFY(colour().red()>100 && colour().green()<150);const auto original=colour();drag->prepare(0,title.value("id").toString(),model.value("revision").toString(),bounds);const auto region=bounds.adjusted(-2,-2,2,2);drag->setOffset(QPointF(370-region.x(),260-region.y()));QTRY_COMPARE_WITH_TIMEOUT(drag->status(),1,15000);QTest::qWait(100);const auto painted=colour();qInfo()<<"Transparent drag sample"<<original<<painted;QVERIFY2(qAbs(painted.red()-original.red())<6 && qAbs(painted.green()-original.green())<6 && qAbs(painted.blue()-original.blue())<6,"Transparent margins must preserve the coloured page below the dragged object");drag->cancel();QVERIFY(!reader->hasUnsavedChanges());
