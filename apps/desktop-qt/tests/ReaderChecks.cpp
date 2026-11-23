@@ -6036,6 +6036,33 @@ private slots:
         };
         QTRY_VERIFY_WITH_TIMEOUT(texturesReady(focusedPage()),15000);
         Performance::Frames frames(window);
+        struct RasterMilestones {
+            qint64 firstReady=0;
+            qint64 lastReady=0;
+            int pageCount=0;
+            int tileCount=0;
+            int pressureCount=0;
+
+            void markReady() {
+                lastReady=Performance::now();
+                if(!firstReady)firstReady=lastReady;
+            }
+        };
+        QHash<int,RasterMilestones> rasterMilestones;
+        QObject observer;
+        connect(reader,&ReaderController::pageReady,&observer,[&](int page,double) {
+            auto &observed=rasterMilestones[page];
+            observed.markReady();
+            ++observed.pageCount;
+        });
+        connect(reader,&ReaderController::tileReady,&observer,[&](int page) {
+            auto &observed=rasterMilestones[page];
+            observed.markReady();
+            ++observed.tileCount;
+        });
+        connect(reader,&ReaderController::rasterPressure,&observer,[&](int page) {
+            ++rasterMilestones[page].pressureCount;
+        });
         QVariantList samples;
         QList<double> settleTimes, drainTimes, actualMoveIntervals;
         QSet<int> visited{focusedPage()};
@@ -6044,6 +6071,7 @@ private slots:
         const auto begin=Performance::now();
         const std::array<double,6> destinations{.38,.84,.38,.14,.84,.14};
         constexpr int trialCount=30;
+        constexpr int readyPollIntervalMs=5;
         for(int trial=0;trial<trialCount;++trial) {
             const double destination=destinations[trial%destinations.size()];
             const int previous=focusedPage();
@@ -6053,6 +6081,8 @@ private slots:
             const auto end=bar->mapToScene(QPointF(bar->width()/2,top+(bottom-top)*destination)).toPoint();
             const auto initialPosition=bar->property("position").toDouble();
             const auto startCancelled=RasterJobs::statistics().value("cancelled").toLongLong();
+            const auto planCountAtPress=reader->tilePlanBatches();
+            rasterMilestones.clear();
             QTest::mouseMove(window,start);
             QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,start);
             QVERIFY(bar->property("pressed").toBool());
@@ -6068,8 +6098,11 @@ private slots:
                 maximumPending=qMax(maximumPending,reader->pendingRasters());
                 sampledRss=qMax(sampledRss,Performance::memory("VmRSS"));
             }
+            const int pageBeforeRelease=focusedPage();
+            const bool readyBeforeRelease=texturesReady(pageBeforeRelease);
             const auto released=Performance::now();
             QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,end);
+            const auto releaseReturned=Performance::now();
             const auto queuedAtRelease=reader->pendingRasters();
             const int pageAtRelease=focusedPage();
             const bool immediateBackdrop=itemAtPage(pageAtRelease) && itemAtPage(pageAtRelease)->backdropVisible();
@@ -6078,31 +6111,55 @@ private slots:
             QTRY_VERIFY(focusedPage()!=previous);
             const auto selected=focusedPage();
             QVERIFY2(qAbs(selected/double(reader->pageCount()-1)-destination)<.12,"The thumb did not reach the requested part of the document.");
-            bool armed=false;
+            qint64 readyObserved=0;
             qint64 drained=0;
+            QEventLoop settlement;
             const auto poll=[&] {
                 if(focusedPage()!=selected || !texturesReady(selected))return;
-                if(!armed){armed=true;frames.arm();window->update();}
+                if(!readyObserved){readyObserved=Performance::now();frames.arm();window->update();}
                 if(!drained && !reader->pendingRasters())drained=Performance::now();
+                if(drained && frames.queued()>0)settlement.quit();
             };
             QTimer ready;
             ready.setTimerType(Qt::PreciseTimer);
-            ready.setInterval(5);
+            ready.setInterval(readyPollIntervalMs);
             connect(&ready,&QTimer::timeout,&ready,poll);
             poll();
-            ready.start();
-            QTRY_VERIFY_WITH_TIMEOUT(frames.queued()>0 && drained>0,15000);
-            ready.stop();
+            if(!drained || frames.queued()==0) {
+                // Let posted raster completions wake the dispatcher, as in the
+                // application. Test polling sleeps can pace a chain of tile jobs.
+                ready.start();
+                QTimer::singleShot(15000,&settlement,&QEventLoop::quit);
+                settlement.exec();
+                ready.stop();
+            }
+            QVERIFY2(frames.queued()>0 && drained>0,"Reader did not settle after the scroll thumb was released.");
             QCOMPARE(focusedPage(),selected);
             settleTimes.append((frames.queued()-released)/1000.0);
             drainTimes.append((drained-released)/1000.0);
             const auto intervals=frames.intervals(firstMove,released);
+            const auto raster=rasterMilestones.value(selected);
+            const auto relativeToRelease=[&](qint64 timestamp) -> QVariant {
+                if(!timestamp)return QVariant::fromValue(nullptr);
+                return (timestamp-released)/1000.0;
+            };
+            const QVariantMap milestones{
+                {"readyBeforeRelease",pageBeforeRelease==selected && readyBeforeRelease},
+                {"releaseDispatchMs",(releaseReturned-released)/1000.0},
+                {"targetFirstRasterReadyMs",relativeToRelease(raster.firstReady)},
+                {"targetLastRasterReadyMs",relativeToRelease(raster.lastReady)},
+                {"targetPageResults",raster.pageCount},{"targetTileResults",raster.tileCount},
+                {"targetPressureSignals",raster.pressureCount},
+                {"releaseToReadyPollMs",relativeToRelease(readyObserved)},
+                {"readyPollToFrameQueueMs",(frames.queued()-readyObserved)/1000.0},
+                {"readerTilePlanBatches",reader->tilePlanBatches()-planCountAtPress},
+            };
             samples.append(QVariantMap{{"fromPage",previous},{"pageAtRelease",pageAtRelease},{"landedPage",selected},
                 {"revisited",visited.contains(selected)},{"backdropVisibleAtRelease",immediateBackdrop},
                 {"draggedThumbFraction",destination},{"rasterRequestsAtRelease",queuedAtRelease},
                 {"cancelledRastersDuringTrial",RasterJobs::statistics().value("cancelled").toLongLong()-startCancelled},
                 {"releaseToRefinedFrameQueueMs",settleTimes.last()},{"releaseToDrainObservedMs",drainTimes.last()},
-                {"inputFrameQueueIntervalsMs",Performance::distribution(intervals)}});
+                {"inputFrameQueueIntervalsMs",Performance::distribution(intervals)},{"readiness",milestones}});
             visited.insert(selected);
         }
         QCOMPARE(samples.size(),trialCount);
@@ -6115,12 +6172,13 @@ private slots:
             {"viewportWidth",viewport->width()},{"viewportHeight",viewport->height()},{"devicePixelRatio",window->effectiveDevicePixelRatio()},
             {"qt",qVersion()},{"architecture",QSysInfo::currentCpuArchitecture()},{"percentileMethod","lower order statistic"},
             {"pageIndicesStartAt",0},{"trialsRequested",trialCount},{"movesPerDrag",12},{"requestedMoveIntervalMs",16},{"actualMoveIntervalsMs",Performance::distribution(actualMoveIntervals)},
+            {"settlementDispatch","qt-event-loop"},{"readyPollIntervalMs",readyPollIntervalMs},
             {"trials",samples},{"pendingRasterPeakSampled",maximumPending},
             {"releaseToRefinedFrameQueueMs",Performance::distribution(settleTimes)},
             {"releaseToDrainObservedMs",Performance::distribution(drainTimes)},{"elapsedMs",(Performance::now()-begin)/1000.0},
             {"rssPeakSampledDuringInputBytes",sampledRss},{"rssAtEndBytes",Performance::memory("VmRSS")},
             {"rasterJobs",RasterJobs::statistics()},{"renderResourcePayloads",RenderBudget::statistics()},
-            {"measurementNotes","Time starts before dispatching the injected release. Refined frame latency includes 5 ms readiness polling and a queued Qt frame. Drain is the first observed empty Reader queue with the target textures ready. Frame callbacks are not physical presentation timestamps. A backdrop reported here is an observation at release, not a cache miss/hit count."}};
+            {"measurementNotes","Time starts before dispatching the injected release. A Qt event loop dispatches completions while a 5 ms timer observes texture readiness and the next queued frame. The first and last target raster results are GUI signal times during this trial, may precede release, and are null when no result arrived. Drain is the first observed empty Reader queue with the target textures ready. Frame callbacks are not physical presentation timestamps. A backdrop reported here is an observation at release, not a cache miss/hit count."}};
         const auto output=qEnvironmentVariable("LYRA_READER_SCROLL_DRAG_OUTPUT");
         const auto body=QJsonDocument::fromVariant(result).toJson(QJsonDocument::Indented);
         if(!output.isEmpty()){
