@@ -55,6 +55,7 @@ ChatGptAccounts::ChatGptAccounts(QObject *parent):QObject(parent) {
     m_useForChat=settings.value(QStringLiteral("useForChat"),false).toBool();
     m_useForSelection=settings.value(QStringLiteral("useForSelection"),false).toBool();
     m_useForLayeredSummaries=settings.value(QStringLiteral("useForLayeredSummaries"),false).toBool();
+    m_useForWholeDocument=settings.value(QStringLiteral("useForWholeDocument"),false).toBool();
     m_pollTimer.setInterval(75);
     connect(&m_pollTimer,&QTimer::timeout,this,&ChatGptAccounts::poll);
     connect(&m_vault,&CredentialStore::finished,this,
@@ -99,6 +100,7 @@ bool ChatGptAccounts::savePreferences() {
     settings.setValue(QStringLiteral("useForChat"),m_useForChat);
     settings.setValue(QStringLiteral("useForSelection"),m_useForSelection);
     settings.setValue(QStringLiteral("useForLayeredSummaries"),m_useForLayeredSummaries);
+    settings.setValue(QStringLiteral("useForWholeDocument"),m_useForWholeDocument);
     settings.sync();
     return settings.status()==QSettings::NoError;
 }
@@ -136,6 +138,10 @@ void ChatGptAccounts::setUseForSelection(bool value) {
 }
 void ChatGptAccounts::setUseForLayeredSummaries(bool value) {
     setUsagePreference(m_useForLayeredSummaries,value);
+}
+
+void ChatGptAccounts::setUseForWholeDocument(bool value) {
+    setUsagePreference(m_useForWholeDocument,value);
 }
 
 void ChatGptAccounts::setUsagePreference(bool &current,bool value) {
@@ -307,11 +313,18 @@ void ChatGptAccounts::signOut() {
 
 bool ChatGptAccounts::send(ReaderController *reader,const QVariantMap &plan,const QString &readingToken) {
     const auto action=plan.value(QStringLiteral("action")).toString();
+    const auto kind=plan.value(QStringLiteral("kind")).toString();
+    const auto scope=plan.value(QStringLiteral("reading_scope")).toMap();
+    const bool selected=!scope.value(QStringLiteral("selection")).toMap().isEmpty();
+    const bool selectionTask=selected && (kind==QStringLiteral("reading_summary_selection") || kind==QStringLiteral("reading_translation"));
+    const bool wholeTask=kind==QStringLiteral("reading_summary") || kind==QStringLiteral("summary_synthesis")
+        || (kind==QStringLiteral("reading_translation") && !selected);
     const bool layered=action==QStringLiteral("SummarizeAbstract") || action==QStringLiteral("SummarizeSection")
         || action==QStringLiteral("SummarizePageLine");
     const bool allowed=readingToken.isEmpty()
         ? (action==QStringLiteral("DocumentChat") && m_useForChat)
-        || (m_useForSelection && (action==QStringLiteral("SummarizeSelection") || action==QStringLiteral("TranslateSelection")))
+        || (m_useForSelection && (selectionTask || kind==QStringLiteral("inplace_translation")))
+        || (wholeTask && m_useForWholeDocument)
         || action==QStringLiteral("RegionQuestion") || (layered && m_useForLayeredSummaries)
         : action==QStringLiteral("SummarizeDocument"); // Reading has its own explicit ChatGPT preview.
     if(!reader || busy() || !allowed || !connected()
@@ -383,8 +396,7 @@ void ChatGptAccounts::finishChat(const QString &token,const QString &error) {
     m_pendingReader.clear();
     const auto plan=std::exchange(m_pendingPlan,{});
     const auto readingToken=std::exchange(m_pendingReadingToken,{});
-    if(error.isEmpty() && reader && (readingToken.isEmpty()
-        ? reader->startAi(token,plan) : reader->startDocumentReading(token,plan,readingToken))) {
+    if(error.isEmpty() && reader && reader->startChatGptRequest(m_selected,token,plan,readingToken)) {
         setStatus({});
         return;
     }

@@ -62,6 +62,7 @@ enum ReadingOutput {
         request: Box<AiMergePlanRequestRecord>,
         style: ReadingSummaryStyle,
         capture: Arc<SummaryCapture>,
+        account: Option<String>,
     },
     Summary {
         capture: Arc<SummaryCapture>,
@@ -222,6 +223,7 @@ impl ReadingReplies {
                 mut request,
                 style,
                 capture,
+                account,
             } => {
                 if !self.done {
                     return None;
@@ -233,17 +235,11 @@ impl ReadingReplies {
                 for (part, reply) in request.parts.iter_mut().zip(self.replies) {
                     part.summary = reply;
                 }
-                let preview = value(
-                    build_ai_merge_plan(*request)
-                        .and_then(|plan| {
-                            style_ai_reading_plan(
-                                plan,
-                                "summary".into(),
-                                style.detail,
-                                style.language,
-                            )
-                        })
-                        .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions)),
+                let preview = render_reviewed_plan(
+                    build_ai_merge_plan(*request).and_then(|plan| {
+                        style_ai_reading_plan(plan, "summary".into(), style.detail, style.language)
+                    }),
+                    account.as_deref(),
                 );
                 let mut plan = match preview {
                     Ok(plan) => plan,
@@ -257,7 +253,7 @@ impl ReadingReplies {
                     .ok_or(
                         "The summary synthesis preview did not contain a request body.".to_owned(),
                     )
-                    .and_then(|body| PendingSummary::new(capture, body));
+                    .and_then(|body| PendingSummary::new(capture, body, account));
                 plan["kind"] = json!("summary_synthesis");
                 let archive = match pending {
                     Ok(pending) => {
@@ -278,6 +274,23 @@ impl ReadingReplies {
 
 fn value<T: Serialize>(result: Result<T, LyraReaderFfiError>) -> Result<Value, String> {
     serde_json::to_value(result.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
+fn render_reviewed_plan(
+    result: Result<AiPlanRecord, LyraReaderFfiError>,
+    account: Option<&str>,
+) -> Result<Value, String> {
+    let mut plan = value(result.and_then(|plan| {
+        if account.is_some() {
+            render_chatgpt_plan(plan)
+        } else {
+            render_ai_plan(plan, AiWireTransport::ChatCompletions)
+        }
+    }))?;
+    if let Some(account) = account {
+        plan["chatgpt_account"] = json!(account);
+    }
+    Ok(plan)
 }
 pub(super) fn chatgpt_account(request: &Value) -> Result<Option<&str>, String> {
     request
@@ -1014,6 +1027,10 @@ impl DesktopDocument {
                         AiActionRecord::DocumentChat => r.get("reading").is_none(),
                         AiActionRecord::SummarizeSelection => reading == Some("summary"),
                         AiActionRecord::TranslateSelection => reading == Some("translation"),
+                        AiActionRecord::SummarizeDocument => {
+                            matches!(reading, Some("summary" | "translation"))
+                                && request.selection.is_none()
+                        }
                         AiActionRecord::RegionQuestion => {
                             r.get("reading").is_none()
                                 && request.region.as_ref().is_some_and(|region| {
@@ -1029,19 +1046,6 @@ impl DesktopDocument {
                     }
                     request.base_url = "https://api.openai.com/v1".into();
                 }
-                let render_preview = |result: Result<AiPlanRecord, LyraReaderFfiError>| {
-                    let mut plan = value(result.and_then(|plan| {
-                        if account.is_some() {
-                            render_chatgpt_plan(plan)
-                        } else {
-                            render_ai_plan(plan, AiWireTransport::ChatCompletions)
-                        }
-                    }))?;
-                    if let Some(account) = account {
-                        plan["chatgpt_account"] = json!(account);
-                    }
-                    Ok(plan)
-                };
                 if r.get("reading").is_some() {
                     let options: AiReadingOptionsRecord = arg(&r, "reading")?;
                     if options.kind == "note" {
@@ -1066,10 +1070,15 @@ impl DesktopDocument {
                                 "A saved translation requires a translation preview.".into()
                             );
                         }
+                        let original_action = request.action;
                         self.replay_translation_source(&d, id, &mut request)?;
-                        if account.is_some() && request.action != AiActionRecord::TranslateSelection
-                        {
-                            return Err("ChatGPT retranslation requires a saved selection.".into());
+                        if account.is_some() && request.action != original_action {
+                            let message = if original_action == AiActionRecord::TranslateSelection {
+                                "ChatGPT retranslation requires a saved selection."
+                            } else {
+                                "This saved translation covers a selection. Preview it with that scope."
+                            };
+                            return Err(message.into());
                         }
                     }
                     let limit = lyra_reader_ai::chat::MAX_SELECTION_CHARS as u64;
@@ -1118,7 +1127,8 @@ impl DesktopDocument {
                         language: request.language.as_deref().unwrap_or("").to_owned(),
                         detail: options.detail.clone(),
                     });
-                    let mut plan = render_preview(d.prepare_ai_reading_task(request, options))?;
+                    let mut plan =
+                        render_reviewed_plan(d.prepare_ai_reading_task(request, options), account)?;
                     if let Some(scope) = scope {
                         plan["kind"] = json!(if translation {
                             "reading_translation"
@@ -1143,7 +1153,7 @@ impl DesktopDocument {
                     &d.document_identity().sha256,
                 )?;
                 self.enrich_reading(&mut request, &d.document_identity().sha256)?;
-                render_preview(d.prepare_ai_plan(request))
+                render_reviewed_plan(d.prepare_ai_plan(request), account)
             }
             "ai_translation_history" => self.translation_history(&d, arg(&r, "selection")?),
             "ai_translation_history_entry" => self.translation_history_entry(&d, &text(&r, "id")?),
@@ -1300,9 +1310,13 @@ impl DesktopDocument {
                         (AiActionRecord::RegionQuestion, None) => {
                             plan.parts.len() == 1 && plan.parts[0].image.is_some()
                         }
-                        (AiActionRecord::SummarizeSelection, Some("reading_summary_selection"))
-                        | (AiActionRecord::TranslateSelection, Some("reading_translation")) => {
+                        (AiActionRecord::SummarizeSelection, Some("reading_summary_selection")) => {
                             r["plan"]["reading_scope"]["selection"].is_object()
+                        }
+                        (AiActionRecord::TranslateSelection, Some("reading_translation"))
+                        | (AiActionRecord::SummarizeDocument, Some("reading_summary")) => true,
+                        (AiActionRecord::SummarizeDocument, Some("summary_synthesis")) => {
+                            r["plan"]["summary_capture"].as_str().is_some()
                         }
                         _ => false,
                     };
@@ -1339,6 +1353,7 @@ impl DesktopDocument {
                             request: Box::new(request),
                             style,
                             capture,
+                            account: account.map(str::to_owned),
                         })
                         }
                     }
@@ -1371,7 +1386,7 @@ impl DesktopDocument {
                                 .ok_or("The synthesis request body is missing. Review it again.")?;
                             let pending=self.pending_summary.lock().map_err(|_| "Summary source state is unavailable")?;
                             let capture=pending.as_ref()
-                                .filter(|pending|plan.parts.len()==1 && pending.matches(token,body,&d.document_identity().sha256))
+                                .filter(|pending|plan.parts.len()==1 && pending.matches(token,body,&d.document_identity().sha256,account))
                                 .ok_or("The document or synthesis request changed. Review a fresh summary.")?
                                 .capture();
                             Some(ReadingOutput::Summary { capture, model:plan.model.clone() })
@@ -5255,6 +5270,122 @@ mod tests {
             "base_url":"http://localhost:11434/v1","model":"synthetic-summary",
             "temperature":null,"max_tokens":null,"reasoning_mode":"default","reasoning_encoding":"none",
             "document_knowledge_text":"UNVERIFIED_PARTIAL_CONTEXT","document_knowledge_pages":[1]})
+    }
+
+    #[test]
+    fn chatgpt_whole_document_review_keeps_synthesis_bound_to_the_reviewed_account() {
+        let fixture = Fixture::new("multipage.pdf");
+        let doc = fixture.open();
+        let account = "whole-document-connection";
+        let mut request = summary_settings();
+        request["chatgpt_account"] = json!(account);
+        let summary = doc
+            .command(json!({"op":"ai_preview","request":request,
+            "reading":{"kind":"summary","detail":"Detailed","force":true}}))
+            .unwrap();
+        let translation = doc
+            .command(json!({"op":"ai_preview","request":request,
+            "reading":{"kind":"translation","detail":"Standard"}}))
+            .unwrap();
+        assert_eq!(summary["kind"], "reading_summary");
+        assert_eq!(translation["kind"], "reading_translation");
+        assert_eq!(translation["action"], "TranslateSelection");
+        assert!(translation["reading_scope"]["selection"].is_null());
+        for preview in [&summary, &translation] {
+            assert_eq!(preview["chatgpt_account"], account);
+            assert_eq!(
+                preview["endpoint"],
+                lyra_reader_ai::openai::CHATGPT_RESPONSES_ENDPOINT
+            );
+            assert_eq!(preview["source_pages"], json!([1, 2, 3]));
+            for part in preview["parts"].as_array().unwrap() {
+                let body = part["wire_body"].as_str().unwrap();
+                let wire: Value = serde_json::from_str(body).unwrap();
+                assert_eq!(wire["store"], false);
+                assert!(wire["input"].is_array());
+                assert!(!body.contains("UNVERIFIED_PARTIAL_CONTEXT"));
+            }
+        }
+
+        let first_stage: AiPlanRecord = serde_json::from_value(summary).unwrap();
+        let fingerprint = doc.engine.read().unwrap().document_identity().sha256;
+        let capture = Arc::new(
+            SummaryCapture::new(
+                &first_stage,
+                fingerprint,
+                String::new(),
+                "Detailed".into(),
+                None,
+            )
+            .unwrap(),
+        );
+        let style = ReadingSummaryStyle {
+            detail: "Detailed".into(),
+            language: String::new(),
+            reasoning_mode: "default".into(),
+            reasoning_encoding: "none".into(),
+        };
+        let merge = consolidation_request(
+            &first_stage,
+            style.reasoning_mode.clone(),
+            style.reasoning_encoding.clone(),
+        )
+        .unwrap();
+        let count = merge.parts.len();
+        let mut replies = ReadingReplies::new(
+            ReadingOutput::Synthesis {
+                request: Box::new(merge),
+                style,
+                capture,
+                account: Some(account.into()),
+            },
+            count,
+        );
+        replies.replies = vec!["Reviewed synthetic partial answer.".into(); count];
+        replies.done = true;
+        let mut result = json!({});
+        let Some(ReadingArchive::PendingSummary(pending)) = replies.publish(&mut result) else {
+            panic!("Missing synthesis preview: {result}");
+        };
+        let synthesis = &result["synthesis_plan"];
+        assert_eq!(synthesis["kind"], "summary_synthesis");
+        assert_eq!(synthesis["chatgpt_account"], account);
+        assert_eq!(
+            synthesis["endpoint"],
+            lyra_reader_ai::openai::CHATGPT_RESPONSES_ENDPOINT
+        );
+        assert_ne!(synthesis["summary_capture"], Value::Null);
+        let body = synthesis["parts"][0]["wire_body"].as_str().unwrap();
+        assert!(body.contains("Reviewed synthetic partial answer."));
+        assert!(body.contains("Consolidate the part summaries"));
+        assert!(!body.contains("UNSENT_QUESTION"));
+        assert_eq!(serde_json::from_str::<Value>(body).unwrap()["store"], false);
+        *doc.pending_summary.lock().unwrap() = Some(pending);
+
+        let mut wrong = synthesis.clone();
+        wrong["chatgpt_account"] = json!("another-account");
+        assert!(
+            doc.command(json!({"op":"ai_start","plan":wrong,
+            "chatgpt_account":"another-account"}))
+                .unwrap_err()
+                .contains("synthesis request changed")
+        );
+        let mut modified = synthesis.clone();
+        modified["parts"][0]["wire_body"] = json!(format!("{body} "));
+        assert!(
+            doc.command(json!({"op":"ai_start","plan":modified,
+            "chatgpt_account":account}))
+                .unwrap_err()
+                .contains("synthesis request changed")
+        );
+        let mut fallback = synthesis.clone();
+        fallback.as_object_mut().unwrap().remove("chatgpt_account");
+        assert!(
+            doc.command(json!({"op":"ai_start","plan":fallback}))
+                .unwrap_err()
+                .contains("synthesis request changed")
+        );
+        assert!(doc.ai.lock().unwrap().is_none());
     }
 
     #[test]

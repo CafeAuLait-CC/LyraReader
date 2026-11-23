@@ -1963,7 +1963,8 @@ ApplicationWindow {
                 const selection = (state.previewView === "summary" || state.previewView === "translation") && state.previewSelection;
                 const layered = state.previewView === "summary" && state.previewLayeredSummary;
                 if (state.previewChatGptAccount || (state.previewView === "chat" && accounts.useForChat)
-                        || (selection && accounts.useForSelection) || (layered && accounts.useForLayeredSummaries))
+                        || (selection && accounts.useForSelection) || (layered && accounts.useForLayeredSummaries)
+                        || (state.previewWholeDocument && accounts.useForWholeDocument))
                     reader.invalidateAiPlan();
                 const reading = reader.documentReading;
                 if (reading.chatgpt_account && ["preparing","preview","starting","reading"].includes(reading.phase))

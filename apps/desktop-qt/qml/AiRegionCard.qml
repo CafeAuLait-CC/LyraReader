@@ -331,7 +331,7 @@ Item {
                         objectName:"prepareAiRegionKnowledge"
                         text:qsTr("Preview knowledge note")
                         visible:!!card.attachment.completed_turn_count && !card.candidate
-                        enabled:!!card.owner && card.attachment.saved && !card.running && !card.owner.pendingCommands && !card.owner.hasUnsavedReadingNotes
+                        enabled:!!card.owner && !!card.attachment.saved && !card.running && !card.owner.pendingCommands && !card.owner.hasUnsavedReadingNotes
                         onClicked:card.owner.prepareAiRegion(card.app.aiSettings,true)
                     }
                     RowLayout {

@@ -34,6 +34,7 @@ bool ReaderController::prepareSummaryBatch(const QString &layer,int offset,const
     const auto current=[&]{return alive && document==m_document && generation==m_generation && epoch==m_aiPreviewEpoch;};
     m_aiPreviewId=0;m_aiState.remove(QStringLiteral("plan"));m_summaryUnitContext.clear();
     m_aiState.remove(QStringLiteral("previewSelection"));
+    m_aiState.remove(QStringLiteral("previewWholeDocument"));
     m_aiState.insert(QStringLiteral("previewChatGptAccount"),settings.value(QStringLiteral("chatgpt_account")));
     m_aiState.insert(QStringLiteral("previewLayeredSummary"),true);
     m_summaryBatchState.insert(QStringLiteral("generation"),generation);m_summaryBatchState.insert(QStringLiteral("layer"),layer);m_summaryBatchState.insert(QStringLiteral("offset"),offset);m_summaryBatchState.insert(QStringLiteral("phase"),QStringLiteral("preparing"));

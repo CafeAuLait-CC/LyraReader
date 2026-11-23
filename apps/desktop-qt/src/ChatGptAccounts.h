@@ -25,6 +25,7 @@ class ChatGptAccounts : public QObject {
     Q_PROPERTY(bool useForChat READ useForChat WRITE setUseForChat NOTIFY profileChanged)
     Q_PROPERTY(bool useForSelection READ useForSelection WRITE setUseForSelection NOTIFY profileChanged)
     Q_PROPERTY(bool useForLayeredSummaries READ useForLayeredSummaries WRITE setUseForLayeredSummaries NOTIFY profileChanged)
+    Q_PROPERTY(bool useForWholeDocument READ useForWholeDocument WRITE setUseForWholeDocument NOTIFY profileChanged)
     Q_PROPERTY(bool busy READ busy NOTIFY changed)
     Q_PROPERTY(bool signingIn READ signingIn NOTIFY changed)
     Q_PROPERTY(QString status READ status NOTIFY changed)
@@ -39,6 +40,7 @@ public:
     bool useForChat() const { return m_useForChat; }
     bool useForSelection() const { return m_useForSelection; }
     bool useForLayeredSummaries() const { return m_useForLayeredSummaries; }
+    bool useForWholeDocument() const { return m_useForWholeDocument; }
     bool busy() const;
     bool signingIn() const { return m_auth && m_worker==WorkerIntent::SignIn; }
     QString status() const { return m_status; }
@@ -53,6 +55,7 @@ public:
     void setUseForChat(bool value);
     void setUseForSelection(bool value);
     void setUseForLayeredSummaries(bool value);
+    void setUseForWholeDocument(bool value);
 
 signals:
     void changed();
@@ -85,6 +88,7 @@ private:
     bool m_useForChat=false;
     bool m_useForSelection=false;
     bool m_useForLayeredSummaries=false;
+    bool m_useForWholeDocument=false;
     VaultIntent m_intent=VaultIntent::None;
     WorkerIntent m_worker=WorkerIntent::SignIn;
     quint64 m_vaultId=0;

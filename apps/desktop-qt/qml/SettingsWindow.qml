@@ -315,6 +315,15 @@ ApplicationWindow {
                             (checked || (chatGptSettings.accounts.connected && !!chatGptSettings.accounts.model))
                         onToggled: chatGptSettings.accounts.useForLayeredSummaries = checked
                     }
+                    CheckBox {
+                        objectName: "useChatGptForWholeDocument"
+                        Layout.fillWidth: true
+                        text: qsTr("Use ChatGPT plan for whole-document summary and translation")
+                        checked: !!chatGptSettings.accounts && chatGptSettings.accounts.useForWholeDocument
+                        enabled: !!chatGptSettings.accounts && !chatGptSettings.accounts.busy &&
+                            (checked || (chatGptSettings.accounts.connected && !!chatGptSettings.accounts.model))
+                        onToggled: chatGptSettings.accounts.useForWholeDocument = checked
+                    }
                     RowLayout {
                         Button {
                             text: qsTr("Sign Out")

@@ -142,6 +142,7 @@ public:
     Q_INVOKABLE void dismissGeneratedRegionNote();
     Q_INVOKABLE void prepareAi(const QVariantMap &request,const QVariantMap &unit={},const QVariantMap &reading={});
     Q_INVOKABLE bool startAi(const QString &key,const QVariantMap &expectedPlan);
+    bool startChatGptRequest(const QString &account,const QString &token,const QVariantMap &plan,const QString &readingToken);
     Q_INVOKABLE void cancelAi();
     Q_INVOKABLE void setAiInput(const QString &key,const QVariant &value);
     Q_INVOKABLE void invalidateAiPlan();
@@ -358,6 +359,8 @@ private:
     quint64 m_aiRegionEpoch=0;
     RasterJobs::Handle m_aiRegionJob;
     QString m_aiSummaryPreviewUnitId,m_aiSummaryPreviewLanguage;
+    bool startAiWithCredential(const QString &key,const QVariantMap &expectedPlan);
+    bool startDocumentReadingWithCredential(const QString &key,const QVariantMap &plan,const QString &token);
     quint64 m_aiPreviewEpoch=0,m_aiActivePreviewEpoch=0;
     quint64 m_aiPreviewId=0,m_aiStartId=0,m_aiPollId=0,m_aiPlanGeneration=0;
     quint64 m_aiChatLoadId=0,m_aiChatLoadEpoch=0;

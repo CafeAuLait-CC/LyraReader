@@ -380,11 +380,20 @@ quint64 ReaderController::submitWithId(quint64 id,const QString &operation,const
     if(mutation)++m_mutationSequence;
     const auto mutationSequence=m_mutationSequence;
     const auto generation = m_generation;
+    const bool admittingAi=operation==QStringLiteral("ai_start") && m_aiState.value(QStringLiteral("running")).toBool();
+    const auto previewEpoch=m_aiPreviewEpoch;
     const bool latestOnly=operation==QStringLiteral("translation_prepare") || operation==QStringLiteral("ai_summary_cached") || operation==QStringLiteral("search") || operation==QStringLiteral("bibtex") || operation==QStringLiteral("layout") || operation==QStringLiteral("ai_preview") || operation==QStringLiteral("ai_summary_catalog") || operation==QStringLiteral("ai_summary_inspect") || operation==QStringLiteral("ai_summary_prepare") || operation==QStringLiteral("ai_summary_batch_prepare") || operation==QStringLiteral("split_plan") || operation==QStringLiteral("content_objects");
     if(latestOnly)m_latestRead.insert(operation,id);
     if(changesRevision)++m_revisionCommands;
     ++m_pendingCommands;
     QPointer<ReaderController> alive(this);emit commandsChanged();if(!alive)return 0;
+    // A direct UI listener can retire the reviewed connection before work is queued.
+    if(admittingAi && (document!=m_document || generation!=m_generation || previewEpoch!=m_aiPreviewEpoch
+                      || m_aiState.value(QStringLiteral("cancelRequested")).toBool())) {
+        --m_pendingCommands;
+        emit commandsChanged();
+        return 0;
+    }
     auto *watcher = new QFutureWatcher<CommandResult>(this);
     connect(watcher, &QFutureWatcher<CommandResult>::finished, this, [this,watcher,id,operation,arguments,generation,latestOnly,document,mutation,eraseControl,changesRevision,mutationSequence,draftKey,savedDraft,draftMatchesRequest,discardedNotes,discardedEdits] {
         const auto outcome = watcher->result();

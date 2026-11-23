@@ -466,6 +466,7 @@ private slots:
         QVERIFY(body.value("store").isBool() && !body.value("store").toBool());
         const QJsonDocument input(body.value("input").toArray());
         QVERIFY(QString::fromUtf8(input.toJson(QJsonDocument::Compact)).contains(exact));
+        QVERIFY(!reader->startAi({}, plan));
 
         QSignalSpy finished(reader, &ReaderController::commandFinished);
         const auto rejected = reader->submit("ai_start", {{"plan", plan}, {"chatgpt_account", "other-connection"}});
@@ -479,7 +480,6 @@ private slots:
         QVERIFY(!reader->aiState().value("running").toBool());
 
         request.insert("action", "SummarizeDocument");
-        request.remove("selection");
         reader->prepareAi(request, {}, options);
         QTRY_COMPARE(reader->pendingCommands(), 0);
         QVERIFY(!reader->aiState().contains("plan"));
@@ -550,6 +550,64 @@ private slots:
         QCOMPARE(view.window->property("credentialReadId").toDouble(), -1.0);
         QVERIFY(view.window->property("operationStatus").toString().contains("Check the ChatGPT connection"));
         QVERIFY(!reader->aiState().value("running").toBool());
+    }
+    void aiStartDoesNotDispatchAfterSynchronousInvalidation_data() {
+        QTest::addColumn<bool>("invalidateDuringAdmission");
+        QTest::newRow("state-notification") << false;
+        QTest::newRow("queue-notification") << true;
+    }
+    void aiStartDoesNotDispatchAfterSynchronousInvalidation() {
+        QFETCH(bool, invalidateDuringAdmission);
+        MockChatServer server;
+        QVERIFY(server.listen());
+        QTemporaryDir scratch;
+        QVERIFY(scratch.isValid());
+        const auto path = scratch.filePath("synthetic-admission.pdf");
+        QVERIFY(QFile::copy(root + "/tests/fixtures/text-page.pdf", path));
+        NativeCorpus::Viewer view;
+        QVERIFY(view.window);
+        view.workspace.openFile(QUrl::fromLocalFile(path));
+        auto *reader = view.workspace.activeReader();
+        QTRY_COMPARE(reader->pageCount(), 1);
+        QTRY_COMPARE(reader->pendingCommands(), 0);
+        const QVariantMap request{{"action", "TranslateSelection"}, {"current_page", 0}, {"language", "French"},
+                                  {"base_url", server.baseUrl()}, {"model", "synthetic"},
+                                  {"document_knowledge_pages", QVariantList{}}, {"reasoning_mode", "default"},
+                                  {"reasoning_encoding", "none"},
+                                  {"selection", QVariantMap{{"page", 0}, {"start", 0}, {"end", 12}}}};
+        const QVariantMap options{{"kind", "translation"}, {"detail", "Standard"}};
+        const auto plan = [&] { return reader->aiState().value("plan").toMap(); };
+        reader->prepareAi(request, {}, options);
+        QTRY_COMPARE(reader->pendingCommands(), 0);
+        const auto reviewed = plan();
+        QVERIFY(!reviewed.isEmpty());
+
+        bool invalidated = false;
+        const auto invalidate = [&] {
+            if (invalidated || !reader->aiState().value("running").toBool()) return;
+            invalidated = true;
+            reader->invalidateAiPlan();
+        };
+        const auto hook = invalidateDuringAdmission
+            ? connect(reader, &ReaderController::commandsChanged, this, invalidate)
+            : connect(reader, &ReaderController::aiStateChanged, this, invalidate);
+        QVERIFY(!reader->startAi("local", reviewed));
+        disconnect(hook);
+        QVERIFY(invalidated);
+        QTRY_COMPARE(reader->pendingCommands(), 0);
+        QVERIFY(!reader->aiState().value("running").toBool());
+        QVERIFY(plan().isEmpty());
+        QCOMPARE(server.requests.size(), 0);
+
+        reader->prepareAi(request, {}, options);
+        QTRY_COMPARE(reader->pendingCommands(), 0);
+        QVERIFY(!plan().isEmpty());
+        const auto response = MockChatServer::delta({{"content", "<!--lyra:0--> Synthetic translation"}});
+        server.responses.append({{response, QByteArray("data: [DONE]\\n\\n")}, 5, 200});
+        QVERIFY(reader->startAi("local", plan()));
+        QTRY_COMPARE(server.requests.size(), 1);
+        QTRY_VERIFY(!reader->aiState().value("running").toBool());
+        QTRY_COMPARE(reader->pendingCommands(), 0);
     }
     void chatGptBackgroundReadingUsesTheReviewedConnectionAndStopsOnProfileChange() {
         QTemporaryDir scratch;

@@ -42,6 +42,11 @@ void ReaderController::prepareDocumentReading(const QVariantMap &request) {
     if(current())m_readingPreviewId=id;
 }
 bool ReaderController::startDocumentReading(const QString &key,const QVariantMap &plan,const QString &token) {
+    if(plan.contains(QStringLiteral("chatgpt_account")))return false;
+    return startDocumentReadingWithCredential(key,plan,token);
+}
+
+bool ReaderController::startDocumentReadingWithCredential(const QString &key,const QVariantMap &plan,const QString &token) {
     if(!m_document || m_snapshotMode || m_loading || m_pendingCommands || m_documentReading.value(QStringLiteral("phase")).toString()!=QStringLiteral("preview") || m_documentReading.value(QStringLiteral("plan")).toMap()!=plan || m_documentReading.value(QStringLiteral("token")).toString()!=token)return false;
     const QPointer<ReaderController> owner(this);
     const auto generation=m_generation;

@@ -213,6 +213,7 @@ Pane {
             if (translateDocument) {
                 request.action = "SummarizeDocument";
                 request.selection = null;
+                if (accounts && !connectChatGpt(request, accounts, accounts.useForWholeDocument)) return;
             } else if (accounts && !connectChatGpt(request, accounts, accounts.useForSelection)) return;
             if (translateInPlace) { owner.prepareInplaceTranslation(request); return; }
             owner.prepareAi(request, {}, {kind: "translation", detail: "Standard"});
@@ -220,7 +221,7 @@ Pane {
         else if (selectedSummary || wholeSummary) {
             const request = baseRequest(modes[action]);
             if (wholeSummary) request.selection = null;
-            if (selectedSummary && accounts && !connectChatGpt(request, accounts, accounts.useForSelection)) return;
+            if (accounts && !connectChatGpt(request, accounts, selectedSummary ? accounts.useForSelection : accounts.useForWholeDocument)) return;
             request.language = input.summaryLanguage || null;
             owner.prepareAi(request, {}, {kind: "summary", detail: summaryDetail,
                 force: wholeSummary && !!viewState.cachedWholeSummary});
@@ -906,8 +907,12 @@ Pane {
                 onClicked: {
                     const entry = translationHistory.entry;
                     const request = aiPanel.baseRequest("TranslateSelection");
+                    if (!entry.selection) {
+                        request.action = "SummarizeDocument";
+                        request.selection = null;
+                    }
                     const accounts = app.session ? app.session.chatGptAccounts : null;
-                    if (entry.selection && accounts && !aiPanel.connectChatGpt(request, accounts, accounts.useForSelection)) return;
+                    if (accounts && !aiPanel.connectChatGpt(request, accounts, entry.selection ? accounts.useForSelection : accounts.useForWholeDocument)) return;
                     aiPanel.owner.prepareAi(request, {}, {
                         kind: "translation", detail: "Standard", saved_translation: entry.id
                     });

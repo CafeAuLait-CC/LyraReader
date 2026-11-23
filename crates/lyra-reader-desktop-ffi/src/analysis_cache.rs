@@ -110,19 +110,34 @@ pub(super) struct PendingSummary {
     pub(super) token: String,
     capture: Arc<SummaryCapture>,
     body_digest: [u8; 32],
+    account: Option<String>,
 }
 
 impl PendingSummary {
-    pub(super) fn new(capture: Arc<SummaryCapture>, body: &str) -> Result<Self, String> {
+    pub(super) fn new(
+        capture: Arc<SummaryCapture>,
+        body: &str,
+        account: Option<String>,
+    ) -> Result<Self, String> {
         Ok(Self {
             token: crate::marks::uuid()?,
             capture,
             body_digest: Sha256::digest(body.as_bytes()).into(),
+            account,
         })
     }
 
-    pub(super) fn matches(&self, token: &str, body: &str, fingerprint: &str) -> bool {
-        if self.token != token || self.capture.record.source_hash != fingerprint {
+    pub(super) fn matches(
+        &self,
+        token: &str,
+        body: &str,
+        fingerprint: &str,
+        account: Option<&str>,
+    ) -> bool {
+        if self.token != token
+            || self.capture.record.source_hash != fingerprint
+            || self.account.as_deref() != account
+        {
             return false;
         }
         let digest: [u8; 32] = Sha256::digest(body.as_bytes()).into();

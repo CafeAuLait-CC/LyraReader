@@ -67,6 +67,7 @@ bool ReaderController::prepareInplaceTranslation(const QVariantMap &request) {
     m_aiState.remove(QStringLiteral("plan"));m_aiState.insert(QStringLiteral("previewView"),QStringLiteral("translation"));m_aiState.insert(QStringLiteral("statusView"),QStringLiteral("translation"));
     m_aiState.insert(QStringLiteral("previewChatGptAccount"),request.value(QStringLiteral("chatgpt_account")));
     m_aiState.insert(QStringLiteral("previewSelection"),request.value(QStringLiteral("selection")));
+    m_aiState.remove(QStringLiteral("previewWholeDocument"));
     m_aiState.insert(QStringLiteral("planSent"),false);m_aiState.insert(QStringLiteral("status"),tr("Preparing in-place translations locally…"));m_aiPlanGeneration=generation;
     emit aiStateChanged();if(!current())return false;
     const auto id=submit(QStringLiteral("translation_prepare"),{{QStringLiteral("request"),request}});
