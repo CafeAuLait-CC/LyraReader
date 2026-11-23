@@ -2,7 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 
-ScrollView {
+AiReadingScrollView {
     id: conversation
     objectName: "aiConversationHistory"
     required property var app
@@ -12,7 +12,6 @@ ScrollView {
     readonly property var owner: app.currentReader
     readonly property bool active: !!viewState.running && viewState.responseView === "chat"
     signal citation(string link, var plan)
-    contentWidth: availableWidth
     clip: true
     function followAnswer() {
         if (!visible || !followTail) return;
@@ -49,11 +48,9 @@ ScrollView {
         }
         function onContentHeightChanged() { conversation.followAnswer(); }
     }
-    ScrollBar.vertical: ScrollBar {
-        onPressedChanged: {
-            if (pressed) conversation.followTail = false;
-            else if (conversation.contentItem.atYEnd) conversation.followTail = true;
-        }
+    onVerticalBarPressedChanged: {
+        if (verticalBarPressed) followTail = false;
+        else if (contentItem && contentItem.atYEnd) followTail = true;
     }
     ColumnLayout {
         width: conversation.availableWidth

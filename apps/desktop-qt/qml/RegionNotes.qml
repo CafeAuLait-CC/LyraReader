@@ -131,12 +131,13 @@ Pane {
             onCountChanged:if(count && currentIndex<0)currentIndex=0
             Keys.onReturnPressed:if(currentItem)notes.load(currentItem.modelData.id)
             Keys.onEnterPressed:if(currentItem)notes.load(currentItem.modelData.id)
-            ScrollBar.vertical:ScrollBar{}
+            ScrollBar.vertical:AiReadingScrollBar { id: listBar }
             delegate:ItemDelegate {
                 id:row
                 required property var modelData
                 required property int index
-                width:list.width
+                x: list.LayoutMirroring.enabled ? listBar.gutterWidth : 0
+                width: Math.max(0, list.width - listBar.gutterWidth)
                 objectName:"regionNoteRow"+modelData.number
                 text:qsTr("Region %1 · page %2").arg(modelData.number).arg(modelData.page+1)
                 implicitHeight:Math.max(86,contentItem.implicitHeight+20)
@@ -198,10 +199,11 @@ Pane {
             }
         }
         BusyIndicator {visible:!!notes.readId;running:visible;Layout.alignment:Qt.AlignHCenter}
-        ScrollView {
-            visible:!!notes.detail;Layout.fillWidth:true;Layout.fillHeight:true;contentWidth:availableWidth;clip:true
+        AiReadingScrollView {
+            id: noteDetail
+            visible:!!notes.detail;Layout.fillWidth:true;Layout.fillHeight:true;clip:true
             ColumnLayout {
-                width:parent.width;spacing:8
+                width:noteDetail.availableWidth;spacing:8
                 Button {
                     objectName:"regionNoteSourcePage";visible:!!notes.detail
                     text:notes.detail ? qsTr("Page %1").arg(notes.detail.attachment.page+1) : ""

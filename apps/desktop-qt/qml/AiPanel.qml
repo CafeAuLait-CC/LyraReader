@@ -393,14 +393,13 @@ Pane {
             Accessible.name: qsTr("Translation language")
             onTextEdited: aiPanel.owner.setAiInput("language", text)
         }
-        ScrollView {
+        AiReadingScrollView {
             id: responseScroll
             objectName: "aiResponseScroll"
             visible: aiPanel.workspace !== "chat" && !aiPanel.batchMode
             Layout.fillWidth: true; Layout.fillHeight: true; Layout.minimumHeight: 24
-            contentWidth: availableWidth
             AiResult {
-                width: parent.width
+                width: responseScroll.availableWidth
                 app: aiPanel.app; value: aiPanel.result; viewport: responseScroll.contentItem
                 onCitation: function(link, responsePlan) { aiPanel.followHistoryLink(link, responsePlan); }
             }

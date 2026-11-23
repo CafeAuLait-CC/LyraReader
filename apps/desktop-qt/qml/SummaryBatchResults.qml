@@ -14,7 +14,7 @@ ListView {
     signal citation(var reader, var generation, string link, var proof)
     clip: true; spacing: 10
     model: order
-    ScrollBar.vertical: ScrollBar {}
+    ScrollBar.vertical: AiReadingScrollBar { id: batchBar }
     ListModel { id: order }
     function syncOrder() {
         if (!owner || !order) return;
@@ -39,7 +39,8 @@ ListView {
         function current() { return expectedOwner && expectedOwner === root.owner && expectedGeneration === expectedOwner.documentGeneration && expectedId === unitId && entry.generation === expectedGeneration; }
         Component.onCompleted: { expectedOwner = root.owner; expectedGeneration = root.owner.documentGeneration; expectedId = unitId; }
         objectName: "summaryBatchRow_" + unitId
-        width: root.width
+        x: root.LayoutMirroring.enabled ? batchBar.gutterWidth : 0
+        width: Math.max(0, root.width - batchBar.gutterWidth)
         spacing: 3
         Label {
             Layout.fillWidth: true; font.bold: true; color: app.colors.textPrimary
